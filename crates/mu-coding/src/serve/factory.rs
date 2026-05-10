@@ -17,19 +17,29 @@ use crate::tools::{LsTool, ReadTool, WriteTool};
 ///
 /// `model` is provider-specific. Faux ignores it; anthropic-api
 /// defaults to `claude-haiku-4-5-20251001` if `model` is None;
-/// openai-codex defaults to `gpt-5-codex`.
+/// openai-codex defaults to `gpt-5.5`.
 ///
 /// `ephemeral` only affects providers that hold rotatable OAuth
 /// tokens (currently: openai-codex). When true, refreshed tokens
 /// stay in memory and aren't written back to the token store.
+///
+/// `thinking` is the reasoning effort level
+/// (`minimal`/`low`/`medium`/`high`). Applied to providers that
+/// support it (openai-codex). Other providers ignore it with a
+/// debug log — passing it isn't an error.
 pub fn build_provider(
     name: &str,
     model: Option<&str>,
     ephemeral: bool,
+    thinking: Option<&str>,
 ) -> Result<Arc<dyn Provider>> {
     match name {
-        "faux" => Ok(Arc::new(FauxProvider::echo())),
+        "faux" => {
+            log_thinking_ignored(name, thinking);
+            Ok(Arc::new(FauxProvider::echo()))
+        }
         "anthropic-api" => {
+            log_thinking_ignored(name, thinking);
             let model = model
                 .unwrap_or("claude-haiku-4-5-20251001")
                 .to_string();
@@ -48,9 +58,14 @@ pub fn build_provider(
                 OpenaiCodexProvider::from_store(model)
             }
             .map_err(|e| anyhow::anyhow!("openai-codex: {e}"))?;
+            let provider = match thinking {
+                Some(t) if !t.is_empty() => provider.with_thinking(t.to_string()),
+                _ => provider,
+            };
             Ok(Arc::new(provider))
         }
         "openrouter" => {
+            log_thinking_ignored(name, thinking);
             let model = model
                 .unwrap_or("anthropic/claude-haiku-4.5")
                 .to_string();
@@ -59,6 +74,17 @@ pub fn build_provider(
         other => anyhow::bail!(
             "unknown provider: {other} (expected: faux, anthropic-api, openai-codex, openrouter)"
         ),
+    }
+}
+
+fn log_thinking_ignored(provider: &str, thinking: Option<&str>) {
+    if let Some(t) = thinking {
+        if !t.is_empty() {
+            tracing::debug!(
+                provider, thinking = %t,
+                "--thinking is ignored for this provider (no reasoning surface)"
+            );
+        }
     }
 }
 
@@ -107,16 +133,18 @@ mod tests {
 
     #[test]
     fn build_provider_faux() {
-        assert!(build_provider("faux", None, false).is_ok());
-        assert!(build_provider("faux", Some("ignored"), false).is_ok());
+        assert!(build_provider("faux", None, false, None).is_ok());
+        assert!(build_provider("faux", Some("ignored"), false, None).is_ok());
         // ephemeral=true is tolerated for providers that ignore it.
-        assert!(build_provider("faux", None, true).is_ok());
+        assert!(build_provider("faux", None, true, None).is_ok());
+        // thinking=Some(...) is tolerated for providers that ignore it.
+        assert!(build_provider("faux", None, false, Some("high")).is_ok());
     }
 
     #[test]
     fn build_provider_unknown_errors() {
         // Can't `.unwrap_err()` because Arc<dyn Provider>: !Debug.
-        match build_provider("bogus", None, false) {
+        match build_provider("bogus", None, false, None) {
             Ok(_) => panic!("expected error for unknown provider"),
             Err(e) => assert!(e.to_string().contains("unknown provider")),
         }

@@ -25,7 +25,9 @@
 #![deny(unsafe_code)]
 
 pub mod faux;
+pub mod providers;
 pub use faux::{FauxProvider, FauxResponse};
+pub use providers::AnthropicProvider;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

@@ -6,6 +6,7 @@
 //! See spec mu-006. v1 supports text-only responses; tools, extended
 //! thinking, and image content are deferred.
 
+use std::collections::HashMap;
 use std::pin::Pin;
 
 use async_trait::async_trait;
@@ -17,7 +18,7 @@ use tokio::sync::oneshot;
 
 use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, Provider, ProviderError, ProviderEvent,
-    StopReason, ToolSpec,
+    StopReason, ToolCall, ToolSpec,
 };
 
 use super::sse::{SseEvent, SseStream};
@@ -243,14 +244,13 @@ struct AnthropicMessageMeta {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
-#[allow(dead_code)]
+#[allow(dead_code)] // `text` is read from content_block_start to seed the
+                    // text block; other fields are present for future use.
 enum AnthropicBlock {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "tool_use")]
-    ToolUse {
-        // ignored in v1
-    },
+    ToolUse { id: String, name: String },
     #[serde(other)]
     Other,
 }
@@ -261,7 +261,7 @@ enum AnthropicDelta {
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
     #[serde(rename = "input_json_delta")]
-    InputJsonDelta { /* tool args */ },
+    InputJsonDelta { partial_json: String },
     #[serde(other)]
     Other,
 }
@@ -308,7 +308,8 @@ fn events_stream(
     let sse = SseStream::new(bytes);
     let state = StreamState {
         sse: Box::pin(sse),
-        accumulated_text: String::new(),
+        blocks: HashMap::new(),
+        block_order: Vec::new(),
         stop_reason: None,
         cancel_rx: Some(cancel_rx),
         finished: false,
@@ -317,9 +318,30 @@ fn events_stream(
     Box::pin(futures::stream::unfold(state, next_event))
 }
 
+/// Per-content-block accumulator. Anthropic streams content in
+/// indexed blocks; each `content_block_start` opens one, deltas
+/// append to it, `content_block_stop` closes it. Blocks may be text
+/// or tool_use (or others we ignore for v1).
+enum BlockBuilder {
+    Text(String),
+    ToolUse {
+        id: String,
+        name: String,
+        /// Accumulated input JSON; parsed at `message_stop` time.
+        input_json: String,
+    },
+}
+
 struct StreamState {
     sse: Pin<Box<dyn Stream<Item = SseEvent> + Send>>,
-    accumulated_text: String,
+    /// Open content blocks indexed by Anthropic's block index. Built
+    /// up as start/delta/stop events arrive; finalized into
+    /// `AssistantMessage::content` at `message_stop`.
+    blocks: HashMap<u32, BlockBuilder>,
+    /// Order in which blocks were opened. Used so the final content
+    /// vec reflects Anthropic's intended order regardless of
+    /// HashMap iteration order.
+    block_order: Vec<u32>,
     stop_reason: Option<String>,
     cancel_rx: Option<oneshot::Receiver<()>>,
     finished: bool,
@@ -334,14 +356,13 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
     loop {
         // Cancel?
         if let Some(rx) = state.cancel_rx.as_mut() {
-            // Try to check cancel without blocking.
             match rx.try_recv() {
                 Ok(_) => {
                     state.finished = true;
                     state.cancel_rx = None;
                     return Some((
                         ProviderEvent::Done(AssistantMessage {
-                            content: assistant_content(&state.accumulated_text),
+                            content: assemble_content(&state.blocks, &state.block_order),
                             stop_reason: StopReason::Aborted,
                         }),
                         state,
@@ -366,7 +387,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                     let stop = map_stop_reason(state.stop_reason.as_deref());
                     return Some((
                         ProviderEvent::Done(AssistantMessage {
-                            content: assistant_content(&state.accumulated_text),
+                            content: assemble_content(&state.blocks, &state.block_order),
                             stop_reason: stop,
                         }),
                         state,
@@ -387,18 +408,62 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
         };
 
         match parsed {
-            AnthropicEvent::ContentBlockDelta {
-                delta: AnthropicDelta::TextDelta { text },
-                ..
-            } => {
-                state.accumulated_text.push_str(&text);
-                return Some((ProviderEvent::TextDelta(text), state));
+            AnthropicEvent::ContentBlockStart { index, content_block } => {
+                // Register a new block. Re-registering an index is a
+                // protocol violation; we replace silently.
+                let builder = match content_block {
+                    AnthropicBlock::Text { text } => BlockBuilder::Text(text),
+                    AnthropicBlock::ToolUse { id, name } => BlockBuilder::ToolUse {
+                        id,
+                        name,
+                        input_json: String::new(),
+                    },
+                    AnthropicBlock::Other => continue,
+                };
+                if !state.blocks.contains_key(&index) {
+                    state.block_order.push(index);
+                }
+                state.blocks.insert(index, builder);
             }
-            AnthropicEvent::ContentBlockStart { .. } => {
-                // No-op for v1.
-            }
+            AnthropicEvent::ContentBlockDelta { index, delta } => match delta {
+                AnthropicDelta::TextDelta { text } => {
+                    if let Some(BlockBuilder::Text(buf)) = state.blocks.get_mut(&index) {
+                        buf.push_str(&text);
+                    } else {
+                        // No matching text block — uncommon; treat as
+                        // implicit start. Push to a fresh text block.
+                        if !state.blocks.contains_key(&index) {
+                            state.block_order.push(index);
+                        }
+                        state.blocks.insert(index, BlockBuilder::Text(text.clone()));
+                    }
+                    return Some((ProviderEvent::TextDelta(text), state));
+                }
+                AnthropicDelta::InputJsonDelta { partial_json } => {
+                    if let Some(BlockBuilder::ToolUse { input_json, .. }) =
+                        state.blocks.get_mut(&index)
+                    {
+                        input_json.push_str(&partial_json);
+                    } else {
+                        // Delta for a tool block we never saw start —
+                        // protocol violation. Log and ignore.
+                        tracing::warn!(
+                            index,
+                            "input_json_delta arrived for unknown or non-tool block"
+                        );
+                    }
+                    // v1: don't emit ProviderEvent::ToolCallDelta; the
+                    // loop ignores it. Final tool calls are surfaced
+                    // in the Done payload.
+                }
+                AnthropicDelta::Other => {
+                    // Unknown delta type (e.g., future thinking_delta);
+                    // ignore.
+                }
+            },
             AnthropicEvent::ContentBlockStop { .. } => {
-                // No-op.
+                // No-op for v1; the block stays in the map until
+                // assembled at message_stop.
             }
             AnthropicEvent::MessageDelta { delta } => {
                 state.stop_reason = delta.stop_reason;
@@ -409,7 +474,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 let stop = map_stop_reason(state.stop_reason.as_deref());
                 return Some((
                     ProviderEvent::Done(AssistantMessage {
-                        content: assistant_content(&state.accumulated_text),
+                        content: assemble_content(&state.blocks, &state.block_order),
                         stop_reason: stop,
                     }),
                     state,
@@ -428,358 +493,69 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
             AnthropicEvent::Ping | AnthropicEvent::MessageStart { .. } => {
                 // No-op for v1. (MessageStart carries metadata we don't use yet.)
             }
-            AnthropicEvent::ContentBlockDelta { .. } => {
-                // Non-text delta types (input_json_delta for tool args). Future.
-            }
         }
     }
 }
 
-fn assistant_content(text: &str) -> Vec<ContentBlock> {
-    if text.is_empty() {
-        Vec::new()
-    } else {
-        vec![ContentBlock::Text {
-            text: text.to_string(),
-        }]
+/// Assemble the final assistant content from accumulated blocks.
+/// Walks `block_order` so the result reflects Anthropic's intended
+/// order regardless of HashMap iteration order. Tool-use blocks
+/// parse their accumulated input_json; on parse error or non-object
+/// result, falls back to an empty object per INV-5.
+fn assemble_content(
+    blocks: &HashMap<u32, BlockBuilder>,
+    block_order: &[u32],
+) -> Vec<ContentBlock> {
+    block_order
+        .iter()
+        .filter_map(|idx| blocks.get(idx))
+        .map(|builder| match builder {
+            BlockBuilder::Text(text) => ContentBlock::Text { text: text.clone() },
+            BlockBuilder::ToolUse {
+                id,
+                name,
+                input_json,
+            } => {
+                let arguments = parse_tool_input(input_json);
+                ContentBlock::ToolCall(ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments,
+                })
+            }
+        })
+        .collect()
+}
+
+/// Parse a tool's accumulated input JSON. On any failure (malformed
+/// JSON, valid JSON that isn't an object), fall back to an empty
+/// object and log a warning. Tools expect an object of arguments;
+/// passing through arrays/strings/numbers would break the contract
+/// with `Tool::execute`.
+fn parse_tool_input(input_json: &str) -> Value {
+    if input_json.is_empty() {
+        return Value::Object(serde_json::Map::new());
+    }
+    match serde_json::from_str::<Value>(input_json) {
+        Ok(v) if v.is_object() => v,
+        Ok(other) => {
+            tracing::warn!(
+                value = %other,
+                "tool input JSON was valid but not an object; using empty object"
+            );
+            Value::Object(serde_json::Map::new())
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                raw = %input_json,
+                "failed to parse tool input JSON; using empty object"
+            );
+            Value::Object(serde_json::Map::new())
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use mu_core::agent::ToolCall;
-
-    #[test]
-    fn b1_translate_user_message() {
-        let m = AgentMessage::User {
-            content: "hi".into(),
-        };
-        let v = translate_message_single(&m).expect("translates");
-        assert_eq!(v["role"], "user");
-        assert_eq!(v["content"], "hi");
-    }
-
-    #[test]
-    fn b2_translate_assistant_message() {
-        let m = AgentMessage::Assistant(AssistantMessage {
-            content: vec![ContentBlock::Text { text: "hi".into() }],
-            stop_reason: StopReason::EndTurn,
-        });
-        let v = translate_message_single(&m).expect("translates");
-        assert_eq!(v["role"], "assistant");
-        assert_eq!(v["content"][0]["type"], "text");
-        assert_eq!(v["content"][0]["text"], "hi");
-    }
-
-    #[test]
-    fn translate_message_single_skips_tool_result() {
-        let m = AgentMessage::ToolResult {
-            call_id: "x".into(),
-            content: "out".into(),
-            is_error: false,
-        };
-        assert!(translate_message_single(&m).is_none());
-    }
-
-    #[test]
-    fn build_request_body_basics() {
-        let messages = vec![AgentMessage::User {
-            content: "hi".into(),
-        }];
-        let body = build_request_body("claude-test", &messages, &[]);
-        assert_eq!(body["model"], "claude-test");
-        assert_eq!(body["stream"], true);
-        assert_eq!(body["max_tokens"], 4096);
-        assert_eq!(body["messages"][0]["role"], "user");
-    }
-
-    #[test]
-    fn b1_translate_tool_spec_shape() {
-        let spec = ToolSpec {
-            name: "read".into(),
-            description: "Read a file".into(),
-            input_schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
-        };
-        assert_eq!(translate_tool_spec(&spec), json!({
-            "name":"read",
-            "description":"Read a file",
-            "input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
-        }));
-    }
-
-    #[test]
-    fn b2_translate_messages_preserves_order() {
-        let messages = vec![
-            AgentMessage::User { content: "first".into() },
-            assistant_text("second"),
-            AgentMessage::User { content: "third".into() },
-            assistant_text("fourth"),
-        ];
-        let translated = translate_messages(&messages);
-        assert_eq!(translated.len(), 4);
-        assert_eq!(translated[0]["role"], "user");
-        assert_eq!(translated[0]["content"], "first");
-        assert_eq!(translated[1]["role"], "assistant");
-        assert_eq!(translated[1]["content"][0]["text"], "second");
-        assert_eq!(translated[2]["role"], "user");
-        assert_eq!(translated[2]["content"], "third");
-        assert_eq!(translated[3]["role"], "assistant");
-        assert_eq!(translated[3]["content"][0]["text"], "fourth");
-    }
-
-    #[test]
-    fn b3_consecutive_tool_results_group_into_one_user_message() {
-        let messages = vec![
-            AgentMessage::User { content: "read both".into() },
-            AgentMessage::Assistant(AssistantMessage {
-                content: vec![tool_call("toolu_a", "a.txt"), tool_call("toolu_b", "b.txt")],
-                stop_reason: StopReason::ToolUse,
-            }),
-            AgentMessage::ToolResult { call_id: "toolu_a".into(), content: "a contents".into(), is_error: false },
-            AgentMessage::ToolResult { call_id: "toolu_b".into(), content: "b failed".into(), is_error: true },
-            assistant_text("done"),
-        ];
-
-        let translated = translate_messages(&messages);
-        assert_eq!(translated.len(), 4);
-        assert_eq!(translated[0]["role"], "user");
-        assert_eq!(translated[1]["role"], "assistant");
-        assert_eq!(translated[1]["content"].as_array().map(Vec::len), Some(2));
-        assert_eq!(translated[1]["content"][0]["type"], "tool_use");
-        assert_eq!(translated[1]["content"][0]["id"], "toolu_a");
-        assert_eq!(translated[1]["content"][0]["input"], json!({ "path": "a.txt" }));
-        assert_eq!(translated[1]["content"][1]["type"], "tool_use");
-        assert_eq!(translated[1]["content"][1]["id"], "toolu_b");
-        assert_eq!(translated[2]["role"], "user");
-        let tool_results = translated[2]["content"].as_array();
-        assert_eq!(tool_results.map(Vec::len), Some(2));
-        assert_eq!(translated[2]["content"][0]["type"], "tool_result");
-        assert_eq!(translated[2]["content"][0]["tool_use_id"], "toolu_a");
-        assert_eq!(translated[2]["content"][0]["content"], "a contents");
-        assert_eq!(translated[2]["content"][0]["is_error"], false);
-        assert_eq!(translated[2]["content"][1]["type"], "tool_result");
-        assert_eq!(translated[2]["content"][1]["tool_use_id"], "toolu_b");
-        assert_eq!(translated[2]["content"][1]["content"], "b failed");
-        assert_eq!(translated[2]["content"][1]["is_error"], true);
-        assert_eq!(translated[3]["role"], "assistant");
-    }
-
-    #[test]
-    fn b4_build_request_body_includes_tools_when_present() {
-        let messages = vec![AgentMessage::User { content: "hi".into() }];
-        let tools = vec![ToolSpec {
-            name: "read".into(),
-            description: "Read a file".into(),
-            input_schema: json!({ "type": "object" }),
-        }];
-        let body = build_request_body("claude-test", &messages, &tools);
-        assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
-        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
-        assert_eq!(body["tools"][0]["name"], "read");
-    }
-
-    #[test]
-    fn b5_build_request_body_omits_tools_when_empty() {
-        let messages = vec![AgentMessage::User { content: "hi".into() }];
-        let body = build_request_body("claude-test", &messages, &[]);
-        assert!(body.get("tools").is_none());
-        assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
-    }
-
-    fn assistant_text(text: &str) -> AgentMessage {
-        AgentMessage::Assistant(AssistantMessage {
-            content: vec![ContentBlock::Text { text: text.into() }],
-            stop_reason: StopReason::EndTurn,
-        })
-    }
-
-    fn tool_call(id: &str, path: &str) -> ContentBlock {
-        ContentBlock::ToolCall(ToolCall {
-            id: id.into(),
-            name: "read".into(),
-            arguments: json!({ "path": path }),
-        })
-    }
-
-    #[tokio::test]
-    async fn b4_sse_to_provider_events() {
-        // Build a fake SSE byte stream that mimics Anthropic's shape.
-        let raw = concat!(
-            r#"event: message_start"#, "\n",
-            r#"data: {"type":"message_start","message":{"id":"m_1","role":"assistant"}}"#, "\n\n",
-            r#"event: content_block_start"#, "\n",
-            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
-            r#"event: content_block_delta"#, "\n",
-            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#, "\n\n",
-            r#"event: content_block_delta"#, "\n",
-            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}"#, "\n\n",
-            r#"event: content_block_stop"#, "\n",
-            r#"data: {"type":"content_block_stop","index":0}"#, "\n\n",
-            r#"event: message_delta"#, "\n",
-            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#, "\n\n",
-            r#"event: message_stop"#, "\n",
-            r#"data: {"type":"message_stop"}"#, "\n\n",
-        );
-        let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
-            raw.as_bytes(),
-        ))]);
-        // events_stream takes Stream<Item = reqwest::Result<Bytes>>;
-        // we adapt by mapping our io::Error to reqwest's. Since we
-        // don't have access to a reqwest::Error constructor, build a
-        // separate adapter for tests.
-        let bytes = bytes.map(|r| r.map_err(|_| panic!("test stream errored")));
-        // Wrap so the stream type matches what events_stream expects
-        // (reqwest::Result<Bytes>). The simplest path: change
-        // events_stream to be generic over any Stream<Item =
-        // Result<Bytes, _>>, so tests can use io::Error. Refactor
-        // below in test_events_stream.
-        let (_tx, rx) = tokio::sync::oneshot::channel();
-        let mut stream = test_events_stream(bytes, rx);
-
-        let mut events = Vec::new();
-        while let Some(e) = stream.next().await {
-            events.push(e);
-        }
-
-        // Expected: TextDelta("hello"), TextDelta(" world"),
-        // Done(AssistantMessage { content: [Text("hello world")], EndTurn })
-        assert_eq!(events.len(), 3);
-        match &events[0] {
-            ProviderEvent::TextDelta(t) => assert_eq!(t, "hello"),
-            other => panic!("expected TextDelta, got {other:?}"),
-        }
-        match &events[1] {
-            ProviderEvent::TextDelta(t) => assert_eq!(t, " world"),
-            other => panic!("expected TextDelta, got {other:?}"),
-        }
-        match &events[2] {
-            ProviderEvent::Done(msg) => {
-                assert_eq!(msg.stop_reason, StopReason::EndTurn);
-                match &msg.content[0] {
-                    ContentBlock::Text { text } => assert_eq!(text, "hello world"),
-                    other => panic!("expected Text block, got {other:?}"),
-                }
-            }
-            other => panic!("expected Done, got {other:?}"),
-        }
-    }
-
-    /// Test-only variant of events_stream that accepts a stream with
-    /// any Result error type, not specifically reqwest::Result.
-    fn test_events_stream(
-        bytes: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
-        cancel_rx: oneshot::Receiver<()>,
-    ) -> BoxStream<'static, ProviderEvent> {
-        let bytes: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
-            Box::pin(bytes);
-        let sse = SseStream::new(bytes);
-        let state = StreamState {
-            sse: Box::pin(sse),
-            accumulated_text: String::new(),
-            stop_reason: None,
-            cancel_rx: Some(cancel_rx),
-            finished: false,
-            emitted_done: false,
-        };
-        Box::pin(futures::stream::unfold(state, next_event))
-    }
-
-    #[tokio::test]
-    async fn anthropic_error_event_terminates_with_provider_error() {
-        let raw = concat!(
-            r#"event: error"#, "\n",
-            r#"data: {"type":"error","error":{"type":"rate_limit_error","message":"too many"}}"#, "\n\n",
-        );
-        let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
-            raw.as_bytes(),
-        ))]);
-        let (_tx, rx) = tokio::sync::oneshot::channel();
-        let mut stream = test_events_stream(bytes, rx);
-        let event = stream.next().await.expect("expected error event");
-        match event {
-            ProviderEvent::Error(msg) => {
-                assert!(msg.contains("rate_limit_error"));
-                assert!(msg.contains("too many"));
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-        // No more events.
-        assert!(stream.next().await.is_none());
-    }
-
-    #[test]
-    fn map_stop_reason_known_and_unknown() {
-        assert_eq!(map_stop_reason(Some("end_turn")), StopReason::EndTurn);
-        assert_eq!(map_stop_reason(Some("tool_use")), StopReason::ToolUse);
-        assert_eq!(map_stop_reason(Some("max_tokens")), StopReason::MaxTokens);
-        assert_eq!(map_stop_reason(Some("weird")), StopReason::EndTurn);
-        assert_eq!(map_stop_reason(None), StopReason::EndTurn);
-    }
-}
-
-// ============================================================================
-// Live integration test (gated on MU_LIVE_ANTHROPIC env var)
-// ============================================================================
-
-#[cfg(test)]
-mod live_tests {
-    use super::*;
-    use mu_core::agent::AgentMessage;
-
-    fn live_enabled() -> bool {
-        std::env::var("MU_LIVE_ANTHROPIC")
-            .ok()
-            .as_deref()
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    }
-
-    /// B-7 (live API smoke). Only runs when MU_LIVE_ANTHROPIC=1.
-    #[tokio::test]
-    async fn b7_live_anthropic_smoke() {
-        if !live_enabled() {
-            eprintln!("skipping b7_live_anthropic_smoke (set MU_LIVE_ANTHROPIC=1 to run)");
-            return;
-        }
-
-        let provider = AnthropicProvider::from_env("claude-haiku-4-5-20251001".into())
-            .expect("ANTHROPIC_API_KEY must be set when MU_LIVE_ANTHROPIC=1");
-
-        let messages = vec![AgentMessage::User {
-            content: "Reply with the single word 'hello' and nothing else.".into(),
-        }];
-        let (_tx, rx) = tokio::sync::oneshot::channel();
-        let mut stream = provider
-            .stream(&messages, &[], rx)
-            .await
-            .expect("provider.stream");
-
-        let mut text = String::new();
-        let mut done_payload: Option<AssistantMessage> = None;
-        while let Some(event) = stream.next().await {
-            match event {
-                ProviderEvent::TextDelta(d) => text.push_str(&d),
-                ProviderEvent::Done(msg) => {
-                    done_payload = Some(msg);
-                    break;
-                }
-                ProviderEvent::Error(e) => panic!("anthropic error: {e}"),
-                _ => {}
-            }
-        }
-
-        let done = done_payload.expect("expected Done");
-        let final_text = match &done.content[..] {
-            [ContentBlock::Text { text }] => text.clone(),
-            other => panic!("unexpected content blocks: {other:?}"),
-        };
-        eprintln!("live anthropic smoke text: {final_text:?}");
-        assert!(
-            final_text.to_lowercase().contains("hello"),
-            "expected response to contain 'hello', got: {final_text:?}"
-        );
-        // Sanity: streamed text matches accumulated text.
-        assert_eq!(text, final_text);
-    }
-}
+#[path = "anthropic_tests.rs"]
+mod tests;

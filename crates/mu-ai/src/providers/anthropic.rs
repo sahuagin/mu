@@ -65,10 +65,10 @@ impl Provider for AnthropicProvider {
     async fn stream(
         &self,
         messages: &[AgentMessage],
-        _tools: &[ToolSpec], // v1: ignored
+        tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
-        let body = build_request_body(&self.model, messages);
+        let body = build_request_body(&self.model, messages, tools);
 
         let resp = self
             .client
@@ -94,28 +94,87 @@ impl Provider for AnthropicProvider {
     }
 }
 
-/// Translate an `AgentMessage` into Anthropic's API message shape.
-/// Returns None for messages that don't map cleanly (e.g.,
-/// `ToolResult` in v1 — tool support is a future spec).
-pub(crate) fn translate_message(m: &AgentMessage) -> Option<Value> {
+/// Translate a mu `ToolSpec` into Anthropic's tool descriptor shape.
+pub(crate) fn translate_tool_spec(spec: &ToolSpec) -> Value {
+    json!({
+        "name": spec.name,
+        "description": spec.description,
+        "input_schema": spec.input_schema,
+    })
+}
+
+/// Translate messages into Anthropic's API message shape.
+///
+/// Consecutive tool results are batched into a single user message
+/// containing multiple `tool_result` content blocks, as required by
+/// Anthropic's tool-use protocol.
+pub(crate) fn translate_messages(messages: &[AgentMessage]) -> Vec<Value> {
+    let mut out = Vec::with_capacity(messages.len());
+    let mut tool_result_buf = Vec::new();
+
+    for message in messages {
+        match message {
+            AgentMessage::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => {
+                tool_result_buf.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": content,
+                    "is_error": is_error,
+                }));
+            }
+            other => {
+                if !tool_result_buf.is_empty() {
+                    out.push(json!({
+                        "role": "user",
+                        "content": std::mem::take(&mut tool_result_buf),
+                    }));
+                }
+                if let Some(translated) = translate_message_single(other) {
+                    out.push(translated);
+                }
+            }
+        }
+    }
+
+    if !tool_result_buf.is_empty() {
+        out.push(json!({
+            "role": "user",
+            "content": tool_result_buf,
+        }));
+    }
+
+    out
+}
+
+/// Single-message translation for non-ToolResult variants. ToolResult
+/// is handled by `translate_messages` because Anthropic requires
+/// consecutive tool results to be grouped in one user message.
+fn translate_message_single(m: &AgentMessage) -> Option<Value> {
     match m {
         AgentMessage::User { content } => Some(json!({
             "role": "user",
             "content": content,
         })),
         AgentMessage::Assistant(a) => {
-            // Translate content blocks: only Text in v1.
             let blocks: Vec<Value> = a
                 .content
                 .iter()
-                .filter_map(|b| match b {
+                .filter_map(|block| match block {
                     ContentBlock::Text { text } => Some(json!({
                         "type": "text",
                         "text": text,
                     })),
-                    // ContentBlock::ToolCall — future spec
-                    // ContentBlock::Thinking — future spec
-                    _ => None,
+                    ContentBlock::ToolCall(tool_call) => Some(json!({
+                        "type": "tool_use",
+                        "id": tool_call.id,
+                        "name": tool_call.name,
+                        "input": tool_call.arguments,
+                    })),
+                    ContentBlock::Thinking { .. } => None,
                 })
                 .collect();
             if blocks.is_empty() {
@@ -127,22 +186,26 @@ pub(crate) fn translate_message(m: &AgentMessage) -> Option<Value> {
                 }))
             }
         }
-        AgentMessage::ToolResult { .. } => {
-            // v1: tool result messages are dropped on the floor.
-            // The model never sees them. Future spec adds this back.
-            None
-        }
+        AgentMessage::ToolResult { .. } => None,
     }
 }
 
-pub(crate) fn build_request_body(model: &str, messages: &[AgentMessage]) -> Value {
-    let api_messages: Vec<Value> = messages.iter().filter_map(translate_message).collect();
-    json!({
+pub(crate) fn build_request_body(
+    model: &str,
+    messages: &[AgentMessage],
+    tools: &[ToolSpec],
+) -> Value {
+    let api_messages = translate_messages(messages);
+    let mut body = json!({
         "model": model,
         "max_tokens": 4096,
         "stream": true,
         "messages": api_messages,
-    })
+    });
+    if !tools.is_empty() {
+        body["tools"] = json!(tools.iter().map(translate_tool_spec).collect::<Vec<_>>());
+    }
+    body
 }
 
 // ============================================================================
@@ -385,13 +448,14 @@ fn assistant_content(text: &str) -> Vec<ContentBlock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mu_core::agent::ToolCall;
 
     #[test]
     fn b1_translate_user_message() {
         let m = AgentMessage::User {
             content: "hi".into(),
         };
-        let v = translate_message(&m).expect("translates");
+        let v = translate_message_single(&m).expect("translates");
         assert_eq!(v["role"], "user");
         assert_eq!(v["content"], "hi");
     }
@@ -399,25 +463,23 @@ mod tests {
     #[test]
     fn b2_translate_assistant_message() {
         let m = AgentMessage::Assistant(AssistantMessage {
-            content: vec![ContentBlock::Text {
-                text: "hi".into(),
-            }],
+            content: vec![ContentBlock::Text { text: "hi".into() }],
             stop_reason: StopReason::EndTurn,
         });
-        let v = translate_message(&m).expect("translates");
+        let v = translate_message_single(&m).expect("translates");
         assert_eq!(v["role"], "assistant");
         assert_eq!(v["content"][0]["type"], "text");
         assert_eq!(v["content"][0]["text"], "hi");
     }
 
     #[test]
-    fn translate_skips_tool_result_in_v1() {
+    fn translate_message_single_skips_tool_result() {
         let m = AgentMessage::ToolResult {
             call_id: "x".into(),
             content: "out".into(),
             is_error: false,
         };
-        assert!(translate_message(&m).is_none());
+        assert!(translate_message_single(&m).is_none());
     }
 
     #[test]
@@ -425,11 +487,119 @@ mod tests {
         let messages = vec![AgentMessage::User {
             content: "hi".into(),
         }];
-        let body = build_request_body("claude-test", &messages);
+        let body = build_request_body("claude-test", &messages, &[]);
         assert_eq!(body["model"], "claude-test");
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_tokens"], 4096);
         assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn b1_translate_tool_spec_shape() {
+        let spec = ToolSpec {
+            name: "read".into(),
+            description: "Read a file".into(),
+            input_schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        };
+        assert_eq!(translate_tool_spec(&spec), json!({
+            "name":"read",
+            "description":"Read a file",
+            "input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+        }));
+    }
+
+    #[test]
+    fn b2_translate_messages_preserves_order() {
+        let messages = vec![
+            AgentMessage::User { content: "first".into() },
+            assistant_text("second"),
+            AgentMessage::User { content: "third".into() },
+            assistant_text("fourth"),
+        ];
+        let translated = translate_messages(&messages);
+        assert_eq!(translated.len(), 4);
+        assert_eq!(translated[0]["role"], "user");
+        assert_eq!(translated[0]["content"], "first");
+        assert_eq!(translated[1]["role"], "assistant");
+        assert_eq!(translated[1]["content"][0]["text"], "second");
+        assert_eq!(translated[2]["role"], "user");
+        assert_eq!(translated[2]["content"], "third");
+        assert_eq!(translated[3]["role"], "assistant");
+        assert_eq!(translated[3]["content"][0]["text"], "fourth");
+    }
+
+    #[test]
+    fn b3_consecutive_tool_results_group_into_one_user_message() {
+        let messages = vec![
+            AgentMessage::User { content: "read both".into() },
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![tool_call("toolu_a", "a.txt"), tool_call("toolu_b", "b.txt")],
+                stop_reason: StopReason::ToolUse,
+            }),
+            AgentMessage::ToolResult { call_id: "toolu_a".into(), content: "a contents".into(), is_error: false },
+            AgentMessage::ToolResult { call_id: "toolu_b".into(), content: "b failed".into(), is_error: true },
+            assistant_text("done"),
+        ];
+
+        let translated = translate_messages(&messages);
+        assert_eq!(translated.len(), 4);
+        assert_eq!(translated[0]["role"], "user");
+        assert_eq!(translated[1]["role"], "assistant");
+        assert_eq!(translated[1]["content"].as_array().map(Vec::len), Some(2));
+        assert_eq!(translated[1]["content"][0]["type"], "tool_use");
+        assert_eq!(translated[1]["content"][0]["id"], "toolu_a");
+        assert_eq!(translated[1]["content"][0]["input"], json!({ "path": "a.txt" }));
+        assert_eq!(translated[1]["content"][1]["type"], "tool_use");
+        assert_eq!(translated[1]["content"][1]["id"], "toolu_b");
+        assert_eq!(translated[2]["role"], "user");
+        let tool_results = translated[2]["content"].as_array();
+        assert_eq!(tool_results.map(Vec::len), Some(2));
+        assert_eq!(translated[2]["content"][0]["type"], "tool_result");
+        assert_eq!(translated[2]["content"][0]["tool_use_id"], "toolu_a");
+        assert_eq!(translated[2]["content"][0]["content"], "a contents");
+        assert_eq!(translated[2]["content"][0]["is_error"], false);
+        assert_eq!(translated[2]["content"][1]["type"], "tool_result");
+        assert_eq!(translated[2]["content"][1]["tool_use_id"], "toolu_b");
+        assert_eq!(translated[2]["content"][1]["content"], "b failed");
+        assert_eq!(translated[2]["content"][1]["is_error"], true);
+        assert_eq!(translated[3]["role"], "assistant");
+    }
+
+    #[test]
+    fn b4_build_request_body_includes_tools_when_present() {
+        let messages = vec![AgentMessage::User { content: "hi".into() }];
+        let tools = vec![ToolSpec {
+            name: "read".into(),
+            description: "Read a file".into(),
+            input_schema: json!({ "type": "object" }),
+        }];
+        let body = build_request_body("claude-test", &messages, &tools);
+        assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["tools"][0]["name"], "read");
+    }
+
+    #[test]
+    fn b5_build_request_body_omits_tools_when_empty() {
+        let messages = vec![AgentMessage::User { content: "hi".into() }];
+        let body = build_request_body("claude-test", &messages, &[]);
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
+    }
+
+    fn assistant_text(text: &str) -> AgentMessage {
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            stop_reason: StopReason::EndTurn,
+        })
+    }
+
+    fn tool_call(id: &str, path: &str) -> ContentBlock {
+        ContentBlock::ToolCall(ToolCall {
+            id: id.into(),
+            name: "read".into(),
+            arguments: json!({ "path": path }),
+        })
     }
 
     #[tokio::test]

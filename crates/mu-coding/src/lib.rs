@@ -24,6 +24,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod ask;
 pub mod serve;
 
 pub fn version() -> &'static str {

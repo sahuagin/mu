@@ -3,13 +3,8 @@
 //! One binary, multiple modes. `mu serve` is the JSON-RPC core daemon;
 //! every other subcommand is a frontend that owns one or more daemons.
 
-use std::sync::Arc;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-
-use mu_ai::FauxProvider;
-use mu_core::agent::Provider;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -25,11 +20,31 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// JSON-RPC core daemon over stdio.
-    Serve,
+    Serve {
+        /// Provider backend. Values: faux, anthropic-api.
+        #[arg(long, default_value = "faux")]
+        provider: String,
+        /// Model id (provider-specific). For anthropic-api, defaults
+        /// to claude-haiku-4-5-20251001 if unset.
+        #[arg(long)]
+        model: Option<String>,
+        /// Comma-separated list of tools to enable. Values: read.
+        #[arg(long, default_value = "")]
+        tools: String,
+    },
     /// One-shot ask — spawn the daemon, single roundtrip, exit.
     Ask {
         /// The prompt to send.
         prompt: String,
+        /// Provider backend (forwarded to the spawned `mu serve`).
+        #[arg(long, default_value = "faux")]
+        provider: String,
+        /// Model id (forwarded to the spawned `mu serve`).
+        #[arg(long)]
+        model: Option<String>,
+        /// Comma-separated list of tools (forwarded).
+        #[arg(long, default_value = "")]
+        tools: String,
     },
     /// Interactive terminal UI.
     Tui,
@@ -59,13 +74,23 @@ async fn main() -> Result<()> {
             println!("mu-coding  {}", mu_coding::version());
             Ok(())
         }
-        Command::Serve => {
-            // v1: hardcoded FauxProvider::echo. Real provider selection
-            // is a future spec.
-            let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-            mu_coding::serve::run(provider).await
+        Command::Serve {
+            provider,
+            model,
+            tools,
+        } => {
+            let provider_arc =
+                mu_coding::serve::build_provider(&provider, model.as_deref())?;
+            let tool_names = mu_coding::serve::parse_tools_csv(&tools);
+            let tool_vec = mu_coding::serve::build_tools(&tool_names)?;
+            mu_coding::serve::run(provider_arc, tool_vec).await
         }
-        Command::Ask { prompt } => mu_coding::ask::run(prompt).await,
+        Command::Ask {
+            prompt,
+            provider,
+            model,
+            tools,
+        } => mu_coding::ask::run(prompt, provider, model, tools).await,
         Command::Tui | Command::Orchestrate { .. } => {
             anyhow::bail!(
                 "this subcommand is not yet implemented; mu is pre-MVP. \

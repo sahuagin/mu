@@ -11,7 +11,7 @@ use anyhow::Result;
 use mu_ai::{AnthropicProvider, FauxProvider};
 use mu_core::agent::{Provider, Tool};
 
-use crate::tools::{ReadTool, WriteTool};
+use crate::tools::{LsTool, ReadTool, WriteTool};
 
 /// Build a `Provider` from a CLI flag value.
 ///
@@ -39,7 +39,8 @@ pub fn build_tools(names: &[String]) -> Result<Vec<Arc<dyn Tool>>> {
         .map(|n| match n.as_str() {
             "read" => Ok(Arc::new(ReadTool::new()) as Arc<dyn Tool>),
             "write" => Ok(Arc::new(WriteTool::new()) as Arc<dyn Tool>),
-            other => anyhow::bail!("unknown tool: {other} (expected: read, write)"),
+            "ls" => Ok(Arc::new(LsTool::new()) as Arc<dyn Tool>),
+            other => anyhow::bail!("unknown tool: {other} (expected: read, write, ls)"),
         })
         .collect()
 }
@@ -105,6 +106,10 @@ mod tests {
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].spec().name, "read");
         assert_eq!(tools[1].spec().name, "write");
+
+        let tools = build_tools(&["ls".to_string()]).expect("build_tools(ls) should succeed");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].spec().name, "ls");
 
         match build_tools(&["bogus".to_string()]) {
             Ok(_) => panic!("expected error for unknown tool"),

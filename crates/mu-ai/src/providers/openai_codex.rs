@@ -1,41 +1,123 @@
-//! OpenAI-via-Codex provider — subprocess wrapper around `pi
-//! --provider openai-codex` to use the user's OpenAI Pro OAuth
-//! without holding tokens in mu's address space (per AGENTS.md).
+//! OpenAI Codex provider — direct HTTP to
+//! `https://chatgpt.com/backend-api/codex/responses` using OAuth
+//! tokens stored by mu-018. Replaces the pi subprocess shell of
+//! mu-015. See spec mu-019.
 //!
-//! v1 limitations (intentional):
-//! - No streaming. pi's `-p` mode is one-shot text.
-//! - No tool support. The subprocess accepts a flat prompt; tool
-//!   calls don't round-trip.
-//! - Cancel doesn't actively kill the subprocess; the `wait` future
-//!   completes naturally and the result is dropped. See §OOC-1.
-//!
-//! See spec mu-015.
+//! Flow:
+//!   1. Load token from `FileSystemTokenStore` (or use one supplied
+//!      via `from_parts`).
+//!   2. Pull `chatgpt_account_id` out of the access_token's JWT
+//!      payload for the required `chatgpt-account-id` header.
+//!   3. Send the request to the Codex backend; stream SSE.
+//!   4. On 401, refresh exactly once and retry. Persist the rotated
+//!      bundle unless ephemeral.
 
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::process::Stdio;
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::stream::{BoxStream, Stream};
-use tokio::sync::oneshot;
+use base64::Engine;
+use bytes::Bytes;
+use futures::stream::{BoxStream, Stream, StreamExt};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tokio::sync::{oneshot, Mutex};
 
 use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, Provider, ProviderError, ProviderEvent,
-    StopReason, ToolSpec,
+    StopReason, ToolCall, ToolSpec,
 };
 
-/// OAuth-authenticated OpenAI access via the `pi` CLI subprocess.
+use crate::auth::{self, FileSystemTokenStore, OAuthToken, TokenStore};
+
+use super::sse::{SseEvent, SseStream};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const DEFAULT_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+const ORIGINATOR: &str = "mu";
+const DEFAULT_THINKING: &str = "medium";
+const PROVIDER_KEY: &str = "openai-codex";
+
+/// Default `instructions` (the Responses API's required system-prompt
+/// field). Kept short and provider-agnostic — actual agent-loop
+/// behavior (tool use, output style) is driven by mu's own loop, not
+/// by this string. Callers can override via `with_instructions`.
+const DEFAULT_INSTRUCTIONS: &str =
+    "You are mu, a coding agent. Respond concisely. \
+     When tools are provided, prefer to use them rather than asking \
+     the user for information you could obtain yourself.";
+
+// ============================================================================
+// Provider struct
+// ============================================================================
+
 pub struct OpenaiCodexProvider {
     model: String,
     thinking: String,
+    instructions: String,
+    /// Wrapped in `Mutex` so a 401-refresh can swap it atomically.
+    /// Reads clone the bundle and release the lock immediately so
+    /// the lock is never held across an `await`.
+    token: Mutex<OAuthToken>,
+    /// `None` = ephemeral (don't persist refreshed tokens).
+    store: Option<Arc<dyn TokenStore>>,
+    http: reqwest::Client,
+    /// Test seam — defaults to the codex endpoint.
+    endpoint: String,
 }
 
 impl OpenaiCodexProvider {
-    /// Defaults `thinking` to "medium" — the agent-router routing
-    /// memory's documented default for codex-oauth.
-    pub fn new(model: String) -> Self {
+    /// Load the bundle from `~/.config/mu/auth/openai-codex.json`.
+    /// Fails if not logged in.
+    pub fn from_store(model: String) -> Result<Self, ProviderError> {
+        let store = FileSystemTokenStore::default_location().map_err(map_auth_err)?;
+        let token = load_token(&store)?;
+        Ok(Self {
+            model,
+            thinking: DEFAULT_THINKING.into(),
+            instructions: DEFAULT_INSTRUCTIONS.into(),
+            token: Mutex::new(token),
+            store: Some(Arc::new(store)),
+            http: reqwest::Client::new(),
+            endpoint: DEFAULT_ENDPOINT.into(),
+        })
+    }
+
+    /// Like `from_store` but won't persist refreshed tokens back
+    /// to disk. The in-memory bundle still rotates on 401-refresh.
+    pub fn from_store_ephemeral(model: String) -> Result<Self, ProviderError> {
+        let store = FileSystemTokenStore::default_location().map_err(map_auth_err)?;
+        let token = load_token(&store)?;
+        Ok(Self {
+            model,
+            thinking: DEFAULT_THINKING.into(),
+            instructions: DEFAULT_INSTRUCTIONS.into(),
+            token: Mutex::new(token),
+            store: None,
+            http: reqwest::Client::new(),
+            endpoint: DEFAULT_ENDPOINT.into(),
+        })
+    }
+
+    /// Caller-supplied token and (optional) store. For tests and
+    /// embedders.
+    pub fn from_parts(
+        model: String,
+        token: OAuthToken,
+        store: Option<Arc<dyn TokenStore>>,
+    ) -> Self {
         Self {
             model,
-            thinking: "medium".to_string(),
+            thinking: DEFAULT_THINKING.into(),
+            instructions: DEFAULT_INSTRUCTIONS.into(),
+            token: Mutex::new(token),
+            store,
+            http: reqwest::Client::new(),
+            endpoint: DEFAULT_ENDPOINT.into(),
         }
     }
 
@@ -43,293 +125,775 @@ impl OpenaiCodexProvider {
         self.thinking = thinking;
         self
     }
+
+    /// Override the Responses API `instructions` field — required
+    /// by the endpoint, conceptually the system prompt.
+    pub fn with_instructions(mut self, instructions: String) -> Self {
+        self.instructions = instructions;
+        self
+    }
+
+    /// Test seam: override the endpoint URL (for wiremock-style tests).
+    pub fn with_endpoint(mut self, endpoint: String) -> Self {
+        self.endpoint = endpoint;
+        self
+    }
 }
+
+fn map_auth_err(e: auth::AuthError) -> ProviderError {
+    ProviderError::Other(format!("auth: {e}"))
+}
+
+fn load_token<S: TokenStore + ?Sized>(store: &S) -> Result<OAuthToken, ProviderError> {
+    let opt = store.load(PROVIDER_KEY).map_err(map_auth_err)?;
+    opt.ok_or_else(|| {
+        ProviderError::Other(
+            "not logged in to openai-codex — run \
+             `mu login --provider openai-codex`"
+                .into(),
+        )
+    })
+}
+
+// ============================================================================
+// JWT claim extraction
+//
+// The access_token from mu-018 is a JWT. We don't verify the
+// signature — it's *our own* token, freshly minted by OpenAI and
+// stored locally; the trust root is the file's 0600 perms, not the
+// signature. We just decode the middle segment to pull the
+// `chatgpt_account_id` claim required for the request header.
+// ============================================================================
+
+pub(crate) fn extract_chatgpt_account_id(access_token: &str) -> Result<String, ProviderError> {
+    let segments: Vec<&str> = access_token.split('.').collect();
+    if segments.len() != 3 {
+        return Err(ProviderError::Other(format!(
+            "access_token is not a JWT (expected 3 segments, got {})",
+            segments.len()
+        )));
+    }
+    // JWT uses base64url *without* padding; the URL_SAFE_NO_PAD
+    // engine matches that exactly.
+    let payload_b64 = segments[1].trim_end_matches('=');
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64.as_bytes())
+        .map_err(|e| ProviderError::Other(format!("decode JWT payload: {e}")))?;
+    let payload: Value = serde_json::from_slice(&payload_bytes)
+        .map_err(|e| ProviderError::Other(format!("parse JWT payload: {e}")))?;
+    let claim_obj = payload.get("https://api.openai.com/auth").ok_or_else(|| {
+        ProviderError::Other(
+            "JWT missing `https://api.openai.com/auth` claim — \
+             this is not an OpenAI Codex token"
+                .into(),
+        )
+    })?;
+    let account_id = claim_obj
+        .get("chatgpt_account_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            ProviderError::Other("JWT auth claim missing `chatgpt_account_id`".into())
+        })?;
+    Ok(account_id.to_string())
+}
+
+// ============================================================================
+// Request body — Responses API shape
+//
+// Distinct from Chat Completions: the input is an array of typed
+// items (message, function_call, function_call_output) rather than
+// role-tagged messages. Tool definitions are flatter — no nested
+// "function" wrapper. Streaming is via SSE typed events, not JSON
+// chunks of choices[].
+// ============================================================================
+
+pub(crate) fn translate_tool_spec(spec: &ToolSpec) -> Value {
+    json!({
+        "type": "function",
+        "name": spec.name,
+        "description": spec.description,
+        "parameters": spec.input_schema,
+    })
+}
+
+pub(crate) fn translate_message(m: &AgentMessage) -> Vec<Value> {
+    match m {
+        AgentMessage::User { content } => vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": content}],
+        })],
+        AgentMessage::Assistant(a) => {
+            // The Responses API treats text and function_calls as
+            // separate top-level items (NOT nested under one message).
+            let mut out: Vec<Value> = Vec::new();
+            let mut text_parts: Vec<String> = Vec::new();
+            for block in &a.content {
+                match block {
+                    ContentBlock::Text { text } => text_parts.push(text.clone()),
+                    ContentBlock::ToolCall(tc) => {
+                        let args_str = serde_json::to_string(&tc.arguments)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        out.push(json!({
+                            "type": "function_call",
+                            "call_id": tc.id,
+                            "name": tc.name,
+                            "arguments": args_str,
+                        }));
+                    }
+                    ContentBlock::Thinking { .. } => {
+                        // Don't re-send reasoning to the model — it
+                        // can't consume its own prior reasoning text
+                        // as input on this API.
+                    }
+                }
+            }
+            if !text_parts.is_empty() {
+                let combined = text_parts.join("");
+                // Prepend the assistant text message so it sits
+                // before function_calls in turn order.
+                out.insert(
+                    0,
+                    json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": combined}],
+                    }),
+                );
+            }
+            out
+        }
+        AgentMessage::ToolResult {
+            call_id,
+            content,
+            is_error,
+        } => {
+            let body = if *is_error {
+                format!("[error] {content}")
+            } else {
+                content.clone()
+            };
+            vec![json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": body,
+            })]
+        }
+    }
+}
+
+pub(crate) fn build_request_body(
+    model: &str,
+    thinking: &str,
+    instructions: &str,
+    messages: &[AgentMessage],
+    tools: &[ToolSpec],
+) -> Value {
+    let input: Vec<Value> = messages.iter().flat_map(translate_message).collect();
+    let mut body = json!({
+        "model": model,
+        "instructions": instructions,
+        "input": input,
+        "stream": true,
+        "store": false,
+        "reasoning": {"effort": thinking, "summary": "auto"},
+    });
+    if !tools.is_empty() {
+        body["tools"] = json!(tools.iter().map(translate_tool_spec).collect::<Vec<_>>());
+        body["tool_choice"] = json!("auto");
+        body["parallel_tool_calls"] = json!(false);
+    }
+    body
+}
+
+// ============================================================================
+// SSE → ProviderEvent
+//
+// Responses API event vocabulary (the ones we care about):
+//   - response.output_text.delta        → TextDelta
+//   - response.output_item.added        → start tool-call accumulator
+//                                         (only when item.type=="function_call")
+//   - response.function_call.arguments.delta → append to tool args,
+//                                              emit ToolCallDelta
+//   - response.output_item.done         → finalize tool call (or message)
+//   - response.reasoning_summary.delta  → ThinkingDelta
+//   - response.completed                → Done(...)
+//   - response.failed / error           → Error
+// Other events (response.created, response.output_text.done, etc.)
+// are noise — ignored.
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
+enum SseFrame {
+    #[serde(rename = "response.output_text.delta")]
+    OutputTextDelta { delta: String },
+    #[serde(rename = "response.output_item.added")]
+    OutputItemAdded {
+        output_index: u32,
+        item: OutputItem,
+    },
+    #[serde(rename = "response.function_call.arguments.delta")]
+    FunctionCallArgumentsDelta {
+        output_index: u32,
+        #[serde(default, rename = "item_id")]
+        _item_id: Option<String>,
+        delta: String,
+    },
+    #[serde(rename = "response.output_item.done")]
+    OutputItemDone {
+        output_index: u32,
+        item: OutputItem,
+    },
+    #[serde(rename = "response.reasoning_summary.delta")]
+    ReasoningSummaryDelta { delta: String },
+    #[serde(rename = "response.reasoning_summary_text.delta")]
+    ReasoningSummaryTextDelta { delta: String },
+    #[serde(rename = "response.completed")]
+    Completed {
+        #[serde(default)]
+        response: Option<CompletedResponse>,
+    },
+    #[serde(rename = "response.failed")]
+    Failed {
+        #[serde(default)]
+        response: Option<FailedResponse>,
+    },
+    #[serde(rename = "error")]
+    Error {
+        #[serde(default)]
+        message: Option<String>,
+    },
+    /// Catch-all for events we don't model.
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[allow(dead_code)]
+enum OutputItem {
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        call_id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        arguments: Option<String>,
+    },
+    #[serde(rename = "message")]
+    Message {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
+struct CompletedResponse {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    incomplete_details: Option<IncompleteDetails>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
+struct FailedResponse {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    error: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
+struct IncompleteDetails {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Default)]
+struct ToolCallBuilder {
+    /// item id (e.g. `fc_...`) — internal
+    _item_id: String,
+    /// call id (e.g. `call_...`) — matches function_call_output later
+    call_id: String,
+    name: String,
+    args_json: String,
+}
+
+struct StreamState {
+    sse: Pin<Box<dyn Stream<Item = SseEvent> + Send>>,
+    accumulated_text: String,
+    tool_calls: HashMap<u32, ToolCallBuilder>,
+    tool_call_order: Vec<u32>,
+    final_status: Option<String>,
+    incomplete_reason: Option<String>,
+    cancel_rx: Option<oneshot::Receiver<()>>,
+    finished: bool,
+    emitted_done: bool,
+    /// Errors that arrived via response.failed / error events.
+    error_message: Option<String>,
+}
+
+fn events_stream(
+    bytes: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+    cancel_rx: oneshot::Receiver<()>,
+) -> BoxStream<'static, ProviderEvent> {
+    let bytes: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> = Box::pin(bytes);
+    let sse = SseStream::new(bytes);
+    let state = StreamState {
+        sse: Box::pin(sse),
+        accumulated_text: String::new(),
+        tool_calls: HashMap::new(),
+        tool_call_order: Vec::new(),
+        final_status: None,
+        incomplete_reason: None,
+        cancel_rx: Some(cancel_rx),
+        finished: false,
+        emitted_done: false,
+        error_message: None,
+    };
+    Box::pin(futures::stream::unfold(state, next_event))
+}
+
+fn map_stop(state: &StreamState) -> StopReason {
+    if state.error_message.is_some() {
+        return StopReason::Error;
+    }
+    if let Some(reason) = state.incomplete_reason.as_deref() {
+        if reason == "max_output_tokens" {
+            return StopReason::MaxTokens;
+        }
+    }
+    if !state.tool_calls.is_empty() {
+        StopReason::ToolUse
+    } else {
+        match state.final_status.as_deref() {
+            Some("completed") => StopReason::EndTurn,
+            Some("incomplete") => StopReason::MaxTokens,
+            Some("failed") => StopReason::Error,
+            _ => StopReason::EndTurn,
+        }
+    }
+}
+
+fn assemble_content(state: &StreamState) -> Vec<ContentBlock> {
+    let mut out: Vec<ContentBlock> = Vec::new();
+    if !state.accumulated_text.is_empty() {
+        out.push(ContentBlock::Text {
+            text: state.accumulated_text.clone(),
+        });
+    }
+    for idx in &state.tool_call_order {
+        if let Some(builder) = state.tool_calls.get(idx) {
+            let arguments = parse_tool_input(&builder.args_json);
+            out.push(ContentBlock::ToolCall(ToolCall {
+                id: builder.call_id.clone(),
+                name: builder.name.clone(),
+                arguments,
+            }));
+        }
+    }
+    out
+}
+
+fn parse_tool_input(input_json: &str) -> Value {
+    if input_json.is_empty() {
+        return Value::Object(serde_json::Map::new());
+    }
+    match serde_json::from_str::<Value>(input_json) {
+        Ok(v) if v.is_object() => v,
+        Ok(other) => {
+            tracing::warn!(value = %other, "tool input JSON wasn't an object; using empty object");
+            Value::Object(serde_json::Map::new())
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, raw = %input_json, "failed to parse tool input JSON; using empty object");
+            Value::Object(serde_json::Map::new())
+        }
+    }
+}
+
+async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamState)> {
+    if state.finished {
+        return None;
+    }
+    loop {
+        // Cancel check.
+        if let Some(rx) = state.cancel_rx.as_mut() {
+            match rx.try_recv() {
+                Ok(_) => {
+                    state.finished = true;
+                    state.cancel_rx = None;
+                    return Some((
+                        ProviderEvent::Done(AssistantMessage {
+                            content: assemble_content(&state),
+                            stop_reason: StopReason::Aborted,
+                        }),
+                        state,
+                    ));
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    state.cancel_rx = None;
+                }
+            }
+        }
+
+        let sse_event = match state.sse.next().await {
+            Some(e) => e,
+            None => {
+                // End of stream.
+                state.finished = true;
+                if !state.emitted_done {
+                    state.emitted_done = true;
+                    if let Some(msg) = state.error_message.take() {
+                        return Some((ProviderEvent::Error(msg), state));
+                    }
+                    let stop = map_stop(&state);
+                    return Some((
+                        ProviderEvent::Done(AssistantMessage {
+                            content: assemble_content(&state),
+                            stop_reason: stop,
+                        }),
+                        state,
+                    ));
+                }
+                return None;
+            }
+        };
+
+        // Skip empty data lines (keep-alive style).
+        if sse_event.data.trim().is_empty() {
+            continue;
+        }
+        // Codex sometimes emits explicit `[DONE]`; treat like EOF.
+        if sse_event.data.trim() == "[DONE]" {
+            state.finished = true;
+            if !state.emitted_done {
+                state.emitted_done = true;
+                let stop = map_stop(&state);
+                return Some((
+                    ProviderEvent::Done(AssistantMessage {
+                        content: assemble_content(&state),
+                        stop_reason: stop,
+                    }),
+                    state,
+                ));
+            }
+            return None;
+        }
+
+        let frame: SseFrame = match serde_json::from_str(&sse_event.data) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(error = %e, data = %sse_event.data, "failed to parse codex SSE frame");
+                continue;
+            }
+        };
+
+        match frame {
+            SseFrame::OutputTextDelta { delta } => {
+                if !delta.is_empty() {
+                    state.accumulated_text.push_str(&delta);
+                    return Some((ProviderEvent::TextDelta(delta), state));
+                }
+            }
+            SseFrame::OutputItemAdded { output_index, item } => {
+                if let OutputItem::FunctionCall {
+                    id,
+                    call_id,
+                    name,
+                    arguments,
+                } = item
+                {
+                    let entry = state
+                        .tool_calls
+                        .entry(output_index)
+                        .or_insert_with(|| {
+                            state.tool_call_order.push(output_index);
+                            ToolCallBuilder::default()
+                        });
+                    if let Some(v) = id {
+                        entry._item_id = v;
+                    }
+                    if let Some(v) = call_id {
+                        entry.call_id = v;
+                    }
+                    if let Some(v) = name {
+                        entry.name = v;
+                    }
+                    if let Some(v) = arguments {
+                        if !v.is_empty() {
+                            entry.args_json.push_str(&v);
+                        }
+                    }
+                }
+                // Non-function_call items get an entry on `done`,
+                // not here.
+            }
+            SseFrame::FunctionCallArgumentsDelta {
+                output_index,
+                _item_id: _,
+                delta,
+            } => {
+                let entry = state
+                    .tool_calls
+                    .entry(output_index)
+                    .or_insert_with(|| {
+                        state.tool_call_order.push(output_index);
+                        ToolCallBuilder::default()
+                    });
+                entry.args_json.push_str(&delta);
+                // Surface the delta — `id` is the call_id (matches
+                // the tool_call_output we'll send back). Empty
+                // call_id is possible if `added` hasn't arrived yet
+                // (shouldn't happen with the documented event order
+                // but we don't depend on it).
+                let id = entry.call_id.clone();
+                return Some((
+                    ProviderEvent::ToolCallDelta {
+                        id,
+                        name_delta: None,
+                        arguments_delta: Some(delta),
+                    },
+                    state,
+                ));
+            }
+            SseFrame::OutputItemDone { output_index, item } => {
+                if let OutputItem::FunctionCall {
+                    id,
+                    call_id,
+                    name,
+                    arguments,
+                } = item
+                {
+                    // Fill any fields that the streamed deltas
+                    // didn't already cover. Final `arguments`
+                    // overrides accumulation if present (it should
+                    // be the full JSON).
+                    let entry = state
+                        .tool_calls
+                        .entry(output_index)
+                        .or_insert_with(|| {
+                            state.tool_call_order.push(output_index);
+                            ToolCallBuilder::default()
+                        });
+                    if let Some(v) = id {
+                        entry._item_id = v;
+                    }
+                    if let Some(v) = call_id {
+                        entry.call_id = v;
+                    }
+                    if let Some(v) = name {
+                        entry.name = v;
+                    }
+                    if let Some(v) = arguments {
+                        if !v.is_empty() {
+                            entry.args_json = v;
+                        }
+                    }
+                }
+            }
+            SseFrame::ReasoningSummaryDelta { delta }
+            | SseFrame::ReasoningSummaryTextDelta { delta } => {
+                if !delta.is_empty() {
+                    return Some((ProviderEvent::ThinkingDelta(delta), state));
+                }
+            }
+            SseFrame::Completed { response } => {
+                if let Some(r) = response {
+                    state.final_status = r.status;
+                    state.incomplete_reason = r.incomplete_details.and_then(|d| d.reason);
+                } else {
+                    state.final_status = Some("completed".into());
+                }
+                state.finished = true;
+                state.emitted_done = true;
+                let stop = map_stop(&state);
+                return Some((
+                    ProviderEvent::Done(AssistantMessage {
+                        content: assemble_content(&state),
+                        stop_reason: stop,
+                    }),
+                    state,
+                ));
+            }
+            SseFrame::Failed { response } => {
+                let err_msg = response
+                    .and_then(|r| r.error.map(|e| e.to_string()))
+                    .unwrap_or_else(|| "codex response failed".into());
+                state.error_message = Some(err_msg.clone());
+                state.finished = true;
+                state.emitted_done = true;
+                return Some((ProviderEvent::Error(err_msg), state));
+            }
+            SseFrame::Error { message } => {
+                let msg = message.unwrap_or_else(|| "codex stream error".into());
+                state.error_message = Some(msg.clone());
+                state.finished = true;
+                state.emitted_done = true;
+                return Some((ProviderEvent::Error(msg), state));
+            }
+            SseFrame::Other => {
+                // Unmodeled event — ignore.
+            }
+        }
+        // Loop and pull the next frame.
+    }
+}
+
+// ============================================================================
+// Provider impl
+// ============================================================================
 
 #[async_trait]
 impl Provider for OpenaiCodexProvider {
     async fn stream(
         &self,
         messages: &[AgentMessage],
-        _tools: &[ToolSpec],
+        tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
-        let prompt = flatten_messages(messages);
-        let pi_binary = locate_pi()?;
-        let response = spawn_and_wait(
-            &pi_binary,
+        let body = build_request_body(
             &self.model,
             &self.thinking,
-            &prompt,
-            cancel_rx,
-        )
-        .await?;
-
-        // v1: emit one TextDelta + Done. No streaming.
-        let text = response.clone();
-        let done = AssistantMessage {
-            content: vec![ContentBlock::Text { text }],
-            stop_reason: StopReason::EndTurn,
-        };
-        let events = vec![
-            ProviderEvent::TextDelta(response),
-            ProviderEvent::Done(done),
-        ];
-        let stream: Pin<Box<dyn Stream<Item = ProviderEvent> + Send>> =
-            Box::pin(futures::stream::iter(events));
-        Ok(stream)
-    }
-}
-
-/// Convert `&[AgentMessage]` into a single text prompt for pi's
-/// `-p` mode. Lossy: assistant content blocks of types other than
-/// Text are dropped; tool calls are flattened into "[tool result]"
-/// pseudo-content (since pi has no tool surface in this path).
-pub(crate) fn flatten_messages(messages: &[AgentMessage]) -> String {
-    let mut out = String::new();
-    for m in messages {
-        match m {
-            AgentMessage::User { content } => {
-                out.push_str(&format!("User: {content}\n\n"));
-            }
-            AgentMessage::Assistant(a) => {
-                let text: String = a
-                    .content
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(text.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                if !text.is_empty() {
-                    out.push_str(&format!("Assistant: {text}\n\n"));
-                }
-            }
-            AgentMessage::ToolResult { content, .. } => {
-                out.push_str(&format!("[tool result] {content}\n\n"));
-            }
-        }
-    }
-    out
-}
-
-/// Locate the `pi` binary. Order: `MU_PI_BINARY` env var (test
-/// override), then PATH lookup.
-pub(crate) fn locate_pi() -> Result<String, ProviderError> {
-    if let Ok(p) = std::env::var("MU_PI_BINARY") {
-        if !p.is_empty() {
-            return Ok(p);
-        }
-    }
-    let out = std::process::Command::new("which")
-        .arg("pi")
-        .output()
-        .map_err(|e| ProviderError::Other(format!("which pi failed: {e}")))?;
-    if !out.status.success() {
-        return Err(ProviderError::Other(
-            "pi binary not found in PATH (set MU_PI_BINARY to override)".into(),
-        ));
-    }
-    let path = String::from_utf8(out.stdout)
-        .map_err(|_| ProviderError::Other("pi path not utf-8".into()))?
-        .trim()
-        .to_string();
-    if path.is_empty() {
-        return Err(ProviderError::Other("pi binary not found in PATH".into()));
-    }
-    Ok(path)
-}
-
-async fn spawn_and_wait(
-    pi: &str,
-    model: &str,
-    thinking: &str,
-    prompt: &str,
-    cancel_rx: oneshot::Receiver<()>,
-) -> Result<String, ProviderError> {
-    let mut cmd = tokio::process::Command::new(pi);
-    cmd.arg("--provider")
-        .arg("openai-codex")
-        .arg("--model")
-        .arg(model)
-        .arg("-p")
-        .arg(prompt)
-        .arg("--thinking")
-        .arg(thinking)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let child = cmd
-        .spawn()
-        .map_err(|e| ProviderError::Other(format!("spawn pi: {e}")))?;
-
-    let wait_fut = child.wait_with_output();
-
-    tokio::select! {
-        out = wait_fut => {
-            let out = out.map_err(|e| ProviderError::Other(format!("wait pi: {e}")))?;
-            if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                return Err(ProviderError::Other(
-                    format!("pi exited {}: {stderr}", out.status),
-                ));
-            }
-            String::from_utf8(out.stdout)
-                .map_err(|_| ProviderError::Other("pi stdout not utf-8".into()))
-        }
-        _ = cancel_rx => {
-            // v1: best-effort cancel. We've moved the child into
-            // wait_with_output so we can't `start_kill()` it from
-            // here. The subprocess will finish naturally; we just
-            // bail with an error. Future spec can split the wait
-            // and keep a `Child` reference for active termination.
-            Err(ProviderError::Other("cancelled".into()))
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn b1_flatten_user_message() {
-        let msgs = vec![AgentMessage::User {
-            content: "hi".into(),
-        }];
-        assert_eq!(flatten_messages(&msgs), "User: hi\n\n");
-    }
-
-    #[test]
-    fn b2_flatten_multi_turn() {
-        let msgs = vec![
-            AgentMessage::User {
-                content: "hello".into(),
-            },
-            AgentMessage::Assistant(AssistantMessage {
-                content: vec![ContentBlock::Text {
-                    text: "hi back".into(),
-                }],
-                stop_reason: StopReason::EndTurn,
-            }),
-            AgentMessage::User {
-                content: "more".into(),
-            },
-        ];
-        let flat = flatten_messages(&msgs);
-        assert_eq!(
-            flat,
-            "User: hello\n\nAssistant: hi back\n\nUser: more\n\n"
+            &self.instructions,
+            messages,
+            tools,
         );
-    }
 
-    #[test]
-    fn b3_flatten_tool_result() {
-        let msgs = vec![AgentMessage::ToolResult {
-            call_id: "c1".into(),
-            content: "foo".into(),
-            is_error: false,
-        }];
-        assert_eq!(flatten_messages(&msgs), "[tool result] foo\n\n");
-    }
-
-    #[test]
-    fn b4_locate_pi_env_var_override() {
-        // Save original, set ours, check, restore.
-        let original = std::env::var("MU_PI_BINARY").ok();
-        // Use a sentinel path so we know the override took effect even
-        // when pi exists in PATH.
-        std::env::set_var("MU_PI_BINARY", "/sentinel/pi/path");
-        let result = locate_pi();
-        // Restore.
-        match original {
-            Some(v) => std::env::set_var("MU_PI_BINARY", v),
-            None => std::env::remove_var("MU_PI_BINARY"),
-        }
-        assert_eq!(result.unwrap(), "/sentinel/pi/path");
-    }
-
-    #[test]
-    fn b6_locate_pi_failure_message() {
-        // Force lookup to fail by using a definitely-bogus PATH AND no
-        // env override. Save original env and PATH; restore at end.
-        let original_mu_pi = std::env::var("MU_PI_BINARY").ok();
-        let original_path = std::env::var("PATH").ok();
-
-        std::env::remove_var("MU_PI_BINARY");
-        std::env::set_var("PATH", "/nonexistent/path/only");
-
-        let result = locate_pi();
-
-        // Restore.
-        match original_mu_pi {
-            Some(v) => std::env::set_var("MU_PI_BINARY", v),
-            None => std::env::remove_var("MU_PI_BINARY"),
-        }
-        match original_path {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
-
-        match result {
-            Ok(_) => panic!("expected error when pi not in PATH"),
-            Err(ProviderError::Other(msg)) => {
-                assert!(
-                    msg.contains("pi binary not found") || msg.contains("which pi failed"),
-                    "unexpected error message: {msg}"
-                );
-            }
-            Err(other) => panic!("expected ProviderError::Other, got: {other:?}"),
-        }
-    }
-}
-
-#[cfg(test)]
-mod live_tests {
-    use super::*;
-    use futures::StreamExt;
-
-    fn live_enabled() -> bool {
-        std::env::var("MU_LIVE_OPENAI_CODEX").ok().as_deref() == Some("1")
-    }
-
-    /// B-7 (live OpenAI Codex via pi). Gated on MU_LIVE_OPENAI_CODEX=1.
-    #[tokio::test]
-    async fn b7_live_openai_codex_smoke() {
-        if !live_enabled() {
-            eprintln!("skipping b7_live_openai_codex_smoke (set MU_LIVE_OPENAI_CODEX=1 to run)");
-            return;
-        }
-
-        let provider = OpenaiCodexProvider::new("gpt-5.5".to_string());
-        let messages = vec![AgentMessage::User {
-            content: "Reply with the single word 'hello' and nothing else.".into(),
-        }];
-        let (_tx, rx) = tokio::sync::oneshot::channel();
-        let mut stream = provider
-            .stream(&messages, &[], rx)
+        // First attempt with the current token.
+        let initial_token = self.token.lock().await.clone();
+        let resp = self
+            .send_request(&initial_token, &body)
             .await
-            .expect("provider.stream");
+            .map_err(|e| ProviderError::Other(format!("codex request: {e}")))?;
 
-        let mut text = String::new();
-        let mut got_done = false;
-        while let Some(event) = stream.next().await {
-            match event {
-                ProviderEvent::TextDelta(d) => text.push_str(&d),
-                ProviderEvent::Done(_) => {
-                    got_done = true;
-                    break;
-                }
-                ProviderEvent::Error(e) => panic!("openai-codex error: {e}"),
-                _ => {}
-            }
+        // Refresh-and-retry on 401.
+        let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let refreshed = self.refresh_token_if_unchanged(&initial_token).await?;
+            self.send_request(&refreshed, &body)
+                .await
+                .map_err(|e| ProviderError::Other(format!("codex retry: {e}")))?
+        } else {
+            resp
+        };
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(ProviderError::Other(
+                "codex credentials rejected even after refresh — \
+                 run `mu login --provider openai-codex` again"
+                    .into(),
+            ));
         }
-        assert!(got_done, "expected Done event");
-        eprintln!("live openai-codex smoke text: {text:?}");
-        assert!(
-            text.to_lowercase().contains("hello"),
-            "expected response to contain 'hello', got: {text:?}"
-        );
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::Other(format!(
+                "codex returned {status}: {text}"
+            )));
+        }
+
+        let bytes = resp.bytes_stream();
+        Ok(events_stream(bytes, cancel_rx))
     }
 }
+
+impl OpenaiCodexProvider {
+    async fn send_request(
+        &self,
+        token: &OAuthToken,
+        body: &Value,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let account_id = match extract_chatgpt_account_id(&token.access_token) {
+            Ok(id) => id,
+            Err(e) => {
+                // Surface as a 401-like response so the retry path can
+                // refresh — but in practice, this is a token-shape
+                // bug, not an expiry bug. Pass through as a request
+                // build failure.
+                tracing::error!(error = %e, "could not extract chatgpt_account_id");
+                // Send the request anyway with an empty header;
+                // backend will return 401 and the caller will
+                // produce a meaningful error message after refresh
+                // fails. (Alternative: return a fake error here.
+                // Keeping the function infallible-on-build keeps
+                // the call sites tidy.)
+                String::new()
+            }
+        };
+
+        self.http
+            .post(&self.endpoint)
+            .header("Authorization", format!("Bearer {}", token.access_token))
+            .header("chatgpt-account-id", account_id)
+            .header("originator", ORIGINATOR)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .json(body)
+            .send()
+            .await
+    }
+
+    /// If the in-memory token still matches `seen` (we're first to
+    /// notice 401), refresh and persist. Otherwise, another caller
+    /// already refreshed; just return the current bundle.
+    async fn refresh_token_if_unchanged(
+        &self,
+        seen: &OAuthToken,
+    ) -> Result<OAuthToken, ProviderError> {
+        let current = self.token.lock().await;
+        if current.access_token != seen.access_token {
+            // Already rotated by someone else. Use the new one.
+            return Ok(current.clone());
+        }
+        let refresh_token = current.refresh_token.clone().ok_or_else(|| {
+            ProviderError::Other(
+                "codex access_token expired and no refresh_token stored — \
+                 run `mu login --provider openai-codex`"
+                    .into(),
+            )
+        })?;
+        // Release the lock across the await — refresh is HTTP, can
+        // be slow. We re-check on the way back.
+        drop(current);
+        let new_bundle = auth::openai_codex::refresh_access_token(&refresh_token)
+            .await
+            .map_err(map_auth_err)?;
+        let mut current = self.token.lock().await;
+        // If someone else won the race, take theirs.
+        if current.access_token != seen.access_token {
+            return Ok(current.clone());
+        }
+        *current = new_bundle.clone();
+        drop(current);
+        if let Some(store) = &self.store {
+            if let Err(e) = store.save(PROVIDER_KEY, &new_bundle) {
+                tracing::warn!(error = %e, "failed to persist refreshed token; continuing in-memory");
+            }
+        }
+        Ok(new_bundle)
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+#[path = "openai_codex_tests.rs"]
+mod tests;

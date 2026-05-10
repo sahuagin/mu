@@ -10,8 +10,8 @@ use tokio::sync::mpsc;
 
 use mu_core::agent::AgentEvent;
 use mu_core::protocol::{
-    DoneEvent, ErrorEvent, TextDeltaEvent, ToolCallCompletedEvent, ToolCallStartedEvent,
-    ToolOutcome,
+    CalloutBody, CalloutEvent, DoneEvent, ErrorEvent, TextDeltaEvent, ToolCallCompletedEvent,
+    ToolCallStartedEvent, ToolOutcome,
 };
 use mu_core::transport::NotificationWriter;
 
@@ -97,6 +97,36 @@ pub async fn forward_events(
                             session_id: session_id.clone(),
                             message,
                             detail: None,
+                        },
+                    )
+                    .await;
+            }
+            AgentEvent::Callout {
+                category,
+                title,
+                body,
+                theme,
+                context_refs,
+            } => {
+                // Coerce the agent-loop-side Value into the wire-side
+                // CalloutBody enum. JSON strings collapse to Text;
+                // anything else stays Structured. The agent-loop's
+                // `category` becomes the wire's `kind` (the agent-loop
+                // already uses `kind` as the AgentEvent serde tag).
+                let body_payload = match body {
+                    serde_json::Value::String(s) => CalloutBody::Text(s),
+                    other => CalloutBody::Structured(other),
+                };
+                let _ = notif
+                    .emit(
+                        CalloutEvent::METHOD,
+                        CalloutEvent {
+                            session_id: session_id.clone(),
+                            kind: category,
+                            title,
+                            body: body_payload,
+                            theme,
+                            context_refs,
                         },
                     )
                     .await;

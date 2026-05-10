@@ -71,3 +71,17 @@ boilerplate trait impls, test writing once shapes are stable) goes to
 (misc cheap-tier models). Architectural / cross-cutting work stays with
 the claude-code session. The routing policy lives in agent memory
 `2da785e5`.
+
+Delegations run in **isolated jj workspaces** under `.delegations/`.
+Use `scripts/delegate.sh <spec-id> <attempt> <auth>` to set one up;
+the script handles workspace creation, branch setup, and surfacing
+the diff for review. Workspace isolation replaces an earlier prompt-
+level "don't touch parallel-session files" rule (see
+`specs/delegations/CONVENTIONS.md` for the full rule set).
+
+Per-spec delegation prompts (`specs/mu-NNN-delegation.md`) reference
+`CONVENTIONS.md` for universal rules and add only spec-specific
+content (deliverable list, what NOT to do that's tied to the spec,
+verification commands particular to the work). Earlier prompts
+(mu-001 through mu-007) restate the universal rules inline; future
+prompts should not.

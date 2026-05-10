@@ -1,115 +1,129 @@
-# Morning summary — overnight session
+# Status: 2026-05-10 afternoon
 
-Wake-up readout. Skim, decide what to keep / tweak, delete this file
-when read (or rename to `MORNING-2026-05-10.md` if you want to keep
-the history).
+Pickup readout. Update of `MORNING.md` from earlier today.
 
-## What landed
+## What landed since you left
 
-Three specs, four commits on `main`:
+### Read tool vertical slice — fully verified live
 
-```
-83fe68e  docs(delegations): add mu-007 row to ledger
-0c24b8f  feat(mu-coding): mu-007 — read tool, first concrete Tool impl
-2cddb14  docs(readme): update Status section to reflect MVP working through mu-006
-3f4bde9  feat(mu-ai): mu-006 — Anthropic API Provider (text-only, v1)
-f779752  feat(mu-coding): mu-005 — mu ask one-shot CLI mode
-```
+- **mu-008** Anthropic Provider tool support (request + response).
+  Part A delegated to gpt-5.5 via the new `scripts/delegate.sh`;
+  part B (claude) refactored StreamState to per-block builders.
+  Live test passes: real Claude calls a fake `echo` tool, parser
+  extracts the `ToolCall` correctly.
+- **mu-009** `--provider` / `--model` / `--tools` flag wiring on
+  `mu serve` and `mu ask`. Includes a `factory` module mapping
+  flag values to `Arc<dyn Provider>` / `Vec<Arc<dyn Tool>>`.
+- **mu-010** integration test locking in the read end-to-end:
+  `mu ask --provider anthropic-api --tools read "..."` works.
 
-(Plus three spec commits: mu-005, mu-006, mu-007 + their delegation
-prompts where applicable.)
+### Write tool vertical slice — fully verified live
 
-## What works now
+- **mu-011** `WriteTool` (delegated to gpt-5.5; same desugared
+  async-fn pattern as ReadTool to avoid pulling in async-trait as
+  a mu-coding dep).
+- **mu-012** wired into factory + live integration test.
+
+### Refactor pass
+
+- **`tests/common/`** — extracted shared `MU_BIN`,
+  `live_anthropic_enabled()`, and `run_mu_ask(args)` helpers.
+  Each integration test shrinks ~10-20 lines.
+- **README** bumped to "as of mu-010" (and is ahead of where it
+  was when you left).
+
+## What `mu` does now (live verified)
 
 ```sh
-mu versions          # workspace smoke
-mu serve             # JSON-RPC daemon over stdio
-mu ask "hello"       # one-shot CLI; spawns mu serve, echoes via FauxProvider
+$ mu ask --provider anthropic-api --tools read \
+    "Read /home/tcovert/src/public_github/mu/Cargo.toml. \
+     Tell me what the workspace's resolver version is. Just the number."
+2
+
+$ mu ask --provider anthropic-api --tools write \
+    "Write 'hello' to /tmp/foo.txt. Reply 'done'."
+done   # and /tmp/foo.txt now contains 'hello'
 ```
 
-Live Anthropic API verified: `MU_LIVE_ANTHROPIC=1 cargo test -p mu-ai
-b7_live_anthropic_smoke` calls real Claude (haiku-4-5), got "hello"
-back, all green.
+Two tools (`read`, `write`) are end-to-end against real Anthropic
+with all 95 unit/integration tests + 2 live tests passing.
 
 ## Tests
 
-70/70 workspace tests pass. Breakdown by crate:
-- mu-core: 47 (protocol, transport, agent loop)
-- mu-ai: 16 (faux, sse, anthropic — live test skipped by default)
-- mu-coding: 7 unit + integration tests across serve_smoke and ask_smoke
+- 95/95 workspace tests pass without `MU_LIVE_ANTHROPIC`.
+- 3/3 live tests pass with the env var set
+  (mu-006 text smoke, mu-008 tool round-trip, mu-010 read e2e,
+  mu-012 write e2e).
 
-## Delegation ledger highlights
+## Delegation ledger
 
-WC fix held for ALL FOUR night delegations. Pattern is reliable. Two
-new positive routing rules surfaced:
-1. **Treat §Invariants as normative, §Interfaces sketches as
-   illustrative.** Evidence: mu-004a (gpt-5.5 mapped mutex poisoning
-   to ProviderError instead of using the spec's literal `expect`).
-2. **Implementers can sometimes avoid a dep the spec implies.**
-   Evidence: mu-007 (gpt-5.5 desugared `Tool::execute` rather than
-   add `async-trait` to mu-coding's deps).
+Two new rows since this morning's `MORNING.md`:
 
-Both rules logged in `specs/delegations.md` "Routing implications"
-section.
+- **mu-008a** (success): first delegation through `scripts/delegate.sh`.
+  Workspace isolation worked; the new shorter prompt format (~70
+  lines instead of ~130) was followed cleanly.
+- **mu-011** (success††): **NEW failure mode discovered.** Wrapper
+  exited 1 due to an SSE truncation on the response stream, but the
+  work itself was complete. New ledger taxonomy entry: TR
+  (Transport / response truncation). Routing rule:
+  > Non-zero exit from `delegate.sh` is NOT sufficient evidence of
+  > failure. Always inspect the workspace and run verification first.
+  > The diff is the source of truth, not the wrapper's exit code.
 
-## Memory — for context
+## Memory note
 
-While working on mu-006 you mentioned the parallel-session work on
-LLM internals + memory dreams. I searched memory and saved a
-forward-looking note (`agent memory show ee639a12`) about wiring mu's
-future memory integration through the existing `agent memory` MCP
-primitives (show / events / patch-log / apply-plan) rather than
-re-implementing storage. Not started; just flagged for whichever spec
-incorporates memory into mu (probably mu-009 or similar).
+While working on mu-008 you flagged the design-session note about
+**cooperating sessions** (typed mailboxes/direct channels between
+live mu sessions, no automatic mind-meld, message kinds:
+status/question/handoff/observation, context_refs to durable
+artifacts). Saved as memory `d22f391a` for whenever we spec the
+coordination plane. Not a current blocker.
 
-## What's next, in order of value
+## What's next, ranked
 
-These are CANDIDATES, not commitments — your call:
+These are CANDIDATES. Pick the order you want when you're back.
 
-1. **mu-006 extension: AnthropicProvider tool support.** Adds the
-   `tools` field to the API request and parses `tool_use`
-   content blocks from the response. Once this lands, `read`
-   (mu-007) can be wired into the daemon's tool list and the agent
-   can actually invoke it. ~2-3 hr; probably half delegation, half
-   claude.
-
-2. **mu-008 candidate: Wire `read` tool + provider selection into
-   `mu serve`.** Adds CLI flags / config so you can do
-   `mu serve --provider anthropic-api --model claude-haiku-4-5
-   --tools read`. ~1-2 hr; mostly claude (config plumbing has
-   judgment calls).
-
-3. **First TUI prototype (`mu tui`).** ratatui-backed interactive
-   client that connects to `mu serve`. Bigger; ~half-day at minimum;
-   architecturally interesting (event-driven UI on top of the same
-   transport).
-
-4. **Memory integration (mu-009 candidate).** Per the parallel-session
-   work — wire `agent memory` (show/recent/search/apply-plan) as a
-   built-in MCP-server-equivalent in `mu serve`. Per memory
-   `ee639a12` saved overnight.
-
-5. **OpenAI provider (mu-010 candidate).** Symmetrical to mu-006 but
-   for the OpenAI API. Mostly mechanical translation. Good
-   delegation candidate.
+1. **mu-013 / mu-014: `ls` tool slice.** Simplest remaining tool.
+   Lists directory contents. Same shape as read/write. ~1 hr,
+   delegate-able.
+2. **mu-015 / mu-016: `bash` tool slice.** Higher value but
+   higher security risk — runs arbitrary shell commands as the
+   daemon's user. Probably warrants explicit approval design
+   (allow/deny lists, prompt-on-dangerous?). Defer to discuss.
+3. **mu-017+: OpenAI Codex provider.** Symmetric to Anthropic but
+   uses your Pro account's OAuth via the codex CLI as a subprocess
+   (per the AGENTS.md no-token-holding rule). After this, mu can
+   choose between Claude and GPT.
+4. **Refactor study** as you proposed — look at what's emerged
+   across the read/write slices, identify abstractions worth
+   pulling out before adding more. The tools/read.rs and
+   tools/write.rs files share a lot of structure; might be a real
+   abstraction there.
+5. **Cooperating sessions spec** (memory `d22f391a`). Probably
+   waits until `mu orchestrate` is real — there need to be N live
+   sessions for the messaging primitive to matter.
+6. **TUI prototype.** Per your earlier guidance, only stub enough
+   to validate the architecture supports push/pull. Not on the
+   critical path yet.
 
 ## Things to review
 
-- **README.md**: I updated the Status section to claim "MVP working."
-  Worth a sanity check.
-- **specs/mu-007-delegation.md** & **mu-007-read-tool.md**: spec
-  + prompt for the delegation. The spec is opinionated about the
-  `spawn_blocking + select!` pattern (§OOC-3) — opinionated for
-  good reason but worth knowing in case future tools want a
-  different shape.
-- **`agent memory show ee639a12`** if you want to read the memory
-  integration note.
+- **`specs/delegations.md`** — new TR failure-mode taxonomy entry,
+  new routing rule about exit codes. Worth a sanity check.
+- **`tests/common/mod.rs`** — first shared test helper. Pattern is
+  pretty light; if you want a different shape, the change cost is
+  low.
+- **`scripts/delegate.sh` + `scripts/delegate-cleanup.sh`** —
+  these worked on mu-008a but the mu-011 case showed how the
+  wrapper-vs-workspace distinction matters. Might want to add a
+  hint in delegate.sh's output saying "exit code is informational;
+  inspect the workspace to confirm work state."
 
-## Stopping rationale
+## Stopping point
 
-Hit my stopping condition: three specs landed cleanly. Could have
-kept going (mu-006 extension is right there) but didn't want to
-rack up a fifth delegation or get into architectural decisions
-without your input on mu-008's shape.
+Stopping deliberately at "two tools complete + refactor pass" so
+you have a reviewable checkpoint. No new specs/delegations fired
+since mu-012's commit. Workspace is clean (no in-flight tasks).
+Most recent commit: `4ef4347e`.
 
 Welcome back.

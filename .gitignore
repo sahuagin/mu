@@ -15,3 +15,10 @@
 
 # code_index per-project DB (we use mu's own caches if wired in)
 /.code_index/
+
+# delegation workspaces — each delegation runs in an isolated jj
+# workspace under here; not part of the source tree.
+/.delegations/
+
+# archived wake-up summaries; current MORNING.md is committed for review.
+/MORNING-*.md

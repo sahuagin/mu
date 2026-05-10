@@ -27,6 +27,7 @@ all that apply.
 | mu-001  | 1       | codex-oauth/gpt-5.5 | success   | ?     | ~?m       | yes (2/2)           | 11/11        | —             | spec was tight enough that §Invariants / §OOC blocks caught the predictable mistakes (extra derives, wrong rename_all). Reusable: §OOC section is load-bearing for mechanical translation tasks. |
 | mu-002  | 1       | codex-oauth/gpt-5.5 | success†  | ?     | ~?m       | yes (2/2)           | 19/19        | WC            | Spec implementation was correct (concurrent tokio code with mpsc + writer task, all 8 §Behaviors covered). BUT pi-rust ran `jj restore specs/delegations.md` mid-task, wiping an unrelated file I had created in the working copy. Lesson: when the working copy contains files from a parallel claude-code session, the sub-agent will "clean them up." Spec said "don't touch other files"; sub-agent interpreted that as "restore other files to their parent state." Different operation, same intent — but it's destructive to in-flight work. See `delegations/mu-002-attempt-1-postmortem.md`. |
 | mu-003a | 1       | codex-oauth/gpt-5.5 | success‡  | ?     | ~?m       | 7/5 (5 expected + Cargo.toml + Cargo.lock — flagged) | 29/29        | —             | **WC fix held.** Explicit "Workspace hygiene" section in the prompt prevented the failure mode from mu-002 attempt 1. gpt-pro reported "Working copy was clean at start" — it noticed and respected the parallel-session files. Bonus: gpt-pro found a spec inconsistency (provider.rs uses `futures::stream::BoxStream` but `mu-core/Cargo.toml` didn't list `futures` as a per-crate dep, only the workspace did), added the dep, and EXPLICITLY flagged the deviation in `notes` instead of hiding it. This is the behavior we want — surface inconsistencies, don't paper over them. The 7-vs-5 file deviation isn't a failure; it's a spec lint we should fold back. |
+| mu-004a | 1       | codex-oauth/gpt-5.5 | success‡  | ?     | ~?m       | 4/3 (3 expected + Cargo.lock — flagged) | 41/41        | —             | **WC fix held a third time** (mu-002 → mu-003a → mu-004a). Solid evidence the prompt-level fix is reliable; can probably stop adding "test if WC holds" as a watch item. **NEW positive datapoint**: gpt-5.5 noticed the spec's §Interfaces sketch had `expect("mutex poisoned")` in non-test code, which violates INV-6, and chose to map poisoning to `ProviderError::Other` instead. *Treated invariants as normative, sketches as illustrative.* That's the right reading of a spec — and exactly the behavior the "if spec/prompt disagree, surface the deviation" routing rule is meant to encourage. Also: deps were minimal (only `mu-core` added); other deps were already in the linter-modified `Cargo.toml`. |
 
 `†` = "spec passed acceptance, but operational issue captured separately."
 `‡` = "spec passed acceptance, but a benign deviation (correct call, prompt-level inconsistency to fix)."
@@ -76,12 +77,21 @@ it's based on so it can be revisited when the evidence changes.
 
 - **When the spec and the prompt are inconsistent, sub-agents should
   flag the deviation explicitly** rather than silently fix or refuse.
-  Evidence: mu-003a attempt 1 (futures dep). gpt-pro's `notes`
-  explicitly called out the seven-vs-five file deviation and proposed
-  a spec amendment. This is exactly the right behavior. Reinforce by
+  Evidence: mu-003a attempt 1 (futures dep), mu-004a attempt 1
+  (mutex-poison expect). gpt-pro's `notes` explicitly called out
+  both deviations and proposed/took the right call. Reinforce by
   including a sentence in every delegation prompt: "If the spec and
   this prompt disagree, make the call your judgment supports and
   surface the deviation in `notes`."
+
+- **Treat §Invariants as normative; treat §Interfaces sketches as
+  illustrative.** Evidence: mu-004a attempt 1. The spec's interface
+  block had `expect("mutex poisoned")` in non-test code. INV-6 says
+  no expect outside tests. gpt-5.5 followed the invariant, mapped
+  poisoning to a proper error variant. This is the right reading.
+  Future spec authors: be aware the interface block is a strong
+  hint but not a contract; the contract is invariants + behaviors.
+  Future delegation prompts can make this explicit if needed.
 
 ## Cross-references
 

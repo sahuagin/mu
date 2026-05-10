@@ -759,6 +759,7 @@ dependencies = [
  "async-trait",
  "base64",
  "futures",
+ "mu-core",
  "rand 0.8.6",
  "reqwest",
  "serde",

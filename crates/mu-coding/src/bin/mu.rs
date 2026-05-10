@@ -3,8 +3,13 @@
 //! One binary, multiple modes. `mu serve` is the JSON-RPC core daemon;
 //! every other subcommand is a frontend that owns one or more daemons.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+
+use mu_ai::FauxProvider;
+use mu_core::agent::Provider;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -37,7 +42,8 @@ enum Command {
     Versions,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -53,10 +59,17 @@ fn main() -> Result<()> {
             println!("mu-coding  {}", mu_coding::version());
             Ok(())
         }
-        Command::Serve | Command::Ask { .. } | Command::Tui | Command::Orchestrate { .. } => {
+        Command::Serve => {
+            // v1: hardcoded FauxProvider::echo. Real provider selection
+            // is a future spec.
+            let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+            mu_coding::serve::run(provider).await
+        }
+        Command::Ask { .. } | Command::Tui | Command::Orchestrate { .. } => {
             anyhow::bail!(
                 "this subcommand is not yet implemented; mu is pre-MVP. \
-                 Try `mu versions` to confirm the workspace builds."
+                 Try `mu serve` for the JSON-RPC daemon, or `mu versions` to \
+                 confirm the workspace builds."
             )
         }
     }

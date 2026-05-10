@@ -208,6 +208,46 @@ impl ErrorEvent {
     pub const METHOD: &'static str = "session.error";
 }
 
+/// Catch-all "the agent has something notable to say" notification.
+/// Free-form `kind` and optional `theme` let new categories be added
+/// without protocol changes. See spec mu-016. Documented starter
+/// `kind` set: `info`, `status`, `observation`, `hint`, `warning`,
+/// `memory`, `peer_message`. Documented starter `theme` set: `info`,
+/// `muted`, `warning`, `danger`, `success`. Frontends fall back to
+/// defaults for unknown values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalloutEvent {
+    pub session_id: String,
+    pub kind: String,
+    pub title: String,
+    pub body: CalloutBody,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+    /// References to durable artifacts (spec IDs, memory IDs,
+    /// code-index paths, beads). Body should be terse; refs let
+    /// consumers fetch full context.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_refs: Vec<String>,
+}
+
+/// `CalloutEvent.body` shape. `Text` for simple cases; `Structured`
+/// for richer payloads frontends may render specially.
+///
+/// Untagged: a Text body encodes as a bare string, a Structured
+/// body as a JSON object/array/etc. This means deserializing a
+/// string-as-Structured is impossible — strings always come back as
+/// Text. That's intentional.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CalloutBody {
+    Text(String),
+    Structured(Value),
+}
+
+impl CalloutEvent {
+    pub const METHOD: &'static str = "session.callout";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +477,66 @@ mod tests {
         );
         assert_eq!(DoneEvent::METHOD, "session.done");
         assert_eq!(ErrorEvent::METHOD, "session.error");
+        assert_eq!(CalloutEvent::METHOD, "session.callout");
+    }
+
+    #[test]
+    fn callout_text_body_round_trip() -> Result<(), serde_json::Error> {
+        let event = CalloutEvent {
+            session_id: "s1".to_owned(),
+            kind: "observation".to_owned(),
+            title: "spotted typo".to_owned(),
+            body: CalloutBody::Text("line 5".to_owned()),
+            theme: Some("info".to_owned()),
+            context_refs: vec!["spec:mu-016".to_owned()],
+        };
+        let value = serde_json::to_value(&event)?;
+        let decoded: CalloutEvent = serde_json::from_value(value.clone())?;
+        assert_eq!(decoded, event);
+        // Untagged enum: body should encode as a bare string.
+        assert_eq!(value["body"], json!("line 5"));
+        Ok(())
+    }
+
+    #[test]
+    fn callout_structured_body_round_trip() -> Result<(), serde_json::Error> {
+        let event = CalloutEvent {
+            session_id: "s1".to_owned(),
+            kind: "memory".to_owned(),
+            title: "recalled".to_owned(),
+            body: CalloutBody::Structured(json!({"id": "abc123", "preview": "..."})),
+            theme: None,
+            context_refs: vec![],
+        };
+        let value = serde_json::to_value(&event)?;
+        let decoded: CalloutEvent = serde_json::from_value(value.clone())?;
+        assert_eq!(decoded, event);
+        // Untagged enum: structured body encodes as the object.
+        assert_eq!(value["body"]["id"], "abc123");
+        Ok(())
+    }
+
+    #[test]
+    fn callout_skips_empty_optionals_in_encoding() -> Result<(), serde_json::Error> {
+        let event = CalloutEvent {
+            session_id: "s1".to_owned(),
+            kind: "info".to_owned(),
+            title: "hi".to_owned(),
+            body: CalloutBody::Text("body".to_owned()),
+            theme: None,
+            context_refs: vec![],
+        };
+        let value = serde_json::to_value(&event)?;
+        let obj = value.as_object().expect("object");
+        assert!(
+            !obj.contains_key("theme"),
+            "theme: None should be omitted"
+        );
+        assert!(
+            !obj.contains_key("context_refs"),
+            "empty context_refs should be omitted"
+        );
+        Ok(())
     }
 
     fn nested_error_data(value: &Value) -> Option<&Value> {

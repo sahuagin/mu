@@ -250,6 +250,7 @@ fn kind(event: &AgentEvent) -> &'static str {
         AgentEvent::TurnEnd => "turn_end",
         AgentEvent::Done { .. } => "done",
         AgentEvent::Error { .. } => "error",
+        AgentEvent::Callout { .. } => "callout",
     }
 }
 

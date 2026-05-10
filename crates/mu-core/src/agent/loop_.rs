@@ -68,6 +68,25 @@ pub enum AgentEvent {
     Error {
         message: String,
     },
+    /// Catch-all "the agent says something notable" event. See spec
+    /// mu-016. Free-form `category`/`theme`. The forwarder
+    /// translates to `session.callout` notifications, where this
+    /// field becomes the wire-level `kind`.
+    ///
+    /// (We use `category` here because AgentEvent's serde tag is
+    /// already named `kind` — the discriminator. The wire surface
+    /// in mu-001's `CalloutEvent` keeps the user-facing `kind` name.)
+    Callout {
+        category: String,
+        title: String,
+        /// Either a JSON string (text body) or any structured value.
+        /// Body shape is preserved end-to-end; the wire layer (mu-001's
+        /// `CalloutBody`) interprets it as Text-or-Structured at
+        /// translation time.
+        body: serde_json::Value,
+        theme: Option<String>,
+        context_refs: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]

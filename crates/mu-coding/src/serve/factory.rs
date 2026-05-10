@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use mu_ai::{AnthropicProvider, FauxProvider, OpenaiCodexProvider};
+use mu_ai::{AnthropicProvider, FauxProvider, OpenRouterProvider, OpenaiCodexProvider};
 use mu_core::agent::{Provider, Tool};
 
 use crate::tools::{LsTool, ReadTool, WriteTool};
@@ -30,8 +30,14 @@ pub fn build_provider(name: &str, model: Option<&str>) -> Result<Arc<dyn Provide
             let model = model.unwrap_or("gpt-5.5").to_string();
             Ok(Arc::new(OpenaiCodexProvider::new(model)))
         }
+        "openrouter" => {
+            let model = model
+                .unwrap_or("anthropic/claude-haiku-4.5")
+                .to_string();
+            Ok(Arc::new(OpenRouterProvider::from_env(model)?))
+        }
         other => anyhow::bail!(
-            "unknown provider: {other} (expected: faux, anthropic-api, openai-codex)"
+            "unknown provider: {other} (expected: faux, anthropic-api, openai-codex, openrouter)"
         ),
     }
 }

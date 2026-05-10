@@ -9,7 +9,9 @@
 
 pub mod anthropic;
 pub mod openai_codex;
+pub mod openrouter;
 pub mod sse;
 
 pub use anthropic::AnthropicProvider;
 pub use openai_codex::OpenaiCodexProvider;
+pub use openrouter::OpenRouterProvider;

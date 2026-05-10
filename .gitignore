@@ -1,0 +1,17 @@
+/target
+/Cargo.lock.dev
+**/*.rs.bk
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# local development scratch
+/scratch/
+/tmp/
+*.local.toml
+.env
+.env.local
+
+# code_index per-project DB (we use mu's own caches if wired in)
+/.code_index/

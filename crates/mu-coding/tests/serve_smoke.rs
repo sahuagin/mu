@@ -23,7 +23,12 @@ fn spawn_server(
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (server_read, server_write) = tokio::io::split(server);
     let server_buf = BufReader::new(server_read);
-    let handle = tokio::spawn(serve::serve_with_io(server_buf, server_write, provider));
+    let handle = tokio::spawn(serve::serve_with_io(
+        server_buf,
+        server_write,
+        provider,
+        Vec::new(),
+    ));
     (client, handle)
 }
 

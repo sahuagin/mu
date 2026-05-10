@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use mu_core::agent::{
-    AgentConfig, AgentInput, AgentLoop, AgentMessage, Provider,
+    AgentConfig, AgentInput, AgentLoop, AgentMessage, Provider, Tool,
 };
 use mu_core::protocol::{
     AskSessionRequest, AskSessionResponse, CancelSessionRequest, CancelSessionResponse,
@@ -27,10 +27,13 @@ pub async fn dispatch(
     notif: NotificationWriter,
     sessions: Sessions,
     provider: Arc<dyn Provider>,
+    tools: Arc<Vec<Arc<dyn Tool>>>,
 ) -> Response<Value> {
     match request.method.as_str() {
         PingRequest::METHOD => handle_ping(request),
-        CreateSessionRequest::METHOD => handle_create_session(request, notif, sessions, provider),
+        CreateSessionRequest::METHOD => {
+            handle_create_session(request, notif, sessions, provider, tools)
+        }
         AskSessionRequest::METHOD => handle_ask_session(request, sessions).await,
         CancelSessionRequest::METHOD => handle_cancel_session(request, sessions).await,
         CloseSessionRequest::METHOD => handle_close_session(request, sessions),
@@ -59,6 +62,7 @@ fn handle_create_session(
     notif: NotificationWriter,
     sessions: Sessions,
     provider: Arc<dyn Provider>,
+    tools: Arc<Vec<Arc<dyn Tool>>>,
 ) -> Response<Value> {
     // v1 ignores request.params.provider — daemon-wide provider only.
     // We don't even need to parse the params for v1, but parsing
@@ -76,7 +80,11 @@ fn handle_create_session(
 
     let session_id = Sessions::next_id();
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
-    let agent = AgentLoop::spawn(provider, Vec::new(), AgentConfig::default(), events_tx);
+    // Each session gets its own copy of the tools vec. Tools
+    // themselves are Arc-wrapped so the actual Tool instances are
+    // shared.
+    let session_tools: Vec<Arc<dyn Tool>> = (*tools).clone();
+    let agent = AgentLoop::spawn(provider, session_tools, AgentConfig::default(), events_tx);
     let input_tx = agent.sender();
 
     // Wrap AgentLoop::join into a JoinHandle<()> so it can sit in

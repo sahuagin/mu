@@ -16,9 +16,15 @@ use tokio::time::timeout;
 
 use mu_core::protocol::{AskSessionRequest, CreateSessionRequest, CreateSessionResponse};
 
-/// Run a single `mu ask` invocation.
-pub async fn run(prompt: String) -> Result<()> {
-    let mut child = spawn_serve()?;
+/// Run a single `mu ask` invocation. Flags (`provider`, `model`,
+/// `tools`) are forwarded to the spawned `mu serve`.
+pub async fn run(
+    prompt: String,
+    provider: String,
+    model: Option<String>,
+    tools: String,
+) -> Result<()> {
+    let mut child = spawn_serve(&provider, model.as_deref(), &tools)?;
     let mut stdin = child
         .stdin
         .take()
@@ -53,7 +59,11 @@ pub async fn run(prompt: String) -> Result<()> {
     }
 }
 
-fn spawn_serve() -> Result<tokio::process::Child> {
+fn spawn_serve(
+    provider: &str,
+    model: Option<&str>,
+    tools: &str,
+) -> Result<tokio::process::Child> {
     // MU_BINARY env override allows integration tests to point at a
     // specific binary path (`env!("CARGO_BIN_EXE_mu")`); production
     // falls back to the current executable.
@@ -65,9 +75,17 @@ fn spawn_serve() -> Result<tokio::process::Child> {
             .into_owned(),
     };
 
-    Command::new(&binary)
-        .arg("serve")
-        .stdin(std::process::Stdio::piped())
+    let mut cmd = Command::new(&binary);
+    cmd.arg("serve")
+        .arg("--provider")
+        .arg(provider);
+    if let Some(m) = model {
+        cmd.arg("--model").arg(m);
+    }
+    if !tools.is_empty() {
+        cmd.arg("--tools").arg(tools);
+    }
+    cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         // stderr inherited — daemon logs go to the user's terminal.
         .spawn()

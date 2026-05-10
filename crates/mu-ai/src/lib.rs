@@ -24,6 +24,9 @@
 
 #![deny(unsafe_code)]
 
+pub mod faux;
+pub use faux::{FauxProvider, FauxResponse};
+
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }

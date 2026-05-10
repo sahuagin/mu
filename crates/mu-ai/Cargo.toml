@@ -9,6 +9,7 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+mu-core = { path = "../mu-core" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }

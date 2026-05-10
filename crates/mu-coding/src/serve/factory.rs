@@ -16,8 +16,17 @@ use crate::tools::{LsTool, ReadTool, WriteTool};
 /// Build a `Provider` from a CLI flag value.
 ///
 /// `model` is provider-specific. Faux ignores it; anthropic-api
-/// defaults to `claude-haiku-4-5-20251001` if `model` is None.
-pub fn build_provider(name: &str, model: Option<&str>) -> Result<Arc<dyn Provider>> {
+/// defaults to `claude-haiku-4-5-20251001` if `model` is None;
+/// openai-codex defaults to `gpt-5-codex`.
+///
+/// `ephemeral` only affects providers that hold rotatable OAuth
+/// tokens (currently: openai-codex). When true, refreshed tokens
+/// stay in memory and aren't written back to the token store.
+pub fn build_provider(
+    name: &str,
+    model: Option<&str>,
+    ephemeral: bool,
+) -> Result<Arc<dyn Provider>> {
     match name {
         "faux" => Ok(Arc::new(FauxProvider::echo())),
         "anthropic-api" => {
@@ -27,8 +36,19 @@ pub fn build_provider(name: &str, model: Option<&str>) -> Result<Arc<dyn Provide
             Ok(Arc::new(AnthropicProvider::from_env(model)?))
         }
         "openai-codex" => {
+            // ChatGPT-account auth (chatgpt.com/backend-api) has its
+            // own model namespace, distinct from api.openai.com.
+            // `gpt-5-codex` is API-tier only; ChatGPT subscribers
+            // get `gpt-5.X`/`gpt-5.X-codex` variants. gpt-5.5 has
+            // 1M context.
             let model = model.unwrap_or("gpt-5.5").to_string();
-            Ok(Arc::new(OpenaiCodexProvider::new(model)))
+            let provider = if ephemeral {
+                OpenaiCodexProvider::from_store_ephemeral(model)
+            } else {
+                OpenaiCodexProvider::from_store(model)
+            }
+            .map_err(|e| anyhow::anyhow!("openai-codex: {e}"))?;
+            Ok(Arc::new(provider))
         }
         "openrouter" => {
             let model = model
@@ -87,14 +107,16 @@ mod tests {
 
     #[test]
     fn build_provider_faux() {
-        assert!(build_provider("faux", None).is_ok());
-        assert!(build_provider("faux", Some("ignored")).is_ok());
+        assert!(build_provider("faux", None, false).is_ok());
+        assert!(build_provider("faux", Some("ignored"), false).is_ok());
+        // ephemeral=true is tolerated for providers that ignore it.
+        assert!(build_provider("faux", None, true).is_ok());
     }
 
     #[test]
     fn build_provider_unknown_errors() {
         // Can't `.unwrap_err()` because Arc<dyn Provider>: !Debug.
-        match build_provider("bogus", None) {
+        match build_provider("bogus", None, false) {
             Ok(_) => panic!("expected error for unknown provider"),
             Err(e) => assert!(e.to_string().contains("unknown provider")),
         }

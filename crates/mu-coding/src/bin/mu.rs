@@ -21,16 +21,23 @@ struct Cli {
 enum Command {
     /// JSON-RPC core daemon over stdio.
     Serve {
-        /// Provider backend. Values: faux, anthropic-api.
+        /// Provider backend. Values: faux, anthropic-api,
+        /// openai-codex, openrouter.
         #[arg(long, default_value = "faux")]
         provider: String,
-        /// Model id (provider-specific). For anthropic-api, defaults
-        /// to claude-haiku-4-5-20251001 if unset.
+        /// Model id (provider-specific). Defaults: anthropic-api →
+        /// claude-haiku-4-5-20251001; openai-codex → gpt-5-codex;
+        /// openrouter → anthropic/claude-haiku-4.5.
         #[arg(long)]
         model: Option<String>,
-        /// Comma-separated list of tools to enable. Values: read.
+        /// Comma-separated list of tools to enable. Values: read,
+        /// write, ls.
         #[arg(long, default_value = "")]
         tools: String,
+        /// For OAuth providers (openai-codex): load stored token but
+        /// don't persist refreshed tokens back to disk.
+        #[arg(long)]
+        ephemeral: bool,
     },
     /// One-shot ask — spawn the daemon, single roundtrip, exit.
     Ask {
@@ -45,6 +52,9 @@ enum Command {
         /// Comma-separated list of tools (forwarded).
         #[arg(long, default_value = "")]
         tools: String,
+        /// Forwarded as `--ephemeral` to `mu serve`. See `mu serve --help`.
+        #[arg(long)]
+        ephemeral: bool,
     },
     /// Interactive terminal UI.
     Tui,
@@ -91,9 +101,10 @@ async fn main() -> Result<()> {
             provider,
             model,
             tools,
+            ephemeral,
         } => {
             let provider_arc =
-                mu_coding::serve::build_provider(&provider, model.as_deref())?;
+                mu_coding::serve::build_provider(&provider, model.as_deref(), ephemeral)?;
             let tool_names = mu_coding::serve::parse_tools_csv(&tools);
             let tool_vec = mu_coding::serve::build_tools(&tool_names)?;
             mu_coding::serve::run(provider_arc, tool_vec).await
@@ -103,7 +114,8 @@ async fn main() -> Result<()> {
             provider,
             model,
             tools,
-        } => mu_coding::ask::run(prompt, provider, model, tools).await,
+            ephemeral,
+        } => mu_coding::ask::run(prompt, provider, model, tools, ephemeral).await,
         Command::Login { provider } => run_login(&provider).await,
         Command::Logout { provider } => run_logout(&provider),
         Command::Tui | Command::Orchestrate { .. } => {

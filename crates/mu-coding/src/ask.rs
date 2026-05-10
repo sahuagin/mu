@@ -24,8 +24,15 @@ pub async fn run(
     model: Option<String>,
     tools: String,
     ephemeral: bool,
+    thinking: Option<String>,
 ) -> Result<()> {
-    let mut child = spawn_serve(&provider, model.as_deref(), &tools, ephemeral)?;
+    let mut child = spawn_serve(
+        &provider,
+        model.as_deref(),
+        &tools,
+        ephemeral,
+        thinking.as_deref(),
+    )?;
     let mut stdin = child
         .stdin
         .take()
@@ -65,6 +72,7 @@ fn spawn_serve(
     model: Option<&str>,
     tools: &str,
     ephemeral: bool,
+    thinking: Option<&str>,
 ) -> Result<tokio::process::Child> {
     // MU_BINARY env override allows integration tests to point at a
     // specific binary path (`env!("CARGO_BIN_EXE_mu")`); production
@@ -89,6 +97,11 @@ fn spawn_serve(
     }
     if ephemeral {
         cmd.arg("--ephemeral");
+    }
+    if let Some(t) = thinking {
+        if !t.is_empty() {
+            cmd.arg("--thinking").arg(t);
+        }
     }
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

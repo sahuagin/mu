@@ -38,6 +38,11 @@ enum Command {
         /// don't persist refreshed tokens back to disk.
         #[arg(long)]
         ephemeral: bool,
+        /// Reasoning effort: minimal | low | medium | high. Only
+        /// affects providers with a reasoning surface (openai-codex
+        /// today); ignored elsewhere.
+        #[arg(long)]
+        thinking: Option<String>,
     },
     /// One-shot ask — spawn the daemon, single roundtrip, exit.
     Ask {
@@ -55,6 +60,9 @@ enum Command {
         /// Forwarded as `--ephemeral` to `mu serve`. See `mu serve --help`.
         #[arg(long)]
         ephemeral: bool,
+        /// Forwarded as `--thinking` to `mu serve`. See `mu serve --help`.
+        #[arg(long)]
+        thinking: Option<String>,
     },
     /// Interactive terminal UI.
     Tui,
@@ -102,9 +110,14 @@ async fn main() -> Result<()> {
             model,
             tools,
             ephemeral,
+            thinking,
         } => {
-            let provider_arc =
-                mu_coding::serve::build_provider(&provider, model.as_deref(), ephemeral)?;
+            let provider_arc = mu_coding::serve::build_provider(
+                &provider,
+                model.as_deref(),
+                ephemeral,
+                thinking.as_deref(),
+            )?;
             let tool_names = mu_coding::serve::parse_tools_csv(&tools);
             let tool_vec = mu_coding::serve::build_tools(&tool_names)?;
             mu_coding::serve::run(provider_arc, tool_vec).await
@@ -115,7 +128,8 @@ async fn main() -> Result<()> {
             model,
             tools,
             ephemeral,
-        } => mu_coding::ask::run(prompt, provider, model, tools, ephemeral).await,
+            thinking,
+        } => mu_coding::ask::run(prompt, provider, model, tools, ephemeral, thinking).await,
         Command::Login { provider } => run_login(&provider).await,
         Command::Logout { provider } => run_logout(&provider),
         Command::Tui | Command::Orchestrate { .. } => {

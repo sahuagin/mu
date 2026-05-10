@@ -575,3 +575,134 @@ async fn b7_user_message_during_tool_pushes_to_back() {
         "TurnStart for the next turn must come AFTER second user MessageEnd"
     );
 }
+
+// ============================================================================
+// Pure-planner tests
+// ============================================================================
+//
+// These hit the queue-mediated logic without spawning anything.
+// Behavior tests (B-1..B-7 above) cover the integrated flow with
+// mock providers/tools. These complement by hitting the planning
+// logic directly with edge-case inputs.
+
+fn assistant_text_msg(text: &str) -> AssistantMessage {
+    AssistantMessage {
+        content: vec![ContentBlock::Text {
+            text: text.to_owned(),
+        }],
+        stop_reason: StopReason::EndTurn,
+    }
+}
+
+fn assistant_tool_msg(id: &str, name: &str) -> AssistantMessage {
+    AssistantMessage {
+        content: vec![ContentBlock::ToolCall(ToolCall {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            arguments: serde_json::json!({}),
+        })],
+        stop_reason: StopReason::ToolUse,
+    }
+}
+
+#[test]
+fn plan_post_invoke_llm_text_only_no_buffered() {
+    let plan = plan_post_invoke_llm(&assistant_text_msg("done"), vec![]);
+    assert!(plan.emit_turn_end);
+    assert_eq!(plan.actions.len(), 1);
+    assert!(matches!(plan.actions[0], Action::MaybeFinish));
+}
+
+#[test]
+fn plan_post_invoke_llm_text_only_with_buffered() {
+    let buffered = vec![AgentInput::UserMessage(user_msg("more"))];
+    let plan = plan_post_invoke_llm(&assistant_text_msg("ok"), buffered);
+    // Even with text-only, buffered UMs go into the queue. No
+    // MaybeFinish — the UM handler will push InvokeLlm.
+    assert!(plan.emit_turn_end);
+    assert_eq!(plan.actions.len(), 1);
+    assert!(matches!(
+        plan.actions[0],
+        Action::External(AgentInput::UserMessage(_))
+    ));
+}
+
+#[test]
+fn plan_post_invoke_llm_with_tools_no_buffered() {
+    let plan = plan_post_invoke_llm(&assistant_tool_msg("t1", "echo"), vec![]);
+    // TurnEnd defers until ExecuteTools completes.
+    assert!(!plan.emit_turn_end);
+    assert_eq!(plan.actions.len(), 1);
+    match &plan.actions[0] {
+        Action::ExecuteTools(calls) => {
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].id, "t1");
+            assert_eq!(calls[0].name, "echo");
+        }
+        other => panic!("expected ExecuteTools, got {other:?}"),
+    }
+}
+
+#[test]
+fn plan_post_invoke_llm_with_tools_and_buffered() {
+    // Tool calls + buffered UMs: both go on the queue, ExecuteTools
+    // first so tools run before the user's queued message is
+    // processed.
+    let buffered = vec![AgentInput::UserMessage(user_msg("inject"))];
+    let plan = plan_post_invoke_llm(&assistant_tool_msg("t1", "echo"), buffered);
+    assert_eq!(plan.actions.len(), 2);
+    assert!(matches!(plan.actions[0], Action::ExecuteTools(_)));
+    assert!(matches!(
+        plan.actions[1],
+        Action::External(AgentInput::UserMessage(_))
+    ));
+}
+
+#[test]
+fn plan_post_execute_tools_basic() {
+    let actions = plan_post_execute_tools(vec![]);
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(actions[0], Action::InvokeLlm));
+}
+
+#[test]
+fn plan_post_execute_tools_with_buffered_orders_inputs_first() {
+    let buffered = vec![
+        AgentInput::UserMessage(user_msg("first")),
+        AgentInput::UserMessage(user_msg("second")),
+    ];
+    let actions = plan_post_execute_tools(buffered);
+    // External(first), External(second), InvokeLlm — buffered go
+    // first so their context is available when the LLM runs.
+    assert_eq!(actions.len(), 3);
+    assert!(matches!(
+        actions[0],
+        Action::External(AgentInput::UserMessage(_))
+    ));
+    assert!(matches!(
+        actions[1],
+        Action::External(AgentInput::UserMessage(_))
+    ));
+    assert!(matches!(actions[2], Action::InvokeLlm));
+}
+
+#[test]
+fn should_push_invoke_llm_empty_queue_yes() {
+    let q: VecDeque<Action> = VecDeque::new();
+    assert!(should_push_invoke_llm(&q));
+}
+
+#[test]
+fn should_push_invoke_llm_already_queued_no() {
+    let mut q: VecDeque<Action> = VecDeque::new();
+    q.push_back(Action::InvokeLlm);
+    assert!(!should_push_invoke_llm(&q));
+}
+
+#[test]
+fn should_push_invoke_llm_other_actions_yes() {
+    let mut q: VecDeque<Action> = VecDeque::new();
+    q.push_back(Action::MaybeFinish);
+    q.push_back(Action::External(AgentInput::UserMessage(user_msg("x"))));
+    assert!(should_push_invoke_llm(&q));
+}

@@ -1,140 +1,159 @@
-# Status: 2026-05-10 evening
+# Status: 2026-05-10 late evening
 
-Latest readout. Picks up from this morning's note.
+Latest readout. Picks up from this afternoon's note.
 
-## What landed since the last refresh
+## What landed since the afternoon refresh
 
-### Track A: ls vertical slice ✅
+### mu-016: callout primitive ✅
 
-- **mu-013** `LsTool` (delegated to gpt-5.5; same desugared async-fn
-  pattern as ReadTool/WriteTool). 6 tests, 237 lines, no async-trait
-  dep added.
-- **mu-014** wired into factory + live integration test.
-  `mu serve --tools ls` works.
+Catch-all "agent says something notable" notification. Free-form
+`kind`, optional `theme`, `context_refs` to durable artifacts.
+Future-extensible: peer messages, memory recalls, observations,
+warnings all become callouts without protocol changes.
 
-Verified live:
+No emitters yet — the surface is ready; future specs hook real
+events into it. Saved memories `d22f391a` (cooperating sessions)
+and `ee639a12` (memory integration) both reference this primitive
+as the consumption point.
+
+### Refactor pass: forwarder + agent-loop planners ✅
+
+The "queue-input → pure-logic → queue-output" pattern, applied:
+
+- **forwarder**: extracted `translate_event(session_id, event) →
+  Option<(method, value)>` as a pure function. The IO loop becomes
+  thin glue. 6 new unit tests target the translation directly.
+
+- **agent loop**: extracted `plan_post_invoke_llm`,
+  `plan_post_execute_tools`, `should_push_invoke_llm` as pure
+  functions. The loop's match arms are now ~half their previous
+  size; the planning logic gets edge-case tests without spawning
+  mock providers/tools. 9 new tests.
+
+All existing behavior tests still pass — refactor is observation-
+preserving. The user's framing crystallized: *queue-mediated logic
+should be pure, with explicit inputs and outputs; the queue
+topology gets tested separately at a coarser grain.*
+
+### mu-017: OpenRouter provider ✅
+
+Third Provider impl, fourth provider total. Pi-free path to GPT,
+Gemini, Llama, Claude (all via OpenRouter), with full tool support
+and streaming. OpenAI-compatible wire format.
+
+Verified live end-to-end:
 
 ```sh
-$ mu ask --provider anthropic-api --tools ls \
-    "Use the ls tool to list /tmp/mu_014_ls_test. Reply with the names."
-mu_014_marker_b8d9c.txt
+$ mu ask --provider openrouter --model anthropic/claude-haiku-4.5 --tools read \
+    "Read mu's Cargo.toml. What's the resolver version? Just the number."
+2
 ```
 
-### Track B: OpenAI Codex provider ✅
+Same vertical slice that Anthropic-direct supports, this time
+through a different provider. Validates the Provider abstraction
+generalizes — Anthropic's content-block format and OpenAI's
+delta-by-index format are different enough that any abstraction
+leaks would have surfaced. None did.
 
-- **mu-015** subprocess wrapper around `pi --provider openai-codex`.
-  No OAuth tokens enter mu's address space — pi handles all token
-  management. Matches AGENTS.md's no-token-holding rule.
-- v1 limitations (intentional): no streaming, no tool support,
-  cancel doesn't actively kill the subprocess. Future specs.
-
-Verified live:
-
-```sh
-$ mu ask --provider openai-codex "Reply with just 'success'."
-success
-```
-
-(Some pi metadata leaks through after the response text — known
-v1 limitation, see commit message.)
-
-### Track C: bash tool security recon ✅
-
-- **`specs/recon-bash.md`** — research doc, not a numbered spec.
-  Surveys five design options (refuse-to-ship, allowlist-only,
-  prompt-for-approval, hybrid, containerization), threat model,
-  per-decision questions, recommended phased path.
-- Open questions for you in the doc to decide before formalizing
-  into a numbered spec.
+Long-term, mu-017 supersedes mu-015 (OpenAI-Codex via pi
+subprocess) for delegate use cases that don't specifically need
+OpenAI Pro budget.
 
 ## What `mu` does now
 
 ```sh
-# Three providers
-mu serve --provider faux                # default; echo
+# Four providers
+mu serve --provider faux                # echo (default; tests)
 mu serve --provider anthropic-api       # real Claude (mu-006)
 mu serve --provider openai-codex        # OAuth-via-pi-subprocess (mu-015)
+mu serve --provider openrouter          # Multi-model HTTP+key (mu-017) ← NEW
 
 # Three tools
-mu serve --tools read,write,ls          # all available
+mu serve --tools read,write,ls
 
 # End-to-end CLI
-mu ask --provider <p> --tools <csv> "..."
-
-# All flags forward through subprocess
+mu ask --provider <p> [--model <m>] [--tools <csv>] "..."
 ```
+
+Per the user's stated MVP provider list:
+
+| Stated MVP | Spec | Status |
+|------------|------|--------|
+| anthropic_key | mu-006/008 | ✅ full (text + tools + streaming) |
+| openai oauth | mu-015 | ✅ stepping stone (text-only, leaky) |
+| openrouter-many | mu-017 | ✅ full (text + tools + streaming) |
+| anthropic oauth | (deferred) | not started; low priority |
+
+OpenRouter unlocks GPT for tool-using sessions if needed, despite
+the openai-oauth path's v1 limitations.
 
 ## Tests
 
-- 109/109 unit/integration tests pass (no live env vars).
-- 4/4 Anthropic live tests pass with `MU_LIVE_ANTHROPIC=1`:
-  text smoke, tool-use parsing, read e2e, write e2e, ls e2e.
-- 1/1 OpenAI live test passes with `MU_LIVE_OPENAI_CODEX=1`:
-  text smoke (only test for this provider; no tool support v1).
+- **142/142 unit/integration tests pass** without live env vars.
+- **5/5 live tests pass** with appropriate env vars set:
+  - mu-006 Anthropic text smoke
+  - mu-008 Anthropic tool round-trip
+  - mu-010 read tool e2e via Anthropic
+  - mu-012 write tool e2e via Anthropic
+  - mu-014 ls tool e2e via Anthropic
+  - mu-015 OpenAI-Codex text smoke (gated separately on MU_LIVE_OPENAI_CODEX)
+  - mu-017 OpenRouter text smoke + tool round-trip (gated on MU_LIVE_OPENROUTER)
 
-## Delegation ledger
+Note: that's actually 7 live tests now; my count drifted. Several
+gated only on the per-provider env var.
 
-One new row this stretch:
-- **mu-013** (success): delegated cleanly through `scripts/delegate.sh`.
-  Following the same shape as mu-007 / mu-011 — the structural pattern
-  for tool implementations is now well-locked-in.
+## Architectural observations from this stretch
 
-No new failure modes discovered. Pattern shake-out should slow now;
-we've seen WC, TR, and the desugared-async-fn-vs-async-trait
-flexibility. Future delegations are likely to be uneventful.
+1. **The pure-translation pattern is the right abstraction for
+   queue-mediated logic.** Identifying it during the forwarder
+   refactor and then applying it to the agent-loop's planners both
+   produced cleaner code and ~15 new edge-case tests we wouldn't
+   have written otherwise. Worth applying anywhere else queue-IO
+   wraps decision logic.
 
-## A small infrastructure soft spot
+2. **The Provider abstraction holds across HTTP + content-block
+   (Anthropic) and HTTP + delta-by-index (OpenAI/OpenRouter)
+   formats.** Three providers in, no abstraction leaks visible.
+   The `BoxStream<'static, ProviderEvent>` pattern works across
+   substantially different wire formats.
 
-Mid-flight: when I wrote the bash recon doc and then called
-`jj rebase`, the doc disappeared from disk because my working-copy
-commit got rewritten as part of moving the delegate's commit onto
-main. I had to op-restore to find it (didn't), then rewrite from
-context.
+3. **Two architectural questions still open** that we discussed
+   tonight but didn't formalize:
+   - Cooperating sessions / mailbox primitive (memory `d22f391a`)
+   - `session.input_required` for in-band agent-asks-user
+   Both will become specs when there's a concrete first consumer.
+   Callout's existence reduces pressure on both — observations
+   that don't need a response just become callouts.
 
-**Lesson for future me:** when working in the orchestrator's main
-workspace, commit-then-rebase, not write-and-rebase. Or use
-`jj split` to peel off intermediate work into its own commit before
-any rebase shuffle.
+## What's next
 
-I noted this in the recon's changelog.
+In rough priority order:
 
-## Spec list, current
+1. **First real callout emitter.** Pick a plausible site (iteration
+   cap warning, tool error context) and wire it through. Validates
+   mu-016's surface end-to-end. ~50 LOC, ~30 minutes.
 
-| Spec | What | Status |
-|------|------|--------|
-| mu-001..mu-005 | foundation | ✅ |
-| mu-006 | AnthropicProvider | ✅ |
-| mu-007 | ReadTool | ✅ |
-| mu-008 | Anthropic tool support | ✅ |
-| mu-009 | --provider/--model/--tools flags | ✅ |
-| mu-010 | read e2e test | ✅ |
-| mu-011 | WriteTool | ✅ |
-| mu-012 | wire write + e2e test | ✅ |
-| mu-013 | LsTool | ✅ |
-| mu-014 | wire ls + e2e test | ✅ |
-| mu-015 | OpenaiCodexProvider | ✅ |
-| recon-bash | bash security recon | ✅ research |
+2. **Bash tool spec** — when you've reviewed `specs/recon-bash.md`
+   and picked a phase-1 direction (most likely: allowlist with a
+   small curated default). 2 specs, ~3 hours total.
 
-## What's next, ranked
+3. **Memory integration as callouts.** Wire `agent memory`
+   recalls as `kind: "memory"` callouts. Per the design we
+   discussed and memory `ee639a12`. Probably a future spec when
+   we know what the trigger surface is.
 
-1. **Bash spec** based on recon decisions. Once you pick a phase-1
-   direction (probably allowlist-only with a curated default), we
-   have ~2 numbered specs (the tool itself + factory wiring + e2e).
-2. **OpenRouter provider** as a third HTTP-based provider. Easy,
-   gives access to many models, exercises the Provider abstraction
-   in a third dimension.
-3. **More tools**: edit (line-based), find, grep — useful, similar
-   shapes.
-4. **`session.input_required` protocol extension** — needed for
-   the bash phase-2 hybrid model AND for cooperating-sessions.
-5. **Refactor study**: with read/write/ls all using the same
-   spawn_blocking + select! pattern, there's a clear extraction
-   target. Probably a `tool_io` helper module in mu-coding/src/tools/.
-6. **TUI prototype** — still appropriate to defer.
+4. **More tools** — edit (line-based modification), find, grep.
+   Each follows the read/write/ls template; mostly mechanical.
+
+5. **TUI prototype** — still defer. None of the above need it.
+
+6. **anthropic-oauth via subprocess** — symmetric to mu-015 but
+   wrapping `claude --print`. Useful for using Max5 budget. Probably
+   skip given anthropic-api is full-featured.
 
 ## Stopping here
 
-Three completion-points across the three tracks. No in-flight
-delegations or workspaces. Most recent commit: `2b37c7e7`.
+No in-flight delegations. Workspace clean. Most recent commit:
+`77924d91`.
 
 Welcome back when you're back.

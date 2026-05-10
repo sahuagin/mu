@@ -8,6 +8,8 @@
 //! `codex`), `bedrock`.
 
 pub mod anthropic;
+pub mod openai_codex;
 pub mod sse;
 
 pub use anthropic::AnthropicProvider;
+pub use openai_codex::OpenaiCodexProvider;

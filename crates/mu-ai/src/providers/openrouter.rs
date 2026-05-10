@@ -1,0 +1,458 @@
+//! OpenRouter provider — HTTP+key access to many models behind one
+//! API. OpenAI-compatible chat-completions endpoint with streaming.
+//!
+//! See spec mu-017. Supports tools and streaming. Same shape as
+//! AnthropicProvider but a different wire format (deltas-by-index
+//! rather than content-blocks-with-explicit-events).
+
+use std::collections::HashMap;
+use std::pin::Pin;
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures::stream::{BoxStream, Stream, StreamExt};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tokio::sync::oneshot;
+
+use mu_core::agent::{
+    AgentMessage, AssistantMessage, ContentBlock, Provider, ProviderError, ProviderEvent,
+    StopReason, ToolCall, ToolSpec,
+};
+
+use super::sse::{SseEvent, SseStream};
+
+const OPENROUTER_API_BASE: &str = "https://openrouter.ai";
+
+pub struct OpenRouterProvider {
+    client: reqwest::Client,
+    api_key: String,
+    model: String,
+    api_base: String,
+}
+
+impl OpenRouterProvider {
+    pub fn new(api_key: String, model: String) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            api_key,
+            model,
+            api_base: OPENROUTER_API_BASE.to_string(),
+        }
+    }
+
+    /// API key from `OPENROUTER_API_KEY`. Fails if unset or empty.
+    pub fn from_env(model: String) -> Result<Self, ProviderError> {
+        let api_key = std::env::var("OPENROUTER_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ProviderError::Other("OPENROUTER_API_KEY not set or empty".into()))?;
+        Ok(Self::new(api_key, model))
+    }
+
+    /// Test hook: override the API base URL.
+    pub fn with_api_base(mut self, base: String) -> Self {
+        self.api_base = base;
+        self
+    }
+}
+
+#[async_trait]
+impl Provider for OpenRouterProvider {
+    async fn stream(
+        &self,
+        messages: &[AgentMessage],
+        tools: &[ToolSpec],
+        cancel_rx: oneshot::Receiver<()>,
+    ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+        let body = build_request_body(&self.model, messages, tools);
+        let resp = self
+            .client
+            .post(format!("{}/api/v1/chat/completions", self.api_base))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .header("X-Title", "mu")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Other(format!("openrouter request: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::Other(format!(
+                "openrouter returned {status}: {text}"
+            )));
+        }
+
+        let bytes = resp.bytes_stream();
+        Ok(events_stream(bytes, cancel_rx))
+    }
+}
+
+// ============================================================================
+// Request side
+// ============================================================================
+
+pub(crate) fn translate_tool_spec(spec: &ToolSpec) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": spec.input_schema,
+        }
+    })
+}
+
+/// Translate mu's AgentMessage into the OpenAI/OpenRouter shape.
+/// Returns None for messages that don't have a wire equivalent in
+/// v1 (Thinking content blocks, etc.).
+pub(crate) fn translate_message(m: &AgentMessage) -> Option<Value> {
+    match m {
+        AgentMessage::User { content } => Some(json!({
+            "role": "user",
+            "content": content,
+        })),
+        AgentMessage::Assistant(a) => {
+            // Concatenate text blocks; collect tool calls separately.
+            let mut text_parts: Vec<String> = Vec::new();
+            let mut tool_calls: Vec<Value> = Vec::new();
+            for block in &a.content {
+                match block {
+                    ContentBlock::Text { text } => text_parts.push(text.clone()),
+                    ContentBlock::ToolCall(tc) => {
+                        // OpenAI puts arguments as a string-encoded JSON.
+                        let args_str = serde_json::to_string(&tc.arguments)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        tool_calls.push(json!({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": args_str,
+                            }
+                        }));
+                    }
+                    ContentBlock::Thinking { .. } => {
+                        // OpenRouter doesn't have a public "thinking"
+                        // content type in this API; v1 drops them.
+                    }
+                }
+            }
+            let content = text_parts.join("");
+            let mut obj = json!({"role": "assistant"});
+            if !content.is_empty() {
+                obj["content"] = Value::String(content);
+            }
+            if !tool_calls.is_empty() {
+                obj["tool_calls"] = Value::Array(tool_calls);
+            }
+            // OpenAI requires content to be present (can be null) when
+            // tool_calls is present. Set null explicitly if neither
+            // is set, but normally one of them is.
+            if obj.get("content").is_none() && obj.get("tool_calls").is_none() {
+                return None;
+            }
+            Some(obj)
+        }
+        AgentMessage::ToolResult {
+            call_id,
+            content,
+            is_error,
+        } => {
+            // OpenAI's tool message has no is_error field; embed it
+            // in the content text so the model knows.
+            let content = if *is_error {
+                format!("[error] {content}")
+            } else {
+                content.clone()
+            };
+            Some(json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": content,
+            }))
+        }
+    }
+}
+
+pub(crate) fn build_request_body(
+    model: &str,
+    messages: &[AgentMessage],
+    tools: &[ToolSpec],
+) -> Value {
+    let api_messages: Vec<Value> = messages.iter().filter_map(translate_message).collect();
+    let mut body = json!({
+        "model": model,
+        "max_tokens": 4096,
+        "stream": true,
+        "messages": api_messages,
+    });
+    if !tools.is_empty() {
+        body["tools"] = json!(tools.iter().map(translate_tool_spec).collect::<Vec<_>>());
+    }
+    body
+}
+
+// ============================================================================
+// Response side: SSE → ProviderEvent
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct OpenAiChunk {
+    #[serde(default)]
+    choices: Vec<OpenAiChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct OpenAiChoice {
+    #[serde(default)]
+    delta: OpenAiDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
+struct OpenAiDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<OpenAiToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct OpenAiToolCallDelta {
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "function")]
+    function: Option<OpenAiFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct OpenAiFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+fn map_finish_reason(s: Option<&str>) -> StopReason {
+    match s {
+        Some("stop") => StopReason::EndTurn,
+        Some("tool_calls") => StopReason::ToolUse,
+        Some("length") => StopReason::MaxTokens,
+        Some(other) => {
+            tracing::warn!(finish_reason = %other, "unrecognized openai finish_reason");
+            StopReason::EndTurn
+        }
+        None => StopReason::EndTurn,
+    }
+}
+
+#[derive(Default)]
+struct ToolCallBuilder {
+    id: String,
+    name: String,
+    args_json: String,
+}
+
+struct StreamState {
+    sse: Pin<Box<dyn Stream<Item = SseEvent> + Send>>,
+    accumulated_text: String,
+    tool_calls: HashMap<u32, ToolCallBuilder>,
+    tool_call_order: Vec<u32>,
+    finish_reason: Option<String>,
+    cancel_rx: Option<oneshot::Receiver<()>>,
+    finished: bool,
+    emitted_done: bool,
+}
+
+fn events_stream(
+    bytes: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+    cancel_rx: oneshot::Receiver<()>,
+) -> BoxStream<'static, ProviderEvent> {
+    let bytes: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> = Box::pin(bytes);
+    let sse = SseStream::new(bytes);
+    let state = StreamState {
+        sse: Box::pin(sse),
+        accumulated_text: String::new(),
+        tool_calls: HashMap::new(),
+        tool_call_order: Vec::new(),
+        finish_reason: None,
+        cancel_rx: Some(cancel_rx),
+        finished: false,
+        emitted_done: false,
+    };
+    Box::pin(futures::stream::unfold(state, next_event))
+}
+
+async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamState)> {
+    if state.finished {
+        return None;
+    }
+
+    loop {
+        // Cancel?
+        if let Some(rx) = state.cancel_rx.as_mut() {
+            match rx.try_recv() {
+                Ok(_) => {
+                    state.finished = true;
+                    state.cancel_rx = None;
+                    return Some((
+                        ProviderEvent::Done(AssistantMessage {
+                            content: assemble_content(&state),
+                            stop_reason: StopReason::Aborted,
+                        }),
+                        state,
+                    ));
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    state.cancel_rx = None;
+                }
+            }
+        }
+
+        // Pull next SSE event.
+        let sse_event = match state.sse.next().await {
+            Some(e) => e,
+            None => {
+                state.finished = true;
+                if !state.emitted_done {
+                    state.emitted_done = true;
+                    let stop = map_finish_reason(state.finish_reason.as_deref());
+                    return Some((
+                        ProviderEvent::Done(AssistantMessage {
+                            content: assemble_content(&state),
+                            stop_reason: stop,
+                        }),
+                        state,
+                    ));
+                }
+                return None;
+            }
+        };
+
+        // OpenAI's stream terminates with `data: [DONE]\n\n`.
+        if sse_event.data.trim() == "[DONE]" {
+            state.finished = true;
+            state.emitted_done = true;
+            let stop = map_finish_reason(state.finish_reason.as_deref());
+            return Some((
+                ProviderEvent::Done(AssistantMessage {
+                    content: assemble_content(&state),
+                    stop_reason: stop,
+                }),
+                state,
+            ));
+        }
+
+        let chunk: OpenAiChunk = match serde_json::from_str(&sse_event.data) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, data = %sse_event.data, "failed to parse openrouter chunk");
+                continue;
+            }
+        };
+
+        // Process every choice (typically just one, choices[0]).
+        let mut emitted_event: Option<ProviderEvent> = None;
+        for choice in chunk.choices {
+            // Text delta?
+            if let Some(content) = choice.delta.content {
+                if !content.is_empty() {
+                    state.accumulated_text.push_str(&content);
+                    if emitted_event.is_none() {
+                        emitted_event = Some(ProviderEvent::TextDelta(content));
+                    }
+                }
+            }
+            // Tool call delta(s)?
+            if let Some(deltas) = choice.delta.tool_calls {
+                for tc_delta in deltas {
+                    let entry = state
+                        .tool_calls
+                        .entry(tc_delta.index)
+                        .or_insert_with(|| {
+                            // First time seeing this index — track its order.
+                            state.tool_call_order.push(tc_delta.index);
+                            ToolCallBuilder::default()
+                        });
+                    if let Some(id) = tc_delta.id {
+                        entry.id = id;
+                    }
+                    if let Some(func) = tc_delta.function {
+                        if let Some(name) = func.name {
+                            entry.name = name;
+                        }
+                        if let Some(args) = func.arguments {
+                            entry.args_json.push_str(&args);
+                        }
+                    }
+                    // v1: don't emit ProviderEvent::ToolCallDelta;
+                    // the loop ignores it. Final tool calls are
+                    // surfaced in Done.
+                }
+            }
+            // finish_reason landed?
+            if let Some(reason) = choice.finish_reason {
+                state.finish_reason = Some(reason);
+            }
+        }
+
+        if let Some(event) = emitted_event {
+            return Some((event, state));
+        }
+        // No emittable event for this chunk (e.g. it was a delta
+        // with only tool_calls or a finish_reason). Loop and pull
+        // the next SSE event.
+    }
+}
+
+fn assemble_content(state: &StreamState) -> Vec<ContentBlock> {
+    let mut out: Vec<ContentBlock> = Vec::new();
+    if !state.accumulated_text.is_empty() {
+        out.push(ContentBlock::Text {
+            text: state.accumulated_text.clone(),
+        });
+    }
+    for idx in &state.tool_call_order {
+        if let Some(builder) = state.tool_calls.get(idx) {
+            let arguments = parse_tool_input(&builder.args_json);
+            out.push(ContentBlock::ToolCall(ToolCall {
+                id: builder.id.clone(),
+                name: builder.name.clone(),
+                arguments,
+            }));
+        }
+    }
+    out
+}
+
+fn parse_tool_input(input_json: &str) -> Value {
+    if input_json.is_empty() {
+        return Value::Object(serde_json::Map::new());
+    }
+    match serde_json::from_str::<Value>(input_json) {
+        Ok(v) if v.is_object() => v,
+        Ok(other) => {
+            tracing::warn!(value = %other, "tool input JSON wasn't an object; using empty object");
+            Value::Object(serde_json::Map::new())
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, raw = %input_json, "failed to parse tool input JSON; using empty object");
+            Value::Object(serde_json::Map::new())
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "openrouter_tests.rs"]
+mod tests;

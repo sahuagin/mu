@@ -65,11 +65,11 @@ async fn main() -> Result<()> {
             let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
             mu_coding::serve::run(provider).await
         }
-        Command::Ask { .. } | Command::Tui | Command::Orchestrate { .. } => {
+        Command::Ask { prompt } => mu_coding::ask::run(prompt).await,
+        Command::Tui | Command::Orchestrate { .. } => {
             anyhow::bail!(
                 "this subcommand is not yet implemented; mu is pre-MVP. \
-                 Try `mu serve` for the JSON-RPC daemon, or `mu versions` to \
-                 confirm the workspace builds."
+                 Try `mu serve` or `mu ask <prompt>` for what's working."
             )
         }
     }

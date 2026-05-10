@@ -17,6 +17,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod protocol;
+
 /// Returns the crate version. Wired up so the workspace `cargo build`
 /// produces something callable from day one.
 pub fn version() -> &'static str {

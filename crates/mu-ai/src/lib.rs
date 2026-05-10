@@ -24,6 +24,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod auth;
 pub mod faux;
 pub mod providers;
 pub use faux::{FauxProvider, FauxResponse};

@@ -40,11 +40,22 @@ not replacements. Read that file first; this file extends it.
 - **Errors per crate.** Each library crate uses `thiserror` for its own
   error type. The binary (`mu-coding/src/bin/mu.rs`) is the only place
   `anyhow::Result` appears.
-- **No third-party-OAuth-token holding.** `mu` never holds Anthropic or
-  OpenAI OAuth tokens directly. The `anthropic-oauth` and
-  `openai-oauth` "providers" are subprocess spawns of the legitimate
-  CLI clients (`claude --print`, `codex` resp.). This is a ToS
-  guardrail; treat it as load-bearing.
+- **Per-provider OAuth posture.** Each provider's OAuth flow gets
+  evaluated on its own merits, not lumped under a blanket rule:
+  - **Anthropic** (claude-code OAuth): Anthropic's ToS appears to
+    discourage third-party clients reimplementing their flow.
+    `anthropic-oauth` provider, if/when added, should subprocess-
+    wrap `claude --print`.
+  - **OpenAI Codex**: open-source CLI, public flow parameters,
+    multiple legit third-party implementations. mu implements
+    directly via `oauth2` crate. See mu-018 for the OAuth flow,
+    mu-019 (planned) for the API integration. Tokens stored at
+    `~/.config/mu/auth/openai-codex.json` with `0600` perms; opt
+    out via `--ephemeral` for memory-only.
+  - **Other providers**: evaluate per-provider when added.
+  Earlier versions of this file lumped these as "no third-party
+  OAuth token holding ever." That was overgeneralized; the actual
+  concern is Anthropic-specific.
 - **Reference, don't copy.** When implementing a feature pi_ts has,
   *read* pi_ts for the shape and *consult* pi_agent_rust for Rust
   idioms — but write fresh code. Pasting either invites the structural

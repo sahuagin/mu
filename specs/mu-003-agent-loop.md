@@ -107,9 +107,13 @@ input — both push `UserMessage` actions onto the same queue.
   the AGENTS.md "no third-party-OAuth-token holding" guardrail —
   mu-core's loop never sees a token.
 - **INV-7 (no unsafe, no unwrap/expect outside tests):** Standard.
-- **INV-8 (no new dependencies):** Use `tokio` (full), `serde`,
-  `serde_json`, `thiserror`, `tracing`, `async-trait`, `futures`, plus
-  stdlib. All already in the workspace deps. Specifically:
+- **INV-8 (no new *workspace* dependencies):** Use `tokio` (full),
+  `serde`, `serde_json`, `thiserror`, `tracing`, `async-trait`,
+  `futures`, plus stdlib. All already in `[workspace.dependencies]` at
+  the workspace root. Per-crate `Cargo.toml` files (e.g.
+  `crates/mu-core/Cargo.toml`) MAY add a workspace-already-listed dep
+  to their own `[dependencies]` section if a new use case requires it
+  — that's not a "new dependency" in the rule's sense. Specifically:
   - **No `tokio-util`** for `CancellationToken` — use `oneshot`
     channels directly. (We can add `tokio-util` later as a separate
     cleanup if cancel patterns proliferate.)
@@ -623,3 +627,9 @@ is preferred over a half-done loop. We can split into mu-003a
 ## Changelog
 
 - 2026-05-09 — initial draft (claude-personal w/ tcovert review).
+- 2026-05-10 — INV-8 clarified: workspace-listed deps may be added to
+  per-crate `Cargo.toml` files without being a "new dependency." This
+  resolves the gpt-pro flag during mu-003a part-A delegation, where
+  `futures` had to be added to `mu-core/Cargo.toml` to satisfy the
+  spec's `provider.rs` interface. Original wording was ambiguous; this
+  amendment matches the actual intent.

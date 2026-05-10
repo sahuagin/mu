@@ -26,8 +26,10 @@ all that apply.
 |---------|---------|---------------------|-----------|-------|-----------|---------------------|--------------|---------------|--------|
 | mu-001  | 1       | codex-oauth/gpt-5.5 | success   | ?     | ~?m       | yes (2/2)           | 11/11        | —             | spec was tight enough that §Invariants / §OOC blocks caught the predictable mistakes (extra derives, wrong rename_all). Reusable: §OOC section is load-bearing for mechanical translation tasks. |
 | mu-002  | 1       | codex-oauth/gpt-5.5 | success†  | ?     | ~?m       | yes (2/2)           | 19/19        | WC            | Spec implementation was correct (concurrent tokio code with mpsc + writer task, all 8 §Behaviors covered). BUT pi-rust ran `jj restore specs/delegations.md` mid-task, wiping an unrelated file I had created in the working copy. Lesson: when the working copy contains files from a parallel claude-code session, the sub-agent will "clean them up." Spec said "don't touch other files"; sub-agent interpreted that as "restore other files to their parent state." Different operation, same intent — but it's destructive to in-flight work. See `delegations/mu-002-attempt-1-postmortem.md`. |
+| mu-003a | 1       | codex-oauth/gpt-5.5 | success‡  | ?     | ~?m       | 7/5 (5 expected + Cargo.toml + Cargo.lock — flagged) | 29/29        | —             | **WC fix held.** Explicit "Workspace hygiene" section in the prompt prevented the failure mode from mu-002 attempt 1. gpt-pro reported "Working copy was clean at start" — it noticed and respected the parallel-session files. Bonus: gpt-pro found a spec inconsistency (provider.rs uses `futures::stream::BoxStream` but `mu-core/Cargo.toml` didn't list `futures` as a per-crate dep, only the workspace did), added the dep, and EXPLICITLY flagged the deviation in `notes` instead of hiding it. This is the behavior we want — surface inconsistencies, don't paper over them. The 7-vs-5 file deviation isn't a failure; it's a spec lint we should fold back. |
 
 `†` = "spec passed acceptance, but operational issue captured separately."
+`‡` = "spec passed acceptance, but a benign deviation (correct call, prompt-level inconsistency to fix)."
 
 Columns:
 - **iters**: iteration count if known (codex-oauth doesn't always
@@ -64,13 +66,22 @@ This section is updated as patterns emerge. Each rule cites the rows
 it's based on so it can be revisited when the evidence changes.
 
 - **Delegation prompts MUST include a "don't touch files you didn't
-  create" rule.** Evidence: mu-002 attempt 1 (WC). The standard "don't
-  touch any other file" wording is insufficient — sub-agents may
-  interpret restoring an unrelated file as a benign "clean up your
-  workspace" action. Future delegation prompts should say explicitly:
-  "If you see files in the working copy that are not in your
-  deliverable list, DO NOT modify, restore, or `jj abandon` them. They
-  belong to a parallel session."
+  create" rule.** Evidence: mu-002 attempt 1 (WC), mu-003a attempt 1
+  (WC fix held). The standard "don't touch any other file" wording is
+  insufficient — sub-agents may interpret restoring an unrelated file
+  as a benign "clean up your workspace" action. The explicit
+  Workspace Hygiene section added to mu-003a's prompt prevented
+  recurrence; keep this section in every future delegation prompt
+  and reference the post-mortem.
+
+- **When the spec and the prompt are inconsistent, sub-agents should
+  flag the deviation explicitly** rather than silently fix or refuse.
+  Evidence: mu-003a attempt 1 (futures dep). gpt-pro's `notes`
+  explicitly called out the seven-vs-five file deviation and proposed
+  a spec amendment. This is exactly the right behavior. Reinforce by
+  including a sentence in every delegation prompt: "If the spec and
+  this prompt disagree, make the call your judgment supports and
+  surface the deviation in `notes`."
 
 ## Cross-references
 

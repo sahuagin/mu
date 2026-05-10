@@ -793,6 +793,7 @@ name = "mu-core"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "futures",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

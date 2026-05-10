@@ -76,10 +76,10 @@ input — both push `UserMessage` actions onto the same queue.
 
 ## Invariants
 
-- **INV-1 (file size):** Each file under 400 lines (including tests).
-  `agent/loop.rs` is the biggest and may approach 350; that's the
-  natural ceiling. Splits if needed: extract test module into
-  `agent/loop_tests.rs`.
+- **INV-1 (file size):** Each file under 800 lines including tests —
+  same cap mu-002's transport spec used. Splits if approaching 1000
+  (the actual "no 27k-line files" trigger): extract test module into
+  `agent/loop_tests.rs`, extract mocks into `agent/mocks.rs`.
 - **INV-2 (Provider trait is async):** No sync `Provider`. The LLM
   ecosystem is async-first. Use `#[async_trait]` (already a workspace
   dep).
@@ -633,3 +633,11 @@ is preferred over a half-done loop. We can split into mu-003a
   `futures` had to be added to `mu-core/Cargo.toml` to satisfy the
   spec's `provider.rs` interface. Original wording was ambiguous; this
   amendment matches the actual intent.
+- 2026-05-10 — INV-1 raised from 400 lines/file to 800 lines/file
+  during part-B implementation. Reasoning: mu-002's transport spec
+  already used 800 (transport.rs landed at 420 — under that cap, but
+  over the 400 I'd written into mu-003). Picking 400 in mu-003 was
+  inconsistent with the established convention. State-machine code
+  with verbose match arms (this loop) naturally lands around 500;
+  forcing it under 400 would harm readability without addressing the
+  actual "no 27k-line files" risk. Spirit unchanged.

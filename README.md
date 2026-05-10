@@ -9,7 +9,21 @@ core daemons in parallel.
 
 ## Status
 
-Pre-MVP. Workspace scaffolded, no working binary yet.
+MVP working. As of mu-006:
+
+- `mu serve` — JSON-RPC daemon over stdio
+- `mu ask "<prompt>"` — one-shot CLI; spawns `mu serve`, sends a
+  message, prints the response, exits
+- `mu versions` — workspace smoke test
+- `AnthropicProvider` — direct Anthropic API (text-only); verified
+  end-to-end against the live API (`MU_LIVE_ANTHROPIC=1`)
+- `FauxProvider` — echo / scripted responses for tests and dev
+
+Try it:
+```sh
+echo '{"jsonrpc":"2.0","id":1,"method":"ping","params":null}' | mu serve
+mu ask "hello"   # echoes back via FauxProvider; AnthropicProvider needs wiring
+```
 
 ## Workspace layout
 
@@ -19,6 +33,24 @@ crates/
   mu-ai/       LLM provider abstraction: anthropic, openai, openrouter
   mu-coding/   the binary — modes (rpc/tui/ask), tools, sessions, extensions
 ```
+
+## Specs
+
+Each spec is in `specs/`. Implementation history:
+
+| Spec | What |
+|------|------|
+| mu-001 | JSON-RPC 2.0 protocol types |
+| mu-002 | stdio transport (newline-framed JSON, concurrent dispatch) |
+| mu-003 | Queue-driven agent loop + Provider/Tool traits |
+| mu-004 | `mu serve` end-to-end + `FauxProvider` |
+| mu-005 | `mu ask` one-shot CLI |
+| mu-006 | Anthropic API Provider (text-only v1) |
+| mu-007 | `read` tool (first concrete `Tool` impl) |
+
+Multi-agent build flow: mechanical specs delegated to gpt-pro via
+`agent-router`; architectural specs implemented directly. See
+`specs/delegations.md` for the ledger.
 
 ## Design choices
 

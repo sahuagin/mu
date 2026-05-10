@@ -9,9 +9,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use mu_core::agent::{
-    AgentConfig, AgentInput, AgentLoop, AgentMessage, Provider, Tool,
-};
+use mu_core::agent::{AgentConfig, AgentInput, AgentLoop, AgentMessage, Tool};
 use mu_core::protocol::{
     AskSessionRequest, AskSessionResponse, CancelSessionRequest, CancelSessionResponse,
     CloseSessionRequest, CloseSessionResponse, CreateSessionRequest, CreateSessionResponse,
@@ -19,6 +17,7 @@ use mu_core::protocol::{
 };
 use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
 
+use super::factory::ProviderFactory;
 use super::forwarder::forward_events;
 use super::sessions::Sessions;
 
@@ -26,13 +25,13 @@ pub async fn dispatch(
     request: Request<Value>,
     notif: NotificationWriter,
     sessions: Sessions,
-    provider: Arc<dyn Provider>,
+    factory: ProviderFactory,
     tools: Arc<Vec<Arc<dyn Tool>>>,
 ) -> Response<Value> {
     match request.method.as_str() {
         PingRequest::METHOD => handle_ping(request),
         CreateSessionRequest::METHOD => {
-            handle_create_session(request, notif, sessions, provider, tools)
+            handle_create_session(request, notif, sessions, factory, tools)
         }
         AskSessionRequest::METHOD => handle_ask_session(request, sessions).await,
         CancelSessionRequest::METHOD => handle_cancel_session(request, sessions).await,
@@ -61,19 +60,31 @@ fn handle_create_session(
     request: Request<Value>,
     notif: NotificationWriter,
     sessions: Sessions,
-    provider: Arc<dyn Provider>,
+    factory: ProviderFactory,
     tools: Arc<Vec<Arc<dyn Tool>>>,
 ) -> Response<Value> {
-    // v1 ignores request.params.provider — daemon-wide provider only.
-    // We don't even need to parse the params for v1, but parsing
-    // gives us a place to surface bad request shapes early.
-    let _params: CreateSessionRequest = match serde_json::from_value(request.params.clone()) {
+    let params: CreateSessionRequest = match serde_json::from_value(request.params.clone()) {
         Ok(p) => p,
         Err(e) => {
             return err_response(
                 request.id,
                 codes::INVALID_PARAMS,
                 format!("create_session: invalid params: {e}"),
+            );
+        }
+    };
+
+    // Per-session provider construction (mu-020). The factory closes
+    // over daemon-startup flags (ephemeral, thinking); the selector
+    // picks which provider + which model. Two sessions on the same
+    // daemon can use different providers.
+    let provider = match factory(&params.provider) {
+        Ok(p) => p,
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("create_session: could not build provider: {e}"),
             );
         }
     };

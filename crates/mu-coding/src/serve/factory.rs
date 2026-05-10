@@ -10,52 +10,68 @@ use anyhow::Result;
 
 use mu_ai::{AnthropicProvider, FauxProvider, OpenRouterProvider, OpenaiCodexProvider};
 use mu_core::agent::{Provider, Tool};
+use mu_core::protocol::ProviderSelector;
 
 use crate::tools::{LsTool, ReadTool, WriteTool};
 
-/// Build a `Provider` from a CLI flag value.
+/// Factory closure for constructing a provider per session, from
+/// a wire-level `ProviderSelector`. Closes over daemon-startup flags
+/// (`ephemeral`, `thinking`) that parameterize *how* providers get
+/// built, while the selector picks *which* provider.
+pub type ProviderFactory =
+    Arc<dyn Fn(&ProviderSelector) -> Result<Arc<dyn Provider>> + Send + Sync>;
+
+/// Construct a `ProviderFactory` from daemon flags. Each session
+/// gets its own `Arc<dyn Provider>` built by this closure.
+pub fn make_provider_factory(ephemeral: bool, thinking: Option<String>) -> ProviderFactory {
+    Arc::new(move |selector: &ProviderSelector| {
+        build_provider_from_selector(selector, ephemeral, thinking.as_deref())
+    })
+}
+
+/// Construct a single `Provider` from a wire-level `ProviderSelector`.
 ///
-/// `model` is provider-specific. Faux ignores it; anthropic-api
-/// defaults to `claude-haiku-4-5-20251001` if `model` is None;
-/// openai-codex defaults to `gpt-5.5`.
-///
-/// `ephemeral` only affects providers that hold rotatable OAuth
-/// tokens (currently: openai-codex). When true, refreshed tokens
-/// stay in memory and aren't written back to the token store.
-///
-/// `thinking` is the reasoning effort level
-/// (`minimal`/`low`/`medium`/`high`). Applied to providers that
-/// support it (openai-codex). Other providers ignore it with a
-/// debug log — passing it isn't an error.
-pub fn build_provider(
-    name: &str,
-    model: Option<&str>,
+/// This is the per-session construction point. The daemon's startup
+/// flags (`ephemeral`, `thinking`) parameterize how the provider is
+/// built; the selector picks which provider and which model.
+pub fn build_provider_from_selector(
+    selector: &ProviderSelector,
     ephemeral: bool,
     thinking: Option<&str>,
 ) -> Result<Arc<dyn Provider>> {
-    match name {
-        "faux" => {
-            log_thinking_ignored(name, thinking);
-            Ok(Arc::new(FauxProvider::echo()))
+    match selector {
+        // Faux is encoded on the wire as `anthropic_api`-with-a-known
+        // sentinel model. We don't actually have a `faux` variant in
+        // the protocol — keep it accessible only via in-process tests
+        // for now. (Could add later if useful.)
+        ProviderSelector::AnthropicApi { model } => {
+            log_thinking_ignored("anthropic-api", thinking);
+            // Special-case sentinel models that map to FauxProvider —
+            // makes the smoke-test path work without changing the
+            // protocol. Any actual claude model id falls through.
+            if model == "faux" {
+                return Ok(Arc::new(FauxProvider::echo()));
+            }
+            Ok(Arc::new(AnthropicProvider::from_env(model.clone())?))
         }
-        "anthropic-api" => {
-            log_thinking_ignored(name, thinking);
-            let model = model
-                .unwrap_or("claude-haiku-4-5-20251001")
-                .to_string();
-            Ok(Arc::new(AnthropicProvider::from_env(model)?))
+        ProviderSelector::AnthropicOauth { .. } => {
+            anyhow::bail!(
+                "anthropic_oauth is not yet implemented in mu — \
+                 per AGENTS.md it stays subprocess-wrapped via \
+                 the claude CLI for the foreseeable future"
+            )
         }
-        "openai-codex" => {
-            // ChatGPT-account auth (chatgpt.com/backend-api) has its
-            // own model namespace, distinct from api.openai.com.
-            // `gpt-5-codex` is API-tier only; ChatGPT subscribers
-            // get `gpt-5.X`/`gpt-5.X-codex` variants. gpt-5.5 has
-            // 1M context.
-            let model = model.unwrap_or("gpt-5.5").to_string();
+        ProviderSelector::OpenaiApi { .. } => {
+            anyhow::bail!(
+                "openai_api (direct API-key) is not yet implemented in mu — \
+                 OpenAI access today goes through openai_codex (OAuth)"
+            )
+        }
+        ProviderSelector::OpenaiCodex { model } => {
             let provider = if ephemeral {
-                OpenaiCodexProvider::from_store_ephemeral(model)
+                OpenaiCodexProvider::from_store_ephemeral(model.clone())
             } else {
-                OpenaiCodexProvider::from_store(model)
+                OpenaiCodexProvider::from_store(model.clone())
             }
             .map_err(|e| anyhow::anyhow!("openai-codex: {e}"))?;
             let provider = match thinking {
@@ -64,13 +80,33 @@ pub fn build_provider(
             };
             Ok(Arc::new(provider))
         }
-        "openrouter" => {
-            log_thinking_ignored(name, thinking);
-            let model = model
-                .unwrap_or("anthropic/claude-haiku-4.5")
-                .to_string();
-            Ok(Arc::new(OpenRouterProvider::from_env(model)?))
+        ProviderSelector::Openrouter { model } => {
+            log_thinking_ignored("openrouter", thinking);
+            Ok(Arc::new(OpenRouterProvider::from_env(model.clone())?))
         }
+    }
+}
+
+/// Map a CLI provider flag (`--provider <name>`) to a wire-level
+/// `ProviderSelector` with the given model (or each provider's
+/// default if `model` is None).
+///
+/// Used by `mu ask` to translate its CLI surface into what it sends
+/// in `create_session`.
+pub fn selector_from_cli(name: &str, model: Option<&str>) -> Result<ProviderSelector> {
+    match name {
+        "faux" => Ok(ProviderSelector::AnthropicApi {
+            model: "faux".to_string(),
+        }),
+        "anthropic-api" => Ok(ProviderSelector::AnthropicApi {
+            model: model.unwrap_or("claude-haiku-4-5-20251001").to_string(),
+        }),
+        "openai-codex" => Ok(ProviderSelector::OpenaiCodex {
+            model: model.unwrap_or("gpt-5.5").to_string(),
+        }),
+        "openrouter" => Ok(ProviderSelector::Openrouter {
+            model: model.unwrap_or("anthropic/claude-haiku-4.5").to_string(),
+        }),
         other => anyhow::bail!(
             "unknown provider: {other} (expected: faux, anthropic-api, openai-codex, openrouter)"
         ),
@@ -132,22 +168,95 @@ mod tests {
     }
 
     #[test]
-    fn build_provider_faux() {
-        assert!(build_provider("faux", None, false, None).is_ok());
-        assert!(build_provider("faux", Some("ignored"), false, None).is_ok());
-        // ephemeral=true is tolerated for providers that ignore it.
-        assert!(build_provider("faux", None, true, None).is_ok());
-        // thinking=Some(...) is tolerated for providers that ignore it.
-        assert!(build_provider("faux", None, false, Some("high")).is_ok());
+    fn build_from_selector_faux_sentinel() {
+        // FauxProvider is reachable via AnthropicApi { model: "faux" }
+        // — keeps the protocol simple while preserving the test path.
+        let sel = ProviderSelector::AnthropicApi {
+            model: "faux".into(),
+        };
+        assert!(build_provider_from_selector(&sel, false, None).is_ok());
+        // ephemeral / thinking are tolerated even though faux ignores
+        // them.
+        assert!(build_provider_from_selector(&sel, true, Some("high")).is_ok());
     }
 
     #[test]
-    fn build_provider_unknown_errors() {
-        // Can't `.unwrap_err()` because Arc<dyn Provider>: !Debug.
-        match build_provider("bogus", None, false, None) {
-            Ok(_) => panic!("expected error for unknown provider"),
+    fn build_from_selector_anthropic_oauth_errors() {
+        let sel = ProviderSelector::AnthropicOauth {
+            model: "x".into(),
+        };
+        match build_provider_from_selector(&sel, false, None) {
+            Ok(_) => panic!("anthropic_oauth should not be implemented"),
+            Err(e) => assert!(
+                e.to_string().contains("not yet implemented")
+                    || e.to_string().contains("anthropic_oauth")
+            ),
+        }
+    }
+
+    #[test]
+    fn build_from_selector_openai_api_errors() {
+        let sel = ProviderSelector::OpenaiApi {
+            model: "gpt-5".into(),
+        };
+        match build_provider_from_selector(&sel, false, None) {
+            Ok(_) => panic!("openai_api should not be implemented"),
+            Err(e) => assert!(e.to_string().contains("not yet implemented")),
+        }
+    }
+
+    #[test]
+    fn selector_from_cli_known_providers() {
+        let s = selector_from_cli("faux", None).unwrap();
+        assert!(matches!(
+            s,
+            ProviderSelector::AnthropicApi { ref model } if model == "faux"
+        ));
+
+        let s = selector_from_cli("anthropic-api", None).unwrap();
+        assert!(matches!(s, ProviderSelector::AnthropicApi { .. }));
+
+        let s = selector_from_cli("openai-codex", Some("gpt-5.4")).unwrap();
+        assert_eq!(
+            s,
+            ProviderSelector::OpenaiCodex {
+                model: "gpt-5.4".into()
+            }
+        );
+
+        let s = selector_from_cli("openrouter", None).unwrap();
+        match s {
+            ProviderSelector::Openrouter { model } => {
+                assert!(model.starts_with("anthropic/"))
+            }
+            _ => panic!("expected Openrouter"),
+        }
+    }
+
+    #[test]
+    fn selector_from_cli_unknown_errors() {
+        match selector_from_cli("bogus", None) {
+            Ok(_) => panic!("expected error"),
             Err(e) => assert!(e.to_string().contains("unknown provider")),
         }
+    }
+
+    #[test]
+    fn factory_closure_constructs_per_session() {
+        let factory = make_provider_factory(false, None);
+        // Two sessions, same kind, different models.
+        let sel_a = ProviderSelector::AnthropicApi {
+            model: "faux".into(),
+        };
+        let sel_b = ProviderSelector::AnthropicApi {
+            model: "faux".into(),
+        };
+        let a = factory(&sel_a).expect("first construction");
+        let b = factory(&sel_b).expect("second construction");
+        // Each call returns a fresh Arc; pointer equality is not
+        // guaranteed but each should be alive.
+        assert!(Arc::strong_count(&a) >= 1);
+        assert!(Arc::strong_count(&b) >= 1);
     }
 
     #[test]

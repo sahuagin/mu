@@ -778,6 +778,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "futures",
  "mu-ai",
  "mu-core",
  "rusqlite",

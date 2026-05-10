@@ -128,6 +128,14 @@ impl AgentLoop {
         self.tx.send(input).await.map_err(|e| e.0)
     }
 
+    /// Clone the input sender. Used by the daemon's session manager
+    /// to drive the loop without holding the AgentLoop value, so
+    /// sync-locked map lookups can clone-and-drop the lock before
+    /// awaiting on the send.
+    pub fn sender(&self) -> mpsc::Sender<AgentInput> {
+        self.tx.clone()
+    }
+
     /// Wait for the loop to finish.
     pub async fn join(self) -> Outcome {
         self.handle

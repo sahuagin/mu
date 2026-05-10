@@ -53,6 +53,19 @@ enum Command {
         /// Path to a plan.toml describing the task graph.
         plan: std::path::PathBuf,
     },
+    /// Sign in to a provider via OAuth. Persists the token bundle
+    /// under `~/.config/mu/auth/<provider>.json` (mode 0600).
+    Login {
+        /// Provider to sign in to. Values: openai-codex.
+        #[arg(long, default_value = "openai-codex")]
+        provider: String,
+    },
+    /// Forget stored OAuth credentials for a provider.
+    Logout {
+        /// Provider to forget. Values: openai-codex.
+        #[arg(long, default_value = "openai-codex")]
+        provider: String,
+    },
     /// Print the version of each crate (smoke test for the workspace).
     Versions,
 }
@@ -91,6 +104,8 @@ async fn main() -> Result<()> {
             model,
             tools,
         } => mu_coding::ask::run(prompt, provider, model, tools).await,
+        Command::Login { provider } => run_login(&provider).await,
+        Command::Logout { provider } => run_logout(&provider),
         Command::Tui | Command::Orchestrate { .. } => {
             anyhow::bail!(
                 "this subcommand is not yet implemented; mu is pre-MVP. \
@@ -98,4 +113,28 @@ async fn main() -> Result<()> {
             )
         }
     }
+}
+
+async fn run_login(provider: &str) -> Result<()> {
+    use mu_ai::auth::{FileSystemTokenStore, TokenStore};
+    match provider {
+        "openai-codex" => {
+            let token = mu_ai::auth::openai_codex::login_flow().await?;
+            let store = FileSystemTokenStore::default_location()?;
+            store.save(provider, &token)?;
+            println!("Signed in to {provider}. Token saved.");
+            Ok(())
+        }
+        other => anyhow::bail!(
+            "unknown provider for login: {other}. Supported: openai-codex."
+        ),
+    }
+}
+
+fn run_logout(provider: &str) -> Result<()> {
+    use mu_ai::auth::{FileSystemTokenStore, TokenStore};
+    let store = FileSystemTokenStore::default_location()?;
+    store.remove(provider)?;
+    println!("Removed stored credentials for {provider} (if any).");
+    Ok(())
 }

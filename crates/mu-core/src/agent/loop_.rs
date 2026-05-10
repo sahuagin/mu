@@ -115,11 +115,102 @@ pub enum Outcome {
 /// the run function wraps `AgentInput::UserMessage` as
 /// `Action::External(...)` and pushes it to the queue. Internal state
 /// transitions (`InvokeLlm`, `ExecuteTools`, `MaybeFinish`) are private.
+#[derive(Debug)]
 enum Action {
     External(AgentInput),
     InvokeLlm,
     ExecuteTools(Vec<ToolCall>),
     MaybeFinish,
+}
+
+// ============================================================================
+// Pure planners
+// ============================================================================
+//
+// Logic between queue-mediated steps gets extracted as pure functions
+// here. The async I/O parts of the loop call these to decide what to
+// queue / emit, then perform the side effects themselves.
+//
+// Tests can target the planners directly without async machinery — the
+// queue-flow integration is covered by the existing behavior tests
+// (B-1..B-7) using mock providers and tools.
+
+/// Output of `plan_post_invoke_llm`.
+struct PostInvokeLlmPlan {
+    /// True iff the loop should emit `AgentEvent::TurnEnd` before
+    /// pushing actions. False when tool calls are queued — TurnEnd
+    /// then gets emitted by `plan_post_execute_tools` after tools
+    /// complete.
+    emit_turn_end: bool,
+    /// Actions to push to the back of the queue, in order.
+    actions: Vec<Action>,
+}
+
+/// Decide what to do after the assistant message comes back from a
+/// successful `InvokeLlm`. Pure — given the assistant message and any
+/// `UserMessage`s that were buffered during the LLM stream, produces
+/// the actions to enqueue and whether to emit TurnEnd.
+fn plan_post_invoke_llm(
+    assistant_msg: &AssistantMessage,
+    buffered: Vec<AgentInput>,
+) -> PostInvokeLlmPlan {
+    let tool_calls: Vec<ToolCall> = assistant_msg
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            ContentBlock::ToolCall(tc) => Some(tc.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let had_buffered = !buffered.is_empty();
+    let mut actions = Vec::new();
+
+    if tool_calls.is_empty() {
+        // No tool calls — TurnEnd here, then drain buffered. Push
+        // MaybeFinish only if no buffered UMs; if there ARE buffered
+        // ones, their handlers will push InvokeLlm and the loop
+        // continues naturally.
+        for input in buffered {
+            actions.push(Action::External(input));
+        }
+        if !had_buffered {
+            actions.push(Action::MaybeFinish);
+        }
+        PostInvokeLlmPlan {
+            emit_turn_end: true,
+            actions,
+        }
+    } else {
+        // Tool calls — defer TurnEnd until after ExecuteTools.
+        actions.push(Action::ExecuteTools(tool_calls));
+        for input in buffered {
+            actions.push(Action::External(input));
+        }
+        PostInvokeLlmPlan {
+            emit_turn_end: false,
+            actions,
+        }
+    }
+}
+
+/// Decide what to enqueue after `ExecuteTools` completes. Pure.
+/// Buffered UMs come first so they land in `messages` before the
+/// next InvokeLlm runs.
+fn plan_post_execute_tools(buffered: Vec<AgentInput>) -> Vec<Action> {
+    let mut actions = Vec::with_capacity(buffered.len() + 1);
+    for input in buffered {
+        actions.push(Action::External(input));
+    }
+    actions.push(Action::InvokeLlm);
+    actions
+}
+
+/// Pure dedup check: should we push `InvokeLlm` after processing a
+/// UserMessage? Yes unless one is already queued (back-to-back UMs
+/// share one LLM call).
+fn should_push_invoke_llm(queue: &VecDeque<Action>) -> bool {
+    !queue.iter().any(|a| matches!(a, Action::InvokeLlm))
 }
 
 /// Handle to a running agent loop.
@@ -208,9 +299,7 @@ async fn run(
                 let _ = events
                     .send(AgentEvent::MessageEnd { message: msg })
                     .await;
-                // Only push InvokeLlm if there isn't already one queued.
-                // Multiple back-to-back UMs share one LLM call.
-                if !queue.iter().any(|a| matches!(a, Action::InvokeLlm)) {
+                if should_push_invoke_llm(&queue) {
                     queue.push_back(Action::InvokeLlm);
                 }
             }
@@ -255,35 +344,12 @@ async fn run(
                             .send(AgentEvent::MessageEnd { message: assistant })
                             .await;
 
-                        let tool_calls: Vec<ToolCall> = assistant_msg
-                            .content
-                            .iter()
-                            .filter_map(|c| {
-                                if let ContentBlock::ToolCall(tc) = c {
-                                    Some(tc.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-
-                        if tool_calls.is_empty() {
+                        let plan = plan_post_invoke_llm(&assistant_msg, buffered);
+                        if plan.emit_turn_end {
                             let _ = events.send(AgentEvent::TurnEnd).await;
-                            let had_buffered = !buffered.is_empty();
-                            for input in buffered {
-                                queue.push_back(Action::External(input));
-                            }
-                            // MaybeFinish only if no buffered UMs;
-                            // otherwise the External(UM) handler will
-                            // push its own InvokeLlm and the loop continues.
-                            if !had_buffered {
-                                queue.push_back(Action::MaybeFinish);
-                            }
-                        } else {
-                            queue.push_back(Action::ExecuteTools(tool_calls));
-                            for input in buffered {
-                                queue.push_back(Action::External(input));
-                            }
+                        }
+                        for action in plan.actions {
+                            queue.push_back(action);
                         }
                     }
                     Err(outcome) => {
@@ -303,12 +369,9 @@ async fn run(
                             messages.push(r);
                         }
                         let _ = events.send(AgentEvent::TurnEnd).await;
-                        // Buffered UMs first so they're added to context
-                        // BEFORE the next InvokeLlm runs.
-                        for input in buffered {
-                            queue.push_back(Action::External(input));
+                        for action in plan_post_execute_tools(buffered) {
+                            queue.push_back(action);
                         }
-                        queue.push_back(Action::InvokeLlm);
                     }
                     Err(outcome) => {
                         if let Outcome::Error(ref m) = outcome {

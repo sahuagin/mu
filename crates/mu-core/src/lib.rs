@@ -18,6 +18,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod protocol;
+pub mod transport;
 
 /// Returns the crate version. Wired up so the workspace `cargo build`
 /// produces something callable from day one.

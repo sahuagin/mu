@@ -9,20 +9,38 @@ core daemons in parallel.
 
 ## Status
 
-MVP working. As of mu-006:
+MVP working through mu-010 — the **read vertical slice** is end-to-
+end, including a real LLM and real tool execution.
 
-- `mu serve` — JSON-RPC daemon over stdio
-- `mu ask "<prompt>"` — one-shot CLI; spawns `mu serve`, sends a
-  message, prints the response, exits
+What runs:
+- `mu serve [--provider <name>] [--model <id>] [--tools <csv>]` —
+  JSON-RPC daemon over stdio
+- `mu ask "<prompt>" [same flags]` — one-shot CLI
 - `mu versions` — workspace smoke test
-- `AnthropicProvider` — direct Anthropic API (text-only); verified
-  end-to-end against the live API (`MU_LIVE_ANTHROPIC=1`)
-- `FauxProvider` — echo / scripted responses for tests and dev
 
-Try it:
+Providers: `faux` (default), `anthropic-api` (real Claude via
+`ANTHROPIC_API_KEY`).
+
+Tools: `read` (more pending).
+
+Try it (FreeBSD/macOS/Linux):
+
 ```sh
-echo '{"jsonrpc":"2.0","id":1,"method":"ping","params":null}' | mu serve
-mu ask "hello"   # echoes back via FauxProvider; AnthropicProvider needs wiring
+# Smoke test, no API needed:
+mu ask "hello"
+# → hello
+
+# Real Claude reading a file end-to-end:
+export ANTHROPIC_API_KEY=...
+mu ask --provider anthropic-api --tools read \
+  "Use the read tool to read /etc/hostname. Just the hostname, nothing else."
+```
+
+Live integration tests are gated on `MU_LIVE_ANTHROPIC=1` so CI
+never spends. Run them locally with:
+
+```sh
+MU_LIVE_ANTHROPIC=1 cargo nextest run --test anthropic_read_smoke
 ```
 
 ## Workspace layout
@@ -47,6 +65,9 @@ Each spec is in `specs/`. Implementation history:
 | mu-005 | `mu ask` one-shot CLI |
 | mu-006 | Anthropic API Provider (text-only v1) |
 | mu-007 | `read` tool (first concrete `Tool` impl) |
+| mu-008 | Anthropic Provider tool support (request + parsing) |
+| mu-009 | `--provider` / `--model` / `--tools` flag wiring |
+| mu-010 | end-to-end integration test for the read slice |
 
 Multi-agent build flow: mechanical specs delegated to gpt-pro via
 `agent-router`; architectural specs implemented directly. See

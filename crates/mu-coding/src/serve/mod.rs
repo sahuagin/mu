@@ -5,31 +5,39 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
 
-use mu_core::agent::{Provider, Tool};
+use mu_core::agent::Tool;
 
 mod dispatch;
 pub mod factory;
 mod forwarder;
 mod sessions;
 
-pub use factory::{build_provider, build_tools, parse_tools_csv};
+pub use factory::{
+    build_provider_from_selector, build_tools, make_provider_factory, parse_tools_csv,
+    selector_from_cli, ProviderFactory,
+};
 pub use sessions::Sessions;
 
 /// Production entry point — serve over the process's stdin/stdout.
+///
+/// `factory` is called once per session, given the client's
+/// `create_session.provider` selector, to construct a fresh
+/// `Arc<dyn Provider>`. Multiple sessions on the same daemon can use
+/// different providers.
 pub async fn run(
-    provider: Arc<dyn Provider>,
+    factory: ProviderFactory,
     tools: Vec<Arc<dyn Tool>>,
 ) -> anyhow::Result<()> {
     let stdin = BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();
-    serve_with_io(stdin, stdout, provider, tools).await
+    serve_with_io(stdin, stdout, factory, tools).await
 }
 
 /// Test/integration hook — serve over generic reader/writer.
 pub async fn serve_with_io<R, W>(
     reader: R,
     writer: W,
-    provider: Arc<dyn Provider>,
+    factory: ProviderFactory,
     tools: Vec<Arc<dyn Tool>>,
 ) -> anyhow::Result<()>
 where
@@ -42,9 +50,9 @@ where
     let tools = Arc::new(tools);
     mu_core::transport::serve(reader, writer, move |req, notif| {
         let sessions = sessions.clone();
-        let provider = provider.clone();
+        let factory = factory.clone();
         let tools = tools.clone();
-        async move { dispatch::dispatch(req, notif, sessions, provider, tools).await }
+        async move { dispatch::dispatch(req, notif, sessions, factory, tools).await }
     })
     .await
     .map_err(Into::into)

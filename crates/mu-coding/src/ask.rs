@@ -26,13 +26,12 @@ pub async fn run(
     ephemeral: bool,
     thinking: Option<String>,
 ) -> Result<()> {
-    let mut child = spawn_serve(
-        &provider,
-        model.as_deref(),
-        &tools,
-        ephemeral,
-        thinking.as_deref(),
-    )?;
+    // Map the CLI provider flag to a wire-level selector. This is what
+    // gets sent in create_session; the daemon constructs the provider
+    // per session from this.
+    let selector = crate::serve::selector_from_cli(&provider, model.as_deref())?;
+
+    let mut child = spawn_serve(&tools, ephemeral, thinking.as_deref())?;
     let mut stdin = child
         .stdin
         .take()
@@ -42,7 +41,7 @@ pub async fn run(
 
     let mut next_id: u64 = 1;
 
-    let session_id = create_session(&mut stdin, &mut stdout, &mut next_id).await?;
+    let session_id = create_session(&mut stdin, &mut stdout, &mut next_id, &selector).await?;
     let text = ask_and_drain(
         &mut stdin,
         &mut stdout,
@@ -68,8 +67,6 @@ pub async fn run(
 }
 
 fn spawn_serve(
-    provider: &str,
-    model: Option<&str>,
     tools: &str,
     ephemeral: bool,
     thinking: Option<&str>,
@@ -86,12 +83,7 @@ fn spawn_serve(
     };
 
     let mut cmd = Command::new(&binary);
-    cmd.arg("serve")
-        .arg("--provider")
-        .arg(provider);
-    if let Some(m) = model {
-        cmd.arg("--model").arg(m);
-    }
+    cmd.arg("serve");
     if !tools.is_empty() {
         cmd.arg("--tools").arg(tools);
     }
@@ -114,6 +106,7 @@ async fn create_session(
     stdin: &mut ChildStdin,
     stdout: &mut BufReader<ChildStdout>,
     next_id: &mut u64,
+    selector: &mu_core::protocol::ProviderSelector,
 ) -> Result<String> {
     let id = *next_id;
     *next_id += 1;
@@ -121,12 +114,7 @@ async fn create_session(
         "jsonrpc": "2.0",
         "id": id,
         "method": CreateSessionRequest::METHOD,
-        "params": {
-            // v1: the daemon's hardcoded provider is used regardless;
-            // the field is required by mu-001's schema, so we send a
-            // valid placeholder.
-            "provider": { "kind": "anthropic_api", "model": "irrelevant" }
-        }
+        "params": { "provider": selector }
     });
     write_line(stdin, &req).await?;
 

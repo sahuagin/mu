@@ -23,10 +23,15 @@ fn spawn_server(
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (server_read, server_write) = tokio::io::split(server);
     let server_buf = BufReader::new(server_read);
+    // Adapt the single Arc<dyn Provider> into a per-session factory
+    // that just hands out clones — preserves the smoke-test semantic
+    // (one provider for all sessions) under the new factory API.
+    let factory: serve::ProviderFactory =
+        std::sync::Arc::new(move |_selector| Ok(provider.clone()));
     let handle = tokio::spawn(serve::serve_with_io(
         server_buf,
         server_write,
-        provider,
+        factory,
         Vec::new(),
     ));
     (client, handle)

@@ -77,13 +77,19 @@ pub struct CreateSessionResponse {
 
 /// Provider selection at session-create time. Tagged enum so the wire
 /// format is `{ "kind": "anthropic_api", "model": "claude-..." }`.
+///
+/// As of mu-019, `openai_codex` is the canonical name for OAuth-based
+/// access to OpenAI via the Codex backend. Earlier protocol drafts
+/// used `openai_oauth`; the rename happened when mu started talking
+/// to `chatgpt.com/backend-api/codex/responses` directly instead of
+/// shelling out to pi.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderSelector {
     AnthropicApi { model: String },
     AnthropicOauth { model: String },
     OpenaiApi { model: String },
-    OpenaiOauth { model: String },
+    OpenaiCodex { model: String },
     Openrouter { model: String },
 }
 
@@ -410,10 +416,10 @@ mod tests {
                 json!({ "kind": "openai_api", "model": "x" }),
             ),
             (
-                ProviderSelector::OpenaiOauth {
+                ProviderSelector::OpenaiCodex {
                     model: "x".to_owned(),
                 },
-                json!({ "kind": "openai_oauth", "model": "x" }),
+                json!({ "kind": "openai_codex", "model": "x" }),
             ),
             (
                 ProviderSelector::Openrouter {

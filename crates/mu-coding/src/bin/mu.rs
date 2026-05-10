@@ -20,16 +20,13 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// JSON-RPC core daemon over stdio.
+    ///
+    /// As of mu-020, the daemon does not take a `--provider` flag —
+    /// providers are constructed per-session from each
+    /// `create_session.provider` request. `--ephemeral` and
+    /// `--thinking` parameterize HOW providers are built across all
+    /// sessions on this daemon.
     Serve {
-        /// Provider backend. Values: faux, anthropic-api,
-        /// openai-codex, openrouter.
-        #[arg(long, default_value = "faux")]
-        provider: String,
-        /// Model id (provider-specific). Defaults: anthropic-api →
-        /// claude-haiku-4-5-20251001; openai-codex → gpt-5-codex;
-        /// openrouter → anthropic/claude-haiku-4.5.
-        #[arg(long)]
-        model: Option<String>,
         /// Comma-separated list of tools to enable. Values: read,
         /// write, ls.
         #[arg(long, default_value = "")]
@@ -106,21 +103,14 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Serve {
-            provider,
-            model,
             tools,
             ephemeral,
             thinking,
         } => {
-            let provider_arc = mu_coding::serve::build_provider(
-                &provider,
-                model.as_deref(),
-                ephemeral,
-                thinking.as_deref(),
-            )?;
+            let factory = mu_coding::serve::make_provider_factory(ephemeral, thinking);
             let tool_names = mu_coding::serve::parse_tools_csv(&tools);
             let tool_vec = mu_coding::serve::build_tools(&tool_names)?;
-            mu_coding::serve::run(provider_arc, tool_vec).await
+            mu_coding::serve::run(factory, tool_vec).await
         }
         Command::Ask {
             prompt,

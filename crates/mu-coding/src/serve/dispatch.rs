@@ -17,11 +17,13 @@ use mu_core::protocol::{
     AskSessionRequest, AskSessionResponse, CancelOutstandingRequest, CancelOutstandingResponse,
     CancelSessionRequest, CancelSessionResponse, CloseSessionRequest, CloseSessionResponse,
     CreateSessionRequest, CreateSessionResponse, DaemonStatsRequest, DaemonStatsResponse,
-    DelegateSessionRequest, DelegateSessionResponse, PingRequest, PingResponse, ProviderSelector,
-    ProviderStatusKind, Request, RespondToInputRequiredRequest, RespondToInputRequiredResponse,
-    Response, SessionEventsRequest, SessionEventsResponse, SessionListRequest, SessionListResponse,
+    DaemonUsageHistoryRequest, DaemonUsageHistoryResponse, DelegateSessionRequest,
+    DelegateSessionResponse, PingRequest, PingResponse, ProviderSelector, ProviderStatusKind,
+    Request, RespondToInputRequiredRequest, RespondToInputRequiredResponse, Response,
+    SessionEventsRequest, SessionEventsResponse, SessionListRequest, SessionListResponse,
     SessionStatsRequest, SessionStatsResponse, SessionStatusSummary,
 };
+use mu_core::usage_history::{aggregate_into_rows, extract_per_session_metrics};
 use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
 
 use super::daemon_info::DaemonInfo;
@@ -57,6 +59,7 @@ pub async fn dispatch(
         SessionListRequest::METHOD => handle_session_list(request, discovery).await,
         SessionEventsRequest::METHOD => handle_session_events(request, sessions),
         DaemonStatsRequest::METHOD => handle_daemon_stats(request, sessions, daemon_info),
+        DaemonUsageHistoryRequest::METHOD => handle_daemon_usage_history(request, sessions),
         RespondToInputRequiredRequest::METHOD => {
             handle_respond_to_input_required(request, sessions)
         }
@@ -697,6 +700,56 @@ fn handle_daemon_stats(
         total_input_tokens,
         total_output_tokens,
         in_flight_calls_count,
+    };
+    ok_response(request.id, to_value_or_null(resp))
+}
+
+/// mu-pex Phase 1 — historical roll-up of timing and token usage
+/// across in-memory sessions (live + retained-recently-closed),
+/// grouped by (provider, model, time-bucket).
+fn handle_daemon_usage_history(
+    request: Request<Value>,
+    sessions: Sessions,
+) -> Response<Value> {
+    let params: DaemonUsageHistoryRequest =
+        match serde_json::from_value(request.params.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                return err_response(
+                    request.id,
+                    codes::INVALID_PARAMS,
+                    format!("daemon.usage_history: invalid params: {e}"),
+                );
+            }
+        };
+
+    let snapshot = sessions.snapshot_for_listing();
+    let mut per_session = Vec::with_capacity(snapshot.len());
+    let mut considered: u32 = 0;
+    for (_sid, log, _parent) in snapshot.iter() {
+        let events = log.snapshot();
+        let Some(metrics) = extract_per_session_metrics(&events) else {
+            continue;
+        };
+        considered = considered.saturating_add(1);
+        if let Some(since) = params.since_unix_ms {
+            if metrics.started_at_unix_ms < since {
+                continue;
+            }
+        }
+        if let Some(until) = params.until_unix_ms {
+            if metrics.started_at_unix_ms >= until {
+                continue;
+            }
+        }
+        per_session.push(metrics);
+    }
+
+    let rows = aggregate_into_rows(per_session, params.time_bucket_ms);
+    let resp = DaemonUsageHistoryResponse {
+        rows,
+        session_count_total: considered,
+        snapshot_at_unix_ms: super::discovery::now_unix_ms(),
     };
     ok_response(request.id, to_value_or_null(resp))
 }

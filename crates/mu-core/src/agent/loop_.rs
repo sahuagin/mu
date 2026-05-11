@@ -474,9 +474,16 @@ async fn run(
 // ============================================================================
 
 /// Bounded sliding window of recent tool dispatches per ask. The
-/// `Never` retry policy refuses a new (tool_name, args) call if any
-/// entry in the window has the same shape AND errored.
+/// `Never` retry policy refuses dispatch on two conditions:
+///   1. Exact-match: same (tool_name, arguments) in the window
+///      previously errored.
+///   2. Consecutive-error-streak: the last `RETRY_STREAK_LIMIT`
+///      calls to this tool ALL errored — regardless of arguments.
+///      Catches the "model trying variants of a rejected command"
+///      pattern observed in the bash strict-mode live test
+///      2026-05-10.
 const TOOL_HISTORY_WINDOW: usize = 8;
+const RETRY_STREAK_LIMIT: usize = 3;
 
 #[derive(Debug, Default)]
 struct ToolHistory {
@@ -513,6 +520,24 @@ impl ToolHistory {
         self.entries
             .iter()
             .any(|e| e.is_error && e.tool_name == tool_name && &e.arguments == arguments)
+    }
+
+    /// Count consecutive errors for `tool_name` starting from the
+    /// most recent entry. A non-error call breaks the streak; calls
+    /// to other tools are skipped (not break, not count).
+    fn consecutive_errors_for(&self, tool_name: &str) -> usize {
+        let mut streak = 0;
+        for e in self.entries.iter().rev() {
+            if e.tool_name != tool_name {
+                continue;
+            }
+            if e.is_error {
+                streak += 1;
+            } else {
+                break;
+            }
+        }
+        streak
     }
 }
 
@@ -600,26 +625,33 @@ async fn handle_execute_tools(
         // Look up the tool + its policy.
         let tool = tools.iter().find(|t| t.spec().name == call.name);
 
-        // Retry guard. If the tool's policy is Never and this same
-        // (name, args) errored in the recent history, refuse the
-        // dispatch without running the tool. Emit a callout so the
-        // UI/log records the refusal alongside the synthesized
-        // tool result.
-        let retry_refused = match tool {
+        // Retry guard. If the tool's policy is Never, refuse on
+        // either of:
+        //   (a) exact-match: same (name, args) errored in window
+        //   (b) error streak: last RETRY_STREAK_LIMIT calls to
+        //       this tool all errored, regardless of args
+        // (b) catches the "variants of a rejected command" pattern.
+        let retry_refusal_reason: Option<&'static str> = match tool {
             Some(t) => {
                 let policy = t.spec().policy;
-                matches!(policy.retry, RetryPolicy::Never)
-                    && history.errored_match(&call.name, &call.arguments)
+                if !matches!(policy.retry, RetryPolicy::Never) {
+                    None
+                } else if history.errored_match(&call.name, &call.arguments) {
+                    Some("exact-match retry of a previously-errored call")
+                } else if history.consecutive_errors_for(&call.name) >= RETRY_STREAK_LIMIT {
+                    Some("error streak — the last several calls to this tool all errored")
+                } else {
+                    None
+                }
             }
-            None => false,
+            None => None,
         };
 
-        let result = if retry_refused {
+        let result = if let Some(reason) = retry_refusal_reason {
             let msg = format!(
-                "runtime refused: tool `{}` was just called with the same arguments \
-                 and errored. Its retry policy is Never — do not retry with the same \
-                 input. Try a different approach, a different tool, or report the \
-                 obstacle to the user instead.",
+                "runtime refused: tool `{}` blocked by RetryPolicy::Never ({reason}). \
+                 Do not retry with variants of the same approach. Switch tools, \
+                 change strategy materially, or report the obstacle to the user.",
                 call.name
             );
             // Surface a structured callout for the UI/log. This is
@@ -632,7 +664,7 @@ async fn handle_execute_tools(
                     body: serde_json::json!({
                         "tool": call.name,
                         "arguments": call.arguments,
-                        "reason": "RetryPolicy::Never matched a prior errored call",
+                        "reason": reason,
                     }),
                     theme: Some("warning".to_owned()),
                     context_refs: vec!["spec:capability-delegation".to_owned()],

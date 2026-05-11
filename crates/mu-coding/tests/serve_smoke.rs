@@ -132,10 +132,27 @@ async fn b5_create_ask_done() {
         .await
         .expect("write ask");
 
-    // Expect 3 lines (in any order, since responses + notifications
-    // share the outbound channel): the ask response, text_delta,
-    // done. Read 3 lines, classify by shape.
-    let lines = read_n_lines(&mut client, 3).await;
+    // Read lines until we've seen the ack, a text_delta, and a done.
+    // The wire surface now also emits session.provider_status (mu-035)
+    // and possibly other notifications between these, so a fixed-count
+    // read is brittle. Use a target-set drain instead.
+    let mut lines: Vec<Value> = Vec::new();
+    let mut saw_ack = false;
+    let mut saw_text_delta = false;
+    let mut saw_done = false;
+    while !(saw_ack && saw_text_delta && saw_done) {
+        let line = read_line(&mut client).await;
+        if line["id"] == 2 {
+            saw_ack = true;
+        }
+        if line["method"] == "session.text_delta" {
+            saw_text_delta = true;
+        }
+        if line["method"] == "session.done" {
+            saw_done = true;
+        }
+        lines.push(line);
+    }
 
     let ask_response = lines
         .iter()
@@ -298,8 +315,15 @@ async fn b8_session_stats_after_ask() {
         .write_all(format!("{req}\n").as_bytes())
         .await
         .unwrap();
-    // Drain: ask response + text_delta + done. Order may vary.
-    let _ = read_n_lines(&mut client, 3).await;
+    // Drain until we see session.done (the post mu-035 wire surface
+    // additionally emits session.provider_status notifications;
+    // fixed-count read is brittle).
+    loop {
+        let line = read_line(&mut client).await;
+        if line["method"] == "session.done" {
+            break;
+        }
+    }
 
     // Query stats.
     let req = json!({

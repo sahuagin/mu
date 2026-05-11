@@ -138,6 +138,29 @@ pub enum AgentEvent {
         tool_result_count: u32,
         tool_count: u32,
     },
+    /// Provider-call lifecycle marker (mu-035 Phase A). Emitted on
+    /// state transitions; Phase B will additionally emit periodic
+    /// ticks while in non-streaming waits so a stalled provider
+    /// remains visible to a watching client.
+    ///
+    /// The forwarder translates this to `session.provider_status`
+    /// notifications.
+    ///
+    /// Field is `state` (not `kind`) because the enum's serde tag is
+    /// already `kind` (the variant discriminator); reusing the name
+    /// causes a serde naming collision.
+    ProviderStatus {
+        state: crate::protocol::ProviderStatusKind,
+        /// Unix milliseconds the session entered this state.
+        started_at_unix_ms: u64,
+        /// Milliseconds since `started_at_unix_ms` at emit time.
+        elapsed_ms: u64,
+        /// Cumulative bytes from the provider's stream so far on
+        /// this call. None when not meaningful.
+        bytes_received: Option<u64>,
+        /// Set only when `state` is ToolExecuting or AwaitingToolResult.
+        tool_call_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -316,8 +339,20 @@ impl AgentLoop {
     }
 
     /// Wait for the loop to finish.
+    ///
+    /// As of mu-035 Phase A (multi-turn fix), the agent loop no
+    /// longer terminates after one ask. It runs until its input
+    /// channel closes (all senders dropped) or it receives Cancel.
+    /// `join` therefore drops the owned `tx` BEFORE awaiting the
+    /// handle, so the loop sees its sole sender close and exits
+    /// cleanly. If the daemon's session manager holds a cloned
+    /// sender (via `sender()`), the loop will wait for that to
+    /// also drop — which is what we want: the session is alive as
+    /// long as the daemon has a way to talk to it.
     pub async fn join(self) -> Outcome {
-        self.handle
+        let Self { tx, handle } = self;
+        drop(tx); // close the owned input sender so the loop can exit
+        handle
             .await
             .unwrap_or_else(|_| Outcome::Error("loop task panicked".into()))
     }
@@ -393,6 +428,11 @@ async fn run(
             }
             Action::InvokeLlm => {
                 if turn_count >= config.max_turns {
+                    // Hit the per-ask iteration cap. Same finalize-
+                    // and-continue pattern as MaybeFinish: this
+                    // terminates the ask, not the session. The user
+                    // can `ask_session` again — perhaps with a
+                    // different prompt that needs fewer turns.
                     let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
                     let _ = events
                         .send(AgentEvent::Done {
@@ -402,8 +442,13 @@ async fn run(
                             elapsed_ms,
                         })
                         .await;
+                    started_at = None;
+                    turn_count = 0;
                     tool_history.clear();
-                    return Outcome::IterationCap;
+                    // Drop any remaining queue entries for this ask
+                    // (e.g. tool calls the model was about to make).
+                    queue.clear();
+                    continue;
                 }
                 if started_at.is_none() {
                     started_at = Some(Instant::now());
@@ -519,10 +564,16 @@ async fn run(
                 }
 
                 if !queue.is_empty() {
-                    // Pending external input — skip termination.
+                    // Pending external input — skip the ask-finalization.
                     continue;
                 }
 
+                // Finalize the current ask: emit Done, then RESET
+                // per-ask accounting and re-enter the loop. The
+                // session stays alive for subsequent ask_sessions.
+                // Termination only happens when all senders drop
+                // (clean exit), cancel arrives, or an unrecoverable
+                // error fires — handled outside this arm.
                 let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
                 let _ = events
                     .send(AgentEvent::Done {
@@ -532,22 +583,23 @@ async fn run(
                         elapsed_ms,
                     })
                     .await;
+                // Reset per-ask state. `messages` keeps the
+                // conversation history — multi-turn requires it.
+                started_at = None;
+                turn_count = 0;
                 tool_history.clear();
-                return Outcome::Done(StopReason::EndTurn);
+                // Continue: next pop_front will block on input_rx.recv()
+                // for the next ask_session.
             }
         }
     }
 
-    // input channel closed and no work pending — clean termination.
-    let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
-    let _ = events
-        .send(AgentEvent::Done {
-            stop_reason: StopReason::EndTurn,
-            turn_count,
-            usage: aggregated_usage.take(),
-            elapsed_ms,
-        })
-        .await;
+    // Input channel closed and no work pending — clean shutdown.
+    // MaybeFinish already emitted a Done for the last ask (post
+    // multi-turn fix), so we do NOT emit another Done here; doing
+    // so would double-emit on every clean shutdown. The Outcome
+    // returned via the JoinHandle is still useful for callers that
+    // care.
     tool_history.clear();
     Outcome::Done(StopReason::EndTurn)
 }
@@ -646,6 +698,14 @@ impl ToolHistory {
     }
 }
 
+fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 async fn handle_invoke_llm(
     provider: &dyn Provider,
     messages: &[AgentMessage],
@@ -653,6 +713,24 @@ async fn handle_invoke_llm(
     input_rx: &mut mpsc::Receiver<AgentInput>,
     events: &mpsc::Sender<AgentEvent>,
 ) -> Result<(AssistantMessage, Vec<AgentInput>), Outcome> {
+    use crate::protocol::ProviderStatusKind;
+
+    // mu-035 Phase A: emit AwaitingFirstToken just before opening
+    // the stream. Client UIs use this to render "thinking…" or
+    // similar; Phase B will add periodic re-emission while in this
+    // state so a stalled provider stays visible.
+    let call_started_at = Instant::now();
+    let call_started_unix_ms = now_unix_ms();
+    let _ = events
+        .send(AgentEvent::ProviderStatus {
+            state: ProviderStatusKind::AwaitingFirstToken,
+            started_at_unix_ms: call_started_unix_ms,
+            elapsed_ms: 0,
+            bytes_received: None,
+            tool_call_id: None,
+        })
+        .await;
+
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let mut stream = provider
         .stream(messages, tool_specs, cancel_rx)
@@ -660,11 +738,37 @@ async fn handle_invoke_llm(
         .map_err(|e| Outcome::Error(e.to_string()))?;
 
     let mut buffered: Vec<AgentInput> = Vec::new();
+    // Track byte count + whether we've transitioned out of
+    // AwaitingFirstToken yet.
+    let mut bytes_received: u64 = 0;
+    let mut seen_first_token = false;
+    // Once the input channel closes (all senders dropped), we want
+    // the in-flight stream to complete naturally — NOT be treated
+    // as a cancel. This was the pre-multi-turn behavior (Outcome::
+    // Cancelled on input None), and it broke `join()` semantics
+    // when the loop was made to survive past Done. Now we just
+    // stop polling input_rx via `std::future::pending` after seeing
+    // its first None.
+    let mut input_drained = false;
 
     loop {
         tokio::select! {
             event = stream.next() => match event {
                 Some(ProviderEvent::TextDelta(d)) => {
+                    bytes_received = bytes_received.saturating_add(d.len() as u64);
+                    if !seen_first_token {
+                        seen_first_token = true;
+                        let streaming_started_unix_ms = now_unix_ms();
+                        let _ = events
+                            .send(AgentEvent::ProviderStatus {
+                                state: ProviderStatusKind::Streaming,
+                                started_at_unix_ms: streaming_started_unix_ms,
+                                elapsed_ms: call_started_at.elapsed().as_millis() as u64,
+                                bytes_received: Some(bytes_received),
+                                tool_call_id: None,
+                            })
+                            .await;
+                    }
                     let _ = events.send(AgentEvent::TextDelta { delta: d }).await;
                 }
                 Some(ProviderEvent::Done(msg)) => {
@@ -690,7 +794,17 @@ async fn handle_invoke_llm(
                     ));
                 }
             },
-            input_opt = input_rx.recv() => match input_opt {
+            input_opt = async {
+                if input_drained {
+                    // Senders are gone; don't poll the receiver any
+                    // more. `std::future::pending` parks this branch
+                    // of the select forever, letting the stream
+                    // arm drain to completion.
+                    std::future::pending::<Option<AgentInput>>().await
+                } else {
+                    input_rx.recv().await
+                }
+            } => match input_opt {
                 Some(AgentInput::Cancel) => {
                     let _ = cancel_tx.send(());
                     return Err(Outcome::Cancelled);
@@ -699,9 +813,11 @@ async fn handle_invoke_llm(
                     buffered.push(input);
                 }
                 None => {
-                    // Input channel closed mid-stream. Treat as cancel.
-                    let _ = cancel_tx.send(());
-                    return Err(Outcome::Cancelled);
+                    // All senders dropped. Let the stream finish
+                    // — emit Done naturally — and on the next
+                    // outer-loop iteration the main recv() will
+                    // also return None and trigger a clean exit.
+                    input_drained = true;
                 }
             },
         }
@@ -721,6 +837,18 @@ async fn handle_execute_tools(
     let mut tool_messages: Vec<AgentMessage> = Vec::new();
 
     for call in calls {
+        // mu-035 Phase A: emit ToolExecuting just before dispatch.
+        // Client UIs render "tool: NAME (Xs)" while waiting on the
+        // tool to return.
+        let _ = events
+            .send(AgentEvent::ProviderStatus {
+                state: crate::protocol::ProviderStatusKind::ToolExecuting,
+                started_at_unix_ms: now_unix_ms(),
+                elapsed_ms: 0,
+                bytes_received: None,
+                tool_call_id: Some(call.id.clone()),
+            })
+            .await;
         let _ = events
             .send(AgentEvent::ToolCallStarted {
                 tool_call_id: call.id.clone(),
@@ -916,10 +1044,20 @@ async fn handle_execute_tools(
                     let mut execute_fut =
                         Box::pin(t.execute(call.arguments.clone(), cancel_rx));
 
+                    // Same "let work finish, don't cancel on
+                    // sender-drop" pattern as handle_invoke_llm
+                    // (mu-035 Phase A multi-turn fix).
+                    let mut input_drained_local = false;
                     loop {
                         tokio::select! {
                             result = &mut execute_fut => break result,
-                            input_opt = input_rx.recv() => match input_opt {
+                            input_opt = async {
+                                if input_drained_local {
+                                    std::future::pending::<Option<AgentInput>>().await
+                                } else {
+                                    input_rx.recv().await
+                                }
+                            } => match input_opt {
                                 Some(AgentInput::Cancel) => {
                                     let _ = cancel_tx.send(());
                                     return Err(Outcome::Cancelled);
@@ -928,8 +1066,11 @@ async fn handle_execute_tools(
                                     buffered.push(input);
                                 }
                                 None => {
-                                    let _ = cancel_tx.send(());
-                                    return Err(Outcome::Cancelled);
+                                    // Senders dropped. Let the
+                                    // tool finish naturally — the
+                                    // outer loop's recv() will
+                                    // catch up on the next idle.
+                                    input_drained_local = true;
                                 }
                             },
                         }

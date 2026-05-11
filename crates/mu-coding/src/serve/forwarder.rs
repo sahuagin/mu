@@ -25,8 +25,8 @@ use tokio::sync::mpsc;
 use mu_core::agent::{AgentEvent, AgentMessage};
 use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
-    CalloutBody, CalloutEvent, DoneEvent, ErrorEvent, InputRequiredEvent, TextDeltaEvent,
-    ToolCallCompletedEvent, ToolCallStartedEvent, ToolOutcome,
+    CalloutBody, CalloutEvent, DoneEvent, ErrorEvent, InputRequiredEvent, ProviderStatusEvent,
+    TextDeltaEvent, ToolCallCompletedEvent, ToolCallStartedEvent, ToolOutcome,
 };
 use mu_core::transport::NotificationWriter;
 
@@ -154,6 +154,23 @@ pub fn translate_event(
                 },
             )
         }
+        AgentEvent::ProviderStatus {
+            state,
+            started_at_unix_ms,
+            elapsed_ms,
+            bytes_received,
+            tool_call_id,
+        } => to_pair(
+            "session.provider_status",
+            ProviderStatusEvent {
+                session_id: session_id.to_string(),
+                kind: state,
+                started_at_unix_ms,
+                elapsed_ms,
+                bytes_received,
+                tool_call_id,
+            },
+        ),
         // Lifecycle events not in mu-001's notification surface.
         // ContextAssembly lands only in the durable event log
         // (mu-032 v1); wire-level exposure is a future TUI/web-ui
@@ -349,7 +366,14 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
         // InputRequired is a transient wire-level prompt; the
         // resulting ToolCall (approved) or ToolResult (denied)
         // already lands in the log.
-        | AgentEvent::InputRequired { .. } => None,
+        | AgentEvent::InputRequired { .. }
+        // ProviderStatus is a wire-level lifecycle ping that
+        // doesn't need to land in the durable log. The transitions
+        // it describes are already derivable from the existing
+        // logged events (UserMessage, AssistantMessageEvent,
+        // ToolCall, ToolResult, Done). v2 may add an
+        // EventPayload::ProviderStatus if there's a consumer.
+        | AgentEvent::ProviderStatus { .. } => None,
     }
 }
 

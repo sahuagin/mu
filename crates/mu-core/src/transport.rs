@@ -142,6 +142,22 @@ where
         }
     }
 
+    // CRITICAL for clean shutdown post mu-035 Phase A (multi-turn fix):
+    // dropping `handler` here releases the closure that captures the
+    // daemon's `sessions` map. Releasing sessions drops every
+    // SessionState, which drops every agent-loop input sender, which
+    // lets the per-session agent loops exit on recv()==None, which
+    // drops their events senders, which lets the per-session
+    // forwarders exit, which drops their NotificationWriter clones,
+    // which finally lets `writer_task` see all `tx` clones drop and
+    // exit.
+    //
+    // Pre-multi-turn this chain worked implicitly because the agent
+    // loop returned after one Done — but with multi-turn the loop
+    // now survives until its input channel actually closes, which
+    // can only happen after sessions drops, which requires this
+    // explicit drop.
+    drop(handler);
     drop(notif);
     drop(tx);
 

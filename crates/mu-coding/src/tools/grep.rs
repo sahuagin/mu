@@ -530,6 +530,15 @@ mod tests {
         Ok(())
     }
 
+    // mu-yyi: this test mutates process-global MU_RG_BINARY, which
+    // races with parallel #[tokio::test]s calling locate_rg() and
+    // surfaces as flaky failures in b4_count_mode / b6_case_insensitive
+    // under `cargo test --workspace`. Run explicitly with
+    //   `cargo test -p mu-coding -- --ignored --test-threads=1`
+    // to verify the rg-not-found error path. Proper fix is to inject
+    // the rg path into GrepTool so this test can avoid env mutation
+    // (see mu-yyi).
+    #[ignore = "mu-yyi: env-var mutation races with parallel tests"]
     #[tokio::test]
     async fn rg_unavailable_returns_clean_error() {
         let original = std::env::var("MU_RG_BINARY").ok();

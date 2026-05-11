@@ -4,12 +4,13 @@ members = [
     "crates/mu-core",
     "crates/mu-ai",
     "crates/mu-coding",
+    "crates/mu-tui",
 ]
 
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-license = "BSD-3-Clause"
+license-file = "LICENSE"
 repository = "https://github.com/sahuagin/mu"
 authors = ["Thaddeus Covert <tcovert@sahuagin.net>"]
 rust-version = "1.80"

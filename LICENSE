@@ -1,28 +1,91 @@
+Business Source License 1.1
+
+Licensor: Thaddeus Covert
+
+Licensed Work: mu. The Licensed Work is (c) 2026 Thaddeus Covert.
+
+Additional Use Grant:
+
+You may use, copy, modify, create derivative works from, distribute, and make available the Licensed Work for:
+
+1. personal use by an individual;
+2. educational use;
+3. academic, public-interest, or noncommercial research;
+4. noncommercial use;
+5. internal evaluation, testing, benchmarking, or proof-of-concept work; and
+6. contribution to, or use within, software projects whose source code is made available under an OSI-approved open-source license, provided that such use does
+   not include offering the Licensed Work as part of a commercial hosted service, proprietary agent runtime, proprietary developer tool, or model-training,
+   model-evaluation, or automated-code-ingestion pipeline.
+
+Commercial production use requires a separate commercial license from the Licensor.
+
+For purposes of this License, "commercial production use" includes, without limitation:
+
+1. offering the Licensed Work, or a derivative work of it, as part of a paid product, hosted service, agent platform, developer tool, or consulting deliverable;
+2. incorporating the Licensed Work, or a derivative work of it, into proprietary infrastructure used to provide commercial services;
+3. using the Licensed Work, or a derivative work of it, to train, fine-tune, evaluate, benchmark, rank, or improve machine-learning models or automated coding
+   systems;
+4. using the Licensed Work, or a derivative work of it, in a dataset, training corpus, evaluation harness, retrieval index, embedding store, or automated
+   ingestion pipeline for machine-learning or agentic-coding systems; and
+5. use by, for, on behalf of, or under the direction of a company or organization whose primary business is developing, operating, or selling large language
+   models, automated coding agents, agent platforms, or model-training infrastructure, except for internal evaluation as allowed above.
+
+If you want to use the Licensed Work commercially, contact the Licensor for a commercial license.
+
+Change Date: 2030-05-11
+
+Change License: BSD 3-Clause License
+
+On the Change Date, or the fourth anniversary of the first public release of the Licensed Work if that date is later, the License converts to the Change License
+for the version of the Licensed Work then available under this License.
+
+The Change License text is included below for clarity.
+
+Business Source License Terms:
+
+The Licensor hereby grants you the right to copy, modify, create derivative works, redistribute, and make non-production use of the Licensed Work. The Licensor
+may make an Additional Use Grant, above, permitting limited production use.
+
+Effective on the Change Date, or the fourth anniversary of the first public release of the Licensed Work if that date is later, the Licensor hereby grants you
+rights under the terms of the Change License, and the rights granted in the paragraph above terminate.
+
+If your use of the Licensed Work does not comply with the requirements currently in effect as described in this License, you must purchase a commercial license
+from the Licensor, its affiliated entities, or authorized resellers, or you must refrain from using the Licensed Work.
+
+All copies of the original and modified Licensed Work, and derivative works of the Licensed Work, are subject to this License. This License applies separately
+for each version of the Licensed Work and the Change Date may vary for each version.
+
+You must conspicuously display this License on each original or modified copy of the Licensed Work. If you receive the Licensed Work in original or modified form
+from a third party, the terms and conditions set forth in this License apply to your use of that work.
+
+Any use of the Licensed Work in violation of this License will automatically terminate your rights under this License for the current and all other versions of
+the Licensed Work.
+
+This License does not grant you any right in any trademark or logo of the Licensor, its affiliates, or its contributors. You may not use the name of the
+Licensor, the names of contributors, or any trademark, service mark, trade name, or logo associated with the Licensed Work to endorse or promote products or
+services derived from the Licensed Work without specific prior written permission.
+
+TO THE EXTENT PERMITTED BY APPLICABLE LAW, THE LICENSED WORK IS PROVIDED ON AN "AS IS" BASIS. LICENSOR DISCLAIMS ALL WARRANTIES AND CONDITIONS, EXPRESS OR
+IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT.
+
+Change License text:
+
 BSD 3-Clause License
 
 Copyright (c) 2026, Thaddeus Covert
 
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
 
-1. Redistributions of source code must retain the above copyright notice, this
-   list of conditions and the following disclaimer.
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
 
-2. Redistributions in binary form must reproduce the above copyright notice,
-   this list of conditions and the following disclaimer in the documentation
-   and/or other materials provided with the distribution.
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or
+   other materials provided with the distribution.
 
-3. Neither the name of the copyright holder nor the names of its
-   contributors may be used to endorse or promote products derived from
-   this software without specific prior written permission.
+3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without
+   specific prior written permission.
 
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
+USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

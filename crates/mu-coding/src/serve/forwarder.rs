@@ -457,6 +457,122 @@ mod tests {
     }
 
     #[test]
+    fn log_records_tool_call_started_as_tool_call() {
+        let ev = AgentEvent::ToolCallStarted {
+            tool_call_id: "call_xyz".into(),
+            tool_name: "bash".into(),
+            arguments: json!({"command": "echo hi"}),
+        };
+        let (actor, payload) = to_log_event(&ev).expect("ToolCallStarted → log");
+        assert!(matches!(actor, EventActor::Agent));
+        match payload {
+            EventPayload::ToolCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(call_id, "call_xyz");
+                assert_eq!(name, "bash");
+                assert_eq!(arguments["command"], "echo hi");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn log_records_tool_call_completed_as_tool_result() {
+        let ev = AgentEvent::ToolCallCompleted {
+            tool_call_id: "call_xyz".into(),
+            content: "hi\nelapsed: 7ms".into(),
+            is_error: false,
+        };
+        let (actor, payload) = to_log_event(&ev).expect("ToolCallCompleted → log");
+        // Tool actor — we know the result came from a tool but the
+        // tool's name isn't on the AgentEvent (future hardening
+        // could thread it through).
+        assert!(matches!(actor, EventActor::Tool { .. }));
+        match payload {
+            EventPayload::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(call_id, "call_xyz");
+                assert!(content.contains("hi"));
+                assert!(!is_error);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn log_records_tool_error_with_is_error_true() {
+        let ev = AgentEvent::ToolCallCompleted {
+            tool_call_id: "call_abc".into(),
+            content: "bash: command not allowed".into(),
+            is_error: true,
+        };
+        let (_actor, payload) = to_log_event(&ev).expect("error tool result → log");
+        match payload {
+            EventPayload::ToolResult { is_error, .. } => {
+                assert!(is_error);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn log_full_tool_loop_round_trip() {
+        // Simulate a complete tool-use turn: text → tool call →
+        // (later) tool result. Confirm the log captures both
+        // sides of the loop in order.
+        let log = Arc::new(SessionEventLog::new("tool-loop"));
+
+        // 1. Agent decides to call a tool.
+        let started = AgentEvent::ToolCallStarted {
+            tool_call_id: "call_1".into(),
+            tool_name: "bash".into(),
+            arguments: json!({"command": "echo audit"}),
+        };
+        if let Some((actor, payload)) = to_log_event(&started) {
+            log.append(actor, payload);
+        }
+
+        // 2. Tool returns.
+        let completed = AgentEvent::ToolCallCompleted {
+            tool_call_id: "call_1".into(),
+            content: "audit\nelapsed: 5ms".into(),
+            is_error: false,
+        };
+        if let Some((actor, payload)) = to_log_event(&completed) {
+            log.append(actor, payload);
+        }
+
+        // Verify both sides landed, in order, with matching call_id.
+        let entries = log.snapshot();
+        assert_eq!(entries.len(), 2);
+        match &entries[0].payload {
+            EventPayload::ToolCall { call_id, name, .. } => {
+                assert_eq!(call_id, "call_1");
+                assert_eq!(name, "bash");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        match &entries[1].payload {
+            EventPayload::ToolResult {
+                call_id,
+                is_error,
+                ..
+            } => {
+                assert_eq!(call_id, "call_1");
+                assert!(!is_error);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+        assert_eq!(log.tool_call_count(), 1);
+    }
+
+    #[test]
     fn log_records_done_with_full_payload() {
         use mu_core::agent::{StopReason, Usage};
         let ev = AgentEvent::Done {

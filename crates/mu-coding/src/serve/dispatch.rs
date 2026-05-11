@@ -14,7 +14,8 @@ use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
     AskSessionRequest, AskSessionResponse, CancelSessionRequest, CancelSessionResponse,
     CloseSessionRequest, CloseSessionResponse, CreateSessionRequest, CreateSessionResponse,
-    PingRequest, PingResponse, ProviderSelector, Request, Response,
+    PingRequest, PingResponse, ProviderSelector, Request, Response, SessionStatsRequest,
+    SessionStatsResponse,
 };
 use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
 
@@ -37,6 +38,7 @@ pub async fn dispatch(
         AskSessionRequest::METHOD => handle_ask_session(request, sessions).await,
         CancelSessionRequest::METHOD => handle_cancel_session(request, sessions).await,
         CloseSessionRequest::METHOD => handle_close_session(request, sessions),
+        SessionStatsRequest::METHOD => handle_session_stats(request, sessions),
         other => err_response(
             request.id,
             codes::METHOD_NOT_FOUND,
@@ -221,6 +223,50 @@ async fn handle_cancel_session(request: Request<Value>, sessions: Sessions) -> R
             ok_response(request.id, to_value_or_null(resp))
         }
     }
+}
+
+fn handle_session_stats(request: Request<Value>, sessions: Sessions) -> Response<Value> {
+    let params: SessionStatsRequest = match serde_json::from_value(request.params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("session.stats: invalid params: {e}"),
+            );
+        }
+    };
+
+    let log = match sessions.event_log(&params.session_id) {
+        Some(l) => l,
+        None => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("session not found: {}", params.session_id),
+            );
+        }
+    };
+
+    let (provider_kind, model) = match log.provider_info() {
+        Some((k, m)) => (Some(k), Some(m)),
+        None => (None, None),
+    };
+
+    let resp = SessionStatsResponse {
+        session_id: params.session_id,
+        provider_kind,
+        model,
+        started_at_unix_ms: log.started_at_unix_ms(),
+        last_activity_unix_ms: log.last_activity_unix_ms(),
+        event_count: log.len() as u32,
+        ask_count: log.ask_count(),
+        total_turn_count: log.total_turn_count(),
+        tool_call_count: log.tool_call_count(),
+        elapsed_total_ms: log.elapsed_total_ms(),
+        usage: log.cumulative_usage(),
+    };
+    ok_response(request.id, to_value_or_null(resp))
 }
 
 fn handle_close_session(request: Request<Value>, sessions: Sessions) -> Response<Value> {

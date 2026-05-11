@@ -457,18 +457,29 @@ impl App {
     }
 
     fn on_key_send_prompt(&mut self, code: KeyCode, mods: KeyModifiers) {
+        // Diagnostic: when in SendPrompt mode, log every keycode so
+        // we can see what crossterm actually receives. Helps debug
+        // terminal-specific binding issues (e.g. Ctrl-Enter often
+        // collapses to plain Enter in many terminals).
+        let debug = format!("[key] code={code:?} mods={mods:?}");
         match (code, mods) {
             (KeyCode::Esc, _) => {
                 self.input_mode = InputMode::Normal;
                 self.prompt_buffer.clear();
             }
-            (KeyCode::Enter, KeyModifiers::CONTROL) => {
-                self.input_mode = InputMode::Normal;
-                self.send_prompt();
+            // Enter submits (the chat-TUI convention). Alt-Enter or
+            // Ctrl-J inserts a newline for multi-line prompts.
+            // Ctrl-Enter ALSO submits when the terminal happens to
+            // distinguish it from plain Enter.
+            (KeyCode::Enter, KeyModifiers::ALT) => {
+                self.prompt_buffer.push('\n');
+            }
+            (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+                self.prompt_buffer.push('\n');
             }
             (KeyCode::Enter, _) => {
-                // Newline in the prompt buffer; Ctrl-Enter to submit.
-                self.prompt_buffer.push('\n');
+                self.input_mode = InputMode::Normal;
+                self.send_prompt();
             }
             (KeyCode::Backspace, _) => {
                 self.prompt_buffer.pop();
@@ -476,7 +487,11 @@ impl App {
             (KeyCode::Char(c), _) => {
                 self.prompt_buffer.push(c);
             }
-            _ => {}
+            _ => {
+                // Log unknown keycodes so the user can see what their
+                // terminal is sending and we can adjust bindings.
+                self.firehose.push(debug);
+            }
         }
     }
 
@@ -1033,7 +1048,7 @@ fn render_statusline(f: &mut Frame, app: &App, area: Rect) {
         InputMode::SendPrompt => {
             let preview: String = app.prompt_buffer.chars().take(80).collect();
             format!(
-                " > {preview}{}    [enter=newline · ctrl-enter=send · esc=cancel]",
+                " > {preview}{}    [enter=send · alt-enter or ctrl-j=newline · esc=cancel]",
                 if app.prompt_buffer.chars().count() > 80 {
                     "…"
                 } else {

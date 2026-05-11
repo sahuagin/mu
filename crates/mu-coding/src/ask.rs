@@ -27,6 +27,7 @@ pub async fn run(
     thinking: Option<String>,
     bash_yolo: bool,
     bash_allow: Vec<String>,
+    bash_prompt: bool,
 ) -> Result<()> {
     // Map the CLI provider flag to a wire-level selector. This is what
     // gets sent in create_session; the daemon constructs the provider
@@ -39,6 +40,7 @@ pub async fn run(
         thinking.as_deref(),
         bash_yolo,
         &bash_allow,
+        bash_prompt,
     )?;
     let mut stdin = child
         .stdin
@@ -80,6 +82,7 @@ fn spawn_serve(
     thinking: Option<&str>,
     bash_yolo: bool,
     bash_allow: &[String],
+    bash_prompt: bool,
 ) -> Result<tokio::process::Child> {
     // MU_BINARY env override allows integration tests to point at a
     // specific binary path (`env!("CARGO_BIN_EXE_mu")`); production
@@ -112,6 +115,9 @@ fn spawn_serve(
         if !entry.is_empty() {
             cmd.arg("--bash-allow").arg(entry);
         }
+    }
+    if bash_prompt {
+        cmd.arg("--bash-prompt");
     }
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

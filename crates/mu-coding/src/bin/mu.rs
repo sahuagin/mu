@@ -51,6 +51,12 @@ enum Command {
         /// Ignored when --bash-yolo is set.
         #[arg(long = "bash-allow", value_name = "CMD")]
         bash_allow: Vec<String>,
+        /// Bash tool: strict mode also requires per-call user
+        /// approval via session.input_required (mu-029). Allowlist
+        /// still gates first; approval prompts on every allowlisted
+        /// command. Ignored when --bash-yolo is set.
+        #[arg(long)]
+        bash_prompt: bool,
     },
     /// One-shot ask — spawn the daemon, single roundtrip, exit.
     Ask {
@@ -77,6 +83,9 @@ enum Command {
         /// Forwarded as `--bash-allow` to `mu serve` (repeatable).
         #[arg(long = "bash-allow", value_name = "CMD")]
         bash_allow: Vec<String>,
+        /// Forwarded as `--bash-prompt` to `mu serve`.
+        #[arg(long)]
+        bash_prompt: bool,
     },
     /// Interactive terminal UI.
     Tui,
@@ -131,12 +140,14 @@ async fn main() -> Result<()> {
             thinking,
             bash_yolo,
             bash_allow,
+            bash_prompt,
         } => {
             let factory = mu_coding::serve::make_provider_factory(ephemeral, thinking);
             let tool_names = mu_coding::serve::parse_tools_csv(&tools);
             let bash_settings = mu_coding::serve::BashSettings {
                 yolo: bash_yolo,
                 extra_allow: bash_allow,
+                prompt: bash_prompt,
             };
             let tool_vec = mu_coding::serve::build_tools(&tool_names, &bash_settings)?;
             mu_coding::serve::run(factory, tool_vec).await
@@ -150,9 +161,11 @@ async fn main() -> Result<()> {
             thinking,
             bash_yolo,
             bash_allow,
+            bash_prompt,
         } => {
             mu_coding::ask::run(
                 prompt, provider, model, tools, ephemeral, thinking, bash_yolo, bash_allow,
+                bash_prompt,
             )
             .await
         }

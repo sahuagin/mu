@@ -24,6 +24,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rusqlite = { workspace = true }
+shlex = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }

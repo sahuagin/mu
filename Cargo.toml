@@ -46,6 +46,9 @@ oauth2 = "4.4"
 webbrowser = "1"
 dirs = "5"
 
+# shell-arg tokenization (bash tool)
+shlex = "1"
+
 # TUI (used by mu-coding's interactive mode; later)
 ratatui = "0.28"
 crossterm = "0.28"

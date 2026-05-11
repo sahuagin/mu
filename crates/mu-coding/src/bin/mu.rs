@@ -28,7 +28,7 @@ enum Command {
     /// sessions on this daemon.
     Serve {
         /// Comma-separated list of tools to enable. Values: read,
-        /// write, ls.
+        /// write, ls, edit, grep, glob, bash.
         #[arg(long, default_value = "")]
         tools: String,
         /// For OAuth providers (openai-codex): load stored token but
@@ -40,6 +40,17 @@ enum Command {
         /// today); ignored elsewhere.
         #[arg(long)]
         thinking: Option<String>,
+        /// Bash tool: YOLO MODE. Bypass allowlist + metachar
+        /// rejection + env scrub; spawn via `bash -c`. Only enable
+        /// for sessions you fully trust the prompt source of.
+        #[arg(long)]
+        bash_yolo: bool,
+        /// Bash tool: extend the default allowlist with these
+        /// commands. Repeatable. Each entry is parsed via shlex
+        /// and token-prefix matched against incoming commands.
+        /// Ignored when --bash-yolo is set.
+        #[arg(long = "bash-allow", value_name = "CMD")]
+        bash_allow: Vec<String>,
     },
     /// One-shot ask — spawn the daemon, single roundtrip, exit.
     Ask {
@@ -60,6 +71,12 @@ enum Command {
         /// Forwarded as `--thinking` to `mu serve`. See `mu serve --help`.
         #[arg(long)]
         thinking: Option<String>,
+        /// Forwarded as `--bash-yolo` to `mu serve`. See `mu serve --help`.
+        #[arg(long)]
+        bash_yolo: bool,
+        /// Forwarded as `--bash-allow` to `mu serve` (repeatable).
+        #[arg(long = "bash-allow", value_name = "CMD")]
+        bash_allow: Vec<String>,
     },
     /// Interactive terminal UI.
     Tui,
@@ -92,6 +109,12 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        // Logs MUST go to stderr — stdout is the JSON-RPC channel for
+        // `mu serve`, so any log line on stdout corrupts the protocol
+        // and crashes the parent (`mu ask`). This was caught when
+        // adding the --bash-yolo startup WARN — same fix would have
+        // been needed eventually for any non-quiet daemon log.
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -106,10 +129,16 @@ async fn main() -> Result<()> {
             tools,
             ephemeral,
             thinking,
+            bash_yolo,
+            bash_allow,
         } => {
             let factory = mu_coding::serve::make_provider_factory(ephemeral, thinking);
             let tool_names = mu_coding::serve::parse_tools_csv(&tools);
-            let tool_vec = mu_coding::serve::build_tools(&tool_names)?;
+            let bash_settings = mu_coding::serve::BashSettings {
+                yolo: bash_yolo,
+                extra_allow: bash_allow,
+            };
+            let tool_vec = mu_coding::serve::build_tools(&tool_names, &bash_settings)?;
             mu_coding::serve::run(factory, tool_vec).await
         }
         Command::Ask {
@@ -119,7 +148,14 @@ async fn main() -> Result<()> {
             tools,
             ephemeral,
             thinking,
-        } => mu_coding::ask::run(prompt, provider, model, tools, ephemeral, thinking).await,
+            bash_yolo,
+            bash_allow,
+        } => {
+            mu_coding::ask::run(
+                prompt, provider, model, tools, ephemeral, thinking, bash_yolo, bash_allow,
+            )
+            .await
+        }
         Command::Login { provider } => run_login(&provider).await,
         Command::Logout { provider } => run_logout(&provider),
         Command::Tui | Command::Orchestrate { .. } => {

@@ -25,13 +25,21 @@ pub async fn run(
     tools: String,
     ephemeral: bool,
     thinking: Option<String>,
+    bash_yolo: bool,
+    bash_allow: Vec<String>,
 ) -> Result<()> {
     // Map the CLI provider flag to a wire-level selector. This is what
     // gets sent in create_session; the daemon constructs the provider
     // per session from this.
     let selector = crate::serve::selector_from_cli(&provider, model.as_deref())?;
 
-    let mut child = spawn_serve(&tools, ephemeral, thinking.as_deref())?;
+    let mut child = spawn_serve(
+        &tools,
+        ephemeral,
+        thinking.as_deref(),
+        bash_yolo,
+        &bash_allow,
+    )?;
     let mut stdin = child
         .stdin
         .take()
@@ -70,6 +78,8 @@ fn spawn_serve(
     tools: &str,
     ephemeral: bool,
     thinking: Option<&str>,
+    bash_yolo: bool,
+    bash_allow: &[String],
 ) -> Result<tokio::process::Child> {
     // MU_BINARY env override allows integration tests to point at a
     // specific binary path (`env!("CARGO_BIN_EXE_mu")`); production
@@ -93,6 +103,14 @@ fn spawn_serve(
     if let Some(t) = thinking {
         if !t.is_empty() {
             cmd.arg("--thinking").arg(t);
+        }
+    }
+    if bash_yolo {
+        cmd.arg("--bash-yolo");
+    }
+    for entry in bash_allow {
+        if !entry.is_empty() {
+            cmd.arg("--bash-allow").arg(entry);
         }
     }
     cmd.stdin(std::process::Stdio::piped())

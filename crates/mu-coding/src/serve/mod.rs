@@ -14,7 +14,7 @@ mod sessions;
 
 pub use factory::{
     build_provider_from_selector, build_tools, make_provider_factory, parse_tools_csv,
-    selector_from_cli, ProviderFactory,
+    selector_from_cli, BashSettings, ProviderFactory,
 };
 pub use sessions::Sessions;
 

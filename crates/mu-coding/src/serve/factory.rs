@@ -12,7 +12,20 @@ use mu_ai::{AnthropicProvider, FauxProvider, OpenRouterProvider, OpenaiCodexProv
 use mu_core::agent::{Provider, Tool};
 use mu_core::protocol::ProviderSelector;
 
-use crate::tools::{EditTool, GlobTool, GrepTool, LsTool, ReadTool, WriteTool};
+use crate::tools::{BashMode, BashTool, EditTool, GlobTool, GrepTool, LsTool, ReadTool, WriteTool};
+
+/// Settings that parameterize how the `bash` tool is built.
+/// Daemon-level: applies to every session this daemon serves.
+#[derive(Debug, Clone, Default)]
+pub struct BashSettings {
+    /// When true, build the tool in YOLO mode (no allowlist, full
+    /// shell, full env). User opt-in via `--bash-yolo`.
+    pub yolo: bool,
+    /// Strings to merge into the default strict-mode allowlist
+    /// (only meaningful when `yolo == false`). Each parsed via
+    /// shlex.
+    pub extra_allow: Vec<String>,
+}
 
 /// Factory closure for constructing a provider per session, from
 /// a wire-level `ProviderSelector`. Closes over daemon-startup flags
@@ -125,7 +138,15 @@ fn log_thinking_ignored(provider: &str, thinking: Option<&str>) {
 }
 
 /// Build a tools vec from a list of names. Unknown names error.
-pub fn build_tools(names: &[String]) -> Result<Vec<Arc<dyn Tool>>> {
+///
+/// `bash` is the one tool whose construction is parameterized by
+/// daemon-level settings (`BashSettings`) rather than being a
+/// no-arg `Tool::new()`. Pass `BashSettings::default()` for "off"
+/// behavior (yolo=false, no extra allowlist entries).
+pub fn build_tools(
+    names: &[String],
+    bash: &BashSettings,
+) -> Result<Vec<Arc<dyn Tool>>> {
     names
         .iter()
         .map(|n| match n.as_str() {
@@ -135,8 +156,20 @@ pub fn build_tools(names: &[String]) -> Result<Vec<Arc<dyn Tool>>> {
             "edit" => Ok(Arc::new(EditTool::new()) as Arc<dyn Tool>),
             "grep" => Ok(Arc::new(GrepTool::new()) as Arc<dyn Tool>),
             "glob" => Ok(Arc::new(GlobTool::new()) as Arc<dyn Tool>),
+            "bash" => {
+                let mode = if bash.yolo {
+                    tracing::warn!(
+                        "bash tool: YOLO MODE active. All allowlist checks bypassed. \
+                         Confirm you trust the prompt source."
+                    );
+                    BashMode::Yolo
+                } else {
+                    BashMode::strict_with_extras(&bash.extra_allow)
+                };
+                Ok(Arc::new(BashTool::new(mode)) as Arc<dyn Tool>)
+            }
             other => anyhow::bail!(
-                "unknown tool: {other} (expected: read, write, ls, edit, grep, glob)"
+                "unknown tool: {other} (expected: read, write, ls, edit, grep, glob, bash)"
             ),
         })
         .collect()
@@ -170,6 +203,12 @@ mod tests {
             parse_tools_csv("read, write , bash"),
             vec!["read", "write", "bash"]
         );
+    }
+
+    /// Test helper: build_tools with default BashSettings (no yolo,
+    /// no extra allowlist entries). Keeps test sites tidy.
+    fn build_tools_default(names: &[String]) -> Result<Vec<Arc<dyn Tool>>> {
+        build_tools(names, &BashSettings::default())
     }
 
     #[test]
@@ -266,41 +305,61 @@ mod tests {
 
     #[test]
     fn build_tools_known_and_unknown() {
-        let tools = build_tools(&["read".to_string()]).expect("build_tools(read) should succeed");
+        let tools = build_tools_default(&["read".to_string()]).expect("build_tools(read) should succeed");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].spec().name, "read");
 
         let tools =
-            build_tools(&["write".to_string()]).expect("build_tools(write) should succeed");
+            build_tools_default(&["write".to_string()]).expect("build_tools(write) should succeed");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].spec().name, "write");
 
-        let tools = build_tools(&["read".to_string(), "write".to_string()])
+        let tools = build_tools_default(&["read".to_string(), "write".to_string()])
             .expect("build_tools(read,write) should succeed");
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].spec().name, "read");
         assert_eq!(tools[1].spec().name, "write");
 
-        let tools = build_tools(&["ls".to_string()]).expect("build_tools(ls) should succeed");
+        let tools = build_tools_default(&["ls".to_string()]).expect("build_tools(ls) should succeed");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].spec().name, "ls");
 
         let tools =
-            build_tools(&["edit".to_string()]).expect("build_tools(edit) should succeed");
+            build_tools_default(&["edit".to_string()]).expect("build_tools(edit) should succeed");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].spec().name, "edit");
 
         let tools =
-            build_tools(&["grep".to_string()]).expect("build_tools(grep) should succeed");
+            build_tools_default(&["grep".to_string()]).expect("build_tools(grep) should succeed");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].spec().name, "grep");
 
         let tools =
-            build_tools(&["glob".to_string()]).expect("build_tools(glob) should succeed");
+            build_tools_default(&["glob".to_string()]).expect("build_tools(glob) should succeed");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].spec().name, "glob");
 
-        match build_tools(&["bogus".to_string()]) {
+        // Bash: strict mode by default, yolo by setting.
+        let tools = build_tools(
+            &["bash".to_string()],
+            &BashSettings::default(),
+        )
+        .expect("build_tools(bash) should succeed");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].spec().name, "bash");
+        assert!(tools[0].spec().description.contains("STRICT MODE"));
+
+        let tools = build_tools(
+            &["bash".to_string()],
+            &BashSettings {
+                yolo: true,
+                extra_allow: vec![],
+            },
+        )
+        .expect("build_tools(bash, yolo) should succeed");
+        assert!(tools[0].spec().description.contains("YOLO MODE"));
+
+        match build_tools_default(&["bogus".to_string()]) {
             Ok(_) => panic!("expected error for unknown tool"),
             Err(e) => assert!(e.to_string().contains("unknown tool")),
         }
@@ -308,7 +367,7 @@ mod tests {
 
     #[test]
     fn build_tools_empty() {
-        let tools = build_tools(&[]).unwrap();
+        let tools = build_tools_default(&[]).unwrap();
         assert!(tools.is_empty());
     }
 }

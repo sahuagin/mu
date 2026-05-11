@@ -1,3 +1,4 @@
+pub mod bash;
 pub mod edit;
 pub mod glob;
 pub mod grep;
@@ -5,6 +6,7 @@ pub mod ls;
 pub mod read;
 pub mod write;
 
+pub use bash::{BashMode, BashTool};
 pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;

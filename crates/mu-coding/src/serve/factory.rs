@@ -12,7 +12,7 @@ use mu_ai::{AnthropicProvider, FauxProvider, OpenRouterProvider, OpenaiCodexProv
 use mu_core::agent::{Provider, Tool};
 use mu_core::protocol::ProviderSelector;
 
-use crate::tools::{LsTool, ReadTool, WriteTool};
+use crate::tools::{EditTool, GlobTool, GrepTool, LsTool, ReadTool, WriteTool};
 
 /// Factory closure for constructing a provider per session, from
 /// a wire-level `ProviderSelector`. Closes over daemon-startup flags
@@ -132,7 +132,12 @@ pub fn build_tools(names: &[String]) -> Result<Vec<Arc<dyn Tool>>> {
             "read" => Ok(Arc::new(ReadTool::new()) as Arc<dyn Tool>),
             "write" => Ok(Arc::new(WriteTool::new()) as Arc<dyn Tool>),
             "ls" => Ok(Arc::new(LsTool::new()) as Arc<dyn Tool>),
-            other => anyhow::bail!("unknown tool: {other} (expected: read, write, ls)"),
+            "edit" => Ok(Arc::new(EditTool::new()) as Arc<dyn Tool>),
+            "grep" => Ok(Arc::new(GrepTool::new()) as Arc<dyn Tool>),
+            "glob" => Ok(Arc::new(GlobTool::new()) as Arc<dyn Tool>),
+            other => anyhow::bail!(
+                "unknown tool: {other} (expected: read, write, ls, edit, grep, glob)"
+            ),
         })
         .collect()
 }
@@ -279,6 +284,21 @@ mod tests {
         let tools = build_tools(&["ls".to_string()]).expect("build_tools(ls) should succeed");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].spec().name, "ls");
+
+        let tools =
+            build_tools(&["edit".to_string()]).expect("build_tools(edit) should succeed");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].spec().name, "edit");
+
+        let tools =
+            build_tools(&["grep".to_string()]).expect("build_tools(grep) should succeed");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].spec().name, "grep");
+
+        let tools =
+            build_tools(&["glob".to_string()]).expect("build_tools(glob) should succeed");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].spec().name, "glob");
 
         match build_tools(&["bogus".to_string()]) {
             Ok(_) => panic!("expected error for unknown tool"),

@@ -97,12 +97,24 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
     // Most recent unmatched ContextAssembly timestamp (pairs with the
     // next AssistantMessageEvent).
     let mut pending_context_assembly_ts: Option<u64> = None;
-    // mu-pex Phase 1.5: track the most-recent ProviderStatus
-    // *transition* emission (elapsed_ms == 0). When the next
-    // transition arrives, the gap measures how long we spent in the
-    // previous state. Periodic ticks (elapsed_ms > 0) share their
-    // state's started_at_unix_ms with the opening transition and are
-    // redundant for duration math; skip them.
+    // mu-pex Phase 1.5: track the open ProviderStatus state period —
+    // the (state, started_at_unix_ms) of the most recent transition
+    // we've observed. The next emission that introduces a NEW
+    // started_at_unix_ms closes out the prior period, contributing
+    // a duration sample if the prior state is one we measure
+    // (AwaitingFirstToken → TTFT, Streaming → streaming_ms).
+    //
+    // The "fresh started_at_unix_ms" signal is more robust than
+    // `elapsed_ms == 0`: the agent loop emits state transitions
+    // with elapsed_ms set to the time-in-call (loop_.rs:880), not
+    // 0. Periodic ticks within a period reuse the period's
+    // started_at_unix_ms (so a tick is detectable as "same started
+    // as last seen") and are correctly skipped.
+    //
+    // A trailing open period at the end of an ask is closed out by
+    // the subsequent Done event (using the Done's timestamp as the
+    // period's end). Without that, the Streaming state of one ask
+    // would leak into the inter-ask gap before the next AFT entry.
     let mut last_provider_status_transition: Option<(ProviderStatusKind, u64)> = None;
 
     for ev in events {
@@ -129,6 +141,26 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
             EventPayload::Done {
                 usage, elapsed_ms, ..
             } => {
+                // Close out any pending provider-status period —
+                // the agent loop doesn't emit a Streaming→Idle
+                // transition at end-of-ask, so without this, the
+                // last ask's Streaming state would bleed into the
+                // gap before the next AFT entry. Use the Done's
+                // timestamp as the period's end.
+                if let Some((prev_state, prev_started_at)) =
+                    last_provider_status_transition.take()
+                {
+                    let duration = ev.timestamp_unix_ms.saturating_sub(prev_started_at);
+                    match prev_state {
+                        ProviderStatusKind::AwaitingFirstToken => {
+                            m.ttft_ms_samples.push(duration);
+                        }
+                        ProviderStatusKind::Streaming => {
+                            m.streaming_ms_samples.push(duration);
+                        }
+                        _ => {}
+                    }
+                }
                 if let Some(em) = elapsed_ms {
                     m.wall_ms_samples.push(*em);
                 }
@@ -154,16 +186,16 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
             EventPayload::ProviderStatusUpdate {
                 state,
                 started_at_unix_ms,
-                elapsed_ms,
                 ..
             } => {
-                // Only transition emissions participate in duration
-                // math. Periodic ticks (elapsed_ms > 0) share
-                // started_at_unix_ms with the opening transition.
-                if *elapsed_ms == 0 {
-                    if let Some((prev_state, prev_started_at)) =
-                        last_provider_status_transition.take()
+                match last_provider_status_transition {
+                    Some((_, prev_started_at))
+                        if *started_at_unix_ms == prev_started_at =>
                     {
+                        // Same period — periodic tick. Skip.
+                    }
+                    Some((prev_state, prev_started_at)) => {
+                        // New period entered; close out the prior one.
                         let duration = started_at_unix_ms.saturating_sub(prev_started_at);
                         match prev_state {
                             ProviderStatusKind::AwaitingFirstToken => {
@@ -174,8 +206,14 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
                             }
                             _ => {}
                         }
+                        last_provider_status_transition =
+                            Some((*state, *started_at_unix_ms));
                     }
-                    last_provider_status_transition = Some((*state, *started_at_unix_ms));
+                    None => {
+                        // First-ever ProviderStatusUpdate for this session.
+                        last_provider_status_transition =
+                            Some((*state, *started_at_unix_ms));
+                    }
                 }
             }
             // Variants that don't carry usage-history signal: skip.
@@ -613,6 +651,79 @@ mod tests {
         assert_eq!(m.ttft_ms_samples, vec![100]);
         // Streaming periods: (1100→1400) = 300, (1800→2200) = 400.
         assert_eq!(m.streaming_ms_samples, vec![300, 400]);
+    }
+
+    #[test]
+    fn extraction_streaming_entry_with_nonzero_elapsed_still_counts() {
+        // Discovered via hand-test: the agent loop emits the
+        // AwaitingFirstToken→Streaming transition with elapsed_ms set
+        // to time-in-call (loop_.rs:880), not 0. The extractor must
+        // detect new periods by `started_at_unix_ms` uniqueness, not
+        // by `elapsed_ms == 0`.
+        let events = vec![
+            session_started_at(900),
+            ps(2, 1000, ProviderStatusKind::AwaitingFirstToken, 1000, 0),
+            // Note: elapsed_ms = 250 here, NOT 0. This is what the
+            // real agent loop sends.
+            ps(3, 1250, ProviderStatusKind::Streaming, 1250, 250),
+            ev(
+                4,
+                1500,
+                EventPayload::Done {
+                    stop_reason: StopReason::EndTurn,
+                    turn_count: 1,
+                    usage: None,
+                    elapsed_ms: Some(500),
+                },
+            ),
+        ];
+        let m = extract_per_session_metrics(&events).unwrap();
+        assert_eq!(m.ttft_ms_samples, vec![250]);
+        // Done closes out the open Streaming period: 1500 - 1250 = 250.
+        assert_eq!(m.streaming_ms_samples, vec![250]);
+    }
+
+    #[test]
+    fn extraction_done_closes_out_pending_state_between_asks() {
+        // Multi-ask: ask #1 leaves Streaming open at Done time; without
+        // close-out, the next AFT entry would attribute the inter-ask
+        // gap to Streaming. With close-out, each ask gets clean
+        // per-ask samples.
+        let events = vec![
+            session_started_at(900),
+            // Ask #1
+            ps(2, 1000, ProviderStatusKind::AwaitingFirstToken, 1000, 0),
+            ps(3, 1100, ProviderStatusKind::Streaming, 1100, 100),
+            ev(
+                4,
+                1400,
+                EventPayload::Done {
+                    stop_reason: StopReason::EndTurn,
+                    turn_count: 1,
+                    usage: None,
+                    elapsed_ms: Some(400),
+                },
+            ),
+            // Ask #2 starts after a ~600ms gap.
+            ps(5, 2000, ProviderStatusKind::AwaitingFirstToken, 2000, 0),
+            ps(6, 2200, ProviderStatusKind::Streaming, 2200, 200),
+            ev(
+                7,
+                2500,
+                EventPayload::Done {
+                    stop_reason: StopReason::EndTurn,
+                    turn_count: 1,
+                    usage: None,
+                    elapsed_ms: Some(500),
+                },
+            ),
+        ];
+        let m = extract_per_session_metrics(&events).unwrap();
+        // TTFT per ask: 1100−1000=100, 2200−2000=200.
+        assert_eq!(m.ttft_ms_samples, vec![100, 200]);
+        // streaming closed by each Done: 1400−1100=300, 2500−2200=300.
+        // Crucially: the 600ms gap between asks is NOT in any sample.
+        assert_eq!(m.streaming_ms_samples, vec![300, 300]);
     }
 
     #[test]

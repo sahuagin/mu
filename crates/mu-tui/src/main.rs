@@ -1062,6 +1062,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         ViewMode::Tools => render_placeholder(f, chunks[2], "Tools / MCP / Skills", "F6"),
         ViewMode::Router => render_placeholder(f, chunks[2], "Router / Proxy", "F7"),
         ViewMode::Events => render_events_explorer(f, app, chunks[2]),
+        // ^ takes &mut for in-render clamping of events_scroll_offset
         ViewMode::Mailbox => render_placeholder(f, chunks[2], "Mailbox (cooperating sessions)", "F9"),
     }
     render_firehose(f, app, chunks[3]);
@@ -1315,7 +1316,7 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
 ///
 /// Single-column for v1 (the mockup's right-side event timeline can
 /// come later — the firehose already serves that role globally).
-fn render_session_detail(f: &mut Frame, app: &App, area: Rect) {
+fn render_session_detail(f: &mut Frame, app: &mut App, area: Rect) {
     // Identify the selected session.
     let selected_sid: Option<String> = app
         .selected_session
@@ -1407,16 +1408,21 @@ fn render_session_detail(f: &mut Frame, app: &App, area: Rect) {
     let inner_height = chunks[1].height.saturating_sub(2) as usize; // -2 for borders
     let total_lines = body_lines.len();
     let max_top = total_lines.saturating_sub(inner_height);
-    let scroll_y = max_top
-        .saturating_sub(app.transcript_scroll_offset as usize)
-        .min(max_top) as u16;
+    // Same clamp as F8: don't let the stored offset exceed max
+    // scrollable range. Without this, the title shows "scrolled up 130"
+    // while the view is pinned to the top, and the user has to scroll
+    // down past the phantom offset before motion resumes.
+    if (app.transcript_scroll_offset as usize) > max_top {
+        app.transcript_scroll_offset = max_top as u16;
+    }
+    let scroll_y = (max_top.saturating_sub(app.transcript_scroll_offset as usize)) as u16;
 
     let title = if app.transcript_scroll_offset == 0 {
         " Transcript ".to_string()
     } else {
         format!(
-            " Transcript (scrolled up {} · End to bottom · Home to top) ",
-            app.transcript_scroll_offset
+            " Transcript (scrolled up {}/{} · End to bottom · Home to top) ",
+            app.transcript_scroll_offset, max_top
         )
     };
     let block = Block::default().borders(Borders::ALL).title(title);
@@ -1622,24 +1628,36 @@ fn push_block(out: &mut Vec<Line<'static>>, label: &str, color: Color, body: &st
 ///
 /// Filter via `:filter <substring>` palette command;
 /// `:clear-filter` or `:filter` (no arg) clears it.
-fn render_events_explorer(f: &mut Frame, app: &App, area: Rect) {
-    let filter = app.events_filter.trim();
+///
+/// Takes `&mut App` so we can clamp `events_scroll_offset` to the
+/// maximum scrollable range here. Without that clamp, the stored
+/// offset could grow past the actual top (the key handler doesn't
+/// know terminal height) and the user would see "scrolled up 130"
+/// while the view stayed pinned at the top, then have to scroll
+/// down past 74 before motion resumed.
+fn render_events_explorer(f: &mut Frame, app: &mut App, area: Rect) {
+    let filter = app.events_filter.trim().to_string();
     // Build the filtered line list. Cheap — firehose is capped at 500.
     let lines_owned: Vec<String> = if filter.is_empty() {
         app.firehose.iter().cloned().collect()
     } else {
         app.firehose
             .iter()
-            .filter(|l| l.contains(filter))
+            .filter(|l| l.contains(&filter))
             .cloned()
             .collect()
     };
     let total = lines_owned.len();
     let inner_height = area.height.saturating_sub(2) as usize;
     let max_top = total.saturating_sub(inner_height);
-    let scroll_y = max_top
-        .saturating_sub(app.events_scroll_offset as usize)
-        .min(max_top) as u16;
+    // Clamp stored offset to the actual maximum here, so the title
+    // shows a value the view can actually reflect and subsequent
+    // PageDown presses don't have to "burn off" phantom offset
+    // before they move anything.
+    if (app.events_scroll_offset as usize) > max_top {
+        app.events_scroll_offset = max_top as u16;
+    }
+    let scroll_y = (max_top.saturating_sub(app.events_scroll_offset as usize)) as u16;
     let title_suffix = if filter.is_empty() {
         format!("{total} events")
     } else {
@@ -1650,8 +1668,8 @@ fn render_events_explorer(f: &mut Frame, app: &App, area: Rect) {
     };
     let scroll_suffix = if app.events_scroll_offset > 0 {
         format!(
-            "  · scrolled up {} · End to bottom · Home to top",
-            app.events_scroll_offset
+            "  · scrolled up {}/{} · End to bottom · Home to top",
+            app.events_scroll_offset, max_top
         )
     } else {
         " · End=bottom · Home=top · :filter to filter".into()

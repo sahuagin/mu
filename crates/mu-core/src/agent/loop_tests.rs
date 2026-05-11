@@ -199,6 +199,7 @@ fn assistant_text(text: &str) -> AssistantMessage {
             text: text.to_owned(),
         }],
         stop_reason: StopReason::EndTurn,
+        usage: None,
     }
 }
 
@@ -210,6 +211,7 @@ fn assistant_tool_call(id: &str, name: &str, args: Value) -> AssistantMessage {
             arguments: args,
         })],
         stop_reason: StopReason::ToolUse,
+        usage: None,
     }
 }
 
@@ -591,6 +593,7 @@ fn assistant_text_msg(text: &str) -> AssistantMessage {
             text: text.to_owned(),
         }],
         stop_reason: StopReason::EndTurn,
+        usage: None,
     }
 }
 
@@ -602,6 +605,7 @@ fn assistant_tool_msg(id: &str, name: &str) -> AssistantMessage {
             arguments: serde_json::json!({}),
         })],
         stop_reason: StopReason::ToolUse,
+        usage: None,
     }
 }
 

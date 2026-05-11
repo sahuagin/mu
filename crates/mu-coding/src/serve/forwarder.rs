@@ -84,11 +84,18 @@ pub fn translate_event(
                 },
             )
         }
-        AgentEvent::Done { .. } => to_pair(
+        AgentEvent::Done {
+            stop_reason,
+            usage,
+            elapsed_ms,
+            ..
+        } => to_pair(
             DoneEvent::METHOD,
             DoneEvent {
                 session_id: session_id.to_string(),
-                usage: None,
+                stop_reason,
+                usage,
+                elapsed_ms,
             },
         ),
         AgentEvent::Error { message } => to_pair(

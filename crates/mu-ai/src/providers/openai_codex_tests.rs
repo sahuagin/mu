@@ -50,6 +50,7 @@ fn test_events_stream(
         tool_call_order: Vec::new(),
         final_status: None,
         incomplete_reason: None,
+        usage: None,
         cancel_rx: Some(cancel_rx),
         finished: false,
         emitted_done: false,
@@ -217,6 +218,7 @@ fn b5_translate_assistant_with_tool_call_produces_two_items() {
             }),
         ],
         stop_reason: StopReason::ToolUse,
+        usage: None,
     });
     let items = translate_message(&m);
     assert_eq!(items.len(), 2, "expected message + function_call");
@@ -516,6 +518,7 @@ fn stop_reason_max_tokens_from_incomplete_details() {
         tool_call_order: Vec::new(),
         final_status: Some("incomplete".into()),
         incomplete_reason: Some("max_output_tokens".into()),
+        usage: None,
         cancel_rx: None,
         finished: false,
         emitted_done: false,

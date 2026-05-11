@@ -21,6 +21,7 @@ fn b2_translate_assistant_text_only() {
             text: "hi".into(),
         }],
         stop_reason: StopReason::EndTurn,
+        usage: None,
     });
     let v = translate_message(&m).expect("translates");
     assert_eq!(v["role"], "assistant");
@@ -43,6 +44,7 @@ fn b3_translate_assistant_with_tool_call() {
             }),
         ],
         stop_reason: StopReason::ToolUse,
+        usage: None,
     });
     let v = translate_message(&m).expect("translates");
     assert_eq!(v["role"], "assistant");
@@ -150,6 +152,7 @@ fn test_events_stream(
         tool_calls: HashMap::new(),
         tool_call_order: Vec::new(),
         finish_reason: None,
+        usage: None,
         cancel_rx: Some(cancel_rx),
         finished: false,
         emitted_done: false,

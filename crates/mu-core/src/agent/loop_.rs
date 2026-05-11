@@ -13,6 +13,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::provider::{Provider, ProviderEvent};
+use super::types::Usage;
 use super::tool::{Tool, ToolResult, ToolSpec};
 use super::types::{AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolCall};
 
@@ -64,6 +66,14 @@ pub enum AgentEvent {
     Done {
         stop_reason: StopReason,
         turn_count: u32,
+        /// Aggregated token usage across this ask_session's turns.
+        /// `None` if no provider in the chain reported usage.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+        /// Wall time from the first turn's start to this Done emit.
+        /// Captures multi-turn tool-use loops; resets per ask_session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        elapsed_ms: Option<u64>,
     },
     Error {
         message: String,
@@ -264,6 +274,11 @@ async fn run(
     let mut messages: Vec<AgentMessage> = Vec::new();
     let mut queue: VecDeque<Action> = VecDeque::new();
     let mut turn_count: u32 = 0;
+    // Per-ask accounting. Set on first transition into InvokeLlm,
+    // emitted in Done, reset on Done emit. Cumulative across turns
+    // within one ask_session; resets per ask.
+    let mut aggregated_usage: Option<Usage> = None;
+    let mut started_at: Option<Instant> = None;
 
     let _ = events.send(AgentEvent::AgentStart).await;
 
@@ -310,13 +325,19 @@ async fn run(
             }
             Action::InvokeLlm => {
                 if turn_count >= config.max_turns {
+                    let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
                     let _ = events
                         .send(AgentEvent::Done {
                             stop_reason: StopReason::EndTurn,
                             turn_count,
+                            usage: aggregated_usage.take(),
+                            elapsed_ms,
                         })
                         .await;
                     return Outcome::IterationCap;
+                }
+                if started_at.is_none() {
+                    started_at = Some(Instant::now());
                 }
                 turn_count += 1;
                 let _ = events.send(AgentEvent::TurnStart).await;
@@ -333,6 +354,12 @@ async fn run(
                 .await
                 {
                     Ok((assistant_msg, buffered)) => {
+                        if let Some(u) = assistant_msg.usage {
+                            aggregated_usage = Some(match aggregated_usage {
+                                Some(prev) => prev.add(u),
+                                None => u,
+                            });
+                        }
                         let assistant = AgentMessage::Assistant(assistant_msg.clone());
                         let _ = events
                             .send(AgentEvent::MessageStart {
@@ -401,10 +428,13 @@ async fn run(
                     continue;
                 }
 
+                let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
                 let _ = events
                     .send(AgentEvent::Done {
                         stop_reason: StopReason::EndTurn,
                         turn_count,
+                        usage: aggregated_usage.take(),
+                        elapsed_ms,
                     })
                     .await;
                 return Outcome::Done(StopReason::EndTurn);
@@ -413,10 +443,13 @@ async fn run(
     }
 
     // input channel closed and no work pending — clean termination.
+    let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
     let _ = events
         .send(AgentEvent::Done {
             stop_reason: StopReason::EndTurn,
             turn_count,
+            usage: aggregated_usage.take(),
+            elapsed_ms,
         })
         .await;
     Outcome::Done(StopReason::EndTurn)

@@ -10,7 +10,9 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use mu_core::agent::{Tool, ToolResult, ToolSpec};
+use mu_core::agent::{
+    PermissionLevel, RetryPolicy, SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec,
+};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
@@ -30,14 +32,13 @@ impl Default for EditTool {
 
 impl Tool for EditTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "edit".to_owned(),
-            description: "Edit a file by replacing a unique occurrence of `old_string` with `new_string`. \
-                          When `old_string` appears multiple times, the call fails unless `replace_all` is true. \
-                          The match is exact (no whitespace normalization) — include enough surrounding context \
-                          for the match to be unique."
-                .to_owned(),
-            input_schema: json!({
+        ToolSpec::new(
+            "edit",
+            "Edit a file by replacing a unique occurrence of `old_string` with `new_string`. \
+             When `old_string` appears multiple times, the call fails unless `replace_all` is true. \
+             The match is exact (no whitespace normalization) — include enough surrounding context \
+             for the match to be unique.",
+            json!({
                 "type": "object",
                 "properties": {
                     "path": {
@@ -60,7 +61,13 @@ impl Tool for EditTool {
                 },
                 "required": ["path", "old_string", "new_string"]
             }),
-        }
+        )
+        .with_policy(ToolPolicy {
+            side_effects: SideEffects::Mutating,
+            permission: PermissionLevel::Allow,
+            retry: RetryPolicy::ModelDecides,
+            idempotent: true, // same args produce same result (or same error)
+        })
     }
 
     fn execute<'life0, 'async_trait>(

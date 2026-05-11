@@ -22,11 +22,11 @@ impl Default for ReadTool {
 
 impl Tool for ReadTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "read".to_owned(),
-            description: "Read a file. Returns the file's contents as text. Use for inspecting source code, configs, or any text file the agent needs to consider."
-                .to_owned(),
-            input_schema: json!({
+        // ReadOnly + Allow + ModelDecides is the default policy.
+        ToolSpec::new(
+            "read",
+            "Read a file. Returns the file's contents as text. Use for inspecting source code, configs, or any text file the agent needs to consider.",
+            json!({
                 "type": "object",
                 "properties": {
                     "path": {
@@ -36,7 +36,7 @@ impl Tool for ReadTool {
                 },
                 "required": ["path"]
             }),
-        }
+        )
     }
 
     fn execute<'life0, 'async_trait>(

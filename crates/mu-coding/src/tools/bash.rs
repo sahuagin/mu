@@ -18,7 +18,9 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use mu_core::agent::{Tool, ToolResult, ToolSpec};
+use mu_core::agent::{
+    PermissionLevel, RetryPolicy, SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec,
+};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
@@ -126,16 +128,35 @@ impl BashTool {
 
 impl Tool for BashTool {
     fn spec(&self) -> ToolSpec {
-        let mode_note = match &self.mode {
-            BashMode::Strict { .. } => {
-                "STRICT MODE: only allowlisted commands run. Shell metas (; & | > < ` $ \\) are rejected. \
-                 The allowlist includes read-only commands like `git status`, `ls`, `cat`. \
-                 If a needed command isn't allowed, ask the user to extend `--bash-allow`."
-            }
-            BashMode::Yolo => {
+        let (mode_note, policy) = match &self.mode {
+            BashMode::Strict { .. } => (
+                "STRICT MODE: only allowlisted commands run. Shell metas (; & | > < ` $ \\) are \
+                 rejected. The allowlist includes read-only commands like `git status`, `ls`, \
+                 `cat`. IMPORTANT: if a command is rejected (allowlist miss, metachar reject), \
+                 DO NOT retry with variants of the same command — the runtime tracks repeated \
+                 failures and will refuse them. Use a different tool, or report the obstacle to \
+                 the user.",
+                ToolPolicy {
+                    side_effects: SideEffects::Mutating,
+                    permission: PermissionLevel::Allow,
+                    // Strict mode rejects on allowlist + metachar grounds.
+                    // Same-call retries can't possibly succeed (the allowlist
+                    // doesn't change mid-session). RetryPolicy::Never makes
+                    // the runtime enforce this even when the model gets confused.
+                    retry: RetryPolicy::Never,
+                    idempotent: false, // file system can change between calls
+                },
+            ),
+            BashMode::Yolo => (
                 "YOLO MODE: any command runs via bash -c. Pipes, redirects, env vars all work. \
-                 Treat this as if you have a shell prompt; behave responsibly."
-            }
+                 Treat this as if you have a shell prompt; behave responsibly.",
+                ToolPolicy {
+                    side_effects: SideEffects::Destructive,
+                    permission: PermissionLevel::Allow,
+                    retry: RetryPolicy::ModelDecides,
+                    idempotent: false,
+                },
+            ),
         };
         ToolSpec {
             name: "bash".to_owned(),
@@ -144,6 +165,7 @@ impl Tool for BashTool {
                  Output capped at 64KB (stdout+stderr). Default timeout 60s; override via timeout_secs (max 600). \
                  Exit code is reflected in is_error."
             ),
+            policy,
             input_schema: json!({
                 "type": "object",
                 "properties": {

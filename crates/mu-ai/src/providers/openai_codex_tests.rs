@@ -190,6 +190,7 @@ fn b5_build_request_body_with_tools() {
             "properties": {"path": {"type": "string"}},
             "required": ["path"],
         }),
+        policy: Default::default(),
     }];
     let body = build_request_body("gpt-5-codex", "medium", "sys", &messages, &tools);
     let api_tools = body["tools"].as_array().expect("tools array");
@@ -602,6 +603,7 @@ mod live_tests {
                 "properties": {"text": {"type": "string"}},
                 "required": ["text"],
             }),
+            policy: Default::default(),
         };
 
         let messages = vec![AgentMessage::User {

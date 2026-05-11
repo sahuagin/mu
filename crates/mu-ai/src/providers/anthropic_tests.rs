@@ -52,6 +52,7 @@
             name: "read".into(),
             description: "Read a file".into(),
             input_schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+            policy: Default::default(),
         };
         assert_eq!(translate_tool_spec(&spec), json!({
             "name":"read",
@@ -125,6 +126,7 @@
             name: "read".into(),
             description: "Read a file".into(),
             input_schema: json!({ "type": "object" }),
+            policy: Default::default(),
         }];
         let body = build_request_body("claude-test", &messages, &tools);
         assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
@@ -553,6 +555,7 @@ mod live_tests {
                 },
                 "required": ["text"]
             }),
+            policy: Default::default(),
         };
 
         let messages = vec![AgentMessage::User {

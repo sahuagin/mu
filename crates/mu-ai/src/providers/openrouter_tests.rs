@@ -95,6 +95,7 @@ fn b5_translate_tool_spec() {
         name: "read".into(),
         description: "Read a file.".into(),
         input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        policy: Default::default(),
     };
     let v = translate_tool_spec(&spec);
     assert_eq!(v["type"], "function");
@@ -112,6 +113,7 @@ fn b6_build_request_body_includes_tools() {
         name: "read".into(),
         description: "Read".into(),
         input_schema: json!({"type": "object"}),
+        policy: Default::default(),
     }];
     let body = build_request_body("test/model", &messages, &tools);
     assert_eq!(body["model"], "test/model");
@@ -399,6 +401,7 @@ mod live_tests {
                 },
                 "required": ["text"]
             }),
+            policy: Default::default(),
         };
 
         let messages = vec![AgentMessage::User {

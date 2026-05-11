@@ -162,6 +162,7 @@ impl Tool for MockTool {
             name: self.name.clone(),
             description: format!("Mock tool: {}", self.name),
             input_schema: json!({"type": "object"}),
+            policy: Default::default(),
         }
     }
 
@@ -709,4 +710,63 @@ fn should_push_invoke_llm_other_actions_yes() {
     q.push_back(Action::MaybeFinish);
     q.push_back(Action::External(AgentInput::UserMessage(user_msg("x"))));
     assert!(should_push_invoke_llm(&q));
+}
+
+// ============================================================================
+// ToolHistory — RetryPolicy::Never enforcement backing store
+// ============================================================================
+
+#[test]
+fn tool_history_empty_has_no_match() {
+    let h = ToolHistory::default();
+    assert!(!h.errored_match("bash", &json!({"command": "echo hi"})));
+}
+
+#[test]
+fn tool_history_matches_errored_call_exactly() {
+    let mut h = ToolHistory::default();
+    h.record("bash".into(), json!({"command": "ls; rm /"}), true);
+    assert!(h.errored_match("bash", &json!({"command": "ls; rm /"})));
+    // Same tool, different args — no match.
+    assert!(!h.errored_match("bash", &json!({"command": "ls"})));
+    // Different tool, same args — no match.
+    assert!(!h.errored_match("edit", &json!({"command": "ls; rm /"})));
+}
+
+#[test]
+fn tool_history_does_not_match_succeeded_calls() {
+    let mut h = ToolHistory::default();
+    // Successful call — not in the "should refuse retry" set.
+    h.record("read".into(), json!({"path": "/etc/hosts"}), false);
+    assert!(!h.errored_match("read", &json!({"path": "/etc/hosts"})));
+}
+
+#[test]
+fn tool_history_window_evicts_oldest() {
+    let mut h = ToolHistory::default();
+    // Fill past the window; oldest should evict.
+    for i in 0..(TOOL_HISTORY_WINDOW + 3) {
+        h.record(
+            "bash".into(),
+            json!({"command": format!("cmd{i}")}),
+            true,
+        );
+    }
+    // Window is capped.
+    assert_eq!(h.entries.len(), TOOL_HISTORY_WINDOW);
+    // Earliest entries dropped off — first command should not match.
+    assert!(!h.errored_match("bash", &json!({"command": "cmd0"})));
+    // Recent entries still there.
+    let last = TOOL_HISTORY_WINDOW + 2;
+    assert!(h.errored_match("bash", &json!({"command": format!("cmd{last}")})));
+}
+
+#[test]
+fn tool_history_clear_empties_window() {
+    let mut h = ToolHistory::default();
+    h.record("bash".into(), json!({"command": "x"}), true);
+    assert!(h.errored_match("bash", &json!({"command": "x"})));
+    h.clear();
+    assert!(!h.errored_match("bash", &json!({"command": "x"})));
+    assert!(h.entries.is_empty());
 }

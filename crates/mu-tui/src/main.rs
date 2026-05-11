@@ -163,6 +163,10 @@ struct App {
     // and a session is selected. Keyed by session_id so switching
     // selection doesn't lose the loaded data.
     transcript_events_by_sid: std::collections::HashMap<String, Vec<serde_json::Value>>,
+    // F3 transcript scroll state: number of LINES back from the
+    // bottom. 0 = pinned to bottom (auto-follow on new content);
+    // >0 = user scrolled up. Reset to 0 with End / `0`.
+    transcript_scroll_offset: u16,
     // Wire integration. None ⇒ scaffold mock-data mode (no live daemon).
     mu: Option<MuClient>,
     /// `provider/model` to use when a new session is created via `n`.
@@ -206,6 +210,7 @@ impl App {
             ask_started_at: std::collections::HashMap::new(),
             streaming_text: std::collections::HashMap::new(),
             transcript_events_by_sid: std::collections::HashMap::new(),
+            transcript_scroll_offset: 0,
             mu,
             default_provider,
         }
@@ -598,7 +603,34 @@ impl App {
             (KeyCode::F(2), _) => self.mode = ViewMode::SessionTree,
             (KeyCode::F(3), _) => {
                 self.mode = ViewMode::SessionDetail;
+                self.transcript_scroll_offset = 0; // start pinned to bottom
                 self.refresh_transcript_for_selection();
+            }
+            // Transcript scrolling — only meaningful on F3.
+            (KeyCode::PageUp, _) if matches!(self.mode, ViewMode::SessionDetail) => {
+                self.transcript_scroll_offset =
+                    self.transcript_scroll_offset.saturating_add(10);
+            }
+            (KeyCode::PageDown, _) if matches!(self.mode, ViewMode::SessionDetail) => {
+                self.transcript_scroll_offset =
+                    self.transcript_scroll_offset.saturating_sub(10);
+            }
+            (KeyCode::Home, _) if matches!(self.mode, ViewMode::SessionDetail) => {
+                // Big offset → render scrolls to the top.
+                self.transcript_scroll_offset = u16::MAX;
+            }
+            (KeyCode::End, _) if matches!(self.mode, ViewMode::SessionDetail) => {
+                self.transcript_scroll_offset = 0;
+            }
+            // j/k scroll the transcript in F3, but still navigate the
+            // session list in other views.
+            (KeyCode::Char('k'), _) if matches!(self.mode, ViewMode::SessionDetail) => {
+                self.transcript_scroll_offset =
+                    self.transcript_scroll_offset.saturating_add(2);
+            }
+            (KeyCode::Char('j'), _) if matches!(self.mode, ViewMode::SessionDetail) => {
+                self.transcript_scroll_offset =
+                    self.transcript_scroll_offset.saturating_sub(2);
             }
             (KeyCode::F(4), _) => self.mode = ViewMode::Context,
             (KeyCode::F(5), _) => self.mode = ViewMode::Usage,
@@ -1177,10 +1209,36 @@ fn render_session_detail(f: &mut Frame, app: &App, area: Rect) {
             )),
         ]
     };
-    let block = Block::default().borders(Borders::ALL).title(" Transcript ");
+    // Scroll: by default pin to bottom (newest content). When the
+    // user has scrolled up (transcript_scroll_offset > 0), back off
+    // from the bottom by that many lines. Compute the scroll arg
+    // ratatui wants — it's "skip N lines from the top before
+    // rendering." We approximate visible_lines using the inner
+    // height of the chunk; this is a rough estimate because line
+    // wrapping (from Wrap { trim: false }) can produce more visual
+    // lines than `body_lines.len()`. v1 ignores wrap-expansion; a
+    // future slice can use ratatui's `LineComposer` to count
+    // post-wrap rows accurately.
+    let inner_height = chunks[1].height.saturating_sub(2) as usize; // -2 for borders
+    let total_lines = body_lines.len();
+    let max_top = total_lines.saturating_sub(inner_height);
+    let scroll_y = max_top
+        .saturating_sub(app.transcript_scroll_offset as usize)
+        .min(max_top) as u16;
+
+    let title = if app.transcript_scroll_offset == 0 {
+        " Transcript ".to_string()
+    } else {
+        format!(
+            " Transcript (scrolled up {} · End to bottom · Home to top) ",
+            app.transcript_scroll_offset
+        )
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
     let paragraph = Paragraph::new(body_lines)
         .block(block)
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_y, 0));
     f.render_widget(paragraph, chunks[1]);
 }
 
@@ -1424,10 +1482,18 @@ fn render_statusline(f: &mut Frame, app: &App, area: Rect) {
                 }
             )
         }
-        InputMode::Normal => format!(
-            " mode: {}   keys: F1-F9 · j/k select · n new session · i/Enter send · : palette · q quit",
-            app.mode.name()
-        ),
+        InputMode::Normal => {
+            let scroll_hint = if matches!(app.mode, ViewMode::SessionDetail) {
+                "j/k PgUp/PgDn Home/End scroll · "
+            } else {
+                "j/k select · "
+            };
+            format!(
+                " mode: {}   keys: F1-F9 · {}n new · i/Enter send · : palette · q quit",
+                app.mode.name(),
+                scroll_hint,
+            )
+        }
     };
     let style = match app.input_mode {
         InputMode::Command => Style::default().fg(Color::Black).bg(Color::Yellow),

@@ -358,6 +358,22 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
                 },
             ))
         }
+        AgentEvent::ProviderStatus {
+            state,
+            started_at_unix_ms,
+            elapsed_ms,
+            bytes_received,
+            tool_call_id,
+        } => Some((
+            EventActor::System,
+            EventPayload::ProviderStatusUpdate {
+                state: *state,
+                started_at_unix_ms: *started_at_unix_ms,
+                elapsed_ms: *elapsed_ms,
+                bytes_received: *bytes_received,
+                tool_call_id: tool_call_id.clone(),
+            },
+        )),
         AgentEvent::TextDelta { .. }
         | AgentEvent::MessageStart { .. }
         | AgentEvent::AgentStart
@@ -366,14 +382,7 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
         // InputRequired is a transient wire-level prompt; the
         // resulting ToolCall (approved) or ToolResult (denied)
         // already lands in the log.
-        | AgentEvent::InputRequired { .. }
-        // ProviderStatus is a wire-level lifecycle ping that
-        // doesn't need to land in the durable log. The transitions
-        // it describes are already derivable from the existing
-        // logged events (UserMessage, AssistantMessageEvent,
-        // ToolCall, ToolResult, Done). v2 may add an
-        // EventPayload::ProviderStatus if there's a consumer.
-        | AgentEvent::ProviderStatus { .. } => None,
+        | AgentEvent::InputRequired { .. } => None,
     }
 }
 
@@ -522,6 +531,38 @@ mod tests {
                 to_log_event(&ev).is_none(),
                 "expected no log entry for {ev:?}"
             );
+        }
+    }
+
+    #[test]
+    fn log_records_provider_status_update() {
+        // mu-pex Phase 1.5: AgentEvent::ProviderStatus is now durable
+        // (previously dropped). The shape carries through with all
+        // fields preserved and EventActor::System.
+        let ev = AgentEvent::ProviderStatus {
+            state: mu_core::protocol::ProviderStatusKind::Streaming,
+            started_at_unix_ms: 1_000_000,
+            elapsed_ms: 0,
+            bytes_received: Some(512),
+            tool_call_id: None,
+        };
+        let (actor, payload) = to_log_event(&ev).expect("ProviderStatus → log");
+        assert!(matches!(actor, EventActor::System));
+        match payload {
+            EventPayload::ProviderStatusUpdate {
+                state,
+                started_at_unix_ms,
+                elapsed_ms,
+                bytes_received,
+                tool_call_id,
+            } => {
+                assert_eq!(state, mu_core::protocol::ProviderStatusKind::Streaming);
+                assert_eq!(started_at_unix_ms, 1_000_000);
+                assert_eq!(elapsed_ms, 0);
+                assert_eq!(bytes_received, Some(512));
+                assert!(tool_call_id.is_none());
+            }
+            other => panic!("expected ProviderStatusUpdate, got {other:?}"),
         }
     }
 
@@ -779,6 +820,7 @@ mod tests {
                 EventPayload::Callout { .. } => "callout",
                 EventPayload::SessionClosed => "session_closed",
                 EventPayload::ContextAssembly { .. } => "context_assembly",
+                EventPayload::ProviderStatusUpdate { .. } => "provider_status_update",
             })
             .collect();
         assert_eq!(kinds, vec!["assistant_message", "done"]);

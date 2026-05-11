@@ -22,7 +22,7 @@
 //! aggregation independent of the in-memory log type.
 
 use crate::event_log::{EventPayload, SessionEvent};
-use crate::protocol::{PercentileStats, UsageHistoryRow};
+use crate::protocol::{PercentileStats, ProviderStatusKind, UsageHistoryRow};
 
 /// One session's contribution to the usage-history projection.
 /// Distribution fields carry **all** sample values (per-ask,
@@ -39,6 +39,15 @@ pub struct PerSessionMetrics {
     /// One value per (ContextAssembly, next AssistantMessageEvent)
     /// pair. Proxy for "model turn-around latency."
     pub model_call_latency_ms_samples: Vec<u64>,
+    /// Time-to-first-token: one value per
+    /// `AwaitingFirstToken→<any-other-state>` transition observed
+    /// via durable ProviderStatusUpdate events (mu-pex Phase 1.5).
+    pub ttft_ms_samples: Vec<u64>,
+    /// Streaming-state duration: one value per
+    /// `Streaming→<any-other-state>` transition. Multiple per call
+    /// when Streaming is interrupted (e.g. by ToolExecuting and
+    /// resumed).
+    pub streaming_ms_samples: Vec<u64>,
     /// One value per (ToolCall, ToolResult) pair, matched by call_id.
     pub tool_ms_samples: Vec<u64>,
     pub input_tokens: u64,
@@ -70,6 +79,8 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
         started_at_unix_ms,
         wall_ms_samples: Vec::new(),
         model_call_latency_ms_samples: Vec::new(),
+        ttft_ms_samples: Vec::new(),
+        streaming_ms_samples: Vec::new(),
         tool_ms_samples: Vec::new(),
         input_tokens: 0,
         output_tokens: 0,
@@ -86,6 +97,13 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
     // Most recent unmatched ContextAssembly timestamp (pairs with the
     // next AssistantMessageEvent).
     let mut pending_context_assembly_ts: Option<u64> = None;
+    // mu-pex Phase 1.5: track the most-recent ProviderStatus
+    // *transition* emission (elapsed_ms == 0). When the next
+    // transition arrives, the gap measures how long we spent in the
+    // previous state. Periodic ticks (elapsed_ms > 0) share their
+    // state's started_at_unix_ms with the opening transition and are
+    // redundant for duration math; skip them.
+    let mut last_provider_status_transition: Option<(ProviderStatusKind, u64)> = None;
 
     for ev in events {
         match &ev.payload {
@@ -132,6 +150,33 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
             }
             EventPayload::Error { .. } => {
                 m.error_count = m.error_count.saturating_add(1);
+            }
+            EventPayload::ProviderStatusUpdate {
+                state,
+                started_at_unix_ms,
+                elapsed_ms,
+                ..
+            } => {
+                // Only transition emissions participate in duration
+                // math. Periodic ticks (elapsed_ms > 0) share
+                // started_at_unix_ms with the opening transition.
+                if *elapsed_ms == 0 {
+                    if let Some((prev_state, prev_started_at)) =
+                        last_provider_status_transition.take()
+                    {
+                        let duration = started_at_unix_ms.saturating_sub(prev_started_at);
+                        match prev_state {
+                            ProviderStatusKind::AwaitingFirstToken => {
+                                m.ttft_ms_samples.push(duration);
+                            }
+                            ProviderStatusKind::Streaming => {
+                                m.streaming_ms_samples.push(duration);
+                            }
+                            _ => {}
+                        }
+                    }
+                    last_provider_status_transition = Some((*state, *started_at_unix_ms));
+                }
             }
             // Variants that don't carry usage-history signal: skip.
             EventPayload::UserMessage { .. }
@@ -181,6 +226,8 @@ pub fn aggregate_into_rows(
             // pooled set.
             let mut wall: Vec<u64> = Vec::new();
             let mut model_call_lat: Vec<u64> = Vec::new();
+            let mut ttft: Vec<u64> = Vec::new();
+            let mut streaming: Vec<u64> = Vec::new();
             let mut tool: Vec<u64> = Vec::new();
             let mut input_tokens_sum: u64 = 0;
             let mut output_tokens_sum: u64 = 0;
@@ -195,6 +242,8 @@ pub fn aggregate_into_rows(
             for m in members {
                 wall.extend(m.wall_ms_samples);
                 model_call_lat.extend(m.model_call_latency_ms_samples);
+                ttft.extend(m.ttft_ms_samples);
+                streaming.extend(m.streaming_ms_samples);
                 tool.extend(m.tool_ms_samples);
                 input_tokens_sum = input_tokens_sum.saturating_add(m.input_tokens);
                 output_tokens_sum = output_tokens_sum.saturating_add(m.output_tokens);
@@ -218,8 +267,8 @@ pub fn aggregate_into_rows(
                 model,
                 bucket_start_unix_ms: effective_bucket_start,
                 session_count,
-                ttft_ms: None,        // Phase 1.5
-                streaming_ms: None,   // Phase 1.5
+                ttft_ms: percentile_stats(ttft),
+                streaming_ms: percentile_stats(streaming),
                 model_call_latency_ms: percentile_stats(model_call_lat),
                 tool_total_ms: percentile_stats(tool).unwrap_or(PercentileStats {
                     median: 0,
@@ -482,6 +531,145 @@ mod tests {
         assert_eq!(m.output_tokens, 70);
     }
 
+    // ===== mu-pex Phase 1.5: ProviderStatusUpdate-driven samples =====
+
+    fn ps(
+        id: u64,
+        ts: u64,
+        state: ProviderStatusKind,
+        started_at: u64,
+        elapsed_ms: u64,
+    ) -> SessionEvent {
+        ev(
+            id,
+            ts,
+            EventPayload::ProviderStatusUpdate {
+                state,
+                started_at_unix_ms: started_at,
+                elapsed_ms,
+                bytes_received: None,
+                tool_call_id: None,
+            },
+        )
+    }
+
+    fn session_started_at(ts: u64) -> SessionEvent {
+        ev(
+            1,
+            ts,
+            EventPayload::SessionCreated {
+                provider_kind: "anthropic_api".into(),
+                model: "haiku".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+            },
+        )
+    }
+
+    #[test]
+    fn extraction_computes_ttft_from_awaiting_first_token_transition() {
+        // AwaitingFirstToken @ 1000 → Streaming @ 1250 ⇒ TTFT = 250.
+        let events = vec![
+            session_started_at(900),
+            ps(2, 1000, ProviderStatusKind::AwaitingFirstToken, 1000, 0),
+            ps(3, 1250, ProviderStatusKind::Streaming, 1250, 0),
+        ];
+        let m = extract_per_session_metrics(&events).unwrap();
+        assert_eq!(m.ttft_ms_samples, vec![250]);
+        assert_eq!(m.streaming_ms_samples, Vec::<u64>::new());
+    }
+
+    #[test]
+    fn extraction_periodic_ticks_do_not_close_a_state_period() {
+        // Three AwaitingFirstToken events: transition + two ticks
+        // (elapsed_ms > 0). Then Streaming closes the period.
+        // TTFT should be 2000 (3000 − 1000), not 800 or 1700.
+        let events = vec![
+            session_started_at(900),
+            ps(2, 1000, ProviderStatusKind::AwaitingFirstToken, 1000, 0),
+            ps(3, 1800, ProviderStatusKind::AwaitingFirstToken, 1000, 800),
+            ps(4, 2700, ProviderStatusKind::AwaitingFirstToken, 1000, 1700),
+            ps(5, 3000, ProviderStatusKind::Streaming, 3000, 0),
+        ];
+        let m = extract_per_session_metrics(&events).unwrap();
+        assert_eq!(m.ttft_ms_samples, vec![2000]);
+    }
+
+    #[test]
+    fn extraction_records_streaming_periods_separately() {
+        // Streaming → ToolExecuting → AwaitingToolResult → Streaming
+        // → Idle ⇒ two streaming periods (interrupted by a tool).
+        let events = vec![
+            session_started_at(900),
+            ps(2, 1000, ProviderStatusKind::AwaitingFirstToken, 1000, 0),
+            ps(3, 1100, ProviderStatusKind::Streaming, 1100, 0),
+            ps(4, 1400, ProviderStatusKind::ToolExecuting, 1400, 0),
+            ps(5, 1500, ProviderStatusKind::AwaitingToolResult, 1500, 0),
+            ps(6, 1800, ProviderStatusKind::Streaming, 1800, 0),
+            ps(7, 2200, ProviderStatusKind::Idle, 2200, 0),
+        ];
+        let m = extract_per_session_metrics(&events).unwrap();
+        // TTFT: 1100 − 1000 = 100.
+        assert_eq!(m.ttft_ms_samples, vec![100]);
+        // Streaming periods: (1100→1400) = 300, (1800→2200) = 400.
+        assert_eq!(m.streaming_ms_samples, vec![300, 400]);
+    }
+
+    #[test]
+    fn extraction_unterminated_state_period_is_dropped() {
+        // AwaitingFirstToken with no follow-up transition (e.g. session
+        // still in flight or aborted before first token). The opening
+        // transition shouldn't contribute a sample.
+        let events = vec![
+            session_started_at(900),
+            ps(2, 1000, ProviderStatusKind::AwaitingFirstToken, 1000, 0),
+        ];
+        let m = extract_per_session_metrics(&events).unwrap();
+        assert!(m.ttft_ms_samples.is_empty());
+        assert!(m.streaming_ms_samples.is_empty());
+    }
+
+    #[test]
+    fn aggregation_populates_ttft_and_streaming_in_row() {
+        let mut m = PerSessionMetrics {
+            provider_kind: "p".into(),
+            model: "m".into(),
+            started_at_unix_ms: 1_000,
+            wall_ms_samples: vec![],
+            model_call_latency_ms_samples: vec![],
+            ttft_ms_samples: vec![100, 250, 400],
+            streaming_ms_samples: vec![300, 500],
+            tool_ms_samples: vec![],
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            reasoning_tokens: 0,
+            tool_call_count: 0,
+            error_count: 0,
+        };
+        let rows = aggregate_into_rows(vec![m.clone()], None);
+        assert_eq!(rows.len(), 1);
+        let ttft = rows[0].ttft_ms.as_ref().expect("ttft populated");
+        assert_eq!(ttft.median, 250);
+        assert_eq!(ttft.count, 3);
+        let streaming = rows[0]
+            .streaming_ms
+            .as_ref()
+            .expect("streaming populated");
+        assert_eq!(streaming.median, 400); // (300+500)/2
+        assert_eq!(streaming.count, 2);
+
+        // And: when there are no provider-status samples in the
+        // group, the row's ttft_ms and streaming_ms stay None — same
+        // shape as Phase 1 behavior.
+        m.ttft_ms_samples.clear();
+        m.streaming_ms_samples.clear();
+        let rows = aggregate_into_rows(vec![m], None);
+        assert!(rows[0].ttft_ms.is_none());
+        assert!(rows[0].streaming_ms.is_none());
+    }
+
     #[test]
     fn percentile_n1() {
         let s = percentile_stats(vec![42]).unwrap();
@@ -530,6 +718,8 @@ mod tests {
             started_at_unix_ms: 1_000,
             wall_ms_samples: vec![100, 200],
             model_call_latency_ms_samples: vec![50],
+            ttft_ms_samples: vec![],
+            streaming_ms_samples: vec![],
             tool_ms_samples: vec![],
             input_tokens: 10,
             output_tokens: 5,
@@ -545,6 +735,8 @@ mod tests {
             started_at_unix_ms: 1_500,
             wall_ms_samples: vec![300],
             model_call_latency_ms_samples: vec![60],
+            ttft_ms_samples: vec![],
+            streaming_ms_samples: vec![],
             tool_ms_samples: vec![25],
             input_tokens: 7,
             output_tokens: 3,
@@ -560,6 +752,8 @@ mod tests {
             started_at_unix_ms: 1_200,
             wall_ms_samples: vec![400],
             model_call_latency_ms_samples: vec![],
+            ttft_ms_samples: vec![],
+            streaming_ms_samples: vec![],
             tool_ms_samples: vec![],
             input_tokens: 8,
             output_tokens: 4,
@@ -603,6 +797,8 @@ mod tests {
             started_at_unix_ms: started,
             wall_ms_samples: vec![100],
             model_call_latency_ms_samples: vec![],
+            ttft_ms_samples: vec![],
+            streaming_ms_samples: vec![],
             tool_ms_samples: vec![],
             input_tokens: 1,
             output_tokens: 1,

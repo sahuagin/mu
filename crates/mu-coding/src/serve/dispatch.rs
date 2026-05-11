@@ -768,5 +768,6 @@ fn payload_kind_str(p: &EventPayload) -> &'static str {
         EventPayload::Callout { .. } => "callout",
         EventPayload::SessionClosed => "session_closed",
         EventPayload::ContextAssembly { .. } => "context_assembly",
+        EventPayload::ProviderStatusUpdate { .. } => "provider_status_update",
     }
 }

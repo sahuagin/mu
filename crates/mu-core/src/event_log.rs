@@ -149,6 +149,31 @@ pub enum EventPayload {
         provider_kind: String,
         model: String,
     },
+    /// Durable mirror of the wire-side `session.provider_status`
+    /// notification (mu-035). Emitted on state transitions and on
+    /// periodic ticks during non-streaming waits, both for
+    /// observability (live TUI / firehose) and for post-hoc
+    /// aggregation (mu-pex: TTFT = AwaitingFirstToken→Streaming gap,
+    /// streaming_ms = time in Streaming per call). Field shape
+    /// mirrors `crate::protocol::ProviderStatusEvent` minus
+    /// `session_id` — the log already knows its session.
+    ProviderStatusUpdate {
+        state: crate::protocol::ProviderStatusKind,
+        /// Unix milliseconds the session entered this state.
+        started_at_unix_ms: u64,
+        /// Milliseconds since `started_at_unix_ms` at emit time.
+        /// Periodic ticks during a long wait re-emit with this
+        /// value advancing; transitions emit with elapsed_ms = 0.
+        elapsed_ms: u64,
+        /// Cumulative bytes from the provider's SSE stream so far.
+        /// None when not meaningful (Idle, pre-first-byte
+        /// AwaitingFirstToken, providers that don't surface counts).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bytes_received: Option<u64>,
+        /// Set only when `state` is ToolExecuting or AwaitingToolResult.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
+    },
 }
 
 /// Append-only per-session log.

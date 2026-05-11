@@ -22,6 +22,7 @@ pub mod capability;
 pub mod event_log;
 pub mod protocol;
 pub mod transport;
+pub mod usage_history;
 
 /// Returns the crate version. Wired up so the workspace `cargo build`
 /// produces something callable from day one.

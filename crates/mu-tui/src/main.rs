@@ -1514,16 +1514,32 @@ fn render_transcript_lines(
                             .join("")
                     })
                     .unwrap_or_default();
+                let has_tool_call = payload
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter().any(|block| {
+                            block.get("type").and_then(|v| v.as_str())
+                                == Some("tool_call")
+                        })
+                    })
+                    .unwrap_or(false);
                 if text.is_empty() {
-                    // Fall through to a small debug marker so the
-                    // block is visible even with no text (e.g.
-                    // tool-only turns).
-                    push_block(
-                        &mut lines,
-                        "assistant",
-                        Color::White,
-                        "(no text in this turn)",
-                    );
+                    // Tool-only turns: the magenta tool block(s) below
+                    // are the visible record of what the model did —
+                    // skip the empty "assistant" header (mu-ooy). If
+                    // text is empty AND no tool_calls are present,
+                    // surface a debug marker so the turn stays visible
+                    // (shouldn't normally happen).
+                    if !has_tool_call {
+                        push_block(
+                            &mut lines,
+                            "assistant",
+                            Color::White,
+                            "(no text in this turn)",
+                        );
+                    }
                 } else {
                     push_block(&mut lines, "assistant", Color::White, &text);
                 }

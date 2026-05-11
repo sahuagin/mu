@@ -25,6 +25,10 @@ pub struct BashSettings {
     /// (only meaningful when `yolo == false`). Each parsed via
     /// shlex.
     pub extra_allow: Vec<String>,
+    /// When true, strict mode requires per-call user approval via
+    /// the mu-029 session.input_required flow. Ignored in yolo mode.
+    /// User opt-in via `--bash-prompt`.
+    pub prompt: bool,
 }
 
 /// Factory closure for constructing a provider per session, from
@@ -164,7 +168,12 @@ pub fn build_tools(
                     );
                     BashMode::Yolo
                 } else {
-                    BashMode::strict_with_extras(&bash.extra_allow)
+                    if bash.prompt {
+                        tracing::info!(
+                            "bash tool: strict + per-call approval (mu-029) active."
+                        );
+                    }
+                    BashMode::strict_with_extras(&bash.extra_allow, bash.prompt)
                 };
                 Ok(Arc::new(BashTool::new(mode)) as Arc<dyn Tool>)
             }
@@ -354,10 +363,29 @@ mod tests {
             &BashSettings {
                 yolo: true,
                 extra_allow: vec![],
+                prompt: false,
             },
         )
         .expect("build_tools(bash, yolo) should succeed");
         assert!(tools[0].spec().description.contains("YOLO MODE"));
+
+        // Strict + prompt should give an Ask-permission policy
+        // and a description containing "WITH APPROVAL".
+        let tools = build_tools(
+            &["bash".to_string()],
+            &BashSettings {
+                yolo: false,
+                extra_allow: vec![],
+                prompt: true,
+            },
+        )
+        .expect("build_tools(bash, strict+prompt) should succeed");
+        let spec = tools[0].spec();
+        assert!(spec.description.contains("WITH APPROVAL"));
+        assert_eq!(
+            spec.policy.permission,
+            mu_core::agent::PermissionLevel::Ask
+        );
 
         match build_tools_default(&["bogus".to_string()]) {
             Ok(_) => panic!("expected error for unknown tool"),

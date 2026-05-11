@@ -87,15 +87,26 @@ const SHELL_METACHARS: &[char] = &[';', '&', '|', '>', '<', '`', '$', '\\', '\n'
 /// Two-mode tool. See module docs.
 #[derive(Debug, Clone)]
 pub enum BashMode {
-    Strict { allowlist: Vec<Vec<String>> },
+    Strict {
+        allowlist: Vec<Vec<String>>,
+        /// When true, the bash tool's policy is `PermissionLevel::Ask`
+        /// — every (allowlist-passing) invocation triggers a
+        /// `session.input_required` prompt before running. When
+        /// false, runs immediately on allowlist match. Defaults to
+        /// false to preserve current behavior; users opt in via
+        /// `--bash-prompt`.
+        prompt: bool,
+    },
     Yolo,
 }
 
 impl BashMode {
     /// Construct a strict-mode allowlist from the default + extras.
     /// Each entry in `extras` is parsed via shlex; invalid entries
-    /// are dropped with a warning log.
-    pub fn strict_with_extras(extras: &[String]) -> Self {
+    /// are dropped with a warning log. `prompt = false` matches the
+    /// classic strict semantics; `prompt = true` activates the
+    /// mu-029 session.input_required gate on every allowlisted call.
+    pub fn strict_with_extras(extras: &[String], prompt: bool) -> Self {
         let mut allowlist: Vec<Vec<String>> = DEFAULT_ALLOWLIST
             .iter()
             .filter_map(|s| shlex::split(s))
@@ -111,7 +122,7 @@ impl BashMode {
                 }
             }
         }
-        BashMode::Strict { allowlist }
+        BashMode::Strict { allowlist, prompt }
     }
 }
 
@@ -129,7 +140,7 @@ impl BashTool {
 impl Tool for BashTool {
     fn spec(&self) -> ToolSpec {
         let (mode_note, policy) = match &self.mode {
-            BashMode::Strict { .. } => (
+            BashMode::Strict { prompt: false, .. } => (
                 "STRICT MODE: only allowlisted commands run. Shell metas (; & | > < ` $ \\) are \
                  rejected. The allowlist includes read-only commands like `git status`, `ls`, \
                  `cat`. IMPORTANT: if a command is rejected (allowlist miss, metachar reject), \
@@ -145,6 +156,19 @@ impl Tool for BashTool {
                     // the runtime enforce this even when the model gets confused.
                     retry: RetryPolicy::Never,
                     idempotent: false, // file system can change between calls
+                },
+            ),
+            BashMode::Strict { prompt: true, .. } => (
+                "STRICT MODE WITH APPROVAL: only allowlisted commands run, AND each invocation \
+                 requires explicit user approval via session.input_required before it dispatches. \
+                 Same allowlist + metachar rejection rules as classic strict. If a command is \
+                 rejected, DO NOT retry with variants. If approval is denied, accept that and \
+                 either try a different approach or report to the user.",
+                ToolPolicy {
+                    side_effects: SideEffects::Mutating,
+                    permission: PermissionLevel::Ask,
+                    retry: RetryPolicy::Never,
+                    idempotent: false,
                 },
             ),
             BashMode::Yolo => (
@@ -221,7 +245,7 @@ impl Tool for BashTool {
             let timeout = Duration::from_secs(timeout_secs);
 
             let mut cmd = match &mode {
-                BashMode::Strict { allowlist } => {
+                BashMode::Strict { allowlist, .. } => {
                     // Reject shell metas first — cheaper than parsing.
                     if let Some(c) = command.chars().find(|c| SHELL_METACHARS.contains(c)) {
                         return ToolResult {
@@ -412,7 +436,7 @@ mod tests {
 
     #[test]
     fn spec_describes_bash_tool() {
-        let strict = BashTool::new(BashMode::strict_with_extras(&[]));
+        let strict = BashTool::new(BashMode::strict_with_extras(&[], false));
         let s = strict.spec();
         assert_eq!(s.name, "bash");
         assert!(s.description.contains("STRICT MODE"));
@@ -468,7 +492,7 @@ mod tests {
 
     #[tokio::test]
     async fn b1_strict_allowlisted_runs() -> Result<(), Box<dyn Error>> {
-        let mode = BashMode::strict_with_extras(&[]);
+        let mode = BashMode::strict_with_extras(&[], false);
         let result = execute_bash(mode, json!({ "command": "echo hello" })).await;
         assert!(!result.is_error, "got: {}", result.content);
         assert!(result.content.contains("hello"));
@@ -478,7 +502,7 @@ mod tests {
 
     #[tokio::test]
     async fn b2_strict_not_allowed_refused() {
-        let mode = BashMode::strict_with_extras(&[]);
+        let mode = BashMode::strict_with_extras(&[], false);
         let result = execute_bash(mode, json!({ "command": "rm /tmp/foo" })).await;
         assert!(result.is_error);
         assert!(result.content.contains("not in the strict-mode allowlist"));
@@ -487,14 +511,14 @@ mod tests {
 
     #[tokio::test]
     async fn b3_extended_allowlist() {
-        let mode = BashMode::strict_with_extras(&["true".to_string()]);
+        let mode = BashMode::strict_with_extras(&["true".to_string()], false);
         let result = execute_bash(mode, json!({ "command": "true" })).await;
         assert!(!result.is_error, "got: {}", result.content);
     }
 
     #[tokio::test]
     async fn b4_strict_metacharacters_rejected() {
-        let mode = BashMode::strict_with_extras(&[]);
+        let mode = BashMode::strict_with_extras(&[], false);
         for cmd in [
             "ls; rm -rf /",
             "echo hi | wc -l",
@@ -520,7 +544,7 @@ mod tests {
         std::env::set_var("MU_TEST_BASH_API_KEY", "should-not-leak");
         // Use printenv with a single var name — read-only & cheap.
         // It's not in the default allowlist, so extend.
-        let mode = BashMode::strict_with_extras(&["printenv".to_string()]);
+        let mode = BashMode::strict_with_extras(&["printenv".to_string()], false);
         let result = execute_bash(
             mode,
             json!({ "command": "printenv MU_TEST_BASH_API_KEY" }),
@@ -540,7 +564,7 @@ mod tests {
 
     #[tokio::test]
     async fn b6_strict_timeout() {
-        let mode = BashMode::strict_with_extras(&["sleep".to_string()]);
+        let mode = BashMode::strict_with_extras(&["sleep".to_string()], false);
         let result = execute_bash(
             mode,
             json!({ "command": "sleep 5", "timeout_secs": 1 }),
@@ -552,7 +576,7 @@ mod tests {
 
     #[tokio::test]
     async fn b8_strict_nonzero_exit_is_error() -> Result<(), Box<dyn Error>> {
-        let mode = BashMode::strict_with_extras(&["false".to_string()]);
+        let mode = BashMode::strict_with_extras(&["false".to_string()], false);
         let result = execute_bash(mode, json!({ "command": "false" })).await;
         assert!(result.is_error);
         assert!(result.content.contains("exit:"));
@@ -588,7 +612,7 @@ mod tests {
     #[tokio::test]
     async fn b11_strict_default_allowlist_runs_git_status() {
         // git status is in the default allowlist.
-        let mode = BashMode::strict_with_extras(&[]);
+        let mode = BashMode::strict_with_extras(&[], false);
         let result = execute_bash(mode, json!({ "command": "git status --short" })).await;
         // Doesn't matter what `git status` returns — what matters
         // is that the allowlist check passed (i.e. we don't see
@@ -602,7 +626,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_command_errors() {
-        let mode = BashMode::strict_with_extras(&[]);
+        let mode = BashMode::strict_with_extras(&[], false);
         let result = execute_bash(mode, json!({})).await;
         assert!(result.is_error);
         assert!(result.content.contains("missing required `command`"));
@@ -610,7 +634,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_command_errors() {
-        let mode = BashMode::strict_with_extras(&[]);
+        let mode = BashMode::strict_with_extras(&[], false);
         let result = execute_bash(mode, json!({ "command": "   " })).await;
         assert!(result.is_error);
         assert!(result.content.contains("empty"));

@@ -8,11 +8,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use mu_core::agent::AgentInput;
 use mu_core::event_log::SessionEventLog;
+use mu_core::protocol::ApprovalDecision;
 
 /// Per-session state held by the daemon.
 struct SessionState {
@@ -28,6 +29,12 @@ struct SessionState {
     /// usage queries, future replay) snapshot via the log's own
     /// methods.
     event_log: Arc<SessionEventLog>,
+    /// Outstanding `session.input_required` prompts (mu-029). Keyed
+    /// by `request_id`. When the client responds via
+    /// `session.respond_to_input_required`, dispatch::handle_…
+    /// pulls the matching oneshot out and sends the decision; the
+    /// agent loop receives it and continues.
+    pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>,
 }
 
 /// In-memory session registry. Cheap to clone (Arc-backed).
@@ -51,7 +58,7 @@ impl Sessions {
 
     /// Insert a new session. Caller has already spawned the agent
     /// loop and forwarder; this just stores their handles + the
-    /// session's event log.
+    /// session's event log + the pending-approvals registry.
     pub fn insert(
         &self,
         id: String,
@@ -59,6 +66,7 @@ impl Sessions {
         forwarder: JoinHandle<()>,
         agent: JoinHandle<()>,
         event_log: Arc<SessionEventLog>,
+        pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>,
     ) {
         if let Ok(mut map) = self.inner.lock() {
             map.insert(
@@ -68,6 +76,7 @@ impl Sessions {
                     _forwarder: forwarder,
                     _agent: agent,
                     event_log,
+                    pending_approvals,
                 },
             );
         }
@@ -100,6 +109,21 @@ impl Sessions {
             .ok()?
             .get(id)
             .map(|s| s.event_log.clone())
+    }
+
+    /// Take a pending-approval oneshot off the session's registry
+    /// for `request_id`. Returns None if the request_id isn't
+    /// outstanding (already answered, expired, or never existed).
+    /// The caller sends a decision on the returned channel.
+    pub fn take_pending_approval(
+        &self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Option<oneshot::Sender<ApprovalDecision>> {
+        let map = self.inner.lock().ok()?;
+        let state = map.get(session_id)?;
+        let mut pending = state.pending_approvals.lock().ok()?;
+        pending.remove(request_id)
     }
 
     /// Remove a session. Dropping its `SessionState` drops the
@@ -141,12 +165,61 @@ mod tests {
         let agent = tokio::spawn(async {});
         let log = Arc::new(SessionEventLog::new(id.clone()));
 
-        sessions.insert(id.clone(), tx, forwarder, agent, log);
+        let approvals = Arc::new(Mutex::new(HashMap::new()));
+        sessions.insert(id.clone(), tx, forwarder, agent, log, approvals);
         assert!(sessions.input_sender(&id).is_some());
         assert!(sessions.event_log(&id).is_some());
         assert!(sessions.remove(&id));
         assert!(sessions.input_sender(&id).is_none());
         assert!(sessions.event_log(&id).is_none());
         assert!(!sessions.remove(&id));
+    }
+
+    #[tokio::test]
+    async fn take_pending_approval_round_trips_via_oneshot() {
+        let sessions = Sessions::new();
+        let id = "session-pending".to_string();
+        let (tx, _rx) = mpsc::channel::<AgentInput>(1);
+        let log = Arc::new(SessionEventLog::new(id.clone()));
+        let approvals = Arc::new(Mutex::new(HashMap::new()));
+
+        // Pre-populate one pending approval before the session is
+        // even fully wired — this mirrors what the agent loop does
+        // (it inserts before emitting the notification).
+        let (decision_tx, decision_rx) = oneshot::channel::<ApprovalDecision>();
+        approvals
+            .lock()
+            .unwrap()
+            .insert("req-1".to_string(), decision_tx);
+
+        sessions.insert(
+            id.clone(),
+            tx,
+            tokio::spawn(async {}),
+            tokio::spawn(async {}),
+            log,
+            approvals,
+        );
+
+        // Take the pending oneshot, simulating the dispatch handler.
+        let sender = sessions
+            .take_pending_approval(&id, "req-1")
+            .expect("pending approval should be present");
+        sender.send(ApprovalDecision::Approve).expect("send decision");
+
+        // Verify the receiver got it.
+        let got = decision_rx.await.expect("recv decision");
+        assert_eq!(got, ApprovalDecision::Approve);
+
+        // Second take returns None (already consumed).
+        assert!(sessions.take_pending_approval(&id, "req-1").is_none());
+        // Unknown request_id returns None.
+        assert!(sessions
+            .take_pending_approval(&id, "req-doesnt-exist")
+            .is_none());
+        // Unknown session returns None.
+        assert!(sessions
+            .take_pending_approval("session-nope", "req-1")
+            .is_none());
     }
 }

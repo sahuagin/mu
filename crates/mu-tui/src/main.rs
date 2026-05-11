@@ -999,7 +999,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             Constraint::Length(3),       // header
             Constraint::Length(2),       // mode tabs
             Constraint::Min(10),         // main body
-            Constraint::Length(5),       // firehose
+            Constraint::Length(10),      // firehose (8 lines content + borders)
             Constraint::Length(1),       // status line
         ])
         .split(area);
@@ -1591,15 +1591,25 @@ fn render_placeholder(f: &mut Frame, area: Rect, name: &str, fkey: &str) {
 }
 
 fn render_firehose(f: &mut Frame, app: &App, area: Rect) {
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let total = app.firehose.len();
     let lines: Vec<Line> = app
         .firehose
         .iter()
         .rev()
-        .take(area.height.saturating_sub(2) as usize)
+        .take(inner_height)
         .rev()
         .map(|s| Line::from(s.as_str()))
         .collect();
-    let block = Block::default().borders(Borders::ALL).title(" Firehose ");
+    // Surface in the title how much history exists vs is visible —
+    // F8 (events explorer, mu-6fv) is the proper place to scroll
+    // through the full log. Firehose is the recent-tail strip.
+    let title = if total > inner_height {
+        format!(" Firehose · last {inner_height} of {total} · F8 for full ")
+    } else {
+        format!(" Firehose · {total} events ")
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
     let paragraph = Paragraph::new(lines).block(block);
     f.render_widget(paragraph, area);
 }

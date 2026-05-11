@@ -770,3 +770,39 @@ fn tool_history_clear_empties_window() {
     assert!(!h.errored_match("bash", &json!({"command": "x"})));
     assert!(h.entries.is_empty());
 }
+
+#[test]
+fn tool_history_streak_counts_consecutive_errors_per_tool() {
+    let mut h = ToolHistory::default();
+    // Three different bash commands, all errored. The streak from
+    // bash's perspective is 3, regardless of args.
+    h.record("bash".into(), json!({"command": "a"}), true);
+    h.record("bash".into(), json!({"command": "b"}), true);
+    h.record("bash".into(), json!({"command": "c"}), true);
+    assert_eq!(h.consecutive_errors_for("bash"), 3);
+    // Other tools at zero.
+    assert_eq!(h.consecutive_errors_for("read"), 0);
+}
+
+#[test]
+fn tool_history_streak_breaks_on_success() {
+    let mut h = ToolHistory::default();
+    h.record("bash".into(), json!({"command": "a"}), true);
+    h.record("bash".into(), json!({"command": "b"}), true);
+    // Success in the middle breaks the streak.
+    h.record("bash".into(), json!({"command": "c"}), false);
+    h.record("bash".into(), json!({"command": "d"}), true);
+    // From the latest entry walking back: error (d), then success
+    // (c) — streak is 1.
+    assert_eq!(h.consecutive_errors_for("bash"), 1);
+}
+
+#[test]
+fn tool_history_streak_skips_other_tools_without_breaking() {
+    let mut h = ToolHistory::default();
+    h.record("bash".into(), json!({"command": "a"}), true);
+    h.record("read".into(), json!({"path": "/x"}), false); // unrelated, skipped
+    h.record("bash".into(), json!({"command": "b"}), true);
+    // bash streak from newest: error, [skip read], error — count 2.
+    assert_eq!(h.consecutive_errors_for("bash"), 2);
+}

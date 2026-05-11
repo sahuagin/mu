@@ -11,8 +11,8 @@
 //! - Termination via no-tool-calls assistant message, iteration cap,
 //!   `Cancel`, or unrecoverable error.
 
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use futures::StreamExt;
@@ -20,10 +20,20 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::protocol::ApprovalDecision;
+
 use super::provider::{Provider, ProviderEvent};
 use super::types::Usage;
-use super::tool::{RetryPolicy, Tool, ToolResult, ToolSpec};
+use super::tool::{PermissionLevel, RetryPolicy, Tool, ToolResult, ToolSpec};
 use super::types::{AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolCall};
+
+/// Map of outstanding `session.input_required` prompts, keyed by
+/// `request_id`. Owned by the daemon's `Sessions` registry but
+/// shared with the AgentLoop so it can both insert pending approvals
+/// (before emitting `AgentEvent::InputRequired`) and have its
+/// counterpart in the daemon's dispatch handler take entries out
+/// when responses arrive.
+pub type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>;
 
 /// External inputs callers push to a running agent loop.
 #[derive(Debug, Clone)]
@@ -96,6 +106,17 @@ pub enum AgentEvent {
         body: serde_json::Value,
         theme: Option<String>,
         context_refs: Vec<String>,
+    },
+    /// A tool whose policy is `PermissionLevel::Ask` is about to
+    /// dispatch; the agent loop is blocked waiting for a
+    /// `session.respond_to_input_required` matching `request_id`
+    /// before it proceeds. See spec mu-029.
+    InputRequired {
+        request_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        arguments: serde_json::Value,
+        summary: String,
     },
 }
 
@@ -232,14 +253,23 @@ pub struct AgentLoop {
 
 impl AgentLoop {
     /// Spawn a new agent loop on the current tokio runtime.
+    ///
+    /// `pending_approvals` is the shared registry the loop uses when
+    /// dispatching tools with `PermissionLevel::Ask`: it inserts a
+    /// fresh oneshot under a generated `request_id`, emits
+    /// `AgentEvent::InputRequired`, then awaits the oneshot. The
+    /// daemon's dispatch handler for `session.respond_to_input_required`
+    /// is responsible for taking the oneshot out and sending the
+    /// decision.
     pub fn spawn(
         provider: Arc<dyn Provider>,
         tools: Vec<Arc<dyn Tool>>,
         config: AgentConfig,
         events: mpsc::Sender<AgentEvent>,
+        pending_approvals: PendingApprovals,
     ) -> Self {
         let (tx, rx) = mpsc::channel(32);
-        let handle = tokio::spawn(run(provider, tools, config, events, rx));
+        let handle = tokio::spawn(run(provider, tools, config, events, rx, pending_approvals));
         Self { tx, handle }
     }
 
@@ -270,6 +300,7 @@ async fn run(
     config: AgentConfig,
     events: mpsc::Sender<AgentEvent>,
     mut input_rx: mpsc::Receiver<AgentInput>,
+    pending_approvals: PendingApprovals,
 ) -> Outcome {
     let mut messages: Vec<AgentMessage> = Vec::new();
     let mut queue: VecDeque<Action> = VecDeque::new();
@@ -400,6 +431,7 @@ async fn run(
                     &mut input_rx,
                     &events,
                     &mut tool_history,
+                    &pending_approvals,
                 )
                 .await
                 {
@@ -484,6 +516,11 @@ async fn run(
 ///      2026-05-10.
 const TOOL_HISTORY_WINDOW: usize = 8;
 const RETRY_STREAK_LIMIT: usize = 3;
+
+/// Monotonic counter used to generate `request_id`s for
+/// `InputRequired` prompts. Combined with the tool_call_id for
+/// readability + uniqueness even across sessions.
+static ASK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[derive(Debug, Default)]
 struct ToolHistory {
@@ -609,6 +646,7 @@ async fn handle_execute_tools(
     input_rx: &mut mpsc::Receiver<AgentInput>,
     events: &mpsc::Sender<AgentEvent>,
     history: &mut ToolHistory,
+    pending_approvals: &PendingApprovals,
 ) -> Result<(Vec<AgentMessage>, Vec<AgentInput>), Outcome> {
     let mut buffered: Vec<AgentInput> = Vec::new();
     let mut tool_messages: Vec<AgentMessage> = Vec::new();
@@ -647,6 +685,79 @@ async fn handle_execute_tools(
             None => None,
         };
 
+        // Permission gate. If the tool's PermissionLevel is Ask,
+        // emit an InputRequired event with a fresh request_id,
+        // register a oneshot in the pending-approvals map, and
+        // await the decision. Approve continues to dispatch; Deny
+        // synthesizes an is_error result. (AskOnce/Always
+        // remembering is reserved for v2.)
+        let permission_decision = if !retry_refusal_reason.is_some() {
+            match tool.as_ref().map(|t| t.spec().policy.permission) {
+                Some(PermissionLevel::Ask) | Some(PermissionLevel::AskOnce) => {
+                    // AskOnce currently treated as Ask in v1; future
+                    // work persists the "approved once" decision so
+                    // subsequent calls skip the prompt.
+                    let request_id = format!("ask-{}-{}", call.id, ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+                    let (decision_tx, decision_rx) = oneshot::channel();
+                    if let Ok(mut pending) = pending_approvals.lock() {
+                        pending.insert(request_id.clone(), decision_tx);
+                    }
+                    let _ = events
+                        .send(AgentEvent::InputRequired {
+                            request_id: request_id.clone(),
+                            tool_call_id: call.id.clone(),
+                            tool_name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                            summary: format!(
+                                "{}({})",
+                                call.name,
+                                serde_json::to_string(&call.arguments)
+                                    .unwrap_or_else(|_| "?".into())
+                            ),
+                        })
+                        .await;
+                    // Race the decision against input_rx for cancel.
+                    let decision = tokio::select! {
+                        d = decision_rx => d.ok(),
+                        input_opt = input_rx.recv() => match input_opt {
+                            Some(AgentInput::Cancel) => {
+                                // Clear the pending entry on cancel
+                                // so the daemon doesn't hold a
+                                // stale sender.
+                                if let Ok(mut pending) = pending_approvals.lock() {
+                                    pending.remove(&request_id);
+                                }
+                                return Err(Outcome::Cancelled);
+                            }
+                            Some(AgentInput::UserMessage(_)) => {
+                                // User sent a message mid-prompt.
+                                // We can't easily buffer + still
+                                // await; treat as implicit cancel
+                                // of this turn.
+                                if let Ok(mut pending) = pending_approvals.lock() {
+                                    pending.remove(&request_id);
+                                }
+                                return Err(Outcome::Cancelled);
+                            }
+                            None => {
+                                if let Ok(mut pending) = pending_approvals.lock() {
+                                    pending.remove(&request_id);
+                                }
+                                return Err(Outcome::Cancelled);
+                            }
+                        },
+                    };
+                    Some(decision.unwrap_or(ApprovalDecision::Deny))
+                }
+                Some(PermissionLevel::Deny) => Some(ApprovalDecision::Deny),
+                _ => None, // Allow or no tool — no gate
+            }
+        } else {
+            None // retry guard takes precedence
+        };
+
+        let permission_denied = matches!(permission_decision, Some(ApprovalDecision::Deny));
+
         let result = if let Some(reason) = retry_refusal_reason {
             let msg = format!(
                 "runtime refused: tool `{}` blocked by RetryPolicy::Never ({reason}). \
@@ -672,6 +783,14 @@ async fn handle_execute_tools(
                 .await;
             ToolResult {
                 content: msg,
+                is_error: true,
+            }
+        } else if permission_denied {
+            ToolResult {
+                content: format!(
+                    "tool `{}` denied by user via session.respond_to_input_required",
+                    call.name
+                ),
                 is_error: true,
             }
         } else {

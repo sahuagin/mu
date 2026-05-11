@@ -182,6 +182,36 @@ pub struct SessionStatsResponse {
     pub usage: Option<crate::agent::Usage>,
 }
 
+/// Respond to an outstanding `session.input_required` notification
+/// (mu-029). The daemon blocks the corresponding tool call until
+/// the client sends this back. `request_id` identifies which prompt
+/// is being answered; `decision` is approve or deny.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RespondToInputRequiredRequest {
+    pub session_id: String,
+    pub request_id: String,
+    pub decision: ApprovalDecision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    Approve,
+    Deny,
+}
+
+impl RespondToInputRequiredRequest {
+    pub const METHOD: &'static str = "session.respond_to_input_required";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RespondToInputRequiredResponse {
+    /// True if the daemon found the pending request and relayed
+    /// the decision. False if the request_id was unknown (already
+    /// answered, timed out, or never existed).
+    pub accepted: bool,
+}
+
 // ===== Event notifications (daemon → frontend) =====
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -257,6 +287,30 @@ pub struct ErrorEvent {
 
 impl ErrorEvent {
     pub const METHOD: &'static str = "session.error";
+}
+
+/// Daemon→client: "the agent is about to call this tool; should it?"
+/// Emitted when a tool's policy says `PermissionLevel::Ask` (or AskOnce
+/// on its first invocation per session). The daemon blocks dispatch
+/// until a matching `session.respond_to_input_required` arrives.
+/// See spec mu-029.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InputRequiredEvent {
+    pub session_id: String,
+    /// Token to match in the corresponding response. Unique per
+    /// pending prompt; the daemon-side registry is keyed on this.
+    pub request_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub arguments: Value,
+    /// Why the agent is asking — typically just a short summary of
+    /// the tool + arguments rendered for the human. Frontends are
+    /// free to show their own UI; this is a fallback.
+    pub summary: String,
+}
+
+impl InputRequiredEvent {
+    pub const METHOD: &'static str = "session.input_required";
 }
 
 /// Catch-all "the agent has something notable to say" notification.
@@ -595,5 +649,60 @@ mod tests {
             Some(Value::Object(error)) => error.get("data"),
             _ => None,
         }
+    }
+
+    // ===== mu-029 session.input_required round-trips =====
+
+    #[test]
+    fn input_required_event_round_trips() -> Result<(), serde_json::Error> {
+        let event = InputRequiredEvent {
+            session_id: "s1".into(),
+            request_id: "req-42".into(),
+            tool_call_id: "call_x".into(),
+            tool_name: "bash".into(),
+            arguments: json!({ "command": "rm -rf /tmp/scratch" }),
+            summary: "bash: rm -rf /tmp/scratch".into(),
+        };
+        let value = serde_json::to_value(&event)?;
+        let decoded: InputRequiredEvent = serde_json::from_value(value)?;
+        assert_eq!(decoded, event);
+        Ok(())
+    }
+
+    #[test]
+    fn respond_to_input_required_round_trip_approve() -> Result<(), serde_json::Error> {
+        let req = RespondToInputRequiredRequest {
+            session_id: "s1".into(),
+            request_id: "req-42".into(),
+            decision: ApprovalDecision::Approve,
+        };
+        let value = serde_json::to_value(&req)?;
+        assert_eq!(value["decision"], "approve");
+        let decoded: RespondToInputRequiredRequest = serde_json::from_value(value)?;
+        assert_eq!(decoded, req);
+        Ok(())
+    }
+
+    #[test]
+    fn respond_to_input_required_round_trip_deny() -> Result<(), serde_json::Error> {
+        let req = RespondToInputRequiredRequest {
+            session_id: "s1".into(),
+            request_id: "req-42".into(),
+            decision: ApprovalDecision::Deny,
+        };
+        let value = serde_json::to_value(&req)?;
+        assert_eq!(value["decision"], "deny");
+        let decoded: RespondToInputRequiredRequest = serde_json::from_value(value)?;
+        assert_eq!(decoded, req);
+        Ok(())
+    }
+
+    #[test]
+    fn input_required_event_method_constant() {
+        assert_eq!(InputRequiredEvent::METHOD, "session.input_required");
+        assert_eq!(
+            RespondToInputRequiredRequest::METHOD,
+            "session.respond_to_input_required"
+        );
     }
 }

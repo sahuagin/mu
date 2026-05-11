@@ -25,8 +25,8 @@ use tokio::sync::mpsc;
 use mu_core::agent::{AgentEvent, AgentMessage};
 use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
-    CalloutBody, CalloutEvent, DoneEvent, ErrorEvent, TextDeltaEvent, ToolCallCompletedEvent,
-    ToolCallStartedEvent, ToolOutcome,
+    CalloutBody, CalloutEvent, DoneEvent, ErrorEvent, InputRequiredEvent, TextDeltaEvent,
+    ToolCallCompletedEvent, ToolCallStartedEvent, ToolOutcome,
 };
 use mu_core::transport::NotificationWriter;
 
@@ -107,6 +107,23 @@ pub fn translate_event(
                 session_id: session_id.to_string(),
                 message,
                 detail: None,
+            },
+        ),
+        AgentEvent::InputRequired {
+            request_id,
+            tool_call_id,
+            tool_name,
+            arguments,
+            summary,
+        } => to_pair(
+            InputRequiredEvent::METHOD,
+            InputRequiredEvent {
+                session_id: session_id.to_string(),
+                request_id,
+                tool_call_id,
+                tool_name,
+                arguments,
+                summary,
             },
         ),
         AgentEvent::Callout {
@@ -267,7 +284,11 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
         | AgentEvent::MessageStart { .. }
         | AgentEvent::AgentStart
         | AgentEvent::TurnStart
-        | AgentEvent::TurnEnd => None,
+        | AgentEvent::TurnEnd
+        // InputRequired is a transient wire-level prompt; the
+        // resulting ToolCall (approved) or ToolResult (denied)
+        // already lands in the log.
+        | AgentEvent::InputRequired { .. } => None,
     }
 }
 
@@ -402,6 +423,13 @@ mod tests {
                 message: mu_core::agent::AgentMessage::User {
                     content: "x".into(),
                 },
+            },
+            AgentEvent::InputRequired {
+                request_id: "req-x".into(),
+                tool_call_id: "call-x".into(),
+                tool_name: "edit".into(),
+                arguments: json!({}),
+                summary: "...".into(),
             },
         ];
         for ev in cases {

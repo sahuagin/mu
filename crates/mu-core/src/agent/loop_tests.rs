@@ -89,6 +89,9 @@ struct MockTool {
     /// FIFO queue of (delay, result) pairs. Each execute() call pops one.
     /// If the queue is empty, returns a default error.
     responses: Mutex<VecDeque<(Duration, ToolResult)>>,
+    /// Optional non-default policy. Tests use `with_policy(...)` to
+    /// mark a mock as needing approval (PermissionLevel::Ask), etc.
+    policy_override: Option<crate::agent::tool::ToolPolicy>,
 }
 
 impl MockTool {
@@ -104,6 +107,7 @@ impl MockTool {
         Self {
             name: name.to_owned(),
             responses: Mutex::new(q),
+            policy_override: None,
         }
     }
 
@@ -119,6 +123,7 @@ impl MockTool {
         Self {
             name: name.to_owned(),
             responses: Mutex::new(q),
+            policy_override: None,
         }
     }
 
@@ -136,7 +141,15 @@ impl MockTool {
         Self {
             name: name.to_owned(),
             responses: Mutex::new(q),
+            policy_override: None,
         }
+    }
+
+    /// Set a non-default policy on this MockTool. Used by mu-029
+    /// tests to mark a mock as PermissionLevel::Ask, etc.
+    fn with_policy(mut self, policy: crate::agent::tool::ToolPolicy) -> Self {
+        self.policy_override = Some(policy);
+        self
     }
 
     fn delayed(name: &str, content: &str, delay: Duration) -> Self {
@@ -151,6 +164,7 @@ impl MockTool {
         Self {
             name: name.to_owned(),
             responses: Mutex::new(q),
+            policy_override: None,
         }
     }
 }
@@ -162,7 +176,7 @@ impl Tool for MockTool {
             name: self.name.clone(),
             description: format!("Mock tool: {}", self.name),
             input_schema: json!({"type": "object"}),
-            policy: Default::default(),
+            policy: self.policy_override.clone().unwrap_or_default(),
         }
     }
 
@@ -227,7 +241,9 @@ fn spawn_loop(
         .into_iter()
         .map(|t| Arc::new(t) as Arc<dyn Tool>)
         .collect();
-    let loop_ = AgentLoop::spawn(provider, tools, config, events_tx);
+    let approvals: PendingApprovals =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let loop_ = AgentLoop::spawn(provider, tools, config, events_tx, approvals);
     (loop_, events_rx)
 }
 
@@ -254,6 +270,7 @@ fn kind(event: &AgentEvent) -> &'static str {
         AgentEvent::Done { .. } => "done",
         AgentEvent::Error { .. } => "error",
         AgentEvent::Callout { .. } => "callout",
+        AgentEvent::InputRequired { .. } => "input_required",
     }
 }
 
@@ -805,4 +822,179 @@ fn tool_history_streak_skips_other_tools_without_breaking() {
     h.record("bash".into(), json!({"command": "b"}), true);
     // bash streak from newest: error, [skip read], error — count 2.
     assert_eq!(h.consecutive_errors_for("bash"), 2);
+}
+
+// ============================================================================
+// mu-029 PermissionLevel::Ask approval flow
+// ============================================================================
+
+/// Build a MockProvider scripted to issue a single tool call then
+/// stop. Useful for end-to-end Ask-flow tests.
+fn mock_provider_one_tool_call(tool_name: &str, args: Value) -> MockProvider {
+    let call = ToolCall {
+        id: "call_under_test".to_string(),
+        name: tool_name.to_string(),
+        arguments: args,
+    };
+    // First provider call: emit the tool call.
+    let first_turn = vec![ProviderEvent::Done(AssistantMessage {
+        content: vec![ContentBlock::ToolCall(call)],
+        stop_reason: StopReason::ToolUse,
+        usage: None,
+    })];
+    // Second provider call (after the tool result): emit text + EndTurn.
+    let second_turn = vec![
+        ProviderEvent::TextDelta("ok".to_string()),
+        ProviderEvent::Done(AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: "ok".to_string(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        }),
+    ];
+    let mut q = VecDeque::new();
+    q.push_back(MockResponse::Events(first_turn));
+    q.push_back(MockResponse::Events(second_turn));
+    MockProvider {
+        responses: Mutex::new(q),
+    }
+}
+
+#[tokio::test]
+async fn ask_permission_emits_input_required_and_dispatches_on_approve() {
+    let provider = mock_provider_one_tool_call("gated", json!({"x": 1}));
+    let tool = MockTool::ok("gated", "tool ran").with_policy(crate::agent::tool::ToolPolicy {
+        permission: crate::agent::tool::PermissionLevel::Ask,
+        ..Default::default()
+    });
+    let approvals: PendingApprovals =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let loop_ = AgentLoop::spawn(
+        Arc::new(provider),
+        vec![Arc::new(tool) as Arc<dyn Tool>],
+        AgentConfig::default(),
+        events_tx,
+        approvals.clone(),
+    );
+    loop_
+        .send(AgentInput::UserMessage(user_msg("please use gated")))
+        .await
+        .expect("send");
+
+    // Drain events until InputRequired arrives; capture request_id.
+    let mut request_id: Option<String> = None;
+    let mut tool_call_started_seen = false;
+    let mut all_events: Vec<AgentEvent> = Vec::new();
+    while let Some(ev) = events_rx.recv().await {
+        match &ev {
+            AgentEvent::ToolCallStarted { .. } => tool_call_started_seen = true,
+            AgentEvent::InputRequired { request_id: rid, .. } => {
+                request_id = Some(rid.clone());
+                break;
+            }
+            _ => {}
+        }
+        all_events.push(ev);
+    }
+    let rid = request_id.expect("InputRequired event should fire for Ask policy");
+    assert!(
+        tool_call_started_seen,
+        "ToolCallStarted should fire before InputRequired"
+    );
+
+    // Approve.
+    let sender = approvals
+        .lock()
+        .unwrap()
+        .remove(&rid)
+        .expect("approvals registry should have an entry under request_id");
+    sender
+        .send(ApprovalDecision::Approve)
+        .expect("send approve");
+
+    // Drain the rest. Expect ToolCallCompleted with non-error
+    // (the mock returned "tool ran" as success).
+    let mut got_tool_completed_ok = false;
+    let mut got_done = false;
+    while let Some(ev) = events_rx.recv().await {
+        match ev {
+            AgentEvent::ToolCallCompleted { is_error, content, .. } => {
+                got_tool_completed_ok = !is_error && content.contains("tool ran");
+            }
+            AgentEvent::Done { .. } => {
+                got_done = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        got_tool_completed_ok,
+        "expected non-error ToolCallCompleted after approval"
+    );
+    assert!(got_done, "expected Done event at end");
+}
+
+#[tokio::test]
+async fn ask_permission_deny_synthesizes_error_result_without_running_tool() {
+    let provider = mock_provider_one_tool_call("gated", json!({"x": 1}));
+    let tool = MockTool::ok("gated", "this should not appear").with_policy(
+        crate::agent::tool::ToolPolicy {
+            permission: crate::agent::tool::PermissionLevel::Ask,
+            ..Default::default()
+        },
+    );
+    let approvals: PendingApprovals =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let loop_ = AgentLoop::spawn(
+        Arc::new(provider),
+        vec![Arc::new(tool) as Arc<dyn Tool>],
+        AgentConfig::default(),
+        events_tx,
+        approvals.clone(),
+    );
+    loop_
+        .send(AgentInput::UserMessage(user_msg("please use gated")))
+        .await
+        .unwrap();
+
+    // Wait for InputRequired, then DENY.
+    let mut request_id: Option<String> = None;
+    while let Some(ev) = events_rx.recv().await {
+        if let AgentEvent::InputRequired { request_id: rid, .. } = ev {
+            request_id = Some(rid);
+            break;
+        }
+    }
+    let rid = request_id.expect("InputRequired");
+    let sender = approvals.lock().unwrap().remove(&rid).unwrap();
+    sender.send(ApprovalDecision::Deny).unwrap();
+
+    // The tool should NOT have been invoked; ToolCallCompleted
+    // should report is_error=true with a "denied by user" message.
+    let mut completed_ev: Option<(bool, String)> = None;
+    while let Some(ev) = events_rx.recv().await {
+        if let AgentEvent::ToolCallCompleted {
+            is_error, content, ..
+        } = ev
+        {
+            completed_ev = Some((is_error, content));
+            break;
+        }
+    }
+    let (is_error, content) = completed_ev.expect("ToolCallCompleted after deny");
+    assert!(is_error, "denial should produce is_error=true");
+    assert!(
+        content.contains("denied"),
+        "denial result content should mention 'denied'; got: {content}"
+    );
+    // The mock's "this should not appear" string must NOT be in
+    // the completed event content — proving the tool didn't run.
+    assert!(
+        !content.contains("this should not appear"),
+        "tool body must not have executed after deny; got: {content}"
+    );
 }

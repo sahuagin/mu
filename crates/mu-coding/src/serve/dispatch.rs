@@ -5,7 +5,8 @@
 //! arms map mu-001's `*Request` types to operations on the session
 //! manager.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
@@ -14,8 +15,8 @@ use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
     AskSessionRequest, AskSessionResponse, CancelSessionRequest, CancelSessionResponse,
     CloseSessionRequest, CloseSessionResponse, CreateSessionRequest, CreateSessionResponse,
-    PingRequest, PingResponse, ProviderSelector, Request, Response, SessionStatsRequest,
-    SessionStatsResponse,
+    PingRequest, PingResponse, ProviderSelector, Request, RespondToInputRequiredRequest,
+    RespondToInputRequiredResponse, Response, SessionStatsRequest, SessionStatsResponse,
 };
 use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
 
@@ -39,6 +40,9 @@ pub async fn dispatch(
         CancelSessionRequest::METHOD => handle_cancel_session(request, sessions).await,
         CloseSessionRequest::METHOD => handle_close_session(request, sessions),
         SessionStatsRequest::METHOD => handle_session_stats(request, sessions),
+        RespondToInputRequiredRequest::METHOD => {
+            handle_respond_to_input_required(request, sessions)
+        }
         other => err_response(
             request.id,
             codes::METHOD_NOT_FOUND,
@@ -109,12 +113,23 @@ fn handle_create_session(
         },
     );
 
+    // Per-session approvals registry (mu-029). The agent loop
+    // inserts oneshots here when it hits PermissionLevel::Ask; the
+    // respond_to_input_required handler pulls them out.
+    let pending_approvals = Arc::new(Mutex::new(HashMap::new()));
+
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
     // Each session gets its own copy of the tools vec. Tools
     // themselves are Arc-wrapped so the actual Tool instances are
     // shared.
     let session_tools: Vec<Arc<dyn Tool>> = (*tools).clone();
-    let agent = AgentLoop::spawn(provider, session_tools, AgentConfig::default(), events_tx);
+    let agent = AgentLoop::spawn(
+        provider,
+        session_tools,
+        AgentConfig::default(),
+        events_tx,
+        pending_approvals.clone(),
+    );
     let input_tx = agent.sender();
 
     // Wrap AgentLoop::join into a JoinHandle<()> so it can sit in
@@ -136,6 +151,7 @@ fn handle_create_session(
         forwarder_handle,
         agent_handle,
         event_log,
+        pending_approvals,
     );
 
     let resp = CreateSessionResponse { session_id };
@@ -266,6 +282,32 @@ fn handle_session_stats(request: Request<Value>, sessions: Sessions) -> Response
         elapsed_total_ms: log.elapsed_total_ms(),
         usage: log.cumulative_usage(),
     };
+    ok_response(request.id, to_value_or_null(resp))
+}
+
+fn handle_respond_to_input_required(
+    request: Request<Value>,
+    sessions: Sessions,
+) -> Response<Value> {
+    let params: RespondToInputRequiredRequest =
+        match serde_json::from_value(request.params.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                return err_response(
+                    request.id,
+                    codes::INVALID_PARAMS,
+                    format!("respond_to_input_required: invalid params: {e}"),
+                );
+            }
+        };
+
+    // Look up the pending oneshot; if found, send the decision.
+    let sender_opt = sessions.take_pending_approval(&params.session_id, &params.request_id);
+    let accepted = match sender_opt {
+        Some(sender) => sender.send(params.decision).is_ok(),
+        None => false,
+    };
+    let resp = RespondToInputRequiredResponse { accepted };
     ok_response(request.id, to_value_or_null(resp))
 }
 

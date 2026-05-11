@@ -35,6 +35,11 @@ struct SessionState {
     /// pulls the matching oneshot out and sends the decision; the
     /// agent loop receives it and continues.
     pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>,
+    /// Parent session if this is a delegate (mu-031). None for root
+    /// sessions. Used by tree queries and future subtree rollup
+    /// computations.
+    #[allow(dead_code)] // Read by future tree-rollup queries.
+    parent_session_id: Option<String>,
 }
 
 /// In-memory session registry. Cheap to clone (Arc-backed).
@@ -58,7 +63,8 @@ impl Sessions {
 
     /// Insert a new session. Caller has already spawned the agent
     /// loop and forwarder; this just stores their handles + the
-    /// session's event log + the pending-approvals registry.
+    /// session's event log + the pending-approvals registry +
+    /// optional parent reference for delegated sessions.
     pub fn insert(
         &self,
         id: String,
@@ -67,6 +73,7 @@ impl Sessions {
         agent: JoinHandle<()>,
         event_log: Arc<SessionEventLog>,
         pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>,
+        parent_session_id: Option<String>,
     ) {
         if let Ok(mut map) = self.inner.lock() {
             map.insert(
@@ -77,6 +84,7 @@ impl Sessions {
                     _agent: agent,
                     event_log,
                     pending_approvals,
+                    parent_session_id,
                 },
             );
         }
@@ -166,7 +174,7 @@ mod tests {
         let log = Arc::new(SessionEventLog::new(id.clone()));
 
         let approvals = Arc::new(Mutex::new(HashMap::new()));
-        sessions.insert(id.clone(), tx, forwarder, agent, log, approvals);
+        sessions.insert(id.clone(), tx, forwarder, agent, log, approvals, None);
         assert!(sessions.input_sender(&id).is_some());
         assert!(sessions.event_log(&id).is_some());
         assert!(sessions.remove(&id));
@@ -199,6 +207,7 @@ mod tests {
             tokio::spawn(async {}),
             log,
             approvals,
+            None,
         );
 
         // Take the pending oneshot, simulating the dispatch handler.

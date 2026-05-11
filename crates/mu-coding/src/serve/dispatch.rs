@@ -15,8 +15,9 @@ use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
     AskSessionRequest, AskSessionResponse, CancelSessionRequest, CancelSessionResponse,
     CloseSessionRequest, CloseSessionResponse, CreateSessionRequest, CreateSessionResponse,
-    PingRequest, PingResponse, ProviderSelector, Request, RespondToInputRequiredRequest,
-    RespondToInputRequiredResponse, Response, SessionStatsRequest, SessionStatsResponse,
+    DelegateSessionRequest, DelegateSessionResponse, PingRequest, PingResponse, ProviderSelector,
+    Request, RespondToInputRequiredRequest, RespondToInputRequiredResponse, Response,
+    SessionStatsRequest, SessionStatsResponse,
 };
 use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
 
@@ -35,6 +36,9 @@ pub async fn dispatch(
         PingRequest::METHOD => handle_ping(request),
         CreateSessionRequest::METHOD => {
             handle_create_session(request, notif, sessions, factory, tools)
+        }
+        DelegateSessionRequest::METHOD => {
+            handle_delegate_session(request, notif, sessions, factory, tools)
         }
         AskSessionRequest::METHOD => handle_ask_session(request, sessions).await,
         CancelSessionRequest::METHOD => handle_cancel_session(request, sessions).await,
@@ -81,47 +85,111 @@ fn handle_create_session(
         }
     };
 
-    // Per-session provider construction (mu-020). The factory closes
-    // over daemon-startup flags (ephemeral, thinking); the selector
-    // picks which provider + which model. Two sessions on the same
-    // daemon can use different providers.
-    let provider = match factory(&params.provider) {
+    match build_and_register_session(
+        &params.provider,
+        None, // no parent — this is a root session
+        None,
+        notif,
+        sessions,
+        factory,
+        tools,
+    ) {
+        Ok(session_id) => {
+            let resp = CreateSessionResponse { session_id };
+            ok_response(request.id, to_value_or_null(resp))
+        }
+        Err(e) => err_response(
+            request.id,
+            codes::INVALID_PARAMS,
+            format!("create_session: {e}"),
+        ),
+    }
+}
+
+fn handle_delegate_session(
+    request: Request<Value>,
+    notif: NotificationWriter,
+    sessions: Sessions,
+    factory: ProviderFactory,
+    tools: Arc<Vec<Arc<dyn Tool>>>,
+) -> Response<Value> {
+    let params: DelegateSessionRequest = match serde_json::from_value(request.params.clone()) {
         Ok(p) => p,
         Err(e) => {
             return err_response(
                 request.id,
                 codes::INVALID_PARAMS,
-                format!("create_session: could not build provider: {e}"),
+                format!("session.delegate: invalid params: {e}"),
             );
         }
     };
 
-    let session_id = Sessions::next_id();
+    // Verify the parent session exists. We don't need anything
+    // from it at runtime (the child is fully independent); we just
+    // want to fail fast if the caller named a session that doesn't
+    // exist. Future biscuit work (mu-032) will read the parent's
+    // capability bundle here to attenuate the child's.
+    if sessions.input_sender(&params.parent_session_id).is_none() {
+        return err_response(
+            request.id,
+            codes::INVALID_PARAMS,
+            format!(
+                "session.delegate: parent session not found: {}",
+                params.parent_session_id
+            ),
+        );
+    }
 
-    // Per-session event log (mu-025). Records significant events
-    // for the lifetime of the session. The forwarder appends as
-    // events arrive; readers (cumulative usage, future replay)
-    // snapshot via the log's methods.
+    match build_and_register_session(
+        &params.provider,
+        Some(params.parent_session_id.clone()),
+        params.branched_at_parent_event_id,
+        notif,
+        sessions,
+        factory,
+        tools,
+    ) {
+        Ok(child_session_id) => {
+            let resp = DelegateSessionResponse { child_session_id };
+            ok_response(request.id, to_value_or_null(resp))
+        }
+        Err(e) => err_response(
+            request.id,
+            codes::INVALID_PARAMS,
+            format!("session.delegate: {e}"),
+        ),
+    }
+}
+
+/// Shared session-creation logic for both `create_session` (root) and
+/// `session.delegate` (child). Returns the new session_id on success
+/// or a human-readable error on provider-construction failure.
+fn build_and_register_session(
+    selector: &ProviderSelector,
+    parent_session_id: Option<String>,
+    branched_at_parent_event_id: Option<u64>,
+    notif: NotificationWriter,
+    sessions: Sessions,
+    factory: ProviderFactory,
+    tools: Arc<Vec<Arc<dyn Tool>>>,
+) -> Result<String, String> {
+    let provider = factory(selector).map_err(|e| format!("could not build provider: {e}"))?;
+
+    let session_id = Sessions::next_id();
     let event_log = Arc::new(SessionEventLog::new(session_id.clone()));
-    // First event: provenance of the session itself.
-    let (kind_str, model_str) = describe_selector(&params.provider);
+    let (kind_str, model_str) = describe_selector(selector);
     event_log.append(
         EventActor::System,
         EventPayload::SessionCreated {
             provider_kind: kind_str,
             model: model_str,
+            parent_session_id: parent_session_id.clone(),
+            branched_at_parent_event_id,
         },
     );
 
-    // Per-session approvals registry (mu-029). The agent loop
-    // inserts oneshots here when it hits PermissionLevel::Ask; the
-    // respond_to_input_required handler pulls them out.
     let pending_approvals = Arc::new(Mutex::new(HashMap::new()));
-
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
-    // Each session gets its own copy of the tools vec. Tools
-    // themselves are Arc-wrapped so the actual Tool instances are
-    // shared.
     let session_tools: Vec<Arc<dyn Tool>> = (*tools).clone();
     let agent = AgentLoop::spawn(
         provider,
@@ -131,13 +199,9 @@ fn handle_create_session(
         pending_approvals.clone(),
     );
     let input_tx = agent.sender();
-
-    // Wrap AgentLoop::join into a JoinHandle<()> so it can sit in
-    // SessionState alongside the forwarder's handle.
     let agent_handle = tokio::spawn(async move {
         let _ = agent.join().await;
     });
-
     let forwarder_handle = tokio::spawn(forward_events(
         session_id.clone(),
         events_rx,
@@ -152,10 +216,10 @@ fn handle_create_session(
         agent_handle,
         event_log,
         pending_approvals,
+        parent_session_id,
     );
 
-    let resp = CreateSessionResponse { session_id };
-    ok_response(request.id, to_value_or_null(resp))
+    Ok(session_id)
 }
 
 /// Pull a (kind, model) pair out of a `ProviderSelector` for logging

@@ -346,3 +346,89 @@ async fn b8_session_stats_after_ask() {
     drop(client);
     let _ = timeout(Duration::from_millis(500), server_handle).await;
 }
+
+/// B-9: session.delegate creates a child session that references its
+/// parent. Verifies (a) the RPC is wired, (b) the child gets a fresh
+/// session_id distinct from the parent's, (c) child can be queried
+/// independently (its own event log + stats), (d) delegating to a
+/// nonexistent parent returns INVALID_PARAMS.
+#[tokio::test]
+async fn b9_session_delegate_creates_child() {
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) = spawn_server(provider);
+
+    // 1. Create the parent.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "create_session",
+        "params": {
+            "provider": { "kind": "openrouter", "model": "parent/model" }
+        }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = read_line(&mut client).await;
+    let parent_id = resp["result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 2. Delegate a child with a different provider selector.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "session.delegate",
+        "params": {
+            "parent_session_id": parent_id,
+            "provider": { "kind": "anthropic_api", "model": "child/model" }
+        }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = read_line(&mut client).await;
+    assert_eq!(resp["id"], 2);
+    let child_id = resp["result"]["child_session_id"]
+        .as_str()
+        .expect("child_session_id")
+        .to_string();
+    assert!(child_id.starts_with("session-"));
+    assert_ne!(child_id, parent_id);
+
+    // 3. Query child's stats — provider_kind/model should reflect
+    //    the child's selector, NOT the parent's.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 3, "method": "session.stats",
+        "params": { "session_id": child_id }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = read_line(&mut client).await;
+    assert_eq!(resp["id"], 3);
+    let result = &resp["result"];
+    assert_eq!(result["provider_kind"], "anthropic_api");
+    assert_eq!(result["model"], "child/model");
+    // Child's event log has the SessionCreated event.
+    assert!(result["event_count"].as_u64().unwrap_or(0) >= 1);
+
+    // 4. Delegate to a missing parent should fail.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 4, "method": "session.delegate",
+        "params": {
+            "parent_session_id": "session-does-not-exist",
+            "provider": { "kind": "openrouter", "model": "x" }
+        }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = read_line(&mut client).await;
+    assert_eq!(resp["id"], 4);
+    assert_eq!(resp["error"]["code"], -32602);
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}

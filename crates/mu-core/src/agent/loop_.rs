@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 
 use super::provider::{Provider, ProviderEvent};
 use super::types::Usage;
-use super::tool::{Tool, ToolResult, ToolSpec};
+use super::tool::{RetryPolicy, Tool, ToolResult, ToolSpec};
 use super::types::{AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolCall};
 
 /// External inputs callers push to a running agent loop.
@@ -279,6 +279,9 @@ async fn run(
     // within one ask_session; resets per ask.
     let mut aggregated_usage: Option<Usage> = None;
     let mut started_at: Option<Instant> = None;
+    // Per-ask tool-history. Used by the RetryPolicy::Never enforcement
+    // path in handle_execute_tools. Reset on Done.
+    let mut tool_history = ToolHistory::default();
 
     let _ = events.send(AgentEvent::AgentStart).await;
 
@@ -334,6 +337,7 @@ async fn run(
                             elapsed_ms,
                         })
                         .await;
+                    tool_history.clear();
                     return Outcome::IterationCap;
                 }
                 if started_at.is_none() {
@@ -390,7 +394,15 @@ async fn run(
                 }
             }
             Action::ExecuteTools(calls) => {
-                match handle_execute_tools(&tools, calls, &mut input_rx, &events).await {
+                match handle_execute_tools(
+                    &tools,
+                    calls,
+                    &mut input_rx,
+                    &events,
+                    &mut tool_history,
+                )
+                .await
+                {
                     Ok((tool_results, buffered)) => {
                         for r in tool_results {
                             messages.push(r);
@@ -437,6 +449,7 @@ async fn run(
                         elapsed_ms,
                     })
                     .await;
+                tool_history.clear();
                 return Outcome::Done(StopReason::EndTurn);
             }
         }
@@ -452,7 +465,55 @@ async fn run(
             elapsed_ms,
         })
         .await;
+    tool_history.clear();
     Outcome::Done(StopReason::EndTurn)
+}
+
+// ============================================================================
+// Per-ask tool history — backs RetryPolicy::Never enforcement
+// ============================================================================
+
+/// Bounded sliding window of recent tool dispatches per ask. The
+/// `Never` retry policy refuses a new (tool_name, args) call if any
+/// entry in the window has the same shape AND errored.
+const TOOL_HISTORY_WINDOW: usize = 8;
+
+#[derive(Debug, Default)]
+struct ToolHistory {
+    entries: VecDeque<ToolHistoryEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct ToolHistoryEntry {
+    tool_name: String,
+    arguments: serde_json::Value,
+    is_error: bool,
+}
+
+impl ToolHistory {
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Record a completed dispatch. Drops the oldest if over capacity.
+    fn record(&mut self, tool_name: String, arguments: serde_json::Value, is_error: bool) {
+        self.entries.push_back(ToolHistoryEntry {
+            tool_name,
+            arguments,
+            is_error,
+        });
+        while self.entries.len() > TOOL_HISTORY_WINDOW {
+            self.entries.pop_front();
+        }
+    }
+
+    /// Has a matching (tool_name, arguments) call in the window
+    /// errored? Used by RetryPolicy::Never enforcement.
+    fn errored_match(&self, tool_name: &str, arguments: &serde_json::Value) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.is_error && e.tool_name == tool_name && &e.arguments == arguments)
+    }
 }
 
 async fn handle_invoke_llm(
@@ -522,6 +583,7 @@ async fn handle_execute_tools(
     calls: Vec<ToolCall>,
     input_rx: &mut mpsc::Receiver<AgentInput>,
     events: &mpsc::Sender<AgentEvent>,
+    history: &mut ToolHistory,
 ) -> Result<(Vec<AgentMessage>, Vec<AgentInput>), Outcome> {
     let mut buffered: Vec<AgentInput> = Vec::new();
     let mut tool_messages: Vec<AgentMessage> = Vec::new();
@@ -535,36 +597,89 @@ async fn handle_execute_tools(
             })
             .await;
 
+        // Look up the tool + its policy.
         let tool = tools.iter().find(|t| t.spec().name == call.name);
-        let result = match tool {
-            Some(t) => {
-                let (cancel_tx, cancel_rx) = oneshot::channel();
-                let mut execute_fut = Box::pin(t.execute(call.arguments.clone(), cancel_rx));
 
-                loop {
-                    tokio::select! {
-                        result = &mut execute_fut => break result,
-                        input_opt = input_rx.recv() => match input_opt {
-                            Some(AgentInput::Cancel) => {
-                                let _ = cancel_tx.send(());
-                                return Err(Outcome::Cancelled);
-                            }
-                            Some(input @ AgentInput::UserMessage(_)) => {
-                                buffered.push(input);
-                            }
-                            None => {
-                                let _ = cancel_tx.send(());
-                                return Err(Outcome::Cancelled);
-                            }
-                        },
+        // Retry guard. If the tool's policy is Never and this same
+        // (name, args) errored in the recent history, refuse the
+        // dispatch without running the tool. Emit a callout so the
+        // UI/log records the refusal alongside the synthesized
+        // tool result.
+        let retry_refused = match tool {
+            Some(t) => {
+                let policy = t.spec().policy;
+                matches!(policy.retry, RetryPolicy::Never)
+                    && history.errored_match(&call.name, &call.arguments)
+            }
+            None => false,
+        };
+
+        let result = if retry_refused {
+            let msg = format!(
+                "runtime refused: tool `{}` was just called with the same arguments \
+                 and errored. Its retry policy is Never — do not retry with the same \
+                 input. Try a different approach, a different tool, or report the \
+                 obstacle to the user instead.",
+                call.name
+            );
+            // Surface a structured callout for the UI/log. This is
+            // visible at the wire layer too (session.callout
+            // notification).
+            let _ = events
+                .send(AgentEvent::Callout {
+                    category: "warning".to_owned(),
+                    title: format!("retry refused for {}", call.name),
+                    body: serde_json::json!({
+                        "tool": call.name,
+                        "arguments": call.arguments,
+                        "reason": "RetryPolicy::Never matched a prior errored call",
+                    }),
+                    theme: Some("warning".to_owned()),
+                    context_refs: vec!["spec:capability-delegation".to_owned()],
+                })
+                .await;
+            ToolResult {
+                content: msg,
+                is_error: true,
+            }
+        } else {
+            match tool {
+                Some(t) => {
+                    let (cancel_tx, cancel_rx) = oneshot::channel();
+                    let mut execute_fut =
+                        Box::pin(t.execute(call.arguments.clone(), cancel_rx));
+
+                    loop {
+                        tokio::select! {
+                            result = &mut execute_fut => break result,
+                            input_opt = input_rx.recv() => match input_opt {
+                                Some(AgentInput::Cancel) => {
+                                    let _ = cancel_tx.send(());
+                                    return Err(Outcome::Cancelled);
+                                }
+                                Some(input @ AgentInput::UserMessage(_)) => {
+                                    buffered.push(input);
+                                }
+                                None => {
+                                    let _ = cancel_tx.send(());
+                                    return Err(Outcome::Cancelled);
+                                }
+                            },
+                        }
                     }
                 }
+                None => ToolResult {
+                    content: format!("tool not found: {}", call.name),
+                    is_error: true,
+                },
             }
-            None => ToolResult {
-                content: format!("tool not found: {}", call.name),
-                is_error: true,
-            },
         };
+
+        // Record the dispatch outcome for future retry checks. We
+        // record even refused calls — if the same call lands again
+        // the refusal still counts as evidence the model should
+        // change strategy.
+        history.record(call.name.clone(), call.arguments.clone(), result.is_error);
 
         let _ = events
             .send(AgentEvent::ToolCallCompleted {

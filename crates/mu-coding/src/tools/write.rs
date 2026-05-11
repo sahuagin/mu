@@ -2,7 +2,9 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use mu_core::agent::{Tool, ToolResult, ToolSpec};
+use mu_core::agent::{
+    PermissionLevel, RetryPolicy, SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec,
+};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
@@ -22,11 +24,10 @@ impl Default for WriteTool {
 
 impl Tool for WriteTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "write".to_owned(),
-            description: "Write a file. Overwrites if the file exists. Returns confirmation on success or an error message if the write fails."
-                .to_owned(),
-            input_schema: json!({
+        ToolSpec::new(
+            "write",
+            "Write a file. Overwrites if the file exists. Returns confirmation on success or an error message if the write fails.",
+            json!({
                 "type": "object",
                 "properties": {
                     "path": {
@@ -40,7 +41,13 @@ impl Tool for WriteTool {
                 },
                 "required": ["path", "content"]
             }),
-        }
+        )
+        .with_policy(ToolPolicy {
+            side_effects: SideEffects::Mutating,
+            permission: PermissionLevel::Allow,
+            retry: RetryPolicy::ModelDecides,
+            idempotent: true, // same path + same content = same end state
+        })
     }
 
     fn execute<'life0, 'async_trait>(

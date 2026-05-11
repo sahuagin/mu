@@ -22,11 +22,11 @@ impl Default for LsTool {
 
 impl Tool for LsTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "ls".to_owned(),
-            description: "List the contents of a directory (one level only). Directories are suffixed with '/'. Returns names one per line. Defaults to the current directory if no path is given."
-                .to_owned(),
-            input_schema: json!({
+        // ReadOnly default policy.
+        ToolSpec::new(
+            "ls",
+            "List the contents of a directory (one level only). Directories are suffixed with '/'. Returns names one per line. Defaults to the current directory if no path is given.",
+            json!({
                 "type": "object",
                 "properties": {
                     "path": {
@@ -36,7 +36,7 @@ impl Tool for LsTool {
                 },
                 "required": []
             }),
-        }
+        )
     }
 
     fn execute<'life0, 'async_trait>(

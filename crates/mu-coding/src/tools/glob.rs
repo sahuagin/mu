@@ -51,14 +51,13 @@ impl Default for GlobTool {
 
 impl Tool for GlobTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "glob".to_owned(),
-            description: "Find files by name pattern using `fd`. \
-                          Pattern is a regex by default; pass `glob: true` \
-                          to use literal-glob syntax (*.rs, src/**/*.ts). \
-                          Respects .gitignore. Returns one path per line."
-                .to_owned(),
-            input_schema: json!({
+        ToolSpec::new(
+            "glob",
+            "Find files by name pattern using `fd`. \
+             Pattern is a regex by default; pass `glob: true` \
+             to use literal-glob syntax (*.rs, src/**/*.ts). \
+             Respects .gitignore. Returns one path per line.",
+            json!({
                 "type": "object",
                 "properties": {
                     "pattern": {
@@ -95,7 +94,7 @@ impl Tool for GlobTool {
                 },
                 "required": ["pattern"]
             }),
-        }
+        )
     }
 
     fn execute<'life0, 'async_trait>(

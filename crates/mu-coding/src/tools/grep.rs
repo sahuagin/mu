@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::process::Stdio;
 
 use mu_core::agent::{Tool, ToolResult, ToolSpec};
+// grep is ReadOnly by default — no policy override needed.
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
@@ -57,14 +58,13 @@ impl Default for GrepTool {
 
 impl Tool for GrepTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "grep".to_owned(),
-            description: "Search file contents using ripgrep (rg). \
-                          Returns matching lines with file:line:content, \
-                          or just file paths / counts based on `output_mode`. \
-                          Respects .gitignore by default. Pattern is a regex."
-                .to_owned(),
-            input_schema: json!({
+        ToolSpec::new(
+            "grep",
+            "Search file contents using ripgrep (rg). \
+             Returns matching lines with file:line:content, \
+             or just file paths / counts based on `output_mode`. \
+             Respects .gitignore by default. Pattern is a regex.",
+            json!({
                 "type": "object",
                 "properties": {
                     "pattern": {
@@ -105,7 +105,7 @@ impl Tool for GrepTool {
                 },
                 "required": ["pattern"]
             }),
-        }
+        )
     }
 
     fn execute<'life0, 'async_trait>(

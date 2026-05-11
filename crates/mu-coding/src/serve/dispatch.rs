@@ -214,13 +214,13 @@ fn build_and_register_session(
     let event_log = Arc::new(SessionEventLog::new(session_id.clone()));
 
     // mu-upb: attach a per-session JSONL writer at
-    // ~/.local/share/mu/events/<daemon_id>/<session_id>.jsonl.
+    // <events_dir>/<daemon_id>/<session_id>.jsonl.
     // Best-effort — failures are logged but don't block session
-    // creation. The path includes daemon_id so multiple concurrent
-    // daemons don't clobber each other's logs.
-    if let Some(home) = dirs::home_dir() {
-        let path = home
-            .join(".local/share/mu/events")
+    // creation. When daemon_info.events_dir() is None (tests),
+    // skip entirely — no disk write happens. Production sets
+    // events_dir to ~/.local/share/mu/events.
+    if let Some(events_dir) = daemon_info.events_dir() {
+        let path = events_dir
             .join(daemon_info.daemon_id())
             .join(format!("{}.jsonl", session_id));
         if let Err(e) = event_log.attach_disk_writer(&path) {

@@ -1,6 +1,7 @@
 //! `mu serve` mode — JSON-RPC daemon over stdio (or generic
 //! reader/writer for tests).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
@@ -22,6 +23,14 @@ pub use factory::{
 };
 pub use sessions::Sessions;
 
+/// Default on-disk events directory used by the production binary
+/// (mu-upb). `None` means "don't write events to disk." Tests
+/// explicitly pass `None` to avoid polluting the developer's
+/// `~/.local/share/mu/events/` with test fixtures.
+pub fn default_events_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".local/share/mu/events"))
+}
+
 /// Production entry point — serve over the process's stdin/stdout.
 ///
 /// `factory` is called once per session, given the client's
@@ -34,22 +43,31 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let stdin = BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();
-    serve_with_io(stdin, stdout, factory, tools).await
+    // Production: events go to the default ~/.local/share/mu/events
+    // directory. Override via the CLI in the future once we have a
+    // `--events-dir` flag.
+    serve_with_io(stdin, stdout, factory, tools, default_events_dir()).await
 }
 
 /// Test/integration hook — serve over generic reader/writer.
+///
+/// `events_dir` controls on-disk event log persistence (mu-upb).
+/// Tests should pass `None` to avoid writing fixtures into the
+/// developer's home directory; production passes
+/// `default_events_dir()`.
 pub async fn serve_with_io<R, W>(
     reader: R,
     writer: W,
     factory: ProviderFactory,
     tools: Vec<Arc<dyn Tool>>,
+    events_dir: Option<PathBuf>,
 ) -> anyhow::Result<()>
 where
     R: AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let sessions = Sessions::new();
-    let daemon_info = DaemonInfo::new(env!("CARGO_PKG_VERSION"));
+    let daemon_info = DaemonInfo::new(env!("CARGO_PKG_VERSION")).with_events_dir(events_dir);
     // v1 (mu-038): always LocalRegistryBackend. Wired via Arc so a
     // future --discovery flag can choose File / Etcd without changing
     // the dispatch surface.

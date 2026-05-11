@@ -28,11 +28,15 @@ fn spawn_server(
     // (one provider for all sessions) under the new factory API.
     let factory: serve::ProviderFactory =
         std::sync::Arc::new(move |_selector| Ok(provider.clone()));
+    // events_dir=None: integration tests do NOT write to disk
+    // (mu-upb). Setting Some(<path>) would pollute the developer's
+    // ~/.local/share/mu/events with test fixtures.
     let handle = tokio::spawn(serve::serve_with_io(
         server_buf,
         server_write,
         factory,
         Vec::new(),
+        None,
     ));
     (client, handle)
 }

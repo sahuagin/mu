@@ -716,9 +716,18 @@ async fn handle_invoke_llm(
     use crate::protocol::ProviderStatusKind;
 
     // mu-035 Phase A: emit AwaitingFirstToken just before opening
-    // the stream. Client UIs use this to render "thinking…" or
-    // similar; Phase B will add periodic re-emission while in this
-    // state so a stalled provider stays visible.
+    // the stream. Phase B adds periodic re-emission while in
+    // non-streaming waits — see PROVIDER_STATUS_TICK_MS below.
+    //
+    // INV-4 (the load-bearing property of the whole spec): the
+    // emit-tick runs on a tokio interval timer that is INDEPENDENT
+    // of the provider stream future. If the stream is wedged on a
+    // syscall waiting for bytes from a stalled backend, the timer
+    // still fires and the client still sees status. (Verified live
+    // 2026-05-11 — codex backend was unresponsive for ~14 hours
+    // overnight with zero diagnostic data on our side; this primitive
+    // exists so that NEVER happens silently again.)
+    const PROVIDER_STATUS_TICK_MS: u64 = 1000;
     let call_started_at = Instant::now();
     let call_started_unix_ms = now_unix_ms();
     let _ = events
@@ -742,6 +751,19 @@ async fn handle_invoke_llm(
     // AwaitingFirstToken yet.
     let mut bytes_received: u64 = 0;
     let mut seen_first_token = false;
+    // Periodic-tick state: the current ProviderStatusKind the agent
+    // loop is conceptually in, plus when we entered it. Updated on
+    // transitions (e.g. AwaitingFirstToken → Streaming on first
+    // token). The tick arm uses these to compose the periodic emit.
+    let mut current_state = ProviderStatusKind::AwaitingFirstToken;
+    let mut state_started_at = call_started_at;
+    let mut state_started_unix_ms = call_started_unix_ms;
+    // Tokio interval timer for the periodic emit. Skip the first
+    // immediate tick (interval() fires at t=0 by default) — we
+    // already emitted at the transition.
+    let mut tick_interval =
+        tokio::time::interval(std::time::Duration::from_millis(PROVIDER_STATUS_TICK_MS));
+    tick_interval.tick().await;
     // Once the input channel closes (all senders dropped), we want
     // the in-flight stream to complete naturally — NOT be treated
     // as a cancel. This was the pre-multi-turn behavior (Outcome::
@@ -758,11 +780,16 @@ async fn handle_invoke_llm(
                     bytes_received = bytes_received.saturating_add(d.len() as u64);
                     if !seen_first_token {
                         seen_first_token = true;
-                        let streaming_started_unix_ms = now_unix_ms();
+                        // Transition: AwaitingFirstToken → Streaming.
+                        // Re-anchor state_started_* so the next tick
+                        // measures Streaming-duration from here.
+                        current_state = ProviderStatusKind::Streaming;
+                        state_started_at = Instant::now();
+                        state_started_unix_ms = now_unix_ms();
                         let _ = events
                             .send(AgentEvent::ProviderStatus {
-                                state: ProviderStatusKind::Streaming,
-                                started_at_unix_ms: streaming_started_unix_ms,
+                                state: current_state,
+                                started_at_unix_ms: state_started_unix_ms,
                                 elapsed_ms: call_started_at.elapsed().as_millis() as u64,
                                 bytes_received: Some(bytes_received),
                                 tool_call_id: None,
@@ -818,6 +845,30 @@ async fn handle_invoke_llm(
                     // outer-loop iteration the main recv() will
                     // also return None and trigger a clean exit.
                     input_drained = true;
+                }
+            },
+            // mu-035 Phase B: periodic provider_status emit during
+            // non-streaming waits. Independent of stream.next() —
+            // INV-4: a stalled provider still produces status here.
+            _ = tick_interval.tick() => {
+                // Only emit while in a wait state. Once streaming
+                // has begun, text_delta is its own implicit
+                // heartbeat; we don't need periodic ticks.
+                if !matches!(current_state, ProviderStatusKind::Streaming) {
+                    let elapsed_ms = state_started_at.elapsed().as_millis() as u64;
+                    let _ = events
+                        .send(AgentEvent::ProviderStatus {
+                            state: current_state,
+                            started_at_unix_ms: state_started_unix_ms,
+                            elapsed_ms,
+                            bytes_received: if bytes_received > 0 {
+                                Some(bytes_received)
+                            } else {
+                                None
+                            },
+                            tool_call_id: None,
+                        })
+                        .await;
                 }
             },
         }
@@ -1044,6 +1095,17 @@ async fn handle_execute_tools(
                     let mut execute_fut =
                         Box::pin(t.execute(call.arguments.clone(), cancel_rx));
 
+                    // mu-035 Phase B: periodic ToolExecuting status
+                    // emit. Same INV-4 motivation as the LLM stream
+                    // — a tool that hangs (e.g. waiting on
+                    // approval, slow IO, network timeout) stays
+                    // visible to clients via these ticks.
+                    let tool_call_started_at = Instant::now();
+                    let tool_state_started_unix_ms = now_unix_ms();
+                    let mut tool_tick =
+                        tokio::time::interval(std::time::Duration::from_millis(1000));
+                    tool_tick.tick().await; // skip the t=0 immediate tick
+
                     // Same "let work finish, don't cancel on
                     // sender-drop" pattern as handle_invoke_llm
                     // (mu-035 Phase A multi-turn fix).
@@ -1073,6 +1135,19 @@ async fn handle_execute_tools(
                                     input_drained_local = true;
                                 }
                             },
+                            _ = tool_tick.tick() => {
+                                let elapsed_ms =
+                                    tool_call_started_at.elapsed().as_millis() as u64;
+                                let _ = events
+                                    .send(AgentEvent::ProviderStatus {
+                                        state: crate::protocol::ProviderStatusKind::ToolExecuting,
+                                        started_at_unix_ms: tool_state_started_unix_ms,
+                                        elapsed_ms,
+                                        bytes_received: None,
+                                        tool_call_id: Some(call.id.clone()),
+                                    })
+                                    .await;
+                            }
                         }
                     }
                 }

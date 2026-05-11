@@ -182,6 +182,34 @@ pub struct SessionStatsResponse {
     pub usage: Option<crate::agent::Usage>,
 }
 
+/// Create a new "child" session that's lineage-aware of `parent_session_id`
+/// (mu-031). The child session is fully independent at the runtime
+/// level — own agent loop, own event log, own pending-approvals
+/// registry — but carries a reference to its parent for audit and
+/// (future) tree-rollup queries. v1: the child starts with empty
+/// message history; `branched_at_parent_event_id` is recorded for
+/// audit/replay but doesn't affect runtime state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DelegateSessionRequest {
+    pub parent_session_id: String,
+    /// Provider for the child. Independent of the parent's — a child
+    /// can use a different provider/model than its parent.
+    pub provider: ProviderSelector,
+    /// Optional: which event in the parent's log this branched from.
+    /// For audit; v1 doesn't act on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branched_at_parent_event_id: Option<u64>,
+}
+
+impl DelegateSessionRequest {
+    pub const METHOD: &'static str = "session.delegate";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DelegateSessionResponse {
+    pub child_session_id: String,
+}
+
 /// Respond to an outstanding `session.input_required` notification
 /// (mu-029). The daemon blocks the corresponding tool call until
 /// the client sends this back. `request_id` identifies which prompt
@@ -704,5 +732,45 @@ mod tests {
             RespondToInputRequiredRequest::METHOD,
             "session.respond_to_input_required"
         );
+    }
+
+    // ===== mu-031 session.delegate round-trips =====
+
+    #[test]
+    fn delegate_session_request_round_trip() -> Result<(), serde_json::Error> {
+        let req = DelegateSessionRequest {
+            parent_session_id: "session-7".into(),
+            provider: ProviderSelector::OpenaiCodex {
+                model: "gpt-5.5".into(),
+            },
+            branched_at_parent_event_id: Some(42),
+        };
+        let value = serde_json::to_value(&req)?;
+        let decoded: DelegateSessionRequest = serde_json::from_value(value)?;
+        assert_eq!(decoded, req);
+        Ok(())
+    }
+
+    #[test]
+    fn delegate_session_request_optional_branch_point_omitted_when_none() -> Result<(), serde_json::Error> {
+        let req = DelegateSessionRequest {
+            parent_session_id: "session-7".into(),
+            provider: ProviderSelector::AnthropicApi {
+                model: "x".into(),
+            },
+            branched_at_parent_event_id: None,
+        };
+        let value = serde_json::to_value(&req)?;
+        let obj = value.as_object().unwrap();
+        assert!(
+            !obj.contains_key("branched_at_parent_event_id"),
+            "None branch-point should be omitted from wire"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delegate_session_method_constant() {
+        assert_eq!(DelegateSessionRequest::METHOD, "session.delegate");
     }
 }

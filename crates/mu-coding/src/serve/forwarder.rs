@@ -155,11 +155,15 @@ pub fn translate_event(
             )
         }
         // Lifecycle events not in mu-001's notification surface.
+        // ContextAssembly lands only in the durable event log
+        // (mu-032 v1); wire-level exposure is a future TUI/web-ui
+        // feature when there's a consumer.
         AgentEvent::AgentStart
         | AgentEvent::TurnStart
         | AgentEvent::TurnEnd
         | AgentEvent::MessageStart { .. }
-        | AgentEvent::MessageEnd { .. } => None,
+        | AgentEvent::MessageEnd { .. }
+        | AgentEvent::ContextAssembly { .. } => None,
     }
 }
 
@@ -184,7 +188,23 @@ pub async fn forward_events(
     while let Some(event) = events_rx.recv().await {
         // Durable projection: append significant events to the log.
         // Streaming deltas + lifecycle ticks are dropped.
-        if let Some((actor, payload)) = to_log_event(&event) {
+        if let Some((actor, mut payload)) = to_log_event(&event) {
+            // ContextAssembly payload doesn't know the session's
+            // provider/model when produced (the AgentLoop has the
+            // info but doesn't pass it through). Patch it in here
+            // by reading the SessionCreated event we already
+            // recorded at session-start.
+            if let EventPayload::ContextAssembly {
+                provider_kind,
+                model,
+                ..
+            } = &mut payload
+            {
+                if let Some((kind, m)) = event_log.provider_info() {
+                    *provider_kind = kind;
+                    *model = m;
+                }
+            }
             event_log.append(actor, payload);
         }
         // Wire projection: translate to mu-001 notification surface.
@@ -280,6 +300,47 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
                 context_refs: context_refs.clone(),
             },
         )),
+        AgentEvent::ContextAssembly {
+            model_call_id,
+            message_count,
+            user_message_count,
+            assistant_message_count,
+            tool_result_count,
+            tool_count,
+        } => {
+            // ContextAssembly is recorded with the session's
+            // provider/model from the log's SessionCreated event.
+            // We need access to the log here to look that up; the
+            // forwarder receives `event_log` as a parameter so we
+            // could pass it down — but to_log_event is a pure
+            // function for testability. Solution: the caller
+            // (forward_events loop) injects the provider info into
+            // the payload right before append. Here we just emit a
+            // "placeholder" payload; the actual log append happens
+            // in forward_events with provider info filled in.
+            //
+            // For the wire-level projection, we also need to emit
+            // a notification — that happens via translate_event
+            // which doesn't go through to_log_event. So the wire
+            // surface is separate.
+            //
+            // Encode as ContextAssembly with empty provider info;
+            // forward_events will replace before storing.
+            Some((
+                EventActor::System,
+                EventPayload::ContextAssembly {
+                    model_call_id: *model_call_id,
+                    message_count: *message_count,
+                    user_message_count: *user_message_count,
+                    assistant_message_count: *assistant_message_count,
+                    tool_result_count: *tool_result_count,
+                    tool_count: *tool_count,
+                    token_count_estimate: None,
+                    provider_kind: String::new(),
+                    model: String::new(),
+                },
+            ))
+        }
         AgentEvent::TextDelta { .. }
         | AgentEvent::MessageStart { .. }
         | AgentEvent::AgentStart
@@ -693,6 +754,7 @@ mod tests {
                 EventPayload::Error { .. } => "error",
                 EventPayload::Callout { .. } => "callout",
                 EventPayload::SessionClosed => "session_closed",
+                EventPayload::ContextAssembly { .. } => "context_assembly",
             })
             .collect();
         assert_eq!(kinds, vec!["assistant_message", "done"]);

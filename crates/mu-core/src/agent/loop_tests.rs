@@ -271,6 +271,7 @@ fn kind(event: &AgentEvent) -> &'static str {
         AgentEvent::Error { .. } => "error",
         AgentEvent::Callout { .. } => "callout",
         AgentEvent::InputRequired { .. } => "input_required",
+        AgentEvent::ContextAssembly { .. } => "context_assembly",
     }
 }
 
@@ -305,6 +306,7 @@ async fn b1_single_turn_no_tools() {
             "message_start",
             "message_end",
             "turn_start",
+            "context_assembly", // mu-032: emitted before provider.stream
             "text_delta",
             "message_start",
             "message_end",
@@ -383,12 +385,14 @@ async fn b2_single_tool_call() {
             "message_start",       // user
             "message_end",         // user
             "turn_start",          // turn 1
+            "context_assembly",    // mu-032: before provider call
             "message_start",       // assistant w/ tool call
             "message_end",         // assistant w/ tool call
             "tool_call_started",   // echo
             "tool_call_completed", // echo
             "turn_end",            // end turn 1
             "turn_start",          // turn 2
+            "context_assembly",    // mu-032: before second provider call
             "text_delta",          // "done"
             "message_start",       // assistant text
             "message_end",         // assistant text

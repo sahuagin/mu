@@ -29,6 +29,8 @@ shlex = { workspace = true }
 async-trait = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
+# mu-upb: home directory for on-disk event log path
+dirs = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }

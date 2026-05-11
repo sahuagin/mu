@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use mu_core::agent::AgentInput;
+use mu_core::capability::Capability;
 use mu_core::event_log::SessionEventLog;
 use mu_core::protocol::ApprovalDecision;
 
@@ -40,6 +41,13 @@ struct SessionState {
     /// computations.
     #[allow(dead_code)] // Read by future tree-rollup queries.
     parent_session_id: Option<String>,
+    /// What this session is allowed to do (mu-033). Wrapped in a
+    /// Mutex so dispatch can decrement the tool-call budget per
+    /// invocation. None on the type isn't possible — we always
+    /// instantiate a Capability (root() for root sessions, attenuated
+    /// for delegates). But check_allow returns a structured result
+    /// so the agent loop can refuse with a specific reason.
+    capability: Arc<Mutex<Capability>>,
 }
 
 /// In-memory session registry. Cheap to clone (Arc-backed).
@@ -64,7 +72,8 @@ impl Sessions {
     /// Insert a new session. Caller has already spawned the agent
     /// loop and forwarder; this just stores their handles + the
     /// session's event log + the pending-approvals registry +
-    /// optional parent reference for delegated sessions.
+    /// optional parent reference for delegated sessions + the
+    /// capability the session is operating under.
     pub fn insert(
         &self,
         id: String,
@@ -74,6 +83,7 @@ impl Sessions {
         event_log: Arc<SessionEventLog>,
         pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>,
         parent_session_id: Option<String>,
+        capability: Arc<Mutex<Capability>>,
     ) {
         if let Ok(mut map) = self.inner.lock() {
             map.insert(
@@ -85,6 +95,7 @@ impl Sessions {
                     event_log,
                     pending_approvals,
                     parent_session_id,
+                    capability,
                 },
             );
         }
@@ -134,6 +145,20 @@ impl Sessions {
         pending.remove(request_id)
     }
 
+    /// Look up a session's capability handle. Returns None if the
+    /// session doesn't exist. Used by:
+    ///   - dispatch::handle_delegate_session to compute the child's
+    ///     attenuated capability from the parent's
+    ///   - dispatch-time tool-call checks (future, when the agent
+    ///     loop is wired to consult capabilities at execute time)
+    pub fn capability(&self, id: &str) -> Option<Arc<Mutex<Capability>>> {
+        self.inner
+            .lock()
+            .ok()?
+            .get(id)
+            .map(|s| s.capability.clone())
+    }
+
     /// Remove a session. Dropping its `SessionState` drops the
     /// `input_tx`; the agent loop sees its input channel close and
     /// terminates naturally on the next iteration.
@@ -174,7 +199,8 @@ mod tests {
         let log = Arc::new(SessionEventLog::new(id.clone()));
 
         let approvals = Arc::new(Mutex::new(HashMap::new()));
-        sessions.insert(id.clone(), tx, forwarder, agent, log, approvals, None);
+        let cap = Arc::new(Mutex::new(Capability::root()));
+        sessions.insert(id.clone(), tx, forwarder, agent, log, approvals, None, cap);
         assert!(sessions.input_sender(&id).is_some());
         assert!(sessions.event_log(&id).is_some());
         assert!(sessions.remove(&id));
@@ -200,6 +226,7 @@ mod tests {
             .unwrap()
             .insert("req-1".to_string(), decision_tx);
 
+        let cap = Arc::new(Mutex::new(Capability::root()));
         sessions.insert(
             id.clone(),
             tx,
@@ -208,6 +235,7 @@ mod tests {
             log,
             approvals,
             None,
+            cap,
         );
 
         // Take the pending oneshot, simulating the dispatch handler.

@@ -185,10 +185,11 @@ pub struct SessionStatsResponse {
 /// Create a new "child" session that's lineage-aware of `parent_session_id`
 /// (mu-031). The child session is fully independent at the runtime
 /// level — own agent loop, own event log, own pending-approvals
-/// registry — but carries a reference to its parent for audit and
-/// (future) tree-rollup queries. v1: the child starts with empty
-/// message history; `branched_at_parent_event_id` is recorded for
-/// audit/replay but doesn't affect runtime state.
+/// registry — but carries a reference to its parent for audit, and
+/// optionally a narrowed `Capability` derived from the parent's
+/// (mu-033). v1: the child starts with empty message history;
+/// `branched_at_parent_event_id` is recorded for audit/replay but
+/// doesn't affect runtime state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DelegateSessionRequest {
     pub parent_session_id: String,
@@ -199,6 +200,14 @@ pub struct DelegateSessionRequest {
     /// For audit; v1 doesn't act on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branched_at_parent_event_id: Option<u64>,
+    /// Optional capability attenuations (mu-033). The child's
+    /// effective capability is the intersection of the parent's
+    /// capability with this. Any field omitted is "no further
+    /// narrowing on this axis from this request." If absent
+    /// entirely, the child inherits the parent's capability
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attenuations: Option<crate::capability::CapabilityAttenuations>,
 }
 
 impl DelegateSessionRequest {
@@ -744,6 +753,11 @@ mod tests {
                 model: "gpt-5.5".into(),
             },
             branched_at_parent_event_id: Some(42),
+            attenuations: Some(crate::capability::CapabilityAttenuations {
+                allowed_tools: Some(vec!["read".into(), "grep".into()]),
+                expires_in_seconds: Some(300),
+                max_tool_calls: Some(10),
+            }),
         };
         let value = serde_json::to_value(&req)?;
         let decoded: DelegateSessionRequest = serde_json::from_value(value)?;
@@ -759,6 +773,7 @@ mod tests {
                 model: "x".into(),
             },
             branched_at_parent_event_id: None,
+            attenuations: None,
         };
         let value = serde_json::to_value(&req)?;
         let obj = value.as_object().unwrap();

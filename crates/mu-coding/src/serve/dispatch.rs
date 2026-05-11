@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 use mu_core::agent::{AgentConfig, AgentInput, AgentLoop, AgentMessage, Tool};
+use mu_core::capability::Capability;
 use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
     AskSessionRequest, AskSessionResponse, CancelSessionRequest, CancelSessionResponse,
@@ -89,6 +90,7 @@ fn handle_create_session(
         &params.provider,
         None, // no parent — this is a root session
         None,
+        Capability::root(), // root session: unrestricted
         notif,
         sessions,
         factory,
@@ -124,26 +126,41 @@ fn handle_delegate_session(
         }
     };
 
-    // Verify the parent session exists. We don't need anything
-    // from it at runtime (the child is fully independent); we just
-    // want to fail fast if the caller named a session that doesn't
-    // exist. Future biscuit work (mu-032) will read the parent's
-    // capability bundle here to attenuate the child's.
-    if sessions.input_sender(&params.parent_session_id).is_none() {
-        return err_response(
-            request.id,
-            codes::INVALID_PARAMS,
-            format!(
-                "session.delegate: parent session not found: {}",
-                params.parent_session_id
-            ),
-        );
-    }
+    // Verify the parent session exists, and snapshot its current
+    // capability so we can attenuate it for the child (mu-033).
+    let parent_cap_handle = match sessions.capability(&params.parent_session_id) {
+        Some(c) => c,
+        None => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!(
+                    "session.delegate: parent session not found: {}",
+                    params.parent_session_id
+                ),
+            );
+        }
+    };
+
+    // Compute child capability = parent ∩ requested attenuations.
+    // If the request didn't supply attenuations, the child inherits
+    // the parent's capability unchanged.
+    let child_capability = {
+        let parent_cap = parent_cap_handle
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_else(|_| Capability::root());
+        match &params.attenuations {
+            Some(attn) => parent_cap.attenuate(attn),
+            None => parent_cap,
+        }
+    };
 
     match build_and_register_session(
         &params.provider,
         Some(params.parent_session_id.clone()),
         params.branched_at_parent_event_id,
+        child_capability,
         notif,
         sessions,
         factory,
@@ -168,6 +185,7 @@ fn build_and_register_session(
     selector: &ProviderSelector,
     parent_session_id: Option<String>,
     branched_at_parent_event_id: Option<u64>,
+    capability: Capability,
     notif: NotificationWriter,
     sessions: Sessions,
     factory: ProviderFactory,
@@ -189,6 +207,7 @@ fn build_and_register_session(
     );
 
     let pending_approvals = Arc::new(Mutex::new(HashMap::new()));
+    let capability_handle = Arc::new(Mutex::new(capability));
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
     let session_tools: Vec<Arc<dyn Tool>> = (*tools).clone();
     let agent = AgentLoop::spawn(
@@ -197,6 +216,7 @@ fn build_and_register_session(
         AgentConfig::default(),
         events_tx,
         pending_approvals.clone(),
+        capability_handle.clone(),
     );
     let input_tx = agent.sender();
     let agent_handle = tokio::spawn(async move {
@@ -217,6 +237,7 @@ fn build_and_register_session(
         event_log,
         pending_approvals,
         parent_session_id,
+        capability_handle,
     );
 
     Ok(session_id)

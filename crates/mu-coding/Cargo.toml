@@ -25,6 +25,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rusqlite = { workspace = true }
 shlex = { workspace = true }
+# mu-038: pluggable session discovery (async trait + random daemon_id)
+async-trait = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }

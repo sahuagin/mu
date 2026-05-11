@@ -119,6 +119,26 @@ impl Sessions {
             .map(|s| s.input_tx.clone())
     }
 
+    /// Snapshot of every session for the discovery layer. Returns
+    /// `(session_id, event_log, parent_session_id)` triples. The
+    /// caller derives `SessionInfo` from these. Same lock-then-clone-
+    /// then-drop pattern as the other accessors.
+    pub fn snapshot_for_listing(
+        &self,
+    ) -> Vec<(String, Arc<SessionEventLog>, Option<String>)> {
+        self.inner
+            .lock()
+            .ok()
+            .map(|map| {
+                map.iter()
+                    .map(|(sid, s)| {
+                        (sid.clone(), s.event_log.clone(), s.parent_session_id.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Look up a session's event log. Returns None if the session
     /// doesn't exist. Same lock-then-clone-then-drop pattern as
     /// `input_sender`.

@@ -182,6 +182,157 @@ pub struct SessionStatsResponse {
     pub usage: Option<crate::agent::Usage>,
 }
 
+// ===== mu-038: projection queries (session.list, session.events, daemon.stats) =====
+
+/// Filter for `session.list`. All fields optional; default = "all
+/// local, no limit." Forward-compat additive: new fields added in
+/// future revisions can be ignored by older daemons.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionListFilter {
+    /// Include sessions from peer daemons (requires a federating
+    /// SessionDiscovery backend like FileBackend or EtcdBackend).
+    /// LocalRegistryBackend ignores this flag — it only sees local.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_remote: bool,
+    /// Only sessions whose parent_session_id matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Only sessions in the given status. Default = any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<SessionStatusSummary>,
+    /// Only sessions with last_activity_unix_ms >= this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_since_unix_ms: Option<u64>,
+    /// Cap response size. 0 or None ⇒ no limit (use cautiously).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Derived summary of where a session is in its lifecycle. Computed
+/// from the session's event log (post-mu-035, the live
+/// ProviderStatusTracker is authoritative for local sessions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatusSummary {
+    /// No ask in flight; last event was Done/SessionClosed or the
+    /// log is empty.
+    Idle,
+    /// User message arrived; model call may or may not have started.
+    Asking,
+    /// Model is producing text (text_delta-style activity within the
+    /// last ~5s).
+    Streaming,
+    /// A tool call is in flight (started but not yet completed).
+    ToolExecuting,
+    /// A session.input_required notification is outstanding; the
+    /// session is blocked on a client approve/deny.
+    AwaitingInputRequired,
+    /// Last completed ask ended cleanly.
+    Done,
+    /// Last event was Error.
+    Errored,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub session_id: String,
+    /// Stable per-daemon identifier (UUID generated at startup). Used
+    /// by federating discovery backends to disambiguate sessions
+    /// across daemons.
+    pub daemon_id: String,
+    /// True iff this session is in a peer daemon (only ever true with
+    /// include_remote + a federating backend).
+    pub is_remote: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    pub provider_kind: String,
+    pub model: String,
+    pub status: SessionStatusSummary,
+    pub started_at_unix_ms: u64,
+    pub last_activity_unix_ms: u64,
+    pub ask_count: u32,
+    pub tool_call_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cumulative_usage: Option<crate::agent::Usage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionListRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<SessionListFilter>,
+}
+
+impl SessionListRequest {
+    pub const METHOD: &'static str = "session.list";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionListResponse {
+    pub sessions: Vec<SessionInfo>,
+    pub snapshot_at_unix_ms: u64,
+    /// Set when `include_remote=true` and one or more peer daemons
+    /// failed to respond. Local results are still included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_peers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionEventsRequest {
+    pub session_id: String,
+    /// Resume cursor from a prior page. Returns events with id > this
+    /// value. Omit to start from the beginning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_event_id: Option<u64>,
+    /// Cap response size. None or 0 ⇒ a sensible default (200).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Restrict to specific payload kinds (e.g. ["text_delta",
+    /// "tool_call"]). Empty/omitted ⇒ all kinds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds_filter: Vec<String>,
+}
+
+impl SessionEventsRequest {
+    pub const METHOD: &'static str = "session.events";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionEventsResponse {
+    /// Already-serialised SessionEvent values (see event_log.rs for
+    /// the shape). Returned as serde_json::Value so wire consumers
+    /// can decode lazily without depending on mu-core types.
+    pub events: Vec<serde_json::Value>,
+    /// Cursor for the next page. None when end_of_log is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_event_id: Option<u64>,
+    pub end_of_log: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DaemonStatsRequest {}
+
+impl DaemonStatsRequest {
+    pub const METHOD: &'static str = "daemon.stats";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonStatsResponse {
+    pub daemon_id: String,
+    pub version: String,
+    pub started_at_unix_ms: u64,
+    pub uptime_ms: u64,
+    pub session_count: u32,
+    pub active_session_count: u32,
+    pub total_events: u64,
+    pub total_tool_calls: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    /// Number of sessions whose derived status is one of {Asking,
+    /// Streaming, ToolExecuting}. Post-mu-035 this should be replaced
+    /// by the live ProviderStatusTracker count.
+    pub in_flight_calls_count: u32,
+}
+
 /// Create a new "child" session that's lineage-aware of `parent_session_id`
 /// (mu-031). The child session is fully independent at the runtime
 /// level — own agent loop, own event log, own pending-approvals

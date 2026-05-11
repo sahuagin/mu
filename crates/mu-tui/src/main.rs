@@ -1606,7 +1606,11 @@ fn render_transcript_lines(
                 let msg = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
                 push_block(&mut lines, "ERROR", Color::Red, msg);
             }
-            "session_created" | "callout" | "context_assembly" | "session_closed" => {
+            "session_created"
+            | "callout"
+            | "context_assembly"
+            | "session_closed"
+            | "provider_status_update" => {
                 // Sidechannel events — not in the transcript pane.
                 // The firehose carries these globally.
             }

@@ -153,6 +153,11 @@ pub fn derive_status_from_events(events: &[SessionEvent], now_unix_ms: u64) -> S
             }
             EventPayload::SessionClosed => return SessionStatusSummary::Idle,
             EventPayload::ContextAssembly { .. } => {}
+            // ProviderStatusUpdate is a lifecycle marker (mu-pex
+            // Phase 1.5), not a session-status-driving event. The
+            // tracker has its own derivation via the live wire
+            // notification; for derive_status_from_events we ignore.
+            EventPayload::ProviderStatusUpdate { .. } => {}
         }
         last_kind = Some(&ev.payload);
     }

@@ -17,7 +17,7 @@ use tokio::sync::oneshot;
 
 use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, Provider, ProviderError, ProviderEvent,
-    StopReason, ToolCall, ToolSpec,
+    StopReason, ToolCall, ToolSpec, Usage,
 };
 
 use super::sse::{SseEvent, SseStream};
@@ -187,6 +187,10 @@ pub(crate) fn build_request_body(
         "model": model,
         "max_tokens": 4096,
         "stream": true,
+        // Ask the streamer to emit a final usage chunk; without this,
+        // most OpenAI-compatible backends omit usage from streaming
+        // responses entirely.
+        "stream_options": {"include_usage": true},
         "messages": api_messages,
     });
     if !tools.is_empty() {
@@ -204,6 +208,58 @@ pub(crate) fn build_request_body(
 struct OpenAiChunk {
     #[serde(default)]
     choices: Vec<OpenAiChoice>,
+    /// Usage may arrive in a separate chunk after choices stop
+    /// streaming. With `stream_options.include_usage = true`, the
+    /// backend emits one final chunk with `choices: []` and `usage`
+    /// populated. We capture it whenever present (defensive — some
+    /// providers attach it to the last content chunk instead).
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<OpenAiCompletionTokensDetails>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
+struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
+struct OpenAiCompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
+}
+
+impl OpenAiUsage {
+    fn to_usage(&self) -> Usage {
+        Usage {
+            input_tokens: self.prompt_tokens.unwrap_or(0),
+            output_tokens: self.completion_tokens.unwrap_or(0),
+            cache_read_input_tokens: self
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.cached_tokens),
+            cache_creation_input_tokens: None,
+            reasoning_tokens: self
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|d| d.reasoning_tokens),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,6 +325,9 @@ struct StreamState {
     tool_calls: HashMap<u32, ToolCallBuilder>,
     tool_call_order: Vec<u32>,
     finish_reason: Option<String>,
+    /// Most-recently-seen usage from any chunk. With `include_usage`,
+    /// the final chunk carries the authoritative number.
+    usage: Option<Usage>,
     cancel_rx: Option<oneshot::Receiver<()>>,
     finished: bool,
     emitted_done: bool,
@@ -286,6 +345,7 @@ fn events_stream(
         tool_calls: HashMap::new(),
         tool_call_order: Vec::new(),
         finish_reason: None,
+        usage: None,
         cancel_rx: Some(cancel_rx),
         finished: false,
         emitted_done: false,
@@ -309,6 +369,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                         ProviderEvent::Done(AssistantMessage {
                             content: assemble_content(&state),
                             stop_reason: StopReason::Aborted,
+                            usage: state.usage,
                         }),
                         state,
                     ));
@@ -332,6 +393,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                         ProviderEvent::Done(AssistantMessage {
                             content: assemble_content(&state),
                             stop_reason: stop,
+                            usage: state.usage,
                         }),
                         state,
                     ));
@@ -349,6 +411,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 ProviderEvent::Done(AssistantMessage {
                     content: assemble_content(&state),
                     stop_reason: stop,
+                    usage: state.usage,
                 }),
                 state,
             ));
@@ -361,6 +424,14 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 continue;
             }
         };
+
+        // Capture usage whenever a chunk includes it. With
+        // `include_usage`, the final chunk has empty choices and just
+        // populated usage; without it, some backends embed usage on
+        // the last content chunk. Either way, latest non-None wins.
+        if let Some(u) = chunk.usage.as_ref() {
+            state.usage = Some(u.to_usage());
+        }
 
         // Process every choice (typically just one, choices[0]).
         let mut emitted_event: Option<ProviderEvent> = None;

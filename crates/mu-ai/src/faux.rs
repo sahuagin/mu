@@ -88,6 +88,7 @@ fn echo_events(messages: &[AgentMessage]) -> Vec<ProviderEvent> {
         ProviderEvent::Done(AssistantMessage {
             content: vec![ContentBlock::Text { text }],
             stop_reason: StopReason::EndTurn,
+            usage: None,
         }),
     ]
 }
@@ -111,6 +112,7 @@ mod tests {
                     text: "assistant".to_owned(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                usage: None,
             }),
             AgentMessage::User {
                 content: "hello".to_owned(),
@@ -133,6 +135,7 @@ mod tests {
             Some(ProviderEvent::Done(AssistantMessage {
                 content,
                 stop_reason: StopReason::EndTurn,
+                usage: _,
             })) if content == &vec![ContentBlock::Text { text: "hello".to_owned() }]
         ));
         Ok(())

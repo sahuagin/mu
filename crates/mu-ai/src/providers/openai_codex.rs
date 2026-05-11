@@ -26,7 +26,7 @@ use tokio::sync::{oneshot, Mutex};
 
 use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, Provider, ProviderError, ProviderEvent,
-    StopReason, ToolCall, ToolSpec,
+    StopReason, ToolCall, ToolSpec, Usage,
 };
 
 use crate::auth::{self, FileSystemTokenStore, OAuthToken, TokenStore};
@@ -406,6 +406,53 @@ struct CompletedResponse {
     status: Option<String>,
     #[serde(default)]
     incomplete_details: Option<IncompleteDetails>,
+    #[serde(default)]
+    usage: Option<ResponsesApiUsage>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
+struct ResponsesApiUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    input_tokens_details: Option<ResponsesApiInputDetails>,
+    #[serde(default)]
+    output_tokens_details: Option<ResponsesApiOutputDetails>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
+struct ResponsesApiInputDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
+struct ResponsesApiOutputDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
+}
+
+impl ResponsesApiUsage {
+    fn to_usage(&self) -> Usage {
+        Usage {
+            input_tokens: self.input_tokens.unwrap_or(0),
+            output_tokens: self.output_tokens.unwrap_or(0),
+            cache_read_input_tokens: self
+                .input_tokens_details
+                .as_ref()
+                .and_then(|d| d.cached_tokens),
+            cache_creation_input_tokens: None,
+            reasoning_tokens: self
+                .output_tokens_details
+                .as_ref()
+                .and_then(|d| d.reasoning_tokens),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -441,6 +488,9 @@ struct StreamState {
     tool_call_order: Vec<u32>,
     final_status: Option<String>,
     incomplete_reason: Option<String>,
+    /// Usage from the `response.completed` event's `response.usage`.
+    /// Codex reliably emits this once per stream.
+    usage: Option<Usage>,
     cancel_rx: Option<oneshot::Receiver<()>>,
     finished: bool,
     emitted_done: bool,
@@ -461,6 +511,7 @@ fn events_stream(
         tool_call_order: Vec::new(),
         final_status: None,
         incomplete_reason: None,
+        usage: None,
         cancel_rx: Some(cancel_rx),
         finished: false,
         emitted_done: false,
@@ -542,6 +593,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                         ProviderEvent::Done(AssistantMessage {
                             content: assemble_content(&state),
                             stop_reason: StopReason::Aborted,
+                            usage: state.usage,
                         }),
                         state,
                     ));
@@ -568,6 +620,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                         ProviderEvent::Done(AssistantMessage {
                             content: assemble_content(&state),
                             stop_reason: stop,
+                            usage: state.usage,
                         }),
                         state,
                     ));
@@ -590,6 +643,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                     ProviderEvent::Done(AssistantMessage {
                         content: assemble_content(&state),
                         stop_reason: stop,
+                        usage: state.usage,
                     }),
                     state,
                 ));
@@ -718,6 +772,9 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 if let Some(r) = response {
                     state.final_status = r.status;
                     state.incomplete_reason = r.incomplete_details.and_then(|d| d.reason);
+                    if let Some(u) = r.usage.as_ref() {
+                        state.usage = Some(u.to_usage());
+                    }
                 } else {
                     state.final_status = Some("completed".into());
                 }
@@ -728,6 +785,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                     ProviderEvent::Done(AssistantMessage {
                         content: assemble_content(&state),
                         stop_reason: stop,
+                        usage: state.usage,
                     }),
                     state,
                 ));

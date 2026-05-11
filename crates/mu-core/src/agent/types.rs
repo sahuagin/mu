@@ -19,6 +19,60 @@ pub enum AgentMessage {
 pub struct AssistantMessage {
     pub content: Vec<ContentBlock>,
     pub stop_reason: StopReason,
+    /// Token usage for this turn, if the provider exposed it. None
+    /// means the provider didn't report (or didn't yet — usage often
+    /// arrives in the same final event as `stop_reason`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+/// Per-turn (or aggregated across turns) token usage.
+///
+/// `input_tokens` and `output_tokens` are always populated when
+/// usage is reported at all. The remaining fields are provider-
+/// specific opt-ins:
+/// - `cache_read_input_tokens`: prompt cache hit (Anthropic + OpenAI)
+/// - `cache_creation_input_tokens`: prompt cache write (Anthropic)
+/// - `reasoning_tokens`: hidden reasoning tokens (OpenAI o-series,
+///   Codex; Anthropic extended thinking doesn't report this yet)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+}
+
+impl Usage {
+    /// Sum two usage snapshots component-wise. Option fields are
+    /// summed when both Some; if either is None, the result keeps
+    /// the Some value (so partial reporting doesn't lose data).
+    pub fn add(self, other: Usage) -> Usage {
+        fn add_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+            match (a, b) {
+                (Some(x), Some(y)) => Some(x + y),
+                (Some(x), None) | (None, Some(x)) => Some(x),
+                (None, None) => None,
+            }
+        }
+        Usage {
+            input_tokens: self.input_tokens + other.input_tokens,
+            output_tokens: self.output_tokens + other.output_tokens,
+            cache_read_input_tokens: add_opt(
+                self.cache_read_input_tokens,
+                other.cache_read_input_tokens,
+            ),
+            cache_creation_input_tokens: add_opt(
+                self.cache_creation_input_tokens,
+                other.cache_creation_input_tokens,
+            ),
+            reasoning_tokens: add_opt(self.reasoning_tokens, other.reasoning_tokens),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -152,6 +206,7 @@ mod tests {
                 },
             ],
             stop_reason: StopReason::ToolUse,
+            usage: None,
         }
     }
 

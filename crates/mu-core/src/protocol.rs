@@ -186,15 +186,17 @@ impl ToolCallCompletedEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DoneEvent {
     pub session_id: String,
-    /// Optional usage metadata. None means provider didn't report.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<UsageInfo>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct UsageInfo {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    /// Why the loop ended — EndTurn, ToolUse (shouldn't see this on
+    /// wire — Done means the chain is over), MaxTokens, Error, Aborted.
+    pub stop_reason: crate::agent::StopReason,
+    /// Aggregated token usage across this ask_session's turns.
+    /// None means no provider in the chain reported usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::agent::Usage>,
+    /// Wall time from the first turn's start to this Done emit, in
+    /// milliseconds. None for clean-shutdown Dones where no turns ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
 }
 
 impl DoneEvent {

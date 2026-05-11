@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 
 use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, Provider, ProviderError, ProviderEvent,
-    StopReason, ToolCall, ToolSpec,
+    StopReason, ToolCall, ToolSpec, Usage,
 };
 
 use super::sse::{SseEvent, SseStream};
@@ -240,6 +240,21 @@ enum AnthropicEvent {
 struct AnthropicMessageMeta {
     id: Option<String>,
     role: Option<String>,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[allow(dead_code)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,6 +284,8 @@ enum AnthropicDelta {
 #[derive(Debug, Deserialize)]
 struct AnthropicMessageDelta {
     stop_reason: Option<String>,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -311,6 +328,7 @@ fn events_stream(
         blocks: HashMap::new(),
         block_order: Vec::new(),
         stop_reason: None,
+        usage: AnthropicUsage::default(),
         cancel_rx: Some(cancel_rx),
         finished: false,
         emitted_done: false,
@@ -343,9 +361,43 @@ struct StreamState {
     /// HashMap iteration order.
     block_order: Vec<u32>,
     stop_reason: Option<String>,
+    /// Combined usage from message_start (input tokens, cache stats)
+    /// and message_delta (output tokens). Anthropic splits across two
+    /// events; we merge as we see them.
+    usage: AnthropicUsage,
     cancel_rx: Option<oneshot::Receiver<()>>,
     finished: bool,
     emitted_done: bool,
+}
+
+impl AnthropicUsage {
+    fn merge(&mut self, other: &AnthropicUsage) {
+        if other.input_tokens.is_some() {
+            self.input_tokens = other.input_tokens;
+        }
+        if other.output_tokens.is_some() {
+            self.output_tokens = other.output_tokens;
+        }
+        if other.cache_creation_input_tokens.is_some() {
+            self.cache_creation_input_tokens = other.cache_creation_input_tokens;
+        }
+        if other.cache_read_input_tokens.is_some() {
+            self.cache_read_input_tokens = other.cache_read_input_tokens;
+        }
+    }
+
+    fn to_usage(&self) -> Option<Usage> {
+        if self.input_tokens.is_none() && self.output_tokens.is_none() {
+            return None;
+        }
+        Some(Usage {
+            input_tokens: self.input_tokens.unwrap_or(0),
+            output_tokens: self.output_tokens.unwrap_or(0),
+            cache_read_input_tokens: self.cache_read_input_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens,
+            reasoning_tokens: None,
+        })
+    }
 }
 
 async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamState)> {
@@ -360,10 +412,12 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 Ok(_) => {
                     state.finished = true;
                     state.cancel_rx = None;
+                    let usage = state.usage.to_usage();
                     return Some((
                         ProviderEvent::Done(AssistantMessage {
                             content: assemble_content(&state.blocks, &state.block_order),
                             stop_reason: StopReason::Aborted,
+                            usage,
                         }),
                         state,
                     ));
@@ -385,10 +439,12 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 if !state.emitted_done {
                     state.emitted_done = true;
                     let stop = map_stop_reason(state.stop_reason.as_deref());
+                    let usage = state.usage.to_usage();
                     return Some((
                         ProviderEvent::Done(AssistantMessage {
                             content: assemble_content(&state.blocks, &state.block_order),
                             stop_reason: stop,
+                            usage,
                         }),
                         state,
                     ));
@@ -467,15 +523,20 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
             }
             AnthropicEvent::MessageDelta { delta } => {
                 state.stop_reason = delta.stop_reason;
+                if let Some(u) = delta.usage.as_ref() {
+                    state.usage.merge(u);
+                }
             }
             AnthropicEvent::MessageStop => {
                 state.finished = true;
                 state.emitted_done = true;
                 let stop = map_stop_reason(state.stop_reason.as_deref());
+                let usage = state.usage.to_usage();
                 return Some((
                     ProviderEvent::Done(AssistantMessage {
                         content: assemble_content(&state.blocks, &state.block_order),
                         stop_reason: stop,
+                        usage,
                     }),
                     state,
                 ));
@@ -490,8 +551,13 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 );
                 return Some((ProviderEvent::Error(msg), state));
             }
-            AnthropicEvent::Ping | AnthropicEvent::MessageStart { .. } => {
-                // No-op for v1. (MessageStart carries metadata we don't use yet.)
+            AnthropicEvent::MessageStart { message } => {
+                if let Some(u) = message.usage.as_ref() {
+                    state.usage.merge(u);
+                }
+            }
+            AnthropicEvent::Ping => {
+                // No-op.
             }
         }
     }

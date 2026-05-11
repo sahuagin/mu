@@ -16,6 +16,7 @@
         let m = AgentMessage::Assistant(AssistantMessage {
             content: vec![ContentBlock::Text { text: "hi".into() }],
             stop_reason: StopReason::EndTurn,
+            usage: None,
         });
         let v = translate_message_single(&m).expect("translates");
         assert_eq!(v["role"], "assistant");
@@ -86,6 +87,7 @@
             AgentMessage::Assistant(AssistantMessage {
                 content: vec![tool_call("toolu_a", "a.txt"), tool_call("toolu_b", "b.txt")],
                 stop_reason: StopReason::ToolUse,
+                usage: None,
             }),
             AgentMessage::ToolResult { call_id: "toolu_a".into(), content: "a contents".into(), is_error: false },
             AgentMessage::ToolResult { call_id: "toolu_b".into(), content: "b failed".into(), is_error: true },
@@ -142,6 +144,7 @@
         AgentMessage::Assistant(AssistantMessage {
             content: vec![ContentBlock::Text { text: text.into() }],
             stop_reason: StopReason::EndTurn,
+            usage: None,
         })
     }
 
@@ -230,6 +233,7 @@
             blocks: HashMap::new(),
             block_order: Vec::new(),
             stop_reason: None,
+            usage: AnthropicUsage::default(),
             cancel_rx: Some(cancel_rx),
             finished: false,
             emitted_done: false,

@@ -79,6 +79,7 @@ mod tests {
                     text: "done".to_owned(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                usage: None,
             }),
             ProviderEvent::Error("rate limit".to_owned()),
         ];

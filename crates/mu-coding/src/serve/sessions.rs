@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use mu_core::agent::AgentInput;
+use mu_core::event_log::SessionEventLog;
 
 /// Per-session state held by the daemon.
 struct SessionState {
@@ -22,6 +23,11 @@ struct SessionState {
     _forwarder: JoinHandle<()>,
     /// Wrapper around the agent loop's JoinHandle. Same intent.
     _agent: JoinHandle<()>,
+    /// Per-session durable-ish event log. v1 is in-memory; future
+    /// work persists. The forwarder appends; readers (cumulative
+    /// usage queries, future replay) snapshot via the log's own
+    /// methods.
+    event_log: Arc<SessionEventLog>,
 }
 
 /// In-memory session registry. Cheap to clone (Arc-backed).
@@ -44,13 +50,15 @@ impl Sessions {
     }
 
     /// Insert a new session. Caller has already spawned the agent
-    /// loop and forwarder; this just stores their handles.
+    /// loop and forwarder; this just stores their handles + the
+    /// session's event log.
     pub fn insert(
         &self,
         id: String,
         input_tx: mpsc::Sender<AgentInput>,
         forwarder: JoinHandle<()>,
         agent: JoinHandle<()>,
+        event_log: Arc<SessionEventLog>,
     ) {
         if let Ok(mut map) = self.inner.lock() {
             map.insert(
@@ -59,6 +67,7 @@ impl Sessions {
                     input_tx,
                     _forwarder: forwarder,
                     _agent: agent,
+                    event_log,
                 },
             );
         }
@@ -80,6 +89,17 @@ impl Sessions {
             .ok()?
             .get(id)
             .map(|s| s.input_tx.clone())
+    }
+
+    /// Look up a session's event log. Returns None if the session
+    /// doesn't exist. Same lock-then-clone-then-drop pattern as
+    /// `input_sender`.
+    pub fn event_log(&self, id: &str) -> Option<Arc<SessionEventLog>> {
+        self.inner
+            .lock()
+            .ok()?
+            .get(id)
+            .map(|s| s.event_log.clone())
     }
 
     /// Remove a session. Dropping its `SessionState` drops the
@@ -119,11 +139,14 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<AgentInput>(1);
         let forwarder = tokio::spawn(async {});
         let agent = tokio::spawn(async {});
+        let log = Arc::new(SessionEventLog::new(id.clone()));
 
-        sessions.insert(id.clone(), tx, forwarder, agent);
+        sessions.insert(id.clone(), tx, forwarder, agent, log);
         assert!(sessions.input_sender(&id).is_some());
+        assert!(sessions.event_log(&id).is_some());
         assert!(sessions.remove(&id));
         assert!(sessions.input_sender(&id).is_none());
+        assert!(sessions.event_log(&id).is_none());
         assert!(!sessions.remove(&id));
     }
 }

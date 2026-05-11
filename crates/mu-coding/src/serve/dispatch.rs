@@ -10,10 +10,11 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use mu_core::agent::{AgentConfig, AgentInput, AgentLoop, AgentMessage, Tool};
+use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
     AskSessionRequest, AskSessionResponse, CancelSessionRequest, CancelSessionResponse,
     CloseSessionRequest, CloseSessionResponse, CreateSessionRequest, CreateSessionResponse,
-    PingRequest, PingResponse, Request, Response,
+    PingRequest, PingResponse, ProviderSelector, Request, Response,
 };
 use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
 
@@ -90,6 +91,22 @@ fn handle_create_session(
     };
 
     let session_id = Sessions::next_id();
+
+    // Per-session event log (mu-025). Records significant events
+    // for the lifetime of the session. The forwarder appends as
+    // events arrive; readers (cumulative usage, future replay)
+    // snapshot via the log's methods.
+    let event_log = Arc::new(SessionEventLog::new(session_id.clone()));
+    // First event: provenance of the session itself.
+    let (kind_str, model_str) = describe_selector(&params.provider);
+    event_log.append(
+        EventActor::System,
+        EventPayload::SessionCreated {
+            provider_kind: kind_str,
+            model: model_str,
+        },
+    );
+
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
     // Each session gets its own copy of the tools vec. Tools
     // themselves are Arc-wrapped so the actual Tool instances are
@@ -108,12 +125,32 @@ fn handle_create_session(
         session_id.clone(),
         events_rx,
         notif.clone(),
+        event_log.clone(),
     ));
 
-    sessions.insert(session_id.clone(), input_tx, forwarder_handle, agent_handle);
+    sessions.insert(
+        session_id.clone(),
+        input_tx,
+        forwarder_handle,
+        agent_handle,
+        event_log,
+    );
 
     let resp = CreateSessionResponse { session_id };
     ok_response(request.id, to_value_or_null(resp))
+}
+
+/// Pull a (kind, model) pair out of a `ProviderSelector` for logging
+/// purposes. The protocol-level enum is already snake_case on the
+/// wire; we just want a flat (string, string) for the event payload.
+fn describe_selector(selector: &ProviderSelector) -> (String, String) {
+    match selector {
+        ProviderSelector::AnthropicApi { model } => ("anthropic_api".into(), model.clone()),
+        ProviderSelector::AnthropicOauth { model } => ("anthropic_oauth".into(), model.clone()),
+        ProviderSelector::OpenaiApi { model } => ("openai_api".into(), model.clone()),
+        ProviderSelector::OpenaiCodex { model } => ("openai_codex".into(), model.clone()),
+        ProviderSelector::Openrouter { model } => ("openrouter".into(), model.clone()),
+    }
 }
 
 async fn handle_ask_session(request: Request<Value>, sessions: Sessions) -> Response<Value> {
@@ -197,6 +234,12 @@ fn handle_close_session(request: Request<Value>, sessions: Sessions) -> Response
             );
         }
     };
+
+    // Emit SessionClosed into the log BEFORE removing the session
+    // from the registry — once removed, the log handle is dropped.
+    if let Some(log) = sessions.event_log(&params.session_id) {
+        log.append(EventActor::System, EventPayload::SessionClosed);
+    }
 
     let removed = sessions.remove(&params.session_id);
     let resp = CloseSessionResponse { closed: removed };

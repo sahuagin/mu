@@ -151,6 +151,18 @@ struct App {
     // session.provider_status notifications; until then, this is the
     // explicit "yes, we sent it" affordance.
     ask_started_at: std::collections::HashMap<String, Instant>,
+    // Per-session live streaming-text accumulator. text_delta
+    // events are NOT logged (per event_log.rs design doc — "streaming-
+    // only events do NOT go in the log"). So to render an in-flight
+    // assistant message in the transcript pane, we have to assemble
+    // it client-side from notifications. Cleared on session.done /
+    // session.error for that sid (the AssistantMessageEvent will be
+    // in the next session.events page).
+    streaming_text: std::collections::HashMap<String, String>,
+    // Transcript cache for F3 view. Populated lazily when F3 is open
+    // and a session is selected. Keyed by session_id so switching
+    // selection doesn't lose the loaded data.
+    transcript_events_by_sid: std::collections::HashMap<String, Vec<serde_json::Value>>,
     // Wire integration. None ⇒ scaffold mock-data mode (no live daemon).
     mu: Option<MuClient>,
     /// `provider/model` to use when a new session is created via `n`.
@@ -192,6 +204,8 @@ impl App {
             cost_budget: (0.0, 10.0),
             poll_tick_counter: 0,
             ask_started_at: std::collections::HashMap::new(),
+            streaming_text: std::collections::HashMap::new(),
+            transcript_events_by_sid: std::collections::HashMap::new(),
             mu,
             default_provider,
         }
@@ -227,6 +241,34 @@ impl App {
                         {
                             self.ask_started_at.remove(sid);
                         }
+                        // Live transcript accumulator. text_delta is
+                        // not in the event log, so the only way to
+                        // render an in-flight assistant message is to
+                        // assemble the deltas here.
+                        if !sid.is_empty() {
+                            match method.as_str() {
+                                "session.text_delta" => {
+                                    let delta = params
+                                        .get("delta")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    self.streaming_text
+                                        .entry(sid.to_string())
+                                        .or_default()
+                                        .push_str(delta);
+                                }
+                                "session.done" | "session.error" => {
+                                    // AssistantMessageEvent will be in
+                                    // the event log on the next
+                                    // session.events refresh.
+                                    self.streaming_text.remove(sid);
+                                    // Invalidate transcript cache so
+                                    // the next F3 visit reloads.
+                                    self.transcript_events_by_sid.remove(sid);
+                                }
+                                _ => {}
+                            }
+                        }
                         handle_notification(
                             &mut self.sessions,
                             &mut self.firehose,
@@ -255,6 +297,42 @@ impl App {
         self.poll_tick_counter = self.poll_tick_counter.wrapping_add(1);
         if self.poll_tick_counter % 4 == 0 {
             self.refresh_daemon_stats();
+        }
+        // Transcript refresh: only when on the SessionDetail (F3)
+        // view and a session is selected. Polls every 2 ticks
+        // (~500ms) so live conversation feels responsive without
+        // flooding session.events on quiet sessions.
+        if matches!(self.mode, ViewMode::SessionDetail)
+            && self.poll_tick_counter % 2 == 0
+        {
+            self.refresh_transcript_for_selection();
+        }
+    }
+
+    fn refresh_transcript_for_selection(&mut self) {
+        let Some(idx) = self.selected_session.selected() else { return };
+        let Some(sid) = self.sessions.get(idx).and_then(|r| r.session_id.clone())
+        else {
+            return;
+        };
+        let Some(mu) = self.mu.as_mut() else { return };
+        // No after_event_id — pull the full first page (limit=200).
+        // For very long sessions, future work adds pagination/scroll;
+        // for daily-driver-today, 200 events covers ~tens of asks.
+        let res = mu.request(
+            "session.events",
+            json!({ "session_id": sid, "limit": 500 }),
+        );
+        match res {
+            Ok(v) => {
+                if let Some(events) = v.get("events").and_then(|e| e.as_array()) {
+                    self.transcript_events_by_sid
+                        .insert(sid.clone(), events.clone());
+                }
+            }
+            Err(e) => {
+                self.firehose.push(format!("[!! session.events] {e}"));
+            }
         }
     }
 
@@ -513,7 +591,10 @@ impl App {
             }
             (KeyCode::F(1), _) => self.mode = ViewMode::CommandCenter,
             (KeyCode::F(2), _) => self.mode = ViewMode::SessionTree,
-            (KeyCode::F(3), _) => self.mode = ViewMode::SessionDetail,
+            (KeyCode::F(3), _) => {
+                self.mode = ViewMode::SessionDetail;
+                self.refresh_transcript_for_selection();
+            }
             (KeyCode::F(4), _) => self.mode = ViewMode::Context,
             (KeyCode::F(5), _) => self.mode = ViewMode::Usage,
             (KeyCode::F(6), _) => self.mode = ViewMode::Tools,
@@ -792,7 +873,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     match app.mode {
         ViewMode::CommandCenter => render_command_center(f, app, chunks[2]),
         ViewMode::SessionTree => render_placeholder(f, chunks[2], "Session Tree", "F2"),
-        ViewMode::SessionDetail => render_placeholder(f, chunks[2], "Session Detail", "F3"),
+        ViewMode::SessionDetail => render_session_detail(f, app, chunks[2]),
         ViewMode::Context => render_placeholder(f, chunks[2], "Context Inspector", "F4"),
         ViewMode::Usage => render_placeholder(f, chunks[2], "Usage / Cache", "F5"),
         ViewMode::Tools => render_placeholder(f, chunks[2], "Tools / MCP / Skills", "F6"),
@@ -1002,6 +1083,263 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
         .title(" Selected session ");
     let paragraph = Paragraph::new(detail_text).block(block).wrap(Wrap { trim: false });
     f.render_widget(paragraph, h[1]);
+}
+
+/// F3 — Session Detail. Renders a chronological transcript of the
+/// selected session: user / assistant / tool-call / tool-result
+/// blocks from the event log, plus a live "(streaming…)" block when
+/// text_delta notifications are arriving but no session.done has
+/// landed yet.
+///
+/// Single-column for v1 (the mockup's right-side event timeline can
+/// come later — the firehose already serves that role globally).
+fn render_session_detail(f: &mut Frame, app: &App, area: Rect) {
+    // Identify the selected session.
+    let selected_sid: Option<String> = app
+        .selected_session
+        .selected()
+        .and_then(|i| app.sessions.get(i))
+        .and_then(|r| r.session_id.clone());
+
+    let Some(sid) = selected_sid else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Session Detail (F3) ");
+        let body = vec![
+            Line::from(""),
+            Line::from("  (no session selected)"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Press F1 to go back, select a session with j/k, then F3 to view its transcript.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(body).block(block), area);
+        return;
+    };
+
+    // Layout: header strip + transcript body.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(5)])
+        .split(area);
+
+    // Header strip: the selected session's identity.
+    let row = app
+        .sessions
+        .iter()
+        .find(|r| r.session_id.as_deref() == Some(sid.as_str()));
+    let header_lines: Vec<Line> = if let Some(r) = row {
+        let phase_style = match r.status {
+            SessionStatus::Running => Style::default().fg(Color::Green),
+            SessionStatus::Done => Style::default().fg(Color::DarkGray),
+            SessionStatus::Idle => Style::default().fg(Color::Yellow),
+        };
+        vec![Line::from(vec![
+            Span::styled("session ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                r.short_id.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(r.model.clone(), Style::default().fg(Color::DarkGray)),
+            Span::raw("  "),
+            Span::styled(r.phase.clone(), phase_style),
+        ])]
+    } else {
+        vec![Line::from(format!("session {sid}"))]
+    };
+    f.render_widget(
+        Paragraph::new(header_lines)
+            .block(Block::default().borders(Borders::ALL).title(" Session Detail (F3) ")),
+        chunks[0],
+    );
+
+    // Transcript body. Pull cached events from the last
+    // session.events poll; degrade to a "(loading…)" placeholder if
+    // we haven't fetched yet.
+    let body_lines: Vec<Line> = if let Some(events) =
+        app.transcript_events_by_sid.get(&sid)
+    {
+        let streaming_partial = app.streaming_text.get(&sid).map(String::as_str);
+        render_transcript_lines(events, streaming_partial)
+    } else {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  loading transcript…",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]
+    };
+    let block = Block::default().borders(Borders::ALL).title(" Transcript ");
+    let paragraph = Paragraph::new(body_lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(paragraph, chunks[1]);
+}
+
+/// Build the line buffer for the transcript pane. Renders one block
+/// per significant event (user / assistant / tool_call+tool_result /
+/// done / error), each with a small header strip and indented body.
+///
+/// Streaming text (live deltas) is appended as a tentative
+/// "assistant (streaming…)" block at the end when present.
+fn render_transcript_lines(
+    events: &[serde_json::Value],
+    streaming_partial: Option<&str>,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(""));
+
+    // Pair ToolCall / ToolResult by call_id so we render them
+    // together. Keep a small map.
+    let mut tool_results: std::collections::HashMap<String, &serde_json::Value> =
+        std::collections::HashMap::new();
+    for ev in events {
+        if let Some(p) = ev.get("payload") {
+            if p.get("kind").and_then(|k| k.as_str()) == Some("tool_result") {
+                if let Some(cid) = p.get("call_id").and_then(|v| v.as_str()) {
+                    tool_results.insert(cid.to_string(), ev);
+                }
+            }
+        }
+    }
+
+    for ev in events {
+        let Some(payload) = ev.get("payload") else { continue };
+        let kind = payload.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+        let ts = ev.get("timestamp_unix_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+        let _ = ts; // future: show timestamps in a compact column
+
+        match kind {
+            "user_message" => {
+                let content = payload
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                push_block(&mut lines, "you", Color::Cyan, content);
+            }
+            "assistant_message_event" => {
+                let text = payload
+                    .get("message")
+                    .and_then(|m| m.get("text"))
+                    .and_then(|v| v.as_str())
+                    .or_else(|| {
+                        payload
+                            .get("message")
+                            .and_then(|m| m.get("content"))
+                            .and_then(|v| v.as_str())
+                    })
+                    .unwrap_or("");
+                push_block(&mut lines, "assistant", Color::White, text);
+            }
+            "tool_call" => {
+                let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let call_id = payload.get("call_id").and_then(|v| v.as_str()).unwrap_or("?");
+                let args = payload
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let args_str = match serde_json::to_string(&args) {
+                    Ok(s) if s.len() <= 200 => s,
+                    Ok(s) => format!("{}…", &s[..199.min(s.len() - 1)]),
+                    Err(_) => "?".to_string(),
+                };
+                let mut body = format!("args: {args_str}");
+                if let Some(result_ev) = tool_results.get(call_id) {
+                    if let Some(result_p) = result_ev.get("payload") {
+                        let result_content = result_p
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let is_error = result_p
+                            .get("is_error")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let result_snip: String =
+                            result_content.chars().take(400).collect();
+                        let marker = if is_error { "!! error" } else { "→ ok" };
+                        body.push_str(&format!("\n{marker}: {result_snip}"));
+                        if result_content.chars().count() > 400 {
+                            body.push('…');
+                        }
+                    }
+                }
+                push_block(
+                    &mut lines,
+                    &format!("tool: {name}"),
+                    Color::Magenta,
+                    &body,
+                );
+            }
+            "tool_result" => {
+                // Rendered inline under its ToolCall above. Skip.
+            }
+            "done" => {
+                let stop = payload
+                    .get("stop_reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let elapsed = payload
+                    .get("elapsed_ms")
+                    .and_then(|v| v.as_u64())
+                    .map(|m| format!("{m}ms"))
+                    .unwrap_or_else(|| "—".into());
+                lines.push(Line::from(Span::styled(
+                    format!("─── done · {stop} · {elapsed} ───"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(""));
+            }
+            "error" => {
+                let msg = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                push_block(&mut lines, "ERROR", Color::Red, msg);
+            }
+            "session_created" | "callout" | "context_assembly" | "session_closed" => {
+                // Sidechannel events — not in the transcript pane.
+                // The firehose carries these globally.
+            }
+            other => {
+                lines.push(Line::from(Span::styled(
+                    format!("({other})"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+    }
+
+    if let Some(partial) = streaming_partial {
+        if !partial.is_empty() {
+            push_block(
+                &mut lines,
+                "assistant (streaming…)",
+                Color::Yellow,
+                partial,
+            );
+        }
+    }
+
+    lines
+}
+
+fn push_block(out: &mut Vec<Line<'static>>, label: &str, color: Color, body: &str) {
+    out.push(Line::from(Span::styled(
+        format!("┌─ {label} "),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )));
+    for raw_line in body.lines() {
+        // Wrap is handled by the outer Paragraph widget; just indent.
+        out.push(Line::from(vec![
+            Span::styled("│ ", Style::default().fg(color)),
+            Span::raw(raw_line.to_string()),
+        ]));
+    }
+    out.push(Line::from(Span::styled(
+        "└─".to_string(),
+        Style::default().fg(color),
+    )));
+    out.push(Line::from(""));
 }
 
 fn render_placeholder(f: &mut Frame, area: Rect, name: &str, fkey: &str) {

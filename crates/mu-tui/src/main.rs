@@ -189,6 +189,13 @@ struct App {
     // bottom. 0 = pinned to bottom (auto-follow on new content);
     // >0 = user scrolled up. Reset to 0 with End / `0`.
     transcript_scroll_offset: u16,
+    // F8 events explorer scroll state. Same semantics as transcript
+    // scroll: 0 = pinned to bottom of firehose, >0 = scrolled up.
+    events_scroll_offset: u16,
+    // F8 events explorer filter: if set, only show firehose lines
+    // matching this substring. Toggleable via `:filter <text>`
+    // palette command. Empty = no filter (show all).
+    events_filter: String,
     // Wire integration. None ⇒ scaffold mock-data mode (no live daemon).
     mu: Option<MuClient>,
     /// `provider/model` to use when a new session is created via `n`.
@@ -234,6 +241,8 @@ impl App {
             streaming_text: std::collections::HashMap::new(),
             transcript_events_by_sid: std::collections::HashMap::new(),
             transcript_scroll_offset: 0,
+            events_scroll_offset: 0,
+            events_filter: String::new(),
             mu,
             default_provider,
         }
@@ -686,11 +695,33 @@ impl App {
                 self.transcript_scroll_offset =
                     self.transcript_scroll_offset.saturating_sub(2);
             }
+            // F8 events-explorer scroll. Same keys as F3 transcript.
+            (KeyCode::PageUp, _) if matches!(self.mode, ViewMode::Events) => {
+                self.events_scroll_offset = self.events_scroll_offset.saturating_add(10);
+            }
+            (KeyCode::PageDown, _) if matches!(self.mode, ViewMode::Events) => {
+                self.events_scroll_offset = self.events_scroll_offset.saturating_sub(10);
+            }
+            (KeyCode::Home, _) if matches!(self.mode, ViewMode::Events) => {
+                self.events_scroll_offset = u16::MAX;
+            }
+            (KeyCode::End, _) if matches!(self.mode, ViewMode::Events) => {
+                self.events_scroll_offset = 0;
+            }
+            (KeyCode::Char('k'), _) if matches!(self.mode, ViewMode::Events) => {
+                self.events_scroll_offset = self.events_scroll_offset.saturating_add(2);
+            }
+            (KeyCode::Char('j'), _) if matches!(self.mode, ViewMode::Events) => {
+                self.events_scroll_offset = self.events_scroll_offset.saturating_sub(2);
+            }
             (KeyCode::F(4), _) => self.mode = ViewMode::Context,
             (KeyCode::F(5), _) => self.mode = ViewMode::Usage,
             (KeyCode::F(6), _) => self.mode = ViewMode::Tools,
             (KeyCode::F(7), _) => self.mode = ViewMode::Router,
-            (KeyCode::F(8), _) => self.mode = ViewMode::Events,
+            (KeyCode::F(8), _) => {
+                self.mode = ViewMode::Events;
+                self.events_scroll_offset = 0; // pinned to bottom on entry
+            }
             (KeyCode::F(9), _) => self.mode = ViewMode::Mailbox,
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
                 let n = self.sessions.len().max(1);
@@ -736,6 +767,22 @@ impl App {
                 }
             }
             "quit" | "q" => self.quit = true,
+            "filter" => {
+                // :filter <substring>   → only F8 lines containing it
+                // :filter               → clear filter
+                self.events_filter = rest.join(" ");
+                self.events_scroll_offset = 0; // jump back to bottom
+                if self.events_filter.is_empty() {
+                    self.firehose.push("[ok] filter cleared".into());
+                } else {
+                    self.firehose
+                        .push(format!("[ok] filter set: {:?}", self.events_filter));
+                }
+            }
+            "clear-filter" => {
+                self.events_filter.clear();
+                self.firehose.push("[ok] filter cleared".into());
+            }
             _ => {
                 self.firehose.push(format!("[unknown command] :{cmd}"));
             }
@@ -1014,7 +1061,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         ViewMode::Usage => render_placeholder(f, chunks[2], "Usage / Cache", "F5"),
         ViewMode::Tools => render_placeholder(f, chunks[2], "Tools / MCP / Skills", "F6"),
         ViewMode::Router => render_placeholder(f, chunks[2], "Router / Proxy", "F7"),
-        ViewMode::Events => render_placeholder(f, chunks[2], "Event Explorer", "F8"),
+        ViewMode::Events => render_events_explorer(f, app, chunks[2]),
         ViewMode::Mailbox => render_placeholder(f, chunks[2], "Mailbox (cooperating sessions)", "F9"),
     }
     render_firehose(f, app, chunks[3]);
@@ -1568,6 +1615,60 @@ fn push_block(out: &mut Vec<Line<'static>>, label: &str, color: Color, body: &st
     out.push(Line::from(""));
 }
 
+/// F8 — Events explorer. Full-screen scrollable view of the
+/// in-memory firehose buffer (up to 500 lines). Same scroll
+/// semantics as F3 transcript: 0 offset = pinned to bottom, >0 =
+/// scrolled up.
+///
+/// Filter via `:filter <substring>` palette command;
+/// `:clear-filter` or `:filter` (no arg) clears it.
+fn render_events_explorer(f: &mut Frame, app: &App, area: Rect) {
+    let filter = app.events_filter.trim();
+    // Build the filtered line list. Cheap — firehose is capped at 500.
+    let lines_owned: Vec<String> = if filter.is_empty() {
+        app.firehose.iter().cloned().collect()
+    } else {
+        app.firehose
+            .iter()
+            .filter(|l| l.contains(filter))
+            .cloned()
+            .collect()
+    };
+    let total = lines_owned.len();
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let max_top = total.saturating_sub(inner_height);
+    let scroll_y = max_top
+        .saturating_sub(app.events_scroll_offset as usize)
+        .min(max_top) as u16;
+    let title_suffix = if filter.is_empty() {
+        format!("{total} events")
+    } else {
+        format!(
+            "{total} events matching {:?}  (:clear-filter to reset)",
+            filter
+        )
+    };
+    let scroll_suffix = if app.events_scroll_offset > 0 {
+        format!(
+            "  · scrolled up {} · End to bottom · Home to top",
+            app.events_scroll_offset
+        )
+    } else {
+        " · End=bottom · Home=top · :filter to filter".into()
+    };
+    let title = format!(" Events Explorer (F8) — {title_suffix}{scroll_suffix} ");
+    let body_lines: Vec<Line> = lines_owned
+        .iter()
+        .map(|s| Line::from(s.as_str()))
+        .collect();
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let paragraph = Paragraph::new(body_lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_y, 0));
+    f.render_widget(paragraph, area);
+}
+
 fn render_placeholder(f: &mut Frame, area: Rect, name: &str, fkey: &str) {
     let body = vec![
         Line::from(""),
@@ -1631,10 +1732,10 @@ fn render_statusline(f: &mut Frame, app: &App, area: Rect) {
             )
         }
         InputMode::Normal => {
-            let scroll_hint = if matches!(app.mode, ViewMode::SessionDetail) {
-                "j/k PgUp/PgDn Home/End scroll · "
-            } else {
-                "j/k select · "
+            let scroll_hint = match app.mode {
+                ViewMode::SessionDetail => "j/k PgUp/PgDn Home/End scroll · ",
+                ViewMode::Events => "j/k PgUp/PgDn Home/End scroll · :filter <text> · ",
+                _ => "j/k select · ",
             };
             format!(
                 " mode: {}   keys: F1-F9 · {}n new · i/Enter send · : palette · q quit",

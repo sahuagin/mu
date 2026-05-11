@@ -130,11 +130,18 @@ struct App {
     prompt_buffer: String,
     quit: bool,
     last_tick: Instant,
-    // Daemon stats (mock until daemon.outstanding_calls + projection
-    // queries land).
-    daemon_uptime: Duration,
-    event_count: u64,
-    cost_budget: (f32, f32), // (used, budget)
+    // Daemon stats — when connected, populated from daemon.stats; in
+    // mock-data mode these stay frozen at the constructed defaults.
+    daemon_uptime_ms: u64,
+    daemon_event_count: u64,
+    daemon_total_input_tokens: u64,
+    daemon_total_output_tokens: u64,
+    daemon_active_session_count: u32,
+    daemon_in_flight_calls_count: u32,
+    daemon_id: Option<String>,
+    cost_budget: (f32, f32), // (used, budget) — still partially mocked v1
+    // Throttle for periodic daemon queries: every N ticks.
+    poll_tick_counter: u32,
     // Wire integration. None ⇒ scaffold mock-data mode (no live daemon).
     mu: Option<MuClient>,
     /// `provider/model` to use when a new session is created via `n`.
@@ -147,7 +154,12 @@ impl App {
         state.select(Some(0));
         let connected = mu.is_some();
         let (sessions, firehose) = if connected {
-            (Vec::new(), vec![format!("[startup] connected to mu serve; type `n` to create a session, `i` to send a prompt to selected.")])
+            (
+                Vec::new(),
+                vec![format!(
+                    "[startup] connected to mu serve; type `n` to create a session, `i` to send a prompt to selected."
+                )],
+            )
         } else {
             (mock_sessions(), mock_firehose())
         };
@@ -161,9 +173,15 @@ impl App {
             prompt_buffer: String::new(),
             quit: false,
             last_tick: Instant::now(),
-            daemon_uptime: Duration::from_secs(0),
-            event_count: 0,
+            daemon_uptime_ms: 0,
+            daemon_event_count: 0,
+            daemon_total_input_tokens: 0,
+            daemon_total_output_tokens: 0,
+            daemon_active_session_count: 0,
+            daemon_in_flight_calls_count: 0,
+            daemon_id: None,
             cost_budget: (0.0, 10.0),
+            poll_tick_counter: 0,
             mu,
             default_provider,
         }
@@ -175,15 +193,21 @@ impl App {
 
     fn tick(&mut self) {
         let now = Instant::now();
-        let dt = now - self.last_tick;
         self.last_tick = now;
-        self.daemon_uptime += dt;
-        // Drain notifications from the daemon (if connected).
+        if !self.connected() {
+            return;
+        }
+        // 1. Drain incoming notifications into the firehose / per-row phase.
         if let Some(mu) = self.mu.as_mut() {
             for _ in 0..64 {
                 match mu.try_recv_notification() {
                     Some(MuMessage::Notification { method, params }) => {
-                        handle_notification(&mut self.sessions, &mut self.firehose, &mut self.event_count, &method, &params);
+                        handle_notification(
+                            &mut self.sessions,
+                            &mut self.firehose,
+                            &method,
+                            &params,
+                        );
                     }
                     Some(MuMessage::Eof) => {
                         self.firehose.push("[!! mu serve closed stdout]".into());
@@ -198,11 +222,98 @@ impl App {
                 }
             }
         }
+        // 2. Periodic projection queries. session.list runs every
+        //    tick (cheap, local registry, microseconds); daemon.stats
+        //    runs every 4 ticks (~1s) to keep header counters fresh
+        //    without flooding the dispatch path.
+        self.refresh_session_list();
+        self.poll_tick_counter = self.poll_tick_counter.wrapping_add(1);
+        if self.poll_tick_counter % 4 == 0 {
+            self.refresh_daemon_stats();
+        }
+    }
+
+    fn refresh_session_list(&mut self) {
+        let Some(mu) = self.mu.as_mut() else { return };
+        let res = mu.request("session.list", json!({}));
+        let rows: Vec<SessionRow> = match res {
+            Ok(v) => v
+                .get("sessions")
+                .and_then(|s| s.as_array())
+                .map(|arr| {
+                    arr.iter().filter_map(session_row_from_info_value).collect()
+                })
+                .unwrap_or_default(),
+            Err(e) => {
+                self.firehose.push(format!("[!! session.list] {e}"));
+                return;
+            }
+        };
+
+        // Preserve selection by session_id, falling back to first row
+        // (or no selection if list is empty).
+        let prior_sid = self
+            .selected_session
+            .selected()
+            .and_then(|i| self.sessions.get(i))
+            .and_then(|r| r.session_id.clone());
+        self.sessions = rows;
+        if let Some(target) = prior_sid {
+            if let Some(idx) = self
+                .sessions
+                .iter()
+                .position(|r| r.session_id.as_deref() == Some(target.as_str()))
+            {
+                self.selected_session.select(Some(idx));
+                return;
+            }
+        }
+        if !self.sessions.is_empty() {
+            self.selected_session.select(Some(0));
+        } else {
+            self.selected_session.select(None);
+        }
+    }
+
+    fn refresh_daemon_stats(&mut self) {
+        let Some(mu) = self.mu.as_mut() else { return };
+        match mu.request("daemon.stats", json!({})) {
+            Ok(v) => {
+                self.daemon_id = v
+                    .get("daemon_id")
+                    .and_then(|s| s.as_str())
+                    .map(String::from);
+                self.daemon_uptime_ms =
+                    v.get("uptime_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+                self.daemon_event_count =
+                    v.get("total_events").and_then(|x| x.as_u64()).unwrap_or(0);
+                self.daemon_total_input_tokens = v
+                    .get("total_input_tokens")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
+                self.daemon_total_output_tokens = v
+                    .get("total_output_tokens")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
+                self.daemon_active_session_count = v
+                    .get("active_session_count")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0) as u32;
+                self.daemon_in_flight_calls_count = v
+                    .get("in_flight_calls_count")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0) as u32;
+            }
+            Err(e) => {
+                self.firehose.push(format!("[!! daemon.stats] {e}"));
+            }
+        }
     }
 
     fn create_session(&mut self) {
         let Some(mu) = self.mu.as_mut() else {
-            self.firehose.push("[no daemon] `n` ignored — not connected".into());
+            self.firehose
+                .push("[no daemon] `n` ignored — not connected".into());
             return;
         };
         let (kind, model) = self.default_provider.clone();
@@ -212,20 +323,24 @@ impl App {
         );
         match res {
             Ok(v) => {
-                let sid = v.get("session_id").and_then(|s| s.as_str()).unwrap_or("?").to_string();
-                self.firehose.push(format!("[ok] create_session → {sid} ({kind}/{model})"));
-                self.sessions.push(SessionRow {
-                    short_id: sid.clone(),
-                    title: format!("(new) {sid}"),
-                    status: SessionStatus::Idle,
-                    model: format!("{kind} / {model}"),
-                    cost_usd: 0.0,
-                    tokens_kilo: 0,
-                    phase: "idle (no ask yet)".into(),
-                    session_id: Some(sid),
-                });
-                // Select the newly created session.
-                self.selected_session.select(Some(self.sessions.len() - 1));
+                let sid = v
+                    .get("session_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                self.firehose
+                    .push(format!("[ok] create_session → {sid} ({kind}/{model})"));
+                // Eagerly refresh so the new session shows up before the
+                // next tick. session.list is cheap.
+                self.refresh_session_list();
+                // Try to select the new row.
+                if let Some(idx) = self
+                    .sessions
+                    .iter()
+                    .position(|r| r.session_id.as_deref() == Some(sid.as_str()))
+                {
+                    self.selected_session.select(Some(idx));
+                }
             }
             Err(e) => {
                 self.firehose.push(format!("[!! create_session] {e}"));
@@ -394,14 +509,61 @@ impl App {
     }
 }
 
+/// Map one `SessionInfo` JSON object (the shape returned by
+/// `session.list`) to a TUI row. Returns None if the payload is
+/// malformed (defensive — forward-compat with older daemons that
+/// might not include all fields).
+fn session_row_from_info_value(v: &serde_json::Value) -> Option<SessionRow> {
+    let sid = v.get("session_id")?.as_str()?.to_string();
+    let provider_kind = v
+        .get("provider_kind")
+        .and_then(|s| s.as_str())
+        .unwrap_or("?");
+    let model = v.get("model").and_then(|s| s.as_str()).unwrap_or("?");
+    let status_str = v.get("status").and_then(|s| s.as_str()).unwrap_or("idle");
+    let status = match status_str {
+        "asking" | "streaming" | "tool_executing" => SessionStatus::Running,
+        "awaiting_input_required" => SessionStatus::Idle, // ○ — needs user
+        "done" => SessionStatus::Done,
+        "errored" => SessionStatus::Idle, // ○ for now — would be nice to have a glyph
+        _ => SessionStatus::Idle,
+    };
+    let phase = match status_str {
+        "asking" => "asking (model call pending)".to_string(),
+        "streaming" => "streaming".to_string(),
+        "tool_executing" => "tool executing".to_string(),
+        "awaiting_input_required" => "awaiting approval".to_string(),
+        "done" => "done".to_string(),
+        "errored" => "error".to_string(),
+        "idle" => "idle".to_string(),
+        other => other.to_string(),
+    };
+    let cumulative_usage = v.get("cumulative_usage");
+    let tokens_kilo = cumulative_usage
+        .and_then(|u| {
+            let i = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+            let o = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+            Some(((i + o) / 1000) as u32)
+        })
+        .unwrap_or(0);
+    Some(SessionRow {
+        short_id: sid.chars().take(12).collect(),
+        title: format!("{provider_kind} / {model}"),
+        status,
+        model: format!("{provider_kind} / {model}"),
+        cost_usd: 0.0, // populated when usage→cost mapping lands
+        tokens_kilo,
+        phase,
+        session_id: Some(sid),
+    })
+}
+
 fn handle_notification(
     sessions: &mut [SessionRow],
     firehose: &mut Vec<String>,
-    event_count: &mut u64,
     method: &str,
     params: &serde_json::Value,
 ) {
-    *event_count += 1;
     let sid = params.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
     let find = |sessions: &mut [SessionRow], sid: &str| -> Option<usize> {
         sessions
@@ -582,15 +744,41 @@ fn ui(f: &mut Frame, app: &mut App) {
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let (used, budget) = app.cost_budget;
+    let dot_style = if app.connected() {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let id_snip = app
+        .daemon_id
+        .as_deref()
+        .map(|s| s.chars().take(6).collect::<String>())
+        .unwrap_or_else(|| "—".into());
+    let events_compact = if app.daemon_event_count >= 1000 {
+        format!(
+            "{}.{}k",
+            app.daemon_event_count / 1000,
+            (app.daemon_event_count / 100) % 10
+        )
+    } else {
+        format!("{}", app.daemon_event_count)
+    };
     let line = Line::from(vec![
         Span::styled("mu", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" — command center  "),
-        Span::raw("●  uptime "),
-        Span::raw(fmt_duration(app.daemon_uptime)),
-        Span::raw(format!("  events {}.{}k  ", app.event_count / 1000, (app.event_count / 100) % 10)),
+        Span::styled("●  ", dot_style),
+        Span::raw(format!("daemon {id_snip}")),
+        Span::raw("  uptime "),
+        Span::raw(fmt_duration(Duration::from_millis(app.daemon_uptime_ms))),
+        Span::raw(format!(
+            "  events {events_compact}  active {}/{} sess  in-flight {}  ",
+            app.daemon_active_session_count,
+            app.sessions.len(),
+            app.daemon_in_flight_calls_count
+        )),
         Span::raw("budget "),
         Span::styled(
-            format!("${:.2}/${:.2}", used, budget),
+            format!("${used:.2}/${budget:.2}"),
             Style::default().fg(if used / budget > 0.7 {
                 Color::Yellow
             } else {

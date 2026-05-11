@@ -113,6 +113,21 @@ impl SessionStatus {
     }
 }
 
+/// Latest provider_status notification snapshot from mu-035. The
+/// TUI caches these per-session and renders the state + elapsed_ms
+/// as the phase line, replacing the session.list-derived heuristic.
+#[derive(Debug, Clone)]
+struct ProviderStatusSnapshot {
+    state: String, // serialized ProviderStatusKind: "awaiting_first_token" | ...
+    elapsed_ms: u64,
+    bytes_received: Option<u64>,
+    tool_call_id: Option<String>,
+    /// When this snapshot was received locally. Used to age out
+    /// snapshots that haven't been refreshed (e.g. session went
+    /// quiet — daemon went away).
+    received_at: Instant,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputMode {
     Normal,
@@ -147,10 +162,17 @@ struct App {
     // intentionally client-side because "when did the user press
     // ctrl-enter" is UI state, not daemon state — and the gap between
     // RPC ack and first token is the most user-confusing silent
-    // window. mu-035 will eventually give us authoritative
-    // session.provider_status notifications; until then, this is the
-    // explicit "yes, we sent it" affordance.
+    // window. With mu-035 Phase B (periodic session.provider_status
+    // notifications), `latest_status` below is the AUTHORITATIVE
+    // source for the phase line; `ask_started_at` stays as the
+    // client-side belt-and-suspenders during the very first ~1s
+    // before the first provider_status tick arrives.
     ask_started_at: std::collections::HashMap<String, Instant>,
+    // Latest provider_status notification per session (mu-035).
+    // Populated by handle_notification on every session.provider_status
+    // tick. The TUI renders { state, elapsed_ms } in the phase line
+    // and the right-pane affordance. Cleared on session.done.
+    latest_status: std::collections::HashMap<String, ProviderStatusSnapshot>,
     // Per-session live streaming-text accumulator. text_delta
     // events are NOT logged (per event_log.rs design doc — "streaming-
     // only events do NOT go in the log"). So to render an in-flight
@@ -208,6 +230,7 @@ impl App {
             cost_budget: (0.0, 10.0),
             poll_tick_counter: 0,
             ask_started_at: std::collections::HashMap::new(),
+            latest_status: std::collections::HashMap::new(),
             streaming_text: std::collections::HashMap::new(),
             transcript_events_by_sid: std::collections::HashMap::new(),
             transcript_scroll_offset: 0,
@@ -282,6 +305,7 @@ impl App {
                         handle_notification(
                             &mut self.sessions,
                             &mut self.firehose,
+                            &mut self.latest_status,
                             &method,
                             &params,
                         );
@@ -349,7 +373,7 @@ impl App {
     fn refresh_session_list(&mut self) {
         let Some(mu) = self.mu.as_mut() else { return };
         let res = mu.request("session.list", json!({}));
-        let rows: Vec<SessionRow> = match res {
+        let mut rows: Vec<SessionRow> = match res {
             Ok(v) => v
                 .get("sessions")
                 .and_then(|s| s.as_array())
@@ -362,6 +386,36 @@ impl App {
                 return;
             }
         };
+        // Overlay authoritative phase + status from the live
+        // session.provider_status snapshot (mu-035). The
+        // session.list value is derived from the event log and lags
+        // by up to a tick; the live snapshot is current.
+        for row in rows.iter_mut() {
+            if let Some(sid) = row.session_id.as_deref() {
+                if let Some(snap) = self.latest_status.get(sid) {
+                    let synthetic_ms = snap.elapsed_ms
+                        + snap.received_at.elapsed().as_millis() as u64;
+                    let secs = synthetic_ms as f32 / 1000.0;
+                    row.phase = match snap.state.as_str() {
+                        "awaiting_first_token" => {
+                            format!("awaiting first token ({secs:.1}s)")
+                        }
+                        "thinking" => format!("thinking ({secs:.1}s)"),
+                        "streaming" => "streaming".into(),
+                        "tool_executing" => format!("tool: executing ({secs:.1}s)"),
+                        "awaiting_tool_result" => {
+                            format!("awaiting tool result ({secs:.1}s)")
+                        }
+                        "idle" => "idle".into(),
+                        other => other.to_string(),
+                    };
+                    row.status = match snap.state.as_str() {
+                        "idle" | "done" => SessionStatus::Idle,
+                        _ => SessionStatus::Running,
+                    };
+                }
+            }
+        }
 
         // Preserve selection by session_id, falling back to first row
         // (or no selection if list is empty).
@@ -741,6 +795,7 @@ fn session_row_from_info_value(v: &serde_json::Value) -> Option<SessionRow> {
 fn handle_notification(
     sessions: &mut [SessionRow],
     firehose: &mut Vec<String>,
+    latest_status: &mut std::collections::HashMap<String, ProviderStatusSnapshot>,
     method: &str,
     params: &serde_json::Value,
 ) {
@@ -786,6 +841,46 @@ fn handle_notification(
             let rid = params.get("request_id").and_then(|v| v.as_str()).unwrap_or("?");
             firehose.push(format!("[{sid}] !! input_required ({rid}) — TUI approval flow TBD"));
         }
+        "session.provider_status" => {
+            // mu-035 Phase B: store the latest snapshot per session.
+            // The phase line + right-pane affordance read this on
+            // every render, so the visible "thinking 3.4s" advances
+            // every tick (~1s).
+            let state = params
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            let elapsed_ms = params
+                .get("elapsed_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let bytes_received = params.get("bytes_received").and_then(|v| v.as_u64());
+            let tool_call_id = params
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            // Detect TRANSITION (state changed since last snapshot)
+            // so we only log to the firehose on state changes — the
+            // periodic re-emits would otherwise flood at ~1/sec.
+            let is_transition = latest_status
+                .get(sid)
+                .map(|prev| prev.state != state)
+                .unwrap_or(true);
+            latest_status.insert(
+                sid.to_string(),
+                ProviderStatusSnapshot {
+                    state: state.clone(),
+                    elapsed_ms,
+                    bytes_received,
+                    tool_call_id,
+                    received_at: Instant::now(),
+                },
+            );
+            if is_transition {
+                firehose.push(format!("[{sid}] status → {state}"));
+            }
+        }
         "session.done" => {
             let stop = params.get("stop_reason").and_then(|v| v.as_str()).unwrap_or("?");
             let elapsed_ms = params.get("elapsed_ms").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -799,10 +894,14 @@ fn handle_notification(
                     sessions[i].tokens_kilo = ((inp + out) / 1000) as u32;
                 }
             }
+            // Clear the status snapshot — session is no longer
+            // running. The next ask will re-populate.
+            latest_status.remove(sid);
         }
         "session.error" => {
             let msg = params.get("message").and_then(|v| v.as_str()).unwrap_or("error");
             firehose.push(format!("[{sid}] !! error: {msg}"));
+            latest_status.remove(sid);
         }
         other => {
             // Forward-compat: unknown methods get logged but don't crash.
@@ -1047,14 +1146,50 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
         .and_then(|i| app.sessions.get(i));
     let detail_text = if let Some(s) = selected {
         let sid_opt = s.session_id.as_deref();
-        // "Awaiting first token" affordance: visible the moment the
-        // user submits a prompt, vanishes as soon as the first
-        // text_delta / tool_call / done arrives. UI state, not daemon
-        // state — fills the silent window before the wire starts
-        // talking.
-        let awaiting_line = sid_opt
-            .and_then(|sid| app.ask_started_at.get(sid))
-            .map(|t| {
+        // Provider-status affordance — preferentially from mu-035
+        // session.provider_status (authoritative server-side timer),
+        // falling back to the client-side ask_started_at for the
+        // ~1s gap before the first periodic tick arrives.
+        //
+        // Show different colors/labels per state:
+        //   awaiting_first_token → yellow ● awaiting first token Xs
+        //   thinking             → yellow ● thinking Xs
+        //   tool_executing       → magenta ● tool executing Xs (call N)
+        //   streaming            → (no affordance — text_delta is its own signal)
+        //   idle / done          → no affordance
+        let awaiting_line = sid_opt.and_then(|sid| {
+            // Prefer authoritative live status from mu-035.
+            if let Some(snap) = app.latest_status.get(sid) {
+                // Bump the elapsed by how long since we received this
+                // snapshot — so the displayed seconds advance smoothly
+                // between ticks rather than jumping every ~1s.
+                let synthetic_elapsed_ms = snap.elapsed_ms
+                    + snap.received_at.elapsed().as_millis() as u64;
+                let secs = synthetic_elapsed_ms as f32 / 1000.0;
+                let (label, color) = match snap.state.as_str() {
+                    "awaiting_first_token" => ("● awaiting first token  ", Color::Yellow),
+                    "thinking" => ("● thinking  ", Color::Yellow),
+                    "tool_executing" => ("● tool executing  ", Color::Magenta),
+                    "awaiting_tool_result" => ("● awaiting tool result  ", Color::Magenta),
+                    "streaming" | "idle" => return None,
+                    _ => ("● working  ", Color::Cyan),
+                };
+                let suffix = snap
+                    .tool_call_id
+                    .as_deref()
+                    .map(|cid| format!(" (call {cid})"))
+                    .unwrap_or_default();
+                return Some(Line::from(vec![
+                    Span::styled(
+                        label,
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("{secs:.1}s{suffix}"), Style::default().fg(color)),
+                ]));
+            }
+            // Fallback: client-side ask_started_at — bridges the
+            // RPC-ack-to-first-tick gap (< 1s typically).
+            app.ask_started_at.get(sid).map(|t| {
                 let elapsed = t.elapsed();
                 Line::from(vec![
                     Span::styled(
@@ -1068,7 +1203,8 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
                         Style::default().fg(Color::Yellow),
                     ),
                 ])
-            });
+            })
+        });
 
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(vec![

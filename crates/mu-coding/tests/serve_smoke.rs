@@ -262,3 +262,87 @@ async fn b7_close_removes_session() {
     drop(client);
     let _ = timeout(Duration::from_millis(500), server_handle).await;
 }
+
+/// B-8: session.stats returns a usable snapshot of the event log.
+/// Verifies (a) the dispatch path is wired, (b) running an
+/// ask_session populates ask_count / total_turn_count / event_count,
+/// (c) the SessionCreated provenance shows up in provider_kind /
+/// model. Usage will be None for FauxProvider (it doesn't report
+/// usage), but the structure of the response is still validated.
+#[tokio::test]
+async fn b8_session_stats_after_ask() {
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) = spawn_server(provider);
+
+    // Create with a real-ish provider selector so we can verify it
+    // round-trips into the SessionCreated event.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "create_session",
+        "params": {
+            "provider": { "kind": "openrouter", "model": "test/model" }
+        }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = read_line(&mut client).await;
+    let session_id = resp["result"]["session_id"].as_str().unwrap().to_string();
+
+    // Ask once.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "ask_session",
+        "params": { "session_id": session_id, "user_message": "hi" }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    // Drain: ask response + text_delta + done. Order may vary.
+    let _ = read_n_lines(&mut client, 3).await;
+
+    // Query stats.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 3, "method": "session.stats",
+        "params": { "session_id": session_id }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = read_line(&mut client).await;
+    assert_eq!(resp["id"], 3);
+    let result = &resp["result"];
+    assert_eq!(result["session_id"], session_id);
+    assert_eq!(result["provider_kind"], "openrouter");
+    assert_eq!(result["model"], "test/model");
+    // Event count: SessionCreated + UserMessage(MessageEnd) +
+    // AssistantMessage(MessageEnd) + Done = at least 3 (UserMessage
+    // may or may not arrive depending on how the loop turns out).
+    let event_count = result["event_count"].as_u64().expect("event_count is u64");
+    assert!(event_count >= 3, "event_count too low: {event_count}");
+    assert_eq!(result["ask_count"], 1);
+    assert!(result["total_turn_count"].as_u64().unwrap_or(0) >= 1);
+    // Timestamps are present.
+    assert!(result["started_at_unix_ms"].is_number());
+    assert!(result["last_activity_unix_ms"].is_number());
+    let started = result["started_at_unix_ms"].as_u64().unwrap();
+    let last = result["last_activity_unix_ms"].as_u64().unwrap();
+    assert!(last >= started, "last < started: {last} vs {started}");
+
+    // Stats query on a missing session is INVALID_PARAMS.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 4, "method": "session.stats",
+        "params": { "session_id": "nonexistent-session" }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = read_line(&mut client).await;
+    assert_eq!(resp["id"], 4);
+    assert_eq!(resp["error"]["code"], -32602);
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}

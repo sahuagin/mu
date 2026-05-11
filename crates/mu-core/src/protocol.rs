@@ -139,6 +139,49 @@ pub struct CloseSessionResponse {
     pub closed: bool,
 }
 
+/// Query a session's running totals (mu-027). The result is a
+/// snapshot, derived from the session's durable event log.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionStatsRequest {
+    pub session_id: String,
+}
+
+impl SessionStatsRequest {
+    pub const METHOD: &'static str = "session.stats";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionStatsResponse {
+    pub session_id: String,
+    /// Provider kind from the wire protocol (e.g. "openai_codex").
+    /// None if no SessionCreated event has been recorded (shouldn't
+    /// happen in normal use; defensive).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Unix ms of the first event (typically SessionCreated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_unix_ms: Option<u64>,
+    /// Unix ms of the most recent event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity_unix_ms: Option<u64>,
+    /// Total event count in the log.
+    pub event_count: u32,
+    /// Number of completed ask_session round-trips.
+    pub ask_count: u32,
+    /// Sum of Done.turn_count across all asks.
+    pub total_turn_count: u32,
+    /// Number of tool invocations.
+    pub tool_call_count: u32,
+    /// Sum of Done.elapsed_ms across all asks.
+    pub elapsed_total_ms: u64,
+    /// Aggregated usage across all asks. None if no Done event
+    /// reported usage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::agent::Usage>,
+}
+
 // ===== Event notifications (daemon → frontend) =====
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

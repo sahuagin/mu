@@ -269,6 +269,40 @@ impl SessionEventLog {
             })
             .unwrap_or(0)
     }
+
+    /// Timestamp of the first event (typically `SessionCreated`).
+    /// None if the log is empty.
+    pub fn started_at_unix_ms(&self) -> Option<u64> {
+        self.events
+            .lock()
+            .ok()
+            .and_then(|events| events.first().map(|e| e.timestamp_unix_ms))
+    }
+
+    /// Timestamp of the most recent event. None if the log is empty.
+    pub fn last_activity_unix_ms(&self) -> Option<u64> {
+        self.events
+            .lock()
+            .ok()
+            .and_then(|events| events.last().map(|e| e.timestamp_unix_ms))
+    }
+
+    /// Pull (provider_kind, model) out of the first SessionCreated
+    /// event. None if no such event has been recorded (e.g. log was
+    /// constructed manually without going through dispatch).
+    pub fn provider_info(&self) -> Option<(String, String)> {
+        let events = self.events.lock().ok()?;
+        for ev in events.iter() {
+            if let EventPayload::SessionCreated {
+                provider_kind,
+                model,
+            } = &ev.payload
+            {
+                return Some((provider_kind.clone(), model.clone()));
+            }
+        }
+        None
+    }
 }
 
 fn now_unix_ms() -> u64 {

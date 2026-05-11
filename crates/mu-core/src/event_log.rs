@@ -116,6 +116,36 @@ pub enum EventPayload {
     },
     /// Session closed (via `close_session` RPC or daemon shutdown).
     SessionClosed,
+    /// Record of the prompt assembled for a provider call (mu-032).
+    /// Emitted BEFORE `provider.stream()`. The agent loop records
+    /// what was about to be sent so postmortem analysis can answer
+    /// "what did the model see right before this?"
+    ///
+    /// v1 records counts + provider info. Per-message source-event
+    /// mapping (the full source-map vision from
+    /// specs/architecture/event-sourced-context.md) is reconstructable
+    /// from the log by walking events of the relevant roles; an
+    /// explicit per-segment field is reserved for v2.
+    ContextAssembly {
+        /// Monotonic counter, unique within this session. Links a
+        /// ContextAssembly to the subsequent AssistantMessage/Done
+        /// for this same model call.
+        model_call_id: u32,
+        message_count: u32,
+        user_message_count: u32,
+        assistant_message_count: u32,
+        tool_result_count: u32,
+        /// Number of tool specs in the request.
+        tool_count: u32,
+        /// Token count estimate, when available. v1 leaves None
+        /// (no tokenizer wired); future provider-specific hooks
+        /// can populate.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_count_estimate: Option<u64>,
+        /// Provider + model from the session's selector.
+        provider_kind: String,
+        model: String,
+    },
 }
 
 /// Append-only per-session log.
@@ -264,6 +294,21 @@ impl SessionEventLog {
             .unwrap_or(0)
     }
 
+    /// Count of `ContextAssembly` events — equals the number of
+    /// provider calls made during this session. Each model call has
+    /// exactly one ContextAssembly (emitted before the call).
+    pub fn context_assembly_count(&self) -> u32 {
+        self.events
+            .lock()
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|e| matches!(e.payload, EventPayload::ContextAssembly { .. }))
+                    .count() as u32
+            })
+            .unwrap_or(0)
+    }
+
     /// Count of tool invocations.
     pub fn tool_call_count(&self) -> u32 {
         self.events
@@ -395,6 +440,83 @@ mod tests {
         assert!(log.cumulative_usage().is_none());
         assert_eq!(log.ask_count(), 1);
         assert_eq!(log.elapsed_total_ms(), 0);
+    }
+
+    #[test]
+    fn context_assembly_count_filters_to_assembly_events() {
+        let log = SessionEventLog::new("ca-count");
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage { content: "hi".into() },
+        );
+        log.append(
+            EventActor::System,
+            EventPayload::ContextAssembly {
+                model_call_id: 1,
+                message_count: 1,
+                user_message_count: 1,
+                assistant_message_count: 0,
+                tool_result_count: 0,
+                tool_count: 0,
+                token_count_estimate: None,
+                provider_kind: "anthropic_api".into(),
+                model: "x".into(),
+            },
+        );
+        log.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: None,
+                elapsed_ms: Some(100),
+            },
+        );
+        log.append(
+            EventActor::System,
+            EventPayload::ContextAssembly {
+                model_call_id: 2,
+                message_count: 3,
+                user_message_count: 2,
+                assistant_message_count: 1,
+                tool_result_count: 0,
+                tool_count: 0,
+                token_count_estimate: None,
+                provider_kind: "anthropic_api".into(),
+                model: "x".into(),
+            },
+        );
+        assert_eq!(log.context_assembly_count(), 2);
+        // Unaffected derivations.
+        assert_eq!(log.ask_count(), 1);
+    }
+
+    #[test]
+    fn context_assembly_payload_round_trips() -> Result<(), serde_json::Error> {
+        let ev = SessionEvent {
+            id: 1,
+            session_id: "s".into(),
+            parent_event_ids: vec![],
+            timestamp_unix_ms: 0,
+            actor: EventActor::System,
+            payload: EventPayload::ContextAssembly {
+                model_call_id: 7,
+                message_count: 5,
+                user_message_count: 2,
+                assistant_message_count: 2,
+                tool_result_count: 1,
+                tool_count: 3,
+                token_count_estimate: Some(2048),
+                provider_kind: "openai_codex".into(),
+                model: "gpt-5.5".into(),
+            },
+        };
+        let v = serde_json::to_value(&ev)?;
+        assert_eq!(v["payload"]["kind"], "context_assembly");
+        assert_eq!(v["payload"]["message_count"], 5);
+        let decoded: SessionEvent = serde_json::from_value(v)?;
+        assert_eq!(decoded, ev);
+        Ok(())
     }
 
     #[test]

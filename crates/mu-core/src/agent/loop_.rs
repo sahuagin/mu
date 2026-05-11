@@ -118,6 +118,19 @@ pub enum AgentEvent {
         arguments: serde_json::Value,
         summary: String,
     },
+    /// Prompt assembly snapshot. Emitted by the agent loop BEFORE
+    /// each `provider.stream()` call. The forwarder lands it in
+    /// the durable event log as `EventPayload::ContextAssembly`.
+    /// See spec mu-032 and
+    /// `specs/architecture/event-sourced-context.md`.
+    ContextAssembly {
+        model_call_id: u32,
+        message_count: u32,
+        user_message_count: u32,
+        assistant_message_count: u32,
+        tool_result_count: u32,
+        tool_count: u32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +326,10 @@ async fn run(
     // Per-ask tool-history. Used by the RetryPolicy::Never enforcement
     // path in handle_execute_tools. Reset on Done.
     let mut tool_history = ToolHistory::default();
+    // Monotonic per-session counter, incremented before each
+    // provider.stream() call. Used to link a ContextAssembly event
+    // to the AssistantMessage/Done it produced.
+    let mut model_call_id: u32 = 0;
 
     let _ = events.send(AgentEvent::AgentStart).await;
 
@@ -378,6 +395,22 @@ async fn run(
                 let _ = events.send(AgentEvent::TurnStart).await;
 
                 let tool_specs: Vec<ToolSpec> = tools.iter().map(|t| t.spec()).collect();
+
+                // Emit ContextAssembly BEFORE the provider call so
+                // the durable log records what the model was about
+                // to see. (mu-032.)
+                model_call_id += 1;
+                let (user_count, assistant_count, tool_result_count) = count_message_roles(&messages);
+                let _ = events
+                    .send(AgentEvent::ContextAssembly {
+                        model_call_id,
+                        message_count: messages.len() as u32,
+                        user_message_count: user_count,
+                        assistant_message_count: assistant_count,
+                        tool_result_count,
+                        tool_count: tool_specs.len() as u32,
+                    })
+                    .await;
 
                 match handle_invoke_llm(
                     provider.as_ref(),
@@ -504,6 +537,23 @@ async fn run(
 // ============================================================================
 // Per-ask tool history — backs RetryPolicy::Never enforcement
 // ============================================================================
+
+/// Count the number of User, Assistant, and ToolResult messages
+/// in a slice. Used by the ContextAssembly emit path (mu-032) to
+/// summarize the prompt being sent to the provider.
+fn count_message_roles(messages: &[AgentMessage]) -> (u32, u32, u32) {
+    let mut u = 0u32;
+    let mut a = 0u32;
+    let mut t = 0u32;
+    for m in messages {
+        match m {
+            AgentMessage::User { .. } => u += 1,
+            AgentMessage::Assistant(_) => a += 1,
+            AgentMessage::ToolResult { .. } => t += 1,
+        }
+    }
+    (u, a, t)
+}
 
 /// Bounded sliding window of recent tool dispatches per ask. The
 /// `Never` retry policy refuses dispatch on two conditions:

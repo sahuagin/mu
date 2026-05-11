@@ -499,7 +499,22 @@ impl App {
                 .push("[no daemon] `n` ignored — not connected".into());
             return;
         };
-        let (kind, model) = self.default_provider.clone();
+        let (kind_raw, model) = self.default_provider.clone();
+        // Normalize common variants → wire-protocol enum names. Mu's
+        // ProviderSelector is serde-tagged with snake_case discrimi-
+        // nators ("anthropic_api", "openai_codex", "openrouter",
+        // "faux"). Users tend to type "openai-codex" / "openai" /
+        // "openapi-codex" (typo) / "anthropic" — accept them all.
+        let kind = match kind_raw.to_lowercase().as_str() {
+            "anthropic" | "anthropic-api" | "anthropic_api" | "claude" => {
+                "anthropic_api".to_string()
+            }
+            "openai" | "openai-codex" | "openai_codex" | "codex" | "openapi-codex"
+            | "openapi_codex" | "openapi" => "openai_codex".to_string(),
+            "openrouter" | "open-router" | "open_router" => "openrouter".to_string(),
+            "faux" => "faux".to_string(),
+            other => other.to_string(), // fall through, daemon will reject
+        };
         let res = mu.request(
             "create_session",
             json!({ "provider": { "kind": kind, "model": model } }),
@@ -1731,7 +1746,11 @@ fn render_firehose(f: &mut Frame, app: &App, area: Rect) {
         format!(" Firehose · {total} events ")
     };
     let block = Block::default().borders(Borders::ALL).title(title);
-    let paragraph = Paragraph::new(lines).block(block);
+    // Wrap long lines so e.g. full error messages stay visible
+    // instead of being cut off at the right border. Wrap-expansion
+    // means a 200-char error consumes multiple visible rows; that's
+    // the trade we want for readability over density.
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     f.render_widget(paragraph, area);
 }
 

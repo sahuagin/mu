@@ -12,6 +12,9 @@
 //! persistence, `ContextAssembly` events, `MemoryWrite` events,
 //! `Compaction` events, branching/lineage via `parent_event_ids`.
 
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex,
@@ -157,6 +160,11 @@ pub struct SessionEventLog {
     session_id: String,
     events: Mutex<Vec<SessionEvent>>,
     next_id: AtomicU64,
+    /// Optional on-disk JSONL writer (mu-upb). When set, every
+    /// append() also writes the encoded event as one line. IO
+    /// failures are logged but never block the in-memory append —
+    /// disk persistence is best-effort, not load-bearing.
+    disk_writer: Mutex<Option<File>>,
 }
 
 impl SessionEventLog {
@@ -165,7 +173,32 @@ impl SessionEventLog {
             session_id: session_id.into(),
             events: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
+            disk_writer: Mutex::new(None),
         }
+    }
+
+    /// Attach an on-disk JSONL writer (mu-upb). Creates the parent
+    /// directories if needed and opens the file in append mode.
+    ///
+    /// Returns the path that was opened on success (useful for
+    /// logging "events going to /path/to/file.jsonl"). On error,
+    /// the writer stays None and append() continues in-memory only.
+    pub fn attach_disk_writer(&self, path: &std::path::Path) -> std::io::Result<PathBuf> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let mut guard = self.disk_writer.lock().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "disk_writer mutex poisoned",
+            )
+        })?;
+        *guard = Some(file);
+        Ok(path.to_path_buf())
     }
 
     pub fn session_id(&self) -> &str {
@@ -194,6 +227,11 @@ impl SessionEventLog {
             actor,
             payload,
         };
+        // mu-upb: best-effort JSONL write before the in-memory push
+        // so the disk record is at least as complete as memory. IO
+        // failures are logged and ignored — disk persistence is not
+        // load-bearing for the running daemon.
+        self.write_to_disk(&event);
         if let Ok(mut events) = self.events.lock() {
             events.push(event);
         } else {
@@ -203,6 +241,33 @@ impl SessionEventLog {
             );
         }
         id
+    }
+
+    fn write_to_disk(&self, event: &SessionEvent) {
+        let Ok(mut guard) = self.disk_writer.lock() else {
+            return;
+        };
+        let Some(file) = guard.as_mut() else {
+            return;
+        };
+        match serde_json::to_string(event) {
+            Ok(line) => {
+                if let Err(e) = writeln!(file, "{line}") {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        error = %e,
+                        "disk write failed; continuing in-memory only"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    error = %e,
+                    "event serialization failed for disk write"
+                );
+            }
+        }
     }
 
     /// Snapshot the log. Clones the inner vec — safe to read without

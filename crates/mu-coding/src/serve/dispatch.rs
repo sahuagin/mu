@@ -42,10 +42,10 @@ pub async fn dispatch(
     match request.method.as_str() {
         PingRequest::METHOD => handle_ping(request),
         CreateSessionRequest::METHOD => {
-            handle_create_session(request, notif, sessions, factory, tools)
+            handle_create_session(request, notif, sessions, factory, tools, daemon_info.clone())
         }
         DelegateSessionRequest::METHOD => {
-            handle_delegate_session(request, notif, sessions, factory, tools)
+            handle_delegate_session(request, notif, sessions, factory, tools, daemon_info.clone())
         }
         AskSessionRequest::METHOD => handle_ask_session(request, sessions).await,
         CancelSessionRequest::METHOD => handle_cancel_session(request, sessions).await,
@@ -86,6 +86,7 @@ fn handle_create_session(
     sessions: Sessions,
     factory: ProviderFactory,
     tools: Arc<Vec<Arc<dyn Tool>>>,
+    daemon_info: DaemonInfo,
 ) -> Response<Value> {
     let params: CreateSessionRequest = match serde_json::from_value(request.params.clone()) {
         Ok(p) => p,
@@ -107,6 +108,7 @@ fn handle_create_session(
         sessions,
         factory,
         tools,
+        &daemon_info,
     ) {
         Ok(session_id) => {
             let resp = CreateSessionResponse { session_id };
@@ -126,6 +128,7 @@ fn handle_delegate_session(
     sessions: Sessions,
     factory: ProviderFactory,
     tools: Arc<Vec<Arc<dyn Tool>>>,
+    daemon_info: DaemonInfo,
 ) -> Response<Value> {
     let params: DelegateSessionRequest = match serde_json::from_value(request.params.clone()) {
         Ok(p) => p,
@@ -177,6 +180,7 @@ fn handle_delegate_session(
         sessions,
         factory,
         tools,
+        &daemon_info,
     ) {
         Ok(child_session_id) => {
             let resp = DelegateSessionResponse { child_session_id };
@@ -202,11 +206,33 @@ fn build_and_register_session(
     sessions: Sessions,
     factory: ProviderFactory,
     tools: Arc<Vec<Arc<dyn Tool>>>,
+    daemon_info: &DaemonInfo,
 ) -> Result<String, String> {
     let provider = factory(selector).map_err(|e| format!("could not build provider: {e}"))?;
 
     let session_id = Sessions::next_id();
     let event_log = Arc::new(SessionEventLog::new(session_id.clone()));
+
+    // mu-upb: attach a per-session JSONL writer at
+    // ~/.local/share/mu/events/<daemon_id>/<session_id>.jsonl.
+    // Best-effort — failures are logged but don't block session
+    // creation. The path includes daemon_id so multiple concurrent
+    // daemons don't clobber each other's logs.
+    if let Some(home) = dirs::home_dir() {
+        let path = home
+            .join(".local/share/mu/events")
+            .join(daemon_info.daemon_id())
+            .join(format!("{}.jsonl", session_id));
+        if let Err(e) = event_log.attach_disk_writer(&path) {
+            tracing::warn!(
+                session_id = %session_id,
+                path = %path.display(),
+                error = %e,
+                "could not attach disk writer; continuing in-memory only",
+            );
+        }
+    }
+
     let (kind_str, model_str) = describe_selector(selector);
     event_log.append(
         EventActor::System,

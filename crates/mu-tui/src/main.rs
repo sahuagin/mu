@@ -1113,18 +1113,25 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
         .sessions
         .iter()
         .map(|s| {
+            // Header: status glyph + session id + provider/model.
             let header = Line::from(vec![
                 Span::styled(format!("{} ", s.status.glyph()), s.status.style()),
                 Span::styled(
-                    format!("{:<7}", s.short_id),
+                    format!("{:<10}", s.short_id),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::raw(s.title.clone()),
+                Span::styled(s.model.clone(), Style::default().fg(Color::DarkGray)),
             ]);
+            // Detail: live phase + cost + tokens. Phase is the most
+            // valuable thing to glance at — replaces the redundant
+            // provider/model line we had before.
             let detail = Line::from(vec![
                 Span::raw("    "),
-                Span::styled(s.model.clone(), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    s.phase.clone(),
+                    Style::default().fg(Color::Cyan),
+                ),
                 Span::raw(format!("   ${:.2}  ", s.cost_usd)),
                 Span::raw(format!("{}k tok", s.tokens_kilo)),
             ]);
@@ -1242,11 +1249,6 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled("context:  ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{}k cumulative", s.tokens_kilo)),
         ]));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "(post-mu-035: 'phase' becomes authoritative via session.provider_status)",
-            Style::default().fg(Color::DarkGray),
-        )));
         lines
     } else {
         vec![Line::from("(no session selected)")]

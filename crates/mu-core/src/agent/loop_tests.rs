@@ -274,6 +274,7 @@ fn kind(event: &AgentEvent) -> &'static str {
         AgentEvent::Callout { .. } => "callout",
         AgentEvent::InputRequired { .. } => "input_required",
         AgentEvent::ContextAssembly { .. } => "context_assembly",
+        AgentEvent::ProviderStatus { .. } => "provider_status",
     }
 }
 
@@ -309,6 +310,8 @@ async fn b1_single_turn_no_tools() {
             "message_end",
             "turn_start",
             "context_assembly", // mu-032: emitted before provider.stream
+            "provider_status",  // mu-035 Phase A: AwaitingFirstToken
+            "provider_status",  // mu-035 Phase A: Streaming on first token
             "text_delta",
             "message_start",
             "message_end",
@@ -388,13 +391,17 @@ async fn b2_single_tool_call() {
             "message_end",         // user
             "turn_start",          // turn 1
             "context_assembly",    // mu-032: before provider call
-            "message_start",       // assistant w/ tool call
+            "provider_status",     // mu-035: AwaitingFirstToken
+            "message_start",       // assistant w/ tool call (no text first → no Streaming transition)
             "message_end",         // assistant w/ tool call
+            "provider_status",     // mu-035: ToolExecuting before dispatch
             "tool_call_started",   // echo
             "tool_call_completed", // echo
             "turn_end",            // end turn 1
             "turn_start",          // turn 2
             "context_assembly",    // mu-032: before second provider call
+            "provider_status",     // mu-035: AwaitingFirstToken turn 2
+            "provider_status",     // mu-035: Streaming on first token
             "text_delta",          // "done"
             "message_start",       // assistant text
             "message_end",         // assistant text
@@ -470,7 +477,13 @@ async fn b3_iteration_cap() {
     let outcome = loop_.join().await;
     let events = events_handle.await.expect("events drain");
 
-    assert_eq!(outcome, Outcome::IterationCap);
+    // Post mu-035 Phase A multi-turn fix: hitting the iteration cap
+    // terminates the ASK, not the session. The session returns to
+    // Idle and the loop only exits cleanly when join() drops the
+    // sender. So Outcome::Done(EndTurn) is the new expected value;
+    // the iteration-cap effect is observable via turn_count == 3 in
+    // the final Done event.
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
 
     let turn_starts = events
         .iter()

@@ -333,6 +333,113 @@ pub struct DaemonStatsResponse {
     pub in_flight_calls_count: u32,
 }
 
+// ===== mu-035: session.provider_status + session.cancel_outstanding =====
+
+/// Provider-call lifecycle states surfaced to clients (mu-035). Tags
+/// stable; future additions are additive. Serialized snake_case to
+/// match the rest of the wire surface.
+///
+/// State transitions roughly:
+///   AwaitingFirstToken → Streaming  (first content token)
+///   AwaitingFirstToken → Thinking   (provider opens stream but stays quiet)
+///   Streaming → Thinking            (gap > idle_threshold_ms mid-stream)
+///   Streaming → ToolExecuting       (model decides to call a tool)
+///   ToolExecuting → AwaitingToolResult (tool dispatched, awaiting result)
+///   AwaitingToolResult → Streaming  (next assistant turn begins)
+///   * → Idle                        (session.done landed)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderStatusKind {
+    Idle,
+    AwaitingFirstToken,
+    Streaming,
+    Thinking,
+    ToolExecuting,
+    AwaitingToolResult,
+}
+
+/// `session.provider_status` notification payload (mu-035). Emitted
+/// periodically while the agent loop is in a non-streaming wait, and
+/// on every state transition. Cumulative wall-clock per call is
+/// computable by summing `elapsed_ms` across consecutive
+/// ProviderStatusEvents for the same session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderStatusEvent {
+    pub session_id: String,
+    pub kind: ProviderStatusKind,
+    /// Unix milliseconds when the session entered this kind.
+    pub started_at_unix_ms: u64,
+    /// Milliseconds since `started_at_unix_ms`. Re-emitted in periodic
+    /// ticks (Phase B) so a watching client sees the value advance.
+    pub elapsed_ms: u64,
+    /// Bytes received from the provider's SSE stream so far (cumulative
+    /// for this turn). None when not meaningful (Idle, AwaitingFirstToken
+    /// before any bytes, or providers that don't surface byte counts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_received: Option<u64>,
+    /// Set only when `kind` is ToolExecuting or AwaitingToolResult.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// Cancel the **outstanding provider call** for a session without
+/// ending the session itself (mu-035). The agent loop aborts the
+/// in-flight stream and surfaces a CancelOutstanding outcome to the
+/// loop's outer driver, which decides what to do next (retry on the
+/// same provider, fall over to a different one, surface to a human).
+///
+/// Distinct from `cancel_session`: that ends the session. This kills
+/// just the current provider call; the session is still addressable
+/// via `ask_session` immediately after.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelOutstandingRequest {
+    pub session_id: String,
+    /// Free-form reason for the cancel. Logged in the event log; not
+    /// otherwise interpreted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl CancelOutstandingRequest {
+    pub const METHOD: &'static str = "session.cancel_outstanding";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelOutstandingResponse {
+    /// True iff a provider call was actually in flight at the time of
+    /// the request. False (with `was_in: Idle`) when the call is a
+    /// no-op because nothing was outstanding.
+    pub canceled: bool,
+    pub was_in: ProviderStatusKind,
+}
+
+/// One outstanding provider call across the daemon, as returned by
+/// `daemon.outstanding_calls`. Element of a snapshot — values can
+/// change between when the snapshot was taken and when the client
+/// reads them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutstandingCall {
+    pub session_id: String,
+    pub kind: ProviderStatusKind,
+    pub provider_kind: String,
+    pub model: String,
+    pub started_at_unix_ms: u64,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DaemonOutstandingCallsRequest {}
+
+impl DaemonOutstandingCallsRequest {
+    pub const METHOD: &'static str = "daemon.outstanding_calls";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonOutstandingCallsResponse {
+    pub calls: Vec<OutstandingCall>,
+    pub snapshot_at_unix_ms: u64,
+}
+
 /// Create a new "child" session that's lineage-aware of `parent_session_id`
 /// (mu-031). The child session is fully independent at the runtime
 /// level — own agent loop, own event log, own pending-approvals

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::capability::{Capability, CapabilityCheck};
 use crate::protocol::ApprovalDecision;
 
 use super::provider::{Provider, ProviderEvent};
@@ -34,6 +35,12 @@ use super::types::{AgentMessage, AssistantMessage, ContentBlock, StopReason, Too
 /// counterpart in the daemon's dispatch handler take entries out
 /// when responses arrive.
 pub type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>;
+
+/// Shared handle to the session's `Capability` (mu-033). Wrapped in
+/// a `Mutex` so the agent loop can both check it (read) and consume
+/// tool-call budget (mutate). The Arc lets the daemon's
+/// `Sessions::insert` and the AgentLoop hold the same instance.
+pub type SessionCapability = Arc<Mutex<Capability>>;
 
 /// External inputs callers push to a running agent loop.
 #[derive(Debug, Clone)]
@@ -280,9 +287,18 @@ impl AgentLoop {
         config: AgentConfig,
         events: mpsc::Sender<AgentEvent>,
         pending_approvals: PendingApprovals,
+        capability: SessionCapability,
     ) -> Self {
         let (tx, rx) = mpsc::channel(32);
-        let handle = tokio::spawn(run(provider, tools, config, events, rx, pending_approvals));
+        let handle = tokio::spawn(run(
+            provider,
+            tools,
+            config,
+            events,
+            rx,
+            pending_approvals,
+            capability,
+        ));
         Self { tx, handle }
     }
 
@@ -314,6 +330,7 @@ async fn run(
     events: mpsc::Sender<AgentEvent>,
     mut input_rx: mpsc::Receiver<AgentInput>,
     pending_approvals: PendingApprovals,
+    capability: SessionCapability,
 ) -> Outcome {
     let mut messages: Vec<AgentMessage> = Vec::new();
     let mut queue: VecDeque<Action> = VecDeque::new();
@@ -465,6 +482,7 @@ async fn run(
                     &events,
                     &mut tool_history,
                     &pending_approvals,
+                    &capability,
                 )
                 .await
                 {
@@ -697,6 +715,7 @@ async fn handle_execute_tools(
     events: &mpsc::Sender<AgentEvent>,
     history: &mut ToolHistory,
     pending_approvals: &PendingApprovals,
+    capability: &SessionCapability,
 ) -> Result<(Vec<AgentMessage>, Vec<AgentInput>), Outcome> {
     let mut buffered: Vec<AgentInput> = Vec::new();
     let mut tool_messages: Vec<AgentMessage> = Vec::new();
@@ -712,6 +731,22 @@ async fn handle_execute_tools(
 
         // Look up the tool + its policy.
         let tool = tools.iter().find(|t| t.spec().name == call.name);
+
+        // Capability gate (mu-033). If the session is operating
+        // under an attenuated capability and this tool isn't in
+        // its allowed set (or the capability has expired / budget
+        // is exhausted), refuse dispatch.
+        let capability_refusal_reason: Option<&'static str> = {
+            let cap = capability.lock().ok();
+            cap.as_ref().and_then(|c| match c.check_allow(&call.name) {
+                CapabilityCheck::Allowed => None,
+                CapabilityCheck::DeniedToolNotAllowed => Some("tool not in session's capability"),
+                CapabilityCheck::DeniedExpired => Some("session capability has expired"),
+                CapabilityCheck::DeniedBudgetExhausted => {
+                    Some("session capability's tool-call budget exhausted")
+                }
+            })
+        };
 
         // Retry guard. If the tool's policy is Never, refuse on
         // either of:
@@ -808,7 +843,31 @@ async fn handle_execute_tools(
 
         let permission_denied = matches!(permission_decision, Some(ApprovalDecision::Deny));
 
-        let result = if let Some(reason) = retry_refusal_reason {
+        let result = if let Some(cap_reason) = capability_refusal_reason {
+            let msg = format!(
+                "runtime refused: tool `{}` blocked by session capability ({cap_reason}). \
+                 This session has been delegated a narrower scope than the root; \
+                 the requested tool falls outside it. Use a different tool, ask the \
+                 user to widen scope, or report the obstacle.",
+                call.name
+            );
+            let _ = events
+                .send(AgentEvent::Callout {
+                    category: "warning".to_owned(),
+                    title: format!("capability refused {}", call.name),
+                    body: serde_json::json!({
+                        "tool": call.name,
+                        "reason": cap_reason,
+                    }),
+                    theme: Some("warning".to_owned()),
+                    context_refs: vec!["spec:capability-delegation".to_owned()],
+                })
+                .await;
+            ToolResult {
+                content: msg,
+                is_error: true,
+            }
+        } else if let Some(reason) = retry_refusal_reason {
             let msg = format!(
                 "runtime refused: tool `{}` blocked by RetryPolicy::Never ({reason}). \
                  Do not retry with variants of the same approach. Switch tools, \
@@ -844,6 +903,13 @@ async fn handle_execute_tools(
                 is_error: true,
             }
         } else {
+            // About to actually dispatch — consume one tool-call
+            // budget unit, if the session's capability has one.
+            // Doing this BEFORE dispatch so cancel/error paths
+            // still count the call (the model attempted it).
+            if let Ok(mut cap) = capability.lock() {
+                cap.consume_tool_call();
+            }
             match tool {
                 Some(t) => {
                     let (cancel_tx, cancel_rx) = oneshot::channel();

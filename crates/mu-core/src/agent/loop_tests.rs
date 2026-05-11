@@ -243,7 +243,9 @@ fn spawn_loop(
         .collect();
     let approvals: PendingApprovals =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let loop_ = AgentLoop::spawn(provider, tools, config, events_tx, approvals);
+    let capability: SessionCapability =
+        Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let loop_ = AgentLoop::spawn(provider, tools, config, events_tx, approvals, capability);
     (loop_, events_rx)
 }
 
@@ -874,6 +876,8 @@ async fn ask_permission_emits_input_required_and_dispatches_on_approve() {
     });
     let approvals: PendingApprovals =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let cap: SessionCapability =
+        Arc::new(Mutex::new(crate::capability::Capability::root()));
     let (events_tx, mut events_rx) = mpsc::channel(64);
     let loop_ = AgentLoop::spawn(
         Arc::new(provider),
@@ -881,6 +885,7 @@ async fn ask_permission_emits_input_required_and_dispatches_on_approve() {
         AgentConfig::default(),
         events_tx,
         approvals.clone(),
+        cap,
     );
     loop_
         .send(AgentInput::UserMessage(user_msg("please use gated")))
@@ -942,6 +947,80 @@ async fn ask_permission_emits_input_required_and_dispatches_on_approve() {
 }
 
 #[tokio::test]
+async fn capability_refuses_tool_outside_allowed_set() {
+    use crate::capability::Capability;
+    use std::collections::HashSet;
+
+    // Provider scripted to call "blocked" tool (not in the
+    // session's capability set).
+    let provider = mock_provider_one_tool_call("blocked", json!({"x": 1}));
+    // A real tool by that name, so absence is not the reason for
+    // failure — capability check is.
+    let tool = MockTool::ok("blocked", "this should not run");
+    // Session is attenuated to allow only "echo".
+    let mut allowed = HashSet::new();
+    allowed.insert("echo".to_string());
+    let cap: SessionCapability = Arc::new(Mutex::new(Capability {
+        allowed_tools: Some(allowed),
+        ..Default::default()
+    }));
+    let approvals: PendingApprovals =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let loop_ = AgentLoop::spawn(
+        Arc::new(provider),
+        vec![Arc::new(tool) as Arc<dyn Tool>],
+        AgentConfig::default(),
+        events_tx,
+        approvals,
+        cap,
+    );
+    loop_
+        .send(AgentInput::UserMessage(user_msg("try blocked")))
+        .await
+        .unwrap();
+
+    // Drain events. Expect: a Callout (warning) for the refusal,
+    // then ToolCallCompleted with is_error=true, then Done.
+    let mut got_capability_callout = false;
+    let mut completed_content: Option<String> = None;
+    let mut completed_is_error = false;
+    while let Some(ev) = events_rx.recv().await {
+        match ev {
+            AgentEvent::Callout {
+                category, title, ..
+            } => {
+                if category == "warning" && title.contains("capability refused") {
+                    got_capability_callout = true;
+                }
+            }
+            AgentEvent::ToolCallCompleted {
+                content, is_error, ..
+            } => {
+                completed_content = Some(content);
+                completed_is_error = is_error;
+            }
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(
+        got_capability_callout,
+        "expected a 'capability refused' callout"
+    );
+    let content = completed_content.expect("ToolCallCompleted should fire");
+    assert!(completed_is_error, "capability refusal => is_error");
+    assert!(
+        content.contains("session capability"),
+        "refusal message should name capability; got: {content}"
+    );
+    assert!(
+        !content.contains("this should not run"),
+        "tool body must not have executed; got: {content}"
+    );
+}
+
+#[tokio::test]
 async fn ask_permission_deny_synthesizes_error_result_without_running_tool() {
     let provider = mock_provider_one_tool_call("gated", json!({"x": 1}));
     let tool = MockTool::ok("gated", "this should not appear").with_policy(
@@ -952,6 +1031,8 @@ async fn ask_permission_deny_synthesizes_error_result_without_running_tool() {
     );
     let approvals: PendingApprovals =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let cap: SessionCapability =
+        Arc::new(Mutex::new(crate::capability::Capability::root()));
     let (events_tx, mut events_rx) = mpsc::channel(64);
     let loop_ = AgentLoop::spawn(
         Arc::new(provider),
@@ -959,6 +1040,7 @@ async fn ask_permission_deny_synthesizes_error_result_without_running_tool() {
         AgentConfig::default(),
         events_tx,
         approvals.clone(),
+        cap,
     );
     loop_
         .send(AgentInput::UserMessage(user_msg("please use gated")))

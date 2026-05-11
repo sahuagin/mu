@@ -50,6 +50,11 @@ pub enum AgentInput {
     /// Stop. In-flight provider stream and tool execution are
     /// cancelled; loop returns `Outcome::Cancelled`.
     Cancel,
+    /// Narrow-cancel (mu-035 Phase C): abort the current provider
+    /// stream / tool dispatch, emit a Done(Aborted) for the ask, but
+    /// keep the session alive for subsequent ask_sessions. Distinct
+    /// from `Cancel`, which terminates the entire agent loop.
+    CancelOutstanding { reason: String },
 }
 
 /// Output events emitted by the loop. Mirrors mu-001's `session.*`
@@ -183,6 +188,13 @@ pub enum Outcome {
     IterationCap,
     Cancelled,
     Error(String),
+    /// mu-035 Phase C narrow-cancel: the current ask was aborted via
+    /// `AgentInput::CancelOutstanding`, but the SESSION is still
+    /// alive. The outer run() loop catches this from the inner
+    /// handlers, emits a Done(Aborted) event for the ask, resets
+    /// per-ask state, and continues to wait for the next ask. Not
+    /// returned by run() itself — purely an internal sentinel.
+    OutstandingCancelled { reason: String },
 }
 
 /// Internal action queue. Callers push `AgentInput` via `AgentLoop::send`;
@@ -391,6 +403,10 @@ async fn run(
         while let Ok(input) = input_rx.try_recv() {
             match input {
                 AgentInput::Cancel => return Outcome::Cancelled,
+                AgentInput::CancelOutstanding { .. } => {
+                    // Nothing in-flight (we're between asks); narrow-
+                    // cancel is a no-op. Drop silently.
+                }
                 AgentInput::UserMessage(_) => {
                     queue.push_back(Action::External(input));
                 }
@@ -403,6 +419,11 @@ async fn run(
         } else {
             match input_rx.recv().await {
                 Some(AgentInput::Cancel) => return Outcome::Cancelled,
+                Some(AgentInput::CancelOutstanding { .. }) => {
+                    // Same: idle, no-op. Continue waiting for real
+                    // input.
+                    continue;
+                }
                 Some(input) => Action::External(input),
                 None => break, // all senders dropped — clean exit
             }
@@ -425,6 +446,10 @@ async fn run(
                 // Defensive: Cancel is short-circuited at drain time, so
                 // this branch is normally unreachable.
                 return Outcome::Cancelled;
+            }
+            Action::External(AgentInput::CancelOutstanding { .. }) => {
+                // Same: short-circuited at drain time, unreachable.
+                continue;
             }
             Action::InvokeLlm => {
                 if turn_count >= config.max_turns {
@@ -509,6 +534,37 @@ async fn run(
                             queue.push_back(action);
                         }
                     }
+                    Err(Outcome::OutstandingCancelled { reason }) => {
+                        // mu-035 Phase C: narrow-cancel of the
+                        // current ask. Emit a Callout explaining
+                        // why, finalize the ask with Done(Aborted),
+                        // reset per-ask state, and continue the
+                        // outer loop — the session stays addressable.
+                        let _ = events
+                            .send(AgentEvent::Callout {
+                                category: "info".into(),
+                                title: "outstanding call cancelled".into(),
+                                body: serde_json::json!({ "reason": reason }),
+                                theme: Some("info".into()),
+                                context_refs: vec!["spec:mu-035".into()],
+                            })
+                            .await;
+                        let elapsed_ms =
+                            started_at.map(|t| t.elapsed().as_millis() as u64);
+                        let _ = events
+                            .send(AgentEvent::Done {
+                                stop_reason: StopReason::Aborted,
+                                turn_count,
+                                usage: aggregated_usage.take(),
+                                elapsed_ms,
+                            })
+                            .await;
+                        started_at = None;
+                        turn_count = 0;
+                        tool_history.clear();
+                        queue.clear();
+                        continue;
+                    }
                     Err(outcome) => {
                         if let Outcome::Error(ref m) = outcome {
                             let _ = events
@@ -540,6 +596,34 @@ async fn run(
                             queue.push_back(action);
                         }
                     }
+                    Err(Outcome::OutstandingCancelled { reason }) => {
+                        // Same finalize-and-continue pattern as the
+                        // InvokeLlm arm above. Tool was mid-flight.
+                        let _ = events
+                            .send(AgentEvent::Callout {
+                                category: "info".into(),
+                                title: "outstanding call cancelled".into(),
+                                body: serde_json::json!({ "reason": reason }),
+                                theme: Some("info".into()),
+                                context_refs: vec!["spec:mu-035".into()],
+                            })
+                            .await;
+                        let elapsed_ms =
+                            started_at.map(|t| t.elapsed().as_millis() as u64);
+                        let _ = events
+                            .send(AgentEvent::Done {
+                                stop_reason: StopReason::Aborted,
+                                turn_count,
+                                usage: aggregated_usage.take(),
+                                elapsed_ms,
+                            })
+                            .await;
+                        started_at = None;
+                        turn_count = 0;
+                        tool_history.clear();
+                        queue.clear();
+                        continue;
+                    }
                     Err(outcome) => {
                         if let Outcome::Error(ref m) = outcome {
                             let _ = events
@@ -557,6 +641,9 @@ async fn run(
                 while let Ok(input) = input_rx.try_recv() {
                     match input {
                         AgentInput::Cancel => return Outcome::Cancelled,
+                        AgentInput::CancelOutstanding { .. } => {
+                            // No ask in flight at this point; no-op.
+                        }
                         AgentInput::UserMessage(_) => {
                             queue.push_back(Action::External(input));
                         }
@@ -836,6 +923,13 @@ async fn handle_invoke_llm(
                     let _ = cancel_tx.send(());
                     return Err(Outcome::Cancelled);
                 }
+                Some(AgentInput::CancelOutstanding { reason }) => {
+                    // mu-035 Phase C: abort the in-flight provider
+                    // call but keep the session alive. The outer
+                    // loop will catch this and emit Done(Aborted).
+                    let _ = cancel_tx.send(());
+                    return Err(Outcome::OutstandingCancelled { reason });
+                }
                 Some(input @ AgentInput::UserMessage(_)) => {
                     buffered.push(input);
                 }
@@ -993,6 +1087,14 @@ async fn handle_execute_tools(
                                 }
                                 return Err(Outcome::Cancelled);
                             }
+                            Some(AgentInput::CancelOutstanding { reason }) => {
+                                // mu-035 Phase C narrow-cancel during
+                                // approval wait.
+                                if let Ok(mut pending) = pending_approvals.lock() {
+                                    pending.remove(&request_id);
+                                }
+                                return Err(Outcome::OutstandingCancelled { reason });
+                            }
                             Some(AgentInput::UserMessage(_)) => {
                                 // User sent a message mid-prompt.
                                 // We can't easily buffer + still
@@ -1123,6 +1225,14 @@ async fn handle_execute_tools(
                                 Some(AgentInput::Cancel) => {
                                     let _ = cancel_tx.send(());
                                     return Err(Outcome::Cancelled);
+                                }
+                                Some(AgentInput::CancelOutstanding { reason }) => {
+                                    // mu-035 Phase C narrow-cancel
+                                    // mid-tool. Abort the tool, surface
+                                    // the OutstandingCancelled to the
+                                    // outer loop.
+                                    let _ = cancel_tx.send(());
+                                    return Err(Outcome::OutstandingCancelled { reason });
                                 }
                                 Some(input @ AgentInput::UserMessage(_)) => {
                                     buffered.push(input);

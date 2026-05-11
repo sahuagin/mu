@@ -14,13 +14,13 @@ use mu_core::agent::{AgentConfig, AgentInput, AgentLoop, AgentMessage, Tool};
 use mu_core::capability::Capability;
 use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
-    AskSessionRequest, AskSessionResponse, CancelSessionRequest, CancelSessionResponse,
-    CloseSessionRequest, CloseSessionResponse, CreateSessionRequest, CreateSessionResponse,
-    DaemonStatsRequest, DaemonStatsResponse, DelegateSessionRequest, DelegateSessionResponse,
-    PingRequest, PingResponse, ProviderSelector, Request, RespondToInputRequiredRequest,
-    RespondToInputRequiredResponse, Response, SessionEventsRequest, SessionEventsResponse,
-    SessionListRequest, SessionListResponse, SessionStatsRequest, SessionStatsResponse,
-    SessionStatusSummary,
+    AskSessionRequest, AskSessionResponse, CancelOutstandingRequest, CancelOutstandingResponse,
+    CancelSessionRequest, CancelSessionResponse, CloseSessionRequest, CloseSessionResponse,
+    CreateSessionRequest, CreateSessionResponse, DaemonStatsRequest, DaemonStatsResponse,
+    DelegateSessionRequest, DelegateSessionResponse, PingRequest, PingResponse, ProviderSelector,
+    ProviderStatusKind, Request, RespondToInputRequiredRequest, RespondToInputRequiredResponse,
+    Response, SessionEventsRequest, SessionEventsResponse, SessionListRequest, SessionListResponse,
+    SessionStatsRequest, SessionStatsResponse, SessionStatusSummary,
 };
 use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
 
@@ -49,6 +49,9 @@ pub async fn dispatch(
         }
         AskSessionRequest::METHOD => handle_ask_session(request, sessions).await,
         CancelSessionRequest::METHOD => handle_cancel_session(request, sessions).await,
+        CancelOutstandingRequest::METHOD => {
+            handle_cancel_outstanding(request, sessions).await
+        }
         CloseSessionRequest::METHOD => handle_close_session(request, sessions),
         SessionStatsRequest::METHOD => handle_session_stats(request, sessions),
         SessionListRequest::METHOD => handle_session_list(request, discovery).await,
@@ -330,6 +333,60 @@ async fn handle_cancel_session(request: Request<Value>, sessions: Sessions) -> R
             // the send fails silently, but we still report cancelled.
             let _ = tx.send(AgentInput::Cancel).await;
             let resp = CancelSessionResponse { cancelled: true };
+            ok_response(request.id, to_value_or_null(resp))
+        }
+    }
+}
+
+async fn handle_cancel_outstanding(
+    request: Request<Value>,
+    sessions: Sessions,
+) -> Response<Value> {
+    // mu-035 Phase C: narrow-cancel of the current provider call.
+    // Sends AgentInput::CancelOutstanding through the session's input
+    // channel; the agent loop aborts the in-flight stream / tool and
+    // emits Done(Aborted), then continues to wait for the next ask.
+    // Session stays alive.
+    let params: CancelOutstandingRequest = match serde_json::from_value(request.params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("cancel_outstanding: invalid params: {e}"),
+            );
+        }
+    };
+
+    let sender = sessions.input_sender(&params.session_id);
+    match sender {
+        None => err_response(
+            request.id,
+            codes::INVALID_PARAMS,
+            format!("session not found: {}", params.session_id),
+        ),
+        Some(tx) => {
+            let reason = params.reason.unwrap_or_else(|| "client request".into());
+            // best-effort — if the loop already terminated, send fails
+            // silently and we report canceled=false.
+            let send_ok = tx
+                .send(AgentInput::CancelOutstanding {
+                    reason: reason.clone(),
+                })
+                .await
+                .is_ok();
+            // We can't synchronously observe what state the loop was
+            // in at the moment we sent (it's racy by nature). v1
+            // reports a best-effort "canceled if we managed to send,
+            // and we don't know was_in." A future slice could plumb
+            // a per-session ProviderStatusTracker into Sessions and
+            // read its current state here — but that's mu-iwq Phase D
+            // territory (daemon.outstanding_calls), so we keep this
+            // handler narrow for now.
+            let resp = CancelOutstandingResponse {
+                canceled: send_ok,
+                was_in: ProviderStatusKind::AwaitingFirstToken, // placeholder; see comment above
+            };
             ok_response(request.id, to_value_or_null(resp))
         }
     }

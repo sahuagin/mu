@@ -1290,6 +1290,7 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
+ "mu-core",
  "ratatui",
  "serde",
  "serde_json",

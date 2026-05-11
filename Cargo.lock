@@ -1256,14 +1256,17 @@ name = "mu-coding"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "futures",
  "mu-ai",
  "mu-core",
+ "rand 0.8.6",
  "rusqlite",
  "serde",
  "serde_json",
  "shlex",
+ "thiserror 1.0.69",
  "tokio",
  "toml",
  "tracing",

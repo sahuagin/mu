@@ -7,11 +7,15 @@ use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
 
 use mu_core::agent::Tool;
 
+pub mod daemon_info;
+pub mod discovery;
 mod dispatch;
 pub mod factory;
 mod forwarder;
 mod sessions;
 
+pub use daemon_info::DaemonInfo;
+pub use discovery::{LocalRegistryBackend, SessionDiscovery};
 pub use factory::{
     build_provider_from_selector, build_tools, make_provider_factory, parse_tools_csv,
     selector_from_cli, BashSettings, ProviderFactory,
@@ -45,6 +49,14 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let sessions = Sessions::new();
+    let daemon_info = DaemonInfo::new(env!("CARGO_PKG_VERSION"));
+    // v1 (mu-038): always LocalRegistryBackend. Wired via Arc so a
+    // future --discovery flag can choose File / Etcd without changing
+    // the dispatch surface.
+    let discovery: Arc<dyn SessionDiscovery> = Arc::new(LocalRegistryBackend::new(
+        sessions.clone(),
+        daemon_info.daemon_id().to_string(),
+    ));
     // Wrap tools in Arc so cloning per request is a single pointer
     // copy regardless of tools list size.
     let tools = Arc::new(tools);
@@ -52,7 +64,11 @@ where
         let sessions = sessions.clone();
         let factory = factory.clone();
         let tools = tools.clone();
-        async move { dispatch::dispatch(req, notif, sessions, factory, tools).await }
+        let daemon_info = daemon_info.clone();
+        let discovery = discovery.clone();
+        async move {
+            dispatch::dispatch(req, notif, sessions, factory, tools, daemon_info, discovery).await
+        }
     })
     .await
     .map_err(Into::into)

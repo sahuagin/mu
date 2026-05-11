@@ -432,3 +432,223 @@ async fn b9_session_delegate_creates_child() {
     drop(client);
     let _ = timeout(Duration::from_millis(500), server_handle).await;
 }
+
+// ── mu-038: projection-query round-trips ──────────────────────────
+
+/// Helper: skim incoming lines until we find the response with `id`,
+/// drop everything else (notifications). Times out at 500ms.
+async fn await_response<R: tokio::io::AsyncRead + Unpin>(reader: &mut R, id: i64) -> Value {
+    timeout(Duration::from_millis(500), async {
+        loop {
+            let line = read_line(reader).await;
+            if line.get("id").and_then(|v| v.as_i64()) == Some(id) {
+                return line;
+            }
+        }
+    })
+    .await
+    .expect("response did not arrive within 500ms")
+}
+
+/// B-10: session.list returns sessions from this daemon, with derived
+/// status + the daemon's stable id, sorted most-recent-first.
+#[tokio::test]
+async fn b10_session_list_round_trip() {
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) = spawn_server(provider);
+
+    // Create two sessions.
+    let mut session_ids: Vec<String> = Vec::new();
+    for i in 1..=2 {
+        let req = json!({
+            "jsonrpc": "2.0", "id": i, "method": "create_session",
+            "params": { "provider": { "kind": "anthropic_api", "model": "x" } }
+        });
+        client
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .unwrap();
+        let resp = await_response(&mut client, i).await;
+        session_ids.push(resp["result"]["session_id"].as_str().unwrap().to_string());
+    }
+
+    // session.list with default filter.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 10, "method": "session.list", "params": {}
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 10).await;
+    assert!(resp["error"].is_null());
+    let list = resp["result"]["sessions"]
+        .as_array()
+        .expect("sessions array")
+        .clone();
+    assert_eq!(list.len(), 2);
+    // daemon_id present and identical across both rows.
+    let daemon_ids: Vec<&str> = list
+        .iter()
+        .map(|s| s["daemon_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(daemon_ids[0], daemon_ids[1]);
+    assert!(!daemon_ids[0].is_empty());
+    // is_remote always false for the LocalRegistry backend.
+    for s in &list {
+        assert_eq!(s["is_remote"], false);
+    }
+    // status: provider/model present.
+    for s in &list {
+        assert_eq!(s["provider_kind"], "anthropic_api");
+        assert_eq!(s["model"], "x");
+    }
+    // Both session ids appear.
+    let ids: std::collections::HashSet<String> = list
+        .iter()
+        .map(|s| s["session_id"].as_str().unwrap().to_string())
+        .collect();
+    for sid in &session_ids {
+        assert!(ids.contains(sid), "missing {sid}");
+    }
+    assert!(resp["result"]["snapshot_at_unix_ms"].as_u64().unwrap() > 0);
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}
+
+/// B-11: session.events paginates and reflects the recorded log.
+#[tokio::test]
+async fn b11_session_events_round_trip() {
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) = spawn_server(provider);
+
+    // Create + ask.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "create_session",
+        "params": { "provider": { "kind": "anthropic_api", "model": "x" } }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 1).await;
+    let session_id = resp["result"]["session_id"].as_str().unwrap().to_string();
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "ask_session",
+        "params": { "session_id": session_id, "user_message": "hello" }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    // Drain the ask response + notifications until we see session.done.
+    let _ = timeout(Duration::from_millis(500), async {
+        loop {
+            let line = read_line(&mut client).await;
+            if line.get("method").and_then(|v| v.as_str()) == Some("session.done") {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("session.done");
+
+    // session.events: full log.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 20, "method": "session.events",
+        "params": { "session_id": session_id }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 20).await;
+    let events = resp["result"]["events"].as_array().expect("events").clone();
+    assert!(!events.is_empty(), "expected non-empty event log");
+
+    // First event is SessionCreated.
+    let first = &events[0];
+    assert_eq!(first["payload"]["kind"], "session_created");
+    assert_eq!(first["payload"]["provider_kind"], "anthropic_api");
+
+    // kinds_filter restricts shape.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 21, "method": "session.events",
+        "params": { "session_id": session_id, "kinds_filter": ["user_message"] }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 21).await;
+    let events = resp["result"]["events"].as_array().expect("events").clone();
+    for e in &events {
+        assert_eq!(e["payload"]["kind"], "user_message");
+    }
+
+    // Unknown session id → INVALID_PARAMS.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 22, "method": "session.events",
+        "params": { "session_id": "session-does-not-exist" }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 22).await;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}
+
+/// B-12: daemon.stats reflects session creation + ask counts.
+#[tokio::test]
+async fn b12_daemon_stats_round_trip() {
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) = spawn_server(provider);
+
+    // Baseline.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "daemon.stats", "params": {}
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 1).await;
+    let stats = &resp["result"];
+    assert_eq!(stats["session_count"], 0);
+    assert_eq!(stats["total_events"], 0);
+    assert!(stats["daemon_id"].as_str().unwrap().len() == 16);
+    assert!(stats["version"].as_str().is_some());
+
+    // Create a session.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "create_session",
+        "params": { "provider": { "kind": "anthropic_api", "model": "x" } }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let _ = await_response(&mut client, 2).await;
+
+    // Stats again — session_count++.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 3, "method": "daemon.stats", "params": {}
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 3).await;
+    let stats = &resp["result"];
+    assert_eq!(stats["session_count"], 1);
+    assert!(stats["total_events"].as_u64().unwrap() >= 1); // SessionCreated
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}

@@ -16,12 +16,16 @@ use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
     AskSessionRequest, AskSessionResponse, CancelSessionRequest, CancelSessionResponse,
     CloseSessionRequest, CloseSessionResponse, CreateSessionRequest, CreateSessionResponse,
-    DelegateSessionRequest, DelegateSessionResponse, PingRequest, PingResponse, ProviderSelector,
-    Request, RespondToInputRequiredRequest, RespondToInputRequiredResponse, Response,
-    SessionStatsRequest, SessionStatsResponse,
+    DaemonStatsRequest, DaemonStatsResponse, DelegateSessionRequest, DelegateSessionResponse,
+    PingRequest, PingResponse, ProviderSelector, Request, RespondToInputRequiredRequest,
+    RespondToInputRequiredResponse, Response, SessionEventsRequest, SessionEventsResponse,
+    SessionListRequest, SessionListResponse, SessionStatsRequest, SessionStatsResponse,
+    SessionStatusSummary,
 };
 use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
 
+use super::daemon_info::DaemonInfo;
+use super::discovery::{derive_status, derive_status_from_events, SessionDiscovery};
 use super::factory::ProviderFactory;
 use super::forwarder::forward_events;
 use super::sessions::Sessions;
@@ -32,6 +36,8 @@ pub async fn dispatch(
     sessions: Sessions,
     factory: ProviderFactory,
     tools: Arc<Vec<Arc<dyn Tool>>>,
+    daemon_info: DaemonInfo,
+    discovery: Arc<dyn SessionDiscovery>,
 ) -> Response<Value> {
     match request.method.as_str() {
         PingRequest::METHOD => handle_ping(request),
@@ -45,6 +51,9 @@ pub async fn dispatch(
         CancelSessionRequest::METHOD => handle_cancel_session(request, sessions).await,
         CloseSessionRequest::METHOD => handle_close_session(request, sessions),
         SessionStatsRequest::METHOD => handle_session_stats(request, sessions),
+        SessionListRequest::METHOD => handle_session_list(request, discovery).await,
+        SessionEventsRequest::METHOD => handle_session_events(request, sessions),
+        DaemonStatsRequest::METHOD => handle_daemon_stats(request, sessions, daemon_info),
         RespondToInputRequiredRequest::METHOD => {
             handle_respond_to_input_required(request, sessions)
         }
@@ -417,4 +426,211 @@ fn handle_close_session(request: Request<Value>, sessions: Sessions) -> Response
     let removed = sessions.remove(&params.session_id);
     let resp = CloseSessionResponse { closed: removed };
     ok_response(request.id, to_value_or_null(resp))
+}
+
+// ── mu-038: projection-query handlers ──────────────────────────────
+
+async fn handle_session_list(
+    request: Request<Value>,
+    discovery: Arc<dyn SessionDiscovery>,
+) -> Response<Value> {
+    let params: SessionListRequest =
+        match serde_json::from_value(request.params.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                return err_response(
+                    request.id,
+                    codes::INVALID_PARAMS,
+                    format!("session.list: invalid params: {e}"),
+                );
+            }
+        };
+    let filter = params.filter.unwrap_or_default();
+    let now_ms = super::discovery::now_unix_ms();
+    match discovery.list(&filter).await {
+        Ok(sessions) => {
+            let resp = SessionListResponse {
+                sessions,
+                snapshot_at_unix_ms: now_ms,
+                failed_peers: Vec::new(),
+            };
+            ok_response(request.id, to_value_or_null(resp))
+        }
+        Err(super::discovery::DiscoveryError::PartialFailure {
+            local,
+            failed_peers,
+        }) => {
+            // INV-2: local results survive a peer outage. Surface
+            // failed_peers so the client can decide whether to retry
+            // or warn.
+            let resp = SessionListResponse {
+                sessions: local,
+                snapshot_at_unix_ms: now_ms,
+                failed_peers,
+            };
+            ok_response(request.id, to_value_or_null(resp))
+        }
+        Err(super::discovery::DiscoveryError::Backend(msg)) => err_response(
+            request.id,
+            codes::INTERNAL_ERROR,
+            format!("session.list: backend error: {msg}"),
+        ),
+    }
+}
+
+fn handle_session_events(
+    request: Request<Value>,
+    sessions: Sessions,
+) -> Response<Value> {
+    let params: SessionEventsRequest =
+        match serde_json::from_value(request.params.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                return err_response(
+                    request.id,
+                    codes::INVALID_PARAMS,
+                    format!("session.events: invalid params: {e}"),
+                );
+            }
+        };
+    let log = match sessions.event_log(&params.session_id) {
+        Some(l) => l,
+        None => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("session not found: {}", params.session_id),
+            );
+        }
+    };
+
+    let limit = params.limit.unwrap_or(200).clamp(1, 5000) as usize;
+    let after = params.after_event_id.unwrap_or(0);
+    let kinds_filter: std::collections::HashSet<String> =
+        params.kinds_filter.iter().cloned().collect();
+
+    let all = log.snapshot();
+    let mut events_json: Vec<Value> = Vec::with_capacity(limit);
+    let mut last_emitted: Option<u64> = None;
+    let mut end_of_log = true;
+
+    for ev in all.iter().filter(|e| e.id > after) {
+        let payload_kind = payload_kind_str(&ev.payload);
+        if !kinds_filter.is_empty() && !kinds_filter.contains(payload_kind) {
+            continue;
+        }
+        if events_json.len() >= limit {
+            end_of_log = false;
+            break;
+        }
+        match serde_json::to_value(ev) {
+            Ok(v) => {
+                last_emitted = Some(ev.id);
+                events_json.push(v);
+            }
+            Err(_) => {
+                // Best-effort: skip unserialisable events rather than
+                // failing the whole page.
+                continue;
+            }
+        }
+    }
+
+    let next_event_id = if end_of_log { None } else { last_emitted };
+    let resp = SessionEventsResponse {
+        events: events_json,
+        next_event_id,
+        end_of_log,
+    };
+    ok_response(request.id, to_value_or_null(resp))
+}
+
+fn handle_daemon_stats(
+    request: Request<Value>,
+    sessions: Sessions,
+    daemon_info: DaemonInfo,
+) -> Response<Value> {
+    let _params: DaemonStatsRequest =
+        match serde_json::from_value(request.params.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                return err_response(
+                    request.id,
+                    codes::INVALID_PARAMS,
+                    format!("daemon.stats: invalid params: {e}"),
+                );
+            }
+        };
+
+    let now_ms = super::discovery::now_unix_ms();
+    let snapshot = sessions.snapshot_for_listing();
+    let session_count = snapshot.len() as u32;
+    let mut active_session_count: u32 = 0;
+    let mut total_events: u64 = 0;
+    let mut total_tool_calls: u64 = 0;
+    let mut total_input_tokens: u64 = 0;
+    let mut total_output_tokens: u64 = 0;
+    let mut in_flight_calls_count: u32 = 0;
+
+    for (_sid, log, _parent) in snapshot.iter() {
+        let events = log.snapshot();
+        total_events = total_events.saturating_add(events.len() as u64);
+        total_tool_calls = total_tool_calls.saturating_add(log.tool_call_count() as u64);
+        if let Some(u) = log.cumulative_usage() {
+            total_input_tokens = total_input_tokens.saturating_add(u.input_tokens as u64);
+            total_output_tokens =
+                total_output_tokens.saturating_add(u.output_tokens as u64);
+        }
+        let status = derive_status_from_events(&events, now_ms);
+        if matches!(
+            status,
+            SessionStatusSummary::Asking
+                | SessionStatusSummary::Streaming
+                | SessionStatusSummary::ToolExecuting
+                | SessionStatusSummary::AwaitingInputRequired
+        ) {
+            active_session_count = active_session_count.saturating_add(1);
+            if matches!(
+                status,
+                SessionStatusSummary::Asking
+                    | SessionStatusSummary::Streaming
+                    | SessionStatusSummary::ToolExecuting
+            ) {
+                in_flight_calls_count = in_flight_calls_count.saturating_add(1);
+            }
+        }
+    }
+
+    let _ = derive_status; // keep import live; status is computed via derive_status_from_events above
+    let resp = DaemonStatsResponse {
+        daemon_id: daemon_info.daemon_id().to_string(),
+        version: daemon_info.version().to_string(),
+        started_at_unix_ms: daemon_info.started_at_unix_ms(),
+        uptime_ms: daemon_info.uptime_ms(),
+        session_count,
+        active_session_count,
+        total_events,
+        total_tool_calls,
+        total_input_tokens,
+        total_output_tokens,
+        in_flight_calls_count,
+    };
+    ok_response(request.id, to_value_or_null(resp))
+}
+
+/// Wire `payload_kind` string for `kinds_filter`. Matches serde's
+/// rename_all snake_case on the EventPayload tag.
+fn payload_kind_str(p: &EventPayload) -> &'static str {
+    match p {
+        EventPayload::SessionCreated { .. } => "session_created",
+        EventPayload::UserMessage { .. } => "user_message",
+        EventPayload::AssistantMessageEvent { .. } => "assistant_message_event",
+        EventPayload::ToolCall { .. } => "tool_call",
+        EventPayload::ToolResult { .. } => "tool_result",
+        EventPayload::Done { .. } => "done",
+        EventPayload::Error { .. } => "error",
+        EventPayload::Callout { .. } => "callout",
+        EventPayload::SessionClosed => "session_closed",
+        EventPayload::ContextAssembly { .. } => "context_assembly",
+    }
 }

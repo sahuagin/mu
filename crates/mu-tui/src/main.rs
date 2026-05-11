@@ -258,13 +258,18 @@ impl App {
                                         .push_str(delta);
                                 }
                                 "session.done" | "session.error" => {
-                                    // AssistantMessageEvent will be in
-                                    // the event log on the next
-                                    // session.events refresh.
+                                    // AssistantMessageEvent has now
+                                    // landed in the event log; the
+                                    // next session.events refresh
+                                    // (every 2 ticks while on F3,
+                                    // i.e. ~500ms) will reflect it.
+                                    // Drop the streaming accumulator
+                                    // — its content is now part of
+                                    // the recorded log. Keep the
+                                    // transcript cache so F3 doesn't
+                                    // flicker through a "loading…"
+                                    // state.
                                     self.streaming_text.remove(sid);
-                                    // Invalidate transcript cache so
-                                    // the next F3 visit reloads.
-                                    self.transcript_events_by_sid.remove(sid);
                                 }
                                 _ => {}
                             }
@@ -1221,18 +1226,43 @@ fn render_transcript_lines(
                 push_block(&mut lines, "you", Color::Cyan, content);
             }
             "assistant_message_event" => {
+                // AssistantMessage.content is Vec<ContentBlock> where
+                // ContentBlock is a tagged enum: {type: "text",
+                // text: "..."} | {type: "tool_call", ...} |
+                // {type: "thinking", ...}. Pull and join all `text`
+                // blocks; tool_call blocks are surfaced separately as
+                // their own ToolCall events.
                 let text = payload
                     .get("message")
-                    .and_then(|m| m.get("text"))
-                    .and_then(|v| v.as_str())
-                    .or_else(|| {
-                        payload
-                            .get("message")
-                            .and_then(|m| m.get("content"))
-                            .and_then(|v| v.as_str())
+                    .and_then(|m| m.get("content"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|block| {
+                                let t = block.get("type").and_then(|v| v.as_str())?;
+                                if t == "text" {
+                                    block.get("text").and_then(|v| v.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("")
                     })
-                    .unwrap_or("");
-                push_block(&mut lines, "assistant", Color::White, text);
+                    .unwrap_or_default();
+                if text.is_empty() {
+                    // Fall through to a small debug marker so the
+                    // block is visible even with no text (e.g.
+                    // tool-only turns).
+                    push_block(
+                        &mut lines,
+                        "assistant",
+                        Color::White,
+                        "(no text in this turn)",
+                    );
+                } else {
+                    push_block(&mut lines, "assistant", Color::White, &text);
+                }
             }
             "tool_call" => {
                 let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("?");

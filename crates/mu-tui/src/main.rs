@@ -142,6 +142,15 @@ struct App {
     cost_budget: (f32, f32), // (used, budget) — still partially mocked v1
     // Throttle for periodic daemon queries: every N ticks.
     poll_tick_counter: u32,
+    // Per-session UI state: when the client submitted an ask.
+    // Cleared when text_delta arrives or session.done fires. This is
+    // intentionally client-side because "when did the user press
+    // ctrl-enter" is UI state, not daemon state — and the gap between
+    // RPC ack and first token is the most user-confusing silent
+    // window. mu-035 will eventually give us authoritative
+    // session.provider_status notifications; until then, this is the
+    // explicit "yes, we sent it" affordance.
+    ask_started_at: std::collections::HashMap<String, Instant>,
     // Wire integration. None ⇒ scaffold mock-data mode (no live daemon).
     mu: Option<MuClient>,
     /// `provider/model` to use when a new session is created via `n`.
@@ -182,6 +191,7 @@ impl App {
             daemon_id: None,
             cost_budget: (0.0, 10.0),
             poll_tick_counter: 0,
+            ask_started_at: std::collections::HashMap::new(),
             mu,
             default_provider,
         }
@@ -202,6 +212,21 @@ impl App {
             for _ in 0..64 {
                 match mu.try_recv_notification() {
                     Some(MuMessage::Notification { method, params }) => {
+                        // Clear the "awaiting first token" affordance
+                        // as soon as we see streaming or terminal
+                        // events from the session.
+                        let sid = params
+                            .get("session_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if !sid.is_empty()
+                            && (method == "session.text_delta"
+                                || method == "session.tool_call_started"
+                                || method == "session.done"
+                                || method == "session.error")
+                        {
+                            self.ask_started_at.remove(sid);
+                        }
                         handle_notification(
                             &mut self.sessions,
                             &mut self.firehose,
@@ -273,6 +298,13 @@ impl App {
         } else {
             self.selected_session.select(None);
         }
+        // Drop ask-tracking for sessions that aren't around anymore.
+        let live: std::collections::HashSet<String> = self
+            .sessions
+            .iter()
+            .filter_map(|r| r.session_id.clone())
+            .collect();
+        self.ask_started_at.retain(|sid, _| live.contains(sid));
     }
 
     fn refresh_daemon_stats(&mut self) {
@@ -361,18 +393,33 @@ impl App {
             return;
         };
         let Some(sid) = row.session_id.clone() else {
-            self.firehose.push("[mock session] can't send (no session_id)".into());
+            self.firehose
+                .push("[mock session] can't send (no session_id)".into());
             return;
         };
         let Some(mu) = self.mu.as_mut() else {
             return;
         };
-        let res = mu.request("ask_session", json!({ "session_id": sid, "user_message": prompt }));
+        let res = mu.request(
+            "ask_session",
+            json!({ "session_id": sid, "user_message": prompt }),
+        );
         match res {
             Ok(_) => {
+                // UI state: mark "we sent at this instant" for the
+                // right-pane affordance until the first token arrives.
+                self.ask_started_at.insert(sid.clone(), Instant::now());
                 row.status = SessionStatus::Running;
-                row.phase = "awaiting first token (just sent)".into();
-                self.firehose.push(format!("[ok] ask_session → {sid}"));
+                row.phase = "sent — awaiting first token".into();
+                // Friendlier firehose line — prompt preview, ellipsised.
+                let preview: String = prompt
+                    .chars()
+                    .take(60)
+                    .collect::<String>()
+                    .replace('\n', " ");
+                let suffix = if prompt.chars().count() > 60 { "…" } else { "" };
+                self.firehose
+                    .push(format!("→ {sid}: {preview:?}{suffix}"));
             }
             Err(e) => {
                 self.firehose.push(format!("[!! ask_session] {e}"));
@@ -866,42 +913,72 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
         .selected()
         .and_then(|i| app.sessions.get(i));
     let detail_text = if let Some(s) = selected {
-        vec![
-            Line::from(vec![
-                Span::styled("session ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    s.short_id.clone(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::raw(s.title.clone()),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("phase:    ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    s.phase.clone(),
-                    Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("model:    ", Style::default().fg(Color::DarkGray)),
-                Span::raw(s.model.clone()),
-            ]),
-            Line::from(vec![
-                Span::styled("cost:     ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!("${:.2}", s.cost_usd)),
-            ]),
-            Line::from(vec![
-                Span::styled("context:  ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!("{}k active / cached", s.tokens_kilo)),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "(post-mu-035: 'phase' comes from session.provider_status; for now mocked)",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]
+        let sid_opt = s.session_id.as_deref();
+        // "Awaiting first token" affordance: visible the moment the
+        // user submits a prompt, vanishes as soon as the first
+        // text_delta / tool_call / done arrives. UI state, not daemon
+        // state — fills the silent window before the wire starts
+        // talking.
+        let awaiting_line = sid_opt
+            .and_then(|sid| app.ask_started_at.get(sid))
+            .map(|t| {
+                let elapsed = t.elapsed();
+                Line::from(vec![
+                    Span::styled(
+                        "● awaiting first token  ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{:.1}s", elapsed.as_secs_f32()),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ])
+            });
+
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled("session ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                s.short_id.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::raw(s.title.clone()),
+        ]));
+        lines.push(Line::from(""));
+        if let Some(l) = awaiting_line {
+            lines.push(l);
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("phase:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                s.phase.clone(),
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Cyan),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("model:    ", Style::default().fg(Color::DarkGray)),
+            Span::raw(s.model.clone()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("cost:     ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("${:.2}", s.cost_usd)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("context:  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{}k cumulative", s.tokens_kilo)),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "(post-mu-035: 'phase' becomes authoritative via session.provider_status)",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines
     } else {
         vec![Line::from("(no session selected)")]
     };

@@ -38,7 +38,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, Wrap},
     Frame, Terminal,
 };
 use serde_json::json;
@@ -196,6 +196,15 @@ struct App {
     // matching this substring. Toggleable via `:filter <text>`
     // palette command. Empty = no filter (show all).
     events_filter: String,
+    // F5 usage / cache dashboard (mu-xln). Holds the most recent
+    // daemon.usage_history response and the wall time it was fetched
+    // at. Refreshed lazily — whenever a session.done lands (so any
+    // F5-switch picks up post-ask data) and every 4 ticks while F5
+    // is the active mode. Polling is event-triggered against the
+    // event log, not interval-driven, so the cost is bounded by
+    // ask completion rate.
+    latest_usage_history: Option<serde_json::Value>,
+    latest_usage_history_at: Option<Instant>,
     // Wire integration. None ⇒ scaffold mock-data mode (no live daemon).
     mu: Option<MuClient>,
     /// `provider/model` to use when a new session is created via `n`.
@@ -243,6 +252,8 @@ impl App {
             transcript_scroll_offset: 0,
             events_scroll_offset: 0,
             events_filter: String::new(),
+            latest_usage_history: None,
+            latest_usage_history_at: None,
             mu,
             default_provider,
         }
@@ -258,6 +269,11 @@ impl App {
         if !self.connected() {
             return;
         }
+        // mu-xln: any session.done observed in this tick's drain
+        // means the metrics aggregator's snapshot is stale; refresh
+        // after the drain so we don't fight the mutable-borrow on
+        // self.mu mid-loop.
+        let mut refresh_usage_after_drain = false;
         // 1. Drain incoming notifications into the firehose / per-row phase.
         if let Some(mu) = self.mu.as_mut() {
             for _ in 0..64 {
@@ -307,6 +323,14 @@ impl App {
                                     // flicker through a "loading…"
                                     // state.
                                     self.streaming_text.remove(sid);
+                                    // mu-xln: a Done means metrics
+                                    // moved. Mark the usage-history
+                                    // cache for refresh after the
+                                    // notification drain completes —
+                                    // we can't refresh inline because
+                                    // we hold a mutable borrow on
+                                    // self.mu via try_recv_notification.
+                                    refresh_usage_after_drain = true;
                                 }
                                 _ => {}
                             }
@@ -349,6 +373,16 @@ impl App {
             && self.poll_tick_counter % 2 == 0
         {
             self.refresh_transcript_for_selection();
+        }
+        // mu-xln F5: refresh whenever a session.done landed this tick,
+        // OR every 4 ticks while F5 is active (so an idle user staring
+        // at the dashboard still sees the bucket time-stamp tick over).
+        // Outside F5 we skip the interval refresh — event-triggered
+        // refresh is the only update path, which is essentially free.
+        if refresh_usage_after_drain
+            || (matches!(self.mode, ViewMode::Usage) && self.poll_tick_counter % 4 == 0)
+        {
+            self.refresh_usage_history();
         }
     }
 
@@ -456,6 +490,25 @@ impl App {
             .filter_map(|r| r.session_id.clone())
             .collect();
         self.ask_started_at.retain(|sid, _| live.contains(sid));
+    }
+
+    /// Refresh the F5 usage / cache pane (mu-xln). Calls
+    /// `daemon.usage_history` and caches the full response. Triggered
+    /// on every session.done (in the tick loop's notification drain)
+    /// and every 4 ticks while F5 is the active mode. Aggregator is
+    /// in-memory and cheap, so failure-mode is just transient stale-
+    /// ness — log and keep the prior snapshot.
+    fn refresh_usage_history(&mut self) {
+        let Some(mu) = self.mu.as_mut() else { return };
+        match mu.request("daemon.usage_history", json!({})) {
+            Ok(v) => {
+                self.latest_usage_history = Some(v);
+                self.latest_usage_history_at = Some(Instant::now());
+            }
+            Err(e) => {
+                self.firehose.push(format!("[!! daemon.usage_history] {e}"));
+            }
+        }
     }
 
     fn refresh_daemon_stats(&mut self) {
@@ -730,7 +783,13 @@ impl App {
                 self.events_scroll_offset = self.events_scroll_offset.saturating_sub(2);
             }
             (KeyCode::F(4), _) => self.mode = ViewMode::Context,
-            (KeyCode::F(5), _) => self.mode = ViewMode::Usage,
+            (KeyCode::F(5), _) => {
+                self.mode = ViewMode::Usage;
+                // Eager refresh on mode entry — the user shouldn't
+                // have to wait for the next tick (~250ms) to see
+                // populated data after pressing F5.
+                self.refresh_usage_history();
+            }
             (KeyCode::F(6), _) => self.mode = ViewMode::Tools,
             (KeyCode::F(7), _) => self.mode = ViewMode::Router,
             (KeyCode::F(8), _) => {
@@ -1073,7 +1132,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         ViewMode::SessionTree => render_placeholder(f, chunks[2], "Session Tree", "F2"),
         ViewMode::SessionDetail => render_session_detail(f, app, chunks[2]),
         ViewMode::Context => render_placeholder(f, chunks[2], "Context Inspector", "F4"),
-        ViewMode::Usage => render_placeholder(f, chunks[2], "Usage / Cache", "F5"),
+        ViewMode::Usage => render_usage(f, app, chunks[2]),
         ViewMode::Tools => render_placeholder(f, chunks[2], "Tools / MCP / Skills", "F6"),
         ViewMode::Router => render_placeholder(f, chunks[2], "Router / Proxy", "F7"),
         ViewMode::Events => render_events_explorer(f, app, chunks[2]),
@@ -1720,6 +1779,175 @@ fn render_events_explorer(f: &mut Frame, app: &mut App, area: Rect) {
         .wrap(Wrap { trim: false })
         .scroll((scroll_y, 0));
     f.render_widget(paragraph, area);
+}
+
+/// mu-xln Phase A — render `daemon.usage_history` as a table.
+///
+/// One row per (provider, model) group (Phase A doesn't expose
+/// time-bucketing yet — the request goes out with no `time_bucket_ms`,
+/// so each (provider, model) collapses to a single row spanning all
+/// in-memory sessions). Columns favor at-a-glance comparison across
+/// models over completeness: TTFT and streaming p95 for "is this
+/// model slow?", wall p95 for "is this model expensive in
+/// round-trips?", token sums + tool count for "how much work?".
+fn render_usage(f: &mut Frame, app: &App, area: Rect) {
+    let snapshot_age = app
+        .latest_usage_history_at
+        .map(|t| t.elapsed().as_secs())
+        .map(|s| format!("{s}s ago"))
+        .unwrap_or_else(|| "never".into());
+    let session_total = app
+        .latest_usage_history
+        .as_ref()
+        .and_then(|v| v.get("session_count_total"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let title = format!(
+        " F5 · Usage / Cache · {session_total} sessions in scope · snapshot {snapshot_age} "
+    );
+
+    let rows_json = app
+        .latest_usage_history
+        .as_ref()
+        .and_then(|v| v.get("rows"))
+        .and_then(|v| v.as_array());
+    let Some(rows_json) = rows_json else {
+        let block = Block::default().title(title).borders(Borders::ALL);
+        let p = Paragraph::new(Line::from(Span::styled(
+            "No usage data yet — run an ask_session, or wait for the next session.done.",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .block(block)
+        .wrap(Wrap { trim: false });
+        f.render_widget(p, area);
+        return;
+    };
+
+    let header_cells = [
+        "provider", "model", "sess", "ttft p95", "stream p95", "wall p95", "in tok",
+        "out tok", "cache%", "tools", "err",
+    ]
+    .iter()
+    .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)));
+    let header = Row::new(header_cells)
+        .style(Style::default().fg(Color::Yellow))
+        .height(1);
+
+    let body_rows: Vec<Row> = rows_json
+        .iter()
+        .map(|row| {
+            let provider = row
+                .get("provider_kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let model = row.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+            let sessions = row
+                .get("session_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let ttft_p95 = fmt_ms_p95(row.get("ttft_ms"));
+            let stream_p95 = fmt_ms_p95(row.get("streaming_ms"));
+            let wall_p95 = fmt_ms_p95(row.get("wall_ms"));
+            let in_tok = row
+                .get("input_tokens_sum")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let out_tok = row
+                .get("output_tokens_sum")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let cache_read = row
+                .get("cache_read_input_tokens_sum")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let cache_creation = row
+                .get("cache_creation_input_tokens_sum")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            // Cache hit % = cache_read / (input + cache_read + cache_creation).
+            // Anthropic surfaces these three as distinct counters; the
+            // denominator is "total input tokens charged" (non-cached
+            // input + cache-read tokens that did hit + cache-creation
+            // tokens that wrote new entries). "—" when no input has
+            // flowed yet to avoid a 0/0 NaN.
+            let total_input = in_tok + cache_read + cache_creation;
+            let cache_pct_str = if total_input == 0 {
+                "—".to_string()
+            } else {
+                let pct = (cache_read as f64 * 100.0) / total_input as f64;
+                format!("{pct:.0}%")
+            };
+            let tools = row
+                .get("tool_call_count_sum")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let errors = row
+                .get("error_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let err_style = if errors > 0 {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default()
+            };
+            Row::new(vec![
+                Cell::from(provider.to_string()),
+                Cell::from(model.to_string()),
+                Cell::from(sessions.to_string()),
+                Cell::from(ttft_p95),
+                Cell::from(stream_p95),
+                Cell::from(wall_p95),
+                Cell::from(format_thousands(in_tok)),
+                Cell::from(format_thousands(out_tok)),
+                Cell::from(cache_pct_str),
+                Cell::from(tools.to_string()),
+                Cell::from(errors.to_string()).style(err_style),
+            ])
+            .height(1)
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(14), // provider
+        Constraint::Min(20),    // model
+        Constraint::Length(5),  // sess
+        Constraint::Length(10), // ttft p95
+        Constraint::Length(10), // stream p95
+        Constraint::Length(10), // wall p95
+        Constraint::Length(8),  // in tok
+        Constraint::Length(8),  // out tok
+        Constraint::Length(6),  // cache%
+        Constraint::Length(5),  // tools
+        Constraint::Length(4),  // err
+    ];
+    let table = Table::new(body_rows, widths)
+        .header(header)
+        .block(Block::default().title(title).borders(Borders::ALL))
+        .column_spacing(1);
+    f.render_widget(table, area);
+}
+
+/// Format the `p95` field of a PercentileStats-shaped value as
+/// `"<n>ms"` or `"—"` if the source is `None`/missing.
+fn fmt_ms_p95(stats: Option<&serde_json::Value>) -> String {
+    stats
+        .and_then(|s| s.get("p95"))
+        .and_then(|v| v.as_u64())
+        .map(|ms| format!("{ms}ms"))
+        .unwrap_or_else(|| "—".into())
+}
+
+/// Format a u64 with thousands separators (`12345` → `"12,345"`).
+fn format_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
 }
 
 fn render_placeholder(f: &mut Frame, area: Rect, name: &str, fkey: &str) {

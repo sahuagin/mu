@@ -39,6 +39,94 @@ pub struct Capability {
     /// None = unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tool_calls_remaining: Option<u32>,
+    /// mu-036: whether the session may enter autonomous mode and the
+    /// bounds it must respect once there. Default is `Disallowed` —
+    /// autonomy is opt-in (INV-1). Wire-format is flat (snake_case)
+    /// for the serde tag.
+    #[serde(default)]
+    pub autonomy: AutonomyCapability,
+}
+
+/// mu-036: whether a session may run autonomously (without an
+/// `ask_session` between turns), and if so, the bounds the daemon
+/// will enforce at every iteration boundary.
+///
+/// INV-1: default is `Disallowed`. A session can only enter
+/// autonomous mode if its capability explicitly grants it.
+/// INV-2: the bounds here are enforced by the daemon, not the model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AutonomyCapability {
+    /// Autonomy disallowed. session.start_autonomous is rejected
+    /// with `CapabilityCheck::DeniedAutonomyDisallowed`.
+    Disallowed,
+    /// Autonomy allowed within these bounds. Whichever bound trips
+    /// first terminates the loop.
+    Allowed {
+        /// Cap on the number of iterations the loop may execute.
+        max_iterations: u32,
+        /// Cap on wall-clock time inside autonomous mode, including
+        /// time spent sleeping (INV-5: sleep doesn't consume model
+        /// budget, but the wall-clock budget still applies).
+        max_wall_clock_ms: u64,
+        /// Cap on total tool invocations across the autonomous run.
+        /// Distinct from `max_tool_calls_remaining` (which applies
+        /// to the whole session, autonomy or not).
+        max_total_tool_calls_in_autonomy: u32,
+        /// Whether the session is permitted to call
+        /// `session.schedule_wakeup` to park itself.
+        allow_schedule_wakeup: bool,
+        /// Whether the session may use the `DelegateGrader`
+        /// goal-check method (which spawns / asks a sibling session
+        /// to grade — non-trivial cost).
+        allow_delegate_grader: bool,
+    },
+}
+
+impl Default for AutonomyCapability {
+    fn default() -> Self {
+        Self::Disallowed
+    }
+}
+
+impl AutonomyCapability {
+    /// True iff this capability permits entry to autonomous mode.
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, Self::Allowed { .. })
+    }
+
+    /// Intersect two AutonomyCapability values. The narrower side
+    /// always wins on every axis:
+    /// * Either side `Disallowed` ⇒ result `Disallowed`.
+    /// * Both `Allowed` ⇒ `Allowed` with the min of each numeric
+    ///   bound and the conjunction of each boolean permission.
+    pub fn intersect(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Disallowed, _) | (_, Self::Disallowed) => Self::Disallowed,
+            (
+                Self::Allowed {
+                    max_iterations: a_iter,
+                    max_wall_clock_ms: a_wall,
+                    max_total_tool_calls_in_autonomy: a_tools,
+                    allow_schedule_wakeup: a_sched,
+                    allow_delegate_grader: a_grader,
+                },
+                Self::Allowed {
+                    max_iterations: b_iter,
+                    max_wall_clock_ms: b_wall,
+                    max_total_tool_calls_in_autonomy: b_tools,
+                    allow_schedule_wakeup: b_sched,
+                    allow_delegate_grader: b_grader,
+                },
+            ) => Self::Allowed {
+                max_iterations: (*a_iter).min(*b_iter),
+                max_wall_clock_ms: (*a_wall).min(*b_wall),
+                max_total_tool_calls_in_autonomy: (*a_tools).min(*b_tools),
+                allow_schedule_wakeup: *a_sched && *b_sched,
+                allow_delegate_grader: *a_grader && *b_grader,
+            },
+        }
+    }
 }
 
 impl Capability {
@@ -97,10 +185,16 @@ impl Capability {
             (Some(a), Some(b)) => Some(a.min(b)),
         };
 
+        // mu-036: intersect autonomy capability the same way.
+        // Delegate sessions cannot widen autonomy beyond the
+        // parent's grant.
+        let autonomy = self.autonomy.intersect(&attenuations.autonomy);
+
         Capability {
             allowed_tools,
             expires_at_unix_ms,
             max_tool_calls_remaining,
+            autonomy,
         }
     }
 
@@ -151,6 +245,11 @@ pub struct CapabilityAttenuations {
     pub expires_in_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tool_calls: Option<u32>,
+    /// mu-036: requested autonomy budget for the delegate. Intersected
+    /// with parent's autonomy capability — narrower side wins.
+    /// Disallowed by default (parent's Disallowed dominates regardless).
+    #[serde(default)]
+    pub autonomy: AutonomyCapability,
 }
 
 /// Result of `Capability::check_allow`. Distinguishes the three
@@ -162,6 +261,10 @@ pub enum CapabilityCheck {
     DeniedToolNotAllowed,
     DeniedExpired,
     DeniedBudgetExhausted,
+    /// mu-036: session.start_autonomous called on a session whose
+    /// capability has `autonomy: Disallowed`. The default for
+    /// `Capability::root()` (INV-1).
+    DeniedAutonomyDisallowed,
 }
 
 impl CapabilityCheck {
@@ -174,6 +277,9 @@ impl CapabilityCheck {
             CapabilityCheck::DeniedToolNotAllowed => "tool not in capability's allowed_tools set",
             CapabilityCheck::DeniedExpired => "capability has expired",
             CapabilityCheck::DeniedBudgetExhausted => "tool-call budget exhausted",
+            CapabilityCheck::DeniedAutonomyDisallowed => {
+                "capability has autonomy: Disallowed; cannot enter autonomous mode"
+            }
         }
     }
 }
@@ -321,6 +427,7 @@ mod tests {
             allowed_tools: Some(set(&["read", "grep"])),
             expires_at_unix_ms: Some(1_800_000_000_000),
             max_tool_calls_remaining: Some(50),
+            autonomy: AutonomyCapability::default(),
         };
         let v = serde_json::to_value(&cap)?;
         let decoded: Capability = serde_json::from_value(v)?;
@@ -333,15 +440,164 @@ mod tests {
         assert!(!CapabilityCheck::DeniedToolNotAllowed.is_allowed());
         assert!(!CapabilityCheck::DeniedExpired.is_allowed());
         assert!(!CapabilityCheck::DeniedBudgetExhausted.is_allowed());
+        assert!(!CapabilityCheck::DeniedAutonomyDisallowed.is_allowed());
         assert!(CapabilityCheck::Allowed.is_allowed());
         // Each has a distinct human-readable reason.
         let reasons: HashSet<&str> = [
             CapabilityCheck::DeniedToolNotAllowed.reason(),
             CapabilityCheck::DeniedExpired.reason(),
             CapabilityCheck::DeniedBudgetExhausted.reason(),
+            CapabilityCheck::DeniedAutonomyDisallowed.reason(),
         ]
         .into_iter()
         .collect();
-        assert_eq!(reasons.len(), 3);
+        assert_eq!(reasons.len(), 4);
+    }
+
+    // ── mu-036: AutonomyCapability ───────────────────────────────
+
+    fn autonomy_allowed(
+        max_iterations: u32,
+        max_wall_clock_ms: u64,
+        max_total_tool_calls: u32,
+    ) -> AutonomyCapability {
+        AutonomyCapability::Allowed {
+            max_iterations,
+            max_wall_clock_ms,
+            max_total_tool_calls_in_autonomy: max_total_tool_calls,
+            allow_schedule_wakeup: true,
+            allow_delegate_grader: true,
+        }
+    }
+
+    #[test]
+    fn autonomy_default_is_disallowed() {
+        assert_eq!(AutonomyCapability::default(), AutonomyCapability::Disallowed);
+        let root = Capability::root();
+        assert_eq!(root.autonomy, AutonomyCapability::Disallowed);
+        assert!(!root.autonomy.is_allowed());
+    }
+
+    #[test]
+    fn autonomy_intersect_with_disallowed_yields_disallowed() {
+        let allowed = autonomy_allowed(10, 60_000, 50);
+        assert_eq!(
+            allowed.intersect(&AutonomyCapability::Disallowed),
+            AutonomyCapability::Disallowed
+        );
+        assert_eq!(
+            AutonomyCapability::Disallowed.intersect(&allowed),
+            AutonomyCapability::Disallowed
+        );
+    }
+
+    #[test]
+    fn autonomy_intersect_takes_min_of_numeric_bounds() {
+        let parent = autonomy_allowed(10, 60_000, 50);
+        let child = autonomy_allowed(20, 30_000, 100);
+        let result = parent.intersect(&child);
+        match result {
+            AutonomyCapability::Allowed {
+                max_iterations,
+                max_wall_clock_ms,
+                max_total_tool_calls_in_autonomy,
+                ..
+            } => {
+                assert_eq!(max_iterations, 10);
+                assert_eq!(max_wall_clock_ms, 30_000);
+                assert_eq!(max_total_tool_calls_in_autonomy, 50);
+            }
+            _ => panic!("expected Allowed"),
+        }
+    }
+
+    #[test]
+    fn autonomy_intersect_conjuncts_boolean_permissions() {
+        let parent = AutonomyCapability::Allowed {
+            max_iterations: 10,
+            max_wall_clock_ms: 60_000,
+            max_total_tool_calls_in_autonomy: 50,
+            allow_schedule_wakeup: true,
+            allow_delegate_grader: false, // ← restrictive
+        };
+        let child = AutonomyCapability::Allowed {
+            max_iterations: 10,
+            max_wall_clock_ms: 60_000,
+            max_total_tool_calls_in_autonomy: 50,
+            allow_schedule_wakeup: true,
+            allow_delegate_grader: true, // ← request, but parent denies
+        };
+        let result = parent.intersect(&child);
+        match result {
+            AutonomyCapability::Allowed {
+                allow_schedule_wakeup,
+                allow_delegate_grader,
+                ..
+            } => {
+                assert!(allow_schedule_wakeup);
+                // Parent's `false` propagates — child can't widen.
+                assert!(!allow_delegate_grader);
+            }
+            _ => panic!("expected Allowed"),
+        }
+    }
+
+    #[test]
+    fn capability_attenuate_carries_autonomy_through() {
+        let parent = Capability {
+            autonomy: autonomy_allowed(10, 60_000, 50),
+            ..Default::default()
+        };
+        // Child requests broader autonomy → narrower side (parent) wins.
+        let attn = CapabilityAttenuations {
+            autonomy: autonomy_allowed(20, 120_000, 100),
+            ..Default::default()
+        };
+        let child = parent.attenuate(&attn);
+        match child.autonomy {
+            AutonomyCapability::Allowed {
+                max_iterations,
+                max_wall_clock_ms,
+                max_total_tool_calls_in_autonomy,
+                ..
+            } => {
+                assert_eq!(max_iterations, 10);
+                assert_eq!(max_wall_clock_ms, 60_000);
+                assert_eq!(max_total_tool_calls_in_autonomy, 50);
+            }
+            _ => panic!("expected Allowed"),
+        }
+    }
+
+    #[test]
+    fn capability_attenuate_disallowed_parent_blocks_autonomy() {
+        // Parent default is Disallowed. Any child request stays Disallowed.
+        let parent = Capability::root();
+        let attn = CapabilityAttenuations {
+            autonomy: autonomy_allowed(99, 999_999, 999),
+            ..Default::default()
+        };
+        let child = parent.attenuate(&attn);
+        assert_eq!(child.autonomy, AutonomyCapability::Disallowed);
+        assert!(!child.autonomy.is_allowed());
+    }
+
+    #[test]
+    fn autonomy_round_trips_via_serde() -> Result<(), serde_json::Error> {
+        // Disallowed round-trip.
+        let disallowed = AutonomyCapability::Disallowed;
+        let v = serde_json::to_value(&disallowed)?;
+        assert_eq!(v["kind"], "disallowed");
+        let decoded: AutonomyCapability = serde_json::from_value(v)?;
+        assert_eq!(decoded, disallowed);
+
+        // Allowed round-trip.
+        let allowed = autonomy_allowed(10, 60_000, 50);
+        let v = serde_json::to_value(&allowed)?;
+        assert_eq!(v["kind"], "allowed");
+        assert_eq!(v["max_iterations"], 10);
+        let decoded: AutonomyCapability = serde_json::from_value(v)?;
+        assert_eq!(decoded, allowed);
+        Ok(())
     }
 }

@@ -1031,6 +1031,12 @@ async fn handle_execute_tools(
                 CapabilityCheck::DeniedBudgetExhausted => {
                     Some("session capability's tool-call budget exhausted")
                 }
+                // mu-036: DeniedAutonomyDisallowed only applies to
+                // session.start_autonomous (where it's checked by
+                // handle_start_autonomous, not here). A tool dispatch
+                // never produces this — but match arm required for
+                // exhaustiveness.
+                CapabilityCheck::DeniedAutonomyDisallowed => None,
             })
         };
 

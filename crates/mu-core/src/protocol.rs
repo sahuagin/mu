@@ -1104,6 +1104,7 @@ mod tests {
                 allowed_tools: Some(vec!["read".into(), "grep".into()]),
                 expires_in_seconds: Some(300),
                 max_tool_calls: Some(10),
+                autonomy: crate::capability::AutonomyCapability::default(),
             }),
         };
         let value = serde_json::to_value(&req)?;

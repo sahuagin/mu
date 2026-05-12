@@ -202,6 +202,70 @@ impl SessionEventLog {
         }
     }
 
+    /// mu-935: rebuild a SessionEventLog from a JSONL file previously
+    /// written by `attach_disk_writer` (mu-upb's path). Used by the
+    /// FileBackend discovery layer to read peer daemons' sessions
+    /// off disk, and will be used by mu-mh4 (session persistence
+    /// across daemon restart) when that lands.
+    ///
+    /// The returned log is in-memory only — no disk writer attached.
+    /// `next_id` is set to `max(existing_id) + 1` so future appends
+    /// don't collide. Malformed lines are skipped with a counter
+    /// returned so callers can surface "we recovered N events,
+    /// skipped M malformed ones." `session_id` is taken from the
+    /// first event; if the file has no events, falls back to the
+    /// filename stem.
+    pub fn from_jsonl(
+        path: &std::path::Path,
+    ) -> std::io::Result<(Self, usize)> {
+        use std::io::BufRead;
+
+        let file = std::fs::File::open(path)?;
+        let reader = std::io::BufReader::new(file);
+        let mut events: Vec<SessionEvent> = Vec::new();
+        let mut malformed: usize = 0;
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => {
+                    malformed = malformed.saturating_add(1);
+                    continue;
+                }
+            };
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<SessionEvent>(&line) {
+                Ok(ev) => events.push(ev),
+                Err(_) => malformed = malformed.saturating_add(1),
+            }
+        }
+        let session_id = events
+            .first()
+            .map(|e| e.session_id.clone())
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("recovered")
+                    .to_string()
+            });
+        let next_id = events
+            .iter()
+            .map(|e| e.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        Ok((
+            Self {
+                session_id,
+                events: Mutex::new(events),
+                next_id: AtomicU64::new(next_id),
+                disk_writer: Mutex::new(None),
+            },
+            malformed,
+        ))
+    }
+
     /// Attach an on-disk JSONL writer (mu-upb). Creates the parent
     /// directories if needed and opens the file in append mode.
     ///

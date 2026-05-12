@@ -21,14 +21,16 @@
 
 use std::sync::Arc;
 
+pub mod file_backend;
+pub mod local_registry;
+
+pub use file_backend::FileBackend;
+pub use local_registry::LocalRegistryBackend;
+
 use async_trait::async_trait;
 
 use mu_core::event_log::{EventActor, EventPayload, SessionEvent, SessionEventLog};
 use mu_core::protocol::{SessionInfo, SessionListFilter, SessionStatusSummary};
-
-mod local_registry;
-
-pub use local_registry::LocalRegistryBackend;
 
 /// Info a daemon publishes to the discovery layer for one of its
 /// local sessions. Backends that federate (file, etcd) serialise

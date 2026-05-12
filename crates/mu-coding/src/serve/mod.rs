@@ -16,7 +16,7 @@ mod forwarder;
 mod sessions;
 
 pub use daemon_info::DaemonInfo;
-pub use discovery::{LocalRegistryBackend, SessionDiscovery};
+pub use discovery::{FileBackend, LocalRegistryBackend, SessionDiscovery};
 pub use factory::{
     build_provider_from_selector, build_tools, make_provider_factory, parse_tools_csv,
     selector_from_cli, BashSettings, ProviderFactory,
@@ -68,13 +68,23 @@ where
 {
     let sessions = Sessions::new();
     let daemon_info = DaemonInfo::new(env!("CARGO_PKG_VERSION")).with_events_dir(events_dir);
-    // v1 (mu-038): always LocalRegistryBackend. Wired via Arc so a
-    // future --discovery flag can choose File / Etcd without changing
-    // the dispatch surface.
-    let discovery: Arc<dyn SessionDiscovery> = Arc::new(LocalRegistryBackend::new(
+    // mu-935: when events_dir is configured (mu-upb's on-disk JSONL
+    // path), wrap the local backend with FileBackend so session.list
+    // with include_remote=true picks up peer daemons' sessions from
+    // the same machine. When events_dir is None (tests, ephemeral
+    // mode), the local backend alone is exactly the right behavior.
+    let local: Arc<dyn SessionDiscovery> = Arc::new(LocalRegistryBackend::new(
         sessions.clone(),
         daemon_info.daemon_id().to_string(),
     ));
+    let discovery: Arc<dyn SessionDiscovery> = match daemon_info.events_dir() {
+        Some(dir) => Arc::new(FileBackend::new(
+            local,
+            dir.to_path_buf(),
+            daemon_info.daemon_id().to_string(),
+        )),
+        None => local,
+    };
     // Wrap tools in Arc so cloning per request is a single pointer
     // copy regardless of tools list size.
     let tools = Arc::new(tools);

@@ -220,7 +220,14 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
             EventPayload::UserMessage { .. }
             | EventPayload::Callout { .. }
             | EventPayload::SessionCreated { .. }
-            | EventPayload::SessionClosed => {}
+            | EventPayload::SessionClosed
+            // mu-036: autonomous-loop bookkeeping is its own
+            // observability surface; the per-call cost figures here
+            // come from the same Done events they always have.
+            | EventPayload::AutonomousIterationStarted { .. }
+            | EventPayload::AutonomousIterationCompleted { .. }
+            | EventPayload::AutonomousScheduledWakeup { .. }
+            | EventPayload::AutonomousTerminated { .. } => {}
         }
     }
 

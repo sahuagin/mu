@@ -160,6 +160,13 @@ pub fn derive_status_from_events(events: &[SessionEvent], now_unix_ms: u64) -> S
             // tracker has its own derivation via the live wire
             // notification; for derive_status_from_events we ignore.
             EventPayload::ProviderStatusUpdate { .. } => {}
+            // mu-036: autonomous-loop events are observability,
+            // not status-driving. The status derivation looks at
+            // ask/done/error events; autonomy events bracket those.
+            EventPayload::AutonomousIterationStarted { .. }
+            | EventPayload::AutonomousIterationCompleted { .. }
+            | EventPayload::AutonomousScheduledWakeup { .. }
+            | EventPayload::AutonomousTerminated { .. } => {}
         }
         last_kind = Some(&ev.payload);
     }

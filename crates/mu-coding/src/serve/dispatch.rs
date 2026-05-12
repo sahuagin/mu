@@ -20,8 +20,9 @@ use mu_core::protocol::{
     DaemonUsageHistoryRequest, DaemonUsageHistoryResponse, DelegateSessionRequest,
     DelegateSessionResponse, PingRequest, PingResponse, ProviderSelector, ProviderStatusKind,
     Request, RespondToInputRequiredRequest, RespondToInputRequiredResponse, Response,
-    SessionEventsRequest, SessionEventsResponse, SessionListRequest, SessionListResponse,
-    SessionStatsRequest, SessionStatsResponse, SessionStatusSummary,
+    ScheduleWakeupRequest, SessionEventsRequest, SessionEventsResponse, SessionListRequest,
+    SessionListResponse, SessionStatsRequest, SessionStatsResponse, SessionStatusSummary,
+    StartAutonomousRequest,
 };
 use mu_core::usage_history::{aggregate_into_rows, extract_per_session_metrics};
 use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
@@ -60,6 +61,11 @@ pub async fn dispatch(
         SessionEventsRequest::METHOD => handle_session_events(request, sessions),
         DaemonStatsRequest::METHOD => handle_daemon_stats(request, sessions, daemon_info),
         DaemonUsageHistoryRequest::METHOD => handle_daemon_usage_history(request, sessions),
+        // mu-036 Phase A.2: wire surface ready, dispatch stubs return
+        // a structured "not yet implemented" until Phase B (mu-3ao /
+        // mu-7zn / mu-pv9) lands the agent-loop integration.
+        StartAutonomousRequest::METHOD => handle_start_autonomous(request, sessions),
+        ScheduleWakeupRequest::METHOD => handle_schedule_wakeup(request, sessions),
         RespondToInputRequiredRequest::METHOD => {
             handle_respond_to_input_required(request, sessions)
         }
@@ -760,6 +766,147 @@ fn handle_daemon_usage_history(
     ok_response(request.id, to_value_or_null(resp))
 }
 
+/// mu-036 Phase A.2: stub for session.start_autonomous.
+///
+/// Validates the session exists and that its capability includes
+/// AutonomyCapability::Allowed (INV-1 enforcement). Returns a
+/// structured "not-yet-implemented" error until Phase B (mu-3ao)
+/// lands the agent-loop integration. The wire surface is complete
+/// — clients can code against the request/response shape today,
+/// just shouldn't yet expect accepted == true.
+fn handle_start_autonomous(
+    request: Request<Value>,
+    sessions: Sessions,
+) -> Response<Value> {
+    use mu_core::capability::AutonomyCapability;
+
+    let params: StartAutonomousRequest =
+        match serde_json::from_value(request.params.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                return err_response(
+                    request.id,
+                    codes::INVALID_PARAMS,
+                    format!("session.start_autonomous: invalid params: {e}"),
+                );
+            }
+        };
+
+    // Capability check is real even in Phase A — better to surface
+    // a clear INV-1 violation now than wait for Phase B.
+    let cap_handle = match sessions.capability(&params.session_id) {
+        Some(c) => c,
+        None => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!(
+                    "session.start_autonomous: session not found: {}",
+                    params.session_id
+                ),
+            );
+        }
+    };
+    let cap_snapshot = cap_handle
+        .lock()
+        .map(|c| c.clone())
+        .unwrap_or_else(|_| Default::default());
+    if matches!(cap_snapshot.autonomy, AutonomyCapability::Disallowed) {
+        return err_response(
+            request.id,
+            codes::INVALID_PARAMS,
+            "session.start_autonomous: session capability has \
+             autonomy: Disallowed (INV-1; default for sessions \
+             created via create_session)"
+                .to_string(),
+        );
+    }
+
+    // Capability check passed but Phase B isn't wired yet. Surface
+    // a clear error so callers don't get a silent accepted=true that
+    // does nothing.
+    err_response(
+        request.id,
+        codes::INTERNAL_ERROR,
+        "session.start_autonomous: wire surface ready (Phase A.2); \
+         agent-loop integration is Phase B (bead mu-3ao). \
+         Capability check passed; no loop will run yet."
+            .to_string(),
+    )
+}
+
+/// mu-036 Phase A.2: stub for session.schedule_wakeup. Same shape
+/// as handle_start_autonomous — wire surface is complete, agent-
+/// loop wiring is Phase C (mu-7zn).
+fn handle_schedule_wakeup(
+    request: Request<Value>,
+    sessions: Sessions,
+) -> Response<Value> {
+    use mu_core::capability::AutonomyCapability;
+
+    let params: ScheduleWakeupRequest =
+        match serde_json::from_value(request.params.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                return err_response(
+                    request.id,
+                    codes::INVALID_PARAMS,
+                    format!("session.schedule_wakeup: invalid params: {e}"),
+                );
+            }
+        };
+    if params.wake_at_unix_ms.is_some() == params.sleep_for_ms.is_some() {
+        return err_response(
+            request.id,
+            codes::INVALID_PARAMS,
+            "session.schedule_wakeup: exactly one of wake_at_unix_ms / \
+             sleep_for_ms must be set"
+                .to_string(),
+        );
+    }
+    let cap_handle = match sessions.capability(&params.session_id) {
+        Some(c) => c,
+        None => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!(
+                    "session.schedule_wakeup: session not found: {}",
+                    params.session_id
+                ),
+            );
+        }
+    };
+    let cap_snapshot = cap_handle
+        .lock()
+        .map(|c| c.clone())
+        .unwrap_or_else(|_| Default::default());
+    let allowed_wakeup = match cap_snapshot.autonomy {
+        AutonomyCapability::Allowed {
+            allow_schedule_wakeup,
+            ..
+        } => allow_schedule_wakeup,
+        AutonomyCapability::Disallowed => false,
+    };
+    if !allowed_wakeup {
+        return err_response(
+            request.id,
+            codes::INVALID_PARAMS,
+            "session.schedule_wakeup: session capability does not permit \
+             schedule_wakeup (AutonomyCapability::Disallowed, or Allowed \
+             with allow_schedule_wakeup: false)"
+                .to_string(),
+        );
+    }
+    err_response(
+        request.id,
+        codes::INTERNAL_ERROR,
+        "session.schedule_wakeup: wire surface ready (Phase A.2); \
+         agent-loop integration is Phase C (bead mu-7zn)."
+            .to_string(),
+    )
+}
+
 /// Wire `payload_kind` string for `kinds_filter`. Matches serde's
 /// rename_all snake_case on the EventPayload tag.
 fn payload_kind_str(p: &EventPayload) -> &'static str {
@@ -775,5 +922,9 @@ fn payload_kind_str(p: &EventPayload) -> &'static str {
         EventPayload::SessionClosed => "session_closed",
         EventPayload::ContextAssembly { .. } => "context_assembly",
         EventPayload::ProviderStatusUpdate { .. } => "provider_status_update",
+        EventPayload::AutonomousIterationStarted { .. } => "autonomous_iteration_started",
+        EventPayload::AutonomousIterationCompleted { .. } => "autonomous_iteration_completed",
+        EventPayload::AutonomousScheduledWakeup { .. } => "autonomous_scheduled_wakeup",
+        EventPayload::AutonomousTerminated { .. } => "autonomous_terminated",
     }
 }

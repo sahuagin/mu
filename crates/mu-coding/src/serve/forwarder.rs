@@ -821,6 +821,10 @@ mod tests {
                 EventPayload::SessionClosed => "session_closed",
                 EventPayload::ContextAssembly { .. } => "context_assembly",
                 EventPayload::ProviderStatusUpdate { .. } => "provider_status_update",
+                EventPayload::AutonomousIterationStarted { .. } => "autonomous_iteration_started",
+                EventPayload::AutonomousIterationCompleted { .. } => "autonomous_iteration_completed",
+                EventPayload::AutonomousScheduledWakeup { .. } => "autonomous_scheduled_wakeup",
+                EventPayload::AutonomousTerminated { .. } => "autonomous_terminated",
             })
             .collect();
         assert_eq!(kinds, vec!["assistant_message", "done"]);

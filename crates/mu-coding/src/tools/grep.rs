@@ -14,17 +14,48 @@ use mu_core::agent::{Tool, ToolResult, ToolSpec};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
-pub struct GrepTool;
+/// mu-yyi: GrepTool now carries an optional `rg_path` field so the
+/// ripgrep binary location is injectable at construction. The old
+/// design read `MU_RG_BINARY` from process env every call — that
+/// worked but meant the "rg not found" test path had to mutate the
+/// process env, which races with parallel `#[tokio::test]`s reading
+/// the same key. Injecting the path makes the test deterministic and
+/// removes the anti-pattern.
+///
+/// Resolution order (each step takes precedence over the next):
+///   1. `rg_path` field set via `with_rg_path`
+///   2. `MU_RG_BINARY` env var (preserved for production overrides;
+///      no longer used by tests)
+///   3. PATH lookup of `rg`
+#[derive(Debug, Default)]
+pub struct GrepTool {
+    rg_path: Option<String>,
+}
 
 impl GrepTool {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
-    /// Resolve the ripgrep binary. Order:
-    ///   1. `MU_RG_BINARY` env var (for tests / explicit override)
-    ///   2. PATH lookup of `rg`
-    fn locate_rg() -> Result<String, String> {
+    /// Override the rg binary path. Tests use this to point at a
+    /// non-existent path and exercise the "ripgrep not found" error
+    /// without mutating process env. Production callers normally
+    /// don't need to set this (PATH lookup is fine); the
+    /// `MU_RG_BINARY` env var is still honored as a runtime override.
+    pub fn with_rg_path(mut self, path: impl Into<String>) -> Self {
+        self.rg_path = Some(path.into());
+        self
+    }
+
+    fn locate_rg(&self) -> Result<String, String> {
+        if let Some(p) = &self.rg_path {
+            if !p.is_empty() {
+                // Don't validate existence here — let the spawn fail
+                // with a clear OS error. Tests rely on a fake path
+                // failing at spawn time, not at locate time.
+                return Ok(p.clone());
+            }
+        }
         if let Ok(p) = std::env::var("MU_RG_BINARY") {
             if !p.is_empty() {
                 return Ok(p);
@@ -47,12 +78,6 @@ impl GrepTool {
             return Err("rg path empty".to_owned());
         }
         Ok(path)
-    }
-}
-
-impl Default for GrepTool {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -161,7 +186,7 @@ impl Tool for GrepTool {
                 .and_then(Value::as_u64)
                 .unwrap_or(250) as usize;
 
-            let rg = match Self::locate_rg() {
+            let rg = match self.locate_rg() {
                 Ok(p) => p,
                 Err(e) => {
                     return ToolResult {
@@ -530,40 +555,25 @@ mod tests {
         Ok(())
     }
 
-    // mu-yyi: this test mutates process-global MU_RG_BINARY, which
-    // races with parallel #[tokio::test]s calling locate_rg() and
-    // surfaces as flaky failures in b4_count_mode / b6_case_insensitive
-    // under `cargo test --workspace`. Run explicitly with
-    //   `cargo test -p mu-coding -- --ignored --test-threads=1`
-    // to verify the rg-not-found error path. Proper fix is to inject
-    // the rg path into GrepTool so this test can avoid env mutation
-    // (see mu-yyi).
-    #[ignore = "mu-yyi: env-var mutation races with parallel tests"]
+    /// mu-yyi: GrepTool with a bogus rg_path injected via
+    /// `with_rg_path` — no process-env mutation, so this test no
+    /// longer races with parallel `#[tokio::test]`s reading
+    /// `MU_RG_BINARY`. Replaces the previously-`#[ignore]`d variant.
     #[tokio::test]
     async fn rg_unavailable_returns_clean_error() {
-        let original = std::env::var("MU_RG_BINARY").ok();
-        let original_path = std::env::var("PATH").ok();
-        std::env::set_var("MU_RG_BINARY", "/no/such/binary/rg");
-        // We can't unset PATH safely in parallel tests. Use the env
-        // var override only — if it points at a bogus path, rg
-        // spawn will fail with a clear OS error.
-        let result = execute_grep(json!({ "pattern": "x" })).await;
-        match original {
-            Some(v) => std::env::set_var("MU_RG_BINARY", v),
-            None => std::env::remove_var("MU_RG_BINARY"),
-        }
-        // Restore PATH if we needed to.
-        if let Some(p) = original_path {
-            std::env::set_var("PATH", p);
-        }
+        let tool = GrepTool::new().with_rg_path("/no/such/binary/rg");
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let result = tool.execute(json!({ "pattern": "x" }), cancel_rx).await;
         assert!(result.is_error);
         // Either "failed to spawn rg" (bad binary path) or
-        // "ripgrep not found" depending on whether the override is
-        // an explicit nonexistent path. We accept either error.
+        // "ripgrep not found" depending on which arm of locate_rg
+        // produced the error. Accept any of the diagnostic strings.
         assert!(
             result.content.contains("rg")
                 || result.content.contains("ripgrep")
-                || result.content.contains("grep:")
+                || result.content.contains("grep:"),
+            "expected diagnostic about rg failure; got: {}",
+            result.content
         );
     }
 }

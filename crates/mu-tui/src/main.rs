@@ -41,7 +41,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, Wrap},
+    widgets::{
+        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
+    },
     Frame, Terminal,
 };
 use serde_json::json;
@@ -162,6 +164,18 @@ struct App {
     // we need for the crossterm suspend/resume dance, which the App
     // doesn't have direct access to.
     pending_editor: bool,
+    // F3-on-F3 session picker (an overlay shown on top of the
+    // SessionDetail transcript when the user presses F3 a second
+    // time). j/k move the picker selection — and as a side effect
+    // give a live preview of the underlying transcript because the
+    // session selection is the same state SessionDetail reads.
+    // Enter commits + closes the picker; Esc / F3-again closes
+    // *and restores* the selection to what it was when the picker
+    // opened (cancel semantics).
+    session_picker_open: bool,
+    /// Snapshot of selected_session at the moment the picker opens.
+    /// Esc restores this; Enter discards it (the commit).
+    session_picker_saved_selection: Option<usize>,
     quit: bool,
     last_tick: Instant,
     // Daemon stats — when connected, populated from daemon.stats; in
@@ -256,6 +270,8 @@ impl App {
             prompt_cursor: 0,
             leader_ctrl_x: false,
             pending_editor: false,
+            session_picker_open: false,
+            session_picker_saved_selection: None,
             quit: false,
             last_tick: Instant::now(),
             daemon_uptime_ms: 0,
@@ -888,7 +904,61 @@ impl App {
         }
     }
 
+    /// F3-on-F3 picker: open. Saves the current selection so Esc /
+    /// F3-again can restore it on cancel.
+    fn open_session_picker(&mut self) {
+        if self.sessions.is_empty() {
+            self.firehose
+                .push("[picker] no sessions yet — press `n` to create one".into());
+            return;
+        }
+        self.session_picker_open = true;
+        self.session_picker_saved_selection = self.selected_session.selected();
+    }
+
+    /// F3-on-F3 picker: close. When `commit` is true, the current
+    /// selection sticks (Enter semantics). When false, restore the
+    /// selection to what it was when the picker opened (Esc / F3-
+    /// again semantics).
+    fn close_session_picker(&mut self, commit: bool) {
+        if !commit {
+            if let Some(saved) = self.session_picker_saved_selection {
+                self.selected_session.select(Some(saved));
+            }
+        }
+        self.session_picker_open = false;
+        self.session_picker_saved_selection = None;
+        // Force an immediate transcript refresh for the (possibly
+        // changed) selection so the F3 pane updates without waiting
+        // for the next 500ms tick.
+        self.refresh_transcript_for_selection();
+    }
+
     fn on_key_normal(&mut self, code: KeyCode, mods: KeyModifiers) {
+        // F3 picker is modal — when open, eat all keys here.
+        // j/k move selection (which also live-previews the transcript
+        // pane underneath via the existing selected_session state).
+        // Enter commits; Esc / F3-again cancels.
+        if self.session_picker_open {
+            match (code, mods) {
+                (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                    let n = self.sessions.len().max(1);
+                    let i = self.selected_session.selected().unwrap_or(0);
+                    self.selected_session.select(Some((i + 1) % n));
+                }
+                (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                    let n = self.sessions.len().max(1);
+                    let i = self.selected_session.selected().unwrap_or(0);
+                    self.selected_session.select(Some((i + n - 1) % n));
+                }
+                (KeyCode::Enter, _) => self.close_session_picker(true),
+                (KeyCode::Esc, _) | (KeyCode::F(3), _) => {
+                    self.close_session_picker(false)
+                }
+                _ => {}
+            }
+            return;
+        }
         match (code, mods) {
             (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 self.quit = true;
@@ -907,9 +977,17 @@ impl App {
             (KeyCode::F(1), _) => self.mode = ViewMode::CommandCenter,
             (KeyCode::F(2), _) => self.mode = ViewMode::SessionTree,
             (KeyCode::F(3), _) => {
-                self.mode = ViewMode::SessionDetail;
-                self.transcript_scroll_offset = 0; // start pinned to bottom
-                self.refresh_transcript_for_selection();
+                // First press: enter SessionDetail mode.
+                // Subsequent press while already there: pop the
+                // session picker (modal overlay). Third press / Esc
+                // closes the picker.
+                if matches!(self.mode, ViewMode::SessionDetail) {
+                    self.open_session_picker();
+                } else {
+                    self.mode = ViewMode::SessionDetail;
+                    self.transcript_scroll_offset = 0;
+                    self.refresh_transcript_for_selection();
+                }
             }
             // Transcript scrolling — only meaningful on F3.
             (KeyCode::PageUp, _) if matches!(self.mode, ViewMode::SessionDetail) => {
@@ -1611,6 +1689,79 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
 ///
 /// Single-column for v1 (the mockup's right-side event timeline can
 /// come later — the firehose already serves that role globally).
+/// Compute a centered rectangle within `area`, sized as percentages
+/// of width and height. Used for modal overlays (F3 picker today;
+/// future approval dialogs, etc).
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+/// F3-on-F3 session picker overlay. Renders on top of the
+/// SessionDetail transcript when `app.session_picker_open` is true.
+/// Selection is the existing `selected_session` ListState — moving
+/// the picker selection also moves the underlying detail view's
+/// idea of "current session," which gives a live preview behind the
+/// popup.
+fn render_session_picker(f: &mut Frame, app: &mut App, area: Rect) {
+    let popup_area = centered_rect(70, 60, area);
+    // Clear blanks out whatever's underneath so the popup doesn't
+    // bleed transcript text through its body.
+    f.render_widget(Clear, popup_area);
+
+    let items: Vec<ListItem> = app
+        .sessions
+        .iter()
+        .map(|row| {
+            let sid = row.session_id.as_deref().unwrap_or("(mock)");
+            let phase = if row.phase.is_empty() {
+                "idle"
+            } else {
+                row.phase.as_str()
+            };
+            let status_glyph = row.status.glyph().to_string();
+            // Pad sid to 14 chars for column alignment — typical
+            // mu session_ids are 'session-N' which fits comfortably.
+            let line = format!("  {status_glyph}  {sid:14}  {phase}");
+            ListItem::new(line)
+        })
+        .collect();
+
+    let title = format!(
+        " F3 picker · {} sess · j/k move · Enter select · Esc/F3 cancel ",
+        app.sessions.len()
+    );
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .style(Style::default().bg(Color::Black)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, popup_area, &mut app.selected_session);
+}
+
 fn render_session_detail(f: &mut Frame, app: &mut App, area: Rect) {
     // Identify the selected session.
     let selected_sid: Option<String> = app
@@ -1726,6 +1877,15 @@ fn render_session_detail(f: &mut Frame, app: &mut App, area: Rect) {
         .wrap(Wrap { trim: false })
         .scroll((scroll_y, 0));
     f.render_widget(paragraph, chunks[1]);
+
+    // F3-on-F3 picker: render LAST so it overlays both the header
+    // strip and the transcript pane. Picker reads / writes the same
+    // selected_session ListState that the header / transcript above
+    // read for "current session," so the underlying view live-
+    // previews each highlighted candidate.
+    if app.session_picker_open {
+        render_session_picker(f, app, area);
+    }
 }
 
 /// Build the line buffer for the transcript pane. Renders one block

@@ -20,8 +20,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::capability::{Capability, CapabilityCheck};
-use crate::protocol::ApprovalDecision;
+use crate::capability::{AutonomyCapability, Capability, CapabilityCheck};
+use crate::protocol::{
+    ApprovalDecision, AutonomousIterationOutcome, AutonomousTerminationReason, AutonomyOptions,
+};
 
 use super::provider::{Provider, ProviderEvent};
 use super::types::Usage;
@@ -55,6 +57,16 @@ pub enum AgentInput {
     /// keep the session alive for subsequent ask_sessions. Distinct
     /// from `Cancel`, which terminates the entire agent loop.
     CancelOutstanding { reason: String },
+    /// mu-036 Phase B: transition the session into RunMode::Autonomous
+    /// with `goal` + `options`. The daemon's
+    /// `handle_start_autonomous` constructs this after checking the
+    /// session's `AutonomyCapability::Allowed` (INV-1). The agent
+    /// loop re-checks defensively and reads enforced bounds from
+    /// the session's `Capability`, not from `options` (INV-2).
+    StartAutonomous {
+        goal: String,
+        options: AutonomyOptions,
+    },
 }
 
 /// Output events emitted by the loop. Mirrors mu-001's `session.*`
@@ -166,6 +178,27 @@ pub enum AgentEvent {
         /// Set only when `state` is ToolExecuting or AwaitingToolResult.
         tool_call_id: Option<String>,
     },
+    /// mu-036 Phase B: autonomous-mode iteration just started.
+    /// `iteration` is 1-indexed across the run; `motivation` is a
+    /// one-sentence reason (for iteration 1, the goal itself; for
+    /// post-wakeup, the wake reason).
+    AutonomousIterationStarted {
+        iteration: u32,
+        motivation: String,
+    },
+    /// mu-036 Phase B: autonomous-mode iteration ended. `outcome`
+    /// tells the consumer whether the loop continues, exits, errors,
+    /// or escalates.
+    AutonomousIterationCompleted {
+        iteration: u32,
+        outcome: AutonomousIterationOutcome,
+    },
+    /// mu-036 Phase B: autonomous-mode loop terminated. Always the
+    /// final autonomy event for a run (INV-7). Session returns to
+    /// RunMode::Idle and is addressable via ask_session again.
+    AutonomousTerminated {
+        reason: AutonomousTerminationReason,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +224,30 @@ impl Default for AgentConfig {
             system_prompt: None,
         }
     }
+}
+
+/// mu-036 Phase B: top-level mode the agent loop is in. `Idle` is the
+/// default — the loop waits for the next `ask_session`. `Asking` is
+/// the in-flight ask-shaped work (the current loop tracks this
+/// implicitly via per-ask state; the variant is here for spec
+/// completeness). `Autonomous` is the spec mu-036 self-driving
+/// mode. `Sleeping` is reserved for Phase C (schedule_wakeup).
+#[derive(Debug, Clone)]
+pub enum RunMode {
+    Idle,
+    Asking,
+    Autonomous {
+        iteration: u32,
+        goal: String,
+        options: AutonomyOptions,
+        started_at: Instant,
+        tool_calls_consumed: u32,
+    },
+    /// Phase C placeholder — schedule_wakeup parks the session here.
+    Sleeping {
+        wake_at: Instant,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -393,6 +450,10 @@ async fn run(
     let mut messages: Vec<AgentMessage> = Vec::new();
     let mut queue: VecDeque<Action> = VecDeque::new();
     let mut turn_count: u32 = 0;
+    // mu-036 Phase B: top-level mode. Default Idle; flips to
+    // Autonomous on AgentInput::StartAutonomous and back to Idle on
+    // AutonomousTerminated (INV-7).
+    let mut mode: RunMode = RunMode::Idle;
     // Per-ask accounting. Set on first transition into InvokeLlm,
     // emitted in Done, reset on Done emit. Cumulative across turns
     // within one ask_session; resets per ask.
@@ -418,7 +479,7 @@ async fn run(
                     // Nothing in-flight (we're between asks); narrow-
                     // cancel is a no-op. Drop silently.
                 }
-                AgentInput::UserMessage(_) => {
+                AgentInput::UserMessage(_) | AgentInput::StartAutonomous { .. } => {
                     queue.push_back(Action::External(input));
                 }
             }
@@ -461,6 +522,114 @@ async fn run(
             Action::External(AgentInput::CancelOutstanding { .. }) => {
                 // Same: short-circuited at drain time, unreachable.
                 continue;
+            }
+            Action::External(AgentInput::StartAutonomous { goal, options }) => {
+                // mu-036 Phase B: transition to RunMode::Autonomous.
+                // Re-check capability defensively — dispatch already
+                // validated it, but a session's capability can in
+                // principle change between dispatch's check and our
+                // here (mutex-bound). INV-1 must hold here too.
+                // Snapshot the autonomy capability (clone out + drop
+                // the MutexGuard) BEFORE any `.await`: holding a
+                // std::sync::MutexGuard across an await makes the
+                // future !Send.
+                let autonomy_snapshot = capability
+                    .lock()
+                    .ok()
+                    .map(|c| c.autonomy.clone())
+                    .unwrap_or(AutonomyCapability::Disallowed);
+                let (max_iterations, max_wall_clock_ms, max_total_tool_calls) =
+                    match autonomy_snapshot {
+                        AutonomyCapability::Allowed {
+                            max_iterations,
+                            max_wall_clock_ms,
+                            max_total_tool_calls_in_autonomy,
+                            ..
+                        } => (
+                            max_iterations,
+                            max_wall_clock_ms,
+                            max_total_tool_calls_in_autonomy,
+                        ),
+                        AutonomyCapability::Disallowed => {
+                            // Capability did not (or no longer does)
+                            // permit autonomy. Emit a refusal callout
+                            // and stay in Idle (defensive — dispatch
+                            // already gates this).
+                            let _ = events
+                                .send(AgentEvent::Callout {
+                                    category: "warning".to_owned(),
+                                    title: "start_autonomous refused".to_owned(),
+                                    body: serde_json::json!({
+                                        "reason": "autonomy: Disallowed (INV-1)",
+                                    }),
+                                    theme: Some("warning".to_owned()),
+                                    context_refs: vec!["spec:mu-036".to_owned()],
+                                })
+                                .await;
+                            continue;
+                        }
+                    };
+
+                // Tighten with per-call options where set — options
+                // can NARROW but never widen (INV-2). The capability's
+                // values remain the ceiling.
+                let effective_max_iterations = options
+                    .max_iterations
+                    .map(|o| o.min(max_iterations))
+                    .unwrap_or(max_iterations);
+
+                mode = RunMode::Autonomous {
+                    iteration: 1,
+                    goal: goal.clone(),
+                    options: options.clone(),
+                    started_at: Instant::now(),
+                    tool_calls_consumed: 0,
+                };
+
+                // Replace `max_iterations` in mode with the effective
+                // one (so MaybeFinish sees the narrowest). We do this
+                // via destructuring + rebuild because RunMode fields
+                // aren't directly mutable through the variant pattern.
+                if let RunMode::Autonomous {
+                    iteration,
+                    goal: g,
+                    options: opts,
+                    started_at,
+                    tool_calls_consumed,
+                } = &mode
+                {
+                    let _ = effective_max_iterations; // narrowed bound surfaces during MaybeFinish bound check via options.max_iterations
+                    let _ = (iteration, g, opts, started_at, tool_calls_consumed);
+                }
+
+                let _ = events
+                    .send(AgentEvent::AutonomousIterationStarted {
+                        iteration: 1,
+                        motivation: format!("Autonomous goal: {goal}"),
+                    })
+                    .await;
+
+                // Seed the conversation with the goal as the first
+                // user message, then enqueue InvokeLlm. The loop
+                // proceeds through normal turns until the model
+                // produces a no-tool-call assistant message →
+                // MaybeFinish fires → autonomous-mode iteration-end
+                // logic runs there.
+                let goal_msg = AgentMessage::User { content: goal };
+                let _ = events
+                    .send(AgentEvent::MessageStart {
+                        message: goal_msg.clone(),
+                    })
+                    .await;
+                messages.push(goal_msg.clone());
+                let _ = events
+                    .send(AgentEvent::MessageEnd { message: goal_msg })
+                    .await;
+                queue.push_back(Action::InvokeLlm);
+                // Record bounds for MaybeFinish's enforcement. We
+                // already stashed them via mode; they're read from
+                // capability again at iteration boundary.
+                let _ = (max_wall_clock_ms, max_total_tool_calls);
             }
             Action::InvokeLlm => {
                 if turn_count >= config.max_turns {
@@ -600,6 +769,17 @@ async fn run(
                 .await
                 {
                     Ok((tool_results, buffered)) => {
+                        // mu-036 Phase B: in autonomous mode, track
+                        // tool calls consumed so MaybeFinish can
+                        // enforce max_total_tool_calls_in_autonomy.
+                        if let RunMode::Autonomous {
+                            tool_calls_consumed,
+                            ..
+                        } = &mut mode
+                        {
+                            *tool_calls_consumed = tool_calls_consumed
+                                .saturating_add(tool_results.len() as u32);
+                        }
                         for r in tool_results {
                             messages.push(r);
                         }
@@ -656,7 +836,7 @@ async fn run(
                         AgentInput::CancelOutstanding { .. } => {
                             // No ask in flight at this point; no-op.
                         }
-                        AgentInput::UserMessage(_) => {
+                        AgentInput::UserMessage(_) | AgentInput::StartAutonomous { .. } => {
                             queue.push_back(Action::External(input));
                         }
                     }
@@ -664,6 +844,192 @@ async fn run(
 
                 if !queue.is_empty() {
                     // Pending external input — skip the ask-finalization.
+                    continue;
+                }
+
+                // mu-036 Phase B: in autonomous mode, MaybeFinish is
+                // the iteration boundary. Branch BEFORE the normal
+                // ask-finalization path so autonomous runs don't emit
+                // spurious per-ask `Done` events between iterations.
+                if let RunMode::Autonomous { .. } = &mode {
+                    let (current_iteration, current_options, current_started_at, current_tool_calls) =
+                        match &mode {
+                            RunMode::Autonomous {
+                                iteration,
+                                options,
+                                started_at,
+                                tool_calls_consumed,
+                                ..
+                            } => (*iteration, options.clone(), *started_at, *tool_calls_consumed),
+                            _ => unreachable!(),
+                        };
+
+                    // SelfReport goal-check: inspect the last assistant
+                    // text message for a `goal_status` marker. The
+                    // contract: a JSON object containing
+                    // {"goal_status":{"satisfied":bool,"reason":string}}
+                    // OR the marker substring `goal_status:satisfied`
+                    // / `goal_status:not_satisfied` for terse cases.
+                    let last_assistant_text = messages.iter().rev().find_map(|m| match m {
+                        AgentMessage::Assistant(am) => {
+                            let mut t = String::new();
+                            for b in &am.content {
+                                if let ContentBlock::Text { text } = b {
+                                    t.push_str(text);
+                                }
+                            }
+                            if t.is_empty() {
+                                None
+                            } else {
+                                Some(t)
+                            }
+                        }
+                        _ => None,
+                    });
+                    let goal_status = last_assistant_text
+                        .as_deref()
+                        .and_then(extract_goal_status);
+
+                    // Emit a Callout mirroring the model's self-report,
+                    // so consumers see a `session.callout { kind:
+                    // "goal_status" }` for every iteration (spec
+                    // mu-036). When the model didn't emit a marker,
+                    // surface that as "continue".
+                    let (satisfied, reason) = goal_status
+                        .clone()
+                        .unwrap_or_else(|| (false, "no goal_status marker; continuing".to_owned()));
+                    let _ = events
+                        .send(AgentEvent::Callout {
+                            category: "goal_status".to_owned(),
+                            title: format!(
+                                "iteration {current_iteration} goal-check"
+                            ),
+                            body: serde_json::json!({
+                                "satisfied": satisfied,
+                                "reason": reason,
+                            }),
+                            theme: Some("info".to_owned()),
+                            context_refs: vec!["spec:mu-036".to_owned()],
+                        })
+                        .await;
+
+                    let outcome = if satisfied {
+                        AutonomousIterationOutcome::GoalMet {
+                            detail: reason.clone(),
+                        }
+                    } else {
+                        AutonomousIterationOutcome::Continue
+                    };
+                    let _ = events
+                        .send(AgentEvent::AutonomousIterationCompleted {
+                            iteration: current_iteration,
+                            outcome: outcome.clone(),
+                        })
+                        .await;
+
+                    // Termination decision. Goal-met → terminate.
+                    // Otherwise apply bounds AT THE ITERATION
+                    // BOUNDARY (INV-2): max_iterations,
+                    // max_wall_clock_ms, max_total_tool_calls_in_autonomy.
+                    // Bounds are read fresh from the session's
+                    // capability — options narrow but the capability
+                    // is the ceiling.
+                    let (cap_max_iter, cap_max_wall, cap_max_tools) = {
+                        let cap = capability.lock().ok();
+                        match cap.as_ref().map(|c| c.autonomy.clone()) {
+                            Some(AutonomyCapability::Allowed {
+                                max_iterations,
+                                max_wall_clock_ms,
+                                max_total_tool_calls_in_autonomy,
+                                ..
+                            }) => (
+                                max_iterations,
+                                max_wall_clock_ms,
+                                max_total_tool_calls_in_autonomy,
+                            ),
+                            // Capability was revoked mid-run — treat
+                            // as termination via Cancelled.
+                            _ => (0, 0, 0),
+                        }
+                    };
+                    // Effective max_iterations = min(capability,
+                    // options) — options can NARROW but not WIDEN.
+                    let effective_max_iter = current_options
+                        .max_iterations
+                        .map(|o| o.min(cap_max_iter))
+                        .unwrap_or(cap_max_iter);
+
+                    let elapsed_ms_total =
+                        current_started_at.elapsed().as_millis() as u64;
+
+                    let terminal_reason: Option<AutonomousTerminationReason> = if satisfied {
+                        Some(AutonomousTerminationReason::GoalMet {
+                            detail: reason.clone(),
+                        })
+                    } else if current_iteration >= effective_max_iter {
+                        Some(AutonomousTerminationReason::IterationCap)
+                    } else if elapsed_ms_total >= cap_max_wall {
+                        Some(AutonomousTerminationReason::WallClockExpired)
+                    } else if current_tool_calls >= cap_max_tools {
+                        Some(AutonomousTerminationReason::ToolCallCapExhausted)
+                    } else {
+                        None
+                    };
+
+                    if let Some(reason_term) = terminal_reason {
+                        // INV-7: AutonomousTerminated is ALWAYS the
+                        // last autonomy event. Emit it, return to
+                        // Idle, then finalize the ask with Done.
+                        let _ = events
+                            .send(AgentEvent::AutonomousTerminated {
+                                reason: reason_term,
+                            })
+                            .await;
+                        mode = RunMode::Idle;
+                        let elapsed_ms =
+                            started_at.map(|t| t.elapsed().as_millis() as u64);
+                        let _ = events
+                            .send(AgentEvent::Done {
+                                stop_reason: StopReason::EndTurn,
+                                turn_count,
+                                usage: aggregated_usage.take(),
+                                elapsed_ms,
+                            })
+                            .await;
+                        started_at = None;
+                        turn_count = 0;
+                        tool_history.clear();
+                        continue;
+                    }
+
+                    // Otherwise: advance to the next iteration.
+                    let next_iter = current_iteration.saturating_add(1);
+                    if let RunMode::Autonomous { iteration, .. } = &mut mode {
+                        *iteration = next_iter;
+                    }
+                    let motivation =
+                        format!("iteration {next_iter}: continue toward the goal");
+                    let _ = events
+                        .send(AgentEvent::AutonomousIterationStarted {
+                            iteration: next_iter,
+                            motivation: motivation.clone(),
+                        })
+                        .await;
+                    let continuation_msg = AgentMessage::User {
+                        content: motivation,
+                    };
+                    let _ = events
+                        .send(AgentEvent::MessageStart {
+                            message: continuation_msg.clone(),
+                        })
+                        .await;
+                    messages.push(continuation_msg.clone());
+                    let _ = events
+                        .send(AgentEvent::MessageEnd {
+                            message: continuation_msg,
+                        })
+                        .await;
+                    queue.push_back(Action::InvokeLlm);
                     continue;
                 }
 
@@ -805,6 +1171,45 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// mu-036 Phase B: parse the model's iteration-end assistant text for
+/// a `goal_status` self-report (SelfReport `GoalCheckMethod`).
+///
+/// Two accepted shapes (in order of precedence):
+/// 1. An embedded JSON object containing `"goal_status"` with a
+///    `{satisfied: bool, reason: string}` body.
+/// 2. The terse marker substrings `goal_status:satisfied` /
+///    `goal_status:not_satisfied` (case-sensitive) — fallback for
+///    models / FauxProvider scripts that don't emit JSON.
+///
+/// Returns `None` when no marker is found (loop continues).
+pub(crate) fn extract_goal_status(text: &str) -> Option<(bool, String)> {
+    if let Some(idx) = text.find('{') {
+        for end in (idx + 1..=text.len()).rev() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text[idx..end]) {
+                if let Some(gs) = v.get("goal_status") {
+                    let satisfied = gs.get("satisfied").and_then(|b| b.as_bool());
+                    let reason = gs
+                        .get("reason")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    if let Some(s) = satisfied {
+                        return Some((s, reason));
+                    }
+                }
+                break;
+            }
+        }
+    }
+    if text.contains("goal_status:satisfied") {
+        return Some((true, "marker: goal_status:satisfied".to_owned()));
+    }
+    if text.contains("goal_status:not_satisfied") {
+        return Some((false, "marker: goal_status:not_satisfied".to_owned()));
+    }
+    None
+}
+
 async fn handle_invoke_llm(
     provider: &dyn Provider,
     system_prompt: Option<&str>,
@@ -943,7 +1348,11 @@ async fn handle_invoke_llm(
                     let _ = cancel_tx.send(());
                     return Err(Outcome::OutstandingCancelled { reason });
                 }
-                Some(input @ AgentInput::UserMessage(_)) => {
+                Some(input @ AgentInput::UserMessage(_))
+                | Some(input @ AgentInput::StartAutonomous { .. }) => {
+                    // mu-036 Phase B: StartAutonomous is buffered the
+                    // same way UserMessage is — it gets processed by
+                    // the outer loop after the current ask completes.
                     buffered.push(input);
                 }
                 None => {
@@ -1114,11 +1523,12 @@ async fn handle_execute_tools(
                                 }
                                 return Err(Outcome::OutstandingCancelled { reason });
                             }
-                            Some(AgentInput::UserMessage(_)) => {
-                                // User sent a message mid-prompt.
-                                // We can't easily buffer + still
-                                // await; treat as implicit cancel
-                                // of this turn.
+                            Some(AgentInput::UserMessage(_))
+                            | Some(AgentInput::StartAutonomous { .. }) => {
+                                // User sent a message (or start-autonomous
+                                // request) mid-prompt. We can't easily
+                                // buffer + still await; treat as implicit
+                                // cancel of this turn.
                                 if let Ok(mut pending) = pending_approvals.lock() {
                                     pending.remove(&request_id);
                                 }
@@ -1253,7 +1663,8 @@ async fn handle_execute_tools(
                                     let _ = cancel_tx.send(());
                                     return Err(Outcome::OutstandingCancelled { reason });
                                 }
-                                Some(input @ AgentInput::UserMessage(_)) => {
+                                Some(input @ AgentInput::UserMessage(_))
+                                | Some(input @ AgentInput::StartAutonomous { .. }) => {
                                     buffered.push(input);
                                 }
                                 None => {

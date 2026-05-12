@@ -276,6 +276,9 @@ fn kind(event: &AgentEvent) -> &'static str {
         AgentEvent::InputRequired { .. } => "input_required",
         AgentEvent::ContextAssembly { .. } => "context_assembly",
         AgentEvent::ProviderStatus { .. } => "provider_status",
+        AgentEvent::AutonomousIterationStarted { .. } => "autonomous_iteration_started",
+        AgentEvent::AutonomousIterationCompleted { .. } => "autonomous_iteration_completed",
+        AgentEvent::AutonomousTerminated { .. } => "autonomous_terminated",
     }
 }
 
@@ -1099,5 +1102,241 @@ async fn ask_permission_deny_synthesizes_error_result_without_running_tool() {
     assert!(
         !content.contains("this should not appear"),
         "tool body must not have executed after deny; got: {content}"
+    );
+}
+
+// ============================================================================
+// mu-036 Phase B (mu-3ao): autonomous-mode tests
+// ============================================================================
+//
+// These exercise the agent loop's RunMode::Autonomous path driven by
+// AgentInput::StartAutonomous. They verify:
+//   - iteration cap enforcement from the session's Capability (INV-2)
+//   - SelfReport goal-status early termination
+//   - INV-7: AutonomousTerminated is the LAST autonomy-namespace event
+//   - defensive callout when capability is Disallowed at StartAutonomous
+//     time (dispatch already gates this; the loop-side check is a
+//     belt-and-braces re-verification)
+
+fn spawn_loop_with_autonomy(
+    provider: MockProvider,
+    tools: Vec<MockTool>,
+    config: AgentConfig,
+    autonomy: crate::capability::AutonomyCapability,
+) -> (AgentLoop, mpsc::Receiver<AgentEvent>) {
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let provider: Arc<dyn Provider> = Arc::new(provider);
+    let tools: Vec<Arc<dyn Tool>> = tools
+        .into_iter()
+        .map(|t| Arc::new(t) as Arc<dyn Tool>)
+        .collect();
+    let approvals: PendingApprovals =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let mut cap = crate::capability::Capability::root();
+    cap.autonomy = autonomy;
+    let capability: SessionCapability = Arc::new(Mutex::new(cap));
+    let loop_ = AgentLoop::spawn(provider, tools, config, events_tx, approvals, capability);
+    (loop_, events_rx)
+}
+
+fn autonomy_allowed(max_iter: u32) -> crate::capability::AutonomyCapability {
+    crate::capability::AutonomyCapability::Allowed {
+        max_iterations: max_iter,
+        max_wall_clock_ms: 60_000,
+        max_total_tool_calls_in_autonomy: 100,
+        allow_schedule_wakeup: false,
+        allow_delegate_grader: false,
+    }
+}
+
+fn last_autonomy_event(events: &[AgentEvent]) -> Option<&AgentEvent> {
+    events.iter().rev().find(|e| {
+        matches!(
+            e,
+            AgentEvent::AutonomousIterationStarted { .. }
+                | AgentEvent::AutonomousIterationCompleted { .. }
+                | AgentEvent::AutonomousTerminated { .. }
+        )
+    })
+}
+
+/// A-1: iteration cap enforcement.
+///
+/// Capability says max_iterations: 3. MockProvider responds with an
+/// assistant message that lacks a `goal_status` marker → outcome is
+/// always Continue. After 3 iterations, MaybeFinish trips the
+/// IterationCap branch and emits AutonomousTerminated{IterationCap}.
+#[tokio::test]
+async fn a1_iteration_cap_terminates_at_capability_bound() {
+    let provider = MockProvider::forever(vec![ProviderEvent::Done(assistant_text("working"))]);
+    let (loop_, events_rx) =
+        spawn_loop_with_autonomy(provider, vec![], AgentConfig::default(), autonomy_allowed(3));
+
+    loop_
+        .send(AgentInput::StartAutonomous {
+            goal: "drive 3 iterations".to_owned(),
+            options: crate::protocol::AutonomyOptions::default(),
+        })
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    let starts = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::AutonomousIterationStarted { .. }))
+        .count();
+    let completes = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::AutonomousIterationCompleted { .. }))
+        .count();
+    let terminates: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::AutonomousTerminated { .. }))
+        .collect();
+    assert_eq!(starts, 3, "expected 3 iteration starts, kinds={:?}", events.iter().map(kind).collect::<Vec<_>>());
+    assert_eq!(completes, 3, "expected 3 iteration completes");
+    assert_eq!(terminates.len(), 1, "expected exactly one terminate");
+    match terminates[0] {
+        AgentEvent::AutonomousTerminated { reason } => {
+            assert!(
+                matches!(reason, AutonomousTerminationReason::IterationCap),
+                "expected IterationCap, got {reason:?}"
+            );
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // INV-7: AutonomousTerminated is the LAST autonomy-namespace event.
+    let last = last_autonomy_event(&events).expect("at least one autonomy event");
+    assert!(
+        matches!(last, AgentEvent::AutonomousTerminated { .. }),
+        "INV-7: last autonomy event must be AutonomousTerminated; got {:?}",
+        kind(last)
+    );
+}
+
+/// A-2: SelfReport goal_status:satisfied early termination.
+///
+/// Iteration 1: provider yields a plain message (no marker → Continue).
+/// Iteration 2: provider yields a message containing the terse marker
+/// `goal_status:satisfied`. extract_goal_status finds it, MaybeFinish
+/// emits AutonomousTerminated{GoalMet}.
+#[tokio::test]
+async fn a2_self_report_goal_met_early_termination() {
+    let provider = MockProvider::new(vec![
+        vec![ProviderEvent::Done(assistant_text("iteration 1 work"))],
+        vec![ProviderEvent::Done(assistant_text(
+            "iteration 2 done. goal_status:satisfied",
+        ))],
+    ]);
+    let (loop_, events_rx) =
+        spawn_loop_with_autonomy(provider, vec![], AgentConfig::default(), autonomy_allowed(10));
+
+    loop_
+        .send(AgentInput::StartAutonomous {
+            goal: "stop at iteration 2".to_owned(),
+            options: crate::protocol::AutonomyOptions::default(),
+        })
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    let starts = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::AutonomousIterationStarted { .. }))
+        .count();
+    assert_eq!(starts, 2, "expected exactly 2 iteration starts (early term)");
+
+    let terminates: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::AutonomousTerminated { .. }))
+        .collect();
+    assert_eq!(terminates.len(), 1, "expected one terminate");
+    match terminates[0] {
+        AgentEvent::AutonomousTerminated { reason } => {
+            assert!(
+                matches!(reason, AutonomousTerminationReason::GoalMet { .. }),
+                "expected GoalMet, got {reason:?}"
+            );
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // INV-7: AutonomousTerminated is the LAST autonomy-namespace event.
+    let last = last_autonomy_event(&events).expect("at least one autonomy event");
+    assert!(
+        matches!(last, AgentEvent::AutonomousTerminated { .. }),
+        "INV-7: last autonomy event must be AutonomousTerminated; got {:?}",
+        kind(last)
+    );
+}
+
+/// A-3: defensive Disallowed callout.
+///
+/// Dispatch already gates start_autonomous on AutonomyCapability::Allowed;
+/// the loop-side defensive check ensures that if a capability is
+/// revoked (or the test bypasses dispatch), no autonomous events fire
+/// and a warning callout surfaces. Verifies INV-1's belt-and-braces
+/// enforcement.
+#[tokio::test]
+async fn a3_disallowed_defensive_callout_no_autonomy_events() {
+    let provider = MockProvider::forever(vec![ProviderEvent::Done(assistant_text(
+        "should not be reached",
+    ))]);
+    let (loop_, events_rx) = spawn_loop_with_autonomy(
+        provider,
+        vec![],
+        AgentConfig::default(),
+        crate::capability::AutonomyCapability::Disallowed,
+    );
+
+    loop_
+        .send(AgentInput::StartAutonomous {
+            goal: "should be refused".to_owned(),
+            options: crate::protocol::AutonomyOptions::default(),
+        })
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    // No autonomous-namespace events at all.
+    let any_autonomy = events.iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::AutonomousIterationStarted { .. }
+                | AgentEvent::AutonomousIterationCompleted { .. }
+                | AgentEvent::AutonomousTerminated { .. }
+        )
+    });
+    assert!(
+        !any_autonomy,
+        "no autonomy events expected on Disallowed; saw {:?}",
+        events.iter().map(kind).collect::<Vec<_>>()
+    );
+
+    // A warning Callout with the INV-1 reason was emitted.
+    let warning_seen = events.iter().any(|e| match e {
+        AgentEvent::Callout {
+            category, body, ..
+        } => {
+            category == "warning"
+                && body
+                    .get("reason")
+                    .and_then(|r| r.as_str())
+                    .map(|s| s.contains("Disallowed") || s.contains("INV-1"))
+                    .unwrap_or(false)
+        }
+        _ => false,
+    });
+    assert!(
+        warning_seen,
+        "expected a warning callout citing Disallowed / INV-1; events={:?}",
+        events.iter().map(kind).collect::<Vec<_>>()
     );
 }

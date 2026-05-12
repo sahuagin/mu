@@ -560,6 +560,47 @@ pub struct ScheduleWakeupResponse {
     pub scheduled_for_unix_ms: u64,
 }
 
+/// `session.autonomous_iteration_started` notification (mu-036). Emitted
+/// at the top of every autonomous iteration. `motivation` is the
+/// model-reported one-sentence "what I'm doing this turn and why"
+/// (after a `schedule_wakeup`, this is the wake reason).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutonomousIterationStartedEvent {
+    pub session_id: String,
+    pub iteration: u32,
+    pub motivation: String,
+}
+
+impl AutonomousIterationStartedEvent {
+    pub const METHOD: &'static str = "session.autonomous_iteration_started";
+}
+
+/// `session.autonomous_iteration_completed` notification (mu-036).
+/// Emitted at the end of every autonomous iteration with the outcome.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutonomousIterationCompletedEvent {
+    pub session_id: String,
+    pub iteration: u32,
+    pub outcome: AutonomousIterationOutcome,
+}
+
+impl AutonomousIterationCompletedEvent {
+    pub const METHOD: &'static str = "session.autonomous_iteration_completed";
+}
+
+/// `session.autonomous_terminated` notification (mu-036). Always the
+/// final autonomy event for a run (INV-7). Session returns to
+/// RunMode::Idle and is addressable via ask_session again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutonomousTerminatedEvent {
+    pub session_id: String,
+    pub reason: AutonomousTerminationReason,
+}
+
+impl AutonomousTerminatedEvent {
+    pub const METHOD: &'static str = "session.autonomous_terminated";
+}
+
 // ===== mu-035: session.provider_status + session.cancel_outstanding =====
 
 /// Provider-call lifecycle states surfaced to clients (mu-035). Tags

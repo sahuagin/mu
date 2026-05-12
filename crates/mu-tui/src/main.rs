@@ -151,6 +151,17 @@ struct App {
     // *between* characters: cursor=0 is before the first char,
     // cursor=N is after the last (where N = char_count(prompt_buffer)).
     prompt_cursor: usize,
+    // mu-82l: Ctrl-X is the leader for two-key chords in SendPrompt
+    // mode. After Ctrl-X, the next keypress is interpreted as the
+    // chord's second key — Ctrl-E currently means "open prompt in
+    // \$EDITOR". Any other follow-up key clears the leader and is
+    // processed normally.
+    leader_ctrl_x: bool,
+    // mu-82l: when set, the run() loop runs the editor-handoff
+    // sequence after the current tick — it owns the Terminal handle
+    // we need for the crossterm suspend/resume dance, which the App
+    // doesn't have direct access to.
+    pending_editor: bool,
     quit: bool,
     last_tick: Instant,
     // Daemon stats — when connected, populated from daemon.stats; in
@@ -243,6 +254,8 @@ impl App {
             command_buffer: String::new(),
             prompt_buffer: String::new(),
             prompt_cursor: 0,
+            leader_ctrl_x: false,
+            pending_editor: false,
             quit: false,
             last_tick: Instant::now(),
             daemon_uptime_ms: 0,
@@ -743,8 +756,27 @@ impl App {
         // we can see what crossterm actually receives. Helps debug
         // terminal-specific binding issues (e.g. Ctrl-Enter often
         // collapses to plain Enter in many terminals).
+        // mu-82l: Ctrl-X is the leader for two-key chords in
+        // SendPrompt mode. After Ctrl-X, the next keypress is
+        // interpreted as the chord's second key. Any non-chord
+        // follow-up clears the leader and the key is processed
+        // normally.
+        if self.leader_ctrl_x {
+            self.leader_ctrl_x = false;
+            if matches!(
+                (code, mods),
+                (KeyCode::Char('e'), KeyModifiers::CONTROL)
+            ) {
+                self.pending_editor = true;
+                return;
+            }
+            // Fall through: process the key like any other.
+        }
         let debug = format!("[key] code={code:?} mods={mods:?}");
         match (code, mods) {
+            (KeyCode::Char('x'), KeyModifiers::CONTROL) => {
+                self.leader_ctrl_x = true;
+            }
             (KeyCode::Esc, _) => {
                 self.input_mode = InputMode::Normal;
                 self.reset_prompt();
@@ -2337,9 +2369,108 @@ fn run<B: Backend>(
             app.tick();
             last_tick = Instant::now();
         }
+        // mu-82l: Ctrl-X Ctrl-E chord → bounce the current prompt
+        // through $EDITOR. App can't drive this itself because the
+        // terminal handoff needs the Terminal handle we own here.
+        if app.pending_editor {
+            app.pending_editor = false;
+            if let Err(e) =
+                open_prompt_in_editor(terminal, &mut app.prompt_buffer, &mut app.prompt_cursor)
+            {
+                app.firehose.push(format!("[!! editor handoff] {e}"));
+            }
+        }
         if app.quit {
             break;
         }
     }
+    Ok(())
+}
+
+/// mu-82l: Suspend the TUI, hand the terminal to $EDITOR with the
+/// current prompt buffer in a tempfile, resume the TUI on exit and
+/// pull the edited content back into the buffer. If the editor exits
+/// with a non-zero status (e.g. `:cq` in vi), the buffer is left
+/// unchanged — that's the standard "cancel" affordance.
+///
+/// The terminal-handoff sequence mirrors main()'s setup/teardown in
+/// reverse and then forward: pop KKP → disable raw → leave alt screen
+/// → spawn editor → enter alt screen → enable raw → re-push KKP →
+/// force redraw via terminal.clear(). KKP-unsupporting terminals
+/// get their existing behavior because the push/pop are silent
+/// no-ops there.
+fn open_prompt_in_editor<B: Backend>(
+    terminal: &mut Terminal<B>,
+    prompt_buffer: &mut String,
+    prompt_cursor: &mut usize,
+) -> io::Result<()> {
+    use std::io::Write as _;
+
+    // 1. Write current buffer to a uniquely-named tempfile. We don't
+    //    use the `tempfile` crate to avoid a new dependency — pid +
+    //    nanos suffices for uniqueness, and we remove the file
+    //    ourselves on the way out (no RAII drop guard).
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("mu-prompt-{pid}-{nanos}.md"));
+    {
+        let mut f = std::fs::File::create(&path)?;
+        f.write_all(prompt_buffer.as_bytes())?;
+    }
+
+    // 2. Suspend TUI control of the terminal.
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    disable_raw_mode()?;
+    execute!(stdout, LeaveAlternateScreen, DisableMouseCapture)?;
+
+    // 3. Spawn $EDITOR (default vi) synchronously. It inherits our
+    //    stdin/stdout/stderr — the terminal is now its.
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+    let status = std::process::Command::new(&editor).arg(&path).status();
+
+    // 4. Reclaim the terminal. Order mirrors main()'s startup so the
+    //    interactive surface comes back identical.
+    enable_raw_mode()?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let _ = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
+    // The clear() forces the next draw() to repaint from a blank
+    // canvas rather than trying to diff against whatever ratatui
+    // thinks was on screen before the handoff.
+    terminal.clear()?;
+
+    // 5. Read back the edited content — but only on a successful
+    //    exit. Non-zero status (e.g. `:cq` in vi) means "I changed
+    //    my mind" — leave the prompt unchanged.
+    let editor_ok = matches!(status, Ok(s) if s.success());
+    if editor_ok {
+        match std::fs::read_to_string(&path) {
+            Ok(new_content) => {
+                // Editors typically append a trailing newline on save.
+                // Strip exactly one to keep the buffer clean; users
+                // who actually want a trailing \n can add it back.
+                let stripped = new_content
+                    .strip_suffix('\n')
+                    .unwrap_or(&new_content)
+                    .to_string();
+                *prompt_buffer = stripped;
+                *prompt_cursor = prompt_buffer.chars().count();
+            }
+            Err(_) => {
+                // Read failure is weird (we just wrote it) but not
+                // catastrophic — leave the buffer alone.
+            }
+        }
+    }
+
+    // 6. Cleanup. Errors here are silent — the next run will
+    //    overwrite whatever's left.
+    let _ = std::fs::remove_file(&path);
     Ok(())
 }

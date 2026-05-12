@@ -52,6 +52,22 @@ use crate::mu_client::{Message as MuMessage, MuClient};
 
 // ── Model ───────────────────────────────────────────────────────────
 
+/// mu-62s: which buffer the next $EDITOR handoff targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorTarget {
+    /// mu-82l: the user prompt being typed in SendPrompt mode.
+    PromptBuffer,
+    /// mu-62s: the session's default system prompt — applies to the
+    /// next `n` (create_session) until changed.
+    SystemPrompt,
+}
+
+impl Default for EditorTarget {
+    fn default() -> Self {
+        Self::PromptBuffer
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     CommandCenter, // F1
@@ -164,6 +180,15 @@ struct App {
     // we need for the crossterm suspend/resume dance, which the App
     // doesn't have direct access to.
     pending_editor: bool,
+    // mu-62s: target of the next editor-handoff. PromptBuffer is the
+    // mu-82l user-prompt path (Ctrl-X Ctrl-E). SystemPrompt is the
+    // mu-62s system-prompt path (Ctrl-X Ctrl-P) — same handoff
+    // machinery, different destination buffer.
+    pending_editor_target: EditorTarget,
+    // mu-62s: default system prompt for the next 'n' (create_session).
+    // None ⇒ no system prompt sent (mu-n48's behavior). Set via
+    // :system_prompt palette command or Ctrl-X Ctrl-P chord.
+    default_system_prompt: Option<String>,
     // F3-on-F3 session picker (an overlay shown on top of the
     // SessionDetail transcript when the user presses F3 a second
     // time). j/k move the picker selection — and as a side effect
@@ -270,6 +295,8 @@ impl App {
             prompt_cursor: 0,
             leader_ctrl_x: false,
             pending_editor: false,
+            pending_editor_target: EditorTarget::default(),
+            default_system_prompt: None,
             session_picker_open: false,
             session_picker_saved_selection: None,
             quit: false,
@@ -606,10 +633,15 @@ impl App {
             "faux" => "faux".to_string(),
             other => other.to_string(), // fall through, daemon will reject
         };
-        let res = mu.request(
-            "create_session",
-            json!({ "provider": { "kind": kind, "model": model } }),
-        );
+        // mu-62s: include system_prompt when set. The wire schema
+        // (CreateSessionRequest, mu-n48) skips_serializing_if::is_none
+        // so a None default produces the same on-the-wire payload
+        // as before — clean back-compat.
+        let mut params = json!({ "provider": { "kind": kind, "model": model } });
+        if let Some(sp) = &self.default_system_prompt {
+            params["system_prompt"] = json!(sp);
+        }
+        let res = mu.request("create_session", params);
         match res {
             Ok(v) => {
                 let sid = v
@@ -772,21 +804,30 @@ impl App {
         // we can see what crossterm actually receives. Helps debug
         // terminal-specific binding issues (e.g. Ctrl-Enter often
         // collapses to plain Enter in many terminals).
-        // mu-82l: Ctrl-X is the leader for two-key chords in
-        // SendPrompt mode. After Ctrl-X, the next keypress is
-        // interpreted as the chord's second key. Any non-chord
-        // follow-up clears the leader and the key is processed
-        // normally.
+        // mu-82l + mu-62s: Ctrl-X is the leader for two-key chords
+        // in SendPrompt mode. After Ctrl-X, the next keypress is
+        // interpreted as the chord's second key:
+        //   Ctrl-E → open the user prompt in $EDITOR (mu-82l)
+        //   Ctrl-P → open the default system prompt in $EDITOR (mu-62s)
+        // Any non-chord follow-up clears the leader and the key is
+        // processed normally.
         if self.leader_ctrl_x {
             self.leader_ctrl_x = false;
-            if matches!(
-                (code, mods),
-                (KeyCode::Char('e'), KeyModifiers::CONTROL)
-            ) {
-                self.pending_editor = true;
-                return;
+            match (code, mods) {
+                (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+                    self.pending_editor = true;
+                    self.pending_editor_target = EditorTarget::PromptBuffer;
+                    return;
+                }
+                (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                    self.pending_editor = true;
+                    self.pending_editor_target = EditorTarget::SystemPrompt;
+                    return;
+                }
+                _ => {
+                    // Fall through: process the key like any other.
+                }
             }
-            // Fall through: process the key like any other.
         }
         let debug = format!("[key] code={code:?} mods={mods:?}");
         match (code, mods) {
@@ -1125,6 +1166,39 @@ impl App {
                     self.firehose
                         .push(format!("[ok] model → {m} (provider {k} unchanged)"));
                 }
+            }
+            // mu-62s: system_prompt management.
+            //   :system_prompt                 → show current
+            //   :system_prompt <inline text>   → set inline
+            //   :clear_system_prompt           → unset
+            // For multi-line prompts, use Ctrl-X Ctrl-P in input mode
+            // to bounce into $EDITOR.
+            "system_prompt" | "sp" => {
+                if rest.is_empty() {
+                    match &self.default_system_prompt {
+                        Some(s) => {
+                            let preview: String = s.chars().take(80).collect();
+                            self.firehose.push(format!(
+                                "[info] system_prompt: {}{}",
+                                preview,
+                                if s.chars().count() > 80 { "…" } else { "" }
+                            ));
+                        }
+                        None => self
+                            .firehose
+                            .push("[info] no default system_prompt".into()),
+                    }
+                } else {
+                    let text = rest.join(" ");
+                    let preview: String = text.chars().take(40).collect();
+                    self.default_system_prompt = Some(text);
+                    self.firehose
+                        .push(format!("[ok] system_prompt set: {preview}…"));
+                }
+            }
+            "clear_system_prompt" | "csp" => {
+                self.default_system_prompt = None;
+                self.firehose.push("[ok] system_prompt cleared".into());
             }
             "quit" | "q" => self.quit = true,
             "filter" => {
@@ -1485,6 +1559,16 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
             format!("{default_kind}/{default_model_snip}"),
             Style::default().fg(Color::Cyan),
         ),
+        // mu-62s: indicator for whether the next session will carry
+        // a system prompt. Don't dump the contents — they can be
+        // long. Show ✓ when set, dimmer · when not. :system_prompt
+        // with no args echoes the contents to the firehose.
+        Span::raw("  sys:"),
+        if app.default_system_prompt.is_some() {
+            Span::styled("✓", Style::default().fg(Color::Green))
+        } else {
+            Span::styled("·", Style::default().fg(Color::DarkGray))
+        },
     ]);
     let block = Block::default().borders(Borders::ALL);
     let paragraph = Paragraph::new(line).block(block);
@@ -2578,15 +2662,49 @@ fn run<B: Backend>(
             app.tick();
             last_tick = Instant::now();
         }
-        // mu-82l: Ctrl-X Ctrl-E chord → bounce the current prompt
-        // through $EDITOR. App can't drive this itself because the
-        // terminal handoff needs the Terminal handle we own here.
+        // mu-82l: Ctrl-X Ctrl-E → user prompt to $EDITOR.
+        // mu-62s: Ctrl-X Ctrl-P → default system prompt to $EDITOR.
+        // App can't drive these itself because the terminal handoff
+        // needs the Terminal handle we own here.
         if app.pending_editor {
             app.pending_editor = false;
-            if let Err(e) =
-                open_prompt_in_editor(terminal, &mut app.prompt_buffer, &mut app.prompt_cursor)
-            {
-                app.firehose.push(format!("[!! editor handoff] {e}"));
+            match app.pending_editor_target {
+                EditorTarget::PromptBuffer => {
+                    if let Err(e) = open_prompt_in_editor(
+                        terminal,
+                        &mut app.prompt_buffer,
+                        &mut app.prompt_cursor,
+                    ) {
+                        app.firehose.push(format!("[!! editor handoff] {e}"));
+                    }
+                }
+                EditorTarget::SystemPrompt => {
+                    // Materialize the option into a working String so
+                    // the editor function (mu-82l's signature) can
+                    // use the same path. None ⇒ start with an empty
+                    // buffer in the editor.
+                    let mut buf = app.default_system_prompt.clone().unwrap_or_default();
+                    let mut cursor: usize = buf.chars().count();
+                    if let Err(e) = open_prompt_in_editor(terminal, &mut buf, &mut cursor) {
+                        app.firehose.push(format!("[!! editor handoff] {e}"));
+                    } else {
+                        // Empty buffer post-edit ⇒ user effectively
+                        // cleared the system prompt; store None to
+                        // suppress the wire field entirely (matches
+                        // :clear_system_prompt semantics).
+                        app.default_system_prompt =
+                            if buf.is_empty() { None } else { Some(buf) };
+                        let preview: String =
+                            app.default_system_prompt
+                                .as_deref()
+                                .unwrap_or("(cleared)")
+                                .chars()
+                                .take(40)
+                                .collect();
+                        app.firehose
+                            .push(format!("[ok] system_prompt updated: {preview}…"));
+                    }
+                }
             }
         }
         if app.quit {

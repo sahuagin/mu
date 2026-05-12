@@ -1003,16 +1003,49 @@ impl App {
                 self.prompt_cursor = self.prompt_char_count();
                 self.send_prompt();
             }
-            "provider" => {
-                if rest.len() >= 2 {
-                    self.default_provider = (rest[0].to_string(), rest[1].to_string());
-                    self.firehose.push(format!(
-                        "[ok] default provider set to {}/{}",
-                        rest[0], rest[1]
-                    ));
-                } else {
+            // mu-ium: :provider [kind] [model]
+            //   :provider                   → show current default
+            //   :provider <kind>            → set kind only (model unchanged)
+            //   :provider <kind> <model>    → set both (existing combined form)
+            //
+            // Kind aliases (anthropic/claude/openai/codex/openrouter/etc)
+            // are normalized at create_session time, not here — so users
+            // can experiment without hitting a "rejected" message
+            // before the daemon has a chance to weigh in.
+            "provider" => match rest.len() {
+                0 => {
+                    let (k, m) = &self.default_provider;
                     self.firehose
-                        .push("[usage] :provider <kind> <model>".into());
+                        .push(format!("[info] default provider: {k}/{m}"));
+                }
+                1 => {
+                    self.default_provider.0 = rest[0].to_string();
+                    let (k, m) = &self.default_provider;
+                    self.firehose
+                        .push(format!("[ok] provider kind → {k} (model {m} unchanged)"));
+                }
+                _ => {
+                    self.default_provider =
+                        (rest[0].to_string(), rest[1..].join(" "));
+                    let (k, m) = &self.default_provider;
+                    self.firehose
+                        .push(format!("[ok] default provider set to {k}/{m}"));
+                }
+            },
+            // mu-ium: :model <id> — set the model leaving kind unchanged.
+            // Trim leading dashes so `:model -- claude-haiku-4-5...`
+            // doesn't trip clap-style flag confusion (there's no real
+            // arg parser here; just a defensive nicety).
+            "model" => {
+                if rest.is_empty() {
+                    let (k, m) = &self.default_provider;
+                    self.firehose
+                        .push(format!("[info] default model: {m} (provider {k})"));
+                } else {
+                    self.default_provider.1 = rest.join(" ");
+                    let (k, m) = &self.default_provider;
+                    self.firehose
+                        .push(format!("[ok] model → {m} (provider {k} unchanged)"));
                 }
             }
             "quit" | "q" => self.quit = true,
@@ -1339,6 +1372,14 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     } else {
         format!("{}", app.daemon_event_count)
     };
+    // mu-ium: surface the current default (provider, model) so the
+    // user can see what `n` will create a session against. Updated
+    // via :provider / :model palette commands. Snake-cased kind on
+    // the wire is what we display; aliases are normalized at
+    // create_session time.
+    let (default_kind, default_model) = &app.default_provider;
+    // Truncate to keep the header readable on narrow terminals.
+    let default_model_snip: String = default_model.chars().take(28).collect();
     let line = Line::from(vec![
         Span::styled("mu", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" — command center  "),
@@ -1360,6 +1401,11 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 Color::Green
             }),
+        ),
+        Span::raw("  next-`n`: "),
+        Span::styled(
+            format!("{default_kind}/{default_model_snip}"),
+            Style::default().fg(Color::Cyan),
         ),
     ]);
     let block = Block::default().borders(Borders::ALL);

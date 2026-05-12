@@ -19,6 +19,7 @@
 
 pub mod agent;
 pub mod capability;
+pub mod context;
 pub mod event_log;
 pub mod protocol;
 pub mod transport;

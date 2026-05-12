@@ -142,6 +142,80 @@
         assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
     }
 
+    // mu-i6j: tool definitions are stable across asks within a
+    // session, so they're a high-value cache target. We mark the last
+    // tool with cache_control: ephemeral, which tells Anthropic to
+    // cache everything up to and including that marker (i.e. the
+    // entire tools array).
+
+    #[test]
+    fn mu_i6j_single_tool_gets_cache_control_marker() {
+        let messages = vec![AgentMessage::User { content: "hi".into() }];
+        let tools = vec![ToolSpec {
+            name: "read".into(),
+            description: "Read a file".into(),
+            input_schema: json!({ "type": "object" }),
+            policy: Default::default(),
+        }];
+        let body = build_request_body("claude-test", &messages, &tools);
+        let tool = &body["tools"][0];
+        assert_eq!(tool["name"], "read");
+        assert_eq!(
+            tool["cache_control"],
+            json!({ "type": "ephemeral" }),
+            "single tool should carry the cache_control marker"
+        );
+    }
+
+    #[test]
+    fn mu_i6j_only_last_tool_gets_cache_control_marker() {
+        let messages = vec![AgentMessage::User { content: "hi".into() }];
+        let tools = vec![
+            ToolSpec {
+                name: "read".into(),
+                description: "Read a file".into(),
+                input_schema: json!({ "type": "object" }),
+                policy: Default::default(),
+            },
+            ToolSpec {
+                name: "glob".into(),
+                description: "Find files".into(),
+                input_schema: json!({ "type": "object" }),
+                policy: Default::default(),
+            },
+            ToolSpec {
+                name: "grep".into(),
+                description: "Search contents".into(),
+                input_schema: json!({ "type": "object" }),
+                policy: Default::default(),
+            },
+        ];
+        let body = build_request_body("claude-test", &messages, &tools);
+        let tool_arr = body["tools"].as_array().expect("tools array");
+        assert_eq!(tool_arr.len(), 3);
+        // Anthropic caches everything UP TO AND INCLUDING the marker,
+        // so the marker on the final tool is sufficient — earlier
+        // tools must NOT carry their own markers (Anthropic allows up
+        // to 4 markers per request, but more is wasteful here).
+        assert!(
+            tool_arr[0].get("cache_control").is_none(),
+            "first tool should not carry cache_control"
+        );
+        assert!(
+            tool_arr[1].get("cache_control").is_none(),
+            "middle tool should not carry cache_control"
+        );
+        assert_eq!(
+            tool_arr[2]["cache_control"],
+            json!({ "type": "ephemeral" }),
+            "last tool should carry the cache_control marker"
+        );
+        // Sanity: tool order is preserved.
+        assert_eq!(tool_arr[0]["name"], "read");
+        assert_eq!(tool_arr[1]["name"], "glob");
+        assert_eq!(tool_arr[2]["name"], "grep");
+    }
+
     fn assistant_text(text: &str) -> AgentMessage {
         AgentMessage::Assistant(AssistantMessage {
             content: vec![ContentBlock::Text { text: text.into() }],

@@ -422,6 +422,144 @@ pub struct PercentileStats {
     pub count: u32,
 }
 
+// ===== mu-036: autonomous session loop ============================
+//
+// Two new RPCs and a small constellation of typed events for the
+// "session runs without a human in the loop" primitive. See
+// specs/mu-036-session-autonomous-loop.md for design intent.
+//
+// Phase A (this slice): the wire surface. Dispatch handlers return
+// a "not-yet-implemented" error until Phase B (mu-3ao) lands the
+// agent-loop integration. The types are stable enough for clients
+// to start coding against.
+
+/// Request to put `session_id` into autonomous mode with `goal` and
+/// bounds in `options`. The daemon validates the session's
+/// capability includes `AutonomyCapability::Allowed` (mu-036 INV-1);
+/// if not, returns an error. The *real* bounds enforcement uses the
+/// capability's values — not these options — so a delegate cannot
+/// widen its autonomy by passing bigger numbers (INV-2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StartAutonomousRequest {
+    pub session_id: String,
+    pub goal: String,
+    pub options: AutonomyOptions,
+}
+
+impl StartAutonomousRequest {
+    pub const METHOD: &'static str = "session.start_autonomous";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StartAutonomousResponse {
+    pub accepted: bool,
+}
+
+/// Per-call autonomy preferences. The capability is the bound; these
+/// options refine within it. All are optional because the capability's
+/// values are the authoritative ceiling.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutonomyOptions {
+    /// Soft cap on iterations. Daemon also enforces the
+    /// `Capability::autonomy::max_iterations` ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
+    /// How often to run the goal-check. 1 = every iteration.
+    /// Higher numbers trade responsiveness for cost (especially
+    /// for `DelegateGrader`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_check_interval: Option<u32>,
+    /// How the loop decides it's done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_check_method: Option<GoalCheckMethod>,
+    /// If no progress (no tool call, no streaming) for this long,
+    /// emit `session.input_required` to ask the human for guidance.
+    /// None ⇒ no escalation timer (loop runs until a bound trips).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalate_on_idle_after_ms: Option<u64>,
+}
+
+/// How an autonomous loop decides whether the goal is met.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "tag", rename_all = "snake_case")]
+pub enum GoalCheckMethod {
+    /// Agent emits `session.callout { kind: "goal_status", body:
+    /// { satisfied: bool, reason: String } }` at end of each
+    /// iteration; loop terminates when satisfied: true.
+    SelfReport,
+    /// Between iterations, ask a sibling/delegate session to grade.
+    /// Constrains the grader's response shape via the prompt template.
+    DelegateGrader {
+        grader_session_id: String,
+        grader_prompt_template: String,
+    },
+    /// Wait for a `session.external_signal` notification with
+    /// matching `signal_name`. Useful for "stop when CI passes."
+    ExternalSignal { signal_name: String },
+}
+
+/// Outcome of one autonomous iteration, recorded in the event log
+/// and surfaced via `session.autonomous_iteration_completed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "tag", rename_all = "snake_case")]
+pub enum AutonomousIterationOutcome {
+    /// Goal not yet met; loop continues to the next iteration.
+    Continue,
+    /// Goal met; loop terminates with `AutonomousTerminated { reason:
+    /// GoalMet }` next.
+    GoalMet { detail: String },
+    /// Iteration failed (e.g. tool error, grader timeout). Loop
+    /// terminates with `AutonomousTerminated { reason: IterationError }`.
+    IterationError { message: String },
+    /// Escalation tripped — the loop emitted `session.input_required`
+    /// and is awaiting a human response.
+    EscalatingToHuman,
+}
+
+/// Why the autonomous loop terminated. Always the final event for
+/// this autonomous run (INV-7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "tag", rename_all = "snake_case")]
+pub enum AutonomousTerminationReason {
+    GoalMet { detail: String },
+    IterationCap,
+    WallClockExpired,
+    ToolCallCapExhausted,
+    EscalationTimedOut,
+    GraderRejected { detail: String },
+    /// Externally cancelled via session.cancel_outstanding or
+    /// session.cancel_session.
+    Cancelled,
+    /// Provider or tool error mid-loop that wasn't recoverable.
+    Errored { message: String },
+}
+
+/// Request to park the session for `sleep_for_ms` (or until
+/// `wake_at_unix_ms`). Exactly one of the two must be set.
+/// While sleeping, the session does not consume model budget
+/// (INV-5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleWakeupRequest {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep_for_ms: Option<u64>,
+    /// Free-form reason. Recorded in the event log and surfaced as
+    /// the next iteration's `motivation` field after wake.
+    pub reason: String,
+}
+
+impl ScheduleWakeupRequest {
+    pub const METHOD: &'static str = "session.schedule_wakeup";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleWakeupResponse {
+    pub accepted: bool,
+    pub scheduled_for_unix_ms: u64,
+}
+
 // ===== mu-035: session.provider_status + session.cancel_outstanding =====
 
 /// Provider-call lifecycle states surfaced to clients (mu-035). Tags

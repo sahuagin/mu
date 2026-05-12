@@ -2134,7 +2134,13 @@ fn render_transcript_lines(
             | "callout"
             | "context_assembly"
             | "session_closed"
-            | "provider_status_update" => {
+            | "provider_status_update"
+            // mu-036: autonomous-loop bookkeeping is observability,
+            // not transcript content. The firehose surfaces them.
+            | "autonomous_iteration_started"
+            | "autonomous_iteration_completed"
+            | "autonomous_scheduled_wakeup"
+            | "autonomous_terminated" => {
                 // Sidechannel events — not in the transcript pane.
                 // The firehose carries these globally.
             }

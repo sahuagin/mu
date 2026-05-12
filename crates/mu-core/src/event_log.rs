@@ -149,6 +149,26 @@ pub enum EventPayload {
         provider_kind: String,
         model: String,
     },
+    /// mu-036: autonomous loop iteration began. `iteration` is
+    /// 0-indexed across the run; `motivation` is the model-reported
+    /// one-sentence "what I'm doing this turn and why" (after a
+    /// schedule_wakeup, this is the wake reason).
+    AutonomousIterationStarted { iteration: u32, motivation: String },
+    /// mu-036: autonomous loop iteration ended. Outcome tells the
+    /// caller whether the loop continues, exits, escalates, or errors.
+    AutonomousIterationCompleted {
+        iteration: u32,
+        outcome: crate::protocol::AutonomousIterationOutcome,
+    },
+    /// mu-036: session has been parked via session.schedule_wakeup.
+    /// While sleeping, no provider calls fire (INV-5). On wake, the
+    /// next `AutonomousIterationStarted` carries `reason` as its
+    /// motivation.
+    AutonomousScheduledWakeup { wake_at_unix_ms: u64, reason: String },
+    /// mu-036: autonomous loop terminated. Always the final autonomy
+    /// event for this run (INV-7); session returns to RunMode::Idle
+    /// and is addressable via ask_session again.
+    AutonomousTerminated { reason: crate::protocol::AutonomousTerminationReason },
     /// Durable mirror of the wire-side `session.provider_status`
     /// notification (mu-035). Emitted on state transitions and on
     /// periodic ticks during non-streaming waits, both for

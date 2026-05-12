@@ -204,7 +204,26 @@ pub(crate) fn build_request_body(
         "messages": api_messages,
     });
     if !tools.is_empty() {
-        body["tools"] = json!(tools.iter().map(translate_tool_spec).collect::<Vec<_>>());
+        let mut tool_specs: Vec<Value> = tools.iter().map(translate_tool_spec).collect();
+        // mu-i6j: mark the last tool definition with cache_control.
+        // Anthropic caches everything up to and including the marker
+        // — placing it on the final tool turns the whole tools array
+        // into a cacheable prefix. Tool definitions are stable across
+        // asks within a session (a new ask adds a user message but
+        // doesn't change which tools are available), so this is a
+        // safe, high-impact target.
+        //
+        // System prompt is the other classic cache target but mu
+        // doesn't currently thread `system_prompt` from
+        // CreateSessionRequest through to Provider::stream — see
+        // protocol.rs:66 for the wire field; the body construction
+        // above does not include a `system` key. When that gap is
+        // closed, add a second cache_control marker on the last
+        // (or only) system content block.
+        if let Some(last) = tool_specs.last_mut() {
+            last["cache_control"] = json!({ "type": "ephemeral" });
+        }
+        body["tools"] = json!(tool_specs);
     }
     body
 }

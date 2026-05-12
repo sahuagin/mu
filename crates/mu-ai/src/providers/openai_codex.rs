@@ -822,14 +822,23 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
 impl Provider for OpenaiCodexProvider {
     async fn stream(
         &self,
+        system_prompt: Option<&str>,
         messages: &[AgentMessage],
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+        // mu-n48: a session-level system_prompt overrides the
+        // provider's default `instructions` (the Responses API's
+        // system-prompt slot). The `with_instructions` provider-
+        // builder mechanism still works at construction time;
+        // session-level just takes precedence per-call.
+        let instructions: &str = system_prompt
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.instructions);
         let body = build_request_body(
             &self.model,
             &self.thinking,
-            &self.instructions,
+            instructions,
             messages,
             tools,
         );

@@ -65,11 +65,12 @@ impl AnthropicProvider {
 impl Provider for AnthropicProvider {
     async fn stream(
         &self,
+        system_prompt: Option<&str>,
         messages: &[AgentMessage],
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
-        let body = build_request_body(&self.model, messages, tools);
+        let body = build_request_body(&self.model, system_prompt, messages, tools);
 
         let resp = self
             .client
@@ -193,6 +194,7 @@ fn translate_message_single(m: &AgentMessage) -> Option<Value> {
 
 pub(crate) fn build_request_body(
     model: &str,
+    system_prompt: Option<&str>,
     messages: &[AgentMessage],
     tools: &[ToolSpec],
 ) -> Value {
@@ -203,6 +205,24 @@ pub(crate) fn build_request_body(
         "stream": true,
         "messages": api_messages,
     });
+    // mu-n48: when a system prompt is configured for the session, emit
+    // it as a content-block array (not a plain string) and tag it
+    // cache_control: ephemeral. Anthropic caches everything up to and
+    // including the marker, so the system block joins the tools array
+    // (mu-i6j) as a cacheable prefix that's stable across asks within
+    // the session. Empty string ⇒ same as None (don't send an empty
+    // system field, which Anthropic rejects).
+    if let Some(s) = system_prompt {
+        if !s.is_empty() {
+            body["system"] = json!([
+                {
+                    "type": "text",
+                    "text": s,
+                    "cache_control": { "type": "ephemeral" }
+                }
+            ]);
+        }
+    }
     if !tools.is_empty() {
         let mut tool_specs: Vec<Value> = tools.iter().map(translate_tool_spec).collect();
         // mu-i6j: mark the last tool definition with cache_control.

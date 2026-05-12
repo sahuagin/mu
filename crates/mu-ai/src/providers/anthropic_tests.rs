@@ -39,7 +39,7 @@
         let messages = vec![AgentMessage::User {
             content: "hi".into(),
         }];
-        let body = build_request_body("claude-test", &messages, &[]);
+        let body = build_request_body("claude-test", None, &messages, &[]);
         assert_eq!(body["model"], "claude-test");
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_tokens"], 4096);
@@ -128,7 +128,7 @@
             input_schema: json!({ "type": "object" }),
             policy: Default::default(),
         }];
-        let body = build_request_body("claude-test", &messages, &tools);
+        let body = build_request_body("claude-test", None, &messages, &tools);
         assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
         assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
         assert_eq!(body["tools"][0]["name"], "read");
@@ -137,7 +137,7 @@
     #[test]
     fn b5_build_request_body_omits_tools_when_empty() {
         let messages = vec![AgentMessage::User { content: "hi".into() }];
-        let body = build_request_body("claude-test", &messages, &[]);
+        let body = build_request_body("claude-test", None, &messages, &[]);
         assert!(body.get("tools").is_none());
         assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
     }
@@ -157,7 +157,7 @@
             input_schema: json!({ "type": "object" }),
             policy: Default::default(),
         }];
-        let body = build_request_body("claude-test", &messages, &tools);
+        let body = build_request_body("claude-test", None, &messages, &tools);
         let tool = &body["tools"][0];
         assert_eq!(tool["name"], "read");
         assert_eq!(
@@ -165,6 +165,42 @@
             json!({ "type": "ephemeral" }),
             "single tool should carry the cache_control marker"
         );
+    }
+
+    // mu-n48: system prompt rendered as content-block array with
+    // cache_control: ephemeral. Mirrors the tool-cache pattern so
+    // the system block also becomes part of the cacheable prefix.
+
+    #[test]
+    fn mu_n48_system_prompt_none_omits_system_field() {
+        let messages = vec![AgentMessage::User { content: "hi".into() }];
+        let body = build_request_body("claude-test", None, &messages, &[]);
+        assert!(
+            body.get("system").is_none(),
+            "no system field when system_prompt is None"
+        );
+    }
+
+    #[test]
+    fn mu_n48_system_prompt_empty_omits_system_field() {
+        let messages = vec![AgentMessage::User { content: "hi".into() }];
+        let body = build_request_body("claude-test", Some(""), &messages, &[]);
+        assert!(
+            body.get("system").is_none(),
+            "no system field when system_prompt is empty"
+        );
+    }
+
+    #[test]
+    fn mu_n48_system_prompt_set_emits_content_block_with_cache_control() {
+        let messages = vec![AgentMessage::User { content: "hi".into() }];
+        let body =
+            build_request_body("claude-test", Some("you are concise"), &messages, &[]);
+        let arr = body["system"].as_array().expect("system is array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "you are concise");
+        assert_eq!(arr[0]["cache_control"], json!({ "type": "ephemeral" }));
     }
 
     #[test]
@@ -190,7 +226,7 @@
                 policy: Default::default(),
             },
         ];
-        let body = build_request_body("claude-test", &messages, &tools);
+        let body = build_request_body("claude-test", None, &messages, &tools);
         let tool_arr = body["tools"].as_array().expect("tools array");
         assert_eq!(tool_arr.len(), 3);
         // Anthropic caches everything UP TO AND INCLUDING the marker,
@@ -572,7 +608,7 @@ mod live_tests {
         }];
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let mut stream = provider
-            .stream(&messages, &[], rx)
+            .stream(None, &messages, &[], rx)
             .await
             .expect("provider.stream");
 
@@ -637,7 +673,7 @@ mod live_tests {
         }];
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let mut stream = provider
-            .stream(&messages, std::slice::from_ref(&echo_tool), rx)
+            .stream(None, &messages, std::slice::from_ref(&echo_tool), rx)
             .await
             .expect("provider.stream");
 

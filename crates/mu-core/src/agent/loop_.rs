@@ -174,11 +174,22 @@ pub struct AgentConfig {
     /// `AgentEvent::Done(EndTurn)` and returns `Outcome::IterationCap`
     /// when this is reached. Default 20.
     pub max_turns: u32,
+    /// mu-n48: optional system prompt forwarded to every
+    /// `Provider::stream` call in this session. None ⇒ no system
+    /// content sent (pre-mu-n48 behavior). When set, providers render
+    /// it appropriately (Anthropic top-level `system` field, OpenAI-
+    /// style prepended {role:"system"} message), and Anthropic
+    /// additionally tags it `cache_control: ephemeral` to amortize
+    /// its tokens across asks in the session.
+    pub system_prompt: Option<String>,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        Self { max_turns: 20 }
+        Self {
+            max_turns: 20,
+            system_prompt: None,
+        }
     }
 }
 
@@ -501,6 +512,7 @@ async fn run(
 
                 match handle_invoke_llm(
                     provider.as_ref(),
+                    config.system_prompt.as_deref(),
                     &messages,
                     &tool_specs,
                     &mut input_rx,
@@ -795,6 +807,7 @@ fn now_unix_ms() -> u64 {
 
 async fn handle_invoke_llm(
     provider: &dyn Provider,
+    system_prompt: Option<&str>,
     messages: &[AgentMessage],
     tool_specs: &[ToolSpec],
     input_rx: &mut mpsc::Receiver<AgentInput>,
@@ -829,7 +842,7 @@ async fn handle_invoke_llm(
 
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let mut stream = provider
-        .stream(messages, tool_specs, cancel_rx)
+        .stream(system_prompt, messages, tool_specs, cancel_rx)
         .await
         .map_err(|e| Outcome::Error(e.to_string()))?;
 

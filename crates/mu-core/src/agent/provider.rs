@@ -53,6 +53,12 @@ pub trait Provider: Send + Sync {
     /// available, otherwise `ProviderEvent::Error`.
     async fn stream(
         &self,
+        // mu-n48: optional system prompt. Each impl decides how to
+        // render it in its provider-specific request shape (Anthropic
+        // has a top-level `system` field; OpenAI-style providers
+        // prepend a {role: "system"} message). None preserves the
+        // pre-mu-n48 behavior of "no system prompt sent."
+        system_prompt: Option<&str>,
         messages: &[AgentMessage],
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,

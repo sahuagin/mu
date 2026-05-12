@@ -104,6 +104,7 @@ fn handle_create_session(
 
     match build_and_register_session(
         &params.provider,
+        params.system_prompt, // mu-n48
         None, // no parent — this is a root session
         None,
         Capability::root(), // root session: unrestricted
@@ -176,6 +177,7 @@ fn handle_delegate_session(
 
     match build_and_register_session(
         &params.provider,
+        None, // mu-n48: delegate sessions inherit (no override yet)
         Some(params.parent_session_id.clone()),
         params.branched_at_parent_event_id,
         child_capability,
@@ -202,6 +204,7 @@ fn handle_delegate_session(
 /// or a human-readable error on provider-construction failure.
 fn build_and_register_session(
     selector: &ProviderSelector,
+    system_prompt: Option<String>,
     parent_session_id: Option<String>,
     branched_at_parent_event_id: Option<u64>,
     capability: Capability,
@@ -254,7 +257,10 @@ fn build_and_register_session(
     let agent = AgentLoop::spawn(
         provider,
         session_tools,
-        AgentConfig::default(),
+        AgentConfig {
+            system_prompt,
+            ..AgentConfig::default()
+        },
         events_tx,
         pending_approvals.clone(),
         capability_handle.clone(),

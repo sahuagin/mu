@@ -115,7 +115,7 @@ fn b6_build_request_body_includes_tools() {
         input_schema: json!({"type": "object"}),
         policy: Default::default(),
     }];
-    let body = build_request_body("test/model", &messages, &tools);
+    let body = build_request_body("test/model", None, &messages, &tools);
     assert_eq!(body["model"], "test/model");
     assert_eq!(body["stream"], true);
     assert_eq!(body["max_tokens"], 4096);
@@ -128,8 +128,47 @@ fn b6b_build_request_body_omits_tools_when_empty() {
     let messages = vec![AgentMessage::User {
         content: "hi".into(),
     }];
-    let body = build_request_body("test/model", &messages, &[]);
+    let body = build_request_body("test/model", None, &messages, &[]);
     assert!(body.get("tools").is_none());
+}
+
+// mu-n48: OpenAI-style providers express the system prompt as a
+// {role: "system"} message prepended to the messages array.
+
+#[test]
+fn mu_n48_system_prompt_none_does_not_prepend_system_message() {
+    let messages = vec![AgentMessage::User {
+        content: "hi".into(),
+    }];
+    let body = build_request_body("test/model", None, &messages, &[]);
+    let arr = body["messages"].as_array().expect("messages array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["role"], "user");
+}
+
+#[test]
+fn mu_n48_system_prompt_set_prepends_system_message() {
+    let messages = vec![AgentMessage::User {
+        content: "hi".into(),
+    }];
+    let body =
+        build_request_body("test/model", Some("you are concise"), &messages, &[]);
+    let arr = body["messages"].as_array().expect("messages array");
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["role"], "system");
+    assert_eq!(arr[0]["content"], "you are concise");
+    assert_eq!(arr[1]["role"], "user");
+}
+
+#[test]
+fn mu_n48_empty_system_prompt_does_not_prepend() {
+    let messages = vec![AgentMessage::User {
+        content: "hi".into(),
+    }];
+    let body = build_request_body("test/model", Some(""), &messages, &[]);
+    let arr = body["messages"].as_array().expect("messages array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["role"], "user");
 }
 
 #[test]
@@ -348,7 +387,7 @@ mod live_tests {
         }];
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let mut stream = provider
-            .stream(&messages, &[], rx)
+            .stream(None, &messages, &[], rx)
             .await
             .expect("provider.stream");
 
@@ -410,7 +449,7 @@ mod live_tests {
         }];
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let mut stream = provider
-            .stream(&messages, std::slice::from_ref(&echo_tool), rx)
+            .stream(None, &messages, std::slice::from_ref(&echo_tool), rx)
             .await
             .expect("provider.stream");
 

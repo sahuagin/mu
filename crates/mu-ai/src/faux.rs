@@ -54,6 +54,10 @@ impl FauxProvider {
 impl Provider for FauxProvider {
     async fn stream(
         &self,
+        // mu-n48: faux ignores system_prompt — it's a deterministic
+        // echo / scripted provider; no need to thread it through the
+        // synthetic event sequence.
+        _system_prompt: Option<&str>,
         messages: &[AgentMessage],
         _tools: &[ToolSpec],
         _cancel_rx: oneshot::Receiver<()>,
@@ -121,7 +125,7 @@ mod tests {
         let (_cancel_tx, cancel_rx) = oneshot::channel();
 
         let events: Vec<ProviderEvent> = provider
-            .stream(&messages, &[], cancel_rx)
+            .stream(None, &messages, &[], cancel_rx)
             .await?
             .collect()
             .await;
@@ -174,7 +178,7 @@ mod tests {
 
     async fn collect_stream(provider: &FauxProvider) -> Result<Vec<ProviderEvent>, ProviderError> {
         let (_cancel_tx, cancel_rx) = oneshot::channel();
-        let stream = provider.stream(&[], &[], cancel_rx).await?;
+        let stream = provider.stream(None, &[], &[], cancel_rx).await?;
         Ok(stream.collect().await)
     }
 }

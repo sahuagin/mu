@@ -29,13 +29,16 @@ use std::{
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, Wrap},
@@ -143,6 +146,11 @@ struct App {
     input_mode: InputMode,
     command_buffer: String,
     prompt_buffer: String,
+    // mu-wd2: cursor position in `prompt_buffer`, measured in CHARS
+    // (not bytes) so unicode prompts behave correctly. The cursor sits
+    // *between* characters: cursor=0 is before the first char,
+    // cursor=N is after the last (where N = char_count(prompt_buffer)).
+    prompt_cursor: usize,
     quit: bool,
     last_tick: Instant,
     // Daemon stats — when connected, populated from daemon.stats; in
@@ -234,6 +242,7 @@ impl App {
             input_mode: InputMode::Normal,
             command_buffer: String::new(),
             prompt_buffer: String::new(),
+            prompt_cursor: 0,
             quit: false,
             last_tick: Instant::now(),
             daemon_uptime_ms: 0,
@@ -599,8 +608,62 @@ impl App {
         }
     }
 
+    /// mu-wd2: byte offset into `prompt_buffer` corresponding to the
+    /// current char-cursor. Clamped at the buffer length so callers
+    /// can safely use it as a `String::insert` / `String::remove`
+    /// index.
+    fn prompt_cursor_byte_pos(&self) -> usize {
+        self.prompt_buffer
+            .char_indices()
+            .nth(self.prompt_cursor)
+            .map(|(b, _)| b)
+            .unwrap_or(self.prompt_buffer.len())
+    }
+
+    /// mu-wd2: number of chars in the prompt buffer.
+    fn prompt_char_count(&self) -> usize {
+        self.prompt_buffer.chars().count()
+    }
+
+    /// mu-wd2: reset cursor to start, used when the buffer is cleared.
+    fn reset_prompt(&mut self) {
+        self.prompt_buffer.clear();
+        self.prompt_cursor = 0;
+    }
+
+    /// mu-wd2: move the char-cursor one word left (skip-then-cross,
+    /// like readline's backward-word). A word boundary is the
+    /// transition from non-alphanumeric to alphanumeric.
+    fn prompt_move_word_left(&mut self) {
+        let chars: Vec<char> = self.prompt_buffer.chars().collect();
+        let mut i = self.prompt_cursor;
+        // Skip whitespace/punctuation immediately before cursor.
+        while i > 0 && !chars[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+        // Then skip alphanumeric run.
+        while i > 0 && chars[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+        self.prompt_cursor = i;
+    }
+
+    /// mu-wd2: mirror of `prompt_move_word_left` for moving right.
+    fn prompt_move_word_right(&mut self) {
+        let chars: Vec<char> = self.prompt_buffer.chars().collect();
+        let mut i = self.prompt_cursor;
+        while i < chars.len() && !chars[i].is_alphanumeric() {
+            i += 1;
+        }
+        while i < chars.len() && chars[i].is_alphanumeric() {
+            i += 1;
+        }
+        self.prompt_cursor = i;
+    }
+
     fn send_prompt(&mut self) {
         let prompt = std::mem::take(&mut self.prompt_buffer);
+        self.prompt_cursor = 0;
         if prompt.trim().is_empty() {
             return;
         }
@@ -684,27 +747,106 @@ impl App {
         match (code, mods) {
             (KeyCode::Esc, _) => {
                 self.input_mode = InputMode::Normal;
-                self.prompt_buffer.clear();
+                self.reset_prompt();
             }
-            // Enter submits (the chat-TUI convention). Alt-Enter or
-            // Ctrl-J inserts a newline for multi-line prompts.
-            // Ctrl-Enter ALSO submits when the terminal happens to
-            // distinguish it from plain Enter.
-            (KeyCode::Enter, KeyModifiers::ALT) => {
-                self.prompt_buffer.push('\n');
+            // Plain Enter submits (chat-TUI convention). Any modified
+            // Enter — Alt, Shift, Ctrl, Meta — inserts a newline so
+            // multi-line prompts work regardless of which terminal-
+            // specific binding the user reaches for. Ctrl-J is the
+            // historical newline alternative (LF as char) and stays.
+            //
+            // Caveat: many terminals strip the Shift modifier on
+            // Enter at the terminal layer (xterm, default GNOME
+            // Terminal) and send plain `\r` — no app can recover
+            // the modifier in that case. Kitty / WezTerm / iTerm2
+            // (with config) preserve it. If Shift-Enter still
+            // submits, that's a terminal-layer issue, not a mu bug.
+            (KeyCode::Enter, m) if !m.is_empty() => {
+                let byte = self.prompt_cursor_byte_pos();
+                self.prompt_buffer.insert(byte, '\n');
+                self.prompt_cursor += 1;
             }
             (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
-                self.prompt_buffer.push('\n');
+                let byte = self.prompt_cursor_byte_pos();
+                self.prompt_buffer.insert(byte, '\n');
+                self.prompt_cursor += 1;
             }
             (KeyCode::Enter, _) => {
                 self.input_mode = InputMode::Normal;
                 self.send_prompt();
             }
-            (KeyCode::Backspace, _) => {
-                self.prompt_buffer.pop();
+            // ── mu-wd2: cursor motion ──────────────────────────────
+            (KeyCode::Left, KeyModifiers::CONTROL) => self.prompt_move_word_left(),
+            (KeyCode::Left, _) => {
+                if self.prompt_cursor > 0 {
+                    self.prompt_cursor -= 1;
+                }
             }
-            (KeyCode::Char(c), _) => {
-                self.prompt_buffer.push(c);
+            (KeyCode::Right, KeyModifiers::CONTROL) => self.prompt_move_word_right(),
+            (KeyCode::Right, _) => {
+                if self.prompt_cursor < self.prompt_char_count() {
+                    self.prompt_cursor += 1;
+                }
+            }
+            (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+                self.prompt_cursor = 0;
+            }
+            (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+                self.prompt_cursor = self.prompt_char_count();
+            }
+            // ── mu-wd2: deletion ────────────────────────────────────
+            (KeyCode::Backspace, _) => {
+                if self.prompt_cursor > 0 {
+                    self.prompt_cursor -= 1;
+                    let byte = self.prompt_cursor_byte_pos();
+                    self.prompt_buffer.remove(byte);
+                }
+            }
+            (KeyCode::Delete, _) => {
+                if self.prompt_cursor < self.prompt_char_count() {
+                    let byte = self.prompt_cursor_byte_pos();
+                    self.prompt_buffer.remove(byte);
+                }
+            }
+            // Ctrl-W: delete previous word (readline backward-kill-word).
+            (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
+                let target = {
+                    let saved = self.prompt_cursor;
+                    self.prompt_move_word_left();
+                    let t = self.prompt_cursor;
+                    self.prompt_cursor = saved;
+                    t
+                };
+                if target < self.prompt_cursor {
+                    let start_byte = self
+                        .prompt_buffer
+                        .char_indices()
+                        .nth(target)
+                        .map(|(b, _)| b)
+                        .unwrap_or(0);
+                    let end_byte = self.prompt_cursor_byte_pos();
+                    self.prompt_buffer.drain(start_byte..end_byte);
+                    self.prompt_cursor = target;
+                }
+            }
+            // Ctrl-U: delete from start of line to cursor (readline
+            // unix-line-discard). For a single-line buffer this is
+            // "kill everything before cursor."
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                let end_byte = self.prompt_cursor_byte_pos();
+                self.prompt_buffer.drain(..end_byte);
+                self.prompt_cursor = 0;
+            }
+            // Ctrl-K: delete from cursor to end (readline kill-line).
+            (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+                let start_byte = self.prompt_cursor_byte_pos();
+                self.prompt_buffer.truncate(start_byte);
+            }
+            // ── mu-wd2: text insert ─────────────────────────────────
+            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+                let byte = self.prompt_cursor_byte_pos();
+                self.prompt_buffer.insert(byte, c);
+                self.prompt_cursor += 1;
             }
             _ => {
                 // Log unknown keycodes so the user can see what their
@@ -727,7 +869,7 @@ impl App {
             (KeyCode::Char('i'), _) | (KeyCode::Enter, _) => {
                 if self.selected_session.selected().is_some() {
                     self.input_mode = InputMode::SendPrompt;
-                    self.prompt_buffer.clear();
+                    self.reset_prompt();
                 }
             }
             (KeyCode::F(1), _) => self.mode = ViewMode::CommandCenter,
@@ -826,6 +968,7 @@ impl App {
                 // Inline single-shot send: `:send <text...>` skips
                 // SendPrompt mode for one-liners.
                 self.prompt_buffer = rest.join(" ");
+                self.prompt_cursor = self.prompt_char_count();
                 self.send_prompt();
             }
             "provider" => {
@@ -2003,18 +2146,54 @@ fn render_firehose(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_statusline(f: &mut Frame, app: &App, area: Rect) {
+    // mu-wd2: when in SendPrompt mode, we want a real terminal
+    // cursor at the typing position. Hold the (x, y) we want until
+    // after render_widget so the cursor lands on top of the painted
+    // content.
+    let mut cursor_pos: Option<Position> = None;
+
     let content = match app.input_mode {
         InputMode::Command => format!(":{}", app.command_buffer),
         InputMode::SendPrompt => {
-            let preview: String = app.prompt_buffer.chars().take(80).collect();
-            format!(
-                " > {preview}{}    [enter=send · alt-enter or ctrl-j=newline · esc=cancel]",
-                if app.prompt_buffer.chars().count() > 80 {
-                    "…"
-                } else {
-                    ""
-                }
-            )
+            // mu-wd2 + mu-h04: render with cursor visible and scroll
+            // horizontally if the prompt is wider than the
+            // statusline. Suppress the inline hint while typing —
+            // it was previously fused with the prompt text after
+            // four spaces, which looked like the prompt was
+            // truncated/obscured for short inputs (mu-h04). The
+            // hint comes back in Normal mode in the statusline's
+            // bottom bar (the F1 command center also documents the
+            // bindings).
+            let chars: Vec<char> = app.prompt_buffer.chars().collect();
+            let cursor = app.prompt_cursor.min(chars.len());
+            let prefix = " > ";
+            let prefix_w = prefix.chars().count();
+            // Available chars for the prompt window — leave 1 cell
+            // of headroom past the cursor so the caret doesn't sit
+            // at the very edge.
+            let avail = (area.width as usize)
+                .saturating_sub(prefix_w + 1)
+                .max(1);
+            let scroll = if cursor >= avail {
+                cursor + 1 - avail
+            } else {
+                0
+            };
+            let visible: String = chars
+                .iter()
+                .skip(scroll)
+                .take(avail)
+                .collect::<String>()
+                // Render newlines as a glyph so multi-line prompts
+                // don't break statusline rendering (the statusline
+                // is one row; alt-enter inserts \n which we want
+                // to surface, not silently swallow).
+                .replace('\n', "↵");
+            cursor_pos = Some(Position {
+                x: area.x + (prefix_w + (cursor - scroll)) as u16,
+                y: area.y,
+            });
+            format!("{prefix}{visible}")
         }
         InputMode::Normal => {
             let scroll_hint = match app.mode {
@@ -2036,6 +2215,9 @@ fn render_statusline(f: &mut Frame, app: &App, area: Rect) {
     };
     let line = Paragraph::new(content).style(style);
     f.render_widget(line, area);
+    if let Some(pos) = cursor_pos {
+        f.set_cursor_position(pos);
+    }
 }
 
 // ── Main loop ───────────────────────────────────────────────────────
@@ -2101,12 +2283,25 @@ fn main() -> Result<()> {
     let mut stdout = io::stdout();
     enable_raw_mode()?;
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // mu-wd2: opt into the Kitty Keyboard Protocol so terminals that
+    // support it (Kitty, Foot, WezTerm, modern Konsole, alacritty
+    // with the right config) forward modifiers on keys that the
+    // legacy xterm encoding drops — most notably Shift-Enter,
+    // Ctrl-Enter, and friends. The escape sequence is a no-op on
+    // terminals that don't support it (they ignore the CSI), so we
+    // don't gate on a supports-check; the Pop on shutdown is
+    // similarly benign.
+    let _ = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let res = run(&mut terminal, mu, (cli.provider, cli.model));
 
     // Cleanup
+    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),

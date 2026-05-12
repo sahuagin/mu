@@ -1999,8 +1999,8 @@ fn render_usage(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let header_cells = [
-        "provider", "model", "sess", "ttft p95", "stream p95", "wall p95", "in tok",
-        "out tok", "cache%", "tools", "err",
+        "provider", "model", "sess", "ttft p95", "strm p95", "tool p95", "wall p95",
+        "in tok", "out tok", "cache%", "tools", "err",
     ]
     .iter()
     .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)));
@@ -2022,6 +2022,7 @@ fn render_usage(f: &mut Frame, app: &App, area: Rect) {
                 .unwrap_or(0);
             let ttft_p95 = fmt_ms_p95(row.get("ttft_ms"));
             let stream_p95 = fmt_ms_p95(row.get("streaming_ms"));
+            let tool_p95 = fmt_ms_p95(row.get("tool_total_ms"));
             let wall_p95 = fmt_ms_p95(row.get("wall_ms"));
             let in_tok = row
                 .get("input_tokens_sum")
@@ -2071,6 +2072,7 @@ fn render_usage(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(sessions.to_string()),
                 Cell::from(ttft_p95),
                 Cell::from(stream_p95),
+                Cell::from(tool_p95),
                 Cell::from(wall_p95),
                 Cell::from(format_thousands(in_tok)),
                 Cell::from(format_thousands(out_tok)),
@@ -2084,11 +2086,12 @@ fn render_usage(f: &mut Frame, app: &App, area: Rect) {
 
     let widths = [
         Constraint::Length(14), // provider
-        Constraint::Min(20),    // model
+        Constraint::Min(18),    // model
         Constraint::Length(5),  // sess
-        Constraint::Length(10), // ttft p95
-        Constraint::Length(10), // stream p95
-        Constraint::Length(10), // wall p95
+        Constraint::Length(9),  // ttft p95
+        Constraint::Length(9),  // strm p95
+        Constraint::Length(9),  // tool p95
+        Constraint::Length(9),  // wall p95
         Constraint::Length(8),  // in tok
         Constraint::Length(8),  // out tok
         Constraint::Length(6),  // cache%

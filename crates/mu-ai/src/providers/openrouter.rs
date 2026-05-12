@@ -61,11 +61,12 @@ impl OpenRouterProvider {
 impl Provider for OpenRouterProvider {
     async fn stream(
         &self,
+        system_prompt: Option<&str>,
         messages: &[AgentMessage],
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
-        let body = build_request_body(&self.model, messages, tools);
+        let body = build_request_body(&self.model, system_prompt, messages, tools);
         let resp = self
             .client
             .post(format!("{}/api/v1/chat/completions", self.api_base))
@@ -179,10 +180,21 @@ pub(crate) fn translate_message(m: &AgentMessage) -> Option<Value> {
 
 pub(crate) fn build_request_body(
     model: &str,
+    system_prompt: Option<&str>,
     messages: &[AgentMessage],
     tools: &[ToolSpec],
 ) -> Value {
-    let api_messages: Vec<Value> = messages.iter().filter_map(translate_message).collect();
+    // mu-n48: OpenAI-style providers express the system prompt as the
+    // first message in the array with role="system". Build the
+    // messages list with the system message PREPENDED (when set) so
+    // the rest of the wire format stays untouched.
+    let mut api_messages: Vec<Value> = Vec::new();
+    if let Some(s) = system_prompt {
+        if !s.is_empty() {
+            api_messages.push(json!({ "role": "system", "content": s }));
+        }
+    }
+    api_messages.extend(messages.iter().filter_map(translate_message));
     let mut body = json!({
         "model": model,
         "max_tokens": 4096,

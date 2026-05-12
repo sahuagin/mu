@@ -67,6 +67,7 @@ impl MockProvider {
 impl Provider for MockProvider {
     async fn stream(
         &self,
+        _system_prompt: Option<&str>,
         _messages: &[AgentMessage],
         _tools: &[ToolSpec],
         _cancel_rx: oneshot::Receiver<()>,
@@ -466,7 +467,10 @@ async fn b3_iteration_cap() {
     let provider = MockProvider::forever(tool_call_response);
     let tools = vec![MockTool::always_ok("echo", "ok")];
 
-    let config = AgentConfig { max_turns: 3 };
+    let config = AgentConfig {
+        max_turns: 3,
+        system_prompt: None,
+    };
     let (loop_, events_rx) = spawn_loop(provider, tools, config);
 
     loop_

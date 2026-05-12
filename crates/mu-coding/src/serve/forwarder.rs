@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 use mu_core::agent::{AgentEvent, AgentMessage};
 use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
+    AutonomousIterationCompletedEvent, AutonomousIterationStartedEvent, AutonomousTerminatedEvent,
     CalloutBody, CalloutEvent, DoneEvent, ErrorEvent, InputRequiredEvent, ProviderStatusEvent,
     TextDeltaEvent, ToolCallCompletedEvent, ToolCallStartedEvent, ToolOutcome,
 };
@@ -169,6 +170,29 @@ pub fn translate_event(
                 elapsed_ms,
                 bytes_received,
                 tool_call_id,
+            },
+        ),
+        AgentEvent::AutonomousIterationStarted { iteration, motivation } => to_pair(
+            AutonomousIterationStartedEvent::METHOD,
+            AutonomousIterationStartedEvent {
+                session_id: session_id.to_string(),
+                iteration,
+                motivation,
+            },
+        ),
+        AgentEvent::AutonomousIterationCompleted { iteration, outcome } => to_pair(
+            AutonomousIterationCompletedEvent::METHOD,
+            AutonomousIterationCompletedEvent {
+                session_id: session_id.to_string(),
+                iteration,
+                outcome,
+            },
+        ),
+        AgentEvent::AutonomousTerminated { reason } => to_pair(
+            AutonomousTerminatedEvent::METHOD,
+            AutonomousTerminatedEvent {
+                session_id: session_id.to_string(),
+                reason,
             },
         ),
         // Lifecycle events not in mu-001's notification surface.
@@ -372,6 +396,26 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
                 elapsed_ms: *elapsed_ms,
                 bytes_received: *bytes_received,
                 tool_call_id: tool_call_id.clone(),
+            },
+        )),
+        AgentEvent::AutonomousIterationStarted { iteration, motivation } => Some((
+            EventActor::Agent,
+            EventPayload::AutonomousIterationStarted {
+                iteration: *iteration,
+                motivation: motivation.clone(),
+            },
+        )),
+        AgentEvent::AutonomousIterationCompleted { iteration, outcome } => Some((
+            EventActor::Agent,
+            EventPayload::AutonomousIterationCompleted {
+                iteration: *iteration,
+                outcome: outcome.clone(),
+            },
+        )),
+        AgentEvent::AutonomousTerminated { reason } => Some((
+            EventActor::Agent,
+            EventPayload::AutonomousTerminated {
+                reason: reason.clone(),
             },
         )),
         AgentEvent::TextDelta { .. }

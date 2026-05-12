@@ -22,7 +22,7 @@ use mu_core::protocol::{
     Request, RespondToInputRequiredRequest, RespondToInputRequiredResponse, Response,
     ScheduleWakeupRequest, SessionEventsRequest, SessionEventsResponse, SessionListRequest,
     SessionListResponse, SessionStatsRequest, SessionStatsResponse, SessionStatusSummary,
-    StartAutonomousRequest,
+    StartAutonomousRequest, StartAutonomousResponse,
 };
 use mu_core::usage_history::{aggregate_into_rows, extract_per_session_metrics};
 use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
@@ -64,7 +64,7 @@ pub async fn dispatch(
         // mu-036 Phase A.2: wire surface ready, dispatch stubs return
         // a structured "not yet implemented" until Phase B (mu-3ao /
         // mu-7zn / mu-pv9) lands the agent-loop integration.
-        StartAutonomousRequest::METHOD => handle_start_autonomous(request, sessions),
+        StartAutonomousRequest::METHOD => handle_start_autonomous(request, sessions).await,
         ScheduleWakeupRequest::METHOD => handle_schedule_wakeup(request, sessions),
         RespondToInputRequiredRequest::METHOD => {
             handle_respond_to_input_required(request, sessions)
@@ -766,15 +766,17 @@ fn handle_daemon_usage_history(
     ok_response(request.id, to_value_or_null(resp))
 }
 
-/// mu-036 Phase A.2: stub for session.start_autonomous.
+/// mu-036 Phase B: session.start_autonomous handler.
 ///
 /// Validates the session exists and that its capability includes
-/// AutonomyCapability::Allowed (INV-1 enforcement). Returns a
-/// structured "not-yet-implemented" error until Phase B (mu-3ao)
-/// lands the agent-loop integration. The wire surface is complete
-/// — clients can code against the request/response shape today,
-/// just shouldn't yet expect accepted == true.
-fn handle_start_autonomous(
+/// `AutonomyCapability::Allowed` (INV-1 enforcement). On pass, sends
+/// `AgentInput::StartAutonomous { goal, options }` into the session's
+/// input channel; the agent loop transitions into `RunMode::Autonomous`
+/// and drives the iteration cycle. Bounds (`max_iterations`,
+/// `max_wall_clock_ms`, `max_total_tool_calls_in_autonomy`) are read
+/// from the session's `Capability` at every iteration boundary, NOT
+/// from `options` — INV-2 (options can narrow but never widen).
+async fn handle_start_autonomous(
     request: Request<Value>,
     sessions: Sessions,
 ) -> Response<Value> {
@@ -792,8 +794,6 @@ fn handle_start_autonomous(
             }
         };
 
-    // Capability check is real even in Phase A — better to surface
-    // a clear INV-1 violation now than wait for Phase B.
     let cap_handle = match sessions.capability(&params.session_id) {
         Some(c) => c,
         None => {
@@ -822,17 +822,36 @@ fn handle_start_autonomous(
         );
     }
 
-    // Capability check passed but Phase B isn't wired yet. Surface
-    // a clear error so callers don't get a silent accepted=true that
-    // does nothing.
-    err_response(
-        request.id,
-        codes::INTERNAL_ERROR,
-        "session.start_autonomous: wire surface ready (Phase A.2); \
-         agent-loop integration is Phase B (bead mu-3ao). \
-         Capability check passed; no loop will run yet."
-            .to_string(),
-    )
+    let sender = sessions.input_sender(&params.session_id);
+    match sender {
+        None => err_response(
+            request.id,
+            codes::INVALID_PARAMS,
+            format!(
+                "session.start_autonomous: session not found: {}",
+                params.session_id
+            ),
+        ),
+        Some(tx) => {
+            match tx
+                .send(AgentInput::StartAutonomous {
+                    goal: params.goal,
+                    options: params.options,
+                })
+                .await
+            {
+                Ok(_) => {
+                    let resp = StartAutonomousResponse { accepted: true };
+                    ok_response(request.id, to_value_or_null(resp))
+                }
+                Err(_) => err_response(
+                    request.id,
+                    codes::INTERNAL_ERROR,
+                    "session.start_autonomous: session loop has terminated",
+                ),
+            }
+        }
+    }
 }
 
 /// mu-036 Phase A.2: stub for session.schedule_wakeup. Same shape

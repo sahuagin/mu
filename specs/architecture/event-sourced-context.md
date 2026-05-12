@@ -535,14 +535,200 @@ Context inspector TUI view
 Mailbox / cooperating-session SessionMessage protocol
 ```
 
+## Skills, tools, and the active context as a retained pointer set
+
+The existing rope model handles memory and transcript spans. This amendment extends the same model to two additional span categories:
+
+- **Skills** — `SKILL.md` + reference files become addressable spans. Skill metadata (frontmatter), section headers, and reference files each address as separate spans. Activating a skill = adding pointers to the retained set; deactivating = dropping them. There is no separate "skill loader" mechanism — skill activation IS pointer-set membership.
+- **Tool schemas** — registered tools' descriptions and parameter schemas are spans. The active tool set IS a retained pointer set over tool-schema spans. Capability attenuation, subagent dispatch, and `--tools` filtering all become pointer-set operations.
+
+```text
+ActiveContext (RetainedPointerSet)
+  span(event: startup_instruction, …)       // pinned, always
+  span(event: skill_activation:goal-protocol, file: SKILL.md, lines 1-50)
+  span(event: skill_activation:goal-protocol, file: stop-criteria.md, lines 1-150)
+  span(event: tool_schema:Edit, version: v3)
+  span(event: tool_schema:Bash, version: v3, capability_filtered: true)
+  span(event: user_turn_N, …)                // volatile
+  span(event: tool_result_M, …)              // volatile
+```
+
+The active context is a *materialization function* over the retained pointer set. Renderers turn the set into provider messages (for the agent) or TUI artifacts (for the operator). Provenance is preserved: every byte in any rendered output traces back to a source span and the event that introduced it.
+
+### Implications
+
+- **No separate skill-loading code path.** The skill manager emits `skill.activated { skill_id, span_ids }` events; the rope picks up the spans into its retained set. Deactivation is the inverse.
+- **Tool registration becomes scope-local.** A subagent's tool set is its own retained subset over tool-schema spans, distinct from the parent's. No more "register globally, filter per-call."
+- **Capability changes are span-set changes.** Attenuating a delegate's capability = filtering the tool-schema span set the delegate inherits. The capability's "tool allowlist" maps directly to a pointer-set predicate.
+
+## Cache-boundary alignment
+
+Provider prompt caching (Anthropic's `cache_control`, equivalents in other providers) is currently expressed at message granularity. Under this model it is *derived* from span retention/stability:
+
+```text
+RopeRenderer
+  for each retained span, ordered by stability:
+    if span.cacheable && span.retention >= hot:
+       emit before cache boundary
+    else:
+       emit after cache boundary
+  attach cache_control at the boundary span (provider-specific rendering)
+```
+
+The cache boundary falls at the first volatile retained span (or the first non-cacheable stable span — a span can be stable but marked uncacheable for other reasons, e.g., contains time-stamps the model shouldn't rely on).
+
+### Why this is the right inversion
+
+Today: developer or harness annotates each message with `cache_control: ephemeral` at hand-picked boundaries.
+
+Under this model: each span carries metadata (`stable`, `cacheable`, `retention_class`). The renderer derives cache boundaries from that metadata. The annotation moves *from the per-message rendering layer* to the *per-span source layer* — closer to ground truth.
+
+### Independent validation: claude-code 2.1.139
+
+The `--exclude-dynamic-system-prompt-sections` flag (claude-code 2.1.139, observed 2026-05-12) does this manually: pushes `cwd`/`env-info`/`memory-paths`/`git-status` out of the system prompt into the first user message so the system prefix stays cacheable. Under mu's rope model, the same outcome is declarative — those spans are tagged `volatile`, the renderer places them after the cache boundary automatically. No flag needed.
+
+The `--bare` flag is the same idea expressed differently — a different *initial retention set* (drop pointers to hooks/LSP/CLAUDE.md/auto-memory/plugin-sync). Not a different code path; just a different policy.
+
+## Pluggable cache and provider strategies
+
+Two orthogonal extensibility points emerge from the cache-boundary section:
+
+```text
+trait ProviderRenderer
+  fn render(rope: &RetainedRope, target: ProjectionTarget) -> ProviderMessages
+
+trait CacheStrategy
+  fn boundaries(rope: &RetainedRope) -> Vec<CacheBoundary>
+  fn annotate(messages: &mut ProviderMessages, boundaries: &[CacheBoundary])
+```
+
+- **`ProviderRenderer`** is per-provider: Anthropic, OpenAI, FauxProvider. Translates the rope into the provider's message format.
+- **`CacheStrategy`** is composable with renderer: where to put cache boundaries, given the rope. Different strategies can be tried over the same rope.
+
+### Why this matters
+
+- **Provider differences are explicit.** Anthropic supports `cache_control`; OpenAI does not (currently); FauxProvider is a no-op. Each gets its own strategy implementation. No coupling between rope semantics and provider quirks.
+- **Strategies are A/B testable.** Run the same rope through two cache strategies, log hit rates, compare. The rope is the controlled variable; the strategy is the experimental variable.
+- **Provider migration is mechanical.** Switching a session from Anthropic to OpenAI = swap the `ProviderRenderer`; the rope is unchanged.
+
+## Agent-view vs operator-view projections
+
+The same retained pointer set materializes into two distinct projections:
+
+```text
+ProjectionTarget {
+  AgentView,       // provider messages — what the model sees
+  OperatorView,    // TUI / log rendering — what the human sees
+}
+```
+
+These share source spans but render *differently*:
+
+| Span kind | AgentView | OperatorView |
+|---|---|---|
+| Tool result (large JSON) | raw JSON, full | structured table or summary |
+| Skill activation | full SKILL.md + references | one-line badge "skill X loaded" |
+| Tool schema | full schema | tool name + one-line description |
+| Conversation turn | verbatim | verbatim (typically) |
+| Memory injection | full content | "memory X recalled" + collapsible |
+| Compacted span | summary only | summary + collapsible to original |
+
+### Why this separation matters
+
+LLM tools today conflate the agent view and the operator view. The human sees the *transcript*, which is also what the model saw. This is convenient but wrong: humans and models have different attention budgets, different relevance criteria, and different debugging needs.
+
+Separating the projections:
+- **Operator gets a usable surface.** Tool results are skimmable; agent context is summarizable; non-essential context can be collapsed.
+- **Agent gets full fidelity.** No display-driven truncation creeping into what the model sees.
+- **Debugging is now possible.** Operator can drill into "what did the agent actually see at turn N?" — that's an `AgentView(at_turn=N)` render of the rope at that time.
+- **The transcript is no longer load-bearing.** It becomes one of several projections; if a richer operator view is more useful, build it without affecting the agent.
+
+## Subagent context handoff via shared events + initial pointer-set
+
+A subagent does not inherit an opaque parent blob. It inherits:
+
+1. **Read-only access to the parent's event log** (entire history, queryable).
+2. **An initial pointer-set** — a subset of the parent's retained spans, plus optionally synthetic spans summarizing parent context (e.g., "your task is X, here's the file you should focus on").
+
+The subagent then maintains its own retained pointer-set (over BOTH parent events and its own events) and emits its own events into its own event log.
+
+```text
+ChildSession {
+  parent_session_id
+  parent_events_view: ReadOnlyHandle  // shared
+  initial_pointer_set: Vec<PointerToParentSpan>
+  own_event_log: WriteableLog
+  own_retained_set: RetainedPointerSet (over parent and own spans)
+}
+```
+
+### Eviction semantics
+
+The subagent's pointer-set is INDEPENDENT of the parent's. When the parent's rope compacts and drops a pointer to span S:
+- The parent's retained set no longer points at S
+- The parent's event log STILL HAS S (events are append-only)
+- If the subagent retained its OWN pointer to S, the subagent's rope is unaffected
+- "Eviction from parent = forgetting that pointer" — the data isn't destroyed, the reference is dropped
+
+This means parent compaction never strands the subagent. A long-running parent can prune its working set freely; a subagent that took an early snapshot keeps its view.
+
+### Why this is the right shape
+
+- **Decouples parent compaction pressure from subagent context.** Parent can be aggressive about working-set reduction without affecting children.
+- **Subagent context is auditable.** "What did the subagent see when it made decision X?" answers from the subagent's retained set at that time, traceable through both parent and own events.
+- **Event log sharing is cheap.** Read-only access to an append-only log is a stable reference, not a copy. Multiple subagents can share the same parent event log without contention.
+
+## Span source-change detection via OS file watches
+
+When a span is loaded from a file (skill, tool schema definition, system prompt template), the harness registers a file watch:
+
+- FreeBSD: `kqueue` (`EVFILT_VNODE`, `NOTE_WRITE | NOTE_DELETE | NOTE_RENAME`)
+- Linux: `inotify` (`IN_MODIFY | IN_DELETE | IN_MOVE`)
+- macOS: `kqueue` or `FSEvents`
+- Cross-platform abstraction via `notify` crate or feature-gated
+
+On change notification, emit:
+
+```text
+SourceChangedEvent {
+  span_id
+  source_path
+  change_kind: Modified | Deleted | Renamed
+  detected_at
+}
+```
+
+### Policy on the signal (separate from the signal itself)
+
+The default policy is **don't auto-reload**. The rope's retained pointer continues to address the *version of the file at activation time* — preserving reproducibility and ensuring the model never sees a context change it didn't observe via an event.
+
+The operator (or the agent, with permission) can issue `rehydrate(span_id)` to pick up the new version. Rehydration emits a `span.rehydrated` event in the log, making the version change observable.
+
+### Why signal/policy separation matters
+
+- **Reproducibility by default.** "What did the model know at turn N?" is answerable in the same way before and after a file change.
+- **Reload is an explicit, audited action.** Not a silent surprise.
+- **Multiple policies can coexist.** A development-mode session might auto-rehydrate skills on change (fast iteration); a production session never auto-rehydrates (stability).
+- **The watch is cheap regardless of policy.** Registering watches and emitting events doesn't force any particular reaction.
+
 ## Related memories
 
 - `a15e6caa` — event-sourced context + rope memory architecture
+- `3cc7a18c` — skills/cache/tools rope extension (the source for this amendment)
 - `5b69bcdf` — cooperating-sessions mailbox architecture
 - `f5a03e25` — mu evening state 2026-05-10
 - `b0e06d20` — per-turn vs session-cumulative accounting split
 - `7e44f7ad` — TUI session tree design
 - `17e4a19d` — accounting requirement
+
+## Related beads (implementation work)
+
+- `mu-qk8` — this amendment (the architecture-doc landing)
+- `mu-ktq` — Pluggable `ProviderRenderer` + `CacheStrategy` traits
+- `mu-nat` — Skills and tool schemas as rope spans (eliminate parallel loading mechanisms)
+- `mu-ovl` — Agent-view vs operator-view projections from the rope
+- `mu-x9j` — Subagent context handoff via shared read-only events + initial pointer-set
+- `mu-56p` — kqueue/inotify watches on file-loaded spans, with signal/policy separation
 
 ## Changelog
 
@@ -551,3 +737,9 @@ Mailbox / cooperating-session SessionMessage protocol
   drafting architecture, one orchestrating implementation tonight).
   Framed as application of existing events-not-mutations discipline
   rather than novel invention.
+- 2026-05-13 — amendment (mu-qk8): six new sections extending the
+  rope model to skills, tool schemas, cache boundaries, projection
+  targets, subagent handoff, and source-change file watches.
+  Independent validation from claude-code 2.1.139's
+  `--exclude-dynamic-system-prompt-sections` and `--bare` flags
+  (memory `3cc7a18c`, `fb5cd5be`).

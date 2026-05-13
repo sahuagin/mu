@@ -182,13 +182,16 @@ fn intersect_aws_sets(
     a: &HashSet<AwsCapability>,
     b: &HashSet<AwsCapability>,
 ) -> HashSet<AwsCapability> {
+    // Pre-index b by name for O(1) lookup, making the overall
+    // operation O(n+m) instead of O(n*m). Practical N is small but
+    // the cleaner algorithm is easy and obvious. (mu-lwt)
+    let b_by_name: std::collections::HashMap<&str, &AwsCapability> =
+        b.iter().map(|c| (c.name.as_str(), c)).collect();
     let mut result = HashSet::new();
     for cap in a {
-        for other in b {
-            if other.name == cap.name {
-                if let Some(narrower) = cap.intersect(other) {
-                    result.insert(narrower);
-                }
+        if let Some(other) = b_by_name.get(cap.name.as_str()) {
+            if let Some(narrower) = cap.intersect(other) {
+                result.insert(narrower);
             }
         }
     }
@@ -896,6 +899,41 @@ mod tests {
         }
         // Result is non-trivial (the test-data has overlap).
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn intersect_aws_sets_preserves_inv1_even_when_some_pairs_drop() {
+        // mu-lwt regression: when same-name caps have both-Some session
+        // policies, `AwsCapability::intersect` returns None (deferred) and
+        // the cap is dropped from `intersect_aws_sets`. The set-level INV-1
+        // property — result names ⊆ a.names AND result names ⊆ b.names —
+        // must still hold. Catches a future regression that might "fall
+        // back to keeping the original cap" on the None return path.
+        let pol_a = serde_json::json!({"Statement": [{"Effect": "Allow"}]});
+        let pol_b = serde_json::json!({"Statement": [{"Effect": "Deny"}]});
+        let a = aws_set(&[
+            aws_with_policy("aws.scout.readonly", pol_a),
+            aws("aws.auditor.read"),
+        ]);
+        let b = aws_set(&[
+            aws_with_policy("aws.scout.readonly", pol_b),
+            aws("aws.auditor.read"),
+        ]);
+        let result = intersect_aws_sets(&a, &b);
+        // scout was dropped (both-Some-Some deferred); auditor survives.
+        let result_names: HashSet<String> = result.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(
+            result_names,
+            ["aws.auditor.read".to_string()].into_iter().collect::<HashSet<String>>(),
+            "scout must be dropped (both-Some-Some deferred); auditor must survive"
+        );
+        // INV-1 at set level: every name in result is in BOTH a and b.
+        let a_names: HashSet<String> = a.iter().map(|c| c.name.clone()).collect();
+        let b_names: HashSet<String> = b.iter().map(|c| c.name.clone()).collect();
+        for cap in &result {
+            assert!(a_names.contains(&cap.name), "INV-1 violated: result name not in a: {}", cap.name);
+            assert!(b_names.contains(&cap.name), "INV-1 violated: result name not in b: {}", cap.name);
+        }
     }
 
     #[test]

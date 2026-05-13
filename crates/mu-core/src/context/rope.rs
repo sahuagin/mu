@@ -63,10 +63,15 @@ impl RetentionClass {
     }
 }
 
-/// Coarse discriminator for what role a span plays when rendered into
-/// provider messages. The full rope will have richer kind information
-/// (skill spans, tool-schema spans, etc.); the stub gives just enough
-/// for a renderer to choose a message role.
+/// Discriminator for what role a span plays when rendered into
+/// provider messages and how it should project differently between
+/// `AgentView` and `OperatorView` (see
+/// `specs/architecture/event-sourced-context.md` lines 538+ and
+/// 614-644). The variant set covers the four conversational roles
+/// (`System`/`User`/`Assistant`/`ToolResult`) plus the six
+/// projection-differentiated kinds the spec table at lines 627-634
+/// names individually (tool calls, tool schemas, skill activations,
+/// memory injections, compactions, file loads).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpanKind {
@@ -78,6 +83,31 @@ pub enum SpanKind {
     Assistant,
     /// Tool-call result delivered back to the model.
     ToolResult,
+    /// An outgoing tool invocation emitted by the assistant
+    /// (name + argument JSON). Distinct from `ToolResult`, which is
+    /// the value flowing back in.
+    ToolCall,
+    /// A registered tool's schema (name + parameter shape) consumed
+    /// as part of the active tool set. Projection-relevant: the
+    /// operator typically wants the name; the agent needs the schema.
+    ToolSchema,
+    /// A span emitted when a skill becomes active (skill metadata +
+    /// reference files entering the retained pointer set per spec
+    /// :542). Operator sees a one-line badge; agent sees the
+    /// activation payload.
+    SkillActivation,
+    /// Content pulled in via memory recall (`agent memory show`-style
+    /// injection). Operator sees a collapsed reference; agent sees
+    /// the full content.
+    MemoryInjection,
+    /// Synthetic span replacing N evicted spans (compaction event,
+    /// spec :531/:634). Operator sees the summary with a
+    /// drill-down handle; agent sees the summary content.
+    Compaction,
+    /// File content loaded into context (spec, skill, source). Often
+    /// volatile under file-watch rehydration. Operator sees a path +
+    /// length; agent sees the file content.
+    FileLoad,
 }
 
 /// One retained span in the rope.
@@ -230,5 +260,30 @@ mod tests {
         ];
         let rope = RetainedRope::from_spans(spans.clone());
         assert_eq!(rope.spans(), spans.as_slice());
+    }
+
+    #[test]
+    fn span_kind_serde_round_trips_all_variants() {
+        let cases = [
+            (SpanKind::System, "\"system\""),
+            (SpanKind::User, "\"user\""),
+            (SpanKind::Assistant, "\"assistant\""),
+            (SpanKind::ToolResult, "\"tool_result\""),
+            (SpanKind::ToolCall, "\"tool_call\""),
+            (SpanKind::ToolSchema, "\"tool_schema\""),
+            (SpanKind::SkillActivation, "\"skill_activation\""),
+            (SpanKind::MemoryInjection, "\"memory_injection\""),
+            (SpanKind::Compaction, "\"compaction\""),
+            (SpanKind::FileLoad, "\"file_load\""),
+        ];
+        for (kind, expected_json) in cases {
+            let encoded = serde_json::to_string(&kind).expect("serialize");
+            assert_eq!(
+                encoded, expected_json,
+                "snake_case wire form for {kind:?}",
+            );
+            let decoded: SpanKind = serde_json::from_str(&encoded).expect("round-trip");
+            assert_eq!(decoded, kind);
+        }
     }
 }

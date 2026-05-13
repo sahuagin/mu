@@ -72,12 +72,27 @@ pub enum ProviderRole {
 }
 
 impl From<SpanKind> for ProviderRole {
+    /// Map every `SpanKind` to the provider role under which its
+    /// content reaches the model. Rationale:
+    /// - `ToolCall` is content the assistant emitted, so it travels
+    ///   under `Assistant`.
+    /// - `ToolSchema`, `SkillActivation`, `MemoryInjection`,
+    ///   `Compaction`, and `FileLoad` are context injected on the
+    ///   harness's behalf (tool registries, recalled memory, file
+    ///   loads, compaction summaries). The model treats these as
+    ///   system-provided context, so they map to `System`.
     fn from(kind: SpanKind) -> Self {
         match kind {
             SpanKind::System => ProviderRole::System,
             SpanKind::User => ProviderRole::User,
             SpanKind::Assistant => ProviderRole::Assistant,
             SpanKind::ToolResult => ProviderRole::ToolResult,
+            SpanKind::ToolCall => ProviderRole::Assistant,
+            SpanKind::ToolSchema
+            | SpanKind::SkillActivation
+            | SpanKind::MemoryInjection
+            | SpanKind::Compaction
+            | SpanKind::FileLoad => ProviderRole::System,
         }
     }
 }
@@ -332,5 +347,29 @@ mod tests {
     fn renderer_trait_object_is_send_sync() {
         fn assert_send_sync<T: Send + Sync + ?Sized>() {}
         assert_send_sync::<dyn ProviderRenderer>();
+    }
+
+    #[test]
+    fn span_kind_maps_to_provider_role_exhaustively() {
+        use SpanKind::*;
+        let cases = [
+            (System, ProviderRole::System),
+            (User, ProviderRole::User),
+            (Assistant, ProviderRole::Assistant),
+            (ToolResult, ProviderRole::ToolResult),
+            (ToolCall, ProviderRole::Assistant),
+            (ToolSchema, ProviderRole::System),
+            (SkillActivation, ProviderRole::System),
+            (MemoryInjection, ProviderRole::System),
+            (Compaction, ProviderRole::System),
+            (FileLoad, ProviderRole::System),
+        ];
+        for (kind, expected) in cases {
+            let actual: ProviderRole = kind.into();
+            assert_eq!(
+                actual, expected,
+                "{kind:?} should map to {expected:?}",
+            );
+        }
     }
 }

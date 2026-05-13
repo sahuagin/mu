@@ -1284,6 +1284,7 @@ mod tests {
                 expires_in_seconds: Some(300),
                 max_tool_calls: Some(10),
                 autonomy: crate::capability::AutonomyCapability::default(),
+                aws: None,
             }),
         };
         let value = serde_json::to_value(&req)?;

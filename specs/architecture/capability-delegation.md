@@ -316,6 +316,97 @@ mu-XXX:           argument-shape caveats (Datalog)
 - `17e4a19d` — accounting requirement; biscuit budget enforcement is
   the runtime answer to "this delegate ran out of budget."
 
+## AWS-capability axis (mu-f5o, 2026-05-13)
+
+The `Capability` struct grows an `aws` axis: a typed namespace of
+AWS-role grants the session holds. Matches the catalog at
+`mu-aws-sandbox-infra/capabilities/aws.json` (entries like
+`aws.scout.readonly`, `aws.sandbox.build`).
+
+```rust
+pub struct AwsCapability {
+    pub name: String,                              // catalog name
+    pub session_policy: Option<serde_json::Value>, // optional inline narrowing
+}
+
+// On Capability:
+pub aws: HashSet<AwsCapability>,                   // empty = no AWS access
+
+// On CapabilityAttenuations:
+pub aws: Option<Vec<AwsCapability>>,               // None = no narrowing requested
+```
+
+**Shape rationale (HashSet, not `Option<AwsCapability>` or
+enum-of-variants):**
+
+- `HashSet` over `Option` so a worker can legitimately hold multiple
+  AWS caps at once (e.g. `aws.scout.readonly` + `aws.sandbox.build`) —
+  the per-experiment design fork in `mu-aws-sandbox-infra/docs/mu-integration.md`
+  required this for the broker pattern.
+- Struct-of-axes over enum-of-variants: the earlier `Capability` enum
+  proposal in the AWS-side doc predates this codebase's design.
+  `Capability` is already a multi-axis struct (`allowed_tools`,
+  `expires_at_unix_ms`, `max_tool_calls_remaining`, `autonomy`, ...);
+  AWS as another axis preserves uniform attenuation algebra and
+  composes with the broker pattern without enum-match scaffolding at
+  every dispatch site.
+
+**Hash/Eq:** `serde_json::Value` lacks a `Hash` impl, so `AwsCapability`
+hand-implements `Hash` on `name` only while keeping `PartialEq` over
+both fields. `HashSet<AwsCapability>` therefore stores caps as distinct
+elements whenever either field differs; the practical invariant
+"one cap per name" is enforced by the `intersect` operation, which
+collapses same-name pairs.
+
+### Narrowing-only semantics (INV-1 generalized)
+
+`AwsCapability::intersect(&self, other) -> Option<Self>`:
+- Different name → `None` (incompatible; drop on intersect).
+- Same name, both `session_policy = None` → `Some` with `None` policy.
+- Same name, exactly one `Some` policy → `Some` with that policy
+  (the `Some` side is narrower than the `None` side, which represents
+  "use the role's identity policy as-is").
+- Same name, both `Some` policies → `None`. AWS-style policy
+  intersection (the algebra over Effect/Action/Resource/Condition) is
+  deferred to a future bead. Conservative `None` preserves the
+  narrowing-only invariant rather than producing a possibly-too-broad
+  combined policy.
+
+`intersect_aws_sets(a, b) -> HashSet<AwsCapability>`: pairwise per-name
+intersect; names present on only one side are dropped. Result ⊆ a and
+result ⊆ b by name.
+
+Two top-level operations consume this:
+
+1. `Capability::attenuate(&self, &CapabilityAttenuations)` —
+   asymmetric (parent + delegate's narrowing request). For AWS:
+   - `attenuations.aws = None` → child inherits parent's set (no
+     narrowing requested on this axis).
+   - `attenuations.aws = Some(req)` → child gets
+     `intersect_aws_sets(parent.aws, req-as-set)`.
+2. `Capability::intersect(&self, &Self) -> Self` (new) — symmetric
+   composition of two grants (broker-pattern primitive: parent's
+   grant ∩ judge's grant). For AWS: `intersect_aws_sets` directly.
+
+INV-1 (narrowing-only) is the load-bearing invariant: every result of
+`intersect` and `attenuate` is ⊆ both inputs on every axis, the AWS
+axis included. Out of `Capability::root()` (empty AWS set), no
+sequence of `attenuate` or `intersect` calls can produce a non-empty
+AWS set — caps must be explicitly granted at construction.
+
+### Deferred (out of scope for mu-f5o)
+
+- `session_policy` intersection algorithm (the AWS-policy algebra over
+  Effect/Action/Resource/Condition). Field is carried; intersect of
+  two `Some` returns `None` for now.
+- The capability-broker runtime (judge + orchestrator agents that
+  produce attenuated grants from a session's stated need).
+- An `aws-recon` skill that activates an `AwsCapability` and routes
+  tool execution through `mu-aws-capability-run.sh`.
+- Cross-daemon biscuit-auth serialization (a future swap of the
+  in-process types for signed biscuit tokens; the algebra stays
+  identical).
+
 ## Changelog
 
 - 2026-05-10 — initial doc, drafted from a late-evening design
@@ -323,3 +414,8 @@ mu-XXX:           argument-shape caveats (Datalog)
   metadata + biscuit attenuation into one coherent capability
   substrate. No immediate implementation beyond v1
   (`RetryPolicy::Never` enforcement) coming in the next commit.
+- 2026-05-13 — mu-f5o adds the `aws` axis on `Capability` (typed
+  AWS role-grants) and a new symmetric `Capability::intersect()` as
+  the broker-pattern primitive. AWS axis follows narrowing-only
+  semantics (INV-1 generalized). `session_policy` intersection
+  deferred.

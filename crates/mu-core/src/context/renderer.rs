@@ -215,28 +215,76 @@ pub trait ProviderRenderer: Send + Sync {
 /// Foundational renderer impl — one message per span, role derived
 /// from [`SpanKind`].
 ///
-/// Differentiation between [`AgentView`] and [`OperatorView`] is
-/// intentionally minimal: the operator view prefixes each message
-/// content with `[span:<id>] ` to demonstrate that the renderer
-/// respects the target. Production renderers will replace tool-
-/// result JSON with structured summaries in OperatorView, surface
-/// skill activations as one-line badges, etc. (see spec table at
-/// lines 626-635).
+/// `AgentView` always emits `span.content` verbatim: production
+/// agents must see full fidelity. `OperatorView` applies per-kind
+/// rules from `specs/architecture/event-sourced-context.md` table
+/// at lines 627-634: conversational kinds render verbatim, while
+/// tool / skill / memory / compaction / file-load kinds project
+/// into compact badges, collapsibles, or one-line summaries.
+///
+/// Production renderers (Anthropic, OpenAI; mu-bn4, mu-3aa) will
+/// keep the same `OperatorView` projection contract — the rope is
+/// the controlled variable and the projection rules are renderer-
+/// independent. `FauxProviderRenderer`'s rules are the reference
+/// implementation.
 ///
 /// [`AgentView`]: ProjectionTarget::AgentView
 /// [`OperatorView`]: ProjectionTarget::OperatorView
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FauxProviderRenderer;
 
+/// Maximum characters of `span.content` to surface in a one-line
+/// `OperatorView` summary before ellipsis. Tuned for readability in
+/// a terminal pane; not a parser-relevant boundary.
+const SUMMARY_LINE_MAX_CHARS: usize = 80;
+
+/// First-line summary of `content`, truncated with an ellipsis if
+/// longer than [`SUMMARY_LINE_MAX_CHARS`]. Used by the rich
+/// `OperatorView` kinds (`ToolCall`, `ToolResult`, `Compaction`)
+/// where a one-line preview is more useful than the full body.
+fn summary_line(content: &str) -> String {
+    let first = content.lines().next().unwrap_or("");
+    if first.chars().count() > SUMMARY_LINE_MAX_CHARS {
+        let truncated: String = first.chars().take(SUMMARY_LINE_MAX_CHARS - 1).collect();
+        format!("{truncated}…")
+    } else {
+        first.to_string()
+    }
+}
+
 impl FauxProviderRenderer {
     pub fn new() -> Self {
         Self
     }
 
+    /// Per-kind `OperatorView` rules. `AgentView` is always
+    /// `span.content` verbatim. See module-level docs and spec
+    /// table at lines 627-634.
     fn render_content(span: &Span, target: ProjectionTarget) -> String {
         match target {
             ProjectionTarget::AgentView => span.content.clone(),
-            ProjectionTarget::OperatorView => format!("[span:{}] {}", span.id, span.content),
+            ProjectionTarget::OperatorView => match span.kind {
+                SpanKind::System | SpanKind::User | SpanKind::Assistant => {
+                    span.content.clone()
+                }
+                SpanKind::ToolResult => {
+                    format!("[tool-result:{}] {}", span.id, summary_line(&span.content))
+                }
+                SpanKind::ToolCall => {
+                    format!("[call:{}] {}", span.id, summary_line(&span.content))
+                }
+                SpanKind::ToolSchema => format!("[tool:{}]", span.id),
+                SpanKind::SkillActivation => format!("[skill:{}]", span.id),
+                SpanKind::MemoryInjection => {
+                    format!("<memory id={} collapsed/>", span.id)
+                }
+                SpanKind::Compaction => {
+                    format!("[compacted:{}] {}", span.id, summary_line(&span.content))
+                }
+                SpanKind::FileLoad => {
+                    format!("[file:{}] {} bytes", span.id, span.content.len())
+                }
+            },
         }
     }
 }
@@ -312,12 +360,125 @@ mod tests {
     }
 
     #[test]
-    fn operator_view_prefixes_with_span_id() {
+    fn operator_view_renders_conversational_kinds_verbatim() {
         let rope = sample_rope();
         let rendered = FauxProviderRenderer::new().render(&rope, ProjectionTarget::OperatorView);
         assert_eq!(rendered.target, ProjectionTarget::OperatorView);
-        assert_eq!(rendered.messages[0].content, "[span:sys] you are mu");
-        assert_eq!(rendered.messages[1].content, "[span:u1] hi");
+        assert_eq!(rendered.messages[0].content, "you are mu");
+        assert_eq!(rendered.messages[1].content, "hi");
+        assert_eq!(rendered.messages[2].content, "hello");
+    }
+
+    #[test]
+    fn operator_view_renders_tool_result_as_one_line_summary() {
+        let rope = sample_rope();
+        let rendered = FauxProviderRenderer::new().render(&rope, ProjectionTarget::OperatorView);
+        assert_eq!(rendered.messages[3].content, "[tool-result:t1] {\"ok\":true}");
+    }
+
+    fn enriched_rope() -> RetainedRope {
+        RetainedRope::from_spans(vec![
+            Span::new(
+                "call-bash",
+                SpanKind::ToolCall,
+                "bash(command=\"ls\")",
+                RetentionClass::Warm,
+            ),
+            Span::new(
+                "bash",
+                SpanKind::ToolSchema,
+                "{\"name\":\"bash\",\"params\":{\"command\":\"string\"}}",
+                RetentionClass::Hot,
+            ),
+            Span::new(
+                "goal-protocol",
+                SpanKind::SkillActivation,
+                "skill: goal-protocol\nreferences: stop-criteria.md, tool-conventions.md",
+                RetentionClass::Pinned,
+            ),
+            Span::new(
+                "mem-42",
+                SpanKind::MemoryInjection,
+                "operator prefers terse responses without trailing summaries",
+                RetentionClass::Warm,
+            ),
+            Span::new(
+                "compact-1",
+                SpanKind::Compaction,
+                "compacted 12 spans: early debugging dialogue about FauxProviderRenderer",
+                RetentionClass::Warm,
+            ),
+            Span::new(
+                "spec.md",
+                SpanKind::FileLoad,
+                "line1\nline2\nline3\n",
+                RetentionClass::Hot,
+            ),
+        ])
+    }
+
+    #[test]
+    fn agent_view_is_unchanged_for_original_four_variants() {
+        let rope = sample_rope();
+        let rendered = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+        for (msg, span) in rendered.messages.iter().zip(rope.spans()) {
+            assert_eq!(
+                msg.content, span.content,
+                "AgentView for original kind {:?} (id={}) must be verbatim",
+                span.kind, span.id,
+            );
+        }
+    }
+
+    #[test]
+    fn agent_view_is_verbatim_for_enriched_kinds_too() {
+        let rope = enriched_rope();
+        let rendered = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+        for (msg, span) in rendered.messages.iter().zip(rope.spans()) {
+            assert_eq!(
+                msg.content, span.content,
+                "AgentView for enriched kind {:?} (id={}) must be verbatim",
+                span.kind, span.id,
+            );
+        }
+    }
+
+    #[test]
+    fn operator_view_differs_from_agent_view_for_enriched_kinds() {
+        let rope = enriched_rope();
+        let renderer = FauxProviderRenderer::new();
+        let agent = renderer.render(&rope, ProjectionTarget::AgentView);
+        let operator = renderer.render(&rope, ProjectionTarget::OperatorView);
+
+        let mut differing = 0usize;
+        for (a, o) in agent.messages.iter().zip(operator.messages.iter()) {
+            assert_eq!(a.role, o.role, "role identity across projections");
+            if a.content != o.content {
+                differing += 1;
+            }
+        }
+        assert!(
+            differing >= 4,
+            "spec :627-634 demands operator-side differentiation for tool/skill/memory/compaction/file-load kinds; only {differing} of {} differed",
+            agent.messages.len(),
+        );
+    }
+
+    #[test]
+    fn operator_view_applies_expected_per_kind_shapes() {
+        let rope = enriched_rope();
+        let rendered = FauxProviderRenderer::new().render(&rope, ProjectionTarget::OperatorView);
+        let contents: Vec<&str> =
+            rendered.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents[0], "[call:call-bash] bash(command=\"ls\")");
+        assert_eq!(contents[1], "[tool:bash]");
+        assert_eq!(contents[2], "[skill:goal-protocol]");
+        assert_eq!(contents[3], "<memory id=mem-42 collapsed/>");
+        assert_eq!(
+            contents[4],
+            "[compacted:compact-1] compacted 12 spans: early debugging dialogue about FauxProviderRenderer",
+        );
+        assert_eq!(contents[5], "[file:spec.md] 18 bytes");
     }
 
     #[test]

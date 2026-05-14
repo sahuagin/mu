@@ -226,7 +226,10 @@ mod tests {
         assert!(s1.cacheable, "stable retention should default to cacheable");
 
         let s2 = Span::new("b", SpanKind::User, "bye", RetentionClass::Cold);
-        assert!(!s2.cacheable, "non-stable retention should default to uncacheable");
+        assert!(
+            !s2.cacheable,
+            "non-stable retention should default to uncacheable"
+        );
     }
 
     #[test]
@@ -278,10 +281,7 @@ mod tests {
         ];
         for (kind, expected_json) in cases {
             let encoded = serde_json::to_string(&kind).expect("serialize");
-            assert_eq!(
-                encoded, expected_json,
-                "snake_case wire form for {kind:?}",
-            );
+            assert_eq!(encoded, expected_json, "snake_case wire form for {kind:?}",);
             let decoded: SpanKind = serde_json::from_str(&encoded).expect("round-trip");
             assert_eq!(decoded, kind);
         }

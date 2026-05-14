@@ -93,7 +93,7 @@ pub enum EventPayload {
         is_error: bool,
     },
     /// One `ask_session` round-trip terminated. The aggregated usage
-    /// + elapsed_ms here is what was sent on the wire's `session.done`
+    /// and elapsed_ms here are what was sent on the wire's `session.done`
     /// notification. Summing across all Done events in a session
     /// gives session-cumulative usage.
     Done {
@@ -164,11 +164,16 @@ pub enum EventPayload {
     /// While sleeping, no provider calls fire (INV-5). On wake, the
     /// next `AutonomousIterationStarted` carries `reason` as its
     /// motivation.
-    AutonomousScheduledWakeup { wake_at_unix_ms: u64, reason: String },
+    AutonomousScheduledWakeup {
+        wake_at_unix_ms: u64,
+        reason: String,
+    },
     /// mu-036: autonomous loop terminated. Always the final autonomy
     /// event for this run (INV-7); session returns to RunMode::Idle
     /// and is addressable via ask_session again.
-    AutonomousTerminated { reason: crate::protocol::AutonomousTerminationReason },
+    AutonomousTerminated {
+        reason: crate::protocol::AutonomousTerminationReason,
+    },
     /// Durable mirror of the wire-side `session.provider_status`
     /// notification (mu-035). Emitted on state transitions and on
     /// periodic ticks during non-streaming waits, both for
@@ -235,9 +240,7 @@ impl SessionEventLog {
     /// skipped M malformed ones." `session_id` is taken from the
     /// first event; if the file has no events, falls back to the
     /// filename stem.
-    pub fn from_jsonl(
-        path: &std::path::Path,
-    ) -> std::io::Result<(Self, usize)> {
+    pub fn from_jsonl(path: &std::path::Path) -> std::io::Result<(Self, usize)> {
         use std::io::BufRead;
 
         let file = std::fs::File::open(path)?;
@@ -296,16 +299,11 @@ impl SessionEventLog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        let mut guard = self.disk_writer.lock().map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "disk_writer mutex poisoned",
-            )
-        })?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut guard = self
+            .disk_writer
+            .lock()
+            .map_err(|_| std::io::Error::other("disk_writer mutex poisoned"))?;
         *guard = Some(file);
         Ok(path.to_path_buf())
     }
@@ -407,7 +405,7 @@ impl SessionEventLog {
         for ev in events.iter() {
             if let EventPayload::Done { usage: Some(u), .. } = &ev.payload {
                 acc = Some(match acc {
-                    Some(prev) => prev.add(*u),
+                    Some(prev) => prev + *u,
                     None => *u,
                 });
             }
@@ -542,7 +540,7 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{ContentBlock, ToolCall};
+    use crate::agent::ContentBlock;
     use serde_json::json;
 
     fn sample_usage(input: u64, output: u64) -> Usage {
@@ -558,13 +556,21 @@ mod tests {
     #[test]
     fn append_assigns_monotonic_ids() {
         let log = SessionEventLog::new("s1");
-        let a = log.append(EventActor::User, EventPayload::UserMessage { content: "hi".into() });
-        let b = log.append(EventActor::Agent, EventPayload::Done {
-            stop_reason: StopReason::EndTurn,
-            turn_count: 1,
-            usage: None,
-            elapsed_ms: None,
-        });
+        let a = log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "hi".into(),
+            },
+        );
+        let b = log.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: None,
+                elapsed_ms: None,
+            },
+        );
         assert_eq!(a, 1);
         assert_eq!(b, 2);
         assert_eq!(log.len(), 2);
@@ -574,26 +580,35 @@ mod tests {
     fn cumulative_usage_sums_done_events() {
         let log = SessionEventLog::new("s1");
         // First ask: 100 in, 50 out
-        log.append(EventActor::Agent, EventPayload::Done {
-            stop_reason: StopReason::EndTurn,
-            turn_count: 1,
-            usage: Some(sample_usage(100, 50)),
-            elapsed_ms: Some(500),
-        });
+        log.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: Some(sample_usage(100, 50)),
+                elapsed_ms: Some(500),
+            },
+        );
         // Second ask: 200 in, 75 out
-        log.append(EventActor::Agent, EventPayload::Done {
-            stop_reason: StopReason::EndTurn,
-            turn_count: 1,
-            usage: Some(sample_usage(200, 75)),
-            elapsed_ms: Some(800),
-        });
+        log.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: Some(sample_usage(200, 75)),
+                elapsed_ms: Some(800),
+            },
+        );
         // Third ask: no usage reported (e.g. provider hiccup)
-        log.append(EventActor::Agent, EventPayload::Done {
-            stop_reason: StopReason::EndTurn,
-            turn_count: 1,
-            usage: None,
-            elapsed_ms: Some(100),
-        });
+        log.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: None,
+                elapsed_ms: Some(100),
+            },
+        );
         let cumulative = log.cumulative_usage().expect("at least one Done had usage");
         assert_eq!(cumulative.input_tokens, 300);
         assert_eq!(cumulative.output_tokens, 125);
@@ -604,13 +619,21 @@ mod tests {
     #[test]
     fn cumulative_usage_none_when_no_done_reported() {
         let log = SessionEventLog::new("s1");
-        log.append(EventActor::User, EventPayload::UserMessage { content: "hi".into() });
-        log.append(EventActor::Agent, EventPayload::Done {
-            stop_reason: StopReason::EndTurn,
-            turn_count: 1,
-            usage: None,
-            elapsed_ms: None,
-        });
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "hi".into(),
+            },
+        );
+        log.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: None,
+                elapsed_ms: None,
+            },
+        );
         assert!(log.cumulative_usage().is_none());
         assert_eq!(log.ask_count(), 1);
         assert_eq!(log.elapsed_total_ms(), 0);
@@ -621,7 +644,9 @@ mod tests {
         let log = SessionEventLog::new("ca-count");
         log.append(
             EventActor::User,
-            EventPayload::UserMessage { content: "hi".into() },
+            EventPayload::UserMessage {
+                content: "hi".into(),
+            },
         );
         log.append(
             EventActor::System,
@@ -696,7 +721,12 @@ mod tests {
     #[test]
     fn tool_call_count_includes_only_tool_calls() {
         let log = SessionEventLog::new("s1");
-        log.append(EventActor::User, EventPayload::UserMessage { content: "do it".into() });
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "do it".into(),
+            },
+        );
         log.append(
             EventActor::Agent,
             EventPayload::ToolCall {
@@ -706,7 +736,9 @@ mod tests {
             },
         );
         log.append(
-            EventActor::Tool { name: "read".into() },
+            EventActor::Tool {
+                name: "read".into(),
+            },
             EventPayload::ToolResult {
                 call_id: "c1".into(),
                 content: "contents".into(),
@@ -769,7 +801,9 @@ mod tests {
                 actor: EventActor::Agent,
                 payload: EventPayload::AssistantMessageEvent {
                     message: AssistantMessage {
-                        content: vec![ContentBlock::Text { text: "hi back".into() }],
+                        content: vec![ContentBlock::Text {
+                            text: "hi back".into(),
+                        }],
                         stop_reason: StopReason::EndTurn,
                         usage: Some(sample_usage(42, 7)),
                     },
@@ -780,7 +814,9 @@ mod tests {
                 session_id: "s1".into(),
                 parent_event_ids: vec![],
                 timestamp_unix_ms: 1_700_000_001_000,
-                actor: EventActor::Tool { name: "read".into() },
+                actor: EventActor::Tool {
+                    name: "read".into(),
+                },
                 payload: EventPayload::ToolResult {
                     call_id: "c1".into(),
                     content: "file contents".into(),

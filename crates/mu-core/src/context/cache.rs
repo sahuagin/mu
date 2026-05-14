@@ -142,10 +142,20 @@ mod tests {
 
     fn sample_rope() -> RetainedRope {
         RetainedRope::from_spans(vec![
-            Span::new("sys", SpanKind::System, "you are mu", RetentionClass::Startup),
+            Span::new(
+                "sys",
+                SpanKind::System,
+                "you are mu",
+                RetentionClass::Startup,
+            ),
             Span::new("u1", SpanKind::User, "hi", RetentionClass::Hot),
             Span::new("a1", SpanKind::Assistant, "hello", RetentionClass::Hot),
-            Span::new("u2", SpanKind::User, "what time is it", RetentionClass::Warm),
+            Span::new(
+                "u2",
+                SpanKind::User,
+                "what time is it",
+                RetentionClass::Warm,
+            ),
         ])
     }
 
@@ -159,8 +169,7 @@ mod tests {
     #[test]
     fn no_cache_annotate_is_no_op() {
         let rope = sample_rope();
-        let mut rendered =
-            FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+        let mut rendered = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
         let before = rendered.clone();
         // Even if (somehow) the caller passes a non-empty boundary
         // list, NoCacheStrategy must not mutate.

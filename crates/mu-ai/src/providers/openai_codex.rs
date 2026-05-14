@@ -46,8 +46,7 @@ const PROVIDER_KEY: &str = "openai-codex";
 /// field). Kept short and provider-agnostic — actual agent-loop
 /// behavior (tool use, output style) is driven by mu's own loop, not
 /// by this string. Callers can override via `with_instructions`.
-const DEFAULT_INSTRUCTIONS: &str =
-    "You are mu, a coding agent. Respond concisely. \
+const DEFAULT_INSTRUCTIONS: &str = "You are mu, a coding agent. Respond concisely. \
      When tools are provided, prefer to use them rather than asking \
      the user for information you could obtain yourself.";
 
@@ -330,10 +329,7 @@ enum SseFrame {
     #[serde(rename = "response.output_text.delta")]
     OutputTextDelta { delta: String },
     #[serde(rename = "response.output_item.added")]
-    OutputItemAdded {
-        output_index: u32,
-        item: OutputItem,
-    },
+    OutputItemAdded { output_index: u32, item: OutputItem },
     #[serde(rename = "response.function_call.arguments.delta")]
     FunctionCallArgumentsDelta {
         output_index: u32,
@@ -342,10 +338,7 @@ enum SseFrame {
         delta: String,
     },
     #[serde(rename = "response.output_item.done")]
-    OutputItemDone {
-        output_index: u32,
-        item: OutputItem,
-    },
+    OutputItemDone { output_index: u32, item: OutputItem },
     #[serde(rename = "response.reasoning_summary.delta")]
     ReasoningSummaryDelta { delta: String },
     #[serde(rename = "response.reasoning_summary_text.delta")]
@@ -674,13 +667,10 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                     arguments,
                 } = item
                 {
-                    let entry = state
-                        .tool_calls
-                        .entry(output_index)
-                        .or_insert_with(|| {
-                            state.tool_call_order.push(output_index);
-                            ToolCallBuilder::default()
-                        });
+                    let entry = state.tool_calls.entry(output_index).or_insert_with(|| {
+                        state.tool_call_order.push(output_index);
+                        ToolCallBuilder::default()
+                    });
                     if let Some(v) = id {
                         entry._item_id = v;
                     }
@@ -704,13 +694,10 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 _item_id: _,
                 delta,
             } => {
-                let entry = state
-                    .tool_calls
-                    .entry(output_index)
-                    .or_insert_with(|| {
-                        state.tool_call_order.push(output_index);
-                        ToolCallBuilder::default()
-                    });
+                let entry = state.tool_calls.entry(output_index).or_insert_with(|| {
+                    state.tool_call_order.push(output_index);
+                    ToolCallBuilder::default()
+                });
                 entry.args_json.push_str(&delta);
                 // Surface the delta — `id` is the call_id (matches
                 // the tool_call_output we'll send back). Empty
@@ -739,13 +726,10 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                     // didn't already cover. Final `arguments`
                     // overrides accumulation if present (it should
                     // be the full JSON).
-                    let entry = state
-                        .tool_calls
-                        .entry(output_index)
-                        .or_insert_with(|| {
-                            state.tool_call_order.push(output_index);
-                            ToolCallBuilder::default()
-                        });
+                    let entry = state.tool_calls.entry(output_index).or_insert_with(|| {
+                        state.tool_call_order.push(output_index);
+                        ToolCallBuilder::default()
+                    });
                     if let Some(v) = id {
                         entry._item_id = v;
                     }
@@ -835,13 +819,7 @@ impl Provider for OpenaiCodexProvider {
         let instructions: &str = system_prompt
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.instructions);
-        let body = build_request_body(
-            &self.model,
-            &self.thinking,
-            instructions,
-            messages,
-            tools,
-        );
+        let body = build_request_body(&self.model, &self.thinking, instructions, messages, tools);
 
         // First attempt with the current token.
         let initial_token = self.token.lock().await.clone();

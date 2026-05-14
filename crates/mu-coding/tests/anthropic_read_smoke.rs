@@ -35,18 +35,15 @@ async fn mu_010_read_tool_end_to_end_via_anthropic() {
         tmp.display()
     );
 
-    let (stdout, status) = run_mu_ask(&[
-        "--provider",
-        "anthropic-api",
-        "--tools",
-        "read",
-        &prompt,
-    ])
-    .await;
+    let (stdout, status) =
+        run_mu_ask(&["--provider", "anthropic-api", "--tools", "read", &prompt]).await;
 
     let _ = std::fs::remove_file(&tmp);
 
-    assert!(status.success(), "non-zero exit: {status}\n--- stdout ---\n{stdout}");
+    assert!(
+        status.success(),
+        "non-zero exit: {status}\n--- stdout ---\n{stdout}"
+    );
     assert!(
         stdout.contains(secret),
         "expected stdout to contain the secret token; got:\n{stdout}"

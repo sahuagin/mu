@@ -112,10 +112,12 @@ impl Tool for EditTool {
             }
 
             let path_for_task = path.clone();
-            let task_handle = tokio::task::spawn_blocking(move || -> std::io::Result<(String, std::path::PathBuf)> {
-                let contents = std::fs::read_to_string(&path_for_task)?;
-                Ok((contents, path_for_task))
-            });
+            let task_handle = tokio::task::spawn_blocking(
+                move || -> std::io::Result<(String, std::path::PathBuf)> {
+                    let contents = std::fs::read_to_string(&path_for_task)?;
+                    Ok((contents, path_for_task))
+                },
+            );
 
             let (contents, path_owned) = tokio::select! {
                 join = task_handle => match join {
@@ -144,10 +146,7 @@ impl Tool for EditTool {
             let occurrences = contents.matches(&old_string).count();
             if occurrences == 0 {
                 return ToolResult {
-                    content: format!(
-                        "edit: `old_string` not found in {}",
-                        path.display()
-                    ),
+                    content: format!("edit: `old_string` not found in {}", path.display()),
                     is_error: true,
                 };
             }
@@ -168,9 +167,8 @@ impl Tool for EditTool {
             } else {
                 // Exactly one occurrence — replace by find+splice for clarity.
                 let idx = contents.find(&old_string).expect("checked count > 0");
-                let mut s = String::with_capacity(
-                    contents.len() - old_string.len() + new_string.len(),
-                );
+                let mut s =
+                    String::with_capacity(contents.len() - old_string.len() + new_string.len());
                 s.push_str(&contents[..idx]);
                 s.push_str(&new_string);
                 s.push_str(&contents[idx + old_string.len()..]);
@@ -178,8 +176,7 @@ impl Tool for EditTool {
             };
 
             let write_handle = tokio::task::spawn_blocking(move || {
-                std::fs::write(&path_owned, new_contents.as_bytes())
-                    .map(|_| new_contents.len())
+                std::fs::write(&path_owned, new_contents.as_bytes()).map(|_| new_contents.len())
             });
 
             match write_handle.await {

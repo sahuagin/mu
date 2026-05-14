@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "mu",
     about = "Coding agent. mu serve is the daemon; everything else is a frontend.",
-    version,
+    version
 )]
 struct Cli {
     #[command(subcommand)]
@@ -164,7 +164,14 @@ async fn main() -> Result<()> {
             bash_prompt,
         } => {
             mu_coding::ask::run(
-                prompt, provider, model, tools, ephemeral, thinking, bash_yolo, bash_allow,
+                prompt,
+                provider,
+                model,
+                tools,
+                ephemeral,
+                thinking,
+                bash_yolo,
+                bash_allow,
                 bash_prompt,
             )
             .await
@@ -190,9 +197,7 @@ async fn run_login(provider: &str) -> Result<()> {
             println!("Signed in to {provider}. Token saved.");
             Ok(())
         }
-        other => anyhow::bail!(
-            "unknown provider for login: {other}. Supported: openai-codex."
-        ),
+        other => anyhow::bail!("unknown provider for login: {other}. Supported: openai-codex."),
     }
 }
 

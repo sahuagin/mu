@@ -50,8 +50,10 @@ use super::rope::{RetainedRope, Span, SpanKind};
 /// See `specs/architecture/event-sourced-context.md` lines 614-644.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ProjectionTarget {
     /// What the model sees — full-fidelity provider messages.
+    #[default]
     AgentView,
     /// What the human sees — may summarize, badge, collapse, etc.
     OperatorView,
@@ -168,12 +170,6 @@ fn default_target() -> ProjectionTarget {
     ProjectionTarget::AgentView
 }
 
-impl Default for ProjectionTarget {
-    fn default() -> Self {
-        ProjectionTarget::AgentView
-    }
-}
-
 impl ProviderMessages {
     /// Empty message set for `target`.
     pub fn empty(target: ProjectionTarget) -> Self {
@@ -264,9 +260,7 @@ impl FauxProviderRenderer {
         match target {
             ProjectionTarget::AgentView => span.content.clone(),
             ProjectionTarget::OperatorView => match span.kind {
-                SpanKind::System | SpanKind::User | SpanKind::Assistant => {
-                    span.content.clone()
-                }
+                SpanKind::System | SpanKind::User | SpanKind::Assistant => span.content.clone(),
                 SpanKind::ToolResult => {
                     format!("[tool-result:{}] {}", span.id, summary_line(&span.content))
                 }
@@ -301,10 +295,7 @@ impl ProviderRenderer for FauxProviderRenderer {
             })
             .collect();
 
-        ProviderMessages {
-            messages,
-            target,
-        }
+        ProviderMessages { messages, target }
     }
 }
 
@@ -315,7 +306,12 @@ mod tests {
 
     fn sample_rope() -> RetainedRope {
         RetainedRope::from_spans(vec![
-            Span::new("sys", SpanKind::System, "you are mu", RetentionClass::Startup),
+            Span::new(
+                "sys",
+                SpanKind::System,
+                "you are mu",
+                RetentionClass::Startup,
+            ),
             Span::new("u1", SpanKind::User, "hi", RetentionClass::Hot),
             Span::new("a1", SpanKind::Assistant, "hello", RetentionClass::Hot),
             Span::new(
@@ -373,7 +369,10 @@ mod tests {
     fn operator_view_renders_tool_result_as_one_line_summary() {
         let rope = sample_rope();
         let rendered = FauxProviderRenderer::new().render(&rope, ProjectionTarget::OperatorView);
-        assert_eq!(rendered.messages[3].content, "[tool-result:t1] {\"ok\":true}");
+        assert_eq!(
+            rendered.messages[3].content,
+            "[tool-result:t1] {\"ok\":true}"
+        );
     }
 
     fn enriched_rope() -> RetainedRope {
@@ -468,8 +467,11 @@ mod tests {
     fn operator_view_applies_expected_per_kind_shapes() {
         let rope = enriched_rope();
         let rendered = FauxProviderRenderer::new().render(&rope, ProjectionTarget::OperatorView);
-        let contents: Vec<&str> =
-            rendered.messages.iter().map(|m| m.content.as_str()).collect();
+        let contents: Vec<&str> = rendered
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
         assert_eq!(contents[0], "[call:call-bash] bash(command=\"ls\")");
         assert_eq!(contents[1], "[tool:bash]");
         assert_eq!(contents[2], "[skill:goal-protocol]");
@@ -527,10 +529,7 @@ mod tests {
         ];
         for (kind, expected) in cases {
             let actual: ProviderRole = kind.into();
-            assert_eq!(
-                actual, expected,
-                "{kind:?} should map to {expected:?}",
-            );
+            assert_eq!(actual, expected, "{kind:?} should map to {expected:?}",);
         }
     }
 }

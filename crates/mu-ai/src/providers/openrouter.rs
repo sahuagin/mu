@@ -460,14 +460,11 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
             // Tool call delta(s)?
             if let Some(deltas) = choice.delta.tool_calls {
                 for tc_delta in deltas {
-                    let entry = state
-                        .tool_calls
-                        .entry(tc_delta.index)
-                        .or_insert_with(|| {
-                            // First time seeing this index — track its order.
-                            state.tool_call_order.push(tc_delta.index);
-                            ToolCallBuilder::default()
-                        });
+                    let entry = state.tool_calls.entry(tc_delta.index).or_insert_with(|| {
+                        // First time seeing this index — track its order.
+                        state.tool_call_order.push(tc_delta.index);
+                        ToolCallBuilder::default()
+                    });
                     if let Some(id) = tc_delta.id {
                         entry.id = id;
                     }

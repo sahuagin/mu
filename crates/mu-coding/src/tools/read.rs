@@ -105,7 +105,10 @@ mod tests {
 
     fn temp_path(name: &str) -> Result<PathBuf, Box<dyn Error>> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        Ok(std::env::temp_dir().join(format!("mu-read-tool-{name}-{}-{nanos}", std::process::id())))
+        Ok(std::env::temp_dir().join(format!(
+            "mu-read-tool-{name}-{}-{nanos}",
+            std::process::id()
+        )))
     }
 
     async fn execute_read(path: &Path) -> ToolResult {

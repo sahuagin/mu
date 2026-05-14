@@ -42,24 +42,14 @@ pub async fn run(
         &bash_allow,
         bash_prompt,
     )?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("child stdin not captured")?;
+    let mut stdin = child.stdin.take().context("child stdin not captured")?;
     let stdout = child.stdout.take().context("child stdout not captured")?;
     let mut stdout = BufReader::new(stdout);
 
     let mut next_id: u64 = 1;
 
     let session_id = create_session(&mut stdin, &mut stdout, &mut next_id, &selector).await?;
-    let text = ask_and_drain(
-        &mut stdin,
-        &mut stdout,
-        &session_id,
-        &prompt,
-        &mut next_id,
-    )
-    .await?;
+    let text = ask_and_drain(&mut stdin, &mut stdout, &session_id, &prompt, &mut next_id).await?;
 
     println!("{}", text);
 

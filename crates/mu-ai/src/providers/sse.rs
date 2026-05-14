@@ -142,10 +142,7 @@ mod tests {
     async fn b3_multi_chunk_event() {
         // First chunk has the event line + start of data; second chunk
         // has the rest of data + the blank-line terminator.
-        let bytes = stream::iter(vec![
-            ok("event: foo\ndata: par"),
-            ok("tial\n\n"),
-        ]);
+        let bytes = stream::iter(vec![ok("event: foo\ndata: par"), ok("tial\n\n")]);
         let events: Vec<_> = SseStream::new(bytes).collect().await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event.as_deref(), Some("foo"));
@@ -154,9 +151,7 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_events_in_one_chunk() {
-        let bytes = stream::iter(vec![ok(
-            "event: a\ndata: 1\n\nevent: b\ndata: 2\n\n",
-        )]);
+        let bytes = stream::iter(vec![ok("event: a\ndata: 1\n\nevent: b\ndata: 2\n\n")]);
         let events: Vec<_> = SseStream::new(bytes).collect().await;
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event.as_deref(), Some("a"));

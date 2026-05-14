@@ -83,11 +83,7 @@ impl FileBackend {
             };
             for f in session_files.flatten() {
                 let session_path = f.path();
-                if session_path
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    != Some("jsonl")
-                {
+                if session_path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                     continue;
                 }
                 let (log, _malformed) = match SessionEventLog::from_jsonl(&session_path) {
@@ -97,16 +93,12 @@ impl FileBackend {
                 // Pull parent_session_id from the SessionCreated event
                 // if present, so the tree-query parent-filter works
                 // across the federation boundary too.
-                let parent_session_id = log
-                    .snapshot()
-                    .iter()
-                    .find_map(|e| match &e.payload {
-                        mu_core::event_log::EventPayload::SessionCreated {
-                            parent_session_id,
-                            ..
-                        } => parent_session_id.clone(),
-                        _ => None,
-                    });
+                let parent_session_id = log.snapshot().iter().find_map(|e| match &e.payload {
+                    mu_core::event_log::EventPayload::SessionCreated {
+                        parent_session_id, ..
+                    } => parent_session_id.clone(),
+                    _ => None,
+                });
                 let mut info =
                     derive_session_info(log.session_id(), &log, parent_session_id, &daemon_id);
                 info.is_remote = true;
@@ -119,10 +111,7 @@ impl FileBackend {
 
 #[async_trait]
 impl SessionDiscovery for FileBackend {
-    async fn list(
-        &self,
-        filter: &SessionListFilter,
-    ) -> Result<Vec<SessionInfo>, DiscoveryError> {
+    async fn list(&self, filter: &SessionListFilter) -> Result<Vec<SessionInfo>, DiscoveryError> {
         // Local results first — authoritative for this daemon's
         // running state. If the inner backend fails, propagate the
         // error (we have nothing else to fall back to for local).
@@ -236,10 +225,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::env::temp_dir().join(format!(
-            "mu-935-{name}-{}-{nanos}",
-            std::process::id()
-        ));
+        let p = std::env::temp_dir().join(format!("mu-935-{name}-{}-{nanos}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -365,10 +351,13 @@ mod tests {
             .await
             .expect("list ok");
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].session_id, "local-x", "future-ts local should sort first");
-        assert_eq!(out[0].is_remote, false);
+        assert_eq!(
+            out[0].session_id, "local-x",
+            "future-ts local should sort first"
+        );
+        assert!(!out[0].is_remote);
         assert_eq!(out[1].session_id, "p-1");
-        assert_eq!(out[1].is_remote, true);
+        assert!(out[1].is_remote);
 
         let _ = std::fs::remove_dir_all(&events_dir);
     }
@@ -381,8 +370,11 @@ mod tests {
         // One subdir with garbage in the jsonl.
         let bad_dir = events_dir.join("peer-bad");
         std::fs::create_dir_all(&bad_dir).unwrap();
-        std::fs::write(bad_dir.join("b-1.jsonl"), b"not valid json\n{also not valid\n")
-            .unwrap();
+        std::fs::write(
+            bad_dir.join("b-1.jsonl"),
+            b"not valid json\n{also not valid\n",
+        )
+        .unwrap();
 
         let backend = FileBackend::new(
             Arc::new(FixedInner(Vec::new())),

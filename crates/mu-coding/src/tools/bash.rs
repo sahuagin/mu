@@ -261,9 +261,7 @@ impl Tool for BashTool {
                         Some(t) if !t.is_empty() => t,
                         _ => {
                             return ToolResult {
-                                content: format!(
-                                    "bash: could not tokenize command: {command:?}"
-                                ),
+                                content: format!("bash: could not tokenize command: {command:?}"),
                                 is_error: true,
                             };
                         }
@@ -449,14 +447,8 @@ mod tests {
 
     #[test]
     fn allowlist_token_prefix_match() {
-        let allowlist = vec![
-            vec!["git".into(), "status".into()],
-            vec!["echo".into()],
-        ];
-        assert!(is_allowed(
-            &["git".into(), "status".into()],
-            &allowlist
-        ));
+        let allowlist = vec![vec!["git".into(), "status".into()], vec!["echo".into()]];
+        assert!(is_allowed(&["git".into(), "status".into()], &allowlist));
         assert!(is_allowed(
             &["git".into(), "status".into(), "-s".into()],
             &allowlist
@@ -465,14 +457,8 @@ mod tests {
             &["echo".into(), "hello".into(), "world".into()],
             &allowlist
         ));
-        assert!(!is_allowed(
-            &["git".into(), "push".into()],
-            &allowlist
-        ));
-        assert!(!is_allowed(
-            &["echoxyz".into()],
-            &allowlist
-        ));
+        assert!(!is_allowed(&["git".into(), "push".into()], &allowlist));
+        assert!(!is_allowed(&["echoxyz".into()], &allowlist));
         // Shorter than allowlist entry doesn't match.
         assert!(!is_allowed(&["git".into()], &allowlist));
     }
@@ -527,8 +513,7 @@ mod tests {
             "echo > /tmp/x",
             "echo & background",
         ] {
-            let result =
-                execute_bash(mode.clone(), json!({ "command": cmd })).await;
+            let result = execute_bash(mode.clone(), json!({ "command": cmd })).await;
             assert!(result.is_error, "expected error for: {cmd}");
             assert!(
                 result.content.contains("metacharacter"),
@@ -545,11 +530,8 @@ mod tests {
         // Use printenv with a single var name — read-only & cheap.
         // It's not in the default allowlist, so extend.
         let mode = BashMode::strict_with_extras(&["printenv".to_string()], false);
-        let result = execute_bash(
-            mode,
-            json!({ "command": "printenv MU_TEST_BASH_API_KEY" }),
-        )
-        .await;
+        let result =
+            execute_bash(mode, json!({ "command": "printenv MU_TEST_BASH_API_KEY" })).await;
         std::env::remove_var("MU_TEST_BASH_API_KEY");
         // printenv with a missing var exits 1 with no output. So
         // is_error may be true, but the content should NOT contain
@@ -565,11 +547,7 @@ mod tests {
     #[tokio::test]
     async fn b6_strict_timeout() {
         let mode = BashMode::strict_with_extras(&["sleep".to_string()], false);
-        let result = execute_bash(
-            mode,
-            json!({ "command": "sleep 5", "timeout_secs": 1 }),
-        )
-        .await;
+        let result = execute_bash(mode, json!({ "command": "sleep 5", "timeout_secs": 1 })).await;
         assert!(result.is_error);
         assert!(result.content.contains("timed out") || result.content.contains("timeout"));
     }
@@ -585,11 +563,8 @@ mod tests {
 
     #[tokio::test]
     async fn b9_yolo_pipes_work() -> Result<(), Box<dyn Error>> {
-        let result = execute_bash(
-            BashMode::Yolo,
-            json!({ "command": "echo hi | tr a-z A-Z" }),
-        )
-        .await;
+        let result =
+            execute_bash(BashMode::Yolo, json!({ "command": "echo hi | tr a-z A-Z" })).await;
         assert!(!result.is_error, "got: {}", result.content);
         assert!(result.content.contains("HI"));
         Ok(())

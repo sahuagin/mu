@@ -9,8 +9,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
 use mu_ai::FauxProvider;
-use mu_core::agent::Provider;
 use mu_coding::serve;
+use mu_core::agent::Provider;
 
 /// Build a duplex pair, spawn `serve_with_io` on one half, return the
 /// other half plus the server's JoinHandle.
@@ -397,10 +397,7 @@ async fn b9_session_delegate_creates_child() {
         .await
         .unwrap();
     let resp = read_line(&mut client).await;
-    let parent_id = resp["result"]["session_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let parent_id = resp["result"]["session_id"].as_str().unwrap().to_string();
 
     // 2. Delegate a child with a different provider selector.
     let req = json!({
@@ -572,7 +569,7 @@ async fn b11_session_events_round_trip() {
         .await
         .unwrap();
     // Drain the ask response + notifications until we see session.done.
-    let _ = timeout(Duration::from_millis(500), async {
+    timeout(Duration::from_millis(500), async {
         loop {
             let line = read_line(&mut client).await;
             if line.get("method").and_then(|v| v.as_str()) == Some("session.done") {

@@ -66,9 +66,7 @@ impl GrepTool {
             .output()
             .map_err(|e| format!("which rg failed: {e}"))?;
         if !out.status.success() {
-            return Err(
-                "ripgrep not found in PATH; install `rg` or set MU_RG_BINARY".to_owned(),
-            );
+            return Err("ripgrep not found in PATH; install `rg` or set MU_RG_BINARY".to_owned());
         }
         let path = String::from_utf8(out.stdout)
             .map_err(|_| "rg path not utf-8".to_owned())?
@@ -163,7 +161,10 @@ impl Tool for GrepTool {
                 .get("path")
                 .and_then(Value::as_str)
                 .map(PathBuf::from);
-            let glob = arguments.get("glob").and_then(Value::as_str).map(str::to_owned);
+            let glob = arguments
+                .get("glob")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             let output_mode = arguments
                 .get("output_mode")
                 .and_then(Value::as_str)
@@ -289,7 +290,11 @@ impl Tool for GrepTool {
                 Some(2) => ToolResult {
                     content: format!(
                         "grep: rg returned error: {}",
-                        stderr.trim().is_empty().then(|| "(no stderr)").unwrap_or(stderr.trim())
+                        stderr
+                            .trim()
+                            .is_empty()
+                            .then_some("(no stderr)")
+                            .unwrap_or(stderr.trim())
                     ),
                     is_error: true,
                 },
@@ -529,9 +534,7 @@ mod tests {
             return Ok(());
         }
         let dir = temp_dir("b9")?;
-        let lines = (0..50)
-            .map(|i| format!("match_{i}\n"))
-            .collect::<String>();
+        let lines = (0..50).map(|i| format!("match_{i}\n")).collect::<String>();
         fs::write(dir.join("a.txt"), lines)?;
 
         let result = execute_grep(json!({

@@ -5,7 +5,9 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum AgentMessage {
-    User { content: String },
+    User {
+        content: String,
+    },
     Assistant(AssistantMessage),
     ToolResult {
         call_id: String,
@@ -47,11 +49,13 @@ pub struct Usage {
     pub reasoning_tokens: Option<u64>,
 }
 
-impl Usage {
+impl std::ops::Add for Usage {
+    type Output = Usage;
+
     /// Sum two usage snapshots component-wise. Option fields are
     /// summed when both Some; if either is None, the result keeps
     /// the Some value (so partial reporting doesn't lose data).
-    pub fn add(self, other: Usage) -> Usage {
+    fn add(self, other: Usage) -> Usage {
         fn add_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
             match (a, b) {
                 (Some(x), Some(y)) => Some(x + y),
@@ -78,10 +82,14 @@ impl Usage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     ToolCall(ToolCall),
     /// Reasoning trace (Anthropic extended thinking, OpenAI reasoning).
-    Thinking { text: String },
+    Thinking {
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

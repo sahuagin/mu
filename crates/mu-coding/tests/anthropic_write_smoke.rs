@@ -31,14 +31,8 @@ async fn mu_012_write_tool_end_to_end_via_anthropic() {
         tmp.display()
     );
 
-    let (stdout, status) = run_mu_ask(&[
-        "--provider",
-        "anthropic-api",
-        "--tools",
-        "write",
-        &prompt,
-    ])
-    .await;
+    let (stdout, status) =
+        run_mu_ask(&["--provider", "anthropic-api", "--tools", "write", &prompt]).await;
 
     let file_contents = std::fs::read_to_string(&tmp).ok();
     let _ = std::fs::remove_file(&tmp);

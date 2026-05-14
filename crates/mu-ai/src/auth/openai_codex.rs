@@ -93,16 +93,12 @@ pub async fn login_flow() -> Result<OAuthToken, AuthError> {
     }
 
     // Wait for the callback, with a generous timeout.
-    let (received_code, received_state) = match timeout(
-        CALLBACK_TIMEOUT,
-        wait_for_callback(listener),
-    )
-    .await
-    {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Err(AuthError::CallbackTimeout),
-    };
+    let (received_code, received_state) =
+        match timeout(CALLBACK_TIMEOUT, wait_for_callback(listener)).await {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(AuthError::CallbackTimeout),
+        };
 
     // CSRF check.
     if received_state != *csrf_token.secret() {
@@ -156,7 +152,10 @@ fn build_client() -> Result<BasicClient, AuthError> {
 }
 
 fn from_token_response(
-    resp: &oauth2::StandardTokenResponse<oauth2::EmptyExtraTokenFields, oauth2::basic::BasicTokenType>,
+    resp: &oauth2::StandardTokenResponse<
+        oauth2::EmptyExtraTokenFields,
+        oauth2::basic::BasicTokenType,
+    >,
 ) -> OAuthToken {
     let expires_at = resp.expires_in().map(|d| {
         std::time::SystemTime::now()
@@ -168,8 +167,10 @@ fn from_token_response(
         access_token: resp.access_token().secret().clone(),
         refresh_token: resp.refresh_token().map(|t| t.secret().clone()),
         id_token: None, // oauth2 crate doesn't expose id_token in this struct;
-                        // future enhancement: parse from raw response if codex returns one.
-        token_type: format!("{:?}", resp.token_type()).to_lowercase().replace('"', ""),
+        // future enhancement: parse from raw response if codex returns one.
+        token_type: format!("{:?}", resp.token_type())
+            .to_lowercase()
+            .replace('"', ""),
         expires_at,
     }
 }
@@ -239,7 +240,9 @@ fn extract_query_params(request_line: &str) -> HashMap<String, String> {
         let value = split.next().unwrap_or("");
         if !key.is_empty() {
             params.insert(
-                urlencoding::decode(key).map(|c| c.into_owned()).unwrap_or_else(|_| key.into()),
+                urlencoding::decode(key)
+                    .map(|c| c.into_owned())
+                    .unwrap_or_else(|_| key.into()),
                 urlencoding::decode(value)
                     .map(|c| c.into_owned())
                     .unwrap_or_else(|_| value.into()),
@@ -326,10 +329,9 @@ mod tests {
         let server = tokio::spawn(wait_for_callback(listener));
 
         // Simulate the browser making the redirect call.
-        let req = format!(
-            "GET /auth/callback?code=test_code&state=expected_state HTTP/1.1\r\n\
+        let req = "GET /auth/callback?code=test_code&state=expected_state HTTP/1.1\r\n\
              Host: localhost\r\nConnection: close\r\n\r\n"
-        );
+            .to_string();
         let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
         sock.write_all(req.as_bytes()).await.unwrap();
         // Read response (drain).

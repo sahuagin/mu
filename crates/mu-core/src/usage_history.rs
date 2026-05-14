@@ -367,8 +367,8 @@ fn percentile_stats(mut samples: Vec<u64>) -> Option<PercentileStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::Usage;
     use crate::agent::types::{AssistantMessage, StopReason};
+    use crate::agent::Usage;
     use crate::event_log::{EventActor, EventPayload, SessionEvent};
 
     fn ev(id: u64, ts: u64, payload: EventPayload) -> SessionEvent {
@@ -394,7 +394,13 @@ mod tests {
 
     #[test]
     fn extraction_requires_session_created() {
-        let events = vec![ev(1, 100, EventPayload::Error { message: "x".into() })];
+        let events = vec![ev(
+            1,
+            100,
+            EventPayload::Error {
+                message: "x".into(),
+            },
+        )];
         assert!(extract_per_session_metrics(&events).is_none());
     }
 
@@ -771,10 +777,7 @@ mod tests {
         let ttft = rows[0].ttft_ms.as_ref().expect("ttft populated");
         assert_eq!(ttft.median, 250);
         assert_eq!(ttft.count, 3);
-        let streaming = rows[0]
-            .streaming_ms
-            .as_ref()
-            .expect("streaming populated");
+        let streaming = rows[0].streaming_ms.as_ref().expect("streaming populated");
         assert_eq!(streaming.median, 400); // (300+500)/2
         assert_eq!(streaming.count, 2);
 
@@ -886,7 +889,10 @@ mod tests {
         let rows = aggregate_into_rows(vec![m1.clone(), m2.clone(), m3.clone()], None);
         assert_eq!(rows.len(), 2);
 
-        let anthropic = rows.iter().find(|r| r.provider_kind == "anthropic_api").unwrap();
+        let anthropic = rows
+            .iter()
+            .find(|r| r.provider_kind == "anthropic_api")
+            .unwrap();
         assert_eq!(anthropic.model, "haiku");
         assert_eq!(anthropic.session_count, 2);
         assert_eq!(anthropic.wall_ms.count, 3); // 100, 200, 300
@@ -899,7 +905,10 @@ mod tests {
         assert!(anthropic.streaming_ms.is_none()); // Phase 1
         assert!(anthropic.model_call_latency_ms.is_some());
 
-        let openai = rows.iter().find(|r| r.provider_kind == "openai_codex").unwrap();
+        let openai = rows
+            .iter()
+            .find(|r| r.provider_kind == "openai_codex")
+            .unwrap();
         assert_eq!(openai.session_count, 1);
         assert_eq!(openai.error_count, 1);
         assert!(openai.model_call_latency_ms.is_none()); // No samples.

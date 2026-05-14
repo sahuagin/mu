@@ -34,14 +34,8 @@ async fn mu_014_ls_tool_end_to_end_via_anthropic() {
         tmp.display()
     );
 
-    let (stdout, status) = run_mu_ask(&[
-        "--provider",
-        "anthropic-api",
-        "--tools",
-        "ls",
-        &prompt,
-    ])
-    .await;
+    let (stdout, status) =
+        run_mu_ask(&["--provider", "anthropic-api", "--tools", "ls", &prompt]).await;
 
     let _ = std::fs::remove_dir_all(&tmp);
 

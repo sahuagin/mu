@@ -668,3 +668,132 @@ async fn b12_daemon_stats_round_trip() {
     drop(client);
     let _ = timeout(Duration::from_millis(500), server_handle).await;
 }
+
+/// mu-035 Phase D: `daemon.outstanding_calls` returns an empty list
+/// when no sessions exist. Exercises the dispatch wiring + response
+/// envelope without depending on agent-loop timing.
+#[tokio::test]
+async fn b13_daemon_outstanding_calls_empty_when_no_sessions() {
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) = spawn_server(provider);
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "daemon.outstanding_calls", "params": {}
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 1).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["result"]["calls"].as_array().unwrap().len(), 0);
+    assert!(resp["result"]["snapshot_at_unix_ms"].as_u64().unwrap() > 0);
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}
+
+/// mu-035 Phase D: after an echo-ask completes, the forwarder has
+/// cleared the tracker on `AgentEvent::Done`. So
+/// `daemon.outstanding_calls` should return an empty list even though
+/// the session is still registered. This verifies the forwarder's
+/// clear-on-done wiring, not just the dispatch handler.
+#[tokio::test]
+async fn b13_daemon_outstanding_calls_empty_after_ask_completes() {
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) = spawn_server(provider);
+
+    // Create.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "create_session",
+        "params": { "provider": { "kind": "anthropic_api", "model": "x" } }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 1).await;
+    let session_id = resp["result"]["session_id"].as_str().unwrap().to_string();
+
+    // Ask.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "ask_session",
+        "params": { "session_id": session_id, "user_message": "hello" }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+
+    // Drain notifications until we see session.done (forwarder has
+    // observed the AgentEvent::Done by the time the wire-side
+    // session.done is emitted — both are produced from the same
+    // event-loop tick).
+    timeout(Duration::from_millis(2000), async {
+        loop {
+            let line = read_line(&mut client).await;
+            if line["method"] == "session.done" {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("session.done did not arrive within 2s");
+
+    // Now query outstanding_calls — tracker should be cleared.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 3, "method": "daemon.outstanding_calls", "params": {}
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 3).await;
+    let calls = resp["result"]["calls"].as_array().unwrap();
+    assert!(
+        calls.is_empty(),
+        "expected empty after Done cleared tracker; got {calls:?}",
+    );
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}
+
+/// mu-035 Phase D: `session.cancel_outstanding` on an idle session
+/// (no provider call in flight) should return `was_in: "idle"` and
+/// `canceled: false`. Pre-Phase-D this returned `awaiting_first_token`
+/// as a placeholder regardless of state; this test guards against
+/// regressing to that placeholder.
+#[tokio::test]
+async fn b13_cancel_outstanding_on_idle_session_reports_idle() {
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) = spawn_server(provider);
+
+    // Create — session is idle (no ask yet).
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "create_session",
+        "params": { "provider": { "kind": "anthropic_api", "model": "x" } }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 1).await;
+    let session_id = resp["result"]["session_id"].as_str().unwrap().to_string();
+
+    // Cancel-outstanding on an idle session.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "session.cancel_outstanding",
+        "params": { "session_id": session_id }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 2).await;
+    assert_eq!(resp["result"]["was_in"], "idle");
+    assert_eq!(resp["result"]["canceled"], false);
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}

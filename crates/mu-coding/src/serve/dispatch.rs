@@ -16,7 +16,8 @@ use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
     AskSessionRequest, AskSessionResponse, CancelOutstandingRequest, CancelOutstandingResponse,
     CancelSessionRequest, CancelSessionResponse, CloseSessionRequest, CloseSessionResponse,
-    CreateSessionRequest, CreateSessionResponse, DaemonStatsRequest, DaemonStatsResponse,
+    CreateSessionRequest, CreateSessionResponse, DaemonOutstandingCallsRequest,
+    DaemonOutstandingCallsResponse, DaemonStatsRequest, DaemonStatsResponse,
     DaemonUsageHistoryRequest, DaemonUsageHistoryResponse, DelegateSessionRequest,
     DelegateSessionResponse, PingRequest, PingResponse, ProviderSelector, ProviderStatusKind,
     Request, RespondToInputRequiredRequest, RespondToInputRequiredResponse, Response,
@@ -69,6 +70,7 @@ pub async fn dispatch(
         SessionEventsRequest::METHOD => handle_session_events(request, sessions),
         DaemonStatsRequest::METHOD => handle_daemon_stats(request, sessions, daemon_info),
         DaemonUsageHistoryRequest::METHOD => handle_daemon_usage_history(request, sessions),
+        DaemonOutstandingCallsRequest::METHOD => handle_outstanding_calls(request, sessions),
         // mu-036 Phase A.2: wire surface ready, dispatch stubs return
         // a structured "not yet implemented" until Phase B (mu-3ao /
         // mu-7zn / mu-pv9) lands the agent-loop integration.
@@ -287,6 +289,9 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
 
     let pending_approvals = Arc::new(Mutex::new(HashMap::new()));
     let capability_handle = Arc::new(Mutex::new(capability));
+    let provider_status = Arc::new(Mutex::new(
+        super::provider_status::ProviderStatusTracker::new(),
+    ));
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
     let session_tools: Vec<Arc<dyn Tool>> = (*tools).clone();
     let agent = AgentLoop::spawn(
@@ -309,6 +314,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         events_rx,
         notif.clone(),
         event_log.clone(),
+        provider_status.clone(),
     ));
 
     sessions.insert(
@@ -321,6 +327,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             pending_approvals,
             parent_session_id,
             capability: capability_handle,
+            provider_status,
         },
     );
 
@@ -435,6 +442,21 @@ async fn handle_cancel_outstanding(request: Request<Value>, sessions: Sessions) 
             format!("session not found: {}", params.session_id),
         ),
         Some(tx) => {
+            // mu-035 Phase D: snapshot the live tracker BEFORE
+            // dispatching the cancel. The tracker is updated
+            // write-through by the forwarder on every ProviderStatus
+            // event, so this is the best approximation of "state at
+            // the moment of the cancel" we can compute server-side.
+            // None means no call was outstanding — was_in = Idle and
+            // canceled = false even if the send succeeds (the loop
+            // is between asks and will drop the input on receipt).
+            let snapshot = sessions.provider_status_snapshot(&params.session_id);
+            let was_in = snapshot
+                .as_ref()
+                .map(|s| s.kind)
+                .unwrap_or(ProviderStatusKind::Idle);
+            let had_outstanding = snapshot.is_some();
+
             let reason = params.reason.unwrap_or_else(|| "client request".into());
             // best-effort — if the loop already terminated, send fails
             // silently and we report canceled=false.
@@ -444,21 +466,29 @@ async fn handle_cancel_outstanding(request: Request<Value>, sessions: Sessions) 
                 })
                 .await
                 .is_ok();
-            // We can't synchronously observe what state the loop was
-            // in at the moment we sent (it's racy by nature). v1
-            // reports a best-effort "canceled if we managed to send,
-            // and we don't know was_in." A future slice could plumb
-            // a per-session ProviderStatusTracker into Sessions and
-            // read its current state here — but that's mu-iwq Phase D
-            // territory (daemon.outstanding_calls), so we keep this
-            // handler narrow for now.
             let resp = CancelOutstandingResponse {
-                canceled: send_ok,
-                was_in: ProviderStatusKind::AwaitingFirstToken, // placeholder; see comment above
+                canceled: send_ok && had_outstanding,
+                was_in,
             };
             ok_response(request.id, to_value_or_null(resp))
         }
     }
+}
+
+/// mu-035 Phase D: `daemon.outstanding_calls` — fleet view of every
+/// in-flight provider call across all sessions on this daemon. Used
+/// by the TUI command-centre view. Each session's tracker is updated
+/// write-through by the forwarder; this handler just snapshots the
+/// registry and computes per-call `elapsed_ms` against a single
+/// `now_unix_ms` so all rows in one response are consistent.
+fn handle_outstanding_calls(request: Request<Value>, sessions: Sessions) -> Response<Value> {
+    let now = super::discovery::now_unix_ms();
+    let calls = sessions.snapshot_outstanding_calls(now);
+    let resp = DaemonOutstandingCallsResponse {
+        calls,
+        snapshot_at_unix_ms: now,
+    };
+    ok_response(request.id, to_value_or_null(resp))
 }
 
 fn handle_session_stats(request: Request<Value>, sessions: Sessions) -> Response<Value> {

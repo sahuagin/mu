@@ -121,6 +121,9 @@ mod tests {
         let agent = tokio::spawn(async {});
         let approvals = Arc::new(Mutex::new(HashMap::new()));
         let cap = Arc::new(Mutex::new(Capability::root()));
+        let provider_status = Arc::new(Mutex::new(
+            crate::serve::provider_status::ProviderStatusTracker::new(),
+        ));
         sessions.insert(
             id.to_string(),
             crate::serve::sessions::NewSession {
@@ -131,6 +134,7 @@ mod tests {
                 pending_approvals: approvals,
                 parent_session_id: parent,
                 capability: cap,
+                provider_status,
             },
         );
         log

@@ -25,8 +25,10 @@
 #![deny(unsafe_code)]
 
 pub mod auth;
+pub mod context;
 pub mod faux;
 pub mod providers;
+pub use context::{AnthropicCacheStrategy, AnthropicProviderRenderer};
 pub use faux::{FauxProvider, FauxResponse};
 pub use providers::{AnthropicProvider, OpenRouterProvider, OpenaiCodexProvider};
 

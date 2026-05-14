@@ -2739,16 +2739,35 @@ struct Cli {
     bash_yolo: bool,
 
     /// Default provider kind (used for `n` → create_session).
-    #[arg(long, default_value = "anthropic_api")]
-    provider: String,
+    /// When omitted, falls back to `[ui.tui].default_provider` from
+    /// `~/.config/mu/config.toml`, then to `"anthropic_api"` (mu-l1z).
+    #[arg(long)]
+    provider: Option<String>,
 
     /// Default provider model (used for `n` → create_session).
-    #[arg(long, default_value = "claude-haiku-4-5-20251001")]
-    model: String,
+    /// When omitted, falls back to `[ui.tui].default_model` from
+    /// `~/.config/mu/config.toml`, then to
+    /// `"claude-haiku-4-5-20251001"` (mu-l1z).
+    #[arg(long)]
+    model: Option<String>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // mu-l1z: load operator config so CLI flags can fall through to
+    // it. CLI > config > code default (clap's old hard-coded values
+    // now live on the Config struct's Default impl, so behavior with
+    // no config file is unchanged).
+    let config = mu_core::config::Config::load_default();
+    let default_provider = cli
+        .provider
+        .clone()
+        .unwrap_or_else(|| config.ui.tui.default_provider.clone());
+    let default_model = cli
+        .model
+        .clone()
+        .unwrap_or_else(|| config.ui.tui.default_model.clone());
 
     // Try to spawn a live mu serve; if it fails, fall through to
     // mock-data scaffold mode (so the TUI is still demoable).
@@ -2795,7 +2814,7 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run(&mut terminal, mu, (cli.provider, cli.model));
+    let res = run(&mut terminal, mu, (default_provider, default_model));
 
     // Cleanup
     let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);

@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use mu_core::config::Config;
+
 #[derive(Debug, Clone)]
 pub struct DaemonInfo {
     inner: Arc<DaemonInfoInner>,
@@ -28,6 +30,11 @@ struct DaemonInfoInner {
     /// disk persistence — used by tests to avoid writing into
     /// `~/.local/share/mu/events/`.
     events_dir: Option<PathBuf>,
+    /// mu-l1z: parsed config loaded at daemon startup. Held as Arc
+    /// so dispatch handlers and other consumers can read it without
+    /// going back to disk. Tests pass `Config::default()` to avoid
+    /// reading from the developer's `~/.config/mu/config.toml`.
+    config: Arc<Config>,
 }
 
 impl DaemonInfo {
@@ -46,6 +53,7 @@ impl DaemonInfo {
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0),
                 events_dir: None,
+                config: Arc::new(Config::default()),
             }),
         }
     }
@@ -63,8 +71,28 @@ impl DaemonInfo {
         }
     }
 
+    /// mu-l1z: builder-style setter for the parsed config. Production
+    /// `serve::run` calls this with `Config::load_default()`; tests
+    /// pass `Config::default()` for hermetic behavior.
+    pub fn with_config(self, config: Config) -> Self {
+        let inner = (*self.inner).clone();
+        Self {
+            inner: Arc::new(DaemonInfoInner {
+                config: Arc::new(config),
+                ..inner
+            }),
+        }
+    }
+
     pub fn events_dir(&self) -> Option<&std::path::Path> {
         self.inner.events_dir.as_deref()
+    }
+
+    /// mu-l1z: read access to the loaded config. Dispatch handlers
+    /// and other daemon-side consumers (compaction judge selection
+    /// in mu-kgu.11) call this to resolve operator preferences.
+    pub fn config(&self) -> &Config {
+        &self.inner.config
     }
 
     /// Test helper: deterministic id, no events_dir.
@@ -76,6 +104,7 @@ impl DaemonInfo {
                 version: version.into(),
                 started_at_unix_ms: 0,
                 events_dir: None,
+                config: Arc::new(Config::default()),
             }),
         }
     }

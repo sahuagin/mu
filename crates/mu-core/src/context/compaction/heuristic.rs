@@ -67,8 +67,9 @@ impl SpanFamilyDropPolicy {
     }
 }
 
-/// v1 token estimate: chars in the span's content. No tokenizer is
-/// wired into mu-core yet; swap in here when one lands.
+/// v1 token estimate: char-count — matches the shared
+/// [`super::estimate_tokens`] semantics so cross-policy benchmarks
+/// compare like-for-like. Real tokenizer swaps in here when one lands.
 fn span_size(span: &Span) -> usize {
     span.content.chars().count()
 }
@@ -130,7 +131,7 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
                 decisions: Vec::new(),
                 tokens_before,
                 tokens_after: tokens_before,
-                wall_clock_ms: start.elapsed().as_millis() as u64,
+                wall_clock_us: start.elapsed().as_micros() as u64,
             };
         }
 
@@ -236,7 +237,7 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
             decisions,
             tokens_before,
             tokens_after,
-            wall_clock_ms: start.elapsed().as_millis() as u64,
+            wall_clock_us: start.elapsed().as_micros() as u64,
         }
     }
 }

@@ -26,6 +26,7 @@
 
 pub mod ask;
 pub mod serve;
+pub mod skills;
 pub mod tools;
 
 pub fn version() -> &'static str {

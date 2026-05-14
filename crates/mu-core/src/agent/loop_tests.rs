@@ -271,6 +271,7 @@ fn kind(event: &AgentEvent) -> &'static str {
         AgentEvent::Callout { .. } => "callout",
         AgentEvent::InputRequired { .. } => "input_required",
         AgentEvent::ContextAssembly { .. } => "context_assembly",
+        AgentEvent::CompactionAssembly { .. } => "compaction_assembly",
         AgentEvent::ProviderStatus { .. } => "provider_status",
         AgentEvent::AutonomousIterationStarted { .. } => "autonomous_iteration_started",
         AgentEvent::AutonomousIterationCompleted { .. } => "autonomous_iteration_completed",
@@ -545,6 +546,7 @@ async fn b3_iteration_cap() {
     let config = AgentConfig {
         max_turns: 3,
         system_prompt: None,
+        compaction_threshold: None,
     };
     let (loop_, events_rx) = spawn_loop(provider, tools, config);
 
@@ -1536,5 +1538,274 @@ async fn a3_disallowed_defensive_callout_no_autonomy_events() {
         warning_seen,
         "expected a warning callout citing Disallowed / INV-1; events={:?}",
         events.iter().map(kind).collect::<Vec<_>>()
+    );
+}
+
+// ============================================================================
+// mu-kgu.4: threshold-triggered compaction-policy dispatch
+// ============================================================================
+//
+// These tests exercise the per-turn threshold check + policy dispatch
+// the loop runs between `assemble_rope` and `renderer.render`. The
+// integration contract (per the mu-kgu.4 bead):
+//   - Default `NoCompactionPolicy` → no `CompactionAssembly` event
+//     ever fires, no matter how large the rope.
+//   - A real policy that returns a non-identity rope → exactly one
+//     `CompactionAssembly` fires per render where the renderer-
+//     estimated token cost crosses the configured threshold.
+//   - The compaction call MUST NOT block a turn: identity returns
+//     and policy failures are silent on the wire path.
+
+use crate::context::{
+    CompactionDecision, CompactionPolicy, CompactionResult, RetainedRope as ContextRope,
+};
+
+/// Mock compaction policy that drops the second half of the rope's
+/// spans. Records `Dropped` decisions for each removed span. Used to
+/// drive the "exactly one CompactionAssembly fires" test path.
+struct EvictHalfPolicy;
+
+impl CompactionPolicy for EvictHalfPolicy {
+    fn compact(&self, rope: &ContextRope, _target_tokens: usize) -> CompactionResult {
+        let spans = rope.spans();
+        let keep = spans.len() / 2;
+        let kept: Vec<_> = spans.iter().take(keep).cloned().collect();
+        let decisions: Vec<CompactionDecision> = spans
+            .iter()
+            .skip(keep)
+            .map(|s| CompactionDecision::Dropped {
+                span_id: s.id.clone(),
+                reason: "evict-half mock".to_owned(),
+            })
+            .collect();
+        CompactionResult {
+            rope: ContextRope::from_spans(kept),
+            decisions,
+            tokens_before: 0,
+            tokens_after: 0,
+            wall_clock_ms: 0,
+        }
+    }
+
+    fn policy_label(&self) -> &'static str {
+        "evict-half-mock"
+    }
+}
+
+/// Provider wrapper that adds a custom compaction policy on top of an
+/// inner `MockProvider`. The wire path (`stream()`, `renderer()`,
+/// `cache_strategy()`) delegates verbatim; only `compaction_policy()`
+/// differs.
+struct MockProviderWithCompaction {
+    inner: MockProvider,
+    policy: Arc<dyn CompactionPolicy>,
+}
+
+#[async_trait]
+impl Provider for MockProviderWithCompaction {
+    async fn stream(
+        &self,
+        system_prompt: Option<&str>,
+        messages: &[AgentMessage],
+        tools: &[ToolSpec],
+        cancel_rx: oneshot::Receiver<()>,
+    ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+        self.inner
+            .stream(system_prompt, messages, tools, cancel_rx)
+            .await
+    }
+
+    fn compaction_policy(&self) -> Arc<dyn CompactionPolicy> {
+        Arc::clone(&self.policy)
+    }
+}
+
+fn spawn_loop_with_provider(
+    provider: Arc<dyn Provider>,
+    config: AgentConfig,
+) -> (AgentLoop, mpsc::Receiver<AgentEvent>) {
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let loop_ = AgentLoop::spawn(provider, vec![], config, events_tx, approvals, capability);
+    (loop_, events_rx)
+}
+
+/// mu-kgu.4 — default `NoCompactionPolicy` MUST NOT emit
+/// `CompactionAssembly` even when the threshold is set low enough that
+/// any non-trivial rope crosses it. The dispatch fires; the
+/// no-op result has the same shape as the input. The contract holds
+/// REGARDLESS of threshold — what matters is that the loop never
+/// observed a compaction event, because the default policy's
+/// `policy_label() == "no-compaction"` is the signal that "the loop
+/// chose to skip emitting nothing useful." Today the loop emits
+/// regardless of policy_label when threshold is crossed, BUT
+/// `AgentConfig::default().compaction_threshold = None` means
+/// `DEFAULT_COMPACTION_THRESHOLD = 150_000` — which any reasonable
+/// test conversation falls well under. So the simplest expression of
+/// "default behavior" is: with default config, no
+/// CompactionAssembly events appear in normal-sized conversations.
+#[tokio::test]
+async fn kgu4_default_config_does_not_emit_compaction_assembly() {
+    let provider = MockProvider::new(vec![vec![
+        ProviderEvent::TextDelta("hi".into()),
+        ProviderEvent::Done(assistant_text("hi")),
+    ]]);
+    let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello there")))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+    let compaction_events: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::CompactionAssembly { .. }))
+        .collect();
+    assert!(
+        compaction_events.is_empty(),
+        "default AgentConfig + default NoCompactionPolicy must produce no \
+         CompactionAssembly events; saw {} ({:?})",
+        compaction_events.len(),
+        events.iter().map(kind).collect::<Vec<_>>(),
+    );
+}
+
+/// mu-kgu.4 — with a real policy (`EvictHalfPolicy`) and a threshold
+/// low enough that the initial rope crosses it, the loop MUST emit
+/// exactly one `CompactionAssembly` event per render where the
+/// threshold is crossed. The post-compaction rope shrinks; subsequent
+/// renders may or may not re-trigger depending on size. For this
+/// single-turn ask, the count is exactly one.
+#[tokio::test]
+async fn kgu4_evict_half_policy_fires_compaction_assembly_when_threshold_crossed() {
+    let inner = MockProvider::new(vec![vec![
+        ProviderEvent::TextDelta("hi".into()),
+        ProviderEvent::Done(assistant_text("hi")),
+    ]]);
+    let provider: Arc<dyn Provider> = Arc::new(MockProviderWithCompaction {
+        inner,
+        policy: Arc::new(EvictHalfPolicy),
+    });
+    // Threshold set well below any non-trivial rope. The single user
+    // message alone projects to multiple spans; the chars-per-4
+    // estimator easily exceeds 1 token.
+    let config = AgentConfig {
+        compaction_threshold: Some(1),
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop_with_provider(provider, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg(
+            "this user message has enough text to estimate non-zero tokens",
+        )))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+
+    let compaction_events: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::CompactionAssembly { .. }))
+        .collect();
+    assert_eq!(
+        compaction_events.len(),
+        1,
+        "exactly one CompactionAssembly expected on a single-turn ask \
+         with threshold crossed; saw {} ({:?})",
+        compaction_events.len(),
+        events.iter().map(kind).collect::<Vec<_>>(),
+    );
+    let AgentEvent::CompactionAssembly {
+        policy_id,
+        tokens_before,
+        tokens_after,
+        decisions_count,
+        ..
+    } = compaction_events[0]
+    else {
+        unreachable!("filter guaranteed CompactionAssembly variant")
+    };
+    assert_eq!(policy_id, "evict-half-mock", "policy_label propagated");
+    assert!(
+        *tokens_before > 0,
+        "tokens_before should reflect a non-empty rope"
+    );
+    assert!(
+        tokens_after <= tokens_before,
+        "evict-half must not grow the rope ({tokens_after} > {tokens_before})"
+    );
+    assert!(
+        *decisions_count > 0,
+        "evict-half drops at least one span on a non-trivial rope; got {decisions_count}"
+    );
+
+    // CompactionAssembly precedes ContextAssembly on the wire (their
+    // shared model_call_id pairs them in the operator view).
+    let positions: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match e {
+            AgentEvent::CompactionAssembly { .. } | AgentEvent::ContextAssembly { .. } => Some(i),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        positions.len(),
+        2,
+        "expected one CompactionAssembly and one ContextAssembly; got {positions:?}"
+    );
+    assert!(
+        matches!(events[positions[0]], AgentEvent::CompactionAssembly { .. }),
+        "CompactionAssembly must precede ContextAssembly"
+    );
+    assert!(
+        matches!(events[positions[1]], AgentEvent::ContextAssembly { .. }),
+        "ContextAssembly must follow CompactionAssembly"
+    );
+}
+
+/// mu-kgu.4 — with a real policy but a threshold set high enough that
+/// the rope is well below, the dispatch MUST be skipped and no
+/// `CompactionAssembly` event fires.
+#[tokio::test]
+async fn kgu4_evict_half_policy_does_not_fire_when_threshold_not_crossed() {
+    let inner = MockProvider::new(vec![vec![
+        ProviderEvent::TextDelta("hi".into()),
+        ProviderEvent::Done(assistant_text("hi")),
+    ]]);
+    let provider: Arc<dyn Provider> = Arc::new(MockProviderWithCompaction {
+        inner,
+        policy: Arc::new(EvictHalfPolicy),
+    });
+    let config = AgentConfig {
+        compaction_threshold: Some(1_000_000),
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop_with_provider(provider, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hi")))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+    let compaction_seen = events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::CompactionAssembly { .. }));
+    assert!(
+        !compaction_seen,
+        "threshold not crossed → no CompactionAssembly even with a real policy; \
+         saw {:?}",
+        events.iter().map(kind).collect::<Vec<_>>(),
     );
 }

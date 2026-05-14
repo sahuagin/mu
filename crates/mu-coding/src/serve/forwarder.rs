@@ -198,13 +198,17 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
         // Lifecycle events not in mu-001's notification surface.
         // ContextAssembly lands only in the durable event log
         // (mu-032 v1); wire-level exposure is a future TUI/web-ui
-        // feature when there's a consumer.
+        // feature when there's a consumer. mu-kgu.4's
+        // CompactionAssembly follows the same pattern — the rope's
+        // own decision-log carries the audit detail; the event
+        // surface is for in-process consumers (TUI / inspector).
         AgentEvent::AgentStart
         | AgentEvent::TurnStart
         | AgentEvent::TurnEnd
         | AgentEvent::MessageStart { .. }
         | AgentEvent::MessageEnd { .. }
-        | AgentEvent::ContextAssembly { .. } => None,
+        | AgentEvent::ContextAssembly { .. }
+        | AgentEvent::CompactionAssembly { .. } => None,
     }
 }
 
@@ -436,7 +440,12 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
         // InputRequired is a transient wire-level prompt; the
         // resulting ToolCall (approved) or ToolResult (denied)
         // already lands in the log.
-        | AgentEvent::InputRequired { .. } => None,
+        | AgentEvent::InputRequired { .. }
+        // mu-kgu.4: CompactionAssembly is an in-process operator
+        // event; the rope's own RopeEvent log already carries the
+        // per-span decision audit. No durable-log surface needed
+        // until a consumer (TUI / inspector) requires it.
+        | AgentEvent::CompactionAssembly { .. } => None,
     }
 }
 

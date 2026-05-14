@@ -116,9 +116,20 @@ fn b6_build_request_body_includes_tools() {
     let body = build_request_body("test/model", None, &messages, &tools);
     assert_eq!(body["model"], "test/model");
     assert_eq!(body["stream"], true);
+    // Unknown model name falls back to the conservative 4096.
     assert_eq!(body["max_tokens"], 4096);
     assert_eq!(body["tools"][0]["function"]["name"], "read");
     assert_eq!(body["messages"][0]["role"], "user");
+}
+
+#[test]
+fn b6c_build_request_body_max_tokens_is_model_aware() {
+    // mu-ql2: real-model identifiers get their per-family ceiling.
+    let messages = vec![AgentMessage::User {
+        content: "hi".into(),
+    }];
+    let gpt5 = build_request_body("gpt-5", None, &messages, &[]);
+    assert_eq!(gpt5["max_tokens"], 16384);
 }
 
 #[test]

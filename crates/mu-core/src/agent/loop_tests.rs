@@ -328,6 +328,77 @@ async fn b1_single_turn_no_tools() {
     }
 }
 
+/// mu-s5h: Done event must reflect the per-turn provider stop_reason
+/// (here `MaxTokens`) rather than collapsing every natural-completion
+/// path to EndTurn.
+#[tokio::test]
+async fn s5h_done_propagates_max_tokens_from_per_turn_stop_reason() {
+    let assistant = AssistantMessage {
+        content: vec![ContentBlock::Text {
+            text: "cut off mid-".into(),
+        }],
+        stop_reason: StopReason::MaxTokens,
+        usage: None,
+    };
+    let provider = MockProvider::new(vec![vec![
+        ProviderEvent::TextDelta("cut off mid-".into()),
+        ProviderEvent::Done(assistant),
+    ]]);
+    let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("write a long thing")))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    let done = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::Done { stop_reason, .. } => Some(*stop_reason),
+            _ => None,
+        })
+        .expect("Done event missing");
+    assert_eq!(
+        done,
+        StopReason::MaxTokens,
+        "Done.stop_reason must reflect the per-turn provider stop_reason, not collapsed to EndTurn"
+    );
+}
+
+/// mu-s5h: EndTurn is still the natural-completion default when the
+/// provider reports it. Regression guard so the propagation fix
+/// doesn't accidentally invent a different stop_reason.
+#[tokio::test]
+async fn s5h_done_propagates_end_turn_when_provider_reports_end_turn() {
+    let provider = MockProvider::new(vec![vec![
+        ProviderEvent::TextDelta("hi".into()),
+        ProviderEvent::Done(assistant_text("hi")),
+    ]]);
+    let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello")))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    let done = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::Done { stop_reason, .. } => Some(*stop_reason),
+            _ => None,
+        })
+        .expect("Done event missing");
+    assert_eq!(done, StopReason::EndTurn);
+}
+
 /// B-6 (run before B-2 so we trust the error path before stacking tools).
 #[tokio::test]
 async fn b6_provider_error_terminates() {

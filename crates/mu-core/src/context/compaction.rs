@@ -167,6 +167,16 @@ pub enum CompactionDecision {
         /// Id of the new summary span in the post-rope.
         summary_span_id: String,
     },
+    /// Compaction could not proceed safely (judge error, malformed
+    /// response, irrecoverable hash collision, etc.). The
+    /// accompanying [`CompactionResult`] MUST contain the **original**
+    /// rope unchanged — the spec's fail-closed contract. `reason`
+    /// is a short human-readable string for the operator log /
+    /// briefing.
+    Failed {
+        /// Short explanation of why compaction was abandoned.
+        reason: String,
+    },
 }
 
 /// No-op compaction policy.
@@ -344,20 +354,9 @@ mod tests {
         assert_eq!(result.rope.spans(), rope.spans());
     }
 
-    /// The remaining phase-2 stub policy shares the same trait
-    /// surface as `NoCompactionPolicy`; its `compact()` is `todo!()`
-    /// until the corresponding bead lands. The `#[should_panic]` test
-    /// here is the gatekeeper's contract: the stub MUST compile and
-    /// MUST panic with the documented message — the Phase 2 worker
-    /// will replace the body while preserving the trait signature.
-    ///
-    /// mu-kgu.2 has landed (this PR): the `SpanFamilyDropPolicy`
-    /// stub-panic test was removed and replaced by the policy-specific
-    /// tests at [`super::heuristic::tests`].
-    #[test]
-    #[should_panic(expected = "mu-kgu.3")]
-    fn hash_and_summary_policy_stub_panics_with_bead_marker() {
-        let rope = sample_rope();
-        let _ = hash_summary::HashAndSummaryPolicy::new().compact(&rope, 1_000);
-    }
+    // mu-kgu.1's stub-panic tests for SpanFamilyDropPolicy and
+    // HashAndSummaryPolicy have both been removed: mu-kgu.2 landed
+    // the real heuristic impl in [`super::heuristic`], and mu-kgu.3
+    // landed the real hash+summary impl in [`super::hash_summary`].
+    // Each policy's real-impl tests live alongside its module.
 }

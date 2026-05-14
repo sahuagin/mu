@@ -178,7 +178,7 @@ mod tests {
         ];
         let rope = assemble_rope(Some("you are mu"), &messages, &[sample_tool()]);
 
-        let kinds: Vec<SpanKind> = rope.iter().map(|s| s.kind).collect();
+        let kinds: Vec<SpanKind> = rope.iter().map(|s| s.kind.clone()).collect();
         assert_eq!(
             kinds,
             vec![

@@ -26,6 +26,7 @@ pub fn live_anthropic_enabled() -> bool {
 ///
 /// Sets `MU_BINARY` so the spawned `mu ask` can find the same
 /// binary when it spawns its own `mu serve` child.
+#[allow(dead_code)] // not all integration tests use this
 pub async fn run_mu_ask(args: &[&str]) -> (String, ExitStatus) {
     let output = timeout(
         Duration::from_secs(60),

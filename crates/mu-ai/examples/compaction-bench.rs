@@ -19,15 +19,15 @@
 //!   --max-sessions N    Stop after N sessions (debug). Default: unlimited.
 //!   --judge mock|live   HashAndSummaryPolicy judge wiring.
 //!                       Default: mock (KeepHalfJudge — no network).
-//!                       `live` errors out: a Provider-backed Judge
-//!                       adapter is not yet wired (mu-kgu.4 follow-up).
+//!                       `live`: Anthropic Haiku via $ANTHROPIC_API_KEY
+//!                       (override model with $MU_BENCH_JUDGE_MODEL).
 //!   -h | --help         Print this banner and exit.
 //! ```
 //!
 //! Mock mode is the load-bearing default — the bead's "Out" list
 //! explicitly defers live judge calls. The `--judge live` switch
-//! exists so the CLI surface is forward-compatible: once an
-//! adapter lands, only the wiring inside `build_policies` changes.
+//! activates the real Provider-backed adapter (mu-kgu.11):
+//! Anthropic Haiku 4.5 by default, ~$0.05 per compaction event.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -39,7 +39,12 @@ use mu_core::context::compaction::bench::{
 };
 use mu_core::context::compaction::hash_summary::HashAndSummaryPolicy;
 use mu_core::context::compaction::heuristic::SpanFamilyDropPolicy;
+use mu_core::context::compaction::provider_judge::ProviderJudge;
 use mu_core::context::compaction::NoCompactionPolicy;
+// mu-kgu.11: --judge live uses Anthropic Haiku 4.5 by default
+// (cheapest reliable judge per the bead). Operator can override via
+// $MU_BENCH_JUDGE_MODEL.
+use mu_ai::AnthropicProvider;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Format {
@@ -168,11 +173,20 @@ fn build_policies(judge: JudgeKind) -> Result<Vec<LabeledPolicy>, String> {
             });
         }
         JudgeKind::Live => {
-            return Err(
-                "--judge live: Provider-backed Judge adapter not yet wired (mu-kgu.4 \
-                 follow-up). Re-run with --judge mock for now."
-                    .to_string(),
-            );
+            // mu-kgu.11: real Provider-backed judge. Default Anthropic
+            // Haiku 4.5 (cheapest reliable per the bead's cost table:
+            // ~$0.05 / event vs ~$2.03 for Opus). Operator can override
+            // the model via $MU_BENCH_JUDGE_MODEL.
+            let model = std::env::var("MU_BENCH_JUDGE_MODEL")
+                .unwrap_or_else(|_| "claude-haiku-4-5-20251001".into());
+            let provider = AnthropicProvider::from_env(model.clone())
+                .map_err(|e| format!("--judge live: {e}"))?;
+            let judge = ProviderJudge::new(Arc::new(provider));
+            policies.push(LabeledPolicy {
+                label: format!("hash-and-summary-v1[live:{model}]"),
+                policy: Arc::new(HashAndSummaryPolicy::new(Arc::new(judge))),
+                model_calls: 1,
+            });
         }
     }
     Ok(policies)

@@ -39,10 +39,7 @@ use mu_core::transport::NotificationWriter;
 /// the wire types are all `Serialize`-derived structs that can't
 /// fail; the early return guards against any future struct gaining
 /// a custom Serialize impl that errors.
-pub fn translate_event(
-    session_id: &str,
-    event: AgentEvent,
-) -> Option<(&'static str, Value)> {
+pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static str, Value)> {
     match event {
         AgentEvent::TextDelta { delta } => to_pair(
             TextDeltaEvent::METHOD,
@@ -172,7 +169,10 @@ pub fn translate_event(
                 tool_call_id,
             },
         ),
-        AgentEvent::AutonomousIterationStarted { iteration, motivation } => to_pair(
+        AgentEvent::AutonomousIterationStarted {
+            iteration,
+            motivation,
+        } => to_pair(
             AutonomousIterationStartedEvent::METHOD,
             AutonomousIterationStartedEvent {
                 session_id: session_id.to_string(),
@@ -439,13 +439,8 @@ mod tests {
 
     #[test]
     fn translate_text_delta() {
-        let (method, params) = translate_event(
-            "s1",
-            AgentEvent::TextDelta {
-                delta: "hi".into(),
-            },
-        )
-        .expect("expected Some");
+        let (method, params) = translate_event("s1", AgentEvent::TextDelta { delta: "hi".into() })
+            .expect("expected Some");
         assert_eq!(method, "session.text_delta");
         assert_eq!(params["session_id"], "s1");
         assert_eq!(params["delta"], "hi");
@@ -758,9 +753,7 @@ mod tests {
         }
         match &entries[1].payload {
             EventPayload::ToolResult {
-                call_id,
-                is_error,
-                ..
+                call_id, is_error, ..
             } => {
                 assert_eq!(call_id, "call_1");
                 assert!(!is_error);
@@ -866,7 +859,9 @@ mod tests {
                 EventPayload::ContextAssembly { .. } => "context_assembly",
                 EventPayload::ProviderStatusUpdate { .. } => "provider_status_update",
                 EventPayload::AutonomousIterationStarted { .. } => "autonomous_iteration_started",
-                EventPayload::AutonomousIterationCompleted { .. } => "autonomous_iteration_completed",
+                EventPayload::AutonomousIterationCompleted { .. } => {
+                    "autonomous_iteration_completed"
+                }
                 EventPayload::AutonomousScheduledWakeup { .. } => "autonomous_scheduled_wakeup",
                 EventPayload::AutonomousTerminated { .. } => "autonomous_terminated",
             })
@@ -887,9 +882,7 @@ mod tests {
 
         let log = Arc::new(SessionEventLog::new("multi-ask"));
         // Three asks. Cumulative input = 100+50+25 = 175.
-        for (input, output, elapsed) in
-            [(100u64, 30u64, 500u64), (50, 12, 400), (25, 8, 200)]
-        {
+        for (input, output, elapsed) in [(100u64, 30u64, 500u64), (50, 12, 400), (25, 8, 200)] {
             let ev = AgentEvent::Done {
                 stop_reason: StopReason::EndTurn,
                 turn_count: 1,

@@ -37,10 +37,7 @@ pub fn default_events_dir() -> Option<PathBuf> {
 /// `create_session.provider` selector, to construct a fresh
 /// `Arc<dyn Provider>`. Multiple sessions on the same daemon can use
 /// different providers.
-pub async fn run(
-    factory: ProviderFactory,
-    tools: Vec<Arc<dyn Tool>>,
-) -> anyhow::Result<()> {
+pub async fn run(factory: ProviderFactory, tools: Vec<Arc<dyn Tool>>) -> anyhow::Result<()> {
     let stdin = BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();
     // Production: events go to the default ~/.local/share/mu/events

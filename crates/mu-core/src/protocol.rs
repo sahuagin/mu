@@ -521,17 +521,23 @@ pub enum AutonomousIterationOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "tag", rename_all = "snake_case")]
 pub enum AutonomousTerminationReason {
-    GoalMet { detail: String },
+    GoalMet {
+        detail: String,
+    },
     IterationCap,
     WallClockExpired,
     ToolCallCapExhausted,
     EscalationTimedOut,
-    GraderRejected { detail: String },
+    GraderRejected {
+        detail: String,
+    },
     /// Externally cancelled via session.cancel_outstanding or
     /// session.cancel_session.
     Cancelled,
     /// Provider or tool error mid-loop that wasn't recoverable.
-    Errored { message: String },
+    Errored {
+        message: String,
+    },
 }
 
 /// Request to park the session for `sleep_for_ms` (or until
@@ -1126,7 +1132,10 @@ mod tests {
         let with_value = serde_json::to_value(with_data)?;
 
         assert_eq!(nested_error_data(&without_value), None);
-        assert_eq!(nested_error_data(&with_value), Some(&json!({ "reason": "example" })));
+        assert_eq!(
+            nested_error_data(&with_value),
+            Some(&json!({ "reason": "example" }))
+        );
         Ok(())
     }
 
@@ -1196,10 +1205,7 @@ mod tests {
         };
         let value = serde_json::to_value(&event)?;
         let obj = value.as_object().expect("object");
-        assert!(
-            !obj.contains_key("theme"),
-            "theme: None should be omitted"
-        );
+        assert!(!obj.contains_key("theme"), "theme: None should be omitted");
         assert!(
             !obj.contains_key("context_refs"),
             "empty context_refs should be omitted"
@@ -1294,12 +1300,11 @@ mod tests {
     }
 
     #[test]
-    fn delegate_session_request_optional_branch_point_omitted_when_none() -> Result<(), serde_json::Error> {
+    fn delegate_session_request_optional_branch_point_omitted_when_none(
+    ) -> Result<(), serde_json::Error> {
         let req = DelegateSessionRequest {
             parent_session_id: "session-7".into(),
-            provider: ProviderSelector::AnthropicApi {
-                model: "x".into(),
-            },
+            provider: ProviderSelector::AnthropicApi { model: "x".into() },
             branched_at_parent_event_id: None,
             attenuations: None,
         };

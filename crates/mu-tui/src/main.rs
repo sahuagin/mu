@@ -53,19 +53,14 @@ use crate::mu_client::{Message as MuMessage, MuClient};
 // ── Model ───────────────────────────────────────────────────────────
 
 /// mu-62s: which buffer the next $EDITOR handoff targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum EditorTarget {
     /// mu-82l: the user prompt being typed in SendPrompt mode.
+    #[default]
     PromptBuffer,
     /// mu-62s: the session's default system prompt — applies to the
     /// next `n` (create_session) until changed.
     SystemPrompt,
-}
-
-impl Default for EditorTarget {
-    fn default() -> Self {
-        Self::PromptBuffer
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +122,9 @@ impl SessionStatus {
     }
     fn style(&self) -> Style {
         match self {
-            Self::Running => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Self::Running => Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
             Self::Idle => Style::default().fg(Color::Yellow),
             Self::Done => Style::default().fg(Color::DarkGray),
         }
@@ -366,10 +363,8 @@ impl App {
                         if !sid.is_empty() {
                             match method.as_str() {
                                 "session.text_delta" => {
-                                    let delta = params
-                                        .get("delta")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
+                                    let delta =
+                                        params.get("delta").and_then(|v| v.as_str()).unwrap_or("");
                                     self.streaming_text
                                         .entry(sid.to_string())
                                         .or_default()
@@ -434,9 +429,7 @@ impl App {
         // view and a session is selected. Polls every 2 ticks
         // (~500ms) so live conversation feels responsive without
         // flooding session.events on quiet sessions.
-        if matches!(self.mode, ViewMode::SessionDetail)
-            && self.poll_tick_counter % 2 == 0
-        {
+        if matches!(self.mode, ViewMode::SessionDetail) && self.poll_tick_counter % 2 == 0 {
             self.refresh_transcript_for_selection();
         }
         // mu-xln F5: refresh whenever a session.done landed this tick,
@@ -452,19 +445,17 @@ impl App {
     }
 
     fn refresh_transcript_for_selection(&mut self) {
-        let Some(idx) = self.selected_session.selected() else { return };
-        let Some(sid) = self.sessions.get(idx).and_then(|r| r.session_id.clone())
-        else {
+        let Some(idx) = self.selected_session.selected() else {
+            return;
+        };
+        let Some(sid) = self.sessions.get(idx).and_then(|r| r.session_id.clone()) else {
             return;
         };
         let Some(mu) = self.mu.as_mut() else { return };
         // No after_event_id — pull the full first page (limit=200).
         // For very long sessions, future work adds pagination/scroll;
         // for daily-driver-today, 200 events covers ~tens of asks.
-        let res = mu.request(
-            "session.events",
-            json!({ "session_id": sid, "limit": 500 }),
-        );
+        let res = mu.request("session.events", json!({ "session_id": sid, "limit": 500 }));
         match res {
             Ok(v) => {
                 if let Some(events) = v.get("events").and_then(|e| e.as_array()) {
@@ -485,9 +476,7 @@ impl App {
             Ok(v) => v
                 .get("sessions")
                 .and_then(|s| s.as_array())
-                .map(|arr| {
-                    arr.iter().filter_map(session_row_from_info_value).collect()
-                })
+                .map(|arr| arr.iter().filter_map(session_row_from_info_value).collect())
                 .unwrap_or_default(),
             Err(e) => {
                 self.firehose.push(format!("[!! session.list] {e}"));
@@ -501,8 +490,8 @@ impl App {
         for row in rows.iter_mut() {
             if let Some(sid) = row.session_id.as_deref() {
                 if let Some(snap) = self.latest_status.get(sid) {
-                    let synthetic_ms = snap.elapsed_ms
-                        + snap.received_at.elapsed().as_millis() as u64;
+                    let synthetic_ms =
+                        snap.elapsed_ms + snap.received_at.elapsed().as_millis() as u64;
                     let secs = synthetic_ms as f32 / 1000.0;
                     row.phase = match snap.state.as_str() {
                         "awaiting_first_token" => {
@@ -584,8 +573,7 @@ impl App {
                     .get("daemon_id")
                     .and_then(|s| s.as_str())
                     .map(String::from);
-                self.daemon_uptime_ms =
-                    v.get("uptime_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+                self.daemon_uptime_ms = v.get("uptime_ms").and_then(|x| x.as_u64()).unwrap_or(0);
                 self.daemon_event_count =
                     v.get("total_events").and_then(|x| x.as_u64()).unwrap_or(0);
                 self.daemon_total_input_tokens = v
@@ -760,9 +748,12 @@ impl App {
                     .take(60)
                     .collect::<String>()
                     .replace('\n', " ");
-                let suffix = if prompt.chars().count() > 60 { "…" } else { "" };
-                self.firehose
-                    .push(format!("→ {sid}: {preview:?}{suffix}"));
+                let suffix = if prompt.chars().count() > 60 {
+                    "…"
+                } else {
+                    ""
+                };
+                self.firehose.push(format!("→ {sid}: {preview:?}{suffix}"));
             }
             Err(e) => {
                 self.firehose.push(format!("[!! ask_session] {e}"));
@@ -993,9 +984,7 @@ impl App {
                     self.selected_session.select(Some((i + n - 1) % n));
                 }
                 (KeyCode::Enter, _) => self.close_session_picker(true),
-                (KeyCode::Esc, _) | (KeyCode::F(3), _) => {
-                    self.close_session_picker(false)
-                }
+                (KeyCode::Esc, _) | (KeyCode::F(3), _) => self.close_session_picker(false),
                 _ => {}
             }
             return;
@@ -1009,11 +998,11 @@ impl App {
                 self.command_buffer.clear();
             }
             (KeyCode::Char('n'), _) => self.create_session(),
-            (KeyCode::Char('i'), _) | (KeyCode::Enter, _) => {
-                if self.selected_session.selected().is_some() {
-                    self.input_mode = InputMode::SendPrompt;
-                    self.reset_prompt();
-                }
+            (KeyCode::Char('i'), _) | (KeyCode::Enter, _)
+                if self.selected_session.selected().is_some() =>
+            {
+                self.input_mode = InputMode::SendPrompt;
+                self.reset_prompt();
             }
             (KeyCode::F(1), _) => self.mode = ViewMode::CommandCenter,
             (KeyCode::F(2), _) => self.mode = ViewMode::SessionTree,
@@ -1032,12 +1021,10 @@ impl App {
             }
             // Transcript scrolling — only meaningful on F3.
             (KeyCode::PageUp, _) if matches!(self.mode, ViewMode::SessionDetail) => {
-                self.transcript_scroll_offset =
-                    self.transcript_scroll_offset.saturating_add(10);
+                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_add(10);
             }
             (KeyCode::PageDown, _) if matches!(self.mode, ViewMode::SessionDetail) => {
-                self.transcript_scroll_offset =
-                    self.transcript_scroll_offset.saturating_sub(10);
+                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(10);
             }
             (KeyCode::Home, _) if matches!(self.mode, ViewMode::SessionDetail) => {
                 // Big offset → render scrolls to the top.
@@ -1049,12 +1036,10 @@ impl App {
             // j/k scroll the transcript in F3, but still navigate the
             // session list in other views.
             (KeyCode::Char('k'), _) if matches!(self.mode, ViewMode::SessionDetail) => {
-                self.transcript_scroll_offset =
-                    self.transcript_scroll_offset.saturating_add(2);
+                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_add(2);
             }
             (KeyCode::Char('j'), _) if matches!(self.mode, ViewMode::SessionDetail) => {
-                self.transcript_scroll_offset =
-                    self.transcript_scroll_offset.saturating_sub(2);
+                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(2);
             }
             // F8 events-explorer scroll. Same keys as F3 transcript.
             (KeyCode::PageUp, _) if matches!(self.mode, ViewMode::Events) => {
@@ -1144,8 +1129,7 @@ impl App {
                         .push(format!("[ok] provider kind → {k} (model {m} unchanged)"));
                 }
                 _ => {
-                    self.default_provider =
-                        (rest[0].to_string(), rest[1..].join(" "));
+                    self.default_provider = (rest[0].to_string(), rest[1..].join(" "));
                     let (k, m) = &self.default_provider;
                     self.firehose
                         .push(format!("[ok] default provider set to {k}/{m}"));
@@ -1184,9 +1168,7 @@ impl App {
                                 if s.chars().count() > 80 { "…" } else { "" }
                             ));
                         }
-                        None => self
-                            .firehose
-                            .push("[info] no default system_prompt".into()),
+                        None => self.firehose.push("[info] no default system_prompt".into()),
                     }
                 } else {
                     let text = rest.join(" ");
@@ -1255,10 +1237,10 @@ fn session_row_from_info_value(v: &serde_json::Value) -> Option<SessionRow> {
     };
     let cumulative_usage = v.get("cumulative_usage");
     let tokens_kilo = cumulative_usage
-        .and_then(|u| {
+        .map(|u| {
             let i = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
             let o = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-            Some(((i + o) / 1000) as u32)
+            ((i + o) / 1000) as u32
         })
         .unwrap_or(0);
     Some(SessionRow {
@@ -1280,7 +1262,10 @@ fn handle_notification(
     method: &str,
     params: &serde_json::Value,
 ) {
-    let sid = params.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+    let sid = params
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let find = |sessions: &mut [SessionRow], sid: &str| -> Option<usize> {
         sessions
             .iter()
@@ -1298,15 +1283,24 @@ fn handle_notification(
             firehose.push(format!("[{sid}] δ {snip:?}"));
         }
         "session.tool_call_started" => {
-            let name = params.get("tool_name").and_then(|v| v.as_str()).unwrap_or("?");
-            let tid = params.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let name = params
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let tid = params
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
             firehose.push(format!("[{sid}] tool.start {name} ({tid})"));
             if let Some(i) = find(sessions, sid) {
                 sessions[i].phase = format!("tool: {name}");
             }
         }
         "session.tool_call_completed" => {
-            let tid = params.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let tid = params
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
             let outcome = params
                 .get("outcome")
                 .and_then(|o| o.get("kind"))
@@ -1319,8 +1313,13 @@ fn handle_notification(
             firehose.push(format!("[{sid}] callout: {title}"));
         }
         "session.input_required" => {
-            let rid = params.get("request_id").and_then(|v| v.as_str()).unwrap_or("?");
-            firehose.push(format!("[{sid}] !! input_required ({rid}) — TUI approval flow TBD"));
+            let rid = params
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            firehose.push(format!(
+                "[{sid}] !! input_required ({rid}) — TUI approval flow TBD"
+            ));
         }
         "session.provider_status" => {
             // mu-035 Phase B: store the latest snapshot per session.
@@ -1363,15 +1362,27 @@ fn handle_notification(
             }
         }
         "session.done" => {
-            let stop = params.get("stop_reason").and_then(|v| v.as_str()).unwrap_or("?");
-            let elapsed_ms = params.get("elapsed_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            let stop = params
+                .get("stop_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let elapsed_ms = params
+                .get("elapsed_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             firehose.push(format!("[{sid}] done stop={stop} elapsed={elapsed_ms}ms"));
             if let Some(i) = find(sessions, sid) {
                 sessions[i].status = SessionStatus::Done;
                 sessions[i].phase = format!("done ({stop})");
                 if let Some(usage) = params.get("usage") {
-                    let inp = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let out = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let inp = usage
+                        .get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let out = usage
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     sessions[i].tokens_kilo = ((inp + out) / 1000) as u32;
                 }
             }
@@ -1380,7 +1391,10 @@ fn handle_notification(
             latest_status.remove(sid);
         }
         "session.error" => {
-            let msg = params.get("message").and_then(|v| v.as_str()).unwrap_or("error");
+            let msg = params
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("error");
             firehose.push(format!("[{sid}] !! error: {msg}"));
             latest_status.remove(sid);
         }
@@ -1477,11 +1491,11 @@ fn ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),       // header
-            Constraint::Length(2),       // mode tabs
-            Constraint::Min(10),         // main body
-            Constraint::Length(10),      // firehose (8 lines content + borders)
-            Constraint::Length(1),       // status line
+            Constraint::Length(3),  // header
+            Constraint::Length(2),  // mode tabs
+            Constraint::Min(10),    // main body
+            Constraint::Length(10), // firehose (8 lines content + borders)
+            Constraint::Length(1),  // status line
         ])
         .split(area);
 
@@ -1497,7 +1511,9 @@ fn ui(f: &mut Frame, app: &mut App) {
         ViewMode::Router => render_placeholder(f, chunks[2], "Router / Proxy", "F7"),
         ViewMode::Events => render_events_explorer(f, app, chunks[2]),
         // ^ takes &mut for in-render clamping of events_scroll_offset
-        ViewMode::Mailbox => render_placeholder(f, chunks[2], "Mailbox (cooperating sessions)", "F9"),
+        ViewMode::Mailbox => {
+            render_placeholder(f, chunks[2], "Mailbox (cooperating sessions)", "F9")
+        }
     }
     render_firehose(f, app, chunks[3]);
     render_statusline(f, app, chunks[4]);
@@ -1633,10 +1649,7 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
             // provider/model line we had before.
             let detail = Line::from(vec![
                 Span::raw("    "),
-                Span::styled(
-                    s.phase.clone(),
-                    Style::default().fg(Color::Cyan),
-                ),
+                Span::styled(s.phase.clone(), Style::default().fg(Color::Cyan)),
                 Span::raw(format!("   ${:.2}  ", s.cost_usd)),
                 Span::raw(format!("{}k tok", s.tokens_kilo)),
             ]);
@@ -1675,8 +1688,8 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
                 // Bump the elapsed by how long since we received this
                 // snapshot — so the displayed seconds advance smoothly
                 // between ticks rather than jumping every ~1s.
-                let synthetic_elapsed_ms = snap.elapsed_ms
-                    + snap.received_at.elapsed().as_millis() as u64;
+                let synthetic_elapsed_ms =
+                    snap.elapsed_ms + snap.received_at.elapsed().as_millis() as u64;
                 let secs = synthetic_elapsed_ms as f32 / 1000.0;
                 let (label, color) = match snap.state.as_str() {
                     "awaiting_first_token" => ("● awaiting first token  ", Color::Yellow),
@@ -1761,7 +1774,9 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Selected session ");
-    let paragraph = Paragraph::new(detail_text).block(block).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(detail_text)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(paragraph, h[1]);
 }
 
@@ -1903,17 +1918,18 @@ fn render_session_detail(f: &mut Frame, app: &mut App, area: Rect) {
         vec![Line::from(format!("session {sid}"))]
     };
     f.render_widget(
-        Paragraph::new(header_lines)
-            .block(Block::default().borders(Borders::ALL).title(" Session Detail (F3) ")),
+        Paragraph::new(header_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Session Detail (F3) "),
+        ),
         chunks[0],
     );
 
     // Transcript body. Pull cached events from the last
     // session.events poll; degrade to a "(loading…)" placeholder if
     // we haven't fetched yet.
-    let body_lines: Vec<Line> = if let Some(events) =
-        app.transcript_events_by_sid.get(&sid)
-    {
+    let body_lines: Vec<Line> = if let Some(events) = app.transcript_events_by_sid.get(&sid) {
         let streaming_partial = app.streaming_text.get(&sid).map(String::as_str);
         render_transcript_lines(events, streaming_partial)
     } else {
@@ -2000,9 +2016,14 @@ fn render_transcript_lines(
     }
 
     for ev in events {
-        let Some(payload) = ev.get("payload") else { continue };
+        let Some(payload) = ev.get("payload") else {
+            continue;
+        };
         let kind = payload.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
-        let ts = ev.get("timestamp_unix_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+        let ts = ev
+            .get("timestamp_unix_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let _ = ts; // future: show timestamps in a compact column
 
         match kind {
@@ -2155,12 +2176,7 @@ fn render_transcript_lines(
 
     if let Some(partial) = streaming_partial {
         if !partial.is_empty() {
-            push_block(
-                &mut lines,
-                "assistant (streaming…)",
-                Color::Yellow,
-                partial,
-            );
+            push_block(&mut lines, "assistant (streaming…)", Color::Yellow, partial);
         }
     }
 
@@ -2204,7 +2220,7 @@ fn render_events_explorer(f: &mut Frame, app: &mut App, area: Rect) {
     let filter = app.events_filter.trim().to_string();
     // Build the filtered line list. Cheap — firehose is capped at 500.
     let lines_owned: Vec<String> = if filter.is_empty() {
-        app.firehose.iter().cloned().collect()
+        app.firehose.to_vec()
     } else {
         app.firehose
             .iter()
@@ -2240,10 +2256,7 @@ fn render_events_explorer(f: &mut Frame, app: &mut App, area: Rect) {
         " · End=bottom · Home=top · :filter to filter".into()
     };
     let title = format!(" Events Explorer (F8) — {title_suffix}{scroll_suffix} ");
-    let body_lines: Vec<Line> = lines_owned
-        .iter()
-        .map(|s| Line::from(s.as_str()))
-        .collect();
+    let body_lines: Vec<Line> = lines_owned.iter().map(|s| Line::from(s.as_str())).collect();
     let block = Block::default().borders(Borders::ALL).title(title);
     let paragraph = Paragraph::new(body_lines)
         .block(block)
@@ -2295,8 +2308,8 @@ fn render_usage(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let header_cells = [
-        "provider", "model", "sess", "ttft p95", "strm p95", "tool p95", "wall p95",
-        "in tok", "out tok", "cache%", "tools", "err",
+        "provider", "model", "sess", "ttft p95", "strm p95", "tool p95", "wall p95", "in tok",
+        "out tok", "cache%", "tools", "err",
     ]
     .iter()
     .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)));
@@ -2353,10 +2366,7 @@ fn render_usage(f: &mut Frame, app: &App, area: Rect) {
                 .get("tool_call_count_sum")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            let errors = row
-                .get("error_count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let errors = row.get("error_count").and_then(|v| v.as_u64()).unwrap_or(0);
             let err_style = if errors > 0 {
                 Style::default().fg(Color::Red)
             } else {
@@ -2443,7 +2453,9 @@ fn render_placeholder(f: &mut Frame, area: Rect, name: &str, fkey: &str) {
             Style::default().fg(Color::DarkGray),
         )),
     ];
-    let block = Block::default().borders(Borders::ALL).title(format!(" {name} "));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {name} "));
     let paragraph = Paragraph::new(body).block(block);
     f.render_widget(paragraph, area);
 }
@@ -2472,7 +2484,9 @@ fn render_firehose(f: &mut Frame, app: &App, area: Rect) {
     // instead of being cut off at the right border. Wrap-expansion
     // means a 200-char error consumes multiple visible rows; that's
     // the trade we want for readability over density.
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(paragraph, area);
 }
 
@@ -2502,9 +2516,7 @@ fn render_statusline(f: &mut Frame, app: &App, area: Rect) {
             // Available chars for the prompt window — leave 1 cell
             // of headroom past the cursor so the caret doesn't sit
             // at the very edge.
-            let avail = (area.width as usize)
-                .saturating_sub(prefix_w + 1)
-                .max(1);
+            let avail = (area.width as usize).saturating_sub(prefix_w + 1).max(1);
             let scroll = if cursor >= avail {
                 cursor + 1 - avail
             } else {
@@ -2595,12 +2607,7 @@ fn main() -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             let tools_refs: Vec<&str> = cli.tools.iter().map(String::as_str).collect();
-            match MuClient::spawn(
-                &bin.to_string_lossy(),
-                &tools_refs,
-                &cwd,
-                cli.bash_yolo,
-            ) {
+            match MuClient::spawn(&bin.to_string_lossy(), &tools_refs, &cwd, cli.bash_yolo) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     eprintln!("warning: failed to spawn mu serve: {e}; running in mock-data mode");
@@ -2698,15 +2705,14 @@ fn run<B: Backend>(
                         // cleared the system prompt; store None to
                         // suppress the wire field entirely (matches
                         // :clear_system_prompt semantics).
-                        app.default_system_prompt =
-                            if buf.is_empty() { None } else { Some(buf) };
-                        let preview: String =
-                            app.default_system_prompt
-                                .as_deref()
-                                .unwrap_or("(cleared)")
-                                .chars()
-                                .take(40)
-                                .collect();
+                        app.default_system_prompt = if buf.is_empty() { None } else { Some(buf) };
+                        let preview: String = app
+                            .default_system_prompt
+                            .as_deref()
+                            .unwrap_or("(cleared)")
+                            .chars()
+                            .take(40)
+                            .collect();
                         app.firehose
                             .push(format!("[ok] system_prompt updated: {preview}…"));
                     }

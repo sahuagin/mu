@@ -144,11 +144,7 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool. The Tool impl owns `cancel_rx` and must
     /// abort when it fires.
-    async fn execute(
-        &self,
-        arguments: Value,
-        cancel_rx: oneshot::Receiver<()>,
-    ) -> ToolResult;
+    async fn execute(&self, arguments: Value, cancel_rx: oneshot::Receiver<()>) -> ToolResult;
 }
 
 #[cfg(test)]

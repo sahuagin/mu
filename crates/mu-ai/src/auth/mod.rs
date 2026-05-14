@@ -118,8 +118,8 @@ impl TokenStore for FileSystemTokenStore {
 fn write_with_restrictive_perms(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -131,9 +131,7 @@ fn write_with_restrictive_perms(path: &std::path::Path, bytes: &[u8]) -> std::io
     }
     #[cfg(not(unix))]
     {
-        tracing::warn!(
-            "non-Unix platform: token file written without explicit perms"
-        );
+        tracing::warn!("non-Unix platform: token file written without explicit perms");
         fs::write(path, bytes)
     }
 }

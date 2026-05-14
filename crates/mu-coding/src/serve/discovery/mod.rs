@@ -66,10 +66,7 @@ pub trait SessionDiscovery: Send + Sync {
     /// returns only this daemon's sessions; federating backends
     /// (File, Etcd) include peers when `filter.include_remote` is
     /// set.
-    async fn list(
-        &self,
-        filter: &SessionListFilter,
-    ) -> Result<Vec<SessionInfo>, DiscoveryError>;
+    async fn list(&self, filter: &SessionListFilter) -> Result<Vec<SessionInfo>, DiscoveryError>;
 
     /// Announce that a local session exists. Best-effort: failures
     /// are logged but do not propagate. LocalRegistry is a no-op
@@ -103,7 +100,10 @@ pub fn derive_status(log: &SessionEventLog) -> SessionStatusSummary {
     derive_status_from_events(&events, now_unix_ms())
 }
 
-pub fn derive_status_from_events(events: &[SessionEvent], now_unix_ms: u64) -> SessionStatusSummary {
+pub fn derive_status_from_events(
+    events: &[SessionEvent],
+    now_unix_ms: u64,
+) -> SessionStatusSummary {
     if events.is_empty() {
         return SessionStatusSummary::Idle;
     }
@@ -147,9 +147,7 @@ pub fn derive_status_from_events(events: &[SessionEvent], now_unix_ms: u64) -> S
                 // today; switch to a dedicated event if/when needed.
                 if category == "input_required" || category == "approval" {
                     input_required_open = true;
-                } else if category == "input_required_resolved"
-                    || category == "approval_resolved"
-                {
+                } else if category == "input_required_resolved" || category == "approval_resolved" {
                     input_required_open = false;
                 }
             }
@@ -250,7 +248,7 @@ pub fn derive_session_info(
 
 // Convenience re-exports so callers can `use serve::discovery::*` and
 // get the bits they need without reaching into protocol crate paths.
-pub use mu_core::protocol::{SessionInfo as PublicSessionInfo};
+pub use mu_core::protocol::SessionInfo as PublicSessionInfo;
 
 #[allow(dead_code)] // referenced by test scaffolding only today
 fn _typecheck(_a: &EventActor) {}

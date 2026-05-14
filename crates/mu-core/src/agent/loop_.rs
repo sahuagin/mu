@@ -26,8 +26,8 @@ use crate::protocol::{
 };
 
 use super::provider::{Provider, ProviderEvent};
-use super::types::Usage;
 use super::tool::{PermissionLevel, RetryPolicy, Tool, ToolResult, ToolSpec};
+use super::types::Usage;
 use super::types::{AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolCall};
 
 /// Map of outstanding `session.input_required` prompts, keyed by
@@ -262,7 +262,9 @@ pub enum Outcome {
     /// handlers, emits a Done(Aborted) event for the ask, resets
     /// per-ask state, and continues to wait for the next ask. Not
     /// returned by run() itself — purely an internal sentinel.
-    OutstandingCancelled { reason: String },
+    OutstandingCancelled {
+        reason: String,
+    },
 }
 
 /// Internal action queue. Callers push `AgentInput` via `AgentLoop::send`;
@@ -504,12 +506,12 @@ async fn run(
         match action {
             Action::External(AgentInput::UserMessage(msg)) => {
                 let _ = events
-                    .send(AgentEvent::MessageStart { message: msg.clone() })
+                    .send(AgentEvent::MessageStart {
+                        message: msg.clone(),
+                    })
                     .await;
                 messages.push(msg.clone());
-                let _ = events
-                    .send(AgentEvent::MessageEnd { message: msg })
-                    .await;
+                let _ = events.send(AgentEvent::MessageEnd { message: msg }).await;
                 if should_push_invoke_llm(&queue) {
                     queue.push_back(Action::InvokeLlm);
                 }
@@ -667,7 +669,8 @@ async fn run(
                 // the durable log records what the model was about
                 // to see. (mu-032.)
                 model_call_id += 1;
-                let (user_count, assistant_count, tool_result_count) = count_message_roles(&messages);
+                let (user_count, assistant_count, tool_result_count) =
+                    count_message_roles(&messages);
                 let _ = events
                     .send(AgentEvent::ContextAssembly {
                         model_call_id,
@@ -692,7 +695,7 @@ async fn run(
                     Ok((assistant_msg, buffered)) => {
                         if let Some(u) = assistant_msg.usage {
                             aggregated_usage = Some(match aggregated_usage {
-                                Some(prev) => prev.add(u),
+                                Some(prev) => prev + u,
                                 None => u,
                             });
                         }
@@ -730,8 +733,7 @@ async fn run(
                                 context_refs: vec!["spec:mu-035".into()],
                             })
                             .await;
-                        let elapsed_ms =
-                            started_at.map(|t| t.elapsed().as_millis() as u64);
+                        let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
                         let _ = events
                             .send(AgentEvent::Done {
                                 stop_reason: StopReason::Aborted,
@@ -748,9 +750,7 @@ async fn run(
                     }
                     Err(outcome) => {
                         if let Outcome::Error(ref m) = outcome {
-                            let _ = events
-                                .send(AgentEvent::Error { message: m.clone() })
-                                .await;
+                            let _ = events.send(AgentEvent::Error { message: m.clone() }).await;
                         }
                         return outcome;
                     }
@@ -777,8 +777,8 @@ async fn run(
                             ..
                         } = &mut mode
                         {
-                            *tool_calls_consumed = tool_calls_consumed
-                                .saturating_add(tool_results.len() as u32);
+                            *tool_calls_consumed =
+                                tool_calls_consumed.saturating_add(tool_results.len() as u32);
                         }
                         for r in tool_results {
                             messages.push(r);
@@ -800,8 +800,7 @@ async fn run(
                                 context_refs: vec!["spec:mu-035".into()],
                             })
                             .await;
-                        let elapsed_ms =
-                            started_at.map(|t| t.elapsed().as_millis() as u64);
+                        let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
                         let _ = events
                             .send(AgentEvent::Done {
                                 stop_reason: StopReason::Aborted,
@@ -818,9 +817,7 @@ async fn run(
                     }
                     Err(outcome) => {
                         if let Outcome::Error(ref m) = outcome {
-                            let _ = events
-                                .send(AgentEvent::Error { message: m.clone() })
-                                .await;
+                            let _ = events.send(AgentEvent::Error { message: m.clone() }).await;
                         }
                         return outcome;
                     }
@@ -852,17 +849,26 @@ async fn run(
                 // ask-finalization path so autonomous runs don't emit
                 // spurious per-ask `Done` events between iterations.
                 if let RunMode::Autonomous { .. } = &mode {
-                    let (current_iteration, current_options, current_started_at, current_tool_calls) =
-                        match &mode {
-                            RunMode::Autonomous {
-                                iteration,
-                                options,
-                                started_at,
-                                tool_calls_consumed,
-                                ..
-                            } => (*iteration, options.clone(), *started_at, *tool_calls_consumed),
-                            _ => unreachable!(),
-                        };
+                    let (
+                        current_iteration,
+                        current_options,
+                        current_started_at,
+                        current_tool_calls,
+                    ) = match &mode {
+                        RunMode::Autonomous {
+                            iteration,
+                            options,
+                            started_at,
+                            tool_calls_consumed,
+                            ..
+                        } => (
+                            *iteration,
+                            options.clone(),
+                            *started_at,
+                            *tool_calls_consumed,
+                        ),
+                        _ => unreachable!(),
+                    };
 
                     // SelfReport goal-check: inspect the last assistant
                     // text message for a `goal_status` marker. The
@@ -886,9 +892,7 @@ async fn run(
                         }
                         _ => None,
                     });
-                    let goal_status = last_assistant_text
-                        .as_deref()
-                        .and_then(extract_goal_status);
+                    let goal_status = last_assistant_text.as_deref().and_then(extract_goal_status);
 
                     // Emit a Callout mirroring the model's self-report,
                     // so consumers see a `session.callout { kind:
@@ -901,9 +905,7 @@ async fn run(
                     let _ = events
                         .send(AgentEvent::Callout {
                             category: "goal_status".to_owned(),
-                            title: format!(
-                                "iteration {current_iteration} goal-check"
-                            ),
+                            title: format!("iteration {current_iteration} goal-check"),
                             body: serde_json::json!({
                                 "satisfied": satisfied,
                                 "reason": reason,
@@ -959,8 +961,7 @@ async fn run(
                         .map(|o| o.min(cap_max_iter))
                         .unwrap_or(cap_max_iter);
 
-                    let elapsed_ms_total =
-                        current_started_at.elapsed().as_millis() as u64;
+                    let elapsed_ms_total = current_started_at.elapsed().as_millis() as u64;
 
                     let terminal_reason: Option<AutonomousTerminationReason> = if satisfied {
                         Some(AutonomousTerminationReason::GoalMet {
@@ -986,8 +987,7 @@ async fn run(
                             })
                             .await;
                         mode = RunMode::Idle;
-                        let elapsed_ms =
-                            started_at.map(|t| t.elapsed().as_millis() as u64);
+                        let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
                         let _ = events
                             .send(AgentEvent::Done {
                                 stop_reason: StopReason::EndTurn,
@@ -1007,8 +1007,7 @@ async fn run(
                     if let RunMode::Autonomous { iteration, .. } = &mut mode {
                         *iteration = next_iter;
                     }
-                    let motivation =
-                        format!("iteration {next_iter}: continue toward the goal");
+                    let motivation = format!("iteration {next_iter}: continue toward the goal");
                     let _ = events
                         .send(AgentEvent::AutonomousIterationStarted {
                             iteration: next_iter,
@@ -1477,13 +1476,17 @@ async fn handle_execute_tools(
         // await the decision. Approve continues to dispatch; Deny
         // synthesizes an is_error result. (AskOnce/Always
         // remembering is reserved for v2.)
-        let permission_decision = if !retry_refusal_reason.is_some() {
+        let permission_decision = if retry_refusal_reason.is_none() {
             match tool.as_ref().map(|t| t.spec().policy.permission) {
                 Some(PermissionLevel::Ask) | Some(PermissionLevel::AskOnce) => {
                     // AskOnce currently treated as Ask in v1; future
                     // work persists the "approved once" decision so
                     // subsequent calls skip the prompt.
-                    let request_id = format!("ask-{}-{}", call.id, ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+                    let request_id = format!(
+                        "ask-{}-{}",
+                        call.id,
+                        ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    );
                     let (decision_tx, decision_rx) = oneshot::channel();
                     if let Ok(mut pending) = pending_approvals.lock() {
                         pending.insert(request_id.clone(), decision_tx);
@@ -1623,8 +1626,7 @@ async fn handle_execute_tools(
             match tool {
                 Some(t) => {
                     let (cancel_tx, cancel_rx) = oneshot::channel();
-                    let mut execute_fut =
-                        Box::pin(t.execute(call.arguments.clone(), cancel_rx));
+                    let mut execute_fut = Box::pin(t.execute(call.arguments.clone(), cancel_rx));
 
                     // mu-035 Phase B: periodic ToolExecuting status
                     // emit. Same INV-4 motivation as the LLM stream

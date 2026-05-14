@@ -5,7 +5,7 @@ use std::pin::Pin;
 use mu_core::agent::{
     PermissionLevel, RetryPolicy, SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 pub struct WriteTool;
@@ -206,11 +206,9 @@ mod tests {
             .await;
 
         assert!(result.is_error);
-        assert!(
-            result
-                .content
-                .contains("missing required `content` argument")
-        );
+        assert!(result
+            .content
+            .contains("missing required `content` argument"));
     }
 
     #[tokio::test]

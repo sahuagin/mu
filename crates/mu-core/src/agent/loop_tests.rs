@@ -15,9 +15,7 @@ use tokio::time::timeout;
 use super::*;
 use crate::agent::provider::{Provider, ProviderError, ProviderEvent};
 use crate::agent::tool::{Tool, ToolResult, ToolSpec};
-use crate::agent::types::{
-    AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolCall,
-};
+use crate::agent::types::{AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolCall};
 
 // ============================================================================
 // MockProvider
@@ -242,10 +240,8 @@ fn spawn_loop(
         .into_iter()
         .map(|t| Arc::new(t) as Arc<dyn Tool>)
         .collect();
-    let approvals: PendingApprovals =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let capability: SessionCapability =
-        Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
     let loop_ = AgentLoop::spawn(provider, tools, config, events_tx, approvals, capability);
     (loop_, events_rx)
 }
@@ -350,7 +346,9 @@ async fn b6_provider_error_terminates() {
 
     // Should see an error event before termination.
     assert!(
-        events.iter().any(|e| matches!(e, AgentEvent::Error { message } if message == "rate limit")),
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { message } if message == "rate limit")),
         "missing error event in {:?}",
         events.iter().map(kind).collect::<Vec<_>>()
     );
@@ -396,20 +394,20 @@ async fn b2_single_tool_call() {
             "turn_start",          // turn 1
             "context_assembly",    // mu-032: before provider call
             "provider_status",     // mu-035: AwaitingFirstToken
-            "message_start",       // assistant w/ tool call (no text first → no Streaming transition)
-            "message_end",         // assistant w/ tool call
-            "provider_status",     // mu-035: ToolExecuting before dispatch
-            "tool_call_started",   // echo
+            "message_start", // assistant w/ tool call (no text first → no Streaming transition)
+            "message_end",   // assistant w/ tool call
+            "provider_status", // mu-035: ToolExecuting before dispatch
+            "tool_call_started", // echo
             "tool_call_completed", // echo
-            "turn_end",            // end turn 1
-            "turn_start",          // turn 2
-            "context_assembly",    // mu-032: before second provider call
-            "provider_status",     // mu-035: AwaitingFirstToken turn 2
-            "provider_status",     // mu-035: Streaming on first token
-            "text_delta",          // "done"
-            "message_start",       // assistant text
-            "message_end",         // assistant text
-            "turn_end",            // end turn 2
+            "turn_end",      // end turn 1
+            "turn_start",    // turn 2
+            "context_assembly", // mu-032: before second provider call
+            "provider_status", // mu-035: AwaitingFirstToken turn 2
+            "provider_status", // mu-035: Streaming on first token
+            "text_delta",    // "done"
+            "message_start", // assistant text
+            "message_end",   // assistant text
+            "turn_end",      // end turn 2
             "done",
         ]
     );
@@ -465,8 +463,11 @@ async fn b5_tool_error_continues() {
 /// B-3: iteration cap. Provider always tool-calls; loop stops at max_turns.
 #[tokio::test]
 async fn b3_iteration_cap() {
-    let tool_call_response =
-        vec![ProviderEvent::Done(assistant_tool_call("t1", "echo", json!({})))];
+    let tool_call_response = vec![ProviderEvent::Done(assistant_tool_call(
+        "t1",
+        "echo",
+        json!({}),
+    ))];
     let provider = MockProvider::forever(tool_call_response);
     let tools = vec![MockTool::always_ok("echo", "ok")];
 
@@ -517,10 +518,7 @@ async fn b4_cancel_during_stream() {
         .expect("send user");
     // Give the loop a beat to enter the stream.
     tokio::time::sleep(Duration::from_millis(20)).await;
-    loop_
-        .send(AgentInput::Cancel)
-        .await
-        .expect("send cancel");
+    loop_.send(AgentInput::Cancel).await.expect("send cancel");
 
     let events_handle = tokio::spawn(collect_events(events_rx));
     let outcome = timeout(Duration::from_millis(500), loop_.join())
@@ -789,11 +787,7 @@ fn tool_history_window_evicts_oldest() {
     let mut h = ToolHistory::default();
     // Fill past the window; oldest should evict.
     for i in 0..(TOOL_HISTORY_WINDOW + 3) {
-        h.record(
-            "bash".into(),
-            json!({"command": format!("cmd{i}")}),
-            true,
-        );
+        h.record("bash".into(), json!({"command": format!("cmd{i}")}), true);
     }
     // Window is capped.
     assert_eq!(h.entries.len(), TOOL_HISTORY_WINDOW);
@@ -894,10 +888,8 @@ async fn ask_permission_emits_input_required_and_dispatches_on_approve() {
         permission: crate::agent::tool::PermissionLevel::Ask,
         ..Default::default()
     });
-    let approvals: PendingApprovals =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let cap: SessionCapability =
-        Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let cap: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
     let (events_tx, mut events_rx) = mpsc::channel(64);
     let loop_ = AgentLoop::spawn(
         Arc::new(provider),
@@ -919,7 +911,9 @@ async fn ask_permission_emits_input_required_and_dispatches_on_approve() {
     while let Some(ev) = events_rx.recv().await {
         match &ev {
             AgentEvent::ToolCallStarted { .. } => tool_call_started_seen = true,
-            AgentEvent::InputRequired { request_id: rid, .. } => {
+            AgentEvent::InputRequired {
+                request_id: rid, ..
+            } => {
                 request_id = Some(rid.clone());
                 break;
             }
@@ -949,7 +943,9 @@ async fn ask_permission_emits_input_required_and_dispatches_on_approve() {
     let mut got_done = false;
     while let Some(ev) = events_rx.recv().await {
         match ev {
-            AgentEvent::ToolCallCompleted { is_error, content, .. } => {
+            AgentEvent::ToolCallCompleted {
+                is_error, content, ..
+            } => {
                 got_tool_completed_ok = !is_error && content.contains("tool ran");
             }
             AgentEvent::Done { .. } => {
@@ -984,8 +980,7 @@ async fn capability_refuses_tool_outside_allowed_set() {
         allowed_tools: Some(allowed),
         ..Default::default()
     }));
-    let approvals: PendingApprovals =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let (events_tx, mut events_rx) = mpsc::channel(64);
     let loop_ = AgentLoop::spawn(
         Arc::new(provider),
@@ -1009,10 +1004,8 @@ async fn capability_refuses_tool_outside_allowed_set() {
         match ev {
             AgentEvent::Callout {
                 category, title, ..
-            } => {
-                if category == "warning" && title.contains("capability refused") {
-                    got_capability_callout = true;
-                }
+            } if category == "warning" && title.contains("capability refused") => {
+                got_capability_callout = true;
             }
             AgentEvent::ToolCallCompleted {
                 content, is_error, ..
@@ -1049,10 +1042,8 @@ async fn ask_permission_deny_synthesizes_error_result_without_running_tool() {
             ..Default::default()
         },
     );
-    let approvals: PendingApprovals =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let cap: SessionCapability =
-        Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let cap: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
     let (events_tx, mut events_rx) = mpsc::channel(64);
     let loop_ = AgentLoop::spawn(
         Arc::new(provider),
@@ -1070,7 +1061,10 @@ async fn ask_permission_deny_synthesizes_error_result_without_running_tool() {
     // Wait for InputRequired, then DENY.
     let mut request_id: Option<String> = None;
     while let Some(ev) = events_rx.recv().await {
-        if let AgentEvent::InputRequired { request_id: rid, .. } = ev {
+        if let AgentEvent::InputRequired {
+            request_id: rid, ..
+        } = ev
+        {
             request_id = Some(rid);
             break;
         }
@@ -1130,8 +1124,7 @@ fn spawn_loop_with_autonomy(
         .into_iter()
         .map(|t| Arc::new(t) as Arc<dyn Tool>)
         .collect();
-    let approvals: PendingApprovals =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let mut cap = crate::capability::Capability::root();
     cap.autonomy = autonomy;
     let capability: SessionCapability = Arc::new(Mutex::new(cap));
@@ -1169,8 +1162,12 @@ fn last_autonomy_event(events: &[AgentEvent]) -> Option<&AgentEvent> {
 #[tokio::test]
 async fn a1_iteration_cap_terminates_at_capability_bound() {
     let provider = MockProvider::forever(vec![ProviderEvent::Done(assistant_text("working"))]);
-    let (loop_, events_rx) =
-        spawn_loop_with_autonomy(provider, vec![], AgentConfig::default(), autonomy_allowed(3));
+    let (loop_, events_rx) = spawn_loop_with_autonomy(
+        provider,
+        vec![],
+        AgentConfig::default(),
+        autonomy_allowed(3),
+    );
 
     loop_
         .send(AgentInput::StartAutonomous {
@@ -1195,7 +1192,12 @@ async fn a1_iteration_cap_terminates_at_capability_bound() {
         .iter()
         .filter(|e| matches!(e, AgentEvent::AutonomousTerminated { .. }))
         .collect();
-    assert_eq!(starts, 3, "expected 3 iteration starts, kinds={:?}", events.iter().map(kind).collect::<Vec<_>>());
+    assert_eq!(
+        starts,
+        3,
+        "expected 3 iteration starts, kinds={:?}",
+        events.iter().map(kind).collect::<Vec<_>>()
+    );
     assert_eq!(completes, 3, "expected 3 iteration completes");
     assert_eq!(terminates.len(), 1, "expected exactly one terminate");
     match terminates[0] {
@@ -1231,8 +1233,12 @@ async fn a2_self_report_goal_met_early_termination() {
             "iteration 2 done. goal_status:satisfied",
         ))],
     ]);
-    let (loop_, events_rx) =
-        spawn_loop_with_autonomy(provider, vec![], AgentConfig::default(), autonomy_allowed(10));
+    let (loop_, events_rx) = spawn_loop_with_autonomy(
+        provider,
+        vec![],
+        AgentConfig::default(),
+        autonomy_allowed(10),
+    );
 
     loop_
         .send(AgentInput::StartAutonomous {
@@ -1249,7 +1255,10 @@ async fn a2_self_report_goal_met_early_termination() {
         .iter()
         .filter(|e| matches!(e, AgentEvent::AutonomousIterationStarted { .. }))
         .count();
-    assert_eq!(starts, 2, "expected exactly 2 iteration starts (early term)");
+    assert_eq!(
+        starts, 2,
+        "expected exactly 2 iteration starts (early term)"
+    );
 
     let terminates: Vec<&AgentEvent> = events
         .iter()
@@ -1322,9 +1331,7 @@ async fn a3_disallowed_defensive_callout_no_autonomy_events() {
 
     // A warning Callout with the INV-1 reason was emitted.
     let warning_seen = events.iter().any(|e| match e {
-        AgentEvent::Callout {
-            category, body, ..
-        } => {
+        AgentEvent::Callout { category, body, .. } => {
             category == "warning"
                 && body
                     .get("reason")

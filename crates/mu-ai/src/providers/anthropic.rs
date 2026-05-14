@@ -259,7 +259,10 @@ enum AnthropicEvent {
     #[serde(rename = "message_start")]
     MessageStart { message: AnthropicMessageMeta },
     #[serde(rename = "content_block_start")]
-    ContentBlockStart { index: u32, content_block: AnthropicBlock },
+    ContentBlockStart {
+        index: u32,
+        content_block: AnthropicBlock,
+    },
     #[serde(rename = "content_block_delta")]
     ContentBlockDelta { index: u32, delta: AnthropicDelta },
     #[serde(rename = "content_block_stop")]
@@ -503,7 +506,10 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
         };
 
         match parsed {
-            AnthropicEvent::ContentBlockStart { index, content_block } => {
+            AnthropicEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
                 // Register a new block. Re-registering an index is a
                 // protocol violation; we replace silently.
                 let builder = match content_block {
@@ -607,10 +613,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
 /// order regardless of HashMap iteration order. Tool-use blocks
 /// parse their accumulated input_json; on parse error or non-object
 /// result, falls back to an empty object per INV-5.
-fn assemble_content(
-    blocks: &HashMap<u32, BlockBuilder>,
-    block_order: &[u32],
-) -> Vec<ContentBlock> {
+fn assemble_content(blocks: &HashMap<u32, BlockBuilder>, block_order: &[u32]) -> Vec<ContentBlock> {
     block_order
         .iter()
         .filter_map(|idx| blocks.get(idx))

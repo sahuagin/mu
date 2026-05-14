@@ -30,33 +30,29 @@ pub struct LocalRegistryBackend {
 
 impl LocalRegistryBackend {
     pub fn new(sessions: Sessions, daemon_id: String) -> Self {
-        Self { sessions, daemon_id }
+        Self {
+            sessions,
+            daemon_id,
+        }
     }
 }
 
 #[async_trait]
 impl SessionDiscovery for LocalRegistryBackend {
-    async fn list(
-        &self,
-        filter: &SessionListFilter,
-    ) -> Result<Vec<SessionInfo>, DiscoveryError> {
+    async fn list(&self, filter: &SessionListFilter) -> Result<Vec<SessionInfo>, DiscoveryError> {
         // include_remote is meaningless here (no peers). Silently
         // honor by simply not adding any remote rows — same outcome
         // as a federating backend with zero peers.
         let snapshot = self.sessions.snapshot_for_listing();
         let mut out: Vec<SessionInfo> = snapshot
             .into_iter()
-            .map(|(sid, log, parent)| {
-                derive_session_info(&sid, &log, parent, &self.daemon_id)
-            })
+            .map(|(sid, log, parent)| derive_session_info(&sid, &log, parent, &self.daemon_id))
             .filter(|info| filter_matches(info, filter))
             .collect();
 
         // Sort most-recently-active first — matches the TUI's expected
         // ordering and gives the limit-clamp a sensible bias.
-        out.sort_by(|a, b| {
-            b.last_activity_unix_ms.cmp(&a.last_activity_unix_ms)
-        });
+        out.sort_by(|a, b| b.last_activity_unix_ms.cmp(&a.last_activity_unix_ms));
 
         if let Some(limit) = filter.limit {
             if limit > 0 {

@@ -129,9 +129,8 @@ impl MuClient {
                             }
                         },
                         Err(e) => {
-                            let _ = tx_clone.send(Message::ReaderError(format!(
-                                "stdout io error: {e}"
-                            )));
+                            let _ = tx_clone
+                                .send(Message::ReaderError(format!("stdout io error: {e}")));
                             return;
                         }
                     }

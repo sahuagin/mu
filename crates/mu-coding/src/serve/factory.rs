@@ -147,10 +147,7 @@ fn log_thinking_ignored(provider: &str, thinking: Option<&str>) {
 /// daemon-level settings (`BashSettings`) rather than being a
 /// no-arg `Tool::new()`. Pass `BashSettings::default()` for "off"
 /// behavior (yolo=false, no extra allowlist entries).
-pub fn build_tools(
-    names: &[String],
-    bash: &BashSettings,
-) -> Result<Vec<Arc<dyn Tool>>> {
+pub fn build_tools(names: &[String], bash: &BashSettings) -> Result<Vec<Arc<dyn Tool>>> {
     names
         .iter()
         .map(|n| match n.as_str() {
@@ -169,9 +166,7 @@ pub fn build_tools(
                     BashMode::Yolo
                 } else {
                     if bash.prompt {
-                        tracing::info!(
-                            "bash tool: strict + per-call approval (mu-029) active."
-                        );
+                        tracing::info!("bash tool: strict + per-call approval (mu-029) active.");
                     }
                     BashMode::strict_with_extras(&bash.extra_allow, bash.prompt)
                 };
@@ -235,9 +230,7 @@ mod tests {
 
     #[test]
     fn build_from_selector_anthropic_oauth_errors() {
-        let sel = ProviderSelector::AnthropicOauth {
-            model: "x".into(),
-        };
+        let sel = ProviderSelector::AnthropicOauth { model: "x".into() };
         match build_provider_from_selector(&sel, false, None) {
             Ok(_) => panic!("anthropic_oauth should not be implemented"),
             Err(e) => assert!(
@@ -314,7 +307,8 @@ mod tests {
 
     #[test]
     fn build_tools_known_and_unknown() {
-        let tools = build_tools_default(&["read".to_string()]).expect("build_tools(read) should succeed");
+        let tools =
+            build_tools_default(&["read".to_string()]).expect("build_tools(read) should succeed");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].spec().name, "read");
 
@@ -329,7 +323,8 @@ mod tests {
         assert_eq!(tools[0].spec().name, "read");
         assert_eq!(tools[1].spec().name, "write");
 
-        let tools = build_tools_default(&["ls".to_string()]).expect("build_tools(ls) should succeed");
+        let tools =
+            build_tools_default(&["ls".to_string()]).expect("build_tools(ls) should succeed");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].spec().name, "ls");
 
@@ -349,11 +344,8 @@ mod tests {
         assert_eq!(tools[0].spec().name, "glob");
 
         // Bash: strict mode by default, yolo by setting.
-        let tools = build_tools(
-            &["bash".to_string()],
-            &BashSettings::default(),
-        )
-        .expect("build_tools(bash) should succeed");
+        let tools = build_tools(&["bash".to_string()], &BashSettings::default())
+            .expect("build_tools(bash) should succeed");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].spec().name, "bash");
         assert!(tools[0].spec().description.contains("STRICT MODE"));
@@ -382,10 +374,7 @@ mod tests {
         .expect("build_tools(bash, strict+prompt) should succeed");
         let spec = tools[0].spec();
         assert!(spec.description.contains("WITH APPROVAL"));
-        assert_eq!(
-            spec.policy.permission,
-            mu_core::agent::PermissionLevel::Ask
-        );
+        assert_eq!(spec.policy.permission, mu_core::agent::PermissionLevel::Ask);
 
         match build_tools_default(&["bogus".to_string()]) {
             Ok(_) => panic!("expected error for unknown tool"),

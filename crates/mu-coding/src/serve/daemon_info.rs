@@ -56,7 +56,10 @@ impl DaemonInfo {
     pub fn with_events_dir(self, events_dir: Option<PathBuf>) -> Self {
         let inner = (*self.inner).clone();
         Self {
-            inner: Arc::new(DaemonInfoInner { events_dir, ..inner }),
+            inner: Arc::new(DaemonInfoInner {
+                events_dir,
+                ..inner
+            }),
         }
     }
 

@@ -112,27 +112,25 @@ impl Sessions {
     /// The lock is held only for the `.get` and `.clone` calls — both
     /// sync, both fast. No `await` runs while the lock is held.
     pub fn input_sender(&self, id: &str) -> Option<mpsc::Sender<AgentInput>> {
-        self.inner
-            .lock()
-            .ok()?
-            .get(id)
-            .map(|s| s.input_tx.clone())
+        self.inner.lock().ok()?.get(id).map(|s| s.input_tx.clone())
     }
 
     /// Snapshot of every session for the discovery layer. Returns
     /// `(session_id, event_log, parent_session_id)` triples. The
     /// caller derives `SessionInfo` from these. Same lock-then-clone-
     /// then-drop pattern as the other accessors.
-    pub fn snapshot_for_listing(
-        &self,
-    ) -> Vec<(String, Arc<SessionEventLog>, Option<String>)> {
+    pub fn snapshot_for_listing(&self) -> Vec<(String, Arc<SessionEventLog>, Option<String>)> {
         self.inner
             .lock()
             .ok()
             .map(|map| {
                 map.iter()
                     .map(|(sid, s)| {
-                        (sid.clone(), s.event_log.clone(), s.parent_session_id.clone())
+                        (
+                            sid.clone(),
+                            s.event_log.clone(),
+                            s.parent_session_id.clone(),
+                        )
                     })
                     .collect()
             })
@@ -143,11 +141,7 @@ impl Sessions {
     /// doesn't exist. Same lock-then-clone-then-drop pattern as
     /// `input_sender`.
     pub fn event_log(&self, id: &str) -> Option<Arc<SessionEventLog>> {
-        self.inner
-            .lock()
-            .ok()?
-            .get(id)
-            .map(|s| s.event_log.clone())
+        self.inner.lock().ok()?.get(id).map(|s| s.event_log.clone())
     }
 
     /// Take a pending-approval oneshot off the session's registry
@@ -262,7 +256,9 @@ mod tests {
         let sender = sessions
             .take_pending_approval(&id, "req-1")
             .expect("pending approval should be present");
-        sender.send(ApprovalDecision::Approve).expect("send decision");
+        sender
+            .send(ApprovalDecision::Approve)
+            .expect("send decision");
 
         // Verify the receiver got it.
         let got = decision_rx.await.expect("recv decision");

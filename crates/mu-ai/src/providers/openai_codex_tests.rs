@@ -2,7 +2,9 @@ use super::*;
 use base64::Engine;
 use bytes::Bytes;
 use futures::StreamExt;
-use mu_core::agent::{AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolCall, ToolSpec};
+use mu_core::agent::{
+    AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolCall, ToolSpec,
+};
 use serde_json::json;
 use std::pin::Pin;
 use tempfile::TempDir;
@@ -270,12 +272,18 @@ fn b5_translate_tool_result_error_embeds_marker() {
 #[tokio::test]
 async fn b6_sse_text_only() {
     let raw = concat!(
-        r#"event: response.output_text.delta"#, "\n",
-        r#"data: {"type":"response.output_text.delta","delta":"hello"}"#, "\n\n",
-        r#"event: response.output_text.delta"#, "\n",
-        r#"data: {"type":"response.output_text.delta","delta":" world"}"#, "\n\n",
-        r#"event: response.completed"#, "\n",
-        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#, "\n\n",
+        r#"event: response.output_text.delta"#,
+        "\n",
+        r#"data: {"type":"response.output_text.delta","delta":"hello"}"#,
+        "\n\n",
+        r#"event: response.output_text.delta"#,
+        "\n",
+        r#"data: {"type":"response.output_text.delta","delta":" world"}"#,
+        "\n\n",
+        r#"event: response.completed"#,
+        "\n",
+        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
+        "\n\n",
     );
     let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
         raw.as_bytes(),
@@ -318,14 +326,19 @@ async fn b6_sse_text_only() {
 async fn b7_sse_tool_call_accumulation() {
     let raw = concat!(
         // Item added — function_call with empty args
-        r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_a","name":"read","arguments":""}}"#, "\n\n",
+        r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_a","name":"read","arguments":""}}"#,
+        "\n\n",
         // Arguments stream
-        r#"data: {"type":"response.function_call.arguments.delta","output_index":0,"item_id":"fc_1","delta":"{\"path\":"}"#, "\n\n",
-        r#"data: {"type":"response.function_call.arguments.delta","output_index":0,"item_id":"fc_1","delta":"\"/tmp/foo\"}"}"#, "\n\n",
+        r#"data: {"type":"response.function_call.arguments.delta","output_index":0,"item_id":"fc_1","delta":"{\"path\":"}"#,
+        "\n\n",
+        r#"data: {"type":"response.function_call.arguments.delta","output_index":0,"item_id":"fc_1","delta":"\"/tmp/foo\"}"}"#,
+        "\n\n",
         // Item done — server replays the full arguments
-        r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_a","name":"read","arguments":"{\"path\":\"/tmp/foo\"}"}}"#, "\n\n",
+        r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_a","name":"read","arguments":"{\"path\":\"/tmp/foo\"}"}}"#,
+        "\n\n",
         // Stream completed
-        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#, "\n\n",
+        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
+        "\n\n",
     );
     let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
         raw.as_bytes(),
@@ -348,7 +361,10 @@ async fn b7_sse_tool_call_accumulation() {
                 ..
             } => {
                 assert_eq!(id, "call_a");
-                assert!(arguments_delta.as_deref().unwrap_or("").contains("path") || arguments_delta.as_deref().unwrap_or("").contains("/tmp"));
+                assert!(
+                    arguments_delta.as_deref().unwrap_or("").contains("path")
+                        || arguments_delta.as_deref().unwrap_or("").contains("/tmp")
+                );
             }
             other => panic!("expected ToolCallDelta, got {other:?}"),
         }
@@ -372,11 +388,16 @@ async fn b7_sse_tool_call_accumulation() {
 #[tokio::test]
 async fn b7b_sse_mixed_text_and_tool() {
     let raw = concat!(
-        r#"data: {"type":"response.output_text.delta","delta":"reading "}"#, "\n\n",
-        r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_2","call_id":"call_b","name":"read","arguments":""}}"#, "\n\n",
-        r#"data: {"type":"response.function_call.arguments.delta","output_index":1,"item_id":"fc_2","delta":"{\"path\":\"/x\"}"}"#, "\n\n",
-        r#"data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_2","call_id":"call_b","name":"read","arguments":"{\"path\":\"/x\"}"}}"#, "\n\n",
-        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#, "\n\n",
+        r#"data: {"type":"response.output_text.delta","delta":"reading "}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_2","call_id":"call_b","name":"read","arguments":""}}"#,
+        "\n\n",
+        r#"data: {"type":"response.function_call.arguments.delta","output_index":1,"item_id":"fc_2","delta":"{\"path\":\"/x\"}"}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_2","call_id":"call_b","name":"read","arguments":"{\"path\":\"/x\"}"}}"#,
+        "\n\n",
+        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
+        "\n\n",
     );
     let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
         raw.as_bytes(),
@@ -391,7 +412,13 @@ async fn b7b_sse_mixed_text_and_tool() {
 
     let done = events
         .iter()
-        .find_map(|e| if let ProviderEvent::Done(m) = e { Some(m) } else { None })
+        .find_map(|e| {
+            if let ProviderEvent::Done(m) = e {
+                Some(m)
+            } else {
+                None
+            }
+        })
         .expect("Done");
     assert_eq!(done.stop_reason, StopReason::ToolUse);
     assert_eq!(done.content.len(), 2);
@@ -415,9 +442,12 @@ async fn b7b_sse_mixed_text_and_tool() {
 #[tokio::test]
 async fn reasoning_summary_emits_thinking_delta() {
     let raw = concat!(
-        r#"data: {"type":"response.reasoning_summary.delta","delta":"planning..."}"#, "\n\n",
-        r#"data: {"type":"response.output_text.delta","delta":"ok"}"#, "\n\n",
-        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#, "\n\n",
+        r#"data: {"type":"response.reasoning_summary.delta","delta":"planning..."}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_text.delta","delta":"ok"}"#,
+        "\n\n",
+        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
+        "\n\n",
     );
     let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
         raw.as_bytes(),
@@ -429,8 +459,12 @@ async fn reasoning_summary_emits_thinking_delta() {
     while let Some(e) = stream.next().await {
         events.push(e);
     }
-    assert!(events.iter().any(|e| matches!(e, ProviderEvent::ThinkingDelta(t) if t == "planning...")));
-    assert!(events.iter().any(|e| matches!(e, ProviderEvent::TextDelta(t) if t == "ok")));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, ProviderEvent::ThinkingDelta(t) if t == "planning...")));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, ProviderEvent::TextDelta(t) if t == "ok")));
     assert!(events.iter().any(|e| matches!(e, ProviderEvent::Done(_))));
 }
 
@@ -441,7 +475,8 @@ async fn reasoning_summary_emits_thinking_delta() {
 #[tokio::test]
 async fn failed_event_emits_error() {
     let raw = concat!(
-        r#"data: {"type":"response.failed","response":{"status":"failed","error":{"message":"boom"}}}"#, "\n\n",
+        r#"data: {"type":"response.failed","response":{"status":"failed","error":{"message":"boom"}}}"#,
+        "\n\n",
     );
     let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
         raw.as_bytes(),
@@ -467,7 +502,8 @@ async fn failed_event_emits_error() {
 #[tokio::test]
 async fn cancel_mid_stream_yields_aborted() {
     let raw = concat!(
-        r#"data: {"type":"response.output_text.delta","delta":"partial"}"#, "\n\n",
+        r#"data: {"type":"response.output_text.delta","delta":"partial"}"#,
+        "\n\n",
     );
     let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
         raw.as_bytes(),
@@ -592,8 +628,8 @@ mod live_tests {
             return;
         }
 
-        let provider = OpenaiCodexProvider::from_store("gpt-5-codex".into())
-            .expect("must be logged in");
+        let provider =
+            OpenaiCodexProvider::from_store("gpt-5-codex".into()).expect("must be logged in");
 
         let echo_tool = ToolSpec {
             name: "echo".into(),

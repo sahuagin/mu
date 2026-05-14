@@ -64,9 +64,11 @@ pub struct Capability {
 /// INV-2: the bounds here are enforced by the daemon, not the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AutonomyCapability {
     /// Autonomy disallowed. session.start_autonomous is rejected
     /// with `CapabilityCheck::DeniedAutonomyDisallowed`.
+    #[default]
     Disallowed,
     /// Autonomy allowed within these bounds. Whichever bound trips
     /// first terminates the loop.
@@ -89,12 +91,6 @@ pub enum AutonomyCapability {
         /// to grade — non-trivial cost).
         allow_delegate_grader: bool,
     },
-}
-
-impl Default for AutonomyCapability {
-    fn default() -> Self {
-        Self::Disallowed
-    }
 }
 
 /// mu-f5o: typed AWS capability — one named role-grant (matched to the
@@ -284,15 +280,13 @@ impl Capability {
             (Some(a), Some(b)) => Some(a.min(b)),
         };
 
-        let max_tool_calls_remaining = match (
-            self.max_tool_calls_remaining,
-            attenuations.max_tool_calls,
-        ) {
-            (None, None) => None,
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (Some(a), Some(b)) => Some(a.min(b)),
-        };
+        let max_tool_calls_remaining =
+            match (self.max_tool_calls_remaining, attenuations.max_tool_calls) {
+                (None, None) => None,
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (Some(a), Some(b)) => Some(a.min(b)),
+            };
 
         // mu-036: intersect autonomy capability the same way.
         // Delegate sessions cannot widen autonomy beyond the
@@ -348,12 +342,14 @@ impl Capability {
             (Some(a), Some(b)) => Some(a.min(b)),
         };
 
-        let max_tool_calls_remaining =
-            match (self.max_tool_calls_remaining, other.max_tool_calls_remaining) {
-                (None, None) => None,
-                (Some(a), None) | (None, Some(a)) => Some(a),
-                (Some(a), Some(b)) => Some(a.min(b)),
-            };
+        let max_tool_calls_remaining = match (
+            self.max_tool_calls_remaining,
+            other.max_tool_calls_remaining,
+        ) {
+            (None, None) => None,
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (Some(a), Some(b)) => Some(a.min(b)),
+        };
 
         let autonomy = self.autonomy.intersect(&other.autonomy);
         let aws = intersect_aws_sets(&self.aws, &other.aws);
@@ -650,7 +646,10 @@ mod tests {
 
     #[test]
     fn autonomy_default_is_disallowed() {
-        assert_eq!(AutonomyCapability::default(), AutonomyCapability::Disallowed);
+        assert_eq!(
+            AutonomyCapability::default(),
+            AutonomyCapability::Disallowed
+        );
         let root = Capability::root();
         assert_eq!(root.autonomy, AutonomyCapability::Disallowed);
         assert!(!root.autonomy.is_allowed());
@@ -805,7 +804,10 @@ mod tests {
         let bare = aws("aws.scout.readonly");
         let v = serde_json::to_value(&bare)?;
         assert_eq!(v["name"], "aws.scout.readonly");
-        assert!(v.get("session_policy").is_none(), "None policy should be skipped");
+        assert!(
+            v.get("session_policy").is_none(),
+            "None policy should be skipped"
+        );
         let decoded: AwsCapability = serde_json::from_value(v)?;
         assert_eq!(decoded, bare);
 
@@ -846,7 +848,9 @@ mod tests {
         // None policy on one side + Some on the other → narrower (Some) wins.
         let r1 = bare.intersect(&with_pol).expect("same name → Some");
         assert_eq!(r1.session_policy, Some(policy.clone()));
-        let r2 = with_pol.intersect(&bare).expect("same name → Some (symmetric)");
+        let r2 = with_pol
+            .intersect(&bare)
+            .expect("same name → Some (symmetric)");
         assert_eq!(r2.session_policy, Some(policy));
     }
 
@@ -894,8 +898,16 @@ mod tests {
         let names_a: HashSet<String> = a.iter().map(|c| c.name.clone()).collect();
         let names_b: HashSet<String> = b.iter().map(|c| c.name.clone()).collect();
         for cap in &result {
-            assert!(names_a.contains(&cap.name), "result has cap not in a: {}", cap.name);
-            assert!(names_b.contains(&cap.name), "result has cap not in b: {}", cap.name);
+            assert!(
+                names_a.contains(&cap.name),
+                "result has cap not in a: {}",
+                cap.name
+            );
+            assert!(
+                names_b.contains(&cap.name),
+                "result has cap not in b: {}",
+                cap.name
+            );
         }
         // Result is non-trivial (the test-data has overlap).
         assert_eq!(result.len(), 2);
@@ -924,15 +936,25 @@ mod tests {
         let result_names: HashSet<String> = result.iter().map(|c| c.name.clone()).collect();
         assert_eq!(
             result_names,
-            ["aws.auditor.read".to_string()].into_iter().collect::<HashSet<String>>(),
+            ["aws.auditor.read".to_string()]
+                .into_iter()
+                .collect::<HashSet<String>>(),
             "scout must be dropped (both-Some-Some deferred); auditor must survive"
         );
         // INV-1 at set level: every name in result is in BOTH a and b.
         let a_names: HashSet<String> = a.iter().map(|c| c.name.clone()).collect();
         let b_names: HashSet<String> = b.iter().map(|c| c.name.clone()).collect();
         for cap in &result {
-            assert!(a_names.contains(&cap.name), "INV-1 violated: result name not in a: {}", cap.name);
-            assert!(b_names.contains(&cap.name), "INV-1 violated: result name not in b: {}", cap.name);
+            assert!(
+                a_names.contains(&cap.name),
+                "INV-1 violated: result name not in a: {}",
+                cap.name
+            );
+            assert!(
+                b_names.contains(&cap.name),
+                "INV-1 violated: result name not in b: {}",
+                cap.name
+            );
         }
     }
 
@@ -979,7 +1001,10 @@ mod tests {
             ..Default::default()
         };
         let child = parent.attenuate(&attn);
-        assert!(child.aws.is_empty(), "empty parent → empty child regardless of request");
+        assert!(
+            child.aws.is_empty(),
+            "empty parent → empty child regardless of request"
+        );
     }
 
     #[test]

@@ -17,9 +17,7 @@ fn b1_translate_user_message() {
 #[test]
 fn b2_translate_assistant_text_only() {
     let m = AgentMessage::Assistant(AssistantMessage {
-        content: vec![ContentBlock::Text {
-            text: "hi".into(),
-        }],
+        content: vec![ContentBlock::Text { text: "hi".into() }],
         stop_reason: StopReason::EndTurn,
         usage: None,
     });
@@ -151,8 +149,7 @@ fn mu_n48_system_prompt_set_prepends_system_message() {
     let messages = vec![AgentMessage::User {
         content: "hi".into(),
     }];
-    let body =
-        build_request_body("test/model", Some("you are concise"), &messages, &[]);
+    let body = build_request_body("test/model", Some("you are concise"), &messages, &[]);
     let arr = body["messages"].as_array().expect("messages array");
     assert_eq!(arr.len(), 2);
     assert_eq!(arr[0]["role"], "system");
@@ -204,10 +201,14 @@ fn test_events_stream(
 #[tokio::test]
 async fn b7_sse_text_only() {
     let raw = concat!(
-        r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#, "\n\n",
-        r#"data: {"choices":[{"delta":{"content":" world"}}]}"#, "\n\n",
-        r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#, "\n\n",
-        r#"data: [DONE]"#, "\n\n",
+        r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"delta":{"content":" world"}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        "\n\n",
+        r#"data: [DONE]"#,
+        "\n\n",
     );
     let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
         raw.as_bytes(),
@@ -246,14 +247,19 @@ async fn b7_sse_text_only() {
 async fn b8_sse_tool_call_accumulation() {
     let raw = concat!(
         // First chunk: tool_call starts with id, name, partial args
-        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read","arguments":""}}]}}]}"#, "\n\n",
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read","arguments":""}}]}}]}"#,
+        "\n\n",
         // Second chunk: more arguments
-        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}"#, "\n\n",
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}"#,
+        "\n\n",
         // Third chunk: rest of arguments
-        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"/tmp/foo\"}"}}]}}]}"#, "\n\n",
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"/tmp/foo\"}"}}]}}]}"#,
+        "\n\n",
         // Final chunk: finish_reason
-        r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#, "\n\n",
-        r#"data: [DONE]"#, "\n\n",
+        r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "\n\n",
+        r#"data: [DONE]"#,
+        "\n\n",
     );
     let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
         raw.as_bytes(),
@@ -290,10 +296,14 @@ async fn b8_sse_tool_call_accumulation() {
 #[tokio::test]
 async fn b9_sse_mixed_text_and_tool_call() {
     let raw = concat!(
-        r#"data: {"choices":[{"delta":{"content":"I will read it. "}}]}"#, "\n\n",
-        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_b","type":"function","function":{"name":"read","arguments":"{\"path\":\"/x\"}"}}]}}]}"#, "\n\n",
-        r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#, "\n\n",
-        r#"data: [DONE]"#, "\n\n",
+        r#"data: {"choices":[{"delta":{"content":"I will read it. "}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_b","type":"function","function":{"name":"read","arguments":"{\"path\":\"/x\"}"}}]}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "\n\n",
+        r#"data: [DONE]"#,
+        "\n\n",
     );
     let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
         raw.as_bytes(),
@@ -330,9 +340,12 @@ async fn b9_sse_mixed_text_and_tool_call() {
 #[tokio::test]
 async fn b10_malformed_tool_args_yield_empty_object() {
     let raw = concat!(
-        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_z","type":"function","function":{"name":"oops","arguments":"{not valid"}}]}}]}"#, "\n\n",
-        r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#, "\n\n",
-        r#"data: [DONE]"#, "\n\n",
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_z","type":"function","function":{"name":"oops","arguments":"{not valid"}}]}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "\n\n",
+        r#"data: [DONE]"#,
+        "\n\n",
     );
     let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
         raw.as_bytes(),

@@ -151,10 +151,7 @@ async fn mu_pex_usage_history_populates_per_call_metrics_via_anthropic() {
         )
         .await;
     let resp = d.wait_response(rid).await;
-    assert!(
-        resp.get("error").is_none(),
-        "create_session failed: {resp}"
-    );
+    assert!(resp.get("error").is_none(), "create_session failed: {resp}");
     let sid = resp["result"]["session_id"]
         .as_str()
         .expect("session_id")
@@ -177,9 +174,7 @@ async fn mu_pex_usage_history_populates_per_call_metrics_via_anthropic() {
         let target_sid = sid.clone();
         d.wait_until(|m| {
             m.get("method").and_then(Value::as_str) == Some("session.done")
-                && m["params"]
-                    .get("session_id")
-                    .and_then(Value::as_str)
+                && m["params"].get("session_id").and_then(Value::as_str)
                     == Some(target_sid.as_str())
         })
         .await;
@@ -257,9 +252,7 @@ async fn mu_pex_usage_history_populates_per_call_metrics_via_anthropic() {
     );
 
     // ── cleanup ───────────────────────────────────────────────────
-    let rid = d
-        .send("close_session", json!({ "session_id": &sid }))
-        .await;
+    let rid = d.send("close_session", json!({ "session_id": &sid })).await;
     d.wait_response(rid).await;
     d.close().await;
 }

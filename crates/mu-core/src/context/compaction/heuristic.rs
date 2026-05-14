@@ -67,11 +67,13 @@ impl SpanFamilyDropPolicy {
     }
 }
 
-/// v1 token estimate: char-count — matches the shared
-/// [`super::estimate_tokens`] semantics so cross-policy benchmarks
-/// compare like-for-like. Real tokenizer swaps in here when one lands.
+/// Per-span token estimate via the shared [`super::estimate_tokens`]
+/// (tiktoken-rs cl100k_base, post mu-kgu.10). Keeps internal eviction
+/// accounting on the same ruler as the reported `CompactionResult`
+/// metrics — heuristic's local sums equal the post-compact rope's
+/// reported total minus the dropped sizes.
 fn span_size(span: &Span) -> usize {
-    span.content.chars().count()
+    super::estimate_tokens(std::slice::from_ref(span))
 }
 
 /// Mark `idx` as dropped with `reason`. Idempotent.
@@ -266,6 +268,15 @@ mod tests {
         result.rope.spans().iter().map(|s| s.id.as_str()).collect()
     }
 
+    /// mu-kgu.10: helper for computing tokenizer-relative targets so
+    /// tests don't depend on specific tokenizer magic numbers.
+    /// Returns a target slightly above the rope's own tokenized size
+    /// for "under target" scenarios, or a fraction of it to force drops.
+    fn target_from_rope(rope: &RetainedRope, fraction: f32) -> usize {
+        let total = super::super::estimate_tokens(rope.spans());
+        ((total as f32) * fraction) as usize
+    }
+
     #[test]
     fn empty_rope_is_identity() {
         let rope = RetainedRope::new();
@@ -278,7 +289,7 @@ mod tests {
 
     #[test]
     fn under_target_returns_rope_unchanged_with_metrics() {
-        // Two small spans, total ~5 chars. Target 1_000.
+        // Two small spans. Target 1_000 — well above any tokenizer's count.
         let rope = RetainedRope::from_spans(vec![
             span("sys", SpanKind::System, "you"),
             span("u1", SpanKind::User, "hi"),
@@ -286,8 +297,10 @@ mod tests {
         let r = SpanFamilyDropPolicy::new().compact(&rope, 1_000);
         assert_eq!(surviving_ids(&r), vec!["sys", "u1"]);
         assert!(r.decisions.is_empty(), "no drops below target");
-        assert_eq!(r.tokens_before, 5);
-        assert_eq!(r.tokens_after, 5);
+        // mu-kgu.10: relational rather than magic-number. Under target →
+        // before == after; rope unchanged.
+        assert_eq!(r.tokens_before, r.tokens_after);
+        assert!(r.tokens_before > 0, "non-empty rope must measure non-zero");
     }
 
     #[test]
@@ -300,15 +313,16 @@ mod tests {
 
     #[test]
     fn preserves_system_and_tool_schema_when_dropping() {
-        // 4 spans each of size 10. Target 25 → must drop 2.
-        // FileLoad is the only droppable tier present.
+        // 4 spans (2 droppable FileLoads + 2 protected System/ToolSchema).
+        // Target = 50% of total → must drop ~half; only FileLoad is droppable.
         let rope = RetainedRope::from_spans(vec![
             span("sys", SpanKind::System, "0123456789"),
             span("ts", SpanKind::ToolSchema, "0123456789"),
             span("f1", SpanKind::FileLoad, "0123456789"),
             span("f2", SpanKind::FileLoad, "0123456789"),
         ]);
-        let r = SpanFamilyDropPolicy::new().compact(&rope, 25);
+        let target = target_from_rope(&rope, 0.6);
+        let r = SpanFamilyDropPolicy::new().compact(&rope, target);
         let survivors = surviving_ids(&r);
         assert!(survivors.contains(&"sys"), "System must survive");
         assert!(survivors.contains(&"ts"), "ToolSchema must survive");
@@ -319,21 +333,22 @@ mod tests {
 
     #[test]
     fn file_loads_dropped_before_tool_results() {
-        // Two FileLoads + a ToolCall/Result pair, each size 10.
-        // Target 25 → 15 chars of drops needed. FileLoad tier exhausted
-        // first; tool cluster only touched if necessary.
+        // Two FileLoads + a ToolCall/Result pair. Target = 60% of total →
+        // forces ~40% drop. FileLoad tier (50% of rope) drains first;
+        // tool cluster only touched if necessary.
         let rope = RetainedRope::from_spans(vec![
             span("f1", SpanKind::FileLoad, "0123456789"),
             span("tc1", SpanKind::ToolCall, "0123456789"),
             span("tr1", SpanKind::ToolResult, "0123456789"),
             span("f2", SpanKind::FileLoad, "0123456789"),
         ]);
-        let r = SpanFamilyDropPolicy::new().compact(&rope, 25);
+        let target = target_from_rope(&rope, 0.6);
+        let r = SpanFamilyDropPolicy::new().compact(&rope, target);
         let drops = dropped_ids(&r);
         // Both FileLoads should drop before any tool span is touched.
         assert!(drops.contains(&"f1"), "f1 dropped in tier 1");
         assert!(drops.contains(&"f2"), "f2 dropped in tier 1");
-        // Tool cluster preserved (15 chars of FileLoad drops were enough).
+        // Tool cluster preserved (FileLoad drops covered the gap).
         let survivors = surviving_ids(&r);
         assert!(survivors.contains(&"tc1"));
         assert!(survivors.contains(&"tr1"));
@@ -342,9 +357,8 @@ mod tests {
     #[test]
     fn tool_call_and_result_drop_as_a_cluster() {
         // No FileLoad to drain; tool cluster is the only droppable tier.
-        // Sizes: sys=3, tc1=10, tr1=10, a1=10, a2=10. Total=43. Target=35.
         // a1/a2 are the two most recent assistants → preserved.
-        // Cluster (tc1,tr1)=20 drops together.
+        // Target forces a moderate drop that requires the tool cluster.
         let rope = RetainedRope::from_spans(vec![
             span("sys", SpanKind::System, "sys"),
             span("tc1", SpanKind::ToolCall, "0123456789"),
@@ -352,7 +366,8 @@ mod tests {
             span("a1", SpanKind::Assistant, "0123456789"),
             span("a2", SpanKind::Assistant, "0123456789"),
         ]);
-        let r = SpanFamilyDropPolicy::new().compact(&rope, 35);
+        let target = target_from_rope(&rope, 0.7);
+        let r = SpanFamilyDropPolicy::new().compact(&rope, target);
         let drops = dropped_ids(&r);
         assert!(drops.contains(&"tc1"), "tc1 dropped");
         assert!(drops.contains(&"tr1"), "tr1 dropped");
@@ -363,8 +378,7 @@ mod tests {
     #[test]
     fn preserves_two_most_recent_assistant_turns() {
         // Five Assistant turns; only a4/a5 (most recent 2) survive.
-        // Sizes 10 each → 50 total. Target 25 → drop 25+ chars
-        // of Assistant tier.
+        // Target = 50% → drop ~half, forcing into Assistant tier.
         let rope = RetainedRope::from_spans(vec![
             span("a1", SpanKind::Assistant, "0123456789"),
             span("a2", SpanKind::Assistant, "0123456789"),
@@ -372,7 +386,8 @@ mod tests {
             span("a4", SpanKind::Assistant, "0123456789"),
             span("a5", SpanKind::Assistant, "0123456789"),
         ]);
-        let r = SpanFamilyDropPolicy::new().compact(&rope, 25);
+        let target = target_from_rope(&rope, 0.5);
+        let r = SpanFamilyDropPolicy::new().compact(&rope, target);
         let survivors = surviving_ids(&r);
         assert!(survivors.contains(&"a4"));
         assert!(survivors.contains(&"a5"));
@@ -421,9 +436,17 @@ mod tests {
             span("sys", SpanKind::System, "abc"),
             span("f1", SpanKind::FileLoad, "0123456789"),
         ]);
-        let r = SpanFamilyDropPolicy::new().compact(&rope, 3);
-        assert_eq!(r.tokens_before, 13);
-        assert_eq!(r.tokens_after, 3, "f1 (10 chars) dropped; sys (3) remains");
+        // Aggressive target forces f1 to drop; sys (System) is protected.
+        let r = SpanFamilyDropPolicy::new().compact(&rope, 1);
+        // mu-kgu.10: assert relationally — tokens_after equals the
+        // surviving rope's tokenized size, which is sys's size alone.
+        let sys_only = super::super::estimate_tokens(&[span("sys", SpanKind::System, "abc")]);
+        assert_eq!(
+            r.tokens_after, sys_only,
+            "tokens_after must equal the surviving rope's tokenized size"
+        );
+        assert!(r.tokens_before > r.tokens_after, "drop reduced tokens");
+        assert_eq!(surviving_ids(&r), vec!["sys"]);
     }
 
     #[test]
@@ -434,7 +457,8 @@ mod tests {
             span("a1", SpanKind::Assistant, "0123456789"),
             span("f1", SpanKind::FileLoad, "0123456789"),
         ]);
-        let r = SpanFamilyDropPolicy::new().compact(&rope, 10);
+        let target = target_from_rope(&rope, 0.5);
+        let r = SpanFamilyDropPolicy::new().compact(&rope, target);
         let survivors = surviving_ids(&r);
         assert!(survivors.contains(&"a1"));
         assert!(!survivors.contains(&"f1"));

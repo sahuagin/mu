@@ -394,7 +394,41 @@ axis included. Out of `Capability::root()` (empty AWS set), no
 sequence of `attenuate` or `intersect` calls can produce a non-empty
 AWS set — caps must be explicitly granted at construction.
 
-### Deferred (out of scope for mu-f5o)
+### AWS catalog resolution (mu-ysh, 2026-05-14)
+
+`AwsCapability` is the session-held grant; the operator-managed catalog is the
+external map from grant name to concrete AWS materialization metadata. The first
+Mu-side integration layer is intentionally pure data/validation:
+
+```rust
+pub struct AwsCapabilityCatalog {
+    pub schema_version: u32,
+    pub default_region: Option<String>,
+    pub capabilities: BTreeMap<String, AwsCapabilityCatalogEntry>,
+}
+```
+
+The catalog shape matches `mu-aws-sandbox-infra/capabilities/aws.json`. It is
+loaded by future broker/runner code from a trusted path; `mu-core` itself does
+no AWS I/O and assumes no roles. It only answers:
+
+1. Does this `AwsCapability.name` exist in the catalog?
+2. Is it materialized now (`aws_profile` + `role_arn`, and not `status:
+   "planned"`)?
+3. What operator/auditor metadata should be preserved (description, mutation
+   flag, policies, constraints, smoke-test hints)?
+
+Resolution is fail-closed:
+
+- unknown name -> `UnknownCapability`
+- known but planned/unmaterialized -> `CapabilityNotMaterialized`
+- materialized -> entry may be handed to a broker/runner layer
+
+This is the bridge between the in-process attenuation algebra and hard AWS
+identity enforcement. It does not grant authority; it prevents future execution
+code from treating a bare string as sufficient authority.
+
+### Deferred
 
 - `session_policy` intersection algorithm (the AWS-policy algebra over
   Effect/Action/Resource/Condition). Field is carried; intersect of

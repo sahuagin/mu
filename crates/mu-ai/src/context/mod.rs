@@ -31,3 +31,6 @@
 pub mod anthropic;
 
 pub use anthropic::{AnthropicCacheStrategy, AnthropicProviderRenderer};
+
+#[cfg(test)]
+mod compaction_cache_tests;

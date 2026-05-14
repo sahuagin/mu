@@ -14,7 +14,9 @@ use tokio::task::JoinHandle;
 use mu_core::agent::AgentInput;
 use mu_core::capability::Capability;
 use mu_core::event_log::SessionEventLog;
-use mu_core::protocol::ApprovalDecision;
+use mu_core::protocol::{ApprovalDecision, OutstandingCall};
+
+use super::provider_status::{ProviderCallState, ProviderStatusTracker};
 
 /// Per-session state held by the daemon.
 struct SessionState {
@@ -48,6 +50,12 @@ struct SessionState {
     /// for delegates). But check_allow returns a structured result
     /// so the agent loop can refuse with a specific reason.
     capability: Arc<Mutex<Capability>>,
+    /// Live provider-call state (mu-035 Phase D). The forwarder
+    /// mirrors `AgentEvent::ProviderStatus` into this on every emit
+    /// and clears it on Done/Error. Dispatch reads it to assemble
+    /// `daemon.outstanding_calls` and to fill in the `was_in` field
+    /// of `session.cancel_outstanding` replies.
+    provider_status: Arc<Mutex<ProviderStatusTracker>>,
 }
 
 /// In-memory session registry. Cheap to clone (Arc-backed).
@@ -69,6 +77,7 @@ pub struct NewSession {
     pub pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>,
     pub parent_session_id: Option<String>,
     pub capability: Arc<Mutex<Capability>>,
+    pub provider_status: Arc<Mutex<ProviderStatusTracker>>,
 }
 
 impl Sessions {
@@ -101,6 +110,7 @@ impl Sessions {
                     pending_approvals: new.pending_approvals,
                     parent_session_id: new.parent_session_id,
                     capability: new.capability,
+                    provider_status: new.provider_status,
                 },
             );
         }
@@ -178,6 +188,71 @@ impl Sessions {
             .map(|s| s.capability.clone())
     }
 
+    /// Snapshot the session's live provider-call state (mu-035 Phase
+    /// D). `None` when the session doesn't exist OR when no provider
+    /// call is currently in flight. Used by `session.cancel_outstanding`
+    /// to fill in the `was_in` field with the actual state at the
+    /// moment of the request.
+    pub fn provider_status_snapshot(&self, id: &str) -> Option<ProviderCallState> {
+        let tracker = self
+            .inner
+            .lock()
+            .ok()?
+            .get(id)
+            .map(|s| s.provider_status.clone())?;
+        let snap = tracker.lock().ok()?.snapshot();
+        snap
+    }
+
+    /// Snapshot every outstanding provider call across all sessions
+    /// (mu-035 Phase D). Returns one [`OutstandingCall`] per session
+    /// currently in a non-idle state. Sessions that are between asks
+    /// (tracker cleared) are omitted. `now_unix_ms` is used to
+    /// compute `elapsed_ms`; the caller passes a single value so all
+    /// elapsed fields in a snapshot are consistent.
+    ///
+    /// Two-phase lock pattern: snapshot the registry's handles under
+    /// the registry lock, drop it, then snapshot each per-session
+    /// tracker under its own lock. Each lock is held only for the
+    /// duration of a sync `.clone()` or `.snapshot()`. No `await`
+    /// runs while any lock is held.
+    pub fn snapshot_outstanding_calls(&self, now_unix_ms: u64) -> Vec<OutstandingCall> {
+        let handles: Vec<(
+            String,
+            Arc<SessionEventLog>,
+            Arc<Mutex<ProviderStatusTracker>>,
+        )> = self
+            .inner
+            .lock()
+            .ok()
+            .map(|map| {
+                map.iter()
+                    .map(|(sid, s)| (sid.clone(), s.event_log.clone(), s.provider_status.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        handles
+            .iter()
+            .filter_map(|(sid, log, tracker)| {
+                let state = tracker.lock().ok()?.snapshot()?;
+                // provider_info comes from the session's first
+                // SessionCreated event log row; absent only if the
+                // log was somehow truncated. Skip such sessions
+                // rather than reporting empty strings.
+                let (provider_kind, model) = log.provider_info()?;
+                Some(OutstandingCall {
+                    session_id: sid.clone(),
+                    kind: state.kind,
+                    provider_kind,
+                    model,
+                    started_at_unix_ms: state.started_at_unix_ms,
+                    elapsed_ms: now_unix_ms.saturating_sub(state.started_at_unix_ms),
+                })
+            })
+            .collect()
+    }
+
     /// Remove a session. Dropping its `SessionState` drops the
     /// `input_tx`; the agent loop sees its input channel close and
     /// terminates naturally on the next iteration.
@@ -219,6 +294,7 @@ mod tests {
 
         let approvals = Arc::new(Mutex::new(HashMap::new()));
         let cap = Arc::new(Mutex::new(Capability::root()));
+        let tracker = Arc::new(Mutex::new(ProviderStatusTracker::new()));
         sessions.insert(
             id.clone(),
             NewSession {
@@ -229,6 +305,7 @@ mod tests {
                 pending_approvals: approvals,
                 parent_session_id: None,
                 capability: cap,
+                provider_status: tracker,
             },
         );
         assert!(sessions.input_sender(&id).is_some());
@@ -257,6 +334,7 @@ mod tests {
             .insert("req-1".to_string(), decision_tx);
 
         let cap = Arc::new(Mutex::new(Capability::root()));
+        let tracker = Arc::new(Mutex::new(ProviderStatusTracker::new()));
         sessions.insert(
             id.clone(),
             NewSession {
@@ -267,6 +345,7 @@ mod tests {
                 pending_approvals: approvals,
                 parent_session_id: None,
                 capability: cap,
+                provider_status: tracker,
             },
         );
 
@@ -292,5 +371,129 @@ mod tests {
         assert!(sessions
             .take_pending_approval("session-nope", "req-1")
             .is_none());
+    }
+
+    /// mu-035 Phase D test helper: build a session pre-populated with
+    /// a SessionCreated event (so provider_info() resolves), a fresh
+    /// (idle) tracker, and return its event log + tracker handle for
+    /// driving from the test body.
+    fn make_session_with_tracker(
+        sessions: &Sessions,
+        id: &str,
+        provider_kind: &str,
+        model: &str,
+    ) -> (Arc<SessionEventLog>, Arc<Mutex<ProviderStatusTracker>>) {
+        use mu_core::event_log::EventActor;
+        use mu_core::event_log::EventPayload;
+        let log = Arc::new(SessionEventLog::new(id.to_string()));
+        log.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: provider_kind.into(),
+                model: model.into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+            },
+        );
+        let (tx, _rx) = mpsc::channel(1);
+        let tracker = Arc::new(Mutex::new(ProviderStatusTracker::new()));
+        sessions.insert(
+            id.to_string(),
+            NewSession {
+                input_tx: tx,
+                forwarder: tokio::spawn(async {}),
+                agent: tokio::spawn(async {}),
+                event_log: log.clone(),
+                pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+                parent_session_id: None,
+                capability: Arc::new(Mutex::new(Capability::root())),
+                provider_status: tracker.clone(),
+            },
+        );
+        (log, tracker)
+    }
+
+    #[tokio::test]
+    async fn provider_status_snapshot_returns_none_when_idle() {
+        use mu_core::protocol::ProviderStatusKind;
+        let sessions = Sessions::new();
+        let (_log, tracker) = make_session_with_tracker(&sessions, "s-1", "anthropic_api", "x");
+
+        // Fresh tracker: no outstanding call.
+        assert!(sessions.provider_status_snapshot("s-1").is_none());
+
+        // Populate, then snapshot.
+        tracker.lock().unwrap().enter(super::ProviderCallState {
+            kind: ProviderStatusKind::Streaming,
+            started_at_unix_ms: 1_000,
+            tool_call_id: None,
+        });
+        let snap = sessions
+            .provider_status_snapshot("s-1")
+            .expect("state present");
+        assert_eq!(snap.kind, ProviderStatusKind::Streaming);
+        assert_eq!(snap.started_at_unix_ms, 1_000);
+
+        // Clear → None again.
+        tracker.lock().unwrap().clear();
+        assert!(sessions.provider_status_snapshot("s-1").is_none());
+
+        // Unknown session → None.
+        assert!(sessions.provider_status_snapshot("unknown").is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_outstanding_calls_omits_idle_sessions() {
+        use mu_core::protocol::ProviderStatusKind;
+        let sessions = Sessions::new();
+        let (_log_a, tracker_a) =
+            make_session_with_tracker(&sessions, "s-a", "anthropic_api", "claude-x");
+        let (_log_b, _tracker_b) =
+            make_session_with_tracker(&sessions, "s-b", "openai_api", "gpt-y");
+
+        // Only s-a has a call in flight.
+        tracker_a.lock().unwrap().enter(super::ProviderCallState {
+            kind: ProviderStatusKind::Streaming,
+            started_at_unix_ms: 1_000,
+            tool_call_id: None,
+        });
+
+        let calls = sessions.snapshot_outstanding_calls(1_500);
+        assert_eq!(calls.len(), 1, "only s-a should appear");
+        let c = &calls[0];
+        assert_eq!(c.session_id, "s-a");
+        assert_eq!(c.kind, ProviderStatusKind::Streaming);
+        assert_eq!(c.provider_kind, "anthropic_api");
+        assert_eq!(c.model, "claude-x");
+        assert_eq!(c.started_at_unix_ms, 1_000);
+        assert_eq!(c.elapsed_ms, 500);
+    }
+
+    #[tokio::test]
+    async fn snapshot_outstanding_calls_uses_single_now_for_all_rows() {
+        use mu_core::protocol::ProviderStatusKind;
+        let sessions = Sessions::new();
+        let (_log_a, tracker_a) =
+            make_session_with_tracker(&sessions, "s-a", "anthropic_api", "claude-x");
+        let (_log_b, tracker_b) =
+            make_session_with_tracker(&sessions, "s-b", "openai_api", "gpt-y");
+
+        tracker_a.lock().unwrap().enter(super::ProviderCallState {
+            kind: ProviderStatusKind::AwaitingFirstToken,
+            started_at_unix_ms: 1_000,
+            tool_call_id: None,
+        });
+        tracker_b.lock().unwrap().enter(super::ProviderCallState {
+            kind: ProviderStatusKind::ToolExecuting,
+            started_at_unix_ms: 1_200,
+            tool_call_id: Some("call-1".into()),
+        });
+
+        let calls = sessions.snapshot_outstanding_calls(2_000);
+        assert_eq!(calls.len(), 2);
+        let by_id: std::collections::HashMap<_, _> =
+            calls.iter().map(|c| (c.session_id.clone(), c)).collect();
+        assert_eq!(by_id["s-a"].elapsed_ms, 1_000);
+        assert_eq!(by_id["s-b"].elapsed_ms, 800);
     }
 }

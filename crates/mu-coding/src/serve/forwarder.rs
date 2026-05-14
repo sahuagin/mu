@@ -17,7 +17,7 @@
 //! doesn't include them. We can amend mu-001 to add them when a
 //! frontend needs them.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -30,6 +30,8 @@ use mu_core::protocol::{
     TextDeltaEvent, ToolCallCompletedEvent, ToolCallStartedEvent, ToolOutcome,
 };
 use mu_core::transport::NotificationWriter;
+
+use super::provider_status::{ProviderCallState, ProviderStatusTracker};
 
 /// Pure translation: AgentEvent → (method_name, params_value), or
 /// None for events that don't have a wire-level representation in
@@ -216,6 +218,40 @@ fn to_pair<T: serde::Serialize>(method: &'static str, value: T) -> Option<(&'sta
     serde_json::to_value(value).ok().map(|v| (method, v))
 }
 
+/// mu-035 Phase D: mirror the AgentEvent into the shared
+/// ProviderStatusTracker so `daemon.outstanding_calls` and the
+/// `was_in` field on `session.cancel_outstanding` see live state.
+///
+/// - `ProviderStatus` sets the tracker.
+/// - `Done` / `Error` clears it — the ask is over and no provider
+///   call is in flight until the next emit.
+///
+/// Other events are pass-through.
+fn update_provider_status(event: &AgentEvent, tracker: &Arc<Mutex<ProviderStatusTracker>>) {
+    match event {
+        AgentEvent::ProviderStatus {
+            state,
+            started_at_unix_ms,
+            tool_call_id,
+            ..
+        } => {
+            if let Ok(mut t) = tracker.lock() {
+                t.enter(ProviderCallState {
+                    kind: *state,
+                    started_at_unix_ms: *started_at_unix_ms,
+                    tool_call_id: tool_call_id.clone(),
+                });
+            }
+        }
+        AgentEvent::Done { .. } | AgentEvent::Error { .. } => {
+            if let Ok(mut t) = tracker.lock() {
+                t.clear();
+            }
+        }
+        _ => {}
+    }
+}
+
 /// IO loop: read events from `events_rx`, append durable events to
 /// `event_log`, and emit wire notifications via `notif`. Exits when
 /// `events_rx` closes.
@@ -229,8 +265,16 @@ pub async fn forward_events(
     mut events_rx: mpsc::Receiver<AgentEvent>,
     notif: NotificationWriter,
     event_log: Arc<SessionEventLog>,
+    provider_status: Arc<Mutex<ProviderStatusTracker>>,
 ) {
     while let Some(event) = events_rx.recv().await {
+        // mu-035 Phase D: mirror provider-call lifecycle into the
+        // shared tracker so dispatch handlers (cancel_outstanding,
+        // daemon.outstanding_calls) see authoritative live state.
+        // The lock is held only for the sync mutate; no `.await`
+        // runs while it's held.
+        update_provider_status(&event, &provider_status);
+
         // Durable projection: append significant events to the log.
         // Streaming deltas + lifecycle ticks are dropped.
         if let Some((actor, mut payload)) = to_log_event(&event) {

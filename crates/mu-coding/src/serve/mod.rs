@@ -13,6 +13,7 @@ pub mod discovery;
 mod dispatch;
 pub mod factory;
 mod forwarder;
+mod provider_status;
 mod sessions;
 
 pub use daemon_info::DaemonInfo;

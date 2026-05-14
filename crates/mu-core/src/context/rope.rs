@@ -94,7 +94,13 @@ impl RetentionClass {
 /// projection-differentiated kinds the spec table at lines 627-634
 /// names individually (tool calls, tool schemas, skill activations,
 /// memory injections, compactions, file loads).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Not `Copy` because [`SpanKind::CompactionSummary`] (added by
+/// mu-kgu.3) carries owned data (the list of span ids it absorbed
+/// plus policy metadata). The other variants are still effectively
+/// cheap to clone; existing call sites that previously moved out of
+/// `&Span` now use `&span.kind` or `.clone()`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpanKind {
     /// System prompt / startup instruction content.
@@ -130,6 +136,27 @@ pub enum SpanKind {
     /// volatile under file-watch rehydration. Operator sees a path +
     /// length; agent sees the file content.
     FileLoad,
+    /// Synthetic span produced by mu-kgu.3's `HashAndSummaryPolicy`:
+    /// a single natural-language paragraph that absorbs every span
+    /// the judge model decided NOT to keep verbatim. Distinct from
+    /// the broader `Compaction` variant — `CompactionSummary` carries
+    /// audit-grade metadata about *which* spans were absorbed so the
+    /// operator can answer "what disappeared and why?" mechanically.
+    CompactionSummary {
+        /// Span ids that this summary span absorbed (i.e., the
+        /// non-kept spans from the pre-compaction rope). Preserves
+        /// the structural audit trail even after the
+        /// `CompactionResult::decisions` log is dropped.
+        absorbed_span_ids: Vec<String>,
+        /// Unix-milliseconds timestamp recording when the summary
+        /// was generated. `0` is a valid sentinel for tests / fixtures
+        /// that don't bother with a clock.
+        generated_at_unix_ms: u64,
+        /// Short stable identifier of the policy that produced the
+        /// summary (e.g., `"hash-and-summary-v1"`). Lets the
+        /// operator view group compaction events by policy.
+        policy_id: String,
+    },
 }
 
 /// One retained span in the rope.

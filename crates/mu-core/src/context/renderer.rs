@@ -73,17 +73,23 @@ pub enum ProviderRole {
     ToolResult,
 }
 
-impl From<SpanKind> for ProviderRole {
+impl From<&SpanKind> for ProviderRole {
     /// Map every `SpanKind` to the provider role under which its
     /// content reaches the model. Rationale:
     /// - `ToolCall` is content the assistant emitted, so it travels
     ///   under `Assistant`.
     /// - `ToolSchema`, `SkillActivation`, `MemoryInjection`,
-    ///   `Compaction`, and `FileLoad` are context injected on the
-    ///   harness's behalf (tool registries, recalled memory, file
-    ///   loads, compaction summaries). The model treats these as
-    ///   system-provided context, so they map to `System`.
-    fn from(kind: SpanKind) -> Self {
+    ///   `Compaction`, `CompactionSummary`, and `FileLoad` are
+    ///   context injected on the harness's behalf (tool registries,
+    ///   recalled memory, file loads, compaction summaries). The
+    ///   model treats these as system-provided context, so they map
+    ///   to `System`.
+    ///
+    /// Takes `&SpanKind` rather than `SpanKind` by value because
+    /// `SpanKind` is no longer `Copy` after mu-kgu.3's
+    /// `CompactionSummary` struct variant landed. Borrow at call
+    /// sites with `(&span.kind).into()`.
+    fn from(kind: &SpanKind) -> Self {
         match kind {
             SpanKind::System => ProviderRole::System,
             SpanKind::User => ProviderRole::User,
@@ -94,6 +100,7 @@ impl From<SpanKind> for ProviderRole {
             | SpanKind::SkillActivation
             | SpanKind::MemoryInjection
             | SpanKind::Compaction
+            | SpanKind::CompactionSummary { .. }
             | SpanKind::FileLoad => ProviderRole::System,
         }
     }
@@ -286,7 +293,7 @@ impl FauxProviderRenderer {
     fn render_content(span: &Span, target: ProjectionTarget) -> String {
         match target {
             ProjectionTarget::AgentView => span.content.clone(),
-            ProjectionTarget::OperatorView => match span.kind {
+            ProjectionTarget::OperatorView => match &span.kind {
                 SpanKind::System | SpanKind::User | SpanKind::Assistant => span.content.clone(),
                 SpanKind::ToolResult => {
                     format!("[tool-result:{}] {}", span.id, summary_line(&span.content))
@@ -302,6 +309,16 @@ impl FauxProviderRenderer {
                 SpanKind::Compaction => {
                     format!("[compacted:{}] {}", span.id, summary_line(&span.content))
                 }
+                SpanKind::CompactionSummary {
+                    absorbed_span_ids, ..
+                } => {
+                    format!(
+                        "[compaction-summary:{} absorbed={}] {}",
+                        span.id,
+                        absorbed_span_ids.len(),
+                        summary_line(&span.content),
+                    )
+                }
                 SpanKind::FileLoad => {
                     format!("[file:{}] {} bytes", span.id, span.content.len())
                 }
@@ -315,7 +332,7 @@ impl ProviderRenderer for FauxProviderRenderer {
         let messages = rope
             .iter()
             .map(|span| ProviderMessage {
-                role: span.kind.into(),
+                role: (&span.kind).into(),
                 content: Self::render_content(span, target),
                 source_span_ids: vec![span.id.clone()],
                 cache_marker: None,
@@ -552,10 +569,18 @@ mod tests {
             (SkillActivation, ProviderRole::System),
             (MemoryInjection, ProviderRole::System),
             (Compaction, ProviderRole::System),
+            (
+                CompactionSummary {
+                    absorbed_span_ids: vec!["x".into()],
+                    generated_at_unix_ms: 0,
+                    policy_id: "test".into(),
+                },
+                ProviderRole::System,
+            ),
             (FileLoad, ProviderRole::System),
         ];
         for (kind, expected) in cases {
-            let actual: ProviderRole = kind.into();
+            let actual: ProviderRole = (&kind).into();
             assert_eq!(actual, expected, "{kind:?} should map to {expected:?}",);
         }
     }

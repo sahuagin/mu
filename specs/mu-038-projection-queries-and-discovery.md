@@ -97,7 +97,7 @@ CONVENTIONS apply.
 
 ### Out
 
-- **FileBackend implementation.** Sketched only — concrete code is a follow-up (one of mu-038a or mu-039). The trait shape MUST be chosen with FileBackend in mind so we don't rev the trait when it lands.
+- **FileBackend implementation.** Sketched only — concrete code is a follow-up. The trait shape MUST be chosen with FileBackend in mind so we don't rev the trait when it lands.
 - **EtcdBackend implementation.** Same — sketched. Add a feature flag `discovery-etcd` so the etcd dep is optional.
 - **Cross-daemon authentication.** A FileBackend or EtcdBackend exposes sessions across daemons; the question of "should I trust the other daemon's claims" is a security question (biscuit-auth direction). mu-038 sets up the surface; trust is a separate spec.
 - **Live tail (`event.tail` from the mockup).** Different shape from `session.events` — a long-lived subscription rather than a query. Worth a separate spec once the projection queries land.

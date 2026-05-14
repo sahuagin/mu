@@ -77,7 +77,7 @@ impl ProviderRenderer for AnthropicProviderRenderer {
         let messages = rope
             .iter()
             .map(|span| ProviderMessage {
-                role: span.kind.into(),
+                role: (&span.kind).into(),
                 content: span.content.clone(),
                 source_span_ids: vec![span.id.clone()],
                 cache_marker: None,

@@ -17,10 +17,10 @@
 //! attenuation algebra stays the same; the bytes-on-the-wire
 //! representation changes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// What a session is allowed to do. `None` on any field means
 /// "unrestricted on this axis." All `Some` values are upper-bound
@@ -45,13 +45,20 @@ pub struct Capability {
     /// for the serde tag.
     #[serde(default)]
     pub autonomy: AutonomyCapability,
-    /// mu-f5o: typed AWS-capability grants the session holds. Empty
-    /// set = no AWS access. Multi-grant by design (a worker may hold
-    /// `aws.scout.readonly` + `aws.sandbox.build` simultaneously).
-    /// Narrowing-only on `intersect` and `attenuate`: child cannot
-    /// gain AWS caps the parent does not hold. See `AwsCapability`
-    /// and `intersect_aws_sets`.
-    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    /// mu-f5o: typed AWS-capability grants the session holds. Unlike
+    /// most other axes, empty set means no AWS access (not unrestricted).
+    /// Multi-grant by design (a worker may hold `aws.scout.readonly` +
+    /// `aws.sandbox.build` simultaneously), but at most one grant per
+    /// capability name is valid; serde deserialization routes through
+    /// `AwsCapability::try_from_iter` to enforce that invariant.
+    /// Narrowing-only on `intersect` and `attenuate`: child cannot gain
+    /// AWS caps the parent does not hold. See `AwsCapability` and
+    /// `intersect_aws_sets`.
+    #[serde(
+        default,
+        skip_serializing_if = "HashSet::is_empty",
+        deserialize_with = "deserialize_aws_capability_set"
+    )]
     pub aws: HashSet<AwsCapability>,
 }
 
@@ -103,10 +110,12 @@ pub enum AutonomyCapability {
 ///
 /// **Hash/Eq subtlety:** `serde_json::Value` does not implement `Hash`,
 /// so `Hash` is implemented manually on `name` only. `PartialEq` compares
-/// both fields. A `HashSet<AwsCapability>` may therefore contain two caps
-/// with the same name and different policies as distinct elements; in
-/// practice the invariant "one cap per name" is maintained by the
-/// `intersect` operation, which collapses same-name pairs.
+/// both fields. A raw `HashSet<AwsCapability>` can therefore contain two
+/// caps with the same name and different policies as distinct elements.
+/// The semantic invariant is stricter: one cap per name. Use
+/// `AwsCapability::try_from_iter` (and `Capability` serde) to enforce it
+/// when accepting externally supplied capability collections; `intersect`
+/// and `attenuate` preserve it while narrowing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AwsCapability {
     /// The capability name from the catalog. Matches the role-bundle
@@ -137,7 +146,42 @@ impl std::hash::Hash for AwsCapability {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("duplicate AWS capability `{name}` with different session policies")]
+pub struct DuplicateAwsCapabilityError {
+    pub name: String,
+    pub prior_policy: Option<serde_json::Value>,
+    pub new_policy: Option<serde_json::Value>,
+}
+
 impl AwsCapability {
+    /// Collect AWS capabilities while enforcing Mu's semantic invariant:
+    /// at most one capability per name. Exact duplicates are harmless and
+    /// deduplicated; same-name entries with different `session_policy`
+    /// values fail closed.
+    pub fn try_from_iter<I>(caps: I) -> Result<HashSet<Self>, DuplicateAwsCapabilityError>
+    where
+        I: IntoIterator<Item = Self>,
+    {
+        let mut by_name: HashMap<String, Self> = HashMap::new();
+        for cap in caps {
+            match by_name.get(&cap.name) {
+                Some(prior) if prior != &cap => {
+                    return Err(DuplicateAwsCapabilityError {
+                        name: cap.name,
+                        prior_policy: prior.session_policy.clone(),
+                        new_policy: cap.session_policy,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    by_name.insert(cap.name.clone(), cap);
+                }
+            }
+        }
+        Ok(by_name.into_values().collect())
+    }
+
     /// Intersect two `AwsCapability` values. Narrowing-only:
     /// * Different name → `None` (incompatible; drop on intersect).
     /// * Same name + at most one `Some` session_policy → `Some` with
@@ -174,6 +218,16 @@ impl AwsCapability {
 /// and include it. Names present in only one side are dropped. Two caps
 /// with the same name and incompatible session_policies (both `Some`)
 /// are also dropped.
+fn deserialize_aws_capability_set<'de, D>(
+    deserializer: D,
+) -> Result<HashSet<AwsCapability>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let caps = Vec::<AwsCapability>::deserialize(deserializer)?;
+    AwsCapability::try_from_iter(caps).map_err(serde::de::Error::custom)
+}
+
 fn intersect_aws_sets(
     a: &HashSet<AwsCapability>,
     b: &HashSet<AwsCapability>,
@@ -821,6 +875,66 @@ mod tests {
         let decoded: AwsCapability = serde_json::from_value(v)?;
         assert_eq!(decoded, policied);
         Ok(())
+    }
+
+    #[test]
+    fn aws_try_from_iter_rejects_same_name_different_policy() {
+        let err = AwsCapability::try_from_iter([
+            aws("aws.scout.readonly"),
+            aws_with_policy(
+                "aws.scout.readonly",
+                serde_json::json!({"Statement": [{"Effect": "Deny"}]}),
+            ),
+        ])
+        .expect_err("same name with different policy must fail");
+
+        assert_eq!(err.name, "aws.scout.readonly");
+        assert!(err.prior_policy.is_none());
+        assert!(err.new_policy.is_some());
+    }
+
+    #[test]
+    fn aws_try_from_iter_deduplicates_exact_duplicates() {
+        let cap = aws_with_policy(
+            "aws.scout.readonly",
+            serde_json::json!({"Statement": [{"Effect": "Deny"}]}),
+        );
+        let set = AwsCapability::try_from_iter([cap.clone(), cap.clone()])
+            .expect("exact duplicates are harmless");
+
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&cap));
+    }
+
+    #[test]
+    fn capability_deserialize_rejects_duplicate_aws_name_different_policy() {
+        let err = serde_json::from_value::<Capability>(serde_json::json!({
+            "aws": [
+                {"name": "aws.scout.readonly"},
+                {
+                    "name": "aws.scout.readonly",
+                    "session_policy": {"Statement": [{"Effect": "Deny"}]}
+                }
+            ]
+        }))
+        .expect_err("serde must enforce one-cap-per-name invariant");
+
+        assert!(err.to_string().contains("duplicate AWS capability"));
+        assert!(err.to_string().contains("aws.scout.readonly"));
+    }
+
+    #[test]
+    fn capability_deserialize_deduplicates_exact_duplicate_aws_caps() {
+        let decoded: Capability = serde_json::from_value(serde_json::json!({
+            "aws": [
+                {"name": "aws.scout.readonly"},
+                {"name": "aws.scout.readonly"}
+            ]
+        }))
+        .expect("exact duplicates are deduplicated");
+
+        assert_eq!(decoded.aws.len(), 1);
+        assert!(decoded.aws.contains(&aws("aws.scout.readonly")));
     }
 
     #[test]

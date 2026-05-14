@@ -650,6 +650,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::AsyncWriteExt;
 
     fn catalog_with(entries: Value) -> AwsCapabilityCatalog {
         serde_json::from_value(json!({
@@ -867,32 +868,23 @@ sleep 20
 
     #[tokio::test]
     async fn large_runner_stdout_is_bounded_and_flagged() {
-        let dir = temp_test_dir("aws-recon-runner-large");
-        let runner = dir.join("runner.sh");
-        let script = dir.join("aws-recon.py");
-        write_passthrough_runner(&runner);
-        write_executable(
-            &script,
-            r#"#!/bin/sh
-python3 - <<'PY'
-print('x' * (11 * 1024 * 1024))
-print('{"report":"reports/aws-recon/large","errors":[],"findings":[]}')
-PY
-"#,
-        );
+        let (reader, mut writer) = tokio::io::duplex(8192);
+        let writer_task = tokio::spawn(async move {
+            let chunk = vec![b'x'; 8192];
+            let mut remaining = MAX_RUNNER_STREAM_BYTES + 1;
+            while remaining > 0 {
+                let n = remaining.min(chunk.len());
+                writer.write_all(&chunk[..n]).await.expect("write chunk");
+                remaining -= n;
+            }
+            writer.shutdown().await.expect("shutdown writer");
+        });
 
-        let tool = AwsReconTool::with_runner(
-            readonly_catalog(),
-            "sha256:test",
-            &runner,
-            &script,
-            Some(dir),
-        );
-        let result = execute(&tool, json!({})).await;
-        let value: Value = serde_json::from_str(&result.content).expect("structured json");
+        let capture = read_limited(Some(reader)).await;
+        writer_task.await.expect("writer task joins");
 
-        assert!(result.is_error);
-        assert_eq!(value["reason"], "runner_output_parse_failed");
+        assert!(capture.truncated);
+        assert_eq!(capture.text.len(), MAX_RUNNER_STREAM_BYTES);
     }
 
     #[tokio::test]
@@ -946,18 +938,6 @@ exit 42
         let dir = std::env::temp_dir().join(format!("mu-{name}-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
-    }
-
-    fn write_passthrough_runner(path: &std::path::Path) {
-        write_executable(
-            path,
-            r#"#!/bin/sh
-shift
-[ "$1" = "--" ] || exit 2
-shift
-exec "$@"
-"#,
-        );
     }
 
     fn write_executable(path: &std::path::Path, content: &str) {

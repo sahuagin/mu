@@ -466,6 +466,17 @@ fn should_push_invoke_llm(queue: &VecDeque<Action>) -> bool {
     !queue.iter().any(|a| matches!(a, Action::InvokeLlm))
 }
 
+/// mu-kgu.8: per-session record of the most recent completed
+/// compaction. The agent loop carries this between turns so the
+/// compacted rope (which only covers `messages[..messages_at_spawn]`)
+/// is extended with fresh spans for messages appended later. Updated
+/// on each completed sync or async compaction.
+#[derive(Debug, Clone)]
+struct CompactionBaseline {
+    rope: crate::context::RetainedRope,
+    messages_at_spawn: usize,
+}
+
 /// Handle to a running agent loop.
 #[derive(Debug)]
 pub struct AgentLoop {
@@ -571,6 +582,19 @@ async fn run(
     // provider.stream() call. Used to link a ContextAssembly event
     // to the AssistantMessage/Done it produced.
     let mut model_call_id: u32 = 0;
+
+    // mu-kgu.8: per-session background-compaction state.
+    //   - `bg_compaction` tracks pending tokio tasks + quota.
+    //   - `compaction_baseline` is the most recent completed (sync or
+    //     async) compaction's rope + the `messages.len()` snapshot at
+    //     that time. Subsequent turns rebuild the effective rope as
+    //     `baseline ++ message_spans(messages[messages_at_spawn..])`
+    //     via [`crate::context::append_messages_to_baseline`] so the
+    //     compacted prefix persists across turns until another
+    //     compaction supersedes it.
+    let mut bg_compaction =
+        crate::context::BackgroundCompactionState::new(crate::context::CompactionQuota::default());
+    let mut compaction_baseline: Option<CompactionBaseline> = None;
 
     let _ = events.send(AgentEvent::AgentStart).await;
 
@@ -784,24 +808,63 @@ async fn run(
                 // computation produces ContextAssembly provenance
                 // (renderer/strategy labels, span counts, cache-
                 // boundary placement, first-N span ids).
-                let rope: RetainedRope = crate::context::assemble_rope(
-                    config.system_prompt.as_deref(),
-                    &messages,
-                    &tool_specs,
-                );
                 let renderer = provider.renderer();
                 let cache_strategy = provider.cache_strategy();
 
+                // mu-kgu.8: drain any pending background-compaction
+                // result BEFORE assembling this turn's rope. If the
+                // task finished, adopt its rope as the new baseline;
+                // if it timed out / panicked, the state machine has
+                // already cleared the pending handle.
+                if let Some(Some(complete)) = bg_compaction.try_take().await {
+                    {
+                        let policy_label = provider.compaction_policy().policy_label().to_owned();
+                        let tokens_after = renderer.estimate_tokens(&complete.result.rope);
+                        let _ = events
+                            .send(AgentEvent::CompactionAssembly {
+                                model_call_id: model_call_id + 1,
+                                policy_id: policy_label,
+                                tokens_before: complete.result.tokens_before,
+                                tokens_after,
+                                decisions_count: complete.result.decisions.len() as u32,
+                                wall_clock_us: complete.result.wall_clock_us,
+                            })
+                            .await;
+                        compaction_baseline = Some(CompactionBaseline {
+                            rope: complete.result.rope,
+                            messages_at_spawn: complete.messages_at_spawn,
+                        });
+                    }
+                }
+
+                // mu-kgu.8: build the effective rope. If a prior
+                // compaction (sync or async) left a baseline, append
+                // freshly-projected spans for any messages added since
+                // the snapshot. Otherwise build from scratch.
+                let rope: RetainedRope = match &compaction_baseline {
+                    Some(b) => crate::context::append_messages_to_baseline(
+                        &b.rope,
+                        b.messages_at_spawn,
+                        &messages,
+                    ),
+                    None => crate::context::assemble_rope(
+                        config.system_prompt.as_deref(),
+                        &messages,
+                        &tool_specs,
+                    ),
+                };
+
                 // mu-kgu.4: check renderer-estimated token cost
                 // against the per-session compaction threshold. If
-                // crossed, dispatch the provider's compaction policy
-                // and use the resulting rope for the rest of this
-                // turn. The default policy is `NoCompactionPolicy`,
-                // which is a no-op; only providers (or sessions)
-                // that opt into a real policy ever see this branch
-                // fire. CompactionAssembly events are emitted BEFORE
-                // the matching ContextAssembly so consumers can
-                // join the two by `model_call_id`.
+                // crossed, dispatch the provider's compaction policy.
+                //
+                // mu-kgu.8: async-capable policies route through the
+                // background worker — spawn `compact()` on a tokio
+                // task and continue this turn with the un-compacted
+                // rope. The result lands on a subsequent turn via the
+                // try_take drain above. Sync policies (the default
+                // NoCompactionPolicy, and policies whose async quota
+                // is exhausted) run inline as before.
                 //
                 // Correctness contract (mu-kgu.4 bead body): if
                 // compaction returns the original rope unchanged
@@ -815,23 +878,46 @@ async fn run(
                     .unwrap_or(DEFAULT_COMPACTION_THRESHOLD);
                 let rope = if pre_compaction_tokens > compaction_threshold {
                     let policy = provider.compaction_policy();
-                    // Target: half the threshold. Coarse but matches
-                    // the bead's "target ≈ 50% of context window"
-                    // guidance and gives policies headroom to under-
-                    // shoot without immediately re-tripping next turn.
                     let target_tokens = compaction_threshold / 2;
-                    let result = policy.compact(&rope, target_tokens);
-                    let _ = events
-                        .send(AgentEvent::CompactionAssembly {
-                            model_call_id: model_call_id + 1,
-                            policy_id: policy.policy_label().to_owned(),
-                            tokens_before: pre_compaction_tokens,
-                            tokens_after: renderer.estimate_tokens(&result.rope),
-                            decisions_count: result.decisions.len() as u32,
-                            wall_clock_us: result.wall_clock_us,
-                        })
-                        .await;
-                    result.rope
+                    if policy.is_async() && bg_compaction.can_start() {
+                        // mu-kgu.8 background path: spawn off-thread,
+                        // this turn keeps the un-compacted rope. Next
+                        // turn's drain picks up the result.
+                        bg_compaction.start(
+                            policy.clone(),
+                            rope.clone(),
+                            target_tokens,
+                            messages.len(),
+                        );
+                        rope
+                    } else {
+                        // Sync path. Either the policy is sync, or
+                        // it's async but quota-blocked (in-flight,
+                        // cooldown, or max-attempts hit). Run inline
+                        // to avoid blowing past the model's hard
+                        // context limit.
+                        let result = policy.compact(&rope, target_tokens);
+                        let _ = events
+                            .send(AgentEvent::CompactionAssembly {
+                                model_call_id: model_call_id + 1,
+                                policy_id: policy.policy_label().to_owned(),
+                                tokens_before: pre_compaction_tokens,
+                                tokens_after: renderer.estimate_tokens(&result.rope),
+                                decisions_count: result.decisions.len() as u32,
+                                wall_clock_us: result.wall_clock_us,
+                            })
+                            .await;
+                        // Inline compaction also updates the baseline
+                        // so subsequent turns (which need fewer
+                        // compactions thanks to a smaller starting
+                        // point) benefit. messages.len() here is the
+                        // snapshot of "what was compacted."
+                        compaction_baseline = Some(CompactionBaseline {
+                            rope: result.rope.clone(),
+                            messages_at_spawn: messages.len(),
+                        });
+                        result.rope
+                    }
                 } else {
                     rope
                 };

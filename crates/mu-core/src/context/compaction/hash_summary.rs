@@ -328,6 +328,23 @@ impl CompactionPolicy for HashAndSummaryPolicy {
         }
         .with_tokens_after_recomputed()
     }
+
+    /// mu-kgu.8: this policy is a candidate for background compaction.
+    /// The judge call may take seconds (live Anthropic Haiku
+    /// ~500-1500ms; Opus several seconds), and that latency should
+    /// not block the foreground turn. The agent loop respects this
+    /// flag by spawning `compact()` on a tokio task and continuing
+    /// with the un-compacted rope until the result lands on a later
+    /// turn.
+    ///
+    /// `is_async = true` regardless of whether the underlying judge
+    /// is a `ProviderJudge` (live) or a `MockJudge` (test). The cost
+    /// of taking the async path for a sync mock is one `tokio::spawn`
+    /// — negligible. The benefit of NOT branching on judge type is a
+    /// simpler trait surface.
+    fn is_async(&self) -> bool {
+        true
+    }
 }
 
 /// Hash every span at `short`. If a collision is detected, retry at

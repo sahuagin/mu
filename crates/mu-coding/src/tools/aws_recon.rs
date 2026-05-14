@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::process::Command;
 
 use mu_core::agent::{
     PermissionLevel, RetryPolicy, SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec,
@@ -19,6 +20,14 @@ pub struct AwsReconTool {
     catalog: AwsCapabilityCatalog,
     catalog_digest: String,
     fixture_dir: Option<PathBuf>,
+    runner: Option<AwsReconRunner>,
+}
+
+#[derive(Debug, Clone)]
+struct AwsReconRunner {
+    runner_path: PathBuf,
+    script_path: PathBuf,
+    cwd: Option<PathBuf>,
 }
 
 impl AwsReconTool {
@@ -31,6 +40,26 @@ impl AwsReconTool {
             catalog,
             catalog_digest: catalog_digest.into(),
             fixture_dir,
+            runner: None,
+        }
+    }
+
+    pub fn with_runner(
+        catalog: AwsCapabilityCatalog,
+        catalog_digest: impl Into<String>,
+        runner_path: impl Into<PathBuf>,
+        script_path: impl Into<PathBuf>,
+        cwd: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            catalog,
+            catalog_digest: catalog_digest.into(),
+            fixture_dir: None,
+            runner: Some(AwsReconRunner {
+                runner_path: runner_path.into(),
+                script_path: script_path.into(),
+                cwd,
+            }),
         }
     }
 
@@ -45,7 +74,25 @@ impl AwsReconTool {
         let fixture_dir = std::env::var("MU_AWS_RECON_FIXTURE_DIR")
             .ok()
             .map(PathBuf::from);
-        Ok(Self::new(catalog, digest, fixture_dir))
+        let runner_path = std::env::var("MU_AWS_RECON_RUNNER").ok().map(PathBuf::from);
+        let script_path = std::env::var("MU_AWS_RECON_SCRIPT").ok().map(PathBuf::from);
+        let cwd = std::env::var("MU_AWS_RECON_CWD").ok().map(PathBuf::from);
+
+        match (fixture_dir, runner_path, script_path) {
+            (Some(fixture_dir), _, _) => Ok(Self::new(catalog, digest, Some(fixture_dir))),
+            (None, Some(runner_path), Some(script_path)) => Ok(Self::with_runner(
+                catalog,
+                digest,
+                runner_path,
+                script_path,
+                cwd,
+            )),
+            (None, None, None) => Ok(Self::new(catalog, digest, None)),
+            (None, _, _) => Err(
+                "MU_AWS_RECON_RUNNER and MU_AWS_RECON_SCRIPT must be set together for live aws_recon"
+                    .to_owned(),
+            ),
+        }
     }
 }
 
@@ -53,7 +100,7 @@ impl Tool for AwsReconTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "aws_recon",
-            "Run read-only AWS sandbox reconnaissance through the Mu AWS capability stack. Fixture-only in this build: no live AWS calls or runner subprocess are invoked.",
+            "Run read-only AWS sandbox reconnaissance through the Mu AWS capability stack. Uses fixture mode when configured with MU_AWS_RECON_FIXTURE_DIR, or an explicit local runner when MU_AWS_RECON_RUNNER and MU_AWS_RECON_SCRIPT are set.",
             json!({
                 "type": "object",
                 "properties": {
@@ -115,6 +162,10 @@ impl AwsReconTool {
             Ok(t) => t,
             Err(result) => return result,
         };
+        let output_dir = match output_dir_argument(&arguments) {
+            Ok(path) => path,
+            Err(result) => return result,
+        };
 
         if capability_name != DEFAULT_CAPABILITY {
             return ToolResult {
@@ -156,36 +207,142 @@ impl AwsReconTool {
             };
         }
 
-        let fixture_dir = match &self.fixture_dir {
-            Some(path) => path,
+        if let Some(fixture_dir) = &self.fixture_dir {
+            let report = json!({
+                "kind": "aws_recon_report",
+                "mode": "fixture",
+                "artifact_dir": fixture_dir,
+                "summary_path": fixture_dir.join("summary.json"),
+                "capability": capability_name,
+                "call_timeout_secs": call_timeout_secs,
+                "catalog_digest": self.catalog_digest,
+                "audit": audit_metadata(DEFAULT_CAPABILITY, &self.catalog_digest, Some(entry)),
+                "sts": null,
+            });
+            return ToolResult {
+                content: serde_json::to_string_pretty(&report)
+                    .expect("json serialization cannot fail"),
+                is_error: false,
+            };
+        }
+
+        let runner = match &self.runner {
+            Some(runner) => runner,
             None => {
                 return ToolResult {
                     content: structured_error(
-                        "runner_not_implemented",
+                        "runner_not_configured",
                         &capability_name,
                         &self.catalog_digest,
                         Some(entry),
-                        "aws_recon runner wiring is not implemented; set MU_AWS_RECON_FIXTURE_DIR or use injected fixture_dir in tests",
+                        "aws_recon live runner is not configured; set MU_AWS_RECON_RUNNER plus MU_AWS_RECON_SCRIPT, or MU_AWS_RECON_FIXTURE_DIR for fixture mode",
                     ),
                     is_error: true,
                 };
             }
         };
 
-        let report = json!({
-            "kind": "aws_recon_report",
-            "mode": "fixture",
-            "artifact_dir": fixture_dir,
-            "summary_path": fixture_dir.join("summary.json"),
-            "capability": capability_name,
-            "call_timeout_secs": call_timeout_secs,
-            "catalog_digest": self.catalog_digest,
-            "audit": audit_metadata(DEFAULT_CAPABILITY, &self.catalog_digest, Some(entry)),
-            "sts": null,
-        });
-        ToolResult {
-            content: serde_json::to_string_pretty(&report).expect("json serialization cannot fail"),
-            is_error: false,
+        self.execute_runner(
+            runner,
+            &capability_name,
+            call_timeout_secs,
+            output_dir,
+            entry,
+        )
+    }
+
+    fn execute_runner(
+        &self,
+        runner: &AwsReconRunner,
+        capability_name: &str,
+        call_timeout_secs: u64,
+        output_dir: Option<PathBuf>,
+        entry: &AwsCapabilityCatalogEntry,
+    ) -> ToolResult {
+        let mut command = Command::new(&runner.runner_path);
+        command
+            .arg(capability_name)
+            .arg("--")
+            .arg(&runner.script_path)
+            .arg("--call-timeout")
+            .arg(call_timeout_secs.to_string());
+        if let Some(output_dir) = &output_dir {
+            command.arg("--out-dir").arg(output_dir);
+        }
+        if let Some(cwd) = &runner.cwd {
+            command.current_dir(cwd);
+        }
+
+        match command.output() {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                match parse_runner_summary(&stdout) {
+                    Ok(summary) => {
+                        let report_dir = summary
+                            .get("report")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_default();
+                        let report = json!({
+                            "kind": "aws_recon_report",
+                            "mode": "runner",
+                            "report_dir": report_dir,
+                            "summary_path": if report_dir.is_empty() { Value::Null } else { json!(format!("{report_dir}/summary.json")) },
+                            "capability": capability_name,
+                            "call_timeout_secs": call_timeout_secs,
+                            "catalog_digest": self.catalog_digest,
+                            "audit": audit_metadata(capability_name, &self.catalog_digest, Some(entry)),
+                            "runner": {
+                                "path": runner.runner_path,
+                                "script": runner.script_path,
+                            },
+                            "stdout_summary": summary,
+                        });
+                        ToolResult {
+                            content: serde_json::to_string_pretty(&report)
+                                .expect("json serialization cannot fail"),
+                            is_error: false,
+                        }
+                    }
+                    Err(message) => ToolResult {
+                        content: structured_error(
+                            "runner_output_parse_failed",
+                            capability_name,
+                            &self.catalog_digest,
+                            Some(entry),
+                            &message,
+                        ),
+                        is_error: true,
+                    },
+                }
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                ToolResult {
+                    content: structured_error(
+                        "runner_failed",
+                        capability_name,
+                        &self.catalog_digest,
+                        Some(entry),
+                        &format!(
+                            "aws_recon runner exited with {}: {}",
+                            output.status,
+                            stderr.trim()
+                        ),
+                    ),
+                    is_error: true,
+                }
+            }
+            Err(err) => ToolResult {
+                content: structured_error(
+                    "runner_spawn_failed",
+                    capability_name,
+                    &self.catalog_digest,
+                    Some(entry),
+                    &format!("failed to spawn aws_recon runner: {err}"),
+                ),
+                is_error: true,
+            },
         }
     }
 }
@@ -201,6 +358,23 @@ fn capability_argument(arguments: &Value) -> Result<String, ToolResult> {
                 "unknown",
                 None,
                 "`capability` must be a non-empty string",
+            ),
+            is_error: true,
+        }),
+    }
+}
+
+fn output_dir_argument(arguments: &Value) -> Result<Option<PathBuf>, ToolResult> {
+    match arguments.get("output_dir") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(PathBuf::from(s.trim()))),
+        Some(_) => Err(ToolResult {
+            content: structured_error(
+                "invalid_output_dir",
+                DEFAULT_CAPABILITY,
+                "unknown",
+                None,
+                "`output_dir` must be a non-empty string when provided",
             ),
             is_error: true,
         }),
@@ -234,6 +408,17 @@ fn call_timeout_argument(arguments: &Value) -> Result<u64, ToolResult> {
             is_error: true,
         }),
     }
+}
+
+fn parse_runner_summary(stdout: &str) -> Result<Value, String> {
+    let start = stdout
+        .find('{')
+        .ok_or_else(|| "aws_recon runner stdout did not contain a JSON summary".to_owned())?;
+    let end = stdout
+        .rfind('}')
+        .ok_or_else(|| "aws_recon runner stdout JSON summary was incomplete".to_owned())?;
+    serde_json::from_str(&stdout[start..=end])
+        .map_err(|err| format!("failed to parse aws_recon runner summary JSON: {err}"))
 }
 
 fn catalog_error(capability: &str, catalog_digest: &str, err: AwsCatalogError) -> String {
@@ -286,6 +471,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn catalog_with(entries: Value) -> AwsCapabilityCatalog {
         serde_json::from_value(json!({
@@ -389,17 +577,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fixture_unset_returns_not_yet_implemented_refusal() {
+    async fn fixture_unset_returns_runner_not_configured_refusal() {
         let tool = AwsReconTool::new(readonly_catalog(), "sha256:test", None);
         let result = execute(&tool, json!({})).await;
         let value: Value = serde_json::from_str(&result.content).expect("structured json");
 
         assert!(result.is_error);
-        assert_eq!(value["reason"], "runner_not_implemented");
+        assert_eq!(value["reason"], "runner_not_configured");
         assert_eq!(
             value["audit"]["role_arn"],
             "arn:aws:iam::123456789012:role/mu-readonly-scout"
         );
+    }
+
+    #[tokio::test]
+    async fn runner_mode_invokes_capability_runner_and_returns_report_shape() {
+        let dir = temp_test_dir("aws-recon-runner-ok");
+        let runner = dir.join("runner.sh");
+        let script = dir.join("aws-recon.py");
+        write_executable(
+            &runner,
+            r#"#!/bin/sh
+printf 'capability=%s\n' "$1" >&2
+shift
+[ "$1" = "--" ] || exit 2
+shift
+exec "$@"
+"#,
+        );
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+printf 'reports/aws-recon/20260514T000000Z\n'
+printf '{"account":"123456789012","aws_profile":"mu-readonly-scout","capability_used":"aws.scout.readonly","report":"reports/aws-recon/20260514T000000Z","errors":[],"findings":[]}\n'
+"#,
+        );
+
+        let tool = AwsReconTool::with_runner(
+            readonly_catalog(),
+            "sha256:test",
+            &runner,
+            &script,
+            Some(dir.clone()),
+        );
+        let result = execute(
+            &tool,
+            json!({"call_timeout_secs": 60, "output_dir": "reports/aws-recon"}),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result.content).expect("structured json");
+
+        assert!(!result.is_error);
+        assert_eq!(value["kind"], "aws_recon_report");
+        assert_eq!(value["mode"], "runner");
+        assert_eq!(value["report_dir"], "reports/aws-recon/20260514T000000Z");
+        assert_eq!(
+            value["summary_path"],
+            "reports/aws-recon/20260514T000000Z/summary.json"
+        );
+        assert_eq!(value["capability"], "aws.scout.readonly");
+        assert_eq!(value["call_timeout_secs"], 60);
+        assert_eq!(value["audit"]["aws_profile"], "mu-readonly-scout");
+        assert_eq!(value["stdout_summary"]["errors"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn runner_failure_is_structured_error() {
+        let dir = temp_test_dir("aws-recon-runner-fail");
+        let runner = dir.join("runner.sh");
+        let script = dir.join("aws-recon.py");
+        write_executable(
+            &runner,
+            r#"#!/bin/sh
+printf 'runner refused\n' >&2
+exit 42
+"#,
+        );
+        write_executable(&script, "#!/bin/sh\nexit 0\n");
+
+        let tool = AwsReconTool::with_runner(
+            readonly_catalog(),
+            "sha256:test",
+            &runner,
+            &script,
+            Some(dir),
+        );
+        let result = execute(&tool, json!({})).await;
+        let value: Value = serde_json::from_str(&result.content).expect("structured json");
+
+        assert!(result.is_error);
+        assert_eq!(value["reason"], "runner_failed");
+        assert!(value["message"]
+            .as_str()
+            .expect("message")
+            .contains("runner refused"));
     }
 
     #[tokio::test]
@@ -411,5 +682,22 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(value["reason"], "unsupported_capability");
         assert_eq!(value["audit"]["capability"], "aws.audit.security");
+    }
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("mu-{name}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn write_executable(path: &std::path::Path, content: &str) {
+        fs::write(path, content).expect("write script");
+        let mut perms = fs::metadata(path).expect("script metadata").permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(path, perms).expect("chmod script");
     }
 }

@@ -118,8 +118,10 @@ The architectural contract is the protocol and event model, not a particular UI.
 
 See also:
 
+- [`specs/architecture/mu-capability-substrate.md`](specs/architecture/mu-capability-substrate.md)
 - [`specs/architecture/event-sourced-context.md`](specs/architecture/event-sourced-context.md)
 - [`specs/architecture/capability-delegation.md`](specs/architecture/capability-delegation.md)
+- [`specs/architecture/os-enforced-agent-sandboxing.md`](specs/architecture/os-enforced-agent-sandboxing.md)
 - [`specs/delegations.md`](specs/delegations.md)
 
 ## Design principles

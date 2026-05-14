@@ -169,7 +169,7 @@ impl Tool for GlobTool {
                 "directory" => {
                     cmd.arg("--type").arg("d");
                 }
-                "any" | _ => {} // no --type
+                _ => {} // "any" or unrecognized → no --type
             }
             if case_insensitive {
                 cmd.arg("-i");

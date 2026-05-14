@@ -435,8 +435,10 @@ code from treating a bare string as sufficient authority.
   two `Some` returns `None` for now.
 - The capability-broker runtime (judge + orchestrator agents that
   produce attenuated grants from a session's stated need).
-- An `aws-recon` skill that activates an `AwsCapability` and routes
-  tool execution through `mu-aws-capability-run.sh`.
+- Implementing the `aws-recon` skill specified in
+  `specs/mu-039-aws-recon-skill.md`: activation with an `AwsCapability`, narrow
+  recon/planner/auditor tool schemas, and runner-backed execution through
+  `mu-aws-capability-run.sh`.
 - Cross-daemon biscuit-auth serialization (a future swap of the
   in-process types for signed biscuit tokens; the algebra stays
   identical).

@@ -20,6 +20,7 @@
 pub mod agent;
 pub mod aws;
 pub mod capability;
+pub mod config;
 pub mod context;
 pub mod event_log;
 pub mod protocol;

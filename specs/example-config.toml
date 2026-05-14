@@ -1,0 +1,113 @@
+# mu config — example operator file.
+#
+# Place at ~/.config/mu/config.toml (per-user) or
+# /etc/mu/config.toml (site-wide).
+#
+# Site config loads first, operator config overlays. Either may be
+# absent. Code defaults apply to any field neither file specifies, so
+# this whole file is optional.
+#
+# Layered resolution order (later wins):
+#   1. Code defaults (mu_core::config::Config::default)
+#   2. /etc/mu/config.toml
+#   3. ~/.config/mu/config.toml
+#   4. CLI flags to mu serve / mu-tui (resolved by consumers)
+#   5. Per-session RPC params (handled at dispatch time)
+#
+# Arrays REPLACE (do not append) across layers. The judge.ranking
+# array in this file would wholesale replace any site-level ranking,
+# not extend it. This is intentional: operator-edited config is the
+# authoritative override.
+
+# ── Compaction ────────────────────────────────────────────────────
+
+[compaction]
+# Policy to instantiate at session creation:
+#   "no-compaction"     — identity policy (pre-mu-kgu behavior)
+#   "heuristic"         — SpanFamilyDropPolicy (mu-kgu.2)
+#   "hash-and-summary"  — HashAndSummaryPolicy (mu-kgu.3) — needs a
+#                         judge model; see [compaction.judge] below.
+default_policy = "no-compaction"
+
+# Token threshold above which the agent loop runs the compaction
+# policy between turns. Default 150_000 — matches Anthropic's
+# documented auto-compaction trigger for comparable headline numbers.
+trigger_threshold_tokens = 150_000
+
+[compaction.judge]
+# Output mode for HashAndSummaryPolicy:
+#   "index_keep" — mu-kgu.7 rung-B; positional kept-spans + summary
+#   "hash_keep"  — mu-kgu.3 v1; content-hashed kept-spans + summary
+output_mode = "index_keep"
+
+# Wall-clock cap for one judge call.
+timeout_secs = 60
+
+# Ordered preference list. The daemon walks this on each compaction
+# event; first entry whose provider+auth is available wins. Empty
+# (the default) leaves the canned judge in place — mu-kgu.3 behavior.
+# mu-kgu.11 (planned) is what actually consumes this ranking.
+[[compaction.judge.ranking]]
+provider = "openrouter"
+model = "deepseek-chat"
+auth = "api_key"
+
+[[compaction.judge.ranking]]
+provider = "anthropic"
+model = "claude-haiku-4-5"
+auth = "oauth"
+
+[[compaction.judge.ranking]]
+provider = "anthropic"
+model = "claude-haiku-4-5"
+auth = "api_key"
+
+
+# ── Providers ─────────────────────────────────────────────────────
+
+[providers]
+# Auth-source preference per provider. First available wins.
+anthropic_auth_ranking  = ["oauth", "api_key"]
+openrouter_auth_ranking = ["api_key"]
+codex_auth_ranking      = ["oauth"]
+
+[providers.proxy]
+# Local proxy for OAuth-mediated traffic. Defaults to unset
+# (no proxying). When set, the listed providers route through it.
+# url = "http://127.0.0.1:3180"
+# use_for = ["anthropic"]
+
+
+# ── Session ───────────────────────────────────────────────────────
+
+[session]
+# Write event-log JSONL to disk under <state_dir>/events/...
+# Today's default behavior (mu-upb). Set false for ephemeral mode.
+persist_events_to_disk = true
+
+# Reload sessions from disk on daemon restart. v1 default is false;
+# the read-side machinery lands in mu-mh4.
+resume_on_daemon_restart = false
+
+# Root directory for daemon state. Unset = platform default
+# (~/.local/share/mu on Linux). The events subdir derives from this:
+# <state_dir>/events/<daemon_id>/<session_id>.jsonl.
+# state_dir = "/var/lib/mu"
+
+
+# ── UI (TUI) ──────────────────────────────────────────────────────
+
+[ui.tui]
+# Defaults the TUI uses when the operator hits `n` for a new session
+# (and didn't override via --provider/--model on the command line).
+default_provider = "anthropic_api"
+default_model    = "claude-haiku-4-5-20251001"
+
+
+# ── Budget ────────────────────────────────────────────────────────
+
+[budget]
+# Soft thresholds for operator awareness. Hard caps still come from
+# CLI flags (e.g. --max-budget-usd). Unset = no warning.
+# api_key_daily_warn_usd  = 10
+# api_key_weekly_warn_usd = 30

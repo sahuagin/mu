@@ -1359,12 +1359,14 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "blake3",
+ "dirs",
  "futures",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tiktoken-rs",
  "tokio",
+ "toml",
  "tracing",
 ]
 

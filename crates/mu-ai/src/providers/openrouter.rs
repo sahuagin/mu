@@ -197,7 +197,7 @@ pub(crate) fn build_request_body(
     api_messages.extend(messages.iter().filter_map(translate_message));
     let mut body = json!({
         "model": model,
-        "max_tokens": 4096,
+        "max_tokens": super::output_limits::max_tokens_for_model(model),
         "stream": true,
         // Ask the streamer to emit a final usage chunk; without this,
         // most OpenAI-compatible backends omit usage from streaming

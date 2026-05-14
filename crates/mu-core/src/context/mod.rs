@@ -35,12 +35,14 @@
 
 pub mod assembly;
 pub mod cache;
+pub mod compaction;
 pub mod event;
 pub mod renderer;
 pub mod rope;
 
 pub use assembly::assemble_rope;
 pub use cache::{CacheBoundary, CacheStrategy, NoCacheStrategy};
+pub use compaction::{CompactionDecision, CompactionPolicy, CompactionResult, NoCompactionPolicy};
 pub use event::RopeEvent;
 pub use renderer::{
     CacheMarker, FauxProviderRenderer, ProjectionTarget, ProviderMessage, ProviderMessages,

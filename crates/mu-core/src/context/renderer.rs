@@ -206,6 +206,33 @@ pub trait ProviderRenderer: Send + Sync {
     /// Render the given rope into provider-shaped messages for the
     /// chosen projection target.
     fn render(&self, rope: &RetainedRope, target: ProjectionTarget) -> ProviderMessages;
+
+    /// mu-kgu.4: estimate the token cost of `rope` under this
+    /// renderer's projection. Used by the agent loop to decide
+    /// whether to dispatch [`CompactionPolicy::compact`] before the
+    /// next provider call.
+    ///
+    /// The default implementation is a coarse `chars / 4`
+    /// approximation summed across [`AgentView`] content. It is
+    /// intentionally tokenizer-agnostic so non-Anthropic providers
+    /// without a bundled tokenizer get a sane default. Concrete
+    /// renderers SHOULD override with a provider-specific tokenizer
+    /// when one is available (e.g., the Anthropic adapter can use
+    /// the API's `count_tokens` endpoint or a local BPE).
+    ///
+    /// The return is an estimate, not a hard count. Callers (the
+    /// agent loop) compare it to a configured threshold; rope
+    /// compaction is best-effort either way.
+    ///
+    /// [`AgentView`]: ProjectionTarget::AgentView
+    /// [`CompactionPolicy::compact`]: super::compaction::CompactionPolicy::compact
+    fn estimate_tokens(&self, rope: &RetainedRope) -> usize {
+        rope.spans()
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum::<usize>()
+            / 4
+    }
 }
 
 /// Foundational renderer impl — one message per span, role derived

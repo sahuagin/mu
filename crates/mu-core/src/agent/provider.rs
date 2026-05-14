@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::oneshot;
 
-use crate::context::{CacheStrategy, FauxProviderRenderer, NoCacheStrategy, ProviderRenderer};
+use crate::context::{
+    CacheStrategy, CompactionPolicy, FauxProviderRenderer, NoCacheStrategy, NoCompactionPolicy,
+    ProviderRenderer,
+};
 
 use super::tool::ToolSpec;
 use super::types::{AgentMessage, AssistantMessage};
@@ -97,6 +100,18 @@ pub trait Provider: Send + Sync {
     /// no-op pair (FauxProviderRenderer + NoCacheStrategy).
     fn provider_label(&self) -> &'static str {
         "faux"
+    }
+
+    /// mu-kgu.1: the [`CompactionPolicy`] this provider uses to compact
+    /// the rope when the agent loop crosses a per-session token
+    /// threshold. Default: [`NoCompactionPolicy`] — preserves the
+    /// pre-mu-kgu behavior of "no compaction." Concrete providers can
+    /// override to declare their preferred policy (e.g., the heuristic
+    /// or hash-summary policies once mu-kgu.2 / mu-kgu.3 land). The
+    /// agent-loop integration (mu-kgu.4) calls this once per session
+    /// to obtain the policy handle.
+    fn compaction_policy(&self) -> Arc<dyn CompactionPolicy> {
+        Arc::new(NoCompactionPolicy::new())
     }
 }
 

@@ -110,6 +110,27 @@ impl SpanHasher for Blake3Hasher {
     }
 }
 
+/// Output mode for the judge's keep-list (mu-kgu.7 rung-B optimization).
+///
+/// - [`HashKeep`] — rung-A (default): judge emits an array of 8-char
+///   hex hashes. Stable across compaction passes; auditable.
+/// - [`IndexKeep`] — rung-B: judge emits an array of 1-based integer
+///   indices into the input span sequence. ~6x smaller on the keep-list
+///   output token count vs hashes; pass-local (no cross-pass identity).
+///   mu maps indices → spans server-side and retains hashes for
+///   provenance in CompactionDecision::Kept.
+///
+/// Both modes preserve verbatim content and the same surgery outcome;
+/// only the JSON shape the model emits differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeepListMode {
+    /// Judge emits hashes (e.g. `["abc12345", "def67890"]`). Default.
+    #[default]
+    HashKeep,
+    /// Judge emits 1-based indices (e.g. `[1, 4, 7]`).
+    IndexKeep,
+}
+
 /// Hash-and-summary compaction policy.
 ///
 /// Holds a judge (the model that will pick kept hashes + produce the
@@ -123,6 +144,7 @@ pub struct HashAndSummaryPolicy {
     hash_short_chars: usize,
     hash_long_chars: usize,
     policy_id: String,
+    output_mode: KeepListMode,
 }
 
 impl HashAndSummaryPolicy {
@@ -138,7 +160,15 @@ impl HashAndSummaryPolicy {
             hash_short_chars: DEFAULT_HASH_SHORT_CHARS,
             hash_long_chars: DEFAULT_HASH_LONG_CHARS,
             policy_id: DEFAULT_POLICY_ID.to_string(),
+            output_mode: KeepListMode::default(),
         }
+    }
+
+    /// mu-kgu.7: opt into IndexKeep output mode — judge emits integer
+    /// indices instead of hashes. ~6x smaller keep-list output.
+    pub fn with_output_mode(mut self, mode: KeepListMode) -> Self {
+        self.output_mode = mode;
+        self
     }
 
     /// Override the hasher (primarily for tests).
@@ -178,11 +208,19 @@ impl std::fmt::Debug for HashAndSummaryPolicy {
     }
 }
 
-/// What the judge is asked to emit. Deserialized via serde; extra
-/// fields are ignored.
+/// What the judge is asked to emit. Hash-mode shape. Deserialized
+/// via serde; extra fields are ignored.
 #[derive(Debug, Clone, Deserialize)]
-struct JudgeOutput {
+struct JudgeOutputHash {
     keep: Vec<String>,
+    summary: String,
+}
+
+/// Index-mode shape (mu-kgu.7 rung-B). Same as `JudgeOutputHash` but
+/// the `keep` array contains 1-based integer indices.
+#[derive(Debug, Clone, Deserialize)]
+struct JudgeOutputIndex {
+    keep: Vec<usize>,
     summary: String,
 }
 
@@ -205,8 +243,8 @@ impl CompactionPolicy for HashAndSummaryPolicy {
             Err(reason) => return failed(rope, reason, start),
         };
 
-        // Step 2: build the judge prompt.
-        let prompt = build_prompt(spans, &hashes, self.preview_chars);
+        // Step 2: build the judge prompt (shape depends on output mode).
+        let prompt = build_prompt(spans, &hashes, self.preview_chars, self.output_mode);
 
         // Step 3: judge call.
         let raw = match self.judge.judge(&prompt) {
@@ -214,38 +252,68 @@ impl CompactionPolicy for HashAndSummaryPolicy {
             Err(e) => return failed(rope, format!("judge call: {e}"), start),
         };
 
-        // Step 4: parse JSON.
-        let parsed = match parse_judge_output(&raw) {
-            Ok(p) => p,
-            Err(reason) => return failed(rope, reason, start),
-        };
-
-        // Step 5: validate keep list — every hash must match exactly
-        // one span. Duplicates and unknowns are both fail-closed:
-        // we can't be sure what the judge meant.
-        let mut hash_to_index: HashMap<&str, usize> = HashMap::with_capacity(hashes.len());
-        for (i, h) in hashes.iter().enumerate() {
-            hash_to_index.insert(h.as_str(), i);
-        }
-        let mut keep_indices: HashSet<usize> = HashSet::new();
-        for entry in &parsed.keep {
-            match hash_to_index.get(entry.as_str()) {
-                Some(&i) => {
-                    if !keep_indices.insert(i) {
-                        return failed(rope, format!("duplicate keep hash {entry:?}"), start);
+        // Step 4: parse JSON (shape depends on output mode) and resolve
+        // the keep list into a HashSet<usize> of span indices.
+        let (keep_indices, summary) = match self.output_mode {
+            KeepListMode::HashKeep => {
+                let parsed = match parse_judge_output_hash(&raw) {
+                    Ok(p) => p,
+                    Err(reason) => return failed(rope, reason, start),
+                };
+                // Resolve hashes → indices. Duplicates and unknowns
+                // are both fail-closed.
+                let mut hash_to_index: HashMap<&str, usize> = HashMap::with_capacity(hashes.len());
+                for (i, h) in hashes.iter().enumerate() {
+                    hash_to_index.insert(h.as_str(), i);
+                }
+                let mut keep: HashSet<usize> = HashSet::new();
+                for entry in &parsed.keep {
+                    match hash_to_index.get(entry.as_str()) {
+                        Some(&i) => {
+                            if !keep.insert(i) {
+                                return failed(
+                                    rope,
+                                    format!("duplicate keep hash {entry:?}"),
+                                    start,
+                                );
+                            }
+                        }
+                        None => {
+                            return failed(rope, format!("unknown keep hash {entry:?}"), start);
+                        }
                     }
                 }
-                None => {
-                    return failed(rope, format!("unknown keep hash {entry:?}"), start);
-                }
+                (keep, parsed.summary)
             }
-        }
+            KeepListMode::IndexKeep => {
+                let parsed = match parse_judge_output_index(&raw) {
+                    Ok(p) => p,
+                    Err(reason) => return failed(rope, reason, start),
+                };
+                // Validate: indices must be 1-based, in-range, no dups.
+                let mut keep: HashSet<usize> = HashSet::new();
+                for &one_based in &parsed.keep {
+                    if one_based == 0 || one_based > spans.len() {
+                        return failed(
+                            rope,
+                            format!("keep index {one_based} out of range (1..={})", spans.len()),
+                            start,
+                        );
+                    }
+                    let zero_based = one_based - 1;
+                    if !keep.insert(zero_based) {
+                        return failed(rope, format!("duplicate keep index {one_based}"), start);
+                    }
+                }
+                (keep, parsed.summary)
+            }
+        };
 
-        // Step 6: surgery. Build the new rope, recording decisions.
+        // Step 5: surgery. Build the new rope, recording decisions.
         let (new_rope, decisions) = surgery(
             spans,
             &keep_indices,
-            &parsed.summary,
+            &summary,
             &self.policy_id,
             generated_at_unix_ms(),
         );
@@ -297,31 +365,41 @@ fn has_duplicate(hs: &[String]) -> bool {
     false
 }
 
-fn build_prompt(spans: &[Span], hashes: &[String], preview_chars: usize) -> String {
-    // The prompt instructs the judge to emit `{keep:[hash], summary}`
-    // JSON. Span entries are line-prefixed with the hash so the
-    // judge's "keep" list is just a copy/paste of the prefixes it
-    // wants to preserve.
+fn build_prompt(
+    spans: &[Span],
+    hashes: &[String],
+    preview_chars: usize,
+    mode: KeepListMode,
+) -> String {
     let mut out =
         String::with_capacity(spans.iter().map(|s| s.content.len()).sum::<usize>() + 1024);
-    out.push_str(
+    let (keep_shape, keep_example) = match mode {
+        KeepListMode::HashKeep => ("hash strings (as shown after `hash=`)", "[\"<hash>\", ...]"),
+        KeepListMode::IndexKeep => (
+            "1-based integer indices (as shown in `#N` at the start of each block)",
+            "[1, 4, 7]",
+        ),
+    };
+    out.push_str(&format!(
         "You are a compaction judge. Given the following retained-rope spans, \
          decide which to preserve VERBATIM (`keep`) and write a SHORT \
          natural-language summary covering everything you did NOT keep.\n\n\
          Output ONLY a JSON object with this shape:\n\
-         {\"keep\": [\"<hash>\", ...], \"summary\": \"<paragraph>\"}\n\n\
-         Spans (one per block, prefixed by hash):\n",
-    );
-    for (span, hash) in spans.iter().zip(hashes.iter()) {
+         {{\"keep\": {keep_example}, \"summary\": \"<paragraph>\"}}\n\n\
+         The `keep` array MUST contain {keep_shape}.\n\n\
+         Spans (one per block):\n"
+    ));
+    for (i, (span, hash)) in spans.iter().zip(hashes.iter()).enumerate() {
         let preview = if span.content.chars().count() <= preview_chars {
             span.content.clone()
         } else {
             let truncated: String = span.content.chars().take(preview_chars).collect();
             format!("{truncated}…")
         };
+        let one_based = i + 1;
         out.push_str("---\n");
         out.push_str(&format!(
-            "hash={hash} kind={kind} id={id}\n{preview}\n",
+            "#{one_based} hash={hash} kind={kind} id={id}\n{preview}\n",
             kind = span_kind_label(&span.kind),
             id = span.id,
         ));
@@ -345,22 +423,36 @@ fn span_kind_label(kind: &SpanKind) -> &'static str {
     }
 }
 
-fn parse_judge_output(s: &str) -> Result<JudgeOutput, String> {
-    if let Ok(out) = serde_json::from_str::<JudgeOutput>(s.trim()) {
+fn parse_judge_output_hash(s: &str) -> Result<JudgeOutputHash, String> {
+    if let Ok(out) = serde_json::from_str::<JudgeOutputHash>(s.trim()) {
         return Ok(out);
     }
-    // Fall back: try to extract a JSON object spanning the first
-    // `{` to the last `}` — handles markdown-fenced or preamble-
-    // wrapped responses.
     if let (Some(start), Some(end)) = (s.find('{'), s.rfind('}')) {
         if end > start {
-            if let Ok(out) = serde_json::from_str::<JudgeOutput>(&s[start..=end]) {
+            if let Ok(out) = serde_json::from_str::<JudgeOutputHash>(&s[start..=end]) {
                 return Ok(out);
             }
         }
     }
     Err(format!(
         "judge output not parseable as {{keep:[hash], summary:string}}: {}",
+        truncate_for_error(s)
+    ))
+}
+
+fn parse_judge_output_index(s: &str) -> Result<JudgeOutputIndex, String> {
+    if let Ok(out) = serde_json::from_str::<JudgeOutputIndex>(s.trim()) {
+        return Ok(out);
+    }
+    if let (Some(start), Some(end)) = (s.find('{'), s.rfind('}')) {
+        if end > start {
+            if let Ok(out) = serde_json::from_str::<JudgeOutputIndex>(&s[start..=end]) {
+                return Ok(out);
+            }
+        }
+    }
+    Err(format!(
+        "judge output not parseable as {{keep:[int], summary:string}}: {}",
         truncate_for_error(s)
     ))
 }
@@ -950,5 +1042,160 @@ mod tests {
         let _arc: Arc<dyn CompactionPolicy> = Arc::new(HashAndSummaryPolicy::new(MockJudge::ok(
             "{\"keep\":[],\"summary\":\"\"}",
         )));
+    }
+
+    // ========================================================================
+    // mu-kgu.7: rung-B IndexKeep mode tests
+    // ========================================================================
+
+    #[test]
+    fn rung_b_valid_index_keep_resolves_to_correct_spans() {
+        // Keep #1 (sys) and #3 (a1) via integer indices — absorbs #2,#4.
+        let rope = sample_rope();
+        let policy = HashAndSummaryPolicy::new(MockJudge::ok(
+            "{\"keep\":[1,3],\"summary\":\"user pinged and tool returned ok\"}",
+        ))
+        .with_output_mode(KeepListMode::IndexKeep);
+
+        let result = policy.compact(&rope, 1_000);
+
+        let new_spans = result.rope.spans();
+        assert_eq!(new_spans.len(), 3, "kept(2) + 1 summary span");
+        assert_eq!(new_spans[0].id, "sys");
+        assert!(matches!(
+            new_spans[1].kind,
+            SpanKind::CompactionSummary { .. }
+        ));
+        assert_eq!(new_spans[2].id, "a1");
+        // No Failed decision.
+        assert!(!result
+            .decisions
+            .iter()
+            .any(|d| matches!(d, CompactionDecision::Failed { .. })));
+    }
+
+    #[test]
+    fn rung_b_empty_keep_absorbs_everything() {
+        let rope = sample_rope();
+        let policy = HashAndSummaryPolicy::new(MockJudge::ok(
+            "{\"keep\":[],\"summary\":\"all rolled into one\"}",
+        ))
+        .with_output_mode(KeepListMode::IndexKeep);
+
+        let result = policy.compact(&rope, 1_000);
+
+        // One CompactionSummary span replacing the entire rope.
+        let new_spans = result.rope.spans();
+        assert_eq!(new_spans.len(), 1);
+        assert!(matches!(
+            new_spans[0].kind,
+            SpanKind::CompactionSummary { .. }
+        ));
+    }
+
+    #[test]
+    fn rung_b_out_of_range_index_fails_closed() {
+        let rope = sample_rope(); // 4 spans → valid indices are 1..=4
+        let policy = HashAndSummaryPolicy::new(MockJudge::ok("{\"keep\":[1,5],\"summary\":\"x\"}"))
+            .with_output_mode(KeepListMode::IndexKeep);
+
+        let result = policy.compact(&rope, 1_000);
+
+        // Fail-closed: original rope preserved + Failed decision.
+        assert_eq!(result.rope.spans(), rope.spans());
+        let failed_reason = result
+            .decisions
+            .iter()
+            .find_map(|d| match d {
+                CompactionDecision::Failed { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("Failed decision expected");
+        assert!(
+            failed_reason.contains("out of range"),
+            "got: {failed_reason}"
+        );
+    }
+
+    #[test]
+    fn rung_b_zero_index_fails_closed() {
+        // 0 is not a valid 1-based index → fail-closed.
+        let rope = sample_rope();
+        let policy = HashAndSummaryPolicy::new(MockJudge::ok("{\"keep\":[0],\"summary\":\"x\"}"))
+            .with_output_mode(KeepListMode::IndexKeep);
+
+        let result = policy.compact(&rope, 1_000);
+        assert_eq!(result.rope.spans(), rope.spans());
+        assert!(result
+            .decisions
+            .iter()
+            .any(|d| matches!(d, CompactionDecision::Failed { .. })));
+    }
+
+    #[test]
+    fn rung_b_duplicate_index_fails_closed() {
+        let rope = sample_rope();
+        let policy = HashAndSummaryPolicy::new(MockJudge::ok("{\"keep\":[1,1],\"summary\":\"x\"}"))
+            .with_output_mode(KeepListMode::IndexKeep);
+
+        let result = policy.compact(&rope, 1_000);
+        assert_eq!(result.rope.spans(), rope.spans());
+        let failed_reason = result
+            .decisions
+            .iter()
+            .find_map(|d| match d {
+                CompactionDecision::Failed { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("Failed decision expected");
+        assert!(failed_reason.contains("duplicate"), "got: {failed_reason}");
+    }
+
+    #[test]
+    fn rung_b_malformed_keep_array_fails_closed() {
+        // Strings where indices were expected.
+        let rope = sample_rope();
+        let policy =
+            HashAndSummaryPolicy::new(MockJudge::ok("{\"keep\":[\"abc\"],\"summary\":\"x\"}"))
+                .with_output_mode(KeepListMode::IndexKeep);
+
+        let result = policy.compact(&rope, 1_000);
+        assert_eq!(result.rope.spans(), rope.spans());
+        assert!(result
+            .decisions
+            .iter()
+            .any(|d| matches!(d, CompactionDecision::Failed { .. })));
+    }
+
+    #[test]
+    fn rung_b_prompt_includes_indexed_markers() {
+        // Verify the prompt is shaped to elicit integer indices.
+        let rope = sample_rope();
+        let hashes = hashes_for(&rope);
+        let prompt = build_prompt(rope.spans(), &hashes, 80, KeepListMode::IndexKeep);
+        assert!(prompt.contains("#1 hash="), "should include #1 prefix");
+        assert!(prompt.contains("#2 hash="), "should include #2 prefix");
+        assert!(
+            prompt.contains("1-based integer indices"),
+            "instruction should name the shape",
+        );
+        assert!(prompt.contains("[1, 4, 7]"), "shape example present");
+    }
+
+    #[test]
+    fn rung_a_prompt_includes_hash_shape_instruction() {
+        // Default mode (HashKeep) instructs the judge to emit hashes.
+        let rope = sample_rope();
+        let hashes = hashes_for(&rope);
+        let prompt = build_prompt(rope.spans(), &hashes, 80, KeepListMode::HashKeep);
+        assert!(prompt.contains("hash strings"), "shape descriptor");
+        assert!(prompt.contains("[\"<hash>\", ...]"), "shape example");
+    }
+
+    #[test]
+    fn rung_b_output_mode_default_is_hash_keep() {
+        // Constructed without override → HashKeep (backward-compatible).
+        let policy = HashAndSummaryPolicy::new(MockJudge::ok("{\"keep\":[],\"summary\":\"\"}"));
+        assert_eq!(policy.output_mode, KeepListMode::HashKeep);
     }
 }

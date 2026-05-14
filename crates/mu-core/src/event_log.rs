@@ -148,6 +148,26 @@ pub enum EventPayload {
         /// Provider + model from the session's selector.
         provider_kind: String,
         model: String,
+        /// mu-fb0: which `ProviderRenderer` rendered the rope for
+        /// this call. `None` for pre-mu-fb0 sessions (durable log
+        /// fixtures); `Some(...)` once the live loop projects through
+        /// `Provider::renderer()`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        renderer: Option<String>,
+        /// mu-fb0: which `CacheStrategy` was applied.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_strategy: Option<String>,
+        /// mu-fb0: total span count in the projected rope (system +
+        /// tool schemas + messages).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span_count: Option<u32>,
+        /// mu-fb0: number of cache boundaries the strategy placed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_boundary_count: Option<u32>,
+        /// mu-fb0: first up-to-5 span ids of the rope (provenance
+        /// breadcrumb without the full rope dump).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        first_span_ids: Vec<String>,
     },
     /// mu-036: autonomous loop iteration began. `iteration` is
     /// 0-indexed across the run; `motivation` is the model-reported
@@ -660,6 +680,11 @@ mod tests {
                 token_count_estimate: None,
                 provider_kind: "anthropic_api".into(),
                 model: "x".into(),
+                renderer: None,
+                cache_strategy: None,
+                span_count: None,
+                cache_boundary_count: None,
+                first_span_ids: Vec::new(),
             },
         );
         log.append(
@@ -683,6 +708,11 @@ mod tests {
                 token_count_estimate: None,
                 provider_kind: "anthropic_api".into(),
                 model: "x".into(),
+                renderer: None,
+                cache_strategy: None,
+                span_count: None,
+                cache_boundary_count: None,
+                first_span_ids: Vec::new(),
             },
         );
         assert_eq!(log.context_assembly_count(), 2);
@@ -708,6 +738,11 @@ mod tests {
                 token_count_estimate: Some(2048),
                 provider_kind: "openai_codex".into(),
                 model: "gpt-5.5".into(),
+                renderer: None,
+                cache_strategy: None,
+                span_count: None,
+                cache_boundary_count: None,
+                first_span_ids: Vec::new(),
             },
         };
         let v = serde_json::to_value(&ev)?;

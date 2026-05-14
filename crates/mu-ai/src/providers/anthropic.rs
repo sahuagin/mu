@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -20,6 +21,9 @@ use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, Provider, ProviderError, ProviderEvent,
     StopReason, ToolCall, ToolSpec, Usage,
 };
+use mu_core::context::{CacheStrategy, ProviderRenderer};
+
+use crate::context::{AnthropicCacheStrategy, AnthropicProviderRenderer};
 
 use super::sse::{SseEvent, SseStream};
 
@@ -93,6 +97,18 @@ impl Provider for AnthropicProvider {
 
         let bytes = resp.bytes_stream();
         Ok(events_stream(bytes, cancel_rx))
+    }
+
+    fn renderer(&self) -> Arc<dyn ProviderRenderer> {
+        Arc::new(AnthropicProviderRenderer::new())
+    }
+
+    fn cache_strategy(&self) -> Arc<dyn CacheStrategy> {
+        Arc::new(AnthropicCacheStrategy::new())
+    }
+
+    fn provider_label(&self) -> &'static str {
+        "anthropic"
     }
 }
 

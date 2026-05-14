@@ -1,5 +1,9 @@
 use super::*;
 use mu_core::agent::ToolCall;
+use mu_core::context::{
+    assemble_rope, CacheMarker, CacheStrategy, ProjectionTarget, ProviderRenderer, ProviderRole,
+    SpanKind,
+};
 
 #[test]
 fn b1_translate_user_message() {
@@ -820,4 +824,213 @@ mod live_tests {
         // Stop reason should be tool_use when the model calls a tool.
         assert_eq!(done.stop_reason, StopReason::ToolUse);
     }
+}
+
+// ============================================================================
+// mu-fb0 equivalence: rope+renderer path vs. existing AgentMessage path.
+// ============================================================================
+//
+// The bead's load-bearing safety property is that the new rope-backed
+// projection must describe the same model-visible payload as the
+// existing `build_request_body` path. Provider::stream() is still fed
+// raw `&[AgentMessage]` (preserving the wire-protocol surface, per
+// stop-criterion #9), so the two paths share the wire body trivially;
+// these tests assert the rope/renderer projection is a faithful
+// shadow — same conversational role ordering, same content surfaces,
+// same cache-boundary intent.
+
+fn equivalence_fixture() -> (
+    Option<String>,
+    Vec<AgentMessage>,
+    Vec<mu_core::agent::ToolSpec>,
+) {
+    let system_prompt = Some("you are mu, a careful assistant".to_string());
+    let tool = mu_core::agent::ToolSpec {
+        name: "read".into(),
+        description: "read a file from the workspace".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }),
+        policy: Default::default(),
+    };
+    let messages = vec![
+        AgentMessage::User {
+            content: "what's in /etc/hostname?".into(),
+        },
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::Text {
+                    text: "I'll read it.".into(),
+                },
+                ContentBlock::ToolCall(ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "/etc/hostname"}),
+                }),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        }),
+        AgentMessage::ToolResult {
+            call_id: "c1".into(),
+            content: "myhost".into(),
+            is_error: false,
+        },
+    ];
+    (system_prompt, messages, vec![tool])
+}
+
+#[test]
+fn fb0_rope_role_sequence_matches_anthropic_wire_role_sequence() {
+    // The rope's AgentView projection must yield the same role
+    // sequence the Anthropic wire body would produce, augmented with
+    // the System-role spans for the system prompt + tool schemas
+    // (which the wire body emits as top-level `system` + `tools`
+    // fields — same intent, different surface).
+    let (system_prompt, messages, tools) = equivalence_fixture();
+    let rope = assemble_rope(system_prompt.as_deref(), &messages, &tools);
+    let projection =
+        crate::context::AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+
+    // Expected role sequence: System (prompt), System (tool schema),
+    // User, Assistant (with tool call), ToolResult.
+    let roles: Vec<ProviderRole> = projection.messages.iter().map(|m| m.role).collect();
+    assert_eq!(
+        roles,
+        vec![
+            ProviderRole::System,
+            ProviderRole::System,
+            ProviderRole::User,
+            ProviderRole::Assistant,
+            ProviderRole::ToolResult,
+        ]
+    );
+}
+
+#[test]
+fn fb0_rope_user_assistant_toolresult_contents_round_trip() {
+    let (system_prompt, messages, tools) = equivalence_fixture();
+    let rope = assemble_rope(system_prompt.as_deref(), &messages, &tools);
+    let projection =
+        crate::context::AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+
+    // User message content is verbatim in the rope projection.
+    let user_msg = projection
+        .messages
+        .iter()
+        .find(|m| m.role == ProviderRole::User)
+        .expect("user message");
+    assert_eq!(user_msg.content, "what's in /etc/hostname?");
+
+    // Assistant text + tool call flatten into one span; verify both
+    // surfaces are present in the projection content. The wire body
+    // emits them as separate content blocks (text + tool_use);
+    // equivalence here is at the "model saw this byte sequence" level.
+    let assistant_msg = projection
+        .messages
+        .iter()
+        .find(|m| m.role == ProviderRole::Assistant)
+        .expect("assistant message");
+    assert!(assistant_msg.content.contains("I'll read it."));
+    assert!(assistant_msg.content.contains("[tool_call:read("));
+
+    // ToolResult content surfaces verbatim (non-error path — no
+    // "error:" prefix).
+    let tool_result = projection
+        .messages
+        .iter()
+        .find(|m| m.role == ProviderRole::ToolResult)
+        .expect("tool result");
+    assert_eq!(tool_result.content, "myhost");
+}
+
+#[test]
+fn fb0_rope_message_count_matches_wire_message_count() {
+    // Every span in the rope's AgentView projection corresponds to
+    // exactly one item the model is meant to see: system prompt,
+    // each tool schema, then each conversational message in order.
+    // The Anthropic wire body's `messages` field has fewer entries
+    // (it groups tool results into a synthetic user message + omits
+    // system from `messages`), but the LOGICAL count (system + tools
+    // + conversational) is the same.
+    let (system_prompt, messages, tools) = equivalence_fixture();
+    let rope = assemble_rope(system_prompt.as_deref(), &messages, &tools);
+    let projection =
+        crate::context::AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+
+    let expected = usize::from(system_prompt.is_some()) + tools.len() + messages.len();
+    assert_eq!(rope.len(), expected);
+    assert_eq!(projection.len(), expected);
+}
+
+#[test]
+fn fb0_cache_boundary_lands_on_last_stable_cacheable_span() {
+    // mu-bn4's AnthropicCacheStrategy places its Ephemeral marker on
+    // the last stable+cacheable span — for our fixture, that's the
+    // tool schema (index 1: system at 0, tool schema at 1, then
+    // volatile user/assistant/tool_result). Compare against the wire
+    // body's `cache_control: ephemeral` on the last tool definition
+    // (build_request_body, mu-i6j).
+    let (system_prompt, messages, tools) = equivalence_fixture();
+    let rope = assemble_rope(system_prompt.as_deref(), &messages, &tools);
+    let renderer = crate::context::AnthropicProviderRenderer::new();
+    let strategy = crate::context::AnthropicCacheStrategy::new();
+    let mut projection = renderer.render(&rope, ProjectionTarget::AgentView);
+    let boundaries = strategy.boundaries(&rope);
+    strategy.annotate(&mut projection, &boundaries);
+
+    // Boundary on the last stable+cacheable span (index 1, the tool
+    // schema).
+    assert_eq!(boundaries.len(), 1);
+    assert_eq!(boundaries[0].message_index, 1);
+    assert_eq!(rope.spans()[1].kind, SpanKind::ToolSchema);
+
+    // Annotation lands on that message.
+    assert_eq!(
+        projection.messages[1].cache_marker,
+        Some(CacheMarker::Ephemeral)
+    );
+
+    // And the wire body marks the last tool with cache_control
+    // ephemeral — same intent.
+    let wire = build_request_body("claude-test", system_prompt.as_deref(), &messages, &tools);
+    assert_eq!(
+        wire["tools"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .get("cache_control")
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str()),
+        Some("ephemeral"),
+        "wire body must still place cache_control on the last tool",
+    );
+}
+
+#[test]
+fn fb0_no_system_prompt_yields_no_system_span() {
+    // When system_prompt is None, neither the rope projection nor
+    // the wire body should manifest a System span/field.
+    let (_, messages, tools) = equivalence_fixture();
+    let rope = assemble_rope(None, &messages, &tools);
+    let projection =
+        crate::context::AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let system_count = projection
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == ProviderRole::System
+                && m.source_span_ids.iter().any(|id| id == "system-prompt")
+        })
+        .count();
+    assert_eq!(system_count, 0);
+
+    let wire = build_request_body("claude-test", None, &messages, &tools);
+    assert!(
+        wire.get("system").is_none(),
+        "no system_prompt → no `system` field in wire body",
+    );
 }

@@ -1,8 +1,12 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::oneshot;
+
+use crate::context::{CacheStrategy, FauxProviderRenderer, NoCacheStrategy, ProviderRenderer};
 
 use super::tool::ToolSpec;
 use super::types::{AgentMessage, AssistantMessage};
@@ -63,6 +67,37 @@ pub trait Provider: Send + Sync {
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError>;
+
+    /// mu-fb0: the [`ProviderRenderer`] this provider uses to project a
+    /// `RetainedRope` into provider-shaped messages. The agent loop
+    /// builds the rope from session state and renders it before each
+    /// model call so `ContextAssembly` events carry rope-derived
+    /// provenance. Default: [`FauxProviderRenderer`] — appropriate
+    /// for providers that have not yet declared a renderer (the wire
+    /// request itself still goes through `stream()` with raw
+    /// `AgentMessage`s; the renderer drives the rope projection and
+    /// the per-call `ContextAssembly` event).
+    fn renderer(&self) -> Arc<dyn ProviderRenderer> {
+        Arc::new(FauxProviderRenderer::new())
+    }
+
+    /// mu-fb0: the [`CacheStrategy`] this provider uses to derive
+    /// cache-boundary positions from the rope. Default:
+    /// [`NoCacheStrategy`] — correct for providers without prompt
+    /// caching support. Anthropic overrides to
+    /// `AnthropicCacheStrategy`.
+    fn cache_strategy(&self) -> Arc<dyn CacheStrategy> {
+        Arc::new(NoCacheStrategy::new())
+    }
+
+    /// mu-fb0: short stable identifier of the provider's renderer +
+    /// cache-strategy pair. Surfaces in `AgentEvent::ContextAssembly`
+    /// so consumers can group calls by render policy without
+    /// parsing trait-object type names. The default `"faux"` is the
+    /// no-op pair (FauxProviderRenderer + NoCacheStrategy).
+    fn provider_label(&self) -> &'static str {
+        "faux"
+    }
 }
 
 #[cfg(test)]

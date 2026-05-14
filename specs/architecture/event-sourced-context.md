@@ -730,6 +730,86 @@ The operator (or the agent, with permission) can issue `rehydrate(span_id)` to p
 - `mu-x9j` — Subagent context handoff via shared read-only events + initial pointer-set
 - `mu-56p` — kqueue/inotify watches on file-loaded spans, with signal/policy separation
 
+## Live-loop adoption (mu-fb0)
+
+The agent loop's per-call sequence now projects session state into
+a `RetainedRope` and runs it through the provider's declared
+`ProviderRenderer` + `CacheStrategy` before each model call:
+
+```text
+assemble_rope(system_prompt, messages, tool_specs)
+  → provider.renderer().render(rope, AgentView)
+  → provider.cache_strategy().boundaries(rope) + annotate(messages)
+  → emit ContextAssembly { renderer, cache_strategy, span_count,
+                           cache_boundary_count, first_span_ids, … }
+  → provider.stream(system_prompt, &messages, &tool_specs, cancel)
+```
+
+The `Provider` trait gained three additive methods (mu-fb0):
+
+```rust
+fn renderer(&self) -> Arc<dyn ProviderRenderer>;
+fn cache_strategy(&self) -> Arc<dyn CacheStrategy>;
+fn provider_label(&self) -> &'static str;
+```
+
+All three carry default impls (`FauxProviderRenderer` /
+`NoCacheStrategy` / `"faux"`), so existing `Provider` impls
+compile unchanged. `AnthropicProvider` overrides to return
+`AnthropicProviderRenderer` + `AnthropicCacheStrategy` + `"anthropic"`.
+
+### Resolved design questions
+
+1. **Rope storage** — per-turn projection from `messages`. The
+   `messages: Vec<AgentMessage>` field remains the canonical
+   session state (external input lands there, the wire `stream()`
+   signature still consumes it). The rope is a *projection function*
+   applied per model call, matching the spec's thesis that context,
+   transcript, and memory are projections. Storing the rope as a
+   field is correct in the long term when events become first-class;
+   for the mu-fb0 transition, building from the source of truth keeps
+   the new path equivalence-preserving with the existing wire body
+   byte-for-byte.
+
+2. **`CacheStrategy` dispatch** — trait method on `Provider`. Each
+   provider self-declares its renderer + strategy pair, eliminating
+   any match-on-`provider_kind` site. The renderer and strategy are
+   independent traits, so a future A/B test could pair the Anthropic
+   renderer with a *different* strategy by overriding only
+   `cache_strategy()`.
+
+3. **`ContextAssembly` event shape** — extended with five optional
+   fields (`renderer`, `cache_strategy`, `span_count`,
+   `cache_boundary_count`, `first_span_ids[<=5]`). All carry
+   `#[serde(default, skip_serializing_if)]` so pre-mu-fb0 fixtures
+   serialize byte-for-byte to the same wire shape. `first_span_ids`
+   is capped at 5 to keep the event-log row size bounded — the full
+   rope is reconstructable from the `SessionEventLog` walk per
+   spec lines 167-228; the breadcrumb is for the common "which spans
+   entered this call?" question.
+
+4. **Cutover** — single commit. The trait additions are
+   default-impl backward-compatible, so all `Provider` impls
+   (`FauxProvider`, `OpenRouterProvider`, `OpenaiCodexProvider`,
+   `AnthropicProvider`) keep compiling; only Anthropic overrides
+   to take advantage of the real renderer + strategy. The
+   `Provider::stream()` signature is unchanged — the rope-projected
+   `ProviderMessages` are observed (their content + cache markers
+   describe what the model will see), but the wire request still
+   goes through the AgentMessage path. This preserves stop-
+   criterion #9 byte-for-byte; threading `ProviderMessages` into
+   `stream()` is left as a separate bead once the operator wants
+   the wire-shape change.
+
+### Equivalence guarantee
+
+`crates/mu-ai/src/providers/anthropic_tests.rs` adds five
+fb0-tagged tests asserting the rope projection's role sequence,
+content surfaces, span count, and cache-boundary placement match
+what `build_request_body` produces for the wire body. These
+augment the existing 100+ Anthropic and agent-loop tests, which
+remain green byte-for-byte (the wire path is untouched).
+
 ## Changelog
 
 - 2026-05-10 — initial doc, promoted from cross-session handoff
@@ -743,3 +823,7 @@ The operator (or the agent, with permission) can issue `rehydrate(span_id)` to p
   Independent validation from claude-code 2.1.139's
   `--exclude-dynamic-system-prompt-sections` and `--bare` flags
   (memory `3cc7a18c`, `fb5cd5be`).
+- 2026-05-14 — amendment (mu-fb0): "Live-loop adoption" section
+  recording the `Provider` trait extension, the per-call rope
+  projection pipeline, the resolved design questions, and the
+  equivalence guarantee preserving the existing wire request body.

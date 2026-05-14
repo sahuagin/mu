@@ -1737,7 +1737,15 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
                     "thinking" => ("thinking  ", Color::Yellow),
                     "tool_executing" => ("tool executing  ", Color::Magenta),
                     "awaiting_tool_result" => ("awaiting tool result  ", Color::Magenta),
-                    "streaming" | "idle" => return None,
+                    // mu-di4 followup: streaming gets its own row + animated
+                    // throbber. The original early-return assumed text deltas
+                    // ARE the visible feedback; with the throbber, motion
+                    // continuity across all active states matters more than
+                    // avoiding redundancy. Green signals "active output" vs.
+                    // yellow (waiting) and magenta (tool work). Idle still
+                    // hides — no work happening.
+                    "streaming" => ("streaming  ", Color::Green),
+                    "idle" => return None,
                     _ => ("working  ", Color::Cyan),
                 };
                 let suffix = snap

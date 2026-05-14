@@ -79,6 +79,13 @@ These are conventions that recur often enough to be worth naming:
 - **"Phase X.Y commit pattern"**: `<type>(<scope>): mu-036 Phase X.Y — <one-line> (<bead>)`. Example: `feat(protocol): mu-036 Phase A.2 — wire types + EventPayload variants + dispatch stubs (mu-28u)`.
 - **"Bead-close commit"**: include `closes mu-XXX` in the commit body when the bead is fully done; the `task_log add` happens after the commit lands.
 - **"Spec-amend commit"**: when a code change requires a spec update, both go in the same commit with a body line explaining the surface change.
+- **Agent attribution**: use `<runtime> + <model>` form ONLY when the runtime distinction carries information. Today, `claude` alone is sufficient — `claude-code → Claude` is the only meaningful path and the runtime is implicit. Switch to structured form **when accurate**, not aspirationally:
+  - **Today**: `claude` (implies claude-code driving Claude)
+  - **First mu-driven Claude work**: `mu + Claude` (mu's own loop, not claude-code's)
+  - **First Codex-via-mu work**: `mu + Codex` (or model-specific: `mu + gpt-5.5-codex`)
+  - **gpt5.5's pi precedent**: their authorship signature is `pi + gpt-5.5` (or `pi` shorthand) — established by the mu-capability-substrate.md doc on PR #1.
+
+  The convention earns its keep when (a) dogfooding makes the runtime distinction load-bearing, or (b) heterogeneous backends produce observable differences in commits. Pre-formalizing before that point makes attribution aspirational rather than informative. Pick the form that's accurate at commit time.
 
 ## Test command shortcuts
 

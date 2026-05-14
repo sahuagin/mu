@@ -43,7 +43,23 @@ pub mod heuristic;
 
 use serde::{Deserialize, Serialize};
 
-use super::rope::RetainedRope;
+use super::rope::{RetainedRope, Span};
+
+/// Shared cross-policy size estimator: char-count per span, summed.
+/// Both [`heuristic::SpanFamilyDropPolicy`] and
+/// [`hash_summary::HashAndSummaryPolicy`] route through this so
+/// cross-policy benchmarks (mu-kgu.5) compare like-for-like — pre-
+/// cleanup the two policies measured in chars vs. bytes/4 and diverged
+/// by ~4x on the same input rope.
+///
+/// Unit is "chars," not true model-tokens. For English ASCII content
+/// the rough conversion is 1 token ≈ 4 chars, so reported "tokens"
+/// over-estimate true tokens by ~4x. Ratios (`tokens_after /
+/// tokens_before`) are preserved regardless. Swap in a real tokenizer
+/// here once mu-core picks one up.
+pub fn estimate_tokens(spans: &[Span]) -> usize {
+    spans.iter().map(|s| s.content.chars().count()).sum()
+}
 
 /// Pluggable strategy for compacting a [`RetainedRope`] toward a token
 /// target.
@@ -115,22 +131,28 @@ pub struct CompactionResult {
     /// MAY differ from `target_tokens` — see the trait doc on the
     /// "best-effort" contract.
     pub tokens_after: usize,
-    /// Wall-clock duration of the `compact()` call in milliseconds.
-    /// `0` is valid for policies that do not measure.
-    pub wall_clock_ms: u64,
+    /// Wall-clock duration of the `compact()` call in microseconds.
+    /// `0` is valid for policies that do not measure. Microsecond
+    /// precision matters because heuristic policies routinely complete
+    /// in under 1ms on real session ropes; rounding to ms loses the
+    /// signal entirely (mu-kgu.5 benchmark output showed `0` for every
+    /// row pre-cleanup).
+    pub wall_clock_us: u64,
 }
 
 impl CompactionResult {
-    /// Identity result: rope unchanged, no decisions, zero metrics.
-    /// Used by [`NoCompactionPolicy`] and as a convenient
-    /// fail-closed return for any policy that hits an error.
+    /// Identity result: rope unchanged, no decisions, tokens measured
+    /// via the shared [`estimate_tokens`] so cross-policy comparison
+    /// stays apples-to-apples. Used by [`NoCompactionPolicy`] and as a
+    /// convenient fail-closed return for any policy that hits an error.
     pub fn identity(rope: RetainedRope) -> Self {
+        let tokens = estimate_tokens(rope.spans());
         Self {
             rope,
             decisions: Vec::new(),
-            tokens_before: 0,
-            tokens_after: 0,
-            wall_clock_ms: 0,
+            tokens_before: tokens,
+            tokens_after: tokens,
+            wall_clock_us: 0,
         }
     }
 }
@@ -242,9 +264,13 @@ mod tests {
             result.decisions.is_empty(),
             "NoCompactionPolicy must produce no decisions"
         );
-        assert_eq!(result.tokens_before, 0);
-        assert_eq!(result.tokens_after, 0);
-        assert_eq!(result.wall_clock_ms, 0);
+        // tokens_before/after now reflect the actual rope size via
+        // estimate_tokens (post-metrics-cleanup). Identity policy
+        // returns equal before/after — they describe the same rope.
+        let expected_tokens = estimate_tokens(rope.spans());
+        assert_eq!(result.tokens_before, expected_tokens);
+        assert_eq!(result.tokens_after, expected_tokens);
+        assert_eq!(result.wall_clock_us, 0);
     }
 
     #[test]
@@ -290,7 +316,7 @@ mod tests {
             ],
             tokens_before: 1234,
             tokens_after: 567,
-            wall_clock_ms: 42,
+            wall_clock_us: 42,
         };
         let json = serde_json::to_string(&result)?;
         let decoded: CompactionResult = serde_json::from_str(&json)?;

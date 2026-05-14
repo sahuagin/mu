@@ -62,10 +62,12 @@ pub struct BenchRow {
     /// emit `0`; the hash-summary policy emits `1` (one judge call per
     /// `compact`).
     pub model_calls: u32,
-    /// Wall-clock duration of `compact()`, in milliseconds. Measured
+    /// Wall-clock duration of `compact()`, in microseconds. Measured
     /// at the harness's call site (independent of the policy's own
-    /// `wall_clock_ms`, which may round to 0 for fast policies).
-    pub wall_clock_ms: u64,
+    /// `wall_clock_us`). Microsecond precision matters: pre-cleanup
+    /// (millisecond) every row for the heuristic policy reported `0`
+    /// because the policy completes in well under 1ms on real ropes.
+    pub wall_clock_us: u64,
     /// Total spans in the rope BEFORE compaction. Lets the operator
     /// sanity-check the "spans dropped" delta independent of token
     /// estimates.
@@ -171,7 +173,7 @@ pub fn benchmark_session(
     for lp in policies {
         let start = Instant::now();
         let result = lp.policy.compact(rope, target_tokens);
-        let wall_clock_ms = start.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let wall_clock_us = start.elapsed().as_micros().min(u64::MAX as u128) as u64;
         rows.push(BenchRow {
             session_id: session_id.to_string(),
             policy_label: lp.label.clone(),
@@ -179,7 +181,7 @@ pub fn benchmark_session(
             tokens_after: result.tokens_after,
             decisions_count: result.decisions.len(),
             model_calls: lp.model_calls,
-            wall_clock_ms,
+            wall_clock_us,
             spans_before,
             spans_after: result.rope.len(),
         });
@@ -240,7 +242,7 @@ impl Judge for KeepHalfJudge {
 
 /// Write a CSV header line matching [`BenchRow`]'s field order.
 pub fn csv_header() -> &'static str {
-    "session_id,policy_label,tokens_before,tokens_after,decisions_count,model_calls,wall_clock_ms,spans_before,spans_after"
+    "session_id,policy_label,tokens_before,tokens_after,decisions_count,model_calls,wall_clock_us,spans_before,spans_after"
 }
 
 /// Render one [`BenchRow`] as a CSV line. Strings are quoted only
@@ -263,7 +265,7 @@ pub fn csv_row(r: &BenchRow) -> String {
         r.tokens_after,
         r.decisions_count,
         r.model_calls,
-        r.wall_clock_ms,
+        r.wall_clock_us,
         r.spans_before,
         r.spans_after,
     )
@@ -506,7 +508,7 @@ mod tests {
             tokens_after: 5,
             decisions_count: 2,
             model_calls: 0,
-            wall_clock_ms: 1,
+            wall_clock_us: 1,
             spans_before: 3,
             spans_after: 1,
         };

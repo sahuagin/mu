@@ -40,6 +40,7 @@
 pub mod bench;
 pub mod hash_summary;
 pub mod heuristic;
+pub mod provider_judge;
 
 use serde::{Deserialize, Serialize};
 

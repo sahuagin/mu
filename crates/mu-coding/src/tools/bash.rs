@@ -155,6 +155,7 @@ impl Tool for BashTool {
                     // doesn't change mid-session). RetryPolicy::Never makes
                     // the runtime enforce this even when the model gets confused.
                     retry: RetryPolicy::Never,
+                    required_aws_capability: None,
                     idempotent: false, // file system can change between calls
                 },
             ),
@@ -168,6 +169,7 @@ impl Tool for BashTool {
                     side_effects: SideEffects::Mutating,
                     permission: PermissionLevel::Ask,
                     retry: RetryPolicy::Never,
+                    required_aws_capability: None,
                     idempotent: false,
                 },
             ),
@@ -178,6 +180,7 @@ impl Tool for BashTool {
                     side_effects: SideEffects::Destructive,
                     permission: PermissionLevel::Allow,
                     retry: RetryPolicy::ModelDecides,
+                    required_aws_capability: None,
                     idempotent: false,
                 },
             ),

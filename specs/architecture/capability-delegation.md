@@ -428,6 +428,29 @@ This is the bridge between the in-process attenuation algebra and hard AWS
 identity enforcement. It does not grant authority; it prevents future execution
 code from treating a bare string as sufficient authority.
 
+### AWS-required tool policy (mu-stw, 2026-05-14)
+
+AWS-backed tools declare their static AWS grant requirement in `ToolPolicy`:
+
+```rust
+pub struct ToolPolicy {
+    pub required_aws_capability: Option<String>,
+    // ... side_effects, permission, retry, idempotent
+}
+```
+
+The agent loop checks this field after the normal tool-name/expiry/budget gate
+and before `Tool::execute`. If the session does not hold an `AwsCapability` with
+that name, dispatch is refused with the same runtime capability-callout path used
+for `allowed_tools` denial. This keeps AWS authority enforcement outside the tool
+body: a future `aws_recon` tool cannot accidentally materialize credentials just
+because its implementation forgot to inspect `Capability::aws`.
+
+`required_aws_capability` is intentionally a static tool policy field. Dynamic
+per-call narrowing still belongs to `AwsCapability::session_policy` and the
+catalog/broker layer; the runtime policy field answers only "may this tool ever
+run without this named AWS grant?"
+
 ### Deferred
 
 - `session_policy` intersection algorithm (the AWS-policy algebra over

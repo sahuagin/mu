@@ -59,6 +59,12 @@ pub struct ToolPolicy {
     pub side_effects: SideEffects,
     pub permission: PermissionLevel,
     pub retry: RetryPolicy,
+    /// Optional AWS capability name required before dispatching this
+    /// tool. This is checked against `Capability::aws` by the agent
+    /// loop before `Tool::execute` runs. `None` means no AWS-specific
+    /// grant is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_aws_capability: Option<String>,
     /// True if running this tool with the same arguments twice
     /// produces the same observable state (e.g. read, edit-with-
     /// unique-old_string, write-with-same-content). False if the
@@ -73,6 +79,7 @@ impl Default for ToolPolicy {
             side_effects: SideEffects::ReadOnly,
             permission: PermissionLevel::Allow,
             retry: RetryPolicy::ModelDecides,
+            required_aws_capability: None,
             idempotent: true,
         }
     }
@@ -195,6 +202,7 @@ mod tests {
         assert_eq!(p.side_effects, SideEffects::ReadOnly);
         assert_eq!(p.permission, PermissionLevel::Allow);
         assert!(matches!(p.retry, RetryPolicy::ModelDecides));
+        assert_eq!(p.required_aws_capability, None);
         assert!(p.idempotent);
     }
 

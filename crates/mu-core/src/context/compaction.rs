@@ -37,6 +37,7 @@
 //! compaction between turns, not during streaming, so a synchronous
 //! API matches the call site.
 
+pub mod bench;
 pub mod hash_summary;
 pub mod heuristic;
 

@@ -1,3 +1,4 @@
+pub mod aws_recon;
 pub mod bash;
 pub mod edit;
 pub mod glob;
@@ -6,6 +7,7 @@ pub mod ls;
 pub mod read;
 pub mod write;
 
+pub use aws_recon::AwsReconTool;
 pub use bash::{BashMode, BashTool};
 pub use edit::EditTool;
 pub use glob::GlobTool;

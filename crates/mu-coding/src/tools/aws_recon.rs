@@ -1,0 +1,415 @@
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
+
+use mu_core::agent::{
+    PermissionLevel, RetryPolicy, SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec,
+};
+use mu_core::aws::{AwsCapabilityCatalog, AwsCapabilityCatalogEntry, AwsCatalogError};
+use mu_core::capability::AwsCapability;
+use serde_json::{json, Value};
+use tokio::sync::oneshot;
+
+const DEFAULT_CAPABILITY: &str = "aws.scout.readonly";
+const DEFAULT_CALL_TIMEOUT_SECS: u64 = 45;
+const MAX_CALL_TIMEOUT_SECS: u64 = 600;
+
+#[derive(Debug, Clone)]
+pub struct AwsReconTool {
+    catalog: AwsCapabilityCatalog,
+    catalog_digest: String,
+    fixture_dir: Option<PathBuf>,
+}
+
+impl AwsReconTool {
+    pub fn new(
+        catalog: AwsCapabilityCatalog,
+        catalog_digest: impl Into<String>,
+        fixture_dir: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            catalog,
+            catalog_digest: catalog_digest.into(),
+            fixture_dir,
+        }
+    }
+
+    pub fn from_env() -> Result<Self, String> {
+        let catalog_path = std::env::var("MU_AWS_CAPABILITY_CATALOG")
+            .map_err(|_| "MU_AWS_CAPABILITY_CATALOG is required for aws_recon".to_owned())?;
+        let catalog_bytes = std::fs::read(&catalog_path)
+            .map_err(|e| format!("failed to read AWS capability catalog {catalog_path}: {e}"))?;
+        let catalog: AwsCapabilityCatalog = serde_json::from_slice(&catalog_bytes)
+            .map_err(|e| format!("failed to parse AWS capability catalog {catalog_path}: {e}"))?;
+        let digest = format!("sha256:{}", sha256_hex(&catalog_bytes));
+        let fixture_dir = std::env::var("MU_AWS_RECON_FIXTURE_DIR")
+            .ok()
+            .map(PathBuf::from);
+        Ok(Self::new(catalog, digest, fixture_dir))
+    }
+}
+
+impl Tool for AwsReconTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            "aws_recon",
+            "Run read-only AWS sandbox reconnaissance through the Mu AWS capability stack. Fixture-only in this build: no live AWS calls or runner subprocess are invoked.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "capability": {
+                        "type": "string",
+                        "description": "AWS capability name to use. Defaults to aws.scout.readonly.",
+                        "default": DEFAULT_CAPABILITY
+                    },
+                    "call_timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_CALL_TIMEOUT_SECS,
+                        "description": "Per-AWS-call timeout. Defaults to 45 seconds."
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Optional output directory for future runner-backed execution. Ignored in fixture mode."
+                    }
+                }
+            }),
+        )
+        .with_policy(ToolPolicy {
+            side_effects: SideEffects::External,
+            permission: PermissionLevel::Allow,
+            retry: RetryPolicy::ModelDecides,
+            required_aws_capability: Some(DEFAULT_CAPABILITY.to_owned()),
+            idempotent: false,
+        })
+    }
+
+    fn execute<'life0, 'async_trait>(
+        &'life0 self,
+        arguments: Value,
+        cancel_rx: oneshot::Receiver<()>,
+    ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            tokio::select! {
+                result = async { self.execute_inner(arguments) } => result,
+                _ = cancel_rx => ToolResult {
+                    content: structured_error("cancelled", DEFAULT_CAPABILITY, &self.catalog_digest, None, "aws_recon cancelled"),
+                    is_error: true,
+                },
+            }
+        })
+    }
+}
+
+impl AwsReconTool {
+    fn execute_inner(&self, arguments: Value) -> ToolResult {
+        let capability_name = match capability_argument(&arguments) {
+            Ok(c) => c,
+            Err(result) => return result,
+        };
+        let call_timeout_secs = match call_timeout_argument(&arguments) {
+            Ok(t) => t,
+            Err(result) => return result,
+        };
+
+        if capability_name != DEFAULT_CAPABILITY {
+            return ToolResult {
+                content: structured_error(
+                    "unsupported_capability",
+                    &capability_name,
+                    &self.catalog_digest,
+                    None,
+                    "aws_recon fixture skeleton only supports aws.scout.readonly",
+                ),
+                is_error: true,
+            };
+        }
+
+        let requested = AwsCapability {
+            name: capability_name.clone(),
+            session_policy: None,
+        };
+        let entry = match self.catalog.resolve_materialized(&requested) {
+            Ok(entry) => entry,
+            Err(err) => {
+                return ToolResult {
+                    content: catalog_error(&capability_name, &self.catalog_digest, err),
+                    is_error: true,
+                };
+            }
+        };
+
+        if entry.mutation_allowed {
+            return ToolResult {
+                content: structured_error(
+                    "mutation_capability_rejected",
+                    &capability_name,
+                    &self.catalog_digest,
+                    Some(entry),
+                    "aws_recon requires a read-only AWS capability",
+                ),
+                is_error: true,
+            };
+        }
+
+        let fixture_dir = match &self.fixture_dir {
+            Some(path) => path,
+            None => {
+                return ToolResult {
+                    content: structured_error(
+                        "runner_not_implemented",
+                        &capability_name,
+                        &self.catalog_digest,
+                        Some(entry),
+                        "aws_recon runner wiring is not implemented; set MU_AWS_RECON_FIXTURE_DIR or use injected fixture_dir in tests",
+                    ),
+                    is_error: true,
+                };
+            }
+        };
+
+        let report = json!({
+            "kind": "aws_recon_report",
+            "mode": "fixture",
+            "artifact_dir": fixture_dir,
+            "summary_path": fixture_dir.join("summary.json"),
+            "capability": capability_name,
+            "call_timeout_secs": call_timeout_secs,
+            "catalog_digest": self.catalog_digest,
+            "audit": audit_metadata(DEFAULT_CAPABILITY, &self.catalog_digest, Some(entry)),
+            "sts": null,
+        });
+        ToolResult {
+            content: serde_json::to_string_pretty(&report).expect("json serialization cannot fail"),
+            is_error: false,
+        }
+    }
+}
+
+fn capability_argument(arguments: &Value) -> Result<String, ToolResult> {
+    match arguments.get("capability") {
+        None => Ok(DEFAULT_CAPABILITY.to_owned()),
+        Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.trim().to_owned()),
+        Some(_) => Err(ToolResult {
+            content: structured_error(
+                "invalid_capability_argument",
+                DEFAULT_CAPABILITY,
+                "unknown",
+                None,
+                "`capability` must be a non-empty string",
+            ),
+            is_error: true,
+        }),
+    }
+}
+
+fn call_timeout_argument(arguments: &Value) -> Result<u64, ToolResult> {
+    match arguments.get("call_timeout_secs") {
+        None => Ok(DEFAULT_CALL_TIMEOUT_SECS),
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(v) if (1..=MAX_CALL_TIMEOUT_SECS).contains(&v) => Ok(v),
+            _ => Err(ToolResult {
+                content: structured_error(
+                    "invalid_call_timeout_secs",
+                    DEFAULT_CAPABILITY,
+                    "unknown",
+                    None,
+                    "`call_timeout_secs` must be an integer between 1 and 600",
+                ),
+                is_error: true,
+            }),
+        },
+        Some(_) => Err(ToolResult {
+            content: structured_error(
+                "invalid_call_timeout_secs",
+                DEFAULT_CAPABILITY,
+                "unknown",
+                None,
+                "`call_timeout_secs` must be an integer between 1 and 600",
+            ),
+            is_error: true,
+        }),
+    }
+}
+
+fn catalog_error(capability: &str, catalog_digest: &str, err: AwsCatalogError) -> String {
+    let reason = match err {
+        AwsCatalogError::UnknownCapability { .. } => "catalog_unknown_capability",
+        AwsCatalogError::CapabilityNotMaterialized { .. } => "catalog_capability_not_materialized",
+    };
+    structured_error(reason, capability, catalog_digest, None, &err.to_string())
+}
+
+fn structured_error(
+    reason: &str,
+    capability: &str,
+    catalog_digest: &str,
+    entry: Option<&AwsCapabilityCatalogEntry>,
+    message: &str,
+) -> String {
+    serde_json::to_string_pretty(&json!({
+        "kind": "aws_recon_refusal",
+        "reason": reason,
+        "message": message,
+        "audit": audit_metadata(capability, catalog_digest, entry),
+    }))
+    .expect("json serialization cannot fail")
+}
+
+fn audit_metadata(
+    capability: &str,
+    catalog_digest: &str,
+    entry: Option<&AwsCapabilityCatalogEntry>,
+) -> Value {
+    json!({
+        "mu_session_id": null,
+        "tool_call_id": null,
+        "capability": capability,
+        "catalog_digest": catalog_digest,
+        "aws_profile": entry.and_then(|e| e.aws_profile.as_deref()),
+        "role_arn": entry.and_then(|e| e.role_arn.as_deref()),
+        "sts": null,
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn catalog_with(entries: Value) -> AwsCapabilityCatalog {
+        serde_json::from_value(json!({
+            "schema_version": 1,
+            "default_region": "us-east-1",
+            "capabilities": entries,
+        }))
+        .expect("catalog fixture parses")
+    }
+
+    fn readonly_catalog() -> AwsCapabilityCatalog {
+        catalog_with(json!({
+            "aws.scout.readonly": {
+                "description": "Read-only scout.",
+                "aws_profile": "mu-readonly-scout",
+                "role_name": "mu-readonly-scout",
+                "role_arn": "arn:aws:iam::123456789012:role/mu-readonly-scout",
+                "mutation_allowed": false,
+                "managed_policies": ["arn:aws:iam::aws:policy/ReadOnlyAccess"]
+            }
+        }))
+    }
+
+    async fn execute(tool: &AwsReconTool, arguments: Value) -> ToolResult {
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        tool.execute(arguments, cancel_rx).await
+    }
+
+    #[test]
+    fn spec_declares_required_aws_capability() {
+        let tool = AwsReconTool::new(readonly_catalog(), "sha256:test", None);
+        let spec = tool.spec();
+
+        assert_eq!(spec.name, "aws_recon");
+        assert_eq!(
+            spec.policy.required_aws_capability.as_deref(),
+            Some("aws.scout.readonly")
+        );
+        assert_eq!(spec.policy.side_effects, SideEffects::External);
+        assert_eq!(
+            spec.input_schema["properties"]["capability"]["default"],
+            DEFAULT_CAPABILITY
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_miss_is_structured_error() {
+        let tool = AwsReconTool::new(
+            catalog_with(json!({})),
+            "sha256:test",
+            Some("fixture".into()),
+        );
+        let result = execute(&tool, json!({})).await;
+        let value: Value = serde_json::from_str(&result.content).expect("structured json");
+
+        assert!(result.is_error);
+        assert_eq!(value["kind"], "aws_recon_refusal");
+        assert_eq!(value["reason"], "catalog_unknown_capability");
+        assert_eq!(value["audit"]["capability"], "aws.scout.readonly");
+    }
+
+    #[tokio::test]
+    async fn mutating_catalog_entry_is_refused() {
+        let catalog = catalog_with(json!({
+            "aws.scout.readonly": {
+                "description": "Bad mutating scout.",
+                "aws_profile": "mu-sandbox-builder",
+                "role_name": "mu-sandbox-builder",
+                "role_arn": "arn:aws:iam::123456789012:role/mu-sandbox-builder",
+                "mutation_allowed": true
+            }
+        }));
+        let tool = AwsReconTool::new(catalog, "sha256:test", Some("fixture".into()));
+        let result = execute(&tool, json!({})).await;
+        let value: Value = serde_json::from_str(&result.content).expect("structured json");
+
+        assert!(result.is_error);
+        assert_eq!(value["reason"], "mutation_capability_rejected");
+        assert_eq!(value["audit"]["aws_profile"], "mu-sandbox-builder");
+    }
+
+    #[tokio::test]
+    async fn fixture_mode_returns_recon_report_shape() {
+        let tool = AwsReconTool::new(
+            readonly_catalog(),
+            "sha256:test",
+            Some("/tmp/mu-fixture".into()),
+        );
+        let result = execute(&tool, json!({"call_timeout_secs": 60})).await;
+        let value: Value = serde_json::from_str(&result.content).expect("structured json");
+
+        assert!(!result.is_error);
+        assert_eq!(value["kind"], "aws_recon_report");
+        assert_eq!(value["mode"], "fixture");
+        assert_eq!(value["artifact_dir"], "/tmp/mu-fixture");
+        assert_eq!(value["summary_path"], "/tmp/mu-fixture/summary.json");
+        assert_eq!(value["capability"], "aws.scout.readonly");
+        assert_eq!(value["call_timeout_secs"], 60);
+        assert_eq!(value["audit"]["catalog_digest"], "sha256:test");
+        assert_eq!(value["audit"]["aws_profile"], "mu-readonly-scout");
+    }
+
+    #[tokio::test]
+    async fn fixture_unset_returns_not_yet_implemented_refusal() {
+        let tool = AwsReconTool::new(readonly_catalog(), "sha256:test", None);
+        let result = execute(&tool, json!({})).await;
+        let value: Value = serde_json::from_str(&result.content).expect("structured json");
+
+        assert!(result.is_error);
+        assert_eq!(value["reason"], "runner_not_implemented");
+        assert_eq!(
+            value["audit"]["role_arn"],
+            "arn:aws:iam::123456789012:role/mu-readonly-scout"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_capability_is_refused_before_catalog_lookup() {
+        let tool = AwsReconTool::new(readonly_catalog(), "sha256:test", Some("fixture".into()));
+        let result = execute(&tool, json!({"capability": "aws.audit.security"})).await;
+        let value: Value = serde_json::from_str(&result.content).expect("structured json");
+
+        assert!(result.is_error);
+        assert_eq!(value["reason"], "unsupported_capability");
+        assert_eq!(value["audit"]["capability"], "aws.audit.security");
+    }
+}

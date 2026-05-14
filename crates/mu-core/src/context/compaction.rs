@@ -78,6 +78,14 @@ pub trait CompactionPolicy: Send + Sync {
     /// a new rope (substrate is immutable) plus a decision log and
     /// metrics. NoCompactionPolicy returns the rope verbatim.
     fn compact(&self, rope: &RetainedRope, target_tokens: usize) -> CompactionResult;
+
+    /// mu-kgu.4: short stable identifier for this policy. Surfaces
+    /// in `AgentEvent::CompactionAssembly` so the operator can tell
+    /// which policy ran without parsing trait-object type names.
+    /// Default `"compaction-policy"`; concrete impls SHOULD override.
+    fn policy_label(&self) -> &'static str {
+        "compaction-policy"
+    }
 }
 
 /// The return type of [`CompactionPolicy::compact`].
@@ -179,6 +187,10 @@ impl NoCompactionPolicy {
 impl CompactionPolicy for NoCompactionPolicy {
     fn compact(&self, rope: &RetainedRope, _target_tokens: usize) -> CompactionResult {
         CompactionResult::identity(rope.clone())
+    }
+
+    fn policy_label(&self) -> &'static str {
+        "no-compaction"
     }
 }
 

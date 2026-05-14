@@ -22,6 +22,13 @@ use tokio::task::JoinHandle;
 
 use crate::capability::{AutonomyCapability, Capability, CapabilityCheck};
 use crate::context::{ProjectionTarget, ProviderMessages, RetainedRope};
+
+/// mu-kgu.4: default compaction threshold in tokens. Matches the
+/// Anthropic API's documented automatic-compaction trigger (150k
+/// input tokens) so a session that opts into a real compaction
+/// policy without specifying a threshold experiences the same
+/// trigger shape as Claude Code's native compaction.
+pub const DEFAULT_COMPACTION_THRESHOLD: usize = 150_000;
 use crate::protocol::{
     ApprovalDecision, AutonomousIterationOutcome, AutonomousTerminationReason, AutonomyOptions,
 };
@@ -192,6 +199,48 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         first_span_ids: Vec<String>,
     },
+    /// mu-kgu.4: a [`CompactionPolicy`] just produced a new rope
+    /// because the pre-render token estimate crossed the configured
+    /// threshold. Emitted BEFORE the matching `ContextAssembly` —
+    /// the rope `ContextAssembly` reports for that turn is the
+    /// POST-compaction rope, so the two events together describe
+    /// "what was compacted" and "what was rendered."
+    ///
+    /// Carries summary fields only; the full per-span audit log
+    /// ([`CompactionDecision`]s) lives on the event-sourced rope log
+    /// and is reachable via session replay. `decisions_count` is the
+    /// summary cardinality.
+    ///
+    /// [`CompactionPolicy`]: crate::context::CompactionPolicy
+    /// [`CompactionDecision`]: crate::context::CompactionDecision
+    CompactionAssembly {
+        /// Same call counter as the matching [`ContextAssembly`]
+        /// event — lets consumers join the two by model_call_id.
+        model_call_id: u32,
+        /// Short policy identifier reported by
+        /// `Provider::compaction_policy().policy_label()` (default:
+        /// the trait-object's type-name suffix; concrete policies can
+        /// override). Surfaces "which policy ran" in the event stream.
+        policy_id: String,
+        /// Renderer-estimated token count of the rope BEFORE
+        /// compaction. Matches the value used in the threshold check.
+        tokens_before: usize,
+        /// Renderer-estimated token count of the post-compaction
+        /// rope. May exceed `target_tokens` — policies are
+        /// best-effort. See [`CompactionPolicy::compact`] doc.
+        ///
+        /// [`CompactionPolicy::compact`]: crate::context::CompactionPolicy::compact
+        tokens_after: usize,
+        /// Number of [`CompactionDecision`] entries in the policy's
+        /// audit log. 0 means the policy returned identity (e.g.,
+        /// fail-closed path); the loop still emits this event so
+        /// the operator sees that compaction was attempted.
+        ///
+        /// [`CompactionDecision`]: crate::context::CompactionDecision
+        decisions_count: u32,
+        /// Wall-clock duration of `policy.compact()` in milliseconds.
+        wall_clock_ms: u64,
+    },
     /// Provider-call lifecycle marker (mu-035 Phase A). Emitted on
     /// state transitions; Phase B will additionally emit periodic
     /// ticks while in non-streaming waits so a stalled provider
@@ -252,6 +301,16 @@ pub struct AgentConfig {
     /// additionally tags it `cache_control: ephemeral` to amortize
     /// its tokens across asks in the session.
     pub system_prompt: Option<String>,
+    /// mu-kgu.4: per-session token threshold above which the agent
+    /// loop dispatches `Provider::compaction_policy().compact(...)`
+    /// on the rope before each provider call. `None` uses
+    /// [`DEFAULT_COMPACTION_THRESHOLD`] (150k tokens). The check is
+    /// renderer-estimated (`ProviderRenderer::estimate_tokens`), not
+    /// wire-accurate; policies that don't trigger (e.g.
+    /// `NoCompactionPolicy`) return identity and the loop proceeds
+    /// with the original rope — compaction failure never blocks a
+    /// turn.
+    pub compaction_threshold: Option<usize>,
 }
 
 impl Default for AgentConfig {
@@ -259,6 +318,7 @@ impl Default for AgentConfig {
         Self {
             max_turns: 20,
             system_prompt: None,
+            compaction_threshold: None,
         }
     }
 }
@@ -731,6 +791,51 @@ async fn run(
                 );
                 let renderer = provider.renderer();
                 let cache_strategy = provider.cache_strategy();
+
+                // mu-kgu.4: check renderer-estimated token cost
+                // against the per-session compaction threshold. If
+                // crossed, dispatch the provider's compaction policy
+                // and use the resulting rope for the rest of this
+                // turn. The default policy is `NoCompactionPolicy`,
+                // which is a no-op; only providers (or sessions)
+                // that opt into a real policy ever see this branch
+                // fire. CompactionAssembly events are emitted BEFORE
+                // the matching ContextAssembly so consumers can
+                // join the two by `model_call_id`.
+                //
+                // Correctness contract (mu-kgu.4 bead body): if
+                // compaction returns the original rope unchanged
+                // (NoCompactionPolicy, or any policy whose internal
+                // check decides "nothing to do"), the loop proceeds
+                // normally with that rope. Compaction failure or
+                // identity MUST NOT block a turn.
+                let pre_compaction_tokens = renderer.estimate_tokens(&rope);
+                let compaction_threshold = config
+                    .compaction_threshold
+                    .unwrap_or(DEFAULT_COMPACTION_THRESHOLD);
+                let rope = if pre_compaction_tokens > compaction_threshold {
+                    let policy = provider.compaction_policy();
+                    // Target: half the threshold. Coarse but matches
+                    // the bead's "target ≈ 50% of context window"
+                    // guidance and gives policies headroom to under-
+                    // shoot without immediately re-tripping next turn.
+                    let target_tokens = compaction_threshold / 2;
+                    let result = policy.compact(&rope, target_tokens);
+                    let _ = events
+                        .send(AgentEvent::CompactionAssembly {
+                            model_call_id: model_call_id + 1,
+                            policy_id: policy.policy_label().to_owned(),
+                            tokens_before: pre_compaction_tokens,
+                            tokens_after: renderer.estimate_tokens(&result.rope),
+                            decisions_count: result.decisions.len() as u32,
+                            wall_clock_ms: result.wall_clock_ms,
+                        })
+                        .await;
+                    result.rope
+                } else {
+                    rope
+                };
+
                 let mut projection: ProviderMessages =
                     renderer.render(&rope, ProjectionTarget::AgentView);
                 let cache_boundaries = cache_strategy.boundaries(&rope);

@@ -116,18 +116,18 @@ fn handle_create_session(
         }
     };
 
-    match build_and_register_session(
-        &params.provider,
-        params.system_prompt, // mu-n48
-        None,                 // no parent — this is a root session
-        None,
-        Capability::root(), // root session: unrestricted
+    match build_and_register_session(BuildSessionRequest {
+        selector: &params.provider,
+        system_prompt: params.system_prompt, // mu-n48
+        parent_session_id: None,             // no parent — this is a root session
+        branched_at_parent_event_id: None,
+        capability: Capability::root(), // root session: unrestricted
         notif,
         sessions,
         factory,
         tools,
-        &daemon_info,
-    ) {
+        daemon_info: &daemon_info,
+    }) {
         Ok(session_id) => {
             let resp = CreateSessionResponse { session_id };
             ok_response(request.id, to_value_or_null(resp))
@@ -189,18 +189,18 @@ fn handle_delegate_session(
         }
     };
 
-    match build_and_register_session(
-        &params.provider,
-        None, // mu-n48: delegate sessions inherit (no override yet)
-        Some(params.parent_session_id.clone()),
-        params.branched_at_parent_event_id,
-        child_capability,
+    match build_and_register_session(BuildSessionRequest {
+        selector: &params.provider,
+        system_prompt: None, // mu-n48: delegate sessions inherit (no override yet)
+        parent_session_id: Some(params.parent_session_id.clone()),
+        branched_at_parent_event_id: params.branched_at_parent_event_id,
+        capability: child_capability,
         notif,
         sessions,
         factory,
         tools,
-        &daemon_info,
-    ) {
+        daemon_info: &daemon_info,
+    }) {
         Ok(child_session_id) => {
             let resp = DelegateSessionResponse { child_session_id };
             ok_response(request.id, to_value_or_null(resp))
@@ -213,21 +213,42 @@ fn handle_delegate_session(
     }
 }
 
-/// Shared session-creation logic for both `create_session` (root) and
-/// `session.delegate` (child). Returns the new session_id on success
-/// or a human-readable error on provider-construction failure.
-fn build_and_register_session(
-    selector: &ProviderSelector,
+/// Input bundle for [`build_and_register_session`]. Groups the
+/// request shape (selector / system prompt / parent linkage /
+/// capability) and the daemon's runtime dependencies (notification
+/// writer / sessions registry / provider factory / tools / daemon
+/// info) into one struct so the call site reads cleanly.
+struct BuildSessionRequest<'a> {
+    // request shape
+    selector: &'a ProviderSelector,
     system_prompt: Option<String>,
     parent_session_id: Option<String>,
     branched_at_parent_event_id: Option<u64>,
     capability: Capability,
+    // runtime deps (daemon-global)
     notif: NotificationWriter,
     sessions: Sessions,
     factory: ProviderFactory,
     tools: Arc<Vec<Arc<dyn Tool>>>,
-    daemon_info: &DaemonInfo,
-) -> Result<String, String> {
+    daemon_info: &'a DaemonInfo,
+}
+
+/// Shared session-creation logic for both `create_session` (root) and
+/// `session.delegate` (child). Returns the new session_id on success
+/// or a human-readable error on provider-construction failure.
+fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, String> {
+    let BuildSessionRequest {
+        selector,
+        system_prompt,
+        parent_session_id,
+        branched_at_parent_event_id,
+        capability,
+        notif,
+        sessions,
+        factory,
+        tools,
+        daemon_info,
+    } = req;
     let provider = factory(selector).map_err(|e| format!("could not build provider: {e}"))?;
 
     let session_id = Sessions::next_id();
@@ -292,13 +313,15 @@ fn build_and_register_session(
 
     sessions.insert(
         session_id.clone(),
-        input_tx,
-        forwarder_handle,
-        agent_handle,
-        event_log,
-        pending_approvals,
-        parent_session_id,
-        capability_handle,
+        crate::serve::sessions::NewSession {
+            input_tx,
+            forwarder: forwarder_handle,
+            agent: agent_handle,
+            event_log,
+            pending_approvals,
+            parent_session_id,
+            capability: capability_handle,
+        },
     );
 
     Ok(session_id)

@@ -16,31 +16,36 @@ use tokio::time::timeout;
 
 use mu_core::protocol::{AskSessionRequest, CreateSessionRequest, CreateSessionResponse};
 
+/// Options for [`run`] — the CLI-flag bundle for a single `mu ask`
+/// invocation. Constructed by the CLI binary's argument parser.
+#[derive(Debug, Default)]
+pub struct AskOptions {
+    pub prompt: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub tools: String,
+    pub ephemeral: bool,
+    pub thinking: Option<String>,
+    pub bash_yolo: bool,
+    pub bash_allow: Vec<String>,
+    pub bash_prompt: bool,
+}
+
 /// Run a single `mu ask` invocation. Flags (`provider`, `model`,
 /// `tools`) are forwarded to the spawned `mu serve`.
-pub async fn run(
-    prompt: String,
-    provider: String,
-    model: Option<String>,
-    tools: String,
-    ephemeral: bool,
-    thinking: Option<String>,
-    bash_yolo: bool,
-    bash_allow: Vec<String>,
-    bash_prompt: bool,
-) -> Result<()> {
+pub async fn run(opts: AskOptions) -> Result<()> {
     // Map the CLI provider flag to a wire-level selector. This is what
     // gets sent in create_session; the daemon constructs the provider
     // per session from this.
-    let selector = crate::serve::selector_from_cli(&provider, model.as_deref())?;
+    let selector = crate::serve::selector_from_cli(&opts.provider, opts.model.as_deref())?;
 
     let mut child = spawn_serve(
-        &tools,
-        ephemeral,
-        thinking.as_deref(),
-        bash_yolo,
-        &bash_allow,
-        bash_prompt,
+        &opts.tools,
+        opts.ephemeral,
+        opts.thinking.as_deref(),
+        opts.bash_yolo,
+        &opts.bash_allow,
+        opts.bash_prompt,
     )?;
     let mut stdin = child.stdin.take().context("child stdin not captured")?;
     let stdout = child.stdout.take().context("child stdout not captured")?;
@@ -49,7 +54,14 @@ pub async fn run(
     let mut next_id: u64 = 1;
 
     let session_id = create_session(&mut stdin, &mut stdout, &mut next_id, &selector).await?;
-    let text = ask_and_drain(&mut stdin, &mut stdout, &session_id, &prompt, &mut next_id).await?;
+    let text = ask_and_drain(
+        &mut stdin,
+        &mut stdout,
+        &session_id,
+        &opts.prompt,
+        &mut next_id,
+    )
+    .await?;
 
     println!("{}", text);
 

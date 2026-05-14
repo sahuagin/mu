@@ -56,6 +56,21 @@ pub struct Sessions {
     inner: Arc<Mutex<HashMap<String, SessionState>>>,
 }
 
+/// Input bundle for [`Sessions::insert`]. Mirrors `SessionState`'s
+/// fields without exposing the inner struct; the caller fills this
+/// in and hands ownership off. The two `JoinHandle`s are conceptually
+/// "owned by the session"; storage documents lifetime intent (tokio
+/// tasks run regardless of whether the handle is held).
+pub struct NewSession {
+    pub input_tx: mpsc::Sender<AgentInput>,
+    pub forwarder: JoinHandle<()>,
+    pub agent: JoinHandle<()>,
+    pub event_log: Arc<SessionEventLog>,
+    pub pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>,
+    pub parent_session_id: Option<String>,
+    pub capability: Arc<Mutex<Capability>>,
+}
+
 impl Sessions {
     pub fn new() -> Self {
         Self {
@@ -74,28 +89,18 @@ impl Sessions {
     /// session's event log + the pending-approvals registry +
     /// optional parent reference for delegated sessions + the
     /// capability the session is operating under.
-    pub fn insert(
-        &self,
-        id: String,
-        input_tx: mpsc::Sender<AgentInput>,
-        forwarder: JoinHandle<()>,
-        agent: JoinHandle<()>,
-        event_log: Arc<SessionEventLog>,
-        pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>,
-        parent_session_id: Option<String>,
-        capability: Arc<Mutex<Capability>>,
-    ) {
+    pub fn insert(&self, id: String, new: NewSession) {
         if let Ok(mut map) = self.inner.lock() {
             map.insert(
                 id,
                 SessionState {
-                    input_tx,
-                    _forwarder: forwarder,
-                    _agent: agent,
-                    event_log,
-                    pending_approvals,
-                    parent_session_id,
-                    capability,
+                    input_tx: new.input_tx,
+                    _forwarder: new.forwarder,
+                    _agent: new.agent,
+                    event_log: new.event_log,
+                    pending_approvals: new.pending_approvals,
+                    parent_session_id: new.parent_session_id,
+                    capability: new.capability,
                 },
             );
         }
@@ -214,7 +219,18 @@ mod tests {
 
         let approvals = Arc::new(Mutex::new(HashMap::new()));
         let cap = Arc::new(Mutex::new(Capability::root()));
-        sessions.insert(id.clone(), tx, forwarder, agent, log, approvals, None, cap);
+        sessions.insert(
+            id.clone(),
+            NewSession {
+                input_tx: tx,
+                forwarder,
+                agent,
+                event_log: log,
+                pending_approvals: approvals,
+                parent_session_id: None,
+                capability: cap,
+            },
+        );
         assert!(sessions.input_sender(&id).is_some());
         assert!(sessions.event_log(&id).is_some());
         assert!(sessions.remove(&id));
@@ -243,13 +259,15 @@ mod tests {
         let cap = Arc::new(Mutex::new(Capability::root()));
         sessions.insert(
             id.clone(),
-            tx,
-            tokio::spawn(async {}),
-            tokio::spawn(async {}),
-            log,
-            approvals,
-            None,
-            cap,
+            NewSession {
+                input_tx: tx,
+                forwarder: tokio::spawn(async {}),
+                agent: tokio::spawn(async {}),
+                event_log: log,
+                pending_approvals: approvals,
+                parent_session_id: None,
+                capability: cap,
+            },
         );
 
         // Take the pending oneshot, simulating the dispatch handler.

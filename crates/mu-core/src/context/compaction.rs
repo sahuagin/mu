@@ -45,20 +45,37 @@ use serde::{Deserialize, Serialize};
 
 use super::rope::{RetainedRope, Span};
 
-/// Shared cross-policy size estimator: char-count per span, summed.
+/// Shared cross-policy token estimator: real-tokenizer count via
+/// tiktoken-rs's `cl100k_base` encoding (the public BPE that's the
+/// closest approximation of Anthropic's undocumented tokenizer; both
+/// are BPE schemes with similar compression ratios within ~5%).
+///
 /// Both [`heuristic::SpanFamilyDropPolicy`] and
 /// [`hash_summary::HashAndSummaryPolicy`] route through this so
-/// cross-policy benchmarks (mu-kgu.5) compare like-for-like — pre-
-/// cleanup the two policies measured in chars vs. bytes/4 and diverged
-/// by ~4x on the same input rope.
+/// cross-policy benchmarks (mu-kgu.5) compare like-for-like AND can
+/// be cited next to Anthropic's reported `usage.iterations[].input_tokens`
+/// from the auto-compaction API.
 ///
-/// Unit is "chars," not true model-tokens. For English ASCII content
-/// the rough conversion is 1 token ≈ 4 chars, so reported "tokens"
-/// over-estimate true tokens by ~4x. Ratios (`tokens_after /
-/// tokens_before`) are preserved regardless. Swap in a real tokenizer
-/// here once mu-core picks one up.
+/// mu-kgu.10: pre-swap this was `chars().count()`, which under-counted
+/// real tokens by ~50% on natural-language content (calibration vs
+/// Anthropic at 124k tokens showed mu's reported 81k via chars/4).
+/// Headline-comparable numbers require a real tokenizer; cl100k_base
+/// is the practical pick for a public Rust crate.
 pub fn estimate_tokens(spans: &[Span]) -> usize {
-    spans.iter().map(|s| s.content.chars().count()).sum()
+    use std::sync::OnceLock;
+    static BPE: OnceLock<Option<tiktoken_rs::CoreBPE>> = OnceLock::new();
+    // One-time encoder construction per process via OnceLock. The
+    // wrapped Option lets us fall back to chars().count() if cl100k_base
+    // ever fails to load (downloaded BPE files, etc.). Never panics in
+    // the agent loop's hot path.
+    let bpe = BPE.get_or_init(|| tiktoken_rs::cl100k_base().ok());
+    match bpe {
+        Some(b) => spans
+            .iter()
+            .map(|s| b.encode_with_special_tokens(&s.content).len())
+            .sum(),
+        None => spans.iter().map(|s| s.content.chars().count()).sum(),
+    }
 }
 
 /// Pluggable strategy for compacting a [`RetainedRope`] toward a token

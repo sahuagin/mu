@@ -54,15 +54,15 @@ impl Tool for GlobTool {
         ToolSpec::new(
             "glob",
             "Find files by name pattern using `fd`. \
-             Pattern is a regex by default; pass `glob: true` \
-             to use literal-glob syntax (*.rs, src/**/*.ts). \
+             Pattern is a glob by default (*.rs, src/**/*.ts); \
+             pass `glob: false` to interpret pattern as a regex instead. \
              Respects .gitignore. Returns one path per line.",
             json!({
                 "type": "object",
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Name pattern. Regex by default; glob if `glob` flag is set."
+                        "description": "Name pattern. Glob by default; regex if `glob: false` is set."
                     },
                     "path": {
                         "type": "string",
@@ -70,8 +70,8 @@ impl Tool for GlobTool {
                     },
                     "glob": {
                         "type": "boolean",
-                        "description": "Treat `pattern` as a glob (fd --glob) instead of a regex. Default false.",
-                        "default": false
+                        "description": "Treat `pattern` as a glob (fd --glob). Default true; set false for regex.",
+                        "default": true
                     },
                     "kind": {
                         "type": "string",
@@ -126,10 +126,13 @@ impl Tool for GlobTool {
                 .get("path")
                 .and_then(Value::as_str)
                 .map(PathBuf::from);
+            // mu-wkn: a tool named "glob" should glob by default.
+            // Legacy callers passing explicit `glob: true` still work;
+            // regex behavior is preserved via explicit `glob: false`.
             let use_glob = arguments
                 .get("glob")
                 .and_then(Value::as_bool)
-                .unwrap_or(false);
+                .unwrap_or(true);
             let kind = arguments
                 .get("kind")
                 .and_then(Value::as_str)
@@ -328,9 +331,12 @@ mod tests {
         fs::write(dir.join("beta.rs"), "")?;
         fs::write(dir.join("gamma.txt"), "")?;
 
+        // mu-wkn: glob is now the default; this test asserts the
+        // regex path still works when explicitly opted into.
         let result = execute_glob(json!({
             "pattern": r"\.rs$",
             "path": dir.to_string_lossy(),
+            "glob": false,
         }))
         .await;
         let _ = fs::remove_dir_all(&dir);
@@ -374,8 +380,9 @@ mod tests {
         fs::create_dir_all(dir.join("subdir-target"))?;
         fs::write(dir.join("file-target.txt"), "")?;
 
+        // mu-wkn: under default-glob the substring match needs `*target*`.
         let result = execute_glob(json!({
-            "pattern": "target",
+            "pattern": "*target*",
             "path": dir.to_string_lossy(),
             "kind": "directory",
         }))
@@ -430,8 +437,11 @@ mod tests {
         let dir = temp_dir("b7")?;
         fs::write(dir.join("MyFile.txt"), "")?;
 
+        // mu-wkn: under default-glob a bare word matches files
+        // whose name is exactly that; widen with `*myfile*` for
+        // the substring-case-insensitive behavior this test asserts.
         let result = execute_glob(json!({
-            "pattern": "myfile",
+            "pattern": "*myfile*",
             "path": dir.to_string_lossy(),
             "case_insensitive": true,
         }))
@@ -441,5 +451,41 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("MyFile.txt"));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn wkn_default_is_glob_when_flag_omitted() -> Result<(), Box<dyn Error>> {
+        // mu-wkn: invocation `glob {pattern: "*.rs"}` (no flag) should
+        // glob, not regex — that's the foot-gun this bead fixes.
+        if !fd_available() {
+            return Ok(());
+        }
+        let dir = temp_dir("wkn-default-glob")?;
+        fs::write(dir.join("alpha.rs"), "")?;
+        fs::write(dir.join("beta.rs"), "")?;
+        fs::write(dir.join("gamma.txt"), "")?;
+
+        let result = execute_glob(json!({
+            "pattern": "*.rs",
+            "path": dir.to_string_lossy(),
+        }))
+        .await;
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(!result.is_error, "got: {}", result.content);
+        assert!(result.content.contains("alpha.rs"));
+        assert!(result.content.contains("beta.rs"));
+        assert!(
+            !result.content.contains("gamma.txt"),
+            "default-glob should not match gamma.txt against *.rs; got: {}",
+            result.content
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wkn_spec_declares_glob_default_true() {
+        let spec = GlobTool::new().spec();
+        assert_eq!(spec.input_schema["properties"]["glob"]["default"], true);
     }
 }

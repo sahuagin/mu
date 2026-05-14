@@ -332,19 +332,16 @@ mod tests {
         assert_eq!(result.rope.spans(), rope.spans());
     }
 
-    /// The two phase-2 stub policies share the same trait surface as
-    /// `NoCompactionPolicy`; their `compact()` is `todo!()` until the
-    /// corresponding bead lands. The `#[should_panic]` tests here are
-    /// the gatekeeper's contract: the stubs MUST compile and MUST
-    /// panic with the documented message — Phase 2 workers will
-    /// replace the body while preserving the trait signature.
-    #[test]
-    #[should_panic(expected = "mu-kgu.2")]
-    fn span_family_drop_policy_stub_panics_with_bead_marker() {
-        let rope = sample_rope();
-        let _ = heuristic::SpanFamilyDropPolicy::new().compact(&rope, 1_000);
-    }
-
+    /// The remaining phase-2 stub policy shares the same trait
+    /// surface as `NoCompactionPolicy`; its `compact()` is `todo!()`
+    /// until the corresponding bead lands. The `#[should_panic]` test
+    /// here is the gatekeeper's contract: the stub MUST compile and
+    /// MUST panic with the documented message — the Phase 2 worker
+    /// will replace the body while preserving the trait signature.
+    ///
+    /// mu-kgu.2 has landed (this PR): the `SpanFamilyDropPolicy`
+    /// stub-panic test was removed and replaced by the policy-specific
+    /// tests at [`super::heuristic::tests`].
     #[test]
     #[should_panic(expected = "mu-kgu.3")]
     fn hash_and_summary_policy_stub_panics_with_bead_marker() {

@@ -1034,6 +1034,126 @@ async fn capability_refuses_tool_outside_allowed_set() {
 }
 
 #[tokio::test]
+async fn capability_refuses_tool_missing_required_aws_capability() {
+    use crate::agent::tool::{PermissionLevel, RetryPolicy, SideEffects, ToolPolicy};
+    use crate::capability::Capability;
+
+    let provider =
+        mock_provider_one_tool_call("aws_recon", json!({"capability": "aws.scout.readonly"}));
+    let tool = MockTool::ok("aws_recon", "this should not run").with_policy(ToolPolicy {
+        side_effects: SideEffects::External,
+        permission: PermissionLevel::Allow,
+        retry: RetryPolicy::ModelDecides,
+        required_aws_capability: Some("aws.scout.readonly".to_string()),
+        idempotent: false,
+    });
+    let cap: SessionCapability = Arc::new(Mutex::new(Capability::root()));
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let loop_ = AgentLoop::spawn(
+        Arc::new(provider),
+        vec![Arc::new(tool) as Arc<dyn Tool>],
+        AgentConfig::default(),
+        events_tx,
+        approvals,
+        cap,
+    );
+    loop_
+        .send(AgentInput::UserMessage(user_msg("run aws recon")))
+        .await
+        .unwrap();
+
+    let mut got_capability_callout = false;
+    let mut completed_content: Option<String> = None;
+    let mut completed_is_error = false;
+    while let Some(ev) = events_rx.recv().await {
+        match ev {
+            AgentEvent::Callout {
+                category, title, ..
+            } if category == "warning" && title.contains("capability refused") => {
+                got_capability_callout = true;
+            }
+            AgentEvent::ToolCallCompleted {
+                content, is_error, ..
+            } => {
+                completed_content = Some(content);
+                completed_is_error = is_error;
+            }
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+
+    assert!(
+        got_capability_callout,
+        "expected capability refusal callout"
+    );
+    let content = completed_content.expect("ToolCallCompleted should fire");
+    assert!(completed_is_error, "missing AWS cap => is_error");
+    assert!(
+        content.contains("missing required AWS capability `aws.scout.readonly`"),
+        "refusal should name missing AWS cap; got: {content}"
+    );
+    assert!(!content.contains("this should not run"));
+}
+
+#[tokio::test]
+async fn capability_allows_tool_when_required_aws_capability_is_held() {
+    use crate::agent::tool::{PermissionLevel, RetryPolicy, SideEffects, ToolPolicy};
+    use crate::capability::{AwsCapability, Capability};
+    use std::collections::HashSet;
+
+    let provider =
+        mock_provider_one_tool_call("aws_recon", json!({"capability": "aws.scout.readonly"}));
+    let tool = MockTool::ok("aws_recon", "aws recon ran").with_policy(ToolPolicy {
+        side_effects: SideEffects::External,
+        permission: PermissionLevel::Allow,
+        retry: RetryPolicy::ModelDecides,
+        required_aws_capability: Some("aws.scout.readonly".to_string()),
+        idempotent: false,
+    });
+    let cap: SessionCapability = Arc::new(Mutex::new(Capability {
+        aws: HashSet::from([AwsCapability {
+            name: "aws.scout.readonly".to_string(),
+            session_policy: None,
+        }]),
+        ..Default::default()
+    }));
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let loop_ = AgentLoop::spawn(
+        Arc::new(provider),
+        vec![Arc::new(tool) as Arc<dyn Tool>],
+        AgentConfig::default(),
+        events_tx,
+        approvals,
+        cap,
+    );
+    loop_
+        .send(AgentInput::UserMessage(user_msg("run aws recon")))
+        .await
+        .unwrap();
+
+    let mut completed_content: Option<String> = None;
+    let mut completed_is_error = true;
+    while let Some(ev) = events_rx.recv().await {
+        match ev {
+            AgentEvent::ToolCallCompleted {
+                content, is_error, ..
+            } => {
+                completed_content = Some(content);
+                completed_is_error = is_error;
+            }
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+
+    assert!(!completed_is_error, "held AWS cap should allow dispatch");
+    assert_eq!(completed_content.as_deref(), Some("aws recon ran"));
+}
+
+#[tokio::test]
 async fn ask_permission_deny_synthesizes_error_result_without_running_tool() {
     let provider = mock_provider_one_tool_call("gated", json!({"x": 1}));
     let tool = MockTool::ok("gated", "this should not appear").with_policy(

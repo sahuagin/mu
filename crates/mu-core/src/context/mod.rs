@@ -34,10 +34,12 @@
 //! - Adoption in the live agent loop
 
 pub mod cache;
+pub mod event;
 pub mod renderer;
 pub mod rope;
 
 pub use cache::{CacheBoundary, CacheStrategy, NoCacheStrategy};
+pub use event::RopeEvent;
 pub use renderer::{
     CacheMarker, FauxProviderRenderer, ProjectionTarget, ProviderMessage, ProviderMessages,
     ProviderRenderer, ProviderRole,

@@ -33,11 +33,13 @@
 //! - Full `RetainedRope` (= mu-nat)
 //! - Adoption in the live agent loop
 
+pub mod assembly;
 pub mod cache;
 pub mod event;
 pub mod renderer;
 pub mod rope;
 
+pub use assembly::assemble_rope;
 pub use cache::{CacheBoundary, CacheStrategy, NoCacheStrategy};
 pub use event::RopeEvent;
 pub use renderer::{

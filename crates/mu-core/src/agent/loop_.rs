@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::capability::{AutonomyCapability, Capability, CapabilityCheck};
+use crate::context::{ProjectionTarget, ProviderMessages, RetainedRope};
 use crate::protocol::{
     ApprovalDecision, AutonomousIterationOutcome, AutonomousTerminationReason, AutonomyOptions,
 };
@@ -147,6 +148,14 @@ pub enum AgentEvent {
     /// the durable event log as `EventPayload::ContextAssembly`.
     /// See spec mu-032 and
     /// `specs/architecture/event-sourced-context.md`.
+    ///
+    /// mu-fb0: the loop now assembles a `RetainedRope` from the
+    /// session state and projects it through the provider's
+    /// `ProviderRenderer` + `CacheStrategy` before each stream call.
+    /// The optional `renderer` / `cache_strategy` / `span_count` /
+    /// `cache_boundary_count` / `first_span_ids` fields carry rope-
+    /// derived provenance. All defaults serde-skip so pre-mu-fb0
+    /// fixtures remain byte-for-byte stable.
     ContextAssembly {
         model_call_id: u32,
         message_count: u32,
@@ -154,6 +163,34 @@ pub enum AgentEvent {
         assistant_message_count: u32,
         tool_result_count: u32,
         tool_count: u32,
+        /// mu-fb0: provider's `renderer().provider_label()`-style tag.
+        /// Surfaces which `ProviderRenderer` projected the rope for
+        /// this call (e.g., `"anthropic"`, `"faux"`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        renderer: Option<String>,
+        /// mu-fb0: the cache-strategy identifier in use. Currently
+        /// equal to `renderer` (each provider supplies a paired
+        /// renderer + strategy), but reported separately so future
+        /// A/B-tested strategies over the same renderer are
+        /// distinguishable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_strategy: Option<String>,
+        /// mu-fb0: total spans in the projected rope (system + tool
+        /// schemas + messages). Differs from `message_count`, which
+        /// counts conversational turns only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span_count: Option<u32>,
+        /// mu-fb0: number of `CacheBoundary` positions the strategy
+        /// placed. 0 for `NoCacheStrategy`; up to 1 for
+        /// `AnthropicCacheStrategy` v1.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_boundary_count: Option<u32>,
+        /// mu-fb0: first N (cap 5) span ids of the rope. Lets
+        /// consumers identify which spans entered the prompt without
+        /// requiring the full rope dump (per spec line 191 — span
+        /// identity + reason_included form the source map).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        first_span_ids: Vec<String>,
     },
     /// Provider-call lifecycle marker (mu-035 Phase A). Emitted on
     /// state transitions; Phase B will additionally emit periodic
@@ -675,9 +712,48 @@ async fn run(
 
                 let tool_specs: Vec<ToolSpec> = tools.iter().map(|t| t.spec()).collect();
 
+                // mu-fb0: project session state into a RetainedRope
+                // and run it through the provider's ProviderRenderer +
+                // CacheStrategy BEFORE the wire call. The rope is the
+                // controlled variable; renderer + strategy are
+                // provider-declared (Provider::renderer() /
+                // ::cache_strategy()). Wire path stays unchanged —
+                // Provider::stream() is still called with the raw
+                // &[AgentMessage] so existing fixtures and behavior
+                // tests pass byte-for-byte. The render + annotate
+                // computation produces ContextAssembly provenance
+                // (renderer/strategy labels, span counts, cache-
+                // boundary placement, first-N span ids).
+                let rope: RetainedRope = crate::context::assemble_rope(
+                    config.system_prompt.as_deref(),
+                    &messages,
+                    &tool_specs,
+                );
+                let renderer = provider.renderer();
+                let cache_strategy = provider.cache_strategy();
+                let mut projection: ProviderMessages =
+                    renderer.render(&rope, ProjectionTarget::AgentView);
+                let cache_boundaries = cache_strategy.boundaries(&rope);
+                cache_strategy.annotate(&mut projection, &cache_boundaries);
+                // The projection is observed (its content/cache
+                // markers are the rope's view of the wire payload).
+                // It is intentionally not yet threaded into
+                // Provider::stream — the wire-signature change is
+                // out of scope for mu-fb0 (preserves stop-criterion
+                // #9). Once a Provider::stream variant takes
+                // ProviderMessages directly, the loop swaps the call
+                // site; today the equivalence is checked via the
+                // rope's content versus the AgentMessage path.
+                let _ = projection;
+                let span_count = rope.len() as u32;
+                let cache_boundary_count = cache_boundaries.len() as u32;
+                let first_span_ids: Vec<String> =
+                    rope.spans().iter().take(5).map(|s| s.id.clone()).collect();
+                let provider_label = provider.provider_label().to_owned();
+
                 // Emit ContextAssembly BEFORE the provider call so
                 // the durable log records what the model was about
-                // to see. (mu-032.)
+                // to see. (mu-032 + mu-fb0.)
                 model_call_id += 1;
                 let (user_count, assistant_count, tool_result_count) =
                     count_message_roles(&messages);
@@ -689,6 +765,11 @@ async fn run(
                         assistant_message_count: assistant_count,
                         tool_result_count,
                         tool_count: tool_specs.len() as u32,
+                        renderer: Some(provider_label.clone()),
+                        cache_strategy: Some(provider_label),
+                        span_count: Some(span_count),
+                        cache_boundary_count: Some(cache_boundary_count),
+                        first_span_ids,
                     })
                     .await;
 

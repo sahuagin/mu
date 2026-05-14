@@ -348,6 +348,11 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
             assistant_message_count,
             tool_result_count,
             tool_count,
+            renderer,
+            cache_strategy,
+            span_count,
+            cache_boundary_count,
+            first_span_ids,
         } => {
             // ContextAssembly is recorded with the session's
             // provider/model from the log's SessionCreated event.
@@ -379,6 +384,11 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
                     token_count_estimate: None,
                     provider_kind: String::new(),
                     model: String::new(),
+                    renderer: renderer.clone(),
+                    cache_strategy: cache_strategy.clone(),
+                    span_count: *span_count,
+                    cache_boundary_count: *cache_boundary_count,
+                    first_span_ids: first_span_ids.clone(),
                 },
             ))
         }

@@ -487,6 +487,11 @@ mod tests {
                     token_count_estimate: None,
                     provider_kind: "p".into(),
                     model: "m".into(),
+                    renderer: None,
+                    cache_strategy: None,
+                    span_count: None,
+                    cache_boundary_count: None,
+                    first_span_ids: Vec::new(),
                 },
             ),
             ev(
@@ -514,6 +519,11 @@ mod tests {
                     token_count_estimate: None,
                     provider_kind: "p".into(),
                     model: "m".into(),
+                    renderer: None,
+                    cache_strategy: None,
+                    span_count: None,
+                    cache_boundary_count: None,
+                    first_span_ids: Vec::new(),
                 },
             ),
             ev(

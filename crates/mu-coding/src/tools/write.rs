@@ -46,6 +46,7 @@ impl Tool for WriteTool {
             side_effects: SideEffects::Mutating,
             permission: PermissionLevel::Allow,
             retry: RetryPolicy::ModelDecides,
+            required_aws_capability: None,
             idempotent: true, // same path + same content = same end state
         })
     }

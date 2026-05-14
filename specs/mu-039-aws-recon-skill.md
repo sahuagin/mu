@@ -163,11 +163,15 @@ Input:
 
 Pre-dispatch checks:
 
-1. session capability contains `AwsCapability { name: capability, ... }`;
-2. catalog has a materialized entry for `capability`;
-3. catalog entry has `mutation_allowed == false` unless operator explicitly
+1. the tool's runtime policy declares `required_aws_capability:
+   "aws.scout.readonly"`;
+2. the agent loop verifies the session capability contains
+   `AwsCapability { name: "aws.scout.readonly", ... }` before `Tool::execute`
+   runs;
+3. catalog has a materialized entry for `capability`;
+4. catalog entry has `mutation_allowed == false` unless operator explicitly
    allows a mutating recon variant (not in v1);
-4. runner path is configured and executable.
+5. runner path is configured and executable.
 
 Execution:
 
@@ -249,20 +253,23 @@ context led to that call?
 - **INV-1 (no ambient AWS authority).** The model never receives raw AWS
   credentials. Tool execution clears ambient AWS environment variables before
   selecting the catalog-backed profile/role.
-- **INV-2 (catalog resolution before execution).** A named AWS capability is not
+- **INV-2 (agent-loop AWS gate before execution).** Tools that require AWS
+  authority declare `ToolPolicy::required_aws_capability`; the agent loop refuses
+  dispatch before `Tool::execute` unless the session holds that AWS grant.
+- **INV-3 (catalog resolution before runner execution).** A named AWS capability is not
   executable until `resolve_materialized()` succeeds.
-- **INV-3 (planned means not executable).** Catalog entries with `status:
+- **INV-4 (planned means not executable).** Catalog entries with `status:
   "planned"` are visible for design/operator context but fail before runner
   execution.
-- **INV-4 (read-only first).** The v1 skill grants only `aws.scout.readonly` by
+- **INV-5 (read-only first).** The v1 skill grants only `aws.scout.readonly` by
   default. Auditor review uses `aws.audit.security`; mutation capabilities are
   out of scope.
-- **INV-5 (local planning is separate).** `aws_plan_from_recon` consumes saved
+- **INV-6 (local planning is separate).** `aws_plan_from_recon` consumes saved
   reports and does not make AWS calls; it should not require AWS credentials.
-- **INV-6 (event log is source of truth).** Compaction may drop pointers to raw
+- **INV-7 (event log is source of truth).** Compaction may drop pointers to raw
   recon output from AgentView, but the event log/artifact refs remain available
   for OperatorView/AuditorView/replay.
-- **INV-7 (fail closed on ambiguity).** Unknown capabilities, planned catalog
+- **INV-8 (fail closed on ambiguity).** Unknown capabilities, planned catalog
   entries, missing runner paths, and ambiguous inline session policies deny
   execution rather than guessing.
 
@@ -277,6 +284,7 @@ context led to that call?
 
 ### Phase B — local skill/tool skeleton
 
+- Add `ToolPolicy::required_aws_capability` and enforce it in the agent loop.
 - Add `aws-recon` skill metadata.
 - Add tool schemas for `aws_recon` and `aws_plan_from_recon`.
 - Implement dry-run tests with fixture catalog and fixture recon reports.

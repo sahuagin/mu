@@ -1430,14 +1430,26 @@ async fn handle_execute_tools(
         // under an attenuated capability and this tool isn't in
         // its allowed set (or the capability has expired / budget
         // is exhausted), refuse dispatch.
-        let capability_refusal_reason: Option<&'static str> = {
+        let capability_refusal_reason: Option<String> = {
             let cap = capability.lock().ok();
             cap.as_ref().and_then(|c| match c.check_allow(&call.name) {
-                CapabilityCheck::Allowed => None,
-                CapabilityCheck::DeniedToolNotAllowed => Some("tool not in session's capability"),
-                CapabilityCheck::DeniedExpired => Some("session capability has expired"),
+                CapabilityCheck::Allowed => {
+                    let required_aws = tool
+                        .as_ref()
+                        .and_then(|t| t.spec().policy.required_aws_capability.clone());
+                    match required_aws {
+                        Some(required) if !c.aws.iter().any(|aws_cap| aws_cap.name == required) => {
+                            Some(format!("missing required AWS capability `{required}`"))
+                        }
+                        _ => None,
+                    }
+                }
+                CapabilityCheck::DeniedToolNotAllowed => {
+                    Some("tool not in session's capability".to_owned())
+                }
+                CapabilityCheck::DeniedExpired => Some("session capability has expired".to_owned()),
                 CapabilityCheck::DeniedBudgetExhausted => {
-                    Some("session capability's tool-call budget exhausted")
+                    Some("session capability's tool-call budget exhausted".to_owned())
                 }
                 // mu-036: DeniedAutonomyDisallowed only applies to
                 // session.start_autonomous (where it's checked by

@@ -49,6 +49,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use serde_json::json;
+use throbber_widgets_tui::{Throbber, ThrobberState};
 
 use crate::mu_client::{Message as MuMessage, MuClient};
 
@@ -234,6 +235,11 @@ struct App {
     // tick. The TUI renders { state, elapsed_ms } in the phase line
     // and the right-pane affordance. Cleared on session.done.
     latest_status: std::collections::HashMap<String, ProviderStatusSnapshot>,
+    // mu-di4: per-session throbber animation state. Lifetime mirrors
+    // `latest_status`: ensured on the first provider_status tick for a
+    // sid, advanced one step per App::tick(), dropped when
+    // `latest_status` drops it (i.e. on session.done / session.error).
+    throbber_states: std::collections::HashMap<String, ThrobberState>,
     // Per-session live streaming-text accumulator. text_delta
     // events are NOT logged (per event_log.rs design doc — "streaming-
     // only events do NOT go in the log"). So to render an in-flight
@@ -315,6 +321,7 @@ impl App {
             poll_tick_counter: 0,
             ask_started_at: std::collections::HashMap::new(),
             latest_status: std::collections::HashMap::new(),
+            throbber_states: std::collections::HashMap::new(),
             streaming_text: std::collections::HashMap::new(),
             transcript_events_by_sid: std::collections::HashMap::new(),
             transcript_scroll_offset: 0,
@@ -448,6 +455,19 @@ impl App {
         {
             self.refresh_usage_history();
         }
+        // mu-di4: keep throbber states in sync with the authoritative
+        // `latest_status` map. Ensure-and-tick for every active sid;
+        // drop entries whose sid has left `latest_status` (i.e. the
+        // session.done handler removed it). The throbber animates at
+        // tick_rate (250ms) — ~4 fps with the default BRAILLE_SIX set.
+        for sid in self.latest_status.keys() {
+            self.throbber_states
+                .entry(sid.clone())
+                .or_default()
+                .calc_next();
+        }
+        self.throbber_states
+            .retain(|sid, _| self.latest_status.contains_key(sid));
     }
 
     fn refresh_transcript_for_selection(&mut self) {
@@ -1652,14 +1672,29 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
             ]);
             // Detail: live phase + cost + tokens. Phase is the most
             // valuable thing to glance at — replaces the redundant
-            // provider/model line we had before.
-            let detail = Line::from(vec![
-                Span::raw("    "),
-                Span::styled(s.phase.clone(), Style::default().fg(Color::Cyan)),
-                Span::raw(format!("   ${:.2}  ", s.cost_usd)),
-                Span::raw(format!("{}k tok", s.tokens_kilo)),
-            ]);
-            ListItem::new(vec![header, detail])
+            // provider/model line we had before. mu-di4: prepend an
+            // animated throbber glyph for sessions with a live
+            // provider_status snapshot, so a glance across the list
+            // shows which sessions are actively working.
+            let mut detail_spans: Vec<Span> = vec![Span::raw("    ")];
+            if let Some(state) = s
+                .session_id
+                .as_deref()
+                .and_then(|sid| app.throbber_states.get(sid))
+            {
+                detail_spans.push(
+                    Throbber::default()
+                        .throbber_style(Style::default().fg(Color::Cyan))
+                        .to_symbol_span(state),
+                );
+            }
+            detail_spans.push(Span::styled(
+                s.phase.clone(),
+                Style::default().fg(Color::Cyan),
+            ));
+            detail_spans.push(Span::raw(format!("   ${:.2}  ", s.cost_usd)));
+            detail_spans.push(Span::raw(format!("{}k tok", s.tokens_kilo)));
+            ListItem::new(vec![header, Line::from(detail_spans)])
         })
         .collect();
     let block = Block::default()
@@ -1698,19 +1733,34 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
                     snap.elapsed_ms + snap.received_at.elapsed().as_millis() as u64;
                 let secs = synthetic_elapsed_ms as f32 / 1000.0;
                 let (label, color) = match snap.state.as_str() {
-                    "awaiting_first_token" => ("● awaiting first token  ", Color::Yellow),
-                    "thinking" => ("● thinking  ", Color::Yellow),
-                    "tool_executing" => ("● tool executing  ", Color::Magenta),
-                    "awaiting_tool_result" => ("● awaiting tool result  ", Color::Magenta),
+                    "awaiting_first_token" => ("awaiting first token  ", Color::Yellow),
+                    "thinking" => ("thinking  ", Color::Yellow),
+                    "tool_executing" => ("tool executing  ", Color::Magenta),
+                    "awaiting_tool_result" => ("awaiting tool result  ", Color::Magenta),
                     "streaming" | "idle" => return None,
-                    _ => ("● working  ", Color::Cyan),
+                    _ => ("working  ", Color::Cyan),
                 };
                 let suffix = snap
                     .tool_call_id
                     .as_deref()
                     .map(|cid| format!(" (call {cid})"))
                     .unwrap_or_default();
+                // mu-di4: animated throbber glyph replaces the static
+                // `● ` bullet. Falls back to a static `● ` only if the
+                // throbber state hasn't been initialized yet for this
+                // sid (shouldn't happen — App::tick ensures it — but
+                // belt-and-suspenders for an off-by-one tick race).
+                let throbber_widget = Throbber::default()
+                    .throbber_style(Style::default().fg(color).add_modifier(Modifier::BOLD));
+                let throbber_span = match app.throbber_states.get(sid) {
+                    Some(state) => throbber_widget.to_symbol_span(state),
+                    None => Span::styled(
+                        "● ",
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                };
                 return Some(Line::from(vec![
+                    throbber_span,
                     Span::styled(
                         label,
                         Style::default().fg(color).add_modifier(Modifier::BOLD),

@@ -1,22 +1,21 @@
 //! mu-tui — terminal UI for `mu serve`.
 //!
-//! Status: **scaffold (Tier 0, mock data)**. Renders the Command Center
-//! view from `mu-ui-mockups-2026-05-10.md` with hard-coded session data,
-//! supports F1–F9 mode-switching (most modes are placeholders), `q` to
-//! quit, and a `:` command-palette stub. The point of the scaffold is to
-//! prove the layout/keybind shape so the wire-integration can follow in
-//! a focused next change rather than as a sprawling first commit.
+//! Status: **live JSON-RPC client over stdio against a spawned `mu serve`**.
+//! Renders the Command Center, F3 transcript replay (with live streaming
+//! text + tool-call/result pairing), F5 usage history percentile table,
+//! F8 firehose events explorer, session picker overlay, `$EDITOR` handoff
+//! for long prompts (Ctrl-X Ctrl-E / Ctrl-X Ctrl-P), and provider-status
+//! throbbers with elapsed-ms interpolation between ticks.
 //!
-//! Next slices (not in this scaffold):
-//!   - JSON-RPC over stdio to a spawned `mu serve` (port the Python
-//!     mu_client.py defensive layer to Rust)
-//!   - Subscribe to `session.text_delta` / `session.tool_call_*` etc.
-//!     and render the firehose live
-//!   - Render `session.provider_status` (mu-035) into the per-session
-//!     "phase:" line — the mockup already assumes this signal
-//!   - Implement Session Tree, Session Detail, Context Inspector,
-//!     Usage Dashboard, Router, Tools views
-//!   - Command palette with `:` prefix, parser, and routing
+//! Open work tracked in br: `mu-gih` (session.input_required modal),
+//! `mu-2za` (typed wire decode via mu-core::protocol), `mu-wk2`
+//! (close streaming-to-finalized swap gap), `mu-mvk` (markdown
+//! rendering), `mu-u8a` (color polish), `mu-cha` (F2 session tree).
+//!
+//! Subscribes to `session.text_delta` / `session.tool_call_*` and renders
+//! the firehose live. Renders `session.provider_status` (mu-035) into the
+//! per-session phase line. F2 Session Tree, F4 Context Inspector, F7
+//! Router, F9 Tools/Mailbox remain placeholders; the rest are live.
 
 mod mu_client;
 

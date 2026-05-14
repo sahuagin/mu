@@ -293,8 +293,20 @@ context led to that call?
 ### Phase C — runner-backed local execution
 
 - Wire `aws_recon` to the sandbox runner behind explicit local config.
-- Return report/artifact paths and caller/session metadata.
-- Keep live AWS tests opt-in/manual.
+- Configure live local execution with:
+  - `MU_AWS_CAPABILITY_CATALOG=/path/to/capabilities/aws.json`
+  - `MU_AWS_RECON_RUNNER=/path/to/scripts/mu-aws-capability-run.sh`
+  - `MU_AWS_RECON_SCRIPT=/path/to/scripts/aws-recon.py`
+  - optional `MU_AWS_RECON_CWD=/path/to/mu-aws-sandbox-infra`
+- The tool invokes:
+
+  ```text
+  $MU_AWS_RECON_RUNNER aws.scout.readonly -- \
+    $MU_AWS_RECON_SCRIPT --call-timeout <n> [--out-dir <dir>]
+  ```
+
+- Return report/artifact paths and runner stdout summary metadata.
+- Keep live AWS tests opt-in/manual; CI remains fixture/mock-runner only.
 
 ### Phase D — audit join
 

@@ -207,7 +207,8 @@ impl Tool for GrepTool {
                 "count" => {
                     cmd.arg("--count");
                 }
-                "content" | _ => {
+                _ => {
+                    // "content" (default) or unrecognized output_mode
                     if show_line_numbers {
                         cmd.arg("--line-number");
                     }
@@ -290,11 +291,11 @@ impl Tool for GrepTool {
                 Some(2) => ToolResult {
                     content: format!(
                         "grep: rg returned error: {}",
-                        stderr
-                            .trim()
-                            .is_empty()
-                            .then_some("(no stderr)")
-                            .unwrap_or(stderr.trim())
+                        if stderr.trim().is_empty() {
+                            "(no stderr)"
+                        } else {
+                            stderr.trim()
+                        }
                     ),
                     is_error: true,
                 },

@@ -240,8 +240,7 @@ impl Tool for BashTool {
                 .get("timeout_secs")
                 .and_then(Value::as_u64)
                 .unwrap_or(DEFAULT_TIMEOUT_SECS)
-                .min(MAX_TIMEOUT_SECS)
-                .max(1);
+                .clamp(1, MAX_TIMEOUT_SECS);
             let timeout = Duration::from_secs(timeout_secs);
 
             let mut cmd = match &mode {

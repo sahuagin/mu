@@ -52,7 +52,7 @@ impl SessionDiscovery for LocalRegistryBackend {
 
         // Sort most-recently-active first — matches the TUI's expected
         // ordering and gives the limit-clamp a sensible bias.
-        out.sort_by(|a, b| b.last_activity_unix_ms.cmp(&a.last_activity_unix_ms));
+        out.sort_by_key(|b| std::cmp::Reverse(b.last_activity_unix_ms));
 
         if let Some(limit) = filter.limit {
             if limit > 0 {

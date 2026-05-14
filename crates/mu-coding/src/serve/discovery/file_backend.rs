@@ -131,7 +131,7 @@ impl SessionDiscovery for FileBackend {
         // Re-sort: most-recently-active first. Same comparator the
         // LocalRegistryBackend uses on its own slice; doing it again
         // after merge keeps the ordering invariant across the union.
-        merged.sort_by(|a, b| b.last_activity_unix_ms.cmp(&a.last_activity_unix_ms));
+        merged.sort_by_key(|b| std::cmp::Reverse(b.last_activity_unix_ms));
         if let Some(limit) = filter.limit {
             if limit > 0 {
                 merged.truncate(limit as usize);

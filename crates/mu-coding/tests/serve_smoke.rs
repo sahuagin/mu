@@ -58,15 +58,6 @@ async fn read_line<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Value {
     serde_json::from_slice(&line).expect("parse JSON line")
 }
 
-/// Read N lines from a reader.
-async fn read_n_lines<R: tokio::io::AsyncRead + Unpin>(reader: &mut R, n: usize) -> Vec<Value> {
-    let mut out = Vec::new();
-    for _ in 0..n {
-        out.push(read_line(reader).await);
-    }
-    out
-}
-
 /// B-4: ping round-trip.
 #[tokio::test]
 async fn b4_ping_round_trip() {

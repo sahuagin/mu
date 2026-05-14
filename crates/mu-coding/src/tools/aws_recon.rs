@@ -1,7 +1,8 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::process::Command;
+use std::process::Stdio;
+use std::time::Duration;
 
 use mu_core::agent::{
     PermissionLevel, RetryPolicy, SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec,
@@ -9,11 +10,18 @@ use mu_core::agent::{
 use mu_core::aws::{AwsCapabilityCatalog, AwsCapabilityCatalogEntry, AwsCatalogError};
 use mu_core::capability::AwsCapability;
 use serde_json::{json, Value};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
 use tokio::sync::oneshot;
+use tokio::time;
 
 const DEFAULT_CAPABILITY: &str = "aws.scout.readonly";
 const DEFAULT_CALL_TIMEOUT_SECS: u64 = 45;
 const MAX_CALL_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_RECON_CALL_COUNT_BUDGET: u64 = 20;
+const RUNNER_TIMEOUT_GRACE_SECS: u64 = 30;
+const MAX_RUNNER_TIMEOUT_SECS: u64 = 14_400;
+const MAX_RUNNER_STREAM_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct AwsReconTool {
@@ -118,6 +126,12 @@ impl Tool for AwsReconTool {
                     "output_dir": {
                         "type": "string",
                         "description": "Optional output directory for future runner-backed execution. Ignored in fixture mode."
+                    },
+                    "runner_timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_RUNNER_TIMEOUT_SECS,
+                        "description": "Outer timeout for the runner subprocess. Defaults to call_timeout_secs * 20 + 30 seconds because call_timeout_secs is per AWS call."
                     }
                 }
             }),
@@ -142,7 +156,7 @@ impl Tool for AwsReconTool {
     {
         Box::pin(async move {
             tokio::select! {
-                result = async { self.execute_inner(arguments) } => result,
+                result = async { self.execute_inner(arguments).await } => result,
                 _ = cancel_rx => ToolResult {
                     content: structured_error("cancelled", DEFAULT_CAPABILITY, &self.catalog_digest, None, "aws_recon cancelled"),
                     is_error: true,
@@ -153,7 +167,7 @@ impl Tool for AwsReconTool {
 }
 
 impl AwsReconTool {
-    fn execute_inner(&self, arguments: Value) -> ToolResult {
+    async fn execute_inner(&self, arguments: Value) -> ToolResult {
         let capability_name = match capability_argument(&arguments) {
             Ok(c) => c,
             Err(result) => return result,
@@ -164,6 +178,10 @@ impl AwsReconTool {
         };
         let output_dir = match output_dir_argument(&arguments) {
             Ok(path) => path,
+            Err(result) => return result,
+        };
+        let runner_timeout_secs = match runner_timeout_argument(&arguments, call_timeout_secs) {
+            Ok(timeout) => timeout,
             Err(result) => return result,
         };
 
@@ -246,16 +264,19 @@ impl AwsReconTool {
             runner,
             &capability_name,
             call_timeout_secs,
+            runner_timeout_secs,
             output_dir,
             entry,
         )
+        .await
     }
 
-    fn execute_runner(
+    async fn execute_runner(
         &self,
         runner: &AwsReconRunner,
         capability_name: &str,
         call_timeout_secs: u64,
+        runner_timeout_secs: u64,
         output_dir: Option<PathBuf>,
         entry: &AwsCapabilityCatalogEntry,
     ) -> ToolResult {
@@ -265,7 +286,9 @@ impl AwsReconTool {
             .arg("--")
             .arg(&runner.script_path)
             .arg("--call-timeout")
-            .arg(call_timeout_secs.to_string());
+            .arg(call_timeout_secs.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         if let Some(output_dir) = &output_dir {
             command.arg("--out-dir").arg(output_dir);
         }
@@ -273,76 +296,118 @@ impl AwsReconTool {
             command.current_dir(cwd);
         }
 
-        match command.output() {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                match parse_runner_summary(&stdout) {
-                    Ok(summary) => {
-                        let report_dir = summary
-                            .get("report")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned)
-                            .unwrap_or_default();
-                        let report = json!({
-                            "kind": "aws_recon_report",
-                            "mode": "runner",
-                            "report_dir": report_dir,
-                            "summary_path": if report_dir.is_empty() { Value::Null } else { json!(format!("{report_dir}/summary.json")) },
-                            "capability": capability_name,
-                            "call_timeout_secs": call_timeout_secs,
-                            "catalog_digest": self.catalog_digest,
-                            "audit": audit_metadata(capability_name, &self.catalog_digest, Some(entry)),
-                            "runner": {
-                                "path": runner.runner_path,
-                                "script": runner.script_path,
-                            },
-                            "stdout_summary": summary,
-                        });
-                        ToolResult {
-                            content: serde_json::to_string_pretty(&report)
-                                .expect("json serialization cannot fail"),
-                            is_error: false,
-                        }
-                    }
-                    Err(message) => ToolResult {
-                        content: structured_error(
-                            "runner_output_parse_failed",
-                            capability_name,
-                            &self.catalog_digest,
-                            Some(entry),
-                            &message,
-                        ),
-                        is_error: true,
-                    },
-                }
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                ToolResult {
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                return ToolResult {
                     content: structured_error(
-                        "runner_failed",
+                        "runner_spawn_failed",
                         capability_name,
                         &self.catalog_digest,
                         Some(entry),
-                        &format!(
-                            "aws_recon runner exited with {}: {}",
-                            output.status,
-                            stderr.trim()
-                        ),
+                        &format!("failed to spawn aws_recon runner: {err}"),
                     ),
                     is_error: true,
-                }
+                };
             }
-            Err(err) => ToolResult {
+        };
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let stdout_task = tokio::spawn(async move { read_limited(stdout).await });
+        let stderr_task = tokio::spawn(async move { read_limited(stderr).await });
+
+        let status =
+            match time::timeout(Duration::from_secs(runner_timeout_secs), child.wait()).await {
+                Ok(Ok(status)) => status,
+                Ok(Err(err)) => {
+                    return ToolResult {
+                        content: structured_error(
+                            "runner_wait_failed",
+                            capability_name,
+                            &self.catalog_digest,
+                            Some(entry),
+                            &format!("failed waiting for aws_recon runner: {err}"),
+                        ),
+                        is_error: true,
+                    };
+                }
+                Err(_) => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return ToolResult {
+                        content: structured_error(
+                            "runner_timeout",
+                            capability_name,
+                            &self.catalog_digest,
+                            Some(entry),
+                            &format!(
+                                "aws_recon runner exceeded outer timeout of {runner_timeout_secs}s"
+                            ),
+                        ),
+                        is_error: true,
+                    };
+                }
+            };
+
+        let stdout_capture = await_capture(stdout_task).await;
+        let stderr_capture = await_capture(stderr_task).await;
+
+        if status.success() {
+            match parse_runner_summary(&stdout_capture.text) {
+                Ok(parsed) => {
+                    let report_dir = parsed.report_dir;
+                    let report = json!({
+                        "kind": "aws_recon_report",
+                        "mode": "runner",
+                        "report_dir": report_dir,
+                        "summary_path": format!("{report_dir}/summary.json"),
+                        "capability": capability_name,
+                        "call_timeout_secs": call_timeout_secs,
+                        "runner_timeout_secs": runner_timeout_secs,
+                        "catalog_digest": self.catalog_digest,
+                        "audit": audit_metadata(capability_name, &self.catalog_digest, Some(entry)),
+                        "runner": {
+                            "path": runner.runner_path,
+                            "script": runner.script_path,
+                        },
+                        "stdout_summary": parsed.value,
+                        "output_capture": {
+                            "stdout_truncated": stdout_capture.truncated,
+                            "stderr_truncated": stderr_capture.truncated,
+                            "limit_bytes": MAX_RUNNER_STREAM_BYTES,
+                        },
+                    });
+                    ToolResult {
+                        content: serde_json::to_string_pretty(&report)
+                            .expect("json serialization cannot fail"),
+                        is_error: false,
+                    }
+                }
+                Err(message) => ToolResult {
+                    content: structured_error(
+                        "runner_output_parse_failed",
+                        capability_name,
+                        &self.catalog_digest,
+                        Some(entry),
+                        &message,
+                    ),
+                    is_error: true,
+                },
+            }
+        } else {
+            ToolResult {
                 content: structured_error(
-                    "runner_spawn_failed",
+                    "runner_failed",
                     capability_name,
                     &self.catalog_digest,
                     Some(entry),
-                    &format!("failed to spawn aws_recon runner: {err}"),
+                    &format!(
+                        "aws_recon runner exited with {status}: {}",
+                        stderr_capture.text.trim()
+                    ),
                 ),
                 is_error: true,
-            },
+            }
         }
     }
 }
@@ -362,6 +427,42 @@ fn capability_argument(arguments: &Value) -> Result<String, ToolResult> {
             is_error: true,
         }),
     }
+}
+
+fn runner_timeout_argument(arguments: &Value, call_timeout_secs: u64) -> Result<u64, ToolResult> {
+    match arguments.get("runner_timeout_secs") {
+        None => Ok(default_runner_timeout_secs(call_timeout_secs)),
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(v) if (1..=MAX_RUNNER_TIMEOUT_SECS).contains(&v) => Ok(v),
+            _ => Err(ToolResult {
+                content: structured_error(
+                    "invalid_runner_timeout_secs",
+                    DEFAULT_CAPABILITY,
+                    "unknown",
+                    None,
+                    "`runner_timeout_secs` must be an integer between 1 and 14400",
+                ),
+                is_error: true,
+            }),
+        },
+        Some(_) => Err(ToolResult {
+            content: structured_error(
+                "invalid_runner_timeout_secs",
+                DEFAULT_CAPABILITY,
+                "unknown",
+                None,
+                "`runner_timeout_secs` must be an integer between 1 and 14400",
+            ),
+            is_error: true,
+        }),
+    }
+}
+
+fn default_runner_timeout_secs(call_timeout_secs: u64) -> u64 {
+    call_timeout_secs
+        .saturating_mul(DEFAULT_RECON_CALL_COUNT_BUDGET)
+        .saturating_add(RUNNER_TIMEOUT_GRACE_SECS)
+        .min(MAX_RUNNER_TIMEOUT_SECS)
 }
 
 fn output_dir_argument(arguments: &Value) -> Result<Option<PathBuf>, ToolResult> {
@@ -410,15 +511,90 @@ fn call_timeout_argument(arguments: &Value) -> Result<u64, ToolResult> {
     }
 }
 
-fn parse_runner_summary(stdout: &str) -> Result<Value, String> {
+#[derive(Debug, Clone, PartialEq)]
+struct RunnerSummary {
+    value: Value,
+    report_dir: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamCapture {
+    text: String,
+    truncated: bool,
+}
+
+async fn read_limited<R>(reader: Option<R>) -> StreamCapture
+where
+    R: AsyncRead + Unpin,
+{
+    let Some(mut reader) = reader else {
+        return StreamCapture {
+            text: String::new(),
+            truncated: false,
+        };
+    };
+    let mut buf = [0_u8; 8192];
+    let mut captured = Vec::new();
+    let mut truncated = false;
+    loop {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if captured.len() < MAX_RUNNER_STREAM_BYTES {
+            let remaining = MAX_RUNNER_STREAM_BYTES - captured.len();
+            let keep = remaining.min(n);
+            captured.extend_from_slice(&buf[..keep]);
+            if keep < n {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+    }
+    StreamCapture {
+        text: String::from_utf8_lossy(&captured).into_owned(),
+        truncated,
+    }
+}
+
+async fn await_capture(handle: tokio::task::JoinHandle<StreamCapture>) -> StreamCapture {
+    handle.await.unwrap_or(StreamCapture {
+        text: String::new(),
+        truncated: true,
+    })
+}
+
+fn parse_runner_summary(stdout: &str) -> Result<RunnerSummary, String> {
     let start = stdout
         .find('{')
         .ok_or_else(|| "aws_recon runner stdout did not contain a JSON summary".to_owned())?;
     let end = stdout
         .rfind('}')
         .ok_or_else(|| "aws_recon runner stdout JSON summary was incomplete".to_owned())?;
-    serde_json::from_str(&stdout[start..=end])
-        .map_err(|err| format!("failed to parse aws_recon runner summary JSON: {err}"))
+    let value: Value = serde_json::from_str(&stdout[start..=end])
+        .map_err(|err| format!("failed to parse aws_recon runner summary JSON: {err}"))?;
+    let report_dir = value
+        .get("report")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            "aws_recon runner summary missing non-empty string field `report`".to_owned()
+        })?
+        .to_owned();
+    require_array_field(&value, "errors")?;
+    require_array_field(&value, "findings")?;
+    Ok(RunnerSummary { value, report_dir })
+}
+
+fn require_array_field(value: &Value, field: &str) -> Result<(), String> {
+    match value.get(field) {
+        Some(Value::Array(_)) => Ok(()),
+        _ => Err(format!(
+            "aws_recon runner summary missing array field `{field}`"
+        )),
+    }
 }
 
 fn catalog_error(capability: &str, catalog_digest: &str, err: AwsCatalogError) -> String {
@@ -637,8 +813,86 @@ printf '{"account":"123456789012","aws_profile":"mu-readonly-scout","capability_
         );
         assert_eq!(value["capability"], "aws.scout.readonly");
         assert_eq!(value["call_timeout_secs"], 60);
+        assert_eq!(
+            value["runner_timeout_secs"],
+            default_runner_timeout_secs(60)
+        );
         assert_eq!(value["audit"]["aws_profile"], "mu-readonly-scout");
         assert_eq!(value["stdout_summary"]["errors"], json!([]));
+        assert_eq!(value["output_capture"]["stdout_truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn runner_timeout_kills_hung_runner() {
+        let dir = temp_test_dir("aws-recon-runner-timeout");
+        let runner = dir.join("runner.sh");
+        let script = dir.join("aws-recon.py");
+        write_executable(
+            &runner,
+            r#"#!/bin/sh
+shift
+shift
+exec "$@"
+"#,
+        );
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+sleep 20
+"#,
+        );
+
+        let tool = AwsReconTool::with_runner(
+            readonly_catalog(),
+            "sha256:test",
+            &runner,
+            &script,
+            Some(dir),
+        );
+        let result = execute(&tool, json!({"runner_timeout_secs": 1})).await;
+        let value: Value = serde_json::from_str(&result.content).expect("structured json");
+
+        assert!(result.is_error);
+        assert_eq!(value["reason"], "runner_timeout");
+        assert!(value["message"].as_str().expect("message").contains("1s"));
+    }
+
+    #[test]
+    fn runner_summary_missing_required_fields_is_refused() {
+        let err = parse_runner_summary(r#"{"report":"reports/aws-recon/x","errors":[]}"#)
+            .expect_err("missing findings must fail");
+
+        assert!(err.contains("findings"));
+    }
+
+    #[tokio::test]
+    async fn large_runner_stdout_is_bounded_and_flagged() {
+        let dir = temp_test_dir("aws-recon-runner-large");
+        let runner = dir.join("runner.sh");
+        let script = dir.join("aws-recon.py");
+        write_passthrough_runner(&runner);
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+python3 - <<'PY'
+print('x' * (11 * 1024 * 1024))
+print('{"report":"reports/aws-recon/large","errors":[],"findings":[]}')
+PY
+"#,
+        );
+
+        let tool = AwsReconTool::with_runner(
+            readonly_catalog(),
+            "sha256:test",
+            &runner,
+            &script,
+            Some(dir),
+        );
+        let result = execute(&tool, json!({})).await;
+        let value: Value = serde_json::from_str(&result.content).expect("structured json");
+
+        assert!(result.is_error);
+        assert_eq!(value["reason"], "runner_output_parse_failed");
     }
 
     #[tokio::test]
@@ -692,6 +946,18 @@ exit 42
         let dir = std::env::temp_dir().join(format!("mu-{name}-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    fn write_passthrough_runner(path: &std::path::Path) {
+        write_executable(
+            path,
+            r#"#!/bin/sh
+shift
+[ "$1" = "--" ] || exit 2
+shift
+exec "$@"
+"#,
+        );
     }
 
     fn write_executable(path: &std::path::Path, content: &str) {

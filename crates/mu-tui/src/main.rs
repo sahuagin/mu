@@ -34,7 +34,9 @@ use crossterm::{
         KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
+    },
 };
 use ratatui::{
     backend::{Backend, CrosstermBackend},
@@ -2624,7 +2626,14 @@ fn main() -> Result<()> {
 
     let mut stdout = io::stdout();
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        // mu-1jq: set terminal title to μ - <username>. Honored by zellij
+        // (per-pane), kitty, tmux, foot, alacritty, etc. via OSC 0.
+        SetTitle(mu_terminal_title()),
+    )?;
     // mu-wd2: opt into the Kitty Keyboard Protocol so terminals that
     // support it (Kitty, Foot, WezTerm, modern Konsole, alacritty
     // with the right config) forward modifiers on keys that the
@@ -2648,11 +2657,23 @@ fn main() -> Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        // mu-1jq: empty title resets the terminal/pane title to default.
+        SetTitle(""),
     )?;
     terminal.show_cursor()?;
 
     res
+}
+
+/// mu-1jq: build the terminal title string, e.g. `μ - tcovert`. Set
+/// via crossterm's `SetTitle` (OSC 0); zellij renders as the pane
+/// title, kitty / tmux / foot / alacritty as the window title.
+/// `USER` env var with a stable fallback so the title is deterministic
+/// even when invoked in environments without `$USER` set.
+fn mu_terminal_title() -> String {
+    let user = std::env::var("USER").unwrap_or_else(|_| "agent".to_string());
+    format!("μ - {user}")
 }
 
 fn run<B: Backend>(
@@ -2778,7 +2799,13 @@ fn open_prompt_in_editor<B: Backend>(
     // 4. Reclaim the terminal. Order mirrors main()'s startup so the
     //    interactive surface comes back identical.
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        // mu-1jq: $EDITOR may have set its own title; re-set ours.
+        SetTitle(mu_terminal_title()),
+    )?;
     let _ = execute!(
         stdout,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)

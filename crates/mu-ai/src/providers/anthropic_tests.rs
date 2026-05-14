@@ -42,8 +42,20 @@ fn build_request_body_basics() {
     let body = build_request_body("claude-test", None, &messages, &[]);
     assert_eq!(body["model"], "claude-test");
     assert_eq!(body["stream"], true);
+    // Unknown model name falls back to the conservative 4096.
     assert_eq!(body["max_tokens"], 4096);
     assert_eq!(body["messages"][0]["role"], "user");
+}
+
+#[test]
+fn build_request_body_max_tokens_is_model_aware() {
+    // mu-ql2: real-model identifiers get their per-family ceiling so
+    // longer responses don't get prematurely truncated.
+    let messages = vec![AgentMessage::User { content: "hi".into() }];
+    let opus = build_request_body("claude-opus-4-7", None, &messages, &[]);
+    assert_eq!(opus["max_tokens"], 16384);
+    let haiku = build_request_body("claude-haiku-4-5", None, &messages, &[]);
+    assert_eq!(haiku["max_tokens"], 8192);
 }
 
 #[test]

@@ -201,7 +201,7 @@ pub(crate) fn build_request_body(
     let api_messages = translate_messages(messages);
     let mut body = json!({
         "model": model,
-        "max_tokens": 4096,
+        "max_tokens": super::output_limits::max_tokens_for_model(model),
         "stream": true,
         "messages": api_messages,
     });

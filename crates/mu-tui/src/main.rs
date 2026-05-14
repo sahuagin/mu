@@ -1995,7 +1995,12 @@ fn render_session_detail(f: &mut Frame, app: &mut App, area: Rect) {
     // we haven't fetched yet.
     let body_lines: Vec<Line> = if let Some(events) = app.transcript_events_by_sid.get(&sid) {
         let streaming_partial = app.streaming_text.get(&sid).map(String::as_str);
-        render_transcript_lines(events, streaming_partial)
+        // mu-2zs: compute the inner content width so push_block can
+        // pre-wrap each row, keeping the `│ ` border on every visual
+        // line. Outer block borders take 2 columns; the `│ ` prefix
+        // takes 2 more; leave a small visual gutter on the right.
+        let wrap_width = (chunks[1].width as usize).saturating_sub(5);
+        render_transcript_lines(events, streaming_partial, Some(wrap_width))
     } else {
         vec![
             Line::from(""),
@@ -2061,6 +2066,7 @@ fn render_session_detail(f: &mut Frame, app: &mut App, area: Rect) {
 fn render_transcript_lines(
     events: &[serde_json::Value],
     streaming_partial: Option<&str>,
+    wrap_width: Option<usize>,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(""));
@@ -2096,7 +2102,7 @@ fn render_transcript_lines(
                     .get("content")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                push_block(&mut lines, "you", Color::Cyan, content);
+                push_block(&mut lines, "you", Color::Cyan, content, wrap_width);
             }
             "assistant_message_event" => {
                 // AssistantMessage.content is Vec<ContentBlock> where
@@ -2147,10 +2153,11 @@ fn render_transcript_lines(
                             "assistant",
                             Color::White,
                             "(no text in this turn)",
+                            wrap_width,
                         );
                     }
                 } else {
-                    push_block(&mut lines, "assistant", Color::White, &text);
+                    push_block(&mut lines, "assistant", Color::White, &text, wrap_width);
                 }
             }
             "tool_call" => {
@@ -2190,6 +2197,7 @@ fn render_transcript_lines(
                     &format!("tool: {name}"),
                     Color::Magenta,
                     &body,
+                    wrap_width,
                 );
             }
             "tool_result" => {
@@ -2213,7 +2221,7 @@ fn render_transcript_lines(
             }
             "error" => {
                 let msg = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                push_block(&mut lines, "ERROR", Color::Red, msg);
+                push_block(&mut lines, "ERROR", Color::Red, msg, wrap_width);
             }
             "session_created"
             | "callout"
@@ -2240,30 +2248,111 @@ fn render_transcript_lines(
 
     if let Some(partial) = streaming_partial {
         if !partial.is_empty() {
-            push_block(&mut lines, "assistant (streaming…)", Color::Yellow, partial);
+            push_block(
+                &mut lines,
+                "assistant (streaming…)",
+                Color::Yellow,
+                partial,
+                wrap_width,
+            );
         }
     }
 
     lines
 }
 
-fn push_block(out: &mut Vec<Line<'static>>, label: &str, color: Color, body: &str) {
+fn push_block(
+    out: &mut Vec<Line<'static>>,
+    label: &str,
+    color: Color,
+    body: &str,
+    wrap_width: Option<usize>,
+) {
     out.push(Line::from(Span::styled(
         format!("┌─ {label} "),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )));
     for raw_line in body.lines() {
-        // Wrap is handled by the outer Paragraph widget; just indent.
-        out.push(Line::from(vec![
-            Span::styled("│ ", Style::default().fg(color)),
-            Span::raw(raw_line.to_string()),
-        ]));
+        // mu-2zs: if a wrap width is available, pre-wrap each raw line
+        // into multiple visual rows. Without this, the outer Paragraph's
+        // Wrap { trim: false } wraps each Line, but the wrapped
+        // continuation rows lose the `│ ` prefix — visually the
+        // bordered block "escapes" on long content. Pre-wrapping here
+        // keeps every visible row anchored inside the box.
+        match wrap_width {
+            Some(w) if w > 0 => {
+                for visual_row in wrap_body_line(raw_line, w) {
+                    out.push(Line::from(vec![
+                        Span::styled("│ ", Style::default().fg(color)),
+                        Span::raw(visual_row),
+                    ]));
+                }
+            }
+            _ => {
+                out.push(Line::from(vec![
+                    Span::styled("│ ", Style::default().fg(color)),
+                    Span::raw(raw_line.to_string()),
+                ]));
+            }
+        }
     }
     out.push(Line::from(Span::styled(
         "└─".to_string(),
         Style::default().fg(color),
     )));
     out.push(Line::from(""));
+}
+
+/// mu-2zs: word-aware wrap of `line` to fit `width` columns. Long
+/// words that exceed `width` are split mid-word so we always make
+/// progress. Returns a Vec of strings, one per visual row.
+///
+/// Char-based width (not grapheme/unicode-width) for simplicity; this
+/// over-counts for combining marks and under-counts for CJK wide
+/// characters, but the failure mode is only "wraps one column early
+/// or late" which is much milder than the bug it replaces (continuation
+/// rows escaping the bordered block entirely).
+fn wrap_body_line(line: &str, width: usize) -> Vec<String> {
+    if line.chars().count() <= width {
+        return vec![line.to_string()];
+    }
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0usize;
+    for word in line.split_inclusive(' ') {
+        let word_len = word.chars().count();
+        if current_len + word_len <= width {
+            current.push_str(word);
+            current_len += word_len;
+            continue;
+        }
+        // Word doesn't fit on the current row.
+        if !current.is_empty() {
+            rows.push(std::mem::take(&mut current));
+            current_len = 0;
+        }
+        if word_len <= width {
+            current.push_str(word);
+            current_len = word_len;
+        } else {
+            // Single word longer than width — split on char boundaries.
+            for ch in word.chars() {
+                if current_len + 1 > width {
+                    rows.push(std::mem::take(&mut current));
+                    current_len = 0;
+                }
+                current.push(ch);
+                current_len += 1;
+            }
+        }
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
 }
 
 /// F8 — Events explorer. Full-screen scrollable view of the
@@ -2901,4 +2990,59 @@ fn open_prompt_in_editor<B: Backend>(
     //    overwrite whatever's left.
     let _ = std::fs::remove_file(&path);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// mu-2zs: short lines should not wrap (returned as a single row).
+    #[test]
+    fn wrap_short_line_returns_single_row() {
+        let rows = wrap_body_line("hello world", 80);
+        assert_eq!(rows, vec!["hello world".to_string()]);
+    }
+
+    /// mu-2zs: lines longer than width break at word boundaries.
+    #[test]
+    fn wrap_word_boundary() {
+        let rows = wrap_body_line("alpha beta gamma delta", 12);
+        assert_eq!(rows.len(), 2);
+        // First row is full words up to width; second is the remainder.
+        assert!(rows[0].chars().count() <= 12);
+        assert!(rows[1].chars().count() <= 12);
+        // No words are split across rows.
+        let recombined = rows.join("").trim().to_string();
+        assert_eq!(recombined, "alpha beta gamma delta");
+    }
+
+    /// mu-2zs: a single word longer than width is split mid-character.
+    #[test]
+    fn wrap_long_word_splits_mid_char() {
+        let rows = wrap_body_line("abcdefghijklmnopqrstuv", 8);
+        assert!(rows.len() >= 2);
+        for r in &rows {
+            assert!(r.chars().count() <= 8);
+        }
+        let recombined: String = rows.concat();
+        assert_eq!(recombined, "abcdefghijklmnopqrstuv");
+    }
+
+    /// mu-2zs: width 0 (degenerate) shouldn't panic; the caller is
+    /// expected to disable wrapping via `None` in that case, but this
+    /// guards against the regression.
+    #[test]
+    fn wrap_zero_width_returns_input_unchanged() {
+        // wrap_body_line is only invoked when wrap_width > 0; this
+        // confirms the loop's invariant doesn't panic if called with 0.
+        let rows = wrap_body_line("x", 0);
+        // With width 0, no chars fit; the function returns an empty
+        // string row plus the single char on its own row. Acceptable
+        // pathological behavior.
+        assert!(!rows.is_empty());
+        // No row exceeds whatever width we'd interpret; the key
+        // assertion is "no panic."
+        let recombined: String = rows.concat();
+        assert_eq!(recombined, "x");
+    }
 }

@@ -1583,7 +1583,7 @@ impl CompactionPolicy for EvictHalfPolicy {
             decisions,
             tokens_before: 0,
             tokens_after: 0,
-            wall_clock_ms: 0,
+            wall_clock_us: 0,
         }
     }
 

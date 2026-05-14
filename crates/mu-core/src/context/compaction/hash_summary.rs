@@ -250,13 +250,13 @@ impl CompactionPolicy for HashAndSummaryPolicy {
             generated_at_unix_ms(),
         );
 
-        let wall_clock_ms = elapsed_ms(start);
+        let wall_clock_us = elapsed_ms(start);
         CompactionResult {
             rope: new_rope,
             decisions,
             tokens_before: estimate_tokens(spans),
             tokens_after: 0, // recomputed below
-            wall_clock_ms,
+            wall_clock_us,
         }
         .with_tokens_after_recomputed()
     }
@@ -462,29 +462,28 @@ fn failed(rope: &RetainedRope, reason: String, start: Instant) -> CompactionResu
         decisions: vec![CompactionDecision::Failed { reason }],
         tokens_before: estimate_tokens(rope.spans()),
         tokens_after: estimate_tokens(rope.spans()),
-        wall_clock_ms: elapsed_ms(start),
+        wall_clock_us: elapsed_ms(start),
     }
 }
 
 fn elapsed_ms(start: Instant) -> u64 {
     let d = start.elapsed();
-    d.as_millis().min(u64::MAX as u128) as u64
+    d.as_micros().min(u64::MAX as u128) as u64
 }
 
 fn generated_at_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+        .map(|d| d.as_micros().min(u64::MAX as u128) as u64)
         .unwrap_or(0)
 }
 
-/// Cheap byte-count proxy for tokens. The agent loop owns the real
-/// tokenizer; for the policy's metrics surface we just want an
-/// order-of-magnitude marker so callers see "compaction dropped N%
-/// of bytes" without us depending on tokenizer crates.
-fn estimate_tokens(spans: &[Span]) -> usize {
-    spans.iter().map(|s| s.content.len()).sum::<usize>() / 4
-}
+/// Cross-policy shared estimator (delegates to
+/// [`super::estimate_tokens`]). Local re-export so call sites in this
+/// module stay terse; semantics are owned by the parent module so
+/// heuristic + hash-summary report comparable numbers in benchmarks
+/// (mu-kgu.5 metrics-cleanup).
+use super::estimate_tokens;
 
 impl CompactionResult {
     /// Internal helper: recompute `tokens_after` from the actual

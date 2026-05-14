@@ -239,7 +239,7 @@ pub enum AgentEvent {
         /// [`CompactionDecision`]: crate::context::CompactionDecision
         decisions_count: u32,
         /// Wall-clock duration of `policy.compact()` in milliseconds.
-        wall_clock_ms: u64,
+        wall_clock_us: u64,
     },
     /// Provider-call lifecycle marker (mu-035 Phase A). Emitted on
     /// state transitions; Phase B will additionally emit periodic
@@ -828,7 +828,7 @@ async fn run(
                             tokens_before: pre_compaction_tokens,
                             tokens_after: renderer.estimate_tokens(&result.rope),
                             decisions_count: result.decisions.len() as u32,
-                            wall_clock_ms: result.wall_clock_ms,
+                            wall_clock_us: result.wall_clock_us,
                         })
                         .await;
                     result.rope

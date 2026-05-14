@@ -23,6 +23,8 @@ pub mod capability;
 pub mod context;
 pub mod event_log;
 pub mod protocol;
+pub mod skill;
+pub mod tool_registry;
 pub mod transport;
 pub mod usage_history;
 

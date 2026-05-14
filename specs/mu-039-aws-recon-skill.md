@@ -156,7 +156,8 @@ Input:
 ```jsonc
 {
   "capability": "aws.scout.readonly",   // default from skill activation
-  "call_timeout_secs": 45,
+  "call_timeout_secs": 45,             // per AWS CLI call inside the runner
+  "runner_timeout_secs": null,          // optional outer subprocess timeout
   "output_dir": null                    // optional; default ignored reports dir
 }
 ```
@@ -305,7 +306,36 @@ context led to that call?
     $MU_AWS_RECON_SCRIPT --call-timeout <n> [--out-dir <dir>]
   ```
 
-- Return report/artifact paths and runner stdout summary metadata.
+- `call_timeout_secs` remains the per-AWS-call timeout passed to the recon
+  script. Mu also enforces an outer `runner_timeout_secs` on the subprocess so a
+  buggy runner cannot wedge the daemon; if omitted, it is derived from the per-
+  call timeout and expected recon call count.
+- Runner stdout/stderr capture is bounded. Excess output is drained but not kept
+  in memory, and result metadata records whether capture was truncated.
+- Runner success output must include a JSON summary with at least:
+  - non-empty string `report`;
+  - array `errors`;
+  - array `findings`.
+- Return report/artifact paths and runner stdout summary metadata using this
+  result shape:
+
+  ```jsonc
+  {
+    "kind": "aws_recon_report",
+    "mode": "runner",
+    "report_dir": "reports/aws-recon/20260514T...Z",
+    "summary_path": "reports/aws-recon/20260514T...Z/summary.json",
+    "capability": "aws.scout.readonly",
+    "call_timeout_secs": 45,
+    "runner_timeout_secs": 930,
+    "catalog_digest": "sha256:...",
+    "audit": { "capability": "aws.scout.readonly", "aws_profile": "...", "role_arn": "..." },
+    "runner": { "path": ".../mu-aws-capability-run.sh", "script": ".../aws-recon.py" },
+    "stdout_summary": { "report": "reports/aws-recon/...", "errors": [], "findings": [] },
+    "output_capture": { "stdout_truncated": false, "stderr_truncated": false, "limit_bytes": 10485760 }
+  }
+  ```
+
 - Keep live AWS tests opt-in/manual; CI remains fixture/mock-runner only.
 
 ### Phase D — audit join

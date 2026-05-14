@@ -53,6 +53,12 @@ pub enum Message {
 const STDERR_BUF_CAP: usize = 8000;
 
 pub struct MuClient {
+    /// RAII handle for the spawned `mu serve` child. Held for the
+    /// lifetime of the client; `close()` consumes it for cooperative
+    /// shutdown (cooperative-then-SIGKILL fallback). Tokio's `Child`
+    /// does NOT kill on drop, so without explicit close() the daemon
+    /// outlives the client — see ping/close below.
+    #[allow(dead_code)]
     child: Child,
     stdin: ChildStdin,
     rx: mpsc::Receiver<Message>,
@@ -286,12 +292,20 @@ impl MuClient {
     }
 
     /// Ping check. Returns true if the daemon answers within `timeout`.
+    ///
+    /// Not yet wired to the TUI's liveness path — held as the protocol
+    /// hook for future health-check integration.
+    #[allow(dead_code)]
     pub fn ping(&mut self, timeout: Duration) -> bool {
         self.request_with_timeout("ping", Value::Object(Default::default()), timeout)
             .is_ok()
     }
 
     /// Shut the daemon down cooperatively (close stdin → exit).
+    ///
+    /// Not yet wired to the TUI's exit path — daemon currently outlives
+    /// the TUI session. Wiring at TUI shutdown is a future TUI bead.
+    #[allow(dead_code)]
     pub fn close(mut self) {
         // Dropping stdin would close the pipe; just be explicit.
         drop(self.stdin);

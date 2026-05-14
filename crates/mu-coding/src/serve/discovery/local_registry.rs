@@ -123,13 +123,15 @@ mod tests {
         let cap = Arc::new(Mutex::new(Capability::root()));
         sessions.insert(
             id.to_string(),
-            tx,
-            forwarder,
-            agent,
-            log.clone(),
-            approvals,
-            parent,
-            cap,
+            crate::serve::sessions::NewSession {
+                input_tx: tx,
+                forwarder,
+                agent,
+                event_log: log.clone(),
+                pending_approvals: approvals,
+                parent_session_id: parent,
+                capability: cap,
+            },
         );
         log
     }

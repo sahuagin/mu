@@ -163,7 +163,7 @@ async fn main() -> Result<()> {
             bash_allow,
             bash_prompt,
         } => {
-            mu_coding::ask::run(
+            mu_coding::ask::run(mu_coding::ask::AskOptions {
                 prompt,
                 provider,
                 model,
@@ -173,7 +173,7 @@ async fn main() -> Result<()> {
                 bash_yolo,
                 bash_allow,
                 bash_prompt,
-            )
+            })
             .await
         }
         Command::Login { provider } => run_login(&provider).await,

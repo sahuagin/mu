@@ -138,6 +138,10 @@ impl SessionStatus {
 struct ProviderStatusSnapshot {
     state: String, // serialized ProviderStatusKind: "awaiting_first_token" | ...
     elapsed_ms: u64,
+    /// Bytes received from the provider so far. Held for wire-format parity
+    /// with mu-035's provider_status notification; the TUI renders only
+    /// state + elapsed_ms today. mu-pex (metrics framework) will consume this.
+    #[allow(dead_code)]
     bytes_received: Option<u64>,
     tool_call_id: Option<String>,
     /// When this snapshot was received locally. Used to age out

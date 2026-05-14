@@ -589,6 +589,18 @@ The `--exclude-dynamic-system-prompt-sections` flag (claude-code 2.1.139, observ
 
 The `--bare` flag is the same idea expressed differently — a different *initial retention set* (drop pointers to hooks/LSP/CLAUDE.md/auto-memory/plugin-sync). Not a different code path; just a different policy.
 
+### Composition with compaction (mu-kgu.6)
+
+Compaction policies operate on the rope and produce a new rope. The cache strategy then re-runs on that post-compaction rope. The two surfaces compose under a single load-bearing invariant:
+
+> **Compaction-cache composition invariant.** After any `CompactionPolicy::compact` returns, running `CacheStrategy::boundaries` on the resulting rope places its boundary AT OR AFTER the position of the last span in the post-compaction rope that is either (a) kept verbatim from the pre-rope AND itself stable + cacheable, or (b) a newly-inserted `SpanKind::CompactionSummary` span. Compaction NEVER shrinks the cacheable prefix below the post-rope's kept-stable span set; it MAY EXTEND the prefix when a Pinned summary span replaces a volatile span that previously truncated it.
+
+The structural reason it holds: `HashAndSummaryPolicy::surgery` (mu-kgu.3) emits `CompactionSummary` spans with `RetentionClass::Pinned`, and the `Span::new` convenience constructor sets `cacheable = retention.is_stable()`, so summary spans are stable + cacheable by construction. A volatile span in the middle of the pre-rope that used to truncate the cacheable prefix becomes a Pinned summary in the post-rope, healing the hole.
+
+Consequence: compaction has a second job beyond saving tokens. It can transform a rope whose cacheable prefix was fractured by interior volatile spans into one whose entire kept tail is a fresh cache prefix — so the *next* ask pays one cache-creation cost and then enjoys cache hits.
+
+Regression coverage lives in `crates/mu-ai/src/context/compaction_cache_tests.rs` and runs under `cargo test -p mu-ai`. The tests assert: drop-tail extends boundary to summary; absorb-volatile-prefix CREATES a cacheable prefix where none existed; absorb-interior heals the truncation; keep-all leaves boundary unchanged; absorb-all yields a single Pinned summary with boundary at index 0. A property sweep asserts the invariant across all five shapes.
+
 ## Pluggable cache and provider strategies
 
 Two orthogonal extensibility points emerge from the cache-boundary section:

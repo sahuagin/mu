@@ -51,7 +51,9 @@ fn build_request_body_basics() {
 fn build_request_body_max_tokens_is_model_aware() {
     // mu-ql2: real-model identifiers get their per-family ceiling so
     // longer responses don't get prematurely truncated.
-    let messages = vec![AgentMessage::User { content: "hi".into() }];
+    let messages = vec![AgentMessage::User {
+        content: "hi".into(),
+    }];
     let opus = build_request_body("claude-opus-4-7", None, &messages, &[]);
     assert_eq!(opus["max_tokens"], 16384);
     let haiku = build_request_body("claude-haiku-4-5", None, &messages, &[]);

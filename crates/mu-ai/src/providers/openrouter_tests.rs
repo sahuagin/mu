@@ -125,7 +125,9 @@ fn b6_build_request_body_includes_tools() {
 #[test]
 fn b6c_build_request_body_max_tokens_is_model_aware() {
     // mu-ql2: real-model identifiers get their per-family ceiling.
-    let messages = vec![AgentMessage::User { content: "hi".into() }];
+    let messages = vec![AgentMessage::User {
+        content: "hi".into(),
+    }];
     let gpt5 = build_request_body("gpt-5", None, &messages, &[]);
     assert_eq!(gpt5["max_tokens"], 16384);
 }

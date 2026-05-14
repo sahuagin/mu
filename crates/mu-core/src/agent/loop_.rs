@@ -460,6 +460,12 @@ async fn run(
     // emitted in Done, reset on Done emit. Cumulative across turns
     // within one ask_session; resets per ask.
     let mut aggregated_usage: Option<Usage> = None;
+    // mu-s5h: latest per-turn stop_reason from the provider. Threaded
+    // into the natural-completion Done emissions so MaxTokens /
+    // StopSequence aren't silently collapsed to EndTurn. Set on every
+    // successful turn; consumed via .take() on Done emit alongside
+    // aggregated_usage.
+    let mut last_stop_reason: Option<StopReason> = None;
     let mut started_at: Option<Instant> = None;
     // Per-ask tool-history. Used by the RetryPolicy::Never enforcement
     // path in handle_execute_tools. Reset on Done.
@@ -652,6 +658,10 @@ async fn run(
                     started_at = None;
                     turn_count = 0;
                     tool_history.clear();
+                    // mu-s5h: clear stale per-turn signal so the next
+                    // ask in this session starts with no inherited
+                    // stop_reason from the iteration-capped one.
+                    last_stop_reason = None;
                     // Drop any remaining queue entries for this ask
                     // (e.g. tool calls the model was about to make).
                     queue.clear();
@@ -699,6 +709,7 @@ async fn run(
                                 None => u,
                             });
                         }
+                        last_stop_reason = Some(assistant_msg.stop_reason);
                         let assistant = AgentMessage::Assistant(assistant_msg.clone());
                         let _ = events
                             .send(AgentEvent::MessageStart {
@@ -745,6 +756,9 @@ async fn run(
                         started_at = None;
                         turn_count = 0;
                         tool_history.clear();
+                        // mu-s5h: Aborted overrides any prior per-turn
+                        // stop_reason; clear so the next ask starts fresh.
+                        last_stop_reason = None;
                         queue.clear();
                         continue;
                     }
@@ -812,6 +826,9 @@ async fn run(
                         started_at = None;
                         turn_count = 0;
                         tool_history.clear();
+                        // mu-s5h: Aborted overrides any prior per-turn
+                        // stop_reason; clear so the next ask starts fresh.
+                        last_stop_reason = None;
                         queue.clear();
                         continue;
                     }
@@ -988,9 +1005,13 @@ async fn run(
                             .await;
                         mode = RunMode::Idle;
                         let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
+                        // mu-s5h: prefer the last per-turn stop_reason
+                        // over a hardcoded EndTurn so MaxTokens etc.
+                        // survive the projection into Done.
+                        let stop_reason = last_stop_reason.take().unwrap_or(StopReason::EndTurn);
                         let _ = events
                             .send(AgentEvent::Done {
-                                stop_reason: StopReason::EndTurn,
+                                stop_reason,
                                 turn_count,
                                 usage: aggregated_usage.take(),
                                 elapsed_ms,
@@ -1039,9 +1060,13 @@ async fn run(
                 // (clean exit), cancel arrives, or an unrecoverable
                 // error fires — handled outside this arm.
                 let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
+                // mu-s5h: prefer the last per-turn stop_reason over a
+                // hardcoded EndTurn so MaxTokens etc. survive the
+                // projection into Done.
+                let stop_reason = last_stop_reason.take().unwrap_or(StopReason::EndTurn);
                 let _ = events
                     .send(AgentEvent::Done {
-                        stop_reason: StopReason::EndTurn,
+                        stop_reason,
                         turn_count,
                         usage: aggregated_usage.take(),
                         elapsed_ms,

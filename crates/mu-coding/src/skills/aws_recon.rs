@@ -115,9 +115,9 @@ fn activation_span(
         }],
         "tool_schemas": [tool_spec.name],
         "runner": {
-            "mode": "fixture",
-            "live_aws": false,
-            "subprocess": false,
+            "mode": "tool_runtime_configured",
+            "live_aws": null,
+            "subprocess": null,
         },
         "audit": {
             "mu_session_id": null,
@@ -208,8 +208,8 @@ mod tests {
         );
         assert_eq!(content["materialized_caps"][0]["mutation_allowed"], false);
         assert_eq!(content["tool_schemas"], json!(["aws_recon"]));
-        assert_eq!(content["runner"]["mode"], "fixture");
-        assert_eq!(content["runner"]["live_aws"], false);
+        assert_eq!(content["runner"]["mode"], "tool_runtime_configured");
+        assert_eq!(content["runner"]["live_aws"], Value::Null);
     }
 
     #[test]

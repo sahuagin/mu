@@ -90,6 +90,31 @@ pub fn assemble_rope(
     RetainedRope::from_spans(spans)
 }
 
+/// mu-kgu.8: extend a baseline rope with spans for messages that
+/// were appended since the baseline was captured.
+///
+/// `baseline` was produced by a synchronous or background
+/// [`crate::context::CompactionPolicy::compact`] call against the
+/// first `messages_at_baseline` messages. The agent loop's per-turn
+/// render needs the full conversation up to the current turn, so any
+/// messages appended since the baseline are appended as fresh spans
+/// with indices continuing from `messages_at_baseline`.
+///
+/// Span ids continue the `msg-{idx}-...` scheme from
+/// [`assemble_rope`] so there's no collision with the baseline rope's
+/// existing spans (those have indices `[0, messages_at_baseline)`).
+pub fn append_messages_to_baseline(
+    baseline: &RetainedRope,
+    messages_at_baseline: usize,
+    messages: &[AgentMessage],
+) -> RetainedRope {
+    let mut spans: Vec<Span> = baseline.spans().to_vec();
+    for (offset, message) in messages.iter().enumerate().skip(messages_at_baseline) {
+        spans.push(message_to_span(offset, message));
+    }
+    RetainedRope::from_spans(spans)
+}
+
 fn message_to_span(idx: usize, message: &AgentMessage) -> Span {
     match message {
         AgentMessage::User { content } => Span {

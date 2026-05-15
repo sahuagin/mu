@@ -121,6 +121,23 @@ pub trait CompactionPolicy: Send + Sync {
     fn policy_label(&self) -> &'static str {
         "compaction-policy"
     }
+
+    /// mu-kgu.8: opt into the background-worker compaction path.
+    ///
+    /// Default `false` — the agent loop runs `compact()` synchronously
+    /// inline, matching mu-kgu.4 behavior. Policies that perform
+    /// network I/O (e.g. [`hash_summary::HashAndSummaryPolicy`] with a
+    /// `ProviderJudge`) SHOULD override to `true`: the agent loop
+    /// wraps the call in `tokio::spawn`, continues the foreground
+    /// turn with the un-compacted rope, and applies the result on a
+    /// subsequent turn.
+    ///
+    /// Tradeoff: turns 1-2 after threshold-cross see the un-compacted
+    /// rope. Set thresholds at least 2-3 turns' worth of growth
+    /// below the model's hard context limit when enabling this path.
+    fn is_async(&self) -> bool {
+        false
+    }
 }
 
 /// The return type of [`CompactionPolicy::compact`].
@@ -242,6 +259,202 @@ impl CompactionPolicy for NoCompactionPolicy {
 
     fn policy_label(&self) -> &'static str {
         "no-compaction"
+    }
+}
+
+// ============================================================================
+// mu-kgu.8: background-worker compaction
+// ============================================================================
+//
+// Bounds how often background compaction can fire and how long any one
+// attempt is allowed to run. Inspired by pi_agent_rust's
+// CompactionWorker quota shape (~/src/flywheel/pi_agent_rust/src/compaction_worker.rs).
+
+/// Per-session quota for background compaction attempts.
+#[derive(Debug, Clone, Copy)]
+pub struct CompactionQuota {
+    /// Minimum elapsed time between successive `start` calls.
+    /// Prevents runaway: even if the policy reports `is_async = true`
+    /// on every turn, we won't fire more often than this.
+    pub cooldown: std::time::Duration,
+    /// Wall-clock cap on a single in-flight background compaction.
+    /// Reached → the agent loop abandons the result and clears the
+    /// pending handle (fail-closed: no compaction this round).
+    pub timeout: std::time::Duration,
+    /// Hard cap on total successful starts per session. Catches a
+    /// degenerate "compact forever" loop without a kill-switch.
+    pub max_attempts_per_session: u32,
+}
+
+impl Default for CompactionQuota {
+    fn default() -> Self {
+        // Matches pi_agent_rust defaults; both daemons hit Anthropic
+        // or OpenRouter-class endpoints with similar latency budgets.
+        Self {
+            cooldown: std::time::Duration::from_secs(60),
+            timeout: std::time::Duration::from_secs(120),
+            max_attempts_per_session: 100,
+        }
+    }
+}
+
+/// Per-session state machine for the background-compaction path.
+///
+/// The agent loop calls [`Self::can_start`] before deciding whether
+/// to invoke an async policy synchronously (fallback) or spawn it on
+/// the background path. After a successful spawn via
+/// [`Self::start`], subsequent turns call [`Self::try_take`] to
+/// non-blockingly poll for completion. The result is then applied to
+/// the next render via [`crate::context::append_messages_to_baseline`].
+///
+/// Designed for in-process per-session use. NOT cross-session; the
+/// daemon-wide tracker mu-iwq Phase D introduced (in mu-coding) is a
+/// separate concern.
+pub struct BackgroundCompactionState {
+    pending: Option<PendingCompaction>,
+    quota: CompactionQuota,
+    last_start: Option<std::time::Instant>,
+    attempt_count: u32,
+}
+
+struct PendingCompaction {
+    handle: tokio::task::JoinHandle<CompactionResult>,
+    started_at: std::time::Instant,
+    /// Snapshot of `messages.len()` at spawn time — the rope
+    /// baseline produced by this compaction covers the first N
+    /// messages; the agent loop appends spans for messages added
+    /// since then via [`append_messages_to_baseline`].
+    messages_at_spawn: usize,
+}
+
+impl std::fmt::Debug for BackgroundCompactionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackgroundCompactionState")
+            .field("pending", &self.pending.is_some())
+            .field("quota", &self.quota)
+            .field("attempt_count", &self.attempt_count)
+            .finish()
+    }
+}
+
+/// Output of [`BackgroundCompactionState::try_take`]: a completed
+/// compaction is paired with the snapshot of `messages.len()` taken at
+/// spawn time so the agent loop knows which suffix to append.
+#[derive(Debug)]
+pub struct CompletedBackgroundCompaction {
+    pub result: CompactionResult,
+    pub messages_at_spawn: usize,
+}
+
+impl BackgroundCompactionState {
+    pub fn new(quota: CompactionQuota) -> Self {
+        Self {
+            pending: None,
+            quota,
+            last_start: None,
+            attempt_count: 0,
+        }
+    }
+
+    /// Whether a new background compaction is allowed to start now.
+    /// False if another is in flight, the cooldown hasn't elapsed,
+    /// or we've hit the per-session attempt cap.
+    pub fn can_start(&self) -> bool {
+        if self.pending.is_some() {
+            return false;
+        }
+        if self.attempt_count >= self.quota.max_attempts_per_session {
+            return false;
+        }
+        if let Some(last) = self.last_start {
+            if last.elapsed() < self.quota.cooldown {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Spawn the policy on a tokio task. Caller must already have
+    /// confirmed [`Self::can_start`]; debug_assert in case it didn't.
+    ///
+    /// `policy` is cloned into the task. `rope_snapshot` is the
+    /// baseline rope the task will compact; it's intentionally owned,
+    /// not borrowed, because the task outlives the caller's stack.
+    /// `target_tokens` is the post-compaction target. `messages_len`
+    /// is the snapshot of `messages.len()` at spawn time — recorded
+    /// so the agent loop can append later-added message spans on
+    /// apply (see [`crate::context::append_messages_to_baseline`]).
+    pub fn start(
+        &mut self,
+        policy: std::sync::Arc<dyn CompactionPolicy>,
+        rope_snapshot: RetainedRope,
+        target_tokens: usize,
+        messages_len: usize,
+    ) {
+        debug_assert!(
+            self.can_start(),
+            "start() called while can_start() is false",
+        );
+        let handle = tokio::spawn(async move {
+            // The policy's compact() is synchronous; the task simply
+            // wraps it. For Provider-backed judges, ProviderJudge
+            // does its own dedicated-thread runtime spawn internally
+            // (see mu-kgu.11's provider_judge module), so we don't
+            // need block_in_place here.
+            policy.compact(&rope_snapshot, target_tokens)
+        });
+        let now = std::time::Instant::now();
+        self.pending = Some(PendingCompaction {
+            handle,
+            started_at: now,
+            messages_at_spawn: messages_len,
+        });
+        self.last_start = Some(now);
+        self.attempt_count = self.attempt_count.saturating_add(1);
+    }
+
+    /// Non-blocking poll. Returns:
+    /// - `Some(Some(completion))` when a pending compaction has
+    ///   finished and the agent loop should adopt its result.
+    /// - `Some(None)` when a pending compaction exceeded the quota
+    ///   timeout and was abandoned. The agent loop should record that
+    ///   no compaction was applied (fail-closed); subsequent turns
+    ///   are free to attempt again once the cooldown elapses.
+    /// - `None` when nothing is pending OR the in-flight task is
+    ///   still running and within the timeout.
+    pub async fn try_take(&mut self) -> Option<Option<CompletedBackgroundCompaction>> {
+        let pending = self.pending.as_ref()?;
+        if pending.started_at.elapsed() > self.quota.timeout {
+            if let Some(p) = self.pending.take() {
+                p.handle.abort();
+            }
+            return Some(None);
+        }
+        if !pending.handle.is_finished() {
+            return None;
+        }
+        let pending = self.pending.take()?;
+        match pending.handle.await {
+            Ok(result) => Some(Some(CompletedBackgroundCompaction {
+                result,
+                messages_at_spawn: pending.messages_at_spawn,
+            })),
+            // Task panicked or was aborted — surface as "no compaction
+            // this round" rather than crashing the session.
+            Err(_) => Some(None),
+        }
+    }
+
+    pub fn attempt_count(&self) -> u32 {
+        self.attempt_count
+    }
+}
+
+impl Drop for BackgroundCompactionState {
+    fn drop(&mut self) {
+        if let Some(p) = self.pending.take() {
+            p.handle.abort();
+        }
     }
 }
 
@@ -404,4 +617,98 @@ mod tests {
     // the real heuristic impl in [`super::heuristic`], and mu-kgu.3
     // landed the real hash+summary impl in [`super::hash_summary`].
     // Each policy's real-impl tests live alongside its module.
+
+    // ── mu-kgu.8 ────────────────────────────────────────────────
+
+    /// Mock async policy: reports `is_async = true` and shrinks the
+    /// rope to its first span. Used to drive BackgroundCompactionState
+    /// tests deterministically.
+    #[derive(Debug, Default)]
+    struct AsyncShrinkPolicy;
+
+    impl CompactionPolicy for AsyncShrinkPolicy {
+        fn compact(&self, rope: &RetainedRope, _target_tokens: usize) -> CompactionResult {
+            let kept: Vec<Span> = rope.spans().iter().take(1).cloned().collect();
+            CompactionResult {
+                rope: RetainedRope::from_spans(kept),
+                decisions: vec![],
+                tokens_before: 1000,
+                tokens_after: 100,
+                wall_clock_us: 1,
+            }
+        }
+        fn policy_label(&self) -> &'static str {
+            "async-shrink-test"
+        }
+        fn is_async(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn default_quota_matches_pi_shape() {
+        let q = CompactionQuota::default();
+        assert_eq!(q.cooldown, std::time::Duration::from_secs(60));
+        assert_eq!(q.timeout, std::time::Duration::from_secs(120));
+        assert_eq!(q.max_attempts_per_session, 100);
+    }
+
+    #[test]
+    fn fresh_bg_state_can_start() {
+        let s = BackgroundCompactionState::new(CompactionQuota::default());
+        assert!(s.can_start());
+        assert_eq!(s.attempt_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn bg_state_start_then_try_take_yields_result_on_next_poll() {
+        let mut s = BackgroundCompactionState::new(CompactionQuota::default());
+        let rope = sample_rope();
+        let policy: std::sync::Arc<dyn CompactionPolicy> = std::sync::Arc::new(AsyncShrinkPolicy);
+        s.start(policy, rope.clone(), 100, 5);
+        assert!(!s.can_start(), "should be blocked while pending");
+        // Let the spawned task run.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let outcome = s.try_take().await.expect("a completion outcome");
+        let complete = outcome.expect("not a timeout");
+        assert_eq!(complete.messages_at_spawn, 5);
+        // Policy keeps just the first span.
+        assert_eq!(complete.result.rope.spans().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bg_state_cooldown_blocks_start() {
+        let quota = CompactionQuota {
+            cooldown: std::time::Duration::from_secs(3600),
+            ..CompactionQuota::default()
+        };
+        let mut s = BackgroundCompactionState::new(quota);
+        let rope = sample_rope();
+        let policy: std::sync::Arc<dyn CompactionPolicy> = std::sync::Arc::new(AsyncShrinkPolicy);
+        s.start(policy, rope.clone(), 100, 0);
+        // Drain the result so pending is None.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = s.try_take().await;
+        // Now pending is gone but cooldown is enormous.
+        assert!(
+            !s.can_start(),
+            "long cooldown should prevent immediate re-start"
+        );
+    }
+
+    #[tokio::test]
+    async fn bg_state_max_attempts_blocks_start() {
+        let quota = CompactionQuota {
+            cooldown: std::time::Duration::from_millis(0),
+            max_attempts_per_session: 1,
+            ..CompactionQuota::default()
+        };
+        let mut s = BackgroundCompactionState::new(quota);
+        let rope = sample_rope();
+        let policy: std::sync::Arc<dyn CompactionPolicy> = std::sync::Arc::new(AsyncShrinkPolicy);
+        s.start(policy.clone(), rope.clone(), 100, 0);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = s.try_take().await;
+        assert!(!s.can_start(), "max_attempts_per_session=1 should block");
+    }
 }

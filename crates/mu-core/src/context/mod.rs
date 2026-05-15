@@ -40,9 +40,12 @@ pub mod event;
 pub mod renderer;
 pub mod rope;
 
-pub use assembly::assemble_rope;
+pub use assembly::{append_messages_to_baseline, assemble_rope};
 pub use cache::{CacheBoundary, CacheStrategy, NoCacheStrategy};
-pub use compaction::{CompactionDecision, CompactionPolicy, CompactionResult, NoCompactionPolicy};
+pub use compaction::{
+    BackgroundCompactionState, CompactionDecision, CompactionPolicy, CompactionQuota,
+    CompactionResult, NoCompactionPolicy,
+};
 pub use event::RopeEvent;
 pub use renderer::{
     CacheMarker, FauxProviderRenderer, ProjectionTarget, ProviderMessage, ProviderMessages,

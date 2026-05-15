@@ -51,6 +51,7 @@
 //! - **`config_set` events** on the event log. The
 //!   "config-changes-as-events" unification is a follow-up.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -71,6 +72,8 @@ pub struct Config {
     pub ui: UiConfig,
     /// `[budget]` — soft daily/weekly warning thresholds.
     pub budget: BudgetConfig,
+    /// `[auth]` — connect-time SASL-shaped handshake config (mu-7rk).
+    pub auth: AuthConfig,
 }
 
 /// `[compaction]` section. Maps to the agent loop's threshold-cross
@@ -225,6 +228,59 @@ impl Default for TuiConfig {
 pub struct BudgetConfig {
     pub api_key_daily_warn_usd: Option<f64>,
     pub api_key_weekly_warn_usd: Option<f64>,
+}
+
+/// `[auth]` section — connect-time SASL-shaped handshake configuration
+/// (mu-7rk). v1 carries BEARER state only; future feature-gated
+/// mechanisms (GSSAPI, OAUTHBEARER, TLS client cert) extend this enum.
+///
+/// Wire form is internally-tagged on `kind`:
+///
+/// ```toml
+/// [auth]
+/// kind = "bearer"
+/// tokens = ["…"]
+/// ```
+///
+/// `Debug` is manually implemented so token bytes never appear in
+/// logs/diagnostics (codex review important #5).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuthConfig {
+    /// RFC 7628 BEARER token allowlist. Empty `tokens` means every
+    /// BEARER attempt is rejected — the safe default for a daemon with
+    /// no operator-supplied auth config.
+    Bearer {
+        /// Tokens accepted by the BEARER handler. Stored in plaintext
+        /// in the config file — operators are expected to keep the
+        /// file readable only by the daemon's user.
+        tokens: Vec<String>,
+    },
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self::Bearer { tokens: Vec::new() }
+    }
+}
+
+impl fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AuthConfig::Bearer { tokens } => f
+                .debug_struct("Bearer")
+                .field("tokens", &RedactedTokenList(tokens.len()))
+                .finish(),
+        }
+    }
+}
+
+struct RedactedTokenList(usize);
+
+impl fmt::Debug for RedactedTokenList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[REDACTED; {} entries]", self.0)
+    }
 }
 
 impl Config {
@@ -489,6 +545,21 @@ default_model = "operator/model"
         );
         assert!(c.session.persist_events_to_disk);
         assert_eq!(c.ui.tui.default_provider, "anthropic_api");
+    }
+
+    #[test]
+    fn auth_config_debug_redacts_tokens() {
+        let cfg = AuthConfig::Bearer {
+            tokens: vec!["super-secret-token".to_string(), "another".to_string()],
+        };
+        let s = format!("{cfg:?}");
+        assert!(
+            !s.contains("super-secret-token"),
+            "token leaked in Debug output: {s}",
+        );
+        assert!(!s.contains("another"), "token leaked in Debug output: {s}",);
+        assert!(s.contains("REDACTED"), "expected REDACTED marker: {s}");
+        assert!(s.contains("2 entries"), "expected entry count: {s}");
     }
 
     #[test]

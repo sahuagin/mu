@@ -14,28 +14,39 @@ use mu_core::agent::{AgentConfig, AgentInput, AgentLoop, AgentMessage, Tool};
 use mu_core::capability::Capability;
 use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
-    AskSessionRequest, AskSessionResponse, CancelOutstandingRequest, CancelOutstandingResponse,
-    CancelSessionRequest, CancelSessionResponse, CloseSessionRequest, CloseSessionResponse,
-    CreateSessionRequest, CreateSessionResponse, DaemonOutstandingCallsRequest,
-    DaemonOutstandingCallsResponse, DaemonStatsRequest, DaemonStatsResponse,
-    DaemonUsageHistoryRequest, DaemonUsageHistoryResponse, DelegateSessionRequest,
-    DelegateSessionResponse, MailboxConsumeRequest, MailboxConsumeResponse, MailboxListRequest,
-    MailboxListResponse, MailboxMessageView, MailboxPostRequest, MailboxPostResponse,
-    PeerHelloRequest, PeerHelloResponse, PingRequest, PingResponse, ProviderSelector,
-    ProviderStatusKind, Request, RespondToInputRequiredRequest, RespondToInputRequiredResponse,
-    Response, ScheduleWakeupRequest, SessionEventsRequest, SessionEventsResponse,
-    SessionListRequest, SessionListResponse, SessionStatsRequest, SessionStatsResponse,
-    SessionStatusSummary, StartAutonomousRequest, StartAutonomousResponse,
+    AskSessionRequest, AskSessionResponse, AuthDenialCode, AuthExchangeResponse,
+    AuthInitiateRequest, AuthOfferRequest, AuthOfferResponse, CancelOutstandingRequest,
+    CancelOutstandingResponse, CancelSessionRequest, CancelSessionResponse, CloseSessionRequest,
+    CloseSessionResponse, CreateSessionRequest, CreateSessionResponse,
+    DaemonOutstandingCallsRequest, DaemonOutstandingCallsResponse, DaemonStatsRequest,
+    DaemonStatsResponse, DaemonUsageHistoryRequest, DaemonUsageHistoryResponse,
+    DelegateSessionRequest, DelegateSessionResponse, MailboxConsumeRequest, MailboxConsumeResponse,
+    MailboxListRequest, MailboxListResponse, MailboxMessageView, MailboxPostRequest,
+    MailboxPostResponse, PeerHelloRequest, PeerHelloResponse, PingRequest, PingResponse,
+    ProviderSelector, ProviderStatusKind, Request, RespondToInputRequiredRequest,
+    RespondToInputRequiredResponse, Response, ScheduleWakeupRequest, SessionEventsRequest,
+    SessionEventsResponse, SessionListRequest, SessionListResponse, SessionStatsRequest,
+    SessionStatsResponse, SessionStatusSummary, StartAutonomousRequest, StartAutonomousResponse,
 };
 use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
 use mu_core::usage_history::{aggregate_into_rows, extract_per_session_metrics};
 
+use super::auth::{AuthRegistry, AuthState, AuthStateHandle, AuthStepOutcome};
 use super::daemon_info::DaemonInfo;
 use super::discovery::{derive_status, derive_status_from_events, SessionDiscovery};
 use super::factory::ProviderFactory;
 use super::forwarder::forward_events;
 use super::sessions::Sessions;
 
+// mu-7rk (mu-yox): `dispatch` now carries two extra daemon-wide
+// handles: a shared `AuthRegistry` (constructed once at serve start
+// from `[auth]` config) and a per-connection `AuthStateHandle`. The
+// two new arms (`peer.auth_offer`, `peer.auth_initiate`) drive the
+// handshake. **No other arm consumes the resulting `AuthState`** —
+// enforcement is mu-fnn (mu-7rk-c) and the clippy "too many arguments"
+// lint stays silenced; bundling these into a struct would only push
+// the same fields into a builder.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch(
     request: Request<Value>,
     notif: NotificationWriter,
@@ -44,9 +55,14 @@ pub async fn dispatch(
     tools: Arc<Vec<Arc<dyn Tool>>>,
     daemon_info: DaemonInfo,
     discovery: Arc<dyn SessionDiscovery>,
+    auth_registry: Arc<AuthRegistry>,
+    auth_state: AuthStateHandle,
 ) -> Response<Value> {
     match request.method.as_str() {
         PingRequest::METHOD => handle_ping(request),
+        // mu-7rk (mu-yox): connect-time SASL-shaped auth handshake.
+        AuthOfferRequest::METHOD => handle_auth_offer(request, &auth_registry),
+        AuthInitiateRequest::METHOD => handle_auth_initiate(request, &auth_registry, &auth_state),
         CreateSessionRequest::METHOD => handle_create_session(
             request,
             notif,
@@ -1347,5 +1363,100 @@ fn payload_kind_str(p: &EventPayload) -> &'static str {
         EventPayload::AutonomousTerminated { .. } => "autonomous_terminated",
         EventPayload::MailboxMessagePosted { .. } => "mailbox_message_posted",
         EventPayload::MailboxMessageConsumed { .. } => "mailbox_message_consumed",
+    }
+}
+
+// ───────────────────────── mu-7rk (mu-yox) ─────────────────────────
+//
+// Connect-time SASL-shaped auth handshake (handler + dispatcher half).
+//
+// Two RPCs:
+//   peer.auth_offer    — server lists supported mechanisms
+//   peer.auth_initiate — caller picks mechanism + submits initial creds
+//
+// `peer.auth_response` is reserved on the wire (mu-vha) but no
+// multi-step state registry exists yet — that's mu-oeo (mu-7rk-g).
+// Until then, the dispatcher does NOT route the method (it falls
+// through to METHOD_NOT_FOUND), keeping the surface honest.
+//
+// On `Accepted`, the per-connection [`AuthState`] is updated to
+// `Authenticated { capability }`. Nothing else in this dispatcher
+// consumes that state — enforcement on session.\*/mailbox.\* RPCs is
+// mu-fnn (mu-7rk-c).
+
+fn handle_auth_offer(request: Request<Value>, auth_registry: &AuthRegistry) -> Response<Value> {
+    let _params: AuthOfferRequest = match serde_json::from_value(request.params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("peer.auth_offer: invalid params: {e}"),
+            );
+        }
+    };
+    let resp = AuthOfferResponse {
+        mechanisms: auth_registry.offered(),
+    };
+    ok_response(request.id, to_value_or_null(resp))
+}
+
+fn handle_auth_initiate(
+    request: Request<Value>,
+    auth_registry: &AuthRegistry,
+    auth_state: &AuthStateHandle,
+) -> Response<Value> {
+    let params: AuthInitiateRequest = match serde_json::from_value(request.params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("peer.auth_initiate: invalid params: {e}"),
+            );
+        }
+    };
+    let handler = match auth_registry.get(&params.mechanism) {
+        Some(h) => h,
+        None => {
+            let resp = AuthExchangeResponse::Denied {
+                code: AuthDenialCode::UnsupportedMechanism,
+                reason: format!("no handler registered for mechanism `{}`", params.mechanism,),
+            };
+            return ok_response(request.id, to_value_or_null(resp));
+        }
+    };
+    let outcome = handler.step_initial(params.initial_response.as_deref());
+    let resp = outcome_to_response(outcome, auth_state);
+    ok_response(request.id, to_value_or_null(resp))
+}
+
+/// Convert a handler step outcome into the wire response. On
+/// `Done(capability)`, the per-connection `AuthState` is updated to
+/// `Authenticated { capability }`. Recording-only in this bead — no
+/// other arm in this dispatcher reads `AuthState` yet (mu-fnn).
+fn outcome_to_response(
+    outcome: AuthStepOutcome,
+    auth_state: &AuthStateHandle,
+) -> AuthExchangeResponse {
+    match outcome {
+        AuthStepOutcome::Done(capability) => {
+            if let Ok(mut s) = auth_state.lock() {
+                *s = AuthState::Authenticated {
+                    capability: capability.clone(),
+                };
+            }
+            AuthExchangeResponse::Accepted {
+                granted_capability: capability,
+            }
+        }
+        AuthStepOutcome::Denied { code, reason } => AuthExchangeResponse::Denied { code, reason },
+        AuthStepOutcome::Challenge {
+            server_state_id,
+            server_data,
+        } => AuthExchangeResponse::Continue {
+            server_state_id,
+            challenge: server_data.unwrap_or_default(),
+        },
     }
 }

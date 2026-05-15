@@ -37,6 +37,10 @@ use crossterm::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
     },
 };
+use mu_core::protocol::{
+    ApprovalDecision, InputRequiredEvent, RespondToInputRequiredRequest,
+    RespondToInputRequiredResponse,
+};
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Position, Rect},
@@ -152,6 +156,24 @@ struct ProviderStatusSnapshot {
     received_at: Instant,
 }
 
+/// mu-gih: one outstanding `session.input_required` prompt captured
+/// from the daemon notification. Kept in `App::pending_approvals`
+/// until the user approves or denies via the modal — at which point
+/// `session.respond_to_input_required` is sent and the entry drops.
+#[derive(Debug, Clone)]
+struct PendingApproval {
+    request_id: String,
+    tool_call_id: String,
+    tool_name: String,
+    /// Raw arguments from the notification. Rendered into the modal
+    /// body via `sanitize_arguments_preview` (truncates to ~200 chars
+    /// after a single-line JSON projection).
+    arguments: serde_json::Value,
+    /// Daemon-rendered fallback summary (mu-029) — typically the
+    /// capability label / reason ("bash command not on allowlist").
+    summary: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputMode {
     Normal,
@@ -204,6 +226,17 @@ struct App {
     /// Snapshot of selected_session at the moment the picker opens.
     /// Esc restores this; Enter discards it (the commit).
     session_picker_saved_selection: Option<usize>,
+    /// mu-gih: per-session FIFO of outstanding `session.input_required`
+    /// prompts. Keyed by session_id. v1 surfaces only the head of the
+    /// selected session's queue via the modal overlay; entries for
+    /// other sessions wait until their session is selected. Entries
+    /// drop in two places: (a) the daemon ACK in
+    /// `dispatch_decision` (Stage 3 / B1 — only on a confirmed
+    /// response, NOT on transport error); (b) session-removal sweep
+    /// in `refresh_session_list` (Stage 3 / I4). `VecDeque` for O(1)
+    /// `pop_front` (Stage 3 minor).
+    pending_approvals:
+        std::collections::HashMap<String, std::collections::VecDeque<PendingApproval>>,
     quit: bool,
     last_tick: Instant,
     // Daemon stats — when connected, populated from daemon.stats; in
@@ -307,6 +340,7 @@ impl App {
             default_system_prompt: None,
             session_picker_open: false,
             session_picker_saved_selection: None,
+            pending_approvals: std::collections::HashMap::new(),
             quit: false,
             last_tick: Instant::now(),
             daemon_uptime_ms: 0,
@@ -411,6 +445,7 @@ impl App {
                             &mut self.sessions,
                             &mut self.firehose,
                             &mut self.latest_status,
+                            &mut self.pending_approvals,
                             &method,
                             &params,
                         );
@@ -569,6 +604,9 @@ impl App {
             .filter_map(|r| r.session_id.clone())
             .collect();
         self.ask_started_at.retain(|sid, _| live.contains(sid));
+        // mu-gih (Stage 3 / I4): drop pending-approval queues for
+        // session_ids no longer present.
+        prune_pending_approvals_to_live(&mut self.pending_approvals, &live, &mut self.firehose);
     }
 
     /// Refresh the F5 usage / cache pane (mu-xln). Calls
@@ -786,11 +824,122 @@ impl App {
         }
     }
 
+    /// mu-gih: session_id of the row currently highlighted in the
+    /// session list, if any. Mock rows (no `session_id`) return None.
+    fn selected_sid(&self) -> Option<String> {
+        self.selected_session
+            .selected()
+            .and_then(|i| self.sessions.get(i))
+            .and_then(|r| r.session_id.clone())
+    }
+
+    /// mu-gih: head of the selected session's pending-approval queue.
+    /// `Some(_)` ⇒ the modal is conceptually open and `on_key_normal`
+    /// eats keys for A/D. `None` ⇒ no pending prompt for the selected
+    /// session, modal is hidden, normal key handling resumes.
+    fn current_pending_approval(&self) -> Option<&PendingApproval> {
+        let sid = self.selected_sid()?;
+        self.pending_approvals.get(&sid)?.front()
+    }
+
+    /// mu-gih: send `session.respond_to_input_required` for the head
+    /// of the selected session's queue. The entry is only dropped on
+    /// a daemon-acknowledged outcome (RPC `Ok(..)`, whether or not
+    /// `accepted` is `true`). An RPC-level error leaves the prompt
+    /// queued so the user can retry — see [`dispatch_decision`] for
+    /// the precise semantics (Stage 3 / B1).
+    fn respond_to_pending_approval(&mut self, approve: bool) {
+        let Some(sid) = self.selected_sid() else {
+            return;
+        };
+        // Split-borrow distinct fields so the closure can capture
+        // `&mut self.mu` while `dispatch_decision` mutably borrows
+        // the queue + firehose. Rust permits disjoint mutable
+        // borrows of separate struct fields.
+        let pending_approvals = &mut self.pending_approvals;
+        let firehose = &mut self.firehose;
+        let mu = &mut self.mu;
+        dispatch_decision(
+            pending_approvals,
+            firehose,
+            &sid,
+            approve,
+            |method, payload| match mu.as_mut() {
+                Some(client) => client.request(method, payload),
+                None => Err(anyhow::anyhow!("no daemon client")),
+            },
+        );
+    }
+
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        // mu-gih (Stage 3 / B2 + I5): explicit overlay priority,
+        // routed BEFORE any `input_mode` dispatch.
+        //
+        // 1. F3 session picker: when the user is actively picking a
+        //    session, all keys go to it. A pending approval is left
+        //    in the queue and the modal does NOT render — it pops
+        //    into view as soon as the picker closes (I5 option (a):
+        //    "suppress modal while picker is open"). This composes
+        //    more cleanly than rendering both overlays at once.
+        //
+        // 2. Pending approval modal: absolute priority over every
+        //    input mode. The agent loop is blocked waiting for A/D,
+        //    so falling through to Command/SendPrompt would leave
+        //    the user typing into the wrong buffer and the daemon
+        //    stuck (B2 — pre-Stage-3 only on_key_normal caught
+        //    this; A/D in Command/SendPrompt mode bypassed approval
+        //    entirely).
+        //
+        // 3. Otherwise the normal `input_mode` machine runs.
+        if self.session_picker_open {
+            self.on_key_session_picker(code, mods);
+            return;
+        }
+        if self.current_pending_approval().is_some() {
+            match code {
+                KeyCode::Char('a') | KeyCode::Char('A') => self.respond_to_pending_approval(true),
+                KeyCode::Char('d') | KeyCode::Char('D') => self.respond_to_pending_approval(false),
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    // mu-gih (Stage 3 / I6): edit-and-resubmit is
+                    // deferred to v2. Eat the key and explain so the
+                    // user isn't left wondering why E does nothing.
+                    self.firehose.push(
+                        "[approval] [E]dit is not implemented in v1 — \
+                         [D]eny and retry from the CLI with --bash-prompt"
+                            .into(),
+                    );
+                }
+                _ => {}
+            }
+            let _ = mods;
+            return;
+        }
         match self.input_mode {
             InputMode::Command => self.on_key_command(code),
             InputMode::SendPrompt => self.on_key_send_prompt(code, mods),
             InputMode::Normal => self.on_key_normal(code, mods),
+        }
+    }
+
+    /// mu-gih (Stage 3 / I5): F3 session-picker key handling,
+    /// extracted from `on_key_normal` so the overlay priority routing
+    /// in `on_key` can dispatch to it directly without leaking F3
+    /// state into `on_key_normal`.
+    fn on_key_session_picker(&mut self, code: KeyCode, mods: KeyModifiers) {
+        match (code, mods) {
+            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                let n = self.sessions.len().max(1);
+                let i = self.selected_session.selected().unwrap_or(0);
+                self.selected_session.select(Some((i + 1) % n));
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                let n = self.sessions.len().max(1);
+                let i = self.selected_session.selected().unwrap_or(0);
+                self.selected_session.select(Some((i + n - 1) % n));
+            }
+            (KeyCode::Enter, _) => self.close_session_picker(true),
+            (KeyCode::Esc, _) | (KeyCode::F(3), _) => self.close_session_picker(false),
+            _ => {}
         }
     }
 
@@ -992,28 +1141,11 @@ impl App {
     }
 
     fn on_key_normal(&mut self, code: KeyCode, mods: KeyModifiers) {
-        // F3 picker is modal — when open, eat all keys here.
-        // j/k move selection (which also live-previews the transcript
-        // pane underneath via the existing selected_session state).
-        // Enter commits; Esc / F3-again cancels.
-        if self.session_picker_open {
-            match (code, mods) {
-                (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
-                    let n = self.sessions.len().max(1);
-                    let i = self.selected_session.selected().unwrap_or(0);
-                    self.selected_session.select(Some((i + 1) % n));
-                }
-                (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
-                    let n = self.sessions.len().max(1);
-                    let i = self.selected_session.selected().unwrap_or(0);
-                    self.selected_session.select(Some((i + n - 1) % n));
-                }
-                (KeyCode::Enter, _) => self.close_session_picker(true),
-                (KeyCode::Esc, _) | (KeyCode::F(3), _) => self.close_session_picker(false),
-                _ => {}
-            }
-            return;
-        }
+        // mu-gih (Stage 3 / B2 + I5): the pending-approval modal and
+        // the F3 session picker both have absolute priority and are
+        // now routed in `on_key` before this function runs. By the
+        // time we land here, neither overlay is active, so the
+        // normal-mode keymap below can dispatch unconditionally.
         match (code, mods) {
             (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 self.quit = true;
@@ -1280,10 +1412,219 @@ fn session_row_from_info_value(v: &serde_json::Value) -> Option<SessionRow> {
     })
 }
 
+/// mu-gih (Stage 3 / I1): build the typed
+/// `RespondToInputRequiredRequest` for a pending approval. Pulled out
+/// so [`dispatch_decision`] and the wire-shape regression tests share
+/// the same construction path — drift between the test and the
+/// production payload is therefore caught at compile time.
+fn build_respond_payload(
+    sid: &str,
+    item: &PendingApproval,
+    approve: bool,
+) -> RespondToInputRequiredRequest {
+    RespondToInputRequiredRequest {
+        session_id: sid.to_string(),
+        request_id: item.request_id.clone(),
+        decision: if approve {
+            ApprovalDecision::Approve
+        } else {
+            ApprovalDecision::Deny
+        },
+    }
+}
+
+/// mu-gih (Stage 3 / B1, I1): peek the head of the selected session's
+/// pending-approval queue, send `session.respond_to_input_required`,
+/// and drop the entry ONLY on a daemon-acknowledged outcome.
+///
+/// Outcome semantics:
+/// - `Ok(v)` parses as [`RespondToInputRequiredResponse`] with
+///   `accepted=true` or `accepted=false`: the daemon either relayed
+///   the decision or told us the request_id is no longer valid (it
+///   timed out, was already answered, or never existed). Either way
+///   the prompt is terminal — pop it.
+/// - `Ok(v)` that FAILS to parse as [`RespondToInputRequiredResponse`]:
+///   protocol/shape error. We cannot prove the daemon registered the
+///   decision, so the daemon side is still waiting. Keep the prompt
+///   queued (same as `Err(_)`) and emit a firehose entry naming the
+///   parse failure. This is the N1 (Stage 5) regression — previously
+///   `unwrap_or(false)` collapsed this into a phantom accepted=false
+///   and silently popped the prompt.
+/// - `Err(_)` (transport / serialization / disconnect): the daemon
+///   side is still waiting. Keep the prompt visible so the user can
+///   retry once the channel recovers. Firehose records the failed
+///   attempt for audit.
+///
+/// The function is generic over the send closure so tests can drive
+/// both success + failure paths without a real `MuClient`.
+fn dispatch_decision<F>(
+    pending_approvals: &mut std::collections::HashMap<
+        String,
+        std::collections::VecDeque<PendingApproval>,
+    >,
+    firehose: &mut Vec<String>,
+    sid: &str,
+    approve: bool,
+    send: F,
+) where
+    F: FnOnce(&str, serde_json::Value) -> Result<serde_json::Value>,
+{
+    // Peek — do NOT pop until the daemon ACKs.
+    let head = match pending_approvals.get(sid).and_then(|q| q.front()) {
+        Some(p) => p.clone(),
+        None => return,
+    };
+    let label = if approve { "approve" } else { "deny" };
+    let req = build_respond_payload(sid, &head, approve);
+    let payload = match serde_json::to_value(&req) {
+        Ok(v) => v,
+        Err(e) => {
+            firehose.push(format!(
+                "[{sid}] !! {label} input_required ({}) tool={} payload encode failed: {e}",
+                head.request_id, head.tool_name
+            ));
+            return;
+        }
+    };
+    match send(RespondToInputRequiredRequest::METHOD, payload) {
+        Ok(v) => match serde_json::from_value::<RespondToInputRequiredResponse>(v) {
+            Ok(parsed) => {
+                // Both accepted=true (daemon relayed) and accepted=false
+                // (daemon has no record — timeout / already answered)
+                // are terminal from the daemon's perspective. Pop.
+                if let Some(q) = pending_approvals.get_mut(sid) {
+                    q.pop_front();
+                    if q.is_empty() {
+                        pending_approvals.remove(sid);
+                    }
+                }
+                let verb = if approve { "approved" } else { "denied" };
+                firehose.push(format!(
+                    "[{sid}] {verb} input_required ({}) tool={} accepted={}",
+                    head.request_id, head.tool_name, parsed.accepted
+                ));
+            }
+            Err(parse_err) => {
+                // Protocol/shape error — the daemon side is still
+                // waiting because we cannot prove it received the
+                // decision. Recreates the B1 data-loss class otherwise:
+                // a malformed Ok must NOT pop the queue. Keep the
+                // prompt visible so the user can retry.
+                firehose.push(format!(
+                    "[{sid}] !! {label} input_required ({}) tool={} response decode failed: {parse_err}",
+                    head.request_id, head.tool_name
+                ));
+            }
+        },
+        Err(e) => {
+            // RPC failed — keep the prompt queued so the user can
+            // retry once the daemon recovers. Audit entry names the
+            // attempted decision direction AND tool name so the
+            // failure context is recoverable from the firehose.
+            firehose.push(format!(
+                "[{sid}] !! {label} input_required ({}) tool={} rpc failed: {e}",
+                head.request_id, head.tool_name
+            ));
+        }
+    }
+}
+
+/// mu-gih (Stage 3 / I4): drop pending-approval queues for any
+/// session_id no longer in the daemon's live session list. Without
+/// this the queue leaks across long sessions and a stale prompt
+/// could later resurface in the modal when its row rotates back
+/// into view. The daemon-side pending request has its own timeout;
+/// the TUI's loss of the entry here is informational, not
+/// load-bearing.
+fn prune_pending_approvals_to_live(
+    pending_approvals: &mut std::collections::HashMap<
+        String,
+        std::collections::VecDeque<PendingApproval>,
+    >,
+    live: &std::collections::HashSet<String>,
+    firehose: &mut Vec<String>,
+) {
+    let stale: Vec<String> = pending_approvals
+        .keys()
+        .filter(|sid| !live.contains(sid.as_str()))
+        .cloned()
+        .collect();
+    for sid in stale {
+        if let Some(queue) = pending_approvals.remove(&sid) {
+            if !queue.is_empty() {
+                firehose.push(format!(
+                    "[{sid}] dropped {} pending approval(s) — session no longer present",
+                    queue.len()
+                ));
+            }
+        }
+    }
+}
+
+/// mu-gih (Stage 3 / I7 + I3): typed handler for
+/// `session.input_required`. Pulls the field shape from
+/// [`InputRequiredEvent`] so a protocol drift fails the compile, and
+/// dedupes by `(session_id, request_id)` so a replayed notification
+/// refreshes the existing entry in place rather than enqueuing a
+/// phantom second prompt.
+fn handle_input_required(
+    firehose: &mut Vec<String>,
+    pending_approvals: &mut std::collections::HashMap<
+        String,
+        std::collections::VecDeque<PendingApproval>,
+    >,
+    fallback_sid: &str,
+    params: &serde_json::Value,
+) {
+    let evt: InputRequiredEvent = match serde_json::from_value(params.clone()) {
+        Ok(e) => e,
+        Err(e) => {
+            firehose.push(format!(
+                "[{fallback_sid}] !! input_required malformed ({e}) — ignored"
+            ));
+            return;
+        }
+    };
+    if evt.session_id.is_empty() || evt.request_id.is_empty() {
+        firehose.push(format!(
+            "[{}] !! input_required missing session_id or request_id — ignored",
+            evt.session_id
+        ));
+        return;
+    }
+    let queue = pending_approvals.entry(evt.session_id.clone()).or_default();
+    if let Some(existing) = queue.iter_mut().find(|p| p.request_id == evt.request_id) {
+        existing.tool_call_id = evt.tool_call_id;
+        existing.tool_name = evt.tool_name.clone();
+        existing.arguments = evt.arguments;
+        existing.summary = evt.summary;
+        firehose.push(format!(
+            "[{}] !! input_required ({}) tool={} (duplicate refreshed)",
+            evt.session_id, evt.request_id, evt.tool_name
+        ));
+    } else {
+        firehose.push(format!(
+            "[{}] !! input_required ({}) tool={}",
+            evt.session_id, evt.request_id, evt.tool_name
+        ));
+        queue.push_back(PendingApproval {
+            request_id: evt.request_id,
+            tool_call_id: evt.tool_call_id,
+            tool_name: evt.tool_name,
+            arguments: evt.arguments,
+            summary: evt.summary,
+        });
+    }
+}
+
 fn handle_notification(
     sessions: &mut [SessionRow],
     firehose: &mut Vec<String>,
     latest_status: &mut std::collections::HashMap<String, ProviderStatusSnapshot>,
+    pending_approvals: &mut std::collections::HashMap<
+        String,
+        std::collections::VecDeque<PendingApproval>,
+    >,
     method: &str,
     params: &serde_json::Value,
 ) {
@@ -1338,13 +1679,14 @@ fn handle_notification(
             firehose.push(format!("[{sid}] callout: {title}"));
         }
         "session.input_required" => {
-            let rid = params
-                .get("request_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            firehose.push(format!(
-                "[{sid}] !! input_required ({rid}) — TUI approval flow TBD"
-            ));
+            // mu-gih (Stage 3 / I7): decode the notification through
+            // the typed `InputRequiredEvent` struct so the field shape
+            // (`tool_call_id`, `tool_name`, `arguments`, `summary`) is
+            // pinned to the protocol crate at compile time. A
+            // malformed/partial notification falls through to the
+            // missing-fields branch instead of silently rendering "?"
+            // / null at modal-paint time.
+            handle_input_required(firehose, pending_approvals, sid, params);
         }
         "session.provider_status" => {
             // mu-035 Phase B: store the latest snapshot per session.
@@ -1542,6 +1884,10 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
     render_firehose(f, app, chunks[3]);
     render_statusline(f, app, chunks[4]);
+    // mu-gih: layered LAST so the modal overlays every view, the
+    // firehose, and any other popup. No-op when there's no pending
+    // approval for the selected session.
+    render_approval_modal(f, app, area);
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
@@ -1922,6 +2268,155 @@ fn render_session_picker(f: &mut Frame, app: &mut App, area: Rect) {
         )
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, popup_area, &mut app.selected_session);
+}
+
+/// mu-gih: render the head of the selected session's pending-approval
+/// queue as a modal overlay with [A]pprove / [D]eny actions. Layered
+/// LAST in `ui()` so it sits on top of every view (including the
+/// firehose strip and any other modal). The agent loop is blocked
+/// until the user responds, so the modal eats all input keys (handled
+/// in `on_key_normal`).
+fn render_approval_modal(f: &mut Frame, app: &App, area: Rect) {
+    // mu-gih (Stage 3 / I5): F3 picker takes precedence — the modal
+    // is suppressed while the picker is open. The pending approval
+    // stays queued and resurfaces as soon as the picker closes.
+    if app.session_picker_open {
+        return;
+    }
+    let Some(item) = app.current_pending_approval() else {
+        return;
+    };
+    let popup_area = centered_rect(70, 50, area);
+    f.render_widget(Clear, popup_area);
+
+    let args_preview = sanitize_arguments_preview(&item.arguments, 200);
+    let summary = if item.summary.is_empty() {
+        "(no daemon-rendered summary)".to_string()
+    } else {
+        item.summary.clone()
+    };
+
+    let lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  tool:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                item.tool_name.clone(),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  call:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(item.tool_call_id.clone(), Style::default().fg(Color::Gray)),
+        ]),
+        Line::from(vec![
+            Span::styled("  reason:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(summary, Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  arguments:",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(vec![
+            Span::raw("    "),
+            Span::styled(args_preview, Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                " [A]pprove ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled(
+                " [D]eny ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            // mu-gih (Stage 3 / I6): explicit "Edit unavailable in
+            // v1" affordance. The key is bound in `on_key` to a
+            // firehose explanation; rendering it disabled here makes
+            // the contract surface visible so users don't expect it
+            // to work.
+            Span::styled(
+                " [E]dit (v2) ",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ),
+        ]),
+    ];
+
+    // mu-gih (Stage 3 minor): title components are bounded so a long
+    // tool_name / request_id doesn't blow out the modal on narrow
+    // terminals.
+    let title_tool = truncate_for_title(&item.tool_name, 32);
+    let title_req = truncate_for_title(&item.request_id, 28);
+    let title = format!(" session.input_required · {title_tool} · req {title_req} ");
+    let block = Block::default().borders(Borders::ALL).title(title).style(
+        Style::default()
+            .bg(Color::Black)
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(paragraph, popup_area);
+}
+
+/// mu-gih (Stage 3 minor + Stage 5 M1): Unicode-safe title truncator.
+/// Returns `s` unchanged when within budget; otherwise truncates so
+/// that the final string (including the trailing `…`) is at most
+/// `max_chars`. Used for modal titles where ratatui would otherwise
+/// clip the raw string at the border (or wrap it onto a second line
+/// on very narrow terminals).
+fn truncate_for_title(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{truncated}…")
+    }
+}
+
+/// mu-gih: render `arguments` (a serde_json::Value, typically an
+/// object) as a single-line JSON projection truncated to `max_chars`.
+/// Both literal newlines AND the JSON-escaped `\n` / `\r` sequences
+/// collapse to spaces so multi-line tool arguments (e.g. a bash
+/// command containing embedded newlines) fit on the modal's preview
+/// row. Unicode-safe truncation.
+fn sanitize_arguments_preview(arguments: &serde_json::Value, max_chars: usize) -> String {
+    let raw = serde_json::to_string(arguments).unwrap_or_else(|_| "(?)".into());
+    // Collapse both forms in one pass: the actual newline byte (rare,
+    // since serde_json escapes inside string values) and the
+    // `\n` / `\r` two-char sequences serde_json emits.
+    let collapsed = raw
+        .replace("\\n", " ")
+        .replace("\\r", " ")
+        .replace(['\n', '\r'], " ");
+    if collapsed.chars().count() <= max_chars {
+        collapsed
+    } else {
+        // mu-gih (Stage 5 / M1): reserve one char for the ellipsis so
+        // the final string fits inside `max_chars`, not max_chars + 1.
+        let truncated: String = collapsed
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect();
+        format!("{truncated}…")
+    }
 }
 
 fn render_session_detail(f: &mut Frame, app: &mut App, area: Rect) {
@@ -2738,6 +3233,13 @@ struct Cli {
     #[arg(long)]
     bash_yolo: bool,
 
+    /// Pass --bash-prompt to the daemon. Enables per-call approval
+    /// gating for non-allowlisted bash commands via the mu-gih modal.
+    /// Mutually exclusive with `--bash-yolo` at the daemon level
+    /// (yolo bypasses the prompt path).
+    #[arg(long)]
+    bash_prompt: bool,
+
     /// Default provider kind (used for `n` → create_session).
     /// When omitted, falls back to `[ui.tui].default_provider` from
     /// `~/.config/mu/config.toml`, then to `"anthropic_api"` (mu-l1z).
@@ -2778,7 +3280,13 @@ fn main() -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             let tools_refs: Vec<&str> = cli.tools.iter().map(String::as_str).collect();
-            match MuClient::spawn(&bin.to_string_lossy(), &tools_refs, &cwd, cli.bash_yolo) {
+            match MuClient::spawn(
+                &bin.to_string_lossy(),
+                &tools_refs,
+                &cwd,
+                cli.bash_yolo,
+                cli.bash_prompt,
+            ) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     eprintln!("warning: failed to spawn mu serve: {e}; running in mock-data mode");
@@ -3044,6 +3552,831 @@ mod tests {
         }
         let recombined: String = rows.concat();
         assert_eq!(recombined, "abcdefghijklmnopqrstuv");
+    }
+
+    /// mu-gih: a `session.input_required` notification populates the
+    /// per-session pending-approval queue with the right fields and
+    /// emits a firehose entry naming the tool.
+    #[test]
+    fn input_required_notification_enqueues_pending_approval() {
+        let mut sessions: Vec<SessionRow> = Vec::new();
+        let mut firehose: Vec<String> = Vec::new();
+        let mut latest_status = std::collections::HashMap::new();
+        let mut pending = std::collections::HashMap::new();
+        let params = json!({
+            "session_id": "session-7",
+            "request_id": "req-abc",
+            "tool_call_id": "call-42",
+            "tool_name": "bash",
+            "arguments": { "command": "rm -rf /" },
+            "summary": "bash command not on allowlist",
+        });
+        handle_notification(
+            &mut sessions,
+            &mut firehose,
+            &mut latest_status,
+            &mut pending,
+            "session.input_required",
+            &params,
+        );
+        let queue = pending.get("session-7").expect("queue created for sid");
+        assert_eq!(queue.len(), 1);
+        let item = &queue[0];
+        assert_eq!(item.request_id, "req-abc");
+        assert_eq!(item.tool_call_id, "call-42");
+        assert_eq!(item.tool_name, "bash");
+        assert_eq!(item.summary, "bash command not on allowlist");
+        assert_eq!(
+            item.arguments,
+            json!({ "command": "rm -rf /" }),
+            "arguments preserved verbatim for sanitize_arguments_preview at render time"
+        );
+        assert!(
+            firehose.iter().any(|l| l.contains("input_required")
+                && l.contains("bash")
+                && l.contains("req-abc")),
+            "firehose entry names tool + request_id, got: {firehose:?}"
+        );
+    }
+
+    /// mu-gih (Stage 5 / N2 — Path B): a notification with an omitted
+    /// required field (here `request_id`) fails the typed
+    /// `InputRequiredEvent` deserialization at the protocol-crate
+    /// boundary and falls through the *malformed* branch — NOT the
+    /// later empty-string check, which is unreachable from omitted
+    /// fields because the struct carries no `#[serde(default)]`.
+    /// Either way the prompt is dropped (we cannot echo a request_id
+    /// we never received) and the firehose names the failure.
+    #[test]
+    fn input_required_notification_with_omitted_required_field_is_dropped_as_malformed() {
+        let mut sessions: Vec<SessionRow> = Vec::new();
+        let mut firehose: Vec<String> = Vec::new();
+        let mut latest_status = std::collections::HashMap::new();
+        let mut pending = std::collections::HashMap::new();
+        let params = json!({
+            "session_id": "session-9",
+            // request_id intentionally omitted — triggers the
+            // typed-deserialization failure, not the empty-string
+            // branch below.
+            "tool_call_id": "call-1",
+            "tool_name": "bash",
+            "arguments": {},
+            "summary": "",
+        });
+        handle_notification(
+            &mut sessions,
+            &mut firehose,
+            &mut latest_status,
+            &mut pending,
+            "session.input_required",
+            &params,
+        );
+        assert!(!pending.contains_key("session-9"));
+        assert!(
+            firehose.iter().any(|l| l.contains("malformed")),
+            "firehose should report the typed-deserializer failure as malformed, got: {firehose:?}"
+        );
+    }
+
+    /// mu-gih (Stage 5 / N2 — Path B): a notification whose required
+    /// fields deserialize but are explicitly empty strings hits the
+    /// later missing-fields branch. We could not synthesize a daemon
+    /// reply for an empty request_id even if the struct happily parsed
+    /// one, so drop and audit.
+    #[test]
+    fn input_required_notification_with_empty_required_field_is_dropped_as_missing() {
+        let mut sessions: Vec<SessionRow> = Vec::new();
+        let mut firehose: Vec<String> = Vec::new();
+        let mut latest_status = std::collections::HashMap::new();
+        let mut pending = std::collections::HashMap::new();
+        let params = json!({
+            "session_id": "session-9",
+            "request_id": "",
+            "tool_call_id": "call-1",
+            "tool_name": "bash",
+            "arguments": {},
+            "summary": "",
+        });
+        handle_notification(
+            &mut sessions,
+            &mut firehose,
+            &mut latest_status,
+            &mut pending,
+            "session.input_required",
+            &params,
+        );
+        assert!(!pending.contains_key("session-9"));
+        assert!(
+            firehose.iter().any(|l| l.contains("missing")),
+            "firehose should report the empty-required-field path as missing, got: {firehose:?}"
+        );
+    }
+
+    /// mu-gih: arguments preview collapses newlines and truncates at
+    /// max_chars (with a trailing ellipsis). Verifies the sanitization
+    /// the modal applies before painting.
+    #[test]
+    fn sanitize_arguments_preview_collapses_newlines_and_truncates() {
+        let args = json!({
+            "command": "echo line1\nline2\nline3",
+        });
+        let preview = sanitize_arguments_preview(&args, 200);
+        assert!(!preview.contains('\n'));
+        assert!(preview.contains("line1 line2 line3"));
+    }
+
+    #[test]
+    fn sanitize_arguments_preview_truncates_long_inputs() {
+        let huge: String = "x".repeat(500);
+        let args = json!({ "data": huge });
+        let preview = sanitize_arguments_preview(&args, 200);
+        // mu-gih (Stage 5 / M1): the budget is a hard cap. The
+        // truncator reserves one char for the trailing ellipsis so
+        // the final string is at most `max_chars`, not max_chars + 1.
+        assert!(
+            preview.chars().count() <= 200,
+            "preview exceeds budget: got {} chars",
+            preview.chars().count()
+        );
+        assert!(preview.ends_with('…'));
+    }
+
+    /// mu-gih (Stage 3 / I2): pin the outgoing RPC payload — both
+    /// the method constant AND the JSON field shape. This regression
+    /// test catches drift on any of: `session_id`, `request_id`,
+    /// `decision` enum casing ("approve" / "deny", NOT "Approve"),
+    /// and absence of the stale `approved` boolean from the bead's
+    /// prose. Bonus: deserialize the serialized payload back into
+    /// `RespondToInputRequiredRequest` and assert field-equality.
+    #[test]
+    fn respond_to_input_required_payload_shape_approve() {
+        let item = PendingApproval {
+            request_id: "req-abc".into(),
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into(),
+            arguments: json!({}),
+            summary: String::new(),
+        };
+        let req = build_respond_payload("session-42", &item, true);
+        let payload = serde_json::to_value(&req).expect("payload serializes");
+
+        // Method constant pinned (unchanged from Stage 1).
+        assert_eq!(
+            RespondToInputRequiredRequest::METHOD,
+            "session.respond_to_input_required",
+        );
+        // Required keys present.
+        assert!(payload.get("session_id").is_some());
+        assert!(payload.get("request_id").is_some());
+        assert!(payload.get("decision").is_some());
+        assert_eq!(payload["session_id"], "session-42");
+        assert_eq!(payload["request_id"], "req-abc");
+        assert_eq!(payload["decision"], "approve");
+        // Stale boolean shape MUST NOT regress.
+        assert!(
+            payload.get("approved").is_none(),
+            "`approved: bool` is the bead's stale prose shape — the wire format is decision: approve/deny"
+        );
+        // Roundtrip back to the typed struct.
+        let decoded: RespondToInputRequiredRequest =
+            serde_json::from_value(payload).expect("roundtrip");
+        assert_eq!(decoded.session_id, "session-42");
+        assert_eq!(decoded.request_id, "req-abc");
+        assert_eq!(decoded.decision, ApprovalDecision::Approve);
+    }
+
+    /// mu-gih (Stage 3 / I2): same wire-shape pin for the deny path,
+    /// since "approve" and "deny" go through separate `serde` enum
+    /// arms and could regress independently.
+    #[test]
+    fn respond_to_input_required_payload_shape_deny() {
+        let item = PendingApproval {
+            request_id: "req-xyz".into(),
+            tool_call_id: "call-2".into(),
+            tool_name: "edit".into(),
+            arguments: json!({}),
+            summary: String::new(),
+        };
+        let req = build_respond_payload("session-7", &item, false);
+        let payload = serde_json::to_value(&req).expect("payload serializes");
+        assert_eq!(payload["decision"], "deny");
+        assert!(payload.get("approved").is_none());
+        let decoded: RespondToInputRequiredRequest =
+            serde_json::from_value(payload).expect("roundtrip");
+        assert_eq!(decoded.decision, ApprovalDecision::Deny);
+    }
+
+    /// mu-gih (Stage 3 / B1): on `Ok(accepted=true)` the prompt is
+    /// popped and the firehose records the outcome. Verifies the
+    /// happy path of `dispatch_decision` keeps the audit shape
+    /// expected by the bead (label + tool name).
+    #[test]
+    fn dispatch_decision_pops_on_ok_accepted() {
+        let mut pending: std::collections::HashMap<
+            String,
+            std::collections::VecDeque<PendingApproval>,
+        > = std::collections::HashMap::new();
+        let sid = "session-1".to_string();
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(PendingApproval {
+            request_id: "req-1".into(),
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into(),
+            arguments: json!({"command": "ls"}),
+            summary: String::new(),
+        });
+        pending.insert(sid.clone(), q);
+        let mut firehose: Vec<String> = Vec::new();
+        dispatch_decision(
+            &mut pending,
+            &mut firehose,
+            &sid,
+            true,
+            |_method, _payload| Ok(json!({ "accepted": true })),
+        );
+        assert!(
+            !pending.contains_key(&sid),
+            "queue cleared after the only entry is popped"
+        );
+        let entry = firehose
+            .iter()
+            .find(|l| l.contains("approved") && l.contains("accepted=true"))
+            .expect("firehose has approve+accepted=true entry");
+        assert!(entry.contains("bash"), "audit names tool: {entry:?}");
+        assert!(entry.contains("req-1"), "audit names request_id: {entry:?}");
+    }
+
+    /// mu-gih (Stage 3 / B1): on `Err(_)` from the RPC, the prompt
+    /// stays in the queue and the firehose records the failed
+    /// attempt. THIS is the load-bearing regression test — pre-Stage
+    /// 3, the entry was popped before the RPC was even sent, so a
+    /// transient daemon error would permanently lose the prompt.
+    #[test]
+    fn dispatch_decision_keeps_queue_on_rpc_error() {
+        let mut pending: std::collections::HashMap<
+            String,
+            std::collections::VecDeque<PendingApproval>,
+        > = std::collections::HashMap::new();
+        let sid = "session-1".to_string();
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(PendingApproval {
+            request_id: "req-1".into(),
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into(),
+            arguments: json!({"command": "ls"}),
+            summary: String::new(),
+        });
+        pending.insert(sid.clone(), q);
+        let mut firehose: Vec<String> = Vec::new();
+        dispatch_decision(
+            &mut pending,
+            &mut firehose,
+            &sid,
+            true,
+            |_method, _payload| Err(anyhow::anyhow!("daemon disconnected")),
+        );
+        assert_eq!(
+            pending.get(&sid).map(|q| q.len()).unwrap_or(0),
+            1,
+            "prompt MUST stay queued on RPC error"
+        );
+        let entry = firehose
+            .iter()
+            .find(|l| l.contains("rpc failed"))
+            .expect("firehose has rpc-failed entry");
+        assert!(
+            entry.contains("approve"),
+            "audit names attempted decision: {entry:?}"
+        );
+        assert!(entry.contains("bash"), "audit names tool: {entry:?}");
+        assert!(
+            entry.contains("daemon disconnected"),
+            "audit names the underlying error: {entry:?}"
+        );
+    }
+
+    /// mu-gih (Stage 3 / B1): on `Ok(accepted=false)` the daemon has
+    /// told us the request_id is no longer valid (timeout / already
+    /// answered / unknown). The prompt is terminal from the daemon's
+    /// perspective — pop it and let the firehose surface the
+    /// rejection so the user knows the click landed too late.
+    #[test]
+    fn dispatch_decision_pops_on_ok_accepted_false() {
+        let mut pending: std::collections::HashMap<
+            String,
+            std::collections::VecDeque<PendingApproval>,
+        > = std::collections::HashMap::new();
+        let sid = "session-1".to_string();
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(PendingApproval {
+            request_id: "req-stale".into(),
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into(),
+            arguments: json!({}),
+            summary: String::new(),
+        });
+        pending.insert(sid.clone(), q);
+        let mut firehose: Vec<String> = Vec::new();
+        dispatch_decision(&mut pending, &mut firehose, &sid, false, |_m, _p| {
+            Ok(json!({ "accepted": false }))
+        });
+        assert!(
+            !pending.contains_key(&sid),
+            "prompt dropped — daemon has no record of it"
+        );
+        assert!(firehose
+            .iter()
+            .any(|l| l.contains("denied") && l.contains("accepted=false")));
+    }
+
+    /// mu-gih (Stage 5 / N1): the load-bearing parse-error regression
+    /// test. A successful RPC whose response body does NOT deserialize
+    /// as `RespondToInputRequiredResponse` is a protocol/shape error,
+    /// not a daemon-acknowledged invalidation. The daemon side is
+    /// still waiting because we cannot prove it relayed the decision,
+    /// so the prompt MUST stay queued and the firehose MUST surface
+    /// the decode failure. Pre-Stage-5 this was `unwrap_or(false)` —
+    /// the prompt was popped under a phantom accepted=false, dropping
+    /// the prompt permanently and recreating the B1 data-loss class
+    /// under a different error class.
+    #[test]
+    fn dispatch_decision_keeps_queue_on_malformed_ok_response() {
+        let mut pending: std::collections::HashMap<
+            String,
+            std::collections::VecDeque<PendingApproval>,
+        > = std::collections::HashMap::new();
+        let sid = "session-1".to_string();
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(PendingApproval {
+            request_id: "req-1".into(),
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into(),
+            arguments: json!({"command": "ls"}),
+            summary: String::new(),
+        });
+        pending.insert(sid.clone(), q);
+        let mut firehose: Vec<String> = Vec::new();
+        // Returned value parses as JSON but NOT as
+        // `RespondToInputRequiredResponse` (wrong type on `accepted`).
+        dispatch_decision(
+            &mut pending,
+            &mut firehose,
+            &sid,
+            true,
+            |_method, _payload| Ok(json!({ "accepted": "not_a_bool" })),
+        );
+        assert_eq!(
+            pending.get(&sid).map(|q| q.len()).unwrap_or(0),
+            1,
+            "prompt MUST stay queued when the response shape is unparseable"
+        );
+        let entry = firehose
+            .iter()
+            .find(|l| l.contains("response decode failed"))
+            .expect("firehose has response-decode-failed entry");
+        assert!(
+            entry.contains("approve"),
+            "audit names attempted decision: {entry:?}"
+        );
+        assert!(entry.contains("bash"), "audit names tool: {entry:?}");
+        assert!(entry.contains("req-1"), "audit names request_id: {entry:?}");
+    }
+
+    /// mu-gih (Stage 5 / N1, companion): a structurally-empty / wrong
+    /// JSON shape (e.g. a bare number) also triggers the
+    /// response-decode-failed path. Belt-and-suspenders on the type
+    /// of malformations the regression covers.
+    #[test]
+    fn dispatch_decision_keeps_queue_on_non_object_ok_response() {
+        let mut pending: std::collections::HashMap<
+            String,
+            std::collections::VecDeque<PendingApproval>,
+        > = std::collections::HashMap::new();
+        let sid = "session-2".to_string();
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(PendingApproval {
+            request_id: "req-2".into(),
+            tool_call_id: "call-2".into(),
+            tool_name: "edit".into(),
+            arguments: json!({}),
+            summary: String::new(),
+        });
+        pending.insert(sid.clone(), q);
+        let mut firehose: Vec<String> = Vec::new();
+        dispatch_decision(&mut pending, &mut firehose, &sid, false, |_m, _p| {
+            Ok(json!(42))
+        });
+        assert_eq!(
+            pending.get(&sid).map(|q| q.len()).unwrap_or(0),
+            1,
+            "prompt MUST stay queued on non-object Ok response"
+        );
+        assert!(firehose
+            .iter()
+            .any(|l| l.contains("response decode failed") && l.contains("deny")));
+    }
+
+    /// mu-gih (Stage 3 / I3): a duplicate notification with the same
+    /// (session_id, request_id) refreshes the existing entry instead
+    /// of enqueuing a phantom second prompt. The refresh updates
+    /// arguments + summary in case the daemon resent with updated
+    /// fields after a reconnect.
+    #[test]
+    fn input_required_duplicate_refreshes_existing_entry() {
+        let mut sessions: Vec<SessionRow> = Vec::new();
+        let mut firehose: Vec<String> = Vec::new();
+        let mut latest_status = std::collections::HashMap::new();
+        let mut pending = std::collections::HashMap::new();
+        let first = json!({
+            "session_id": "session-1",
+            "request_id": "req-dup",
+            "tool_call_id": "call-1",
+            "tool_name": "bash",
+            "arguments": { "command": "ls" },
+            "summary": "first",
+        });
+        let second = json!({
+            "session_id": "session-1",
+            "request_id": "req-dup",
+            "tool_call_id": "call-1",
+            "tool_name": "bash",
+            "arguments": { "command": "ls -la" },
+            "summary": "second",
+        });
+        handle_notification(
+            &mut sessions,
+            &mut firehose,
+            &mut latest_status,
+            &mut pending,
+            "session.input_required",
+            &first,
+        );
+        handle_notification(
+            &mut sessions,
+            &mut firehose,
+            &mut latest_status,
+            &mut pending,
+            "session.input_required",
+            &second,
+        );
+        let queue = pending.get("session-1").expect("queue exists");
+        assert_eq!(queue.len(), 1, "duplicate did NOT enqueue a second prompt");
+        let item = queue.front().expect("head present");
+        assert_eq!(item.summary, "second", "duplicate refreshed summary");
+        assert_eq!(
+            item.arguments,
+            json!({ "command": "ls -la" }),
+            "duplicate refreshed arguments"
+        );
+        assert!(
+            firehose.iter().any(|l| l.contains("duplicate refreshed")),
+            "firehose surfaces the dedupe: {firehose:?}"
+        );
+    }
+
+    /// mu-gih (Stage 3 / I3): two distinct request_ids for the same
+    /// session DO both land in the queue. This is the negative
+    /// control for the dedupe test above — proves the dedupe is
+    /// keyed on request_id, not on session_id alone.
+    #[test]
+    fn input_required_distinct_request_ids_both_enqueue() {
+        let mut sessions: Vec<SessionRow> = Vec::new();
+        let mut firehose: Vec<String> = Vec::new();
+        let mut latest_status = std::collections::HashMap::new();
+        let mut pending = std::collections::HashMap::new();
+        for rid in ["req-a", "req-b"] {
+            let params = json!({
+                "session_id": "session-2",
+                "request_id": rid,
+                "tool_call_id": format!("call-{rid}"),
+                "tool_name": "bash",
+                "arguments": {},
+                "summary": "",
+            });
+            handle_notification(
+                &mut sessions,
+                &mut firehose,
+                &mut latest_status,
+                &mut pending,
+                "session.input_required",
+                &params,
+            );
+        }
+        let queue = pending.get("session-2").expect("queue exists");
+        assert_eq!(queue.len(), 2, "distinct request_ids enqueue separately");
+        assert_eq!(queue[0].request_id, "req-a");
+        assert_eq!(queue[1].request_id, "req-b");
+    }
+
+    /// mu-gih (Stage 3 / I7): a notification with a malformed
+    /// `arguments` field (wrong JSON shape, not just missing
+    /// scalars) is rejected at the typed-deserialization layer with
+    /// a malformed-firehose entry — instead of silently degrading to
+    /// `?` / null at render time. Verifies the typed
+    /// `InputRequiredEvent` deserializer is on the hot path.
+    #[test]
+    fn input_required_typed_deserializer_rejects_wrong_arguments_shape() {
+        let mut sessions: Vec<SessionRow> = Vec::new();
+        let mut firehose: Vec<String> = Vec::new();
+        let mut latest_status = std::collections::HashMap::new();
+        let mut pending = std::collections::HashMap::new();
+        // `arguments` is missing entirely → typed deserialize fails.
+        let params = json!({
+            "session_id": "session-3",
+            "request_id": "req-bad",
+            "tool_call_id": "call-1",
+            "tool_name": "bash",
+            "summary": "",
+        });
+        handle_notification(
+            &mut sessions,
+            &mut firehose,
+            &mut latest_status,
+            &mut pending,
+            "session.input_required",
+            &params,
+        );
+        assert!(!pending.contains_key("session-3"));
+        assert!(
+            firehose.iter().any(|l| l.contains("malformed")),
+            "firehose surfaces typed-deserialize failure: {firehose:?}"
+        );
+    }
+
+    /// mu-gih (Stage 3 / minor + Stage 5 / M1): title truncation
+    /// appends an ellipsis past the budget. The final string fits
+    /// inside `max_chars` (the ellipsis displaces one source char),
+    /// so the modal title is bounded on narrow terminals.
+    #[test]
+    fn truncate_for_title_appends_ellipsis_past_budget() {
+        let s = "a".repeat(50);
+        let out = truncate_for_title(&s, 10);
+        assert!(
+            out.chars().count() <= 10,
+            "truncated title exceeds budget: got {} chars",
+            out.chars().count()
+        );
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_for_title_passthrough_under_budget() {
+        let out = truncate_for_title("short", 10);
+        assert_eq!(out, "short");
+    }
+
+    /// mu-gih (Stage 3 / I4): pending-approval queues for session_ids
+    /// not in the live set are dropped, with a firehose entry naming
+    /// the count. Queues for live session_ids stay untouched.
+    #[test]
+    fn prune_pending_approvals_drops_stale_sessions() {
+        let mut pending: std::collections::HashMap<
+            String,
+            std::collections::VecDeque<PendingApproval>,
+        > = std::collections::HashMap::new();
+        let mut q_alive = std::collections::VecDeque::new();
+        q_alive.push_back(PendingApproval {
+            request_id: "req-a".into(),
+            tool_call_id: "call-a".into(),
+            tool_name: "bash".into(),
+            arguments: json!({}),
+            summary: String::new(),
+        });
+        let mut q_dead = std::collections::VecDeque::new();
+        q_dead.push_back(PendingApproval {
+            request_id: "req-b".into(),
+            tool_call_id: "call-b".into(),
+            tool_name: "edit".into(),
+            arguments: json!({}),
+            summary: String::new(),
+        });
+        pending.insert("session-alive".into(), q_alive);
+        pending.insert("session-dead".into(), q_dead);
+        let mut live = std::collections::HashSet::new();
+        live.insert("session-alive".to_string());
+        let mut firehose: Vec<String> = Vec::new();
+        prune_pending_approvals_to_live(&mut pending, &live, &mut firehose);
+        assert!(
+            pending.contains_key("session-alive"),
+            "live queue preserved"
+        );
+        assert!(!pending.contains_key("session-dead"), "stale queue dropped");
+        assert!(
+            firehose
+                .iter()
+                .any(|l| l.contains("session-dead") && l.contains("no longer present")),
+            "firehose surfaces the drop: {firehose:?}"
+        );
+    }
+
+    /// mu-gih (Stage 3 / I4): an empty queue for a stale session is
+    /// dropped silently — no firehose noise for the no-op cleanup.
+    #[test]
+    fn prune_pending_approvals_silent_on_empty_stale_queue() {
+        let mut pending: std::collections::HashMap<
+            String,
+            std::collections::VecDeque<PendingApproval>,
+        > = std::collections::HashMap::new();
+        pending.insert("session-dead".into(), std::collections::VecDeque::new());
+        let live = std::collections::HashSet::new();
+        let mut firehose: Vec<String> = Vec::new();
+        prune_pending_approvals_to_live(&mut pending, &live, &mut firehose);
+        assert!(!pending.contains_key("session-dead"));
+        assert!(
+            firehose.is_empty(),
+            "no firehose entry for an empty stale queue"
+        );
+    }
+
+    /// mu-gih (Stage 3 / B2): A and D are routed to the approval
+    /// modal even when the user is in `InputMode::Command` (or any
+    /// non-Normal mode). Pre-Stage-3, the modal check lived inside
+    /// `on_key_normal` and these keys were appended to the command
+    /// buffer instead, leaving the agent loop stranded.
+    #[test]
+    fn on_key_approval_modal_intercepts_in_command_mode() {
+        let mut app = App::new(None, ("anthropic".into(), "haiku".into()));
+        // Inject a live session row so `selected_sid()` resolves.
+        app.sessions = vec![SessionRow {
+            short_id: "sid".into(),
+            title: "t".into(),
+            status: SessionStatus::Running,
+            model: "m".into(),
+            cost_usd: 0.0,
+            tokens_kilo: 0,
+            phase: "".into(),
+            session_id: Some("session-1".into()),
+        }];
+        app.selected_session.select(Some(0));
+        // Queue a pending approval for that session.
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(PendingApproval {
+            request_id: "req-1".into(),
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into(),
+            arguments: json!({}),
+            summary: String::new(),
+        });
+        app.pending_approvals.insert("session-1".into(), q);
+        // Put the app into Command mode. Pre-Stage 3, 'A' would land
+        // in `command_buffer`. Post-Stage 3, the approval modal
+        // intercepts before the input_mode dispatch runs.
+        app.input_mode = InputMode::Command;
+        app.command_buffer.clear();
+        app.firehose.clear();
+        app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(
+            app.command_buffer.is_empty(),
+            "approval modal intercepted; 'a' did NOT land in command_buffer (got: {:?})",
+            app.command_buffer
+        );
+        // The RPC fails (no daemon), so the prompt stays queued and
+        // the firehose carries the "rpc failed" attempt entry. That
+        // proves the approval path ran, not the command path.
+        assert_eq!(
+            app.pending_approvals.get("session-1").map(|q| q.len()),
+            Some(1),
+            "prompt stayed queued because RPC failed (no daemon in test)"
+        );
+        assert!(
+            app.firehose
+                .iter()
+                .any(|l| l.contains("rpc failed") && l.contains("approve")),
+            "firehose has the failed-approve audit entry: {:?}",
+            app.firehose
+        );
+    }
+
+    /// mu-gih (Stage 3 / B2): same as above, but for D in SendPrompt
+    /// mode. SendPrompt is the most user-visible non-Normal mode —
+    /// the user is typing a prompt for the selected session, and an
+    /// approval prompt arriving mid-typing should NOT land 'd' in
+    /// their prompt buffer.
+    #[test]
+    fn on_key_approval_modal_intercepts_in_send_prompt_mode() {
+        let mut app = App::new(None, ("anthropic".into(), "haiku".into()));
+        app.sessions = vec![SessionRow {
+            short_id: "sid".into(),
+            title: "t".into(),
+            status: SessionStatus::Running,
+            model: "m".into(),
+            cost_usd: 0.0,
+            tokens_kilo: 0,
+            phase: "".into(),
+            session_id: Some("session-1".into()),
+        }];
+        app.selected_session.select(Some(0));
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(PendingApproval {
+            request_id: "req-1".into(),
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into(),
+            arguments: json!({}),
+            summary: String::new(),
+        });
+        app.pending_approvals.insert("session-1".into(), q);
+        app.input_mode = InputMode::SendPrompt;
+        app.prompt_buffer.clear();
+        app.firehose.clear();
+        app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert!(
+            app.prompt_buffer.is_empty(),
+            "approval modal intercepted; 'd' did NOT land in prompt_buffer (got: {:?})",
+            app.prompt_buffer
+        );
+        assert!(
+            app.firehose
+                .iter()
+                .any(|l| l.contains("rpc failed") && l.contains("deny")),
+            "firehose has the failed-deny audit entry: {:?}",
+            app.firehose
+        );
+    }
+
+    /// mu-gih (Stage 3 / I5): F3 session picker has higher priority
+    /// than the approval modal. Pressing 'a' while the picker is open
+    /// does NOT trigger approval — it falls through to the picker's
+    /// key handler (which ignores it). The prompt stays queued and
+    /// resurfaces as soon as the picker closes.
+    #[test]
+    fn on_key_session_picker_suppresses_approval_modal() {
+        let mut app = App::new(None, ("anthropic".into(), "haiku".into()));
+        app.sessions = vec![SessionRow {
+            short_id: "sid".into(),
+            title: "t".into(),
+            status: SessionStatus::Running,
+            model: "m".into(),
+            cost_usd: 0.0,
+            tokens_kilo: 0,
+            phase: "".into(),
+            session_id: Some("session-1".into()),
+        }];
+        app.selected_session.select(Some(0));
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(PendingApproval {
+            request_id: "req-1".into(),
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into(),
+            arguments: json!({}),
+            summary: String::new(),
+        });
+        app.pending_approvals.insert("session-1".into(), q);
+        app.session_picker_open = true;
+        app.firehose.clear();
+        app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(
+            app.pending_approvals.get("session-1").map(|q| q.len()),
+            Some(1),
+            "approval modal did NOT fire while picker is open"
+        );
+        assert!(
+            !app.firehose.iter().any(|l| l.contains("rpc failed")),
+            "no approval RPC was attempted (picker had key priority): {:?}",
+            app.firehose
+        );
+    }
+
+    /// mu-gih (Stage 3 / I6): pressing E while a pending approval is
+    /// active eats the key with a firehose explanation, instead of
+    /// silently doing nothing (which would let users wonder why E
+    /// looks like an action button).
+    #[test]
+    fn on_key_e_in_modal_emits_unavailable_message() {
+        let mut app = App::new(None, ("anthropic".into(), "haiku".into()));
+        app.sessions = vec![SessionRow {
+            short_id: "sid".into(),
+            title: "t".into(),
+            status: SessionStatus::Running,
+            model: "m".into(),
+            cost_usd: 0.0,
+            tokens_kilo: 0,
+            phase: "".into(),
+            session_id: Some("session-1".into()),
+        }];
+        app.selected_session.select(Some(0));
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(PendingApproval {
+            request_id: "req-1".into(),
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into(),
+            arguments: json!({}),
+            summary: String::new(),
+        });
+        app.pending_approvals.insert("session-1".into(), q);
+        app.firehose.clear();
+        app.on_key(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert!(
+            app.firehose
+                .iter()
+                .any(|l| l.contains("[approval]") && l.to_lowercase().contains("not implemented")),
+            "firehose explains Edit is unavailable in v1: {:?}",
+            app.firehose
+        );
+        // Queue is unchanged — E neither approves nor denies.
+        assert_eq!(
+            app.pending_approvals.get("session-1").map(|q| q.len()),
+            Some(1)
+        );
     }
 
     /// mu-2zs: width 0 (degenerate) shouldn't panic; the caller is

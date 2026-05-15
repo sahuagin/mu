@@ -84,6 +84,7 @@ impl MuClient {
         tools: &[&str],
         cwd: &std::path::Path,
         bash_yolo: bool,
+        bash_prompt: bool,
     ) -> Result<Self> {
         // Warn on orphan mu serves — same heuristic as the Python
         // defensive layer (claude-personal scripts/mu_client.py:172).
@@ -98,6 +99,9 @@ impl MuClient {
         }
         if bash_yolo {
             cmd.arg("--bash-yolo");
+        }
+        if bash_prompt {
+            cmd.arg("--bash-prompt");
         }
         cmd.current_dir(cwd)
             .stdin(Stdio::piped())

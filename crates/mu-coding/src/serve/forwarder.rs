@@ -927,6 +927,8 @@ mod tests {
                 }
                 EventPayload::AutonomousScheduledWakeup { .. } => "autonomous_scheduled_wakeup",
                 EventPayload::AutonomousTerminated { .. } => "autonomous_terminated",
+                EventPayload::MailboxMessagePosted { .. } => "mailbox_message_posted",
+                EventPayload::MailboxMessageConsumed { .. } => "mailbox_message_consumed",
             })
             .collect();
         assert_eq!(kinds, vec!["assistant_message", "done"]);

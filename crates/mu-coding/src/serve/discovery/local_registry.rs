@@ -135,6 +135,7 @@ mod tests {
                 parent_session_id: parent,
                 capability: cap,
                 provider_status,
+                mailbox: Arc::new(crate::serve::mailbox::MailboxState::new()),
             },
         );
         log

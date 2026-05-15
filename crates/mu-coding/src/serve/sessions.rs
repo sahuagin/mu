@@ -16,6 +16,9 @@ use mu_core::capability::Capability;
 use mu_core::event_log::SessionEventLog;
 use mu_core::protocol::{ApprovalDecision, OutstandingCall};
 
+#[cfg(test)]
+use super::mailbox::MailboxState;
+use super::mailbox::MailboxStateHandle;
 use super::provider_status::{ProviderCallState, ProviderStatusTracker};
 
 /// Per-session state held by the daemon.
@@ -56,6 +59,12 @@ struct SessionState {
     /// `daemon.outstanding_calls` and to fill in the `was_in` field
     /// of `session.cancel_outstanding` replies.
     provider_status: Arc<Mutex<ProviderStatusTracker>>,
+    /// mu-lho (mu-037 Phase 1): per-session mailbox + peer-handle
+    /// state. Holds the monotonic seq counter for new posts and the
+    /// peer-handle registry for handles this session has issued.
+    /// Mailbox messages themselves live in the session's event log;
+    /// this struct is the coordination state around them.
+    mailbox: MailboxStateHandle,
 }
 
 /// In-memory session registry. Cheap to clone (Arc-backed).
@@ -78,6 +87,7 @@ pub struct NewSession {
     pub parent_session_id: Option<String>,
     pub capability: Arc<Mutex<Capability>>,
     pub provider_status: Arc<Mutex<ProviderStatusTracker>>,
+    pub mailbox: MailboxStateHandle,
 }
 
 impl Sessions {
@@ -111,6 +121,7 @@ impl Sessions {
                     parent_session_id: new.parent_session_id,
                     capability: new.capability,
                     provider_status: new.provider_status,
+                    mailbox: new.mailbox,
                 },
             );
         }
@@ -186,6 +197,14 @@ impl Sessions {
             .ok()?
             .get(id)
             .map(|s| s.capability.clone())
+    }
+
+    /// mu-lho (mu-037 Phase 1): handle to a session's mailbox state
+    /// (seq counter + issued peer handles). Returned by clone, so
+    /// dispatch handlers can hold it across awaits without keeping
+    /// the registry lock.
+    pub fn mailbox(&self, id: &str) -> Option<MailboxStateHandle> {
+        self.inner.lock().ok()?.get(id).map(|s| s.mailbox.clone())
     }
 
     /// Snapshot the session's live provider-call state (mu-035 Phase
@@ -306,6 +325,7 @@ mod tests {
                 parent_session_id: None,
                 capability: cap,
                 provider_status: tracker,
+                mailbox: Arc::new(MailboxState::new()),
             },
         );
         assert!(sessions.input_sender(&id).is_some());
@@ -346,6 +366,7 @@ mod tests {
                 parent_session_id: None,
                 capability: cap,
                 provider_status: tracker,
+                mailbox: Arc::new(MailboxState::new()),
             },
         );
 
@@ -408,6 +429,7 @@ mod tests {
                 parent_session_id: None,
                 capability: Arc::new(Mutex::new(Capability::root())),
                 provider_status: tracker.clone(),
+                mailbox: Arc::new(MailboxState::new()),
             },
         );
         (log, tracker)

@@ -157,3 +157,275 @@ Phase 4 (TUI integration):
 Sketch — design axes named, minimal viable version proposed. Implementation is at least Phase 1 (single-daemon peer/mailbox primitive) of multi-week work; ordering against mu-035 and mu-036 implementation needs a real-world sanity check. Recommend prototyping `peer.hello` + `mailbox.post` in a feature branch before locking the wire shape.
 
 The spec exists so the "agent-mesh" direction is on paper and we know where the F9 mockup's data is supposed to come from. Closes the original Thread B that motivated the night's work.
+
+---
+
+## Phase 1 — locked design (2026-05-14)
+
+This section converts the "sketch" above into the **implementable Phase 1
+contract** for bead mu-lho. The minimal viable version in scope is
+unchanged; this section nails wire shapes, authorization, and the
+extension axes that survive into Phase 2+.
+
+The architectural decisions were arrived at independently by two design
+sessions (claude-personal and openai-codex/gpt-5.5) on 2026-05-14 and
+cross-checked; convergence on substrate decisions is recorded in the
+mu-lho bead comments. Where the two sessions diverged, this section
+captures the chosen resolution.
+
+### Wire surface (mu-core/src/protocol.rs additions)
+
+```jsonc
+// peer.hello — request/response pair. `peer.reply` is the response
+// shape, NOT a second RPC method. Phase 1 has no challenge round-trips;
+// it's a single accept-or-deny exchange.
+
+method  = "peer.hello"
+request = PeerHelloRequest {
+    from: PeerIdentity {
+        daemon_id: String,
+        session_id: String,
+        advertised_capabilities: Vec<String>,
+    },
+    want: PeerWant {
+        method: String,         // "mailbox.post" in Phase 1
+        scope: Option<String>,  // free-form; informational
+    },
+}
+
+response = PeerHelloResponse {
+    PeerHelloResponse::Accepted {
+        peer_handle: String,            // opaque token, 32 hex chars
+        allowed_methods: Vec<String>,   // ⊆ requested `want.method`s
+        expires_at_unix_ms: Option<u64>,
+    } |
+    PeerHelloResponse::Denied {
+        reason: String,
+    }
+}
+```
+
+```jsonc
+method  = "mailbox.post"
+request = MailboxPostRequest {
+    to_session_id: String,
+    peer_handle: String,                // required even in same-daemon
+    from: PeerOriginIdentity {
+        daemon_id: String,
+        session_id: String,
+    },
+    kind: String,                       // "callout|task|fyi|file_reference|grader_result"
+    subject: String,
+    body: Value,                        // shape varies by kind
+    expires_at_unix_ms: Option<u64>,
+}
+response = MailboxPostResponse {
+    posted: bool,
+    seq: u64,                           // per-target-session monotonic
+}
+```
+
+```jsonc
+method  = "mailbox.list"
+request = MailboxListRequest {
+    session_id: String,
+    peer_handle: Option<String>,        // omit when session is its own caller
+    since_seq: Option<u64>,
+    include_consumed: bool,
+}
+response = MailboxListResponse {
+    messages: Vec<MailboxMessageView {
+        seq: u64,
+        from_daemon_id: String,
+        from_session_id: String,
+        kind: String,
+        subject: String,
+        body: Value,
+        posted_at_unix_ms: u64,
+        consumed: bool,
+        expires_at_unix_ms: Option<u64>,
+    }>,
+}
+```
+
+```jsonc
+method  = "mailbox.consume"
+request = MailboxConsumeRequest {
+    session_id: String,
+    peer_handle: Option<String>,        // omit when session is its own caller
+    seqs: Vec<u64>,
+}
+response = MailboxConsumeResponse {
+    consumed_count: u32,
+}
+```
+
+```jsonc
+// Wire notification — emitted from the forwarder on every
+// MailboxMessagePosted event-log append. Phase 4 (F9 TUI mailbox view)
+// subscribes to this; daemon callers can also subscribe.
+notification = "session.mailbox_message"
+params = MailboxMessageEvent {
+    session_id: String,                 // recipient
+    seq: u64,
+    from_daemon_id: String,
+    from_session_id: String,
+    kind: String,
+    subject: String,
+    body: Value,
+    posted_at_unix_ms: u64,
+    expires_at_unix_ms: Option<u64>,
+}
+```
+
+### Event log (mu-core/src/event_log.rs additions)
+
+Two new `EventPayload` variants. Append-only; no in-place mutation.
+`mailbox.list` is a projection over these — `posted_set ∖ consumed_set`.
+
+```rust
+EventPayload::MailboxMessagePosted {
+    seq: u64,                       // per-session monotonic
+    from_daemon_id: String,
+    from_session_id: String,
+    kind: String,
+    subject: String,
+    body: serde_json::Value,
+    expires_at_unix_ms: Option<u64>,
+}
+
+EventPayload::MailboxMessageConsumed {
+    seq: u64,                       // refers back to the posted record
+}
+```
+
+### Authorization
+
+**`mailbox.post` / `.list` / `.consume` require a valid peer handle
+even when both sessions are in the same daemon.** The only exception
+is **self-access**: a session calling `mailbox.list` / `.consume`
+against its own `session_id` without a handle. Self-access is detected
+at the dispatch layer (caller-session identity is asserted via the
+request's `from` field; v1 trusts this assertion within the single
+daemon — see "Caller identity gap" below).
+
+Phase 1 default policy in `peer.hello`: hardcoded **accept any
+same-daemon peer whose `want.method` ⊆ `{"mailbox.post"}`**. Future
+iterations make this policy programmable.
+
+**Caller identity gap (known limitation):** today's JSON-RPC layer
+authenticates the daemon's stdio caller but not the *session* a
+request claims to be from. The `from.session_id` field in
+`mailbox.post` is asserted by the caller. Within a single daemon
+(Phase 1's scope), this is acceptable — the daemon mediates all
+sessions itself. Cross-daemon (Phase 2+) requires either a
+challenge round-trip in `peer.hello` (deferred) or signed tokens
+(biscuit / mu-w4o, separate spec).
+
+### Peer handle representation
+
+Opaque token, **NOT** an extension to the `Capability` axis.
+
+```rust
+struct PeerHandle {
+    peer_session_id: String,
+    allowed_methods: HashSet<String>,
+    expires_at_unix_ms: Option<u64>,
+    max_calls_remaining: Option<u32>,
+}
+```
+
+Stored per-issuing-session in `peer_handles_issued: Arc<Mutex<HashMap<String /* token */, PeerHandle>>>`.
+
+**Why not a Capability axis:** the spec's "peer handles ARE attenuated
+capabilities" framing is right at the substrate level but conflates two
+surfaces. Existing `Capability` (mu-033) bounds tool/aws/autonomy
+invocation a session performs *internally*. Peer handles bound which
+RPC methods another session can invoke *against* this session — a
+different surface. Phase 2 (cross-daemon + biscuit) is the right point
+to unify if unification proves load-bearing.
+
+### PeerDiscovery trait — shaped for lease + watch (deferred to Phase 2 follow-up)
+
+The eventual liveness model is **etcd-leases-with-watch** (the
+kube-controller-manager pattern). The trait surface that anticipates
+this is sketched here so Phase 2's etcd backend slots in without
+consumer rewrites — but **the trait + LocalPeerDiscovery
+implementation are NOT in Phase 1's scope.** Phase 1's RPC surface
+works purely off the `Sessions` registry; peer enumeration and
+liveness events are not yet consumers. The trait will land alongside
+its first consumer (Phase 2 cross-daemon work or a warm-pool
+orchestrator).
+
+Sketch for reference:
+
+```rust
+trait PeerDiscovery {
+    /// Register a session under this discovery layer with optional
+    /// liveness (TTL). Returns a handle whose `refresh()` extends the
+    /// lease and whose `Drop` releases it.
+    async fn register_session(
+        &self,
+        info: SessionPeerInfo,
+        ttl: Option<Duration>,
+    ) -> Result<LeaseHandle>;
+
+    /// Push-driven peer events: Added, Removed (via explicit withdraw
+    /// OR lease expiry). Orchestrator liveness story is "subscribe +
+    /// react", not "poll + diff". No heartbeat storm.
+    async fn watch(&self) -> Result<BoxStream<'static, PeerEvent>>;
+
+    /// Snapshot enumeration for catch-up after watch-stream reconnect.
+    async fn list_peers(&self) -> Result<Vec<SessionPeerInfo>>;
+}
+```
+
+When the etcd backend lands (Phase 2+), lease refresh wires into the
+agent loop's existing 1Hz tick (the one mu-iwq Phase B added for
+`session.provider_status`): one additional `tokio::select!` arm that
+calls `discovery.refresh_session_lease(...).await` periodically. Lease
+TTL ~30s; refresh ~10s; expire-on-crash detection ~10-30s.
+
+**Verify-before-declare-dead pragma:** when an orchestrator observes a
+lease-expiry event, it MUST attempt verification before declaring the
+worker permanently dead. Verification options (implementation-specific):
+direct ping, check for recent event-log activity, attempt
+`mailbox.post` and observe delivery. Lease expiry can have false
+positives (worker's etcd connection blipped, worker is fine). The
+contract is "expiry triggers investigation, not immediate cleanup."
+
+### Phase 1 acceptance demonstrator
+
+Two delegate sessions A and B in the same daemon:
+
+1. A → `peer.hello { from: { session_id: "A" }, want: { method: "mailbox.post" } }` → B accepts, returns `peer_handle`
+2. A → `mailbox.post { to_session_id: "B", peer_handle, from: { session_id: "A" }, kind: "fyi", subject: "ping", body: {...} }`
+3. B → `mailbox.list { session_id: "B" /* self-access */ }` → sees the message
+4. B → `mailbox.consume { session_id: "B", seqs: [the posted seq] }`
+5. B → `mailbox.list { session_id: "B", include_consumed: false }` → message is gone
+
+Negative test: A → `mailbox.post` without a `peer_handle` (or with an
+expired/wrong-target handle) → dispatch rejects.
+
+### Out of Phase 1 (Phase 2+)
+
+- Cross-daemon over unix sockets
+- Filesystem registry + `~/.local/share/mu/daemons/`
+- mDNS cross-machine
+- Capability-as-credential (biscuit / mu-w4o)
+- Challenge round-trips in `peer.hello`
+- Etcd backend for `PeerDiscovery`
+- Capability revocation primitive
+- Rate limiting / DoS protection
+- Auto-trigger `session.input_required` on `kind: "task"`
+
+These compose with Phase 1's substrate; none require Phase 1's wire
+shape to change.
+
+### Composition recap (Phase 1)
+
+- mu-031 (session.delegate): provides the two-in-one-daemon scenario for the demonstrator
+- mu-iwq Phase D: event-log + Sessions-registry mutation patterns reused
+- mu-033 Capability: NOT consumed for peer handles in v1 — intentional divergence
+- mu-038 SessionDiscovery: the architectural analog the PeerDiscovery trait mirrors
+- Future warm-pool/orchestrator work consumes the watch surface

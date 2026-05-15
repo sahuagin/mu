@@ -285,12 +285,24 @@ struct App {
     // selection doesn't lose the loaded data.
     transcript_events_by_sid: std::collections::HashMap<String, Vec<serde_json::Value>>,
     // F3 transcript scroll state: number of LINES back from the
-    // bottom. 0 = pinned to bottom (auto-follow on new content);
-    // >0 = user scrolled up. Reset to 0 with End / `0`.
+    // bottom, ANCHORED across appends. 0 = pinned to bottom
+    // (auto-follow on new content); >0 = user scrolled up. Reset
+    // to 0 with End / `0`. Anchoring (mu-sod): when new lines are
+    // appended while offset > 0, render bumps the offset by the
+    // delta so the visible window stays on the same absolute
+    // content instead of drifting downward.
     transcript_scroll_offset: u16,
+    // mu-sod: previous body_lines length for the F3 transcript
+    // pane, used to detect appends between renders so we can
+    // anchor `transcript_scroll_offset` against streaming growth.
+    prev_transcript_total_lines: usize,
     // F8 events explorer scroll state. Same semantics as transcript
-    // scroll: 0 = pinned to bottom of firehose, >0 = scrolled up.
+    // scroll: 0 = pinned to bottom of firehose, >0 = scrolled up
+    // and ANCHORED across appends (mu-sod).
     events_scroll_offset: u16,
+    // mu-sod: previous filtered firehose length for the F8 events
+    // pane, used to anchor `events_scroll_offset` across appends.
+    prev_events_total_lines: usize,
     // F8 events explorer filter: if set, only show firehose lines
     // matching this substring. Toggleable via `:filter <text>`
     // palette command. Empty = no filter (show all).
@@ -358,7 +370,9 @@ impl App {
             streaming_text: std::collections::HashMap::new(),
             transcript_events_by_sid: std::collections::HashMap::new(),
             transcript_scroll_offset: 0,
+            prev_transcript_total_lines: 0,
             events_scroll_offset: 0,
+            prev_events_total_lines: 0,
             events_filter: String::new(),
             latest_usage_history: None,
             latest_usage_history_at: None,
@@ -2419,6 +2433,30 @@ fn sanitize_arguments_preview(arguments: &serde_json::Value, max_chars: usize) -
     }
 }
 
+/// mu-sod: anchor a "lines back from bottom" scroll offset against
+/// content appends between renders. When `current_total > prev_total`
+/// and the user is scrolled up (offset > 0), the visible window
+/// would otherwise drift downward by the delta — the bottom moved,
+/// but the offset stayed put. Adding the delta to the offset keeps
+/// the visible window pinned to the same absolute content.
+///
+/// When offset is 0 (auto-follow / pinned to bottom), do NOT bump:
+/// the user wants to follow the tail, so let appends pull the view
+/// along. When content shrank (`current_total < prev_total`), do
+/// NOT bump either — the downstream `max_top` clamp will pull the
+/// offset back into range without us double-adjusting here.
+///
+/// Saturating add caps at `u16::MAX`, consistent with the Home key
+/// handler that sets the offset to `u16::MAX` to scroll to top.
+fn anchor_scroll_offset(prev_total: usize, current_total: usize, offset: u16) -> u16 {
+    if offset == 0 || current_total <= prev_total {
+        return offset;
+    }
+    let delta = current_total - prev_total;
+    let delta_u16 = u16::try_from(delta).unwrap_or(u16::MAX);
+    offset.saturating_add(delta_u16)
+}
+
 fn render_session_detail(f: &mut Frame, app: &mut App, area: Rect) {
     // Identify the selected session.
     let selected_sid: Option<String> = app
@@ -2516,11 +2554,24 @@ fn render_session_detail(f: &mut Frame, app: &mut App, area: Rect) {
     // post-wrap rows accurately.
     let inner_height = chunks[1].height.saturating_sub(2) as usize; // -2 for borders
     let total_lines = body_lines.len();
+    // mu-sod: anchor against append-during-scroll. If total grew
+    // since last render AND the user is scrolled up, bump the
+    // offset by the delta so the visible window stays on the same
+    // absolute lines instead of drifting downward.
+    app.transcript_scroll_offset = anchor_scroll_offset(
+        app.prev_transcript_total_lines,
+        total_lines,
+        app.transcript_scroll_offset,
+    );
+    app.prev_transcript_total_lines = total_lines;
     let max_top = total_lines.saturating_sub(inner_height);
     // Same clamp as F8: don't let the stored offset exceed max
     // scrollable range. Without this, the title shows "scrolled up 130"
     // while the view is pinned to the top, and the user has to scroll
-    // down past the phantom offset before motion resumes.
+    // down past the phantom offset before motion resumes. This also
+    // handles content shrinkage: when total_lines drops, the anchored
+    // offset is brought back into range so the user doesn't see a
+    // phantom-scrolled state.
     if (app.transcript_scroll_offset as usize) > max_top {
         app.transcript_scroll_offset = max_top as u16;
     }
@@ -2877,11 +2928,20 @@ fn render_events_explorer(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let total = lines_owned.len();
     let inner_height = area.height.saturating_sub(2) as usize;
+    // mu-sod: anchor F8 events against append-during-scroll. Same
+    // shape as the F3 transcript anchor: when total grew since
+    // last render AND user is scrolled up, bump offset by the
+    // delta so the visible window stays on the same absolute lines.
+    app.events_scroll_offset =
+        anchor_scroll_offset(app.prev_events_total_lines, total, app.events_scroll_offset);
+    app.prev_events_total_lines = total;
     let max_top = total.saturating_sub(inner_height);
     // Clamp stored offset to the actual maximum here, so the title
     // shows a value the view can actually reflect and subsequent
     // PageDown presses don't have to "burn off" phantom offset
-    // before they move anything.
+    // before they move anything. Also handles content shrinkage
+    // (e.g. filter toggled on) so the anchored offset doesn't
+    // strand the view past the new top.
     if (app.events_scroll_offset as usize) > max_top {
         app.events_scroll_offset = max_top as u16;
     }
@@ -4395,5 +4455,44 @@ mod tests {
         // assertion is "no panic."
         let recombined: String = rows.concat();
         assert_eq!(recombined, "x");
+    }
+
+    #[test]
+    fn anchor_scroll_offset_bumps_on_grow_when_scrolled_up() {
+        // mu-sod: with offset > 0 and total growing by N, the offset
+        // should bump by N so the visible window stays on the same
+        // absolute content instead of drifting downward by N.
+        let prev_total = 50;
+        let current_total = 55; // 5 new lines appended
+        let offset = 10;
+        let anchored = anchor_scroll_offset(prev_total, current_total, offset);
+        assert_eq!(anchored, 15, "offset must bump by the delta");
+    }
+
+    #[test]
+    fn anchor_scroll_offset_no_bump_at_offset_zero() {
+        // mu-sod: offset 0 = auto-follow. Even when total grows,
+        // offset stays at 0 so the render pins to the new bottom.
+        let anchored = anchor_scroll_offset(50, 100, 0);
+        assert_eq!(anchored, 0, "auto-follow must not be bumped");
+    }
+
+    #[test]
+    fn anchor_scroll_offset_no_bump_on_shrink() {
+        // mu-sod: when content shrinks (rare, but possible if the
+        // session-event buffer is rebuilt smaller), do not bump.
+        // The downstream max_top clamp handles bringing offset back
+        // into range without us double-adjusting here.
+        let anchored = anchor_scroll_offset(100, 50, 10);
+        assert_eq!(anchored, 10, "shrinkage must leave offset alone");
+    }
+
+    #[test]
+    fn anchor_scroll_offset_saturating_at_u16_max() {
+        // mu-sod: saturating-add caps at u16::MAX, matching the Home
+        // key handler that uses u16::MAX to scroll to top. A massive
+        // append should not silently wrap to a tiny offset.
+        let anchored = anchor_scroll_offset(0, usize::from(u16::MAX) + 100, u16::MAX - 5);
+        assert_eq!(anchored, u16::MAX, "saturating-add must cap at u16::MAX");
     }
 }

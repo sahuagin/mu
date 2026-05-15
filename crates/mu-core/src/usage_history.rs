@@ -227,7 +227,12 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
             | EventPayload::AutonomousIterationStarted { .. }
             | EventPayload::AutonomousIterationCompleted { .. }
             | EventPayload::AutonomousScheduledWakeup { .. }
-            | EventPayload::AutonomousTerminated { .. } => {}
+            | EventPayload::AutonomousTerminated { .. }
+            // mu-lho: mailbox events are inter-session coordination,
+            // not per-call usage. The mailbox view projects from
+            // these directly; they don't feed token/latency metrics.
+            | EventPayload::MailboxMessagePosted { .. }
+            | EventPayload::MailboxMessageConsumed { .. } => {}
         }
     }
 

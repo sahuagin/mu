@@ -164,7 +164,11 @@ pub fn derive_status_from_events(
             EventPayload::AutonomousIterationStarted { .. }
             | EventPayload::AutonomousIterationCompleted { .. }
             | EventPayload::AutonomousScheduledWakeup { .. }
-            | EventPayload::AutonomousTerminated { .. } => {}
+            | EventPayload::AutonomousTerminated { .. }
+            // mu-lho: mailbox events don't drive session-status
+            // derivation; they're a parallel projection of their own.
+            | EventPayload::MailboxMessagePosted { .. }
+            | EventPayload::MailboxMessageConsumed { .. } => {}
         }
         last_kind = Some(&ev.payload);
     }

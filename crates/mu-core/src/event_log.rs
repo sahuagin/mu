@@ -219,6 +219,53 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
     },
+    /// mu-lho (mu-037 Phase 1): a peer posted a mailbox message to
+    /// this session. Append-only — consumption is recorded as a
+    /// separate `MailboxMessageConsumed` event referring back by
+    /// `seq`. `mailbox.list` projects from these two variants:
+    /// `posted_set ∖ consumed_set`. v1 retains all message bodies
+    /// in the event log; a future retention/compaction pass can
+    /// summarize old posted-and-consumed pairs (mu-mh4 territory).
+    MailboxMessagePosted {
+        /// Per-session monotonic sequence number. Assigned at
+        /// `mailbox.post` dispatch time via the session's
+        /// `mailbox_next_seq` atomic counter; carried on the wire
+        /// in the `MailboxPostResponse`.
+        seq: u64,
+        /// Originating daemon id. Same-daemon in Phase 1; meaningful
+        /// in Phase 2+ cross-daemon scenarios.
+        from_daemon_id: String,
+        /// Originating session id within `from_daemon_id`.
+        from_session_id: String,
+        /// Message-kind discriminator. Free-form string for v1
+        /// (typical values: `"callout" | "task" | "fyi" |
+        /// "file_reference" | "grader_result"`). A future spec
+        /// can lock the enum.
+        ///
+        /// Wire-level rename to `kind` would collide with the
+        /// EventPayload enum's `#[serde(tag = "kind")]` outer tag,
+        /// so the on-disk field is `message_kind`. The wire-level
+        /// `MailboxMessageView` (a separate struct) uses `kind`.
+        message_kind: String,
+        /// Short subject line, like an email Subject header.
+        subject: String,
+        /// Shape varies by `message_kind`; v1 stores opaque JSON so
+        /// receivers can interpret per their handler.
+        body: Value,
+        /// Optional wall-clock expiration. None = no expiry.
+        /// Receivers MAY filter expired messages from `mailbox.list`
+        /// projections.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at_unix_ms: Option<u64>,
+    },
+    /// mu-lho (mu-037 Phase 1): the recipient session marked a
+    /// previously-posted mailbox message as consumed via
+    /// `mailbox.consume`. Refers back by the post's `seq`. Append-
+    /// only — un-consuming requires a new post.
+    MailboxMessageConsumed {
+        /// The `seq` of the `MailboxMessagePosted` being marked.
+        seq: u64,
+    },
 }
 
 /// Append-only per-session log.

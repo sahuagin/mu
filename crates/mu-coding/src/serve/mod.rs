@@ -13,6 +13,7 @@ pub mod discovery;
 mod dispatch;
 pub mod factory;
 mod forwarder;
+mod mailbox;
 mod provider_status;
 mod sessions;
 

@@ -1435,21 +1435,37 @@ fn handle_auth_initiate(
 /// `Done(capability)`, the per-connection `AuthState` is updated to
 /// `Authenticated { capability }`. Recording-only in this bead — no
 /// other arm in this dispatcher reads `AuthState` yet (mu-fnn).
+///
+/// mu-m84: when the per-connection mutex is poisoned at the moment a
+/// `Done(_)` outcome arrives, the connection's `AuthState` cannot be
+/// safely transitioned to `Authenticated`. Answering `Accepted`
+/// regardless (pre-fix behavior) is a lying response — the client
+/// believes it is authenticated while the server's state stays at
+/// `Unauthenticated`, so every subsequent protected RPC (once mu-fnn
+/// lands enforcement) would surface `auth_required` and trigger a
+/// retry loop. We instead surface the lock failure as
+/// `Denied { MalformedExchange, .. }`. `MalformedExchange` is the
+/// closest existing variant; adding a new `AuthDenialCode` for
+/// "internal state error" is mu-fnn surface, not mu-m84's.
 fn outcome_to_response(
     outcome: AuthStepOutcome,
     auth_state: &AuthStateHandle,
 ) -> AuthExchangeResponse {
     match outcome {
-        AuthStepOutcome::Done(capability) => {
-            if let Ok(mut s) = auth_state.lock() {
+        AuthStepOutcome::Done(capability) => match auth_state.lock() {
+            Ok(mut s) => {
                 *s = AuthState::Authenticated {
                     capability: capability.clone(),
                 };
+                AuthExchangeResponse::Accepted {
+                    granted_capability: capability,
+                }
             }
-            AuthExchangeResponse::Accepted {
-                granted_capability: capability,
-            }
-        }
+            Err(_poisoned) => AuthExchangeResponse::Denied {
+                code: AuthDenialCode::MalformedExchange,
+                reason: "internal state error".into(),
+            },
+        },
         AuthStepOutcome::Denied { code, reason } => AuthExchangeResponse::Denied { code, reason },
         AuthStepOutcome::Challenge {
             server_state_id,
@@ -1458,5 +1474,77 @@ fn outcome_to_response(
             server_state_id,
             challenge: server_data.unwrap_or_default(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! mu-m84: poisoned-mutex regression coverage for
+    //! `outcome_to_response`. Lives inline because the function is
+    //! private to this module; integration tests in
+    //! `crates/mu-coding/tests/auth_smoke.rs` would require exposing
+    //! it as `pub`, which is API-surface creep for a test-only need.
+
+    use super::*;
+
+    /// mu-m84: when the per-connection `AuthState` mutex is poisoned
+    /// at the moment a `Done(_)` outcome arrives, the dispatcher must
+    /// NOT answer `Accepted` (a lying success) — it must answer
+    /// `Denied { MalformedExchange, .. }`. Pre-fix, the lock failure
+    /// was silently swallowed by `if let Ok(...)` and `Accepted` was
+    /// returned regardless, leaving the state at `Unauthenticated`
+    /// while the client believed it was in.
+    #[test]
+    fn bearer_done_under_lock_poison_does_not_respond_accepted() {
+        let handle: AuthStateHandle = Arc::new(Mutex::new(AuthState::Unauthenticated));
+
+        // Poison the mutex by panicking a background thread while it
+        // holds the lock. `.join()` returns `Err(_)` once the panic
+        // unwinds; we ignore it — the side effect we care about is
+        // the now-poisoned state of `handle`.
+        let poison = Arc::clone(&handle);
+        let join_result = std::thread::spawn(move || {
+            let _g = poison
+                .lock()
+                .expect("test setup: acquire lock to intentionally poison");
+            panic!("mu-m84 test setup: intentional poison");
+        })
+        .join();
+        assert!(
+            join_result.is_err(),
+            "test setup: poisoner thread must have panicked",
+        );
+        assert!(
+            handle.is_poisoned(),
+            "test setup: mutex must be poisoned after the panicking holder",
+        );
+
+        let outcome = AuthStepOutcome::Done(Capability::root());
+        let resp = outcome_to_response(outcome, &handle);
+
+        match resp {
+            AuthExchangeResponse::Denied { code, .. } => {
+                assert_eq!(
+                    code,
+                    AuthDenialCode::MalformedExchange,
+                    "poisoned-lock denial must reuse MalformedExchange, not a new variant",
+                );
+            }
+            other => {
+                panic!("expected Denied{{MalformedExchange}} under poisoned lock; got {other:?}",)
+            }
+        }
+
+        // State must remain `Unauthenticated` — we surfaced the
+        // failure to the client and did not unilaterally upgrade the
+        // session.
+        let guard = handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            matches!(*guard, AuthState::Unauthenticated),
+            "AuthState must stay Unauthenticated after poisoned-lock denial; got {:?}",
+            *guard,
+        );
     }
 }

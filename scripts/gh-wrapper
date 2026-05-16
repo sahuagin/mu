@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# gh wrapper — runs scripts/pre-pr-check.sh before `gh pr create` and `gh pr ready`.
+#
+# Installed via scripts/install-hooks.sh as a symlink at ~/.local/bin/gh so it
+# resolves earlier in PATH than the system gh. Only intercepts the two PR-
+# promotion subcommands; every other gh invocation passes through unchanged.
+#
+# Rationale: pre-PR checks (fmt + clippy + test) belong at the PR-opening
+# moment — that's when the assertion "this is ready" is made. Pushes are for
+# persistence and should not be gated. Pre-PR-rework PR replaced PR #54's
+# pre-push hook with this gh wrapper for that reason.
+#
+# Bypass: MU_SKIP_PR_CHECK=1 gh pr create ...
+
+set -e
+
+# Find the real gh by walking PATH and skipping any entry that resolves to this
+# script. realpath handles the symlink case (~/.local/bin/gh -> scripts/gh-wrapper).
+script_path="$(realpath "$0")"
+real_gh=""
+saved_ifs="$IFS"
+IFS=:
+for d in $PATH; do
+  candidate="$d/gh"
+  if [ -x "$candidate" ]; then
+    resolved="$(realpath "$candidate" 2>/dev/null || true)"
+    if [ -n "$resolved" ] && [ "$resolved" != "$script_path" ]; then
+      real_gh="$candidate"
+      break
+    fi
+  fi
+done
+IFS="$saved_ifs"
+
+if [ -z "$real_gh" ]; then
+  echo "gh-wrapper: cannot find a real gh in PATH (everything resolved back to this wrapper)" >&2
+  exit 127
+fi
+
+# Only intercept gh pr create / gh pr ready. Pass through everything else.
+case "${1:-} ${2:-}" in
+  "pr create"|"pr ready")
+    if [ "${MU_SKIP_PR_CHECK:-}" = "1" ]; then
+      echo "gh-wrapper: MU_SKIP_PR_CHECK=1 — skipping pre-pr-check.sh" >&2
+    else
+      # Locate the check script via repo root. Prefer jj for workspace-aware
+      # resolution (workspaces don't have a top-level .git).
+      if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then
+        root="$(jj root)"
+      else
+        root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+      fi
+      check="$root/scripts/pre-pr-check.sh"
+      if [ -x "$check" ]; then
+        echo "gh-wrapper: running $check before PR promotion (bypass with MU_SKIP_PR_CHECK=1)" >&2
+        "$check"
+      else
+        echo "gh-wrapper: $check not found or not executable; passing through to gh" >&2
+      fi
+    fi
+    ;;
+esac
+
+exec "$real_gh" "$@"

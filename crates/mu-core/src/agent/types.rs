@@ -113,6 +113,10 @@ pub enum StopReason {
     /// Cancel was requested (via AgentInput::Cancel or via cancellation
     /// signal from outside).
     Aborted,
+    /// SSE stream closed without terminal message_stop event (connection
+    /// drop, upstream truncation, or provider protocol violation).
+    /// The message may be partial; this signals degraded completion.
+    DegradedEof,
 }
 
 #[cfg(test)]
@@ -192,6 +196,7 @@ mod tests {
             StopReason::MaxTokens,
             StopReason::Error,
             StopReason::Aborted,
+            StopReason::DegradedEof,
         ];
 
         for reason in samples {

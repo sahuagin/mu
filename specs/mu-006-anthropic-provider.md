@@ -333,6 +333,24 @@ optimization spec.
   impl in `src/providers/anthropic.rs` if the SSE parsing turns out
   to have undocumented quirks; consult, don't copy.
 
+## Amendments
+
+### A-1 (mu-r94): Distinguish clean message_stop from EOF-without-message_stop
+
+Added `StopReason::DegradedEof` to signal SSE stream termination without a
+terminal `message_stop` event. This distinguishes connection drops / upstream
+truncations from normal completion.
+
+**Behavior change:** When the SSE stream closes without `message_stop`, the
+provider now emits `Done(AssistantMessage { stop_reason: DegradedEof, ... })`.
+Previously, it would emit a mapped stop_reason from the last `message_delta`
+event (often `EndTurn`), obscuring the degraded condition.
+
+**Downstream impact:** Consumers of ProviderEvent now see `stop_reason:
+DegradedEof` for truncated/dropped streams. This is observable in the event log
+and can be used to surface warnings (TUI callout, metrics, retry policy).
+
 ## Changelog
 
 - 2026-05-10 — initial draft (claude-personal).
+- 2026-05-16 — amended (mu-r94): add DegradedEof signal for EOF-without-message_stop.

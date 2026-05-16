@@ -416,6 +416,21 @@ impl App {
                                         .or_default()
                                         .push_str(delta);
                                 }
+                                "session.assistant_text_finalized" => {
+                                    // mu-wk2: swap streaming-text accumulator
+                                    // for finalized text atomically. The text
+                                    // here matches what will appear in the
+                                    // AssistantMessageEvent shortly, preventing
+                                    // the visible flicker between streaming
+                                    // (yellow, in-memory) and finalized (white,
+                                    // durable log) blocks.
+                                    let text =
+                                        params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                                    if !text.is_empty() {
+                                        self.streaming_text
+                                            .insert(sid.to_string(), text.to_string());
+                                    }
+                                }
                                 "session.done" | "session.error" => {
                                     // AssistantMessageEvent has now
                                     // landed in the event log; the
@@ -1647,6 +1662,12 @@ fn handle_notification(
             // Avoid flooding the firehose with every token — only the first 20 chars.
             let snip: String = delta.chars().take(20).collect();
             firehose.push(format!("[{sid}] δ {snip:?}"));
+        }
+        "session.assistant_text_finalized" => {
+            // mu-wk2: finalized text arrives. Mark the session as
+            // having finalized text to distinguish from streaming-only.
+            let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            firehose.push(format!("[{sid}] finalized ({} chars)", text.len()));
         }
         "session.tool_call_started" => {
             let name = params

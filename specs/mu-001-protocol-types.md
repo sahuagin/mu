@@ -29,8 +29,9 @@ hand structured work to non-claude agents and get clean output back.
   - Domain method types (request / response pairs) for: `ping`,
     `create_session`, `ask_session`, `cancel_session`, `close_session`.
   - Event-notification types emitted by the daemon during `ask_session`:
-    `session.text_delta`, `session.tool_call_started`,
-    `session.tool_call_completed`, `session.done`, `session.error`.
+    `session.text_delta`, `session.assistant_text_finalized`,
+    `session.tool_call_started`, `session.tool_call_completed`,
+    `session.done`, `session.error`.
   - Serde derives + serialization tests for every shape above.
   - One file, `crates/mu-core/src/protocol.rs`, plus `pub mod protocol;`
     re-export in `lib.rs`.
@@ -215,6 +216,21 @@ impl TextDeltaEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssistantTextFinalizedEvent {
+    pub session_id: String,
+    /// The final assembled text from the assistant message. Emitted when
+    /// streaming completes, before session.done. Allows clients to swap
+    /// from streaming-text accumulator to finalized text atomically,
+    /// preventing visible flicker between streaming and finalized blocks.
+    /// See mu-wk2.
+    pub text: String,
+}
+
+impl AssistantTextFinalizedEvent {
+    pub const METHOD: &'static str = "session.assistant_text_finalized";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallStartedEvent {
     pub session_id: String,
     pub tool_call_id: String,
@@ -303,8 +319,8 @@ impl ErrorEvent {
    `const METHOD`, a test asserts the constant matches the spec table:
    `"ping"`, `"create_session"`, `"ask_session"`, `"cancel_session"`,
    `"close_session"`, `"session.text_delta"`,
-   `"session.tool_call_started"`, `"session.tool_call_completed"`,
-   `"session.done"`, `"session.error"`.
+   `"session.assistant_text_finalized"`, `"session.tool_call_started"`,
+   `"session.tool_call_completed"`, `"session.done"`, `"session.error"`.
 
 ## Acceptance
 

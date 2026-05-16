@@ -155,7 +155,15 @@ lessons, but the code here is written fresh.
 
 ## Development
 
-Useful commands:
+A top-level `justfile` collects the common workflows. `just --list` for the menu; recipes wrap the underlying `cargo` and `scripts/` invocations.
+
+```sh
+just check         # full pre-PR check (fmt + clippy + test)
+just smoke         # mu ask against the faux provider — no API key needed
+just pr <branch>   # push current jj @ as <branch> and open a PR
+```
+
+Or the underlying commands directly:
 
 ```sh
 cargo build --workspace

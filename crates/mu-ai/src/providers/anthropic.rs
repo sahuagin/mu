@@ -491,17 +491,16 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
         let sse_event = match state.sse.next().await {
             Some(e) => e,
             None => {
-                // Stream ended without message_stop. Emit Done if we
-                // haven't yet.
+                // Stream ended without message_stop. Emit Done with DegradedEof
+                // to signal the degraded condition.
                 state.finished = true;
                 if !state.emitted_done {
                     state.emitted_done = true;
-                    let stop = map_stop_reason(state.stop_reason.as_deref());
                     let usage = state.usage.to_usage();
                     return Some((
                         ProviderEvent::Done(AssistantMessage {
                             content: assemble_content(&state.blocks, &state.block_order),
-                            stop_reason: stop,
+                            stop_reason: StopReason::DegradedEof,
                             usage,
                         }),
                         state,

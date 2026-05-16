@@ -442,6 +442,57 @@ async fn anthropic_error_event_terminates_with_provider_error() {
     assert!(stream.next().await.is_none());
 }
 
+#[tokio::test]
+async fn eof_without_message_stop_emits_degraded_eof() {
+    // Simulate a stream that ends mid-response without a terminal message_stop
+    // event (connection drop, upstream truncation, etc.). The provider should emit
+    // Done with stop_reason: DegradedEof to signal the degraded condition.
+    let raw = concat!(
+        r#"event: message_start"#,
+        "\n",
+        r#"data: {"type":"message_start","message":{"id":"m_1","role":"assistant"}}"#,
+        "\n\n",
+        r#"event: content_block_start"#,
+        "\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"event: content_block_delta"#,
+        "\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}"#,
+        "\n\n",
+        // NOTE: NO message_stop event. Stream ends here.
+    );
+    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+        raw.as_bytes(),
+    ))]);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let mut stream = test_events_stream(bytes, rx);
+
+    let mut events = Vec::new();
+    while let Some(e) = stream.next().await {
+        events.push(e);
+    }
+
+    // Expected: TextDelta("partial"), Done with DegradedEof
+    assert_eq!(events.len(), 2);
+    match &events[0] {
+        ProviderEvent::TextDelta(t) => assert_eq!(t, "partial"),
+        other => panic!("expected TextDelta, got {other:?}"),
+    }
+    match &events[1] {
+        ProviderEvent::Done(msg) => {
+            // The key assertion: stop_reason should be DegradedEof, not EndTurn or whatever
+            // the provider might have seen mid-stream.
+            assert_eq!(msg.stop_reason, StopReason::DegradedEof);
+            match &msg.content[0] {
+                ContentBlock::Text { text } => assert_eq!(text, "partial"),
+                other => panic!("expected Text block, got {other:?}"),
+            }
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
 #[test]
 fn map_stop_reason_known_and_unknown() {
     assert_eq!(map_stop_reason(Some("end_turn")), StopReason::EndTurn);

@@ -795,5 +795,6 @@ fn payload_kind_str(p: &EventPayload) -> &'static str {
         EventPayload::AutonomousTerminated { .. } => "autonomous_terminated",
         EventPayload::MailboxMessagePosted { .. } => "mailbox_message_posted",
         EventPayload::MailboxMessageConsumed { .. } => "mailbox_message_consumed",
+        EventPayload::TaskTelemetry { .. } => "task_telemetry",
     }
 }

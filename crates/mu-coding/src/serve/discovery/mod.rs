@@ -168,7 +168,10 @@ pub fn derive_status_from_events(
             // mu-lho: mailbox events don't drive session-status
             // derivation; they're a parallel projection of their own.
             | EventPayload::MailboxMessagePosted { .. }
-            | EventPayload::MailboxMessageConsumed { .. } => {}
+            | EventPayload::MailboxMessageConsumed { .. }
+            // mu-5g7i: TaskTelemetry is a derived projection of Done;
+            // status derivation already handles Done above.
+            | EventPayload::TaskTelemetry { .. } => {}
         }
         last_kind = Some(&ev.payload);
     }

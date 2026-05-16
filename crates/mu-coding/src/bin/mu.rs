@@ -160,6 +160,22 @@ enum AnalyticsCmd {
         #[arg(long, value_name = "UNIX_MS")]
         since: Option<u64>,
     },
+    /// Documentary historical inserts: pre-classified task entries from
+    /// a TOML file (or bundled preset). Bypasses the classifier — use
+    /// only for ground-truth historical data, not live tasks (spec
+    /// mu-043, bead mu-mk9l).
+    Backfill {
+        /// Name of a bundled preset. Currently supported:
+        /// `overnight-2026-05-16`. Mutually exclusive with `--input`.
+        #[arg(long, value_name = "NAME")]
+        preset: Option<String>,
+        /// Path to an external TOML file. Mutually exclusive with
+        /// `--preset`.
+        #[arg(long, value_name = "PATH")]
+        input: Option<std::path::PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        db: Option<std::path::PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -307,6 +323,31 @@ fn run_analytics(cmd: AnalyticsCmd) -> Result<()> {
             let conn = sink_open(&db_path)?;
             let rows = rate_hallucination(&conn, since)?;
             print!("{}", format_rate(&rows, &metric));
+            Ok(())
+        }
+        AnalyticsCmd::Backfill { preset, input, db } => {
+            use mu_coding::analytics::backfill::{
+                apply, load_file, parse_str, PRESET_OVERNIGHT_2026_05_16,
+            };
+            let file = match (preset.as_deref(), input.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("--preset and --input are mutually exclusive")
+                }
+                (None, None) => {
+                    anyhow::bail!("one of --preset NAME or --input PATH is required")
+                }
+                (Some(name), None) => match name {
+                    "overnight-2026-05-16" => parse_str(PRESET_OVERNIGHT_2026_05_16)?,
+                    other => {
+                        anyhow::bail!("unknown preset '{other}'. v1 supports: overnight-2026-05-16")
+                    }
+                },
+                (None, Some(path)) => load_file(path)?,
+            };
+            let db_path = resolve_db(db)?;
+            let conn = sink_open(&db_path)?;
+            let summary = apply(&conn, &file)?;
+            println!("backfilled: {} task(s) upserted", summary.tasks_upserted);
             Ok(())
         }
     }

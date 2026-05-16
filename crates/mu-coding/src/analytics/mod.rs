@@ -8,6 +8,7 @@
 //!   rows by calling [`mu_core::forensics::classify_task`] on each
 //! - [`query`]: preset queries (`summary`, `rate`) over the sink
 
+pub mod backfill;
 pub mod compact;
 pub mod query;
 pub mod sink;

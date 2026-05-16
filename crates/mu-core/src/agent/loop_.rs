@@ -91,6 +91,14 @@ pub enum AgentEvent {
     TextDelta {
         delta: String,
     },
+    /// Emitted when the assistant message streaming completes, with the
+    /// final assembled text. Fires before MessageEnd and before session.done,
+    /// allowing clients to swap from streaming-text accumulator to finalized
+    /// text atomically. The text here matches what will appear in the durable
+    /// AssistantMessageEvent. See mu-wk2.
+    AssistantTextFinalized {
+        text: String,
+    },
     ToolCallStarted {
         tool_call_id: String,
         tool_name: String,
@@ -1600,6 +1608,19 @@ async fn handle_invoke_llm(
                     let _ = events.send(AgentEvent::TextDelta { delta: d }).await;
                 }
                 Some(ProviderEvent::Done(msg)) => {
+                    // Extract text from the message's content blocks (non-reasoning).
+                    // Emit AssistantTextFinalized before returning, allowing clients
+                    // to swap from streaming-text accumulator to finalized text
+                    // atomically. See mu-wk2.
+                    let mut text = String::new();
+                    for block in &msg.content {
+                        if let ContentBlock::Text { text: block_text } = block {
+                            text.push_str(block_text);
+                        }
+                    }
+                    let _ = events
+                        .send(AgentEvent::AssistantTextFinalized { text })
+                        .await;
                     // Best-effort signal that we're done with the stream.
                     let _ = cancel_tx.send(());
                     return Ok((msg, buffered));

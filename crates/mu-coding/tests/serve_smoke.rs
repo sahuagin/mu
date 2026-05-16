@@ -797,3 +797,97 @@ async fn b13_cancel_outstanding_on_idle_session_reports_idle() {
     drop(client);
     let _ = timeout(Duration::from_millis(500), server_handle).await;
 }
+
+/// B-8: assistant_text_finalized notification is emitted when streaming
+/// completes, with the finalized text that matches what's in the durable
+/// event log. See mu-wk2.
+#[tokio::test]
+async fn b8_assistant_text_finalized_on_stream_complete() {
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) = spawn_server(provider);
+
+    // Step 1: create_session.
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "create_session",
+        "params": {
+            "provider": { "kind": "anthropic_api", "model": "irrelevant" }
+        }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write");
+    let resp = read_line(&mut client).await;
+    let session_id = resp["result"]["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    // Step 2: ask_session.
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "ask_session",
+        "params": {
+            "session_id": session_id,
+            "user_message": "hello",
+        }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write ask");
+
+    // Read lines until we've seen all expected events: ack, text_delta,
+    // assistant_text_finalized, and done. Collect them for verification.
+    let mut lines: Vec<Value> = Vec::new();
+    let mut saw_ack = false;
+    let mut saw_text_delta = false;
+    let mut saw_finalized = false;
+    let mut saw_done = false;
+    while !(saw_ack && saw_text_delta && saw_finalized && saw_done) {
+        let line = read_line(&mut client).await;
+        if line["id"] == 2 {
+            saw_ack = true;
+        }
+        if line["method"] == "session.text_delta" {
+            saw_text_delta = true;
+        }
+        if line["method"] == "session.assistant_text_finalized" {
+            saw_finalized = true;
+        }
+        if line["method"] == "session.done" {
+            saw_done = true;
+        }
+        lines.push(line);
+    }
+
+    // Verify the finalized event is present and has the correct structure.
+    let finalized = lines
+        .iter()
+        .find(|v| v["method"] == "session.assistant_text_finalized")
+        .expect("missing assistant_text_finalized");
+    assert_eq!(finalized["params"]["session_id"], session_id);
+    // FauxProvider::echo() echoes back the user message, so the finalized
+    // text should be "hello".
+    assert_eq!(finalized["params"]["text"], "hello");
+
+    // Verify that finalized is emitted before done.
+    let finalized_idx = lines
+        .iter()
+        .position(|v| v["method"] == "session.assistant_text_finalized")
+        .expect("finalized index");
+    let done_idx = lines
+        .iter()
+        .position(|v| v["method"] == "session.done")
+        .expect("done index");
+    assert!(
+        finalized_idx < done_idx,
+        "assistant_text_finalized should arrive before session.done"
+    );
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}

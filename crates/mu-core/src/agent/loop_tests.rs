@@ -262,6 +262,7 @@ fn kind(event: &AgentEvent) -> &'static str {
         AgentEvent::TurnStart => "turn_start",
         AgentEvent::MessageStart { .. } => "message_start",
         AgentEvent::TextDelta { .. } => "text_delta",
+        AgentEvent::AssistantTextFinalized { .. } => "assistant_text_finalized",
         AgentEvent::ToolCallStarted { .. } => "tool_call_started",
         AgentEvent::ToolCallCompleted { .. } => "tool_call_completed",
         AgentEvent::MessageEnd { .. } => "message_end",
@@ -314,6 +315,7 @@ async fn b1_single_turn_no_tools() {
             "provider_status",  // mu-035 Phase A: AwaitingFirstToken
             "provider_status",  // mu-035 Phase A: Streaming on first token
             "text_delta",
+            "assistant_text_finalized", // mu-wk2: fires before message_start of finalized assistant text
             "message_start",
             "message_end",
             "turn_end",
@@ -461,11 +463,12 @@ async fn b2_single_tool_call() {
         kinds,
         vec![
             "agent_start",
-            "message_start",       // user
-            "message_end",         // user
-            "turn_start",          // turn 1
-            "context_assembly",    // mu-032: before provider call
-            "provider_status",     // mu-035: AwaitingFirstToken
+            "message_start",            // user
+            "message_end",              // user
+            "turn_start",               // turn 1
+            "context_assembly",         // mu-032: before provider call
+            "provider_status",          // mu-035: AwaitingFirstToken
+            "assistant_text_finalized", // mu-wk2: fires for every assistant turn end (empty text for tool-only)
             "message_start", // assistant w/ tool call (no text first → no Streaming transition)
             "message_end",   // assistant w/ tool call
             "provider_status", // mu-035: ToolExecuting before dispatch
@@ -477,9 +480,10 @@ async fn b2_single_tool_call() {
             "provider_status", // mu-035: AwaitingFirstToken turn 2
             "provider_status", // mu-035: Streaming on first token
             "text_delta",    // "done"
-            "message_start", // assistant text
-            "message_end",   // assistant text
-            "turn_end",      // end turn 2
+            "assistant_text_finalized", // mu-wk2: fires before message_start of finalized assistant text
+            "message_start",            // assistant text
+            "message_end",              // assistant text
+            "turn_end",                 // end turn 2
             "done",
         ]
     );

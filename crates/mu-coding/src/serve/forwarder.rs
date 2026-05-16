@@ -25,9 +25,10 @@ use tokio::sync::mpsc;
 use mu_core::agent::{AgentEvent, AgentMessage};
 use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
-    AutonomousIterationCompletedEvent, AutonomousIterationStartedEvent, AutonomousTerminatedEvent,
-    CalloutBody, CalloutEvent, DoneEvent, ErrorEvent, InputRequiredEvent, ProviderStatusEvent,
-    TextDeltaEvent, ToolCallCompletedEvent, ToolCallStartedEvent, ToolOutcome,
+    AssistantTextFinalizedEvent, AutonomousIterationCompletedEvent,
+    AutonomousIterationStartedEvent, AutonomousTerminatedEvent, CalloutBody, CalloutEvent,
+    DoneEvent, ErrorEvent, InputRequiredEvent, ProviderStatusEvent, TextDeltaEvent,
+    ToolCallCompletedEvent, ToolCallStartedEvent, ToolOutcome,
 };
 use mu_core::transport::NotificationWriter;
 
@@ -48,6 +49,13 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
             TextDeltaEvent {
                 session_id: session_id.to_string(),
                 delta,
+            },
+        ),
+        AgentEvent::AssistantTextFinalized { text } => to_pair(
+            AssistantTextFinalizedEvent::METHOD,
+            AssistantTextFinalizedEvent {
+                session_id: session_id.to_string(),
+                text,
             },
         ),
         AgentEvent::ToolCallStarted {
@@ -477,6 +485,10 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
             },
         )),
         AgentEvent::TextDelta { .. }
+        // mu-wk2: AssistantTextFinalized is a transient wire-level
+        // notification to prevent TUI flicker. The durable event is
+        // the AssistantMessageEvent from MessageEnd.
+        | AgentEvent::AssistantTextFinalized { .. }
         | AgentEvent::MessageStart { .. }
         | AgentEvent::AgentStart
         | AgentEvent::TurnStart

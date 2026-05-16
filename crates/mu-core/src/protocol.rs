@@ -794,6 +794,21 @@ impl TextDeltaEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssistantTextFinalizedEvent {
+    pub session_id: String,
+    /// The final assembled text from the assistant message. This text
+    /// matches what will appear in the durable AssistantMessageEvent.
+    /// Emitted when streaming completes, before session.done, allowing
+    /// clients to swap from streaming-text to finalized text atomically.
+    /// See mu-wk2.
+    pub text: String,
+}
+
+impl AssistantTextFinalizedEvent {
+    pub const METHOD: &'static str = "session.assistant_text_finalized";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallStartedEvent {
     pub session_id: String,
     pub tool_call_id: String,

@@ -891,3 +891,71 @@ async fn b8_assistant_text_finalized_on_stream_complete() {
     drop(client);
     let _ = timeout(Duration::from_millis(500), server_handle).await;
 }
+
+/// mu-x83o: create_session accepts and honors a `system_prompt`
+/// param (the field has existed in CreateSessionRequest since
+/// mu-n48; this test pins the wire contract so the
+/// `--append-system-prompt` CLI flag has a guarantee to lean on).
+/// FauxProvider ignores system_prompt at the provider boundary, so
+/// what this test proves is the *handler* path: params parse, the
+/// session builds without INVALID_PARAMS, ask_session still works.
+#[tokio::test]
+async fn b14_create_session_with_system_prompt() {
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) = spawn_server(provider);
+
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "create_session",
+        "params": {
+            "provider": { "kind": "anthropic_api", "model": "irrelevant" },
+            "system_prompt": "you are a careful assistant"
+        }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write");
+    let resp = read_line(&mut client).await;
+    assert_eq!(resp["id"], 1);
+    assert!(
+        resp.get("error").is_none(),
+        "create_session errored: {resp}"
+    );
+    let session_id = resp["result"]["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+    assert!(session_id.starts_with("session-"));
+
+    // Round-trip an ask to confirm the session is fully alive.
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "ask_session",
+        "params": {
+            "session_id": session_id,
+            "user_message": "ping",
+        }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write ask");
+
+    let mut saw_ack = false;
+    let mut saw_done = false;
+    while !(saw_ack && saw_done) {
+        let line = read_line(&mut client).await;
+        if line["id"] == 2 {
+            saw_ack = true;
+        }
+        if line["method"] == "session.done" {
+            saw_done = true;
+        }
+    }
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}

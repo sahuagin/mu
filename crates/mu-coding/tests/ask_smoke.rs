@@ -33,3 +33,32 @@ async fn b4_empty_prompt() {
     assert!(status.success(), "non-zero exit: {status}");
     assert_eq!(stdout, "\n");
 }
+
+/// mu-x83o: `--append-system-prompt <FILE>` reads FILE and forwards
+/// content via `CreateSessionRequest.system_prompt`. Faux provider
+/// ignores system_prompt (see faux.rs), so observable behavior is
+/// unchanged — this test proves the flag parses, the file is read,
+/// and the wire layer doesn't choke on the extra param.
+#[tokio::test]
+async fn b5_append_system_prompt_flag_does_not_break_echo() {
+    let path = std::env::temp_dir().join("mu_x83o_sysprompt.txt");
+    std::fs::write(&path, "you are a careful assistant").expect("write tempfile");
+
+    let path_str = path.to_string_lossy().into_owned();
+    let (stdout, status) = run_mu_ask(&["--append-system-prompt", &path_str, "hello"]).await;
+
+    let _ = std::fs::remove_file(&path);
+    assert!(status.success(), "non-zero exit: {status}");
+    assert_eq!(stdout.trim(), "hello");
+}
+
+/// mu-x83o: missing file is a hard error before any RPC is sent.
+#[tokio::test]
+async fn b6_append_system_prompt_missing_file_errors() {
+    let missing = "/tmp/mu-x83o-this-path-should-not-exist-abc123def456";
+    let (_stdout, status) = run_mu_ask(&["--append-system-prompt", missing, "hello"]).await;
+    assert!(
+        !status.success(),
+        "expected non-zero exit for missing file, got success"
+    );
+}

@@ -3,7 +3,7 @@
 //! One binary, multiple modes. `mu serve` is the JSON-RPC core daemon;
 //! every other subcommand is a frontend that owns one or more daemons.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -86,6 +86,15 @@ enum Command {
         /// Forwarded as `--bash-prompt` to `mu serve`.
         #[arg(long)]
         bash_prompt: bool,
+        /// Read FILE and use its contents as the session's system
+        /// prompt (sent as `CreateSessionRequest.system_prompt`).
+        /// Today this overrides the daemon default rather than
+        /// appending to it; flag is named for compatibility with
+        /// pi's `--append-system-prompt` so callers (e.g.
+        /// `agent-spawn-v2`) can substitute mu for pi without
+        /// changing flags. Errors if FILE cannot be read (mu-x83o).
+        #[arg(long = "append-system-prompt", value_name = "FILE")]
+        append_system_prompt: Option<std::path::PathBuf>,
     },
     /// Interactive terminal UI.
     Tui,
@@ -162,7 +171,14 @@ async fn main() -> Result<()> {
             bash_yolo,
             bash_allow,
             bash_prompt,
+            append_system_prompt,
         } => {
+            let system_prompt = match append_system_prompt {
+                Some(path) => Some(std::fs::read_to_string(&path).with_context(|| {
+                    format!("--append-system-prompt: reading {}", path.display())
+                })?),
+                None => None,
+            };
             mu_coding::ask::run(mu_coding::ask::AskOptions {
                 prompt,
                 provider,
@@ -173,6 +189,7 @@ async fn main() -> Result<()> {
                 bash_yolo,
                 bash_allow,
                 bash_prompt,
+                system_prompt,
             })
             .await
         }

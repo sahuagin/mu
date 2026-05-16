@@ -29,6 +29,12 @@ pub struct AskOptions {
     pub bash_yolo: bool,
     pub bash_allow: Vec<String>,
     pub bash_prompt: bool,
+    /// System prompt for the session. When present, sent as
+    /// `CreateSessionRequest.system_prompt` (mu-n48 plumbing); when
+    /// None, the daemon default is used. Populated by the CLI from
+    /// `--append-system-prompt <FILE>` (file content read by the
+    /// binary, not here, so this layer stays I/O-free).
+    pub system_prompt: Option<String>,
 }
 
 /// Run a single `mu ask` invocation. Flags (`provider`, `model`,
@@ -53,7 +59,14 @@ pub async fn run(opts: AskOptions) -> Result<()> {
 
     let mut next_id: u64 = 1;
 
-    let session_id = create_session(&mut stdin, &mut stdout, &mut next_id, &selector).await?;
+    let session_id = create_session(
+        &mut stdin,
+        &mut stdout,
+        &mut next_id,
+        &selector,
+        opts.system_prompt.as_deref(),
+    )
+    .await?;
     let text = ask_and_drain(
         &mut stdin,
         &mut stdout,
@@ -133,14 +146,23 @@ async fn create_session(
     stdout: &mut BufReader<ChildStdout>,
     next_id: &mut u64,
     selector: &mu_core::protocol::ProviderSelector,
+    system_prompt: Option<&str>,
 ) -> Result<String> {
     let id = *next_id;
     *next_id += 1;
+    // Build params from the typed protocol struct so that
+    // serde's `skip_serializing_if = "Option::is_none"` on
+    // CreateSessionRequest.system_prompt is honored — no
+    // explicit null field when unset (mu-x83o).
+    let body = CreateSessionRequest {
+        provider: selector.clone(),
+        system_prompt: system_prompt.map(str::to_owned),
+    };
     let req = json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": CreateSessionRequest::METHOD,
-        "params": { "provider": selector }
+        "params": body,
     });
     write_line(stdin, &req).await?;
 

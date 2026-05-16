@@ -118,6 +118,48 @@ enum Command {
     },
     /// Print the version of each crate (smoke test for the workspace).
     Versions,
+    /// Telemetry projection + preset analytics queries over the
+    /// `TaskTelemetry` event log (spec mu-042, bead mu-8ypx).
+    Analytics {
+        #[command(subcommand)]
+        cmd: AnalyticsCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AnalyticsCmd {
+    /// Project `TaskTelemetry` events from per-session JSONL files into the
+    /// sqlite sink. Idempotent — re-running re-classifies & UPSERTs.
+    Compact {
+        /// Path to the events directory. Default:
+        /// `~/.local/share/mu/events/`.
+        #[arg(long, value_name = "PATH")]
+        events_dir: Option<std::path::PathBuf>,
+        /// Path to the analytics DB. Default:
+        /// `~/.local/share/mu/telemetry.sqlite`.
+        #[arg(long, value_name = "PATH")]
+        db: Option<std::path::PathBuf>,
+        /// Only project tasks with `ended_at_unix_ms >= SINCE`. Default:
+        /// 0 (all).
+        #[arg(long, value_name = "UNIX_MS")]
+        since: Option<u64>,
+    },
+    /// Print totals + breakdowns by exit_reason, provider+model, outcome.
+    Summary {
+        #[arg(long, value_name = "PATH")]
+        db: Option<std::path::PathBuf>,
+        #[arg(long, value_name = "UNIX_MS")]
+        since: Option<u64>,
+    },
+    /// Print a rate (hallucination only in v1) grouped by provider+model.
+    Rate {
+        #[arg(long, default_value = "hallucination", value_name = "METRIC")]
+        metric: String,
+        #[arg(long, value_name = "PATH")]
+        db: Option<std::path::PathBuf>,
+        #[arg(long, value_name = "UNIX_MS")]
+        since: Option<u64>,
+    },
 }
 
 #[tokio::main]
@@ -200,6 +242,72 @@ async fn main() -> Result<()> {
                 "this subcommand is not yet implemented; mu is pre-MVP. \
                  Try `mu serve` or `mu ask <prompt>` for what's working."
             )
+        }
+        Command::Analytics { cmd } => run_analytics(cmd),
+    }
+}
+
+fn run_analytics(cmd: AnalyticsCmd) -> Result<()> {
+    use mu_coding::analytics::{
+        compact::compact_dir,
+        default_db_path,
+        query::{format_rate, format_summary, rate_hallucination, summary},
+        sink::open as sink_open,
+    };
+
+    fn resolve_db(arg: Option<std::path::PathBuf>) -> Result<std::path::PathBuf> {
+        if let Some(p) = arg {
+            return Ok(p);
+        }
+        default_db_path()
+            .context("could not resolve default analytics DB path; pass --db PATH explicitly")
+    }
+    fn resolve_events_dir(arg: Option<std::path::PathBuf>) -> Result<std::path::PathBuf> {
+        if let Some(p) = arg {
+            return Ok(p);
+        }
+        mu_coding::serve::default_events_dir()
+            .context("could not resolve default events dir; pass --events-dir PATH explicitly")
+    }
+
+    match cmd {
+        AnalyticsCmd::Compact {
+            events_dir,
+            db,
+            since,
+        } => {
+            let db_path = resolve_db(db)?;
+            let ev_dir = resolve_events_dir(events_dir)?;
+            let conn = sink_open(&db_path)
+                .with_context(|| format!("opening sink at {}", db_path.display()))?;
+            let summary = compact_dir(&conn, &ev_dir, since)?;
+            println!(
+                "compacted: {} file(s), {} line(s), {} task(s) upserted, \
+                 {} malformed, {} filtered",
+                summary.files_scanned,
+                summary.lines_read,
+                summary.tasks_upserted,
+                summary.malformed_lines_skipped,
+                summary.tasks_filtered_out
+            );
+            Ok(())
+        }
+        AnalyticsCmd::Summary { db, since } => {
+            let db_path = resolve_db(db)?;
+            let conn = sink_open(&db_path)?;
+            let s = summary(&conn, since)?;
+            print!("{}", format_summary(&s));
+            Ok(())
+        }
+        AnalyticsCmd::Rate { metric, db, since } => {
+            if metric != "hallucination" {
+                anyhow::bail!("unsupported --metric '{metric}'. v1 supports: hallucination.");
+            }
+            let db_path = resolve_db(db)?;
+            let conn = sink_open(&db_path)?;
+            let rows = rate_hallucination(&conn, since)?;
+            print!("{}", format_rate(&rows, &metric));
+            Ok(())
         }
     }
 }

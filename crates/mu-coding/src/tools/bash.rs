@@ -56,11 +56,11 @@ pub const OUTPUT_CAP_BYTES: usize = 64 * 1024;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 pub const MAX_TIMEOUT_SECS: u64 = 600;
 
-/// Env vars to whitelist through to spawned processes in strict mode.
-/// Everything else is dropped (notably API keys), except variables
-/// that don't match the secret-pattern regex below — those are kept
-/// because they're common build-system vars (CARGO_HOME, RUSTUP_HOME,
-/// LD_LIBRARY_PATH, ...).
+/// Env vars to pass through to spawned processes in strict mode.
+/// Everything else is dropped (notably API keys and custom-named
+/// sensitive values). The secret-name check remains a defense in
+/// depth if a future whitelist entry accidentally matches a secret
+/// pattern.
 const ENV_WHITELIST: &[&str] = &[
     "PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "TZ", "TMPDIR", "PWD",
 ];
@@ -284,13 +284,9 @@ impl Tool for BashTool {
                         c.args(&tokens[1..]);
                     }
                     c.env_clear();
-                    // Inherit a curated env subset.
+                    // Strict mode inherits only explicit non-secret whitelist entries.
                     for (k, v) in std::env::vars() {
-                        if is_secret_env_var(&k) {
-                            continue;
-                        }
-                        // Whitelist or anything that doesn't look secret-y.
-                        if ENV_WHITELIST.contains(&k.as_str()) || !is_secret_env_var(&k) {
+                        if ENV_WHITELIST.contains(&k.as_str()) && !is_secret_env_var(&k) {
                             c.env(&k, &v);
                         }
                     }
@@ -541,6 +537,24 @@ mod tests {
         assert!(
             !result.content.contains("should-not-leak"),
             "env scrub failed; result: {}",
+            result.content
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn b5_strict_env_requires_whitelist_even_when_not_secret() -> Result<(), Box<dyn Error>> {
+        std::env::set_var("MU_TEST_BASH_PUBLIC_VAR", "should-not-pass");
+        let mode = BashMode::strict_with_extras(&["printenv".to_string()], false);
+        let result = execute_bash(
+            mode,
+            json!({ "command": "printenv MU_TEST_BASH_PUBLIC_VAR" }),
+        )
+        .await;
+        std::env::remove_var("MU_TEST_BASH_PUBLIC_VAR");
+        assert!(
+            !result.content.contains("should-not-pass"),
+            "non-whitelisted env var leaked; result: {}",
             result.content
         );
         Ok(())

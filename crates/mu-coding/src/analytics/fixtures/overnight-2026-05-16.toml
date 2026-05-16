@@ -1,0 +1,159 @@
+# 2026-05-16 overnight worker run — inaugural telemetry dataset.
+#
+# Five workers spawned in parallel under the overnight goal-session
+# protocol (supervisor bead mu-6znf). Worker registry recorded in
+# ~/.claude-personal/experiments/overnight-2026-05-16/workers.tsv.
+# Per-worker state.json files preserved under ~/.claude-personal/jobs/.
+# This dataset is referenced from spec mu-043 and bead mu-mk9l.
+#
+# Outcome assignments below are the operator's documentary record of
+# what each attempt produced, determined from PR review + worker
+# state.json + commit content at the time. They are NOT the output of
+# the live classifier — backfill bypasses classification by design.
+#
+# Timestamps use unix milliseconds; values are derived from the
+# preserved state.json createdAt/updatedAt fields where available, and
+# left null where the attempt left no recoverable timestamp ("don't
+# fabricate" per mu-043 §Discipline).
+
+description = "2026-05-16 overnight worker run — 5 workers, 7 attempts, 4 merged PRs (#49–#51, #53), 1 closed (#52)"
+
+# ─── mu-r94: clean_success ─────────────────────────────────────────────
+# Anthropic provider EOF-without-message_stop surfaces as DegradedEof.
+# Cleanest of the overnight: 3-minute worker run, direct PR, merged
+# 17:13:41 UTC. Worker job id 80bda120.
+
+[[tasks]]
+task_id            = "backfill-overnight-2026-05-16-r94"
+session_id         = "overnight-2026-05-16"
+provider           = "anthropic_oauth"
+model              = "claude-opus-4-7"
+exit_reason        = "done"
+outcome_class      = "clean_success"
+outcome_confidence = "definite"
+rationale          = "PR #49 merged 2026-05-16T17:13:41Z; spec mu-006 amended cleanly; no rework required"
+started_at_unix_ms = 1778920659170
+ended_at_unix_ms   = 1778920847323
+wall_clock_ms      = 188153
+
+# ─── mu-el3c attempt 1 (codex): narrative_no_action ─────────────────────
+# `mu ask --provider openai-codex` against gpt-5.5-codex (or similar
+# codex tier) exited with a narrative completion message — zero file
+# modifications. The attempt was not preserved as a separate jobs/
+# entry; only the subsequent claude attempt has a state.json.
+# Timestamps null per the don't-fabricate discipline; ended_at uses the
+# claude attempt's createdAt as a chronological bound (codex finished
+# at or before that point).
+
+[[tasks]]
+task_id            = "backfill-overnight-2026-05-16-el3c-attempt-1-codex"
+session_id         = "overnight-2026-05-16"
+provider           = "openai_codex"
+model              = "gpt-5.5-codex"
+exit_reason        = "done"
+outcome_class      = "narrative_no_action"
+outcome_confidence = "definite"
+rationale          = "codex exited with narrative completion message, zero file modifications; operator restarted via claude"
+ended_at_unix_ms   = 1778920838693
+
+# ─── mu-el3c attempt 2 (claude): clean_success ──────────────────────────
+# Worker job id 1c3ff338. After the codex attempt produced nothing,
+# the claude worker fixed the bash env-whitelist issue cleanly in
+# 86 seconds and merged as PR #50 at 17:21:09 UTC.
+
+[[tasks]]
+task_id            = "backfill-overnight-2026-05-16-el3c-attempt-2-claude"
+session_id         = "overnight-2026-05-16"
+parent_task_id     = "backfill-overnight-2026-05-16-el3c-attempt-1-codex"
+provider           = "anthropic_oauth"
+model              = "claude-opus-4-7"
+exit_reason        = "done"
+outcome_class      = "clean_success"
+outcome_confidence = "definite"
+rationale          = "PR #50 merged 2026-05-16T17:21:09Z; regression test added; previous codex narrative-only attempt linked via parent_task_id"
+started_at_unix_ms = 1778920838693
+ended_at_unix_ms   = 1778920924994
+wall_clock_ms      = 86301
+
+# ─── mu-wk2: bug_in_output ─────────────────────────────────────────────
+# session.assistant_text_finalized notification. Worker landed PR but
+# the diff had a match-arm bug + a sequence test that needed an extra
+# transition. Fixed during operator review before merge.
+# Worker job id a7fbe083.
+
+[[tasks]]
+task_id            = "backfill-overnight-2026-05-16-wk2"
+session_id         = "overnight-2026-05-16"
+provider           = "anthropic_oauth"
+model              = "claude-opus-4-7"
+exit_reason        = "done"
+outcome_class      = "bug_in_output"
+outcome_confidence = "definite"
+rationale          = "match-arm + sequence test bugs surfaced during operator review; rework applied; PR #51 merged 2026-05-16T17:40:14Z"
+started_at_unix_ms = 1778920664754
+ended_at_unix_ms   = 1778921365473
+wall_clock_ms      = 700719
+
+# ─── mu-nk3: hollow_commit ─────────────────────────────────────────────
+# Worker split agent/loop_.rs across 5 modules per the bead. State.json
+# reported "5 modules, 291+ tests green, PR #52 open". But commit
+# message claimed to have created 6 new files, and `git diff-tree`
+# showed zero new files in the diff. PR #52 closed unmerged.
+# Worker job id d7894628. This is the inaugural hollow_commit detection
+# data point for mu-fvy0's pattern work.
+
+[[tasks]]
+task_id            = "backfill-overnight-2026-05-16-nk3"
+session_id         = "overnight-2026-05-16"
+provider           = "anthropic_oauth"
+model              = "claude-opus-4-7"
+exit_reason        = "done"
+outcome_class      = "hollow_commit"
+outcome_confidence = "definite"
+rationale          = "commit message claimed 6 new files; zero new files in diff per git diff-tree; PR #52 closed unmerged 2026-05-16T17:47:17Z"
+started_at_unix_ms = 1778920657696
+ended_at_unix_ms   = 1778921558892
+wall_clock_ms      = 901196
+
+# ─── mu-2jg attempt 1: lying_state ─────────────────────────────────────
+# Same worker job id (dc8065ad) but the lifecycle had an initial socket
+# failure where the worker's state.json briefly claimed `done` with
+# zero commits and no PR. Operator detected during status sweep,
+# respawned via the supervisor's restart path. The lying-state instant
+# is the inaugural data point for that failure mode.
+#
+# wall_clock_ms left null — the lying state lasted a brief unknown
+# duration within the worker's overall lifecycle. ended_at is bounded
+# by the worker's createdAt (lying state happened at-or-shortly-after
+# start).
+
+[[tasks]]
+task_id            = "backfill-overnight-2026-05-16-2jg-attempt-1"
+session_id         = "overnight-2026-05-16"
+provider           = "anthropic_oauth"
+model              = "claude-opus-4-7"
+exit_reason        = "done"
+outcome_class      = "lying_state"
+outcome_confidence = "definite"
+rationale          = "state.json briefly reported done with zero commits and no PR after initial socket failure; operator detected during sweep and restarted"
+started_at_unix_ms = 1778921479496
+ended_at_unix_ms   = 1778921479496
+
+# ─── mu-2jg attempt 2: bug_in_output ────────────────────────────────────
+# Same worker job id (dc8065ad) — recovery completed the dispatch
+# refactor. Diff had an unused import surfaced after rework, otherwise
+# clean. PR #53 merged 2026-05-16T18:32:01Z.
+
+[[tasks]]
+task_id            = "backfill-overnight-2026-05-16-2jg-attempt-2"
+session_id         = "overnight-2026-05-16"
+parent_task_id     = "backfill-overnight-2026-05-16-2jg-attempt-1"
+provider           = "anthropic_oauth"
+model              = "claude-opus-4-7"
+exit_reason        = "done"
+outcome_class      = "bug_in_output"
+outcome_confidence = "definite"
+rationale          = "unused import surfaced after rework; PR #53 merged 2026-05-16T18:32:01Z; recovery linked to attempt-1 lying_state via parent_task_id"
+started_at_unix_ms = 1778921479496
+ended_at_unix_ms   = 1778922338568
+wall_clock_ms      = 859072

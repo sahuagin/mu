@@ -196,8 +196,8 @@ pub enum EventPayload {
     },
     /// Durable mirror of the wire-side `session.provider_status`
     /// notification (mu-035). Emitted on state transitions and on
-    /// periodic ticks during non-streaming waits, both for
-    /// observability (live TUI / firehose) and for post-hoc
+    /// periodic ticks during non-streaming waits, both for live
+    /// observability by streaming consumers and for post-hoc
     /// aggregation (mu-pex: TTFT = AwaitingFirstToken→Streaming gap,
     /// streaming_ms = time in Streaming per call). Field shape
     /// mirrors `crate::protocol::ProviderStatusEvent` minus

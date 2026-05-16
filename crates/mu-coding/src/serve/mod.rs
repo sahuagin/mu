@@ -8,6 +8,7 @@ use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
 
 use mu_core::agent::Tool;
 
+pub mod auth;
 pub mod daemon_info;
 pub mod discovery;
 mod dispatch;
@@ -122,6 +123,15 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let sessions = Sessions::new();
+    // mu-7rk (mu-yox): build the connect-time auth registry from
+    // `[auth]` config and allocate a fresh per-connection `AuthState`
+    // handle. This `serve_with_io_with_config` call corresponds to one
+    // connection — stdio in production, one duplex pipe in tests. The
+    // handle is freshly allocated here so cross-connection auth state
+    // never leaks.
+    let auth_registry = Arc::new(auth::registry_from_config(&config.auth));
+    let auth_state: auth::AuthStateHandle =
+        Arc::new(std::sync::Mutex::new(auth::AuthState::default()));
     let daemon_info = DaemonInfo::new(env!("CARGO_PKG_VERSION"))
         .with_events_dir(events_dir)
         .with_config(config);
@@ -151,8 +161,21 @@ where
         let tools = tools.clone();
         let daemon_info = daemon_info.clone();
         let discovery = discovery.clone();
+        let auth_registry = auth_registry.clone();
+        let auth_state = auth_state.clone();
         async move {
-            dispatch::dispatch(req, notif, sessions, factory, tools, daemon_info, discovery).await
+            dispatch::dispatch(
+                req,
+                notif,
+                sessions,
+                factory,
+                tools,
+                daemon_info,
+                discovery,
+                auth_registry,
+                auth_state,
+            )
+            .await
         }
     })
     .await

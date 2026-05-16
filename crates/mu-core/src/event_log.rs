@@ -266,6 +266,75 @@ pub enum EventPayload {
         /// The `seq` of the `MailboxMessagePosted` being marked.
         seq: u64,
     },
+    /// mu-5g7i / spec mu-040: per-task termination envelope for the
+    /// forensics axis (mu-fvy0 cluster). Emitted exactly once per
+    /// task end, alongside the existing `Done` / `Error` events.
+    /// Carries the rich envelope downstream analytics need (provider,
+    /// timing, usage, exit reason). Fields the forwarder cannot
+    /// populate yet (tools_granted/called, budget, local time) emit
+    /// as `None` / empty `Vec` rather than being skipped — the
+    /// contract is "always emit, fill in over time," not "emit only
+    /// when complete."
+    TaskTelemetry {
+        task_id: String,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_task_id: Option<String>,
+        provider_kind: String,
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_version: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at_unix_ms: Option<u64>,
+        ended_at_unix_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wall_clock_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_read_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_write_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools_granted: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools_actually_called: Vec<(String, u32)>,
+        exit_reason: TaskExitReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_budget_usd: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actual_spend_usd: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_hour: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        day_of_week: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tz: Option<String>,
+    },
+}
+
+/// Categorical exit reason for a task — what brought the task to its
+/// terminal state. Companion to `EventPayload::TaskTelemetry`. mu-5g7i.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskExitReason {
+    /// Provider returned a terminal stop_reason (EndTurn, MaxTokens, etc).
+    Done,
+    /// Loop emitted `AgentEvent::Error` (provider failure, tool failure
+    /// surfaced as terminal, internal panic-equivalent).
+    Error,
+    /// Task was aborted via cancel_session or operator stop. Maps from
+    /// `StopReason::Aborted` in the existing Done path.
+    Cancelled,
+    /// Budget ledger tripped a cap. Not yet emitted by the loop
+    /// (budget enforcement is a separate axis under mu-fvy0).
+    BudgetCap,
+    /// Watchdog timeout. Not yet emitted by the loop.
+    Timeout,
+    /// Operator-issued stop distinct from Cancelled. Reserved.
+    OperatorStopped,
 }
 
 /// Append-only per-session log.

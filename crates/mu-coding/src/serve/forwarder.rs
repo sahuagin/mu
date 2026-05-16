@@ -304,11 +304,93 @@ pub async fn forward_events(
             }
             event_log.append(actor, payload);
         }
+        // mu-5g7i / spec mu-040: at every task termination (Done or
+        // Error AgentEvent), emit one TaskTelemetry envelope. This is
+        // the forensics-axis foundation — downstream classifier
+        // (mu-8alb) and analytics sink (mu-8ypx) project from these.
+        if let Some(telemetry) = task_telemetry_for(&session_id, &event, event_log.provider_info())
+        {
+            event_log.append(EventActor::System, telemetry);
+        }
         // Wire projection: translate to mu-001 notification surface.
         if let Some((method, params)) = translate_event(&session_id, event) {
             let _ = notif.emit(method, params).await;
         }
     }
+}
+
+/// mu-5g7i: build a `TaskTelemetry` payload for terminal `AgentEvent`s
+/// (Done, Error). Non-terminal events return None. Kept pure so tests
+/// can verify envelope shape across exit paths without spinning up the
+/// full forwarder loop.
+///
+/// `provider_info` is what `SessionEventLog::provider_info()` returns at
+/// emit time (Some((kind, model)) once SessionCreated has been recorded;
+/// None before then — should not happen at task-end in practice, but we
+/// emit defensively with empty strings if it does).
+pub(crate) fn task_telemetry_for(
+    session_id: &str,
+    event: &AgentEvent,
+    provider_info: Option<(String, String)>,
+) -> Option<EventPayload> {
+    use mu_core::agent::StopReason;
+    use mu_core::event_log::TaskExitReason;
+
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let task_id = format!(
+        "task-{:020}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+
+    let (exit_reason, wall_clock_ms, usage) = match event {
+        AgentEvent::Done {
+            stop_reason,
+            usage,
+            elapsed_ms,
+            ..
+        } => {
+            let reason = match stop_reason {
+                StopReason::Aborted => TaskExitReason::Cancelled,
+                _ => TaskExitReason::Done,
+            };
+            (reason, *elapsed_ms, *usage)
+        }
+        AgentEvent::Error { .. } => (TaskExitReason::Error, None, None),
+        _ => return None,
+    };
+
+    let (provider_kind, model) = provider_info.unwrap_or_default();
+
+    Some(EventPayload::TaskTelemetry {
+        task_id,
+        session_id: session_id.to_owned(),
+        parent_task_id: None,
+        provider_kind,
+        model,
+        model_version: None,
+        started_at_unix_ms: None, // session-local timing not wired yet (mu-040 MVP)
+        ended_at_unix_ms: now_unix_ms,
+        wall_clock_ms,
+        prompt_tokens: usage.map(|u| u.input_tokens),
+        completion_tokens: usage.map(|u| u.output_tokens),
+        cache_read_tokens: usage.and_then(|u| u.cache_read_input_tokens),
+        cache_write_tokens: usage.and_then(|u| u.cache_creation_input_tokens),
+        tools_granted: Vec::new(),
+        tools_actually_called: Vec::new(),
+        exit_reason,
+        max_budget_usd: None,
+        actual_spend_usd: None,
+        local_hour: None,
+        day_of_week: None,
+        tz: None,
+    })
 }
 
 /// Translate an `AgentEvent` into a durable-log entry, or None if the
@@ -941,6 +1023,7 @@ mod tests {
                 EventPayload::AutonomousTerminated { .. } => "autonomous_terminated",
                 EventPayload::MailboxMessagePosted { .. } => "mailbox_message_posted",
                 EventPayload::MailboxMessageConsumed { .. } => "mailbox_message_consumed",
+                EventPayload::TaskTelemetry { .. } => "task_telemetry",
             })
             .collect();
         assert_eq!(kinds, vec!["assistant_message", "done"]);
@@ -981,5 +1064,198 @@ mod tests {
         assert_eq!(cumulative.output_tokens, 50);
         assert_eq!(log.ask_count(), 3);
         assert_eq!(log.elapsed_total_ms(), 1100);
+    }
+
+    // ─── mu-5g7i / spec mu-040: TaskTelemetry envelope emission ──────────
+
+    /// Done with EndTurn → TaskExitReason::Done; usage/wall propagate.
+    #[test]
+    fn mu_5g7i_telemetry_done_endturn_carries_envelope() {
+        use mu_core::agent::{StopReason, Usage};
+        use mu_core::event_log::TaskExitReason;
+
+        let event = AgentEvent::Done {
+            stop_reason: StopReason::EndTurn,
+            turn_count: 1,
+            usage: Some(Usage {
+                input_tokens: 2400,
+                output_tokens: 17,
+                cache_read_input_tokens: Some(100),
+                cache_creation_input_tokens: Some(50),
+                reasoning_tokens: None,
+            }),
+            elapsed_ms: Some(1234),
+        };
+        let payload = task_telemetry_for(
+            "session-abc",
+            &event,
+            Some((
+                "openrouter".to_owned(),
+                "deepseek/deepseek-v4-flash".to_owned(),
+            )),
+        )
+        .expect("Done should yield TaskTelemetry");
+
+        match payload {
+            EventPayload::TaskTelemetry {
+                session_id,
+                exit_reason,
+                wall_clock_ms,
+                prompt_tokens,
+                completion_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                provider_kind,
+                model,
+                task_id,
+                ended_at_unix_ms,
+                started_at_unix_ms,
+                tools_granted,
+                tools_actually_called,
+                max_budget_usd,
+                actual_spend_usd,
+                local_hour,
+                day_of_week,
+                tz,
+                parent_task_id,
+                model_version,
+            } => {
+                assert_eq!(session_id, "session-abc");
+                assert_eq!(exit_reason, TaskExitReason::Done);
+                assert_eq!(wall_clock_ms, Some(1234));
+                assert_eq!(prompt_tokens, Some(2400));
+                assert_eq!(completion_tokens, Some(17));
+                assert_eq!(cache_read_tokens, Some(100));
+                assert_eq!(cache_write_tokens, Some(50));
+                assert_eq!(provider_kind, "openrouter");
+                assert_eq!(model, "deepseek/deepseek-v4-flash");
+                assert!(task_id.starts_with("task-"), "task_id: {task_id}");
+                assert!(ended_at_unix_ms > 0, "ended_at_unix_ms should be set");
+                // MVP-Nones — explicit so a future bead that populates these
+                // makes us update the assertions intentionally.
+                assert_eq!(started_at_unix_ms, None);
+                assert!(tools_granted.is_empty());
+                assert!(tools_actually_called.is_empty());
+                assert_eq!(max_budget_usd, None);
+                assert_eq!(actual_spend_usd, None);
+                assert_eq!(local_hour, None);
+                assert_eq!(day_of_week, None);
+                assert_eq!(tz, None);
+                assert_eq!(parent_task_id, None);
+                assert_eq!(model_version, None);
+            }
+            other => panic!("expected TaskTelemetry, got {other:?}"),
+        }
+    }
+
+    /// Done with Aborted stop_reason → TaskExitReason::Cancelled (the
+    /// cancel_session / operator-stop code path).
+    #[test]
+    fn mu_5g7i_telemetry_done_aborted_maps_to_cancelled() {
+        use mu_core::agent::StopReason;
+        use mu_core::event_log::TaskExitReason;
+
+        let event = AgentEvent::Done {
+            stop_reason: StopReason::Aborted,
+            turn_count: 0,
+            usage: None,
+            elapsed_ms: None,
+        };
+        let payload = task_telemetry_for(
+            "session-xyz",
+            &event,
+            Some(("anthropic_api".to_owned(), "claude-haiku-4-5".to_owned())),
+        )
+        .expect("Aborted Done should yield TaskTelemetry");
+
+        match payload {
+            EventPayload::TaskTelemetry {
+                exit_reason,
+                wall_clock_ms,
+                prompt_tokens,
+                completion_tokens,
+                ..
+            } => {
+                assert_eq!(exit_reason, TaskExitReason::Cancelled);
+                assert_eq!(wall_clock_ms, None);
+                assert_eq!(prompt_tokens, None);
+                assert_eq!(completion_tokens, None);
+            }
+            other => panic!("expected TaskTelemetry, got {other:?}"),
+        }
+    }
+
+    /// Error AgentEvent → TaskExitReason::Error; provider info still
+    /// carried so error postmortems can attribute by provider/model.
+    #[test]
+    fn mu_5g7i_telemetry_error_carries_provider_info() {
+        use mu_core::event_log::TaskExitReason;
+
+        let event = AgentEvent::Error {
+            message: "provider stream closed unexpectedly".into(),
+        };
+        let payload = task_telemetry_for(
+            "session-err",
+            &event,
+            Some(("openai_api".to_owned(), "gpt-5.5-codex".to_owned())),
+        )
+        .expect("Error should yield TaskTelemetry");
+
+        match payload {
+            EventPayload::TaskTelemetry {
+                session_id,
+                exit_reason,
+                provider_kind,
+                model,
+                wall_clock_ms,
+                ..
+            } => {
+                assert_eq!(session_id, "session-err");
+                assert_eq!(exit_reason, TaskExitReason::Error);
+                assert_eq!(provider_kind, "openai_api");
+                assert_eq!(model, "gpt-5.5-codex");
+                // Errors don't carry a Done-style elapsed_ms — leave None
+                // rather than fabricate a duration.
+                assert_eq!(wall_clock_ms, None);
+            }
+            other => panic!("expected TaskTelemetry, got {other:?}"),
+        }
+    }
+
+    /// Non-terminal events return None — no spurious telemetry emission.
+    #[test]
+    fn mu_5g7i_telemetry_skips_non_terminal_events() {
+        let event = AgentEvent::TextDelta { delta: "hi".into() };
+        assert!(
+            task_telemetry_for("session-x", &event, Some(("p".into(), "m".into()))).is_none(),
+            "TextDelta is not terminal — should not produce TaskTelemetry"
+        );
+    }
+
+    /// When provider_info is None (unusual — would mean no SessionCreated
+    /// yet), still emit; provider/model fall back to empty strings rather
+    /// than skipping the telemetry event (emission is not optional).
+    #[test]
+    fn mu_5g7i_telemetry_emits_with_empty_provider_info() {
+        use mu_core::agent::StopReason;
+
+        let event = AgentEvent::Done {
+            stop_reason: StopReason::EndTurn,
+            turn_count: 1,
+            usage: None,
+            elapsed_ms: None,
+        };
+        let payload = task_telemetry_for("session-no-info", &event, None).expect("must still emit");
+        match payload {
+            EventPayload::TaskTelemetry {
+                provider_kind,
+                model,
+                ..
+            } => {
+                assert_eq!(provider_kind, "");
+                assert_eq!(model, "");
+            }
+            other => panic!("expected TaskTelemetry, got {other:?}"),
+        }
     }
 }

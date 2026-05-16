@@ -232,7 +232,11 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
             // not per-call usage. The mailbox view projects from
             // these directly; they don't feed token/latency metrics.
             | EventPayload::MailboxMessagePosted { .. }
-            | EventPayload::MailboxMessageConsumed { .. } => {}
+            | EventPayload::MailboxMessageConsumed { .. }
+            // mu-5g7i: TaskTelemetry is the forensics-axis projection.
+            // Its tokens are sourced from the same Done events we
+            // already aggregate above, so re-counting here would double.
+            | EventPayload::TaskTelemetry { .. } => {}
         }
     }
 

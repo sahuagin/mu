@@ -24,6 +24,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod analytics;
 pub mod ask;
 pub mod serve;
 pub mod skills;

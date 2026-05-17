@@ -3,11 +3,11 @@
 | field      | value                                          |
 | ---------- | ---------------------------------------------- |
 | spec_id    | mu-026                                         |
-| status     | ready                                          |
+| status     | shipped                                        |
 | created    | 2026-05-10                                     |
-| updated    | 2026-05-10                                     |
+| updated    | 2026-05-16                                     |
 | authors    | tcovert + claude-personal (claude-opus-4.7)    |
-| supersedes | none (resolves recon-bash.md Phase 1)          |
+| supersedes | none (resolves recon-bash.md Phase 1 + part of Phase 2 — prompt-mode via mu-gih) |
 
 ## Why
 
@@ -72,15 +72,25 @@ CONVENTIONS apply.
   invokes `bash`, `sh`, or any shell. It parses argv via `shlex`
   and execs directly. Shell metas in the command string are a
   rejection condition.
-- **INV-4 (env scrub in strict mode).** Strict-mode env strips any
-  variable matching `^[A-Z0-9_]*(API_KEY|TOKEN|SECRET|PASSWORD)$`
-  before spawn. Whitelisted: `PATH`, `HOME`, `USER`, `SHELL`,
-  `TERM`, `LANG`, `LC_*`, `TZ`, `TMPDIR`, `PWD`. Anything else
-  goes through unchanged (so e.g. `CARGO_HOME` works).
-  Yolo mode passes the full env.
-- **INV-5 (output cap is non-bypassable).** Even yolo mode caps
-  output at 64KB combined (stdout + stderr). The cap is a memory-
-  pressure / context-window concern, not a security one.
+- **INV-4 (env scrub in strict mode).** Strict mode passes ONLY the
+  explicit whitelist through, regardless of name: `PATH`, `HOME`,
+  `USER`, `SHELL`, `TERM`, `LANG`, `TZ`, `TMPDIR`, `PWD`. Anything
+  off-list — including `CARGO_HOME`, `LC_*`, custom tooling vars — is
+  dropped. The secret-name regex
+  (`^[A-Z0-9_]*(API_KEY|TOKEN|SECRET|PASSWORD)$`) remains as defense
+  in depth, in case a future whitelist entry accidentally matches a
+  secret-named variable. Yolo mode passes the full env.
+  *(Hardened from the original permissive design — whitelist OR
+  non-secret — to strict-whitelist via mu-el3c / PR #50; the permissive
+  form let non-secret-named-but-still-sensitive vars through.)*
+- **INV-5 (output cap is non-bypassable).** Both modes cap each
+  stream independently at 32KB (= `OUTPUT_CAP_BYTES / 2`). Total
+  possible output is 64KB if BOTH streams fill; a stdout-only command
+  sees 32KB max, not 64KB. The per-stream split reserves half the
+  budget for stderr so error messages can't be drowned out by a
+  chatty stdout. The cap is a memory-pressure / context-window
+  concern (tool output goes back to the model as `tool_result`
+  content on the next turn), not a security one.
 - **INV-6 (timeout is non-bypassable in v1).** 60s default,
   configurable per-call via tool args. Both modes enforce. Future
   spec for unbounded.
@@ -101,6 +111,12 @@ pub enum BashMode {
     /// Allowlist-checked, direct-exec, scrubbed env.
     Strict {
         allowlist: Vec<Vec<String>>,  // tokenized argv prefixes
+        /// When true, every allowlist-passing invocation ALSO
+        /// triggers a `session.input_required` prompt before
+        /// dispatch (Phase 2 / mu-029 integration; user opts in
+        /// via `--bash-prompt`). When false, allowlisted commands
+        /// run immediately on match (classic strict semantics).
+        prompt: bool,
     },
     /// Full bash -c, full env. User opts in via --bash-yolo.
     Yolo,
@@ -128,11 +144,14 @@ elapsed: <ms>ms
 ### CLI surface
 
 ```text
-mu serve [...existing flags...] [--bash-yolo] [--bash-allow <cmd>]...
-mu ask   [...existing flags...] [--bash-yolo] [--bash-allow <cmd>]...
+mu serve [...existing flags...] [--bash-yolo] [--bash-allow <cmd>]... [--bash-prompt]
+mu ask   [...existing flags...] [--bash-yolo] [--bash-allow <cmd>]... [--bash-prompt]
 ```
 
-`mu ask` forwards the flags to its spawned `mu serve`.
+`mu ask` forwards all three flags to its spawned `mu serve`.
+`--bash-prompt` is mutually compatible with `--bash-allow` (the
+allowlist still applies; prompt fires AFTER allowlist passes) and
+ignored when `--bash-yolo` is set.
 
 ### Factory
 
@@ -140,6 +159,7 @@ mu ask   [...existing flags...] [--bash-yolo] [--bash-allow <cmd>]...
 pub struct BashSettings {
     pub yolo: bool,
     pub extra_allow: Vec<String>,  // strings to parse + merge into default
+    pub prompt: bool,               // per-call session.input_required gate (--bash-prompt)
 }
 
 // build_tools signature grows:
@@ -279,3 +299,9 @@ is allowed but `git push` is not, so it can plan accordingly.
 ## Changelog
 
 - 2026-05-10 — initial draft (claude-personal).
+- 2026-05-16 — sync spec with shipped implementation after mu-el3c
+  (env scrub tightened to strict-whitelist, PR #50) and mu-gih
+  (`--bash-prompt` mode for per-call approval via mu-029
+  `session.input_required`, PR #45). Clarified INV-5 output-cap
+  semantics (per-stream split, not combined). Filed follow-up bead
+  for missing B-7 (output cap) test.

@@ -56,6 +56,17 @@ use throbber_widgets_tui::{Throbber, ThrobberState};
 
 use crate::mu_client::{Message as MuMessage, MuClient};
 
+// ── Palette ─────────────────────────────────────────────────────────
+// mu-u8a: desaturated replacements for `Color::Yellow` and
+// `Color::Green` to match the moonfly / github_dark family the user
+// runs in helix. Saturated primaries read as jarring against the
+// muted editor palette; soft amber and sage green keep the same
+// semantic categories (warning/attention vs. healthy/active) at
+// lower volume. `Color::Cyan` (active tab) and `Color::Red` (real
+// danger) stay as-is — they're already in family or signal severity.
+const MUTED_AMBER: Color = Color::Rgb(204, 153, 102);
+const MUTED_GREEN: Color = Color::Rgb(122, 162, 122);
+
 // ── Model ───────────────────────────────────────────────────────────
 
 /// mu-62s: which buffer the next $EDITOR handoff targets.
@@ -129,9 +140,9 @@ impl SessionStatus {
     fn style(&self) -> Style {
         match self {
             Self::Running => Style::default()
-                .fg(Color::Green)
+                .fg(MUTED_GREEN)
                 .add_modifier(Modifier::BOLD),
-            Self::Idle => Style::default().fg(Color::Yellow),
+            Self::Idle => Style::default().fg(MUTED_AMBER),
             Self::Done => Style::default().fg(Color::DarkGray),
         }
     }
@@ -1928,7 +1939,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let (used, budget) = app.cost_budget;
     let dot_style = if app.connected() {
-        Style::default().fg(Color::Green)
+        Style::default().fg(MUTED_GREEN)
     } else {
         Style::default().fg(Color::DarkGray)
     };
@@ -1971,9 +1982,9 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(
             format!("${used:.2}/${budget:.2}"),
             Style::default().fg(if used / budget > 0.7 {
-                Color::Yellow
+                MUTED_AMBER
             } else {
-                Color::Green
+                MUTED_GREEN
             }),
         ),
         Span::raw("  next-`n`: "),
@@ -1987,7 +1998,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         // with no args echoes the contents to the firehose.
         Span::raw("  sys:"),
         if app.default_system_prompt.is_some() {
-            Span::styled("✓", Style::default().fg(Color::Green))
+            Span::styled("✓", Style::default().fg(MUTED_GREEN))
         } else {
             Span::styled("·", Style::default().fg(Color::DarkGray))
         },
@@ -2113,18 +2124,18 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
                     snap.elapsed_ms + snap.received_at.elapsed().as_millis() as u64;
                 let secs = synthetic_elapsed_ms as f32 / 1000.0;
                 let (label, color) = match snap.state.as_str() {
-                    "awaiting_first_token" => ("awaiting first token  ", Color::Yellow),
-                    "thinking" => ("thinking  ", Color::Yellow),
+                    "awaiting_first_token" => ("awaiting first token  ", MUTED_AMBER),
+                    "thinking" => ("thinking  ", MUTED_AMBER),
                     "tool_executing" => ("tool executing  ", Color::Magenta),
                     "awaiting_tool_result" => ("awaiting tool result  ", Color::Magenta),
                     // mu-di4 followup: streaming gets its own row + animated
                     // throbber. The original early-return assumed text deltas
                     // ARE the visible feedback; with the throbber, motion
                     // continuity across all active states matters more than
-                    // avoiding redundancy. Green signals "active output" vs.
-                    // yellow (waiting) and magenta (tool work). Idle still
-                    // hides — no work happening.
-                    "streaming" => ("streaming  ", Color::Green),
+                    // avoiding redundancy. Sage green signals "active output"
+                    // vs. soft amber (waiting) and magenta (tool work). Idle
+                    // still hides — no work happening.
+                    "streaming" => ("streaming  ", MUTED_GREEN),
                     "idle" => return None,
                     _ => ("working  ", Color::Cyan),
                 };
@@ -2164,12 +2175,12 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
                     Span::styled(
                         "● awaiting first token  ",
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(MUTED_AMBER)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!("{:.1}s", elapsed.as_secs_f32()),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(MUTED_AMBER),
                     ),
                 ])
             })
@@ -2348,7 +2359,7 @@ fn render_approval_modal(f: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("  reason:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(summary, Style::default().fg(Color::Yellow)),
+            Span::styled(summary, Style::default().fg(MUTED_AMBER)),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -2367,7 +2378,7 @@ fn render_approval_modal(f: &mut Frame, app: &App, area: Rect) {
                 " [A]pprove ",
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Green)
+                    .bg(MUTED_GREEN)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("   "),
@@ -2402,7 +2413,7 @@ fn render_approval_modal(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(title).style(
         Style::default()
             .bg(Color::Black)
-            .fg(Color::Yellow)
+            .fg(MUTED_AMBER)
             .add_modifier(Modifier::BOLD),
     );
     let paragraph = Paragraph::new(lines)
@@ -2516,9 +2527,9 @@ fn render_session_detail(f: &mut Frame, app: &mut App, area: Rect) {
         .find(|r| r.session_id.as_deref() == Some(sid.as_str()));
     let header_lines: Vec<Line> = if let Some(r) = row {
         let phase_style = match r.status {
-            SessionStatus::Running => Style::default().fg(Color::Green),
+            SessionStatus::Running => Style::default().fg(MUTED_GREEN),
             SessionStatus::Done => Style::default().fg(Color::DarkGray),
-            SessionStatus::Idle => Style::default().fg(Color::Yellow),
+            SessionStatus::Idle => Style::default().fg(MUTED_AMBER),
         };
         vec![Line::from(vec![
             Span::styled("session ", Style::default().fg(Color::DarkGray)),
@@ -2817,7 +2828,7 @@ fn render_transcript_lines(
             push_block(
                 &mut lines,
                 "assistant (streaming…)",
-                Color::Yellow,
+                MUTED_AMBER,
                 partial,
                 wrap_width,
             );
@@ -3042,7 +3053,7 @@ fn render_usage(f: &mut Frame, app: &App, area: Rect) {
     .iter()
     .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells)
-        .style(Style::default().fg(Color::Yellow))
+        .style(Style::default().fg(MUTED_AMBER))
         .height(1);
 
     let body_rows: Vec<Row> = rows_json
@@ -3280,7 +3291,7 @@ fn render_statusline(f: &mut Frame, app: &App, area: Rect) {
         }
     };
     let style = match app.input_mode {
-        InputMode::Command => Style::default().fg(Color::Black).bg(Color::Yellow),
+        InputMode::Command => Style::default().fg(Color::Black).bg(MUTED_AMBER),
         InputMode::SendPrompt => Style::default().fg(Color::Black).bg(Color::Cyan),
         InputMode::Normal => Style::default().fg(Color::Black).bg(Color::Gray),
     };

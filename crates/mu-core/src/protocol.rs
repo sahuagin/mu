@@ -1799,4 +1799,142 @@ mod tests {
         }
         Ok(())
     }
+
+    // ===== mu-bys: response-shape locking tests =====
+    //
+    // Lock the wire shape of the auth response types so a future
+    // accidental change to internal/external tagging, field renaming,
+    // or `deny_unknown_fields` removal surfaces as a test failure
+    // rather than as a silent client breakage.
+
+    #[test]
+    fn auth_mechanism_bearer_deserializes_from_lowercase() -> Result<(), serde_json::Error> {
+        let m: AuthMechanism = serde_json::from_value(json!("bearer"))?;
+        assert_eq!(m, AuthMechanism::Bearer);
+        Ok(())
+    }
+
+    #[test]
+    fn auth_exchange_response_accepted_wire_shape() -> Result<(), serde_json::Error> {
+        let resp = AuthExchangeResponse::Accepted {
+            granted_capability: crate::capability::Capability::default(),
+        };
+        let v = serde_json::to_value(&resp)?;
+        assert_eq!(v["outcome"], "accepted");
+        assert!(
+            v.get("granted_capability").is_some(),
+            "Accepted variant must carry granted_capability"
+        );
+        let back: AuthExchangeResponse = serde_json::from_value(v)?;
+        assert_eq!(back, resp);
+        Ok(())
+    }
+
+    #[test]
+    fn auth_exchange_response_denied_wire_shape() -> Result<(), serde_json::Error> {
+        let resp = AuthExchangeResponse::Denied {
+            code: AuthDenialCode::InvalidCredentials,
+            reason: "token not in allowlist".into(),
+        };
+        let v = serde_json::to_value(&resp)?;
+        assert_eq!(
+            v,
+            json!({
+                "outcome": "denied",
+                "code": "invalid_credentials",
+                "reason": "token not in allowlist",
+            })
+        );
+        let back: AuthExchangeResponse = serde_json::from_value(v)?;
+        assert_eq!(back, resp);
+        Ok(())
+    }
+
+    #[test]
+    fn auth_exchange_response_continue_wire_shape() -> Result<(), serde_json::Error> {
+        let resp = AuthExchangeResponse::Continue {
+            server_state_id: "state-abc".into(),
+            challenge: "Y2hhbGxlbmdl".into(),
+        };
+        let v = serde_json::to_value(&resp)?;
+        assert_eq!(
+            v,
+            json!({
+                "outcome": "continue",
+                "server_state_id": "state-abc",
+                "challenge": "Y2hhbGxlbmdl",
+            })
+        );
+        let back: AuthExchangeResponse = serde_json::from_value(v)?;
+        assert_eq!(back, resp);
+        Ok(())
+    }
+
+    #[test]
+    fn auth_exchange_response_accepted_rejects_unknown_field() {
+        let v: Value = json!({
+            "outcome": "accepted",
+            "granted_capability": {"autonomy": {"kind": "disallowed"}},
+            "extra": true,
+        });
+        let result: Result<AuthExchangeResponse, _> = serde_json::from_value(v);
+        assert!(
+            result.is_err(),
+            "AuthExchangeResponse::Accepted must reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn auth_exchange_response_denied_rejects_unknown_field() {
+        let v: Value = json!({
+            "outcome": "denied",
+            "code": "invalid_credentials",
+            "reason": "nope",
+            "extra": true,
+        });
+        let result: Result<AuthExchangeResponse, _> = serde_json::from_value(v);
+        assert!(
+            result.is_err(),
+            "AuthExchangeResponse::Denied must reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn auth_exchange_response_continue_rejects_unknown_field() {
+        let v: Value = json!({
+            "outcome": "continue",
+            "server_state_id": "state-1",
+            "challenge": "Y2g=",
+            "extra": true,
+        });
+        let result: Result<AuthExchangeResponse, _> = serde_json::from_value(v);
+        assert!(
+            result.is_err(),
+            "AuthExchangeResponse::Continue must reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn auth_offer_response_wire_shape_mixed_mechanisms() -> Result<(), serde_json::Error> {
+        let resp = AuthOfferResponse {
+            mechanisms: vec![AuthMechanism::Bearer, AuthMechanism::Other("gssapi".into())],
+        };
+        let v = serde_json::to_value(&resp)?;
+        assert_eq!(v, json!({ "mechanisms": ["bearer", "gssapi"] }));
+        let back: AuthOfferResponse = serde_json::from_value(v)?;
+        assert_eq!(back, resp);
+        Ok(())
+    }
+
+    #[test]
+    fn auth_offer_response_rejects_unknown_field() {
+        let result: Result<AuthOfferResponse, _> = serde_json::from_value(json!({
+            "mechanisms": ["bearer"],
+            "extra": true,
+        }));
+        assert!(
+            result.is_err(),
+            "AuthOfferResponse must reject unknown fields"
+        );
+    }
 }

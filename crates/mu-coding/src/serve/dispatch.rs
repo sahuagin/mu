@@ -19,7 +19,7 @@ use mu_core::protocol::{
 };
 use mu_core::transport::{codes, err_response, NotificationWriter};
 
-use super::auth::{AuthRegistry, AuthStateHandle};
+use super::auth::{AuthRegistry, AuthState, AuthStateHandle};
 use super::daemon_info::DaemonInfo;
 use super::discovery::SessionDiscovery;
 use super::factory::ProviderFactory;
@@ -27,14 +27,41 @@ use super::handlers::auth::{handle_auth_initiate, handle_auth_offer};
 use super::handlers::{daemon::*, mailbox::*, session::*};
 use super::sessions::Sessions;
 
-// mu-7rk (mu-yox): `dispatch` now carries two extra daemon-wide
-// handles: a shared `AuthRegistry` (constructed once at serve start
-// from `[auth]` config) and a per-connection `AuthStateHandle`. The
-// two new arms (`peer.auth_offer`, `peer.auth_initiate`) drive the
-// handshake. **No other arm consumes the resulting `AuthState`** —
-// enforcement is mu-fnn (mu-7rk-c) and the clippy "too many arguments"
-// lint stays silenced; bundling these into a struct would only push
-// the same fields into a builder.
+// mu-7rk (mu-yox): `dispatch` carries two extra daemon-wide handles:
+// a shared `AuthRegistry` (constructed once at serve start from
+// `[auth]` config) and a per-connection `AuthStateHandle`. The clippy
+// "too many arguments" lint stays silenced; bundling into a struct
+// would just push the same fields into a builder.
+//
+// mu-fnn (mu-7rk-c): the connect-time auth gate. Methods are split
+// into a pre-auth allowlist (`peer.auth_*`) and the protected
+// remainder. The gate enforces:
+//
+//   - `AuthState::Authenticated { .. }` → all methods proceed.
+//   - `AuthState::Unauthenticated` → only pre-auth methods proceed;
+//     everything else is rejected with `auth_required`.
+//   - `AuthState::Denied { .. }` → terminal; ALL methods (including
+//     pre-auth retries) are rejected with `auth_denied`. The transport
+//     close on denial lands in mu-1p6 (mu-7rk-d), separate.
+//
+// `peer.auth_response` is reserved (mu-vha) but not yet routed; it is
+// listed in the pre-auth allowlist for future-proofing — the
+// dispatcher still returns `METHOD_NOT_FOUND` for it until mu-oeo
+// (mu-7rk-g) wires up multi-step state. The order matters: gate first,
+// route second — otherwise an unauthenticated `METHOD_NOT_FOUND`
+// reveals routing surface.
+
+/// Methods callable without an `Authenticated` `AuthState`. Anything
+/// outside this list requires the gate to pass.
+const PRE_AUTH_METHODS: &[&str] = &[
+    AuthOfferRequest::METHOD,
+    AuthInitiateRequest::METHOD,
+    // peer.auth_response is reserved in the protocol (mu-vha) but the
+    // dispatcher doesn't route it until mu-oeo (mu-7rk-g). Listed here
+    // so when routing is added, callers don't need to re-auth first.
+    "peer.auth_response",
+];
+
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch(
     request: Request<Value>,
@@ -47,7 +74,41 @@ pub async fn dispatch(
     auth_registry: Arc<AuthRegistry>,
     auth_state: AuthStateHandle,
 ) -> Response<Value> {
-    match request.method.as_str() {
+    // mu-fnn enforcement gate. Snapshot the AuthState (lock + clone +
+    // drop) so the rest of the dispatcher doesn't hold a Mutex across
+    // .await points. A poisoned lock fails closed: snapshot becomes a
+    // synthetic `Denied { MalformedExchange }` and every method is
+    // rejected.
+    let state_snapshot: AuthState = match auth_state.lock() {
+        Ok(s) => s.clone(),
+        Err(_poisoned) => AuthState::Denied {
+            code: mu_core::protocol::AuthDenialCode::MalformedExchange,
+        },
+    };
+    let method = request.method.as_str();
+    match &state_snapshot {
+        AuthState::Authenticated { .. } => { /* gate open */ }
+        AuthState::Unauthenticated => {
+            if !PRE_AUTH_METHODS.contains(&method) {
+                return err_response(
+                    request.id,
+                    codes::AUTH_REQUIRED,
+                    format!("method `{method}` requires an authenticated connection"),
+                );
+            }
+        }
+        AuthState::Denied { code } => {
+            // Denied is terminal — every method (including auth
+            // retries) is rejected until reconnect.
+            return err_response(
+                request.id,
+                codes::AUTH_DENIED,
+                format!("connection auth denied (code={code:?}); reconnect required"),
+            );
+        }
+    }
+
+    match method {
         PingRequest::METHOD => handle_ping(request),
         // mu-7rk (mu-yox): connect-time SASL-shaped auth handshake.
         AuthOfferRequest::METHOD => handle_auth_offer(request, &auth_registry),

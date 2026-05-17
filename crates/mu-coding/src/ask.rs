@@ -45,6 +45,13 @@ pub async fn run(opts: AskOptions) -> Result<()> {
     // per session from this.
     let selector = crate::serve::selector_from_cli(&opts.provider, opts.model.as_deref())?;
 
+    // mu-fnn: generate a per-spawn bearer token for the trust-on-spawn
+    // handshake with the child `mu serve`. The child reads
+    // `MU_BEARER_TOKEN` from its env (see `serve::run`) and configures
+    // BEARER auth with this single token; we then present the same
+    // token in `peer.auth_initiate` before any session.* RPC.
+    let bearer_token = generate_bearer_token();
+
     let mut child = spawn_serve(
         &opts.tools,
         opts.ephemeral,
@@ -52,12 +59,17 @@ pub async fn run(opts: AskOptions) -> Result<()> {
         opts.bash_yolo,
         &opts.bash_allow,
         opts.bash_prompt,
+        &bearer_token,
     )?;
     let mut stdin = child.stdin.take().context("child stdin not captured")?;
     let stdout = child.stdout.take().context("child stdout not captured")?;
     let mut stdout = BufReader::new(stdout);
 
     let mut next_id: u64 = 1;
+
+    // Authenticate before any protected RPC. Failure here is fatal —
+    // the gate will reject every subsequent call.
+    authenticate(&mut stdin, &mut stdout, &mut next_id, &bearer_token).await?;
 
     let session_id = create_session(
         &mut stdin,
@@ -91,6 +103,53 @@ pub async fn run(opts: AskOptions) -> Result<()> {
     }
 }
 
+/// Generate a per-spawn opaque bearer token for the parent↔child
+/// handshake. The strength bar is "unguessable across this process
+/// lifetime"; SHA-256 + constant-time comparison on the daemon side
+/// already absorb timing concerns. 32 hex chars / 128 bits is plenty.
+fn generate_bearer_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Run the `peer.auth_initiate` BEARER handshake. Returns Ok on
+/// `Accepted`; surfaces a clear error on `Denied` or any non-success.
+async fn authenticate(
+    stdin: &mut ChildStdin,
+    stdout: &mut BufReader<ChildStdout>,
+    next_id: &mut u64,
+    token: &str,
+) -> Result<()> {
+    let id = *next_id;
+    *next_id += 1;
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "peer.auth_initiate",
+        "params": {
+            "mechanism": "bearer",
+            "initial_response": token,
+        },
+    });
+    write_line(stdin, &req).await?;
+    loop {
+        let line = read_line(stdout).await?;
+        if line.get("id").and_then(|v| v.as_u64()) == Some(id) {
+            let outcome = line
+                .get("result")
+                .and_then(|r| r.get("outcome"))
+                .and_then(|v| v.as_str());
+            if outcome == Some("accepted") {
+                return Ok(());
+            }
+            bail!("peer.auth_initiate did not accept the spawn-time token: {line}");
+        }
+        // Skip unrelated notifications.
+    }
+}
+
 fn spawn_serve(
     tools: &str,
     ephemeral: bool,
@@ -98,6 +157,7 @@ fn spawn_serve(
     bash_yolo: bool,
     bash_allow: &[String],
     bash_prompt: bool,
+    bearer_token: &str,
 ) -> Result<tokio::process::Child> {
     // MU_BINARY env override allows integration tests to point at a
     // specific binary path (`env!("CARGO_BIN_EXE_mu")`); production
@@ -112,6 +172,9 @@ fn spawn_serve(
 
     let mut cmd = Command::new(&binary);
     cmd.arg("serve");
+    // mu-fnn: hand the child the same BEARER token we'll present at
+    // `peer.auth_initiate`. Single source of truth: this string.
+    cmd.env("MU_BEARER_TOKEN", bearer_token);
     if !tools.is_empty() {
         cmd.arg("--tools").arg(tools);
     }

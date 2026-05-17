@@ -27,6 +27,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use rand::RngCore;
 use serde_json::Value;
 
 /// One message read off the daemon's stdout. Either a response to one
@@ -92,8 +93,15 @@ impl MuClient {
         // hangs on the next spawn.
         warn_on_orphans(mu_binary);
 
+        // mu-fnn: generate a per-spawn bearer token and pass it via env
+        // to the child. Daemon (serve::run) reads MU_BEARER_TOKEN, sets
+        // BEARER auth, and rejects every protected RPC until we present
+        // the same token in peer.auth_initiate below.
+        let bearer_token = generate_bearer_token();
+
         let mut cmd = Command::new(mu_binary);
         cmd.arg("serve");
+        cmd.env("MU_BEARER_TOKEN", &bearer_token);
         if !tools.is_empty() {
             cmd.arg("--tools").arg(tools.join(","));
         }
@@ -170,7 +178,7 @@ impl MuClient {
                 }
             })?;
 
-        Ok(Self {
+        let mut this = Self {
             child,
             stdin,
             rx,
@@ -178,7 +186,35 @@ impl MuClient {
             next_id: AtomicI64::new(1),
             stderr_buf,
             default_read_timeout: Duration::from_secs(60),
-        })
+        };
+
+        // mu-fnn: present the spawn-time token before any protected RPC.
+        // Without this every session.list / daemon.stats poll returns
+        // -32001 and the firehose fills with auth errors.
+        this.authenticate_with(&bearer_token)?;
+
+        Ok(this)
+    }
+
+    /// mu-fnn handshake. Sends peer.auth_initiate with the BEARER token
+    /// shared at spawn time. Bails on Denied or any non-success.
+    fn authenticate_with(&mut self, token: &str) -> Result<()> {
+        let result = self.request_with_timeout(
+            "peer.auth_initiate",
+            serde_json::json!({
+                "mechanism": "bearer",
+                "initial_response": token,
+            }),
+            Duration::from_secs(10),
+        )?;
+        let outcome = result.get("outcome").and_then(|v| v.as_str());
+        if outcome == Some("accepted") {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "peer.auth_initiate did not accept spawn-time token: {result}; stderr tail:\n{}",
+            self.stderr_tail()
+        ))
     }
 
     /// Tail of recently received stderr lines. Useful for diagnostics
@@ -377,4 +413,13 @@ fn warn_on_orphans(mu_binary: &str) {
             eprintln!("  {ln}");
         }
     }
+}
+
+/// Per-spawn opaque BEARER token (128 bits hex). Mirrors
+/// crates/mu-coding/src/ask.rs:generate_bearer_token — kept inline to
+/// avoid a mu-coding dep just for one helper.
+fn generate_bearer_token() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }

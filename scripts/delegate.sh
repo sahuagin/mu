@@ -127,6 +127,44 @@ print "=== Diff vs main:"
 (cd "$workspace" && jj diff --stat -r "main..@" 2>/dev/null) || \
   print "(no diff or jj couldn't compute one — check workspace state)"
 print
+
+# verify-claims gate (mu-b5kl): compare each delegate commit's `## Files`
+# claim block against the actual diff. Surfaces hallucinated-claim failures
+# right next to the workspace path, so the operator sees them at review time.
+print "=== Verify claims (each commit in main..@):"
+gate_exit=0
+verify_script="${repo_root}/scripts/verify-claims.sh"
+if [[ -x "$verify_script" ]]; then
+  (
+    cd "$workspace"
+    base=$(git merge-base main HEAD 2>/dev/null || true)
+    if [[ -n "$base" ]]; then
+      commits=$(git rev-list --reverse --no-merges "$base..HEAD")
+    else
+      commits=$(git rev-parse HEAD)
+    fi
+    if [[ -z "$commits" ]]; then
+      print "(no commits in main..@ — nothing to verify)"
+      exit 0
+    fi
+    rc=0
+    for c in $commits; do
+      "$verify_script" "$c" || rc=$?
+    done
+    exit "$rc"
+  )
+  gate_exit=$?
+else
+  print "(scripts/verify-claims.sh missing — skipping)"
+fi
+print
+
+# If the delegate exited cleanly but the gate caught a hallucinated claim,
+# inherit the gate's exit code so callers (CI, operator scripts) see the failure.
+if [[ "$delegate_exit" -eq 0 && "$gate_exit" -ne 0 ]]; then
+  print "=== gate failure detected — overriding clean delegate exit (was 0, now $gate_exit)"
+  delegate_exit="$gate_exit"
+fi
 print "Review steps:"
 print "  cd $workspace"
 print "  jj log -r main..@"

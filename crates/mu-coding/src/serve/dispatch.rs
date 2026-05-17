@@ -10,21 +10,32 @@ use serde_json::Value;
 
 use mu_core::agent::Tool;
 use mu_core::protocol::{
-    AskSessionRequest, CancelOutstandingRequest, CancelSessionRequest, CloseSessionRequest,
-    CreateSessionRequest, DaemonOutstandingCallsRequest, DaemonStatsRequest,
-    DaemonUsageHistoryRequest, DelegateSessionRequest, MailboxConsumeRequest, MailboxListRequest,
-    MailboxPostRequest, PeerHelloRequest, PingRequest, Request, RespondToInputRequiredRequest,
-    Response, ScheduleWakeupRequest, SessionEventsRequest, SessionListRequest, SessionStatsRequest,
-    StartAutonomousRequest,
+    AskSessionRequest, AuthInitiateRequest, AuthOfferRequest, CancelOutstandingRequest,
+    CancelSessionRequest, CloseSessionRequest, CreateSessionRequest, DaemonOutstandingCallsRequest,
+    DaemonStatsRequest, DaemonUsageHistoryRequest, DelegateSessionRequest, MailboxConsumeRequest,
+    MailboxListRequest, MailboxPostRequest, PeerHelloRequest, PingRequest, Request,
+    RespondToInputRequiredRequest, Response, ScheduleWakeupRequest, SessionEventsRequest,
+    SessionListRequest, SessionStatsRequest, StartAutonomousRequest,
 };
 use mu_core::transport::{codes, err_response, NotificationWriter};
 
+use super::auth::{AuthRegistry, AuthStateHandle};
 use super::daemon_info::DaemonInfo;
 use super::discovery::SessionDiscovery;
 use super::factory::ProviderFactory;
+use super::handlers::auth::{handle_auth_initiate, handle_auth_offer};
 use super::handlers::{daemon::*, mailbox::*, session::*};
 use super::sessions::Sessions;
 
+// mu-7rk (mu-yox): `dispatch` now carries two extra daemon-wide
+// handles: a shared `AuthRegistry` (constructed once at serve start
+// from `[auth]` config) and a per-connection `AuthStateHandle`. The
+// two new arms (`peer.auth_offer`, `peer.auth_initiate`) drive the
+// handshake. **No other arm consumes the resulting `AuthState`** —
+// enforcement is mu-fnn (mu-7rk-c) and the clippy "too many arguments"
+// lint stays silenced; bundling these into a struct would only push
+// the same fields into a builder.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch(
     request: Request<Value>,
     notif: NotificationWriter,
@@ -33,9 +44,14 @@ pub async fn dispatch(
     tools: Arc<Vec<Arc<dyn Tool>>>,
     daemon_info: DaemonInfo,
     discovery: Arc<dyn SessionDiscovery>,
+    auth_registry: Arc<AuthRegistry>,
+    auth_state: AuthStateHandle,
 ) -> Response<Value> {
     match request.method.as_str() {
         PingRequest::METHOD => handle_ping(request),
+        // mu-7rk (mu-yox): connect-time SASL-shaped auth handshake.
+        AuthOfferRequest::METHOD => handle_auth_offer(request, &auth_registry),
+        AuthInitiateRequest::METHOD => handle_auth_initiate(request, &auth_registry, &auth_state),
         CreateSessionRequest::METHOD => handle_create_session(
             request,
             notif,

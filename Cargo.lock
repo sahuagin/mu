@@ -1379,6 +1379,7 @@ dependencies = [
  "clap",
  "crossterm",
  "mu-core",
+ "rand 0.8.6",
  "ratatui",
  "serde",
  "serde_json",

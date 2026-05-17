@@ -11,16 +11,26 @@ use tokio::time::timeout;
 use mu_ai::FauxProvider;
 use mu_coding::serve;
 use mu_core::agent::Provider;
+use mu_core::config::{AuthConfig, Config};
 
-/// Build a duplex pair, spawn `serve_with_io` on one half, return the
-/// other half plus the server's JoinHandle.
-fn spawn_server(
+/// Shared bearer token used by the test harness. The dispatcher's
+/// mu-fnn enforcement gate (mu-7rk-c) rejects every protected RPC
+/// against an unauthenticated connection, so the harness authenticates
+/// during `spawn_server` and returns an already-authed client.
+const TEST_BEARER_TOKEN: &str = "smoke-test-token";
+
+/// Build a duplex pair, spawn `serve_with_io_with_config` with a
+/// bearer-token allowlist, authenticate the client, and return the
+/// authenticated client + server JoinHandle. Tests can then issue
+/// protected RPCs against the returned client without further
+/// handshaking.
+async fn spawn_server(
     provider: Arc<dyn Provider>,
 ) -> (
     tokio::io::DuplexStream,
     tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
-    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
     let (server_read, server_write) = tokio::io::split(server);
     let server_buf = BufReader::new(server_read);
     // Adapt the single Arc<dyn Provider> into a per-session factory
@@ -28,17 +38,50 @@ fn spawn_server(
     // (one provider for all sessions) under the new factory API.
     let factory: serve::ProviderFactory =
         std::sync::Arc::new(move |_selector| Ok(provider.clone()));
+    let config = Config {
+        auth: AuthConfig::Bearer {
+            tokens: vec![TEST_BEARER_TOKEN.to_string()],
+        },
+        ..Default::default()
+    };
     // events_dir=None: integration tests do NOT write to disk
     // (mu-upb). Setting Some(<path>) would pollute the developer's
     // ~/.local/share/mu/events with test fixtures.
-    let handle = tokio::spawn(serve::serve_with_io(
+    let handle = tokio::spawn(serve::serve_with_io_with_config(
         server_buf,
         server_write,
         factory,
         Vec::new(),
         None,
+        config,
     ));
+    authenticate(&mut client).await;
     (client, handle)
+}
+
+/// Perform the BEARER handshake on `client` so subsequent RPCs pass
+/// the mu-fnn enforcement gate. Panics on any non-success — the
+/// happy-path here is contract, not the test under verification.
+async fn authenticate(client: &mut tokio::io::DuplexStream) {
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "peer.auth_initiate",
+        "params": {
+            "mechanism": "bearer",
+            "initial_response": TEST_BEARER_TOKEN,
+        },
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("auth write");
+    let resp = read_line(client).await;
+    assert_eq!(resp["id"], 0, "auth response id mismatch: {resp}");
+    assert_eq!(
+        resp["result"]["outcome"], "accepted",
+        "auth handshake did not accept the test token: {resp}",
+    );
 }
 
 /// Read exactly one newline-terminated JSON line from a reader.
@@ -62,7 +105,7 @@ async fn read_line<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Value {
 #[tokio::test]
 async fn b4_ping_round_trip() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider);
+    let (mut client, server_handle) = spawn_server(provider).await;
 
     let req = json!({
         "jsonrpc": "2.0",
@@ -89,7 +132,7 @@ async fn b4_ping_round_trip() {
 #[tokio::test]
 async fn b5_create_ask_done() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider);
+    let (mut client, server_handle) = spawn_server(provider).await;
 
     // Step 1: create_session.
     let req = json!({
@@ -185,7 +228,7 @@ async fn b6_cancel_terminates_promptly() {
     // pending-stream mode (mu-003 had MockProvider::pending). For v1
     // this proves cancel_session at least dispatches without hanging.
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider);
+    let (mut client, server_handle) = spawn_server(provider).await;
 
     // Create.
     let req = json!({
@@ -225,7 +268,7 @@ async fn b6_cancel_terminates_promptly() {
 #[tokio::test]
 async fn b7_close_removes_session() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider);
+    let (mut client, server_handle) = spawn_server(provider).await;
 
     // Create.
     let req = json!({
@@ -284,7 +327,7 @@ async fn b7_close_removes_session() {
 #[tokio::test]
 async fn b8_session_stats_after_ask() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider);
+    let (mut client, server_handle) = spawn_server(provider).await;
 
     // Create with a real-ish provider selector so we can verify it
     // round-trips into the SessionCreated event.
@@ -374,7 +417,7 @@ async fn b8_session_stats_after_ask() {
 #[tokio::test]
 async fn b9_session_delegate_creates_child() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider);
+    let (mut client, server_handle) = spawn_server(provider).await;
 
     // 1. Create the parent.
     let req = json!({
@@ -471,7 +514,7 @@ async fn await_response<R: tokio::io::AsyncRead + Unpin>(reader: &mut R, id: i64
 #[tokio::test]
 async fn b10_session_list_round_trip() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider);
+    let (mut client, server_handle) = spawn_server(provider).await;
 
     // Create two sessions.
     let mut session_ids: Vec<String> = Vec::new();
@@ -537,7 +580,7 @@ async fn b10_session_list_round_trip() {
 #[tokio::test]
 async fn b11_session_events_round_trip() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider);
+    let (mut client, server_handle) = spawn_server(provider).await;
 
     // Create + ask.
     let req = json!({
@@ -624,7 +667,7 @@ async fn b11_session_events_round_trip() {
 #[tokio::test]
 async fn b12_daemon_stats_round_trip() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider);
+    let (mut client, server_handle) = spawn_server(provider).await;
 
     // Baseline.
     let req = json!({
@@ -675,7 +718,7 @@ async fn b12_daemon_stats_round_trip() {
 #[tokio::test]
 async fn b13_daemon_outstanding_calls_empty_when_no_sessions() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider);
+    let (mut client, server_handle) = spawn_server(provider).await;
 
     let req = json!({
         "jsonrpc": "2.0", "id": 1, "method": "daemon.outstanding_calls", "params": {}
@@ -701,7 +744,7 @@ async fn b13_daemon_outstanding_calls_empty_when_no_sessions() {
 #[tokio::test]
 async fn b13_daemon_outstanding_calls_empty_after_ask_completes() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider);
+    let (mut client, server_handle) = spawn_server(provider).await;
 
     // Create.
     let req = json!({
@@ -767,7 +810,7 @@ async fn b13_daemon_outstanding_calls_empty_after_ask_completes() {
 #[tokio::test]
 async fn b13_cancel_outstanding_on_idle_session_reports_idle() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider);
+    let (mut client, server_handle) = spawn_server(provider).await;
 
     // Create — session is idle (no ask yet).
     let req = json!({
@@ -804,7 +847,7 @@ async fn b13_cancel_outstanding_on_idle_session_reports_idle() {
 #[tokio::test]
 async fn b8_assistant_text_finalized_on_stream_complete() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider);
+    let (mut client, server_handle) = spawn_server(provider).await;
 
     // Step 1: create_session.
     let req = json!({
@@ -902,7 +945,7 @@ async fn b8_assistant_text_finalized_on_stream_complete() {
 #[tokio::test]
 async fn b14_create_session_with_system_prompt() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider);
+    let (mut client, server_handle) = spawn_server(provider).await;
 
     let req = json!({
         "jsonrpc": "2.0",

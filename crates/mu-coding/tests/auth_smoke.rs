@@ -194,6 +194,111 @@ fn constant_time_comparison_smoke() {
     );
 }
 
+/// L8 (mu-fnn): protected RPC against an unauthenticated connection
+/// is rejected with the structured `AUTH_REQUIRED` error code. The
+/// dispatcher's enforcement gate runs BEFORE handler dispatch, so the
+/// session is never created.
+#[tokio::test]
+async fn unauthenticated_session_create_is_rejected() {
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) =
+        spawn_server(provider, config_with_bearer_tokens(&["secret-1"]));
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "session.create",
+        "params": { "provider": { "kind": "faux" } }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write");
+    let resp = await_response(&mut client, 1).await;
+    assert_eq!(
+        resp["error"]["code"], -32001,
+        "expected AUTH_REQUIRED: {resp}"
+    );
+    assert!(
+        resp["result"].is_null(),
+        "auth-rejected request must not return a result: {resp}",
+    );
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}
+
+/// L9 (mu-fnn): same gate on `session.list`. Confirms the gate
+/// applies broadly — not just to session.create — by exercising a
+/// different protected method.
+#[tokio::test]
+async fn unauthenticated_session_list_is_rejected() {
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) =
+        spawn_server(provider, config_with_bearer_tokens(&["secret-1"]));
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "session.list",
+        "params": null
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write");
+    let resp = await_response(&mut client, 1).await;
+    assert_eq!(
+        resp["error"]["code"], -32001,
+        "expected AUTH_REQUIRED: {resp}"
+    );
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}
+
+/// L10 (mu-fnn): denial is terminal. After `peer.auth_initiate` returns
+/// `Denied`, every subsequent RPC (INCLUDING a fresh
+/// `peer.auth_initiate` with a valid token) is rejected with the
+/// structured `AUTH_DENIED` code until the connection is closed.
+#[tokio::test]
+async fn denied_state_is_terminal() {
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) =
+        spawn_server(provider, config_with_bearer_tokens(&["secret-1"]));
+
+    // First attempt: bad token → Denied.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "peer.auth_initiate",
+        "params": { "mechanism": "bearer", "initial_response": "wrong" }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write");
+    let resp = await_response(&mut client, 1).await;
+    assert_eq!(
+        resp["result"]["outcome"], "denied",
+        "expected initial deny: {resp}"
+    );
+
+    // Second attempt on the SAME connection, this time with the right
+    // token. Gate should still reject because the connection's
+    // AuthState is terminally Denied.
+    let req2 = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "peer.auth_initiate",
+        "params": { "mechanism": "bearer", "initial_response": "secret-1" }
+    });
+    client
+        .write_all(format!("{req2}\n").as_bytes())
+        .await
+        .expect("write");
+    let resp2 = await_response(&mut client, 2).await;
+    assert_eq!(
+        resp2["error"]["code"], -32002,
+        "expected AUTH_DENIED on post-denial retry: {resp2}",
+    );
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}
+
 /// L7: registering two handlers for the same `AuthMechanism` returns
 /// `DuplicateMechanismError`. Silent overwrite hid wiring bugs in v0
 /// (codex review minor #1).

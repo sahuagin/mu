@@ -24,6 +24,7 @@ pub mod config;
 pub mod context;
 pub mod event_log;
 pub mod forensics;
+pub mod pricing;
 pub mod protocol;
 pub mod skill;
 pub mod tool_registry;

@@ -284,7 +284,16 @@ enum AnthropicEvent {
     #[serde(rename = "content_block_stop")]
     ContentBlockStop { index: u32 },
     #[serde(rename = "message_delta")]
-    MessageDelta { delta: AnthropicMessageDelta },
+    MessageDelta {
+        delta: AnthropicMessageDelta,
+        /// mu-yz48: Anthropic puts the cumulative stream `usage` at the
+        /// TOP level of the message_delta event, sibling to `delta` —
+        /// not nested inside it. Reading `delta.usage` always returns
+        /// None and leaves `output_tokens` stuck at the message_start
+        /// baseline (1-5). Capture it here.
+        #[serde(default)]
+        usage: Option<AnthropicUsage>,
+    },
     #[serde(rename = "message_stop")]
     MessageStop,
     #[serde(rename = "ping")]
@@ -581,9 +590,12 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 // No-op for v1; the block stays in the map until
                 // assembled at message_stop.
             }
-            AnthropicEvent::MessageDelta { delta } => {
+            AnthropicEvent::MessageDelta { delta, usage } => {
                 state.stop_reason = delta.stop_reason;
-                if let Some(u) = delta.usage.as_ref() {
+                // Prefer the top-level usage (the real wire location).
+                // Fall back to nested delta.usage so older fixtures /
+                // servers that put it inside delta still work.
+                if let Some(u) = usage.as_ref().or(delta.usage.as_ref()) {
                     state.usage.merge(u);
                 }
             }

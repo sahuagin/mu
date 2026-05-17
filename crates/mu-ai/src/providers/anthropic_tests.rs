@@ -418,6 +418,75 @@ fn test_events_stream(
 }
 
 #[tokio::test]
+async fn mu_yz48_message_delta_top_level_usage_is_captured() {
+    // Regression for mu-yz48 — Anthropic's streaming API puts the
+    // cumulative usage on the message_delta event at the TOP level,
+    // sibling to `delta` (not nested inside it). Previously we
+    // deserialized only the nested `delta.usage` (which is always
+    // absent), so output_tokens stayed pinned to message_start's
+    // baseline (1) across the entire stream. Verified against real
+    // 10-turn opus-4-7 session 3262c036eaca7daa where 25 messages
+    // totaling 1.4M chars of text all reported output_tokens=1-6.
+    let raw = concat!(
+        r#"event: message_start"#,
+        "\n",
+        r#"data: {"type":"message_start","message":{"id":"m_1","role":"assistant","usage":{"input_tokens":2000,"output_tokens":1,"cache_read_input_tokens":500,"cache_creation_input_tokens":100}}}"#,
+        "\n\n",
+        r#"event: content_block_start"#,
+        "\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"event: content_block_delta"#,
+        "\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"long reply"}}"#,
+        "\n\n",
+        r#"event: content_block_stop"#,
+        "\n",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        r#"event: message_delta"#,
+        "\n",
+        // The bug: pre-fix we'd parse `delta.usage` only — actual API puts usage HERE, top-level.
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5547}}"#,
+        "\n\n",
+        r#"event: message_stop"#,
+        "\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+        raw.as_bytes(),
+    ))]);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let mut stream = test_events_stream(bytes, rx);
+
+    let mut events = Vec::new();
+    while let Some(e) = stream.next().await {
+        events.push(e);
+    }
+
+    let done = events
+        .into_iter()
+        .rev()
+        .find(|e| matches!(e, ProviderEvent::Done(_)))
+        .expect("stream emits a Done event");
+    let ProviderEvent::Done(msg) = done else {
+        unreachable!()
+    };
+    let usage = msg.usage.expect("Done carries usage");
+    assert_eq!(
+        usage.output_tokens, 5547,
+        "output_tokens must come from top-level usage on message_delta, not the message_start baseline of 1"
+    );
+    assert_eq!(
+        usage.input_tokens, 2000,
+        "input_tokens from message_start preserved"
+    );
+    assert_eq!(usage.cache_read_input_tokens, Some(500));
+    assert_eq!(usage.cache_creation_input_tokens, Some(100));
+}
+
+#[tokio::test]
 async fn anthropic_error_event_terminates_with_provider_error() {
     let raw = concat!(
         r#"event: error"#,

@@ -44,3 +44,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features --no-fail-fast
+
+  verify-claims:
+    name: verify-claims (per-commit)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Run verify-claims over PR commits
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -u
+          commits=$(git rev-list --reverse --no-merges "${BASE_SHA}..${HEAD_SHA}")
+          if [ -z "$commits" ]; then
+            echo "verify-claims: no non-merge commits in ${BASE_SHA}..${HEAD_SHA}"
+            exit 0
+          fi
+          rc=0
+          for c in $commits; do
+            scripts/verify-claims.sh "$c" || rc=$?
+          done
+          exit "$rc"

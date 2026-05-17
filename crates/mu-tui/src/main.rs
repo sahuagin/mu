@@ -622,6 +622,10 @@ impl App {
             .and_then(|i| self.sessions.get(i))
             .and_then(|r| r.session_id.clone());
         self.sessions = rows;
+        // mu-fqvc: aggregate per-session cost into the header budget.
+        // The budget ceiling stays whatever main() set; only `used` is
+        // computed from live data.
+        self.cost_budget.0 = self.sessions.iter().map(|r| r.cost_usd).sum();
         if let Some(target) = prior_sid {
             if let Some(idx) = self
                 .sessions
@@ -1440,12 +1444,30 @@ fn session_row_from_info_value(v: &serde_json::Value) -> Option<SessionRow> {
             ((i + o) / 1000) as u32
         })
         .unwrap_or(0);
+    // mu-fqvc: per-session cost from cumulative_usage + per-model pricing.
+    // Unknown (provider, model) pairs leave cost at 0.0 (best-effort
+    // display — don't show a confidently-wrong number).
+    let cost_usd = cumulative_usage
+        .and_then(|u| {
+            let pricing = mu_core::pricing::for_model(provider_kind, model)?;
+            let usage = mu_core::agent::types::Usage {
+                input_tokens: u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                output_tokens: u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                cache_read_input_tokens: u.get("cache_read_input_tokens").and_then(|x| x.as_u64()),
+                cache_creation_input_tokens: u
+                    .get("cache_creation_input_tokens")
+                    .and_then(|x| x.as_u64()),
+                reasoning_tokens: u.get("reasoning_tokens").and_then(|x| x.as_u64()),
+            };
+            Some(pricing.cost(&usage) as f32)
+        })
+        .unwrap_or(0.0);
     Some(SessionRow {
         short_id: sid.chars().take(12).collect(),
         title: format!("{provider_kind} / {model}"),
         status,
         model: format!("{provider_kind} / {model}"),
-        cost_usd: 0.0, // populated when usage→cost mapping lands
+        cost_usd,
         tokens_kilo,
         phase,
         session_id: Some(sid),

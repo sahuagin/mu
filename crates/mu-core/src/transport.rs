@@ -30,6 +30,16 @@ pub mod codes {
     pub const METHOD_NOT_FOUND: i32 = -32601;
     pub const INVALID_PARAMS: i32 = -32602;
     pub const INTERNAL_ERROR: i32 = -32603;
+
+    // mu-fnn (mu-7rk-c): application-defined codes for the connect-time
+    // auth enforcement gate. JSON-RPC 2.0 reserves -32099..=-32000 for
+    // server-defined application errors.
+    /// The method requires an authenticated connection (per-connection
+    /// `AuthState` is `Unauthenticated`).
+    pub const AUTH_REQUIRED: i32 = -32001;
+    /// The connection's `AuthState` is terminally `Denied` — including
+    /// re-attempts of pre-auth methods are rejected until reconnect.
+    pub const AUTH_DENIED: i32 = -32002;
 }
 
 /// Build a successful Response<Value>. Caller has already serialized

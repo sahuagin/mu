@@ -14,26 +14,65 @@ use tokio::time::timeout;
 use mu_ai::FauxProvider;
 use mu_coding::serve;
 use mu_core::agent::Provider;
+use mu_core::config::{AuthConfig, Config};
 
-fn spawn_server(
+/// Shared bearer token used by the test harness. The mu-fnn enforcement
+/// gate rejects every protected RPC against an unauthenticated
+/// connection, so the harness authenticates during `spawn_server` and
+/// returns an already-authed client.
+const TEST_BEARER_TOKEN: &str = "mailbox-test-token";
+
+async fn spawn_server(
     provider: Arc<dyn Provider>,
 ) -> (
     tokio::io::DuplexStream,
     tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
-    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
     let (server_read, server_write) = tokio::io::split(server);
     let server_buf = BufReader::new(server_read);
     let factory: serve::ProviderFactory =
         std::sync::Arc::new(move |_selector| Ok(provider.clone()));
-    let handle = tokio::spawn(serve::serve_with_io(
+    let config = Config {
+        auth: AuthConfig::Bearer {
+            tokens: vec![TEST_BEARER_TOKEN.to_string()],
+        },
+        ..Default::default()
+    };
+    let handle = tokio::spawn(serve::serve_with_io_with_config(
         server_buf,
         server_write,
         factory,
         Vec::new(),
         None,
+        config,
     ));
+    authenticate(&mut client).await;
     (client, handle)
+}
+
+/// Perform the BEARER handshake on `client` so subsequent RPCs pass
+/// the mu-fnn enforcement gate.
+async fn authenticate(client: &mut tokio::io::DuplexStream) {
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "peer.auth_initiate",
+        "params": {
+            "mechanism": "bearer",
+            "initial_response": TEST_BEARER_TOKEN,
+        },
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("auth write");
+    let resp = read_line(client).await;
+    assert_eq!(resp["id"], 0, "auth response id mismatch: {resp}");
+    assert_eq!(
+        resp["result"]["outcome"], "accepted",
+        "auth handshake did not accept the test token: {resp}",
+    );
 }
 
 async fn read_line<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Value {
@@ -100,7 +139,7 @@ async fn create_session<W: tokio::io::AsyncWrite + Unpin>(client: &mut W, id: i6
 #[tokio::test]
 async fn l1_two_sessions_exchange_mailbox_message_round_trip() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider);
+    let (mut client, server_handle) = spawn_server(provider).await;
 
     // Step 1: create A.
     create_session(&mut client, 1).await;
@@ -275,7 +314,7 @@ async fn l1_two_sessions_exchange_mailbox_message_round_trip() {
 #[tokio::test]
 async fn l2_mailbox_post_without_handle_is_rejected() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider);
+    let (mut client, server_handle) = spawn_server(provider).await;
 
     // Create A and B.
     create_session(&mut client, 1).await;
@@ -332,7 +371,7 @@ async fn l2_mailbox_post_without_handle_is_rejected() {
 #[tokio::test]
 async fn l3_peer_hello_unsupported_method_is_denied() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider);
+    let (mut client, server_handle) = spawn_server(provider).await;
 
     create_session(&mut client, 1).await;
     let resp = await_response(&mut client, 1).await;

@@ -106,7 +106,19 @@ fn outcome_to_response(
                 reason: "internal state error".into(),
             },
         },
-        AuthStepOutcome::Denied { code, reason } => AuthExchangeResponse::Denied { code, reason },
+        AuthStepOutcome::Denied { code, reason } => {
+            // mu-fnn: denial is terminal at the connection level. The
+            // dispatcher's enforcement gate uses `AuthState::Denied` to
+            // reject all subsequent RPCs (including auth retries) with
+            // `auth_denied`. If the lock is poisoned we fall through
+            // without mutating state — the wire response still carries
+            // the denial, and the gate rejects everything-but-
+            // Authenticated, so the connection remains safe.
+            if let Ok(mut s) = auth_state.lock() {
+                *s = AuthState::Denied { code };
+            }
+            AuthExchangeResponse::Denied { code, reason }
+        }
         AuthStepOutcome::Challenge {
             server_state_id,
             server_data,

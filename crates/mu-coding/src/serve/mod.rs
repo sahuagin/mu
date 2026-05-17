@@ -66,8 +66,23 @@ pub fn resolve_events_dir(config: &mu_core::config::Config) -> Option<PathBuf> {
 /// mu-l1z: loads `Config::load_default()` and consults
 /// `[session].state_dir` / `persist_events_to_disk` to derive the
 /// events directory. Config-less operators see no behavior change.
+///
+/// mu-fnn: when the `MU_BEARER_TOKEN` environment variable is set, it
+/// overrides any bearer tokens from the config file with a single
+/// process-scoped token. This is the trust-on-spawn handshake used by
+/// `mu ask` (and any in-process parent that spawns `mu serve` as a
+/// child): the parent generates a token, exports it to the child, and
+/// presents the same token in `peer.auth_initiate`. The env override
+/// is intentionally one-shot and not persisted to disk.
 pub async fn run(factory: ProviderFactory, tools: Vec<Arc<dyn Tool>>) -> anyhow::Result<()> {
-    let config = mu_core::config::Config::load_default();
+    let mut config = mu_core::config::Config::load_default();
+    if let Ok(token) = std::env::var("MU_BEARER_TOKEN") {
+        if !token.is_empty() {
+            config.auth = mu_core::config::AuthConfig::Bearer {
+                tokens: vec![token],
+            };
+        }
+    }
     let events_dir = resolve_events_dir(&config);
     let stdin = BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();

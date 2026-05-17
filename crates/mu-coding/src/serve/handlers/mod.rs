@@ -3,6 +3,7 @@
 //! Dispatched by the router in [`super::dispatch`]. Methods are organized
 //! by domain (session, daemon, mailbox, peer).
 
+pub mod auth;
 pub mod daemon;
 pub mod mailbox;
 pub mod session;

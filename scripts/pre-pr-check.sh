@@ -73,4 +73,41 @@ else
   run_step "cargo test --workspace" cargo test --workspace --all-features --no-fail-fast
 fi
 
+# verify-claims gate (mu-b5kl): iterate every non-merge commit in main..@ (jj)
+# or main..HEAD (git) and run scripts/verify-claims.sh on each. Opt-in
+# strictness: commits without a `## Files` block exit 0 with a skip note.
+# Bypass: MU_SKIP_CLAIM_CHECK=1.
+#
+# jj colocated mode keeps refs/heads/<bookmark> in sync but doesn't move git
+# HEAD with @, so `git diff-tree HEAD` sees main and main..HEAD is empty.
+# Prefer jj's view when jj is available.
+verify_claims_step() {
+  local check="$REPO_ROOT/scripts/verify-claims.sh"
+  if [ ! -x "$check" ]; then
+    printf "%s    verify-claims.sh missing — skipping%s\n\n" "$C_DIM" "$C_OFF"
+    return 0
+  fi
+  local commits=""
+  if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then
+    commits=$(jj log -r 'main..@ ~ empty() ~ merges()' --no-graph \
+                --reversed -T 'commit_id ++ "\n"' 2>/dev/null || true)
+  fi
+  if [ -z "$commits" ]; then
+    local base
+    if base=$(git merge-base main HEAD 2>/dev/null); then
+      commits=$(git rev-list --reverse --no-merges "$base..HEAD")
+    fi
+  fi
+  if [ -z "$commits" ]; then
+    printf "%s    no commits in main..@%s\n\n" "$C_DIM" "$C_OFF"
+    return 0
+  fi
+  local rc=0 c
+  for c in $commits; do
+    "$check" "$c" || rc=$?
+  done
+  return "$rc"
+}
+run_step "verify-claims (main..@)" verify_claims_step
+
 printf "%spre-pr-check: all checks green%s\n" "$C_GREEN" "$C_OFF"

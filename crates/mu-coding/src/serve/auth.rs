@@ -237,18 +237,25 @@ impl AuthRegistry {
 /// (per-connection state is shared across the connection's concurrent
 /// tasks).
 ///
-/// **mu-yox scope: no other handler in this bead consumes
-/// `AuthState`.** Enforcement on session.\* / mailbox.\* lands in
-/// mu-fnn (mu-7rk-c). A `Denied` variant is deliberately omitted —
-/// that's also mu-fnn.
+/// Per-connection authentication state. The dispatcher consults this
+/// for every RPC: only `Authenticated { .. }` passes the enforcement
+/// gate (mu-fnn). `Denied { code }` is terminal — once a connection
+/// has been denied, every subsequent method (including re-attempts of
+/// pre-auth methods) is rejected with `auth_denied` until the
+/// connection is closed (which is mu-1p6 / mu-7rk-d's job).
 #[derive(Debug, Clone, Default)]
 pub enum AuthState {
-    /// No successful handshake yet.
+    /// No successful handshake yet. Pre-auth methods (`peer.auth_*`)
+    /// are still allowed; everything else is rejected with
+    /// `auth_required`.
     #[default]
     Unauthenticated,
-    /// Handshake succeeded; subsequent RPCs will (in mu-fnn) run under
-    /// this capability.
+    /// Handshake succeeded; subsequent RPCs run under this capability.
     Authenticated { capability: Capability },
+    /// Terminal denial. All subsequent RPCs (including auth retries)
+    /// are rejected with `auth_denied`. The connection-close on denial
+    /// is mu-1p6 (mu-7rk-d), separate.
+    Denied { code: AuthDenialCode },
 }
 
 /// Shared handle to a connection's [`AuthState`]. The dispatcher

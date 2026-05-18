@@ -90,11 +90,19 @@ pub enum BashMode {
     Strict {
         allowlist: Vec<Vec<String>>,
         /// When true, the bash tool's policy is `PermissionLevel::Ask`
-        /// — every (allowlist-passing) invocation triggers a
-        /// `session.input_required` prompt before running. When
-        /// false, runs immediately on allowlist match. Defaults to
-        /// false to preserve current behavior; users opt in via
-        /// `--bash-prompt`.
+        /// — every **allowlist-passing** invocation triggers a
+        /// `session.input_required` prompt before running. When false,
+        /// runs immediately on allowlist match. Defaults to false to
+        /// preserve current behavior; users opt in via `--bash-prompt`.
+        ///
+        /// Order of operations (mu-bkjr): the dispatcher calls
+        /// `Tool::validate(&args)` BEFORE the approval gate.
+        /// `BashTool::validate` performs the metachar + allowlist
+        /// checks, so a non-allowlisted command (e.g. `curl`) fails
+        /// immediately with the allowlist-rejection message — no
+        /// approval modal is dispatched. The "allowlist gates first"
+        /// promise from mu-030 is honored architecturally rather than
+        /// by convention.
         prompt: bool,
     },
     Yolo,
@@ -106,6 +114,8 @@ impl BashMode {
     /// are dropped with a warning log. `prompt = false` matches the
     /// classic strict semantics; `prompt = true` activates the
     /// mu-029 session.input_required gate on every allowlisted call.
+    /// Non-allowlisted commands short-circuit via `Tool::validate`
+    /// before the approval gate fires (mu-bkjr).
     pub fn strict_with_extras(extras: &[String], prompt: bool) -> Self {
         let mut allowlist: Vec<Vec<String>> = DEFAULT_ALLOWLIST
             .iter()
@@ -212,6 +222,21 @@ impl Tool for BashTool {
         }
     }
 
+    fn validate(&self, arguments: &Value) -> Result<(), String> {
+        // mu-bkjr: argument-aware pre-flight. The dispatcher calls this
+        // BEFORE the PermissionLevel::Ask gate, so non-allowlisted
+        // commands fail immediately without prompting the user for
+        // approval on a doomed call.
+        let command = parse_command_arg(arguments)?;
+        match &self.mode {
+            BashMode::Strict { allowlist, .. } => {
+                validate_strict_command(&command, allowlist)?;
+                Ok(())
+            }
+            BashMode::Yolo => Ok(()),
+        }
+    }
+
     fn execute<'life0, 'async_trait>(
         &'life0 self,
         arguments: Value,
@@ -221,23 +246,22 @@ impl Tool for BashTool {
         'life0: 'async_trait,
         Self: 'async_trait,
     {
+        // Defense-in-depth: re-run validate. The dispatcher (mu-bkjr)
+        // calls validate before the policy gate, but direct-call paths
+        // (unit tests, future API surfaces) bypass the dispatcher.
+        if let Err(reason) = self.validate(&arguments) {
+            return Box::pin(async move {
+                ToolResult {
+                    content: reason,
+                    is_error: true,
+                }
+            });
+        }
         let mode = self.mode.clone();
         Box::pin(async move {
-            let command = match arguments.get("command").and_then(Value::as_str) {
-                Some(c) if !c.trim().is_empty() => c.to_owned(),
-                Some(_) => {
-                    return ToolResult {
-                        content: "bash: empty `command` is not allowed".to_owned(),
-                        is_error: true,
-                    };
-                }
-                None => {
-                    return ToolResult {
-                        content: "bash: missing required `command` argument".to_owned(),
-                        is_error: true,
-                    };
-                }
-            };
+            // validate() succeeded — parse_command_arg cannot fail now.
+            let command = parse_command_arg(&arguments)
+                .expect("parse_command_arg succeeded in validate() just above");
 
             let timeout_secs = arguments
                 .get("timeout_secs")
@@ -248,37 +272,10 @@ impl Tool for BashTool {
 
             let mut cmd = match &mode {
                 BashMode::Strict { allowlist, .. } => {
-                    // Reject shell metas first — cheaper than parsing.
-                    if let Some(c) = command.chars().find(|c| SHELL_METACHARS.contains(c)) {
-                        return ToolResult {
-                            content: format!(
-                                "bash: shell metacharacter '{c}' rejected in strict mode. \
-                                 Use --bash-yolo for full shell, or break the command into \
-                                 separate tool calls."
-                            ),
-                            is_error: true,
-                        };
-                    }
-                    let tokens = match shlex::split(&command) {
-                        Some(t) if !t.is_empty() => t,
-                        _ => {
-                            return ToolResult {
-                                content: format!("bash: could not tokenize command: {command:?}"),
-                                is_error: true,
-                            };
-                        }
-                    };
-                    if !is_allowed(&tokens, allowlist) {
-                        return ToolResult {
-                            content: format!(
-                                "bash: command {tokens:?} is not in the strict-mode allowlist. \
-                                 Currently allowed prefixes: {}. \
-                                 Extend with --bash-allow on `mu serve`, or use --bash-yolo.",
-                                fmt_allowlist(allowlist),
-                            ),
-                            is_error: true,
-                        };
-                    }
+                    // validate() already accepted this command; re-run the
+                    // strict check to obtain the tokenized argv.
+                    let tokens = validate_strict_command(&command, allowlist)
+                        .expect("validate_strict_command succeeded in validate() just above");
                     let mut c = tokio::process::Command::new(&tokens[0]);
                     if tokens.len() > 1 {
                         c.args(&tokens[1..]);
@@ -382,6 +379,50 @@ impl Tool for BashTool {
 
 /// Token-prefix match: tokens must start with one of allowlist's
 /// entries. Equal-length match counts as prefix.
+/// Extract the `command` field from the JSON arguments. Returns the
+/// command string or an `Err` with a user-facing reason. Used by both
+/// `Tool::validate` (pre-flight) and `Tool::execute` (run-time);
+/// keeping the parse logic here means the two paths agree on what
+/// "valid arguments" means. (mu-bkjr)
+fn parse_command_arg(arguments: &Value) -> Result<String, String> {
+    match arguments.get("command").and_then(Value::as_str) {
+        Some(c) if !c.trim().is_empty() => Ok(c.to_owned()),
+        Some(_) => Err("bash: empty `command` is not allowed".to_owned()),
+        None => Err("bash: missing required `command` argument".to_owned()),
+    }
+}
+
+/// Strict-mode pre-flight check: reject shell metacharacters,
+/// tokenize via shlex, allowlist-check. Returns the tokenized argv
+/// on success (`execute` consumes the tokens to build the
+/// `tokio::process::Command`). Called by both `Tool::validate` and
+/// `Tool::execute` for the strict mode path. (mu-bkjr)
+fn validate_strict_command(
+    command: &str,
+    allowlist: &[Vec<String>],
+) -> Result<Vec<String>, String> {
+    if let Some(c) = command.chars().find(|c| SHELL_METACHARS.contains(c)) {
+        return Err(format!(
+            "bash: shell metacharacter '{c}' rejected in strict mode. \
+             Use --bash-yolo for full shell, or break the command into \
+             separate tool calls."
+        ));
+    }
+    let tokens = match shlex::split(command) {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(format!("bash: could not tokenize command: {command:?}")),
+    };
+    if !is_allowed(&tokens, allowlist) {
+        return Err(format!(
+            "bash: command {tokens:?} is not in the strict-mode allowlist. \
+             Currently allowed prefixes: {}. \
+             Extend with --bash-allow on `mu serve`, or use --bash-yolo.",
+            fmt_allowlist(allowlist),
+        ));
+    }
+    Ok(tokens)
+}
+
 fn is_allowed(tokens: &[String], allowlist: &[Vec<String>]) -> bool {
     allowlist
         .iter()
@@ -441,6 +482,67 @@ mod tests {
         let yolo = BashTool::new(BashMode::Yolo);
         let y = yolo.spec();
         assert!(y.description.contains("YOLO MODE"));
+    }
+
+    /// mu-bkjr: `validate()` is the dispatcher-facing pre-flight check.
+    /// These tests pin its behavior directly (without going through
+    /// `execute()`), since the dispatcher consults it BEFORE the
+    /// PermissionLevel::Ask approval gate.
+    #[test]
+    fn validate_strict_accepts_allowlisted_command() {
+        let tool = BashTool::new(BashMode::strict_with_extras(&[], true));
+        assert!(tool.validate(&json!({ "command": "echo hi" })).is_ok());
+        assert!(tool.validate(&json!({ "command": "git status" })).is_ok());
+    }
+
+    #[test]
+    fn validate_strict_rejects_non_allowlisted() {
+        let tool = BashTool::new(BashMode::strict_with_extras(&[], true));
+        let err = tool
+            .validate(&json!({ "command": "curl -I example.com" }))
+            .expect_err("curl must be rejected by allowlist");
+        assert!(err.contains("not in the strict-mode allowlist"));
+        assert!(err.contains("--bash-allow") || err.contains("--bash-yolo"));
+    }
+
+    #[test]
+    fn validate_strict_rejects_metacharacters() {
+        let tool = BashTool::new(BashMode::strict_with_extras(&[], true));
+        for cmd in ["ls; rm -rf /", "echo $(whoami)", "ls > /tmp/x"] {
+            let err = tool
+                .validate(&json!({ "command": cmd }))
+                .expect_err("metachar must be rejected");
+            assert!(err.contains("metacharacter"), "for {cmd}, got: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_missing_or_empty_command() {
+        let tool = BashTool::new(BashMode::strict_with_extras(&[], false));
+        assert!(tool
+            .validate(&json!({}))
+            .expect_err("missing must reject")
+            .contains("missing required"));
+        assert!(tool
+            .validate(&json!({ "command": "" }))
+            .expect_err("empty must reject")
+            .contains("empty"));
+        assert!(tool
+            .validate(&json!({ "command": "   " }))
+            .expect_err("whitespace-only must reject")
+            .contains("empty"));
+    }
+
+    #[test]
+    fn validate_yolo_always_ok() {
+        let tool = BashTool::new(BashMode::Yolo);
+        // Yolo accepts anything that has a non-empty `command` — no
+        // allowlist, no metachar rejection at the pre-flight level.
+        assert!(tool
+            .validate(&json!({ "command": "rm -rf / ; curl whatever" }))
+            .is_ok());
+        // But still rejects missing/empty.
+        assert!(tool.validate(&json!({})).is_err());
     }
 
     #[test]

@@ -2812,10 +2812,28 @@ fn render_transcript_lines(
                     .and_then(|v| v.as_u64())
                     .map(|m| format!("{m}ms"))
                     .unwrap_or_else(|| "—".into());
-                lines.push(Line::from(Span::styled(
-                    format!("─── done · {stop} · {elapsed} ───"),
-                    Style::default().fg(Color::DarkGray),
-                )));
+                // mu-779s: surface iteration_cap distinctly — the conversation
+                // didn't finish naturally; the operator should know they can
+                // ask a follow-up or raise --max-iterations.
+                let (label, color) = if stop == "iteration_cap" {
+                    let turns = payload
+                        .get("turn_count")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| format!(" ({n} turns)"))
+                        .unwrap_or_default();
+                    (
+                        format!(
+                            "─── turn budget reached{turns} · ask a follow-up to continue, or restart with --max-iterations · {elapsed} ───"
+                        ),
+                        Color::Yellow,
+                    )
+                } else {
+                    (
+                        format!("─── done · {stop} · {elapsed} ───"),
+                        Color::DarkGray,
+                    )
+                };
+                lines.push(Line::from(Span::styled(label, Style::default().fg(color))));
                 lines.push(Line::from(""));
             }
             "error" => {

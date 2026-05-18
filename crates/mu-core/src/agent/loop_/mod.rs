@@ -348,6 +348,28 @@ impl Default for AgentConfig {
     }
 }
 
+/// Provider-aware default for [`AgentConfig::max_turns`]. (mu-779s)
+///
+/// Empirically (2026-05-18 daemon `8c78230c467e1de7`) OpenAI models
+/// dispatch noticeably more tool calls than Anthropic models on the
+/// same prompt — 20 turns is enough for Anthropic but routinely caps
+/// out OpenAI sessions on tool-heavy reads. Per-provider defaults keep
+/// the ceiling honest without making operators pass `--max-iterations`
+/// every time they touch a non-Anthropic provider.
+///
+/// `provider_kind` matches the strings produced by
+/// `handlers::session::describe_selector` (e.g. `"anthropic_api"`,
+/// `"openai_codex"`). Unknown / faux providers fall through to the
+/// conservative default.
+pub fn default_max_turns_for(provider_kind: &str) -> u32 {
+    match provider_kind {
+        "anthropic_api" | "anthropic_oauth" => 20,
+        "openai_api" | "openai_codex" => 35,
+        "openrouter" => 30,
+        _ => 20,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
     Done(StopReason),
@@ -687,10 +709,14 @@ async fn run(
             }
             Action::InvokeLlm => {
                 if turn_count >= config.max_turns {
+                    // mu-779s: distinguish iteration-cap exit from natural
+                    // end_turn so downstream consumers (TUI, transcript,
+                    // telemetry) can surface "turn budget exhausted" rather
+                    // than reporting a normal conversation end.
                     let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
                     let _ = events
                         .send(AgentEvent::Done {
-                            stop_reason: StopReason::EndTurn,
+                            stop_reason: StopReason::IterationCap,
                             turn_count,
                             usage: aggregated_usage.take(),
                             elapsed_ms,

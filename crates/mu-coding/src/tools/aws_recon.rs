@@ -930,12 +930,42 @@ exit 42
         assert_eq!(value["audit"]["capability"], "aws.audit.security");
     }
 
+    /// Root of an exec-allowed test tempdir. `std::env::temp_dir()` is `/tmp`
+    /// on most systems, which is mounted `noexec` on FreeBSD (and on hardened
+    /// Linux configs). aws_recon tests write shell scripts and exec them, so
+    /// we route through the workspace `target/` directory instead — that's
+    /// exec-allowed by construction (cargo builds binaries there) and
+    /// `cargo clean` handles cleanup.
+    fn exec_temp_root() -> PathBuf {
+        // `CARGO_TARGET_TMPDIR` is set by cargo for integration tests in `tests/`.
+        if let Some(p) = std::env::var_os("CARGO_TARGET_TMPDIR") {
+            return PathBuf::from(p);
+        }
+        // Unit tests get `CARGO_MANIFEST_DIR` (crate root). Walk up looking
+        // for the workspace `target/` directory.
+        if let Some(m) = std::env::var_os("CARGO_MANIFEST_DIR") {
+            let mut path = PathBuf::from(m);
+            loop {
+                let target = path.join("target");
+                if target.is_dir() {
+                    return target.join("test-tmp");
+                }
+                if !path.pop() {
+                    break;
+                }
+            }
+        }
+        // Last resort: env::temp_dir(). Tests that exec scripts will fail
+        // here if /tmp is noexec — but that's strictly better than today.
+        std::env::temp_dir()
+    }
+
     fn temp_test_dir(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mu-{name}-{}-{nonce}", std::process::id()));
+        let dir = exec_temp_root().join(format!("mu-{name}-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
     }

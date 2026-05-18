@@ -213,6 +213,11 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     }
 
     let (kind_str, model_str) = describe_selector(selector);
+    // mu-779s: per-provider max_turns default. OpenAI/openrouter models
+    // are chattier than Anthropic on tool-heavy reads and routinely hit
+    // the default 20-turn cap; bump them so the common case stays
+    // productive. Operator can still pin per-session via `--max-iterations`.
+    let max_turns = mu_core::agent::loop_::default_max_turns_for(&kind_str);
     event_log.append(
         EventActor::System,
         EventPayload::SessionCreated {
@@ -236,6 +241,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         session_tools,
         AgentConfig {
             system_prompt,
+            max_turns,
             ..AgentConfig::default()
         },
         events_tx,

@@ -12,10 +12,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use oauth2::basic::BasicClient;
-use oauth2::reqwest::async_http_client;
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl, Scope,
-    TokenResponse, TokenUrl,
+    AuthUrl, AuthorizationCode, ClientId, CsrfToken, EndpointNotSet, EndpointSet,
+    PkceCodeChallenge, RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -106,10 +105,11 @@ pub async fn login_flow() -> Result<OAuthToken, AuthError> {
     }
 
     // Exchange the auth code for tokens.
+    let http_client = build_http_client()?;
     let token_result = client
         .exchange_code(AuthorizationCode::new(received_code))
         .set_pkce_verifier(pkce_verifier)
-        .request_async(async_http_client)
+        .request_async(&http_client)
         .await
         .map_err(|e| AuthError::OAuthFlow(format!("token exchange failed: {e}")))?;
 
@@ -122,9 +122,10 @@ pub async fn login_flow() -> Result<OAuthToken, AuthError> {
 pub async fn refresh_access_token(refresh_token: &str) -> Result<OAuthToken, AuthError> {
     use oauth2::RefreshToken;
     let client = build_client()?;
+    let http_client = build_http_client()?;
     let token_result = client
         .exchange_refresh_token(&RefreshToken::new(refresh_token.into()))
-        .request_async(async_http_client)
+        .request_async(&http_client)
         .await
         .map_err(|e| AuthError::OAuthFlow(format!("refresh failed: {e}")))?;
     Ok(from_token_response(&token_result))
@@ -134,21 +135,35 @@ pub async fn refresh_access_token(refresh_token: &str) -> Result<OAuthToken, Aut
 // Helpers
 // ============================================================================
 
-fn build_client() -> Result<BasicClient, AuthError> {
+/// Public-client (PKCE-only) oauth2 client with AuthUrl and TokenUrl set.
+/// Device-auth / introspection / revocation endpoints unused — left
+/// at `EndpointNotSet`.
+type CodexOAuthClient =
+    BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
+
+fn build_client() -> Result<CodexOAuthClient, AuthError> {
     let auth_url = AuthUrl::new(AUTHORIZE_URL.to_string())
         .map_err(|e| AuthError::OAuthFlow(format!("bad authorize url: {e}")))?;
     let token_url = TokenUrl::new(TOKEN_URL.to_string())
         .map_err(|e| AuthError::OAuthFlow(format!("bad token url: {e}")))?;
     let redirect_url = RedirectUrl::new(REDIRECT_URI.to_string())
         .map_err(|e| AuthError::OAuthFlow(format!("bad redirect url: {e}")))?;
-    let client = BasicClient::new(
-        ClientId::new(CLIENT_ID.into()),
-        None, // No client secret — public client w/ PKCE.
-        auth_url,
-        Some(token_url),
-    )
-    .set_redirect_uri(redirect_url);
+    // oauth2 5.x: typestate builder. No client secret — public client w/ PKCE.
+    let client = BasicClient::new(ClientId::new(CLIENT_ID.into()))
+        .set_auth_uri(auth_url)
+        .set_token_uri(token_url)
+        .set_redirect_uri(redirect_url);
     Ok(client)
+}
+
+/// Build the reqwest client passed to oauth2's `request_async`.
+/// `redirect::Policy::none()` is recommended by oauth2 to keep token
+/// exchanges single-hop.
+fn build_http_client() -> Result<reqwest::Client, AuthError> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| AuthError::OAuthFlow(format!("http client build: {e}")))
 }
 
 fn from_token_response(

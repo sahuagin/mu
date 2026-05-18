@@ -6,15 +6,13 @@ from the code or git history.
 
 ## What this is
 
-`mu` is a coding agent toolkit. Pre-MVP. Architectural blueprint is
-[pi_ts](https://github.com/earendil-works/pi) (`@earendil-works/pi-*`);
-[pi_agent_rust](https://github.com/Dicklesworthstone/pi_agent_rust) is
-consulted for Rust-specific implementation details only — neither is a
-dependency.
+`mu` is a coding agent toolkit. Pre-MVP. Architecture is event-sourced
+(typed events as substrate, context as projection, capability-bounded
+delegation); see `specs/architecture/` and the top-level README for the
+shape.
 
 The name: μ (Greek small mu, U+03BC) — the response the agent gives
-when the question's premise is wrong. Also: µ (micro sign, U+00B5) →
-"micro pi" — the lineage joke. Logo is a cow. Don't fight it.
+when the question's premise is wrong. Logo is a cow. Don't fight it.
 
 ## Architecture in two sentences
 
@@ -29,11 +27,9 @@ conforms.
 These are *additions* to the global rules in `~/.pi/agent/AGENTS.md` —
 not replacements. Read that file first; this file extends it.
 
-- **No 27k-line files.** This rule exists because the whole point of
-  forking off pi_agent_rust was to avoid its monolithic structure. If a
-  module is approaching ~1000 lines, that's the point to split. The
-  tags.scm patterns won't accidentally produce a 27k-line file, but
-  human-and-agent decisions can.
+- **No 27k-line files.** If a module is approaching ~1000 lines, that's
+  the point to split. The tags.scm patterns won't accidentally produce
+  a 27k-line file, but human-and-agent decisions can.
 - **No async-ness leaking through traits unnecessarily.** Use
   `async fn` in trait methods (Rust 1.75+) only when the implementation
   actually does I/O. Pure-compute trait methods stay sync.
@@ -56,19 +52,9 @@ not replacements. Read that file first; this file extends it.
   Earlier versions of this file lumped these as "no third-party
   OAuth token holding ever." That was overgeneralized; the actual
   concern is Anthropic-specific.
-- **Reference, don't copy.** When implementing a feature pi_ts has,
-  *read* pi_ts for the shape and *consult* pi_agent_rust for Rust
-  idioms — but write fresh code. Pasting either invites the structural
-  problems of the source.
-
 ## Where to look
 
-- `~/src/public_github/pi/packages/` — pi_ts, the blueprint.
-  - `agent/` ≈ `mu-core`
-  - `ai/` ≈ `mu-ai`
-  - `coding-agent/` ≈ `mu-coding`
-- `~/src/flywheel/pi_agent_rust/src/` — pi_rs, Rust-syntax cross-check.
-- `~/src/agent_tools/code_index` — semantic recall over either tree;
+- `~/src/agent_tools/code_index` — semantic recall over the codebase;
   also the eventual built-in MCP code-search server.
 - `~/src/agent_tools/agent` — the memory CLI, also the eventual
   built-in MCP memory server.

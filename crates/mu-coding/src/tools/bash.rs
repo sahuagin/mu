@@ -89,12 +89,20 @@ const SHELL_METACHARS: &[char] = &[';', '&', '|', '>', '<', '`', '$', '\\', '\n'
 pub enum BashMode {
     Strict {
         allowlist: Vec<Vec<String>>,
-        /// When true, the bash tool's policy is `PermissionLevel::Ask`
-        /// — every (allowlist-passing) invocation triggers a
-        /// `session.input_required` prompt before running. When
-        /// false, runs immediately on allowlist match. Defaults to
-        /// false to preserve current behavior; users opt in via
-        /// `--bash-prompt`.
+        /// When true, the bash tool's policy is `PermissionLevel::Ask`,
+        /// so the agent loop dispatches a `session.input_required`
+        /// prompt for **every** invocation before the tool runs. The
+        /// allowlist + metachar checks happen *inside* `execute()`
+        /// after the approval round-trip, so a non-allowlisted command
+        /// will still prompt and then reject if approved (mu-20l). When
+        /// false, the tool's policy is `PermissionLevel::Allow` and the
+        /// allowlist gate runs unmediated. Defaults to false; users opt
+        /// in via `--bash-prompt`.
+        ///
+        /// If you want non-allowlisted commands to short-circuit before
+        /// the user is asked to approve them, that requires argument-
+        /// aware policy on the `Tool` trait — out of scope here, would
+        /// be its own bead.
         prompt: bool,
     },
     Yolo,
@@ -105,7 +113,9 @@ impl BashMode {
     /// Each entry in `extras` is parsed via shlex; invalid entries
     /// are dropped with a warning log. `prompt = false` matches the
     /// classic strict semantics; `prompt = true` activates the
-    /// mu-029 session.input_required gate on every allowlisted call.
+    /// mu-029 session.input_required gate on every invocation (the
+    /// allowlist check runs after approval — see `BashMode::Strict`
+    /// for the full behavior contract).
     pub fn strict_with_extras(extras: &[String], prompt: bool) -> Self {
         let mut allowlist: Vec<Vec<String>> = DEFAULT_ALLOWLIST
             .iter()

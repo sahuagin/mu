@@ -2,35 +2,45 @@
 
 `mu` is a local-first coding-agent runtime written in Rust.
 
-It is a single binary with multiple frontends: `mu serve` runs the JSON-RPC daemon, `mu ask` runs one-shot prompts, and future frontends
-such as `mu tui` and `mu orchestrate` attach to the same runtime contract.
+It is a single binary with multiple frontends: `mu serve` runs the JSON-RPC daemon, `mu ask` runs one-shot prompts, and `mu tui` is the interactive terminal UI. They all attach to the same runtime contract.
 
 `mu` is the answer the agent gives when the question's premise is wrong.
 
-## Why mu exists
+## Why this architecture pays off
 
-Most agent tools look like chat wrapped around tool calls. `mu` is built around a different center:
+The architectural thesis (events as substrate, context as projection, capability-bounded delegation) is below in [Architectural bet](#architectural-bet). This section is the concrete cash-out: one place where the architecture has already produced a measurable win you can reproduce.
 
-> agent work should be inspectable, replayable, accountable, and capability-bounded.
+### Compaction: structural beats LLM-summary
 
-The runtime is moving toward an event-sourced model where sessions, model calls, tool calls, context assemblies, usage records, approvals, delegations, and
-observability facts are all typed events. Transcripts, dashboards, session trees, context inspectors, and accounting reports are projections over that event log.
+**Claim.** mu represents context as a typed event log + retained rope of spans, not as a transcript blob. That makes compaction a *structural transform* over typed spans instead of a model-mediated summarization. For the apples-to-apples case where both approaches spend an LLM call on semantic summarization, mu's compaction is approximately **700× faster and ~40× cheaper** than Anthropic's beta `compact_20260112` pathway in our measurement. For workloads that can accept structural-only compaction (no semantic summary), mu's heuristic tier runs at microsecond scale.
 
-The goal is not another opaque coding chatbot. The goal is a toolkit where you can see what the agent knew, which tools it could use, what it did, what it cost,
-why it paused for approval, and how a delegated sub-session inherited authority.
+**Mechanism.** `crates/mu-core/src/context/compaction/` defines a policy ladder over the same `RetainedRope` interface:
 
-## Highlights
+| Policy | What it does | Cost surface |
+|---|---|---|
+| `SpanFamilyDropPolicy` (heuristic) | Structural: drop low-value span families (verbose tool results, superseded states) by event-type rules | CPU only — no LLM call |
+| `HashAndSummaryPolicy` (mock judge) | Hash-and-replace with deterministic stub summaries | CPU only |
+| `HashAndSummaryPolicy` (live judge) | Same shape, but a configurable provider (e.g. Haiku) generates the summary spans — this is the apples-to-apples comparison with Anthropic compaction | One small LLM call per compaction |
 
-- **One binary, multiple modes**: `serve`, `ask`, `tui`, `orchestrate`, `login`, `logout`, and `versions`.
-- **JSON-RPC daemon core**: frontends talk to the daemon over a stable protocol instead of reaching into implementation internals.
-- **Provider abstraction**: faux provider for tests, Anthropic API, OpenRouter, and OpenAI Codex OAuth/direct-backend work.
-- **Real tool execution**: file and shell tools including `read`, `write`, `ls`, `edit`, `grep`, `glob`, and `bash`.
-- **Capability-oriented tool policy**: tools are explicit capabilities; policy gates decide what a session can invoke and when approval is required.
-- **Human-or-policy approval primitive**: `session.input_required` suspends work until an attached UI, parent session, orchestrator, or policy answers.
-- **Session event log**: session state is increasingly represented as typed events with cumulative views and stats projections.
-- **Context provenance**: `ContextAssembly` records are the beginning of an inspectable "what did the model know?" surface.
-- **Delegation-aware runtime**: sub-sessions are becoming first-class instead of ad-hoc subprocess prompts.
-- **Local-first by default**: state is backed by SQLite and the daemon runs locally.
+Each tier is selected by config (`[context.compaction.policy]`), not by a code-path rewrite.
+
+**Measurement.** Against a real 124,091-token mu session corpus, 5 runs each, median wall-clock:
+
+| | Wall-clock | Cost per event | Reduction |
+|---|---|---|---|
+| Anthropic Opus 4.7 auto-compaction (beta) | 38.18 s | $2.03 | 124k → 2.3k tokens (~98%) |
+| mu `HashAndSummaryPolicy` (live Haiku judge, estimated) | ~50 ms | ~$0.05 | mid-tier semantic |
+| mu `SpanFamilyDropPolicy` (heuristic, structural-only) | 19 µs | $0.00 | structural drop, no semantic summary |
+
+The 2M× headline ratio between Anthropic and the heuristic is not a fair single-axis comparison — the heuristic preserves structure, not semantics, and its measurement does not include a real tokenization pass. The ~700× / ~40× numbers for the live-judge case are the more defensible "same trade-off, much cheaper" claim.
+
+**Reproduce locally:**
+
+```sh
+cargo run --example compaction-bench -p mu-ai
+```
+
+**Methodology (5 runs, real corpus, isolated wall-clock):** [`specs/measurements/compaction-2026-05-14.md`](specs/measurements/compaction-2026-05-14.md).
 
 ## Quick start
 
@@ -82,76 +92,92 @@ cargo run -p mu-coding --bin mu -- ask \
 
 `--bash-yolo` exists for trusted sessions, but it deliberately bypasses the strict allowlist and approval path. Treat it like handing the prompt a shell.
 
-## Current status
+Launch the TUI against a running daemon:
 
-`mu` is young and moving quickly. The current implementation already has:
+```sh
+cargo run -p mu-tui -- --mu-binary "$(which mu)" --provider anthropic_api --model claude-haiku-4-5
+# or, after `cargo install`:
+mu tui
+```
 
-- a stdio JSON-RPC daemon;
-- one-shot `mu ask`;
-- per-session provider selection;
-- Anthropic API, OpenRouter, and OpenAI Codex provider paths;
-- OAuth login/logout support for providers that need it;
-- read/write/list/edit/search/bash tools;
-- tool policy, retry policy, session stats, approval suspension, and session delegation primitives;
-- early event-log and context-assembly observability.
+## What works today
 
-The TUI and orchestrator commands are part of the intended surface but are not yet the primary daily-driver interface.
+### Runtime
 
-## Architecture
+- **Stdio JSON-RPC daemon** (`mu serve`) — the architectural contract. Frontends, dashboards, and tools talk to this; they do not reach into implementation internals.
+- **One-shot CLI** (`mu ask`) — single-prompt invocations with full tool access, useful for both interactive use and `agent-spawn`-style automation.
+- **Provider abstraction** — Anthropic Messages API, OpenRouter, OpenAI Codex (OAuth + direct backend), and a faux provider for tests. Provider selection is per-session.
+- **Real tool execution** — `read`, `write`, `ls`, `edit`, `grep`, `glob`, and `bash` (with strict allowlist, per-call approval mode, and yolo mode).
+- **Capability-oriented policy** — every tool call is gated by an explicit policy. The runtime only dispatches what the session is authorized to use. Delegation attenuates authority; it never widens.
+- **Approval primitive** — `session.input_required` suspends work until an attached UI, parent session, orchestrator, or policy answers. The same primitive backs the bash-prompt modal, capability prompts, and orchestrator-mediated approvals.
+- **OAuth login** for providers that need it (currently `openai-codex` via the standard PKCE flow); tokens persist under `~/.config/mu/auth/` mode 0600.
 
-The workspace is split into three crates:
+### Terminal UI (`mu tui`)
+
+`mu-tui` is a fully implemented ratatui-based interactive client (~4,500 LOC in [`crates/mu-tui/`](crates/mu-tui/)). It is the most-developed frontend, not aspirational scaffolding. `mu tui` execs the `mu-tui` binary directly (mu-yvvz); arguments after `tui` pass through.
+
+What's wired up today:
+
+- F1–F9 dashboards: command center, session tree, transcript, context inspector, raw firehose, provider stats, approvals queue, etc.
+- Streaming response rendering with throbbers per provider call.
+- Modal approval flows for bash-prompt and capability gates.
+- `$EDITOR` handoff for long-form prompt editing (KKP push/pop, alternate-screen save/restore, post-edit reflow).
+- Tool-call inspector with arguments, results, and timing.
+- Per-session cost and token-usage panel (mu-fqvc pricing table).
+
+### Observability
+
+- **Typed session event log** — `~/.local/share/mu/events/<session-id>/` is the durable substrate. Sessions, tool calls, model calls, context assemblies, approvals, usage, and delegations are all events.
+- **`ContextAssembly` records** — for each model call, the runtime is moving toward an answer to "what did the model know, and why?" — included spans, omitted spans, cacheable spans, and what the provider actually received.
+- **TaskTelemetry + analytics** — `mu analytics` projects the event log into a queryable SQLite at `~/.local/share/mu/analytics.sqlite`. Preset queries: per-session cost, per-policy compaction stats, outcome classification (clean / dirty / hollow / lying / narrative).
+- **Live firehose** in the TUI (F4): every protocol frame in/out of the daemon, scrollable, with anchor on streaming.
+
+### What's still pre-MVP
+
+- **`mu orchestrate`** — multi-daemon coordination is sketched in specs but not implemented; the subcommand bails with a pointer to `mu tui`.
+- **Web/external dashboards** — the JSON-RPC contract supports them, but nothing's been built yet.
+- **Persistent session re-hydration across daemon restarts** — events are durable, but the rehydration path is in progress ([mu-u1ld](https://github.com/sahuagin/mu/issues?q=mu-u1ld)).
+
+## Architectural bet
+
+Most agent tools look like chat wrapped around tool calls. `mu` is built around a different center:
+
+> agent work should be inspectable, replayable, accountable, and capability-bounded.
+
+The runtime is event-sourced: sessions, model calls, tool calls, context assemblies, usage records, approvals, delegations, and observability facts are typed events. Transcripts, dashboards, session trees, context inspectors, and accounting reports are projections over that event log.
+
+The goal is not another opaque coding chatbot. The goal is a toolkit where you can see what the agent knew, which tools it could use, what it did, what it cost, why it paused for approval, and how a delegated sub-session inherited authority.
+
+### Workspace shape
 
 ```text
 crates/
-  mu-core/     protocol types, agent loop, event log, transport, tool/provider traits
+  mu-core/     protocol types, agent loop, event log, transport, tool/provider traits, compaction
   mu-ai/       LLM provider implementations and provider translation layers
-  mu-coding/   the binary: CLI modes, serve frontend, tools, sessions, config
+  mu-coding/   the `mu` binary: CLI modes, serve frontend, tools, sessions, config, analytics
+  mu-tui/      the `mu-tui` binary: ratatui interactive client (4,500+ LOC)
 ```
 
-The architectural contract is the protocol and event model, not a particular UI. The same daemon should be able to support:
+The architectural contract is the protocol and event model, not a particular UI. The same daemon supports a terminal UI, one-shot CLI calls, future orchestrated multi-agent runs, and external observability tooling — all over the same JSON-RPC interface.
 
-- a terminal UI;
-- a web dashboard;
-- one-shot CLI calls;
-- orchestrated multi-agent runs;
-- external observability and replay tooling.
+### Design principles
 
-See also:
+**Context is a projection, not a blob.** The transcript is not the session. The prompt is not the context. The memory is not the store. All three are projections over the event log. A model call should eventually be explainable by a `ContextAssembly` record: which spans were included, where they came from, why, what was omitted, what was cacheable, and what the provider actually received.
+
+**Tools are capabilities.** A model can ask for any tool name it wants. The runtime only dispatches tools the session is authorized to use. Delegation should attenuate authority, never widen it.
+
+**Streaming beats whole-state replacement.** When a consumer might want deltas or whole state, the primitive should be deltas. A UI can buffer deltas into a whole view; it cannot recover deltas from an opaque replacement.
+
+**Observability is a product feature.** Usage, cache behavior, tool calls, router/proxy state, approvals, session lineage, and context assembly should be visible. The agent runtime should not require users to guess what happened.
+
+### Architecture deep-dives
 
 - [`specs/architecture/mu-capability-substrate.md`](specs/architecture/mu-capability-substrate.md)
 - [`specs/architecture/event-sourced-context.md`](specs/architecture/event-sourced-context.md)
 - [`specs/architecture/capability-delegation.md`](specs/architecture/capability-delegation.md)
 - [`specs/architecture/os-enforced-agent-sandboxing.md`](specs/architecture/os-enforced-agent-sandboxing.md)
+- [`specs/measurements/compaction-2026-05-14.md`](specs/measurements/compaction-2026-05-14.md)
 - [`specs/delegations.md`](specs/delegations.md)
-
-## Design principles
-
-### Context is a projection, not a blob
-
-The transcript is not the session. The prompt is not the context. The memory is not the store. All three are projections over the event log.
-
-A model call should eventually be explainable by a `ContextAssembly` record: which spans were included, where they came from, why they were included, what was
-omitted, what was cacheable, and what the provider actually received.
-
-### Tools are capabilities
-
-A model can ask for any tool name it wants. The runtime only dispatches tools that the session is authorized to use. Delegation should attenuate authority, never
-widen it.
-
-### Streaming beats whole-state replacement
-
-When a consumer might want deltas or whole state, the primitive should be deltas. A UI can buffer deltas into a whole view; it cannot recover deltas from an opaque
-replacement.
-
-### Observability is a product feature
-
-Usage, cache behavior, tool calls, router/proxy state, approvals, session lineage, and context assembly should be visible. The agent runtime should not require
-users to guess what happened.
-
-### Reference, do not fork
-
-[`pi_ts`](https://github.com/earendil-works/pi) is the architectural blueprint. `pi_agent_rust` is a Rust implementation reference. `mu` reads both for shape and
-lessons, but the code here is written fresh.
 
 ## Development
 
@@ -178,8 +204,7 @@ Live provider tests are gated so CI and routine local runs do not spend API cred
 MU_LIVE_ANTHROPIC=1 cargo nextest run -p mu-ai
 ```
 
-Project specs live under [`specs/`](specs/). Most features are developed from small specs, with mechanical work sometimes delegated to sub-agents in isolated jj
-workspaces under `.delegations/`.
+Project specs live under [`specs/`](specs/). Most features are developed from small specs, with mechanical work sometimes delegated to sub-agents in isolated jj workspaces under `.delegations/`.
 
 ## Contributing
 
@@ -192,12 +217,10 @@ Before contributing, read:
 - [`AGENTS.md`](AGENTS.md)
 - the relevant spec under [`specs/`](specs/)
 
-If you are building commercial products, hosted agent services, proprietary agent runtimes, model-training pipelines, or agent-evaluation systems from `mu`, read
-the license carefully. Commercial production use requires a separate commercial license until the delayed-open change date.
+If you are building commercial products, hosted agent services, proprietary agent runtimes, model-training pipelines, or agent-evaluation systems from `mu`, read the license carefully. Commercial production use requires a separate commercial license until the delayed-open change date.
 
 ## License
 
-`mu` is source-available under a delayed-open license: Business Source License 1.1 with an Additional Use Grant for personal, educational, research,
-noncommercial, internal-evaluation, and open-source-project use. This version converts to BSD-3-Clause on the change date.
+`mu` is source-available under a delayed-open license: Business Source License 1.1 with an Additional Use Grant for personal, educational, research, noncommercial, internal-evaluation, and open-source-project use. This version converts to BSD-3-Clause on the change date.
 
 See [`LICENSE`](LICENSE) for the controlling terms and [`LICENSING.md`](LICENSING.md) for the project licensing philosophy.

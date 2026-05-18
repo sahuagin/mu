@@ -91,6 +91,11 @@ struct MockTool {
     /// Optional non-default policy. Tests use `with_policy(...)` to
     /// mark a mock as needing approval (PermissionLevel::Ask), etc.
     policy_override: Option<crate::agent::tool::ToolPolicy>,
+    /// mu-bkjr: when Some, `Tool::validate` returns `Err(reason)` for
+    /// every call regardless of arguments. Used to test that the
+    /// dispatcher's pre-flight gate short-circuits without firing
+    /// the approval round-trip.
+    validate_rejection: Option<String>,
 }
 
 impl MockTool {
@@ -107,6 +112,7 @@ impl MockTool {
             name: name.to_owned(),
             responses: Mutex::new(q),
             policy_override: None,
+            validate_rejection: None,
         }
     }
 
@@ -123,6 +129,7 @@ impl MockTool {
             name: name.to_owned(),
             responses: Mutex::new(q),
             policy_override: None,
+            validate_rejection: None,
         }
     }
 
@@ -141,6 +148,7 @@ impl MockTool {
             name: name.to_owned(),
             responses: Mutex::new(q),
             policy_override: None,
+            validate_rejection: None,
         }
     }
 
@@ -148,6 +156,14 @@ impl MockTool {
     /// tests to mark a mock as PermissionLevel::Ask, etc.
     fn with_policy(mut self, policy: crate::agent::tool::ToolPolicy) -> Self {
         self.policy_override = Some(policy);
+        self
+    }
+
+    /// mu-bkjr: configure `Tool::validate` to reject every call with
+    /// this reason. The dispatcher should short-circuit the call
+    /// before any approval round-trip is dispatched.
+    fn with_validate_rejection(mut self, reason: impl Into<String>) -> Self {
+        self.validate_rejection = Some(reason.into());
         self
     }
 
@@ -164,6 +180,7 @@ impl MockTool {
             name: name.to_owned(),
             responses: Mutex::new(q),
             policy_override: None,
+            validate_rejection: None,
         }
     }
 }
@@ -176,6 +193,13 @@ impl Tool for MockTool {
             description: format!("Mock tool: {}", self.name),
             input_schema: json!({"type": "object"}),
             policy: self.policy_override.clone().unwrap_or_default(),
+        }
+    }
+
+    fn validate(&self, _arguments: &Value) -> Result<(), String> {
+        match &self.validate_rejection {
+            Some(reason) => Err(reason.clone()),
+            None => Ok(()),
         }
     }
 
@@ -1105,6 +1129,72 @@ async fn ask_permission_emits_input_required_and_dispatches_on_approve() {
         "expected non-error ToolCallCompleted after approval"
     );
     assert!(got_done, "expected Done event at end");
+}
+
+/// mu-bkjr: the dispatcher's argument-aware pre-flight (`Tool::validate`)
+/// must short-circuit a call BEFORE firing `InputRequired`. This pins the
+/// fix for mu-20l: previously, a tool with `PermissionLevel::Ask` whose
+/// validate would reject would still dispatch an approval modal, wasting
+/// a click on a doomed call.
+#[tokio::test]
+async fn mu_bkjr_validate_rejection_short_circuits_before_input_required() {
+    let provider = mock_provider_one_tool_call("gated", json!({"x": 1}));
+    let tool = MockTool::ok("gated", "tool would have run but...")
+        .with_policy(crate::agent::tool::ToolPolicy {
+            permission: crate::agent::tool::PermissionLevel::Ask,
+            ..Default::default()
+        })
+        .with_validate_rejection("mock validate refused: bad argument shape");
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let cap: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let loop_ = AgentLoop::spawn(
+        Arc::new(provider),
+        vec![Arc::new(tool) as Arc<dyn Tool>],
+        AgentConfig::default(),
+        events_tx,
+        approvals.clone(),
+        cap,
+    );
+    loop_
+        .send(AgentInput::UserMessage(user_msg("trigger gated")))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    let mut got_input_required = false;
+    let mut got_tool_completed_with_rejection = false;
+    let mut got_done = false;
+    for ev in &events {
+        match ev {
+            AgentEvent::InputRequired { .. } => got_input_required = true,
+            AgentEvent::ToolCallCompleted {
+                is_error, content, ..
+            } => {
+                if *is_error && content.contains("mock validate refused") {
+                    got_tool_completed_with_rejection = true;
+                }
+            }
+            AgentEvent::Done { .. } => got_done = true,
+            _ => {}
+        }
+    }
+
+    assert!(
+        !got_input_required,
+        "InputRequired must NOT fire when validate rejected (mu-bkjr)"
+    );
+    assert!(
+        got_tool_completed_with_rejection,
+        "ToolCallCompleted must carry the validate rejection reason"
+    );
+    assert!(got_done, "Done must fire after rejection");
+    assert!(
+        approvals.lock().unwrap().is_empty(),
+        "no pending approval entries should remain — none were inserted"
+    );
 }
 
 #[tokio::test]

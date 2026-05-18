@@ -168,70 +168,88 @@ pub(crate) async fn handle_execute_tools(
             None => None,
         };
 
-        let permission_decision = if retry_refusal_reason.is_none() {
-            match tool.as_ref().map(|t| t.spec().policy.permission) {
-                Some(PermissionLevel::Ask) | Some(PermissionLevel::AskOnce) => {
-                    let request_id = format!(
-                        "ask-{}-{}",
-                        call.id,
-                        ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    );
-                    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
-                    if let Ok(mut pending) = pending_approvals.lock() {
-                        pending.insert(request_id.clone(), decision_tx);
+        // mu-bkjr: argument-aware pre-flight check. Tools that reject
+        // specific argument shapes (e.g. bash's allowlist) can fail the
+        // call here, BEFORE the PermissionLevel::Ask gate dispatches a
+        // session.input_required modal. Without this, the user would be
+        // asked to approve a call that the tool will reject anyway.
+        //
+        // Only run when no higher-priority refusal applies — keeps the
+        // refusal-reason ordering stable (capability > retry > validate >
+        // permission-denied > execute).
+        let validate_refusal_reason: Option<String> =
+            if capability_refusal_reason.is_none() && retry_refusal_reason.is_none() {
+                tool.as_ref()
+                    .and_then(|t| t.validate(&call.arguments).err())
+            } else {
+                None
+            };
+
+        let permission_decision =
+            if retry_refusal_reason.is_none() && validate_refusal_reason.is_none() {
+                match tool.as_ref().map(|t| t.spec().policy.permission) {
+                    Some(PermissionLevel::Ask) | Some(PermissionLevel::AskOnce) => {
+                        let request_id = format!(
+                            "ask-{}-{}",
+                            call.id,
+                            ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        );
+                        let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+                        if let Ok(mut pending) = pending_approvals.lock() {
+                            pending.insert(request_id.clone(), decision_tx);
+                        }
+                        let _ = events
+                            .send(AgentEvent::InputRequired {
+                                request_id: request_id.clone(),
+                                tool_call_id: call.id.clone(),
+                                tool_name: call.name.clone(),
+                                arguments: call.arguments.clone(),
+                                summary: format!(
+                                    "{}({})",
+                                    call.name,
+                                    serde_json::to_string(&call.arguments)
+                                        .unwrap_or_else(|_| "?".into())
+                                ),
+                            })
+                            .await;
+                        let decision = tokio::select! {
+                            d = decision_rx => d.ok(),
+                            input_opt = input_rx.recv() => match input_opt {
+                                Some(AgentInput::Cancel) => {
+                                    if let Ok(mut pending) = pending_approvals.lock() {
+                                        pending.remove(&request_id);
+                                    }
+                                    return Err(Outcome::Cancelled);
+                                }
+                                Some(AgentInput::CancelOutstanding { reason }) => {
+                                    if let Ok(mut pending) = pending_approvals.lock() {
+                                        pending.remove(&request_id);
+                                    }
+                                    return Err(Outcome::OutstandingCancelled { reason });
+                                }
+                                Some(AgentInput::UserMessage(_))
+                                | Some(AgentInput::StartAutonomous { .. }) => {
+                                    if let Ok(mut pending) = pending_approvals.lock() {
+                                        pending.remove(&request_id);
+                                    }
+                                    return Err(Outcome::Cancelled);
+                                }
+                                None => {
+                                    if let Ok(mut pending) = pending_approvals.lock() {
+                                        pending.remove(&request_id);
+                                    }
+                                    return Err(Outcome::Cancelled);
+                                }
+                            },
+                        };
+                        Some(decision.unwrap_or(ApprovalDecision::Deny))
                     }
-                    let _ = events
-                        .send(AgentEvent::InputRequired {
-                            request_id: request_id.clone(),
-                            tool_call_id: call.id.clone(),
-                            tool_name: call.name.clone(),
-                            arguments: call.arguments.clone(),
-                            summary: format!(
-                                "{}({})",
-                                call.name,
-                                serde_json::to_string(&call.arguments)
-                                    .unwrap_or_else(|_| "?".into())
-                            ),
-                        })
-                        .await;
-                    let decision = tokio::select! {
-                        d = decision_rx => d.ok(),
-                        input_opt = input_rx.recv() => match input_opt {
-                            Some(AgentInput::Cancel) => {
-                                if let Ok(mut pending) = pending_approvals.lock() {
-                                    pending.remove(&request_id);
-                                }
-                                return Err(Outcome::Cancelled);
-                            }
-                            Some(AgentInput::CancelOutstanding { reason }) => {
-                                if let Ok(mut pending) = pending_approvals.lock() {
-                                    pending.remove(&request_id);
-                                }
-                                return Err(Outcome::OutstandingCancelled { reason });
-                            }
-                            Some(AgentInput::UserMessage(_))
-                            | Some(AgentInput::StartAutonomous { .. }) => {
-                                if let Ok(mut pending) = pending_approvals.lock() {
-                                    pending.remove(&request_id);
-                                }
-                                return Err(Outcome::Cancelled);
-                            }
-                            None => {
-                                if let Ok(mut pending) = pending_approvals.lock() {
-                                    pending.remove(&request_id);
-                                }
-                                return Err(Outcome::Cancelled);
-                            }
-                        },
-                    };
-                    Some(decision.unwrap_or(ApprovalDecision::Deny))
+                    Some(PermissionLevel::Deny) => Some(ApprovalDecision::Deny),
+                    _ => None,
                 }
-                Some(PermissionLevel::Deny) => Some(ApprovalDecision::Deny),
-                _ => None,
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         let permission_denied = matches!(permission_decision, Some(ApprovalDecision::Deny));
 
@@ -281,6 +299,15 @@ pub(crate) async fn handle_execute_tools(
                 .await;
             ToolResult {
                 content: msg,
+                is_error: true,
+            }
+        } else if let Some(reason) = validate_refusal_reason {
+            // mu-bkjr: tool's pre-flight check rejected the arguments.
+            // No InputRequired was dispatched — the user was never asked
+            // to approve a call that would fail. The reason string is
+            // already user-facing (e.g. bash's allowlist message).
+            ToolResult {
+                content: reason,
                 is_error: true,
             }
         } else if permission_denied {

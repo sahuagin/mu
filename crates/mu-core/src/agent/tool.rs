@@ -149,6 +149,29 @@ pub trait Tool: Send + Sync {
     /// What the model sees about this tool.
     fn spec(&self) -> ToolSpec;
 
+    /// Argument-aware pre-flight check. Tools that reject specific
+    /// argument shapes (e.g. bash's allowlist, aws_recon's
+    /// `unsupported_capability`) implement this to short-circuit
+    /// doomed calls *before* the dispatcher dispatches them.
+    ///
+    /// The agent loop calls `validate` BEFORE the `PermissionLevel::Ask`
+    /// approval gate. Returning `Err(reason)` causes the call to fail
+    /// immediately with `ToolResult { content: reason, is_error: true }`
+    /// — the user is never asked to approve a call that would fail.
+    ///
+    /// Default: `Ok(())` (no pre-checks). Tools whose policy is
+    /// argument-agnostic (most of them) can ignore this. Implementations
+    /// that delegate to per-call validation in `execute` SHOULD also
+    /// keep that call as defense-in-depth — direct unit tests of
+    /// `execute` bypass the dispatcher.
+    ///
+    /// `cancel_rx` is intentionally absent: validation must be cheap
+    /// and synchronous-shaped (no I/O, no async). If validation needs
+    /// to wait on something, do it in `execute`. (mu-bkjr)
+    fn validate(&self, _arguments: &Value) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Execute the tool. The Tool impl owns `cancel_rx` and must
     /// abort when it fires.
     async fn execute(&self, arguments: Value, cancel_rx: oneshot::Receiver<()>) -> ToolResult;

@@ -3467,7 +3467,10 @@ fn run<B: Backend>(
     terminal: &mut Terminal<B>,
     mu: Option<MuClient>,
     default_provider: (String, String),
-) -> Result<()> {
+) -> Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let mut app = App::new(mu, default_provider);
     let tick_rate = Duration::from_millis(250);
     let mut last_tick = Instant::now();
@@ -3554,7 +3557,10 @@ fn open_prompt_in_editor<B: Backend>(
     terminal: &mut Terminal<B>,
     prompt_buffer: &mut String,
     prompt_cursor: &mut usize,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     use std::io::Write as _;
 
     // 1. Write current buffer to a uniquely-named tempfile. We don't
@@ -3599,8 +3605,9 @@ fn open_prompt_in_editor<B: Backend>(
     );
     // The clear() forces the next draw() to repaint from a blank
     // canvas rather than trying to diff against whatever ratatui
-    // thinks was on screen before the handoff.
-    terminal.clear()?;
+    // thinks was on screen before the handoff. (ratatui 0.30: Backend::Error
+    // is no longer fixed to io::Error, so route through io::Error::other.)
+    terminal.clear().map_err(io::Error::other)?;
 
     // 5. Read back the edited content — but only on a successful
     //    exit. Non-zero status (e.g. `:cq` in vi) means "I changed

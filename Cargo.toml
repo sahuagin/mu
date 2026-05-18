@@ -46,7 +46,7 @@ base64 = "0.22"
 rand = "0.8"
 url = "2"
 urlencoding = "2"
-oauth2 = "4.4"
+oauth2 = "5"
 webbrowser = "1"
 dirs = "5"
 
@@ -54,7 +54,7 @@ dirs = "5"
 shlex = "1"
 
 # TUI (used by mu-coding's interactive mode; later)
-ratatui = "0.28"
+ratatui = "0.30"
 crossterm = "0.28"
 
 # MCP (used for built-in MCP servers and client; later)

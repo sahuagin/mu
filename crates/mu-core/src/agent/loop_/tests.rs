@@ -583,6 +583,74 @@ async fn b3_iteration_cap() {
     }
 }
 
+/// mu-779s: the iteration-cap exit emits `AgentEvent::Done {
+/// stop_reason: StopReason::IterationCap }`, not `EndTurn`. Distinguishing
+/// the two lets the TUI/transcript surface "turn budget exhausted" rather
+/// than reporting a natural conversation end.
+#[tokio::test]
+async fn mu_779s_iteration_cap_done_event_uses_iteration_cap_stop_reason() {
+    let tool_call_response = vec![ProviderEvent::Done(assistant_tool_call(
+        "t1",
+        "echo",
+        json!({}),
+    ))];
+    let provider = MockProvider::forever(tool_call_response);
+    let tools = vec![MockTool::always_ok("echo", "ok")];
+
+    let config = AgentConfig {
+        max_turns: 2,
+        system_prompt: None,
+        compaction_threshold: None,
+    };
+    let (loop_, events_rx) = spawn_loop(provider, tools, config);
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("trigger cap")))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    let done = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Done {
+                stop_reason,
+                turn_count,
+                ..
+            } => Some((*stop_reason, *turn_count)),
+            _ => None,
+        })
+        .last()
+        .expect("expected a Done event after iteration cap");
+
+    assert_eq!(
+        done.0,
+        StopReason::IterationCap,
+        "cap-exit must report IterationCap, not {:?}",
+        done.0
+    );
+    assert_eq!(done.1, 2, "turn_count in Done event should equal max_turns");
+}
+
+/// mu-779s: per-provider max_turns defaults. Anthropic stays at 20;
+/// OpenAI bumps to 35 because in practice OpenAI models dispatch
+/// noticeably more tool calls per task than Anthropic; openrouter
+/// sits in the middle; unknown providers fall through to the
+/// conservative default.
+#[test]
+fn default_max_turns_for_returns_provider_aware_defaults() {
+    use super::default_max_turns_for;
+    assert_eq!(default_max_turns_for("anthropic_api"), 20);
+    assert_eq!(default_max_turns_for("anthropic_oauth"), 20);
+    assert_eq!(default_max_turns_for("openai_api"), 35);
+    assert_eq!(default_max_turns_for("openai_codex"), 35);
+    assert_eq!(default_max_turns_for("openrouter"), 30);
+    assert_eq!(default_max_turns_for("faux"), 20);
+    assert_eq!(default_max_turns_for("not_a_real_provider_kind"), 20);
+}
+
 /// B-4: cancel during a long stream returns Outcome::Cancelled promptly.
 #[tokio::test]
 async fn b4_cancel_during_stream() {

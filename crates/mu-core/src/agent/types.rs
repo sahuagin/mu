@@ -117,6 +117,13 @@ pub enum StopReason {
     /// drop, upstream truncation, or provider protocol violation).
     /// The message may be partial; this signals degraded completion.
     DegradedEof,
+    /// Agent loop hit its `max_turns` configured ceiling and stopped
+    /// without invoking the model again. The conversation is not
+    /// naturally finished — distinguishing this from `EndTurn` lets the
+    /// TUI/transcript surface it as "turn budget exhausted, ask a
+    /// follow-up or raise --max-iterations" instead of silently
+    /// terminating. (mu-779s)
+    IterationCap,
 }
 
 #[cfg(test)]
@@ -197,6 +204,7 @@ mod tests {
             StopReason::Error,
             StopReason::Aborted,
             StopReason::DegradedEof,
+            StopReason::IterationCap,
         ];
 
         for reason in samples {

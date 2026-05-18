@@ -96,8 +96,15 @@ enum Command {
         #[arg(long = "append-system-prompt", value_name = "FILE")]
         append_system_prompt: Option<std::path::PathBuf>,
     },
-    /// Interactive terminal UI.
-    Tui,
+    /// Interactive terminal UI. Delegates to the `mu-tui` binary
+    /// (resolved next to the `mu` binary, falling back to `$PATH`).
+    /// Any arguments after `tui` are forwarded to `mu-tui` unchanged,
+    /// including `--help` and `--version`. (mu-yvvz)
+    #[command(disable_help_flag = true)]
+    Tui {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Orchestrator — spawn N daemons and coordinate.
     Orchestrate {
         /// Path to a plan.toml describing the task graph.
@@ -253,10 +260,12 @@ async fn main() -> Result<()> {
         }
         Command::Login { provider } => run_login(&provider).await,
         Command::Logout { provider } => run_logout(&provider),
-        Command::Tui | Command::Orchestrate { .. } => {
+        Command::Tui { args } => exec_mu_tui(args),
+        Command::Orchestrate { .. } => {
             anyhow::bail!(
-                "this subcommand is not yet implemented; mu is pre-MVP. \
-                 Try `mu serve` or `mu ask <prompt>` for what's working."
+                "`mu orchestrate` is not yet implemented; mu is pre-MVP. \
+                 The interactive TUI is available via `mu tui` (delegates \
+                 to the `mu-tui` binary)."
             )
         }
         Command::Analytics { cmd } => run_analytics(cmd),
@@ -351,6 +360,34 @@ fn run_analytics(cmd: AnalyticsCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Hand off to the `mu-tui` binary. Looks first alongside the current
+/// `mu` executable (so a local cargo build picks up the matching local
+/// `mu-tui`), then falls back to `$PATH`. Uses `exec` so signals, stdio,
+/// and exit codes flow through transparently.
+///
+/// Returns only on failure — on success `exec` replaces this process and
+/// never returns. (mu-yvvz)
+fn exec_mu_tui(args: Vec<String>) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let candidate = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("mu-tui")))
+        .filter(|p| p.is_file());
+
+    let mut cmd = match candidate {
+        Some(p) => std::process::Command::new(p),
+        None => std::process::Command::new("mu-tui"),
+    };
+    cmd.args(&args);
+
+    let err = cmd.exec();
+    anyhow::bail!(
+        "could not exec mu-tui: {err}. Make sure the `mu-tui` binary is installed \
+         alongside `mu` (e.g. via `cargo install --path crates/mu-tui`) or available on `$PATH`."
+    )
 }
 
 async fn run_login(provider: &str) -> Result<()> {

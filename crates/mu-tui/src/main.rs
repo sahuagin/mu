@@ -47,7 +47,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
+        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Widget, Wrap,
     },
     Frame, Terminal, TerminalOptions, Viewport,
 };
@@ -334,9 +334,20 @@ struct App {
     /// mu-o1y7: signal from in-loop logic that the terminal should be
     /// rebuilt in a different viewport mode. `run` checks + takes() this
     /// each tick and returns `RunOutcome::ModeChange` to its caller, which
-    /// owns the actual terminal-rebuild. Phase 2a lands the field; phase
-    /// 2b will set it when entering / leaving F3.
+    /// owns the actual terminal-rebuild.
     pending_mode_change: Option<ViewportMode>,
+    /// mu-o1y7: the viewport mode the terminal is currently rendered
+    /// in. Updated by `main` after a successful mode swap. Rendering
+    /// uses this to dispatch — F3 in Inline mode draws the footer +
+    /// input-only inline viewport; F3 in Fullscreen mode draws the
+    /// bordered transcript pane (legacy behavior).
+    current_mode: ViewportMode,
+    /// mu-o1y7 phase 2c: how many transcript events we've emitted into
+    /// terminal scrollback (via `Terminal::insert_before`) for each
+    /// session_id. Used to compute the delta to emit each tick when
+    /// F3 is in Inline mode. Survives mode swaps so re-entering F3
+    /// doesn't duplicate transcript history that's already in scrollback.
+    f3_emitted_count_by_sid: std::collections::HashMap<String, usize>,
 }
 
 impl App {
@@ -396,6 +407,41 @@ impl App {
             mu,
             default_provider,
             pending_mode_change: None,
+            current_mode: ViewportMode::Fullscreen,
+            f3_emitted_count_by_sid: std::collections::HashMap::new(),
+        }
+    }
+
+    /// mu-o1y7: switch the visible view, requesting a terminal-mode
+    /// rebuild when the transition crosses the F3 boundary. Entering
+    /// SessionDetail asks for `Inline(N)` (primary buffer, mux owns
+    /// scrollback). Leaving SessionDetail asks for `Fullscreen`
+    /// (alt-screen takeover, today's behavior for dashboards). Other
+    /// transitions (between non-F3 views) require no terminal-mode
+    /// change.
+    ///
+    /// Idempotent — switching to the view you're already on is a no-op.
+    /// Routed through every on_key handler that changes `self.mode`
+    /// so the mode-swap signal can't be forgotten.
+    fn switch_view(&mut self, new_view: ViewMode) {
+        let was_f3 = matches!(self.mode, ViewMode::SessionDetail);
+        let will_f3 = matches!(new_view, ViewMode::SessionDetail);
+        self.mode = new_view;
+        if was_f3 != will_f3 {
+            // Inline viewport height: 6 lines is enough for a
+            // 1-line top rule + 3-line input region + 1-line bottom
+            // rule + 1-line footer. Phase 2c will refine when the
+            // real layout lands.
+            let target = if will_f3 {
+                ViewportMode::Inline(6)
+            } else {
+                ViewportMode::Fullscreen
+            };
+            // Only set if it actually differs from the current mode.
+            // Avoids a no-op rebuild if (somehow) we're already there.
+            if self.current_mode != target {
+                self.pending_mode_change = Some(target);
+            }
         }
     }
 
@@ -1212,8 +1258,8 @@ impl App {
                 self.input_mode = InputMode::SendPrompt;
                 self.reset_prompt();
             }
-            (KeyCode::F(1), _) => self.mode = ViewMode::CommandCenter,
-            (KeyCode::F(2), _) => self.mode = ViewMode::SessionTree,
+            (KeyCode::F(1), _) => self.switch_view(ViewMode::CommandCenter),
+            (KeyCode::F(2), _) => self.switch_view(ViewMode::SessionTree),
             (KeyCode::F(3), _) => {
                 // First press: enter SessionDetail mode.
                 // Subsequent press while already there: pop the
@@ -1222,7 +1268,7 @@ impl App {
                 if matches!(self.mode, ViewMode::SessionDetail) {
                     self.open_session_picker();
                 } else {
-                    self.mode = ViewMode::SessionDetail;
+                    self.switch_view(ViewMode::SessionDetail);
                     self.transcript_scroll_offset = 0;
                     self.refresh_transcript_for_selection();
                 }
@@ -1268,21 +1314,21 @@ impl App {
             (KeyCode::Char('j'), _) if matches!(self.mode, ViewMode::Events) => {
                 self.events_scroll_offset = self.events_scroll_offset.saturating_sub(2);
             }
-            (KeyCode::F(4), _) => self.mode = ViewMode::Context,
+            (KeyCode::F(4), _) => self.switch_view(ViewMode::Context),
             (KeyCode::F(5), _) => {
-                self.mode = ViewMode::Usage;
+                self.switch_view(ViewMode::Usage);
                 // Eager refresh on mode entry — the user shouldn't
                 // have to wait for the next tick (~250ms) to see
                 // populated data after pressing F5.
                 self.refresh_usage_history();
             }
-            (KeyCode::F(6), _) => self.mode = ViewMode::Tools,
-            (KeyCode::F(7), _) => self.mode = ViewMode::Router,
+            (KeyCode::F(6), _) => self.switch_view(ViewMode::Tools),
+            (KeyCode::F(7), _) => self.switch_view(ViewMode::Router),
             (KeyCode::F(8), _) => {
-                self.mode = ViewMode::Events;
+                self.switch_view(ViewMode::Events);
                 self.events_scroll_offset = 0; // pinned to bottom on entry
             }
-            (KeyCode::F(9), _) => self.mode = ViewMode::Mailbox,
+            (KeyCode::F(9), _) => self.switch_view(ViewMode::Mailbox),
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
                 let n = self.sessions.len().max(1);
                 let i = self.selected_session.selected().unwrap_or(0);
@@ -1930,6 +1976,20 @@ fn mock_firehose() -> Vec<String> {
 
 fn ui(f: &mut Frame, app: &mut App) {
     let area = f.area();
+
+    // mu-o1y7: F3 in Inline mode renders only the inline viewport
+    // (footer + input region — phase 2c wires real content; phase 2b
+    // lands a placeholder). Transcript lives in multiplexer scrollback
+    // via insert_before (emitted from outside `ui` in phase 2c).
+    // Skip the full-screen header/tabs/firehose layout entirely; the
+    // inline viewport is sized to fit just the inline content.
+    if matches!(app.mode, ViewMode::SessionDetail)
+        && matches!(app.current_mode, ViewportMode::Inline(_))
+    {
+        render_inline_session_detail(f, app, area);
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2516,6 +2576,204 @@ fn anchor_scroll_offset(prev_total: usize, current_total: usize, offset: u16) ->
     let delta = current_total - prev_total;
     let delta_u16 = u16::try_from(delta).unwrap_or(u16::MAX);
     offset.saturating_add(delta_u16)
+}
+
+/// mu-o1y7 phase 2c: emit any new transcript events for F3's selected
+/// session into terminal scrollback via `Terminal::insert_before`.
+/// Called once per tick when the terminal is in Inline mode and the
+/// active view is SessionDetail. Tracks the per-session emit count in
+/// `App.f3_emitted_count_by_sid` so re-entering F3 after a dashboard
+/// doesn't re-emit content that's already in scrollback.
+///
+/// Pre-wraps via `render_transcript_lines` to (terminal.width - 2) so
+/// the visual line count matches `lines.len()` exactly — that's the
+/// `height` argument `insert_before` needs.
+///
+/// ToolCall + ToolResult pairing only applies within a single emit
+/// batch (typical case: first emit after entering F3 contains both;
+/// subsequent ticks see one or the other and render as separate
+/// blocks). Acceptable tradeoff — incremental emit is a minor visual
+/// degradation vs. the full-batch paired form.
+fn emit_transcript_delta_inline<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let selected_sid: Option<String> = app
+        .selected_session
+        .selected()
+        .and_then(|i| app.sessions.get(i))
+        .and_then(|r| r.session_id.clone());
+
+    let Some(sid) = selected_sid else {
+        return Ok(());
+    };
+
+    // Compute the delta to emit + the new emitted-count. Scoped so
+    // the immutable borrow on `app.transcript_events_by_sid` is
+    // released before the mutable borrow for `f3_emitted_count_by_sid`.
+    let (lines_to_emit, new_count) = {
+        let events = match app.transcript_events_by_sid.get(&sid) {
+            Some(e) => e,
+            None => return Ok(()),
+        };
+        let emitted = *app.f3_emitted_count_by_sid.get(&sid).unwrap_or(&0);
+        if events.len() <= emitted {
+            return Ok(());
+        }
+        let new_events: Vec<serde_json::Value> = events[emitted..].to_vec();
+        let width = terminal.size()?.width as usize;
+        let wrap_width = width.saturating_sub(2);
+        let lines = render_transcript_lines(&new_events, None, Some(wrap_width));
+        (lines, events.len())
+    };
+
+    if lines_to_emit.is_empty() {
+        return Ok(());
+    }
+
+    let height = lines_to_emit.len() as u16;
+    terminal.insert_before(height, |buf| {
+        let area = buf.area;
+        let paragraph = Paragraph::new(lines_to_emit).wrap(Wrap { trim: false });
+        Widget::render(paragraph, area, buf);
+    })?;
+    app.f3_emitted_count_by_sid.insert(sid, new_count);
+    Ok(())
+}
+
+/// mu-o1y7 phase 2c+2d: F3 inline-mode render. The terminal is in
+/// `Viewport::Inline(N)` so `area` is N lines tall at the bottom of
+/// the primary screen buffer. Transcript content lives in mux
+/// scrollback (emitted by `emit_transcript_delta_inline` from `run`);
+/// this function renders only the inline viewport's content:
+///
+///   [blank input-growth area — phase 3 grows the prompt upward here]
+///   `>` <prompt buffer with cursor>
+///   `──────`  thin separator
+///   F3 · session-id · model · phase   (footer)
+///
+/// In Normal input mode the prompt row shows a one-line hint; in
+/// SendPrompt mode it shows the editable buffer with a real terminal
+/// cursor (via `f.set_cursor_position`).
+fn render_inline_session_detail(f: &mut Frame, app: &App, area: Rect) {
+    let height = area.height;
+    if height < 3 {
+        // Viewport too small to render the input + separator + footer
+        // shape. Bail with just a footer placeholder.
+        let line = Line::from(Span::styled(
+            " (viewport too narrow for F3 inline) ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    let footer_y_offset = height - 1;
+    let separator_y_offset = height - 2;
+    let input_y_offset = height - 3;
+
+    // Compute input-row content + cursor position (only for SendPrompt
+    // mode does a real cursor get set; Normal mode shows a hint and
+    // Command mode shows the `:cmd` buffer).
+    let mut cursor_pos: Option<Position> = None;
+    let input_line: Line<'static> = match app.input_mode {
+        InputMode::SendPrompt => {
+            let chars: Vec<char> = app.prompt_buffer.chars().collect();
+            let cursor = app.prompt_cursor.min(chars.len());
+            let prefix = " > ";
+            let prefix_w = prefix.chars().count();
+            // Horizontal scroll so the cursor stays visible on long lines.
+            // Same logic as render_statusline; phase 3 will replace with
+            // a real multi-line edit region that grows upward.
+            let avail = (area.width as usize).saturating_sub(prefix_w + 1).max(1);
+            let scroll = if cursor >= avail {
+                cursor + 1 - avail
+            } else {
+                0
+            };
+            let visible: String = chars
+                .iter()
+                .skip(scroll)
+                .take(avail)
+                .collect::<String>()
+                .replace('\n', "↵");
+            cursor_pos = Some(Position {
+                x: area.x + (prefix_w + (cursor - scroll)) as u16,
+                y: area.y + input_y_offset,
+            });
+            Line::from(format!("{prefix}{visible}"))
+        }
+        InputMode::Command => Line::from(format!(" :{}", app.command_buffer)),
+        InputMode::Normal => {
+            let hint = if app.selected_session.selected().is_some() {
+                " press i to send a prompt · F1 dashboard · F3 picker · q quit"
+            } else {
+                " (no session selected — F1 to dashboard, n to create one)"
+            };
+            Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))
+        }
+    };
+
+    // Separator: thin rule across the viewport width.
+    let separator_line = Line::from(Span::styled(
+        "─".repeat(area.width as usize),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    // Footer: session metadata + (when no session) a hint to switch back.
+    let footer_line: Line<'static> = match app
+        .selected_session
+        .selected()
+        .and_then(|i| app.sessions.get(i))
+    {
+        Some(r) => {
+            let id = if r.short_id.is_empty() {
+                "?".to_string()
+            } else {
+                r.short_id.clone()
+            };
+            let phase = if r.phase.is_empty() {
+                "idle".to_string()
+            } else {
+                r.phase.clone()
+            };
+            Line::from(vec![
+                Span::styled(" F3 · ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("session {id}"), Style::default().fg(Color::Cyan)),
+                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                Span::styled(r.model.clone(), Style::default().fg(Color::Gray)),
+                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                Span::styled(phase, Style::default().fg(MUTED_AMBER)),
+                Span::styled(
+                    format!("  ${:.2}", r.cost_usd),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        }
+        None => Line::from(Span::styled(
+            " F3 · (no session selected)",
+            Style::default().fg(Color::DarkGray),
+        )),
+    };
+
+    // Compose the viewport: blank top region (room for phase 3's
+    // upward-growing prompt), then input row, separator, footer.
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(height as usize);
+    for _ in 0..input_y_offset {
+        lines.push(Line::from(""));
+    }
+    lines.push(input_line);
+    let _ = separator_y_offset; // index-only; line already at the right slot
+    lines.push(separator_line);
+    let _ = footer_y_offset;
+    lines.push(footer_line);
+
+    let paragraph = Paragraph::new(lines);
+    f.render_widget(paragraph, area);
+
+    if let Some(pos) = cursor_pos {
+        f.set_cursor_position(pos);
+    }
 }
 
 fn render_session_detail(f: &mut Frame, app: &mut App, area: Rect) {
@@ -3460,6 +3718,7 @@ fn main() -> Result<()> {
                     Err(e) => break Err(e.into()),
                 };
                 mode = new_mode;
+                app.current_mode = new_mode;
             }
             Err(e) => break Err(e),
         }
@@ -3601,6 +3860,19 @@ where
 
     loop {
         terminal.draw(|f| ui(f, &mut *app))?;
+
+        // mu-o1y7 phase 2c: when F3 is in Inline mode, emit any new
+        // transcript events for the selected session into terminal
+        // scrollback via `Terminal::insert_before`. Multiplexers (zellij
+        // mod-s, tmux Ctrl-b `[`) navigate this; zellij's
+        // open-buffer-in-editor captures it. The per-session emit count
+        // survives mode swaps so re-entering F3 doesn't duplicate
+        // already-emitted content.
+        if matches!(app.current_mode, ViewportMode::Inline(_))
+            && matches!(app.mode, ViewMode::SessionDetail)
+        {
+            emit_transcript_delta_inline(terminal, app)?;
+        }
 
         let timeout = tick_rate
             .checked_sub(last_tick.elapsed())

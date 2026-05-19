@@ -411,3 +411,91 @@ fn run_logout(provider: &str) -> Result<()> {
     println!("Removed stored credentials for {provider} (if any).");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    //! `run_analytics` argument-validation tests.
+    //!
+    //! The analytics subcommand handlers in `run_analytics` delegate
+    //! the actual work (file scanning, SQL aggregation, backfill)
+    //! to functions in `mu_coding::analytics`, which have their own
+    //! unit tests. What's NOT covered elsewhere is the CLI-level
+    //! argument-validation that lives in `run_analytics` itself: the
+    //! `Backfill` `(preset, input)` XOR rules and the `Rate` metric-
+    //! name allowlist. These tests pin the user-facing contracts on
+    //! those bail paths (which run before any DB access, so they're
+    //! cheap and hermetic).
+    use super::*;
+
+    #[test]
+    fn backfill_rejects_both_preset_and_input_set() {
+        let err = run_analytics(AnalyticsCmd::Backfill {
+            preset: Some("overnight-2026-05-16".into()),
+            input: Some("/dev/null".into()),
+            db: None,
+        })
+        .expect_err("both flags set must error");
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "expected mutually-exclusive message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn backfill_rejects_neither_preset_nor_input() {
+        let err = run_analytics(AnalyticsCmd::Backfill {
+            preset: None,
+            input: None,
+            db: None,
+        })
+        .expect_err("neither flag set must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--preset") && msg.contains("--input"),
+            "expected message naming both flags, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn backfill_rejects_unknown_preset_and_lists_supported() {
+        let err = run_analytics(AnalyticsCmd::Backfill {
+            preset: Some("not-a-real-preset".into()),
+            input: None,
+            db: None,
+        })
+        .expect_err("unknown preset must error");
+        let msg = err.to_string();
+        // The user sees both the offending name and the supported
+        // list — both halves are load-bearing for UX. Pinning the
+        // current preset name is intentional: when a future bead
+        // adds another preset, this test forces an update so the
+        // error stays accurate.
+        assert!(
+            msg.contains("not-a-real-preset"),
+            "error must echo the bad preset name, got: {msg}"
+        );
+        assert!(
+            msg.contains("overnight-2026-05-16"),
+            "error must name the supported preset(s), got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rate_rejects_unknown_metric_and_lists_supported() {
+        let err = run_analytics(AnalyticsCmd::Rate {
+            metric: "not-a-real-metric".into(),
+            db: None,
+            since: None,
+        })
+        .expect_err("unknown metric must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not-a-real-metric"),
+            "error must echo the bad metric name, got: {msg}"
+        );
+        assert!(
+            msg.contains("hallucination"),
+            "error must name the supported metric(s), got: {msg}"
+        );
+    }
+}

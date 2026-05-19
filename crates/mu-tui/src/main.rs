@@ -896,31 +896,19 @@ impl App {
                 .push("[mock session] can't send (no session_id)".into());
             return;
         };
-        // mu-o1y7 phase 3a: surface visible feedback when the operator
-        // tries to send to a session that's already done. The daemon
-        // may silently accept or reject, but either way no new event
-        // flows back — without this check the operator types Enter and
-        // sees nothing, leaving them confused (observed 2026-05-19).
-        // Emit an inline marker so the feedback lands above the input
-        // region in scrollback; also push to firehose for fullscreen
-        // observers.
-        if matches!(row.status, SessionStatus::Done) {
-            let short_sid: String = sid.chars().take(12).collect();
-            let msg = format!(
-                "─── send blocked: session {short_sid} is done · press n to create a new session ───"
-            );
-            // Phase 3a follow-up: only queue the inline marker when
-            // the terminal is actually in Inline mode. Otherwise the
-            // marker sits queued and emits stale-but-newly-visible the
-            // next time the operator enters F3, leading to two markers
-            // when they only attempted one F3-send (observed 2026-05-19).
-            // The firehose entry covers fullscreen feedback on its own.
-            if matches!(self.current_mode, ViewportMode::Inline(_)) {
-                self.pending_inline_markers.push(msg.clone());
-            }
-            self.firehose.push(format!("[blocked] {msg}"));
-            return;
-        }
+        // mu-o1y7 phase 3a follow-up #2 (2026-05-19): no Done-session
+        // block. `SessionStatus::Done` in current mu means "phase is
+        // done" — which is also the state a session sits in *between
+        // turns* (after one ask completed, before the next). There's
+        // no terminal "closed" state distinct from "pause between
+        // turns" today; blocking sends on Done would block legitimate
+        // session-resume. Daemon decides what to do with stuck or
+        // already-finished provider sessions; firehose surfaces any
+        // error / no-op.
+        // (Architectural gap noted: see bead filed alongside this
+        // commit — Monty Python's Mr. Orbiter has the same problem:
+        // distinct gestures needed for "still going, just paused" vs
+        // "done done.")
         let Some(mu) = self.mu.as_mut() else {
             return;
         };

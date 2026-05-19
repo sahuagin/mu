@@ -67,6 +67,24 @@ use crate::mu_client::{Message as MuMessage, MuClient};
 const MUTED_AMBER: Color = Color::Rgb(204, 153, 102);
 const MUTED_GREEN: Color = Color::Rgb(122, 162, 122);
 
+/// mu-o1y7 phase 3d+3e: shared help-content for both the Inline-mode
+/// scrollback dump (one push per line into `pending_inline_markers`)
+/// and the Fullscreen popup overlay (rendered as a single Paragraph in
+/// `render_help_overlay`).
+const HELP_LINES: [&str; 11] = [
+    "─── mu key reference ─────────────────────────────────",
+    " Views:    F1 command · F2 sessions · F3 session · F4 context · F5 usage",
+    "           F6 tools · F7 router · F8 events · F9 mailbox",
+    " Navigate: j/k select · n new session · F3 (in F3) picker · Esc cancel",
+    " Send:     i to enter prompt · Enter to send · Alt-Enter newline",
+    " Editor:   Ctrl-X Ctrl-E prompt → $EDITOR · Ctrl-X Ctrl-P system → $EDITOR",
+    " Palette:  : commands · :provider <kind/model> · :model <model>",
+    " Help:     ? this list · Esc closes overlays",
+    " Quit:     q · Ctrl-C",
+    " (In Inline F3, transcript scrolls into mux scrollback —",
+    "  zellij mod-s, tmux Ctrl-b [ to navigate; older history below.)",
+];
+
 // ── Model ───────────────────────────────────────────────────────────
 
 /// mu-62s: which buffer the next $EDITOR handoff targets.
@@ -362,6 +380,12 @@ struct App {
     /// `emit_transcript_delta_inline` to emit a boundary marker on
     /// transition and to scope per-tick emit to the active session.
     f3_active_session_id: Option<String>,
+    /// mu-o1y7 phase 3e: whether the `?` help overlay is open. Only
+    /// meaningful in Fullscreen mode (Inline mode dumps help into
+    /// scrollback instead — `pending_inline_markers`). When true,
+    /// `render_help_overlay` paints a centered popup over the active
+    /// view. Toggled by `?`; dismissed by `?`, Esc, or `q`.
+    help_overlay_open: bool,
 }
 
 impl App {
@@ -425,6 +449,7 @@ impl App {
             f3_emitted_count_by_sid: std::collections::HashMap::new(),
             pending_inline_markers: Vec::new(),
             f3_active_session_id: None,
+            help_overlay_open: false,
         }
     }
 
@@ -461,34 +486,22 @@ impl App {
         }
     }
 
-    /// mu-o1y7 phase 3d: render the full key reference. In Inline mode
-    /// the lines emit into mux scrollback above the input region (via
-    /// the pending_inline_markers channel — one line per push). In
-    /// Fullscreen mode the lines go to the firehose strip. Either way
-    /// the operator sees them where they're looking. Sequence is
-    /// preserved by push order.
+    /// mu-o1y7 phase 3d+3e: surface the full key reference. In
+    /// Inline mode the lines emit into mux scrollback above the input
+    /// region (via `pending_inline_markers`, one push per line so
+    /// sequence is preserved). In Fullscreen mode it toggles the
+    /// help overlay popup — using firehose for help text pollutes the
+    /// event stream (firehose feeds F8 events explorer, observed
+    /// 2026-05-19).
     fn show_help(&mut self) {
-        let lines: [&str; 11] = [
-            "─── mu key reference ─────────────────────────────────",
-            " Views:    F1 command · F2 sessions · F3 session · F4 context · F5 usage",
-            "           F6 tools · F7 router · F8 events · F9 mailbox",
-            " Navigate: j/k select · n new session · F3 (in F3) picker · Esc cancel",
-            " Send:     i to enter prompt · Enter to send · Alt-Enter newline",
-            " Editor:   Ctrl-X Ctrl-E prompt → $EDITOR · Ctrl-X Ctrl-P system → $EDITOR",
-            " Palette:  : commands · :provider <kind/model> · :model <model>",
-            " Help:     ? this list · Esc closes overlays",
-            " Quit:     q · Ctrl-C",
-            " (In Inline F3, transcript scrolls into mux scrollback —",
-            "  zellij mod-s, tmux Ctrl-b [ to navigate; older history below.)",
-        ];
         if matches!(self.current_mode, ViewportMode::Inline(_)) {
-            for line in lines {
+            for line in HELP_LINES {
                 self.pending_inline_markers.push(line.to_string());
             }
         } else {
-            for line in lines {
-                self.firehose.push(line.to_string());
-            }
+            // Fullscreen: toggle the popup overlay. Second ? press
+            // closes it.
+            self.help_overlay_open = !self.help_overlay_open;
         }
     }
 
@@ -1066,6 +1079,19 @@ impl App {
         //    entirely).
         //
         // 3. Otherwise the normal `input_mode` machine runs.
+        // mu-o1y7 phase 3e: help overlay has highest priority — any
+        // dismiss key closes it, all other keys are eaten (modal). The
+        // overlay is Fullscreen-only; Inline mode dumps help into
+        // scrollback and never opens this overlay.
+        if self.help_overlay_open {
+            if matches!(
+                (code, mods),
+                (KeyCode::Esc, _) | (KeyCode::Char('q'), _) | (KeyCode::Char('?'), _)
+            ) {
+                self.help_overlay_open = false;
+            }
+            return;
+        }
         if self.session_picker_open {
             self.on_key_session_picker(code, mods);
             return;
@@ -2106,6 +2132,13 @@ fn ui(f: &mut Frame, app: &mut App) {
     // firehose, and any other popup. No-op when there's no pending
     // approval for the selected session.
     render_approval_modal(f, app, area);
+    // mu-o1y7 phase 3e: help overlay sits on top of everything except
+    // the pending-approval modal. Approval is blocking the agent loop,
+    // so it stays absolute-priority. Help is informational; it can
+    // wait its turn.
+    if app.help_overlay_open {
+        render_help_overlay(f, area);
+    }
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
@@ -2486,6 +2519,42 @@ fn render_session_picker(f: &mut Frame, app: &mut App, area: Rect) {
         )
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, popup_area, &mut app.selected_session);
+}
+
+/// mu-o1y7 phase 3e: render the `?` help overlay as a centered popup
+/// in Fullscreen mode. Sized to fit `HELP_LINES`. Inline mode uses the
+/// scrollback dump path instead (`pending_inline_markers`) and never
+/// opens this overlay.
+fn render_help_overlay(f: &mut Frame, area: Rect) {
+    // Fixed-size popup: 78 columns × HELP_LINES + 2 for borders, or
+    // smaller if the terminal is narrow. centered_rect uses
+    // percentages, so adapt: ~80% wide, ~(HELP_LINES + 2 borders)/area.height%.
+    let want_height = (HELP_LINES.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let want_width = 80.min(area.width.saturating_sub(4));
+    // Compute centered rect manually so we get exact sizes (the
+    // percent-based centered_rect would round oddly for tight popups).
+    let x = area.x + (area.width.saturating_sub(want_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(want_height)) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width: want_width,
+        height: want_height,
+    };
+    f.render_widget(Clear, popup);
+
+    let lines: Vec<Line> = HELP_LINES
+        .iter()
+        .map(|s| Line::from(Span::raw(*s)))
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" help · ? toggle · Esc / q close ")
+        .style(Style::default().bg(Color::Black).fg(Color::Gray));
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(paragraph, popup);
 }
 
 /// mu-gih: render the head of the selected session's pending-approval

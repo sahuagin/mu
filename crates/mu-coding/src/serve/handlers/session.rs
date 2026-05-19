@@ -804,3 +804,118 @@ fn payload_kind_str(p: &EventPayload) -> &'static str {
         EventPayload::TaskTelemetry { .. } => "task_telemetry",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! mu-u1ld phase B: verify that read-only queries against
+    //! rehydrated sessions route through `Sessions::event_log(id)` and
+    //! produce the same response shape as live sessions.
+    //!
+    //! Phase A added `insert_rehydrated` and made `event_log` consult
+    //! both maps; the handlers below (`handle_session_stats`,
+    //! `handle_session_events`) already go through that path. These
+    //! tests pin that contract.
+
+    use super::*;
+    use mu_core::event_log::SessionEventLog;
+    use mu_core::protocol::JSONRPC_VERSION;
+    use serde_json::json;
+
+    fn rehydrated_session_with_events(session_id: &str) -> Sessions {
+        let sessions = Sessions::new();
+        let log = SessionEventLog::new(session_id.to_string());
+        log.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "anthropic_api".into(),
+                model: "haiku".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+            },
+        );
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "hello".into(),
+            },
+        );
+        log.append(
+            EventActor::System,
+            EventPayload::Done {
+                stop_reason: mu_core::agent::StopReason::EndTurn,
+                usage: None,
+                turn_count: 1,
+                elapsed_ms: Some(42),
+            },
+        );
+        sessions.insert_rehydrated(session_id.to_string(), Arc::new(log), None);
+        sessions
+    }
+
+    #[test]
+    fn session_stats_works_for_rehydrated_session() {
+        let session_id = "ghost-stats";
+        let sessions = rehydrated_session_with_events(session_id);
+
+        let req = Request {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id: json!(1),
+            method: "session.stats".into(),
+            params: json!({ "session_id": session_id }),
+        };
+        let resp = handle_session_stats(req, sessions);
+        let value = serde_json::to_value(resp).expect("serialize response");
+        let result = value
+            .get("result")
+            .expect("response must have a result, not an error");
+        assert_eq!(result["session_id"], session_id);
+        assert_eq!(result["provider_kind"], "anthropic_api");
+        assert_eq!(result["model"], "haiku");
+        assert_eq!(result["event_count"], 3);
+        assert_eq!(result["ask_count"], 1);
+        assert_eq!(result["elapsed_total_ms"], 42);
+    }
+
+    #[test]
+    fn session_events_works_for_rehydrated_session() {
+        let session_id = "ghost-events";
+        let sessions = rehydrated_session_with_events(session_id);
+
+        let req = Request {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id: json!(2),
+            method: "session.events".into(),
+            params: json!({ "session_id": session_id }),
+        };
+        let resp = handle_session_events(req, sessions);
+        let value = serde_json::to_value(resp).expect("serialize response");
+        let result = value
+            .get("result")
+            .expect("response must have a result, not an error");
+        let events = result["events"].as_array().expect("events array");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["payload"]["kind"], "session_created");
+        assert_eq!(events[2]["payload"]["kind"], "done");
+        assert_eq!(result["end_of_log"], true);
+    }
+
+    #[test]
+    fn session_stats_returns_not_found_for_unknown_session() {
+        // Sanity check: nonexistent IDs still get the error shape;
+        // rehydrated lookup doesn't accidentally fall through to a
+        // synthetic-empty response.
+        let sessions = Sessions::new();
+        let req = Request {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id: json!(3),
+            method: "session.stats".into(),
+            params: json!({ "session_id": "never-existed" }),
+        };
+        let resp = handle_session_stats(req, sessions);
+        let value = serde_json::to_value(resp).expect("serialize response");
+        assert!(
+            value.get("error").is_some(),
+            "expected an error response, got {value}"
+        );
+    }
+}

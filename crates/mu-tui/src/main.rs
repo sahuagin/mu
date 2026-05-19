@@ -461,6 +461,37 @@ impl App {
         }
     }
 
+    /// mu-o1y7 phase 3d: render the full key reference. In Inline mode
+    /// the lines emit into mux scrollback above the input region (via
+    /// the pending_inline_markers channel — one line per push). In
+    /// Fullscreen mode the lines go to the firehose strip. Either way
+    /// the operator sees them where they're looking. Sequence is
+    /// preserved by push order.
+    fn show_help(&mut self) {
+        let lines: [&str; 11] = [
+            "─── mu key reference ─────────────────────────────────",
+            " Views:    F1 command · F2 sessions · F3 session · F4 context · F5 usage",
+            "           F6 tools · F7 router · F8 events · F9 mailbox",
+            " Navigate: j/k select · n new session · F3 (in F3) picker · Esc cancel",
+            " Send:     i to enter prompt · Enter to send · Alt-Enter newline",
+            " Editor:   Ctrl-X Ctrl-E prompt → $EDITOR · Ctrl-X Ctrl-P system → $EDITOR",
+            " Palette:  : commands · :provider <kind/model> · :model <model>",
+            " Help:     ? this list · Esc closes overlays",
+            " Quit:     q · Ctrl-C",
+            " (In Inline F3, transcript scrolls into mux scrollback —",
+            "  zellij mod-s, tmux Ctrl-b [ to navigate; older history below.)",
+        ];
+        if matches!(self.current_mode, ViewportMode::Inline(_)) {
+            for line in lines {
+                self.pending_inline_markers.push(line.to_string());
+            }
+        } else {
+            for line in lines {
+                self.firehose.push(line.to_string());
+            }
+        }
+    }
+
     fn connected(&self) -> bool {
         self.mu.is_some()
     }
@@ -1294,6 +1325,11 @@ impl App {
             (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 self.quit = true;
             }
+            // mu-o1y7 phase 3d: `?` shows the full key reference.
+            // Inline mode: dump help lines into mux scrollback above
+            // the input region. Fullscreen mode: push to firehose so
+            // it surfaces in the bottom strip.
+            (KeyCode::Char('?'), _) => self.show_help(),
             (KeyCode::Char(':'), _) => {
                 self.input_mode = InputMode::Command;
                 self.command_buffer.clear();

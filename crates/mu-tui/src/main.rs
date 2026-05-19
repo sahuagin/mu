@@ -394,6 +394,13 @@ struct App {
     /// scrollback retains the previous dump so re-pressing isn't
     /// needed — operator scrolls up to find it.
     f3_inline_help_dumped: bool,
+    /// mu-o1y7 phase 3g: terminal dimensions, sampled each tick at the
+    /// top of the run loop via `terminal.size()`. Stored here so
+    /// `on_key_send_prompt` can compute the needed inline viewport height
+    /// without holding a Terminal reference. Defaults to 80×24 until
+    /// the first run-loop tick updates them.
+    terminal_cols: u16,
+    terminal_rows: u16,
 }
 
 impl App {
@@ -459,6 +466,8 @@ impl App {
             f3_active_session_id: None,
             help_overlay_open: false,
             f3_inline_help_dumped: false,
+            terminal_cols: 80,
+            terminal_rows: 24,
         }
     }
 
@@ -478,12 +487,15 @@ impl App {
         let will_f3 = matches!(new_view, ViewMode::SessionDetail);
         self.mode = new_view;
         if was_f3 != will_f3 {
-            // Inline viewport height: 6 lines is enough for a
-            // 1-line top rule + 3-line input region + 1-line bottom
-            // rule + 1-line footer. Phase 2c will refine when the
-            // real layout lands.
+            // mu-o1y7 phase 3g: start at the minimum inline height
+            // (empty buffer = 1 input row + 3 overhead rows = 4).
+            // on_key_send_prompt refines this on the first keystroke.
             let target = if will_f3 {
-                ViewportMode::Inline(6)
+                ViewportMode::Inline(compute_needed_inline_height(
+                    "",
+                    self.terminal_cols,
+                    self.terminal_rows,
+                ))
             } else {
                 ViewportMode::Fullscreen
             };
@@ -1329,6 +1341,21 @@ impl App {
                 // Log unknown keycodes so the user can see what their
                 // terminal is sending and we can adjust bindings.
                 self.firehose.push(debug);
+            }
+        }
+
+        // mu-o1y7 phase 3g: recompute the needed inline viewport height after
+        // every key in SendPrompt mode. Only fires in Inline mode; no-op in
+        // Fullscreen. Handles buffer growth (insert/newline) and shrink
+        // (backspace, Ctrl-K, submit/Esc which clear the buffer).
+        if matches!(self.current_mode, ViewportMode::Inline(_)) {
+            let new_h = compute_needed_inline_height(
+                &self.prompt_buffer,
+                self.terminal_cols,
+                self.terminal_rows,
+            );
+            if self.current_mode != ViewportMode::Inline(new_h) {
+                self.pending_mode_change = Some(ViewportMode::Inline(new_h));
             }
         }
     }
@@ -2877,25 +2904,21 @@ where
     Ok(())
 }
 
-/// mu-o1y7 phase 2c+2d: F3 inline-mode render. The terminal is in
-/// `Viewport::Inline(N)` so `area` is N lines tall at the bottom of
-/// the primary screen buffer. Transcript content lives in mux
-/// scrollback (emitted by `emit_transcript_delta_inline` from `run`);
-/// this function renders only the inline viewport's content:
+/// mu-o1y7 phase 3g: F3 inline-mode render with multi-line prompt growing
+/// upward. Layout (top → bottom within the Inline viewport):
 ///
-///   [blank input-growth area — phase 3 grows the prompt upward here]
-///   `>` <prompt buffer with cursor>
-///   `──────`  thin separator
-///   F3 · session-id · model · phase   (footer)
+///   row 0:         ────── upper separator
+///   rows 1..h-2:   input rows (h-3 rows; up to cap; scrollable)
+///   row h-2:       ────── lower separator
+///   row h-1:       footer (session metadata / picker state)
 ///
-/// In Normal input mode the prompt row shows a one-line hint; in
-/// SendPrompt mode it shows the editable buffer with a real terminal
-/// cursor (via `f.set_cursor_position`).
+/// Transcript content lives in mux scrollback (emitted by
+/// `emit_transcript_delta_inline`); this function renders only the
+/// inline viewport itself.
 fn render_inline_session_detail(f: &mut Frame, app: &App, area: Rect) {
     let height = area.height;
-    if height < 3 {
-        // Viewport too small to render the input + separator + footer
-        // shape. Bail with just a footer placeholder.
+    if height < 4 {
+        // Need at least: upper-sep + 1 input row + lower-sep + footer = 4.
         let line = Line::from(Span::styled(
             " (viewport too narrow for F3 inline) ",
             Style::default().fg(Color::DarkGray),
@@ -2904,40 +2927,55 @@ fn render_inline_session_detail(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let footer_y_offset = height - 1;
-    let separator_y_offset = height - 2;
-    let input_y_offset = height - 3;
+    // Rows between the two separators (h - 3 = upper-sep + lower-sep + footer).
+    let input_region_rows = (height as usize).saturating_sub(3);
 
-    // Compute input-row content + cursor position (only for SendPrompt
-    // mode does a real cursor get set; Normal mode shows a hint and
-    // Command mode shows the `:cmd` buffer).
     let mut cursor_pos: Option<Position> = None;
-    let input_line: Line<'static> = match app.input_mode {
+    // For SendPrompt: populated with one Line per visible input row.
+    // For other modes: None; single_input_line is used instead.
+    let mut multi_input_lines: Option<Vec<Line<'static>>> = None;
+
+    let single_input_line: Line<'static> = match app.input_mode {
         InputMode::SendPrompt => {
-            let chars: Vec<char> = app.prompt_buffer.chars().collect();
-            let cursor = app.prompt_cursor.min(chars.len());
-            let prefix = " > ";
-            let prefix_w = prefix.chars().count();
-            // Horizontal scroll so the cursor stays visible on long lines.
-            // Same logic as render_statusline; phase 3 will replace with
-            // a real multi-line edit region that grows upward.
-            let avail = (area.width as usize).saturating_sub(prefix_w + 1).max(1);
-            let scroll = if cursor >= avail {
-                cursor + 1 - avail
-            } else {
+            let cursor_char = app.prompt_cursor.min(app.prompt_buffer.chars().count());
+            let prefix_w: usize = 3; // " > " / "   "
+            let avail = (area.width as usize).saturating_sub(prefix_w).max(1);
+            let visual_rows = compute_visual_rows(&app.prompt_buffer, avail);
+            let total_vrows = visual_rows.len();
+            let (cursor_vrow, cursor_vcol) =
+                find_cursor_position(&app.prompt_buffer, cursor_char, avail);
+
+            // Scroll to keep cursor on the last visible row when typing at end.
+            let vscroll = if total_vrows <= input_region_rows {
                 0
+            } else {
+                let floor = cursor_vrow.saturating_sub(input_region_rows.saturating_sub(1));
+                let ceil = total_vrows.saturating_sub(input_region_rows);
+                floor.min(ceil)
             };
-            let visible: String = chars
-                .iter()
-                .skip(scroll)
-                .take(avail)
-                .collect::<String>()
-                .replace('\n', "↵");
+
+            // +1 on Y for the upper separator at row 0.
+            let cursor_vrow_in_vp = cursor_vrow.saturating_sub(vscroll);
             cursor_pos = Some(Position {
-                x: area.x + (prefix_w + (cursor - scroll)) as u16,
-                y: area.y + input_y_offset,
+                x: area.x + (prefix_w + cursor_vcol) as u16,
+                y: area.y + 1 + cursor_vrow_in_vp as u16,
             });
-            Line::from(format!("{prefix}{visible}"))
+
+            // Build lines for the visible window [vscroll, vscroll+input_region_rows).
+            let visible_end = (vscroll + input_region_rows).min(total_vrows);
+            let mut ml: Vec<Line<'static>> = Vec::with_capacity(input_region_rows);
+            for (offset, content) in visual_rows[vscroll..visible_end].iter().enumerate() {
+                let vr = vscroll + offset;
+                // " > " prefix on the very first visual row; "   " everywhere else.
+                let prefix = if vr == 0 { " > " } else { "   " };
+                ml.push(Line::from(format!("{prefix}{content}")));
+            }
+            // Pad to fill the region when the buffer is shorter than the viewport.
+            while ml.len() < input_region_rows {
+                ml.push(Line::from(""));
+            }
+            multi_input_lines = Some(ml);
+            Line::from("") // placeholder — unused in SendPrompt compose path
         }
         InputMode::Command => Line::from(format!(" :{}", app.command_buffer)),
         InputMode::Normal => {
@@ -2950,11 +2988,13 @@ fn render_inline_session_detail(f: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    // Separator: thin rule across the viewport width.
-    let separator_line = Line::from(Span::styled(
-        "─".repeat(area.width as usize),
-        Style::default().fg(Color::DarkGray),
-    ));
+    // Lower separator (reused style for both separators).
+    let sep = || {
+        Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
 
     // Footer: session metadata + (when no session) a hint to switch
     // back. mu-o1y7 phase 3a: when the F3-on-F3 picker is open, swap
@@ -3025,21 +3065,34 @@ fn render_inline_session_detail(f: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    // Compose the viewport: blank top region (room for phase 3's
-    // upward-growing prompt), then input row, separator, footer.
+    // Compose the viewport:
+    //   row 0:         upper separator
+    //   rows 1..h-2:   input region (SendPrompt: multi_input_lines;
+    //                                Normal/Command: blank padding + single line)
+    //   row h-2:       lower separator
+    //   row h-1:       footer
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(height as usize);
-    for _ in 0..input_y_offset {
-        lines.push(Line::from(""));
+    lines.push(sep()); // upper separator
+
+    match multi_input_lines {
+        Some(ml) => {
+            for line in ml {
+                lines.push(line);
+            }
+        }
+        None => {
+            // Normal/Command: hint/command at the bottom of the input region.
+            for _ in 0..(input_region_rows.saturating_sub(1)) {
+                lines.push(Line::from(""));
+            }
+            lines.push(single_input_line);
+        }
     }
-    lines.push(input_line);
-    let _ = separator_y_offset; // index-only; line already at the right slot
-    lines.push(separator_line);
-    let _ = footer_y_offset;
+
+    lines.push(sep()); // lower separator
     lines.push(footer_line);
 
-    let paragraph = Paragraph::new(lines);
-    f.render_widget(paragraph, area);
-
+    f.render_widget(Paragraph::new(lines), area);
     if let Some(pos) = cursor_pos {
         f.set_cursor_position(pos);
     }
@@ -4128,6 +4181,18 @@ where
     let mut last_tick = Instant::now();
 
     loop {
+        // mu-o1y7 phase 3g: sample terminal dimensions so on_key resize
+        // trigger has fresh col/row counts without needing a Terminal ref.
+        if let Ok(sz) = terminal.size() {
+            app.terminal_cols = sz.width;
+            app.terminal_rows = sz.height;
+        }
+        // mu-o1y7 phase 3g (Q3 decision): honor pending_mode_change BEFORE
+        // terminal.draw so the resize takes effect on this frame, not the
+        // next. Quit still takes priority (checked after the editor path).
+        if let Some(new_mode) = app.pending_mode_change.take() {
+            return Ok(RunOutcome::ModeChange(new_mode));
+        }
         terminal.draw(|f| ui(f, &mut *app))?;
 
         // mu-o1y7 phase 2c: when F3 is in Inline mode, emit any new
@@ -4223,14 +4288,6 @@ where
         }
         if app.quit {
             return Ok(RunOutcome::Exit);
-        }
-        // mu-o1y7 phase 2a: any in-loop logic that needs the terminal
-        // rebuilt in a different viewport mode sets this flag. We
-        // honor it AFTER `app.quit` (quit takes precedence) so a quit
-        // immediately preceded by a mode-change request still exits
-        // cleanly.
-        if let Some(new_mode) = app.pending_mode_change.take() {
-            return Ok(RunOutcome::ModeChange(new_mode));
         }
     }
 }
@@ -4331,6 +4388,107 @@ where
     //    overwrite whatever's left.
     let _ = std::fs::remove_file(&path);
     Ok(())
+}
+
+// ── mu-o1y7 phase 3g: pure helpers for the multi-line prompt ─────────────
+
+/// Split `prompt` into visual rows given `avail` columns of usable width
+/// (i.e. area.width minus the 3-wide " > " / "   " prefix). Each logical
+/// line (delimited by `\n`) wraps into ceil(lc/avail) visual rows, or one
+/// empty row if the logical line is itself empty.
+///
+/// The returned strings carry raw content only — no prefix. The prefix is
+/// applied at render time: `" > "` on visual row 0, `"   "` on all others.
+fn compute_visual_rows(prompt: &str, avail: usize) -> Vec<String> {
+    let avail = avail.max(1);
+    let mut visual_rows: Vec<String> = Vec::new();
+    for logical_line in prompt.split('\n') {
+        let chars: Vec<char> = logical_line.chars().collect();
+        if chars.is_empty() {
+            visual_rows.push(String::new());
+        } else {
+            let mut start = 0;
+            while start < chars.len() {
+                let end = (start + avail).min(chars.len());
+                visual_rows.push(chars[start..end].iter().collect());
+                start = end;
+            }
+        }
+    }
+    if visual_rows.is_empty() {
+        visual_rows.push(String::new()); // always at least one row
+    }
+    visual_rows
+}
+
+/// Compute `(vrow, vcol)` — the visual row and column within
+/// `compute_visual_rows(prompt, avail)` where the cursor should appear.
+/// `cursor_char` is in char units (matches `App.prompt_cursor`).
+///
+/// **Exact-wrap edge case** (orchestrator decision: Option A variant):
+/// When the cursor lands exactly at the end of a logical line whose char
+/// count is a non-zero multiple of `avail`, the naive `col/avail` formula
+/// would advance to a phantom next row (placing the cursor outside the
+/// rendered viewport or aliasing with the next line's start). Instead the
+/// cursor stays on the last visual row of the current logical line at
+/// `vcol = avail` — the "one past last char on a full row" position —
+/// which is what conventional terminal text editors show.
+///
+/// The trailing-newline case ("abc\n", cursor=4) is handled naturally:
+/// the cursor matches the empty logical line *after* the `\n`, landing at
+/// `(vrow_of_empty_line, 0)` without any special-casing needed.
+fn find_cursor_position(prompt: &str, cursor_char: usize, avail: usize) -> (usize, usize) {
+    let avail = avail.max(1);
+    let char_count: usize = prompt.chars().count();
+    let cursor_char = cursor_char.min(char_count);
+    let logical_lines: Vec<&str> = prompt.split('\n').collect();
+
+    let mut chars_seen: usize = 0;
+    let mut vrow_offset: usize = 0;
+
+    for logical_line in &logical_lines {
+        let lc = logical_line.chars().count();
+        let vrows_for_line = if lc == 0 { 1 } else { lc.div_ceil(avail) };
+
+        if cursor_char <= chars_seen + lc {
+            let col_in_line = cursor_char - chars_seen;
+            let (vrow, vcol) = if col_in_line == lc && lc > 0 && lc % avail == 0 {
+                // Exact-wrap: cursor at end of a line whose length is a multiple
+                // of avail. Stay on the last visual row with vcol = avail instead
+                // of advancing to a phantom row.
+                (vrow_offset + vrows_for_line - 1, avail)
+            } else {
+                (vrow_offset + col_in_line / avail, col_in_line % avail)
+            };
+            return (vrow, vcol);
+        }
+
+        vrow_offset += vrows_for_line;
+        chars_seen += lc + 1; // +1 for the consumed '\n'
+    }
+
+    // Cursor past all logical lines — shouldn't happen with cursor_char clamped
+    // to char_count, but provide a safe fallback.
+    (vrow_offset.saturating_sub(1), 0)
+}
+
+/// Compute the desired `Viewport::Inline(N)` height for the current prompt
+/// buffer. Pure: safe to call from `on_key_send_prompt` and unit tests.
+///
+/// Layout: upper-sep (1) + input-rows (N) + lower-sep (1) + footer (1) = N+3.
+/// N is capped at `terminal_rows / 3` so the prompt never dominates the mux
+/// scrollback window.
+fn compute_needed_inline_height(
+    prompt_buffer: &str,
+    terminal_cols: u16,
+    terminal_rows: u16,
+) -> u16 {
+    let prefix_w: usize = 3; // " > " / "   "
+    let avail = (terminal_cols as usize).saturating_sub(prefix_w).max(1);
+    let total_vrows = compute_visual_rows(prompt_buffer, avail).len();
+    let cap_input_rows = (terminal_rows as usize) / 3;
+    let needed_input_rows = total_vrows.min(cap_input_rows);
+    (needed_input_rows + 3) as u16
 }
 
 #[cfg(test)]
@@ -5249,5 +5407,235 @@ mod tests {
         // append should not silently wrap to a tiny offset.
         let anchored = anchor_scroll_offset(0, usize::from(u16::MAX) + 100, u16::MAX - 5);
         assert_eq!(anchored, u16::MAX, "saturating-add must cap at u16::MAX");
+    }
+
+    // ── mu-o1y7 phase 3g: compute_visual_rows unit tests ─────────────────
+
+    /// Test 1: empty buffer → one empty visual row.
+    #[test]
+    fn visual_rows_empty_buffer() {
+        let rows = compute_visual_rows("", 10);
+        assert_eq!(rows, vec![String::new()]);
+    }
+
+    /// Test 2: single char, large avail → one visual row containing the char.
+    #[test]
+    fn visual_rows_single_char() {
+        let rows = compute_visual_rows("a", 10);
+        assert_eq!(rows, vec!["a".to_string()]);
+    }
+
+    /// Test 3: single line shorter than avail → one visual row.
+    #[test]
+    fn visual_rows_short_line_no_wrap() {
+        let rows = compute_visual_rows("hello", 80);
+        assert_eq!(rows, vec!["hello".to_string()]);
+    }
+
+    /// Test 4: line exactly avail wide → still one visual row (no phantom extra).
+    #[test]
+    fn visual_rows_exact_avail_width() {
+        let rows = compute_visual_rows("abc", 3);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], "abc");
+    }
+
+    /// Test 5: line avail+1 wide → two visual rows.
+    #[test]
+    fn visual_rows_one_over_avail() {
+        let rows = compute_visual_rows("abcd", 3);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], "abc");
+        assert_eq!(rows[1], "d");
+    }
+
+    /// Two logical lines separated by \n → each becomes its own set of rows.
+    #[test]
+    fn visual_rows_two_logical_lines() {
+        let rows = compute_visual_rows("abc\nde", 10);
+        assert_eq!(rows, vec!["abc".to_string(), "de".to_string()]);
+    }
+
+    /// Trailing \n → empty logical line appended as an empty visual row.
+    #[test]
+    fn visual_rows_trailing_newline() {
+        let rows = compute_visual_rows("abc\n", 10);
+        assert_eq!(rows, vec!["abc".to_string(), String::new()]);
+    }
+
+    // ── mu-o1y7 phase 3g: find_cursor_position unit tests ────────────────
+
+    /// Test 1 (cursor algorithm): empty buffer, cursor=0 → (0, 0).
+    #[test]
+    fn cursor_pos_empty_buffer() {
+        let (vr, vc) = find_cursor_position("", 0, 10);
+        assert_eq!((vr, vc), (0, 0));
+    }
+
+    /// Test 2: single char "a", cursor=0 → (0, 0) (before 'a').
+    #[test]
+    fn cursor_pos_single_char_before() {
+        let (vr, vc) = find_cursor_position("a", 0, 10);
+        assert_eq!((vr, vc), (0, 0));
+    }
+
+    /// Test 3: single char "a", cursor=1 → (0, 1) (after 'a').
+    #[test]
+    fn cursor_pos_single_char_after() {
+        let (vr, vc) = find_cursor_position("a", 1, 10);
+        assert_eq!((vr, vc), (0, 1));
+    }
+
+    /// Test 4 (exact-wrap edge case): line exactly avail wide, cursor at end.
+    /// Option A variant: cursor stays on last visual row at vcol=avail,
+    /// not on a phantom next row that would collide with the separator.
+    #[test]
+    fn cursor_pos_exact_wrap_end_of_buffer() {
+        // "abc" is exactly 3 chars wide with avail=3.
+        // cursor=3 must land on row 0 at col 3 — NOT on a phantom row 1.
+        let (vr, vc) = find_cursor_position("abc", 3, 3);
+        assert_eq!((vr, vc), (0, 3), "exact-wrap: cursor stays on last row");
+    }
+
+    /// Test 5: line avail+1 wide, cursor at end → on second visual row.
+    #[test]
+    fn cursor_pos_avail_plus_one_end() {
+        // "abcd" with avail=3 → rows ["abc","d"]. cursor=4 (after 'd').
+        // col_in_line=4, not exact-wrap (4%3=1). vrow=4/3=1, vcol=4%3=1.
+        let (vr, vc) = find_cursor_position("abcd", 4, 3);
+        assert_eq!((vr, vc), (1, 1));
+    }
+
+    /// Test 6: "abc\nde", cursor=0 → start of first line.
+    #[test]
+    fn cursor_pos_multiline_start() {
+        let (vr, vc) = find_cursor_position("abc\nde", 0, 80);
+        assert_eq!((vr, vc), (0, 0));
+    }
+
+    /// Test 7: "abc\nde", cursor=3 → end of "abc" (before '\n').
+    #[test]
+    fn cursor_pos_multiline_end_first_line() {
+        let (vr, vc) = find_cursor_position("abc\nde", 3, 80);
+        assert_eq!((vr, vc), (0, 3));
+    }
+
+    /// Test 8: "abc\nde", cursor=4 → start of "de" (after '\n').
+    #[test]
+    fn cursor_pos_multiline_start_second_line() {
+        let (vr, vc) = find_cursor_position("abc\nde", 4, 80);
+        assert_eq!((vr, vc), (1, 0));
+    }
+
+    /// Test 9: "abc\nde", cursor=6 → end of "de".
+    #[test]
+    fn cursor_pos_multiline_end_second_line() {
+        let (vr, vc) = find_cursor_position("abc\nde", 6, 80);
+        assert_eq!((vr, vc), (1, 2));
+    }
+
+    /// Test 10: "abc\n", cursor=4 → trailing empty row at (1, 0).
+    #[test]
+    fn cursor_pos_trailing_newline() {
+        let (vr, vc) = find_cursor_position("abc\n", 4, 80);
+        assert_eq!(
+            (vr, vc),
+            (1, 0),
+            "cursor on empty row after trailing newline"
+        );
+    }
+
+    /// Test 13: single-line "hello" avail=80 → same as horizontal path.
+    /// Regression check: cursor at each position maps to the expected column.
+    #[test]
+    fn cursor_pos_single_line_regression() {
+        for i in 0..=5 {
+            let (vr, vc) = find_cursor_position("hello", i, 80);
+            assert_eq!(vr, 0, "vrow must be 0 for short single-line buffer");
+            assert_eq!(vc, i, "vcol must equal cursor position for short line");
+        }
+    }
+
+    // ── mu-o1y7 phase 3g: vscroll unit tests ─────────────────────────────
+
+    /// Test 11: long buffer (many visual rows) → vscroll activates, cursor visible.
+    #[test]
+    fn vscroll_long_buffer_cursor_visible() {
+        // 20 newlines → 21 logical lines → 21 visual rows (avail=80).
+        let prompt = "line\n".repeat(20);
+        let avail: usize = 77; // 80 - prefix_w(3)
+        let rows = compute_visual_rows(&prompt, avail);
+        let total = rows.len();
+        let cap_input = 8_usize; // simulating cap
+        let cursor_char = prompt.chars().count(); // cursor at end
+        let (cursor_vrow, _) = find_cursor_position(&prompt, cursor_char, avail);
+
+        // Compute vscroll same way as the render function.
+        let vscroll = if total <= cap_input {
+            0
+        } else {
+            let floor = cursor_vrow.saturating_sub(cap_input.saturating_sub(1));
+            let ceil = total.saturating_sub(cap_input);
+            floor.min(ceil)
+        };
+
+        assert!(vscroll > 0, "vscroll must be > 0 for long buffer");
+        assert!(
+            cursor_vrow >= vscroll && cursor_vrow < vscroll + cap_input,
+            "cursor_vrow={cursor_vrow} must be in [{vscroll}, {})",
+            vscroll + cap_input
+        );
+    }
+
+    /// Test 12: long buffer, cursor at top → vscroll=0.
+    #[test]
+    fn vscroll_long_buffer_cursor_at_top() {
+        let prompt = "line\n".repeat(20);
+        let avail: usize = 77;
+        let rows = compute_visual_rows(&prompt, avail);
+        let total = rows.len();
+        let cap_input = 8_usize;
+
+        // cursor at position 0 (top of buffer)
+        let (cursor_vrow, _) = find_cursor_position(&prompt, 0, avail);
+        let vscroll = if total <= cap_input {
+            0
+        } else {
+            let floor = cursor_vrow.saturating_sub(cap_input.saturating_sub(1));
+            let ceil = total.saturating_sub(cap_input);
+            floor.min(ceil)
+        };
+
+        assert_eq!(vscroll, 0, "cursor at top → vscroll=0");
+    }
+
+    // ── mu-o1y7 phase 3g: compute_needed_inline_height tests ─────────────
+
+    /// Test 14: empty buffer → minimum height = 1 input row + 3 overhead = 4.
+    #[test]
+    fn inline_height_empty_buffer() {
+        let h = compute_needed_inline_height("", 80, 24);
+        assert_eq!(h, 4, "empty buffer: 1 input row + 3 overhead");
+    }
+
+    /// Test 15: two-line buffer → 2 input rows + 3 overhead = 5.
+    #[test]
+    fn inline_height_two_line_buffer() {
+        let h = compute_needed_inline_height("hello\nworld", 80, 24);
+        assert_eq!(h, 5, "two logical lines → 2 input rows + 3 overhead");
+    }
+
+    /// Test 16: buffer exceeding cap → height capped at cap_input_rows + 3.
+    #[test]
+    fn inline_height_capped_at_terminal_fraction() {
+        // terminal_rows=24 → cap = 24/3 = 8 input rows → max height = 11.
+        let many_lines = "x\n".repeat(20); // 21 visual rows > cap=8
+        let h = compute_needed_inline_height(&many_lines, 80, 24);
+        let cap = 24_usize / 3;
+        assert_eq!(
+            h as usize,
+            cap + 3,
+            "height must be capped at cap_input + 3"
+        );
     }
 }

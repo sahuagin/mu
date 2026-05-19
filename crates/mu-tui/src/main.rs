@@ -336,6 +336,14 @@ struct App {
     // matching this substring. Toggleable via `:filter <text>`
     // palette command. Empty = no filter (show all).
     events_filter: String,
+    // F8 events explorer: focused row index in the filtered list.
+    // j/k moves this; Enter toggles expansion. usize::MAX = sentinel
+    // meaning "clamp to last event" (set on F8 entry and filter reset).
+    events_focused_index: usize,
+    // F8 events explorer: set of filtered-list indices that are
+    // expanded to show the full payload. Uses filtered-list indices;
+    // cleared on filter change to avoid stale index mapping.
+    expanded_events: std::collections::HashSet<usize>,
     // F5 usage / cache dashboard (mu-xln). Holds the most recent
     // daemon.usage_history response and the wall time it was fetched
     // at. Refreshed lazily — whenever a session.done lands (so any
@@ -455,6 +463,8 @@ impl App {
             events_scroll_offset: 0,
             prev_events_total_lines: 0,
             events_filter: String::new(),
+            events_focused_index: usize::MAX,
+            expanded_events: std::collections::HashSet::new(),
             latest_usage_history: None,
             latest_usage_history_at: None,
             mu,
@@ -1410,6 +1420,14 @@ impl App {
                 self.command_buffer.clear();
             }
             (KeyCode::Char('n'), _) => self.create_session(),
+            // F8 expand/collapse: Enter toggles full-payload view for the
+            // focused event. Must come before the generic Enter/i handler.
+            (KeyCode::Enter, _) if matches!(self.mode, ViewMode::Events) => {
+                let idx = self.events_focused_index;
+                if !self.expanded_events.remove(&idx) {
+                    self.expanded_events.insert(idx);
+                }
+            }
             (KeyCode::Char('i'), _) | (KeyCode::Enter, _)
                 if self.selected_session.selected().is_some() =>
             {
@@ -1467,10 +1485,11 @@ impl App {
                 self.events_scroll_offset = 0;
             }
             (KeyCode::Char('k'), _) if matches!(self.mode, ViewMode::Events) => {
-                self.events_scroll_offset = self.events_scroll_offset.saturating_add(2);
+                self.events_focused_index = self.events_focused_index.saturating_sub(1);
             }
             (KeyCode::Char('j'), _) if matches!(self.mode, ViewMode::Events) => {
-                self.events_scroll_offset = self.events_scroll_offset.saturating_sub(2);
+                // upper clamp to last event happens in render_events_explorer
+                self.events_focused_index = self.events_focused_index.saturating_add(1);
             }
             (KeyCode::F(4), _) => self.switch_view(ViewMode::Context),
             (KeyCode::F(5), _) => {
@@ -1485,6 +1504,7 @@ impl App {
             (KeyCode::F(8), _) => {
                 self.switch_view(ViewMode::Events);
                 self.events_scroll_offset = 0; // pinned to bottom on entry
+                self.events_focused_index = usize::MAX; // clamps to last event in render
             }
             (KeyCode::F(9), _) => self.switch_view(ViewMode::Mailbox),
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
@@ -1600,6 +1620,8 @@ impl App {
                 // :filter               → clear filter
                 self.events_filter = rest.join(" ");
                 self.events_scroll_offset = 0; // jump back to bottom
+                self.events_focused_index = usize::MAX; // clamp to last after filter change
+                self.expanded_events.clear();
                 if self.events_filter.is_empty() {
                     self.firehose.push("[ok] filter cleared".into());
                 } else {
@@ -1609,6 +1631,8 @@ impl App {
             }
             "clear-filter" => {
                 self.events_filter.clear();
+                self.events_focused_index = usize::MAX;
+                self.expanded_events.clear();
                 self.firehose.push("[ok] filter cleared".into());
             }
             _ => {
@@ -3575,58 +3599,141 @@ fn wrap_body_line(line: &str, width: usize) -> Vec<String> {
 /// down past 74 before motion resumed.
 fn render_events_explorer(f: &mut Frame, app: &mut App, area: Rect) {
     let filter = app.events_filter.trim().to_string();
-    // Build the filtered line list. Cheap — firehose is capped at 500.
-    let lines_owned: Vec<String> = if filter.is_empty() {
-        app.firehose.to_vec()
+    // Build filtered list as (filtered_idx, firehose_string) pairs.
+    // Cheap — firehose is capped at 500.
+    let filtered: Vec<&str> = if filter.is_empty() {
+        app.firehose.iter().map(|s| s.as_str()).collect()
     } else {
         app.firehose
             .iter()
             .filter(|l| l.contains(&filter))
-            .cloned()
+            .map(|s| s.as_str())
             .collect()
     };
-    let total = lines_owned.len();
+    let total_events = filtered.len();
+
+    // Clamp focused index; usize::MAX is the sentinel "clamp to last".
+    if total_events == 0 {
+        app.events_focused_index = 0;
+    } else if app.events_focused_index >= total_events {
+        app.events_focused_index = total_events - 1;
+    }
+    let focused_idx = app.events_focused_index;
+
     let inner_height = area.height.saturating_sub(2) as usize;
-    // mu-sod: anchor F8 events against append-during-scroll. Same
-    // shape as the F3 transcript anchor: when total grew since
-    // last render AND user is scrolled up, bump offset by the
-    // delta so the visible window stays on the same absolute lines.
-    app.events_scroll_offset =
-        anchor_scroll_offset(app.prev_events_total_lines, total, app.events_scroll_offset);
-    app.prev_events_total_lines = total;
-    let max_top = total.saturating_sub(inner_height);
-    // Clamp stored offset to the actual maximum here, so the title
-    // shows a value the view can actually reflect and subsequent
-    // PageDown presses don't have to "burn off" phantom offset
-    // before they move anything. Also handles content shrinkage
-    // (e.g. filter toggled on) so the anchored offset doesn't
-    // strand the view past the new top.
+    // Content width: subtract borders (2) and cursor prefix "  " / "> " (2).
+    let content_width = area.width.saturating_sub(4).max(20) as usize;
+
+    const PREVIEW_LEN: usize = 60;
+
+    // Build visual body lines.  For each filtered event:
+    //   collapsed → 1 line: prefix + first PREVIEW_LEN chars + "…" if longer
+    //   expanded  → N lines: prefix + word-wrapped full content
+    // Track the visual start row of the focused event for auto-scroll.
+    let mut body_lines: Vec<Line> = Vec::with_capacity(total_events + 4);
+    let mut focused_visual_start = 0usize;
+
+    for (fi_idx, &s) in filtered.iter().enumerate() {
+        let is_focused = fi_idx == focused_idx;
+        let is_expanded = app.expanded_events.contains(&fi_idx);
+
+        if is_focused {
+            focused_visual_start = body_lines.len();
+        }
+
+        let prefix_style = if is_focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        let prefix: &str = if is_focused { "> " } else { "  " };
+
+        if is_expanded && s.len() > PREVIEW_LEN {
+            // Full content, word-wrapped using existing wrap_body_line helper.
+            let wrapped = wrap_body_line(s, content_width);
+            for (i, chunk) in wrapped.iter().enumerate() {
+                let (lp, ls): (&str, Style) = if i == 0 {
+                    (prefix, prefix_style)
+                } else {
+                    ("  ", Style::default())
+                };
+                body_lines.push(Line::from(vec![
+                    Span::styled(lp, ls),
+                    Span::raw(chunk.clone()),
+                ]));
+            }
+        } else {
+            // Single collapsed line (or short expanded — no visual difference).
+            let preview: String = if s.len() > PREVIEW_LEN && !is_expanded {
+                format!("{}\u{2026}", &s[..PREVIEW_LEN])
+            } else {
+                s.to_string()
+            };
+            body_lines.push(Line::from(vec![
+                Span::styled(prefix, prefix_style),
+                Span::raw(preview),
+            ]));
+        }
+    }
+
+    let total_visual = body_lines.len();
+
+    // mu-sod: anchor scroll offset against newly appended events (not
+    // against visual-line changes from expand/collapse). Using total_events
+    // (filtered event count) ensures the anchor only fires on real appends.
+    app.events_scroll_offset = anchor_scroll_offset(
+        app.prev_events_total_lines,
+        total_events,
+        app.events_scroll_offset,
+    );
+    app.prev_events_total_lines = total_events;
+
+    let max_top = total_visual.saturating_sub(inner_height);
     if (app.events_scroll_offset as usize) > max_top {
         app.events_scroll_offset = max_top as u16;
     }
-    let scroll_y = (max_top.saturating_sub(app.events_scroll_offset as usize)) as u16;
+
+    // Auto-scroll to keep the focused event visible after j/k movement.
+    if total_events > 0 {
+        let scroll_y_now = max_top.saturating_sub(app.events_scroll_offset as usize);
+        if focused_visual_start < scroll_y_now {
+            // Focused event is above the viewport: scroll up to show it.
+            let new_offset = max_top.saturating_sub(focused_visual_start);
+            app.events_scroll_offset = new_offset.min(u16::MAX as usize) as u16;
+        } else if focused_visual_start >= scroll_y_now.saturating_add(inner_height) {
+            // Focused event is below the viewport: scroll down to show it.
+            let new_scroll_y = focused_visual_start.saturating_sub(inner_height.saturating_sub(1));
+            let new_offset = max_top.saturating_sub(new_scroll_y);
+            app.events_scroll_offset = new_offset.min(u16::MAX as usize) as u16;
+        }
+        // Re-clamp after cursor-visibility adjustment.
+        if (app.events_scroll_offset as usize) > max_top {
+            app.events_scroll_offset = max_top as u16;
+        }
+    }
+
+    let scroll_y = max_top.saturating_sub(app.events_scroll_offset as usize) as u16;
+
     let title_suffix = if filter.is_empty() {
-        format!("{total} events")
+        format!("{total_events} events")
     } else {
         format!(
-            "{total} events matching {:?}  (:clear-filter to reset)",
+            "{total_events} events matching {:?}  (:clear-filter to reset)",
             filter
         )
     };
     let scroll_suffix = if app.events_scroll_offset > 0 {
         format!(
-            "  · scrolled up {}/{} · End to bottom · Home to top",
+            "  · scrolled up {}/{} · End=bottom · Home=top",
             app.events_scroll_offset, max_top
         )
     } else {
-        " · End=bottom · Home=top · :filter to filter".into()
+        " · j/k focus · Enter expand/collapse · :filter to filter".into()
     };
     let title = format!(" Events Explorer (F8) — {title_suffix}{scroll_suffix} ");
-    let body_lines: Vec<Line> = lines_owned.iter().map(|s| Line::from(s.as_str())).collect();
     let block = Block::default().borders(Borders::ALL).title(title);
     let paragraph = Paragraph::new(body_lines)
         .block(block)
-        .wrap(Wrap { trim: false })
         .scroll((scroll_y, 0));
     f.render_widget(paragraph, area);
 }
@@ -3907,7 +4014,9 @@ fn render_statusline(f: &mut Frame, app: &App, area: Rect) {
         InputMode::Normal => {
             let scroll_hint = match app.mode {
                 ViewMode::SessionDetail => "j/k PgUp/PgDn Home/End scroll · ",
-                ViewMode::Events => "j/k PgUp/PgDn Home/End scroll · :filter <text> · ",
+                ViewMode::Events => {
+                    "j/k focus · Enter expand/collapse · PgUp/PgDn scroll · :filter <text> · "
+                }
                 _ => "j/k select · ",
             };
             format!(

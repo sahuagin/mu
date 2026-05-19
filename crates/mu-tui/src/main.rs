@@ -937,7 +937,25 @@ impl App {
                 self.firehose.push(format!("→ {sid}: {preview:?}{suffix}"));
             }
             Err(e) => {
-                self.firehose.push(format!("[!! ask_session] {e}"));
+                // mu-o1y7 phase 3b: surface the daemon error in inline
+                // mode too. The firehose strip is only visible in
+                // Fullscreen views; in F3 inline the operator types
+                // Enter and sees nothing (observed 2026-05-19 against
+                // rehydrated read-only sessions from mu-u1ld phase A,
+                // which the daemon reports as 'session not found' —
+                // resolvable when phase C / mu-1flg lands writable
+                // rehydration).
+                let firehose_msg = format!("[!! ask_session] {e}");
+                self.firehose.push(firehose_msg);
+                if matches!(self.current_mode, ViewportMode::Inline(_)) {
+                    // Compact error rendering — daemon errors are
+                    // often JSON-ish blobs ({"code":-32602,...}). Keep
+                    // the scrollback marker concise; the firehose has
+                    // the full text.
+                    let short_err: String = e.to_string().chars().take(120).collect();
+                    self.pending_inline_markers
+                        .push(format!("─── ask failed: {short_err} ───"));
+                }
             }
         }
     }

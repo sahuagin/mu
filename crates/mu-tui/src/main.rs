@@ -909,7 +909,15 @@ impl App {
             let msg = format!(
                 "─── send blocked: session {short_sid} is done · press n to create a new session ───"
             );
-            self.pending_inline_markers.push(msg.clone());
+            // Phase 3a follow-up: only queue the inline marker when
+            // the terminal is actually in Inline mode. Otherwise the
+            // marker sits queued and emits stale-but-newly-visible the
+            // next time the operator enters F3, leading to two markers
+            // when they only attempted one F3-send (observed 2026-05-19).
+            // The firehose entry covers fullscreen feedback on its own.
+            if matches!(self.current_mode, ViewportMode::Inline(_)) {
+                self.pending_inline_markers.push(msg.clone());
+            }
             self.firehose.push(format!("[blocked] {msg}"));
             return;
         }

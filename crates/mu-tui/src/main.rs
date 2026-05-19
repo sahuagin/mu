@@ -355,6 +355,13 @@ struct App {
     /// `run` after each `terminal.draw`. Inline-mode only; firehose is
     /// the alt-screen-mode equivalent.
     pending_inline_markers: Vec<String>,
+    /// mu-o1y7 phase 3c: the session whose transcript is currently
+    /// being emitted into scrollback. Distinct from `selected_session`
+    /// so picker preview (rotating with j/k) doesn't dump every
+    /// candidate's transcript — only the committed selection. Used by
+    /// `emit_transcript_delta_inline` to emit a boundary marker on
+    /// transition and to scope per-tick emit to the active session.
+    f3_active_session_id: Option<String>,
 }
 
 impl App {
@@ -417,6 +424,7 @@ impl App {
             current_mode: ViewportMode::Fullscreen,
             f3_emitted_count_by_sid: std::collections::HashMap::new(),
             pending_inline_markers: Vec::new(),
+            f3_active_session_id: None,
         }
     }
 
@@ -2637,6 +2645,15 @@ fn emit_transcript_delta_inline<B: Backend>(terminal: &mut Terminal<B>, app: &mu
 where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    // Phase 3c: don't emit while the F3-on-F3 picker is open —
+    // selected_session moves with j/k during preview, and dumping
+    // every previewed candidate's transcript would flood scrollback.
+    // The picker's close-with-commit lands; next tick's emit detects
+    // the active-vs-selected mismatch and handles the transition.
+    if app.session_picker_open {
+        return Ok(());
+    }
+
     let selected_sid: Option<String> = app
         .selected_session
         .selected()
@@ -2646,6 +2663,59 @@ where
     let Some(sid) = selected_sid else {
         return Ok(());
     };
+
+    // Phase 3c: detect session transitions. When `f3_active_session_id`
+    // differs from the current selection, the operator just switched
+    // sessions (via the F3 picker, or by navigating in F1 + entering
+    // F3). Emit a one-line boundary marker so scrollback has a visual
+    // break, plus a header line giving the new session's identity for
+    // context. The previous session's transcript stays in mux
+    // scrollback (operator can scroll up to find it).
+    let active_changed = app.f3_active_session_id.as_ref() != Some(&sid);
+    if active_changed {
+        let from_sid = app.f3_active_session_id.clone();
+        let to_sid = sid.clone();
+        // Build the session header for `to_sid` from the current row.
+        let header_text = app
+            .sessions
+            .iter()
+            .find(|r| r.session_id.as_deref() == Some(to_sid.as_str()))
+            .map(|r| {
+                let phase = if r.phase.is_empty() {
+                    "idle".to_string()
+                } else {
+                    r.phase.clone()
+                };
+                format!(
+                    "─── {} · {} · {} · ${:.2} ───",
+                    r.short_id, r.model, phase, r.cost_usd
+                )
+            })
+            .unwrap_or_else(|| format!("─── {to_sid} ───"));
+
+        // First-ever entry to F3 in this run has `f3_active_session_id`
+        // None — skip the "switched from" marker (there's no
+        // meaningful "from"), but still emit the header so the
+        // operator knows which session's transcript follows.
+        if let Some(from) = from_sid {
+            let switch_marker = format!("─── ⇄ switched session: {from} → {to_sid} ───");
+            terminal.insert_before(1, |buf| {
+                let line = Line::from(Span::styled(
+                    switch_marker,
+                    Style::default()
+                        .fg(MUTED_AMBER)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                Widget::render(Paragraph::new(line), buf.area, buf);
+            })?;
+        }
+        terminal.insert_before(1, |buf| {
+            let line = Line::from(Span::styled(header_text, Style::default().fg(Color::Cyan)));
+            Widget::render(Paragraph::new(line), buf.area, buf);
+        })?;
+
+        app.f3_active_session_id = Some(sid.clone());
+    }
 
     // Compute the delta to emit + the new emitted-count. Scoped so
     // the immutable borrow on `app.transcript_events_by_sid` is

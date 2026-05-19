@@ -336,6 +336,20 @@ struct App {
     // matching this substring. Toggleable via `:filter <text>`
     // palette command. Empty = no filter (show all).
     events_filter: String,
+    // F8 events explorer: focused row index in the filtered list.
+    // j/k moves this; Enter toggles expansion. usize::MAX = sentinel
+    // meaning "clamp to last event" (set on F8 entry and filter reset).
+    events_focused_index: usize,
+    // F8 events explorer: set of filtered-list indices that are
+    // expanded to show the full payload. Uses filtered-list indices;
+    // cleared on filter change AND shifted by drop_count on firehose
+    // ring eviction so markers stay attached to the same event lines.
+    expanded_events: std::collections::HashSet<usize>,
+    // F8 events explorer: previous frame's focused index. The
+    // auto-scroll-to-keep-cursor-visible block in render_events_explorer
+    // only fires when the cursor MOVED this frame, so PageUp/PageDn/Home/End
+    // can scroll past the cursor without the next render snapping back.
+    prev_focused_index_for_scroll: Option<usize>,
     // F5 usage / cache dashboard (mu-xln). Holds the most recent
     // daemon.usage_history response and the wall time it was fetched
     // at. Refreshed lazily — whenever a session.done lands (so any
@@ -455,6 +469,9 @@ impl App {
             events_scroll_offset: 0,
             prev_events_total_lines: 0,
             events_filter: String::new(),
+            events_focused_index: usize::MAX,
+            expanded_events: std::collections::HashSet::new(),
+            prev_focused_index_for_scroll: None,
             latest_usage_history: None,
             latest_usage_history_at: None,
             mu,
@@ -628,7 +645,7 @@ impl App {
                                 _ => {}
                             }
                         }
-                        handle_notification(
+                        let evicted = handle_notification(
                             &mut self.sessions,
                             &mut self.firehose,
                             &mut self.latest_status,
@@ -636,6 +653,19 @@ impl App {
                             &method,
                             &params,
                         );
+                        if evicted > 0 {
+                            let (new_expanded, new_focused) = shift_f8_indices_after_eviction(
+                                &self.expanded_events,
+                                self.events_focused_index,
+                                evicted,
+                            );
+                            self.expanded_events = new_expanded;
+                            self.events_focused_index = new_focused;
+                            // Invalidate the prev-focused tracker so the next
+                            // render's auto-scroll-to-cursor block fires once
+                            // (cursor logically moved relative to the buffer).
+                            self.prev_focused_index_for_scroll = None;
+                        }
                     }
                     Some(MuMessage::Eof) => {
                         self.firehose.push("[!! mu serve closed stdout]".into());
@@ -1410,6 +1440,14 @@ impl App {
                 self.command_buffer.clear();
             }
             (KeyCode::Char('n'), _) => self.create_session(),
+            // F8 expand/collapse: Enter toggles full-payload view for the
+            // focused event. Must come before the generic Enter/i handler.
+            (KeyCode::Enter, _) if matches!(self.mode, ViewMode::Events) => {
+                let idx = self.events_focused_index;
+                if !self.expanded_events.remove(&idx) {
+                    self.expanded_events.insert(idx);
+                }
+            }
             (KeyCode::Char('i'), _) | (KeyCode::Enter, _)
                 if self.selected_session.selected().is_some() =>
             {
@@ -1467,10 +1505,11 @@ impl App {
                 self.events_scroll_offset = 0;
             }
             (KeyCode::Char('k'), _) if matches!(self.mode, ViewMode::Events) => {
-                self.events_scroll_offset = self.events_scroll_offset.saturating_add(2);
+                self.events_focused_index = self.events_focused_index.saturating_sub(1);
             }
             (KeyCode::Char('j'), _) if matches!(self.mode, ViewMode::Events) => {
-                self.events_scroll_offset = self.events_scroll_offset.saturating_sub(2);
+                // upper clamp to last event happens in render_events_explorer
+                self.events_focused_index = self.events_focused_index.saturating_add(1);
             }
             (KeyCode::F(4), _) => self.switch_view(ViewMode::Context),
             (KeyCode::F(5), _) => {
@@ -1485,6 +1524,7 @@ impl App {
             (KeyCode::F(8), _) => {
                 self.switch_view(ViewMode::Events);
                 self.events_scroll_offset = 0; // pinned to bottom on entry
+                self.events_focused_index = usize::MAX; // clamps to last event in render
             }
             (KeyCode::F(9), _) => self.switch_view(ViewMode::Mailbox),
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
@@ -1600,6 +1640,8 @@ impl App {
                 // :filter               → clear filter
                 self.events_filter = rest.join(" ");
                 self.events_scroll_offset = 0; // jump back to bottom
+                self.events_focused_index = usize::MAX; // clamp to last after filter change
+                self.expanded_events.clear();
                 if self.events_filter.is_empty() {
                     self.firehose.push("[ok] filter cleared".into());
                 } else {
@@ -1609,6 +1651,8 @@ impl App {
             }
             "clear-filter" => {
                 self.events_filter.clear();
+                self.events_focused_index = usize::MAX;
+                self.expanded_events.clear();
                 self.firehose.push("[ok] filter cleared".into());
             }
             _ => {
@@ -1890,6 +1934,10 @@ fn handle_input_required(
     }
 }
 
+// Returns the number of front entries evicted from `firehose` during
+// the cap-and-drain at function exit (0 if no eviction). Callers that
+// track index-keyed firehose state (F8 cursor / expanded set) must
+// shift those indices by the returned count to stay aligned.
 fn handle_notification(
     sessions: &mut [SessionRow],
     firehose: &mut Vec<String>,
@@ -1900,7 +1948,7 @@ fn handle_notification(
     >,
     method: &str,
     params: &serde_json::Value,
-) {
+) -> usize {
     let sid = params
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -2049,11 +2097,16 @@ fn handle_notification(
             firehose.push(format!("[{sid}] {other}"));
         }
     }
-    // Cap firehose length to avoid unbounded growth.
+    // Cap firehose length to avoid unbounded growth. The drop count
+    // is returned so the caller can re-align F8 index-keyed state
+    // (events_focused_index, expanded_events) to the post-drain
+    // positions — see the call site in App's event-pump tick.
     if firehose.len() > 500 {
         let drop = firehose.len() - 500;
         firehose.drain(..drop);
+        return drop;
     }
+    0
 }
 
 fn fmt_duration(d: Duration) -> String {
@@ -2777,6 +2830,35 @@ fn anchor_scroll_offset(prev_total: usize, current_total: usize, offset: u16) ->
     let delta = current_total - prev_total;
     let delta_u16 = u16::try_from(delta).unwrap_or(u16::MAX);
     offset.saturating_add(delta_u16)
+}
+
+/// Shift F8 index-keyed state (`expanded_events`, `events_focused_index`)
+/// to compensate for `evicted` front-dropped entries on a firehose ring
+/// eviction. Indices that would underflow are dropped from the expanded
+/// set (the corresponding events are gone from the firehose). The cursor
+/// is shifted down by `evicted`; if that underflows OR the cursor was
+/// already at the `usize::MAX` sentinel, return `usize::MAX` so the next
+/// render's clamp re-targets the last surviving event.
+///
+/// Returns `(new_expanded, new_focused)`. Pure function; no I/O.
+fn shift_f8_indices_after_eviction(
+    expanded: &std::collections::HashSet<usize>,
+    focused: usize,
+    evicted: usize,
+) -> (std::collections::HashSet<usize>, usize) {
+    let new_expanded: std::collections::HashSet<usize> = expanded
+        .iter()
+        .filter_map(|&i| i.checked_sub(evicted))
+        .collect();
+    // Sentinel preserved across eviction: usize::MAX means "clamp to
+    // last at render time," and that intent is independent of any drop
+    // count. Only non-sentinel cursors shift.
+    let new_focused = if focused == usize::MAX {
+        usize::MAX
+    } else {
+        focused.checked_sub(evicted).unwrap_or(usize::MAX)
+    };
+    (new_expanded, new_focused)
 }
 
 /// mu-o1y7 phase 2c: emit any new transcript events for F3's selected
@@ -3575,58 +3657,154 @@ fn wrap_body_line(line: &str, width: usize) -> Vec<String> {
 /// down past 74 before motion resumed.
 fn render_events_explorer(f: &mut Frame, app: &mut App, area: Rect) {
     let filter = app.events_filter.trim().to_string();
-    // Build the filtered line list. Cheap — firehose is capped at 500.
-    let lines_owned: Vec<String> = if filter.is_empty() {
-        app.firehose.to_vec()
+    // Build filtered list as (filtered_idx, firehose_string) pairs.
+    // Cheap — firehose is capped at 500.
+    let filtered: Vec<&str> = if filter.is_empty() {
+        app.firehose.iter().map(|s| s.as_str()).collect()
     } else {
         app.firehose
             .iter()
             .filter(|l| l.contains(&filter))
-            .cloned()
+            .map(|s| s.as_str())
             .collect()
     };
-    let total = lines_owned.len();
+    let total_events = filtered.len();
+
+    // Clamp focused index; usize::MAX is the sentinel "clamp to last".
+    if total_events == 0 {
+        app.events_focused_index = 0;
+    } else if app.events_focused_index >= total_events {
+        app.events_focused_index = total_events - 1;
+    }
+    let focused_idx = app.events_focused_index;
+
     let inner_height = area.height.saturating_sub(2) as usize;
-    // mu-sod: anchor F8 events against append-during-scroll. Same
-    // shape as the F3 transcript anchor: when total grew since
-    // last render AND user is scrolled up, bump offset by the
-    // delta so the visible window stays on the same absolute lines.
-    app.events_scroll_offset =
-        anchor_scroll_offset(app.prev_events_total_lines, total, app.events_scroll_offset);
-    app.prev_events_total_lines = total;
-    let max_top = total.saturating_sub(inner_height);
-    // Clamp stored offset to the actual maximum here, so the title
-    // shows a value the view can actually reflect and subsequent
-    // PageDown presses don't have to "burn off" phantom offset
-    // before they move anything. Also handles content shrinkage
-    // (e.g. filter toggled on) so the anchored offset doesn't
-    // strand the view past the new top.
+    // Content width: subtract borders (2) and cursor prefix "  " / "> " (2).
+    let content_width = area.width.saturating_sub(4).max(20) as usize;
+
+    const PREVIEW_LEN: usize = 60;
+
+    // Build visual body lines.  For each filtered event:
+    //   collapsed → 1 line: prefix + first PREVIEW_LEN chars + "…" if longer
+    //   expanded  → N lines: prefix + word-wrapped full content
+    // Track the visual start row of the focused event for auto-scroll.
+    let mut body_lines: Vec<Line> = Vec::with_capacity(total_events + 4);
+    let mut focused_visual_start = 0usize;
+
+    for (fi_idx, &s) in filtered.iter().enumerate() {
+        let is_focused = fi_idx == focused_idx;
+        let is_expanded = app.expanded_events.contains(&fi_idx);
+
+        if is_focused {
+            focused_visual_start = body_lines.len();
+        }
+
+        let prefix_style = if is_focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        let prefix: &str = if is_focused { "> " } else { "  " };
+
+        if is_expanded && s.len() > PREVIEW_LEN {
+            // Full content, word-wrapped using existing wrap_body_line helper.
+            let wrapped = wrap_body_line(s, content_width);
+            for (i, chunk) in wrapped.iter().enumerate() {
+                let (lp, ls): (&str, Style) = if i == 0 {
+                    (prefix, prefix_style)
+                } else {
+                    ("  ", Style::default())
+                };
+                body_lines.push(Line::from(vec![
+                    Span::styled(lp, ls),
+                    Span::raw(chunk.clone()),
+                ]));
+            }
+        } else {
+            // Single collapsed line (or short expanded — no visual difference).
+            // Slice by char boundary, not bytes: `&s[..PREVIEW_LEN]` would
+            // panic if PREVIEW_LEN landed mid-codepoint (multi-byte UTF-8).
+            let preview: String = if s.chars().count() > PREVIEW_LEN && !is_expanded {
+                let cut = s
+                    .char_indices()
+                    .nth(PREVIEW_LEN)
+                    .map(|(i, _)| i)
+                    .unwrap_or(s.len());
+                format!("{}\u{2026}", &s[..cut])
+            } else {
+                s.to_string()
+            };
+            body_lines.push(Line::from(vec![
+                Span::styled(prefix, prefix_style),
+                Span::raw(preview),
+            ]));
+        }
+    }
+
+    let total_visual = body_lines.len();
+
+    // mu-sod: anchor scroll offset against newly appended events (not
+    // against visual-line changes from expand/collapse). Using total_events
+    // (filtered event count) ensures the anchor only fires on real appends.
+    app.events_scroll_offset = anchor_scroll_offset(
+        app.prev_events_total_lines,
+        total_events,
+        app.events_scroll_offset,
+    );
+    app.prev_events_total_lines = total_events;
+
+    let max_top = total_visual.saturating_sub(inner_height);
     if (app.events_scroll_offset as usize) > max_top {
         app.events_scroll_offset = max_top as u16;
     }
-    let scroll_y = (max_top.saturating_sub(app.events_scroll_offset as usize)) as u16;
+
+    // Auto-scroll to keep the focused event visible — but only when the
+    // cursor moved THIS frame (j/k/F8-entry/filter-reset/drain-shift).
+    // Without this gate the block would fire every render and silently
+    // override the user's PageUp/PageDn/Home/End intent on the next frame
+    // by snapping the viewport back to the cursor.
+    let cursor_moved = app.prev_focused_index_for_scroll != Some(focused_idx);
+    if total_events > 0 && cursor_moved {
+        let scroll_y_now = max_top.saturating_sub(app.events_scroll_offset as usize);
+        if focused_visual_start < scroll_y_now {
+            // Focused event is above the viewport: scroll up to show it.
+            let new_offset = max_top.saturating_sub(focused_visual_start);
+            app.events_scroll_offset = new_offset.min(u16::MAX as usize) as u16;
+        } else if focused_visual_start >= scroll_y_now.saturating_add(inner_height) {
+            // Focused event is below the viewport: scroll down to show it.
+            let new_scroll_y = focused_visual_start.saturating_sub(inner_height.saturating_sub(1));
+            let new_offset = max_top.saturating_sub(new_scroll_y);
+            app.events_scroll_offset = new_offset.min(u16::MAX as usize) as u16;
+        }
+        // Re-clamp after cursor-visibility adjustment.
+        if (app.events_scroll_offset as usize) > max_top {
+            app.events_scroll_offset = max_top as u16;
+        }
+    }
+    app.prev_focused_index_for_scroll = Some(focused_idx);
+
+    let scroll_y = max_top.saturating_sub(app.events_scroll_offset as usize) as u16;
+
     let title_suffix = if filter.is_empty() {
-        format!("{total} events")
+        format!("{total_events} events")
     } else {
         format!(
-            "{total} events matching {:?}  (:clear-filter to reset)",
+            "{total_events} events matching {:?}  (:clear-filter to reset)",
             filter
         )
     };
     let scroll_suffix = if app.events_scroll_offset > 0 {
         format!(
-            "  · scrolled up {}/{} · End to bottom · Home to top",
+            "  · scrolled up {}/{} · End=bottom · Home=top",
             app.events_scroll_offset, max_top
         )
     } else {
-        " · End=bottom · Home=top · :filter to filter".into()
+        " · j/k focus · Enter expand/collapse · :filter to filter".into()
     };
     let title = format!(" Events Explorer (F8) — {title_suffix}{scroll_suffix} ");
-    let body_lines: Vec<Line> = lines_owned.iter().map(|s| Line::from(s.as_str())).collect();
     let block = Block::default().borders(Borders::ALL).title(title);
     let paragraph = Paragraph::new(body_lines)
         .block(block)
-        .wrap(Wrap { trim: false })
         .scroll((scroll_y, 0));
     f.render_widget(paragraph, area);
 }
@@ -3907,7 +4085,9 @@ fn render_statusline(f: &mut Frame, app: &App, area: Rect) {
         InputMode::Normal => {
             let scroll_hint = match app.mode {
                 ViewMode::SessionDetail => "j/k PgUp/PgDn Home/End scroll · ",
-                ViewMode::Events => "j/k PgUp/PgDn Home/End scroll · :filter <text> · ",
+                ViewMode::Events => {
+                    "j/k focus · Enter expand/collapse · PgUp/PgDn scroll · :filter <text> · "
+                }
                 _ => "j/k select · ",
             };
             format!(
@@ -4544,7 +4724,7 @@ mod tests {
             "arguments": { "command": "rm -rf /" },
             "summary": "bash command not on allowlist",
         });
-        handle_notification(
+        let _ = handle_notification(
             &mut sessions,
             &mut firehose,
             &mut latest_status,
@@ -4596,7 +4776,7 @@ mod tests {
             "arguments": {},
             "summary": "",
         });
-        handle_notification(
+        let _ = handle_notification(
             &mut sessions,
             &mut firehose,
             &mut latest_status,
@@ -4630,7 +4810,7 @@ mod tests {
             "arguments": {},
             "summary": "",
         });
-        handle_notification(
+        let _ = handle_notification(
             &mut sessions,
             &mut firehose,
             &mut latest_status,
@@ -4976,7 +5156,7 @@ mod tests {
             "arguments": { "command": "ls -la" },
             "summary": "second",
         });
-        handle_notification(
+        let _ = handle_notification(
             &mut sessions,
             &mut firehose,
             &mut latest_status,
@@ -4984,7 +5164,7 @@ mod tests {
             "session.input_required",
             &first,
         );
-        handle_notification(
+        let _ = handle_notification(
             &mut sessions,
             &mut firehose,
             &mut latest_status,
@@ -5061,7 +5241,7 @@ mod tests {
             "tool_name": "bash",
             "summary": "",
         });
-        handle_notification(
+        let _ = handle_notification(
             &mut sessions,
             &mut firehose,
             &mut latest_status,
@@ -5637,5 +5817,76 @@ mod tests {
             cap + 3,
             "height must be capped at cap_input + 3"
         );
+    }
+
+    // ── mu-2ft iter-9: F8 firehose-eviction index shift tests ───────────
+
+    /// Both expanded markers survive the drain with indices shifted
+    /// down by `evicted`; the cursor likewise shifts.
+    #[test]
+    fn shift_f8_indices_after_eviction_shifts_above_drop() {
+        let mut expanded = std::collections::HashSet::new();
+        expanded.insert(15);
+        expanded.insert(20);
+        let (new_exp, new_focused) = shift_f8_indices_after_eviction(&expanded, 25, 10);
+        let mut want: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        want.insert(5);
+        want.insert(10);
+        assert_eq!(new_exp, want, "expanded markers shifted by evicted=10");
+        assert_eq!(new_focused, 15, "focused cursor shifted by evicted=10");
+    }
+
+    /// Markers at indices < `evicted` correspond to events that were
+    /// just dropped from the firehose. They must be removed from the set
+    /// (not left as ghosts pointing at someone else's index).
+    #[test]
+    fn shift_f8_indices_after_eviction_drops_underflowing_markers() {
+        let mut expanded = std::collections::HashSet::new();
+        expanded.insert(3); // gone after evicting 10
+        expanded.insert(7); // gone after evicting 10
+        expanded.insert(15); // survives → becomes 5
+        let (new_exp, _) = shift_f8_indices_after_eviction(&expanded, 20, 10);
+        let mut want: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        want.insert(5);
+        assert_eq!(
+            new_exp, want,
+            "underflowing markers dropped, surviving marker shifted"
+        );
+    }
+
+    /// Cursor that was on one of the evicted events resets to the
+    /// `usize::MAX` sentinel so the next render's clamp re-targets the
+    /// last surviving event.
+    #[test]
+    fn shift_f8_indices_after_eviction_resets_cursor_on_underflow() {
+        let expanded = std::collections::HashSet::new();
+        let (_, new_focused) = shift_f8_indices_after_eviction(&expanded, 3, 10);
+        assert_eq!(
+            new_focused,
+            usize::MAX,
+            "cursor that was below evicted bound resets to clamp-to-last sentinel"
+        );
+    }
+
+    /// Cursor at the `usize::MAX` sentinel stays at the sentinel (the
+    /// render-time clamp will re-pin it to the new last event).
+    #[test]
+    fn shift_f8_indices_after_eviction_preserves_sentinel_cursor() {
+        let expanded = std::collections::HashSet::new();
+        let (_, new_focused) = shift_f8_indices_after_eviction(&expanded, usize::MAX, 10);
+        assert_eq!(
+            new_focused,
+            usize::MAX,
+            "sentinel cursor survives eviction unchanged"
+        );
+    }
+
+    /// Empty expanded set + cursor above eviction count: trivial pass-through.
+    #[test]
+    fn shift_f8_indices_after_eviction_empty_expanded_set() {
+        let expanded = std::collections::HashSet::new();
+        let (new_exp, new_focused) = shift_f8_indices_after_eviction(&expanded, 50, 10);
+        assert!(new_exp.is_empty(), "empty set stays empty");
+        assert_eq!(new_focused, 40, "cursor shifted by evicted=10");
     }
 }

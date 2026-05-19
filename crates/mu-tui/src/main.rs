@@ -2937,8 +2937,7 @@ fn render_inline_session_detail(f: &mut Frame, app: &App, area: Rect) {
 
     let single_input_line: Line<'static> = match app.input_mode {
         InputMode::SendPrompt => {
-            let cursor_char =
-                app.prompt_cursor.min(app.prompt_buffer.chars().count());
+            let cursor_char = app.prompt_cursor.min(app.prompt_buffer.chars().count());
             let prefix_w: usize = 3; // " > " / "   "
             let avail = (area.width as usize).saturating_sub(prefix_w).max(1);
             let visual_rows = compute_visual_rows(&app.prompt_buffer, avail);
@@ -2965,8 +2964,8 @@ fn render_inline_session_detail(f: &mut Frame, app: &App, area: Rect) {
             // Build lines for the visible window [vscroll, vscroll+input_region_rows).
             let visible_end = (vscroll + input_region_rows).min(total_vrows);
             let mut ml: Vec<Line<'static>> = Vec::with_capacity(input_region_rows);
-            for vr in vscroll..visible_end {
-                let content = visual_rows[vr].clone();
+            for (offset, content) in visual_rows[vscroll..visible_end].iter().enumerate() {
+                let vr = vscroll + offset;
                 // " > " prefix on the very first visual row; "   " everywhere else.
                 let prefix = if vr == 0 { " > " } else { "   " };
                 ml.push(Line::from(format!("{prefix}{content}")));
@@ -4449,7 +4448,7 @@ fn find_cursor_position(prompt: &str, cursor_char: usize, avail: usize) -> (usiz
 
     for logical_line in &logical_lines {
         let lc = logical_line.chars().count();
-        let vrows_for_line = if lc == 0 { 1 } else { (lc + avail - 1) / avail };
+        let vrows_for_line = if lc == 0 { 1 } else { lc.div_ceil(avail) };
 
         if cursor_char <= chars_seen + lc {
             let col_in_line = cursor_char - chars_seen;
@@ -5539,7 +5538,11 @@ mod tests {
     #[test]
     fn cursor_pos_trailing_newline() {
         let (vr, vc) = find_cursor_position("abc\n", 4, 80);
-        assert_eq!((vr, vc), (1, 0), "cursor on empty row after trailing newline");
+        assert_eq!(
+            (vr, vc),
+            (1, 0),
+            "cursor on empty row after trailing newline"
+        );
     }
 
     /// Test 13: single-line "hello" avail=80 → same as horizontal path.
@@ -5629,6 +5632,10 @@ mod tests {
         let many_lines = "x\n".repeat(20); // 21 visual rows > cap=8
         let h = compute_needed_inline_height(&many_lines, 80, 24);
         let cap = 24_usize / 3;
-        assert_eq!(h as usize, cap + 3, "height must be capped at cap_input + 3");
+        assert_eq!(
+            h as usize,
+            cap + 3,
+            "height must be capped at cap_input + 3"
+        );
     }
 }

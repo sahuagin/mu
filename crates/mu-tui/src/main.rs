@@ -342,8 +342,14 @@ struct App {
     events_focused_index: usize,
     // F8 events explorer: set of filtered-list indices that are
     // expanded to show the full payload. Uses filtered-list indices;
-    // cleared on filter change to avoid stale index mapping.
+    // cleared on filter change AND shifted by drop_count on firehose
+    // ring eviction so markers stay attached to the same event lines.
     expanded_events: std::collections::HashSet<usize>,
+    // F8 events explorer: previous frame's focused index. The
+    // auto-scroll-to-keep-cursor-visible block in render_events_explorer
+    // only fires when the cursor MOVED this frame, so PageUp/PageDn/Home/End
+    // can scroll past the cursor without the next render snapping back.
+    prev_focused_index_for_scroll: Option<usize>,
     // F5 usage / cache dashboard (mu-xln). Holds the most recent
     // daemon.usage_history response and the wall time it was fetched
     // at. Refreshed lazily — whenever a session.done lands (so any
@@ -465,6 +471,7 @@ impl App {
             events_filter: String::new(),
             events_focused_index: usize::MAX,
             expanded_events: std::collections::HashSet::new(),
+            prev_focused_index_for_scroll: None,
             latest_usage_history: None,
             latest_usage_history_at: None,
             mu,
@@ -638,7 +645,7 @@ impl App {
                                 _ => {}
                             }
                         }
-                        handle_notification(
+                        let evicted = handle_notification(
                             &mut self.sessions,
                             &mut self.firehose,
                             &mut self.latest_status,
@@ -646,6 +653,19 @@ impl App {
                             &method,
                             &params,
                         );
+                        if evicted > 0 {
+                            let (new_expanded, new_focused) = shift_f8_indices_after_eviction(
+                                &self.expanded_events,
+                                self.events_focused_index,
+                                evicted,
+                            );
+                            self.expanded_events = new_expanded;
+                            self.events_focused_index = new_focused;
+                            // Invalidate the prev-focused tracker so the next
+                            // render's auto-scroll-to-cursor block fires once
+                            // (cursor logically moved relative to the buffer).
+                            self.prev_focused_index_for_scroll = None;
+                        }
                     }
                     Some(MuMessage::Eof) => {
                         self.firehose.push("[!! mu serve closed stdout]".into());
@@ -1914,6 +1934,10 @@ fn handle_input_required(
     }
 }
 
+// Returns the number of front entries evicted from `firehose` during
+// the cap-and-drain at function exit (0 if no eviction). Callers that
+// track index-keyed firehose state (F8 cursor / expanded set) must
+// shift those indices by the returned count to stay aligned.
 fn handle_notification(
     sessions: &mut [SessionRow],
     firehose: &mut Vec<String>,
@@ -1924,7 +1948,7 @@ fn handle_notification(
     >,
     method: &str,
     params: &serde_json::Value,
-) {
+) -> usize {
     let sid = params
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -2073,11 +2097,16 @@ fn handle_notification(
             firehose.push(format!("[{sid}] {other}"));
         }
     }
-    // Cap firehose length to avoid unbounded growth.
+    // Cap firehose length to avoid unbounded growth. The drop count
+    // is returned so the caller can re-align F8 index-keyed state
+    // (events_focused_index, expanded_events) to the post-drain
+    // positions — see the call site in App's event-pump tick.
     if firehose.len() > 500 {
         let drop = firehose.len() - 500;
         firehose.drain(..drop);
+        return drop;
     }
+    0
 }
 
 fn fmt_duration(d: Duration) -> String {
@@ -2801,6 +2830,35 @@ fn anchor_scroll_offset(prev_total: usize, current_total: usize, offset: u16) ->
     let delta = current_total - prev_total;
     let delta_u16 = u16::try_from(delta).unwrap_or(u16::MAX);
     offset.saturating_add(delta_u16)
+}
+
+/// Shift F8 index-keyed state (`expanded_events`, `events_focused_index`)
+/// to compensate for `evicted` front-dropped entries on a firehose ring
+/// eviction. Indices that would underflow are dropped from the expanded
+/// set (the corresponding events are gone from the firehose). The cursor
+/// is shifted down by `evicted`; if that underflows OR the cursor was
+/// already at the `usize::MAX` sentinel, return `usize::MAX` so the next
+/// render's clamp re-targets the last surviving event.
+///
+/// Returns `(new_expanded, new_focused)`. Pure function; no I/O.
+fn shift_f8_indices_after_eviction(
+    expanded: &std::collections::HashSet<usize>,
+    focused: usize,
+    evicted: usize,
+) -> (std::collections::HashSet<usize>, usize) {
+    let new_expanded: std::collections::HashSet<usize> = expanded
+        .iter()
+        .filter_map(|&i| i.checked_sub(evicted))
+        .collect();
+    // Sentinel preserved across eviction: usize::MAX means "clamp to
+    // last at render time," and that intent is independent of any drop
+    // count. Only non-sentinel cursors shift.
+    let new_focused = if focused == usize::MAX {
+        usize::MAX
+    } else {
+        focused.checked_sub(evicted).unwrap_or(usize::MAX)
+    };
+    (new_expanded, new_focused)
 }
 
 /// mu-o1y7 phase 2c: emit any new transcript events for F3's selected
@@ -3664,8 +3722,15 @@ fn render_events_explorer(f: &mut Frame, app: &mut App, area: Rect) {
             }
         } else {
             // Single collapsed line (or short expanded — no visual difference).
-            let preview: String = if s.len() > PREVIEW_LEN && !is_expanded {
-                format!("{}\u{2026}", &s[..PREVIEW_LEN])
+            // Slice by char boundary, not bytes: `&s[..PREVIEW_LEN]` would
+            // panic if PREVIEW_LEN landed mid-codepoint (multi-byte UTF-8).
+            let preview: String = if s.chars().count() > PREVIEW_LEN && !is_expanded {
+                let cut = s
+                    .char_indices()
+                    .nth(PREVIEW_LEN)
+                    .map(|(i, _)| i)
+                    .unwrap_or(s.len());
+                format!("{}\u{2026}", &s[..cut])
             } else {
                 s.to_string()
             };
@@ -3693,8 +3758,13 @@ fn render_events_explorer(f: &mut Frame, app: &mut App, area: Rect) {
         app.events_scroll_offset = max_top as u16;
     }
 
-    // Auto-scroll to keep the focused event visible after j/k movement.
-    if total_events > 0 {
+    // Auto-scroll to keep the focused event visible — but only when the
+    // cursor moved THIS frame (j/k/F8-entry/filter-reset/drain-shift).
+    // Without this gate the block would fire every render and silently
+    // override the user's PageUp/PageDn/Home/End intent on the next frame
+    // by snapping the viewport back to the cursor.
+    let cursor_moved = app.prev_focused_index_for_scroll != Some(focused_idx);
+    if total_events > 0 && cursor_moved {
         let scroll_y_now = max_top.saturating_sub(app.events_scroll_offset as usize);
         if focused_visual_start < scroll_y_now {
             // Focused event is above the viewport: scroll up to show it.
@@ -3711,6 +3781,7 @@ fn render_events_explorer(f: &mut Frame, app: &mut App, area: Rect) {
             app.events_scroll_offset = max_top as u16;
         }
     }
+    app.prev_focused_index_for_scroll = Some(focused_idx);
 
     let scroll_y = max_top.saturating_sub(app.events_scroll_offset as usize) as u16;
 
@@ -4653,7 +4724,7 @@ mod tests {
             "arguments": { "command": "rm -rf /" },
             "summary": "bash command not on allowlist",
         });
-        handle_notification(
+        let _ = handle_notification(
             &mut sessions,
             &mut firehose,
             &mut latest_status,
@@ -4705,7 +4776,7 @@ mod tests {
             "arguments": {},
             "summary": "",
         });
-        handle_notification(
+        let _ = handle_notification(
             &mut sessions,
             &mut firehose,
             &mut latest_status,
@@ -4739,7 +4810,7 @@ mod tests {
             "arguments": {},
             "summary": "",
         });
-        handle_notification(
+        let _ = handle_notification(
             &mut sessions,
             &mut firehose,
             &mut latest_status,
@@ -5085,7 +5156,7 @@ mod tests {
             "arguments": { "command": "ls -la" },
             "summary": "second",
         });
-        handle_notification(
+        let _ = handle_notification(
             &mut sessions,
             &mut firehose,
             &mut latest_status,
@@ -5093,7 +5164,7 @@ mod tests {
             "session.input_required",
             &first,
         );
-        handle_notification(
+        let _ = handle_notification(
             &mut sessions,
             &mut firehose,
             &mut latest_status,
@@ -5170,7 +5241,7 @@ mod tests {
             "tool_name": "bash",
             "summary": "",
         });
-        handle_notification(
+        let _ = handle_notification(
             &mut sessions,
             &mut firehose,
             &mut latest_status,
@@ -5746,5 +5817,76 @@ mod tests {
             cap + 3,
             "height must be capped at cap_input + 3"
         );
+    }
+
+    // ── mu-2ft iter-9: F8 firehose-eviction index shift tests ───────────
+
+    /// Both expanded markers survive the drain with indices shifted
+    /// down by `evicted`; the cursor likewise shifts.
+    #[test]
+    fn shift_f8_indices_after_eviction_shifts_above_drop() {
+        let mut expanded = std::collections::HashSet::new();
+        expanded.insert(15);
+        expanded.insert(20);
+        let (new_exp, new_focused) = shift_f8_indices_after_eviction(&expanded, 25, 10);
+        let mut want: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        want.insert(5);
+        want.insert(10);
+        assert_eq!(new_exp, want, "expanded markers shifted by evicted=10");
+        assert_eq!(new_focused, 15, "focused cursor shifted by evicted=10");
+    }
+
+    /// Markers at indices < `evicted` correspond to events that were
+    /// just dropped from the firehose. They must be removed from the set
+    /// (not left as ghosts pointing at someone else's index).
+    #[test]
+    fn shift_f8_indices_after_eviction_drops_underflowing_markers() {
+        let mut expanded = std::collections::HashSet::new();
+        expanded.insert(3); // gone after evicting 10
+        expanded.insert(7); // gone after evicting 10
+        expanded.insert(15); // survives → becomes 5
+        let (new_exp, _) = shift_f8_indices_after_eviction(&expanded, 20, 10);
+        let mut want: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        want.insert(5);
+        assert_eq!(
+            new_exp, want,
+            "underflowing markers dropped, surviving marker shifted"
+        );
+    }
+
+    /// Cursor that was on one of the evicted events resets to the
+    /// `usize::MAX` sentinel so the next render's clamp re-targets the
+    /// last surviving event.
+    #[test]
+    fn shift_f8_indices_after_eviction_resets_cursor_on_underflow() {
+        let expanded = std::collections::HashSet::new();
+        let (_, new_focused) = shift_f8_indices_after_eviction(&expanded, 3, 10);
+        assert_eq!(
+            new_focused,
+            usize::MAX,
+            "cursor that was below evicted bound resets to clamp-to-last sentinel"
+        );
+    }
+
+    /// Cursor at the `usize::MAX` sentinel stays at the sentinel (the
+    /// render-time clamp will re-pin it to the new last event).
+    #[test]
+    fn shift_f8_indices_after_eviction_preserves_sentinel_cursor() {
+        let expanded = std::collections::HashSet::new();
+        let (_, new_focused) = shift_f8_indices_after_eviction(&expanded, usize::MAX, 10);
+        assert_eq!(
+            new_focused,
+            usize::MAX,
+            "sentinel cursor survives eviction unchanged"
+        );
+    }
+
+    /// Empty expanded set + cursor above eviction count: trivial pass-through.
+    #[test]
+    fn shift_f8_indices_after_eviction_empty_expanded_set() {
+        let expanded = std::collections::HashSet::new();
+        let (new_exp, new_focused) = shift_f8_indices_after_eviction(&expanded, 50, 10);
+        assert!(new_exp.is_empty(), "empty set stays empty");
+        assert_eq!(new_focused, 40, "cursor shifted by evicted=10");
     }
 }

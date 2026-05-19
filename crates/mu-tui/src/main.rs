@@ -49,7 +49,7 @@ use ratatui::{
     widgets::{
         Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
     },
-    Frame, Terminal,
+    Frame, Terminal, TerminalOptions, Viewport,
 };
 use serde_json::json;
 use throbber_widgets_tui::{Throbber, ThrobberState};
@@ -3429,46 +3429,111 @@ fn main() -> Result<()> {
         None => None,
     };
 
+    // mu-o1y7 phase 1: terminal setup goes through enter/leave helpers.
+    // Default mode is Fullscreen (alt-screen takeover, same as pre-phase
+    // behavior). Phase 2 will let F3 swap to ViewportMode::Inline.
+    let mode = ViewportMode::Fullscreen;
+    let mut terminal = enter_terminal_mode(mode)?;
+
+    let res = run(&mut terminal, mu, (default_provider, default_model));
+
+    leave_terminal_mode(&mut terminal, mode)?;
+
+    res
+}
+
+/// mu-o1y7: terminal viewport mode. `Fullscreen` takes over the
+/// alternate screen buffer — today's behavior, where the entire TUI
+/// lives in an offscreen buffer the terminal restores on exit. Mux
+/// scrollback sees nothing of what mu rendered.
+///
+/// `Inline(N)` lives in the bottom N lines of the primary screen
+/// buffer instead. The viewport stays at the bottom; new transcript
+/// content emits above it via `Terminal::insert_before`, scrolling
+/// naturally into multiplexer scrollback (zellij mod-s, tmux Ctrl-b
+/// `[`). Used by F3 to give claude-code / pi-style chat-UX.
+///
+/// Phase 1 (this commit) lands the enum + setup helpers so the
+/// architecture is in place; mu-tui still uses `Fullscreen` everywhere.
+/// Phase 2 wires F3's enter/leave to switch to `Inline`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewportMode {
+    Fullscreen,
+    #[allow(dead_code)] // wired up in mu-o1y7 phase 2
+    Inline(u16),
+}
+
+/// mu-o1y7: enable raw mode, set up the terminal for `mode`, and
+/// return a ratatui Terminal handle. Mirrors the setup that lived
+/// inline in `main` pre-phase-1 — mu-wd2's Kitty Keyboard Protocol
+/// push and mu-1jq's terminal title are preserved across both modes.
+///
+/// Fullscreen takes the alternate screen + mouse capture. Inline does
+/// neither: the primary buffer stays writeable and the terminal /
+/// multiplexer owns mouse + scroll.
+fn enter_terminal_mode(mode: ViewportMode) -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     let mut stdout = io::stdout();
     enable_raw_mode()?;
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        // mu-1jq: set terminal title to μ - <username>. Honored by zellij
-        // (per-pane), kitty, tmux, foot, alacritty, etc. via OSC 0.
-        SetTitle(mu_terminal_title()),
-    )?;
-    // mu-wd2: opt into the Kitty Keyboard Protocol so terminals that
-    // support it (Kitty, Foot, WezTerm, modern Konsole, alacritty
-    // with the right config) forward modifiers on keys that the
-    // legacy xterm encoding drops — most notably Shift-Enter,
-    // Ctrl-Enter, and friends. The escape sequence is a no-op on
-    // terminals that don't support it (they ignore the CSI), so we
-    // don't gate on a supports-check; the Pop on shutdown is
-    // similarly benign.
+    match mode {
+        ViewportMode::Fullscreen => {
+            execute!(
+                stdout,
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                SetTitle(mu_terminal_title()),
+            )?;
+        }
+        ViewportMode::Inline(_) => {
+            // Inline mode lives in the primary buffer; no alt-screen,
+            // and mouse capture is left to the terminal/multiplexer so
+            // scrollback + text selection behave normally.
+            execute!(stdout, SetTitle(mu_terminal_title()))?;
+        }
+    }
+    // mu-wd2: opt into the Kitty Keyboard Protocol. Same in both modes.
     let _ = execute!(
         stdout,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let terminal = match mode {
+        ViewportMode::Fullscreen => Terminal::new(backend)?,
+        ViewportMode::Inline(height) => Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(height),
+            },
+        )?,
+    };
+    Ok(terminal)
+}
 
-    let res = run(&mut terminal, mu, (default_provider, default_model));
-
-    // Cleanup
+/// mu-o1y7: tear down whatever `enter_terminal_mode` set up. The mode
+/// argument tells us whether to LeaveAlternateScreen + DisableMouseCapture
+/// (Fullscreen) or just clear the title (Inline). Errors from the
+/// keyboard-protocol pop are ignored — terminals without the feature
+/// silently no-op the original push, so the pop is benign either way.
+fn leave_terminal_mode(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    mode: ViewportMode,
+) -> io::Result<()> {
     let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        // mu-1jq: empty title resets the terminal/pane title to default.
-        SetTitle(""),
-    )?;
+    match mode {
+        ViewportMode::Fullscreen => {
+            execute!(
+                terminal.backend_mut(),
+                LeaveAlternateScreen,
+                DisableMouseCapture,
+                SetTitle(""),
+            )?;
+        }
+        ViewportMode::Inline(_) => {
+            execute!(terminal.backend_mut(), SetTitle(""))?;
+        }
+    }
     terminal.show_cursor()?;
-
-    res
+    Ok(())
 }
 
 /// mu-1jq: build the terminal title string, e.g. `μ - tcovert`. Set

@@ -386,6 +386,14 @@ struct App {
     /// `render_help_overlay` paints a centered popup over the active
     /// view. Toggled by `?`; dismissed by `?`, Esc, or `q`.
     help_overlay_open: bool,
+    /// mu-o1y7 phase 3f: whether help has already been dumped into
+    /// scrollback during the current F3 inline-mode visit. Resets on
+    /// F3 entry so each fresh visit can dump once. Without this flag,
+    /// the operator gets one stacked help block per `?` press, which
+    /// the user (2026-05-19 testing) flagged as cluttered. Mux
+    /// scrollback retains the previous dump so re-pressing isn't
+    /// needed — operator scrolls up to find it.
+    f3_inline_help_dumped: bool,
 }
 
 impl App {
@@ -450,6 +458,7 @@ impl App {
             pending_inline_markers: Vec::new(),
             f3_active_session_id: None,
             help_overlay_open: false,
+            f3_inline_help_dumped: false,
         }
     }
 
@@ -483,6 +492,11 @@ impl App {
             if self.current_mode != target {
                 self.pending_mode_change = Some(target);
             }
+            // Phase 3f: reset the inline-help one-shot when entering
+            // F3 so each fresh visit can dump help. Leaving F3 also
+            // resets — if the operator comes back to F3 later from
+            // any other view, they get the "first visit" semantics.
+            self.f3_inline_help_dumped = false;
         }
     }
 
@@ -495,9 +509,17 @@ impl App {
     /// 2026-05-19).
     fn show_help(&mut self) {
         if matches!(self.current_mode, ViewportMode::Inline(_)) {
+            // Phase 3f: only dump once per F3 inline visit. Mux
+            // scrollback retains the previous dump; pressing ? again
+            // in the same visit is a no-op so the buffer doesn't pile
+            // up duplicated copies.
+            if self.f3_inline_help_dumped {
+                return;
+            }
             for line in HELP_LINES {
                 self.pending_inline_markers.push(line.to_string());
             }
+            self.f3_inline_help_dumped = true;
         } else {
             // Fullscreen: toggle the popup overlay. Second ? press
             // closes it.

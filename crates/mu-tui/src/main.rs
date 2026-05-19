@@ -331,6 +331,12 @@ struct App {
     mu: Option<MuClient>,
     /// `provider/model` to use when a new session is created via `n`.
     default_provider: (String, String),
+    /// mu-o1y7: signal from in-loop logic that the terminal should be
+    /// rebuilt in a different viewport mode. `run` checks + takes() this
+    /// each tick and returns `RunOutcome::ModeChange` to its caller, which
+    /// owns the actual terminal-rebuild. Phase 2a lands the field; phase
+    /// 2b will set it when entering / leaving F3.
+    pending_mode_change: Option<ViewportMode>,
 }
 
 impl App {
@@ -389,6 +395,7 @@ impl App {
             latest_usage_history_at: None,
             mu,
             default_provider,
+            pending_mode_change: None,
         }
     }
 
@@ -3429,15 +3436,36 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    // mu-o1y7 phase 1: terminal setup goes through enter/leave helpers.
-    // Default mode is Fullscreen (alt-screen takeover, same as pre-phase
-    // behavior). Phase 2 will let F3 swap to ViewportMode::Inline.
-    let mode = ViewportMode::Fullscreen;
+    // mu-o1y7 phase 2a: App is built once in main and lives across
+    // terminal-mode rebuilds. The outer loop owns the terminal handle
+    // and the current ViewportMode; `run` returns RunOutcome::ModeChange
+    // when in-loop logic requests a swap (no callers in phase 2a — F3
+    // wiring lands in phase 2b). Default Fullscreen preserves the
+    // alt-screen takeover behavior from pre-mu-o1y7.
+    let mut app = App::new(mu, (default_provider, default_model));
+    let mut mode = ViewportMode::Fullscreen;
     let mut terminal = enter_terminal_mode(mode)?;
 
-    let res = run(&mut terminal, mu, (default_provider, default_model));
+    let res = loop {
+        match run(&mut terminal, &mut app) {
+            Ok(RunOutcome::Exit) => break Ok(()),
+            Ok(RunOutcome::ModeChange(new_mode)) => {
+                // Mid-flight leave errors during a mode swap are
+                // logged-ignored: we still want to attempt the new
+                // mode, and a half-torn-down terminal isn't a useful
+                // place to bail.
+                let _ = leave_terminal_mode(&mut terminal, mode);
+                terminal = match enter_terminal_mode(new_mode) {
+                    Ok(t) => t,
+                    Err(e) => break Err(e.into()),
+                };
+                mode = new_mode;
+            }
+            Err(e) => break Err(e),
+        }
+    };
 
-    leave_terminal_mode(&mut terminal, mode)?;
+    let _ = leave_terminal_mode(&mut terminal, mode);
 
     res
 }
@@ -3461,6 +3489,18 @@ enum ViewportMode {
     Fullscreen,
     #[allow(dead_code)] // wired up in mu-o1y7 phase 2
     Inline(u16),
+}
+
+/// mu-o1y7: outcome of one `run` iteration. Lets `main` distinguish
+/// a clean exit (app.quit) from a request to rebuild the terminal in
+/// a different viewport mode. Phase 2a wires the plumbing; nothing
+/// inside the App currently sets `pending_mode_change`, so the only
+/// outcome in practice is `Exit`.
+#[derive(Debug)]
+enum RunOutcome {
+    Exit,
+    #[allow(dead_code)] // wired up in mu-o1y7 phase 2b
+    ModeChange(ViewportMode),
 }
 
 /// mu-o1y7: enable raw mode, set up the terminal for `mode`, and
@@ -3546,20 +3586,21 @@ fn mu_terminal_title() -> String {
     format!("μ - {user}")
 }
 
-fn run<B: Backend>(
-    terminal: &mut Terminal<B>,
-    mu: Option<MuClient>,
-    default_provider: (String, String),
-) -> Result<()>
+/// mu-o1y7: event loop. App is owned by the caller (main) so it
+/// survives terminal-mode rebuilds — sessions, transcript cache,
+/// in-flight selection, etc. don't reset when F3 swaps between
+/// Fullscreen and Inline viewports. Returns `RunOutcome::Exit` on
+/// `app.quit`, or `RunOutcome::ModeChange(new_mode)` when in-loop
+/// logic sets `app.pending_mode_change`.
+fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<RunOutcome>
 where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    let mut app = App::new(mu, default_provider);
     let tick_rate = Duration::from_millis(250);
     let mut last_tick = Instant::now();
 
     loop {
-        terminal.draw(|f| ui(f, &mut app))?;
+        terminal.draw(|f| ui(f, &mut *app))?;
 
         let timeout = tick_rate
             .checked_sub(last_tick.elapsed())
@@ -3618,10 +3659,17 @@ where
             }
         }
         if app.quit {
-            break;
+            return Ok(RunOutcome::Exit);
+        }
+        // mu-o1y7 phase 2a: any in-loop logic that needs the terminal
+        // rebuilt in a different viewport mode sets this flag. We
+        // honor it AFTER `app.quit` (quit takes precedence) so a quit
+        // immediately preceded by a mode-change request still exits
+        // cleanly.
+        if let Some(new_mode) = app.pending_mode_change.take() {
+            return Ok(RunOutcome::ModeChange(new_mode));
         }
     }
-    Ok(())
 }
 
 /// mu-82l: Suspend the TUI, hand the terminal to $EDITOR with the

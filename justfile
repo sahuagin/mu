@@ -62,6 +62,22 @@ serve *args:
 versions:
     cargo run -q -p mu-coding --bin mu -- versions
 
+# Defaults for `just tui`. Override per-invocation:
+#   just provider=anthropic model=claude-opus-4-7 tui
+provider := "openai-codex"
+model := "gpt-5.5"
+
+# Build mu + mu-tui and launch the TUI against the local mu binary.
+tui *args:
+    cargo build --release --bin mu --bin mu-tui
+    ANTHROPIC_API_KEY=$(tq -f ~/.config/agent/config.toml -r anthropic.api_key) \
+        ./target/release/mu-tui \
+            --provider {{provider}} \
+            --model {{model}} \
+            --bash-yolo \
+            --mu-binary ./target/release/mu \
+            {{args}}
+
 # ── PR flow (jj-aware) ────────────────────────────────────────────────────
 
 # scripts/gh-wrapper auto-runs pre-pr-check.sh at `gh pr create`, so don't

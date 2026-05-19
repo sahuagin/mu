@@ -67,10 +67,34 @@ struct SessionState {
     mailbox: MailboxStateHandle,
 }
 
+/// A session loaded from disk at daemon startup (mu-u1ld). The
+/// session is read-only — no input channel, no agent loop. Only the
+/// event log + parent reference are retained, just enough to satisfy
+/// `session.list`, `session.events`, and `session.stats` queries.
+///
+/// New asks against a rehydrated session ID return the standard
+/// "session not found" error — see [`Sessions::input_sender`], which
+/// only consults the live map.
+struct RehydratedSession {
+    event_log: Arc<SessionEventLog>,
+    parent_session_id: Option<String>,
+}
+
 /// In-memory session registry. Cheap to clone (Arc-backed).
+///
+/// Two parallel maps:
+/// - `inner` — fully live sessions (agent loop running, input channel
+///   open). Created by `insert`.
+/// - `rehydrated` (mu-u1ld) — read-only ghost sessions loaded from the
+///   on-disk event log at daemon startup. Created by `insert_rehydrated`.
+///
+/// Listing and event-log queries see both maps (live wins on ID
+/// collision); live-state queries (input sender, capability, mailbox,
+/// provider status) see only `inner`. Removal hits both.
 #[derive(Clone)]
 pub struct Sessions {
     inner: Arc<Mutex<HashMap<String, SessionState>>>,
+    rehydrated: Arc<Mutex<HashMap<String, RehydratedSession>>>,
 }
 
 /// Input bundle for [`Sessions::insert`]. Mirrors `SessionState`'s
@@ -94,6 +118,7 @@ impl Sessions {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            rehydrated: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -132,6 +157,34 @@ impl Sessions {
         // "session not found." Better than crashing the daemon.
     }
 
+    /// Register a read-only session rehydrated from the on-disk event
+    /// log at daemon startup (mu-u1ld). The session is queryable via
+    /// `session.list`, `session.events`, and `session.stats`, but
+    /// `ask_session` / `session.cancel_outstanding` / etc. return
+    /// "session not found" because no live state exists.
+    ///
+    /// Collisions: if a live session already exists with the same ID
+    /// (e.g. the counter-based `next_id` produced a clash with a prior
+    /// run), the rehydrated entry is still recorded — but the live one
+    /// takes precedence in `snapshot_for_listing` and `event_log`. New
+    /// inserts via `insert` similarly shadow rehydrated entries.
+    pub fn insert_rehydrated(
+        &self,
+        id: String,
+        event_log: Arc<SessionEventLog>,
+        parent_session_id: Option<String>,
+    ) {
+        if let Ok(mut map) = self.rehydrated.lock() {
+            map.insert(
+                id,
+                RehydratedSession {
+                    event_log,
+                    parent_session_id,
+                },
+            );
+        }
+    }
+
     /// Clone a session's input sender, briefly locking the map.
     /// Returns None if the session doesn't exist.
     ///
@@ -143,31 +196,46 @@ impl Sessions {
 
     /// Snapshot of every session for the discovery layer. Returns
     /// `(session_id, event_log, parent_session_id)` triples. The
-    /// caller derives `SessionInfo` from these. Same lock-then-clone-
-    /// then-drop pattern as the other accessors.
+    /// caller derives `SessionInfo` from these. Includes both live and
+    /// rehydrated (mu-u1ld) sessions. On ID collision, the live entry
+    /// shadows the rehydrated one. Same lock-then-clone-then-drop
+    /// pattern as the other accessors.
     pub fn snapshot_for_listing(&self) -> Vec<(String, Arc<SessionEventLog>, Option<String>)> {
-        self.inner
-            .lock()
-            .ok()
-            .map(|map| {
-                map.iter()
-                    .map(|(sid, s)| {
-                        (
-                            sid.clone(),
-                            s.event_log.clone(),
-                            s.parent_session_id.clone(),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        let mut out: HashMap<String, (Arc<SessionEventLog>, Option<String>)> = HashMap::new();
+        if let Ok(map) = self.rehydrated.lock() {
+            for (sid, s) in map.iter() {
+                out.insert(
+                    sid.clone(),
+                    (s.event_log.clone(), s.parent_session_id.clone()),
+                );
+            }
+        }
+        if let Ok(map) = self.inner.lock() {
+            for (sid, s) in map.iter() {
+                out.insert(
+                    sid.clone(),
+                    (s.event_log.clone(), s.parent_session_id.clone()),
+                );
+            }
+        }
+        out.into_iter()
+            .map(|(sid, (log, parent))| (sid, log, parent))
+            .collect()
     }
 
     /// Look up a session's event log. Returns None if the session
-    /// doesn't exist. Same lock-then-clone-then-drop pattern as
+    /// doesn't exist in either the live or rehydrated map. Live wins
+    /// on ID collision. Same lock-then-clone-then-drop pattern as
     /// `input_sender`.
     pub fn event_log(&self, id: &str) -> Option<Arc<SessionEventLog>> {
-        self.inner.lock().ok()?.get(id).map(|s| s.event_log.clone())
+        if let Some(log) = self.inner.lock().ok()?.get(id).map(|s| s.event_log.clone()) {
+            return Some(log);
+        }
+        self.rehydrated
+            .lock()
+            .ok()?
+            .get(id)
+            .map(|s| s.event_log.clone())
     }
 
     /// Take a pending-approval oneshot off the session's registry
@@ -274,12 +342,20 @@ impl Sessions {
 
     /// Remove a session. Dropping its `SessionState` drops the
     /// `input_tx`; the agent loop sees its input channel close and
-    /// terminates naturally on the next iteration.
+    /// terminates naturally on the next iteration. Also evicts any
+    /// rehydrated entry (mu-u1ld) under the same ID — symmetry so the
+    /// session disappears from `session.list` after explicit removal.
+    /// Returns true if either map had an entry.
     pub fn remove(&self, id: &str) -> bool {
-        match self.inner.lock() {
+        let live = match self.inner.lock() {
             Ok(mut map) => map.remove(id).is_some(),
             Err(_) => false,
-        }
+        };
+        let ghost = match self.rehydrated.lock() {
+            Ok(mut map) => map.remove(id).is_some(),
+            Err(_) => false,
+        };
+        live || ghost
     }
 }
 
@@ -334,6 +410,89 @@ mod tests {
         assert!(sessions.input_sender(&id).is_none());
         assert!(sessions.event_log(&id).is_none());
         assert!(!sessions.remove(&id));
+    }
+
+    #[tokio::test]
+    async fn rehydrated_session_appears_in_listing_and_event_log() {
+        // mu-u1ld: a rehydrated entry must be visible to the
+        // discovery layer (snapshot_for_listing) and to event-log
+        // lookups, but invisible to live-state queries.
+        let sessions = Sessions::new();
+        let id = "ghost-1".to_string();
+        let log = Arc::new(SessionEventLog::new(id.clone()));
+        sessions.insert_rehydrated(id.clone(), log, Some("parent-7".into()));
+
+        let listing = sessions.snapshot_for_listing();
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing[0].0, id);
+        assert_eq!(listing[0].2, Some("parent-7".into()));
+
+        assert!(sessions.event_log(&id).is_some());
+
+        // Live-state queries must NOT see rehydrated sessions —
+        // ask_session against a ghost ID will fall through to the
+        // standard "session not found" error.
+        assert!(sessions.input_sender(&id).is_none());
+        assert!(sessions.capability(&id).is_none());
+        assert!(sessions.mailbox(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn rehydrated_session_can_be_removed() {
+        let sessions = Sessions::new();
+        let id = "ghost-2".to_string();
+        let log = Arc::new(SessionEventLog::new(id.clone()));
+        sessions.insert_rehydrated(id.clone(), log, None);
+
+        assert!(sessions.event_log(&id).is_some());
+        assert!(sessions.remove(&id), "remove should return true for ghost");
+        assert!(sessions.event_log(&id).is_none());
+        assert!(!sessions.remove(&id), "removing twice should return false");
+    }
+
+    #[tokio::test]
+    async fn live_session_shadows_rehydrated_on_id_collision() {
+        // The counter-based `next_id` can collide with rehydrated
+        // session IDs from a prior run. When both exist, the live
+        // entry must take precedence in listings and event_log.
+        let sessions = Sessions::new();
+        let id = "session-1".to_string();
+
+        // Rehydrated first.
+        let ghost_log = Arc::new(SessionEventLog::new(id.clone()));
+        sessions.insert_rehydrated(id.clone(), ghost_log.clone(), Some("ghost-parent".into()));
+
+        // Now a live session under the same ID.
+        let live_log = Arc::new(SessionEventLog::new(id.clone()));
+        let (tx, _rx) = mpsc::channel::<AgentInput>(1);
+        sessions.insert(
+            id.clone(),
+            NewSession {
+                input_tx: tx,
+                forwarder: tokio::spawn(async {}),
+                agent: tokio::spawn(async {}),
+                event_log: live_log.clone(),
+                pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+                parent_session_id: Some("live-parent".into()),
+                capability: Arc::new(Mutex::new(Capability::root())),
+                provider_status: Arc::new(Mutex::new(ProviderStatusTracker::new())),
+                mailbox: Arc::new(MailboxState::new()),
+            },
+        );
+
+        let listing = sessions.snapshot_for_listing();
+        assert_eq!(listing.len(), 1);
+        assert_eq!(
+            listing[0].2,
+            Some("live-parent".into()),
+            "live entry should shadow ghost in listing"
+        );
+        // event_log returns the live one (Arc::ptr_eq for identity).
+        let got = sessions.event_log(&id).expect("event_log");
+        assert!(
+            Arc::ptr_eq(&got, &live_log),
+            "event_log should return the live log when both exist"
+        );
     }
 
     #[tokio::test]

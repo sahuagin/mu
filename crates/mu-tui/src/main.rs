@@ -348,6 +348,13 @@ struct App {
     /// F3 is in Inline mode. Survives mode swaps so re-entering F3
     /// doesn't duplicate transcript history that's already in scrollback.
     f3_emitted_count_by_sid: std::collections::HashMap<String, usize>,
+    /// mu-o1y7 phase 3a: one-line markers that should emit into
+    /// scrollback above the inline viewport on the next tick. Used to
+    /// surface ephemeral feedback (e.g. "can't send — session is
+    /// done") that the user otherwise can't tell happened. Drained by
+    /// `run` after each `terminal.draw`. Inline-mode only; firehose is
+    /// the alt-screen-mode equivalent.
+    pending_inline_markers: Vec<String>,
 }
 
 impl App {
@@ -409,6 +416,7 @@ impl App {
             pending_mode_change: None,
             current_mode: ViewportMode::Fullscreen,
             f3_emitted_count_by_sid: std::collections::HashMap::new(),
+            pending_inline_markers: Vec::new(),
         }
     }
 
@@ -888,6 +896,23 @@ impl App {
                 .push("[mock session] can't send (no session_id)".into());
             return;
         };
+        // mu-o1y7 phase 3a: surface visible feedback when the operator
+        // tries to send to a session that's already done. The daemon
+        // may silently accept or reject, but either way no new event
+        // flows back — without this check the operator types Enter and
+        // sees nothing, leaving them confused (observed 2026-05-19).
+        // Emit an inline marker so the feedback lands above the input
+        // region in scrollback; also push to firehose for fullscreen
+        // observers.
+        if matches!(row.status, SessionStatus::Done) {
+            let short_sid: String = sid.chars().take(12).collect();
+            let msg = format!(
+                "─── send blocked: session {short_sid} is done · press n to create a new session ───"
+            );
+            self.pending_inline_markers.push(msg.clone());
+            self.firehose.push(format!("[blocked] {msg}"));
+            return;
+        }
         let Some(mu) = self.mu.as_mut() else {
             return;
         };
@@ -2720,40 +2745,73 @@ fn render_inline_session_detail(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray),
     ));
 
-    // Footer: session metadata + (when no session) a hint to switch back.
-    let footer_line: Line<'static> = match app
-        .selected_session
-        .selected()
-        .and_then(|i| app.sessions.get(i))
-    {
-        Some(r) => {
-            let id = if r.short_id.is_empty() {
-                "?".to_string()
-            } else {
-                r.short_id.clone()
-            };
-            let phase = if r.phase.is_empty() {
-                "idle".to_string()
-            } else {
-                r.phase.clone()
-            };
-            Line::from(vec![
-                Span::styled(" F3 · ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("session {id}"), Style::default().fg(Color::Cyan)),
-                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-                Span::styled(r.model.clone(), Style::default().fg(Color::Gray)),
-                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-                Span::styled(phase, Style::default().fg(MUTED_AMBER)),
-                Span::styled(
-                    format!("  ${:.2}", r.cost_usd),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])
+    // Footer: session metadata + (when no session) a hint to switch
+    // back. mu-o1y7 phase 3a: when the F3-on-F3 picker is open, swap
+    // to a high-contrast picker-mode footer so the operator can tell
+    // they're in a different input context. Otherwise typing j/k feels
+    // like nothing's changing (observed 2026-05-19).
+    let footer_line: Line<'static> = if app.session_picker_open {
+        let selected_sid: String = app
+            .selected_session
+            .selected()
+            .and_then(|i| app.sessions.get(i))
+            .map(|r| r.short_id.clone())
+            .unwrap_or_else(|| "—".to_string());
+        Line::from(vec![
+            Span::styled(
+                " F3 picker ",
+                Style::default()
+                    .bg(MUTED_AMBER)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("previewing {selected_sid}"),
+                Style::default()
+                    .fg(MUTED_AMBER)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " · j/k move · Enter commit · Esc cancel",
+                Style::default().fg(Color::Gray),
+            ),
+        ])
+    } else {
+        match app
+            .selected_session
+            .selected()
+            .and_then(|i| app.sessions.get(i))
+        {
+            Some(r) => {
+                let id = if r.short_id.is_empty() {
+                    "?".to_string()
+                } else {
+                    r.short_id.clone()
+                };
+                let phase = if r.phase.is_empty() {
+                    "idle".to_string()
+                } else {
+                    r.phase.clone()
+                };
+                Line::from(vec![
+                    Span::styled(" F3 · ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("session {id}"), Style::default().fg(Color::Cyan)),
+                    Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(r.model.clone(), Style::default().fg(Color::Gray)),
+                    Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(phase, Style::default().fg(MUTED_AMBER)),
+                    Span::styled(
+                        format!("  ${:.2}", r.cost_usd),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+            }
+            None => Line::from(Span::styled(
+                " F3 · (no session selected)",
+                Style::default().fg(Color::DarkGray),
+            )),
         }
-        None => Line::from(Span::styled(
-            " F3 · (no session selected)",
-            Style::default().fg(Color::DarkGray),
-        )),
     };
 
     // Compose the viewport: blank top region (room for phase 3's
@@ -3872,6 +3930,28 @@ where
             && matches!(app.mode, ViewMode::SessionDetail)
         {
             emit_transcript_delta_inline(terminal, app)?;
+        }
+
+        // mu-o1y7 phase 3a: drain any pending inline markers into
+        // scrollback. Inline-mode only — alt-screen views already see
+        // these via the firehose strip. Drains regardless of view so
+        // a marker pushed just before a view switch still lands.
+        if matches!(app.current_mode, ViewportMode::Inline(_))
+            && !app.pending_inline_markers.is_empty()
+        {
+            let markers = std::mem::take(&mut app.pending_inline_markers);
+            for msg in markers {
+                terminal.insert_before(1, |buf| {
+                    let line = Line::from(Span::styled(
+                        msg,
+                        Style::default()
+                            .fg(MUTED_AMBER)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    let paragraph = Paragraph::new(line);
+                    Widget::render(paragraph, buf.area, buf);
+                })?;
+            }
         }
 
         let timeout = tick_rate

@@ -1,79 +1,28 @@
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+//! mu-core's JSON-RPC wire surface.
+//!
+//! Per mu-6a8 (phases 1–6, 2026-05-16 → 2026-05-18), every type lives in
+//! a topic-scoped submodule under `protocol/`. This module file declares
+//! those submodules and re-exports them flat — so external callers say
+//! `use mu_core::protocol::{Request, CreateSessionRequest, …};` without
+//! caring which submodule each type lives in.
+//!
+//! The remaining content in this file is the integration test module,
+//! which exercises round-trips that cross submodule boundaries.
 
-// mu-6a8: extracted submodules. Re-exported below so external callers
-// (`use mu_core::protocol::{X};`) see no API change. The remaining
-// in-file section (jsonrpc envelope + Ping) is the phase 6 extraction
-// target — at that point protocol.rs becomes protocol/mod.rs.
 mod auth;
 mod autonomy;
 mod events;
+mod jsonrpc;
 mod mailbox;
 mod session;
 mod stats;
 pub use auth::*;
 pub use autonomy::*;
 pub use events::*;
+pub use jsonrpc::*;
 pub use mailbox::*;
 pub use session::*;
 pub use stats::*;
-
-// ===== JSON-RPC 2.0 envelope =====
-
-pub const JSONRPC_VERSION: &str = "2.0";
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Request<P> {
-    pub jsonrpc: String,
-    pub id: Value,
-    pub method: String,
-    pub params: P,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Response<R> {
-    Ok {
-        jsonrpc: String,
-        id: Value,
-        result: R,
-    },
-    Err {
-        jsonrpc: String,
-        id: Value,
-        error: ErrorObject,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ErrorObject {
-    pub code: i32,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Notification<P> {
-    pub jsonrpc: String,
-    pub method: String,
-    pub params: P,
-}
-
-// ===== Methods =====
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PingRequest;
-
-impl PingRequest {
-    pub const METHOD: &'static str = "ping";
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PingResponse {
-    pub pong: bool,
-    pub server_version: String,
-}
 
 #[cfg(test)]
 mod tests {

@@ -73,11 +73,19 @@ fi
 # Block starts at a line `## Files` and ends at the next `## ` heading or EOF.
 # Blank lines inside the block are allowed and ignored. Lines starting with `#`
 # (other than the heading delimiter) are treated as comments and ignored.
+# Git trailer lines (`Token: value` where Token is letters/digits/underscore/hyphen)
+# are also skipped — e.g., `Co-Authored-By:`, `Signed-off-by:`, `Reviewed-by:`,
+# `Reported-by:`. This matters because the trailer section conventionally appears
+# at the END of the commit message, after the body, so a `## Files` block that's
+# the last body section will see the trailer lines in its scan. Without this skip
+# the trailer would be parsed as a Files entry (e.g. "Co-Authored-By:" parsed as
+# status=C, path=Claude — see bead mu-d33g for the regression that motivated this).
 CLAIM_BLOCK="$(printf "%s\n" "$MSG" | awk '
   /^## Files[[:space:]]*$/ { in_block = 1; next }
   in_block && /^## / { in_block = 0 }
   in_block && /^[[:space:]]*$/ { next }
   in_block && /^[[:space:]]*#/ { next }
+  in_block && /^[A-Za-z][A-Za-z0-9_-]*:[[:space:]]/ { next }
   in_block { print }
 ')"
 

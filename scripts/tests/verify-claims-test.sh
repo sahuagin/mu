@@ -202,6 +202,31 @@ assert_gate "bypass env var skips" 0 "MU_SKIP_CLAIM_CHECK=1" HEAD MU_SKIP_CLAIM_
 
 assert_gate "bad commit ref returns 2" 2 "is not a commit" "definitely-not-a-commit"
 
+# --- case 9: git trailers after ## Files block are ignored (mu-d33g) ----
+# Regression: before the fix, lines like "Co-Authored-By: Claude ..." after
+# the ## Files block were parsed as Files entries with status=C path=Claude,
+# causing "claimed file not in diff" failures on any commit with git trailers.
+
+cat > /tmp/msg.$$ <<'EOF'
+feat: trailers after files block must be ignored
+
+Regression test for mu-d33g. Git trailer lines (Co-Authored-By,
+Signed-off-by, Reviewed-by, etc.) at the end of the commit message
+follow the convention of being placed AFTER the body. A ## Files
+block that's the last body section will see those trailers in its
+scan, and they must be skipped — not parsed as Files entries.
+
+## Files
+A trailer-test.txt +5
+
+Co-Authored-By: Someone Else <someone@example.com>
+Signed-off-by: Maintainer Mantis <maint@example.com>
+Reviewed-by: A Reviewer <review@example.com>
+EOF
+make_commit /tmp/msg.$$ add trailer-test.txt 5
+rm /tmp/msg.$$
+assert_gate "trailers after files block ignored" 0 "matches diff" HEAD
+
 # --- summary -------------------------------------------------------------
 
 printf "\n%d passed, %d failed\n" "$PASS" "$FAIL"

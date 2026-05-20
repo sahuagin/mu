@@ -388,7 +388,7 @@ async fn b4_sse_to_provider_events() {
         ProviderEvent::Done(msg) => {
             assert_eq!(msg.stop_reason, StopReason::EndTurn);
             match &msg.content[0] {
-                ContentBlock::Text { text } => assert_eq!(text, "hello world"),
+                ContentBlock::Text { text } => assert_eq!(text.as_ref(), "hello world"),
                 other => panic!("expected Text block, got {other:?}"),
             }
         }
@@ -554,7 +554,7 @@ async fn eof_without_message_stop_emits_degraded_eof() {
             // the provider might have seen mid-stream.
             assert_eq!(msg.stop_reason, StopReason::DegradedEof);
             match &msg.content[0] {
-                ContentBlock::Text { text } => assert_eq!(text, "partial"),
+                ContentBlock::Text { text } => assert_eq!(text.as_ref(), "partial"),
                 other => panic!("expected Text block, got {other:?}"),
             }
         }
@@ -643,7 +643,7 @@ async fn b6_sse_mixed_text_and_tool_use() {
     assert_eq!(done.stop_reason, StopReason::ToolUse);
     assert_eq!(done.content.len(), 2);
     match &done.content[0] {
-        ContentBlock::Text { text } => assert_eq!(text, "I will read it. "),
+        ContentBlock::Text { text } => assert_eq!(text.as_ref(), "I will read it. "),
         other => panic!("expected Text, got {other:?}"),
     }
     match &done.content[1] {
@@ -863,7 +863,7 @@ mod live_tests {
             final_text.to_lowercase().contains("hello"),
             "expected response to contain 'hello', got: {final_text:?}"
         );
-        assert_eq!(text, final_text);
+        assert_eq!(text.as_str(), final_text.as_ref());
     }
 
     /// B-9: live API tool round-trip. Sends a tool spec; verifies the
@@ -1016,7 +1016,7 @@ fn fb0_rope_role_sequence_matches_anthropic_wire_role_sequence() {
 
     // Expected role sequence: System (prompt), System (tool schema),
     // User, Assistant (with tool call), ToolResult.
-    let roles: Vec<ProviderRole> = projection.messages.iter().map(|m| m.role).collect();
+    let roles: Vec<ProviderRole> = projection.messages.iter().map(|m| m.role()).collect();
     assert_eq!(
         roles,
         vec![
@@ -1040,9 +1040,9 @@ fn fb0_rope_user_assistant_toolresult_contents_round_trip() {
     let user_msg = projection
         .messages
         .iter()
-        .find(|m| m.role == ProviderRole::User)
+        .find(|m| m.role() == ProviderRole::User)
         .expect("user message");
-    assert_eq!(user_msg.content, "what's in /etc/hostname?");
+    assert_eq!(user_msg.content(), "what's in /etc/hostname?");
 
     // Assistant text + tool call flatten into one span; verify both
     // surfaces are present in the projection content. The wire body
@@ -1051,19 +1051,19 @@ fn fb0_rope_user_assistant_toolresult_contents_round_trip() {
     let assistant_msg = projection
         .messages
         .iter()
-        .find(|m| m.role == ProviderRole::Assistant)
+        .find(|m| m.role() == ProviderRole::Assistant)
         .expect("assistant message");
-    assert!(assistant_msg.content.contains("I'll read it."));
-    assert!(assistant_msg.content.contains("[tool_call:read("));
+    assert!(assistant_msg.content().contains("I'll read it."));
+    assert!(assistant_msg.content().contains("[tool_call:read("));
 
     // ToolResult content surfaces verbatim (non-error path — no
     // "error:" prefix).
     let tool_result = projection
         .messages
         .iter()
-        .find(|m| m.role == ProviderRole::ToolResult)
+        .find(|m| m.role() == ProviderRole::ToolResult)
         .expect("tool result");
-    assert_eq!(tool_result.content, "myhost");
+    assert_eq!(tool_result.content(), "myhost");
 }
 
 #[test]
@@ -1105,11 +1105,11 @@ fn fb0_cache_boundary_lands_on_last_stable_cacheable_span() {
     // schema).
     assert_eq!(boundaries.len(), 1);
     assert_eq!(boundaries[0].message_index, 1);
-    assert_eq!(rope.spans()[1].kind, SpanKind::ToolSchema);
+    assert_eq!(rope.spans()[1].kind(), &SpanKind::ToolSchema);
 
     // Annotation lands on that message.
     assert_eq!(
-        projection.messages[1].cache_marker,
+        projection.messages[1].cache_marker(),
         Some(CacheMarker::Ephemeral)
     );
 
@@ -1142,8 +1142,10 @@ fn fb0_no_system_prompt_yields_no_system_span() {
         .messages
         .iter()
         .filter(|m| {
-            m.role == ProviderRole::System
-                && m.source_span_ids.iter().any(|id| id == "system-prompt")
+            m.role() == ProviderRole::System
+                && m.source_span_ids()
+                    .iter()
+                    .any(|id| id.as_ref() == "system-prompt")
         })
         .count();
     assert_eq!(system_count, 0);

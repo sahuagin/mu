@@ -48,6 +48,8 @@
 //! [`RetentionClass::is_stable`]: mu_core::context::RetentionClass::is_stable
 //! [`Span::cacheable`]: mu_core::context::Span
 
+use std::sync::Arc;
+
 use mu_core::context::{
     CacheBoundary, CacheMarker, CacheStrategy, ProjectionTarget, ProviderMessage, ProviderMessages,
     ProviderRenderer, RetainedRope,
@@ -76,11 +78,12 @@ impl ProviderRenderer for AnthropicProviderRenderer {
     fn render(&self, rope: &RetainedRope, target: ProjectionTarget) -> ProviderMessages {
         let messages = rope
             .iter()
-            .map(|span| ProviderMessage {
-                role: (&span.kind).into(),
-                content: span.content.clone(),
-                source_span_ids: vec![span.id.clone()],
-                cache_marker: None,
+            .map(|span| {
+                ProviderMessage::new(
+                    span.kind().into(),
+                    span.content(),
+                    vec![Arc::from(span.id())],
+                )
             })
             .collect();
 
@@ -117,7 +120,7 @@ impl CacheStrategy for AnthropicCacheStrategy {
         // single mid-rope hole invalidates the prefix.
         let mut last_in_prefix: Option<usize> = None;
         for (idx, span) in rope.iter().enumerate() {
-            if span.retention.is_stable() && span.cacheable {
+            if span.retention().is_stable() && span.cacheable() {
                 last_in_prefix = Some(idx);
             } else {
                 break;
@@ -132,7 +135,7 @@ impl CacheStrategy for AnthropicCacheStrategy {
     fn annotate(&self, messages: &mut ProviderMessages, boundaries: &[CacheBoundary]) {
         for boundary in boundaries {
             if let Some(message) = messages.messages.get_mut(boundary.message_index) {
-                message.cache_marker = Some(CacheMarker::Ephemeral);
+                message.set_cache_marker(Some(CacheMarker::Ephemeral));
             }
             // Out-of-range indices are tolerated silently per trait
             // contract (cache.rs:100-107) — boundaries computed from
@@ -177,7 +180,7 @@ mod tests {
     fn anthropic_renderer_maps_span_kind_to_role() {
         let rope = split_rope();
         let rendered = AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
-        let roles: Vec<ProviderRole> = rendered.messages.iter().map(|m| m.role).collect();
+        let roles: Vec<ProviderRole> = rendered.messages.iter().map(|m| m.role()).collect();
         assert_eq!(
             roles,
             vec![
@@ -195,10 +198,11 @@ mod tests {
         let rope = split_rope();
         let rendered = AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
         for (msg, span) in rendered.messages.iter().zip(rope.spans()) {
-            assert_eq!(msg.content, span.content);
-            assert_eq!(msg.source_span_ids, vec![span.id.clone()]);
+            assert_eq!(msg.content(), span.content());
+            let ids: Vec<&str> = msg.source_span_ids().iter().map(AsRef::as_ref).collect();
+            assert_eq!(ids, vec![span.id()]);
             assert!(
-                msg.cache_marker.is_none(),
+                msg.cache_marker().is_none(),
                 "renderer leaves cache_marker None — strategy fills it"
             );
         }
@@ -217,8 +221,8 @@ mod tests {
         )]);
         let rendered = AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
         assert_eq!(rendered.messages.len(), 1);
-        assert_eq!(rendered.messages[0].role, ProviderRole::System);
-        assert_eq!(rendered.messages[0].content, "system instruction");
+        assert_eq!(rendered.messages[0].role(), ProviderRole::System);
+        assert_eq!(rendered.messages[0].content(), "system instruction");
     }
 
     // ===== Cache strategy tests =====
@@ -268,13 +272,13 @@ mod tests {
             Span::new("a", SpanKind::System, "intro", RetentionClass::Startup),
             Span::new("b", SpanKind::User, "hi", RetentionClass::Hot),
             // Stable-but-uncacheable hole at index 2:
-            Span {
-                id: "ts".into(),
-                kind: SpanKind::System,
-                content: "now is 12:34".into(),
-                retention: RetentionClass::Hot,
-                cacheable: false,
-            },
+            Span::with_cacheable(
+                "ts",
+                SpanKind::System,
+                "now is 12:34",
+                RetentionClass::Hot,
+                false,
+            ),
             // Even though this is stable+cacheable again, the
             // contiguous cacheable prefix already ended at index 1.
             Span::new("c", SpanKind::Assistant, "hello", RetentionClass::Hot),
@@ -297,13 +301,13 @@ mod tests {
         for (i, msg) in rendered.messages.iter().enumerate() {
             if i == 2 {
                 assert_eq!(
-                    msg.cache_marker,
+                    msg.cache_marker(),
                     Some(CacheMarker::Ephemeral),
                     "boundary message must carry Ephemeral",
                 );
             } else {
                 assert!(
-                    msg.cache_marker.is_none(),
+                    msg.cache_marker().is_none(),
                     "non-boundary message {i} must not carry a cache marker",
                 );
             }
@@ -328,7 +332,7 @@ mod tests {
         strategy.annotate(&mut rendered, &bogus);
 
         assert_eq!(
-            rendered.messages[0].cache_marker,
+            rendered.messages[0].cache_marker(),
             Some(CacheMarker::Ephemeral)
         );
         assert_eq!(rendered.messages.len(), 1, "no panic on bogus index");
@@ -357,9 +361,14 @@ mod tests {
         assert_eq!(boundaries, vec![CacheBoundary::at(2)]);
         // Boundary message is the third one (the last stable+cacheable
         // span, "a1" / Assistant "hello").
-        assert_eq!(rendered.messages[2].source_span_ids, vec!["a1".to_string()]);
+        let ids: Vec<&str> = rendered.messages[2]
+            .source_span_ids()
+            .iter()
+            .map(AsRef::as_ref)
+            .collect();
+        assert_eq!(ids, vec!["a1"]);
         assert_eq!(
-            rendered.messages[2].cache_marker,
+            rendered.messages[2].cache_marker(),
             Some(CacheMarker::Ephemeral)
         );
     }

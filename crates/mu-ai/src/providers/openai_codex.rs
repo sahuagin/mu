@@ -229,7 +229,7 @@ pub(crate) fn translate_message(m: &AgentMessage) -> Vec<Value> {
             let mut text_parts: Vec<String> = Vec::new();
             for block in &a.content {
                 match block {
-                    ContentBlock::Text { text } => text_parts.push(text.clone()),
+                    ContentBlock::Text { text } => text_parts.push(text.to_string()),
                     ContentBlock::ToolCall(tc) => {
                         let args_str = serde_json::to_string(&tc.arguments)
                             .unwrap_or_else(|_| "{}".to_string());
@@ -538,7 +538,7 @@ fn assemble_content(state: &StreamState) -> Vec<ContentBlock> {
     let mut out: Vec<ContentBlock> = Vec::new();
     if !state.accumulated_text.is_empty() {
         out.push(ContentBlock::Text {
-            text: state.accumulated_text.clone(),
+            text: state.accumulated_text.as_str().into(),
         });
     }
     for idx in &state.tool_call_order {

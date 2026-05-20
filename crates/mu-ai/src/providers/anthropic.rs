@@ -645,7 +645,9 @@ fn assemble_content(blocks: &HashMap<u32, BlockBuilder>, block_order: &[u32]) ->
         .iter()
         .filter_map(|idx| blocks.get(idx))
         .map(|builder| match builder {
-            BlockBuilder::Text(text) => ContentBlock::Text { text: text.clone() },
+            BlockBuilder::Text(text) => ContentBlock::Text {
+                text: text.as_str().into(),
+            },
             BlockBuilder::ToolUse {
                 id,
                 name,

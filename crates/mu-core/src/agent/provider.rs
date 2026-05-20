@@ -132,7 +132,7 @@ mod tests {
             },
             ProviderEvent::Done(AssistantMessage {
                 content: vec![ContentBlock::Text {
-                    text: "done".to_owned(),
+                    text: "done".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: None,

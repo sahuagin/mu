@@ -44,7 +44,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 
 use super::{CompactionDecision, CompactionPolicy, CompactionResult};
-use crate::context::rope::{RetainedRope, RetentionClass, Span, SpanKind};
+use crate::context::rope::{RetainedRope, RetentionClass, Span, SpanId, SpanKind};
 
 /// Default short hex length (mu-kgu.3 design: 8 hex = 32 bits ≈
 /// 10⁻⁴ collision probability at 1000 spans).
@@ -408,7 +408,7 @@ fn build_prompt(
     ));
     for (i, (span, hash)) in spans.iter().zip(hashes.iter()).enumerate() {
         let preview = if span.content.chars().count() <= preview_chars {
-            span.content.clone()
+            span.content.to_string()
         } else {
             let truncated: String = span.content.chars().take(preview_chars).collect();
             format!("{truncated}…")
@@ -507,13 +507,13 @@ fn surgery(
     for (i, span) in spans.iter().enumerate() {
         if keep_indices.contains(&i) {
             decisions.push(CompactionDecision::Kept {
-                span_id: span.id.clone(),
+                span_id: span.id.to_string(),
             });
         } else {
             if earliest_absorbed_idx.is_none() {
                 earliest_absorbed_idx = Some(i);
             }
-            absorbed_ids.push(span.id.clone());
+            absorbed_ids.push(span.id.to_string());
         }
     }
 
@@ -524,10 +524,12 @@ fn surgery(
     }
 
     let summary_span_id = format!("compaction-summary:{generated_at_unix_ms}");
+    let absorbed_span_ids_arc: Vec<SpanId> =
+        absorbed_ids.iter().map(|s| Arc::from(s.as_str())).collect();
     let summary_span = Span::new(
         summary_span_id.clone(),
         SpanKind::CompactionSummary {
-            absorbed_span_ids: absorbed_ids.clone(),
+            absorbed_span_ids: absorbed_span_ids_arc,
             generated_at_unix_ms,
             policy_id: policy_id.to_string(),
         },
@@ -648,9 +650,9 @@ mod tests {
         fn hash(&self, span: &Span, n_chars: usize) -> String {
             let full = self
                 .per_id
-                .get(&span.id)
+                .get(span.id())
                 .cloned()
-                .unwrap_or_else(|| format!("{:0>16}", span.id));
+                .unwrap_or_else(|| format!("{:0>16}", span.id()));
             full[..n_chars.min(full.len())].to_string()
         }
     }
@@ -729,7 +731,7 @@ mod tests {
         // Rope: sys, [summary], a1
         let new_spans = result.rope.spans();
         assert_eq!(new_spans.len(), 3, "kept(2) + 1 summary span");
-        assert_eq!(new_spans[0].id, "sys");
+        assert_eq!(new_spans[0].id(), "sys");
         // Summary inserted at the position of the earliest absorbed
         // span (u1 was at index 1).
         match &new_spans[1].kind {
@@ -738,16 +740,17 @@ mod tests {
                 policy_id,
                 ..
             } => {
-                assert_eq!(absorbed_span_ids, &vec!["u1".to_string(), "t1".to_string()]);
+                let actual: Vec<&str> = absorbed_span_ids.iter().map(AsRef::as_ref).collect();
+                assert_eq!(actual, vec!["u1", "t1"]);
                 assert_eq!(policy_id, DEFAULT_POLICY_ID);
             }
             other => panic!("expected CompactionSummary, got {other:?}"),
         }
         assert_eq!(
-            new_spans[1].content,
+            new_spans[1].content(),
             "the user pinged and a tool returned ok=true with value=42"
         );
-        assert_eq!(new_spans[2].id, "a1");
+        assert_eq!(new_spans[2].id(), "a1");
 
         // Decisions: Kept(sys), Kept(a1), Summarized([u1, t1] → summary).
         let kept_ids: Vec<&str> = result
@@ -838,19 +841,12 @@ mod tests {
             SpanKind::CompactionSummary {
                 absorbed_span_ids, ..
             } => {
-                assert_eq!(
-                    absorbed_span_ids,
-                    &vec![
-                        "sys".to_string(),
-                        "u1".to_string(),
-                        "a1".to_string(),
-                        "t1".to_string(),
-                    ],
-                );
+                let actual: Vec<&str> = absorbed_span_ids.iter().map(AsRef::as_ref).collect();
+                assert_eq!(actual, vec!["sys", "u1", "a1", "t1"]);
             }
             other => panic!("expected CompactionSummary, got {other:?}"),
         }
-        assert_eq!(result.rope.spans()[0].content, "everything happened");
+        assert_eq!(result.rope.spans()[0].content(), "everything happened");
 
         // No Kept decisions; one Summarized covering all four span ids.
         let kept_count = result
@@ -926,7 +922,7 @@ mod tests {
             result.decisions,
         );
         // Outcome: span "a" kept; span "b" absorbed; one summary span.
-        let ids: Vec<&str> = result.rope.spans().iter().map(|s| s.id.as_str()).collect();
+        let ids: Vec<&str> = result.rope.spans().iter().map(|s| s.id()).collect();
         assert_eq!(ids.len(), 2);
         assert_eq!(ids[0], "a");
         assert!(matches!(
@@ -1049,7 +1045,7 @@ mod tests {
             result.decisions,
         );
         // Kept "sys", absorbed the other three.
-        assert_eq!(result.rope.spans()[0].id, "sys");
+        assert_eq!(result.rope.spans()[0].id(), "sys");
     }
 
     #[test]
@@ -1078,12 +1074,12 @@ mod tests {
 
         let new_spans = result.rope.spans();
         assert_eq!(new_spans.len(), 3, "kept(2) + 1 summary span");
-        assert_eq!(new_spans[0].id, "sys");
+        assert_eq!(new_spans[0].id(), "sys");
         assert!(matches!(
             new_spans[1].kind,
             SpanKind::CompactionSummary { .. }
         ));
-        assert_eq!(new_spans[2].id, "a1");
+        assert_eq!(new_spans[2].id(), "a1");
         // No Failed decision.
         assert!(!result
             .decisions

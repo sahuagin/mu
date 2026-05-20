@@ -46,10 +46,29 @@
 //! [`unregister_tool_schema`]: RetainedRope::unregister_tool_schema
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use super::event::RopeEvent;
+
+/// Per-conceptual-type alias for span identifiers (mu-yqeq.2).
+///
+/// Backing storage is `Arc<str>` so rope clones and provenance-map
+/// lookups bump a refcount rather than allocating a fresh `String`.
+/// Public alias so external crates can name the type explicitly when
+/// they need to construct a `Vec<SpanId>` (e.g., a
+/// [`ProviderMessage::source_span_ids`](super::renderer::ProviderMessage)
+/// field).
+pub type SpanId = Arc<str>;
+
+/// Per-conceptual-type alias for span content payloads (mu-yqeq.2).
+///
+/// Backing storage is `Arc<str>`. See [`SpanId`] for the rationale.
+/// Distinct alias from `SpanId` so future changes to either storage
+/// strategy (e.g., a lazy-rehydration handle for `content` only) can
+/// happen without touching the other.
+pub type SpanText = Arc<str>;
 
 /// Retention classes for a span, mirroring the names in
 /// `specs/architecture/event-sourced-context.md` ("Memory as rope/
@@ -147,7 +166,7 @@ pub enum SpanKind {
         /// non-kept spans from the pre-compaction rope). Preserves
         /// the structural audit trail even after the
         /// `CompactionResult::decisions` log is dropped.
-        absorbed_span_ids: Vec<String>,
+        absorbed_span_ids: Vec<SpanId>,
         /// Unix-milliseconds timestamp recording when the summary
         /// was generated. `0` is a valid sentinel for tests / fixtures
         /// that don't bother with a clock.
@@ -165,43 +184,80 @@ pub enum SpanKind {
 /// this with provenance (`source_event_id`), coordinates
 /// (`prompt_range_start`/`end`), and policy metadata. The stub keeps
 /// just the fields the foundational traits need.
+///
+/// Fields are `pub(crate)` so in-crate construction (rope internals,
+/// renderer, compaction, hash-summary) keeps struct-literal access,
+/// while external crates go through accessor methods and the
+/// constructors below. See spec mu-044 §Encapsulation discipline for
+/// the rationale: insulates external call sites from future field-
+/// type evolution (e.g., the `String → Arc<str>` swap in mu-yqeq.2b).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
-    /// Stable identifier within a rope. Caller-assigned; the stub
-    /// does not allocate ids.
-    pub id: String,
-    /// What role this span maps to when rendered as a provider
-    /// message.
-    pub kind: SpanKind,
-    /// The literal text content of the span. The full rope addresses
-    /// content by `(source_event_id, byte_range)`; the stub inlines
-    /// it for simplicity.
-    pub content: String,
-    /// Retention class. Determines stable-prefix eligibility.
-    pub retention: RetentionClass,
-    /// `true` iff this span is eligible for provider-side prompt
-    /// caching. A span can be stable but uncacheable (e.g., contains
-    /// timestamps the model shouldn't anchor on). See
-    /// `specs/architecture/event-sourced-context.md` lines 575-578.
-    pub cacheable: bool,
+    pub(crate) id: SpanId,
+    pub(crate) kind: SpanKind,
+    pub(crate) content: SpanText,
+    pub(crate) retention: RetentionClass,
+    pub(crate) cacheable: bool,
 }
 
 impl Span {
     /// Convenience constructor for the common case where a span is
     /// cacheable iff its retention class is stable.
     pub fn new(
-        id: impl Into<String>,
+        id: impl Into<SpanId>,
         kind: SpanKind,
-        content: impl Into<String>,
+        content: impl Into<SpanText>,
         retention: RetentionClass,
+    ) -> Self {
+        Self::with_cacheable(id, kind, content, retention, retention.is_stable())
+    }
+
+    /// Constructor for the less-common case where `cacheable` must
+    /// be set independently of the retention class (e.g., a stable
+    /// span whose content carries volatile data the model shouldn't
+    /// anchor on — see `specs/architecture/event-sourced-context.md`
+    /// lines 575-578).
+    pub fn with_cacheable(
+        id: impl Into<SpanId>,
+        kind: SpanKind,
+        content: impl Into<SpanText>,
+        retention: RetentionClass,
+        cacheable: bool,
     ) -> Self {
         Self {
             id: id.into(),
             kind,
             content: content.into(),
             retention,
-            cacheable: retention.is_stable(),
+            cacheable,
         }
+    }
+
+    /// Stable identifier within a rope.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// What role this span maps to when rendered as a provider
+    /// message.
+    pub fn kind(&self) -> &SpanKind {
+        &self.kind
+    }
+
+    /// The literal text content of the span.
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    /// Retention class. Determines stable-prefix eligibility.
+    pub fn retention(&self) -> RetentionClass {
+        self.retention
+    }
+
+    /// `true` iff this span is eligible for provider-side prompt
+    /// caching.
+    pub fn cacheable(&self) -> bool {
+        self.cacheable
     }
 }
 
@@ -228,7 +284,7 @@ pub struct RetainedRope {
     /// for each span. Entries are never removed: a deactivated span
     /// still has a provenance answer.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    origins: HashMap<String, usize>,
+    origins: HashMap<SpanId, usize>,
 }
 
 impl RetainedRope {
@@ -306,7 +362,7 @@ impl RetainedRope {
         span_refs: Vec<Span>,
     ) -> &mut Self {
         let skill_id = skill_id.into();
-        let span_ids: Vec<String> = span_refs.iter().map(|s| s.id.clone()).collect();
+        let span_ids: Vec<SpanId> = span_refs.iter().map(|s| s.id.clone()).collect();
         let event_index = self.events.len();
         self.events.push(RopeEvent::SkillActivated {
             skill_id,
@@ -333,7 +389,7 @@ impl RetainedRope {
     /// emits a `SkillDeactivated` with an empty `span_ids`. No
     /// error — over-deactivation is benign.
     pub fn deactivate_skill(&mut self, skill_id: &str) -> &mut Self {
-        let active_span_ids: Vec<String> = self
+        let active_span_ids: Vec<SpanId> = self
             .spans
             .iter()
             .filter(|span| {
@@ -389,9 +445,9 @@ impl RetainedRope {
     /// span id removed is whichever span's origin is the
     /// most-recent (still-active) `ToolSchemaRegistered` for
     /// `tool_name`. Idempotent: unregistering an unknown tool emits
-    /// an event with `span_id == ""` and is otherwise a no-op.
+    /// an event with empty `span_id` and is otherwise a no-op.
     pub fn unregister_tool_schema(&mut self, tool_name: &str) -> &mut Self {
-        let span_id = self
+        let span_id: SpanId = self
             .spans
             .iter()
             .find(|span| {
@@ -404,7 +460,7 @@ impl RetainedRope {
                     ))
             })
             .map(|s| s.id.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| Arc::from(""));
         if !span_id.is_empty() {
             self.spans.retain(|span| span.id != span_id);
         }
@@ -498,7 +554,7 @@ mod tests {
             RetentionClass::Hot,
         ));
 
-        let ids: Vec<&str> = rope.iter().map(|s| s.id.as_str()).collect();
+        let ids: Vec<&str> = rope.iter().map(|s| s.id()).collect();
         assert_eq!(ids, vec!["s1", "u1", "a1"]);
         assert_eq!(rope.len(), 3);
         assert!(!rope.is_empty());
@@ -581,14 +637,15 @@ mod tests {
         rope.deactivate_skill("goal-protocol");
         // Only "review"'s span remains.
         assert_eq!(rope.len(), 1);
-        assert_eq!(rope.spans()[0].id, "skill:review:SKILL.md");
+        assert_eq!(rope.spans()[0].id(), "skill:review:SKILL.md");
 
         // SkillDeactivated event recorded both spans retired.
         let last = rope.events().last().expect("event recorded");
         match last {
             RopeEvent::SkillDeactivated { skill_id, span_ids } => {
                 assert_eq!(skill_id, "goal-protocol");
-                assert_eq!(span_ids, &vec!["skill:goal-protocol:SKILL.md".to_string()]);
+                let actual: Vec<&str> = span_ids.iter().map(AsRef::as_ref).collect();
+                assert_eq!(actual, vec!["skill:goal-protocol:SKILL.md"]);
             }
             other => panic!("expected SkillDeactivated, got {other:?}"),
         }
@@ -661,7 +718,7 @@ mod tests {
         match rope.events().last().expect("event") {
             RopeEvent::ToolSchemaRegistered { tool_name, span_id } => {
                 assert_eq!(tool_name, "read");
-                assert_eq!(span_id, "tool-schema:read");
+                assert_eq!(span_id.as_ref(), "tool-schema:read");
             }
             other => panic!("expected ToolSchemaRegistered, got {other:?}"),
         }
@@ -676,11 +733,11 @@ mod tests {
 
         rope.unregister_tool_schema("read");
         assert_eq!(rope.len(), 1);
-        assert_eq!(rope.spans()[0].id, "tool-schema:write");
+        assert_eq!(rope.spans()[0].id(), "tool-schema:write");
         match rope.events().last().expect("event") {
             RopeEvent::ToolSchemaUnregistered { tool_name, span_id } => {
                 assert_eq!(tool_name, "read");
-                assert_eq!(span_id, "tool-schema:read");
+                assert_eq!(span_id.as_ref(), "tool-schema:read");
             }
             other => panic!("expected ToolSchemaUnregistered, got {other:?}"),
         }
@@ -700,9 +757,9 @@ mod tests {
 
         // Predicate: allowed_tools = {read, bash}.
         let allowed = ["tool-schema:read", "tool-schema:bash"];
-        let view = rope.filter_tools(|s| allowed.contains(&s.id.as_str()));
+        let view = rope.filter_tools(|s| allowed.contains(&s.id()));
         assert_eq!(view.len(), 2);
-        let ids: Vec<&str> = view.iter().map(|s| s.id.as_str()).collect();
+        let ids: Vec<&str> = view.iter().map(|s| s.id()).collect();
         assert!(ids.contains(&"tool-schema:read"));
         assert!(ids.contains(&"tool-schema:bash"));
         // Skill span is excluded even if predicate is "true".
@@ -721,7 +778,7 @@ mod tests {
         rope.register_tool_schema("write", tool_schema_span("write", "w"));
         let original_len = rope.len();
         let original_events = rope.events().len();
-        let _view = rope.filter_tools(|s| s.id == "tool-schema:read");
+        let _view = rope.filter_tools(|s| s.id() == "tool-schema:read");
         // Substrate is unchanged.
         assert_eq!(rope.len(), original_len);
         assert_eq!(rope.events().len(), original_events);
@@ -738,11 +795,11 @@ mod tests {
         rope.register_tool_schema("write", tool_schema_span("write", "w"));
         rope.register_tool_schema("bash", tool_schema_span("bash", "b"));
 
-        let full: Vec<&str> = rope.spans().iter().map(|s| s.id.as_str()).collect();
+        let full: Vec<&str> = rope.spans().iter().map(|s| s.id()).collect();
         let attenuated_ids: Vec<&str> = rope
-            .filter_tools(|s| s.id == "tool-schema:read")
+            .filter_tools(|s| s.id() == "tool-schema:read")
             .into_iter()
-            .map(|s| s.id.as_str())
+            .map(|s| s.id())
             .collect();
         let diff: Vec<&str> = full
             .iter()

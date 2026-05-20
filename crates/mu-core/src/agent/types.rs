@@ -1,5 +1,15 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Per-conceptual-type alias for ContentBlock text payloads
+/// (mu-yqeq.2). Backing storage is `Arc<str>` so structural assistant
+/// content (Text + Thinking blocks) clones cheaply and can byte-share
+/// with the flat [`Span.content`](crate::context::Span) via the same
+/// underlying buffer once mu-yqeq.A wires
+/// [`Span.blocks`](crate::context::Span) in.
+pub type BlockText = Arc<str>;
 
 /// One message in an agent's conversation context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -83,12 +93,12 @@ impl std::ops::Add for Usage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
-        text: String,
+        text: BlockText,
     },
     ToolCall(ToolCall),
     /// Reasoning trace (Anthropic extended thinking, OpenAI reasoning).
     Thinking {
-        text: String,
+        text: BlockText,
     },
 }
 
@@ -167,12 +177,10 @@ mod tests {
     #[test]
     fn content_block_round_trips() -> Result<(), serde_json::Error> {
         let samples = [
-            ContentBlock::Text {
-                text: "hi".to_owned(),
-            },
+            ContentBlock::Text { text: "hi".into() },
             ContentBlock::ToolCall(tool_call()),
             ContentBlock::Thinking {
-                text: "reasoning".to_owned(),
+                text: "reasoning".into(),
             },
         ];
 
@@ -219,11 +227,11 @@ mod tests {
         AssistantMessage {
             content: vec![
                 ContentBlock::Text {
-                    text: "hello".to_owned(),
+                    text: "hello".into(),
                 },
                 ContentBlock::ToolCall(tool_call()),
                 ContentBlock::Thinking {
-                    text: "thinking".to_owned(),
+                    text: "thinking".into(),
                 },
             ],
             stop_reason: StopReason::ToolUse,

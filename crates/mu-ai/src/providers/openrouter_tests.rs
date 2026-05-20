@@ -246,7 +246,7 @@ async fn b7_sse_text_only() {
             assert_eq!(msg.stop_reason, StopReason::EndTurn);
             assert_eq!(msg.content.len(), 1);
             match &msg.content[0] {
-                ContentBlock::Text { text } => assert_eq!(text, "hello world"),
+                ContentBlock::Text { text } => assert_eq!(text.as_ref(), "hello world"),
                 other => panic!("expected Text, got {other:?}"),
             }
         }
@@ -335,7 +335,7 @@ async fn b9_sse_mixed_text_and_tool_call() {
     };
     assert_eq!(done.content.len(), 2);
     match &done.content[0] {
-        ContentBlock::Text { text } => assert_eq!(text, "I will read it. "),
+        ContentBlock::Text { text } => assert_eq!(text.as_ref(), "I will read it. "),
         other => panic!("expected Text, got {other:?}"),
     }
     match &done.content[1] {
@@ -440,7 +440,7 @@ mod live_tests {
             [ContentBlock::Text { text }] => text.clone(),
             other => panic!("unexpected content blocks: {other:?}"),
         };
-        assert_eq!(text, content_text);
+        assert_eq!(text.as_str(), content_text.as_ref());
     }
 
     /// B-13: live tool round-trip.

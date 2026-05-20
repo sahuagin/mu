@@ -38,9 +38,17 @@
 //! [`OperatorView`]: ProjectionTarget::OperatorView
 //! [`RetainedRope`]: super::rope::RetainedRope
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
-use super::rope::{RetainedRope, Span, SpanKind};
+use super::rope::{RetainedRope, Span, SpanId, SpanKind};
+
+/// Per-conceptual-type alias for provider-message text payloads
+/// (mu-yqeq.2). Backing storage is `Arc<str>` so [`ProviderMessage`]
+/// clones are cheap refcount bumps, matching the
+/// rope's [`SpanText`](super::rope::SpanText) storage strategy.
+pub type MessageText = Arc<str>;
 
 /// Which projection a renderer should produce.
 ///
@@ -120,21 +128,76 @@ impl From<&SpanKind> for ProviderRole {
 ///
 /// [`CacheStrategy`]: super::cache::CacheStrategy
 /// [`annotate`]: super::cache::CacheStrategy::annotate
+///
+/// Fields are `pub(crate)` so in-crate renderers can construct via
+/// struct literals while external crates use [`ProviderMessage::new`]
+/// + accessor methods. See spec mu-044 §Encapsulation discipline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderMessage {
-    pub role: ProviderRole,
-    pub content: String,
+    pub(crate) role: ProviderRole,
+    pub(crate) content: MessageText,
     /// Source provenance: which span(s) produced this message.
     /// In the stub this is typically a singleton; future renderers
     /// may coalesce adjacent same-role spans into one message.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub source_span_ids: Vec<String>,
+    pub(crate) source_span_ids: Vec<SpanId>,
     /// Cache annotation, populated by a [`CacheStrategy::annotate`]
     /// pass. `None` means "no cache directive at this position."
     ///
     /// [`CacheStrategy::annotate`]: super::cache::CacheStrategy::annotate
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_marker: Option<CacheMarker>,
+    pub(crate) cache_marker: Option<CacheMarker>,
+}
+
+impl ProviderMessage {
+    /// Constructor for external crates (the renderer impls outside
+    /// `mu_core::context`). `cache_marker` is `None` — a
+    /// [`CacheStrategy::annotate`] pass attaches it via
+    /// [`Self::set_cache_marker`].
+    ///
+    /// [`CacheStrategy::annotate`]: super::cache::CacheStrategy::annotate
+    pub fn new(
+        role: ProviderRole,
+        content: impl Into<MessageText>,
+        source_span_ids: Vec<SpanId>,
+    ) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            source_span_ids,
+            cache_marker: None,
+        }
+    }
+
+    /// Conversational role for this message.
+    pub fn role(&self) -> ProviderRole {
+        self.role
+    }
+
+    /// Flat-text content of the message.
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    /// Back-pointer to the rope span(s) that produced this message.
+    pub fn source_span_ids(&self) -> &[SpanId] {
+        &self.source_span_ids
+    }
+
+    /// Cache annotation attached by a
+    /// [`CacheStrategy::annotate`] pass, if any.
+    ///
+    /// [`CacheStrategy::annotate`]: super::cache::CacheStrategy::annotate
+    pub fn cache_marker(&self) -> Option<CacheMarker> {
+        self.cache_marker
+    }
+
+    /// Setter for [`Self::cache_marker`]. Used by external
+    /// [`CacheStrategy`](super::cache::CacheStrategy) impls that
+    /// annotate already-rendered messages.
+    pub fn set_cache_marker(&mut self, marker: Option<CacheMarker>) {
+        self.cache_marker = marker;
+    }
 }
 
 /// Cache annotation attached to a [`ProviderMessage`] by a
@@ -292,9 +355,9 @@ impl FauxProviderRenderer {
     /// table at lines 627-634.
     fn render_content(span: &Span, target: ProjectionTarget) -> String {
         match target {
-            ProjectionTarget::AgentView => span.content.clone(),
+            ProjectionTarget::AgentView => span.content.to_string(),
             ProjectionTarget::OperatorView => match &span.kind {
-                SpanKind::System | SpanKind::User | SpanKind::Assistant => span.content.clone(),
+                SpanKind::System | SpanKind::User | SpanKind::Assistant => span.content.to_string(),
                 SpanKind::ToolResult => {
                     format!("[tool-result:{}] {}", span.id, summary_line(&span.content))
                 }
@@ -333,7 +396,7 @@ impl ProviderRenderer for FauxProviderRenderer {
             .iter()
             .map(|span| ProviderMessage {
                 role: (&span.kind).into(),
-                content: Self::render_content(span, target),
+                content: Self::render_content(span, target).into(),
                 source_span_ids: vec![span.id.clone()],
                 cache_marker: None,
             })
@@ -379,7 +442,7 @@ mod tests {
     fn faux_renderer_maps_span_kind_to_role() {
         let rope = sample_rope();
         let rendered = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
-        let roles: Vec<ProviderRole> = rendered.messages.iter().map(|m| m.role).collect();
+        let roles: Vec<ProviderRole> = rendered.messages.iter().map(|m| m.role()).collect();
         assert_eq!(
             roles,
             vec![
@@ -395,8 +458,8 @@ mod tests {
     fn agent_view_renders_raw_content() {
         let rope = sample_rope();
         let rendered = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
-        assert_eq!(rendered.messages[0].content, "you are mu");
-        assert_eq!(rendered.messages[1].content, "hi");
+        assert_eq!(rendered.messages[0].content(), "you are mu");
+        assert_eq!(rendered.messages[1].content(), "hi");
     }
 
     #[test]
@@ -404,9 +467,9 @@ mod tests {
         let rope = sample_rope();
         let rendered = FauxProviderRenderer::new().render(&rope, ProjectionTarget::OperatorView);
         assert_eq!(rendered.target, ProjectionTarget::OperatorView);
-        assert_eq!(rendered.messages[0].content, "you are mu");
-        assert_eq!(rendered.messages[1].content, "hi");
-        assert_eq!(rendered.messages[2].content, "hello");
+        assert_eq!(rendered.messages[0].content(), "you are mu");
+        assert_eq!(rendered.messages[1].content(), "hi");
+        assert_eq!(rendered.messages[2].content(), "hello");
     }
 
     #[test]
@@ -414,7 +477,7 @@ mod tests {
         let rope = sample_rope();
         let rendered = FauxProviderRenderer::new().render(&rope, ProjectionTarget::OperatorView);
         assert_eq!(
-            rendered.messages[3].content,
+            rendered.messages[3].content(),
             "[tool-result:t1] {\"ok\":true}"
         );
     }
@@ -466,9 +529,11 @@ mod tests {
         let rendered = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
         for (msg, span) in rendered.messages.iter().zip(rope.spans()) {
             assert_eq!(
-                msg.content, span.content,
+                msg.content(),
+                span.content(),
                 "AgentView for original kind {:?} (id={}) must be verbatim",
-                span.kind, span.id,
+                span.kind(),
+                span.id(),
             );
         }
     }
@@ -479,9 +544,11 @@ mod tests {
         let rendered = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
         for (msg, span) in rendered.messages.iter().zip(rope.spans()) {
             assert_eq!(
-                msg.content, span.content,
+                msg.content(),
+                span.content(),
                 "AgentView for enriched kind {:?} (id={}) must be verbatim",
-                span.kind, span.id,
+                span.kind(),
+                span.id(),
             );
         }
     }
@@ -495,8 +562,8 @@ mod tests {
 
         let mut differing = 0usize;
         for (a, o) in agent.messages.iter().zip(operator.messages.iter()) {
-            assert_eq!(a.role, o.role, "role identity across projections");
-            if a.content != o.content {
+            assert_eq!(a.role(), o.role(), "role identity across projections");
+            if a.content() != o.content() {
                 differing += 1;
             }
         }
@@ -511,11 +578,7 @@ mod tests {
     fn operator_view_applies_expected_per_kind_shapes() {
         let rope = enriched_rope();
         let rendered = FauxProviderRenderer::new().render(&rope, ProjectionTarget::OperatorView);
-        let contents: Vec<&str> = rendered
-            .messages
-            .iter()
-            .map(|m| m.content.as_str())
-            .collect();
+        let contents: Vec<&str> = rendered.messages.iter().map(|m| m.content()).collect();
         assert_eq!(contents[0], "[call:call-bash] bash(command=\"ls\")");
         assert_eq!(contents[1], "[tool:bash]");
         assert_eq!(contents[2], "[skill:goal-protocol]");
@@ -532,7 +595,7 @@ mod tests {
         let rope = sample_rope();
         let rendered = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
         for (msg, span) in rendered.messages.iter().zip(rope.spans()) {
-            assert_eq!(msg.source_span_ids, vec![span.id.clone()]);
+            assert_eq!(msg.source_span_ids(), std::slice::from_ref(&span.id));
         }
     }
 

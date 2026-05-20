@@ -90,7 +90,7 @@ fn echo_events(messages: &[AgentMessage]) -> Vec<ProviderEvent> {
     vec![
         ProviderEvent::TextDelta(text.clone()),
         ProviderEvent::Done(AssistantMessage {
-            content: vec![ContentBlock::Text { text }],
+            content: vec![ContentBlock::Text { text: text.into() }],
             stop_reason: StopReason::EndTurn,
             usage: None,
         }),
@@ -113,7 +113,7 @@ mod tests {
             },
             AgentMessage::Assistant(AssistantMessage {
                 content: vec![ContentBlock::Text {
-                    text: "assistant".to_owned(),
+                    text: "assistant".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: None,
@@ -140,7 +140,7 @@ mod tests {
                 content,
                 stop_reason: StopReason::EndTurn,
                 usage: _,
-            })) if content == &vec![ContentBlock::Text { text: "hello".to_owned() }]
+            })) if content == &vec![ContentBlock::Text { text: "hello".into() }]
         ));
         Ok(())
     }

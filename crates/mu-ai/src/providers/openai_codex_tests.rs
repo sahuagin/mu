@@ -310,7 +310,7 @@ async fn b6_sse_text_only() {
             assert_eq!(msg.stop_reason, StopReason::EndTurn);
             assert_eq!(msg.content.len(), 1);
             match &msg.content[0] {
-                ContentBlock::Text { text } => assert_eq!(text, "hello world"),
+                ContentBlock::Text { text } => assert_eq!(text.as_ref(), "hello world"),
                 other => panic!("expected Text, got {other:?}"),
             }
         }
@@ -423,7 +423,7 @@ async fn b7b_sse_mixed_text_and_tool() {
     assert_eq!(done.stop_reason, StopReason::ToolUse);
     assert_eq!(done.content.len(), 2);
     match &done.content[0] {
-        ContentBlock::Text { text } => assert_eq!(text, "reading "),
+        ContentBlock::Text { text } => assert_eq!(text.as_ref(), "reading "),
         other => panic!("expected Text, got {other:?}"),
     }
     match &done.content[1] {
@@ -537,7 +537,7 @@ async fn cancel_mid_stream_yields_aborted() {
     ));
     // Partial text preserved.
     match &done.content[..] {
-        [ContentBlock::Text { text }] => assert_eq!(text, "partial"),
+        [ContentBlock::Text { text }] => assert_eq!(text.as_ref(), "partial"),
         other => panic!("expected Text content, got {other:?}"),
     }
 }

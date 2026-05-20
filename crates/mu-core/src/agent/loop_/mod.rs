@@ -818,8 +818,12 @@ async fn run(
                 let _ = projection;
                 let span_count = rope.len() as u32;
                 let cache_boundary_count = cache_boundaries.len() as u32;
-                let first_span_ids: Vec<String> =
-                    rope.spans().iter().take(5).map(|s| s.id.clone()).collect();
+                let first_span_ids: Vec<String> = rope
+                    .spans()
+                    .iter()
+                    .take(5)
+                    .map(|s| s.id.to_string())
+                    .collect();
                 let provider_label = provider.provider_label().to_owned();
 
                 model_call_id += 1;

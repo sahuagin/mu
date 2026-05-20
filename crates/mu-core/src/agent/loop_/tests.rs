@@ -233,9 +233,7 @@ fn user_msg(content: &str) -> AgentMessage {
 
 fn assistant_text(text: &str) -> AssistantMessage {
     AssistantMessage {
-        content: vec![ContentBlock::Text {
-            text: text.to_owned(),
-        }],
+        content: vec![ContentBlock::Text { text: text.into() }],
         stop_reason: StopReason::EndTurn,
         usage: None,
     }
@@ -800,9 +798,7 @@ async fn b7_user_message_during_tool_pushes_to_back() {
 
 fn assistant_text_msg(text: &str) -> AssistantMessage {
     AssistantMessage {
-        content: vec![ContentBlock::Text {
-            text: text.to_owned(),
-        }],
+        content: vec![ContentBlock::Text { text: text.into() }],
         stop_reason: StopReason::EndTurn,
         usage: None,
     }
@@ -1035,9 +1031,7 @@ fn mock_provider_one_tool_call(tool_name: &str, args: Value) -> MockProvider {
     let second_turn = vec![
         ProviderEvent::TextDelta("ok".to_string()),
         ProviderEvent::Done(AssistantMessage {
-            content: vec![ContentBlock::Text {
-                text: "ok".to_string(),
-            }],
+            content: vec![ContentBlock::Text { text: "ok".into() }],
             stop_reason: StopReason::EndTurn,
             usage: None,
         }),
@@ -1736,7 +1730,7 @@ impl CompactionPolicy for EvictHalfPolicy {
             .iter()
             .skip(keep)
             .map(|s| CompactionDecision::Dropped {
-                span_id: s.id.clone(),
+                span_id: s.id.to_string(),
                 reason: "evict-half mock".to_owned(),
             })
             .collect();

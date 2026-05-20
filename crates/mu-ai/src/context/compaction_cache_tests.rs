@@ -82,11 +82,11 @@ impl CompactionPolicy for MockDropPolicy {
 
         // First pass: identify earliest absorbed index.
         for (i, span) in spans.iter().enumerate() {
-            if !self.keep_ids.contains(&span.id.as_str()) && earliest_absorbed_idx.is_none() {
+            if !self.keep_ids.contains(&span.id()) && earliest_absorbed_idx.is_none() {
                 earliest_absorbed_idx = Some(i);
             }
-            if !self.keep_ids.contains(&span.id.as_str()) {
-                absorbed_ids.push(span.id.clone());
+            if !self.keep_ids.contains(&span.id()) {
+                absorbed_ids.push(span.id().to_string());
             }
         }
 
@@ -94,10 +94,12 @@ impl CompactionPolicy for MockDropPolicy {
             return mu_core::context::CompactionResult::identity(rope.clone());
         }
 
+        let absorbed_arcs: Vec<Arc<str>> =
+            absorbed_ids.iter().map(|s| Arc::from(s.as_str())).collect();
         let summary_span = Span::new(
             "mock-summary",
             SpanKind::CompactionSummary {
-                absorbed_span_ids: absorbed_ids.clone(),
+                absorbed_span_ids: absorbed_arcs,
                 generated_at_unix_ms: 0,
                 policy_id: "mock-drop-v1".to_string(),
             },
@@ -112,7 +114,7 @@ impl CompactionPolicy for MockDropPolicy {
                 new_spans.push(summary_span.clone());
                 inserted = true;
             }
-            if self.keep_ids.contains(&span.id.as_str()) {
+            if self.keep_ids.contains(&span.id()) {
                 new_spans.push(span.clone());
             }
         }
@@ -147,8 +149,8 @@ fn last_eligible_index(rope: &RetainedRope) -> Option<usize> {
         .enumerate()
         .rev()
         .find(|(_, s)| {
-            let is_summary = matches!(s.kind, SpanKind::CompactionSummary { .. });
-            (s.retention.is_stable() && s.cacheable) || is_summary
+            let is_summary = matches!(s.kind(), SpanKind::CompactionSummary { .. });
+            (s.retention().is_stable() && s.cacheable()) || is_summary
         })
         .map(|(i, _)| i)
 }
@@ -159,7 +161,7 @@ fn last_eligible_index(rope: &RetainedRope) -> Option<usize> {
 fn last_contiguous_stable_index(rope: &RetainedRope) -> Option<usize> {
     let mut last: Option<usize> = None;
     for (i, s) in rope.spans().iter().enumerate() {
-        if s.retention.is_stable() && s.cacheable {
+        if s.retention().is_stable() && s.cacheable() {
             last = Some(i);
         } else {
             break;
@@ -211,7 +213,7 @@ fn drop_volatile_tail_extends_boundary_to_summary_span() {
 
     assert_eq!(post_rope.len(), 4, "kept(3) + 1 summary span");
     assert!(matches!(
-        post_rope.spans()[3].kind,
+        post_rope.spans()[3].kind(),
         SpanKind::CompactionSummary { .. }
     ));
 
@@ -262,10 +264,10 @@ fn absorb_volatile_prefix_creates_cacheable_prefix() {
     // [summary(Pinned), a1(Hot)] — both stable+cacheable.
     assert_eq!(post_rope.len(), 2);
     assert!(matches!(
-        post_rope.spans()[0].kind,
+        post_rope.spans()[0].kind(),
         SpanKind::CompactionSummary { .. }
     ));
-    assert_eq!(post_rope.spans()[1].id, "a1");
+    assert_eq!(post_rope.spans()[1].id(), "a1");
 
     let post = boundaries(&post_rope);
     assert_eq!(
@@ -304,7 +306,7 @@ fn absorb_interior_volatile_extends_prefix_past_old_truncation() {
 
     assert_eq!(post_rope.len(), 4);
     assert!(matches!(
-        post_rope.spans()[2].kind,
+        post_rope.spans()[2].kind(),
         SpanKind::CompactionSummary { .. }
     ));
 
@@ -369,7 +371,7 @@ fn absorb_all_yields_single_summary_with_boundary_at_zero() {
 
     assert_eq!(post_rope.len(), 1);
     assert!(matches!(
-        post_rope.spans()[0].kind,
+        post_rope.spans()[0].kind(),
         SpanKind::CompactionSummary { .. }
     ));
     assert_eq!(boundaries(&post_rope), vec![CacheBoundary::at(0)]);
@@ -476,8 +478,8 @@ fn boundary_falls_within_kept_stable_region_for_every_scenario() {
             // no eligible span at position 0.
             let head_eligible = {
                 let s = &post_rope.spans()[0];
-                let is_summary = matches!(s.kind, SpanKind::CompactionSummary { .. });
-                (s.retention.is_stable() && s.cacheable) || is_summary
+                let is_summary = matches!(s.kind(), SpanKind::CompactionSummary { .. });
+                (s.retention().is_stable() && s.cacheable()) || is_summary
             };
             assert!(
                 !head_eligible,
@@ -579,11 +581,11 @@ fn real_hash_and_summary_policy_produces_cacheable_summary_span() {
     // [sys, u1, a1, summary(Pinned)] — summary at the position of the
     // earliest absorbed span (t1 was index 3).
     assert_eq!(post_rope.len(), 4);
-    assert_eq!(post_rope.spans()[0].id, "sys");
-    assert_eq!(post_rope.spans()[1].id, "u1");
-    assert_eq!(post_rope.spans()[2].id, "a1");
+    assert_eq!(post_rope.spans()[0].id(), "sys");
+    assert_eq!(post_rope.spans()[1].id(), "u1");
+    assert_eq!(post_rope.spans()[2].id(), "a1");
     assert!(matches!(
-        post_rope.spans()[3].kind,
+        post_rope.spans()[3].kind(),
         SpanKind::CompactionSummary { .. }
     ));
 
@@ -602,13 +604,13 @@ fn real_hash_and_summary_policy_produces_cacheable_summary_span() {
     for (i, m) in rendered.messages.iter().enumerate() {
         if i == 3 {
             assert_eq!(
-                m.cache_marker,
+                m.cache_marker(),
                 Some(CacheMarker::Ephemeral),
                 "summary span must carry Ephemeral",
             );
         } else {
             assert!(
-                m.cache_marker.is_none(),
+                m.cache_marker().is_none(),
                 "message {i} must not carry marker"
             );
         }

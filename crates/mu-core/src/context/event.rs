@@ -22,6 +22,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::rope::SpanId;
+
 /// Event introduced or retired by a [`RetainedRope`] operation.
 ///
 /// The variant set mirrors the four operations [`RetainedRope`]
@@ -46,7 +48,7 @@ pub enum RopeEvent {
     /// `SkillManager::activate` call is the source of this event.
     SkillActivated {
         skill_id: String,
-        span_ids: Vec<String>,
+        span_ids: Vec<SpanId>,
     },
     /// A skill was deactivated. `span_ids` echo the spans removed
     /// from the rope as a result. The matching `SkillActivated`
@@ -54,16 +56,16 @@ pub enum RopeEvent {
     /// is mutated.
     SkillDeactivated {
         skill_id: String,
-        span_ids: Vec<String>,
+        span_ids: Vec<SpanId>,
     },
     /// A tool's schema span was added to the rope. `tool_name` and
     /// `span_id` together identify which schema; `tool_name` is the
     /// stable handle, `span_id` is the rope-local id (typically
     /// `format!("tool-schema:{tool_name}")`).
-    ToolSchemaRegistered { tool_name: String, span_id: String },
+    ToolSchemaRegistered { tool_name: String, span_id: SpanId },
     /// A tool's schema span was removed from the rope (typically
     /// because the tool was unregistered or replaced).
-    ToolSchemaUnregistered { tool_name: String, span_id: String },
+    ToolSchemaUnregistered { tool_name: String, span_id: SpanId },
 }
 
 impl RopeEvent {
@@ -75,10 +77,10 @@ impl RopeEvent {
         match self {
             RopeEvent::SkillActivated { span_ids, .. }
             | RopeEvent::SkillDeactivated { span_ids, .. } => {
-                span_ids.iter().map(String::as_str).collect()
+                span_ids.iter().map(AsRef::as_ref).collect()
             }
             RopeEvent::ToolSchemaRegistered { span_id, .. }
-            | RopeEvent::ToolSchemaUnregistered { span_id, .. } => vec![span_id.as_str()],
+            | RopeEvent::ToolSchemaUnregistered { span_id, .. } => vec![span_id.as_ref()],
         }
     }
 

@@ -92,7 +92,7 @@ fn record_drop(
     dropped[idx] = true;
     *tokens_after = tokens_after.saturating_sub(sizes[idx]);
     decisions.push(CompactionDecision::Dropped {
-        span_id: spans[idx].id.clone(),
+        span_id: spans[idx].id.to_string(),
         reason: reason.to_string(),
     });
 }
@@ -265,7 +265,7 @@ mod tests {
     }
 
     fn surviving_ids(result: &CompactionResult) -> Vec<&str> {
-        result.rope.spans().iter().map(|s| s.id.as_str()).collect()
+        result.rope.spans().iter().map(|s| s.id()).collect()
     }
 
     /// mu-kgu.10: helper for computing tokenizer-relative targets so

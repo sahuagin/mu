@@ -240,9 +240,9 @@ mod tests {
         assert!(reg.get("read").is_some());
         assert_eq!(rope.len(), 1);
         assert_eq!(rope.spans()[0].kind, SpanKind::ToolSchema);
-        assert_eq!(rope.spans()[0].id, "tool-schema:read");
+        assert_eq!(rope.spans()[0].id(), "tool-schema:read");
         // Content carries the serialized schema.
-        assert!(rope.spans()[0].content.contains("\"name\":\"read\""));
+        assert!(rope.spans()[0].content().contains("\"name\":\"read\""));
     }
 
     #[test]
@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(reg.len(), 1);
         assert!(reg.get("read").is_none());
         assert_eq!(rope.len(), 1);
-        assert_eq!(rope.spans()[0].id, "tool-schema:write");
+        assert_eq!(rope.spans()[0].id(), "tool-schema:write");
     }
 
     #[test]
@@ -315,7 +315,7 @@ mod tests {
         let cap = allow(&["read", "bash"]);
         let view = reg.filter_tool_spans(&rope, &cap);
         assert_eq!(view.len(), 2);
-        let ids: HashSet<&str> = view.iter().map(|s| s.id.as_str()).collect();
+        let ids: HashSet<&str> = view.iter().map(|s| s.id()).collect();
         assert!(ids.contains("tool-schema:read"));
         assert!(ids.contains("tool-schema:bash"));
     }

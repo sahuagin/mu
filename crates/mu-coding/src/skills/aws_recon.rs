@@ -180,8 +180,11 @@ mod tests {
 
         assert_eq!(activation.skill.id, "aws-recon");
         assert_eq!(activation.skill.spans.len(), 1);
-        assert_eq!(activation.skill.spans[0].kind, SpanKind::SkillActivation);
-        assert_eq!(activation.skill.spans[0].retention, RetentionClass::Pinned);
+        assert_eq!(activation.skill.spans[0].kind(), &SpanKind::SkillActivation);
+        assert_eq!(
+            activation.skill.spans[0].retention(),
+            RetentionClass::Pinned
+        );
 
         assert_eq!(
             activation.capability_request.allowed_tools,
@@ -194,7 +197,7 @@ mod tests {
         }));
 
         let content: Value =
-            serde_json::from_str(&activation.skill.spans[0].content).expect("activation json");
+            serde_json::from_str(activation.skill.spans[0].content()).expect("activation json");
         assert_eq!(content["kind"], "skill_activated");
         assert_eq!(content["skill_id"], "aws-recon");
         assert_eq!(
@@ -233,9 +236,9 @@ mod tests {
         assert!(skill_manager.is_active("aws-recon"));
         assert!(tool_registry.get("aws_recon").is_some());
         assert_eq!(rope.len(), 2);
-        assert_eq!(rope.spans()[0].kind, SpanKind::SkillActivation);
-        assert_eq!(rope.spans()[1].kind, SpanKind::ToolSchema);
-        assert_eq!(rope.spans()[1].id, "tool-schema:aws_recon");
+        assert_eq!(rope.spans()[0].kind(), &SpanKind::SkillActivation);
+        assert_eq!(rope.spans()[1].kind(), &SpanKind::ToolSchema);
+        assert_eq!(rope.spans()[1].id(), "tool-schema:aws_recon");
         assert_eq!(tool_registry.attenuated_names(&cap), vec!["aws_recon"]);
 
         assert!(matches!(

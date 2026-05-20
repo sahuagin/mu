@@ -117,35 +117,38 @@ pub fn append_messages_to_baseline(
 
 fn message_to_span(idx: usize, message: &AgentMessage) -> Span {
     match message {
-        AgentMessage::User { content } => Span {
-            id: format!("msg-{idx}-user"),
-            kind: SpanKind::User,
-            content: content.clone(),
-            retention: RetentionClass::Hot,
-            cacheable: false,
-        },
-        AgentMessage::Assistant(assistant) => Span {
-            id: format!("msg-{idx}-assistant"),
-            kind: SpanKind::Assistant,
-            content: flatten_assistant(&assistant.content),
-            retention: RetentionClass::Hot,
-            cacheable: false,
-        },
+        AgentMessage::User { content } => Span::with_cacheable(
+            format!("msg-{idx}-user"),
+            SpanKind::User,
+            content.clone(),
+            RetentionClass::Hot,
+            false,
+        ),
+        AgentMessage::Assistant(assistant) => Span::with_cacheable(
+            format!("msg-{idx}-assistant"),
+            SpanKind::Assistant,
+            flatten_assistant(&assistant.content),
+            RetentionClass::Hot,
+            false,
+        ),
         AgentMessage::ToolResult {
             call_id,
             content,
             is_error,
-        } => Span {
-            id: format!("msg-{idx}-tool-result:{call_id}"),
-            kind: SpanKind::ToolResult,
-            content: if *is_error {
+        } => {
+            let body = if *is_error {
                 format!("error: {content}")
             } else {
                 content.clone()
-            },
-            retention: RetentionClass::Warm,
-            cacheable: false,
-        },
+            };
+            Span::with_cacheable(
+                format!("msg-{idx}-tool-result:{call_id}"),
+                SpanKind::ToolResult,
+                body,
+                RetentionClass::Warm,
+                false,
+            )
+        }
     }
 }
 
@@ -157,7 +160,7 @@ fn flatten_assistant(blocks: &[ContentBlock]) -> String {
     let pieces: Vec<String> = blocks
         .iter()
         .map(|b| match b {
-            ContentBlock::Text { text } => text.clone(),
+            ContentBlock::Text { text } => text.to_string(),
             ContentBlock::ToolCall(tc) => format!(
                 "[tool_call:{}({})]",
                 tc.name,
@@ -269,7 +272,7 @@ mod tests {
             is_error: true,
         }];
         let rope = assemble_rope(None, &messages, &[]);
-        assert_eq!(rope.spans()[0].content, "error: permission denied");
+        assert_eq!(rope.spans()[0].content(), "error: permission denied");
         assert_eq!(rope.spans()[0].kind, SpanKind::ToolResult);
     }
 

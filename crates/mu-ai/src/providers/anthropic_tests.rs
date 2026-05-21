@@ -412,6 +412,156 @@ fn yqeq8_projected_without_cache_strategy_emits_no_cache_control() {
     assert!(tool_arr[0].get("cache_control").is_none());
 }
 
+#[test]
+fn mu_s855_projected_concatenates_memory_injection_and_file_load_into_system_block() {
+    // mu-s855 regression test. mu-phl v0 introduced MemoryInjection +
+    // FileLoad spans into the rope via assemble_rope_with_context. The
+    // Anthropic Projected arm must include their content in
+    // body.system[0].text (Anthropic's system field can be a string or
+    // an array of content blocks; mu currently emits a single text
+    // block with all System-role content concatenated).
+    //
+    // Pre-fix this test failed: translate_provider_messages only
+    // captured the span with id literally "system-prompt" and silently
+    // dropped memory-recall:* + project-file:* spans.
+    //
+    // Codex sibling: mu-2puu. OpenRouter sibling: mu-745h.
+    use mu_core::context::{
+        assemble_rope_with_context, ProjectContext, ProjectionTarget, ProviderRenderer,
+        RecallSource, RecalledItem,
+    };
+    use std::path::PathBuf;
+
+    let memory_blob = "## Active Memory Context\n\nfavorite color is 'cat'";
+    let claude_md_text = "# CLAUDE.md\n\nuse SpanText for content fields.";
+
+    let project_context = ProjectContext {
+        items: vec![
+            RecalledItem {
+                source: RecallSource::Memory,
+                content: memory_blob.into(),
+                stable_id: "abc123".into(),
+            },
+            RecalledItem {
+                source: RecallSource::ProjectFile {
+                    path: PathBuf::from("/home/u/CLAUDE.md"),
+                },
+                content: claude_md_text.into(),
+                stable_id: "def456".into(),
+            },
+        ],
+    };
+
+    let messages = vec![AgentMessage::User {
+        content: "hi".into(),
+    }];
+    let rope =
+        assemble_rope_with_context(Some("you are mu"), Some(&project_context), &messages, &[]);
+    let projection =
+        crate::context::AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let body = build_request_body_from_projection("claude-test", &projection, &[]);
+
+    let sys_arr = body.get("system").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(sys_arr.len(), 1, "expect one consolidated system block");
+    let sys_text = sys_arr[0]["text"].as_str().unwrap_or("");
+
+    assert!(
+        sys_text.contains("you are mu"),
+        "system prompt missing: {sys_text:?}",
+    );
+    assert!(
+        sys_text.contains("favorite color is 'cat'"),
+        "memory-recall content missing: {sys_text:?}",
+    );
+    assert!(
+        sys_text.contains("use SpanText for content fields."),
+        "project-file content missing: {sys_text:?}",
+    );
+}
+
+#[test]
+fn mu_s855_projected_excludes_tool_schema_from_system_block() {
+    // Tool-schema spans map to ProviderRole::System but MUST NOT
+    // appear in body.system — tools go separately via body.tools.
+    use mu_core::context::{assemble_rope, ProjectionTarget, ProviderRenderer};
+
+    let tools = vec![ToolSpec {
+        name: "read".into(),
+        description: "read a file content here".into(),
+        input_schema: json!({ "type": "object" }),
+        policy: Default::default(),
+    }];
+    let messages = vec![AgentMessage::User {
+        content: "go".into(),
+    }];
+    let rope = assemble_rope(Some("system-only-text"), &messages, &tools);
+    let projection =
+        crate::context::AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let body = build_request_body_from_projection("claude-test", &projection, &tools);
+
+    let sys_arr = body.get("system").and_then(|v| v.as_array()).unwrap();
+    let sys_text = sys_arr[0]["text"].as_str().unwrap_or("");
+    assert!(
+        sys_text.contains("system-only-text"),
+        "system prompt missing: {sys_text:?}",
+    );
+    // Tool-schema content (description, JSON schema) MUST NOT appear
+    // in the system block. The description string we check for is
+    // distinctive enough that an accidental leak would catch it.
+    assert!(
+        !sys_text.contains("read a file content here"),
+        "tool-schema content leaked into system block: {sys_text:?}",
+    );
+}
+
+#[test]
+fn mu_s855_cache_marker_on_recall_span_triggers_system_cache_control() {
+    // mu-s855 issue 2: when AnthropicCacheStrategy places a cache
+    // marker on a memory-recall:* or project-file:* span (which it
+    // can post-mu-phl since those are stable+cacheable spans extending
+    // the cacheable prefix), detect_cache_targets must recognize the
+    // marker as a system_should_cache trigger — those spans now
+    // contribute to body.system.
+    //
+    // Pre-fix the detect_cache_targets helper only triggered on the
+    // literal "system-prompt" span id, so markers on recall spans
+    // were effectively dead.
+    use mu_core::context::{
+        assemble_rope_with_context, CacheStrategy, ProjectContext, ProjectionTarget,
+        ProviderRenderer, RecallSource, RecalledItem,
+    };
+    use std::path::PathBuf;
+
+    let project_context = ProjectContext {
+        items: vec![RecalledItem {
+            source: RecallSource::ProjectFile {
+                path: PathBuf::from("/home/u/CLAUDE.md"),
+            },
+            content: "project content".into(),
+            stable_id: "x".into(),
+        }],
+    };
+    let messages = vec![AgentMessage::User {
+        content: "hi".into(),
+    }];
+    let rope =
+        assemble_rope_with_context(Some("you are mu"), Some(&project_context), &messages, &[]);
+    let mut projection =
+        crate::context::AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let strategy = crate::context::AnthropicCacheStrategy::new();
+    let boundaries = strategy.boundaries(&rope);
+    strategy.annotate(&mut projection, &boundaries);
+    let body = build_request_body_from_projection("claude-test", &projection, &[]);
+
+    let sys = &body["system"].as_array().expect("system array")[0];
+    assert_eq!(
+        sys["cache_control"],
+        json!({ "type": "ephemeral" }),
+        "system block must carry cache_control when the cache strategy \
+         marks any non-tool-schema System-role span (mu-s855)",
+    );
+}
+
 fn assistant_text(text: &str) -> AgentMessage {
     AgentMessage::Assistant(AssistantMessage {
         content: vec![ContentBlock::Text { text: text.into() }],

@@ -19,6 +19,9 @@ use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
     ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
 };
+use mu_core::context::{
+    extract_call_id_from_span_id, ProviderMessage, ProviderMessages, ProviderRole,
+};
 
 use super::sse::{SseEvent, SseStream};
 
@@ -66,19 +69,33 @@ impl Provider for OpenRouterProvider {
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
-        // mu-yqeq.3: only Legacy is implemented today. mu-yqeq.6 will
-        // split the `_` arm into MessageInput::Projected(p).
-        let messages = match input {
-            MessageInput::Legacy(msgs) => msgs,
+        // mu-yqeq.6: sealed-enum dispatch (Legacy + Projected). The
+        // `_` arm remains for forward-compat with future MessageInput
+        // variants — adding one will compile-warn here for review.
+        //
+        // Projected arm produces byte-identical wire JSON to the
+        // Legacy arm; the `yqeq6_parity_*` tests in
+        // openrouter_tests.rs assert that invariant for the canonical
+        // scenarios. The agent loop's mod.rs:818 still passes Legacy
+        // until mu-yqeq.8 wires the cutover.
+        let body = match input {
+            MessageInput::Legacy(msgs) => {
+                build_request_body(&self.model, system_prompt, msgs, tools)
+            }
+            MessageInput::Projected(pmsgs) => {
+                // The projection itself carries the session system
+                // prompt (assemble_rope put it there from
+                // `system_prompt`); the helper prepends it as a
+                // `{role: "system", ...}` message when non-empty —
+                // matching Legacy's `mu-n48` prepend logic.
+                build_request_body_from_projection(&self.model, pmsgs, tools)
+            }
             _ => {
                 return Err(ProviderError::Other(
-                    "OpenRouterProvider: only MessageInput::Legacy is currently supported \
-                     (mu-yqeq.6 will add Projected)"
-                        .to_string(),
+                    "OpenRouterProvider: unrecognized MessageInput variant".to_string(),
                 ));
             }
         };
-        let body = build_request_body(&self.model, system_prompt, messages, tools);
         let resp = self
             .client
             .post(format!("{}/api/v1/chat/completions", self.api_base))
@@ -214,6 +231,167 @@ pub(crate) fn build_request_body(
         // Ask the streamer to emit a final usage chunk; without this,
         // most OpenAI-compatible backends omit usage from streaming
         // responses entirely.
+        "stream_options": {"include_usage": true},
+        "messages": api_messages,
+    });
+    if !tools.is_empty() {
+        body["tools"] = json!(tools.iter().map(translate_tool_spec).collect::<Vec<_>>());
+    }
+    body
+}
+
+// ============================================================================
+// mu-yqeq.6: Projected path — wire body built from &ProviderMessages
+// ============================================================================
+//
+// Mirrors `translate_message` + `build_request_body` semantics but
+// reads structural `ContentBlock`s from `ProviderMessage.blocks`
+// instead of `AgentMessage::Assistant.content`. The session
+// system-prompt span (`source_span_ids[0] == "system-prompt"`) is
+// PREPENDED to the messages array as `{role: "system", content: ...}`
+// (matching Legacy's `mu-n48` behavior). Tool-schema spans are
+// silently dropped (the `tools` parameter is authoritative for
+// `body.tools`).
+//
+// Wire-format byte equivalence with the Legacy path is the contract;
+// see `yqeq6_parity_*` tests in openrouter_tests.rs for the canonical
+// scenarios.
+
+/// Translate a [`ProviderMessages`] projection into the OpenAI
+/// chat-completions `messages` array shape. The session
+/// system-prompt (if any, and non-empty) is emitted as the FIRST
+/// message with `role: "system"`, matching Legacy's `mu-n48`
+/// prepend behavior.
+fn translate_provider_messages_openrouter(pmsgs: &ProviderMessages) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(pmsgs.messages.len());
+    let mut system_emitted = false;
+
+    for msg in &pmsgs.messages {
+        match msg.role() {
+            ProviderRole::System => {
+                let is_session_prompt = msg
+                    .source_span_ids()
+                    .first()
+                    .map(|sid| sid.as_ref() == "system-prompt")
+                    .unwrap_or(false);
+                if is_session_prompt && !system_emitted {
+                    let content = msg.content();
+                    if !content.is_empty() {
+                        out.push(json!({
+                            "role": "system",
+                            "content": content,
+                        }));
+                        system_emitted = true;
+                    }
+                }
+                // Tool-schema spans are silently skipped — `tools`
+                // param on Provider::stream is authoritative for the
+                // wire `tools` field.
+            }
+            ProviderRole::User => {
+                out.push(json!({
+                    "role": "user",
+                    "content": msg.content(),
+                }));
+            }
+            ProviderRole::Assistant => {
+                if let Some(translated) = translate_provider_assistant_openrouter(msg) {
+                    out.push(translated);
+                }
+            }
+            ProviderRole::ToolResult => {
+                out.push(translate_provider_tool_result_openrouter(msg));
+            }
+        }
+    }
+
+    out
+}
+
+/// Translate one assistant-role [`ProviderMessage`] into the
+/// OpenAI chat-completions shape: a single message with combined
+/// `content` text plus a `tool_calls` array. Mirrors the Legacy
+/// `translate_message` Assistant arm exactly. `Thinking` blocks are
+/// skipped per spec mu-044 §"Thinking-block skip". Returns `None`
+/// if neither text nor tool calls are present (mirrors the Legacy
+/// elision rule at openrouter.rs:166-169).
+fn translate_provider_assistant_openrouter(msg: &ProviderMessage) -> Option<Value> {
+    let blocks = msg.blocks()?;
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } => text_parts.push(text.to_string()),
+            ContentBlock::ToolCall(tc) => {
+                let args_str =
+                    serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".to_string());
+                tool_calls.push(json!({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": args_str,
+                    }
+                }));
+            }
+            ContentBlock::Thinking { .. } => {}
+        }
+    }
+    let content = text_parts.join("");
+    let mut obj = json!({"role": "assistant"});
+    if !content.is_empty() {
+        obj["content"] = Value::String(content);
+    }
+    if !tool_calls.is_empty() {
+        obj["tool_calls"] = Value::Array(tool_calls);
+    }
+    if obj.get("content").is_none() && obj.get("tool_calls").is_none() {
+        return None;
+    }
+    Some(obj)
+}
+
+/// Translate one tool-result [`ProviderMessage`] into a
+/// `{role: "tool", tool_call_id, content}` message. `tool_call_id`
+/// recovered from the synthesized span id via
+/// `extract_call_id_from_span_id` (mu-yqeq.3 helper); `is_error`
+/// recovered from the `"error: "` prefix added by
+/// `assembly.rs::message_to_span`. Errors re-encoded as
+/// `"[error] {content}"` matching Legacy
+/// `translate_message::AgentMessage::ToolResult`.
+fn translate_provider_tool_result_openrouter(msg: &ProviderMessage) -> Value {
+    let call_id: &str = msg
+        .source_span_ids()
+        .first()
+        .and_then(|sid| extract_call_id_from_span_id(sid.as_ref()))
+        .unwrap_or("");
+    let content: String = match msg.content().strip_prefix("error: ") {
+        Some(stripped) => format!("[error] {stripped}"),
+        None => msg.content().to_string(),
+    };
+    json!({
+        "role": "tool",
+        "tool_call_id": call_id,
+        "content": content,
+    })
+}
+
+/// Sibling of [`build_request_body`] that builds the OpenRouter
+/// (OpenAI chat-completions) request body from a
+/// [`ProviderMessages`] projection instead of a raw
+/// `&[AgentMessage]` slice. Wire JSON is byte-identical to the
+/// Legacy path for the canonical scenarios (asserted by
+/// `yqeq6_parity_*` tests).
+pub(crate) fn build_request_body_from_projection(
+    model: &str,
+    pmsgs: &ProviderMessages,
+    tools: &[ToolSpec],
+) -> Value {
+    let api_messages = translate_provider_messages_openrouter(pmsgs);
+    let mut body = json!({
+        "model": model,
+        "max_tokens": super::output_limits::max_tokens_for_model(model),
+        "stream": true,
         "stream_options": {"include_usage": true},
         "messages": api_messages,
     });

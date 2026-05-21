@@ -52,13 +52,36 @@ impl AnthropicProvider {
         }
     }
 
-    /// API key from `ANTHROPIC_API_KEY`. Fails if unset or empty.
+    /// API key from `ANTHROPIC_API_KEY`, base URL from
+    /// `ANTHROPIC_BASE_URL` (defaults to api.anthropic.com).
+    ///
+    /// When `ANTHROPIC_BASE_URL` points at a non-default base (a local
+    /// proxy or gateway), the API key is allowed to be unset or empty —
+    /// the proxy handles its own auth (OAuth passthrough, OpenRouter
+    /// fallback, etc.) and the `x-api-key` header value is irrelevant.
+    /// When the base is the default api.anthropic.com endpoint,
+    /// `ANTHROPIC_API_KEY` must be set; otherwise the request would be
+    /// rejected.
     pub fn from_env(model: String) -> Result<Self, ProviderError> {
+        let api_base = std::env::var("ANTHROPIC_BASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| ANTHROPIC_API_BASE.to_string());
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .ok()
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| ProviderError::Other("ANTHROPIC_API_KEY not set or empty".into()))?;
-        Ok(Self::new(api_key, model))
+            .unwrap_or_default();
+        if api_key.is_empty() && api_base == ANTHROPIC_API_BASE {
+            return Err(ProviderError::Other(
+                "ANTHROPIC_API_KEY not set or empty (required when ANTHROPIC_BASE_URL points at api.anthropic.com)".into(),
+            ));
+        }
+        Ok(Self {
+            client: reqwest::Client::new(),
+            api_key,
+            model,
+            api_base,
+        })
     }
 
     /// Test hook: override the API base URL for mock servers.

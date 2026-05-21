@@ -106,6 +106,7 @@ pub trait RecallProvider: Send + Sync {
     fn recall(&self, cwd: &Path, capability: &Capability) -> Vec<RecalledItem>;
 }
 
-// Subprocess + project-file impls land in mu-3j32 / mu-zj4e.
-// pub mod subprocess;
-// pub mod project_files;
+pub mod subprocess;
+// pub mod project_files;  // lands in mu-zj4e (Phase C.2)
+
+pub use subprocess::SubprocessRecallProvider;

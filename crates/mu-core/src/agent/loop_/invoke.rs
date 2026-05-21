@@ -5,7 +5,7 @@ use std::time::Instant;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use super::super::provider::Provider;
+use super::super::provider::{MessageInput, Provider};
 use super::super::tool::ToolSpec;
 use super::super::types::{AgentMessage, AssistantMessage, ContentBlock};
 
@@ -43,8 +43,16 @@ pub(crate) async fn handle_invoke_llm(
         .await;
 
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    // mu-yqeq.3: wrap into MessageInput::Legacy. mu-yqeq.8 will switch
+    // the call site to MessageInput::Projected(&projection) once every
+    // C-bead provider implements the Projected arm.
     let mut stream = provider
-        .stream(system_prompt, messages, tool_specs, cancel_rx)
+        .stream(
+            system_prompt,
+            MessageInput::Legacy(messages),
+            tool_specs,
+            cancel_rx,
+        )
         .await
         .map_err(|e| Outcome::Error(e.to_string()))?;
 

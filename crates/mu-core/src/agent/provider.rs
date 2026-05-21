@@ -8,11 +8,41 @@ use tokio::sync::oneshot;
 
 use crate::context::{
     CacheStrategy, CompactionPolicy, FauxProviderRenderer, NoCacheStrategy, NoCompactionPolicy,
-    ProviderRenderer,
+    ProviderMessages, ProviderRenderer,
 };
 
 use super::tool::ToolSpec;
 use super::types::{AgentMessage, AssistantMessage};
+
+/// Sealed-enum input shape for [`Provider::stream`] (mu-yqeq.3).
+///
+/// The agent-loop call boundary remains uniform — every provider's
+/// `stream()` takes one `input: MessageInput<'_>` — while each
+/// provider's impl dispatches internally on the variant:
+///
+/// - [`Self::Legacy`] is the pre-cutover path. The agent loop's raw
+///   `&[AgentMessage]` flows through; each provider's `Legacy` arm
+///   wraps the existing `translate_messages` / `build_request_body`
+///   logic. Wire-format byte-equivalent to pre-mu-yqeq behavior.
+/// - [`Self::Projected`] is the post-cutover path. The agent loop's
+///   per-turn [`ProviderMessages`] projection — already cache-annotated
+///   by the provider's [`CacheStrategy`] — flows through. The `blocks`
+///   field on each message carries structured `ContentBlock`s for
+///   wire reconstruction. Initially every provider returns
+///   [`ProviderError::Other`] from this arm; each Phase C bead
+///   (mu-yqeq.4–7) implements its provider's `Projected` arm.
+///
+/// `#[non_exhaustive]` so future variants can be added without
+/// requiring every downstream `match` to update in lockstep with the
+/// foundation. Spec mu-044 §"Provider trait amendment".
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub enum MessageInput<'a> {
+    /// Pre-cutover input: raw agent-loop messages.
+    Legacy(&'a [AgentMessage]),
+    /// Post-cutover input: rope-derived, cache-annotated projection.
+    Projected(&'a ProviderMessages),
+}
 
 /// Events from a provider's streaming response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +96,11 @@ pub trait Provider: Send + Sync {
         // prepend a {role: "system"} message). None preserves the
         // pre-mu-n48 behavior of "no system prompt sent."
         system_prompt: Option<&str>,
-        messages: &[AgentMessage],
+        // mu-yqeq.3: sealed-enum dispatch. Each provider's impl
+        // matches on the variant. `Legacy` carries the pre-cutover
+        // agent-loop messages; `Projected` carries the rope-derived
+        // projection that Phase C beads (mu-yqeq.4–7) will implement.
+        input: MessageInput<'_>,
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError>;

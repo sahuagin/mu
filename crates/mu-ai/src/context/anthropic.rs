@@ -79,11 +79,15 @@ impl ProviderRenderer for AnthropicProviderRenderer {
         let messages = rope
             .iter()
             .map(|span| {
-                ProviderMessage::new(
+                let msg = ProviderMessage::new(
                     span.kind().into(),
                     span.content(),
                     vec![Arc::from(span.id())],
-                )
+                );
+                match span.blocks() {
+                    Some(blocks) => msg.with_blocks(blocks.to_vec()),
+                    None => msg,
+                }
             })
             .collect();
 

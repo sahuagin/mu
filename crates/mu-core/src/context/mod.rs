@@ -40,7 +40,7 @@ pub mod event;
 pub mod renderer;
 pub mod rope;
 
-pub use assembly::{append_messages_to_baseline, assemble_rope};
+pub use assembly::{append_messages_to_baseline, assemble_rope, extract_call_id_from_span_id};
 pub use cache::{CacheBoundary, CacheStrategy, NoCacheStrategy};
 pub use compaction::{
     BackgroundCompactionState, CompactionDecision, CompactionPolicy, CompactionQuota,

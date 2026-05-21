@@ -43,6 +43,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::rope::{RetainedRope, Span, SpanId, SpanKind};
+use crate::agent::types::ContentBlock;
 
 /// Per-conceptual-type alias for provider-message text payloads
 /// (mu-yqeq.2). Backing storage is `Arc<str>` so [`ProviderMessage`]
@@ -132,7 +133,7 @@ impl From<&SpanKind> for ProviderRole {
 /// Fields are `pub(crate)` so in-crate renderers can construct via
 /// struct literals while external crates use [`ProviderMessage::new`]
 /// + accessor methods. See spec mu-044 §Encapsulation discipline.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderMessage {
     pub(crate) role: ProviderRole,
     pub(crate) content: MessageText,
@@ -147,13 +148,24 @@ pub struct ProviderMessage {
     /// [`CacheStrategy::annotate`]: super::cache::CacheStrategy::annotate
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cache_marker: Option<CacheMarker>,
+    /// Structured content blocks paralleling the flat [`Self::content`]
+    /// projection. Cloned through by renderers from the originating
+    /// [`Span::blocks`](super::rope::Span). `None` when the originating
+    /// span did not carry structured blocks (User, ToolResult, system,
+    /// tool schemas, etc.); `Some(...)` for assistant turns whose
+    /// tool-call / thinking structure the wire adapters (mu-yqeq.4–7)
+    /// will consume directly. Spec mu-044 §"Parallel `blocks` field"
+    /// (mu-yqeq.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) blocks: Option<Vec<ContentBlock>>,
 }
 
 impl ProviderMessage {
     /// Constructor for external crates (the renderer impls outside
-    /// `mu_core::context`). `cache_marker` is `None` — a
-    /// [`CacheStrategy::annotate`] pass attaches it via
-    /// [`Self::set_cache_marker`].
+    /// `mu_core::context`). `cache_marker` and `blocks` are `None` —
+    /// a [`CacheStrategy::annotate`] pass attaches the former via
+    /// [`Self::set_cache_marker`]; structural blocks attach via
+    /// [`Self::with_blocks`].
     ///
     /// [`CacheStrategy::annotate`]: super::cache::CacheStrategy::annotate
     pub fn new(
@@ -166,7 +178,16 @@ impl ProviderMessage {
             content: content.into(),
             source_span_ids,
             cache_marker: None,
+            blocks: None,
         }
+    }
+
+    /// Builder variant: attach structured content blocks. Used by
+    /// external renderer impls when cloning blocks through from the
+    /// originating [`Span`](super::rope::Span).
+    pub fn with_blocks(mut self, blocks: Vec<ContentBlock>) -> Self {
+        self.blocks = Some(blocks);
+        self
     }
 
     /// Conversational role for this message.
@@ -198,6 +219,13 @@ impl ProviderMessage {
     pub fn set_cache_marker(&mut self, marker: Option<CacheMarker>) {
         self.cache_marker = marker;
     }
+
+    /// Structured content blocks for assistant turns. `None` when
+    /// the originating span carried only the flat
+    /// [`Self::content`] projection.
+    pub fn blocks(&self) -> Option<&[ContentBlock]> {
+        self.blocks.as_deref()
+    }
 }
 
 /// Cache annotation attached to a [`ProviderMessage`] by a
@@ -226,7 +254,7 @@ pub enum CacheMarker {
 ///    spec's signature (see lines 597-603).
 ///
 /// [`CacheStrategy::annotate`]: super::cache::CacheStrategy::annotate
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProviderMessages {
     pub messages: Vec<ProviderMessage>,
     /// Echo of the target projection this was rendered for. Helps
@@ -399,6 +427,7 @@ impl ProviderRenderer for FauxProviderRenderer {
                 content: Self::render_content(span, target).into(),
                 source_span_ids: vec![span.id.clone()],
                 cache_marker: None,
+                blocks: span.blocks.clone(),
             })
             .collect();
 

@@ -184,36 +184,52 @@ fn b5_build_request_body_omits_tools_when_empty() {
     assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
 }
 
-// mu-i6j: tool definitions are stable across asks within a
-// session, so they're a high-value cache target. We mark the last
-// tool with cache_control: ephemeral, which tells Anthropic to
-// cache everything up to and including that marker (i.e. the
-// entire tools array).
+// mu-yqeq.8 retired the unconditional cache_control emission from
+// the Legacy build_request_body. AnthropicCacheStrategy is now the
+// sole source; the projected wire emitter propagates per-message
+// cache_marker flags. The Legacy path no longer caches at all —
+// preserved only for rollback and out-of-loop callers.
 
 #[test]
-fn mu_i6j_single_tool_gets_cache_control_marker() {
+fn yqeq8_legacy_build_request_body_emits_no_cache_control() {
     let messages = vec![AgentMessage::User {
         content: "hi".into(),
     }];
-    let tools = vec![ToolSpec {
-        name: "read".into(),
-        description: "Read a file".into(),
-        input_schema: json!({ "type": "object" }),
-        policy: Default::default(),
-    }];
-    let body = build_request_body("claude-test", None, &messages, &tools);
-    let tool = &body["tools"][0];
-    assert_eq!(tool["name"], "read");
-    assert_eq!(
-        tool["cache_control"],
-        json!({ "type": "ephemeral" }),
-        "single tool should carry the cache_control marker"
+    let tools = vec![
+        ToolSpec {
+            name: "read".into(),
+            description: "Read a file".into(),
+            input_schema: json!({ "type": "object" }),
+            policy: Default::default(),
+        },
+        ToolSpec {
+            name: "grep".into(),
+            description: "Search".into(),
+            input_schema: json!({ "type": "object" }),
+            policy: Default::default(),
+        },
+    ];
+    let body = build_request_body("claude-test", Some("be concise"), &messages, &tools);
+
+    let arr = body["system"].as_array().expect("system is array");
+    assert_eq!(arr[0]["text"], "be concise");
+    assert!(
+        arr[0].get("cache_control").is_none(),
+        "Legacy path must not emit cache_control on body.system",
     );
+
+    let tool_arr = body["tools"].as_array().expect("tools array");
+    for (i, tool) in tool_arr.iter().enumerate() {
+        assert!(
+            tool.get("cache_control").is_none(),
+            "Legacy path must not emit cache_control on body.tools[{i}]",
+        );
+    }
 }
 
-// mu-n48: system prompt rendered as content-block array with
-// cache_control: ephemeral. Mirrors the tool-cache pattern so
-// the system block also becomes part of the cacheable prefix.
+// mu-n48: system prompt rendered as content-block array. The
+// content-block shape is preserved post-mu-yqeq.8 (cache_control
+// emission is now strategy-driven, not unconditional).
 
 #[test]
 fn mu_n48_system_prompt_none_omits_system_field() {
@@ -240,7 +256,10 @@ fn mu_n48_system_prompt_empty_omits_system_field() {
 }
 
 #[test]
-fn mu_n48_system_prompt_set_emits_content_block_with_cache_control() {
+fn mu_n48_system_prompt_set_emits_content_block() {
+    // mu-yqeq.8: cache_control is no longer unconditional here —
+    // the content-block shape is preserved (text + type) but
+    // caching is driven by the strategy on the Projected path.
     let messages = vec![AgentMessage::User {
         content: "hi".into(),
     }];
@@ -249,58 +268,148 @@ fn mu_n48_system_prompt_set_emits_content_block_with_cache_control() {
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["type"], "text");
     assert_eq!(arr[0]["text"], "you are concise");
-    assert_eq!(arr[0]["cache_control"], json!({ "type": "ephemeral" }));
+    assert!(arr[0].get("cache_control").is_none());
+}
+
+// mu-yqeq.8: cache_control emission verified via the Projected path
+// with AnthropicCacheStrategy applied. This is the canonical
+// post-Phase-D path; the Legacy path tests above pin the
+// no-cache-control behavior.
+
+fn build_projection_with_cache_strategy(
+    system_prompt: Option<&str>,
+    messages: &[AgentMessage],
+    tools: &[ToolSpec],
+) -> ProviderMessages {
+    let rope = assemble_rope(system_prompt, messages, tools);
+    let mut projection =
+        crate::context::AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let strategy = crate::context::AnthropicCacheStrategy::new();
+    let boundaries = strategy.boundaries(&rope);
+    strategy.annotate(&mut projection, &boundaries);
+    projection
 }
 
 #[test]
-fn mu_i6j_only_last_tool_gets_cache_control_marker() {
+fn yqeq8_projected_emits_cache_control_on_system_and_last_tool() {
     let messages = vec![AgentMessage::User {
         content: "hi".into(),
     }];
     let tools = vec![
         ToolSpec {
             name: "read".into(),
-            description: "Read a file".into(),
+            description: "Read".into(),
             input_schema: json!({ "type": "object" }),
             policy: Default::default(),
         },
         ToolSpec {
             name: "glob".into(),
-            description: "Find files".into(),
+            description: "Glob".into(),
             input_schema: json!({ "type": "object" }),
             policy: Default::default(),
         },
         ToolSpec {
             name: "grep".into(),
-            description: "Search contents".into(),
+            description: "Grep".into(),
             input_schema: json!({ "type": "object" }),
             policy: Default::default(),
         },
     ];
-    let body = build_request_body("claude-test", None, &messages, &tools);
+    let projection = build_projection_with_cache_strategy(Some("be concise"), &messages, &tools);
+    let body = build_request_body_from_projection("claude-test", &projection, &tools);
+
+    // System carries cache_control.
+    let sys = &body["system"].as_array().expect("system array")[0];
+    assert_eq!(
+        sys["cache_control"],
+        json!({ "type": "ephemeral" }),
+        "system block must carry cache_control"
+    );
+
+    // Only the LAST tool carries cache_control; earlier tools must not.
     let tool_arr = body["tools"].as_array().expect("tools array");
-    assert_eq!(tool_arr.len(), 3);
-    // Anthropic caches everything UP TO AND INCLUDING the marker,
-    // so the marker on the final tool is sufficient — earlier
-    // tools must NOT carry their own markers (Anthropic allows up
-    // to 4 markers per request, but more is wasteful here).
-    assert!(
-        tool_arr[0].get("cache_control").is_none(),
-        "first tool should not carry cache_control"
-    );
-    assert!(
-        tool_arr[1].get("cache_control").is_none(),
-        "middle tool should not carry cache_control"
-    );
+    assert!(tool_arr[0].get("cache_control").is_none());
+    assert!(tool_arr[1].get("cache_control").is_none());
     assert_eq!(
         tool_arr[2]["cache_control"],
         json!({ "type": "ephemeral" }),
-        "last tool should carry the cache_control marker"
+        "last tool must carry cache_control"
     );
-    // Sanity: tool order is preserved.
-    assert_eq!(tool_arr[0]["name"], "read");
-    assert_eq!(tool_arr[1]["name"], "glob");
-    assert_eq!(tool_arr[2]["name"], "grep");
+}
+
+#[test]
+fn yqeq8_projected_no_system_no_tools_emits_no_cache_control() {
+    // Volatile-only rope ⇒ no boundaries ⇒ no cache_control anywhere.
+    let messages = vec![AgentMessage::User {
+        content: "hi".into(),
+    }];
+    let projection = build_projection_with_cache_strategy(None, &messages, &[]);
+    let body = build_request_body_from_projection("claude-test", &projection, &[]);
+    assert!(body.get("system").is_none());
+    assert!(body.get("tools").is_none());
+}
+
+#[test]
+fn yqeq8_projected_system_only_caches_system() {
+    let messages = vec![AgentMessage::User {
+        content: "hi".into(),
+    }];
+    let projection = build_projection_with_cache_strategy(Some("be concise"), &messages, &[]);
+    let body = build_request_body_from_projection("claude-test", &projection, &[]);
+    let sys = &body["system"].as_array().expect("system array")[0];
+    assert_eq!(sys["cache_control"], json!({ "type": "ephemeral" }));
+    assert!(body.get("tools").is_none());
+}
+
+#[test]
+fn yqeq8_projected_tools_only_caches_last_tool() {
+    let messages = vec![AgentMessage::User {
+        content: "hi".into(),
+    }];
+    let tools = vec![
+        ToolSpec {
+            name: "read".into(),
+            description: "Read".into(),
+            input_schema: json!({ "type": "object" }),
+            policy: Default::default(),
+        },
+        ToolSpec {
+            name: "grep".into(),
+            description: "Grep".into(),
+            input_schema: json!({ "type": "object" }),
+            policy: Default::default(),
+        },
+    ];
+    let projection = build_projection_with_cache_strategy(None, &messages, &tools);
+    let body = build_request_body_from_projection("claude-test", &projection, &tools);
+    assert!(body.get("system").is_none());
+    let tool_arr = body["tools"].as_array().expect("tools array");
+    assert!(tool_arr[0].get("cache_control").is_none());
+    assert_eq!(tool_arr[1]["cache_control"], json!({ "type": "ephemeral" }));
+}
+
+#[test]
+fn yqeq8_projected_without_cache_strategy_emits_no_cache_control() {
+    // No strategy applied ⇒ no markers ⇒ no cache_control. This is
+    // what the yqeq4_parity_* tests rely on for byte-equality with
+    // the Legacy path (which also emits no cache_control post-yqeq.8).
+    let messages = vec![AgentMessage::User {
+        content: "hi".into(),
+    }];
+    let tools = vec![ToolSpec {
+        name: "read".into(),
+        description: "Read".into(),
+        input_schema: json!({ "type": "object" }),
+        policy: Default::default(),
+    }];
+    let rope = assemble_rope(Some("be concise"), &messages, &tools);
+    let projection =
+        crate::context::AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let body = build_request_body_from_projection("claude-test", &projection, &tools);
+    let sys = &body["system"].as_array().expect("system array")[0];
+    assert!(sys.get("cache_control").is_none());
+    let tool_arr = body["tools"].as_array().expect("tools array");
+    assert!(tool_arr[0].get("cache_control").is_none());
 }
 
 fn assistant_text(text: &str) -> AgentMessage {
@@ -1091,13 +1200,14 @@ fn fb0_rope_message_count_matches_wire_message_count() {
 }
 
 #[test]
-fn fb0_cache_boundary_lands_on_last_stable_cacheable_span() {
-    // mu-bn4's AnthropicCacheStrategy places its Ephemeral marker on
-    // the last stable+cacheable span — for our fixture, that's the
-    // tool schema (index 1: system at 0, tool schema at 1, then
-    // volatile user/assistant/tool_result). Compare against the wire
-    // body's `cache_control: ephemeral` on the last tool definition
-    // (build_request_body, mu-i6j).
+fn fb0_cache_boundaries_land_on_system_and_last_tool_schema() {
+    // mu-yqeq.8: AnthropicCacheStrategy now emits TWO boundaries —
+    // the system span (index 0) and the last span in the
+    // stable+cacheable prefix (index 1, the tool schema). For our
+    // fixture: system at 0, tool schema at 1, then volatile
+    // user/assistant/tool_result. The Projected wire body picks up
+    // the markers via cache_marker on each ProviderMessage; the
+    // Legacy wire body no longer emits cache_control at all.
     let (system_prompt, messages, tools) = equivalence_fixture();
     let rope = assemble_rope(system_prompt.as_deref(), &messages, &tools);
     let renderer = crate::context::AnthropicProviderRenderer::new();
@@ -1106,33 +1216,37 @@ fn fb0_cache_boundary_lands_on_last_stable_cacheable_span() {
     let boundaries = strategy.boundaries(&rope);
     strategy.annotate(&mut projection, &boundaries);
 
-    // Boundary on the last stable+cacheable span (index 1, the tool
-    // schema).
-    assert_eq!(boundaries.len(), 1);
-    assert_eq!(boundaries[0].message_index, 1);
+    // Two boundaries: system (0) + last-in-prefix (1, the tool schema).
+    assert_eq!(boundaries.len(), 2);
+    assert_eq!(boundaries[0].message_index, 0);
+    assert_eq!(boundaries[1].message_index, 1);
+    assert_eq!(rope.spans()[0].kind(), &SpanKind::System);
     assert_eq!(rope.spans()[1].kind(), &SpanKind::ToolSchema);
 
-    // Annotation lands on that message.
+    // Annotations land on both messages.
+    assert_eq!(
+        projection.messages[0].cache_marker(),
+        Some(CacheMarker::Ephemeral)
+    );
     assert_eq!(
         projection.messages[1].cache_marker(),
         Some(CacheMarker::Ephemeral)
     );
 
-    // And the wire body marks the last tool with cache_control
-    // ephemeral — same intent.
-    let wire = build_request_body("claude-test", system_prompt.as_deref(), &messages, &tools);
-    assert_eq!(
-        wire["tools"]
-            .as_array()
-            .unwrap()
-            .last()
-            .unwrap()
-            .get("cache_control")
-            .and_then(|v| v.get("type"))
-            .and_then(|v| v.as_str()),
-        Some("ephemeral"),
-        "wire body must still place cache_control on the last tool",
-    );
+    // Projected wire body picks up both markers: system block and
+    // last tool spec both carry cache_control.
+    let wire = build_request_body_from_projection("claude-test", &projection, &tools);
+    let sys = &wire["system"].as_array().unwrap()[0];
+    assert_eq!(sys["cache_control"], json!({ "type": "ephemeral" }));
+    let last_tool = wire["tools"].as_array().unwrap().last().unwrap();
+    assert_eq!(last_tool["cache_control"], json!({ "type": "ephemeral" }));
+
+    // Legacy wire body no longer emits cache_control (mu-yqeq.8).
+    let legacy = build_request_body("claude-test", system_prompt.as_deref(), &messages, &tools);
+    let legacy_sys = &legacy["system"].as_array().unwrap()[0];
+    assert!(legacy_sys.get("cache_control").is_none());
+    let legacy_last_tool = legacy["tools"].as_array().unwrap().last().unwrap();
+    assert!(legacy_last_tool.get("cache_control").is_none());
 }
 
 #[test]

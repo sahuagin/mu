@@ -202,7 +202,12 @@ fn drop_volatile_tail_extends_boundary_to_summary_span() {
         Span::new("a2", SpanKind::Assistant, "noon", RetentionClass::Warm),
     ]);
     let pre = boundaries(&pre_rope);
-    assert_eq!(pre, vec![CacheBoundary::at(2)], "sanity: pre-rope shape");
+    // mu-yqeq.8: two boundaries — system (0) + last-in-prefix (2).
+    assert_eq!(
+        pre,
+        vec![CacheBoundary::at(0), CacheBoundary::at(2)],
+        "sanity: pre-rope shape",
+    );
 
     let policy = MockDropPolicy {
         keep_ids: vec!["sys", "u1", "a1"],
@@ -220,14 +225,14 @@ fn drop_volatile_tail_extends_boundary_to_summary_span() {
     let post = boundaries(&post_rope);
     assert_eq!(
         post,
-        vec![CacheBoundary::at(3)],
-        "boundary should land on the Pinned summary at the new tail",
+        vec![CacheBoundary::at(0), CacheBoundary::at(3)],
+        "boundaries: system (0) + Pinned summary at the new tail (3)",
     );
 
-    // Invariant: post-boundary ≥ position of last kept-stable span.
-    // Last kept-stable in post-rope is index 2 ("a1"); boundary is 3. ✓
+    // Invariant: post-LAST-boundary ≥ position of last kept-stable span.
+    // Last kept-stable in post-rope is index 2 ("a1"); last boundary is 3. ✓
     let floor = last_contiguous_stable_index(&post_rope).unwrap();
-    assert!(post[0].message_index >= floor);
+    assert!(post.last().unwrap().message_index >= floor);
 }
 
 /// Scenario B: pre-rope has a volatile *prefix* — no cacheable prefix
@@ -296,7 +301,11 @@ fn absorb_interior_volatile_extends_prefix_past_old_truncation() {
         Span::new("u2", SpanKind::User, "transient", RetentionClass::Warm),
         Span::new("a1", SpanKind::Assistant, "pong", RetentionClass::Hot),
     ]);
-    assert_eq!(boundaries(&pre_rope), vec![CacheBoundary::at(1)]);
+    // mu-yqeq.8: system (0) + last-in-prefix (1) before the volatile break at u2.
+    assert_eq!(
+        boundaries(&pre_rope),
+        vec![CacheBoundary::at(0), CacheBoundary::at(1)],
+    );
 
     let policy = MockDropPolicy {
         keep_ids: vec!["sys", "u1", "a1"],
@@ -311,16 +320,17 @@ fn absorb_interior_volatile_extends_prefix_past_old_truncation() {
     ));
 
     let post = boundaries(&post_rope);
+    // mu-yqeq.8: system (0) + summary tail (3).
     assert_eq!(
         post,
-        vec![CacheBoundary::at(3)],
+        vec![CacheBoundary::at(0), CacheBoundary::at(3)],
         "post-compaction prefix should cover the entire post-rope",
     );
     let pre_idx = 1usize;
-    let post_idx = post[0].message_index;
+    let post_idx = post.last().unwrap().message_index;
     assert!(
         post_idx > pre_idx,
-        "compaction must STRICTLY extend the boundary (pre={pre_idx}, post={post_idx})",
+        "compaction must STRICTLY extend the last boundary (pre={pre_idx}, post={post_idx})",
     );
 }
 
@@ -340,7 +350,8 @@ fn keep_all_leaves_boundary_unchanged() {
         Span::new("u2", SpanKind::User, "now?", RetentionClass::Warm),
     ]);
     let pre = boundaries(&pre_rope);
-    assert_eq!(pre, vec![CacheBoundary::at(2)]);
+    // mu-yqeq.8: system (0) + last-in-prefix (2).
+    assert_eq!(pre, vec![CacheBoundary::at(0), CacheBoundary::at(2)]);
 
     let policy = MockDropPolicy {
         keep_ids: vec!["sys", "u1", "a1", "u2"],
@@ -473,7 +484,7 @@ fn boundary_falls_within_kept_stable_region_for_every_scenario() {
             continue;
         }
 
-        let Some(b) = bs.first() else {
+        if bs.is_empty() {
             // No cacheable prefix at all is acceptable iff there is
             // no eligible span at position 0.
             let head_eligible = {
@@ -487,36 +498,43 @@ fn boundary_falls_within_kept_stable_region_for_every_scenario() {
                 case.name,
             );
             continue;
-        };
+        }
 
         // Floor: last kept-stable contiguous span index (must reach).
         let floor = last_contiguous_stable_index(&post_rope);
         // Ceiling: last eligible span in the post-rope.
-        let ceiling = last_eligible_index(&post_rope).expect("non-empty rope, b.is_some");
+        let ceiling = last_eligible_index(&post_rope).expect("non-empty rope, bs non-empty");
 
-        assert!(
-            b.message_index <= ceiling,
-            "{}: boundary {} past last eligible index {}",
-            case.name,
-            b.message_index,
-            ceiling,
-        );
-        if let Some(f) = floor {
+        // mu-yqeq.8: the strategy emits up to two boundaries (system
+        // + last-in-prefix). EVERY boundary must land within the
+        // post-rope range and at-or-below the eligible ceiling; the
+        // LAST boundary must reach the floor (cover the prefix).
+        for b in &bs {
             assert!(
-                b.message_index >= f,
-                "{}: boundary {} below last kept-stable index {}",
+                b.message_index <= ceiling,
+                "{}: boundary {} past last eligible index {}",
                 case.name,
                 b.message_index,
+                ceiling,
+            );
+            assert!(
+                b.message_index < post_rope.len(),
+                "{}: boundary {} out of post-rope range (len={})",
+                case.name,
+                b.message_index,
+                post_rope.len(),
+            );
+        }
+        if let Some(f) = floor {
+            let last = bs.last().unwrap();
+            assert!(
+                last.message_index >= f,
+                "{}: last boundary {} below last kept-stable index {}",
+                case.name,
+                last.message_index,
                 f,
             );
         }
-        assert!(
-            b.message_index < post_rope.len(),
-            "{}: boundary {} out of post-rope range (len={})",
-            case.name,
-            b.message_index,
-            post_rope.len(),
-        );
     }
 }
 
@@ -555,7 +573,12 @@ fn real_hash_and_summary_policy_produces_cacheable_summary_span() {
         ),
     ]);
     let pre = boundaries(&pre_rope);
-    assert_eq!(pre, vec![CacheBoundary::at(2)], "sanity");
+    // mu-yqeq.8: system (0) + last-in-prefix (2, "a1").
+    assert_eq!(
+        pre,
+        vec![CacheBoundary::at(0), CacheBoundary::at(2)],
+        "sanity",
+    );
 
     // Compute hashes the same way the production policy will, so the
     // mock judge can refer to spans by their real hash.
@@ -589,12 +612,12 @@ fn real_hash_and_summary_policy_produces_cacheable_summary_span() {
         SpanKind::CompactionSummary { .. }
     ));
 
-    // Boundary should land on the summary span (3) — the post-rope is
-    // entirely stable+cacheable.
+    // mu-yqeq.8: boundaries on system (0) AND summary tail (3) —
+    // the post-rope is entirely stable+cacheable.
     let post = boundaries(&post_rope);
-    assert_eq!(post, vec![CacheBoundary::at(3)]);
+    assert_eq!(post, vec![CacheBoundary::at(0), CacheBoundary::at(3)]);
 
-    // Render + annotate ⇒ ephemeral marker only on the summary message.
+    // Render + annotate ⇒ ephemeral marker on system AND summary spans.
     let renderer = AnthropicProviderRenderer::new();
     let strategy = AnthropicCacheStrategy::new();
     let mut rendered = renderer.render(&post_rope, ProjectionTarget::AgentView);
@@ -602,17 +625,15 @@ fn real_hash_and_summary_policy_produces_cacheable_summary_span() {
 
     assert_eq!(rendered.messages.len(), 4);
     for (i, m) in rendered.messages.iter().enumerate() {
-        if i == 3 {
-            assert_eq!(
-                m.cache_marker(),
-                Some(CacheMarker::Ephemeral),
-                "summary span must carry Ephemeral",
-            );
+        let expected = if i == 0 || i == 3 {
+            Some(CacheMarker::Ephemeral)
         } else {
-            assert!(
-                m.cache_marker().is_none(),
-                "message {i} must not carry marker"
-            );
-        }
+            None
+        };
+        assert_eq!(
+            m.cache_marker(),
+            expected,
+            "message {i}: expected {expected:?}",
+        );
     }
 }

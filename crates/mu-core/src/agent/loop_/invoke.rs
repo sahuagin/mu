@@ -5,9 +5,11 @@ use std::time::Instant;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
+use crate::context::ProviderMessages;
+
 use super::super::provider::{MessageInput, Provider};
 use super::super::tool::ToolSpec;
-use super::super::types::{AgentMessage, AssistantMessage, ContentBlock};
+use super::super::types::{AssistantMessage, ContentBlock};
 
 use super::{AgentEvent, AgentInput, Outcome};
 
@@ -22,7 +24,7 @@ fn now_unix_ms() -> u64 {
 pub(crate) async fn handle_invoke_llm(
     provider: &dyn Provider,
     system_prompt: Option<&str>,
-    messages: &[AgentMessage],
+    projection: &ProviderMessages,
     tool_specs: &[ToolSpec],
     input_rx: &mut mpsc::Receiver<AgentInput>,
     events: &mpsc::Sender<AgentEvent>,
@@ -43,13 +45,15 @@ pub(crate) async fn handle_invoke_llm(
         .await;
 
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-    // mu-yqeq.3: wrap into MessageInput::Legacy. mu-yqeq.8 will switch
-    // the call site to MessageInput::Projected(&projection) once every
-    // C-bead provider implements the Projected arm.
+    // mu-yqeq.8: the cache-annotated `ProviderMessages` projection is
+    // the canonical agent-loop → provider input. Per-provider
+    // adapters consume it via `MessageInput::Projected` and produce
+    // byte-equivalent wire JSON to the pre-cutover Legacy path (plus
+    // cache_control driven by the projection's cache_marker flags).
     let mut stream = provider
         .stream(
             system_prompt,
-            MessageInput::Legacy(messages),
+            MessageInput::Projected(projection),
             tool_specs,
             cancel_rx,
         )

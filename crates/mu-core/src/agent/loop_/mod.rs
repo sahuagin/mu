@@ -815,7 +815,6 @@ async fn run(
                     renderer.render(&rope, ProjectionTarget::AgentView);
                 let cache_boundaries = cache_strategy.boundaries(&rope);
                 cache_strategy.annotate(&mut projection, &cache_boundaries);
-                let _ = projection;
                 let span_count = rope.len() as u32;
                 let cache_boundary_count = cache_boundaries.len() as u32;
                 let first_span_ids: Vec<String> = rope
@@ -848,7 +847,7 @@ async fn run(
                 match handle_invoke_llm(
                     provider.as_ref(),
                     config.system_prompt.as_deref(),
-                    &messages,
+                    &projection,
                     &tool_specs,
                     &mut input_rx,
                     &events,

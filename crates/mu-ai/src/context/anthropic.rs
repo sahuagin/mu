@@ -21,28 +21,38 @@
 //!
 //! ## Cache strategy
 //!
-//! [`AnthropicCacheStrategy`] places a single
-//! [`CacheMarker::Ephemeral`] boundary at the message corresponding
-//! to the LAST span in the rope that is both stable
-//! ([`RetentionClass::is_stable`]) and cacheable
-//! ([`Span::cacheable`]). Anthropic's `cache_control: ephemeral`
-//! caches the prefix up to and including the marker, so the marker
-//! lands on the last cacheable item in the stable prefix.
+//! [`AnthropicCacheStrategy`] places up to TWO
+//! [`CacheMarker::Ephemeral`] boundaries — matching the pattern the
+//! pre-mu-yqeq.8 live-loop annotation used (system block + last tool
+//! spec):
 //!
-//! See spec lines 567-578 for the boundary rule. The boundary stops
-//! at the first non-cacheable position: as soon as a span fails
-//! either the stable or the cacheable predicate, the cacheable
-//! prefix has ended.
+//! 1. The first [`SpanKind::System`] span in the consecutive
+//!    stable+cacheable prefix, when present.
+//! 2. The last span in the consecutive stable+cacheable prefix,
+//!    when it differs from (1).
 //!
-//! ## Coexistence note (mu-i6j)
+//! Anthropic supports up to four `cache_control` markers per
+//! request; this strategy uses at most two. Two markers (vs one)
+//! create two independently-cacheable prefixes: the system prompt
+//! stays cached even when tools change, and the tools-end is the
+//! second cacheable prefix. With one marker, a tools change would
+//! invalidate the system prefix too.
 //!
-//! The pre-existing `cache_control` annotation in
-//! [`crate::providers::anthropic::build_request_body`] operates on
-//! the live-loop `&[AgentMessage]` type and tags the system block +
-//! the last tool spec. That path is unaffected by this module — same
-//! intent (cache the stable prefix), different input type. mu-fb0
-//! is the bead that wires the rope into the live loop and retires
-//! the `AgentMessage`-shaped annotation.
+//! See spec lines 567-578 for the boundary rule, and
+//! `specs/mu-044-provider-messages-cutover.md`
+//! §"Cache-annotation consolidation (Phase D)" for the
+//! two-marker pre-condition. The cacheable prefix stops at the
+//! first non-cacheable position: as soon as a span fails either
+//! the stable or the cacheable predicate, the prefix has ended.
+//!
+//! Phase D (mu-yqeq.8) made this strategy the SOLE source of
+//! Anthropic cache_control emission. The previously-unconditional
+//! annotation in
+//! [`crate::providers::anthropic::build_request_body`] has been
+//! retired; the Projected wire emitter reads each
+//! [`ProviderMessage::cache_marker`] and propagates to the wire
+//! position (system block or last tool spec) based on the source
+//! span id discrimination.
 //!
 //! [`OperatorView`]: ProjectionTarget::OperatorView
 //! [`RetentionClass::is_stable`]: mu_core::context::RetentionClass::is_stable
@@ -52,7 +62,7 @@ use std::sync::Arc;
 
 use mu_core::context::{
     CacheBoundary, CacheMarker, CacheStrategy, ProjectionTarget, ProviderMessage, ProviderMessages,
-    ProviderRenderer, RetainedRope,
+    ProviderRenderer, RetainedRope, SpanKind,
 };
 
 /// Anthropic-shaped provider renderer (mu-bn4).
@@ -97,15 +107,22 @@ impl ProviderRenderer for AnthropicProviderRenderer {
 
 /// Anthropic ephemeral-cache strategy (mu-bn4).
 ///
-/// Places at most one [`CacheBoundary`] at the last span position
-/// that is both stable and cacheable. Anthropic caches everything up
-/// to and including the marker — placing the marker on the last
-/// cacheable item maximizes the cached prefix.
+/// Places up to two [`CacheBoundary`]s in the consecutive
+/// stable+cacheable prefix: one on the first
+/// [`SpanKind::System`] span (when present) and one on the last
+/// span in the prefix (when different from the system span).
 ///
 /// Per spec lines 567-578, the cacheable prefix ends at the FIRST
-/// span that is either non-stable or marked uncacheable. The boundary
-/// thus lands on the span immediately before that point — i.e., the
-/// last cacheable position in the prefix.
+/// span that is either non-stable or marked uncacheable. Boundary
+/// placement is restricted to spans within that contiguous prefix
+/// — a span that becomes stable+cacheable again AFTER the prefix
+/// break doesn't qualify.
+///
+/// The two-marker shape mirrors the pre-mu-yqeq.8 live-loop
+/// annotation: it cached `body.system` and `body.tools.last()`
+/// independently so a tools-change wouldn't invalidate the system
+/// cache. Phase D made this strategy the sole source; matching the
+/// pre-cutover marker count avoids a cache-effectiveness regression.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AnthropicCacheStrategy;
 
@@ -117,23 +134,33 @@ impl AnthropicCacheStrategy {
 
 impl CacheStrategy for AnthropicCacheStrategy {
     fn boundaries(&self, rope: &RetainedRope) -> Vec<CacheBoundary> {
-        // Walk the rope; the boundary ends at the LAST consecutive
-        // stable+cacheable span starting from the front. Once any
-        // span fails either predicate, the cacheable prefix has
-        // ended — later stable+cacheable spans don't count, since a
-        // single mid-rope hole invalidates the prefix.
+        // Walk the rope once; track the first System-kind index and
+        // the last index encountered within the consecutive
+        // stable+cacheable prefix. Stop at the first span that fails
+        // either predicate (a single mid-prefix hole ends the
+        // cacheable prefix; later stable+cacheable spans don't count).
+        let mut system_idx: Option<usize> = None;
         let mut last_in_prefix: Option<usize> = None;
         for (idx, span) in rope.iter().enumerate() {
             if span.retention().is_stable() && span.cacheable() {
+                if matches!(span.kind(), SpanKind::System) && system_idx.is_none() {
+                    system_idx = Some(idx);
+                }
                 last_in_prefix = Some(idx);
             } else {
                 break;
             }
         }
-        match last_in_prefix {
-            Some(idx) => vec![CacheBoundary::at(idx)],
-            None => Vec::new(),
+        let mut out: Vec<CacheBoundary> = Vec::new();
+        if let Some(s) = system_idx {
+            out.push(CacheBoundary::at(s));
         }
+        if let Some(last) = last_in_prefix {
+            if Some(last) != system_idx {
+                out.push(CacheBoundary::at(last));
+            }
+        }
+        out
     }
 
     fn annotate(&self, messages: &mut ProviderMessages, boundaries: &[CacheBoundary]) {
@@ -232,12 +259,13 @@ mod tests {
     // ===== Cache strategy tests =====
 
     #[test]
-    fn boundary_lands_at_last_stable_cacheable_span() {
-        // 3 stable+cacheable spans (indices 0,1,2), then 2 volatile
-        // (Warm) → boundary at index 2.
+    fn boundary_marks_system_and_last_in_prefix() {
+        // mu-yqeq.8: split_rope has System at 0, User/Assistant at
+        // 1/2 (all stable+cacheable), then 2 Warm spans (volatile).
+        // Strategy emits TWO boundaries: system (0) and last-in-prefix (2).
         let rope = split_rope();
         let boundaries = AnthropicCacheStrategy::new().boundaries(&rope);
-        assert_eq!(boundaries, vec![CacheBoundary::at(2)]);
+        assert_eq!(boundaries, vec![CacheBoundary::at(0), CacheBoundary::at(2)]);
     }
 
     #[test]
@@ -255,23 +283,29 @@ mod tests {
     }
 
     #[test]
-    fn boundary_at_last_index_when_entire_rope_is_stable() {
+    fn boundary_at_first_system_and_last_index_when_entire_rope_is_stable() {
+        // mu-yqeq.8: with TWO System spans + 1 User (all
+        // stable+cacheable), the strategy marks the FIRST System
+        // (index 0) and the last span in the prefix (index 2). The
+        // second System span (index 1) is NOT marked — only the
+        // first.
         let rope = RetainedRope::from_spans(vec![
             Span::new("a", SpanKind::System, "s", RetentionClass::Startup),
             Span::new("b", SpanKind::System, "s2", RetentionClass::Pinned),
             Span::new("c", SpanKind::User, "u", RetentionClass::Hot),
         ]);
         let boundaries = AnthropicCacheStrategy::new().boundaries(&rope);
-        assert_eq!(boundaries, vec![CacheBoundary::at(2)]);
+        assert_eq!(boundaries, vec![CacheBoundary::at(0), CacheBoundary::at(2)]);
     }
 
     #[test]
     fn stable_but_uncacheable_ends_the_prefix() {
         // A span can be stable yet marked uncacheable (e.g.,
         // contains timestamps the model shouldn't anchor on — spec
-        // :575-578). The boundary lands on the LAST stable+cacheable
-        // span BEFORE the hole, even if later stable+cacheable spans
-        // exist (the prefix is contiguous from index 0).
+        // :575-578). The cacheable prefix ends at the hole. With
+        // mu-yqeq.8's two-marker strategy, system at index 0 still
+        // gets marked, and the last-in-prefix (index 1, before the
+        // hole) also gets marked.
         let rope = RetainedRope::from_spans(vec![
             Span::new("a", SpanKind::System, "intro", RetentionClass::Startup),
             Span::new("b", SpanKind::User, "hi", RetentionClass::Hot),
@@ -288,11 +322,13 @@ mod tests {
             Span::new("c", SpanKind::Assistant, "hello", RetentionClass::Hot),
         ]);
         let boundaries = AnthropicCacheStrategy::new().boundaries(&rope);
-        assert_eq!(boundaries, vec![CacheBoundary::at(1)]);
+        assert_eq!(boundaries, vec![CacheBoundary::at(0), CacheBoundary::at(1)]);
     }
 
     #[test]
-    fn annotate_attaches_ephemeral_marker_at_boundary() {
+    fn annotate_attaches_ephemeral_marker_at_each_boundary() {
+        // mu-yqeq.8: two boundaries on split_rope (system at 0,
+        // last-in-prefix at 2) ⇒ both messages carry the marker.
         let rope = split_rope();
         let strategy = AnthropicCacheStrategy::new();
         let mut rendered =
@@ -301,20 +337,18 @@ mod tests {
         let boundaries = strategy.boundaries(&rope);
         strategy.annotate(&mut rendered, &boundaries);
 
-        // Boundary at index 2 ⇒ only that message gets Ephemeral.
         for (i, msg) in rendered.messages.iter().enumerate() {
-            if i == 2 {
-                assert_eq!(
-                    msg.cache_marker(),
-                    Some(CacheMarker::Ephemeral),
-                    "boundary message must carry Ephemeral",
-                );
+            let expected_marker = if i == 0 || i == 2 {
+                Some(CacheMarker::Ephemeral)
             } else {
-                assert!(
-                    msg.cache_marker().is_none(),
-                    "non-boundary message {i} must not carry a cache marker",
-                );
-            }
+                None
+            };
+            assert_eq!(
+                msg.cache_marker(),
+                expected_marker,
+                "message {i}: expected {expected_marker:?}, got {:?}",
+                msg.cache_marker(),
+            );
         }
     }
 
@@ -352,7 +386,7 @@ mod tests {
     #[test]
     fn compose_renderer_and_strategy_end_to_end() {
         // Full pipeline: rope → render → boundaries → annotate. The
-        // marker lands on the right message, content is preserved.
+        // markers land on both expected messages, content preserved.
         let rope = split_rope();
         let renderer = AnthropicProviderRenderer::new();
         let strategy = AnthropicCacheStrategy::new();
@@ -362,15 +396,25 @@ mod tests {
         strategy.annotate(&mut rendered, &boundaries);
 
         assert_eq!(rendered.len(), 5);
-        assert_eq!(boundaries, vec![CacheBoundary::at(2)]);
-        // Boundary message is the third one (the last stable+cacheable
-        // span, "a1" / Assistant "hello").
-        let ids: Vec<&str> = rendered.messages[2]
+        // mu-yqeq.8: two boundaries — system (index 0) and last
+        // in-prefix (index 2, "a1" / Assistant "hello").
+        assert_eq!(boundaries, vec![CacheBoundary::at(0), CacheBoundary::at(2)]);
+        let system_ids: Vec<&str> = rendered.messages[0]
             .source_span_ids()
             .iter()
             .map(AsRef::as_ref)
             .collect();
-        assert_eq!(ids, vec!["a1"]);
+        assert_eq!(system_ids, vec!["sys"]);
+        let last_ids: Vec<&str> = rendered.messages[2]
+            .source_span_ids()
+            .iter()
+            .map(AsRef::as_ref)
+            .collect();
+        assert_eq!(last_ids, vec!["a1"]);
+        assert_eq!(
+            rendered.messages[0].cache_marker(),
+            Some(CacheMarker::Ephemeral)
+        );
         assert_eq!(
             rendered.messages[2].cache_marker(),
             Some(CacheMarker::Ephemeral)

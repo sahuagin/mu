@@ -33,6 +33,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::capability::{AutonomyCapability, Capability};
+use crate::context::rope::SpanText;
 use crate::context::{ProjectionTarget, ProviderMessages, RetainedRope};
 
 /// mu-kgu.4: default compaction threshold in tokens. Matches the
@@ -325,7 +326,14 @@ pub struct AgentConfig {
     /// style prepended {role:"system"} message), and Anthropic
     /// additionally tags it `cache_control: ephemeral` to amortize
     /// its tokens across asks in the session.
-    pub system_prompt: Option<String>,
+    ///
+    /// Backing storage is [`SpanText`] (`Arc<str>` via the mu-yqeq.2
+    /// per-type alias) so the daemon pays one allocation when building
+    /// the config rather than re-allocating on each rope-build cycle.
+    /// The conversion from the wire-layer `Option<String>` happens at
+    /// the daemon's session-creation site
+    /// ([`crates/mu-coding/src/serve/handlers/session.rs`]).
+    pub system_prompt: Option<SpanText>,
     /// mu-kgu.4: per-session token threshold above which the agent
     /// loop dispatches `Provider::compaction_policy().compact(...)`
     /// on the rope before each provider call. `None` uses

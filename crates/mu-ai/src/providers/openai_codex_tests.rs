@@ -3,7 +3,7 @@ use base64::Engine;
 use bytes::Bytes;
 use futures::StreamExt;
 use mu_core::agent::{
-    AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolCall, ToolSpec,
+    AgentMessage, AssistantMessage, ContentBlock, MessageInput, StopReason, ToolCall, ToolSpec,
 };
 use serde_json::json;
 use std::pin::Pin;
@@ -595,7 +595,7 @@ mod live_tests {
         }];
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let mut stream = provider
-            .stream(None, &messages, &[], rx)
+            .stream(None, MessageInput::Legacy(&messages), &[], rx)
             .await
             .expect("provider.stream");
 
@@ -647,7 +647,12 @@ mod live_tests {
         }];
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let mut stream = provider
-            .stream(None, &messages, std::slice::from_ref(&echo_tool), rx)
+            .stream(
+                None,
+                MessageInput::Legacy(&messages),
+                std::slice::from_ref(&echo_tool),
+                rx,
+            )
             .await
             .expect("provider.stream");
 

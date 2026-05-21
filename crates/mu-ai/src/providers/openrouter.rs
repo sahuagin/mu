@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 use mu_core::agent::{
-    AgentMessage, AssistantMessage, ContentBlock, Provider, ProviderError, ProviderEvent,
-    StopReason, ToolCall, ToolSpec, Usage,
+    AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
+    ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
 };
 
 use super::sse::{SseEvent, SseStream};
@@ -62,10 +62,22 @@ impl Provider for OpenRouterProvider {
     async fn stream(
         &self,
         system_prompt: Option<&str>,
-        messages: &[AgentMessage],
+        input: MessageInput<'_>,
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+        // mu-yqeq.3: only Legacy is implemented today. mu-yqeq.6 will
+        // split the `_` arm into MessageInput::Projected(p).
+        let messages = match input {
+            MessageInput::Legacy(msgs) => msgs,
+            _ => {
+                return Err(ProviderError::Other(
+                    "OpenRouterProvider: only MessageInput::Legacy is currently supported \
+                     (mu-yqeq.6 will add Projected)"
+                        .to_string(),
+                ));
+            }
+        };
         let body = build_request_body(&self.model, system_prompt, messages, tools);
         let resp = self
             .client

@@ -25,8 +25,8 @@ use serde_json::{json, Value};
 use tokio::sync::{oneshot, Mutex};
 
 use mu_core::agent::{
-    AgentMessage, AssistantMessage, ContentBlock, Provider, ProviderError, ProviderEvent,
-    StopReason, ToolCall, ToolSpec, Usage,
+    AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
+    ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
 };
 
 use crate::auth::{self, FileSystemTokenStore, OAuthToken, TokenStore};
@@ -807,10 +807,22 @@ impl Provider for OpenaiCodexProvider {
     async fn stream(
         &self,
         system_prompt: Option<&str>,
-        messages: &[AgentMessage],
+        input: MessageInput<'_>,
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+        // mu-yqeq.3: only Legacy is implemented today. mu-yqeq.5 will
+        // split the `_` arm into MessageInput::Projected(p).
+        let messages = match input {
+            MessageInput::Legacy(msgs) => msgs,
+            _ => {
+                return Err(ProviderError::Other(
+                    "OpenaiCodexProvider: only MessageInput::Legacy is currently supported \
+                     (mu-yqeq.5 will add Projected)"
+                        .to_string(),
+                ));
+            }
+        };
         // mu-n48: a session-level system_prompt overrides the
         // provider's default `instructions` (the Responses API's
         // system-prompt slot). The `with_instructions` provider-

@@ -49,7 +49,7 @@ use futures::StreamExt;
 use tokio::sync::oneshot;
 
 use crate::agent::types::AgentMessage;
-use crate::agent::{Provider, ProviderEvent};
+use crate::agent::{MessageInput, Provider, ProviderEvent};
 
 use super::hash_summary::{Judge, JudgeError};
 
@@ -146,7 +146,7 @@ async fn call_provider(
 
     let work = async {
         let mut stream = provider
-            .stream(None, &messages, &[], cancel_rx)
+            .stream(None, MessageInput::Legacy(&messages), &[], cancel_rx)
             .await
             .map_err(|e| JudgeError::Call(format!("provider.stream open: {e}")))?;
         let mut text = String::new();
@@ -204,7 +204,7 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::agent::tool::ToolSpec;
-    use crate::agent::types::{AgentMessage, AssistantMessage, ContentBlock, StopReason};
+    use crate::agent::types::{AssistantMessage, ContentBlock, StopReason};
     use crate::agent::{Provider, ProviderError, ProviderEvent};
 
     /// Minimal Provider for tests: hand it a `Vec<ProviderEvent>` and
@@ -230,7 +230,7 @@ mod tests {
         async fn stream(
             &self,
             _system_prompt: Option<&str>,
-            _messages: &[AgentMessage],
+            _input: MessageInput<'_>,
             _tools: &[ToolSpec],
             _cancel_rx: tokio::sync::oneshot::Receiver<()>,
         ) -> Result<futures::stream::BoxStream<'static, ProviderEvent>, ProviderError> {

@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 use super::*;
-use crate::agent::provider::{Provider, ProviderError, ProviderEvent};
+use crate::agent::provider::{MessageInput, Provider, ProviderError, ProviderEvent};
 use crate::agent::tool::{Tool, ToolResult, ToolSpec};
 use crate::agent::types::{AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolCall};
 
@@ -66,7 +66,7 @@ impl Provider for MockProvider {
     async fn stream(
         &self,
         _system_prompt: Option<&str>,
-        _messages: &[AgentMessage],
+        _input: MessageInput<'_>,
         _tools: &[ToolSpec],
         _cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
@@ -1762,12 +1762,12 @@ impl Provider for MockProviderWithCompaction {
     async fn stream(
         &self,
         system_prompt: Option<&str>,
-        messages: &[AgentMessage],
+        input: MessageInput<'_>,
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
         self.inner
-            .stream(system_prompt, messages, tools, cancel_rx)
+            .stream(system_prompt, input, tools, cancel_rx)
             .await
     }
 

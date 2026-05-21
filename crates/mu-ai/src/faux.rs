@@ -6,8 +6,8 @@ use futures::stream::{self, BoxStream};
 use tokio::sync::oneshot;
 
 use mu_core::agent::{
-    AgentMessage, AssistantMessage, ContentBlock, Provider, ProviderError, ProviderEvent,
-    StopReason, ToolSpec,
+    AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
+    ProviderEvent, StopReason, ToolSpec,
 };
 
 /// What a single FauxProvider::stream() call should produce.
@@ -58,10 +58,22 @@ impl Provider for FauxProvider {
         // echo / scripted provider; no need to thread it through the
         // synthetic event sequence.
         _system_prompt: Option<&str>,
-        messages: &[AgentMessage],
+        input: MessageInput<'_>,
         _tools: &[ToolSpec],
         _cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+        // mu-yqeq.3: only Legacy is implemented today. mu-yqeq.7 will
+        // split the `_` arm into MessageInput::Projected(p).
+        let messages = match input {
+            MessageInput::Legacy(msgs) => msgs,
+            _ => {
+                return Err(ProviderError::Other(
+                    "FauxProvider: only MessageInput::Legacy is currently supported \
+                     (mu-yqeq.7 will add Projected)"
+                        .to_string(),
+                ));
+            }
+        };
         let response = {
             let mut q = self
                 .responses
@@ -125,7 +137,7 @@ mod tests {
         let (_cancel_tx, cancel_rx) = oneshot::channel();
 
         let events: Vec<ProviderEvent> = provider
-            .stream(None, &messages, &[], cancel_rx)
+            .stream(None, MessageInput::Legacy(&messages), &[], cancel_rx)
             .await?
             .collect()
             .await;
@@ -178,7 +190,9 @@ mod tests {
 
     async fn collect_stream(provider: &FauxProvider) -> Result<Vec<ProviderEvent>, ProviderError> {
         let (_cancel_tx, cancel_rx) = oneshot::channel();
-        let stream = provider.stream(None, &[], &[], cancel_rx).await?;
+        let stream = provider
+            .stream(None, MessageInput::Legacy(&[]), &[], cancel_rx)
+            .await?;
         Ok(stream.collect().await)
     }
 }

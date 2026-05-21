@@ -1211,4 +1211,90 @@ mod tests {
         let policy = HashAndSummaryPolicy::new(MockJudge::ok("{\"keep\":[],\"summary\":\"\"}"));
         assert_eq!(policy.output_mode, KeepListMode::HashKeep);
     }
+
+    #[test]
+    fn compaction_preserves_blocks_field_on_kept_assistant_spans() {
+        // mu-yqeq.3 acceptance: post-compaction non-absorbed spans
+        // retain their blocks field. Phase C wire adapters depend on
+        // this — if a kept assistant span loses its blocks, the
+        // adapter can't reconstruct tool calls.
+        use crate::agent::types::{ContentBlock, ToolCall};
+
+        let original_blocks = vec![
+            ContentBlock::Text {
+                text: "calling read".into(),
+            },
+            ContentBlock::ToolCall(ToolCall {
+                id: "toolu_kept".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "/x"}),
+            }),
+        ];
+        // Build a rope by hand: sys + an assistant span carrying blocks
+        // + a volatile user span that we expect compaction to absorb.
+        let assistant_span = Span::with_cacheable(
+            "msg-0-assistant",
+            SpanKind::Assistant,
+            "calling read [tool_call:read({\"path\":\"/x\"})]",
+            RetentionClass::Hot,
+            false,
+        )
+        .with_blocks(original_blocks.clone());
+        let pre_rope = RetainedRope::from_spans(vec![
+            Span::new(
+                "sys",
+                SpanKind::System,
+                "you are mu",
+                RetentionClass::Startup,
+            ),
+            assistant_span,
+            Span::with_cacheable(
+                "msg-1-user",
+                SpanKind::User,
+                "stale",
+                RetentionClass::Warm,
+                false,
+            ),
+        ]);
+
+        // Judge keeps sys + assistant; absorbs the volatile user.
+        let hasher = Blake3Hasher;
+        let hashes: Vec<String> = pre_rope
+            .spans()
+            .iter()
+            .map(|s| hasher.hash(s, DEFAULT_HASH_SHORT_CHARS))
+            .collect();
+        let response = format!(
+            "{{\"keep\":[\"{}\",\"{}\"],\"summary\":\"absorbed stale user\"}}",
+            hashes[0], hashes[1],
+        );
+        let policy = HashAndSummaryPolicy::new(MockJudge::ok(response));
+        let result = policy.compact(&pre_rope, 1_000);
+
+        // The kept assistant span retains its blocks verbatim.
+        let kept_assistant = result
+            .rope
+            .spans()
+            .iter()
+            .find(|s| s.id() == "msg-0-assistant")
+            .expect("assistant span survived compaction");
+        let kept_blocks = kept_assistant
+            .blocks()
+            .expect("kept assistant span still carries blocks");
+        assert_eq!(kept_blocks, original_blocks.as_slice());
+
+        // The newly-inserted CompactionSummary span has no blocks
+        // (none were supplied at synthesis).
+        let summary = result
+            .rope
+            .spans()
+            .iter()
+            .find(|s| matches!(s.kind(), SpanKind::CompactionSummary { .. }))
+            .expect("summary span inserted");
+        assert!(
+            summary.blocks().is_none(),
+            "CompactionSummary span carries no blocks (Phase A scope; structural reconstruction \
+             from kept-span blocks happens at the wire adapter layer)",
+        );
+    }
 }

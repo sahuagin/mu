@@ -51,6 +51,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::event::RopeEvent;
+use crate::agent::types::ContentBlock;
 
 /// Per-conceptual-type alias for span identifiers (mu-yqeq.2).
 ///
@@ -191,13 +192,25 @@ pub enum SpanKind {
 /// constructors below. See spec mu-044 §Encapsulation discipline for
 /// the rationale: insulates external call sites from future field-
 /// type evolution (e.g., the `String → Arc<str>` swap in mu-yqeq.2b).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Span {
     pub(crate) id: SpanId,
     pub(crate) kind: SpanKind,
     pub(crate) content: SpanText,
     pub(crate) retention: RetentionClass,
     pub(crate) cacheable: bool,
+    /// Structured content blocks paralleling the flat [`Self::content`]
+    /// projection. `None` for non-assistant spans (User, ToolResult,
+    /// system, tool schemas, etc.); `Some(...)` for assistant turns
+    /// where the wire-adapter consumers need tool-call / thinking
+    /// structure that flat text loses. Populated by
+    /// [`super::assembly::assemble_rope`] at ingestion time per spec
+    /// mu-044 §"Parallel `blocks` field on `Span` and `ProviderMessage`"
+    /// (mu-yqeq.3). The `ContentBlock` text payloads share bytes with
+    /// [`Self::content`] via `Arc<str>` — storing both views is
+    /// byte-cheap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) blocks: Option<Vec<ContentBlock>>,
 }
 
 impl Span {
@@ -230,7 +243,19 @@ impl Span {
             content: content.into(),
             retention,
             cacheable,
+            blocks: None,
         }
+    }
+
+    /// Builder variant: attach structured [`ContentBlock`]s alongside
+    /// the flat content projection. Used by
+    /// [`super::assembly::assemble_rope`] when constructing
+    /// `Assistant`-kind spans from an `AssistantMessage` so the wire
+    /// adapters (mu-yqeq.4–7) can reconstruct tool calls without
+    /// re-parsing the flat string.
+    pub fn with_blocks(mut self, blocks: Vec<ContentBlock>) -> Self {
+        self.blocks = Some(blocks);
+        self
     }
 
     /// Stable identifier within a rope.
@@ -259,6 +284,13 @@ impl Span {
     pub fn cacheable(&self) -> bool {
         self.cacheable
     }
+
+    /// Structured content blocks for assistant turns. `None` for spans
+    /// where the flat [`Self::content`] is the only authoritative
+    /// projection (User, ToolResult, system, tool schemas, etc.).
+    pub fn blocks(&self) -> Option<&[ContentBlock]> {
+        self.blocks.as_deref()
+    }
 }
 
 /// The retained pointer set ("rope") — an ordered sequence of active
@@ -273,7 +305,7 @@ impl Span {
 /// the rope to the index of its originating event — even after a
 /// span has been deactivated, [`Self::provenance`] still answers
 /// "where did this span come from?"
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RetainedRope {
     spans: Vec<Span>,
     /// Append-only provenance log. Indexed by `origins` for

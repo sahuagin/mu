@@ -130,7 +130,8 @@ fn message_to_span(idx: usize, message: &AgentMessage) -> Span {
             flatten_assistant(&assistant.content),
             RetentionClass::Hot,
             false,
-        ),
+        )
+        .with_blocks(assistant.content.clone()),
         AgentMessage::ToolResult {
             call_id,
             content,
@@ -150,6 +151,20 @@ fn message_to_span(idx: usize, message: &AgentMessage) -> Span {
             )
         }
     }
+}
+
+/// Recover the `call_id` embedded in a `ToolResult` span's id.
+///
+/// `assemble_rope` (and `append_messages_to_baseline`) build
+/// `ToolResult` span ids as `msg-{idx}-tool-result:{call_id}`
+/// (see [`message_to_span`]). Phase C wire adapters need to recover
+/// the `call_id` to bind a tool result back to its originating tool
+/// call without re-walking `Vec<AgentMessage>`. Returns the suffix
+/// after `tool-result:` for `ToolResult` span ids; `None` for any
+/// other id shape.
+pub fn extract_call_id_from_span_id(span_id: &str) -> Option<&str> {
+    let (_, rest) = span_id.split_once("-tool-result:")?;
+    Some(rest)
 }
 
 /// Flatten assistant content blocks into a deterministic JSON-ish
@@ -280,5 +295,124 @@ mod tests {
     fn empty_inputs_produce_empty_rope() {
         let rope = assemble_rope(None, &[], &[]);
         assert!(rope.is_empty());
+    }
+
+    #[test]
+    fn extract_call_id_recovers_suffix_for_tool_result_span_ids() {
+        // mu-yqeq.3 acceptance: Phase C wire adapters can recover the
+        // tool-call binding from the synthesized span id without
+        // re-walking Vec<AgentMessage>.
+        assert_eq!(
+            extract_call_id_from_span_id("msg-2-tool-result:toolu_abc123"),
+            Some("toolu_abc123"),
+        );
+        // Embedded colons in the call_id survive (everything after the
+        // first "tool-result:" is the call_id).
+        assert_eq!(
+            extract_call_id_from_span_id("msg-0-tool-result:call:with:colons"),
+            Some("call:with:colons"),
+        );
+        // Non-ToolResult span ids return None.
+        assert_eq!(extract_call_id_from_span_id("msg-0-user"), None);
+        assert_eq!(extract_call_id_from_span_id("msg-1-assistant"), None);
+        assert_eq!(extract_call_id_from_span_id("system-prompt"), None);
+        assert_eq!(
+            extract_call_id_from_span_id("tool-schema:read"),
+            None,
+            "tool-SCHEMA, not tool-RESULT — distinct id space",
+        );
+    }
+
+    #[test]
+    fn assistant_span_blocks_reconstruct_original_content_byte_for_byte() {
+        // mu-yqeq.3 round-trip acceptance: assemble_rope populates the
+        // Span.blocks field with the original AssistantMessage.content
+        // verbatim. The flat content remains the flattened projection;
+        // the blocks field preserves the structured shape for Phase C
+        // wire adapters.
+        let original_blocks = vec![
+            ContentBlock::Text {
+                text: "I'll read the file.".into(),
+            },
+            ContentBlock::ToolCall(ToolCall {
+                id: "toolu_42".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "/etc/hostname"}),
+            }),
+            ContentBlock::Thinking {
+                text: "user wants the hostname".into(),
+            },
+        ];
+        let messages = vec![AgentMessage::Assistant(AssistantMessage {
+            content: original_blocks.clone(),
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        })];
+        let rope = assemble_rope(None, &messages, &[]);
+
+        // The assistant span carries the original blocks intact.
+        let assistant_span = &rope.spans()[0];
+        assert_eq!(assistant_span.kind(), &SpanKind::Assistant);
+        let blocks = assistant_span.blocks().expect("assistant span has blocks");
+        assert_eq!(blocks, original_blocks.as_slice());
+
+        // Flat content remains the existing flattened projection — both
+        // views coexist.
+        assert!(assistant_span.content().contains("I'll read the file."));
+        assert!(assistant_span.content().contains("[tool_call:read("));
+    }
+
+    #[test]
+    fn rendered_provider_message_carries_blocks_through() {
+        use crate::context::{FauxProviderRenderer, ProjectionTarget, ProviderRenderer};
+
+        let original_blocks = vec![
+            ContentBlock::Text { text: "ok".into() },
+            ContentBlock::ToolCall(ToolCall {
+                id: "toolu_1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "ls"}),
+            }),
+        ];
+        let messages = vec![AgentMessage::Assistant(AssistantMessage {
+            content: original_blocks.clone(),
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        })];
+        let rope = assemble_rope(None, &messages, &[]);
+        let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+
+        // The single assistant message in the projection has blocks
+        // identical to the originating AssistantMessage.content.
+        assert_eq!(projection.messages.len(), 1);
+        let msg_blocks = projection.messages[0]
+            .blocks()
+            .expect("assistant ProviderMessage has blocks");
+        assert_eq!(msg_blocks, original_blocks.as_slice());
+    }
+
+    #[test]
+    fn non_assistant_spans_have_no_blocks() {
+        let messages = vec![
+            AgentMessage::User {
+                content: "hi".into(),
+            },
+            AgentMessage::ToolResult {
+                call_id: "toolu_x".into(),
+                content: "ok".into(),
+                is_error: false,
+            },
+        ];
+        let rope = assemble_rope(Some("sys"), &messages, &[sample_tool()]);
+
+        // system, tool-schema, user, tool-result: all None.
+        for span in rope.spans() {
+            assert!(
+                span.blocks().is_none(),
+                "non-assistant span (kind={:?}, id={}) must have blocks=None",
+                span.kind(),
+                span.id(),
+            );
+        }
     }
 }

@@ -568,6 +568,252 @@ fn stop_reason_max_tokens_from_incomplete_details() {
 }
 
 // ============================================================================
+// mu-yqeq.5 parity tests
+//
+// Each test runs the SAME scenario through both wire-body builders:
+//   - Legacy:    build_request_body(model, thinking, instructions, &[AgentMessage], tools)
+//   - Projected: build_request_body_from_projection(model, thinking,
+//                  default_instructions, &ProviderMessages, tools)
+//                where ProviderMessages comes from
+//                FauxProviderRenderer::render(&assemble_rope(...),
+//                ProjectionTarget::AgentView).
+//
+// The Legacy call uses the same resolved `instructions` value that
+// `OpenaiCodexProvider::stream` would compute from `system_prompt`
+// and `self.instructions`; the Projected call passes the default
+// fallback and lets the helper recover the hoisted system text from
+// the projection. Byte-equality on the two `serde_json::Value`
+// outputs is the contract.
+//
+// Phase D (mu-yqeq.8) flips the call site at mod.rs:818 from Legacy
+// to Projected; if these parity tests pass, the cutover is
+// observably equivalent at the wire layer.
+// ============================================================================
+
+const PARITY_DEFAULT_INSTRUCTIONS: &str = "you are a test";
+
+fn parity_compare(system_prompt: Option<&str>, messages: &[AgentMessage], tools: &[ToolSpec]) {
+    use mu_core::context::{
+        assemble_rope, FauxProviderRenderer, ProjectionTarget, ProviderRenderer,
+    };
+
+    // Resolve instructions the same way OpenaiCodexProvider::stream
+    // would in the Legacy arm.
+    let resolved_instructions = system_prompt
+        .filter(|s| !s.is_empty())
+        .unwrap_or(PARITY_DEFAULT_INSTRUCTIONS);
+    let legacy = build_request_body(
+        "gpt-5-codex",
+        "high",
+        resolved_instructions,
+        messages,
+        tools,
+    );
+
+    let rope = assemble_rope(system_prompt, messages, tools);
+    let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let projected = build_request_body_from_projection(
+        "gpt-5-codex",
+        "high",
+        PARITY_DEFAULT_INSTRUCTIONS,
+        &projection,
+        tools,
+    );
+
+    assert_eq!(
+        legacy, projected,
+        "Legacy vs Projected wire body diverged.\nLegacy:    {legacy:#}\nProjected: {projected:#}",
+    );
+}
+
+#[test]
+fn yqeq5_parity_pure_text_turn() {
+    // User → Assistant text. No tools, no system, no tool calls.
+    let messages = vec![
+        AgentMessage::User {
+            content: "hi".into(),
+        },
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        }),
+    ];
+    parity_compare(None, &messages, &[]);
+}
+
+#[test]
+fn yqeq5_parity_single_tool_call() {
+    // User → Assistant(text + ToolCall) → ToolResult → Assistant text.
+    // Exercises the Responses API split shape: each Assistant turn
+    // emits a `message` item (text) + a `function_call` item, and the
+    // ToolResult emits a `function_call_output` item.
+    let tool = ToolSpec {
+        name: "read".into(),
+        description: "read a file".into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+        }),
+        policy: Default::default(),
+    };
+    let messages = vec![
+        AgentMessage::User {
+            content: "what's in /tmp/x?".into(),
+        },
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::Text {
+                    text: "I'll read it.".into(),
+                },
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_42".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "/tmp/x"}),
+                }),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        }),
+        AgentMessage::ToolResult {
+            call_id: "call_42".into(),
+            content: "contents".into(),
+            is_error: false,
+        },
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: "it says contents".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        }),
+    ];
+    parity_compare(None, &messages, std::slice::from_ref(&tool));
+}
+
+#[test]
+fn yqeq5_parity_consecutive_tool_results() {
+    // Three back-to-back ToolResults. Unlike Anthropic (which groups
+    // these into a single user message), the OpenAI Responses API
+    // emits each as a separate function_call_output item. The
+    // Projected path must preserve that lack of grouping.
+    let messages = vec![
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_1".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "/a"}),
+                }),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_2".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "/b"}),
+                }),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_3".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "/c"}),
+                }),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        }),
+        AgentMessage::ToolResult {
+            call_id: "call_1".into(),
+            content: "a-contents".into(),
+            is_error: false,
+        },
+        AgentMessage::ToolResult {
+            call_id: "call_2".into(),
+            content: "b-contents".into(),
+            is_error: true,
+        },
+        AgentMessage::ToolResult {
+            call_id: "call_3".into(),
+            content: "c-contents".into(),
+            is_error: false,
+        },
+    ];
+    parity_compare(None, &messages, &[]);
+}
+
+#[test]
+fn yqeq5_parity_system_prompt_plus_tools() {
+    // System prompt + multiple tools. Exercises:
+    //   - the instructions-hoisting path (Projected extracts from the
+    //     "system-prompt" span; Legacy uses the resolved instructions).
+    //   - the tool_choice + parallel_tool_calls extra fields that
+    //     appear only when tools are present.
+    let tools = vec![
+        ToolSpec {
+            name: "read".into(),
+            description: "read a file".into(),
+            input_schema: json!({"type": "object"}),
+            policy: Default::default(),
+        },
+        ToolSpec {
+            name: "bash".into(),
+            description: "run shell".into(),
+            input_schema: json!({"type": "object"}),
+            policy: Default::default(),
+        },
+    ];
+    let messages = vec![AgentMessage::User {
+        content: "list files".into(),
+    }];
+    parity_compare(Some("you are a helpful assistant"), &messages, &tools);
+}
+
+#[test]
+fn yqeq5_thinking_blocks_are_skipped_in_projected_wire_output() {
+    // Spec mu-044 §"Thinking-block skip": Projected wire emission
+    // MUST NOT echo the model's reasoning trace back as input.
+    // Mirrors the Legacy `translate_message` behavior
+    // (openai_codex.rs:243-247 filters Thinking blocks).
+    use mu_core::context::{
+        assemble_rope, FauxProviderRenderer, ProjectionTarget, ProviderRenderer,
+    };
+
+    let messages = vec![AgentMessage::Assistant(AssistantMessage {
+        content: vec![
+            ContentBlock::Thinking {
+                text: "INTERNAL_REASONING_DO_NOT_LEAK".into(),
+            },
+            ContentBlock::Text {
+                text: "public answer".into(),
+            },
+        ],
+        stop_reason: StopReason::EndTurn,
+        usage: None,
+    })];
+    let rope = assemble_rope(None, &messages, &[]);
+    let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let projected = build_request_body_from_projection(
+        "gpt-5-codex",
+        "high",
+        PARITY_DEFAULT_INSTRUCTIONS,
+        &projection,
+        &[],
+    );
+
+    let wire = serde_json::to_string(&projected).expect("serialize");
+    assert!(
+        !wire.contains("INTERNAL_REASONING_DO_NOT_LEAK"),
+        "Thinking block content leaked to wire: {wire}",
+    );
+    assert!(
+        wire.contains("public answer"),
+        "non-thinking text was lost: {wire}",
+    );
+
+    // Also: parity vs Legacy (which also strips thinking).
+    parity_compare(None, &messages, &[]);
+}
+
+// ============================================================================
 // Live integration tests (gated on MU_LIVE_OPENAI_CODEX=1)
 // ============================================================================
 

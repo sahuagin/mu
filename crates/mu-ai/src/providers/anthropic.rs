@@ -316,18 +316,33 @@ pub(crate) fn build_request_body(
 // see `parity_*` tests below for the canonical scenarios.
 
 /// Translate a [`ProviderMessages`] projection into Anthropic's API
-/// message array shape, returning the hoisted system-prompt text (if
+/// message array shape, returning the hoisted system-content text (if
 /// any) separately for [`build_request_body_from_projection`] to
 /// place in the top-level `system` field.
 ///
-/// Hoisting rule: the FIRST `ProviderRole::System` message's content
-/// is captured as the system prompt; subsequent System messages are
-/// silently dropped (assemble_rope produces at most one). Tool-schema
-/// messages are skipped (the `tools` parameter on `Provider::stream`
-/// is authoritative for `body.tools`). All other roles are translated
-/// per the Legacy `translate_messages` rules, with consecutive
-/// `ToolResult` messages batched into a single user message — Anthropic's
-/// tool-use protocol requires that grouping.
+/// Hoisting rule (mu-s855, post-mu-phl v0):
+///   - All `ProviderRole::System` messages EXCEPT tool-schema spans
+///     get their content hoisted into `system_text`, concatenated
+///     with "\n\n" between spans. This covers:
+///       - "system-prompt" (the session system_prompt)
+///       - "memory-recall:*" (SubprocessRecallProvider per mu-phl v0)
+///       - "project-file:*" (ProjectFileRecallProvider per mu-phl v0)
+///       - any other future System-role span kind
+///   - Tool-schema spans are skipped (the `tools` parameter on
+///     Provider::stream is authoritative for `body.tools`; the rope's
+///     ToolSchema spans exist for operator-view + cache positioning,
+///     not wire emission).
+///
+/// Pre-fix this branch only hoisted the literal "system-prompt" span
+/// and silently dropped every other System-role span — invisible in
+/// yqeq4_parity_* tests because pre-mu-phl ropes had no other
+/// System-role spans. Codex sibling: mu-2puu. OpenRouter sibling:
+/// mu-745h.
+///
+/// All other roles are translated per the Legacy `translate_messages`
+/// rules, with consecutive `ToolResult` messages batched into a
+/// single user message — Anthropic's tool-use protocol requires that
+/// grouping.
 fn translate_provider_messages(pmsgs: &ProviderMessages) -> (Vec<Value>, Option<String>) {
     let mut out: Vec<Value> = Vec::with_capacity(pmsgs.messages.len());
     let mut tool_result_buf: Vec<Value> = Vec::new();
@@ -336,25 +351,24 @@ fn translate_provider_messages(pmsgs: &ProviderMessages) -> (Vec<Value>, Option<
     for msg in &pmsgs.messages {
         match msg.role() {
             ProviderRole::System => {
-                // System-role messages come from two distinct rope
-                // sources mapped to the same provider role by
-                // `From<&SpanKind> for ProviderRole`:
-                //   1. The session system prompt — source span id
-                //      "system-prompt" (from assemble_rope).
-                //   2. Tool-schema spans — source span ids
-                //      "tool-schema:{name}".
-                // Only (1) is hoisted into Anthropic's top-level
-                // `system` field. (2) is skipped because the `tools`
-                // parameter on Provider::stream is authoritative for
-                // `body.tools`; the rope's ToolSchema spans exist for
-                // operator-view + cache positioning, not wire emission.
-                let is_session_prompt = msg
+                let is_tool_schema = msg
                     .source_span_ids()
                     .first()
-                    .map(|sid| sid.as_ref() == "system-prompt")
+                    .map(|sid| sid.as_ref().starts_with("tool-schema:"))
                     .unwrap_or(false);
-                if is_session_prompt && system_text.is_none() {
-                    system_text = Some(msg.content().to_string());
+                if !is_tool_schema {
+                    let content = msg.content();
+                    if !content.is_empty() {
+                        match system_text.as_mut() {
+                            Some(existing) => {
+                                existing.push_str("\n\n");
+                                existing.push_str(content);
+                            }
+                            None => {
+                                system_text = Some(content.to_string());
+                            }
+                        }
+                    }
                 }
             }
             ProviderRole::ToolResult => {
@@ -501,7 +515,17 @@ pub(crate) fn build_request_body_from_projection(
 /// Walk the projection and determine which Anthropic wire positions
 /// should carry `cache_control`. The rope strategy puts cache markers
 /// on the ProviderMessage layer; this helper maps marker positions
-/// back to wire positions via source-span-id discrimination.
+/// back to wire positions.
+///
+/// mu-s855: post-mu-phl v0, multiple non-tool-schema System-role spans
+/// (system-prompt, memory-recall:*, project-file:*) all contribute to
+/// `body.system`. A cache marker on ANY of those spans triggers
+/// `system_should_cache`. Pre-fix this helper only recognized
+/// "system-prompt" — markers on memory or file spans were
+/// effectively dead because their wire target was wrong.
+///
+/// Tool-schema marker still flows to `tools_should_cache` (separate
+/// wire target).
 fn detect_cache_targets(pmsgs: &ProviderMessages) -> (bool, bool) {
     let mut system_should_cache = false;
     let mut tools_should_cache = false;
@@ -509,19 +533,27 @@ fn detect_cache_targets(pmsgs: &ProviderMessages) -> (bool, bool) {
         if msg.cache_marker() != Some(CacheMarker::Ephemeral) {
             continue;
         }
+        // Only System-role markers map to wire-side cache_control —
+        // markers on User/Assistant/ToolResult don't have a current
+        // wire target (Anthropic allows cache_control on content
+        // blocks but the legacy strategy only marked system + tools,
+        // so we preserve that mapping).
+        if msg.role() != ProviderRole::System {
+            continue;
+        }
         let Some(sid) = msg.source_span_ids().first() else {
             continue;
         };
         let sid_str = sid.as_ref();
-        if sid_str == "system-prompt" {
-            system_should_cache = true;
-        } else if sid_str.starts_with("tool-schema:") {
+        if sid_str.starts_with("tool-schema:") {
             tools_should_cache = true;
+        } else {
+            // Any other System-role span (system-prompt,
+            // memory-recall:*, project-file:*, future SkillActivation
+            // / Compaction kinds) lands in body.system, so its
+            // marker flows there too.
+            system_should_cache = true;
         }
-        // Markers on other span kinds (User/Assistant/ToolResult)
-        // don't have a current wire target — Anthropic allows
-        // cache_control on content blocks but the legacy strategy
-        // only marked system + tools, so we preserve that mapping.
     }
     (system_should_cache, tools_should_cache)
 }

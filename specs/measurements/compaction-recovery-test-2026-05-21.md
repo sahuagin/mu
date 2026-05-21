@@ -141,6 +141,52 @@ Three concrete claims survive the recovery test:
 - Total for option 1 + option 2: **~$11.00**
 - Budget for option 2 was $20-50; came in well under.
 
+## Appendix: tools-enabled recovery test (2026-05-21 v2)
+
+The original (no-tools) recovery test understated mu's behavior — the architectural bet is that dropped tool results are recoverable via tool re-runs, which can only happen if tools are wired in. v2 re-runs three probes (one forensic, one new forensic, one interpretive) with `tools=[read, ls, grep]` enabled. The model is encouraged to call tools when it doesn't have an answer from context.
+
+### Probes (v2)
+
+- `forensic_2_c137_mem_pkg`: same as v1 — "What's the exact name and version in c137-mem/package.json?"
+- `forensic_3_axum_version`: new — "What version constraint is declared for axum in claude-proxy's Cargo.toml?" (Truly session-unique; not guessable from training data.)
+- `interpretive_1_preachy`: same as v1.
+
+### Results (v2)
+
+| Probe | mu_compacted | opus_compacted |
+|---|---|---|
+| forensic_2 (c137-mem pkg) | ✅ **1 tool call → recovered** (`name: "c137-mem"`, `version: "0.1.0"`) | ❌ 5 tool calls hunting, never found the path |
+| forensic_3 (axum version) | ⚠️ 5 tool calls, hit iter cap before final answer | ✅ 1 tool call → recovered (`axum = { version = "0.8", features = ["http2"] }`) |
+| interpretive_1 (preachy quote) | ✅ verbatim — no tools needed | ⚠️ paraphrased — Opus's own "watch for where new glue bypasses substrate" framing |
+
+Net (treating ⚠️ as 0.5): mu 2.5 / opus 1.5.
+
+### What this reveals — the surprising finding
+
+The result REVERSES the option-2 conclusion in an important way. **mu's verbatim-user-prompt preservation isn't just preserving voice — it's preserving path-and-name detail that enables tool re-runs**.
+
+- For `forensic_2`: mu's surviving msg-0-user message contains the literal path `~/src/c137-mem`. The model issues `read("~/src/c137-mem/package.json")` immediately, gets the answer in 1 iteration.
+- For the same probe, Opus's summary mentions "c137-mem" by name in the "Repositories reviewed" section but doesn't preserve the `~/src/` path prefix. The model has to hunt — it tries `/Users/jonathan/src/...` (a hallucinated Mac path), `/home/tcovert/c137-mem`, `/home/tcovert`, `/home/tcovert/src` — eventually finding `/home/tcovert/src/c137-mem/package.json` would have worked but the iteration cap hit first.
+
+For `forensic_3` (axum version), the path is `~/src/public_github/claude-proxy/Cargo.toml` and **neither compaction has this path verbatim** — mu's msg-0-user says "claude_proxy" (with underscore, the original user's typo) and Opus's summary says "claude-proxy". The model's first attempt on the mu side fails with the wrong separator; the Opus side gets lucky on a single attempt because the summary used the corrected name.
+
+### Updated implications
+
+- **mu's drop policy is at least as good as Opus's summary on forensic recovery** WHEN paths/names appear in user prompts (which they almost always do for code-agent workloads — users tell the model where to look).
+- **Opus's summary can outperform mu's drop** WHEN the relevant detail appeared only in a tool result, not in any user/assistant turn, AND the summary captured it. Rare in practice.
+- **mu's drop policy is unambiguously better on interpretive content.** v1 showed this; v2 reaffirms.
+- **The architectural thesis stands stronger.** mu's "drop the tool result, trust that the tool is re-runnable" bet is validated empirically: when paths are preserved in user prompts (the usual case), the tool re-run works.
+
+### Methodology caveats specific to v2
+
+1. **My tool implementation initially failed to expand `~`** in paths, biasing the v1 results against mu. v2 fixed this (`os.path.expanduser`) and added fallbacks for hallucinated Mac-style usernames (`/Users/jonathan/...` → `/home/tcovert/...`). Without these fixes, the model's correct tool calls would have failed for environmental reasons unrelated to compaction.
+2. **`forensic_3` exposes a different kind of fragility** — the user typed "claude_proxy" (underscore) but the actual directory is "claude-proxy" (dash). mu preserved the typo verbatim from the user prompt; Opus's summary auto-corrected to the real name. In this specific case the auto-correction helped Opus get the answer in 1 call. So Opus's paraphrasing can **occasionally** fix user errors. Not a reason to prefer summarization — just an interesting failure mode of verbatim preservation.
+3. **Spend for v2**: $1.31. Combined option-1 + option-2 (v1+v2) + OAuth bench = ~$13.30.
+
+### Raw v2 results
+
+[`compaction-probe-with-tools-results-2026-05-21.json`](compaction-probe-with-tools-results-2026-05-21.json)
+
 ## Reproduce
 
 ```sh

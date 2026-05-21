@@ -1,0 +1,178 @@
+[
+  {
+    "probe_id": "forensic_2_c137_mem_pkg",
+    "axis": "forensic",
+    "answer": "That's a really nice validation of the event-sourced approach \u2014 the \"why did that happen?\" moment is exactly where it pays for itself, and the fact that *adding a missing event* is a small, local change rather than a refactor means the substrate is doing its job.\n\nLet me check that file for you.- `name`: `\"c137-mem\"`\n- `version`: `\"0.1.0\"`\n\nAnd worth noting on the way past: the capability_manifest in there is itself a nice example of the pattern we were just talking about \u2014 the extension declares its authority (env vars + specific hosts) as data, not as ambient runtime permission. That's the kind of seam that stays honest as long as nothing downstream quietly bypasses it.",
+    "ground_truth_hint": "name: \"c137-mem\"; version: \"0.1.0\"",
+    "iterations": 2,
+    "tool_calls": [
+      {
+        "name": "read",
+        "input": {
+          "path": "~/src/c137-mem/package.json"
+        },
+        "output_chars": 836
+      }
+    ],
+    "wall_ms": 9773.210624989588,
+    "total_input_tokens": 10820,
+    "total_output_tokens": 298,
+    "total_cache_read_input_tokens": 0,
+    "total_cache_creation_input_tokens": 0,
+    "input": "mu_compacted"
+  },
+  {
+    "probe_id": "forensic_3_axum_version",
+    "axis": "forensic",
+    "answer": "Interesting \u2014 the path didn't resolve. Let me check what's actually in the workspace.It's `claude-proxy` (hyphen), not `claude_proxy` (underscore). I should also note: the working directory here appears to be `/home/tcovert/...`, not `/Users/jrm/...` as I assumed in the first call. Let me try the correct path.",
+    "ground_truth_hint": "axum = { version = \"0.8\", ... }",
+    "iterations": 5,
+    "tool_calls": [
+      {
+        "name": "grep",
+        "input": {
+          "pattern": "^axum",
+          "path": "/Users/jrm/src/public_github/claude_proxy/Cargo.toml"
+        },
+        "output_chars": 12
+      },
+      {
+        "name": "grep",
+        "input": {
+          "path": "/Users/jrm/src/public_github/claude_proxy/Cargo.toml",
+          "pattern": "axum"
+        },
+        "output_chars": 12
+      },
+      {
+        "name": "read",
+        "input": {
+          "path": "/Users/jrm/src/public_github/claude_proxy/Cargo.toml"
+        },
+        "output_chars": 189
+      },
+      {
+        "name": "ls",
+        "input": {
+          "path": "~/src/public_github"
+        },
+        "output_chars": 445
+      },
+      {
+        "name": "grep",
+        "input": {
+          "path": "/home/tcovert/src/public_github/claude-proxy/Cargo.toml",
+          "pattern": "axum"
+        },
+        "output_chars": 51
+      }
+    ],
+    "wall_ms": 17624.359981011366,
+    "total_input_tokens": 27308,
+    "total_output_tokens": 613,
+    "total_cache_read_input_tokens": 0,
+    "total_cache_creation_input_tokens": 0,
+    "input": "mu_compacted"
+  },
+  {
+    "probe_id": "interpretive_1_preachy",
+    "axis": "interpretive",
+    "answer": "Their main counterpoint was that they had already arrived at the architecture and discipline I was describing without needing the advice. The phrasing was:\n\n> \"a little preachy. But thanks? I mean, I did get here wihout that advice.\"\n\nAnd they followed it with a concrete example of the kind of advice that *would* have been useful \u2014 specific, tied to what they\u2019d already built, e.g. warning them not to throw away the event-log/projection substrate when adding memory:\n\n> \"hey, you've built this cool architecture where everything is a prejection from the event log. Be sure that when you make memory you don't just throw all that away and copy a bunch of strings into a a list somewhere.\"\n\nSo the counterpoint was basically: generic discipline lectures aren\u2019t useful to someone already doing it; specific warnings about *their* seams are.\n\nAnd on the event log point you just made \u2014 that\u2019s a really good validation of the design. \u201cWhy did that happen?\u201d being answerable by reading the log, *and* the log itself being extensible when you find a gap, is exactly the payoff event-sourced systems are supposed to deliver and frequently don\u2019t. A lot of systems claim to be event-sourced but the events are too coarse, too late, or too lossy to actually reconstruct intent. The fact that you\u2019re routinely using it for forensics \u2014 and occasionally finding \u201cwe needed an event here\u201d and adding it cheaply \u2014 means the substrate is doing real work, not just sitting there as an architectural ornament.\n\nThat also suggests a small habit worth formalizing: when you add an event because of a forensic gap, note it. Even just:\n\n```text\nevents/CHANGELOG.md\n- Added ToolInvocationRejected { reason } \u2014 needed to explain why a delegation silently no-op'd on 2025-xx-xx.\n- Added SessionConfigChanged { provider, model } \u2014 needed to explain mid-session model switch.\n```\n\nOver time that file becomes a really honest description of what your system actually needs to be observable, written in the language of real incidents rather than upfront speculation.",
+    "ground_truth_hint": "User said: 'I did get here without that advice'",
+    "iterations": 1,
+    "tool_calls": [],
+    "wall_ms": 17337.68397400854,
+    "total_input_tokens": 5131,
+    "total_output_tokens": 640,
+    "total_cache_read_input_tokens": 0,
+    "total_cache_creation_input_tokens": 0,
+    "input": "mu_compacted"
+  },
+  {
+    "probe_id": "forensic_2_c137_mem_pkg",
+    "axis": "forensic",
+    "answer": "",
+    "ground_truth_hint": "name: \"c137-mem\"; version: \"0.1.0\"",
+    "iterations": 5,
+    "tool_calls": [
+      {
+        "name": "read",
+        "input": {
+          "path": "/Users/jonathan/src/c137-mem/package.json"
+        },
+        "output_chars": 149
+      },
+      {
+        "name": "ls",
+        "input": {
+          "path": "/home/tcovert/c137-mem"
+        },
+        "output_chars": 123
+      },
+      {
+        "name": "ls",
+        "input": {
+          "path": "/home/tcovert"
+        },
+        "output_chars": 4756
+      },
+      {
+        "name": "ls",
+        "input": {
+          "path": "/home/tcovert/src"
+        },
+        "output_chars": 1445
+      },
+      {
+        "name": "read",
+        "input": {
+          "path": "/home/tcovert/src/c137-mem/package.json"
+        },
+        "output_chars": 836
+      }
+    ],
+    "wall_ms": 15381.34406102472,
+    "total_input_tokens": 22948,
+    "total_output_tokens": 371,
+    "total_cache_read_input_tokens": 0,
+    "total_cache_creation_input_tokens": 0,
+    "input": "opus_compacted"
+  },
+  {
+    "probe_id": "forensic_3_axum_version",
+    "axis": "forensic",
+    "answer": "`axum = { version = \"0.8\", features = [\"http2\"] }` \u2014 so the version constraint is `\"0.8\"` (with the `http2` feature enabled).",
+    "ground_truth_hint": "axum = { version = \"0.8\", ... }",
+    "iterations": 2,
+    "tool_calls": [
+      {
+        "name": "grep",
+        "input": {
+          "pattern": "^axum",
+          "path": "/Users/cmiles/src/public_github/claude-proxy/Cargo.toml"
+        },
+        "output_chars": 51
+      }
+    ],
+    "wall_ms": 6190.440170001239,
+    "total_input_tokens": 6175,
+    "total_output_tokens": 169,
+    "total_cache_read_input_tokens": 0,
+    "total_cache_creation_input_tokens": 0,
+    "input": "opus_compacted"
+  },
+  {
+    "probe_id": "interpretive_1_preachy",
+    "axis": "interpretive",
+    "answer": "Their main counterpoint was that they got to their current state **without** that kind of advice \u2014 i.e., the architecture, the event-sourced design, the careful seams, the spec-first progression all happened without anyone telling them to \"be disciplined.\"\n\nThe reframe they offered was that the useful framing isn't \"be disciplined\" but rather:\n\n> **\"watch for where new glue accidentally bypasses good substrate\"**\n\nWith the concrete example that memory shouldn't just throw away the event-log/projection architecture that's already there.\n\nSo the corrective wasn't \"don't give advice\" \u2014 it was \"the generic discipline advice is noise; the signal is specific warnings about integration paths that route around the substrate you've already built.\" The person doing the work has already demonstrated the discipline; what they can't always see from inside the work is where a convenient new path is quietly undoing an architectural commitment.",
+    "ground_truth_hint": "User said: 'I did get here without that advice'",
+    "iterations": 1,
+    "tool_calls": [],
+    "wall_ms": 7036.781436007004,
+    "total_input_tokens": 3022,
+    "total_output_tokens": 277,
+    "total_cache_read_input_tokens": 0,
+    "total_cache_creation_input_tokens": 0,
+    "input": "opus_compacted"
+  }
+]

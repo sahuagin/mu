@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use mu_core::agent::Provider;
 use mu_core::context::compaction::bench::{
     benchmark_session, csv_header, csv_row, load_session_rope, BenchRow, KeepHalfJudge,
     LabeledPolicy,
@@ -44,7 +45,11 @@ use mu_core::context::compaction::NoCompactionPolicy;
 // mu-kgu.11: --judge live uses Anthropic Haiku 4.5 by default
 // (cheapest reliable judge per the bead). Operator can override via
 // $MU_BENCH_JUDGE_MODEL.
-use mu_ai::AnthropicProvider;
+// 2026-05-21: --judge-provider {anthropic|openai-codex|openrouter} lets
+// the operator route the judge's LLM call through their preferred
+// provider (e.g., subscription-priced OpenAI Codex OAuth instead of
+// pay-per-token Anthropic API).
+use mu_ai::{AnthropicProvider, OpenRouterProvider, OpenaiCodexProvider};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Format {
@@ -58,12 +63,37 @@ enum JudgeKind {
     Live,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JudgeProvider {
+    Anthropic,
+    OpenaiCodex,
+    Openrouter,
+}
+
+impl JudgeProvider {
+    fn label(self) -> &'static str {
+        match self {
+            JudgeProvider::Anthropic => "anthropic",
+            JudgeProvider::OpenaiCodex => "openai-codex",
+            JudgeProvider::Openrouter => "openrouter",
+        }
+    }
+    fn default_model(self) -> &'static str {
+        match self {
+            JudgeProvider::Anthropic => "claude-haiku-4-5-20251001",
+            JudgeProvider::OpenaiCodex => "gpt-5.5",
+            JudgeProvider::Openrouter => "anthropic/claude-haiku-4.5",
+        }
+    }
+}
+
 struct Args {
     corpus: PathBuf,
     format: Format,
     target_tokens: usize,
     max_sessions: Option<usize>,
     judge: JudgeKind,
+    judge_provider: JudgeProvider,
 }
 
 fn default_corpus() -> PathBuf {
@@ -79,12 +109,17 @@ fn print_help() {
          Loads ~/.local/share/mu/events/<daemon>/<session>.jsonl session\n\
          logs and benchmarks each registered CompactionPolicy.\n\n\
          Flags:\n  \
-         --corpus DIR        root of per-daemon JSONL trees (default ~/.local/share/mu/events)\n  \
-         --format csv|json   output shape (default csv)\n  \
-         --target-tokens N   target_tokens for compact() (default 4000)\n  \
-         --max-sessions N    stop after N sessions (default unlimited)\n  \
-         --judge mock|live   HashAndSummaryPolicy judge (default mock; live not wired)\n  \
-         -h, --help          print this banner\n",
+         --corpus DIR                       root of per-daemon JSONL trees (default ~/.local/share/mu/events)\n  \
+         --format csv|json                  output shape (default csv)\n  \
+         --target-tokens N                  target_tokens for compact() (default 4000)\n  \
+         --max-sessions N                   stop after N sessions (default unlimited)\n  \
+         --judge mock|live                  HashAndSummaryPolicy judge (default mock)\n  \
+         --judge-provider PROVIDER          live-judge backend: anthropic | openai-codex | openrouter\n  \
+         \\\\                                  (default anthropic). OpenAI Codex uses OAuth; OpenRouter uses\n  \
+         \\\\                                  OPENROUTER_API_KEY. Subscription-priced backends help bound cost\n  \
+         \\\\                                  on heavy research runs. Set MU_BENCH_JUDGE_MODEL to override\n  \
+         \\\\                                  the per-provider default model.\n  \
+         -h, --help                         print this banner\n",
     );
 }
 
@@ -95,6 +130,7 @@ fn parse_args() -> Result<Args, String> {
         target_tokens: 4_000,
         max_sessions: None,
         judge: JudgeKind::Mock,
+        judge_provider: JudgeProvider::Anthropic,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -146,13 +182,31 @@ fn parse_args() -> Result<Args, String> {
                     other => return Err(format!("--judge: expected mock|live, got {other:?}")),
                 };
             }
+            "--judge-provider" => {
+                let v = it.next().ok_or_else(|| {
+                    "--judge-provider requires anthropic|openai-codex|openrouter".to_string()
+                })?;
+                args.judge_provider = match v.as_str() {
+                    "anthropic" => JudgeProvider::Anthropic,
+                    "openai-codex" => JudgeProvider::OpenaiCodex,
+                    "openrouter" => JudgeProvider::Openrouter,
+                    other => {
+                        return Err(format!(
+                            "--judge-provider: expected anthropic|openai-codex|openrouter, got {other:?}"
+                        ))
+                    }
+                };
+            }
             other => return Err(format!("unknown flag: {other}")),
         }
     }
     Ok(args)
 }
 
-fn build_policies(judge: JudgeKind) -> Result<Vec<LabeledPolicy>, String> {
+fn build_policies(
+    judge: JudgeKind,
+    judge_provider: JudgeProvider,
+) -> Result<Vec<LabeledPolicy>, String> {
     let mut policies: Vec<LabeledPolicy> = Vec::new();
     policies.push(LabeledPolicy {
         label: "no-compaction".into(),
@@ -173,18 +227,36 @@ fn build_policies(judge: JudgeKind) -> Result<Vec<LabeledPolicy>, String> {
             });
         }
         JudgeKind::Live => {
-            // mu-kgu.11: real Provider-backed judge. Default Anthropic
-            // Haiku 4.5 (cheapest reliable per the bead's cost table:
-            // ~$0.05 / event vs ~$2.03 for Opus). Operator can override
-            // the model via $MU_BENCH_JUDGE_MODEL.
+            // mu-kgu.11 + 2026-05-21: real Provider-backed judge.
+            // judge_provider picks the backend; MU_BENCH_JUDGE_MODEL
+            // overrides the per-provider default model. Anthropic
+            // remains the default for backward compatibility.
             let model = std::env::var("MU_BENCH_JUDGE_MODEL")
-                .unwrap_or_else(|_| "claude-haiku-4-5-20251001".into());
-            let provider = AnthropicProvider::from_env(model.clone())
-                .map_err(|e| format!("--judge live: {e}"))?;
-            let judge = ProviderJudge::new(Arc::new(provider));
+                .unwrap_or_else(|_| judge_provider.default_model().to_string());
+            let provider: Arc<dyn Provider> = match judge_provider {
+                JudgeProvider::Anthropic => {
+                    let p = AnthropicProvider::from_env(model.clone())
+                        .map_err(|e| format!("--judge live (anthropic): {e}"))?;
+                    Arc::new(p)
+                }
+                JudgeProvider::OpenaiCodex => {
+                    let p = OpenaiCodexProvider::from_store(model.clone())
+                        .map_err(|e| format!("--judge live (openai-codex): {e}"))?;
+                    Arc::new(p)
+                }
+                JudgeProvider::Openrouter => {
+                    let p = OpenRouterProvider::from_env(model.clone())
+                        .map_err(|e| format!("--judge live (openrouter): {e}"))?;
+                    Arc::new(p)
+                }
+            };
+            let judge_impl = ProviderJudge::new(provider);
             policies.push(LabeledPolicy {
-                label: format!("hash-and-summary-v1[live:{model}]"),
-                policy: Arc::new(HashAndSummaryPolicy::new(Arc::new(judge))),
+                label: format!(
+                    "hash-and-summary-v1[live:{}:{model}]",
+                    judge_provider.label()
+                ),
+                policy: Arc::new(HashAndSummaryPolicy::new(Arc::new(judge_impl))),
                 model_calls: 1,
             });
         }
@@ -235,7 +307,7 @@ fn emit_json(rows: &[BenchRow]) {
 }
 
 fn run(args: Args) -> Result<(), String> {
-    let policies = build_policies(args.judge)?;
+    let policies = build_policies(args.judge, args.judge_provider)?;
     let sessions = discover_sessions(&args.corpus)
         .map_err(|e| format!("read corpus {:?}: {}", args.corpus, e))?;
     if sessions.is_empty() {

@@ -12,7 +12,7 @@ The architectural thesis (events as substrate, context as projection, capability
 
 ### Compaction: structural beats LLM-summary
 
-**Claim.** mu represents context as a typed event log + retained rope of spans, not as a transcript blob. That makes compaction a *structural transform* over typed spans instead of a model-mediated summarization. For the apples-to-apples case where both approaches spend an LLM call on semantic summarization, mu's compaction is approximately **700× faster and ~40× cheaper** than Anthropic's beta `compact_20260112` pathway in our measurement. For workloads that can accept structural-only compaction (no semantic summary), mu's heuristic tier runs at microsecond scale.
+**Claim.** mu represents context as a typed event log + retained rope of spans, not as a transcript blob. That makes compaction a *structural transform* over typed spans instead of a model-mediated summarization. On a real-workload corpus, mu's structural-drop policy reduces context by **97%** in **~62 ms** with **zero LLM cost** — within a point of Anthropic Opus's 98% reduction but ~600× faster and free. The live-judge policy (Haiku-summary) is ~7× faster and ~17× cheaper than Opus auto-compaction at the same corpus size.
 
 **Mechanism.** `crates/mu-core/src/context/compaction/` defines a policy ladder over the same `RetainedRope` interface:
 
@@ -24,23 +24,26 @@ The architectural thesis (events as substrate, context as projection, capability
 
 Each tier is selected by config (`[context.compaction.policy]`), not by a code-path rewrite.
 
-**Measurement.** Against a real 124,091-token mu session corpus, 5 runs each, median wall-clock:
+**Measurement.** Two measurement points were run against real mu session corpora:
 
-| | Wall-clock | Cost per event | Reduction |
+*Anthropic Opus baseline* — 5 runs against a 124,091-token session through Anthropic's beta `compact_20260112` API, median wall-clock and direct token-cost calculation. [`specs/measurements/compaction-2026-05-14.md`](specs/measurements/compaction-2026-05-14.md).
+
+*mu policy ladder* — 5 sessions ranging 91k–235k tokens (727k total) run through each policy in `compaction-bench --judge live`, median wall-clock from the in-process timer, Haiku cost calculated from measured per-call token usage. [`specs/measurements/compaction-2026-05-21.md`](specs/measurements/compaction-2026-05-21.md).
+
+| | Wall-clock (median) | Cost per event | Reduction |
 |---|---|---|---|
 | Anthropic Opus 4.7 auto-compaction (beta) | 38.18 s | $2.03 | 124k → 2.3k tokens (~98%) |
-| mu `HashAndSummaryPolicy` (live Haiku judge, estimated) | ~50 ms | ~$0.05 | mid-tier semantic |
-| mu `SpanFamilyDropPolicy` (heuristic, structural-only) | 19 µs | $0.00 | structural drop, no semantic summary |
+| mu `HashAndSummaryPolicy` (live Haiku judge) | 6.0 s | ~$0.16 | 727k → 235k tokens (~67%) |
+| mu `SpanFamilyDropPolicy` (heuristic, structural-only) | 62 ms | $0.00 | 727k → 16k tokens (~97%) |
 
-The 2M× headline ratio between Anthropic and the heuristic is not a fair single-axis comparison — the heuristic preserves structure, not semantics, and its measurement does not include a real tokenization pass. The ~700× / ~40× numbers for the live-judge case are the more defensible "same trade-off, much cheaper" claim.
+Against the closest single-session corpus match to the Opus baseline (a 122,478-token mu session), the live-Haiku policy ran in **5.12 s** at **~$0.12** — a **~7.5× speed and ~17× cost win** over Opus on the same corpus size. The structural-drop policy ran in **62 ms** at **$0.00** — a **~616× speed win** while landing within a percentage point of Opus's reduction ratio.
 
 **Reproduce locally:**
 
 ```sh
-cargo run --example compaction-bench -p mu-ai
+cargo run --release --example compaction-bench -p mu-ai -- \
+  --judge live --max-sessions 20 --format json
 ```
-
-**Methodology (5 runs, real corpus, isolated wall-clock):** [`specs/measurements/compaction-2026-05-14.md`](specs/measurements/compaction-2026-05-14.md).
 
 ## Quick start
 

@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use mu_core::agent::{AgentConfig, AgentInput, AgentLoop, AgentMessage, Tool};
 use mu_core::capability::Capability;
+use mu_core::context::rope::SpanText;
 use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
     AskSessionRequest, AskSessionResponse, CancelOutstandingRequest, CancelOutstandingResponse,
@@ -240,7 +241,11 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         provider,
         session_tools,
         AgentConfig {
-            system_prompt,
+            // mu-kn7a (mu-yqeq.2 cleanup): convert wire-layer Option<String>
+            // to Option<SpanText> (Arc<str>) here, at the boundary between
+            // the JSON-RPC layer and the config layer. Downstream rope
+            // construction works directly on SpanText, no further allocs.
+            system_prompt: system_prompt.map(SpanText::from),
             max_turns,
             ..AgentConfig::default()
         },

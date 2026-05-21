@@ -22,7 +22,7 @@ use mu_core::agent::{
     ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
 };
 use mu_core::context::{
-    extract_call_id_from_span_id, CacheStrategy, ProviderMessage, ProviderMessages,
+    extract_call_id_from_span_id, CacheMarker, CacheStrategy, ProviderMessage, ProviderMessages,
     ProviderRenderer, ProviderRole,
 };
 
@@ -240,6 +240,14 @@ fn translate_message_single(m: &AgentMessage) -> Option<Value> {
     }
 }
 
+/// mu-yqeq.8 retired the unconditional `cache_control: ephemeral`
+/// annotation that used to live here. `AnthropicCacheStrategy` is
+/// now the sole source of Anthropic cache markers, and the Projected
+/// wire emitter ([`build_request_body_from_projection`]) propagates
+/// per-message `cache_marker` flags to the wire. The Legacy path is
+/// retained for rollback and out-of-loop callers (parity tests,
+/// embedders); it emits NO cache_control and therefore NO caching —
+/// in-loop callers should always use the Projected path post-mu-yqeq.8.
 pub(crate) fn build_request_body(
     model: &str,
     system_prompt: Option<&str>,
@@ -253,44 +261,18 @@ pub(crate) fn build_request_body(
         "stream": true,
         "messages": api_messages,
     });
-    // mu-n48: when a system prompt is configured for the session, emit
-    // it as a content-block array (not a plain string) and tag it
-    // cache_control: ephemeral. Anthropic caches everything up to and
-    // including the marker, so the system block joins the tools array
-    // (mu-i6j) as a cacheable prefix that's stable across asks within
-    // the session. Empty string ⇒ same as None (don't send an empty
-    // system field, which Anthropic rejects).
     if let Some(s) = system_prompt {
         if !s.is_empty() {
             body["system"] = json!([
                 {
                     "type": "text",
                     "text": s,
-                    "cache_control": { "type": "ephemeral" }
                 }
             ]);
         }
     }
     if !tools.is_empty() {
-        let mut tool_specs: Vec<Value> = tools.iter().map(translate_tool_spec).collect();
-        // mu-i6j: mark the last tool definition with cache_control.
-        // Anthropic caches everything up to and including the marker
-        // — placing it on the final tool turns the whole tools array
-        // into a cacheable prefix. Tool definitions are stable across
-        // asks within a session (a new ask adds a user message but
-        // doesn't change which tools are available), so this is a
-        // safe, high-impact target.
-        //
-        // System prompt is the other classic cache target but mu
-        // doesn't currently thread `system_prompt` from
-        // CreateSessionRequest through to Provider::stream — see
-        // protocol.rs:66 for the wire field; the body construction
-        // above does not include a `system` key. When that gap is
-        // closed, add a second cache_control marker on the last
-        // (or only) system content block.
-        if let Some(last) = tool_specs.last_mut() {
-            last["cache_control"] = json!({ "type": "ephemeral" });
-        }
+        let tool_specs: Vec<Value> = tools.iter().map(translate_tool_spec).collect();
         body["tools"] = json!(tool_specs);
     }
     body
@@ -448,25 +430,21 @@ fn translate_provider_assistant(msg: &ProviderMessage) -> Option<Value> {
 
 /// Sibling of [`build_request_body`] that builds Anthropic's request
 /// body from a [`ProviderMessages`] projection instead of a raw
-/// `&[AgentMessage]` slice. Wire JSON is byte-identical to the Legacy
-/// path for the canonical scenarios (asserted by `parity_*` tests).
-///
-/// ## System hoisting + cache_control decision (Phase D note)
-///
-/// The first `ProviderRole::System` message in the projection is
-/// hoisted into Anthropic's top-level `system` field with an
-/// unconditional `cache_control: ephemeral` annotation — matching the
-/// Legacy path's behavior. This pins Phase A/C byte-equality. When
-/// mu-yqeq.8 (Phase D) lands, the unconditional annotation retires
-/// and `AnthropicCacheStrategy`'s per-message `cache_marker` becomes
-/// the sole source of cache positioning; that change happens in the
-/// cutover bead, not here.
+/// `&[AgentMessage]` slice. After mu-yqeq.8, `cache_control` emission
+/// is driven by per-message [`CacheMarker`] flags set by
+/// [`AnthropicCacheStrategy`]: a marker on the projection's
+/// `"system-prompt"` message triggers `cache_control` on `body.system`;
+/// a marker on any `"tool-schema:*"` message triggers `cache_control`
+/// on the last tool spec. The wire shape (minus cache_control) is
+/// byte-identical to the Legacy path for the canonical scenarios —
+/// asserted by `yqeq4_parity_*` tests in anthropic_tests.rs.
 pub(crate) fn build_request_body_from_projection(
     model: &str,
     pmsgs: &ProviderMessages,
     tools: &[ToolSpec],
 ) -> Value {
     let (api_messages, hoisted_system) = translate_provider_messages(pmsgs);
+    let (system_should_cache, tools_should_cache) = detect_cache_targets(pmsgs);
     let mut body = json!({
         "model": model,
         "max_tokens": super::output_limits::max_tokens_for_model(model),
@@ -475,23 +453,54 @@ pub(crate) fn build_request_body_from_projection(
     });
     if let Some(s) = hoisted_system {
         if !s.is_empty() {
-            body["system"] = json!([
-                {
-                    "type": "text",
-                    "text": s,
-                    "cache_control": { "type": "ephemeral" }
-                }
-            ]);
+            let mut system_block = json!({
+                "type": "text",
+                "text": s,
+            });
+            if system_should_cache {
+                system_block["cache_control"] = json!({ "type": "ephemeral" });
+            }
+            body["system"] = json!([system_block]);
         }
     }
     if !tools.is_empty() {
         let mut tool_specs: Vec<Value> = tools.iter().map(translate_tool_spec).collect();
-        if let Some(last) = tool_specs.last_mut() {
-            last["cache_control"] = json!({ "type": "ephemeral" });
+        if tools_should_cache {
+            if let Some(last) = tool_specs.last_mut() {
+                last["cache_control"] = json!({ "type": "ephemeral" });
+            }
         }
         body["tools"] = json!(tool_specs);
     }
     body
+}
+
+/// Walk the projection and determine which Anthropic wire positions
+/// should carry `cache_control`. The rope strategy puts cache markers
+/// on the ProviderMessage layer; this helper maps marker positions
+/// back to wire positions via source-span-id discrimination.
+fn detect_cache_targets(pmsgs: &ProviderMessages) -> (bool, bool) {
+    let mut system_should_cache = false;
+    let mut tools_should_cache = false;
+    for msg in &pmsgs.messages {
+        if msg.cache_marker() != Some(CacheMarker::Ephemeral) {
+            continue;
+        }
+        let Some(sid) = msg.source_span_ids().first() else {
+            continue;
+        };
+        let sid_str = sid.as_ref();
+        if sid_str == "system-prompt" {
+            system_should_cache = true;
+        } else if sid_str.starts_with("tool-schema:") {
+            tools_should_cache = true;
+        }
+        // Markers on other span kinds (User/Assistant/ToolResult)
+        // don't have a current wire target — Anthropic allows
+        // cache_control on content blocks but the legacy strategy
+        // only marked system + tools, so we preserve that mapping.
+    }
+    (system_should_cache, tools_should_cache)
 }
 
 // ============================================================================

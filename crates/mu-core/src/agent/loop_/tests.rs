@@ -1965,3 +1965,184 @@ async fn kgu4_evict_half_policy_does_not_fire_when_threshold_not_crossed() {
         events.iter().map(kind).collect::<Vec<_>>(),
     );
 }
+
+// ============================================================================
+// mu-yqeq.8 Phase D smoke test
+//
+// Spec mu-044 §"Phase D end-to-end smoke test" calls for a recorded
+// fixture-driven smoke covering the behavioral surface of the
+// cutover. The recorded-fixture path is deferred (filed as a
+// follow-up bead — no fixture infrastructure in-tree yet); this
+// inline smoke covers the spec's core requirement: confirm the
+// agent loop now invokes provider.stream with MessageInput::Projected
+// (not Legacy), and that the structural decisions of a tool-call
+// round-trip survive the cutover.
+// ============================================================================
+
+/// A Provider wrapper that records the MessageInput variant + a
+/// structural snapshot of each stream() call's input. Otherwise
+/// behaves like MockProvider — pops scripted events from a queue.
+struct RecordingProvider {
+    responses: Mutex<VecDeque<Vec<ProviderEvent>>>,
+    records: Arc<Mutex<Vec<InputRecord>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InputVariant {
+    Legacy,
+    Projected,
+}
+
+#[derive(Debug, Clone)]
+struct InputRecord {
+    variant: InputVariant,
+    /// Number of messages in the projection (or legacy slice).
+    message_count: usize,
+    /// First five source span ids in the projection — a structural
+    /// fingerprint that catches reshape regressions.
+    first_span_ids: Vec<String>,
+}
+
+impl RecordingProvider {
+    fn new(responses: Vec<Vec<ProviderEvent>>) -> (Arc<Self>, Arc<Mutex<Vec<InputRecord>>>) {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(Self {
+            responses: Mutex::new(responses.into_iter().collect()),
+            records: records.clone(),
+        });
+        (provider, records)
+    }
+}
+
+#[async_trait]
+impl Provider for RecordingProvider {
+    async fn stream(
+        &self,
+        _system_prompt: Option<&str>,
+        input: MessageInput<'_>,
+        _tools: &[ToolSpec],
+        _cancel_rx: oneshot::Receiver<()>,
+    ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+        let record = match input {
+            MessageInput::Legacy(msgs) => InputRecord {
+                variant: InputVariant::Legacy,
+                message_count: msgs.len(),
+                first_span_ids: Vec::new(),
+            },
+            MessageInput::Projected(pmsgs) => InputRecord {
+                variant: InputVariant::Projected,
+                message_count: pmsgs.messages.len(),
+                first_span_ids: pmsgs
+                    .messages
+                    .iter()
+                    .take(5)
+                    .filter_map(|m| m.source_span_ids().first().map(|s| s.as_ref().to_string()))
+                    .collect(),
+            },
+        };
+        self.records.lock().expect("records mutex").push(record);
+
+        let chunk = self.responses.lock().expect("mutex poisoned").pop_front();
+        Ok(Box::pin(stream::iter(chunk.unwrap_or_default())))
+    }
+}
+
+/// mu-yqeq.8: a tool-call round-trip survives the cutover. Two
+/// provider calls fire (assistant tool-call → tool result → assistant
+/// text); BOTH receive MessageInput::Projected (not Legacy), and the
+/// projection's structural shape grows by exactly the expected number
+/// of new spans between turns (one for each new AgentMessage). This
+/// is the inline-fixture stand-in for the recorded-smoke acceptance
+/// in spec mu-044 §"Phase D end-to-end smoke test".
+#[tokio::test]
+async fn yqeq8_phase_d_smoke_tool_call_round_trip_uses_projected_path() {
+    let (provider, records) = RecordingProvider::new(vec![
+        // Turn 1: assistant calls a tool.
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "t1",
+            "echo",
+            json!({"x": 1}),
+        ))],
+        // Turn 2: assistant text → end.
+        vec![
+            ProviderEvent::TextDelta("done".into()),
+            ProviderEvent::Done(assistant_text("done")),
+        ],
+    ]);
+    let tools = vec![MockTool::ok("echo", "echoed")];
+    let tools_arc: Vec<Arc<dyn Tool>> = tools
+        .into_iter()
+        .map(|t| Arc::new(t) as Arc<dyn Tool>)
+        .collect();
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let loop_ = AgentLoop::spawn(
+        provider as Arc<dyn Provider>,
+        tools_arc,
+        AgentConfig::default(),
+        events_tx,
+        approvals,
+        capability,
+    );
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("call the tool")))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    let _events = events_handle.await.expect("events drain");
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+
+    let records = records.lock().expect("records mutex").clone();
+
+    // Both provider calls fired (one per turn).
+    assert_eq!(
+        records.len(),
+        2,
+        "expected exactly 2 provider calls (assistant tool-call + assistant text)",
+    );
+
+    // EVERY call received MessageInput::Projected — the Phase D
+    // cutover invariant.
+    for (i, rec) in records.iter().enumerate() {
+        assert_eq!(
+            rec.variant,
+            InputVariant::Projected,
+            "provider call {i}: expected MessageInput::Projected, got {:?}",
+            rec.variant,
+        );
+    }
+
+    // Turn 1 projection: tool-schema span + user message → 2 spans.
+    // assemble_rope inserts a span per ToolSpec before the message
+    // spans (mu-ktq); the "echo" tool spec becomes "tool-schema:echo".
+    assert_eq!(
+        records[0].message_count, 2,
+        "turn 1 projection should carry tool-schema(echo) + user message",
+    );
+    assert_eq!(
+        records[0].first_span_ids,
+        vec!["tool-schema:echo", "msg-0-user"],
+    );
+
+    // Turn 2 projection: tool-schema + user + assistant(tool_call) +
+    // tool_result → 4 spans. Assemble_rope appends each new
+    // AgentMessage as a span with id `msg-{idx}-{kind}`; tool-result
+    // spans carry the call_id in the id (`msg-{idx}-tool-result:{call_id}`).
+    assert_eq!(
+        records[1].message_count, 4,
+        "turn 2 projection should carry the tool-call round-trip context",
+    );
+    assert_eq!(
+        records[1].first_span_ids,
+        vec![
+            "tool-schema:echo",
+            "msg-0-user",
+            "msg-1-assistant",
+            "msg-2-tool-result:t1",
+        ],
+    );
+}

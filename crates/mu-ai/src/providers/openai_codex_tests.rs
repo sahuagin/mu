@@ -741,6 +741,128 @@ fn yqeq5_parity_consecutive_tool_results() {
 }
 
 #[test]
+fn mu_2puu_projected_hoists_memory_injection_and_file_load_into_instructions() {
+    // mu-2puu regression test. mu-phl v0 introduced MemoryInjection +
+    // FileLoad spans into the rope via assemble_rope_with_context; the
+    // codex Projected arm must include their content in
+    // body.instructions (OpenAI Responses API has only one
+    // instructions slot, so multiple System-role spans concat there).
+    //
+    // Pre-fix this test failed: translate_provider_messages_codex
+    // only hoisted the span with id literally "system-prompt" and
+    // silently dropped memory-recall:* and project-file:* spans.
+    //
+    // The fix hoists all System-role spans EXCEPT tool-schema:*
+    // (tools go separately via body.tools).
+    use mu_core::context::{
+        assemble_rope_with_context, FauxProviderRenderer, ProjectContext, ProjectionTarget,
+        ProviderRenderer, RecallSource, RecalledItem,
+    };
+    use std::path::PathBuf;
+
+    let memory_blob = "## Active Memory Context\n\nfavorite color is 'cat'";
+    let claude_md_text = "# CLAUDE.md\n\nuse SpanText for content fields.";
+
+    let project_context = ProjectContext {
+        items: vec![
+            RecalledItem {
+                source: RecallSource::Memory,
+                content: memory_blob.into(),
+                stable_id: "abc123".into(),
+            },
+            RecalledItem {
+                source: RecallSource::ProjectFile {
+                    path: PathBuf::from("/home/u/CLAUDE.md"),
+                },
+                content: claude_md_text.into(),
+                stable_id: "def456".into(),
+            },
+        ],
+    };
+
+    let messages = vec![AgentMessage::User {
+        content: "hi".into(),
+    }];
+    let rope =
+        assemble_rope_with_context(Some("you are mu"), Some(&project_context), &messages, &[]);
+    let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let body = build_request_body_from_projection(
+        "gpt-5-codex",
+        "high",
+        "fallback default instructions",
+        &projection,
+        &[],
+    );
+
+    let instructions = body
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // System prompt content
+    assert!(
+        instructions.contains("you are mu"),
+        "system prompt missing from instructions: {instructions:?}",
+    );
+    // Memory recall content (SubprocessRecallProvider)
+    assert!(
+        instructions.contains("favorite color is 'cat'"),
+        "memory-recall content missing from instructions: {instructions:?}",
+    );
+    // Project-file content (ProjectFileRecallProvider)
+    assert!(
+        instructions.contains("use SpanText for content fields."),
+        "project-file content missing from instructions: {instructions:?}",
+    );
+    // Fallback default should NOT be used since we have system content
+    assert!(
+        !instructions.contains("fallback default instructions"),
+        "fallback default leaked into instructions: {instructions:?}",
+    );
+}
+
+#[test]
+fn mu_2puu_projected_excludes_tool_schema_from_instructions() {
+    // Companion to the regression above: tool-schema spans also map
+    // to ProviderRole::System (per renderer.rs From<&SpanKind>), but
+    // they MUST NOT land in body.instructions — tools go separately
+    // via body.tools. The fix's exclusion clause is
+    // `source_span_ids.first().starts_with("tool-schema:")`.
+    use mu_core::context::{
+        assemble_rope, FauxProviderRenderer, ProjectionTarget, ProviderRenderer,
+    };
+
+    let tools = vec![ToolSpec {
+        name: "read".into(),
+        description: "read a file".into(),
+        input_schema: json!({"type": "object"}),
+        policy: Default::default(),
+    }];
+    let messages = vec![AgentMessage::User {
+        content: "go".into(),
+    }];
+    let rope = assemble_rope(Some("system-only-text"), &messages, &tools);
+    let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let body =
+        build_request_body_from_projection("gpt-5-codex", "high", "fallback", &projection, &tools);
+
+    let instructions = body
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        instructions.contains("system-only-text"),
+        "system prompt missing: {instructions:?}",
+    );
+    // Tool schema content (description, JSON schema) MUST NOT appear
+    // in instructions — it's passed separately via body.tools.
+    assert!(
+        !instructions.contains("read a file"),
+        "tool-schema content leaked into instructions: {instructions:?}",
+    );
+}
+
+#[test]
 fn yqeq5_parity_system_prompt_plus_tools() {
     // System prompt + multiple tools. Exercises:
     //   - the instructions-hoisting path (Projected extracts from the

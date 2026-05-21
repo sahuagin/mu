@@ -4,6 +4,20 @@ A coherent contract for mu's prompt-cache behavior. Captures the conceptual mode
 
 This document is reference material — not a spec for an unbuilt feature. The pieces that are implemented are noted; the pieces that aren't are flagged.
 
+## Relationship to `claude-code-feature-mapping.md`
+
+The sibling doc [`claude-code-feature-mapping.md`](claude-code-feature-mapping.md) (c137 research output, 2026-05-21, memory anchor `f3c61b6b`) contains in §A a comprehensive **cache-discipline contract** derived from Claude Code's documentation. That §A is the canonical source for the invariants, invalidator/non-invalidator tables, TTL details (including the `ENABLE_PROMPT_CACHING_1H` / `FORCE_PROMPT_CACHING_5M` env-var controls), and the operating rules for live-loop adoption.
+
+**This document complements that one rather than duplicates it.** It adds:
+
+- The **memory-segmentation mental model** (tcovert's framing of program/tools/conversation regions analogous to stack/heap/static) that motivated mu's rope structure
+- **Hierarchical marker strategies** (using markers 3 and 4 of the 4-marker budget for patterns like append-tool-without-invalidating)
+- **The file-as-memmap direction** — v1 hash-check, v1.5 watchman, future AST via code_index — sketched as a multi-tier roadmap
+- A **mu-specific implementation checklist** distinguishing what landed in mu-yqeq.8 from what's still open
+- Cross-references to mu's actual code, commits, and beads
+
+When the two documents agree (the invalidator table, TTL discipline, observability metrics), `claude-code-feature-mapping.md` §A is the authoritative source — it has the Claude Code doc URLs as provenance. When they cover different ground (the mental model, file-as-memmap, mu's state), this document is the source.
+
 ## Motivation
 
 Prompt caching is the load-bearing optimization that makes long agent sessions economically viable. Anthropic's caching ([docs](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching)) lets a request mark prefix boundaries via `cache_control: ephemeral`; subsequent requests with the same prefix get a 10× cost reduction on those tokens and a substantial latency win. Used well, it turns multi-turn coding sessions from "every turn pays for the whole history" into "every turn pays for cache_read of the history plus a small delta."

@@ -190,6 +190,223 @@ fn map_finish_reason_known_and_unknown() {
     assert_eq!(map_finish_reason(None), StopReason::EndTurn);
 }
 
+// ============================================================================
+// mu-yqeq.6 parity tests
+//
+// Each test runs the SAME scenario through both wire-body builders:
+//   - Legacy:    build_request_body(model, system_prompt, &[AgentMessage], tools)
+//   - Projected: build_request_body_from_projection(model, &ProviderMessages, tools)
+//                where ProviderMessages comes from FauxProviderRenderer::render
+//                over assemble_rope(system_prompt, messages, tools).
+//
+// Byte-equality on the two `serde_json::Value` outputs is the contract.
+// Phase D (mu-yqeq.8) flips the call site at mod.rs:818 from Legacy to
+// Projected; if these parity tests pass, the cutover is observably
+// equivalent at the wire layer.
+// ============================================================================
+
+fn parity_compare(
+    system_prompt: Option<&str>,
+    messages: &[AgentMessage],
+    tools: &[mu_core::agent::ToolSpec],
+) {
+    use mu_core::context::{
+        assemble_rope, FauxProviderRenderer, ProjectionTarget, ProviderRenderer,
+    };
+
+    let legacy = build_request_body("openrouter-test-model", system_prompt, messages, tools);
+
+    let rope = assemble_rope(system_prompt, messages, tools);
+    let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let projected = build_request_body_from_projection("openrouter-test-model", &projection, tools);
+
+    assert_eq!(
+        legacy, projected,
+        "Legacy vs Projected wire body diverged.\nLegacy:    {legacy:#}\nProjected: {projected:#}",
+    );
+}
+
+#[test]
+fn yqeq6_parity_pure_text_turn() {
+    // User → Assistant text. No tools, no system, no tool calls.
+    let messages = vec![
+        AgentMessage::User {
+            content: "hi".into(),
+        },
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        }),
+    ];
+    parity_compare(None, &messages, &[]);
+}
+
+#[test]
+fn yqeq6_parity_single_tool_call() {
+    // User → Assistant(text + ToolCall) → ToolResult → Assistant text.
+    // Exercises the OpenRouter assistant-message shape: a single
+    // message with both `content` text AND a `tool_calls` array; tool
+    // results become separate `{role: "tool", ...}` messages.
+    let tool = mu_core::agent::ToolSpec {
+        name: "read".into(),
+        description: "read a file".into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+        }),
+        policy: Default::default(),
+    };
+    let messages = vec![
+        AgentMessage::User {
+            content: "what's in /tmp/x?".into(),
+        },
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::Text {
+                    text: "I'll read it.".into(),
+                },
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_42".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "/tmp/x"}),
+                }),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        }),
+        AgentMessage::ToolResult {
+            call_id: "call_42".into(),
+            content: "contents".into(),
+            is_error: false,
+        },
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: "it says contents".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        }),
+    ];
+    parity_compare(None, &messages, std::slice::from_ref(&tool));
+}
+
+#[test]
+fn yqeq6_parity_consecutive_tool_results() {
+    // Three back-to-back ToolResults. Unlike Anthropic (which groups
+    // these into a single user message), OpenRouter (OpenAI
+    // chat-completions) emits each as a separate `{role: "tool", ...}`
+    // message. The Projected path must preserve that lack of grouping.
+    let messages = vec![
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_1".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "/a"}),
+                }),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_2".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "/b"}),
+                }),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_3".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "/c"}),
+                }),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        }),
+        AgentMessage::ToolResult {
+            call_id: "call_1".into(),
+            content: "a-contents".into(),
+            is_error: false,
+        },
+        AgentMessage::ToolResult {
+            call_id: "call_2".into(),
+            content: "b-contents".into(),
+            is_error: true,
+        },
+        AgentMessage::ToolResult {
+            call_id: "call_3".into(),
+            content: "c-contents".into(),
+            is_error: false,
+        },
+    ];
+    parity_compare(None, &messages, &[]);
+}
+
+#[test]
+fn yqeq6_parity_system_prompt_plus_tools() {
+    // System prompt + multiple tools. Exercises:
+    //   - the mu-n48 prepend path: `{role: "system", content: ...}`
+    //     emitted as the FIRST message in the array.
+    //   - the tools-present body shape with nested
+    //     `{type: function, function: {...}}` tool specs.
+    let tools = vec![
+        mu_core::agent::ToolSpec {
+            name: "read".into(),
+            description: "read a file".into(),
+            input_schema: json!({"type": "object"}),
+            policy: Default::default(),
+        },
+        mu_core::agent::ToolSpec {
+            name: "bash".into(),
+            description: "run shell".into(),
+            input_schema: json!({"type": "object"}),
+            policy: Default::default(),
+        },
+    ];
+    let messages = vec![AgentMessage::User {
+        content: "list files".into(),
+    }];
+    parity_compare(Some("you are a helpful assistant"), &messages, &tools);
+}
+
+#[test]
+fn yqeq6_thinking_blocks_are_skipped_in_projected_wire_output() {
+    // Spec mu-044 §"Thinking-block skip": Projected wire emission
+    // MUST NOT echo the model's reasoning trace back as input.
+    // Mirrors the Legacy `translate_message` behavior
+    // (openrouter.rs:150-153 filters Thinking blocks).
+    use mu_core::context::{
+        assemble_rope, FauxProviderRenderer, ProjectionTarget, ProviderRenderer,
+    };
+
+    let messages = vec![AgentMessage::Assistant(AssistantMessage {
+        content: vec![
+            ContentBlock::Thinking {
+                text: "INTERNAL_REASONING_DO_NOT_LEAK".into(),
+            },
+            ContentBlock::Text {
+                text: "public answer".into(),
+            },
+        ],
+        stop_reason: StopReason::EndTurn,
+        usage: None,
+    })];
+    let rope = assemble_rope(None, &messages, &[]);
+    let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let projected = build_request_body_from_projection("openrouter-test-model", &projection, &[]);
+
+    let wire = serde_json::to_string(&projected).expect("serialize");
+    assert!(
+        !wire.contains("INTERNAL_REASONING_DO_NOT_LEAK"),
+        "Thinking block content leaked to wire: {wire}",
+    );
+    assert!(
+        wire.contains("public answer"),
+        "non-thinking text was lost: {wire}",
+    );
+
+    // Also: parity vs Legacy (which also strips thinking).
+    parity_compare(None, &messages, &[]);
+}
+
 /// Helper: build a stream from raw SSE bytes for tests.
 fn test_events_stream(
     bytes: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,

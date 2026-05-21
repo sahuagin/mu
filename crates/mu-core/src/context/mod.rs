@@ -37,18 +37,23 @@ pub mod assembly;
 pub mod cache;
 pub mod compaction;
 pub mod event;
+pub mod recall;
 pub mod renderer;
 pub mod rope;
 
-pub use assembly::{append_messages_to_baseline, assemble_rope, extract_call_id_from_span_id};
+pub use assembly::{
+    append_messages_to_baseline, assemble_rope, assemble_rope_with_context,
+    extract_call_id_from_span_id,
+};
 pub use cache::{CacheBoundary, CacheStrategy, NoCacheStrategy};
 pub use compaction::{
     BackgroundCompactionState, CompactionDecision, CompactionPolicy, CompactionQuota,
     CompactionResult, NoCompactionPolicy,
 };
 pub use event::RopeEvent;
+pub use recall::{ProjectContext, RecallProvider, RecallSource, RecalledItem};
 pub use renderer::{
     CacheMarker, FauxProviderRenderer, ProjectionTarget, ProviderMessage, ProviderMessages,
     ProviderRenderer, ProviderRole,
 };
-pub use rope::{RetainedRope, RetentionClass, Span, SpanKind};
+pub use rope::{RetainedRope, RetentionClass, Span, SpanId, SpanKind, SpanText};

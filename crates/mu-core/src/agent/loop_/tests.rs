@@ -573,6 +573,7 @@ async fn b3_iteration_cap() {
         max_turns: 3,
         system_prompt: None,
         compaction_threshold: None,
+        project_context: None,
     };
     let (loop_, events_rx) = spawn_loop(provider, tools, config);
 
@@ -623,6 +624,7 @@ async fn mu_779s_iteration_cap_done_event_uses_iteration_cap_stop_reason() {
         max_turns: 2,
         system_prompt: None,
         compaction_threshold: None,
+        project_context: None,
     };
     let (loop_, events_rx) = spawn_loop(provider, tools, config);
 

@@ -34,7 +34,7 @@ use tokio::task::JoinHandle;
 
 use crate::capability::{AutonomyCapability, Capability};
 use crate::context::rope::SpanText;
-use crate::context::{ProjectionTarget, ProviderMessages, RetainedRope};
+use crate::context::{ProjectContext, ProjectionTarget, ProviderMessages, RetainedRope};
 
 /// mu-kgu.4: default compaction threshold in tokens. Matches the
 /// Anthropic API's documented automatic-compaction trigger (150k
@@ -344,6 +344,18 @@ pub struct AgentConfig {
     /// with the original rope — compaction failure never blocks a
     /// turn.
     pub compaction_threshold: Option<usize>,
+    /// mu-phl v0 (bead mu-vm81): pre-built recall context to inject at
+    /// session start. Built by the daemon at create-session time
+    /// (see `crates/mu-coding/src/serve/handlers/session.rs`) so the
+    /// agent loop's hot path stays free of subprocess spawning or
+    /// filesystem walks. `None` ⇒ no injection (pre-mu-phl behavior;
+    /// tests rely on this default).
+    ///
+    /// The bundled items land as `MemoryInjection` / `FileLoad` spans
+    /// in the stable cacheable prefix of the rope, between the System
+    /// span and the ToolSchema spans, via
+    /// [`crate::context::assemble_rope_with_context`].
+    pub project_context: Option<ProjectContext>,
 }
 
 impl Default for AgentConfig {
@@ -352,6 +364,7 @@ impl Default for AgentConfig {
             max_turns: 20,
             system_prompt: None,
             compaction_threshold: None,
+            project_context: None,
         }
     }
 }
@@ -775,8 +788,9 @@ async fn run(
                         b.messages_at_spawn,
                         &messages,
                     ),
-                    None => crate::context::assemble_rope(
+                    None => crate::context::assemble_rope_with_context(
                         config.system_prompt.as_deref(),
+                        config.project_context.as_ref(),
                         &messages,
                         &tool_specs,
                     ),

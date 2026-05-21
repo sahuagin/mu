@@ -23,6 +23,7 @@
 use crate::agent::tool::ToolSpec;
 use crate::agent::types::{AgentMessage, ContentBlock};
 
+use super::recall::{ProjectContext, RecallSource};
 use super::{RetainedRope, RetentionClass, Span, SpanKind};
 
 /// Build a rope from the agent loop's per-call inputs.
@@ -51,8 +52,45 @@ pub fn assemble_rope(
     messages: &[AgentMessage],
     tool_specs: &[ToolSpec],
 ) -> RetainedRope {
+    assemble_rope_with_context(system_prompt, None, messages, tool_specs)
+}
+
+/// mu-phl v0 (bead mu-vm81): build a rope including session-start memory
+/// recall + project-file injection.
+///
+/// Extends [`assemble_rope`] by inserting recalled items between the
+/// System span and the ToolSchema spans, preserving the stable cacheable
+/// prefix. Each [`super::recall::RecalledItem`] lands as either a
+/// `MemoryInjection` or `FileLoad` span (chosen by its
+/// [`super::recall::RecallSource`] variant), at `RetentionClass::Startup`
+/// (cacheable + stable).
+///
+/// Span layout (when `project_context` is `Some(...)`):
+///
+/// ```text
+/// [System] | [MemoryInjection: agent memory ...] |
+///          | [FileLoad: CLAUDE.md, AGENTS.md, ...] |
+///          | [ToolSchema...] | [Conversation...]
+/// ```
+///
+/// When `project_context` is `None`, span layout is identical to
+/// [`assemble_rope`] (i.e., `[System] | [ToolSchema...] | [Messages...]`).
+///
+/// Per `specs/architecture/cache-discipline.md`, session-start injection
+/// of immutable program-region content is the safe shape: it expands
+/// the cacheable prefix and does not invalidate the cache on each turn.
+/// Mid-session re-recall (mu-fb0 live-loop) is out of v0 scope; if
+/// landed later it must append-to-conversation per cache-discipline,
+/// not rewrite the cached prefix.
+pub fn assemble_rope_with_context(
+    system_prompt: Option<&str>,
+    project_context: Option<&ProjectContext>,
+    messages: &[AgentMessage],
+    tool_specs: &[ToolSpec],
+) -> RetainedRope {
+    let recall_count = project_context.map(|c| c.items.len()).unwrap_or(0);
     let mut spans: Vec<Span> = Vec::with_capacity(
-        usize::from(system_prompt.is_some()) + tool_specs.len() + messages.len(),
+        usize::from(system_prompt.is_some()) + recall_count + tool_specs.len() + messages.len(),
     );
 
     if let Some(prompt) = system_prompt {
@@ -62,6 +100,31 @@ pub fn assemble_rope(
             prompt,
             RetentionClass::Startup,
         ));
+    }
+
+    // Recall spans (Memory + ProjectFile) between System and ToolSchemas.
+    // Both kinds get RetentionClass::Startup (stable + cacheable), so
+    // they extend the cacheable prefix downstream cache strategies
+    // can mark — see mu-bn4's AnthropicCacheStrategy.
+    if let Some(ctx) = project_context {
+        for item in &ctx.items {
+            let (kind, id) = match &item.source {
+                RecallSource::Memory => (
+                    SpanKind::MemoryInjection,
+                    format!("memory-recall:{}", item.stable_id),
+                ),
+                RecallSource::ProjectFile { path } => (
+                    SpanKind::FileLoad,
+                    format!("project-file:{}", path.display()),
+                ),
+            };
+            spans.push(Span::new(
+                id,
+                kind,
+                item.content.clone(),
+                RetentionClass::Startup,
+            ));
+        }
     }
 
     for spec in tool_specs {
@@ -389,6 +452,87 @@ mod tests {
             .blocks()
             .expect("assistant ProviderMessage has blocks");
         assert_eq!(msg_blocks, original_blocks.as_slice());
+    }
+
+    #[test]
+    fn assemble_rope_with_context_injects_memory_and_file_spans_in_stable_prefix() {
+        // mu-phl v0 acceptance (bead mu-vm81): when project_context is
+        // Some(...), recalled items land between System and ToolSchema
+        // as MemoryInjection and FileLoad spans, all at Startup retention
+        // and cacheable. When project_context is None, behavior is
+        // identical to assemble_rope (covered by the existing tests).
+        use super::super::recall::{ProjectContext, RecallSource, RecalledItem};
+        use std::path::PathBuf;
+
+        let project_context = ProjectContext {
+            items: vec![
+                RecalledItem {
+                    source: RecallSource::Memory,
+                    content: "## Active Memory Context\n…".into(),
+                    stable_id: "abc123".into(),
+                },
+                RecalledItem {
+                    source: RecallSource::ProjectFile {
+                        path: PathBuf::from("/home/u/CLAUDE.md"),
+                    },
+                    content: "# CLAUDE.md\nsome content".into(),
+                    stable_id: "def456".into(),
+                },
+            ],
+        };
+
+        let messages = vec![AgentMessage::User {
+            content: "hi".into(),
+        }];
+
+        let rope = assemble_rope_with_context(
+            Some("you are mu"),
+            Some(&project_context),
+            &messages,
+            &[sample_tool()],
+        );
+
+        let kinds: Vec<SpanKind> = rope.iter().map(|s| s.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SpanKind::System,
+                SpanKind::MemoryInjection,
+                SpanKind::FileLoad,
+                SpanKind::ToolSchema,
+                SpanKind::User,
+            ],
+            "[System] | [Memory] | [Files] | [ToolSchemas] | [Messages]",
+        );
+
+        // Recall spans extend the cacheable prefix: they're cacheable +
+        // stable like the surrounding program-region content.
+        let spans = rope.spans();
+        for (idx, expected_kind) in [(1, SpanKind::MemoryInjection), (2, SpanKind::FileLoad)] {
+            assert_eq!(spans[idx].kind, expected_kind);
+            assert!(
+                spans[idx].retention.is_stable(),
+                "recall span {idx} must be at stable retention",
+            );
+            assert!(spans[idx].cacheable, "recall span {idx} must be cacheable",);
+        }
+    }
+
+    #[test]
+    fn assemble_rope_with_context_none_matches_assemble_rope() {
+        // Equivalence: assemble_rope_with_context(sp, None, msgs, tools)
+        // produces the same kinds + count as assemble_rope. The wrapper
+        // is a no-op when project_context is None.
+        let messages = vec![AgentMessage::User {
+            content: "hi".into(),
+        }];
+
+        let a = assemble_rope(Some("sys"), &messages, &[sample_tool()]);
+        let b = assemble_rope_with_context(Some("sys"), None, &messages, &[sample_tool()]);
+
+        let kinds_a: Vec<SpanKind> = a.iter().map(|s| s.kind.clone()).collect();
+        let kinds_b: Vec<SpanKind> = b.iter().map(|s| s.kind.clone()).collect();
+        assert_eq!(kinds_a, kinds_b);
     }
 
     #[test]

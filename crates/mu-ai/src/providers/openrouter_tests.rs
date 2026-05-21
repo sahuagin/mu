@@ -341,6 +341,122 @@ fn yqeq6_parity_consecutive_tool_results() {
 }
 
 #[test]
+fn mu_745h_projected_concatenates_memory_injection_and_file_load_into_leading_system_msg() {
+    // mu-745h regression test. mu-phl v0 introduced MemoryInjection +
+    // FileLoad spans into the rope via assemble_rope_with_context.
+    // OpenRouter's Projected arm must include their content in the
+    // leading role=system message (Chat Completions API has one
+    // canonical system slot; multiple system spans concat there).
+    //
+    // Pre-fix this test failed: translate_provider_messages_openrouter
+    // only emitted the span with id literally "system-prompt" and
+    // silently dropped memory-recall:* + project-file:* spans.
+    //
+    // Codex sibling: mu_2puu_projected_hoists_memory_injection_and_file_load_into_instructions.
+    use mu_core::context::{
+        assemble_rope_with_context, FauxProviderRenderer, ProjectContext, ProjectionTarget,
+        ProviderRenderer, RecallSource, RecalledItem,
+    };
+    use std::path::PathBuf;
+
+    let memory_blob = "## Active Memory Context\n\nfavorite color is 'cat'";
+    let claude_md_text = "# CLAUDE.md\n\nuse SpanText for content fields.";
+
+    let project_context = ProjectContext {
+        items: vec![
+            RecalledItem {
+                source: RecallSource::Memory,
+                content: memory_blob.into(),
+                stable_id: "abc123".into(),
+            },
+            RecalledItem {
+                source: RecallSource::ProjectFile {
+                    path: PathBuf::from("/home/u/CLAUDE.md"),
+                },
+                content: claude_md_text.into(),
+                stable_id: "def456".into(),
+            },
+        ],
+    };
+
+    let messages = vec![AgentMessage::User {
+        content: "hi".into(),
+    }];
+    let rope =
+        assemble_rope_with_context(Some("you are mu"), Some(&project_context), &messages, &[]);
+    let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let body = build_request_body_from_projection("test-or-model", &projection, &[]);
+
+    let messages_arr = body.get("messages").and_then(|v| v.as_array()).unwrap();
+    // Leading message must be role=system.
+    let leading = &messages_arr[0];
+    assert_eq!(leading["role"], "system");
+    let system_content = leading["content"].as_str().unwrap_or("");
+
+    // System prompt content
+    assert!(
+        system_content.contains("you are mu"),
+        "system prompt missing from leading system message: {system_content:?}",
+    );
+    // Memory recall content
+    assert!(
+        system_content.contains("favorite color is 'cat'"),
+        "memory-recall content missing: {system_content:?}",
+    );
+    // Project-file content
+    assert!(
+        system_content.contains("use SpanText for content fields."),
+        "project-file content missing: {system_content:?}",
+    );
+
+    // Only one leading system message (concatenated, not duplicated).
+    let system_count = messages_arr
+        .iter()
+        .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("system"))
+        .count();
+    assert_eq!(system_count, 1, "expected exactly one leading system msg");
+}
+
+#[test]
+fn mu_745h_projected_excludes_tool_schema_from_leading_system_msg() {
+    // Companion to the regression above: tool-schema spans also map
+    // to ProviderRole::System (per renderer.rs From<&SpanKind>), but
+    // they MUST NOT land in the leading system message — tools go
+    // separately via body.tools.
+    use mu_core::context::{
+        assemble_rope, FauxProviderRenderer, ProjectionTarget, ProviderRenderer,
+    };
+
+    let tools = vec![mu_core::agent::ToolSpec {
+        name: "read".into(),
+        description: "read a file".into(),
+        input_schema: json!({"type": "object"}),
+        policy: Default::default(),
+    }];
+    let messages = vec![AgentMessage::User {
+        content: "go".into(),
+    }];
+    let rope = assemble_rope(Some("system-only-text"), &messages, &tools);
+    let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let body = build_request_body_from_projection("test-or-model", &projection, &tools);
+
+    let messages_arr = body.get("messages").and_then(|v| v.as_array()).unwrap();
+    let leading = &messages_arr[0];
+    assert_eq!(leading["role"], "system");
+    let system_content = leading["content"].as_str().unwrap_or("");
+    assert!(
+        system_content.contains("system-only-text"),
+        "system prompt missing: {system_content:?}",
+    );
+    // Tool-schema content (description, JSON schema) MUST NOT appear
+    // in the system message.
+    assert!(
+        !system_content.contains("read a file"),
+        "tool-schema content leaked into system msg: {system_content:?}",
+    );
+}
+
+#[test]
 fn yqeq6_parity_system_prompt_plus_tools() {
     // System prompt + multiple tools. Exercises:
     //   - the mu-n48 prepend path: `{role: "system", content: ...}`

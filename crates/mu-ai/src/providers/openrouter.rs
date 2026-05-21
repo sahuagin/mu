@@ -264,29 +264,44 @@ pub(crate) fn build_request_body(
 /// prepend behavior.
 fn translate_provider_messages_openrouter(pmsgs: &ProviderMessages) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::with_capacity(pmsgs.messages.len());
-    let mut system_emitted = false;
+    // mu-745h: accumulator for all non-tool-schema System-role spans.
+    // Concatenated and prepended as a single leading role=system
+    // message at the end of the loop. Pre-fix this branch only
+    // emitted the "system-prompt"-id span and dropped every other
+    // System-role span (memory-recall:*, project-file:*) silently —
+    // invisible in yqeq6_parity_* tests because pre-mu-phl ropes had
+    // no such spans. Codex sibling fix is mu-2puu.
+    let mut system_content: Option<String> = None;
 
     for msg in &pmsgs.messages {
         match msg.role() {
             ProviderRole::System => {
-                let is_session_prompt = msg
+                // Hoist ALL System-role spans EXCEPT tool-schema:*
+                // (tool schemas are passed separately via the wire's
+                // `tools` array). Includes:
+                //   - "system-prompt" (session system_prompt)
+                //   - "memory-recall:*" (SubprocessRecallProvider)
+                //   - "project-file:*" (ProjectFileRecallProvider)
+                //   - any other future System-role span kind
+                let is_tool_schema = msg
                     .source_span_ids()
                     .first()
-                    .map(|sid| sid.as_ref() == "system-prompt")
+                    .map(|sid| sid.as_ref().starts_with("tool-schema:"))
                     .unwrap_or(false);
-                if is_session_prompt && !system_emitted {
+                if !is_tool_schema {
                     let content = msg.content();
                     if !content.is_empty() {
-                        out.push(json!({
-                            "role": "system",
-                            "content": content,
-                        }));
-                        system_emitted = true;
+                        match system_content.as_mut() {
+                            Some(existing) => {
+                                existing.push_str("\n\n");
+                                existing.push_str(content);
+                            }
+                            None => {
+                                system_content = Some(content.to_string());
+                            }
+                        }
                     }
                 }
-                // Tool-schema spans are silently skipped — `tools`
-                // param on Provider::stream is authoritative for the
-                // wire `tools` field.
             }
             ProviderRole::User => {
                 out.push(json!({
@@ -303,6 +318,21 @@ fn translate_provider_messages_openrouter(pmsgs: &ProviderMessages) -> Vec<Value
                 out.push(translate_provider_tool_result_openrouter(msg));
             }
         }
+    }
+
+    // Prepend the accumulated system content as a single leading
+    // role=system message. The Chat Completions API canonically
+    // expects one system slot at the start; concatenating
+    // produces consistent behavior across upstream OpenRouter
+    // models that handle multiple system messages inconsistently.
+    if let Some(content) = system_content {
+        out.insert(
+            0,
+            json!({
+                "role": "system",
+                "content": content,
+            }),
+        );
     }
 
     out

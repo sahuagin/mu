@@ -342,15 +342,39 @@ fn translate_provider_messages_codex(pmsgs: &ProviderMessages) -> (Vec<Value>, O
     for msg in &pmsgs.messages {
         match msg.role() {
             ProviderRole::System => {
-                let is_session_prompt = msg
+                // mu-2puu: hoist ALL System-role spans into the
+                // Responses API's `instructions` field, EXCEPT
+                // tool-schema spans (those are passed separately via
+                // `body.tools`). This includes:
+                //   - the "system-prompt" span (session system_prompt)
+                //   - "memory-recall:*" spans (SubprocessRecallProvider)
+                //   - "project-file:*" spans (ProjectFileRecallProvider)
+                //   - any other future System-role span kind
+                //     (SkillActivation, Compaction, etc.)
+                // Multiple system-role spans concatenate with "\n\n"
+                // because the Responses API has only one
+                // `instructions` slot. Pre-fix this branch only
+                // hoisted the `system-prompt` span verbatim, silently
+                // dropping every other System-role span — invisible
+                // in `yqeq5_parity_*` tests because pre-mu-phl ropes
+                // had no other System-role spans. See bead mu-2puu.
+                let is_tool_schema = msg
                     .source_span_ids()
                     .first()
-                    .map(|sid| sid.as_ref() == "system-prompt")
+                    .map(|sid| sid.as_ref().starts_with("tool-schema:"))
                     .unwrap_or(false);
-                if is_session_prompt && system_text.is_none() {
+                if !is_tool_schema {
                     let content = msg.content();
                     if !content.is_empty() {
-                        system_text = Some(content.to_string());
+                        match system_text.as_mut() {
+                            Some(existing) => {
+                                existing.push_str("\n\n");
+                                existing.push_str(content);
+                            }
+                            None => {
+                                system_text = Some(content.to_string());
+                            }
+                        }
                     }
                 }
             }

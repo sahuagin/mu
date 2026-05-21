@@ -71,12 +71,20 @@ pub async fn run(opts: AskOptions) -> Result<()> {
     // the gate will reject every subsequent call.
     authenticate(&mut stdin, &mut stdout, &mut next_id, &bearer_token).await?;
 
+    // mu-phl v0 / mu-lfgh: capture the operator's cwd at the entry of
+    // the ask path so the daemon's session-start recall (subprocess
+    // agent memory + project-file hierarchy) scopes to the operator's
+    // actual project. Falls back to `None` if cwd can't be determined
+    // (extremely unusual; the daemon resolves its own fallback in
+    // build_project_context).
+    let invocation_cwd = std::env::current_dir().ok();
     let session_id = create_session(
         &mut stdin,
         &mut stdout,
         &mut next_id,
         &selector,
         opts.system_prompt.as_deref(),
+        invocation_cwd,
     )
     .await?;
     let text = ask_and_drain(
@@ -210,6 +218,7 @@ async fn create_session(
     next_id: &mut u64,
     selector: &mu_core::protocol::ProviderSelector,
     system_prompt: Option<&str>,
+    cwd: Option<std::path::PathBuf>,
 ) -> Result<String> {
     let id = *next_id;
     *next_id += 1;
@@ -217,12 +226,16 @@ async fn create_session(
     // serde's `skip_serializing_if = "Option::is_none"` on
     // CreateSessionRequest.system_prompt is honored — no
     // explicit null field when unset (mu-x83o).
+    //
+    // mu-phl v0 / mu-lfgh: cwd is plumbed through from the operator's
+    // invocation (set by the `ask()` entry point to
+    // std::env::current_dir()) so the daemon-side recall providers
+    // (subprocess agent memory + project-file hierarchy) scope to the
+    // operator's actual project rather than the daemon's process cwd.
     let body = CreateSessionRequest {
         provider: selector.clone(),
         system_prompt: system_prompt.map(str::to_owned),
-        // mu-phl v0 Phase D: cwd is added in Phase E (mu-lfgh); this
-        // construction stays None for now to preserve back-compat.
-        cwd: None,
+        cwd,
     };
     let req = json!({
         "jsonrpc": "2.0",

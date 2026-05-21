@@ -21,7 +21,10 @@ use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
     ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
 };
-use mu_core::context::{CacheStrategy, ProviderRenderer};
+use mu_core::context::{
+    extract_call_id_from_span_id, CacheStrategy, ProviderMessage, ProviderMessages,
+    ProviderRenderer, ProviderRole,
+};
 
 use crate::context::{AnthropicCacheStrategy, AnthropicProviderRenderer};
 
@@ -74,20 +77,36 @@ impl Provider for AnthropicProvider {
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
-        // mu-yqeq.3: only Legacy is implemented today. mu-yqeq.4 will
-        // split the `_` arm into MessageInput::Projected(p) and walk
-        // the rope-derived projection directly.
-        let messages = match input {
-            MessageInput::Legacy(msgs) => msgs,
+        // mu-yqeq.3: sealed-enum dispatch (Legacy + Projected). The
+        // `_` arm remains for forward-compat with future MessageInput
+        // variants — adding one will compile-warn here for review.
+        //
+        // mu-yqeq.4: Projected arm produces byte-identical wire JSON
+        // to the Legacy arm; the parity test in this file asserts that
+        // invariant for the canonical scenarios (text-only, single
+        // tool call, consecutive tool results, system+tools, Thinking-
+        // block skip). The agent loop's mod.rs:818 still passes Legacy
+        // until mu-yqeq.8 wires the cutover.
+        let body = match input {
+            MessageInput::Legacy(msgs) => {
+                build_request_body(&self.model, system_prompt, msgs, tools)
+            }
+            MessageInput::Projected(pmsgs) => {
+                // The projection's first ProviderRole::System message
+                // carries the system prompt (assemble_rope put it
+                // there from the agent loop's system_prompt). The
+                // `system_prompt` parameter on this method is the
+                // Legacy-path channel; in the Projected path we
+                // source from the projection itself for
+                // self-containedness, ignoring the parameter.
+                build_request_body_from_projection(&self.model, pmsgs, tools)
+            }
             _ => {
                 return Err(ProviderError::Other(
-                    "AnthropicProvider: only MessageInput::Legacy is currently supported \
-                     (mu-yqeq.4 will add Projected)"
-                        .to_string(),
+                    "AnthropicProvider: unrecognized MessageInput variant".to_string(),
                 ));
             }
         };
-        let body = build_request_body(&self.model, system_prompt, messages, tools);
 
         let resp = self
             .client
@@ -269,6 +288,204 @@ pub(crate) fn build_request_body(
         // above does not include a `system` key. When that gap is
         // closed, add a second cache_control marker on the last
         // (or only) system content block.
+        if let Some(last) = tool_specs.last_mut() {
+            last["cache_control"] = json!({ "type": "ephemeral" });
+        }
+        body["tools"] = json!(tool_specs);
+    }
+    body
+}
+
+// ============================================================================
+// mu-yqeq.4: Projected path — wire body built from &ProviderMessages
+// ============================================================================
+//
+// Mirrors `translate_messages` + `build_request_body` semantics but
+// reads structural `ContentBlock`s from `ProviderMessage.blocks`
+// instead of `AgentMessage::Assistant.content`. Tool-result binding
+// (`tool_use_id`) is recovered from each `ToolResult` message's
+// `source_span_ids[0]` via the `extract_call_id_from_span_id` helper
+// (mu-yqeq.3).
+//
+// Wire-format byte equivalence with the Legacy path is the contract;
+// see `parity_*` tests below for the canonical scenarios.
+
+/// Translate a [`ProviderMessages`] projection into Anthropic's API
+/// message array shape, returning the hoisted system-prompt text (if
+/// any) separately for [`build_request_body_from_projection`] to
+/// place in the top-level `system` field.
+///
+/// Hoisting rule: the FIRST `ProviderRole::System` message's content
+/// is captured as the system prompt; subsequent System messages are
+/// silently dropped (assemble_rope produces at most one). Tool-schema
+/// messages are skipped (the `tools` parameter on `Provider::stream`
+/// is authoritative for `body.tools`). All other roles are translated
+/// per the Legacy `translate_messages` rules, with consecutive
+/// `ToolResult` messages batched into a single user message — Anthropic's
+/// tool-use protocol requires that grouping.
+fn translate_provider_messages(pmsgs: &ProviderMessages) -> (Vec<Value>, Option<String>) {
+    let mut out: Vec<Value> = Vec::with_capacity(pmsgs.messages.len());
+    let mut tool_result_buf: Vec<Value> = Vec::new();
+    let mut system_text: Option<String> = None;
+
+    for msg in &pmsgs.messages {
+        match msg.role() {
+            ProviderRole::System => {
+                // System-role messages come from two distinct rope
+                // sources mapped to the same provider role by
+                // `From<&SpanKind> for ProviderRole`:
+                //   1. The session system prompt — source span id
+                //      "system-prompt" (from assemble_rope).
+                //   2. Tool-schema spans — source span ids
+                //      "tool-schema:{name}".
+                // Only (1) is hoisted into Anthropic's top-level
+                // `system` field. (2) is skipped because the `tools`
+                // parameter on Provider::stream is authoritative for
+                // `body.tools`; the rope's ToolSchema spans exist for
+                // operator-view + cache positioning, not wire emission.
+                let is_session_prompt = msg
+                    .source_span_ids()
+                    .first()
+                    .map(|sid| sid.as_ref() == "system-prompt")
+                    .unwrap_or(false);
+                if is_session_prompt && system_text.is_none() {
+                    system_text = Some(msg.content().to_string());
+                }
+            }
+            ProviderRole::ToolResult => {
+                tool_result_buf.push(translate_provider_tool_result(msg));
+            }
+            ProviderRole::User => {
+                flush_tool_result_buf(&mut out, &mut tool_result_buf);
+                out.push(json!({
+                    "role": "user",
+                    "content": msg.content(),
+                }));
+            }
+            ProviderRole::Assistant => {
+                flush_tool_result_buf(&mut out, &mut tool_result_buf);
+                if let Some(translated) = translate_provider_assistant(msg) {
+                    out.push(translated);
+                }
+            }
+        }
+    }
+    flush_tool_result_buf(&mut out, &mut tool_result_buf);
+
+    (out, system_text)
+}
+
+fn flush_tool_result_buf(out: &mut Vec<Value>, buf: &mut Vec<Value>) {
+    if !buf.is_empty() {
+        out.push(json!({
+            "role": "user",
+            "content": std::mem::take(buf),
+        }));
+    }
+}
+
+fn translate_provider_tool_result(msg: &ProviderMessage) -> Value {
+    // call_id recovered from the synthesized span id
+    // (`msg-{idx}-tool-result:{call_id}` — see assembly.rs). Fall back
+    // to empty string if absent so a malformed projection produces a
+    // visibly wrong wire payload rather than silently swallowing the
+    // tool-call binding.
+    let call_id: &str = msg
+        .source_span_ids()
+        .first()
+        .and_then(|sid| extract_call_id_from_span_id(sid.as_ref()))
+        .unwrap_or("");
+    // is_error recovered from the "error: " prefix that
+    // assembly.rs:message_to_span adds when AgentMessage::ToolResult
+    // had is_error=true.
+    let (is_error, content) = match msg.content().strip_prefix("error: ") {
+        Some(stripped) => (true, stripped),
+        None => (false, msg.content()),
+    };
+    json!({
+        "type": "tool_result",
+        "tool_use_id": call_id,
+        "content": content,
+        "is_error": is_error,
+    })
+}
+
+/// Translate one assistant-role [`ProviderMessage`] into Anthropic's
+/// `{role: "assistant", content: [...]}` block. Reads structural
+/// blocks from `msg.blocks()` — populated by `assemble_rope` for
+/// `AgentMessage::Assistant`. `Thinking` blocks are intentionally
+/// skipped per spec mu-044 §"Thinking-block skip" (provider never
+/// receives the model's own reasoning trace as input). Returns `None`
+/// if the assistant produced no wire-bearing blocks (e.g. only
+/// thinking) — mirrors `translate_message_single`'s elision rule.
+fn translate_provider_assistant(msg: &ProviderMessage) -> Option<Value> {
+    let blocks = msg.blocks()?;
+    let translated: Vec<Value> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(json!({
+                "type": "text",
+                "text": text.as_ref(),
+            })),
+            ContentBlock::ToolCall(tool_call) => Some(json!({
+                "type": "tool_use",
+                "id": tool_call.id,
+                "name": tool_call.name,
+                "input": tool_call.arguments,
+            })),
+            ContentBlock::Thinking { .. } => None,
+        })
+        .collect();
+    if translated.is_empty() {
+        None
+    } else {
+        Some(json!({
+            "role": "assistant",
+            "content": translated,
+        }))
+    }
+}
+
+/// Sibling of [`build_request_body`] that builds Anthropic's request
+/// body from a [`ProviderMessages`] projection instead of a raw
+/// `&[AgentMessage]` slice. Wire JSON is byte-identical to the Legacy
+/// path for the canonical scenarios (asserted by `parity_*` tests).
+///
+/// ## System hoisting + cache_control decision (Phase D note)
+///
+/// The first `ProviderRole::System` message in the projection is
+/// hoisted into Anthropic's top-level `system` field with an
+/// unconditional `cache_control: ephemeral` annotation — matching the
+/// Legacy path's behavior. This pins Phase A/C byte-equality. When
+/// mu-yqeq.8 (Phase D) lands, the unconditional annotation retires
+/// and `AnthropicCacheStrategy`'s per-message `cache_marker` becomes
+/// the sole source of cache positioning; that change happens in the
+/// cutover bead, not here.
+pub(crate) fn build_request_body_from_projection(
+    model: &str,
+    pmsgs: &ProviderMessages,
+    tools: &[ToolSpec],
+) -> Value {
+    let (api_messages, hoisted_system) = translate_provider_messages(pmsgs);
+    let mut body = json!({
+        "model": model,
+        "max_tokens": super::output_limits::max_tokens_for_model(model),
+        "stream": true,
+        "messages": api_messages,
+    });
+    if let Some(s) = hoisted_system {
+        if !s.is_empty() {
+            body["system"] = json!([
+                {
+                    "type": "text",
+                    "text": s,
+                    "cache_control": { "type": "ephemeral" }
+                }
+            ]);
+        }
+    }
+    if !tools.is_empty() {
+        let mut tool_specs: Vec<Value> = tools.iter().map(translate_tool_spec).collect();
         if let Some(last) = tool_specs.last_mut() {
             last["cache_control"] = json!({ "type": "ephemeral" });
         }

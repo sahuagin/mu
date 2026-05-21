@@ -1161,3 +1161,211 @@ fn fb0_no_system_prompt_yields_no_system_span() {
         "no system_prompt → no `system` field in wire body",
     );
 }
+
+// ============================================================================
+// mu-yqeq.4 parity tests
+//
+// Each test runs the SAME scenario through both wire-body builders:
+//   - Legacy:    build_request_body(model, system_prompt, &[AgentMessage], tools)
+//   - Projected: build_request_body_from_projection(model, &ProviderMessages, tools)
+//                where ProviderMessages is the AnthropicProviderRenderer's
+//                output for assemble_rope(system_prompt, messages, tools).
+//
+// Byte-equality on the two `serde_json::Value` outputs is the contract.
+// Phase D (mu-yqeq.8) flips the call site at mod.rs:818 from Legacy to
+// Projected; if these parity tests pass, the cutover is observably
+// equivalent at the wire layer.
+// ============================================================================
+
+fn parity_compare(
+    system_prompt: Option<&str>,
+    messages: &[AgentMessage],
+    tools: &[mu_core::agent::ToolSpec],
+) {
+    let legacy = build_request_body("claude-test", system_prompt, messages, tools);
+
+    let rope = assemble_rope(system_prompt, messages, tools);
+    let projection =
+        crate::context::AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let projected = build_request_body_from_projection("claude-test", &projection, tools);
+
+    assert_eq!(
+        legacy, projected,
+        "Legacy vs Projected wire body diverged.\nLegacy:    {legacy:#}\nProjected: {projected:#}",
+    );
+}
+
+#[test]
+fn yqeq4_parity_pure_text_turn() {
+    // User → Assistant text. No tools, no system, no tool calls.
+    let messages = vec![
+        AgentMessage::User {
+            content: "hi".into(),
+        },
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        }),
+    ];
+    parity_compare(None, &messages, &[]);
+}
+
+#[test]
+fn yqeq4_parity_single_tool_call() {
+    // User → Assistant(text + ToolCall) → ToolResult → Assistant text.
+    let tool = mu_core::agent::ToolSpec {
+        name: "read".into(),
+        description: "read a file".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+        }),
+        policy: Default::default(),
+    };
+    let messages = vec![
+        AgentMessage::User {
+            content: "what's in /tmp/x?".into(),
+        },
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::Text {
+                    text: "I'll read it.".into(),
+                },
+                ContentBlock::ToolCall(ToolCall {
+                    id: "toolu_42".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "/tmp/x"}),
+                }),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        }),
+        AgentMessage::ToolResult {
+            call_id: "toolu_42".into(),
+            content: "contents".into(),
+            is_error: false,
+        },
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: "it says contents".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        }),
+    ];
+    parity_compare(None, &messages, std::slice::from_ref(&tool));
+}
+
+#[test]
+fn yqeq4_parity_consecutive_tool_results_group_into_one_user_message() {
+    // Three back-to-back ToolResults → Anthropic requires one user
+    // message with multiple tool_result content blocks. This is the
+    // load-bearing case from b3_consecutive_tool_results_group_into_
+    // one_user_message in this file (anthropic_tests.rs:109-160 ish).
+    let messages = vec![
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::ToolCall(ToolCall {
+                    id: "toolu_1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "/a"}),
+                }),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "toolu_2".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "/b"}),
+                }),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "toolu_3".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "/c"}),
+                }),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        }),
+        AgentMessage::ToolResult {
+            call_id: "toolu_1".into(),
+            content: "a-contents".into(),
+            is_error: false,
+        },
+        AgentMessage::ToolResult {
+            call_id: "toolu_2".into(),
+            content: "b-contents".into(),
+            is_error: true,
+        },
+        AgentMessage::ToolResult {
+            call_id: "toolu_3".into(),
+            content: "c-contents".into(),
+            is_error: false,
+        },
+    ];
+    parity_compare(None, &messages, &[]);
+}
+
+#[test]
+fn yqeq4_parity_system_prompt_plus_tools() {
+    // System prompt + multiple tools — exercises both cache_control
+    // positions (top-level `system` block AND last tool spec). Phase D
+    // open question about cache positioning surfaces here: this test
+    // pins the Phase C contract that the Projected path emits
+    // unconditional cache_control on both, matching Legacy.
+    let tools = vec![
+        mu_core::agent::ToolSpec {
+            name: "read".into(),
+            description: "read a file".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            policy: Default::default(),
+        },
+        mu_core::agent::ToolSpec {
+            name: "bash".into(),
+            description: "run shell".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            policy: Default::default(),
+        },
+    ];
+    let messages = vec![AgentMessage::User {
+        content: "list files".into(),
+    }];
+    parity_compare(Some("you are a helpful assistant"), &messages, &tools);
+}
+
+#[test]
+fn yqeq4_thinking_blocks_are_skipped_in_projected_wire_output() {
+    // Spec mu-044 §"Thinking-block skip": Projected wire emission MUST
+    // NOT echo the model's reasoning trace back as input. Mirrors the
+    // Legacy `translate_message_single` behavior (anthropic.rs:208
+    // filters Thinking blocks).
+    let messages = vec![AgentMessage::Assistant(AssistantMessage {
+        content: vec![
+            ContentBlock::Thinking {
+                text: "INTERNAL_REASONING_DO_NOT_LEAK".into(),
+            },
+            ContentBlock::Text {
+                text: "public answer".into(),
+            },
+        ],
+        stop_reason: StopReason::EndTurn,
+        usage: None,
+    })];
+    let rope = assemble_rope(None, &messages, &[]);
+    let projection =
+        crate::context::AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let projected = build_request_body_from_projection("claude-test", &projection, &[]);
+
+    let wire = serde_json::to_string(&projected).expect("serialize");
+    assert!(
+        !wire.contains("INTERNAL_REASONING_DO_NOT_LEAK"),
+        "Thinking block content leaked to wire: {wire}",
+    );
+    assert!(
+        wire.contains("public answer"),
+        "non-thinking text was lost: {wire}",
+    );
+
+    // Also: parity vs Legacy (which also strips thinking).
+    parity_compare(None, &messages, &[]);
+}

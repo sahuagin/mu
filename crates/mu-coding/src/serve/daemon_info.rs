@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mu_core::config::Config;
+use mu_core::context::RecallProvider;
 
 #[derive(Debug, Clone)]
 pub struct DaemonInfo {
@@ -35,6 +36,14 @@ struct DaemonInfoInner {
     /// going back to disk. Tests pass `Config::default()` to avoid
     /// reading from the developer's `~/.config/mu/config.toml`.
     config: Arc<Config>,
+    /// mu-phl v0 (mu-0bxv): session-start recall providers. The
+    /// session handler iterates these on `create_session` /
+    /// `session.delegate`, collects [`RecalledItem`]s, and bundles
+    /// them into the new session's `AgentConfig.project_context`.
+    /// Default: empty Vec (tests pass; no recall happens). Production
+    /// wires up [`SubprocessRecallProvider`] +
+    /// [`ProjectFileRecallProvider`] via [`with_recall_providers`].
+    recall_providers: Arc<Vec<Arc<dyn RecallProvider>>>,
 }
 
 impl DaemonInfo {
@@ -54,6 +63,7 @@ impl DaemonInfo {
                     .unwrap_or(0),
                 events_dir: None,
                 config: Arc::new(Config::default()),
+                recall_providers: Arc::new(Vec::new()),
             }),
         }
     }
@@ -84,6 +94,23 @@ impl DaemonInfo {
         }
     }
 
+    /// mu-phl v0 (mu-0bxv): builder-style setter for the session-start
+    /// recall provider chain. Production wires up
+    /// `vec![Arc::new(SubprocessRecallProvider::default()),
+    ///       Arc::new(ProjectFileRecallProvider::default())]`;
+    /// tests pass an empty vec (the default) to skip recall, or a
+    /// custom Vec containing stub providers for deterministic
+    /// recall-content tests.
+    pub fn with_recall_providers(self, providers: Vec<Arc<dyn RecallProvider>>) -> Self {
+        let inner = (*self.inner).clone();
+        Self {
+            inner: Arc::new(DaemonInfoInner {
+                recall_providers: Arc::new(providers),
+                ..inner
+            }),
+        }
+    }
+
     pub fn events_dir(&self) -> Option<&std::path::Path> {
         self.inner.events_dir.as_deref()
     }
@@ -93,6 +120,15 @@ impl DaemonInfo {
     /// in mu-kgu.11) call this to resolve operator preferences.
     pub fn config(&self) -> &Config {
         &self.inner.config
+    }
+
+    /// mu-phl v0 (mu-0bxv): read access to the recall provider chain.
+    /// The session handler iterates this on every `create_session` /
+    /// `session.delegate` to build the new session's `ProjectContext`.
+    /// Empty in tests and (by default) in `DaemonInfo::new` — production
+    /// wires up via [`with_recall_providers`].
+    pub fn recall_providers(&self) -> &[Arc<dyn RecallProvider>] {
+        &self.inner.recall_providers
     }
 
     /// Test helper: deterministic id, no events_dir.
@@ -105,6 +141,7 @@ impl DaemonInfo {
                 started_at_unix_ms: 0,
                 events_dir: None,
                 config: Arc::new(Config::default()),
+                recall_providers: Arc::new(Vec::new()),
             }),
         }
     }

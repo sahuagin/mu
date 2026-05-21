@@ -220,6 +220,9 @@ async fn create_session(
     let body = CreateSessionRequest {
         provider: selector.clone(),
         system_prompt: system_prompt.map(str::to_owned),
+        // mu-phl v0 Phase D: cwd is added in Phase E (mu-lfgh); this
+        // construction stays None for now to preserve back-compat.
+        cwd: None,
     };
     let req = json!({
         "jsonrpc": "2.0",

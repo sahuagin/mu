@@ -19,6 +19,13 @@ pub struct CreateSessionRequest {
     /// Optional system prompt override. None → daemon default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    /// mu-phl v0 / mu-045: operator's working directory at the time
+    /// of session creation. Used by the daemon to scope recall
+    /// providers (`agent memory context --cwd ...`, `./CLAUDE.md`
+    /// resolution). None → daemon falls back to its own process cwd
+    /// (back-compat with pre-mu-phl clients).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 impl CreateSessionRequest {
@@ -322,6 +329,12 @@ pub struct DelegateSessionRequest {
     /// unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attenuations: Option<crate::capability::CapabilityAttenuations>,
+    /// mu-phl v0 / mu-045: child session's working directory. Same
+    /// semantics as [`CreateSessionRequest::cwd`]. None → daemon
+    /// fallback (process cwd); see mu-045 for the rationale on why
+    /// children do not auto-inherit parent cwd in v0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 impl DelegateSessionRequest {

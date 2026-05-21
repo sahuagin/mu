@@ -28,6 +28,9 @@ use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
     ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
 };
+use mu_core::context::{
+    extract_call_id_from_span_id, ProviderMessage, ProviderMessages, ProviderRole,
+};
 
 use crate::auth::{self, FileSystemTokenStore, OAuthToken, TokenStore};
 
@@ -289,6 +292,179 @@ pub(crate) fn build_request_body(
     tools: &[ToolSpec],
 ) -> Value {
     let input: Vec<Value> = messages.iter().flat_map(translate_message).collect();
+    let mut body = json!({
+        "model": model,
+        "instructions": instructions,
+        "input": input,
+        "stream": true,
+        "store": false,
+        "reasoning": {"effort": thinking, "summary": "auto"},
+    });
+    if !tools.is_empty() {
+        body["tools"] = json!(tools.iter().map(translate_tool_spec).collect::<Vec<_>>());
+        body["tool_choice"] = json!("auto");
+        body["parallel_tool_calls"] = json!(false);
+    }
+    body
+}
+
+// ============================================================================
+// mu-yqeq.5: Projected path — wire body built from &ProviderMessages
+// ============================================================================
+//
+// Mirrors `translate_message` + `build_request_body` semantics but
+// reads structural `ContentBlock`s from `ProviderMessage.blocks`
+// instead of `AgentMessage::Assistant.content`. The session
+// system-prompt span (`source_span_ids[0] == "system-prompt"`) is
+// hoisted into the top-level `instructions` field with the same
+// Legacy fallback rule: empty/missing hoisted text falls back to the
+// provider's default `instructions`. Tool-schema spans are silently
+// dropped (the `tools` parameter is authoritative for `body.tools`).
+//
+// Wire-format byte equivalence with the Legacy path is the contract;
+// see `yqeq5_parity_*` tests in openai_codex_tests.rs for the
+// canonical scenarios.
+
+/// Translate a [`ProviderMessages`] projection into the OpenAI
+/// Responses API `input` array, returning the hoisted system-prompt
+/// text (if any) separately for [`build_request_body_from_projection`]
+/// to place in the top-level `instructions` field.
+///
+/// Hoisting rule: the FIRST `ProviderRole::System` message whose
+/// `source_span_ids[0] == "system-prompt"` has its content captured.
+/// Tool-schema spans (`source_span_ids[0]` starts with `"tool-schema:"`)
+/// are silently skipped — the `tools` parameter on `Provider::stream`
+/// is authoritative for `body.tools`.
+fn translate_provider_messages_codex(pmsgs: &ProviderMessages) -> (Vec<Value>, Option<String>) {
+    let mut out: Vec<Value> = Vec::with_capacity(pmsgs.messages.len());
+    let mut system_text: Option<String> = None;
+
+    for msg in &pmsgs.messages {
+        match msg.role() {
+            ProviderRole::System => {
+                let is_session_prompt = msg
+                    .source_span_ids()
+                    .first()
+                    .map(|sid| sid.as_ref() == "system-prompt")
+                    .unwrap_or(false);
+                if is_session_prompt && system_text.is_none() {
+                    let content = msg.content();
+                    if !content.is_empty() {
+                        system_text = Some(content.to_string());
+                    }
+                }
+            }
+            ProviderRole::User => {
+                out.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": msg.content()}],
+                }));
+            }
+            ProviderRole::Assistant => {
+                out.extend(translate_provider_assistant_codex(msg));
+            }
+            ProviderRole::ToolResult => {
+                out.push(translate_provider_tool_result_codex(msg));
+            }
+        }
+    }
+
+    (out, system_text)
+}
+
+/// Translate one assistant-role [`ProviderMessage`] into the
+/// Responses API's split shape: a `message` item carrying any text
+/// (combined like the Legacy path), followed by one `function_call`
+/// item per [`ContentBlock::ToolCall`]. `Thinking` blocks are
+/// skipped per spec mu-044 §"Thinking-block skip" — the model never
+/// receives its own reasoning trace as input. Returns an empty `Vec`
+/// when the assistant has no wire-bearing blocks (mirrors the Legacy
+/// `translate_message` behavior).
+fn translate_provider_assistant_codex(msg: &ProviderMessage) -> Vec<Value> {
+    let blocks = match msg.blocks() {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+    let mut out: Vec<Value> = Vec::new();
+    let mut text_parts: Vec<String> = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } => text_parts.push(text.to_string()),
+            ContentBlock::ToolCall(tc) => {
+                let args_str =
+                    serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".to_string());
+                out.push(json!({
+                    "type": "function_call",
+                    "call_id": tc.id,
+                    "name": tc.name,
+                    "arguments": args_str,
+                }));
+            }
+            ContentBlock::Thinking { .. } => {}
+        }
+    }
+    if !text_parts.is_empty() {
+        let combined = text_parts.join("");
+        out.insert(
+            0,
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": combined}],
+            }),
+        );
+    }
+    out
+}
+
+/// Translate one tool-result [`ProviderMessage`] into a
+/// `function_call_output` item. `call_id` is recovered from the
+/// synthesized span id (`msg-{idx}-tool-result:{call_id}`); `is_error`
+/// is recovered from the `"error: "` prefix that
+/// `assembly.rs::message_to_span` adds when the original
+/// `AgentMessage::ToolResult.is_error` was `true`. Errors are
+/// re-encoded as `"[error] {content}"` to match the Legacy
+/// `translate_message` shape.
+fn translate_provider_tool_result_codex(msg: &ProviderMessage) -> Value {
+    let call_id: &str = msg
+        .source_span_ids()
+        .first()
+        .and_then(|sid| extract_call_id_from_span_id(sid.as_ref()))
+        .unwrap_or("");
+    let body: String = match msg.content().strip_prefix("error: ") {
+        Some(stripped) => format!("[error] {stripped}"),
+        None => msg.content().to_string(),
+    };
+    json!({
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": body,
+    })
+}
+
+/// Sibling of [`build_request_body`] that builds the Responses API
+/// request body from a [`ProviderMessages`] projection instead of a
+/// raw `&[AgentMessage]` slice. Wire JSON is byte-identical to the
+/// Legacy path for the canonical scenarios (asserted by
+/// `yqeq5_parity_*` tests).
+///
+/// `default_instructions` is the provider's static fallback (used
+/// when the projection has no hoisted system span or the span's
+/// content is empty) — matches Legacy's
+/// `system_prompt.filter(|s| !s.is_empty()).unwrap_or(&self.instructions)`.
+pub(crate) fn build_request_body_from_projection(
+    model: &str,
+    thinking: &str,
+    default_instructions: &str,
+    pmsgs: &ProviderMessages,
+    tools: &[ToolSpec],
+) -> Value {
+    let (input, hoisted_system) = translate_provider_messages_codex(pmsgs);
+    let instructions: &str = match hoisted_system.as_deref() {
+        Some(s) if !s.is_empty() => s,
+        _ => default_instructions,
+    };
     let mut body = json!({
         "model": model,
         "instructions": instructions,
@@ -811,27 +987,46 @@ impl Provider for OpenaiCodexProvider {
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
-        // mu-yqeq.3: only Legacy is implemented today. mu-yqeq.5 will
-        // split the `_` arm into MessageInput::Projected(p).
-        let messages = match input {
-            MessageInput::Legacy(msgs) => msgs,
+        // mu-yqeq.5: sealed-enum dispatch (Legacy + Projected). The
+        // `_` arm remains for forward-compat with future MessageInput
+        // variants — adding one will compile-warn here for review.
+        //
+        // Projected arm produces byte-identical wire JSON to the
+        // Legacy arm; the `yqeq5_parity_*` tests in
+        // openai_codex_tests.rs assert that invariant for the
+        // canonical scenarios. The agent loop's mod.rs:818 still
+        // passes Legacy until mu-yqeq.8 wires the cutover.
+        let body = match input {
+            MessageInput::Legacy(msgs) => {
+                // mu-n48: a session-level system_prompt overrides
+                // the provider's default `instructions`.
+                let instructions: &str = system_prompt
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&self.instructions);
+                build_request_body(&self.model, &self.thinking, instructions, msgs, tools)
+            }
+            MessageInput::Projected(pmsgs) => {
+                // In the Projected path the projection itself carries
+                // the session system prompt (assemble_rope put it
+                // there from `system_prompt`); the helper hoists it
+                // into `body.instructions` and falls back to
+                // `self.instructions` when the projection has no
+                // (or an empty) system span — matching Legacy's
+                // `.filter(|s| !s.is_empty()).unwrap_or(...)` rule.
+                build_request_body_from_projection(
+                    &self.model,
+                    &self.thinking,
+                    &self.instructions,
+                    pmsgs,
+                    tools,
+                )
+            }
             _ => {
                 return Err(ProviderError::Other(
-                    "OpenaiCodexProvider: only MessageInput::Legacy is currently supported \
-                     (mu-yqeq.5 will add Projected)"
-                        .to_string(),
+                    "OpenaiCodexProvider: unrecognized MessageInput variant".to_string(),
                 ));
             }
         };
-        // mu-n48: a session-level system_prompt overrides the
-        // provider's default `instructions` (the Responses API's
-        // system-prompt slot). The `with_instructions` provider-
-        // builder mechanism still works at construction time;
-        // session-level just takes precedence per-call.
-        let instructions: &str = system_prompt
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&self.instructions);
-        let body = build_request_body(&self.model, &self.thinking, instructions, messages, tools);
 
         // First attempt with the current token.
         let initial_token = self.token.lock().await.clone();

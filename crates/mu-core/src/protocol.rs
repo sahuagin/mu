@@ -394,6 +394,7 @@ mod tests {
                 autonomy: crate::capability::AutonomyCapability::default(),
                 aws: None,
             }),
+            cwd: None,
         };
         let value = serde_json::to_value(&req)?;
         let decoded: DelegateSessionRequest = serde_json::from_value(value)?;
@@ -409,6 +410,7 @@ mod tests {
             provider: ProviderSelector::AnthropicApi { model: "x".into() },
             branched_at_parent_event_id: None,
             attenuations: None,
+            cwd: None,
         };
         let value = serde_json::to_value(&req)?;
         let obj = value.as_object().unwrap();

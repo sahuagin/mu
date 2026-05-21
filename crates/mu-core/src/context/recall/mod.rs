@@ -102,7 +102,12 @@ pub struct ProjectContext {
 /// Can lift to `Box<dyn Iterator<Item = RecalledItem> + Send>` later
 /// if a provider wants lazy generation; consumers using `for` or
 /// `.into_iter()` migrate trivially.
-pub trait RecallProvider: Send + Sync {
+///
+/// `Debug` is required so containers holding `Arc<dyn RecallProvider>`
+/// (most notably `DaemonInfo`) can derive `Debug` uniformly. Both v0
+/// impls (`SubprocessRecallProvider`, `ProjectFileRecallProvider`)
+/// already use `#[derive(Debug)]`.
+pub trait RecallProvider: Send + Sync + std::fmt::Debug {
     fn recall(&self, cwd: &Path, capability: &Capability) -> Vec<RecalledItem>;
 }
 

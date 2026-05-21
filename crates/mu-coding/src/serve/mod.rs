@@ -214,9 +214,17 @@ where
     let auth_registry = Arc::new(auth::registry_from_config(&config.auth));
     let auth_state: auth::AuthStateHandle =
         Arc::new(std::sync::Mutex::new(auth::AuthState::default()));
+    // mu-phl v0 (mu-0bxv): wire up the canonical session-start recall
+    // provider chain. Tests construct DaemonInfo without these (empty
+    // vec) to skip recall; production runs both.
+    let recall_providers: Vec<Arc<dyn mu_core::context::RecallProvider>> = vec![
+        Arc::new(mu_core::context::recall::SubprocessRecallProvider::default()),
+        Arc::new(mu_core::context::recall::ProjectFileRecallProvider::default()),
+    ];
     let daemon_info = DaemonInfo::new(env!("CARGO_PKG_VERSION"))
         .with_events_dir(events_dir)
-        .with_config(config);
+        .with_config(config)
+        .with_recall_providers(recall_providers);
     // mu-935: when events_dir is configured (mu-upb's on-disk JSONL
     // path), wrap the local backend with FileBackend so session.list
     // with include_remote=true picks up peer daemons' sessions from

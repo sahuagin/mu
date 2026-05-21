@@ -5,9 +5,12 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
+use std::path::PathBuf;
+
 use mu_core::agent::{AgentConfig, AgentInput, AgentLoop, AgentMessage, Tool};
 use mu_core::capability::Capability;
 use mu_core::context::rope::SpanText;
+use mu_core::context::{ProjectContext, RecalledItem};
 use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
     AskSessionRequest, AskSessionResponse, CancelOutstandingRequest, CancelOutstandingResponse,
@@ -58,6 +61,7 @@ pub fn handle_create_session(
     match build_and_register_session(BuildSessionRequest {
         selector: &params.provider,
         system_prompt: params.system_prompt, // mu-n48
+        cwd: params.cwd,                     // mu-phl v0 / mu-045
         parent_session_id: None,             // no parent — this is a root session
         branched_at_parent_event_id: None,
         capability: Capability::root(), // root session: unrestricted
@@ -131,6 +135,7 @@ pub fn handle_delegate_session(
     match build_and_register_session(BuildSessionRequest {
         selector: &params.provider,
         system_prompt: None, // mu-n48: delegate sessions inherit (no override yet)
+        cwd: params.cwd,     // mu-phl v0 / mu-045
         parent_session_id: Some(params.parent_session_id.clone()),
         branched_at_parent_event_id: params.branched_at_parent_event_id,
         capability: child_capability,
@@ -161,6 +166,11 @@ struct BuildSessionRequest<'a> {
     // request shape
     selector: &'a ProviderSelector,
     system_prompt: Option<String>,
+    /// mu-phl v0 / mu-045: operator's cwd at session creation time.
+    /// Used to scope the recall providers attached via
+    /// [`DaemonInfo::recall_providers`]. None → daemon falls back to
+    /// `std::env::current_dir()` (back-compat).
+    cwd: Option<PathBuf>,
     parent_session_id: Option<String>,
     branched_at_parent_event_id: Option<u64>,
     capability: Capability,
@@ -179,6 +189,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     let BuildSessionRequest {
         selector,
         system_prompt,
+        cwd,
         parent_session_id,
         branched_at_parent_event_id,
         capability,
@@ -230,6 +241,12 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     );
 
     let pending_approvals = Arc::new(Mutex::new(HashMap::new()));
+    // mu-phl v0 / mu-0bxv: build the new session's project context by
+    // iterating the daemon's recall providers (set up at daemon startup
+    // via DaemonInfo::with_recall_providers) against the effective cwd
+    // and the session's capability. Computed BEFORE capability is moved
+    // into capability_handle so we can borrow it.
+    let project_context = build_project_context(daemon_info, cwd.as_deref(), &capability);
     let capability_handle = Arc::new(Mutex::new(capability));
     let provider_status = Arc::new(Mutex::new(
         super::super::provider_status::ProviderStatusTracker::new(),
@@ -247,6 +264,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             // construction works directly on SpanText, no further allocs.
             system_prompt: system_prompt.map(SpanText::from),
             max_turns,
+            project_context,
             ..AgentConfig::default()
         },
         events_tx,
@@ -281,6 +299,46 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     );
 
     Ok(session_id)
+}
+
+/// mu-phl v0 (mu-0bxv): iterate the daemon's recall providers against
+/// the effective cwd + session capability, collecting all returned
+/// items into a single [`ProjectContext`].
+///
+/// Returns `None` when no items were produced (either no providers
+/// configured — the test default — or all providers returned empty).
+/// `None` is the back-compat case: downstream
+/// [`assemble_rope_with_context`] takes `Option<&ProjectContext>` and
+/// no-ops on `None`, producing the pre-mu-phl rope layout.
+///
+/// `cwd` resolution: caller's `cwd` parameter is honored when `Some`;
+/// `None` falls back to `std::env::current_dir()`. If both fail
+/// (extremely unlikely), uses `/` as a defensible last resort — the
+/// recall providers will produce empty results, which is correct.
+fn build_project_context(
+    daemon_info: &DaemonInfo,
+    cwd: Option<&std::path::Path>,
+    capability: &Capability,
+) -> Option<ProjectContext> {
+    let providers = daemon_info.recall_providers();
+    if providers.is_empty() {
+        return None;
+    }
+
+    let resolved_cwd: PathBuf = cwd
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+
+    let mut items: Vec<RecalledItem> = Vec::new();
+    for provider in providers {
+        items.extend(provider.recall(&resolved_cwd, capability));
+    }
+
+    if items.is_empty() {
+        None
+    } else {
+        Some(ProjectContext { items })
+    }
 }
 
 /// Pull a (kind, model) pair out of a `ProviderSelector` for logging

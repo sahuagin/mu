@@ -441,6 +441,14 @@ impl App {
                         self.cmd_model(terminal, tail)?;
                         return Ok(false);
                     }
+                    "/cancel" if tail.is_empty() => {
+                        self.cmd_cancel(terminal)?;
+                        return Ok(false);
+                    }
+                    "/clear" if tail.is_empty() => {
+                        self.cmd_clear(terminal)?;
+                        return Ok(false);
+                    }
                     _ if head.starts_with('/') => {
                         self.emit_unknown_command(terminal, head)?;
                         return Ok(false);
@@ -925,6 +933,87 @@ impl App {
         Ok(())
     }
 
+    /// /cancel — abort the in-flight provider call without ending the
+    /// session. Maps to `session.cancel_outstanding` (mu-035). Routes
+    /// to whichever session owns the current streaming turn (main or
+    /// /btw sidecar) so cancelling a side question doesn't kill the
+    /// main turn or vice versa. Idempotent — if nothing is in flight,
+    /// the daemon returns `canceled: false` and we say so.
+    fn cmd_cancel<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        // Pick the session whose turn is currently streaming. Fall
+        // back to the main session if nothing is in flight — the
+        // daemon will tell us it was idle.
+        let sid = match self.streaming_route {
+            Some(TurnRoute::Btw) => self
+                .sidecar_session_id
+                .clone()
+                .unwrap_or_else(|| self.session_id.clone()),
+            _ => self.session_id.clone(),
+        };
+        let resp = self
+            .client
+            .request(
+                "session.cancel_outstanding",
+                serde_json::json!({
+                    "session_id": sid,
+                    "reason": "user pressed /cancel",
+                }),
+            )
+            .context("session.cancel_outstanding RPC failed")?;
+        let canceled = resp.get("canceled").and_then(|v| v.as_bool()).unwrap_or(false);
+        let was_in = resp
+            .get("was_in")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unknown)");
+        let lines: Vec<Line<'static>> = if canceled {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "/cancel — provider call aborted".to_string(),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!("  was_in: {was_in}"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+            ]
+        } else {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "/cancel — nothing in flight".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    format!("  was_in: {was_in}"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+            ]
+        };
+        let h = lines.len() as u16;
+        terminal.insert_before(h, |buf| {
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
+        Ok(())
+    }
+
+    /// /clear — clear the visible scrollback. Doesn't touch the
+    /// daemon's event log; this is a display-only reset. The inline
+    /// viewport redraws on the next tick.
+    fn cmd_clear<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        terminal.clear()?;
+        Ok(())
+    }
+
     /// Unknown-command stub. Keeps typos from getting sent to the
     /// model as a prompt (which would burn tokens and confuse the
     /// session). Mirrors claude-code's "Unknown slash command" hint.
@@ -973,6 +1062,8 @@ impl App {
             Line::from("  /provider [name]   list-picker (bare) or set directly"),
             Line::from("  /model [name]      list-picker (bare) or set directly"),
             Line::from("  /btw <message>     side question via sidecar (main history unaffected)"),
+            Line::from("  /cancel            abort the in-flight provider call"),
+            Line::from("  /clear             clear the visible scrollback"),
             Line::from("  /q, /quit, /exit   leave the session"),
             Line::from(""),
             Line::from("  Esc                clear the current prompt"),

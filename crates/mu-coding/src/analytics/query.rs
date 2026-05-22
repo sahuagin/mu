@@ -202,13 +202,24 @@ impl RateRow {
 /// `rate --metric hallucination --by provider,model`. The hallucination
 /// definition (per spec mu-042): `hollow_commit + lying_state +
 /// narrative_no_action` divided by total `Done` tasks.
+///
+/// Filters to `tool_call_count > 0` to exclude pure-chat sessions
+/// from the denominator. The classifier's `narrative_no_action`
+/// outcome fires on every `Done + no-commit` task, which is the
+/// right call for autonomous coding agents but classifies all chat
+/// sessions (mu-solo, mu-tui) as hallucinations by construction.
+/// Filtering to tasks that called at least one tool is a structural
+/// proxy for "intended an action," and gets the rate honest without
+/// requiring an upstream `session_kind` field on every task. If a
+/// chat session happens to call `bash ls` it'll be counted — false
+/// positive, but small in the data.
 pub fn rate_hallucination(conn: &Connection, since_unix_ms: Option<u64>) -> Result<Vec<RateRow>> {
     let since = since_unix_ms.unwrap_or(0) as i64;
     let sql = "\
         SELECT provider, model,\n        \
                SUM(CASE WHEN outcome_class IN ('hollow_commit','lying_state','narrative_no_action') THEN 1 ELSE 0 END) AS hallu,\n        \
                SUM(CASE WHEN exit_reason = 'done' THEN 1 ELSE 0 END) AS done_count\n        \
-          FROM tasks\n         WHERE ended_at_unix_ms >= ?1\n      GROUP BY provider, model\n      ORDER BY hallu DESC, provider ASC, model ASC";
+          FROM tasks\n         WHERE ended_at_unix_ms >= ?1\n           AND tool_call_count > 0\n      GROUP BY provider, model\n      ORDER BY hallu DESC, provider ASC, model ASC";
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt
         .query_map([since], |r| {
@@ -276,6 +287,10 @@ mod tests {
         outcome: Outcome,
         ended_at: u64,
     ) -> TaskRow {
+        // Default fixture is a tool-using task (tool_call_count = 1)
+        // so it's included in the hallu rate denominator. Tests that
+        // want to exercise the "pure chat" filter mutate the row
+        // after construction to set tool_call_count = 0.
         TaskRow {
             task_id: task_id.to_owned(),
             session_id: "s".to_owned(),
@@ -296,6 +311,7 @@ mod tests {
                 confidence: Confidence::Definite,
                 rationale: "fixture".to_owned(),
             },
+            tool_call_count: 1,
         }
     }
 
@@ -434,6 +450,56 @@ mod tests {
         assert_eq!(by_label["openrouter/ds"], (3, 3));
         // anthropic_api: 0 hallu out of 2 Done.
         assert_eq!(by_label["anthropic_api/claude-haiku-4-5"], (0, 2));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rate_hallucination_excludes_zero_tool_call_chat_sessions() {
+        // Mirror the real-world blind spot: a chat session with no
+        // tool calls hits narrative_no_action by definition (it
+        // produced no commit). Before the filter it was 100% hallu;
+        // now it's excluded from the rate denominator entirely.
+        let path = std::env::temp_dir().join("mu_8ypx_q_chat_filter.sqlite");
+        let _ = std::fs::remove_file(&path);
+        let conn = open(&path).unwrap();
+
+        // One tool-calling task that legitimately failed to commit.
+        upsert_task(
+            &conn,
+            &fixture(
+                "tool-1",
+                "openrouter",
+                "ds",
+                TaskExitReason::Done,
+                Outcome::NarrativeNoAction,
+                2000,
+            ),
+        )
+        .unwrap();
+        // Three pure-chat tasks (same provider+model, no tool calls).
+        for (i, id) in ["chat-1", "chat-2", "chat-3"].iter().enumerate() {
+            let mut row = fixture(
+                id,
+                "openrouter",
+                "ds",
+                TaskExitReason::Done,
+                Outcome::NarrativeNoAction,
+                2100 + i as u64,
+            );
+            row.tool_call_count = 0;
+            upsert_task(&conn, &row).unwrap();
+        }
+
+        let rows = rate_hallucination(&conn, None).unwrap();
+        let by_label: std::collections::HashMap<_, _> = rows
+            .iter()
+            .map(|r| (r.group_label.as_str(), (r.numerator, r.denominator)))
+            .collect();
+        // Only the one tool-calling task is counted. The chat rows
+        // are excluded — not (1, 4).
+        assert_eq!(by_label["openrouter/ds"], (1, 1));
 
         drop(conn);
         let _ = std::fs::remove_file(&path);

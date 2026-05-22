@@ -380,6 +380,33 @@ struct App {
     /// F3 is in Inline mode. Survives mode swaps so re-entering F3
     /// doesn't duplicate transcript history that's already in scrollback.
     f3_emitted_count_by_sid: std::collections::HashMap<String, usize>,
+    /// mu-304g: number of chars from `streaming_text[sid]` already
+    /// emitted to mux scrollback as in-flight assistant preview. Tracked
+    /// in chars (not bytes) for UTF-8 safety. Cleared when the streaming
+    /// block closes (session.done / session.error).
+    f3_streaming_chars_emitted: std::collections::HashMap<String, usize>,
+    /// mu-304g: session_ids whose "┌─ assistant " block header is open
+    /// in scrollback (waiting on more body lines or a closer). When set,
+    /// the next emit treats subsequent text as continuation; when the
+    /// streaming accumulator clears, the closer "└─" is emitted and the
+    /// sid is removed from this set.
+    f3_streaming_header_emitted: std::collections::HashSet<String>,
+    /// mu-304g: per-sid count of upcoming AssistantMessage event commits
+    /// whose text was already emitted as streaming preview. Incremented
+    /// in emit_transcript_delta_inline's closer-emit branch ONLY when
+    /// (a) a complete preview block actually ran (header + body + closer)
+    /// AND (b) the committed AssistantMessage has not already been
+    /// rendered in the same tick. Consumed (decremented) when phase 1
+    /// filters the matching event out of the committed-events render.
+    /// Robust to fast back-to-back turns.
+    f3_preview_complete_pending: std::collections::HashMap<String, usize>,
+    /// mu-304g: per-sid snapshot of `streaming_text[sid]` captured at
+    /// `session.done` / `session.error` BEFORE the accumulator is
+    /// cleared. Lets the closer-emit branch flush any trailing
+    /// no-newline content that the in-stream emission deferred (e.g.,
+    /// short single-line responses). Dropped after the flush, or on the
+    /// next (None, false) emit when no header was ever emitted (orphan).
+    f3_streaming_final_text: std::collections::HashMap<String, String>,
     /// mu-o1y7 phase 3a: one-line markers that should emit into
     /// scrollback above the inline viewport on the next tick. Used to
     /// surface ephemeral feedback (e.g. "can't send — session is
@@ -485,6 +512,10 @@ impl App {
             f3_inline_help_dumped: false,
             terminal_cols: 80,
             terminal_rows: 24,
+            f3_streaming_chars_emitted: std::collections::HashMap::new(),
+            f3_streaming_header_emitted: std::collections::HashSet::new(),
+            f3_preview_complete_pending: std::collections::HashMap::new(),
+            f3_streaming_final_text: std::collections::HashMap::new(),
         }
     }
 
@@ -613,6 +644,17 @@ impl App {
                                     // the visible flicker between streaming
                                     // (yellow, in-memory) and finalized (white,
                                     // durable log) blocks.
+                                    //
+                                    // mu-304g: the pending-skip increment is
+                                    // intentionally NOT done here — it's done
+                                    // in emit_transcript_delta_inline's
+                                    // closer-emit branch only after we've
+                                    // confirmed a complete preview ran in F3
+                                    // Inline. Incrementing here would
+                                    // erroneously filter the AssistantMessage
+                                    // even when the user was on F8 (or another
+                                    // view) during the stream and never saw a
+                                    // preview.
                                     let text =
                                         params.get("text").and_then(|v| v.as_str()).unwrap_or("");
                                     if !text.is_empty() {
@@ -632,6 +674,21 @@ impl App {
                                     // transcript cache so F3 doesn't
                                     // flicker through a "loading…"
                                     // state.
+                                    //
+                                    // mu-304g: BEFORE clearing
+                                    // streaming_text, snapshot its
+                                    // contents so emit_transcript_delta_inline
+                                    // can flush any trailing
+                                    // no-newline content (short
+                                    // single-line responses fall in
+                                    // this case) when it emits the
+                                    // block closer.
+                                    if let Some(text) = self.streaming_text.get(sid) {
+                                        if !text.is_empty() {
+                                            self.f3_streaming_final_text
+                                                .insert(sid.to_string(), text.clone());
+                                        }
+                                    }
                                     self.streaming_text.remove(sid);
                                     // mu-xln: a Done means metrics
                                     // moved. Mark the usage-history
@@ -2953,36 +3010,263 @@ where
         app.f3_active_session_id = Some(sid.clone());
     }
 
-    // Compute the delta to emit + the new emitted-count. Scoped so
-    // the immutable borrow on `app.transcript_events_by_sid` is
-    // released before the mutable borrow for `f3_emitted_count_by_sid`.
-    let (lines_to_emit, new_count) = {
-        let events = match app.transcript_events_by_sid.get(&sid) {
-            Some(e) => e,
-            None => return Ok(()),
-        };
-        let emitted = *app.f3_emitted_count_by_sid.get(&sid).unwrap_or(&0);
-        if events.len() <= emitted {
-            return Ok(());
-        }
-        let new_events: Vec<serde_json::Value> = events[emitted..].to_vec();
-        let width = terminal.size()?.width as usize;
-        let wrap_width = width.saturating_sub(2);
-        let lines = render_transcript_lines(&new_events, None, Some(wrap_width));
-        (lines, events.len())
-    };
+    let width = terminal.size()?.width as usize;
+    let wrap_width = width.saturating_sub(2);
 
-    if lines_to_emit.is_empty() {
-        return Ok(());
+    // Phase A (streaming-preview emit, runs FIRST): mirror the
+    // Fullscreen path's `streaming_partial` handling. Unlike Fullscreen
+    // (which re-renders the whole pane each tick), Inline uses
+    // append-only `insert_before`, so the block is emitted in four
+    // visually-coherent steps:
+    //
+    //   - on the first text_delta of a turn: emit a "┌─ assistant "
+    //     header
+    //   - on each tick where more text has arrived: emit any new
+    //     complete-line chunks (up to the last '\n'), buffering the
+    //     in-progress trailing line for the next tick
+    //   - on streaming end (streaming_text cleared by session.done):
+    //     flush any trailing buffer captured at session.done, then
+    //     emit "└─" + blank to close the block
+    //   - whole-turn-in-one-tick: if all of text_delta /
+    //     assistant_text_finalized / session.done arrived in the same
+    //     `tick()` drain (which batches up to 64 notifications), emit
+    //     never saw streaming_text live. Render the complete block in
+    //     one shot from the f3_streaming_final_text snapshot.
+    //
+    // Runs BEFORE phase B (committed events) so the committed
+    // AssistantMessageEvent that lands in transcript_events_by_sid is
+    // filtered by phase B in the same tick — avoiding a duplicate
+    // assistant block in scrollback. In a closer-emit, phase A
+    // increments `f3_preview_complete_pending[sid]` to signal phase B.
+    let streaming_now: Option<String> = app.streaming_text.get(&sid).cloned();
+    let header_open = app.f3_streaming_header_emitted.contains(&sid);
+    match (streaming_now, header_open) {
+        (Some(text), false) if !text.is_empty() => {
+            // First-emit-of-turn: header + initial body up to last '\n'.
+            let header_line = Line::from(Span::styled(
+                "┌─ assistant ".to_string(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            terminal.insert_before(1, |buf| {
+                Widget::render(Paragraph::new(header_line), buf.area, buf);
+            })?;
+            app.f3_streaming_header_emitted.insert(sid.clone());
+
+            // Emit the body up to last '\n', if any. Track char count
+            // so subsequent ticks know where to resume.
+            let safe_byte_end = text.rfind('\n').map(|p| p + 1).unwrap_or(0);
+            if safe_byte_end > 0 {
+                let body_slice = &text[..safe_byte_end];
+                emit_streaming_body_chunk(terminal, body_slice, wrap_width)?;
+                let safe_chars = body_slice.chars().count();
+                app.f3_streaming_chars_emitted.insert(sid.clone(), safe_chars);
+            }
+        }
+        (Some(text), true) => {
+            // Continuation: emit any new chars up to the last '\n'.
+            let emitted_chars = *app.f3_streaming_chars_emitted.get(&sid).unwrap_or(&0);
+            let safe_byte_end = text.rfind('\n').map(|p| p + 1).unwrap_or(0);
+            if safe_byte_end > 0 {
+                let safe_chars = text[..safe_byte_end].chars().count();
+                if safe_chars > emitted_chars {
+                    let new_text: String = text
+                        .chars()
+                        .skip(emitted_chars)
+                        .take(safe_chars - emitted_chars)
+                        .collect();
+                    emit_streaming_body_chunk(terminal, &new_text, wrap_width)?;
+                    app.f3_streaming_chars_emitted.insert(sid.clone(), safe_chars);
+                }
+            }
+        }
+        (None, true) => {
+            // Streaming ended (session.done/error cleared the
+            // accumulator). Flush any trailing un-emitted content
+            // (short single-line responses with no newline, or any
+            // text past the last newline) BEFORE emitting the closer.
+            if let Some(final_text) = app.f3_streaming_final_text.remove(&sid) {
+                let emitted_chars = *app.f3_streaming_chars_emitted.get(&sid).unwrap_or(&0);
+                let final_chars = final_text.chars().count();
+                if final_chars > emitted_chars {
+                    let remaining: String =
+                        final_text.chars().skip(emitted_chars).collect();
+                    emit_streaming_body_chunk(terminal, &remaining, wrap_width)?;
+                }
+            }
+
+            let closer = Line::from(Span::styled(
+                "└─".to_string(),
+                Style::default().fg(Color::White),
+            ));
+            terminal.insert_before(2, |buf| {
+                let area = buf.area;
+                let lines = vec![closer, Line::from("")];
+                Widget::render(Paragraph::new(lines), area, buf);
+            })?;
+            app.f3_streaming_header_emitted.remove(&sid);
+            app.f3_streaming_chars_emitted.remove(&sid);
+
+            // Phase A is closing a complete preview block (header +
+            // body + closer). Mark the upcoming AssistantMessageEvent
+            // commit for skip so phase B (below) filters it. Since
+            // phase A runs BEFORE phase B in this tick, the
+            // AssistantMessage hasn't been rendered yet — no
+            // duplicate-render race to guard against.
+            *app.f3_preview_complete_pending
+                .entry(sid.clone())
+                .or_default() += 1;
+        }
+        (None, false) => {
+            // Streaming ended without us ever emitting a header —
+            // either all of text_delta / assistant_text_finalized /
+            // session.done arrived in the same `tick()` drain (so
+            // emit never saw streaming_text live), OR the user wasn't
+            // on F3 Inline during the stream. Either way, if
+            // f3_streaming_final_text was captured, render the
+            // complete block (header + body + closer) in one shot
+            // and mark the upcoming AssistantMessage for skip.
+            if let Some(final_text) = app.f3_streaming_final_text.remove(&sid) {
+                let header_line = Line::from(Span::styled(
+                    "┌─ assistant ".to_string(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                terminal.insert_before(1, |buf| {
+                    Widget::render(Paragraph::new(header_line), buf.area, buf);
+                })?;
+                emit_streaming_body_chunk(terminal, &final_text, wrap_width)?;
+                let closer = Line::from(Span::styled(
+                    "└─".to_string(),
+                    Style::default().fg(Color::White),
+                ));
+                terminal.insert_before(2, |buf| {
+                    let area = buf.area;
+                    let lines = vec![closer, Line::from("")];
+                    Widget::render(Paragraph::new(lines), area, buf);
+                })?;
+                *app.f3_preview_complete_pending
+                    .entry(sid.clone())
+                    .or_default() += 1;
+            }
+        }
+        _ => {}
     }
 
-    let height = lines_to_emit.len() as u16;
+    // Phase B (committed-events emit, runs SECOND): render the new
+    // slice of transcript_events_by_sid past f3_emitted_count_by_sid.
+    // When `f3_preview_complete_pending[sid] > 0` we filter that many
+    // `assistant_message_event` records out of the slice — their text
+    // was just emitted (or is already in scrollback from earlier
+    // ticks) as a streaming preview block. The slice's *length* still
+    // advances unconditionally so the filtered events aren't re-tried
+    // on the next tick.
+    //
+    // Scoped so the immutable borrow on `app.transcript_events_by_sid`
+    // is released before the mutable borrow for `f3_emitted_count_by_sid`.
+    let (lines_to_emit, new_count, pending_consumed) =
+        match app.transcript_events_by_sid.get(&sid) {
+            Some(events) => {
+                let emitted = *app.f3_emitted_count_by_sid.get(&sid).unwrap_or(&0);
+                if events.len() <= emitted {
+                    (Vec::new(), emitted, 0usize)
+                } else {
+                    let slice = &events[emitted..];
+                    let pending = app
+                        .f3_preview_complete_pending
+                        .get(&sid)
+                        .copied()
+                        .unwrap_or(0);
+                    let mut skipped = 0usize;
+                    let filtered: Vec<serde_json::Value> = slice
+                        .iter()
+                        .filter(|ev| {
+                            if skipped < pending {
+                                let is_assistant = ev
+                                    .get("payload")
+                                    .and_then(|p| p.get("kind"))
+                                    .and_then(|k| k.as_str())
+                                    == Some("assistant_message_event");
+                                if is_assistant {
+                                    skipped += 1;
+                                    return false;
+                                }
+                            }
+                            true
+                        })
+                        .cloned()
+                        .collect();
+                    let lines = if filtered.is_empty() {
+                        Vec::new()
+                    } else {
+                        render_transcript_lines(&filtered, None, Some(wrap_width))
+                    };
+                    (lines, events.len(), skipped)
+                }
+            }
+            None => (Vec::new(), 0, 0),
+        };
+
+    if !lines_to_emit.is_empty() {
+        let height = lines_to_emit.len() as u16;
+        terminal.insert_before(height, |buf| {
+            let area = buf.area;
+            let paragraph = Paragraph::new(lines_to_emit).wrap(Wrap { trim: false });
+            Widget::render(paragraph, area, buf);
+        })?;
+    }
+    if new_count > 0 {
+        app.f3_emitted_count_by_sid.insert(sid.clone(), new_count);
+    }
+    if pending_consumed > 0 {
+        let counter = app
+            .f3_preview_complete_pending
+            .entry(sid.clone())
+            .or_default();
+        *counter = counter.saturating_sub(pending_consumed);
+        if *counter == 0 {
+            app.f3_preview_complete_pending.remove(&sid);
+        }
+    }
+
+    Ok(())
+}
+
+/// mu-304g: emit one chunk of streaming assistant body text to mux
+/// scrollback. Wraps to `wrap_width` and prefixes each visual row with
+/// the `│ ` block-border glyph so it matches the visual shape of
+/// `push_block`-rendered assistant content. Caller is responsible for
+/// emitting the `┌─ assistant ` header (once per turn) and the `└─`
+/// closer (when streaming ends).
+fn emit_streaming_body_chunk<B: Backend>(
+    terminal: &mut Terminal<B>,
+    body: &str,
+    wrap_width: usize,
+) -> Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let inner_width = wrap_width.saturating_sub(2).max(1); // -2 for "│ " prefix
+    for raw_line in body.lines() {
+        for visual_row in wrap_body_line(raw_line, inner_width) {
+            lines.push(Line::from(vec![
+                Span::styled("│ ", Style::default().fg(Color::White)),
+                Span::raw(visual_row),
+            ]));
+        }
+    }
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let height = lines.len() as u16;
     terminal.insert_before(height, |buf| {
         let area = buf.area;
-        let paragraph = Paragraph::new(lines_to_emit).wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
         Widget::render(paragraph, area, buf);
     })?;
-    app.f3_emitted_count_by_sid.insert(sid, new_count);
     Ok(())
 }
 

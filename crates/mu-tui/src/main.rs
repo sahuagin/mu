@@ -3873,10 +3873,10 @@ fn render_usage(f: &mut Frame, app: &App, area: Rect) {
                 .get("session_count")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            let ttft_p95 = fmt_ms_p95(row.get("ttft_ms"));
-            let stream_p95 = fmt_ms_p95(row.get("streaming_ms"));
-            let tool_p95 = fmt_ms_p95(row.get("tool_total_ms"));
-            let wall_p95 = fmt_ms_p95(row.get("wall_ms"));
+            let ttft_p95 = fmt_duration_p95(row.get("ttft_ms"));
+            let stream_p95 = fmt_duration_p95(row.get("streaming_ms"));
+            let tool_p95 = fmt_duration_p95(row.get("tool_total_ms"));
+            let wall_p95 = fmt_duration_p95(row.get("wall_ms"));
             let in_tok = row
                 .get("input_tokens_sum")
                 .and_then(|v| v.as_u64())
@@ -3924,8 +3924,8 @@ fn render_usage(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(stream_p95),
                 Cell::from(tool_p95),
                 Cell::from(wall_p95),
-                Cell::from(format_thousands(in_tok)),
-                Cell::from(format_thousands(out_tok)),
+                Cell::from(fmt_tokens_compact(in_tok)),
+                Cell::from(fmt_tokens_compact(out_tok)),
                 Cell::from(cache_pct_str),
                 Cell::from(tools.to_string()),
                 Cell::from(errors.to_string()).style(err_style),
@@ -3955,14 +3955,69 @@ fn render_usage(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(table, area);
 }
 
-/// Format the `p95` field of a PercentileStats-shaped value as
-/// `"<n>ms"` or `"—"` if the source is `None`/missing.
-fn fmt_ms_p95(stats: Option<&serde_json::Value>) -> String {
+/// mu-4xjf: extract the `p95` field of a PercentileStats-shaped value and
+/// render it as a compact human-readable duration. Falls back to `"—"` when
+/// the field is absent / null / non-integer.
+fn fmt_duration_p95(stats: Option<&serde_json::Value>) -> String {
     stats
         .and_then(|s| s.get("p95"))
         .and_then(|v| v.as_u64())
-        .map(|ms| format!("{ms}ms"))
+        .map(fmt_duration_ms)
         .unwrap_or_else(|| "—".into())
+}
+
+/// mu-4xjf: render a millisecond count as a compact duration that fits the
+/// F5 9-char latency cell across all realistic magnitudes (sub-second up to
+/// multi-day). The brackets:
+///
+/// | Input             | Output form         | Example       | Width |
+/// |-------------------|---------------------|---------------|-------|
+/// | `< 1_000`         | `"<n>ms"`           | `"234ms"`     | ≤ 5   |
+/// | `< 60_000`        | `"<n>s"`            | `"42s"`       | ≤ 3   |
+/// | `< 3_600_000`     | `"<m>m<ss>s"`       | `"10m23s"`    | ≤ 6   |
+/// | `< 86_400_000`    | `"<h>h<mm>m<ss>s"`  | `"10h23m18s"` | ≤ 9   |
+/// | `≥ 86_400_000`    | `"<d>d<hh>h"`       | `"3d05h"`     | typ. 5–6 |
+fn fmt_duration_ms(ms: u64) -> String {
+    if ms < 1_000 {
+        return format!("{ms}ms");
+    }
+    let total_secs = ms / 1_000;
+    if total_secs < 60 {
+        return format!("{total_secs}s");
+    }
+    let total_mins = total_secs / 60;
+    let s = total_secs % 60;
+    if total_mins < 60 {
+        return format!("{total_mins}m{s:02}s");
+    }
+    let total_hours = total_mins / 60;
+    let m = total_mins % 60;
+    if total_hours < 24 {
+        return format!("{total_hours}h{m:02}m{s:02}s");
+    }
+    let days = total_hours / 24;
+    let h = total_hours % 24;
+    format!("{days}d{h:02}h")
+}
+
+/// mu-4xjf: render a u64 token count so it always fits the F5 8-char cell.
+/// Under 100k uses comma grouping (max `"99,999"`, 6 chars); above that
+/// abbreviates to K/M/B with one decimal place for single-digit magnitudes
+/// (so `1_234_567` reads as `"1.2M"` rather than collapsing to `"1M"`).
+fn fmt_tokens_compact(n: u64) -> String {
+    if n < 100_000 {
+        format_thousands(n)
+    } else if n < 1_000_000 {
+        format!("{}K", n / 1_000)
+    } else if n < 10_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n < 1_000_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else if n < 10_000_000_000 {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    } else {
+        format!("{}B", n / 1_000_000_000)
+    }
 }
 
 /// Format a u64 with thousands separators (`12345` → `"12,345"`).
@@ -5888,5 +5943,161 @@ mod tests {
         let (new_exp, new_focused) = shift_f8_indices_after_eviction(&expanded, 50, 10);
         assert!(new_exp.is_empty(), "empty set stays empty");
         assert_eq!(new_focused, 40, "cursor shifted by evicted=10");
+    }
+
+    // ── mu-4xjf: F5 compact formatters (tokens + duration) ───────────────
+
+    /// mu-4xjf: token counts under 100k keep comma grouping.
+    #[test]
+    fn fmt_tokens_compact_under_100k_uses_commas() {
+        assert_eq!(fmt_tokens_compact(0), "0");
+        assert_eq!(fmt_tokens_compact(7), "7");
+        assert_eq!(fmt_tokens_compact(999), "999");
+        assert_eq!(fmt_tokens_compact(1_234), "1,234");
+        assert_eq!(fmt_tokens_compact(99_999), "99,999");
+    }
+
+    /// mu-4xjf: 100k–999k switches to K suffix; max width 4 chars.
+    #[test]
+    fn fmt_tokens_compact_hundreds_of_k() {
+        assert_eq!(fmt_tokens_compact(100_000), "100K");
+        assert_eq!(fmt_tokens_compact(456_789), "456K");
+        assert_eq!(fmt_tokens_compact(999_999), "999K");
+    }
+
+    /// mu-4xjf: 1M..<10M shows one decimal so 1.2M doesn't collapse to 1M.
+    #[test]
+    fn fmt_tokens_compact_single_digit_millions() {
+        assert_eq!(fmt_tokens_compact(1_000_000), "1.0M");
+        assert_eq!(fmt_tokens_compact(1_234_567), "1.2M");
+        assert_eq!(fmt_tokens_compact(9_999_999), "10.0M");
+    }
+
+    /// mu-4xjf: 10M..<1B uses integer M; 1B+ uses B with one decimal when
+    /// the leading digit is single, else integer B.
+    #[test]
+    fn fmt_tokens_compact_tens_of_millions_through_billions() {
+        assert_eq!(fmt_tokens_compact(12_345_678), "12M");
+        assert_eq!(fmt_tokens_compact(456_000_000), "456M");
+        assert_eq!(fmt_tokens_compact(1_000_000_000), "1.0B");
+        assert_eq!(fmt_tokens_compact(7_890_000_000), "7.9B");
+        assert_eq!(fmt_tokens_compact(12_345_678_901), "12B");
+    }
+
+    /// mu-4xjf: every output fits in the F5 8-char token cell across the
+    /// realistic-AI-workload range (up to ~1 trillion tokens cumulative,
+    /// well above any plausible mu session). Truly astronomical values
+    /// (10^16+) would overflow the cell, but no real workload reaches them.
+    #[test]
+    fn fmt_tokens_compact_fits_in_eight_chars() {
+        for &n in &[
+            0_u64,
+            1,
+            999,
+            1_000,
+            99_999,
+            100_000,
+            999_999,
+            1_000_000,
+            9_999_999,
+            10_000_000,
+            999_999_999,
+            1_000_000_000,
+            9_999_999_999,
+            10_000_000_000,
+            999_999_999_999,
+        ] {
+            let s = fmt_tokens_compact(n);
+            assert!(
+                s.chars().count() <= 8,
+                "fmt_tokens_compact({n}) = {s:?} ({} chars) overflows 8-char cell",
+                s.chars().count()
+            );
+        }
+    }
+
+    /// mu-4xjf: sub-second values render as `<n>ms`.
+    #[test]
+    fn fmt_duration_ms_sub_second() {
+        assert_eq!(fmt_duration_ms(0), "0ms");
+        assert_eq!(fmt_duration_ms(234), "234ms");
+        assert_eq!(fmt_duration_ms(999), "999ms");
+    }
+
+    /// mu-4xjf: 1s..<60s rounds down to whole seconds.
+    #[test]
+    fn fmt_duration_ms_under_a_minute() {
+        assert_eq!(fmt_duration_ms(1_000), "1s");
+        assert_eq!(fmt_duration_ms(42_500), "42s");
+        assert_eq!(fmt_duration_ms(59_999), "59s");
+    }
+
+    /// mu-4xjf: 1m..<1h formats as `<m>m<ss>s` with zero-padded seconds.
+    #[test]
+    fn fmt_duration_ms_minutes_and_seconds() {
+        assert_eq!(fmt_duration_ms(60_000), "1m00s");
+        assert_eq!(fmt_duration_ms(125_000), "2m05s");
+        assert_eq!(fmt_duration_ms(623_000), "10m23s");
+        assert_eq!(fmt_duration_ms(3_599_999), "59m59s");
+    }
+
+    /// mu-4xjf: 1h..<24h formats as `<h>h<mm>m<ss>s` and fits the 9-char cell.
+    /// `37_398_000` ms = 10h23m18s — the operator's worked example for mu-4xjf.
+    #[test]
+    fn fmt_duration_ms_hours_minutes_seconds() {
+        assert_eq!(fmt_duration_ms(3_600_000), "1h00m00s");
+        assert_eq!(fmt_duration_ms(37_398_000), "10h23m18s");
+        assert_eq!(fmt_duration_ms(86_399_000), "23h59m59s");
+    }
+
+    /// mu-4xjf: ≥24h folds into days+hours so multi-day windows still render
+    /// compactly.
+    #[test]
+    fn fmt_duration_ms_days_and_hours() {
+        assert_eq!(fmt_duration_ms(86_400_000), "1d00h");
+        assert_eq!(fmt_duration_ms(86_400_000 + 5 * 3_600_000), "1d05h");
+        assert_eq!(fmt_duration_ms(7 * 86_400_000), "7d00h");
+    }
+
+    /// mu-4xjf: every realistic duration up to a year fits the F5 9-char
+    /// latency cell.
+    #[test]
+    fn fmt_duration_ms_fits_in_nine_chars() {
+        for &ms in &[
+            0_u64,
+            999,
+            1_000,
+            59_999,
+            60_000,
+            3_599_999,
+            3_600_000,
+            37_398_000,
+            86_399_999,
+            86_400_000,
+            7 * 86_400_000,
+            30 * 86_400_000,
+            365 * 86_400_000,
+        ] {
+            let s = fmt_duration_ms(ms);
+            assert!(
+                s.chars().count() <= 9,
+                "fmt_duration_ms({ms}) = {s:?} ({} chars) overflows 9-char cell",
+                s.chars().count()
+            );
+        }
+    }
+
+    /// mu-4xjf: `fmt_duration_p95` returns `"—"` when the source is None,
+    /// missing the `p95` field, or non-integer.
+    #[test]
+    fn fmt_duration_p95_handles_missing_data() {
+        use serde_json::json;
+        assert_eq!(fmt_duration_p95(None), "—");
+        let no_p95 = json!({ "p50": 100 });
+        assert_eq!(fmt_duration_p95(Some(&no_p95)), "—");
+        let non_int = json!({ "p95": "string" });
+        assert_eq!(fmt_duration_p95(Some(&non_int)), "—");
+        let valid = json!({ "p95": 37_398_000_u64 });
+        assert_eq!(fmt_duration_p95(Some(&valid)), "10h23m18s");
     }
 }

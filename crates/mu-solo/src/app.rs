@@ -22,7 +22,42 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde_json::Value;
 
 use crate::client::{Client, Message};
+use crate::picker;
 use crate::render;
+
+/// Known providers offered by the `/provider` picker. Free-form
+/// `/provider <name>` also works for anything not on this list.
+const KNOWN_PROVIDERS: &[&str] = &[
+    "openai-codex",
+    "anthropic",
+    "anthropic-oauth",
+    "openai-api",
+    "openrouter",
+    "faux",
+];
+
+/// Known models per provider for the `/model` picker. Returns an
+/// empty slice for providers we don't have curated lists for; the
+/// caller falls back to free-form entry. Strings live as `&'static str`
+/// so we can hand them to the picker without allocating.
+fn known_models_for(provider: &str) -> &'static [&'static str] {
+    match normalize_provider_kind(provider).as_str() {
+        "anthropic_api" | "anthropic_oauth" => &[
+            "claude-opus-4-7",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+        ],
+        "openai_codex" => &["gpt-5.5"],
+        "openai_api" => &["gpt-4o", "gpt-4-turbo"],
+        "openrouter" => &[
+            "anthropic/claude-3.5-sonnet",
+            "openai/gpt-4o",
+            "google/gemini-pro",
+        ],
+        "faux" => &["faux"],
+        _ => &[],
+    }
+}
 
 /// Which session's turn is currently being rendered. v0 has two
 /// possible owners: the main session (default) or the lazily-created
@@ -398,6 +433,14 @@ impl App {
                         self.cmd_btw(terminal, tail)?;
                         return Ok(false);
                     }
+                    "/provider" => {
+                        self.cmd_provider(terminal, tail)?;
+                        return Ok(false);
+                    }
+                    "/model" => {
+                        self.cmd_model(terminal, tail)?;
+                        return Ok(false);
+                    }
                     _ if head.starts_with('/') => {
                         self.emit_unknown_command(terminal, head)?;
                         return Ok(false);
@@ -728,6 +771,160 @@ impl App {
         Ok(())
     }
 
+    /// /provider [name] — show or change the selected provider. Bare
+    /// `/provider` opens a modal picker (KNOWN_PROVIDERS); `/provider
+    /// <name>` sets directly without the picker (useful for any
+    /// provider not on the curated list).
+    ///
+    /// v0 stub-first semantics (memory 85cf7400): updates App state +
+    /// banner + /status. The currently-running main session stays
+    /// bound to its original provider — there's no session.switch_provider
+    /// RPC yet, so live-switch isn't wired. The new value DOES take
+    /// effect for future /btw sidecars and for the next process restart.
+    fn cmd_provider<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        arg: &str,
+    ) -> Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let new_provider = if arg.is_empty() {
+            let items: Vec<String> =
+                KNOWN_PROVIDERS.iter().map(|s| (*s).to_string()).collect();
+            let current = items.iter().position(|s| s == &self.provider).unwrap_or(0);
+            match picker::run_picker("/provider", &items, current)? {
+                Some(idx) => items[idx].clone(),
+                None => return Ok(()), // cancelled
+            }
+        } else {
+            arg.to_string()
+        };
+
+        let changed = new_provider != self.provider;
+        self.provider = new_provider.clone();
+        // Refresh the bottom-of-viewport status string so the next
+        // draw shows the new provider immediately.
+        self.status = format!(" {} · {} · {} ", self.provider, self.model, self.session_id);
+
+        let lines: Vec<Line<'static>> = if changed {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("provider → {new_provider}"),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "  applies to new sessions (e.g. /btw); current session keeps its bound provider"
+                        .to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+            ]
+        } else {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("provider unchanged ({new_provider})"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+            ]
+        };
+        let h = lines.len() as u16;
+        terminal.insert_before(h, |buf| {
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
+        Ok(())
+    }
+
+    /// /model [name] — show or change the selected model. Bare
+    /// `/model` opens a picker scoped to the current provider; `/model
+    /// <name>` sets directly. Same stub-first semantics as /provider:
+    /// updates App state, applies to new sessions; the current main
+    /// session keeps its bound model.
+    fn cmd_model<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        arg: &str,
+    ) -> Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let new_model = if arg.is_empty() {
+            let known = known_models_for(&self.provider);
+            if known.is_empty() {
+                let lines: Vec<Line<'static>> = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("no curated model list for provider {:?}", self.provider),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from("  use /model <name> to set directly"),
+                    Line::from(""),
+                ];
+                let h = lines.len() as u16;
+                terminal.insert_before(h, |buf| {
+                    let p = Paragraph::new(lines);
+                    ratatui::widgets::Widget::render(p, buf.area, buf);
+                })?;
+                return Ok(());
+            }
+            // If the current model is not in the known list, prepend
+            // it so the picker doesn't pretend it doesn't exist.
+            let mut items: Vec<String> = Vec::with_capacity(known.len() + 1);
+            if !known.iter().any(|m| *m == self.model) {
+                items.push(self.model.clone());
+            }
+            items.extend(known.iter().map(|s| (*s).to_string()));
+            let current = items.iter().position(|s| s == &self.model).unwrap_or(0);
+            match picker::run_picker("/model", &items, current)? {
+                Some(idx) => items[idx].clone(),
+                None => return Ok(()),
+            }
+        } else {
+            arg.to_string()
+        };
+
+        let changed = new_model != self.model;
+        self.model = new_model.clone();
+        self.status = format!(" {} · {} · {} ", self.provider, self.model, self.session_id);
+
+        let lines: Vec<Line<'static>> = if changed {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("model → {new_model}"),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "  applies to new sessions (e.g. /btw); current session keeps its bound model"
+                        .to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+            ]
+        } else {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("model unchanged ({new_model})"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+            ]
+        };
+        let h = lines.len() as u16;
+        terminal.insert_before(h, |buf| {
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
+        Ok(())
+    }
+
     /// Unknown-command stub. Keeps typos from getting sent to the
     /// model as a prompt (which would burn tokens and confuse the
     /// session). Mirrors claude-code's "Unknown slash command" hint.
@@ -773,6 +970,8 @@ impl App {
             Line::from("  /help              show this list"),
             Line::from("  /effort [LEVEL]    show or set effort: low|medium|high|xhigh|max"),
             Line::from("  /focus [on|off]    toggle focus mode (suppress streaming preview)"),
+            Line::from("  /provider [name]   list-picker (bare) or set directly"),
+            Line::from("  /model [name]      list-picker (bare) or set directly"),
             Line::from("  /btw <message>     side question via sidecar (main history unaffected)"),
             Line::from("  /q, /quit, /exit   leave the session"),
             Line::from(""),

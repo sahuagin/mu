@@ -29,3 +29,16 @@ clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rand = { workspace = true }
+# Layered config: defaults < ~/.config/mu/solo.toml < env (MU_SOLO_) < CLI.
+# TUI-local keys land in App state; session-bound keys forward to `mu serve`
+# (flags) and `create_session` (params). See src/config.rs for the split.
+figment = { version = "0.10", features = ["toml", "env"] }
+# `dirs` resolves XDG config / home paths cross-platform (rather than
+# hand-rolling $HOME / $XDG_CONFIG_HOME). Tiny crate, transitive-light.
+dirs = "5"
+
+[dev-dependencies]
+# Used by config.rs roundtrip tests. figment already pulls in `toml`
+# transitively for its TOML provider; we depend on it directly here to
+# (de)serialize SoloConfig in tests without going through figment.
+toml = { workspace = true }

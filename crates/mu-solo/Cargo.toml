@@ -1,0 +1,31 @@
+[package]
+name = "mu-solo"
+version = { workspace = true }
+edition = { workspace = true }
+license-file = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+rust-version = { workspace = true }
+description = "Standalone single-pane chat TUI for mu serve — claude-code-inspired UX, library + main split, intentionally small."
+
+# Library half: exposes App, Client, Render so they can be used by other
+# binaries or tested independently.
+[lib]
+name = "mu_solo"
+path = "src/lib.rs"
+
+# Binary half: thin wrapper that wires lib together.
+[[bin]]
+name = "mu-solo"
+path = "src/bin/mu-solo.rs"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.28"
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = { workspace = true }

@@ -1,0 +1,17 @@
+# Use `br merge-driver` to merge `.beads/issues.jsonl` semantically.
+#
+# The default text merger sees parallel branches as conflicting whenever
+# both touch the JSONL (e.g. branch A closes bead X, branch B closes
+# bead Y). `br merge-driver` reads each side as a set of bead records
+# and unions them semantically — only flagging conflicts when the SAME
+# bead is modified incompatibly on both sides.
+#
+# Setup (per-clone — git won't honor a committed driver definition for
+# security reasons):
+#
+#   git config --local merge.beads-jsonl.name "beads_rust JSONL semantic merge"
+#   git config --local merge.beads-jsonl.driver "br merge-driver %O %A %B"
+#
+# jj users: add the matching merge-tool to ~/.config/jj/config.toml — see
+# docs/beads-merge-driver-setup.md.
+.beads/issues.jsonl merge=beads-jsonl

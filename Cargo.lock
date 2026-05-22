@@ -1510,6 +1510,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mu-solo"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossterm 0.28.1",
+ "rand 0.8.6",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mu-tui"
 version = "0.0.1"
 dependencies = [

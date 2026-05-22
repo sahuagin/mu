@@ -240,7 +240,10 @@ impl App {
         let lines = render::you_block(text, wrap_width);
         let height = lines.len() as u16;
         terminal.insert_before(height, |buf| {
-            let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+            // No .wrap() — block_lines already pre-wrapped to a
+            // budget that includes safety gutter; double-wrap loses
+            // the "│ " prefix on continuation rows.
+            let p = Paragraph::new(lines);
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
 
@@ -284,7 +287,8 @@ impl App {
                     );
                     let h = lines.len() as u16;
                     terminal.insert_before(h, |buf| {
-                        let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+                        // No .wrap() — pre-wrapped by block_lines.
+                        let p = Paragraph::new(lines);
                         ratatui::widgets::Widget::render(p, buf.area, buf);
                     })?;
                     anyhow::bail!("daemon exited unexpectedly");
@@ -295,7 +299,8 @@ impl App {
                     let lines = render::error_block(&format!("reader error: {e}"), wrap);
                     let h = lines.len() as u16;
                     terminal.insert_before(h, |buf| {
-                        let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+                        // No .wrap() — pre-wrapped by block_lines.
+                        let p = Paragraph::new(lines);
                         ratatui::widgets::Widget::render(p, buf.area, buf);
                     })?;
                 }
@@ -449,7 +454,13 @@ fn emit_body_chunk<B: Backend>(
 where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    let inner = wrap_width.saturating_sub(2).max(1);
+    // Budget: wrap_width is already (terminal_width - 2). Reserve 2
+    // more for the "│ " prefix AND 2 more as a safety gutter so the
+    // pre-wrapped content provably fits in the destination width
+    // without provoking ratatui's wrap to re-wrap and strip our
+    // prefix. 4 columns of margin is the empirical safe number for
+    // ratatui 0.30 + crossterm on narrow zellij panes.
+    let inner = wrap_width.saturating_sub(4).max(1);
     let mut lines: Vec<Line<'static>> = Vec::new();
     for raw in body.lines() {
         for row in render::wrap_line(raw, inner) {
@@ -464,7 +475,11 @@ where
     }
     let h = lines.len() as u16;
     terminal.insert_before(h, |buf| {
-        let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+        // No Wrap option — we pre-wrapped above. Adding ratatui's
+        // wrap on top would re-wrap continuations and lose the "│ "
+        // prefix on the new visual rows (same hazard mu-tui's
+        // push_block / mu-2zs comment documents).
+        let p = Paragraph::new(lines);
         ratatui::widgets::Widget::render(p, buf.area, buf);
     })?;
     Ok(())

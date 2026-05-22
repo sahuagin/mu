@@ -1622,7 +1622,11 @@ impl App {
                         self.cancel_outstanding_for_focused_session();
                         self.last_esc_at = Some(now);
                     }
-                    EscChord::Double => {
+                    EscChord::DoubleTap => {
+                        // mu-iuou: Tallahassee's Rule #2 — confirm the
+                        // kill. Single Esc killed the call; this
+                        // second tap ends the session for good so it
+                        // can't rise again on the next ask.
                         self.cancel_focused_session();
                         self.last_esc_at = None;
                     }
@@ -4378,12 +4382,19 @@ const ESC_CHORD_WINDOW: Duration = Duration::from_millis(500);
 
 /// mu-iuou: classification of an Esc keypress in F3 given the timestamp
 /// of the previous Esc.
+///
+/// Naming: `DoubleTap` after Zombieland Rule #2 — "make sure the zombie
+/// is actually dead." Single Esc kills the in-flight provider call
+/// (`session.cancel_outstanding`), but the session is still addressable
+/// and the model could rise again on the next ask. DoubleTap ends the
+/// session entirely (`cancel_session`) — confirms the kill. Never get
+/// stingy with your bullets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscChord {
     /// First Esc, or follow-up after the chord window expired.
     Single,
     /// Second Esc within `ESC_CHORD_WINDOW` of the previous one.
-    Double,
+    DoubleTap,
 }
 
 /// mu-iuou: pure decision for whether an Esc press at `now` is the
@@ -4392,7 +4403,7 @@ enum EscChord {
 /// the App / daemon client.
 fn classify_esc(last_esc_at: Option<Instant>, now: Instant, window: Duration) -> EscChord {
     match last_esc_at {
-        Some(prev) if now.duration_since(prev) < window => EscChord::Double,
+        Some(prev) if now.duration_since(prev) < window => EscChord::DoubleTap,
         _ => EscChord::Single,
     }
 }
@@ -6562,7 +6573,7 @@ mod tests {
         let prev = Instant::now();
         // 100ms later — well within the 500ms window.
         let now = prev + Duration::from_millis(100);
-        assert_eq!(classify_esc(Some(prev), now, window), EscChord::Double);
+        assert_eq!(classify_esc(Some(prev), now, window), EscChord::DoubleTap);
     }
 
     /// mu-iuou: prior Esc past the window → single tap (chord resets).

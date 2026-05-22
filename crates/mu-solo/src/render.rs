@@ -22,7 +22,9 @@ pub fn block_lines(label: &str, color: Color, body: &str, wrap_width: usize) -> 
         format!("┌─ {label} "),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )));
-    let inner = wrap_width.saturating_sub(2).max(1);
+    // Reserve 2 cols for "│ " prefix + 2 cols safety gutter (so
+    // ratatui's Paragraph wrap can't re-wrap and strip the prefix).
+    let inner = wrap_width.saturating_sub(4).max(1);
     for raw in body.lines() {
         for row in wrap_line(raw, inner) {
             out.push(Line::from(vec![

@@ -1,0 +1,74 @@
+# mu-solo example config — copy to ~/.config/mu/solo.toml and edit.
+#
+# Layered config precedence (highest wins):
+#   1. CLI flags
+#   2. Environment variables (MU_SOLO_<SECTION>__<KEY>)
+#   3. ~/.config/mu/solo.toml         ← this file
+#   4. Built-in defaults
+#
+# Examples of env-var overrides:
+#   MU_SOLO_TUI__EFFORT=high
+#   MU_SOLO_SESSION__MODEL=claude-haiku-4-5
+#   MU_SOLO_SESSION__BASH_YOLO=true
+#
+# Every key below has its default value uncommented. To use a default,
+# delete the line; to override, edit the value.
+#
+# Two namespaces (per the design framing in src/config.rs):
+#   [tui]      — stays in the TUI process
+#   [session]  — forwarded to the daemon (today via `mu serve` flags +
+#                create_session params; eventually via a single
+#                session.configure RPC)
+
+# ──────────────────────────────────────────────────────────
+# [tui] — TUI-local settings
+# ──────────────────────────────────────────────────────────
+[tui]
+
+# Initial /effort value. Display-only in v0 — ask_session does not yet
+# carry an effort field. The value surfaces in the banner and /status,
+# and is staged to attach when the daemon learns the wire field.
+# Valid: low | medium | high | xhigh | max
+effort = "medium"
+
+# Whether to start with /focus mode on. When true, streaming text_delta
+# previews are suppressed and only the finalized assistant block is
+# emitted to scrollback. Useful for long autonomous runs.
+focus_mode = false
+
+# ──────────────────────────────────────────────────────────
+# [session] — forwarded to the daemon
+# ──────────────────────────────────────────────────────────
+[session]
+
+# Provider for the initial session. Maps to
+# CreateSessionRequest.provider.kind after normalization.
+# Common values: openai-codex, anthropic, anthropic-oauth,
+#                openai-api, openrouter, faux
+provider = "openai-codex"
+
+# Model id passed alongside the provider. Provider determines which
+# models are valid; /model picker shows a curated list per provider
+# but free-form values work too (e.g. "anthropic/claude-3.5-sonnet"
+# for openrouter).
+model = "gpt-5.5"
+
+# Comma-separated tools to register on the daemon (`mu serve --tools`).
+# Empty string ⇒ no tools registered. Without tools, the model will
+# hallucinate tool-call XML as text, so usually you want the default.
+# Available: read, write, edit, ls, glob, grep, bash
+tools = "read,write,edit,glob,grep,bash"
+
+# Auto-approve bash invocations (`mu serve --bash-yolo`). Solo
+# convenience. NEVER enable for sessions whose prompt source you
+# don't fully trust — it bypasses allowlist + metachar rejection +
+# env scrub and spawns commands via `bash -c`.
+bash_yolo = false
+
+# Path to the `mu` daemon binary. Default expects you've built
+# `cargo build --release` in the workspace root.
+mu_binary = "./target/release/mu"
+
+# Working directory passed to the spawned daemon. Comment out (or
+# leave commented) to use the current process cwd at startup time.
+# cwd = "/home/you/code/some-project"

@@ -52,6 +52,10 @@ pub struct App {
     pending_skip_assistant: usize,
     /// Status line at the bottom (provider/model/cost/etc).
     status: String,
+    /// Daemon ID (per daemon.stats at startup). Surfaced via /status.
+    daemon_id: String,
+    /// Daemon version string. Surfaced via /status.
+    daemon_version: String,
 }
 
 impl App {
@@ -92,6 +96,23 @@ impl App {
             .context("session.create response missing session_id")?
             .to_string();
 
+        // daemon.stats — query once at startup for the daemon_id /
+        // version so /status can surface them. Non-fatal if missing
+        // (older daemons may not expose these fields).
+        let stats = client
+            .request("daemon.stats", serde_json::json!({}))
+            .unwrap_or(serde_json::Value::Null);
+        let daemon_id = stats
+            .get("daemon_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unknown)")
+            .to_string();
+        let daemon_version = stats
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unknown)")
+            .to_string();
+
         let status = format!(" {provider} · {model} · {session_id} ");
 
         Ok(Self {
@@ -106,6 +127,8 @@ impl App {
             pending_close: false,
             pending_skip_assistant: 0,
             status,
+            daemon_id,
+            daemon_version,
         })
     }
 
@@ -215,8 +238,21 @@ impl App {
                 if trimmed.is_empty() {
                     return Ok(false);
                 }
-                if trimmed == "/q" || trimmed == "/quit" {
-                    return Ok(true);
+                // Built-in slash commands handled locally — never
+                // sent as prompts to the model. Per claude-code
+                // convention (memory ff33f770), slash-commands are
+                // the operator surface.
+                match trimmed {
+                    "/q" | "/quit" | "/exit" => return Ok(true),
+                    "/status" => {
+                        self.emit_status_lines(terminal)?;
+                        return Ok(false);
+                    }
+                    "/help" => {
+                        self.emit_help_lines(terminal)?;
+                        return Ok(false);
+                    }
+                    _ => {}
                 }
                 self.send_prompt(terminal, trimmed)?;
             }
@@ -263,6 +299,71 @@ impl App {
                 "user_message": text,
             }),
         )?;
+        Ok(())
+    }
+
+    /// /status — print provider, model, session_id, daemon_id, version
+    /// to scrollback. Lets the operator find the daemon's events
+    /// directory: ~/.local/share/mu/events/{daemon_id}/session-N.jsonl
+    fn emit_status_lines<B: Backend>(&self, terminal: &mut Terminal<B>) -> Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let lines: Vec<Line<'static>> = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "── /status ─────────────────────────".to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("  provider:    {}", self.provider)),
+            Line::from(format!("  model:       {}", self.model)),
+            Line::from(format!("  session_id:  {}", self.session_id)),
+            Line::from(format!("  daemon_id:   {}", self.daemon_id)),
+            Line::from(format!("  daemon ver:  {}", self.daemon_version)),
+            Line::from(format!(
+                "  events:      ~/.local/share/mu/events/{}/session-1.jsonl",
+                self.daemon_id
+            )),
+            Line::from(""),
+        ];
+        let h = lines.len() as u16;
+        terminal.insert_before(h, |buf| {
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
+        Ok(())
+    }
+
+    /// /help — print the built-in command surface to scrollback.
+    fn emit_help_lines<B: Backend>(&self, terminal: &mut Terminal<B>) -> Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let lines: Vec<Line<'static>> = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "── /help ───────────────────────────".to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from("  /status            current provider / model / session / daemon"),
+            Line::from("  /help              show this list"),
+            Line::from("  /q, /quit, /exit   leave the session"),
+            Line::from(""),
+            Line::from("  Esc                clear the current prompt"),
+            Line::from("  Ctrl-C             leave the session"),
+            Line::from(""),
+            Line::from("  Anything else is sent to the model as a prompt."),
+            Line::from(""),
+        ];
+        let h = lines.len() as u16;
+        terminal.insert_before(h, |buf| {
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
         Ok(())
     }
 

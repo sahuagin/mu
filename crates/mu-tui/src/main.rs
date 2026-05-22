@@ -71,13 +71,14 @@ const MUTED_GREEN: Color = Color::Rgb(122, 162, 122);
 /// scrollback dump (one push per line into `pending_inline_markers`)
 /// and the Fullscreen popup overlay (rendered as a single Paragraph in
 /// `render_help_overlay`).
-const HELP_LINES: [&str; 11] = [
+const HELP_LINES: [&str; 12] = [
     "─── mu key reference ─────────────────────────────────",
     " Views:    F1 command · F2 sessions · F3 session · F4 context · F5 usage",
     "           F6 tools · F7 router · F8 events · F9 mailbox",
     " Navigate: j/k select · n new session · F3 (in F3) picker · Esc cancel",
     " Send:     i to enter prompt · Enter to send · Alt-Enter newline",
     " Editor:   Ctrl-X Ctrl-E prompt → $EDITOR · Ctrl-X Ctrl-P system → $EDITOR",
+    " Cancel:   (F3) Esc cancels in-flight RPC · Esc-Esc (<500ms) ends session",
     " Palette:  : commands · :provider <kind/model> · :model <model>",
     " Help:     ? this list · Esc closes overlays",
     " Quit:     q · Ctrl-C",
@@ -442,6 +443,12 @@ struct App {
     /// the first run-loop tick updates them.
     terminal_cols: u16,
     terminal_rows: u16,
+    /// mu-iuou: timestamp of the most recent Esc keypress in F3
+    /// (SessionDetail) so a follow-up Esc within
+    /// `ESC_CHORD_WINDOW` upgrades single-Esc (cancel outstanding RPC)
+    /// to Esc-Esc (cancel session). Cleared after the double-tap
+    /// resolves or when the user navigates away from F3.
+    last_esc_at: Option<Instant>,
 }
 
 impl App {
@@ -516,6 +523,7 @@ impl App {
             f3_streaming_header_emitted: std::collections::HashSet::new(),
             f3_preview_complete_pending: std::collections::HashMap::new(),
             f3_streaming_final_text: std::collections::HashMap::new(),
+            last_esc_at: None,
         }
     }
 
@@ -557,6 +565,11 @@ impl App {
             // resets — if the operator comes back to F3 later from
             // any other view, they get the "first visit" semantics.
             self.f3_inline_help_dumped = false;
+            // mu-iuou: clear the Esc-chord window when crossing the
+            // F3 boundary. A stale `last_esc_at` from a previous F3
+            // visit would otherwise let an Esc press in another view
+            // wake up and accidentally chord into cancel_session.
+            self.last_esc_at = None;
         }
     }
 
@@ -1594,7 +1607,122 @@ impl App {
                 let i = self.selected_session.selected().unwrap_or(0);
                 self.selected_session.select(Some((i + n - 1) % n));
             }
+            // mu-iuou: Esc in F3 is a graduated cancel. Single Esc kills
+            // the in-flight RPC for the focused session (session is
+            // still addressable for the next ask). A second Esc within
+            // ESC_CHORD_WINDOW upgrades to cancel_session, fully ending
+            // the session. Outside F3 Esc still no-ops here — overlays
+            // (help, picker, modal) catch their own Esc before this
+            // function runs.
+            (KeyCode::Esc, _) if matches!(self.mode, ViewMode::SessionDetail) => {
+                let now = Instant::now();
+                let chord = classify_esc(self.last_esc_at, now, ESC_CHORD_WINDOW);
+                match chord {
+                    EscChord::Single => {
+                        self.cancel_outstanding_for_focused_session();
+                        self.last_esc_at = Some(now);
+                    }
+                    EscChord::Double => {
+                        self.cancel_focused_session();
+                        self.last_esc_at = None;
+                    }
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// mu-iuou: send `session.cancel_outstanding` for the focused
+    /// session and surface the daemon's response to the firehose.
+    /// Single-Esc gesture in F3. Idempotent: if no provider call is
+    /// in flight the daemon returns `canceled=false, was_in=Idle`
+    /// and the user sees a clear "nothing to cancel" line instead of
+    /// silent inaction.
+    fn cancel_outstanding_for_focused_session(&mut self) {
+        let Some(idx) = self.selected_session.selected() else {
+            self.firehose
+                .push("[esc] no session selected — nothing to cancel".into());
+            return;
+        };
+        let Some(row) = self.sessions.get(idx) else {
+            return;
+        };
+        let Some(sid) = row.session_id.clone() else {
+            self.firehose
+                .push("[esc] mock session — no daemon to cancel".into());
+            return;
+        };
+        let Some(mu) = self.mu.as_mut() else {
+            self.firehose
+                .push("[esc] no daemon — cancel ignored".into());
+            return;
+        };
+        let res = mu.request(
+            "session.cancel_outstanding",
+            json!({ "session_id": sid, "reason": "operator pressed Esc in F3" }),
+        );
+        match res {
+            Ok(v) => {
+                let canceled = v.get("canceled").and_then(|x| x.as_bool()).unwrap_or(false);
+                let was_in = v.get("was_in").and_then(|x| x.as_str()).unwrap_or("?");
+                if canceled {
+                    self.firehose.push(format!(
+                        "[esc] {sid}: cancelled in-flight call (was: {was_in})"
+                    ));
+                } else {
+                    self.firehose
+                        .push(format!("[esc] {sid}: nothing in flight (state: {was_in})"));
+                }
+            }
+            Err(e) => {
+                self.firehose
+                    .push(format!("[esc] {sid}: cancel failed: {e}"));
+            }
+        }
+    }
+
+    /// mu-iuou: send `cancel_session` for the focused session — the
+    /// stronger Esc-Esc gesture. Ends the session entirely; the row
+    /// stays in the list (for transcript review) but no further asks
+    /// are routed to it.
+    fn cancel_focused_session(&mut self) {
+        let Some(idx) = self.selected_session.selected() else {
+            self.firehose
+                .push("[esc-esc] no session selected — nothing to end".into());
+            return;
+        };
+        let Some(row) = self.sessions.get(idx) else {
+            return;
+        };
+        let Some(sid) = row.session_id.clone() else {
+            self.firehose
+                .push("[esc-esc] mock session — no daemon to end".into());
+            return;
+        };
+        let Some(mu) = self.mu.as_mut() else {
+            self.firehose
+                .push("[esc-esc] no daemon — cancel_session ignored".into());
+            return;
+        };
+        let res = mu.request("cancel_session", json!({ "session_id": sid }));
+        match res {
+            Ok(v) => {
+                let cancelled = v
+                    .get("cancelled")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                if cancelled {
+                    self.firehose
+                        .push(format!("[esc-esc] {sid}: session ended"));
+                } else {
+                    self.firehose
+                        .push(format!("[esc-esc] {sid}: cancel_session returned false"));
+                }
+            }
+            Err(e) => {
+                self.firehose
+                    .push(format!("[esc-esc] {sid}: cancel_session failed: {e}"));
+            }
         }
     }
 
@@ -4239,6 +4367,36 @@ fn render_usage(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(table, area);
 }
 
+/// mu-iuou: the double-tap window for Esc in F3. Two Esc presses within
+/// this interval upgrade single-cancel (`session.cancel_outstanding`,
+/// which kills the in-flight RPC but leaves the session addressable) to
+/// double-cancel (`cancel_session`, which ends the session entirely).
+/// 500ms is the typical chord-key feel — long enough for deliberate
+/// double-tap, short enough that two unrelated Esc presses don't
+/// accidentally chord into ending a session.
+const ESC_CHORD_WINDOW: Duration = Duration::from_millis(500);
+
+/// mu-iuou: classification of an Esc keypress in F3 given the timestamp
+/// of the previous Esc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscChord {
+    /// First Esc, or follow-up after the chord window expired.
+    Single,
+    /// Second Esc within `ESC_CHORD_WINDOW` of the previous one.
+    Double,
+}
+
+/// mu-iuou: pure decision for whether an Esc press at `now` is the
+/// second half of a double-tap chord or a fresh single tap. Extracted
+/// from `on_key_normal` so it can be unit-tested without spinning up
+/// the App / daemon client.
+fn classify_esc(last_esc_at: Option<Instant>, now: Instant, window: Duration) -> EscChord {
+    match last_esc_at {
+        Some(prev) if now.duration_since(prev) < window => EscChord::Double,
+        _ => EscChord::Single,
+    }
+}
+
 /// mu-4xjf: extract the `p95` field of a PercentileStats-shaped value and
 /// render it as a compact human-readable duration. Falls back to `"—"` when
 /// the field is absent / null / non-integer.
@@ -6383,5 +6541,49 @@ mod tests {
         assert_eq!(fmt_duration_p95(Some(&non_int)), "—");
         let valid = json!({ "p95": 37_398_000_u64 });
         assert_eq!(fmt_duration_p95(Some(&valid)), "10h23m18s");
+    }
+
+    // ── mu-iuou: F3 Esc-chord classifier ───────────────────────────────
+
+    /// mu-iuou: no prior Esc → single tap.
+    #[test]
+    fn classify_esc_none_is_single() {
+        let now = Instant::now();
+        assert_eq!(
+            classify_esc(None, now, Duration::from_millis(500)),
+            EscChord::Single
+        );
+    }
+
+    /// mu-iuou: prior Esc inside the window → double tap.
+    #[test]
+    fn classify_esc_within_window_is_double() {
+        let window = Duration::from_millis(500);
+        let prev = Instant::now();
+        // 100ms later — well within the 500ms window.
+        let now = prev + Duration::from_millis(100);
+        assert_eq!(classify_esc(Some(prev), now, window), EscChord::Double);
+    }
+
+    /// mu-iuou: prior Esc past the window → single tap (chord resets).
+    #[test]
+    fn classify_esc_past_window_is_single() {
+        let window = Duration::from_millis(500);
+        let prev = Instant::now();
+        // 600ms later — past the 500ms window.
+        let now = prev + Duration::from_millis(600);
+        assert_eq!(classify_esc(Some(prev), now, window), EscChord::Single);
+    }
+
+    /// mu-iuou: exactly-at-window-boundary → single (strict less-than).
+    /// Documents the boundary so a future refactor doesn't silently
+    /// flip inclusive/exclusive and surprise the operator near the
+    /// edge of the chord window.
+    #[test]
+    fn classify_esc_at_window_boundary_is_single() {
+        let window = Duration::from_millis(500);
+        let prev = Instant::now();
+        let now = prev + window;
+        assert_eq!(classify_esc(Some(prev), now, window), EscChord::Single);
     }
 }

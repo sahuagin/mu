@@ -65,16 +65,26 @@ impl App {
         bash_yolo: bool,
     ) -> Result<Self> {
         let mut client = Client::spawn(mu_binary, cwd, bash_yolo)?;
+
+        // Normalize provider input → daemon's snake_case wire enum
+        // (mirrors mu-tui's accept-anything mapping in create_session).
+        let lc = provider.to_lowercase();
+        let kind: String = match lc.as_str() {
+            "anthropic" | "anthropic-api" | "anthropic_api" | "claude" => "anthropic_api".into(),
+            "openai" | "openai-codex" | "openai_codex" | "codex" => "openai_codex".into(),
+            "openrouter" | "open-router" | "open_router" => "openrouter".into(),
+            "faux" => "faux".into(),
+            _ => lc.clone(),
+        };
+
         let resp = client
             .request(
-                "session.create",
+                "create_session",
                 serde_json::json!({
-                    "provider": provider,
-                    "model": model,
-                    "cwd": cwd.to_string_lossy(),
+                    "provider": { "kind": kind, "model": model },
                 }),
             )
-            .context("session.create failed")?;
+            .context("create_session failed")?;
         let session_id = resp
             .get("session_id")
             .and_then(|v| v.as_str())
@@ -233,12 +243,13 @@ impl App {
         self.pending_close = false;
 
         // Fire and forget the request; responses come back as
-        // notifications drained in `drain_notifications`.
+        // notifications drained in `drain_notifications`. Method per
+        // mu's wire protocol is `ask_session` with `user_message`.
         let _ = self.client.request(
-            "session.ask",
+            "ask_session",
             serde_json::json!({
                 "session_id": self.session_id,
-                "prompt": text,
+                "user_message": text,
             }),
         )?;
         Ok(())

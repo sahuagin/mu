@@ -116,10 +116,23 @@ impl Client {
         };
 
         // Authenticate immediately. Daemon rejects every protected RPC
-        // until peer.auth_initiate succeeds.
-        client
-            .request("peer.auth_initiate", serde_json::json!({ "token": bearer_token }))
-            .context("peer.auth_initiate failed (wrong bearer token?)")?;
+        // until peer.auth_initiate succeeds. Schema per mu-fnn:
+        // { mechanism: "bearer", initial_response: <token> } and the
+        // result must carry outcome == "accepted".
+        let result = client
+            .request(
+                "peer.auth_initiate",
+                serde_json::json!({
+                    "mechanism": "bearer",
+                    "initial_response": bearer_token,
+                }),
+            )
+            .context("peer.auth_initiate failed (daemon rejected handshake)")?;
+        if result.get("outcome").and_then(|v| v.as_str()) != Some("accepted") {
+            return Err(anyhow!(
+                "peer.auth_initiate did not accept spawn-time token: {result}"
+            ));
+        }
 
         Ok(client)
     }

@@ -78,6 +78,19 @@ tui *args:
             --mu-binary ./target/release/mu \
             {{args}}
 
+# Build mu + mu-solo and launch the standalone single-pane TUI. Same
+# provider/model defaults as `just tui` — override per-invocation:
+#   just provider=anthropic model=claude-haiku-4-5 solo
+solo *args:
+    cargo build --release --bin mu -p mu-solo
+    ANTHROPIC_API_KEY=$(tq -f ~/.config/agent/config.toml -r anthropic.api_key) \
+        ./target/release/mu-solo \
+            --provider {{provider}} \
+            --model {{model}} \
+            --bash-yolo \
+            --mu-binary ./target/release/mu \
+            {{args}}
+
 # ── PR flow (jj-aware) ────────────────────────────────────────────────────
 
 # scripts/gh-wrapper auto-runs pre-pr-check.sh at `gh pr create`, so don't

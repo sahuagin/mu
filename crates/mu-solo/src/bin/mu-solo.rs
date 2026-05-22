@@ -23,12 +23,16 @@ struct Cli {
     #[arg(long)]
     cwd: Option<PathBuf>,
 
-    /// Provider to use for the initial session.
-    #[arg(long, default_value = "anthropic")]
+    /// Provider to use for the initial session. Default is
+    /// openai-codex/gpt-5.5 because that path is subscription-billed
+    /// (no per-token cost) for solo development. Override with
+    /// --provider anthropic / --model claude-haiku-4-5 etc. when you
+    /// want a different provider.
+    #[arg(long, default_value = "openai-codex")]
     provider: String,
 
     /// Model to use for the initial session.
-    #[arg(long, default_value = "claude-haiku-4-5")]
+    #[arg(long, default_value = "gpt-5.5")]
     model: String,
 
     /// Auto-approve bash invocations (convenience for solo dev).

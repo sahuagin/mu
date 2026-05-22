@@ -196,7 +196,14 @@ impl App {
     {
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => return Ok(true),
-            (_, KeyCode::Esc) => return Ok(true),
+            // Esc clears the prompt buffer (conventional "cancel
+            // typed input"). It is NOT an exit shortcut — zellij /
+            // tmux multiplexer scrollback exits also send Esc, and
+            // having Esc quit mu-solo turned that into an accidental
+            // session kill. Quit paths are now: /q, /quit, Ctrl-C.
+            (_, KeyCode::Esc) => {
+                self.prompt.clear();
+            }
             (_, KeyCode::Char(c)) => self.prompt.push(c),
             (_, KeyCode::Backspace) => {
                 self.prompt.pop();

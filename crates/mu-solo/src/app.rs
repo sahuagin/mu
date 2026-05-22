@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::Backend;
 use ratatui::style::{Color, Modifier, Style};
@@ -179,6 +179,10 @@ pub struct App {
 impl App {
     /// Spawn `mu serve`, authenticate, create a session, and return an
     /// App ready to run.
+    ///
+    /// `effort` is parsed via [`EffortLevel::parse`]; invalid values
+    /// surface as an error so a typo in `solo.toml` doesn't silently
+    /// fall back to Medium. `focus_mode` seeds the /focus toggle.
     pub fn new(
         mu_binary: &str,
         cwd: &std::path::Path,
@@ -186,7 +190,14 @@ impl App {
         model: &str,
         bash_yolo: bool,
         tools: &str,
+        effort: &str,
+        focus_mode: bool,
     ) -> Result<Self> {
+        let effort = EffortLevel::parse(effort).ok_or_else(|| {
+            anyhow!(
+                "invalid effort {effort:?} (valid: low|medium|high|xhigh|max)"
+            )
+        })?;
         let mut client = Client::spawn(mu_binary, cwd, bash_yolo, tools)?;
 
         // Normalize provider input → daemon's snake_case wire enum
@@ -240,8 +251,8 @@ impl App {
             status,
             daemon_id,
             daemon_version,
-            effort: EffortLevel::Medium,
-            focus_mode: false,
+            effort,
+            focus_mode,
             sidecar_session_id: None,
             streaming_route: None,
         })

@@ -82,7 +82,7 @@ tui *args:
 # provider/model defaults as `just tui` — override per-invocation:
 #   just provider=anthropic model=claude-haiku-4-5 solo
 solo *args:
-    cargo build --release --bin mu -p mu-solo
+    cargo build --release --bin mu --bin mu-solo
     ANTHROPIC_API_KEY=$(tq -f ~/.config/agent/config.toml -r anthropic.api_key) \
         ./target/release/mu-solo \
             --provider {{provider}} \

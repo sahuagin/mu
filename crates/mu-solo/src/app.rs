@@ -24,6 +24,63 @@ use serde_json::Value;
 use crate::client::{Client, Message};
 use crate::render;
 
+/// Which session's turn is currently being rendered. v0 has two
+/// possible owners: the main session (default) or the lazily-created
+/// sidecar that holds `/btw` side questions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnRoute {
+    Main,
+    Btw,
+}
+
+impl TurnRoute {
+    /// Header label + body-prefix color for streaming output.
+    pub fn header_label(self) -> &'static str {
+        match self {
+            Self::Main => "assistant",
+            Self::Btw => "assistant ⋅ btw",
+        }
+    }
+
+    pub fn color(self) -> Color {
+        match self {
+            Self::Main => Color::White,
+            Self::Btw => Color::Magenta,
+        }
+    }
+
+    /// Color + label for the "you" block emitted when the user
+    /// submits a prompt.
+    pub fn you_label(self) -> &'static str {
+        match self {
+            Self::Main => "you",
+            Self::Btw => "you ⋅ btw",
+        }
+    }
+
+    pub fn you_color(self) -> Color {
+        match self {
+            Self::Main => Color::Cyan,
+            Self::Btw => Color::Magenta,
+        }
+    }
+}
+
+/// Normalize a provider string to the daemon's wire enum
+/// (`ProviderSelector::kind`, snake_case). Accept the common spellings
+/// users type at the CLI. Shared between session create and
+/// `session.delegate` (sidecar creation for /btw).
+fn normalize_provider_kind(provider: &str) -> String {
+    let lc = provider.to_lowercase();
+    match lc.as_str() {
+        "anthropic" | "anthropic-api" | "anthropic_api" | "claude" => "anthropic_api".into(),
+        "openai" | "openai-codex" | "openai_codex" | "codex" => "openai_codex".into(),
+        "openrouter" | "open-router" | "open_router" => "openrouter".into(),
+        "faux" => "faux".into(),
+        _ => lc,
+    }
+}
+
 /// Session-level effort dial. Layer on top of model selection per
 /// claude-code-feature-mapping §17. v0 is display-only — `ask_session`'s
 /// wire schema doesn't carry effort yet, so this knob exists in the
@@ -107,6 +164,16 @@ pub struct App {
     /// previews and render the assistant block in one shot on
     /// `assistant_text_finalized`. Default off.
     focus_mode: bool,
+    /// Sidecar session for `/btw` side questions (§13). Created
+    /// lazily on first `/btw` via `session.delegate`. Persists across
+    /// /btw calls so follow-ups stay coherent; main session history
+    /// is unaffected.
+    sidecar_session_id: Option<String>,
+    /// Which session owns the currently-streaming turn. Set when an
+    /// ask is fired (Main on /send, Btw on /btw); used by
+    /// `emit_streaming` and the closer-emit path to pick the right
+    /// label + color. None when no turn is in flight.
+    streaming_route: Option<TurnRoute>,
 }
 
 impl App {
@@ -124,14 +191,7 @@ impl App {
 
         // Normalize provider input → daemon's snake_case wire enum
         // (mirrors mu-tui's accept-anything mapping in create_session).
-        let lc = provider.to_lowercase();
-        let kind: String = match lc.as_str() {
-            "anthropic" | "anthropic-api" | "anthropic_api" | "claude" => "anthropic_api".into(),
-            "openai" | "openai-codex" | "openai_codex" | "codex" => "openai_codex".into(),
-            "openrouter" | "open-router" | "open_router" => "openrouter".into(),
-            "faux" => "faux".into(),
-            _ => lc.clone(),
-        };
+        let kind = normalize_provider_kind(provider);
 
         let resp = client
             .request(
@@ -182,6 +242,8 @@ impl App {
             daemon_version,
             effort: EffortLevel::Medium,
             focus_mode: false,
+            sidecar_session_id: None,
+            streaming_route: None,
         })
     }
 
@@ -321,6 +383,10 @@ impl App {
                         self.cmd_focus(terminal, tail)?;
                         return Ok(false);
                     }
+                    "/btw" => {
+                        self.cmd_btw(terminal, tail)?;
+                        return Ok(false);
+                    }
                     _ if head.starts_with('/') => {
                         self.emit_unknown_command(terminal, head)?;
                         return Ok(false);
@@ -361,6 +427,7 @@ impl App {
         self.streaming_header_open = false;
         self.streaming_chars_emitted = 0;
         self.pending_close = false;
+        self.streaming_route = Some(TurnRoute::Main);
 
         // Fire and forget the request; responses come back as
         // notifications drained in `drain_notifications`. Method per
@@ -370,6 +437,122 @@ impl App {
             serde_json::json!({
                 "session_id": self.session_id,
                 "user_message": text,
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// /btw <message> — fire a side question to a sidecar session
+    /// without polluting the main session's history. Lazily creates
+    /// the sidecar via `session.delegate` (mu-031) on first use, then
+    /// reuses it across subsequent /btw calls so follow-ups thread
+    /// coherently in the side conversation.
+    ///
+    /// v0 constraint: only one in-flight turn at a time across both
+    /// routes. If main is streaming, /btw refuses with a hint to wait.
+    fn cmd_btw<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        msg: &str,
+    ) -> Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        if msg.is_empty() {
+            let lines: Vec<Line<'static>> = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "usage: /btw <message>".to_string(),
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                )),
+                Line::from("  fires a side question to a sidecar session;"),
+                Line::from("  main session history is unaffected."),
+                Line::from(""),
+            ];
+            let h = lines.len() as u16;
+            terminal.insert_before(h, |buf| {
+                let p = Paragraph::new(lines);
+                ratatui::widgets::Widget::render(p, buf.area, buf);
+            })?;
+            return Ok(());
+        }
+        if self.streaming_header_open {
+            let lines: Vec<Line<'static>> = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "wait — main turn still streaming".to_string(),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )),
+                Line::from("  retry /btw once the current response finishes."),
+                Line::from(""),
+            ];
+            let h = lines.len() as u16;
+            terminal.insert_before(h, |buf| {
+                let p = Paragraph::new(lines);
+                ratatui::widgets::Widget::render(p, buf.area, buf);
+            })?;
+            return Ok(());
+        }
+
+        // Lazily create the sidecar session via session.delegate.
+        // Parent linkage gives audit trail; child has its own event
+        // log so its turns never appear in the main session's
+        // history. Provider/model mirrors the main session — could
+        // become an arg later.
+        if self.sidecar_session_id.is_none() {
+            let kind = normalize_provider_kind(&self.provider);
+            let resp = self
+                .client
+                .request(
+                    "session.delegate",
+                    serde_json::json!({
+                        "parent_session_id": self.session_id,
+                        "provider": { "kind": kind, "model": self.model },
+                    }),
+                )
+                .context("session.delegate failed (sidecar creation)")?;
+            let child_id = resp
+                .get("child_session_id")
+                .and_then(|v| v.as_str())
+                .context("session.delegate response missing child_session_id")?
+                .to_string();
+            self.sidecar_session_id = Some(child_id);
+        }
+        let sid = self
+            .sidecar_session_id
+            .as_ref()
+            .expect("sidecar_session_id set above")
+            .clone();
+
+        // Emit a "you ⋅ btw" block in magenta so it's visually
+        // distinct from the main cyan "you" blocks.
+        let width = terminal.size()?.width as usize;
+        let wrap_width = width.saturating_sub(2);
+        let route = TurnRoute::Btw;
+        let lines = render::block_lines(
+            route.you_label(),
+            route.you_color(),
+            msg,
+            wrap_width,
+        );
+        let h = lines.len() as u16;
+        terminal.insert_before(h, |buf| {
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
+
+        // Reset per-turn streaming state and route this turn to btw.
+        self.streaming_text.clear();
+        self.streaming_header_open = false;
+        self.streaming_chars_emitted = 0;
+        self.pending_close = false;
+        self.streaming_route = Some(route);
+
+        let _ = self.client.request(
+            "ask_session",
+            serde_json::json!({
+                "session_id": sid,
+                "user_message": msg,
             }),
         )?;
         Ok(())
@@ -398,6 +581,12 @@ impl App {
                 if self.focus_mode { "on" } else { "off" }
             )),
             Line::from(format!("  session_id:  {}", self.session_id)),
+            Line::from(format!(
+                "  sidecar:     {} (/btw)",
+                self.sidecar_session_id
+                    .as_deref()
+                    .unwrap_or("(none — created on first /btw)")
+            )),
             Line::from(format!("  daemon_id:   {}", self.daemon_id)),
             Line::from(format!("  daemon ver:  {}", self.daemon_version)),
             Line::from(format!(
@@ -573,6 +762,7 @@ impl App {
             Line::from("  /help              show this list"),
             Line::from("  /effort [LEVEL]    show or set effort: low|medium|high|xhigh|max"),
             Line::from("  /focus [on|off]    toggle focus mode (suppress streaming preview)"),
+            Line::from("  /btw <message>     side question via sidecar (main history unaffected)"),
             Line::from("  /q, /quit, /exit   leave the session"),
             Line::from(""),
             Line::from("  Esc                clear the current prompt"),
@@ -631,10 +821,13 @@ impl App {
             }
         }
         // Phase 2: if streaming ended (pending_close) and we have an
-        // open header, flush trailing buffer and emit closer.
+        // open header, flush trailing buffer and emit closer. Color
+        // matches the route owning the current turn (white for main,
+        // magenta for /btw).
         if self.pending_close && self.streaming_header_open {
             let width = terminal.size()?.width as usize;
             let wrap_width = width.saturating_sub(2);
+            let route = self.streaming_route.unwrap_or(TurnRoute::Main);
             // Flush any trailing chars past the last newline.
             let total = self.streaming_text.chars().count();
             if total > self.streaming_chars_emitted {
@@ -643,12 +836,12 @@ impl App {
                     .chars()
                     .skip(self.streaming_chars_emitted)
                     .collect();
-                emit_body_chunk(terminal, &remaining, wrap_width)?;
+                emit_body_chunk(terminal, &remaining, wrap_width, route.color())?;
             }
             // Closer.
             let closer = Line::from(Span::styled(
                 "└─".to_string(),
-                Style::default().fg(Color::White),
+                Style::default().fg(route.color()),
             ));
             terminal.insert_before(2, |buf| {
                 let lines = vec![closer, Line::from("")];
@@ -664,6 +857,7 @@ impl App {
             self.streaming_header_open = false;
             self.streaming_chars_emitted = 0;
             self.pending_close = false;
+            self.streaming_route = None;
         }
         Ok(())
     }
@@ -678,11 +872,19 @@ impl App {
     where
         B::Error: std::error::Error + Send + Sync + 'static,
     {
-        // Filter to this session only. (v0 has one session anyway, but
-        // be defensive.)
+        // Route notifications to the right turn (main vs sidecar /btw).
+        // Notifications without a session_id (rare; some daemon
+        // events) fall through with whatever streaming_route is set.
         let sid = params.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-        if !sid.is_empty() && sid != self.session_id {
-            return Ok(());
+        if !sid.is_empty() {
+            if sid == self.session_id {
+                // main turn — route already set by send_prompt
+            } else if self.sidecar_session_id.as_deref() == Some(sid) {
+                // sidecar turn — route already set by cmd_btw
+            } else {
+                // unknown session — drop
+                return Ok(());
+            }
         }
         let width = terminal.size()?.width as usize;
         let wrap_width = width.saturating_sub(2);
@@ -711,9 +913,13 @@ impl App {
                     // Render the entire assistant turn as one block —
                     // bypasses the header/body/closer streaming
                     // pipeline so we don't have to fix up partial
-                    // emission state.
+                    // emission state. Route-aware so /btw turns
+                    // render as magenta "assistant ⋅ btw" blocks.
                     if !self.streaming_text.is_empty() {
-                        let lines = render::assistant_block(
+                        let route = self.streaming_route.unwrap_or(TurnRoute::Main);
+                        let lines = render::block_lines(
+                            route.header_label(),
+                            route.color(),
                             &self.streaming_text,
                             wrap_width,
                         );
@@ -727,6 +933,7 @@ impl App {
                     self.streaming_header_open = false;
                     self.streaming_chars_emitted = 0;
                     self.pending_close = false;
+                    self.streaming_route = None;
                 } else {
                     if !self.streaming_text.is_empty() {
                         self.emit_streaming(terminal, wrap_width)?;
@@ -762,11 +969,12 @@ impl App {
         if self.streaming_text.is_empty() {
             return Ok(());
         }
+        let route = self.streaming_route.unwrap_or(TurnRoute::Main);
         if !self.streaming_header_open {
             let header = Line::from(Span::styled(
-                "┌─ assistant ".to_string(),
+                format!("┌─ {} ", route.header_label()),
                 Style::default()
-                    .fg(Color::White)
+                    .fg(route.color())
                     .add_modifier(Modifier::BOLD),
             ));
             terminal.insert_before(1, |buf| {
@@ -789,7 +997,7 @@ impl App {
                     .skip(self.streaming_chars_emitted)
                     .take(safe_chars - self.streaming_chars_emitted)
                     .collect();
-                emit_body_chunk(terminal, &chunk, wrap_width)?;
+                emit_body_chunk(terminal, &chunk, wrap_width, route.color())?;
                 self.streaming_chars_emitted = safe_chars;
             }
         }
@@ -801,6 +1009,7 @@ fn emit_body_chunk<B: Backend>(
     terminal: &mut Terminal<B>,
     body: &str,
     wrap_width: usize,
+    color: Color,
 ) -> Result<()>
 where
     B::Error: std::error::Error + Send + Sync + 'static,
@@ -816,7 +1025,7 @@ where
     for raw in body.lines() {
         for row in render::wrap_line(raw, inner) {
             lines.push(Line::from(vec![
-                Span::styled("│ ", Style::default().fg(Color::White)),
+                Span::styled("│ ", Style::default().fg(color)),
                 Span::raw(row),
             ]));
         }

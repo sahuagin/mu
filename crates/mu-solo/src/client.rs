@@ -50,7 +50,12 @@ impl Client {
     /// is the daemon executable path (typically `target/release/mu`).
     /// `bash_yolo` controls whether the daemon auto-approves bash
     /// invocations (convenience for solo development).
-    pub fn spawn(mu_binary: &str, cwd: &std::path::Path, bash_yolo: bool) -> Result<Self> {
+    pub fn spawn(
+        mu_binary: &str,
+        cwd: &std::path::Path,
+        bash_yolo: bool,
+        tools: &str,
+    ) -> Result<Self> {
         // Per-spawn bearer token, set via env. Daemon reads
         // `MU_BEARER_TOKEN`, requires every protected RPC to present
         // the same token via `peer.auth_initiate`.
@@ -59,6 +64,9 @@ impl Client {
         let mut cmd = Command::new(mu_binary);
         cmd.arg("serve");
         cmd.env("MU_BEARER_TOKEN", &bearer_token);
+        if !tools.is_empty() {
+            cmd.arg("--tools").arg(tools);
+        }
         if bash_yolo {
             cmd.arg("--bash-yolo");
         }

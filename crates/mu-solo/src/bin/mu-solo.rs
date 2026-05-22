@@ -38,6 +38,14 @@ struct Cli {
     /// Auto-approve bash invocations (convenience for solo dev).
     #[arg(long)]
     bash_yolo: bool,
+
+    /// Comma-separated list of tools to register with the daemon.
+    /// Without this, the session has zero tools and the model is
+    /// likely to hallucinate tool-call syntax as text. The default
+    /// covers the standard coding-agent set; pass an empty string
+    /// (`--tools ""`) for a strictly-text session.
+    #[arg(long, default_value = "read,write,edit,glob,grep,bash")]
+    tools: String,
 }
 
 fn main() -> Result<()> {
@@ -49,8 +57,15 @@ fn main() -> Result<()> {
 
     // Build the app FIRST (spawns daemon, creates session). Errors here
     // shouldn't leave the terminal in a weird state.
-    let mut app = App::new(&cli.mu_binary, &cwd, &cli.provider, &cli.model, cli.bash_yolo)
-        .context("App::new failed (is the mu binary path correct?)")?;
+    let mut app = App::new(
+        &cli.mu_binary,
+        &cwd,
+        &cli.provider,
+        &cli.model,
+        cli.bash_yolo,
+        &cli.tools,
+    )
+    .context("App::new failed (is the mu binary path correct?)")?;
 
     // Enter raw mode for ratatui inline rendering.
     enable_raw_mode().context("enable_raw_mode")?;

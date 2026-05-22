@@ -63,8 +63,9 @@ impl App {
         provider: &str,
         model: &str,
         bash_yolo: bool,
+        tools: &str,
     ) -> Result<Self> {
-        let mut client = Client::spawn(mu_binary, cwd, bash_yolo)?;
+        let mut client = Client::spawn(mu_binary, cwd, bash_yolo, tools)?;
 
         // Normalize provider input → daemon's snake_case wire enum
         // (mirrors mu-tui's accept-anything mapping in create_session).

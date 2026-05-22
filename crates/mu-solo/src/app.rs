@@ -24,6 +24,50 @@ use serde_json::Value;
 use crate::client::{Client, Message};
 use crate::render;
 
+/// Session-level effort dial. Layer on top of model selection per
+/// claude-code-feature-mapping §17. v0 is display-only — `ask_session`'s
+/// wire schema doesn't carry effort yet, so this knob exists in the
+/// TUI surface ready to attach when the daemon learns the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortLevel {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl EffortLevel {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "low" | "l" => Some(Self::Low),
+            "medium" | "med" | "m" => Some(Self::Medium),
+            "high" | "h" => Some(Self::High),
+            "xhigh" | "x-high" | "extra-high" | "x" => Some(Self::XHigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    pub const ALL: &'static [Self] = &[
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+        Self::Max,
+    ];
+}
+
 /// User-visible app state. Held across the run loop.
 pub struct App {
     client: Client,
@@ -56,6 +100,13 @@ pub struct App {
     daemon_id: String,
     /// Daemon version string. Surfaced via /status.
     daemon_version: String,
+    /// Session-level effort dial (§17). Display-only in v0 — attached
+    /// to `ask_session` params once the daemon learns the field.
+    effort: EffortLevel,
+    /// Focus mode (§16): when true, suppress streaming text_delta
+    /// previews and render the assistant block in one shot on
+    /// `assistant_text_finalized`. Default off.
+    focus_mode: bool,
 }
 
 impl App {
@@ -129,6 +180,8 @@ impl App {
             status,
             daemon_id,
             daemon_version,
+            effort: EffortLevel::Medium,
+            focus_mode: false,
         })
     }
 
@@ -144,7 +197,11 @@ impl App {
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
-                "Type a prompt + Enter to send. /q or Ctrl-C to quit.",
+                format!(
+                    "effort: {} · focus: {} · /help for commands · /q to quit",
+                    self.effort.as_str(),
+                    if self.focus_mode { "on" } else { "off" }
+                ),
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(""),
@@ -242,14 +299,30 @@ impl App {
                 // sent as prompts to the model. Per claude-code
                 // convention (memory ff33f770), slash-commands are
                 // the operator surface.
-                match trimmed {
-                    "/q" | "/quit" | "/exit" => return Ok(true),
-                    "/status" => {
+                let (head, tail) = trimmed
+                    .split_once(char::is_whitespace)
+                    .map(|(h, t)| (h, t.trim()))
+                    .unwrap_or((trimmed, ""));
+                match head {
+                    "/q" | "/quit" | "/exit" if tail.is_empty() => return Ok(true),
+                    "/status" if tail.is_empty() => {
                         self.emit_status_lines(terminal)?;
                         return Ok(false);
                     }
-                    "/help" => {
+                    "/help" if tail.is_empty() => {
                         self.emit_help_lines(terminal)?;
+                        return Ok(false);
+                    }
+                    "/effort" => {
+                        self.cmd_effort(terminal, tail)?;
+                        return Ok(false);
+                    }
+                    "/focus" => {
+                        self.cmd_focus(terminal, tail)?;
+                        return Ok(false);
+                    }
+                    _ if head.starts_with('/') => {
+                        self.emit_unknown_command(terminal, head)?;
                         return Ok(false);
                     }
                     _ => {}
@@ -319,6 +392,11 @@ impl App {
             )),
             Line::from(format!("  provider:    {}", self.provider)),
             Line::from(format!("  model:       {}", self.model)),
+            Line::from(format!("  effort:      {}", self.effort.as_str())),
+            Line::from(format!(
+                "  focus:       {} (suppress streaming preview)",
+                if self.focus_mode { "on" } else { "off" }
+            )),
             Line::from(format!("  session_id:  {}", self.session_id)),
             Line::from(format!("  daemon_id:   {}", self.daemon_id)),
             Line::from(format!("  daemon ver:  {}", self.daemon_version)),
@@ -326,6 +404,148 @@ impl App {
                 "  events:      ~/.local/share/mu/events/{}/session-1.jsonl",
                 self.daemon_id
             )),
+            Line::from(""),
+        ];
+        let h = lines.len() as u16;
+        terminal.insert_before(h, |buf| {
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
+        Ok(())
+    }
+
+    /// /effort — show or set the session-level effort dial (§17).
+    /// Bare `/effort` prints the current value plus valid choices;
+    /// `/effort <level>` sets it. v0 is display-only — the value
+    /// surfaces in /status and the banner; once the daemon learns
+    /// an effort field on `ask_session`, it will attach here.
+    fn cmd_effort<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        arg: &str,
+    ) -> Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let lines: Vec<Line<'static>> = if arg.is_empty() {
+            let choices: Vec<String> = EffortLevel::ALL
+                .iter()
+                .map(|e| e.as_str().to_string())
+                .collect();
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "── /effort ─────────────────────────".to_string(),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(format!("  current:  {}", self.effort.as_str())),
+                Line::from(format!("  choices:  {}", choices.join(" · "))),
+                Line::from("  usage:    /effort <level>"),
+                Line::from(""),
+            ]
+        } else if let Some(level) = EffortLevel::parse(arg) {
+            self.effort = level;
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("effort → {}", level.as_str()),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+            ]
+        } else {
+            let choices: Vec<String> = EffortLevel::ALL
+                .iter()
+                .map(|e| e.as_str().to_string())
+                .collect();
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("unknown effort level: {arg:?}"),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(format!("  choices:  {}", choices.join(" · "))),
+                Line::from(""),
+            ]
+        };
+        let h = lines.len() as u16;
+        terminal.insert_before(h, |buf| {
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
+        Ok(())
+    }
+
+    /// /focus — toggle suppression of streaming text_delta previews
+    /// (§16). `/focus` alone toggles; `/focus on|off` sets explicitly.
+    /// When on, only the finalized assistant block lands in
+    /// scrollback — useful for long autonomous runs where you don't
+    /// want to scroll past partial chunks.
+    fn cmd_focus<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        arg: &str,
+    ) -> Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let new_value = match arg.trim().to_lowercase().as_str() {
+            "" | "toggle" => !self.focus_mode,
+            "on" | "true" | "1" | "yes" => true,
+            "off" | "false" | "0" | "no" => false,
+            other => {
+                let lines: Vec<Line<'static>> = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("unknown focus arg: {other:?}"),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from("  usage:    /focus [on|off|toggle]"),
+                    Line::from(""),
+                ];
+                let h = lines.len() as u16;
+                terminal.insert_before(h, |buf| {
+                    let p = Paragraph::new(lines);
+                    ratatui::widgets::Widget::render(p, buf.area, buf);
+                })?;
+                return Ok(());
+            }
+        };
+        self.focus_mode = new_value;
+        let lines: Vec<Line<'static>> = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("focus → {}", if new_value { "on" } else { "off" }),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+        ];
+        let h = lines.len() as u16;
+        terminal.insert_before(h, |buf| {
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
+        Ok(())
+    }
+
+    /// Unknown-command stub. Keeps typos from getting sent to the
+    /// model as a prompt (which would burn tokens and confuse the
+    /// session). Mirrors claude-code's "Unknown slash command" hint.
+    fn emit_unknown_command<B: Backend>(
+        &self,
+        terminal: &mut Terminal<B>,
+        head: &str,
+    ) -> Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let lines: Vec<Line<'static>> = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("unknown command: {head}"),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )),
+            Line::from("  /help for the built-in command list"),
             Line::from(""),
         ];
         let h = lines.len() as u16;
@@ -351,6 +571,8 @@ impl App {
             )),
             Line::from("  /status            current provider / model / session / daemon"),
             Line::from("  /help              show this list"),
+            Line::from("  /effort [LEVEL]    show or set effort: low|medium|high|xhigh|max"),
+            Line::from("  /focus [on|off]    toggle focus mode (suppress streaming preview)"),
             Line::from("  /q, /quit, /exit   leave the session"),
             Line::from(""),
             Line::from("  Esc                clear the current prompt"),
@@ -471,7 +693,11 @@ impl App {
                     return Ok(());
                 }
                 self.streaming_text.push_str(delta);
-                self.emit_streaming(terminal, wrap_width)?;
+                // Focus mode (§16): accumulate silently; the finalized
+                // event renders the whole block in one shot below.
+                if !self.focus_mode {
+                    self.emit_streaming(terminal, wrap_width)?;
+                }
             }
             "session.assistant_text_finalized" => {
                 // Replace accumulator with canonical (matches mu-tui's
@@ -480,13 +706,37 @@ impl App {
                 let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 if !text.is_empty() {
                     self.streaming_text = text.to_string();
-                    self.emit_streaming(terminal, wrap_width)?;
                 }
-                // In agent loops this fires per-invocation. Trigger
-                // the close so the block lands in scrollback before
-                // any subsequent tool calls / next invocation render.
-                if self.streaming_header_open {
-                    self.pending_close = true;
+                if self.focus_mode {
+                    // Render the entire assistant turn as one block —
+                    // bypasses the header/body/closer streaming
+                    // pipeline so we don't have to fix up partial
+                    // emission state.
+                    if !self.streaming_text.is_empty() {
+                        let lines = render::assistant_block(
+                            &self.streaming_text,
+                            wrap_width,
+                        );
+                        let h = lines.len() as u16;
+                        terminal.insert_before(h, |buf| {
+                            let p = Paragraph::new(lines);
+                            ratatui::widgets::Widget::render(p, buf.area, buf);
+                        })?;
+                    }
+                    self.streaming_text.clear();
+                    self.streaming_header_open = false;
+                    self.streaming_chars_emitted = 0;
+                    self.pending_close = false;
+                } else {
+                    if !self.streaming_text.is_empty() {
+                        self.emit_streaming(terminal, wrap_width)?;
+                    }
+                    // In agent loops this fires per-invocation. Trigger
+                    // the close so the block lands in scrollback before
+                    // any subsequent tool calls / next invocation render.
+                    if self.streaming_header_open {
+                        self.pending_close = true;
+                    }
                 }
             }
             "session.done" | "session.error" if self.streaming_header_open => {

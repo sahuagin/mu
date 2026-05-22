@@ -69,6 +69,19 @@ pub fn compact_dir(
 }
 
 /// Compact a single JSONL file. Pure helper for testability.
+///
+/// Walks the event stream in order, accumulating ToolCall events into
+/// a running counter. When a TaskTelemetry event fires, it consumes
+/// the counter (attributing those calls to that task) and resets to
+/// zero for the next task. This assumes the JSONL is one session per
+/// file (true per the `<daemon_id>/session-N.jsonl` layout) and that
+/// events appear chronologically — both invariants hold in mu's
+/// current event log.
+///
+/// Why not read tools_actually_called from the TaskTelemetry payload:
+/// the producer doesn't populate that field in the existing corpus
+/// (verified empirically). Counting ToolCall events directly works on
+/// historical data without a producer-side migration.
 pub fn compact_file(
     conn: &Connection,
     path: &Path,
@@ -77,6 +90,7 @@ pub fn compact_file(
 ) -> Result<()> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading event log {}", path.display()))?;
+    let mut running_tool_calls: u32 = 0;
     for line in raw.lines() {
         if line.trim().is_empty() {
             continue;
@@ -89,12 +103,21 @@ pub fn compact_file(
                 continue;
             }
         };
-        if let Some(row) = project_event(&event, min_ended_at_unix_ms) {
+        // Increment the running counter on every ToolCall before the
+        // next TaskTelemetry fires.
+        if matches!(event.payload, EventPayload::ToolCall { .. }) {
+            running_tool_calls = running_tool_calls.saturating_add(1);
+            continue;
+        }
+        if let Some(row) = project_event(&event, min_ended_at_unix_ms, running_tool_calls) {
             upsert_task(conn, &row)?;
             summary.tasks_upserted += 1;
+            running_tool_calls = 0;
         } else if matches!(event.payload, EventPayload::TaskTelemetry { .. }) {
-            // Filtered by --since
+            // Filtered by --since: still consume the counter so the
+            // next task doesn't inherit it.
             summary.tasks_filtered_out += 1;
+            running_tool_calls = 0;
         }
     }
     Ok(())
@@ -103,7 +126,16 @@ pub fn compact_file(
 /// Project a single SessionEvent into a TaskRow, or None if this event
 /// isn't a TaskTelemetry (or is filtered out by `--since`). Pure
 /// function for unit testing.
-pub fn project_event(event: &SessionEvent, min_ended_at_unix_ms: Option<u64>) -> Option<TaskRow> {
+///
+/// `tool_call_count` is the number of ToolCall events that fired
+/// between this task's predecessor (the previous TaskTelemetry, or
+/// the start of the file) and this event. Caller is responsible for
+/// the running-counter accounting in `compact_file`.
+pub fn project_event(
+    event: &SessionEvent,
+    min_ended_at_unix_ms: Option<u64>,
+    tool_call_count: u32,
+) -> Option<TaskRow> {
     // Use a manually-deserialized shape so we don't depend on the
     // exact variant shape staying stable — we read by serde from the
     // payload tag. mu-040's `TaskTelemetry` variant is what we want.
@@ -147,6 +179,14 @@ pub fn project_event(event: &SessionEvent, min_ended_at_unix_ms: Option<u64>) ->
         cache_write_tokens: parsed.cache_write_tokens,
         exit_reason,
         classification,
+        // Prefer the producer-supplied list when present (older
+        // events leave it empty); fall back to the count caller
+        // accumulated from ToolCall events.
+        tool_call_count: if parsed.tools_actually_called.is_empty() {
+            tool_call_count
+        } else {
+            parsed.tools_actually_called.len() as u32
+        },
     })
 }
 
@@ -178,6 +218,11 @@ struct ParsedTelemetry {
     cache_read_tokens: Option<u64>,
     #[serde(default)]
     cache_write_tokens: Option<u64>,
+    /// Names of tools the agent actually invoked during this task.
+    /// Defaults to empty when the producer omits the field (older
+    /// events) so back-compat doesn't break.
+    #[serde(default)]
+    tools_actually_called: Vec<String>,
     exit_reason: TaskExitReason,
 }
 
@@ -222,16 +267,26 @@ mod tests {
     #[test]
     fn project_telemetry_event_produces_row() {
         let event = telemetry_event();
-        let row = project_event(&event, None).expect("telemetry should project");
+        let row = project_event(&event, None, 0).expect("telemetry should project");
         assert_eq!(row.task_id, "task-00000000000000000001");
         assert_eq!(row.session_id, "session-abc");
         assert_eq!(row.provider, "openrouter");
         assert_eq!(row.model, "deepseek/deepseek-v4-flash");
         assert_eq!(row.exit_reason, TaskExitReason::Done);
         assert_eq!(row.prompt_tokens, Some(2400));
+        assert_eq!(row.tool_call_count, 0);
         // No commit info → classifier returns NarrativeNoAction for Done.
         use mu_core::forensics::Outcome;
         assert_eq!(row.classification.outcome, Outcome::NarrativeNoAction);
+    }
+
+    #[test]
+    fn project_uses_caller_supplied_tool_call_count_when_payload_empty() {
+        let event = telemetry_event();
+        let row = project_event(&event, None, 7).expect("telemetry should project");
+        // payload has tools_actually_called=[]; caller-supplied count
+        // is the source of truth.
+        assert_eq!(row.tool_call_count, 7);
     }
 
     #[test]
@@ -246,15 +301,75 @@ mod tests {
                 content: "hi".to_owned(),
             },
         };
-        assert!(project_event(&event, None).is_none());
+        assert!(project_event(&event, None, 0).is_none());
     }
 
     #[test]
     fn project_respects_since_filter() {
         let event = telemetry_event();
         // ended_at = 1778963762000
-        assert!(project_event(&event, Some(1778963762001)).is_none());
-        assert!(project_event(&event, Some(1778963761999)).is_some());
+        assert!(project_event(&event, Some(1778963762001), 0).is_none());
+        assert!(project_event(&event, Some(1778963761999), 0).is_some());
+    }
+
+    #[test]
+    fn compact_file_attributes_tool_calls_to_following_task() {
+        use mu_core::event_log::EventActor;
+        let tmp = std::env::temp_dir().join("mu_8ypx_compact_tools.jsonl");
+        let _ = std::fs::remove_file(&tmp);
+        // Stream: tool_call, tool_call, task_telemetry → first task
+        // gets count=2. Then tool_call, task_telemetry → second task
+        // gets count=1.
+        let tc = |id: u64, name: &str| SessionEvent {
+            id,
+            session_id: "s".to_owned(),
+            parent_event_ids: vec![],
+            timestamp_unix_ms: id,
+            actor: EventActor::System,
+            payload: EventPayload::ToolCall {
+                call_id: format!("c{id}"),
+                name: name.to_owned(),
+                arguments: serde_json::json!({}),
+            },
+        };
+        let mut t1 = telemetry_event();
+        t1.id = 3;
+        if let EventPayload::TaskTelemetry { ref mut task_id, .. } = t1.payload {
+            *task_id = "task-A".to_owned();
+        }
+        let mut t2 = telemetry_event();
+        t2.id = 5;
+        if let EventPayload::TaskTelemetry { ref mut task_id, .. } = t2.payload {
+            *task_id = "task-B".to_owned();
+        }
+        let lines = [
+            serde_json::to_string(&tc(1, "read")).unwrap(),
+            serde_json::to_string(&tc(2, "bash")).unwrap(),
+            serde_json::to_string(&t1).unwrap(),
+            serde_json::to_string(&tc(4, "edit")).unwrap(),
+            serde_json::to_string(&t2).unwrap(),
+        ];
+        std::fs::write(&tmp, lines.join("\n")).unwrap();
+
+        let dbpath = std::env::temp_dir().join("mu_8ypx_compact_tools.sqlite");
+        let _ = std::fs::remove_file(&dbpath);
+        let conn = crate::analytics::sink::open(&dbpath).unwrap();
+        let mut s = CompactSummary::default();
+        compact_file(&conn, &tmp, None, &mut s).unwrap();
+
+        let counts: std::collections::HashMap<String, i64> = conn
+            .prepare("SELECT task_id, tool_call_count FROM tasks")
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(counts["task-A"], 2);
+        assert_eq!(counts["task-B"], 1);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&dbpath);
     }
 
     #[test]

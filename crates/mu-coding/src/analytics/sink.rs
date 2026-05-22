@@ -29,15 +29,29 @@ CREATE TABLE IF NOT EXISTS tasks (
     exit_reason          TEXT NOT NULL,
     outcome_class        TEXT NOT NULL,
     outcome_confidence   TEXT NOT NULL,
-    rationale            TEXT
+    rationale            TEXT,
+    tool_call_count      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_provider_model ON tasks(provider, model);
 CREATE INDEX IF NOT EXISTS idx_tasks_ended_at ON tasks(ended_at_unix_ms);
 CREATE INDEX IF NOT EXISTS idx_tasks_outcome ON tasks(outcome_class);
 ";
 
+/// Lightweight additive migrations applied to existing DBs. Each
+/// entry is checked against the current schema; if the column already
+/// exists, the ALTER is skipped. Keeps existing telemetry.sqlite files
+/// working without forcing a delete-and-recompact dance.
+const MIGRATIONS: &[(&str, &str)] = &[
+    // (column_name, alter_sql)
+    (
+        "tool_call_count",
+        "ALTER TABLE tasks ADD COLUMN tool_call_count INTEGER NOT NULL DEFAULT 0",
+    ),
+];
+
 /// Open the sink at `path`, creating the file (and parent dirs) + schema if
-/// needed. Subsequent opens of an existing DB just attach.
+/// needed. Subsequent opens of an existing DB just attach + run any
+/// pending additive migrations from MIGRATIONS.
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -46,7 +60,27 @@ pub fn open(path: &Path) -> Result<Connection> {
     let conn =
         Connection::open(path).with_context(|| format!("opening sink at {}", path.display()))?;
     conn.execute_batch(SCHEMA).context("ensuring schema")?;
+    for (col, sql) in MIGRATIONS {
+        if !column_exists(&conn, "tasks", col)? {
+            conn.execute_batch(sql)
+                .with_context(|| format!("migration: adding column {col}"))?;
+        }
+    }
     Ok(conn)
+}
+
+/// Check whether `column` exists on `table`. Uses sqlite's
+/// `pragma_table_info` virtual table — present since 3.16, well below
+/// any version we'd realistically encounter.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, column],
+            |r| r.get(0),
+        )
+        .context("pragma_table_info")?;
+    Ok(n > 0)
 }
 
 /// One denormalized row per task. Mirrors the `tasks` table column order
@@ -68,6 +102,13 @@ pub struct TaskRow {
     pub cache_write_tokens: Option<u64>,
     pub exit_reason: TaskExitReason,
     pub classification: Classification,
+    /// Number of tools the agent actually called during this task. 0
+    /// for pure-chat sessions (mu-solo / mu-tui responding without
+    /// invoking any tool). Lets the hallu metric exclude chat
+    /// sessions from its denominator — the classifier's
+    /// `narrative_no_action` outcome fires on any Done+no-commit and
+    /// can't tell intent on its own.
+    pub tool_call_count: u32,
 }
 
 /// UPSERT a task row by task_id. Re-running compact over the same logs
@@ -78,8 +119,9 @@ pub fn upsert_task(conn: &Connection, row: &TaskRow) -> Result<()> {
             task_id, session_id, parent_task_id, provider, model, model_version,
             started_at_unix_ms, ended_at_unix_ms, wall_clock_ms,
             prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
-            exit_reason, outcome_class, outcome_confidence, rationale
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            exit_reason, outcome_class, outcome_confidence, rationale,
+            tool_call_count
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
         ON CONFLICT(task_id) DO UPDATE SET
             session_id           = excluded.session_id,
             parent_task_id       = excluded.parent_task_id,
@@ -96,7 +138,8 @@ pub fn upsert_task(conn: &Connection, row: &TaskRow) -> Result<()> {
             exit_reason          = excluded.exit_reason,
             outcome_class        = excluded.outcome_class,
             outcome_confidence   = excluded.outcome_confidence,
-            rationale            = excluded.rationale
+            rationale            = excluded.rationale,
+            tool_call_count      = excluded.tool_call_count
         ",
         params![
             row.task_id,
@@ -116,6 +159,7 @@ pub fn upsert_task(conn: &Connection, row: &TaskRow) -> Result<()> {
             outcome_str(row.classification.outcome),
             confidence_str(row.classification.confidence),
             row.classification.rationale,
+            row.tool_call_count,
         ],
     )
     .context("upserting task row")?;
@@ -185,6 +229,7 @@ mod tests {
                 confidence: Confidence::Definite,
                 rationale: "exit=Done, no commit produced".to_owned(),
             },
+            tool_call_count: 0,
         }
     }
 

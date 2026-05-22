@@ -121,6 +121,12 @@ pub fn task_to_row(t: &BackfillTask) -> Result<TaskRow> {
             confidence: parse_confidence(&t.outcome_confidence)?,
             rationale: t.rationale.clone().unwrap_or_default(),
         },
+        // Backfill is for documentary inserts (pre-classified historic
+        // tasks), not live tool-call telemetry. The TOML schema has no
+        // tool_call_count field; default to 0. If a future backfill
+        // wants to record this, add an Option field on BackfillTask
+        // and surface it here.
+        tool_call_count: 0,
     })
 }
 

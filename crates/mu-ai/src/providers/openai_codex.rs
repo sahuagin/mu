@@ -1087,6 +1087,15 @@ impl Provider for OpenaiCodexProvider {
         let bytes = resp.bytes_stream();
         Ok(events_stream(bytes, cancel_rx))
     }
+
+    /// Identify as `"openai_codex"` so ContextAssembly events and
+    /// downstream diagnostics (mu-solo's renderer-mismatch warning,
+    /// etc.) don't see the default `"faux"` label and conclude the
+    /// daemon silently fell back to FauxProvider when it didn't.
+    /// Matches the snake_case wire `provider_kind` enum.
+    fn provider_label(&self) -> &'static str {
+        "openai_codex"
+    }
 }
 
 impl OpenaiCodexProvider {

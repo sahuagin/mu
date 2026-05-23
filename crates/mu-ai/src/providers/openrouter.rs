@@ -118,6 +118,13 @@ impl Provider for OpenRouterProvider {
         let bytes = resp.bytes_stream();
         Ok(events_stream(bytes, cancel_rx))
     }
+
+    /// Identify as `"openrouter"` so ContextAssembly events and
+    /// downstream diagnostics don't see the default `"faux"` label.
+    /// Matches the snake_case wire `provider_kind` enum.
+    fn provider_label(&self) -> &'static str {
+        "openrouter"
+    }
 }
 
 // ============================================================================

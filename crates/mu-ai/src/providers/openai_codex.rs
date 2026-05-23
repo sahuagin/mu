@@ -23,6 +23,7 @@ use futures::stream::{BoxStream, Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, Mutex};
+use tracing::debug;
 
 use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
@@ -806,9 +807,24 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 if !state.emitted_done {
                     state.emitted_done = true;
                     if let Some(msg) = state.error_message.take() {
+                        debug!(
+                            target: "mu_ai::providers::openai_codex",
+                            "codex stream ended with error: {msg}"
+                        );
                         return Some((ProviderEvent::Error(msg), state));
                     }
                     let stop = map_stop(&state);
+                    debug!(
+                        target: "mu_ai::providers::openai_codex",
+                        "codex stream EOF: text_len={} tool_calls={} final_status={:?} \
+                         incomplete_reason={:?} usage_present={} stop={:?}",
+                        state.accumulated_text.len(),
+                        state.tool_calls.len(),
+                        state.final_status,
+                        state.incomplete_reason,
+                        state.usage.is_some(),
+                        stop,
+                    );
                     return Some((
                         ProviderEvent::Done(AssistantMessage {
                             content: assemble_content(&state),
@@ -832,6 +848,16 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
             if !state.emitted_done {
                 state.emitted_done = true;
                 let stop = map_stop(&state);
+                debug!(
+                    target: "mu_ai::providers::openai_codex",
+                    "codex stream [DONE]: text_len={} tool_calls={} final_status={:?} \
+                     usage_present={} stop={:?}",
+                    state.accumulated_text.len(),
+                    state.tool_calls.len(),
+                    state.final_status,
+                    state.usage.is_some(),
+                    stop,
+                );
                 return Some((
                     ProviderEvent::Done(AssistantMessage {
                         content: assemble_content(&state),
@@ -1051,6 +1077,18 @@ impl Provider for OpenaiCodexProvider {
                 ));
             }
         };
+
+        // mu-solo debug: surface the actual wire body for codex calls
+        // so we can diff what's being sent across sessions. Gated by
+        // RUST_LOG=mu_ai=debug (or mu_ai::providers::openai_codex=debug
+        // for just this site). Pretty-prints the JSON; large but
+        // useful when investigating empty-response cases.
+        debug!(
+            target: "mu_ai::providers::openai_codex",
+            "codex request body: {}",
+            serde_json::to_string_pretty(&body)
+                .unwrap_or_else(|e| format!("(serialize failed: {e})"))
+        );
 
         // First attempt with the current token.
         let initial_token = self.token.lock().await.clone();

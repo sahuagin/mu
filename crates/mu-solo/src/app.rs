@@ -49,10 +49,20 @@ fn known_models_for(provider: &str) -> &'static [&'static str] {
         ],
         "openai_codex" => &["gpt-5.5"],
         "openai_api" => &["gpt-4o", "gpt-4-turbo"],
+        // OpenRouter model IDs drift faster than mu releases; this is
+        // a curated *small* set of currently-valid entries (verified
+        // against openrouter.ai/api/v1/models as of 2026-05-23). For
+        // the long tail, use `/model <full-id>` to set directly —
+        // free-form entry skips the picker. A future commit can
+        // populate this list dynamically by querying OpenRouter's
+        // /api/v1/models on first /model invocation.
         "openrouter" => &[
-            "anthropic/claude-3.5-sonnet",
-            "openai/gpt-4o",
-            "google/gemini-pro",
+            "anthropic/claude-opus-4.7",
+            "anthropic/claude-haiku-4-5",
+            "openai/gpt-5.5",
+            "google/gemini-3.5-flash",
+            "x-ai/grok-4.3",
+            "meta-llama/llama-4-maverick",
         ],
         "faux" => &["faux"],
         _ => &[],
@@ -1317,27 +1327,65 @@ impl App {
                         self.renderer_mismatch_warned = true;
                     }
                 }
+                // For session.error: pull the daemon-supplied message
+                // so the operator sees WHAT failed instead of just
+                // "(turn ended with error)". Per mu-core's ErrorEvent,
+                // params.message is a human-readable string explaining
+                // the failure (e.g. provider HTTP errors, validation
+                // failures, malformed model IDs).
+                let error_msg: Option<String> = if method == "session.error" {
+                    params
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                } else {
+                    None
+                };
                 if self.streaming_header_open {
+                    // Emit the error inline before the closer fires so
+                    // the operator sees the message attached to the
+                    // turn it killed. Otherwise the close happens
+                    // silently and the error is invisible.
+                    if let Some(msg) = error_msg.as_deref() {
+                        self.emit_inline_error(terminal, msg, wrap_width)?;
+                    }
                     self.pending_close = true;
                 } else {
-                    // Turn ended with no text AND no tool calls (rare).
+                    // Turn ended with no text AND no tool calls.
                     // Without this marker the user has no visual proof
                     // the turn ever ended — they sent a prompt, then
-                    // staring into silence.
-                    let label = if method == "session.error" {
-                        "(turn ended with error)"
+                    // staring into silence. For error turns we ALSO
+                    // include the daemon-supplied message.
+                    let lines: Vec<Line<'static>> = if let Some(msg) = error_msg.as_deref() {
+                        // Truncate ridiculously long messages to keep
+                        // the scrollback usable; the full text lives
+                        // in the events JSONL if you need it.
+                        let short: String = msg.chars().take(400).collect();
+                        vec![
+                            Line::from(""),
+                            Line::from(Span::styled(
+                                "× turn ended with error".to_string(),
+                                Style::default()
+                                    .fg(Color::Red)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
+                            Line::from(Span::styled(
+                                format!("  {short}"),
+                                Style::default().fg(Color::Red),
+                            )),
+                            Line::from(""),
+                        ]
                     } else {
-                        "(turn ended, no output)"
+                        vec![
+                            Line::from(Span::styled(
+                                "  (turn ended, no output)".to_string(),
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::ITALIC),
+                            )),
+                            Line::from(""),
+                        ]
                     };
-                    let lines: Vec<Line<'static>> = vec![
-                        Line::from(Span::styled(
-                            format!("  {label}"),
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        )),
-                        Line::from(""),
-                    ];
                     let h = lines.len() as u16;
                     terminal.insert_before(h, |buf| {
                         let p = Paragraph::new(lines);
@@ -1531,6 +1579,39 @@ impl App {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
             Span::styled(name.to_string(), Style::default().fg(Color::Yellow)),
+        ]);
+        terminal.insert_before(1, |buf| {
+            ratatui::widgets::Widget::render(Paragraph::new(line), buf.area, buf);
+        })?;
+        Ok(())
+    }
+
+    /// Emit a `× error: <message>` line inside an already-open
+    /// assistant block, so when `session.error` lands the operator
+    /// sees what failed before the closer fires. Without this the
+    /// turn just ends silently and you have to grep the events JSONL
+    /// to find out (e.g. "google/gemini-pro is not a valid model ID"
+    /// for a /btw with a stale picker entry).
+    fn emit_inline_error<B: Backend>(
+        &self,
+        terminal: &mut Terminal<B>,
+        msg: &str,
+        _wrap_width: usize,
+    ) -> Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let route = self.streaming_route.unwrap_or(TurnRoute::Main);
+        // Truncate to keep the scrollback usable. Full message lives
+        // in the daemon's event log if you need to inspect it.
+        let short: String = msg.chars().take(400).collect();
+        let line = Line::from(vec![
+            Span::styled("│ ", Style::default().fg(route.color())),
+            Span::styled(
+                "× ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(short, Style::default().fg(Color::Red)),
         ]);
         terminal.insert_before(1, |buf| {
             ratatui::widgets::Widget::render(Paragraph::new(line), buf.area, buf);

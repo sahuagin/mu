@@ -68,9 +68,14 @@ provider := "openai-codex"
 model := "gpt-5.5"
 
 # Build mu + mu-tui and launch the TUI against the local mu binary.
+# Sources every provider key we know about from ~/.config/agent/config.toml
+# at launch. Missing keys are silently treated as empty (2>/dev/null ||
+# true), so the daemon only sees env vars for providers you've actually
+# configured — no spurious "key set but empty" confusion.
 tui *args:
     cargo build --release --bin mu --bin mu-tui
-    ANTHROPIC_API_KEY=$(tq -f ~/.config/agent/config.toml -r anthropic.api_key) \
+    ANTHROPIC_API_KEY=$(tq -f ~/.config/agent/config.toml -r anthropic.api_key 2>/dev/null || true) \
+    OPENROUTER_API_KEY=$(tq -f ~/.config/agent/config.toml -r openrouter.api_key 2>/dev/null || true) \
         ./target/release/mu-tui \
             --provider {{provider}} \
             --model {{model}} \
@@ -81,9 +86,11 @@ tui *args:
 # Build mu + mu-solo and launch the standalone single-pane TUI. Same
 # provider/model defaults as `just tui` — override per-invocation:
 #   just provider=anthropic model=claude-haiku-4-5 solo
+#   just provider=openrouter model=x-ai/grok-2-latest solo
 solo *args:
     cargo build --release --bin mu --bin mu-solo
-    ANTHROPIC_API_KEY=$(tq -f ~/.config/agent/config.toml -r anthropic.api_key) \
+    ANTHROPIC_API_KEY=$(tq -f ~/.config/agent/config.toml -r anthropic.api_key 2>/dev/null || true) \
+    OPENROUTER_API_KEY=$(tq -f ~/.config/agent/config.toml -r openrouter.api_key 2>/dev/null || true) \
         ./target/release/mu-solo \
             --provider {{provider}} \
             --model {{model}} \

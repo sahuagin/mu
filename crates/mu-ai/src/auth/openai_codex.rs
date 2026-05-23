@@ -80,15 +80,40 @@ pub async fn login_flow() -> Result<OAuthToken, AuthError> {
             ))
         })?;
 
-    // Open the URL in the user's browser. Fall back to instructing
-    // them manually if no browser is available.
+    // Always print the URL prominently up front. `webbrowser::open`
+    // returns Ok as soon as it *spawns* a launcher process — even if
+    // that launcher then errors out (the common Linux case is Firefox
+    // showing "profile already in use" when the spawned `firefox`
+    // binary can't attach to a running instance). We can't detect
+    // that failure post-hoc, so we make sure the URL is on the
+    // terminal for paste before we ever attempt the auto-open.
+    //
+    // Set `MU_NO_BROWSER=1` to skip the auto-open entirely if your
+    // browser launcher misbehaves (Firefox profile collision, etc.).
     let url_str = auth_url.to_string();
-    let browser_opened = webbrowser::open(&url_str).is_ok();
-    if !browser_opened {
-        eprintln!("\nCould not open a browser automatically. Please open:\n");
-        eprintln!("    {url_str}\n");
+    eprintln!();
+    eprintln!("Open this URL to authorize mu:");
+    eprintln!();
+    eprintln!("    {url_str}");
+    eprintln!();
+    let no_browser = std::env::var("MU_NO_BROWSER")
+        .map(|v| !v.is_empty() && v != "0" && v.to_ascii_lowercase() != "false")
+        .unwrap_or(false);
+    if no_browser {
+        eprintln!("MU_NO_BROWSER set — skipping auto-open. Waiting for callback…");
     } else {
-        eprintln!("Opened browser to OpenAI auth page; waiting for callback…");
+        match webbrowser::open(&url_str) {
+            Ok(_) => eprintln!(
+                "Attempted browser auto-open. If your browser shows \
+                 \"profile already in use\" or never loads the page, \
+                 paste the URL above into a running browser tab. \
+                 Waiting for callback…"
+            ),
+            Err(_) => eprintln!(
+                "No browser launcher available — paste the URL above \
+                 into a browser. Waiting for callback…"
+            ),
+        }
     }
 
     // Wait for the callback, with a generous timeout.

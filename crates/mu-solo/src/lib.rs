@@ -17,5 +17,6 @@
 pub mod app;
 pub mod client;
 pub mod config;
+pub mod input;
 pub mod picker;
 pub mod render;

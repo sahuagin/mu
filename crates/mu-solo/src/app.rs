@@ -13,7 +13,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, KeyEventKind};
 use ratatui::backend::Backend;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -22,6 +22,7 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde_json::Value;
 
 use crate::client::{Client, Message};
+use crate::input::InputBuffer;
 use crate::picker;
 use crate::render;
 
@@ -177,8 +178,9 @@ pub struct App {
     /// Provider + model strings (display-only for v0).
     provider: String,
     model: String,
-    /// Currently typed prompt (single line for v0; multi-line later).
-    prompt: String,
+    /// Cursor-aware input buffer. Supports multi-line (paste), cursor
+    /// movement, and visual wrapping for the grow-upward prompt.
+    prompt: InputBuffer,
     /// Streaming-text accumulator for the in-flight assistant turn.
     /// Cleared on `session.done` / `session.error`.
     streaming_text: String,
@@ -315,7 +317,7 @@ impl App {
             session_id,
             provider: provider.to_string(),
             model: model.to_string(),
-            prompt: String::new(),
+            prompt: InputBuffer::new(),
             streaming_text: String::new(),
             streaming_header_open: false,
             streaming_chars_emitted: 0,
@@ -373,29 +375,62 @@ impl App {
             // Draw the inline viewport (status + input prompt).
             terminal.draw(|f| {
                 let area = f.area();
-                let lines = vec![
-                    // Separator line.
-                    Line::from(Span::styled(
-                        "─".repeat(area.width as usize),
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                    // Input prompt.
-                    Line::from(vec![
-                        Span::styled(" > ", Style::default().fg(Color::Cyan)),
-                        Span::raw(self.prompt.clone()),
-                        Span::styled(
-                            "_",
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::SLOW_BLINK),
-                        ),
-                    ]),
-                    // Status footer.
-                    Line::from(Span::styled(
-                        self.status.clone(),
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                ];
+                let term_width = area.width as usize;
+                let prompt_wrap_width = term_width.saturating_sub(4); // " > " prefix + gutter
+                let layout = self.prompt.visual_layout(prompt_wrap_width);
+                let max_prompt_rows = (area.height as usize).saturating_sub(2); // separator + status
+                let prompt_rows = layout.lines.len().min(max_prompt_rows);
+                // Show the tail of the prompt (most recent visual lines including cursor row)
+                let skip = layout.lines.len().saturating_sub(prompt_rows);
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                // Separator line.
+                lines.push(Line::from(Span::styled(
+                    "─".repeat(term_width),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                // Prompt lines — one per visual row.
+                for (display_idx, vline) in layout.lines.iter().skip(skip).enumerate() {
+                    let row_idx = display_idx + skip;
+                    let prefix = if row_idx == 0 { " > " } else { "   " };
+                    let is_cursor_row = row_idx == layout.cursor_row;
+                    if is_cursor_row {
+                        let before: String =
+                            vline.text.chars().take(layout.cursor_col).collect();
+                        let after: String =
+                            vline.text.chars().skip(layout.cursor_col).collect();
+                        let cursor_char = if after.is_empty() {
+                            " ".to_string()
+                        } else {
+                            after.chars().next().unwrap().to_string()
+                        };
+                        let rest: String = after.chars().skip(1).collect();
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix.to_string(), Style::default().fg(Color::Cyan)),
+                            Span::raw(before),
+                            Span::styled(
+                                cursor_char,
+                                Style::default()
+                                    .fg(Color::Black)
+                                    .bg(Color::Cyan),
+                            ),
+                            Span::raw(rest),
+                        ]));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix.to_string(), Style::default().fg(Color::Cyan)),
+                            Span::raw(vline.text.clone()),
+                        ]));
+                    }
+                }
+                // Blank fill if viewport has extra space
+                while lines.len() < (area.height as usize).saturating_sub(1) {
+                    lines.push(Line::from(""));
+                }
+                // Status footer.
+                lines.push(Line::from(Span::styled(
+                    self.status.clone(),
+                    Style::default().fg(Color::DarkGray),
+                )));
                 let p = Paragraph::new(lines);
                 f.render_widget(p, area);
             })?;
@@ -405,10 +440,16 @@ impl App {
             let elapsed = last_tick.elapsed();
             let wait = tick.saturating_sub(elapsed);
             if event::poll(wait)? {
-                if let Event::Key(key) = event::read()? {
-                    if self.handle_key(terminal, key)? {
-                        break; // user requested exit
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if self.handle_key(terminal, key)? {
+                            break; // user requested exit
+                        }
                     }
+                    Event::Paste(text) => {
+                        self.prompt.insert_str(&text);
+                    }
+                    _ => {}
                 }
             }
             if last_tick.elapsed() >= tick {
@@ -437,12 +478,26 @@ impl App {
             (_, KeyCode::Esc) => {
                 self.prompt.clear();
             }
-            (_, KeyCode::Char(c)) => self.prompt.push(c),
+            // Word-wise movement (Alt+Left/Right) — must precede bare Left/Right
+            (KeyModifiers::ALT, KeyCode::Left) => self.prompt.move_word_left(),
+            (KeyModifiers::ALT, KeyCode::Right) => self.prompt.move_word_right(),
+            // Cursor movement
+            (_, KeyCode::Left) => self.prompt.move_left(),
+            (_, KeyCode::Right) => self.prompt.move_right(),
+            (_, KeyCode::Home) => self.prompt.move_home(),
+            (_, KeyCode::End) => self.prompt.move_end(),
+            (KeyModifiers::CONTROL, KeyCode::Char('a')) => self.prompt.move_home(),
+            (KeyModifiers::CONTROL, KeyCode::Char('e')) => self.prompt.move_end(),
+            // Delete
             (_, KeyCode::Backspace) => {
-                self.prompt.pop();
+                self.prompt.delete_before();
             }
+            (_, KeyCode::Delete) => {
+                self.prompt.delete_after();
+            }
+            (_, KeyCode::Char(c)) => self.prompt.insert_char(c),
             (_, KeyCode::Enter) => {
-                let text = std::mem::take(&mut self.prompt);
+                let text = self.prompt.take();
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
                     return Ok(false);
@@ -1547,15 +1602,13 @@ impl App {
         Ok(())
     }
 
-    /// Render a `session.tool_call_started` notification as a one-line
-    /// entry inside the open assistant block:
+    /// Render a `session.tool_call_started` notification showing the
+    /// tool name and primary argument:
     ///
-    ///     │ ▸ bash
+    ///     │ ● Bash(cargo check -p mu-core)
     ///
-    /// The prefix bar uses the route color (white for main, magenta
-    /// for /btw); the marker + tool name use a dim accent so they
-    /// visually recede from any narration that follows. Header is
-    /// opened on demand if no text had streamed yet.
+    /// Extracts the "primary arg" per tool type: `command` for bash,
+    /// `file_path`/`path` for read/write/edit, `pattern` for grep.
     fn emit_tool_call_started<B: Backend>(
         &mut self,
         terminal: &mut Terminal<B>,
@@ -1565,20 +1618,33 @@ impl App {
     where
         B::Error: std::error::Error + Send + Sync + 'static,
     {
-        let _ = wrap_width; // single-line for now; wrap deferred
         let name = params
             .get("tool_name")
             .and_then(|v| v.as_str())
             .unwrap_or("?");
+        let arguments = params.get("arguments");
+        let primary_arg = extract_primary_arg(name, arguments);
+        let display_name = titlecase_tool(name);
+        let header_text = if primary_arg.is_empty() {
+            format!("● {display_name}")
+        } else {
+            let max_arg_len = wrap_width.saturating_sub(display_name.len() + 5); // "│ ● Name()"
+            let truncated = if primary_arg.chars().count() > max_arg_len {
+                let short: String = primary_arg.chars().take(max_arg_len.saturating_sub(1)).collect();
+                format!("{short}…")
+            } else {
+                primary_arg
+            };
+            format!("● {display_name}({truncated})")
+        };
         self.ensure_streaming_header_open(terminal)?;
         let route = self.streaming_route.unwrap_or(TurnRoute::Main);
         let line = Line::from(vec![
             Span::styled("│ ", Style::default().fg(route.color())),
             Span::styled(
-                "▸ ",
+                header_text,
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(name.to_string(), Style::default().fg(Color::Yellow)),
         ]);
         terminal.insert_before(1, |buf| {
             ratatui::widgets::Widget::render(Paragraph::new(line), buf.area, buf);
@@ -1619,16 +1685,15 @@ impl App {
         Ok(())
     }
 
-    /// Render a `session.tool_call_completed` notification as a
-    /// one-line outcome inside the open assistant block:
+    /// Render a `session.tool_call_completed` notification with a
+    /// bounded output preview:
     ///
-    ///     │ ◂ ok    (green)
-    ///     │ ◂ err   (red, plus any short error message)
+    ///     │   ⎿  first line of output
+    ///     │      second line
+    ///     │      third line
+    ///     │      … +N lines
     ///
-    /// `params.outcome.kind` is the discriminator (per
-    /// `ToolOutcome::{Ok, Err}` in mu-core's events.rs). On Err we
-    /// pull a short prefix of `outcome.message` so the operator sees
-    /// *why* it failed without leaving the TUI.
+    /// On error, shows the error message in red instead.
     fn emit_tool_call_completed<B: Backend>(
         &mut self,
         terminal: &mut Terminal<B>,
@@ -1638,49 +1703,122 @@ impl App {
     where
         B::Error: std::error::Error + Send + Sync + 'static,
     {
-        let _ = wrap_width;
+        const PREVIEW_LINES: usize = 4;
+
         let outcome = params.get("outcome");
         let kind = outcome
             .and_then(|o| o.get("kind"))
             .and_then(|v| v.as_str())
             .unwrap_or("?");
-        let (label, accent, detail) = match kind {
-            "ok" => ("ok", Color::Green, String::new()),
+
+        self.ensure_streaming_header_open(terminal)?;
+        let route = self.streaming_route.unwrap_or(TurnRoute::Main);
+        let bar_style = Style::default().fg(route.color());
+        let indent = "│   ";
+
+        match kind {
+            "ok" => {
+                let result_text = outcome
+                    .and_then(|o| o.get("result"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if result_text.is_empty() {
+                    let line = Line::from(vec![
+                        Span::styled(indent.to_string(), bar_style),
+                        Span::styled(
+                            "⎿  (no output)".to_string(),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]);
+                    terminal.insert_before(1, |buf| {
+                        ratatui::widgets::Widget::render(Paragraph::new(line), buf.area, buf);
+                    })?;
+                } else {
+                    let all_lines: Vec<&str> = result_text.lines().collect();
+                    let total = all_lines.len();
+                    let show = total.min(PREVIEW_LINES);
+                    let max_line_width = wrap_width.saturating_sub(8); // indent + connector
+                    let mut output_lines: Vec<Line<'static>> = Vec::new();
+                    for (i, &text_line) in all_lines.iter().take(show).enumerate() {
+                        let truncated: String = text_line.chars().take(max_line_width).collect();
+                        let prefix = if i == 0 {
+                            format!("{indent}⎿  ")
+                        } else {
+                            format!("{indent}   ")
+                        };
+                        output_lines.push(Line::from(vec![
+                            Span::styled(prefix, bar_style),
+                            Span::raw(truncated),
+                        ]));
+                    }
+                    if total > show {
+                        let remaining = total - show;
+                        output_lines.push(Line::from(vec![
+                            Span::styled(format!("{indent}   "), bar_style),
+                            Span::styled(
+                                format!("… +{remaining} lines"),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ]));
+                    }
+                    let h = output_lines.len() as u16;
+                    terminal.insert_before(h, |buf| {
+                        let p = Paragraph::new(output_lines);
+                        ratatui::widgets::Widget::render(p, buf.area, buf);
+                    })?;
+                }
+            }
             "err" => {
                 let msg = outcome
                     .and_then(|o| o.get("message"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let short: String = msg.chars().take(80).collect();
-                (
-                    "err",
-                    Color::Red,
-                    if short.is_empty() {
-                        String::new()
+                    .unwrap_or("(unknown error)");
+                let all_lines: Vec<&str> = msg.lines().collect();
+                let total = all_lines.len();
+                let show = total.min(PREVIEW_LINES);
+                let max_line_width = wrap_width.saturating_sub(8);
+                let mut output_lines: Vec<Line<'static>> = Vec::new();
+                for (i, &text_line) in all_lines.iter().take(show).enumerate() {
+                    let truncated: String = text_line.chars().take(max_line_width).collect();
+                    let prefix = if i == 0 {
+                        format!("{indent}⎿  ")
                     } else {
-                        format!(" · {short}")
-                    },
-                )
+                        format!("{indent}   ")
+                    };
+                    output_lines.push(Line::from(vec![
+                        Span::styled(prefix, bar_style),
+                        Span::styled(truncated, Style::default().fg(Color::Red)),
+                    ]));
+                }
+                if total > show {
+                    let remaining = total - show;
+                    output_lines.push(Line::from(vec![
+                        Span::styled(format!("{indent}   "), bar_style),
+                        Span::styled(
+                            format!("… +{remaining} lines"),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
+                let h = output_lines.len() as u16;
+                terminal.insert_before(h, |buf| {
+                    let p = Paragraph::new(output_lines);
+                    ratatui::widgets::Widget::render(p, buf.area, buf);
+                })?;
             }
-            other => (other, Color::DarkGray, String::new()),
-        };
-        self.ensure_streaming_header_open(terminal)?;
-        let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-        let mut spans = vec![
-            Span::styled("│ ", Style::default().fg(route.color())),
-            Span::styled(
-                "◂ ",
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(label.to_string(), Style::default().fg(accent)),
-        ];
-        if !detail.is_empty() {
-            spans.push(Span::styled(detail, Style::default().fg(Color::DarkGray)));
+            _ => {
+                let line = Line::from(vec![
+                    Span::styled(indent.to_string(), bar_style),
+                    Span::styled(
+                        format!("⎿  ({kind})"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]);
+                terminal.insert_before(1, |buf| {
+                    ratatui::widgets::Widget::render(Paragraph::new(line), buf.area, buf);
+                })?;
+            }
         }
-        let line = Line::from(spans);
-        terminal.insert_before(1, |buf| {
-            ratatui::widgets::Widget::render(Paragraph::new(line), buf.area, buf);
-        })?;
         Ok(())
     }
 
@@ -1764,14 +1902,84 @@ where
     Ok(())
 }
 
+/// Extract the "primary argument" from a tool call's arguments JSON
+/// for display in the tool-call header. Returns an empty string if
+/// nothing meaningful can be extracted.
+fn extract_primary_arg(tool_name: &str, arguments: Option<&Value>) -> String {
+    let args = match arguments {
+        Some(v) => v,
+        None => return String::new(),
+    };
+    match tool_name {
+        "bash" => args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "read" | "write" => args
+            .get("file_path")
+            .or_else(|| args.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "edit" | "str_replace_editor" => args
+            .get("file_path")
+            .or_else(|| args.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "grep" => {
+            let pattern = args
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if path.is_empty() {
+                pattern.to_string()
+            } else {
+                format!("{pattern}, {path}")
+            }
+        }
+        "glob" => args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => {
+            // Generic fallback: try common field names
+            args.get("command")
+                .or_else(|| args.get("file_path"))
+                .or_else(|| args.get("path"))
+                .or_else(|| args.get("query"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        }
+    }
+}
+
+/// Title-case a tool name for display: "bash" → "Bash", "read" → "Read".
+fn titlecase_tool(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
 /// Construct a `Terminal<CrosstermBackend>` configured for inline
 /// rendering. Used by the binary; exposed here so library consumers
 /// can construct their own.
+const INLINE_VIEWPORT_HEIGHT: u16 = 3;
+
 pub fn make_inline_terminal(
 ) -> Result<Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>> {
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
     let opts = TerminalOptions {
-        viewport: Viewport::Inline(3),
+        viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
     };
     Terminal::with_options(backend, opts).context("terminal init")
 }

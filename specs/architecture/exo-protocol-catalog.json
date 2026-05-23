@@ -1,0 +1,1282 @@
+{
+  "format": "mu.exo-protocol-catalog",
+  "version": 1,
+  "generated": "2026-05-24",
+  "corpus": {
+    "files": 300,
+    "sessions": 242,
+    "events": 152339,
+    "parse_errors": 1,
+    "accounts": {
+      "claude-personal": 261,
+      "claude-openrouter": 25,
+      "claude": 14
+    },
+    "date_range": [
+      "2026-04",
+      "2026-05"
+    ]
+  },
+  "event_types": {
+    "agent-color": {
+      "count": 2,
+      "first_version": "2.1.120",
+      "category": "metadata",
+      "fields": {
+        "type": {
+          "count": 2,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "agentColor": {
+          "count": 2,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "sessionId": {
+          "count": 2,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        }
+      }
+    },
+    "agent-name": {
+      "count": 215,
+      "first_version": "2.1.142",
+      "category": "metadata",
+      "fields": {
+        "type": {
+          "count": 215,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "agentName": {
+          "count": 215,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "sessionId": {
+          "count": 215,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        }
+      }
+    },
+    "ai-title": {
+      "count": 4215,
+      "first_version": "2.1.123",
+      "category": "metadata",
+      "fields": {
+        "type": {
+          "count": 4215,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "aiTitle": {
+          "count": 4215,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "sessionId": {
+          "count": 4215,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        }
+      }
+    },
+    "assistant": {
+      "count": 58823,
+      "first_version": "2.1.108",
+      "category": "envelope",
+      "fields": {
+        "parentUuid": {
+          "count": 58823,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "isSidechain": {
+          "count": 58823,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "bool"
+          ]
+        },
+        "message": {
+          "count": 58823,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "dict"
+          ]
+        },
+        "requestId": {
+          "count": 58658,
+          "frequency_pct": 99.7,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "type": {
+          "count": 58823,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "uuid": {
+          "count": 58823,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "timestamp": {
+          "count": 58823,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "userType": {
+          "count": 58823,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "entrypoint": {
+          "count": 58823,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "cwd": {
+          "count": 58823,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "sessionId": {
+          "count": 58823,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "version": {
+          "count": 58823,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "gitBranch": {
+          "count": 58823,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "error": {
+          "count": 52,
+          "frequency_pct": 0.1,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "isApiErrorMessage": {
+          "count": 55,
+          "frequency_pct": 0.1,
+          "required": false,
+          "value_types": [
+            "bool"
+          ]
+        },
+        "apiErrorStatus": {
+          "count": 26,
+          "frequency_pct": 0.0,
+          "required": false,
+          "value_types": [
+            "int"
+          ]
+        },
+        "sessionKind": {
+          "count": 1201,
+          "frequency_pct": 2.0,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "attributionSkill": {
+          "count": 1272,
+          "frequency_pct": 2.2,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "agentId": {
+          "count": 2266,
+          "frequency_pct": 3.9,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "attributionAgent": {
+          "count": 1627,
+          "frequency_pct": 2.8,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "slug": {
+          "count": 15580,
+          "frequency_pct": 26.5,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "attributionMcpServer": {
+          "count": 1,
+          "frequency_pct": 0.0,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "attributionMcpTool": {
+          "count": 1,
+          "frequency_pct": 0.0,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        }
+      }
+    },
+    "attachment": {
+      "count": 13019,
+      "first_version": "2.1.108",
+      "category": "envelope",
+      "fields": {
+        "parentUuid": {
+          "count": 13019,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "NoneType",
+            "str"
+          ]
+        },
+        "isSidechain": {
+          "count": 13019,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "bool"
+          ]
+        },
+        "attachment": {
+          "count": 13019,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "dict"
+          ]
+        },
+        "type": {
+          "count": 13019,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "uuid": {
+          "count": 13019,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "timestamp": {
+          "count": 13019,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "userType": {
+          "count": 13019,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "entrypoint": {
+          "count": 13019,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "cwd": {
+          "count": 13019,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "sessionId": {
+          "count": 13019,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "version": {
+          "count": 13019,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "gitBranch": {
+          "count": 13019,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "sessionKind": {
+          "count": 120,
+          "frequency_pct": 0.9,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "agentId": {
+          "count": 38,
+          "frequency_pct": 0.3,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "slug": {
+          "count": 2904,
+          "frequency_pct": 22.3,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        }
+      }
+    },
+    "bridge-session": {
+      "count": 2631,
+      "first_version": "2.1.142",
+      "category": "metadata",
+      "fields": {
+        "type": {
+          "count": 2631,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "sessionId": {
+          "count": 2631,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "bridgeSessionId": {
+          "count": 2631,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "lastSequenceNum": {
+          "count": 2631,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "int"
+          ]
+        }
+      }
+    },
+    "file-history-snapshot": {
+      "count": 5698,
+      "first_version": null,
+      "category": "metadata",
+      "fields": {
+        "type": {
+          "count": 5698,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "messageId": {
+          "count": 5698,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "snapshot": {
+          "count": 5698,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "dict"
+          ]
+        },
+        "isSnapshotUpdate": {
+          "count": 5698,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "bool"
+          ]
+        }
+      }
+    },
+    "last-prompt": {
+      "count": 8775,
+      "first_version": "2.1.108",
+      "category": "metadata",
+      "fields": {
+        "type": {
+          "count": 8775,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "lastPrompt": {
+          "count": 8237,
+          "frequency_pct": 93.9,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "sessionId": {
+          "count": 8775,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "leafUuid": {
+          "count": 5225,
+          "frequency_pct": 59.5,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        }
+      }
+    },
+    "permission-mode": {
+      "count": 7712,
+      "first_version": "2.1.108",
+      "category": "metadata",
+      "fields": {
+        "type": {
+          "count": 7712,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "permissionMode": {
+          "count": 7712,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "sessionId": {
+          "count": 7712,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        }
+      }
+    },
+    "pr-link": {
+      "count": 3185,
+      "first_version": "2.1.113",
+      "category": "metadata",
+      "fields": {
+        "type": {
+          "count": 3185,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "sessionId": {
+          "count": 3185,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "prNumber": {
+          "count": 3185,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "int"
+          ]
+        },
+        "prUrl": {
+          "count": 3185,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "prRepository": {
+          "count": 3185,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "timestamp": {
+          "count": 3185,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        }
+      }
+    },
+    "queue-operation": {
+      "count": 3419,
+      "first_version": "2.1.108",
+      "category": "metadata",
+      "fields": {
+        "type": {
+          "count": 3419,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "operation": {
+          "count": 3419,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "timestamp": {
+          "count": 3419,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "sessionId": {
+          "count": 3419,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "content": {
+          "count": 1746,
+          "frequency_pct": 51.1,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        }
+      }
+    },
+    "system": {
+      "count": 8671,
+      "first_version": "2.1.108",
+      "category": "envelope",
+      "fields": {
+        "parentUuid": {
+          "count": 8671,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "NoneType",
+            "str"
+          ]
+        },
+        "isSidechain": {
+          "count": 8671,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "bool"
+          ]
+        },
+        "type": {
+          "count": 8671,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "subtype": {
+          "count": 8671,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "level": {
+          "count": 4585,
+          "frequency_pct": 52.9,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "cause": {
+          "count": 82,
+          "frequency_pct": 0.9,
+          "required": false,
+          "value_types": [
+            "dict"
+          ]
+        },
+        "error": {
+          "count": 172,
+          "frequency_pct": 2.0,
+          "required": false,
+          "value_types": [
+            "dict"
+          ]
+        },
+        "retryInMs": {
+          "count": 172,
+          "frequency_pct": 2.0,
+          "required": false,
+          "value_types": [
+            "float"
+          ]
+        },
+        "retryAttempt": {
+          "count": 172,
+          "frequency_pct": 2.0,
+          "required": false,
+          "value_types": [
+            "int"
+          ]
+        },
+        "maxRetries": {
+          "count": 172,
+          "frequency_pct": 2.0,
+          "required": false,
+          "value_types": [
+            "int"
+          ]
+        },
+        "timestamp": {
+          "count": 8671,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "uuid": {
+          "count": 8671,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "userType": {
+          "count": 8671,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "entrypoint": {
+          "count": 8671,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "cwd": {
+          "count": 8671,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "sessionId": {
+          "count": 8671,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "version": {
+          "count": 8671,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "gitBranch": {
+          "count": 8671,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "content": {
+          "count": 437,
+          "frequency_pct": 5.0,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "isMeta": {
+          "count": 4162,
+          "frequency_pct": 48.0,
+          "required": false,
+          "value_types": [
+            "bool"
+          ]
+        },
+        "durationMs": {
+          "count": 3725,
+          "frequency_pct": 43.0,
+          "required": false,
+          "value_types": [
+            "int"
+          ]
+        },
+        "messageCount": {
+          "count": 3725,
+          "frequency_pct": 43.0,
+          "required": false,
+          "value_types": [
+            "int"
+          ]
+        },
+        "url": {
+          "count": 94,
+          "frequency_pct": 1.1,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "sessionKind": {
+          "count": 23,
+          "frequency_pct": 0.3,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "hookCount": {
+          "count": 4337,
+          "frequency_pct": 50.0,
+          "required": false,
+          "value_types": [
+            "int"
+          ]
+        },
+        "hookInfos": {
+          "count": 4337,
+          "frequency_pct": 50.0,
+          "required": false,
+          "value_types": [
+            "list"
+          ]
+        },
+        "hookErrors": {
+          "count": 4337,
+          "frequency_pct": 50.0,
+          "required": false,
+          "value_types": [
+            "list"
+          ]
+        },
+        "preventedContinuation": {
+          "count": 4337,
+          "frequency_pct": 50.0,
+          "required": false,
+          "value_types": [
+            "bool"
+          ]
+        },
+        "stopReason": {
+          "count": 4337,
+          "frequency_pct": 50.0,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "hasOutput": {
+          "count": 4337,
+          "frequency_pct": 50.0,
+          "required": false,
+          "value_types": [
+            "bool"
+          ]
+        },
+        "toolUseID": {
+          "count": 4337,
+          "frequency_pct": 50.0,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "logicalParentUuid": {
+          "count": 18,
+          "frequency_pct": 0.2,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "compactMetadata": {
+          "count": 18,
+          "frequency_pct": 0.2,
+          "required": false,
+          "value_types": [
+            "dict"
+          ]
+        },
+        "slug": {
+          "count": 2256,
+          "frequency_pct": 26.0,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        }
+      },
+      "subtypes": {
+        "stop_hook_summary": 4337,
+        "turn_duration": 3725,
+        "away_summary": 260,
+        "api_error": 172,
+        "bridge_status": 94,
+        "local_command": 52,
+        "compact_boundary": 18,
+        "scheduled_task_fire": 7,
+        "informational": 6
+      }
+    },
+    "user": {
+      "count": 35917,
+      "first_version": "2.1.108",
+      "category": "envelope",
+      "fields": {
+        "parentUuid": {
+          "count": 35917,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "NoneType",
+            "str"
+          ]
+        },
+        "isSidechain": {
+          "count": 35917,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "bool"
+          ]
+        },
+        "promptId": {
+          "count": 35872,
+          "frequency_pct": 99.9,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "type": {
+          "count": 35917,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "message": {
+          "count": 35917,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "dict"
+          ]
+        },
+        "uuid": {
+          "count": 35917,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "timestamp": {
+          "count": 35917,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "permissionMode": {
+          "count": 4556,
+          "frequency_pct": 12.7,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "userType": {
+          "count": 35917,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "entrypoint": {
+          "count": 35917,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "cwd": {
+          "count": 35917,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "sessionId": {
+          "count": 35917,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "version": {
+          "count": 35917,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "gitBranch": {
+          "count": 35917,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "isMeta": {
+          "count": 1979,
+          "frequency_pct": 5.5,
+          "required": false,
+          "value_types": [
+            "bool"
+          ]
+        },
+        "toolUseResult": {
+          "count": 27601,
+          "frequency_pct": 76.8,
+          "required": false,
+          "value_types": [
+            "dict",
+            "list",
+            "str"
+          ]
+        },
+        "sourceToolAssistantUUID": {
+          "count": 28928,
+          "frequency_pct": 80.5,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "sessionKind": {
+          "count": 544,
+          "frequency_pct": 1.5,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "origin": {
+          "count": 372,
+          "frequency_pct": 1.0,
+          "required": false,
+          "value_types": [
+            "dict"
+          ]
+        },
+        "sourceToolUseID": {
+          "count": 38,
+          "frequency_pct": 0.1,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "agentId": {
+          "count": 1480,
+          "frequency_pct": 4.1,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "isVisibleInTranscriptOnly": {
+          "count": 18,
+          "frequency_pct": 0.1,
+          "required": false,
+          "value_types": [
+            "bool"
+          ]
+        },
+        "isCompactSummary": {
+          "count": 18,
+          "frequency_pct": 0.1,
+          "required": false,
+          "value_types": [
+            "bool"
+          ]
+        },
+        "slug": {
+          "count": 9849,
+          "frequency_pct": 27.4,
+          "required": false,
+          "value_types": [
+            "str"
+          ]
+        },
+        "imagePasteIds": {
+          "count": 13,
+          "frequency_pct": 0.0,
+          "required": false,
+          "value_types": [
+            "list"
+          ]
+        }
+      }
+    },
+    "worktree-state": {
+      "count": 95,
+      "first_version": "2.1.142",
+      "category": "metadata",
+      "fields": {
+        "type": {
+          "count": 95,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        },
+        "worktreeSession": {
+          "count": 95,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "NoneType",
+            "dict"
+          ]
+        },
+        "sessionId": {
+          "count": 95,
+          "frequency_pct": 100.0,
+          "required": true,
+          "value_types": [
+            "str"
+          ]
+        }
+      }
+    }
+  },
+  "versions_observed": [
+    "2.1.108",
+    "2.1.110",
+    "2.1.111",
+    "2.1.113",
+    "2.1.117",
+    "2.1.118",
+    "2.1.119",
+    "2.1.120",
+    "2.1.121",
+    "2.1.123",
+    "2.1.126",
+    "2.1.136",
+    "2.1.137",
+    "2.1.139",
+    "2.1.142",
+    "2.1.143",
+    "2.1.144",
+    "2.1.146",
+    "2.1.147",
+    "2.1.148",
+    "2.1.149",
+    "2.1.150",
+    "2.1.86"
+  ],
+  "tool_usage": {
+    "Bash": 17758,
+    "Read": 3454,
+    "Edit": 3389,
+    "TaskUpdate": 1242,
+    "Write": 1124,
+    "TaskCreate": 658,
+    "Grep": 301,
+    "WebFetch": 173,
+    "ToolSearch": 165,
+    "AskUserQuestion": 136,
+    "mcp__snake__step": 105,
+    "Monitor": 64,
+    "TodoWrite": 58,
+    "Agent": 57,
+    "WebSearch": 47,
+    "Skill": 39,
+    "TaskOutput": 39,
+    "Glob": 34,
+    "TaskStop": 18,
+    "EnterWorktree": 9,
+    "ExitWorktree": 8,
+    "ScheduleWakeup": 7,
+    "SendUserFile": 7,
+    "RemoteTrigger": 7,
+    "ExitPlanMode": 6,
+    "TaskList": 6,
+    "CronList": 4,
+    "EnterPlanMode": 3,
+    "CronCreate": 3,
+    "mcp__warden__memory_recall": 3,
+    "PushNotification": 2,
+    "CronDelete": 2,
+    "mcp__orchestrator__watch_task": 2,
+    "mcp__snake__new_game": 1,
+    "mcp__warden__get_task": 1,
+    "mcp__warden__list_tasks": 1,
+    "mcp__orchestrator__run_task": 1,
+    "mcp__orchestrator__memory_recall": 1
+  }
+}

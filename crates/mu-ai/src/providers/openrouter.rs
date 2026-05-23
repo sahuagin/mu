@@ -125,6 +125,26 @@ impl Provider for OpenRouterProvider {
     fn provider_label(&self) -> &'static str {
         "openrouter"
     }
+
+    /// OpenRouter proxies to many backing models with OpenAI-style
+    /// chat completions:
+    /// - System content is inlined as a `{role: "system", ...}`
+    ///   message, not a separate top-level field. Limits inherit
+    ///   from the backing model's per-message budget rather than a
+    ///   separate cap on a system slot.
+    /// - Caching support varies by backing model; conservative
+    ///   default is false until per-model overrides exist.
+    /// - No `developer` role in the chat-completions shape.
+    fn capabilities(&self) -> mu_core::agent::capabilities::ProviderCapabilities {
+        use mu_core::agent::capabilities::{ProviderCapabilities, SystemPromptCapability};
+        ProviderCapabilities {
+            system_prompt: SystemPromptCapability::MessageRole,
+            supports_prompt_caching: false,
+            supports_developer_role: false,
+            max_tools: None,
+            context_window_tokens: None,
+        }
+    }
 }
 
 // ============================================================================

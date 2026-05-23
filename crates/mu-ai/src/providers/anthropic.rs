@@ -165,6 +165,24 @@ impl Provider for AnthropicProvider {
     fn provider_label(&self) -> &'static str {
         "anthropic"
     }
+
+    /// Anthropic's Messages API:
+    /// - Dedicated top-level `system` field, no observed size cap
+    ///   (handles arbitrary length; cache_control is the practical
+    ///   tuning knob).
+    /// - First-class prompt caching via `cache_control` markers on
+    ///   system content blocks and message content.
+    /// - No `developer` role; uses standard system/user/assistant.
+    fn capabilities(&self) -> mu_core::agent::capabilities::ProviderCapabilities {
+        use mu_core::agent::capabilities::{ProviderCapabilities, SystemPromptCapability};
+        ProviderCapabilities {
+            system_prompt: SystemPromptCapability::TopLevelField { max_bytes: None },
+            supports_prompt_caching: true,
+            supports_developer_role: false,
+            max_tools: None,
+            context_window_tokens: None,
+        }
+    }
 }
 
 /// Translate a mu `ToolSpec` into Anthropic's tool descriptor shape.

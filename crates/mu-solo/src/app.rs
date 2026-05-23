@@ -204,6 +204,24 @@ pub struct App {
     /// /btw calls so follow-ups stay coherent; main session history
     /// is unaffected.
     sidecar_session_id: Option<String>,
+    /// Absolute path to the durable event log for the main session.
+    /// Used by the renderer-mismatch diagnostic: ContextAssembly
+    /// events aren't on the wire (per forwarder.rs:209), so we read
+    /// them off disk to detect a silent faux-fallback. None when we
+    /// can't resolve the data dir on this platform/user.
+    events_file: Option<std::path::PathBuf>,
+    /// What the daemon *actually* picked for the renderer / cache /
+    /// provider on this session, read from the first ContextAssembly
+    /// event. None until the first session.done lets us peek. The
+    /// "asked" side is `self.provider` + `self.model`.
+    actual_renderer: Option<String>,
+    actual_cache_strategy: Option<String>,
+    actual_provider_kind: Option<String>,
+    actual_model: Option<String>,
+    /// Set after we've shown the mismatch warning once; the warning
+    /// fires at most once per process to avoid spamming scrollback if
+    /// the user keeps sending prompts to a faux session.
+    renderer_mismatch_warned: bool,
     /// Which session owns the currently-streaming turn. Set when an
     /// ask is fired (Main on /send, Btw on /btw); used by
     /// `emit_streaming` and the closer-emit path to pick the right
@@ -271,6 +289,16 @@ impl App {
             .to_string();
 
         let status = format!(" {provider} · {model} · {session_id} ");
+        // Construct the events log path before moving daemon_id into
+        // the struct. dirs::data_dir() returns None only on
+        // pathological setups (no $HOME / no equivalent); in that
+        // case the diagnostic silently degrades to "(pending)".
+        let events_file = dirs::data_dir().map(|p| {
+            p.join("mu")
+                .join("events")
+                .join(&daemon_id)
+                .join("session-1.jsonl")
+        });
 
         Ok(Self {
             client,
@@ -290,6 +318,12 @@ impl App {
             focus_mode,
             sidecar_session_id: None,
             streaming_route: None,
+            events_file,
+            actual_renderer: None,
+            actual_cache_strategy: None,
+            actual_provider_kind: None,
+            actual_model: None,
+            renderer_mismatch_warned: false,
         })
     }
 
@@ -637,6 +671,23 @@ impl App {
             )),
             Line::from(format!("  provider:    {}", self.provider)),
             Line::from(format!("  model:       {}", self.model)),
+            {
+                // Renderer/cache row: surfaces the daemon's actual
+                // resolved provider plumbing so a silent faux-fallback
+                // is visible from /status without needing the
+                // warning to fire again. Yellow when mismatched.
+                let r = self.actual_renderer.as_deref().unwrap_or("(pending)");
+                let c = self.actual_cache_strategy.as_deref().unwrap_or("(pending)");
+                let text = format!("  renderer:    {r} · cache: {c}");
+                if self.is_renderer_mismatch() {
+                    Line::from(Span::styled(
+                        format!("{text}  ⚠ asked != running"),
+                        Style::default().fg(Color::Yellow),
+                    ))
+                } else {
+                    Line::from(text)
+                }
+            },
             Line::from(format!("  effort:      {}", self.effort.as_str())),
             Line::from(format!(
                 "  focus:       {} (suppress streaming preview)",
@@ -1254,6 +1305,18 @@ impl App {
                 self.emit_tool_call_completed(terminal, params, wrap_width)?;
             }
             "session.done" | "session.error" => {
+                // One-shot renderer-mismatch diagnostic: after the
+                // first turn lands a context_assembly into the events
+                // log, scan for it and surface a warning if the
+                // daemon silently fell back to faux (or any renderer
+                // other than what the user asked for).
+                if self.actual_renderer.is_none() {
+                    self.try_load_actual_renderer();
+                    if self.is_renderer_mismatch() && !self.renderer_mismatch_warned {
+                        self.emit_renderer_mismatch_warning(terminal)?;
+                        self.renderer_mismatch_warned = true;
+                    }
+                }
                 if self.streaming_header_open {
                     self.pending_close = true;
                 } else {
@@ -1288,6 +1351,121 @@ impl App {
             }
             _ => {} // ignore unhandled notifications for v0
         }
+        Ok(())
+    }
+
+    /// One-shot read of the durable events log to extract the
+    /// *actual* renderer / cache_strategy / provider_kind / model the
+    /// daemon resolved for this session. ContextAssembly isn't on the
+    /// wire (forwarder.rs:209 — "wire-level exposure is a future
+    /// TUI/web-ui feature"), so we scan the JSONL directly. Idempotent:
+    /// once populated, subsequent calls noop. Best-effort — missing
+    /// file or parse errors are silently treated as "not yet known."
+    fn try_load_actual_renderer(&mut self) {
+        if self.actual_renderer.is_some() {
+            return;
+        }
+        let Some(path) = self.events_file.as_ref() else {
+            return;
+        };
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return;
+        };
+        for line in raw.lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(p) = v.get("payload") else { continue };
+            if p.get("kind").and_then(|k| k.as_str()) != Some("context_assembly") {
+                continue;
+            }
+            // Restrict to OUR session_id when present — defensive in
+            // case the file ever holds multiplexed sessions.
+            let event_sid = v.get("session_id").and_then(|x| x.as_str()).unwrap_or("");
+            if !event_sid.is_empty() && event_sid != self.session_id {
+                continue;
+            }
+            self.actual_renderer = p
+                .get("renderer")
+                .and_then(|r| r.as_str())
+                .map(String::from);
+            self.actual_cache_strategy = p
+                .get("cache_strategy")
+                .and_then(|r| r.as_str())
+                .map(String::from);
+            self.actual_provider_kind = p
+                .get("provider_kind")
+                .and_then(|r| r.as_str())
+                .map(String::from);
+            self.actual_model = p.get("model").and_then(|r| r.as_str()).map(String::from);
+            return;
+        }
+    }
+
+    /// True iff the daemon resolved to a renderer / cache strategy
+    /// that the user didn't explicitly ask for. Today this means
+    /// "faux fallback when the requested provider couldn't be
+    /// constructed" — the most common case being expired OAuth on
+    /// openai-codex. Returns false if we don't yet have actual data.
+    fn is_renderer_mismatch(&self) -> bool {
+        let asked = normalize_provider_kind(&self.provider);
+        let faux_renderer = self.actual_renderer.as_deref() == Some("faux");
+        let faux_cache = self.actual_cache_strategy.as_deref() == Some("faux");
+        let asked_faux = asked == "faux";
+        (faux_renderer || faux_cache) && !asked_faux
+    }
+
+    /// Yellow warning block emitted once after a faux-fallback
+    /// detection. Tells the operator what was asked vs. what's
+    /// actually running and points at the most likely fix.
+    fn emit_renderer_mismatch_warning<B: Backend>(
+        &self,
+        terminal: &mut Terminal<B>,
+    ) -> Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let lines: Vec<Line<'static>> = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "⚠  renderer mismatch — daemon fell back to faux".to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!(
+                "  asked:    {}/{}",
+                self.provider, self.model
+            )),
+            Line::from(format!(
+                "  running:  renderer={} · cache={} · provider_kind={}",
+                self.actual_renderer.as_deref().unwrap_or("?"),
+                self.actual_cache_strategy.as_deref().unwrap_or("?"),
+                self.actual_provider_kind.as_deref().unwrap_or("?"),
+            )),
+            Line::from(Span::styled(
+                "  faux returns empty content — your prompts will get no response.".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "  most likely: provider auth missing/expired. Try one of:".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "    mu login --provider openai-codex".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "    /q  then relaunch with --provider <other>".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+        ];
+        let h = lines.len() as u16;
+        terminal.insert_before(h, |buf| {
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
         Ok(())
     }
 

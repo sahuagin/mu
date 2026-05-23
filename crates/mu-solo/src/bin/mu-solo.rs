@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use mu_solo::app::{make_inline_terminal, App};
@@ -115,13 +116,15 @@ fn main() -> Result<()> {
     )
     .context("App::new failed (is the mu binary path correct?)")?;
 
-    // Enter raw mode for ratatui inline rendering.
+    // Enter raw mode + bracketed paste for ratatui inline rendering.
     enable_raw_mode().context("enable_raw_mode")?;
+    execute!(std::io::stdout(), EnableBracketedPaste)?;
     let mut terminal = make_inline_terminal()?;
 
     let run_result = app.run(&mut terminal);
 
     // Always restore the terminal, even on error.
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = disable_raw_mode();
     let _ = execute!(std::io::stdout(), crossterm::cursor::Show);
 

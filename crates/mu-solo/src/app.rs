@@ -1247,11 +1247,181 @@ impl App {
                     }
                 }
             }
-            "session.done" | "session.error" if self.streaming_header_open => {
-                self.pending_close = true;
+            "session.tool_call_started" => {
+                self.emit_tool_call_started(terminal, params, wrap_width)?;
+            }
+            "session.tool_call_completed" => {
+                self.emit_tool_call_completed(terminal, params, wrap_width)?;
+            }
+            "session.done" | "session.error" => {
+                if self.streaming_header_open {
+                    self.pending_close = true;
+                } else {
+                    // Turn ended with no text AND no tool calls (rare).
+                    // Without this marker the user has no visual proof
+                    // the turn ever ended — they sent a prompt, then
+                    // staring into silence.
+                    let label = if method == "session.error" {
+                        "(turn ended with error)"
+                    } else {
+                        "(turn ended, no output)"
+                    };
+                    let lines: Vec<Line<'static>> = vec![
+                        Line::from(Span::styled(
+                            format!("  {label}"),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        )),
+                        Line::from(""),
+                    ];
+                    let h = lines.len() as u16;
+                    terminal.insert_before(h, |buf| {
+                        let p = Paragraph::new(lines);
+                        ratatui::widgets::Widget::render(p, buf.area, buf);
+                    })?;
+                    // Reset per-turn state so the next turn starts clean.
+                    self.streaming_text.clear();
+                    self.streaming_chars_emitted = 0;
+                    self.streaming_route = None;
+                }
             }
             _ => {} // ignore unhandled notifications for v0
         }
+        Ok(())
+    }
+
+    /// Open the assistant block header if it isn't already. Shared
+    /// between the streaming-text path (`emit_streaming`) and the
+    /// tool-call rendering paths so a turn that only fires tool calls
+    /// still produces a header + closer pair in scrollback. Header
+    /// color and label come from `streaming_route` so /btw turns get
+    /// magenta "assistant ⋅ btw" framing.
+    fn ensure_streaming_header_open<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+    ) -> Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        if self.streaming_header_open {
+            return Ok(());
+        }
+        let route = self.streaming_route.unwrap_or(TurnRoute::Main);
+        let header = Line::from(Span::styled(
+            format!("┌─ {} ", route.header_label()),
+            Style::default()
+                .fg(route.color())
+                .add_modifier(Modifier::BOLD),
+        ));
+        terminal.insert_before(1, |buf| {
+            ratatui::widgets::Widget::render(Paragraph::new(header), buf.area, buf);
+        })?;
+        self.streaming_header_open = true;
+        Ok(())
+    }
+
+    /// Render a `session.tool_call_started` notification as a one-line
+    /// entry inside the open assistant block:
+    ///
+    ///     │ ▸ bash
+    ///
+    /// The prefix bar uses the route color (white for main, magenta
+    /// for /btw); the marker + tool name use a dim accent so they
+    /// visually recede from any narration that follows. Header is
+    /// opened on demand if no text had streamed yet.
+    fn emit_tool_call_started<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        params: &Value,
+        wrap_width: usize,
+    ) -> Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let _ = wrap_width; // single-line for now; wrap deferred
+        let name = params
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        self.ensure_streaming_header_open(terminal)?;
+        let route = self.streaming_route.unwrap_or(TurnRoute::Main);
+        let line = Line::from(vec![
+            Span::styled("│ ", Style::default().fg(route.color())),
+            Span::styled(
+                "▸ ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(name.to_string(), Style::default().fg(Color::Yellow)),
+        ]);
+        terminal.insert_before(1, |buf| {
+            ratatui::widgets::Widget::render(Paragraph::new(line), buf.area, buf);
+        })?;
+        Ok(())
+    }
+
+    /// Render a `session.tool_call_completed` notification as a
+    /// one-line outcome inside the open assistant block:
+    ///
+    ///     │ ◂ ok    (green)
+    ///     │ ◂ err   (red, plus any short error message)
+    ///
+    /// `params.outcome.kind` is the discriminator (per
+    /// `ToolOutcome::{Ok, Err}` in mu-core's events.rs). On Err we
+    /// pull a short prefix of `outcome.message` so the operator sees
+    /// *why* it failed without leaving the TUI.
+    fn emit_tool_call_completed<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        params: &Value,
+        wrap_width: usize,
+    ) -> Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let _ = wrap_width;
+        let outcome = params.get("outcome");
+        let kind = outcome
+            .and_then(|o| o.get("kind"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let (label, accent, detail) = match kind {
+            "ok" => ("ok", Color::Green, String::new()),
+            "err" => {
+                let msg = outcome
+                    .and_then(|o| o.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let short: String = msg.chars().take(80).collect();
+                (
+                    "err",
+                    Color::Red,
+                    if short.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {short}")
+                    },
+                )
+            }
+            other => (other, Color::DarkGray, String::new()),
+        };
+        self.ensure_streaming_header_open(terminal)?;
+        let route = self.streaming_route.unwrap_or(TurnRoute::Main);
+        let mut spans = vec![
+            Span::styled("│ ", Style::default().fg(route.color())),
+            Span::styled(
+                "◂ ",
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(label.to_string(), Style::default().fg(accent)),
+        ];
+        if !detail.is_empty() {
+            spans.push(Span::styled(detail, Style::default().fg(Color::DarkGray)));
+        }
+        let line = Line::from(spans);
+        terminal.insert_before(1, |buf| {
+            ratatui::widgets::Widget::render(Paragraph::new(line), buf.area, buf);
+        })?;
         Ok(())
     }
 
@@ -1270,19 +1440,8 @@ impl App {
         if self.streaming_text.is_empty() {
             return Ok(());
         }
+        self.ensure_streaming_header_open(terminal)?;
         let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-        if !self.streaming_header_open {
-            let header = Line::from(Span::styled(
-                format!("┌─ {} ", route.header_label()),
-                Style::default()
-                    .fg(route.color())
-                    .add_modifier(Modifier::BOLD),
-            ));
-            terminal.insert_before(1, |buf| {
-                ratatui::widgets::Widget::render(Paragraph::new(header), buf.area, buf);
-            })?;
-            self.streaming_header_open = true;
-        }
         // Emit any new chars up to the last newline.
         let safe_byte_end = self
             .streaming_text

@@ -136,6 +136,21 @@ pub trait Provider: Send + Sync {
         "faux"
     }
 
+    /// What we know about this provider's wire-protocol capabilities
+    /// — system-prompt shape and size constraints, supported roles,
+    /// caching, etc. Source-of-truth for diagnostics and (eventually)
+    /// request-body builders that should respect provider-specific
+    /// constraints (codex's `instructions` 8KB cap, etc.) rather than
+    /// hardcoding constants close to the wire-format code.
+    ///
+    /// Default is conservative — `Unknown` for system-prompt shape,
+    /// no assumed features. Concrete providers override with what
+    /// we've learned. See [`super::capabilities`] for the type +
+    /// the rationale.
+    fn capabilities(&self) -> super::capabilities::ProviderCapabilities {
+        super::capabilities::ProviderCapabilities::default()
+    }
+
     /// mu-kgu.1: the [`CompactionPolicy`] this provider uses to compact
     /// the rope when the agent loop crosses a per-session token
     /// threshold. Default: [`NoCompactionPolicy`] — preserves the

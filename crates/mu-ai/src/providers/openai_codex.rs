@@ -1200,6 +1200,28 @@ impl Provider for OpenaiCodexProvider {
     fn provider_label(&self) -> &'static str {
         "openai_codex"
     }
+
+    /// What we know empirically about the Responses API:
+    /// - Dedicated `instructions` top-level field with a ~8KB soft
+    ///   cap (see [`INSTRUCTIONS_SOFT_CAP`] — codex closes the SSE
+    ///   stream with zero events when this is exceeded).
+    /// - No published prompt-caching surface.
+    /// - The `developer` role exists distinct from `system`/`user`/
+    ///   `assistant`; not currently used by mu but available.
+    /// - Context window varies by model — left as None pending
+    ///   per-model capability lookup.
+    fn capabilities(&self) -> mu_core::agent::capabilities::ProviderCapabilities {
+        use mu_core::agent::capabilities::{ProviderCapabilities, SystemPromptCapability};
+        ProviderCapabilities {
+            system_prompt: SystemPromptCapability::TopLevelField {
+                max_bytes: Some(INSTRUCTIONS_SOFT_CAP),
+            },
+            supports_prompt_caching: false,
+            supports_developer_role: true,
+            max_tools: None,
+            context_window_tokens: None,
+        }
+    }
 }
 
 impl OpenaiCodexProvider {

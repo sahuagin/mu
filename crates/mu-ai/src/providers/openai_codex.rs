@@ -285,6 +285,56 @@ pub(crate) fn translate_message(m: &AgentMessage) -> Vec<Value> {
     }
 }
 
+/// Soft cap for the codex Responses API `instructions` field.
+///
+/// Empirically, codex closes the SSE stream with zero events when
+/// `instructions` is much larger than this (verified at ~108 KB, where
+/// the daemon was concatenating CLAUDE.md / AGENTS.md / memory content
+/// into the system prompt). 8 KB sits comfortably under any plausible
+/// limit while accommodating a substantial DEFAULT_INSTRUCTIONS + a
+/// modest session-supplied prefix.
+///
+/// Content that exceeds the cap is moved out of `instructions` and
+/// prepended to `input` as a synthetic user message — codex handles
+/// long input messages fine, it's specifically the `instructions`
+/// field that chokes. Anthropic's `system` parameter has no such
+/// constraint, which is why this only surfaced on codex.
+pub(crate) const INSTRUCTIONS_SOFT_CAP: usize = 8 * 1024;
+
+/// Apply [`INSTRUCTIONS_SOFT_CAP`] to a candidate instructions string.
+/// Returns the value to put in the `instructions` field and an optional
+/// overflow body to prepend to `input`.
+///
+/// Below the cap → `(actual, None)`, identical to the pre-cap behavior.
+/// At or above → `(DEFAULT_INSTRUCTIONS, Some(actual))`, so the model
+/// still receives a short "you are mu" instruction in the dedicated
+/// field and the long context lands as a regular input message.
+fn split_oversized_instructions<'a>(actual: &'a str) -> (&'a str, Option<&'a str>) {
+    if actual.len() > INSTRUCTIONS_SOFT_CAP {
+        (DEFAULT_INSTRUCTIONS, Some(actual))
+    } else {
+        (actual, None)
+    }
+}
+
+/// Build a single synthetic `role: "user"` message that wraps the
+/// overflow with a brief framing line. Goes at `input[0]`. We use
+/// `role: "user"` rather than `developer` because the Responses API's
+/// developer role is newer and not universally supported on all model
+/// variants we might target via the same wire path.
+fn make_instructions_overflow_message(content: &str) -> Value {
+    let framed = format!(
+        "[System context — too large for the instructions field. \
+         Treat this as your standing instructions and project context, \
+         not as a question to respond to directly.]\n\n{content}"
+    );
+    json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": framed}],
+    })
+}
+
 pub(crate) fn build_request_body(
     model: &str,
     thinking: &str,
@@ -292,10 +342,15 @@ pub(crate) fn build_request_body(
     messages: &[AgentMessage],
     tools: &[ToolSpec],
 ) -> Value {
-    let input: Vec<Value> = messages.iter().flat_map(translate_message).collect();
+    let (instructions_field, overflow) = split_oversized_instructions(instructions);
+    let mut input: Vec<Value> = Vec::with_capacity(messages.len() + 1);
+    if let Some(o) = overflow {
+        input.push(make_instructions_overflow_message(o));
+    }
+    input.extend(messages.iter().flat_map(translate_message));
     let mut body = json!({
         "model": model,
-        "instructions": instructions,
+        "instructions": instructions_field,
         "input": input,
         "stream": true,
         "store": false,
@@ -490,9 +545,20 @@ pub(crate) fn build_request_body_from_projection(
         Some(s) if !s.is_empty() => s,
         _ => default_instructions,
     };
+    let (instructions_field, overflow) = split_oversized_instructions(instructions);
+    // Reconstruct input with overflow prepended if needed. `input` was
+    // built without it; we only allocate a new Vec on overflow.
+    let input = if let Some(o) = overflow {
+        let mut v = Vec::with_capacity(input.len() + 1);
+        v.push(make_instructions_overflow_message(o));
+        v.extend(input);
+        v
+    } else {
+        input
+    };
     let mut body = json!({
         "model": model,
-        "instructions": instructions,
+        "instructions": instructions_field,
         "input": input,
         "stream": true,
         "store": false,

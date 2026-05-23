@@ -180,6 +180,70 @@ fn b5_build_request_body_basic() {
 }
 
 #[test]
+fn instructions_under_cap_unchanged() {
+    // Sanity: typical short instructions stay in the dedicated field
+    // and don't perturb the input array.
+    use super::INSTRUCTIONS_SOFT_CAP;
+    let short = "you are mu";
+    assert!(short.len() < INSTRUCTIONS_SOFT_CAP);
+    let body = build_request_body(
+        "gpt-5-codex",
+        "medium",
+        short,
+        &[AgentMessage::User { content: "hi".into() }],
+        &[],
+    );
+    assert_eq!(body["instructions"], short);
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 1);
+    assert_eq!(input[0]["role"], "user");
+    assert_eq!(input[0]["content"][0]["text"], "hi");
+}
+
+#[test]
+fn instructions_over_cap_moved_to_input() {
+    // The bug we shipped this fix for: codex's instructions field
+    // silently fails (200 OK, empty SSE stream) when the daemon
+    // crams all project context (CLAUDE.md / AGENTS.md / memory) in.
+    // After the fix, oversized instructions move to a synthetic
+    // user message at input[0] and the field holds DEFAULT_INSTRUCTIONS.
+    use super::INSTRUCTIONS_SOFT_CAP;
+    let huge = "X".repeat(INSTRUCTIONS_SOFT_CAP + 1);
+    let body = build_request_body(
+        "gpt-5-codex",
+        "medium",
+        &huge,
+        &[AgentMessage::User { content: "hi".into() }],
+        &[],
+    );
+
+    // Instructions field holds a short string — no longer the huge blob.
+    let field = body["instructions"].as_str().unwrap();
+    assert!(
+        field.len() <= INSTRUCTIONS_SOFT_CAP,
+        "instructions field still oversized after split: {} bytes",
+        field.len()
+    );
+
+    // Input now has 2 messages: overflow at [0], original user prompt at [1].
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 2, "expected overflow + original user msg");
+    assert_eq!(input[0]["role"], "user");
+    let overflow_text = input[0]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        overflow_text.contains(&huge),
+        "overflow message should carry the original instructions"
+    );
+    assert!(
+        overflow_text.starts_with("[System context"),
+        "overflow should be prefixed with framing so the model knows it's system context"
+    );
+    // Original user message is still at the end.
+    assert_eq!(input[1]["role"], "user");
+    assert_eq!(input[1]["content"][0]["text"], "hi");
+}
+
+#[test]
 fn b5_build_request_body_with_tools() {
     let messages = vec![AgentMessage::User {
         content: "hi".into(),

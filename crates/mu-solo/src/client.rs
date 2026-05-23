@@ -80,7 +80,46 @@ impl Client {
             .with_context(|| format!("failed to spawn mu binary at {mu_binary}"))?;
         let stdin = child.stdin.take().context("missing stdin pipe")?;
         let stdout = child.stdout.take().context("missing stdout pipe")?;
-        let _stderr = child.stderr.take(); // drop; v1 doesn't surface daemon stderr
+        let stderr = child.stderr.take().context("missing stderr pipe")?;
+
+        // Drain stderr in a background thread. Two reasons:
+        //  1. If we just drop the handle, daemon writes to stderr
+        //     eventually fill the pipe buffer and block — bad with
+        //     verbose tracing turned on.
+        //  2. We can route daemon logs somewhere visible. If
+        //     MU_SOLO_DAEMON_LOG is set to a path, daemon stderr is
+        //     appended there (good for RUST_LOG=mu_ai=debug runs).
+        //     Otherwise the bytes are read and discarded so the
+        //     pipe stays drained.
+        let log_path: Option<std::path::PathBuf> = std::env::var_os("MU_SOLO_DAEMON_LOG")
+            .map(std::path::PathBuf::from);
+        thread::Builder::new()
+            .name("mu-solo-daemon-stderr".into())
+            .spawn(move || {
+                use std::io::Write;
+                let mut sink: Option<std::fs::File> = log_path.and_then(|p| {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&p)
+                        .ok()
+                });
+                let mut reader = BufReader::new(stderr);
+                let mut buf = String::new();
+                loop {
+                    buf.clear();
+                    match reader.read_line(&mut buf) {
+                        Ok(0) => return, // EOF
+                        Ok(_) => {
+                            if let Some(f) = sink.as_mut() {
+                                let _ = f.write_all(buf.as_bytes());
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+            })
+            .context("spawning daemon-stderr drain thread")?;
 
         let (tx, rx) = mpsc::channel::<Message>();
 

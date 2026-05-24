@@ -181,6 +181,8 @@ pub struct App {
     /// Cursor-aware input buffer. Supports multi-line (paste), cursor
     /// movement, and visual wrapping for the grow-upward prompt.
     prompt: InputBuffer,
+    /// Session-wide paste counter for collapse display.
+    paste_count: usize,
     /// Streaming-text accumulator for the in-flight assistant turn.
     /// Cleared on `session.done` / `session.error`.
     streaming_text: String,
@@ -318,6 +320,7 @@ impl App {
             provider: provider.to_string(),
             model: model.to_string(),
             prompt: InputBuffer::new(),
+            paste_count: 0,
             streaming_text: String::new(),
             streaming_header_open: false,
             streaming_chars_emitted: 0,
@@ -340,10 +343,12 @@ impl App {
     }
 
     /// Run the event loop. Returns Ok(()) on clean exit (user pressed q).
-    pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
-    {
+    /// Owns the terminal so it can resize the inline viewport dynamically
+    /// as the prompt grows/shrinks.
+    pub fn run(
+        &mut self,
+        mut terminal: Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
         // Initial banner — printed once into scrollback.
         let banner_lines = vec![
             Line::from(Span::styled(
@@ -370,34 +375,33 @@ impl App {
 
         loop {
             // Drain any notifications that arrived since the last tick.
-            self.drain_notifications(terminal)?;
+            self.drain_notifications(&mut terminal)?;
 
             // Draw the inline viewport (status + input prompt).
             terminal.draw(|f| {
                 let area = f.area();
-                let term_width = area.width as usize;
-                let prompt_wrap_width = term_width.saturating_sub(4); // " > " prefix + gutter
-                let layout = self.prompt.visual_layout(prompt_wrap_width);
-                let max_prompt_rows = (area.height as usize).saturating_sub(2); // separator + status
-                let prompt_rows = layout.lines.len().min(max_prompt_rows);
-                // Show the tail of the prompt (most recent visual lines including cursor row)
-                let skip = layout.lines.len().saturating_sub(prompt_rows);
+                let w = area.width as usize;
+                let vp_wrap = w.saturating_sub(4);
+                let vp_layout = self.prompt.visual_layout(vp_wrap);
+                let max_prompt_rows = (area.height as usize).saturating_sub(2);
+                let prompt_rows = vp_layout.lines.len().min(max_prompt_rows);
+                let skip = vp_layout.lines.len().saturating_sub(prompt_rows);
                 let mut lines: Vec<Line<'static>> = Vec::new();
                 // Separator line.
                 lines.push(Line::from(Span::styled(
-                    "─".repeat(term_width),
+                    "─".repeat(w),
                     Style::default().fg(Color::DarkGray),
                 )));
                 // Prompt lines — one per visual row.
-                for (display_idx, vline) in layout.lines.iter().skip(skip).enumerate() {
+                for (display_idx, vline) in vp_layout.lines.iter().skip(skip).enumerate() {
                     let row_idx = display_idx + skip;
                     let prefix = if row_idx == 0 { " > " } else { "   " };
-                    let is_cursor_row = row_idx == layout.cursor_row;
+                    let is_cursor_row = row_idx == vp_layout.cursor_row;
                     if is_cursor_row {
                         let before: String =
-                            vline.text.chars().take(layout.cursor_col).collect();
+                            vline.text.chars().take(vp_layout.cursor_col).collect();
                         let after: String =
-                            vline.text.chars().skip(layout.cursor_col).collect();
+                            vline.text.chars().skip(vp_layout.cursor_col).collect();
                         let cursor_char = if after.is_empty() {
                             " ".to_string()
                         } else {
@@ -442,12 +446,13 @@ impl App {
             if event::poll(wait)? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if self.handle_key(terminal, key)? {
+                        if self.handle_key(&mut terminal, key)? {
                             break; // user requested exit
                         }
                     }
                     Event::Paste(text) => {
-                        self.prompt.insert_str(&text);
+                        self.paste_count += 1;
+                        self.prompt.insert_paste(&text, self.paste_count);
                     }
                     _ => {}
                 }
@@ -469,7 +474,16 @@ impl App {
         B::Error: std::error::Error + Send + Sync + 'static,
     {
         match (key.modifiers, key.code) {
-            (KeyModifiers::CONTROL, KeyCode::Char('c')) => return Ok(true),
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
+                if !self.prompt.is_empty() {
+                    self.prompt.clear();
+                } else if self.streaming_header_open {
+                    // Cancel in-flight turn
+                    self.cmd_cancel(terminal)?;
+                } else {
+                    return Ok(true);
+                }
+            }
             // Esc clears the prompt buffer (conventional "cancel
             // typed input"). It is NOT an exit shortcut — zellij /
             // tmux multiplexer scrollback exits also send Esc, and
@@ -1970,16 +1984,20 @@ fn titlecase_tool(name: &str) -> String {
     }
 }
 
-/// Construct a `Terminal<CrosstermBackend>` configured for inline
-/// rendering. Used by the binary; exposed here so library consumers
-/// can construct their own.
-const INLINE_VIEWPORT_HEIGHT: u16 = 3;
+/// Viewport height (separator + 3 prompt lines + status).
+const VIEWPORT_HEIGHT: u16 = 5;
 
 pub fn make_inline_terminal(
 ) -> Result<Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>> {
+    make_inline_terminal_with_height(VIEWPORT_HEIGHT)
+}
+
+pub fn make_inline_terminal_with_height(
+    height: u16,
+) -> Result<Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>> {
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
     let opts = TerminalOptions {
-        viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
+        viewport: Viewport::Inline(height),
     };
     Terminal::with_options(backend, opts).context("terminal init")
 }

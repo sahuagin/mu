@@ -119,9 +119,9 @@ fn main() -> Result<()> {
     // Enter raw mode + bracketed paste for ratatui inline rendering.
     enable_raw_mode().context("enable_raw_mode")?;
     execute!(std::io::stdout(), EnableBracketedPaste)?;
-    let mut terminal = make_inline_terminal()?;
+    let terminal = make_inline_terminal()?;
 
-    let run_result = app.run(&mut terminal);
+    let run_result = app.run(terminal);
 
     // Always restore the terminal, even on error.
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);

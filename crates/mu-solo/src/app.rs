@@ -10,6 +10,7 @@
 //! send-prompt → see-response loop. Commands (`/model`, `/help`, etc.)
 //! land next.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -23,6 +24,7 @@ use crate::client::{Client, Message};
 use crate::input::InputBuffer;
 use crate::picker;
 use crate::render;
+use crate::skills::{self, DiscoveredSkill};
 use crate::viewport::DynamicViewport;
 
 /// Known providers offered by the `/provider` picker. Free-form
@@ -123,6 +125,17 @@ fn normalize_provider_kind(provider: &str) -> String {
         "openrouter" | "open-router" | "open_router" => "openrouter".into(),
         "faux" => "faux".into(),
         _ => lc,
+    }
+}
+
+fn truncate_at_word(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let truncated = &s[..s.floor_char_boundary(max)];
+    match truncated.rfind(' ') {
+        Some(pos) if pos > max / 2 => format!("{}…", &truncated[..pos]),
+        _ => format!("{truncated}…"),
     }
 }
 
@@ -241,6 +254,8 @@ pub struct App {
     /// label + color. None when no turn is in flight.
     streaming_route: Option<TurnRoute>,
     bash_yolo: bool,
+    /// Discovered skills from SKILL.md files on disk.
+    skills: HashMap<String, DiscoveredSkill>,
 }
 
 impl App {
@@ -266,6 +281,12 @@ impl App {
             )
         })?;
         let mut client = Client::spawn(mu_binary, cwd, bash_yolo, tools)?;
+
+        let search_dirs = skills::default_search_dirs(Some(cwd));
+        let skills = skills::discover(&search_dirs);
+        if !skills.is_empty() {
+            tracing::info!(count = skills.len(), "discovered skills");
+        }
 
         // Normalize provider input → daemon's snake_case wire enum
         // (mirrors mu-tui's accept-anything mapping in create_session).
@@ -340,6 +361,7 @@ impl App {
             actual_model: None,
             renderer_mismatch_warned: false,
             bash_yolo,
+            skills,
         })
     }
 
@@ -539,7 +561,7 @@ impl App {
                         self.emit_status_lines(vp)?;
                         return Ok(false);
                     }
-                    "/help" if tail.is_empty() => {
+                    "/help" => {
                         self.emit_help_lines(vp)?;
                         return Ok(false);
                     }
@@ -572,6 +594,11 @@ impl App {
                         return Ok(false);
                     }
                     _ if head.starts_with('/') => {
+                        let skill_name = &head[1..];
+                        if self.skills.contains_key(skill_name) {
+                            self.cmd_skill(vp, skill_name, tail)?;
+                            return Ok(false);
+                        }
                         self.emit_unknown_command(vp, head)?;
                         return Ok(false);
                     }
@@ -592,38 +619,48 @@ impl App {
         text: &str,
     ) -> Result<()>
     {
-        // Clear the viewport so the raw prompt text doesn't persist
-        // as a ghost in scrollback after push-down.
-        vp.clear_viewport()?;
+        self.emit_you_block(vp, text)?;
+        self.fire_ask(vp, text)
+    }
 
+    /// Show the "you" block in scrollback without sending anything.
+    fn emit_you_block(
+        &self,
+        vp: &mut DynamicViewport,
+        display_text: &str,
+    ) -> Result<()>
+    {
+        vp.clear_viewport()?;
         let width = vp.area().width as usize;
         let wrap_width = width.saturating_sub(2);
-        let lines = render::you_block(text, wrap_width);
+        let lines = render::you_block(display_text, wrap_width);
         let height = lines.len() as u16;
         vp.insert_before(height, |buf| {
             let p = Paragraph::new(lines);
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
+        Ok(())
+    }
 
-        // Snap viewport to bottom so streaming inserts don't trigger
-        // push-downs (which create blank line gaps).
+    /// Reset streaming state, snap viewport, and fire `ask_session`.
+    fn fire_ask(
+        &mut self,
+        vp: &mut DynamicViewport,
+        wire_text: &str,
+    ) -> Result<()>
+    {
         vp.snap_to_bottom()?;
-
-        // Reset per-turn streaming state.
         self.streaming_text.clear();
         self.streaming_header_open = false;
         self.streaming_chars_emitted = 0;
         self.pending_close = false;
         self.streaming_route = Some(TurnRoute::Main);
 
-        // Fire and forget the request; responses come back as
-        // notifications drained in `drain_notifications`. Method per
-        // mu's wire protocol is `ask_session` with `user_message`.
         let _ = self.client.request(
             "ask_session",
             serde_json::json!({
                 "session_id": self.session_id,
-                "user_message": text,
+                "user_message": wire_text,
             }),
         )?;
         Ok(())
@@ -1140,6 +1177,86 @@ impl App {
         Ok(())
     }
 
+    /// Invoke a discovered skill. Injects the skill body as context
+    /// by prepending it to the user's message. If no message was
+    /// provided, sends just the skill body with a brief preamble.
+    fn cmd_skill(
+        &mut self,
+        vp: &mut DynamicViewport,
+        skill_name: &str,
+        tail: &str,
+    ) -> Result<()>
+    {
+        if self.streaming_header_open {
+            let lines: Vec<Line<'static>> = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "wait — turn still streaming".to_string(),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(format!(
+                    "  retry /{skill_name} once the current response finishes."
+                )),
+                Line::from(""),
+            ];
+            let h = lines.len() as u16;
+            vp.insert_before(h, |buf| {
+                let p = Paragraph::new(lines);
+                ratatui::widgets::Widget::render(p, buf.area, buf);
+            })?;
+            return Ok(());
+        }
+
+        let skill = match self.skills.get(skill_name) {
+            Some(s) => s.clone(),
+            None => {
+                self.emit_unknown_command(vp, &format!("/{skill_name}"))?;
+                return Ok(());
+            }
+        };
+
+        // Activation banner — the only visual feedback.
+        let banner_lines: Vec<Line<'static>> = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    format!("  /{skill_name}"),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" — {}", skill.description),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(""),
+        ];
+        let bh = banner_lines.len() as u16;
+        vp.insert_before(bh, |buf| {
+            let p = Paragraph::new(banner_lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
+
+        // Build the wire message: skill body is invisible context,
+        // only the user's message (if any) shows in scrollback.
+        let injection = skill.injection_text();
+        let wire_msg = if tail.is_empty() {
+            format!(
+                "The user activated the /{skill_name} skill. \
+                 Follow the instructions below.\n\n{injection}"
+            )
+        } else {
+            format!("{injection}\n\n---\n\nUser request: {tail}")
+        };
+
+        if !tail.is_empty() {
+            self.emit_you_block(vp, tail)?;
+        }
+        self.fire_ask(vp, &wire_msg)?;
+        Ok(())
+    }
+
     /// Unknown-command stub. Keeps typos from getting sent to the
     /// model as a prompt (which would burn tokens and confuse the
     /// session). Mirrors claude-code's "Unknown slash command" hint.
@@ -1169,7 +1286,7 @@ impl App {
     /// /help — print the built-in command surface to scrollback.
     fn emit_help_lines(&self, vp: &mut DynamicViewport) -> Result<()>
     {
-        let lines: Vec<Line<'static>> = vec![
+        let mut lines: Vec<Line<'static>> = vec![
             Line::from(""),
             Line::from(Span::styled(
                 "── /help ───────────────────────────".to_string(),
@@ -1190,10 +1307,32 @@ impl App {
             Line::from(""),
             Line::from("  Esc                clear the current prompt"),
             Line::from("  Ctrl-C             leave the session"),
-            Line::from(""),
-            Line::from("  Anything else is sent to the model as a prompt."),
-            Line::from(""),
         ];
+
+        if !self.skills.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "── skills ──────────────────────────".to_string(),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            let mut names: Vec<&str> = self.skills.keys().map(|s| s.as_str()).collect();
+            names.sort();
+            for name in names {
+                if let Some(skill) = self.skills.get(name) {
+                    let desc = truncate_at_word(&skill.description, 50);
+                    lines.push(Line::from(format!(
+                        "  /{name:<18} {desc}"
+                    )));
+                }
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from("  Anything else is sent to the model as a prompt."));
+        lines.push(Line::from(""));
+
         let h = lines.len() as u16;
         vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);

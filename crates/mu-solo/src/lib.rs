@@ -20,4 +20,5 @@ pub mod config;
 pub mod input;
 pub mod picker;
 pub mod render;
+pub mod skills;
 pub mod viewport;

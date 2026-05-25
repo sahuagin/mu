@@ -1,5 +1,5 @@
 use super::*;
-use mu_core::agent::{MessageInput, ToolCall};
+use mu_core::agent::{MessageInput, ToolArgs, ToolCall};
 use mu_core::context::{
     assemble_rope, CacheMarker, CacheStrategy, ProjectionTarget, ProviderRenderer, ProviderRole,
     SpanKind,
@@ -339,13 +339,19 @@ fn yqeq8_projected_emits_cache_control_on_system_and_last_tool() {
 
 #[test]
 fn yqeq8_projected_no_system_no_tools_emits_no_cache_control() {
-    // Volatile-only rope ⇒ no boundaries ⇒ no cache_control anywhere.
+    // mu-0q44: empty tools now injects a no-tools clause as a System
+    // span, so there IS a system block — but the test still verifies
+    // that no tools array is emitted.
     let messages = vec![AgentMessage::User {
         content: "hi".into(),
     }];
     let projection = build_projection_with_cache_strategy(None, &messages, &[]);
     let body = build_request_body_from_projection("claude-test", &projection, &[]);
-    assert!(body.get("system").is_none());
+    let sys = body["system"].as_array().expect("mu-0q44 system block");
+    assert!(sys[0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("no tools available"));
     assert!(body.get("tools").is_none());
 }
 
@@ -574,7 +580,7 @@ fn tool_call(id: &str, path: &str) -> ContentBlock {
     ContentBlock::ToolCall(ToolCall {
         id: id.into(),
         name: "read".into(),
-        arguments: json!({ "path": path }),
+        arguments: ToolArgs::new(json!({ "path": path })).unwrap(),
     })
 }
 
@@ -909,7 +915,7 @@ async fn b6_sse_mixed_text_and_tool_use() {
         ContentBlock::ToolCall(tc) => {
             assert_eq!(tc.id, "toolu_X");
             assert_eq!(tc.name, "read");
-            assert_eq!(tc.arguments["path"], "/etc/hostname");
+            assert_eq!(tc.arguments.as_value()["path"], "/etc/hostname");
         }
         other => panic!("expected ToolCall, got {other:?}"),
     }
@@ -965,7 +971,7 @@ async fn b7_sse_tool_use_only() {
         ContentBlock::ToolCall(tc) => {
             assert_eq!(tc.id, "toolu_Y");
             assert_eq!(tc.name, "echo");
-            assert_eq!(tc.arguments["text"], "hi");
+            assert_eq!(tc.arguments.as_value()["text"], "hi");
         }
         other => panic!("expected ToolCall, got {other:?}"),
     }
@@ -1014,8 +1020,8 @@ async fn b8_malformed_input_json_yields_empty_object() {
         ContentBlock::ToolCall(tc) => {
             assert_eq!(tc.id, "toolu_Z");
             // Per INV-5: fall back to empty object on parse failure.
-            assert!(tc.arguments.is_object());
-            assert_eq!(tc.arguments.as_object().unwrap().len(), 0);
+            assert!(tc.arguments.as_value().is_object());
+            assert_eq!(tc.arguments.as_value().as_object().unwrap().len(), 0);
         }
         other => panic!("expected ToolCall, got {other:?}"),
     }
@@ -1057,8 +1063,8 @@ async fn non_object_input_json_yields_empty_object() {
     };
     match &done.content[0] {
         ContentBlock::ToolCall(tc) => {
-            assert!(tc.arguments.is_object());
-            assert_eq!(tc.arguments.as_object().unwrap().len(), 0);
+            assert!(tc.arguments.as_value().is_object());
+            assert_eq!(tc.arguments.as_value().as_object().unwrap().len(), 0);
         }
         _ => panic!("expected ToolCall"),
     }
@@ -1195,11 +1201,13 @@ mod live_tests {
 
         assert_eq!(tool_call.name, "echo");
         assert!(
-            tool_call.arguments.is_object(),
+            tool_call.arguments.as_value().is_object(),
             "arguments must be an object, got: {:?}",
             tool_call.arguments
         );
-        let text_arg = tool_call.arguments["text"].as_str().unwrap_or("");
+        let text_arg = tool_call.arguments.as_value()["text"]
+            .as_str()
+            .unwrap_or("");
         assert!(
             text_arg.to_lowercase().contains("hi"),
             "expected text arg to contain 'hi', got: {text_arg:?}"
@@ -1251,7 +1259,7 @@ fn equivalence_fixture() -> (
                 ContentBlock::ToolCall(ToolCall {
                     id: "c1".into(),
                     name: "read".into(),
-                    arguments: serde_json::json!({"path": "/etc/hostname"}),
+                    arguments: ToolArgs::new(serde_json::json!({"path": "/etc/hostname"})).unwrap(),
                 }),
             ],
             stop_reason: StopReason::ToolUse,
@@ -1461,7 +1469,15 @@ fn parity_compare(
 
 #[test]
 fn yqeq4_parity_pure_text_turn() {
-    // User → Assistant text. No tools, no system, no tool calls.
+    // User → Assistant text, no tool calls. A dummy tool is supplied so
+    // the mu-0q44 no-tools clause doesn't fire (that clause intentionally
+    // diverges Legacy vs Projected).
+    let dummy = mu_core::agent::ToolSpec {
+        name: "noop".into(),
+        description: "no-op".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+        policy: Default::default(),
+    };
     let messages = vec![
         AgentMessage::User {
             content: "hi".into(),
@@ -1474,7 +1490,7 @@ fn yqeq4_parity_pure_text_turn() {
             usage: None,
         }),
     ];
-    parity_compare(None, &messages, &[]);
+    parity_compare(None, &messages, &[dummy]);
 }
 
 #[test]
@@ -1501,7 +1517,7 @@ fn yqeq4_parity_single_tool_call() {
                 ContentBlock::ToolCall(ToolCall {
                     id: "toolu_42".into(),
                     name: "read".into(),
-                    arguments: serde_json::json!({"path": "/tmp/x"}),
+                    arguments: ToolArgs::new(serde_json::json!({"path": "/tmp/x"})).unwrap(),
                 }),
             ],
             stop_reason: StopReason::ToolUse,
@@ -1535,17 +1551,17 @@ fn yqeq4_parity_consecutive_tool_results_group_into_one_user_message() {
                 ContentBlock::ToolCall(ToolCall {
                     id: "toolu_1".into(),
                     name: "read".into(),
-                    arguments: serde_json::json!({"path": "/a"}),
+                    arguments: ToolArgs::new(serde_json::json!({"path": "/a"})).unwrap(),
                 }),
                 ContentBlock::ToolCall(ToolCall {
                     id: "toolu_2".into(),
                     name: "read".into(),
-                    arguments: serde_json::json!({"path": "/b"}),
+                    arguments: ToolArgs::new(serde_json::json!({"path": "/b"})).unwrap(),
                 }),
                 ContentBlock::ToolCall(ToolCall {
                     id: "toolu_3".into(),
                     name: "read".into(),
-                    arguments: serde_json::json!({"path": "/c"}),
+                    arguments: ToolArgs::new(serde_json::json!({"path": "/c"})).unwrap(),
                 }),
             ],
             stop_reason: StopReason::ToolUse,
@@ -1567,7 +1583,15 @@ fn yqeq4_parity_consecutive_tool_results_group_into_one_user_message() {
             is_error: false,
         },
     ];
-    parity_compare(None, &messages, &[]);
+    // Dummy tool: mu-0q44's no-tools clause intentionally diverges
+    // Legacy vs Projected when tools is empty.
+    let dummy = mu_core::agent::ToolSpec {
+        name: "noop".into(),
+        description: "no-op".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+        policy: Default::default(),
+    };
+    parity_compare(None, &messages, &[dummy]);
 }
 
 #[test]
@@ -1630,6 +1654,13 @@ fn yqeq4_thinking_blocks_are_skipped_in_projected_wire_output() {
         "non-thinking text was lost: {wire}",
     );
 
-    // Also: parity vs Legacy (which also strips thinking).
-    parity_compare(None, &messages, &[]);
+    // Also: parity vs Legacy (which also strips thinking). Dummy tool
+    // avoids mu-0q44 no-tools clause divergence.
+    let dummy = mu_core::agent::ToolSpec {
+        name: "noop".into(),
+        description: "no-op".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+        policy: Default::default(),
+    };
+    parity_compare(None, &messages, &[dummy]);
 }

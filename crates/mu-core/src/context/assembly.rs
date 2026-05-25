@@ -127,23 +127,26 @@ pub fn assemble_rope_with_context(
         }
     }
 
-    for spec in tool_specs {
+    if tool_specs.is_empty() {
         spans.push(Span::new(
-            format!("tool-schema:{}", spec.name),
-            SpanKind::ToolSchema,
-            // Schema content: the human-visible description plus the
-            // structured input schema. Renderers don't currently read
-            // span.content for tool schemas (the wire request gets the
-            // spec via Provider::stream's tools arg), but we record a
-            // deterministic projection so /context why and rope
-            // diffing have something to compare.
-            format!(
-                "{}\n{}",
-                spec.description,
-                serde_json::to_string(&spec.input_schema).unwrap_or_default(),
-            ),
-            RetentionClass::Hot,
+            "no-tools-clause",
+            SpanKind::System,
+            "You have no tools available in this session. Do not attempt to use tools or emit tool calls. Answer the user's question directly using only the context provided above.",
+            RetentionClass::Startup,
         ));
+    } else {
+        for spec in tool_specs {
+            spans.push(Span::new(
+                format!("tool-schema:{}", spec.name),
+                SpanKind::ToolSchema,
+                format!(
+                    "{}\n{}",
+                    spec.description,
+                    serde_json::to_string(&spec.input_schema).unwrap_or_default(),
+                ),
+                RetentionClass::Hot,
+            ));
+        }
     }
 
     for (idx, message) in messages.iter().enumerate() {
@@ -329,15 +332,16 @@ mod tests {
                 ContentBlock::ToolCall(ToolCall {
                     id: "c-1".into(),
                     name: "read".into(),
-                    arguments: serde_json::json!({"path": "/x"}),
+                    arguments: crate::agent::ToolArgs::new(serde_json::json!({"path": "/x"}))
+                        .unwrap(),
                 }),
             ],
             stop_reason: StopReason::ToolUse,
             usage: None,
         })];
         let rope = assemble_rope(None, &messages, &[]);
-        assert_eq!(rope.len(), 1);
-        let content = &rope.spans()[0].content;
+        assert_eq!(rope.len(), 2);
+        let content = &rope.spans()[1].content;
         assert!(content.contains("thinking"));
         assert!(content.contains("[tool_call:read("));
     }
@@ -350,14 +354,35 @@ mod tests {
             is_error: true,
         }];
         let rope = assemble_rope(None, &messages, &[]);
-        assert_eq!(rope.spans()[0].content(), "error: permission denied");
-        assert_eq!(rope.spans()[0].kind, SpanKind::ToolResult);
+        assert_eq!(rope.spans()[1].content(), "error: permission denied");
+        assert_eq!(rope.spans()[1].kind, SpanKind::ToolResult);
     }
 
     #[test]
-    fn empty_inputs_produce_empty_rope() {
+    fn empty_inputs_produce_no_tools_clause_only() {
         let rope = assemble_rope(None, &[], &[]);
-        assert!(rope.is_empty());
+        assert_eq!(rope.len(), 1);
+        assert_eq!(rope.spans()[0].id(), "no-tools-clause");
+    }
+
+    #[test]
+    fn no_tools_injects_no_tools_clause() {
+        let rope = assemble_rope(Some("you are mu"), &[], &[]);
+        assert_eq!(rope.len(), 2);
+        let spans = rope.spans();
+        assert_eq!(spans[0].kind, SpanKind::System);
+        assert_eq!(spans[1].kind, SpanKind::System);
+        assert_eq!(spans[1].id(), "no-tools-clause");
+        assert!(spans[1].content().contains("no tools available"));
+        assert!(spans[1].cacheable);
+        assert!(spans[1].retention.is_stable());
+    }
+
+    #[test]
+    fn tools_present_suppresses_no_tools_clause() {
+        let rope = assemble_rope(Some("you are mu"), &[], &[sample_tool()]);
+        let has_clause = rope.spans().iter().any(|s| s.id() == "no-tools-clause");
+        assert!(!has_clause);
     }
 
     #[test]
@@ -400,7 +425,10 @@ mod tests {
             ContentBlock::ToolCall(ToolCall {
                 id: "toolu_42".into(),
                 name: "read".into(),
-                arguments: serde_json::json!({"path": "/etc/hostname"}),
+                arguments: crate::agent::ToolArgs::new(
+                    serde_json::json!({"path": "/etc/hostname"}),
+                )
+                .unwrap(),
             }),
             ContentBlock::Thinking {
                 text: "user wants the hostname".into(),
@@ -414,7 +442,8 @@ mod tests {
         let rope = assemble_rope(None, &messages, &[]);
 
         // The assistant span carries the original blocks intact.
-        let assistant_span = &rope.spans()[0];
+        // (spans()[0] is the no-tools clause; assistant is spans()[1])
+        let assistant_span = &rope.spans()[1];
         assert_eq!(assistant_span.kind(), &SpanKind::Assistant);
         let blocks = assistant_span.blocks().expect("assistant span has blocks");
         assert_eq!(blocks, original_blocks.as_slice());
@@ -434,7 +463,8 @@ mod tests {
             ContentBlock::ToolCall(ToolCall {
                 id: "toolu_1".into(),
                 name: "bash".into(),
-                arguments: serde_json::json!({"command": "ls"}),
+                arguments: crate::agent::ToolArgs::new(serde_json::json!({"command": "ls"}))
+                    .unwrap(),
             }),
         ];
         let messages = vec![AgentMessage::Assistant(AssistantMessage {
@@ -445,10 +475,10 @@ mod tests {
         let rope = assemble_rope(None, &messages, &[]);
         let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
 
-        // The single assistant message in the projection has blocks
-        // identical to the originating AssistantMessage.content.
-        assert_eq!(projection.messages.len(), 1);
-        let msg_blocks = projection.messages[0]
+        // projection[0] is the no-tools clause (System); projection[1] is
+        // the assistant message with blocks identical to the original.
+        assert_eq!(projection.messages.len(), 2);
+        let msg_blocks = projection.messages[1]
             .blocks()
             .expect("assistant ProviderMessage has blocks");
         assert_eq!(msg_blocks, original_blocks.as_slice());

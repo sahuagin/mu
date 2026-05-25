@@ -278,6 +278,92 @@ def analyze_turn_productivity(events: list[dict]) -> dict:
 
 # ── Assistant message patterns ────────────────────────────────────
 
+# ── Startup tax detection ─────────────────────────────────────────
+
+def analyze_startup_tax(events: list[dict]) -> dict:
+    """Detect early-session error patterns: tool calls in the first N
+    events that fail and are retried. The classic pattern is agent
+    memory commands with unquoted args failing 2-3 times before the
+    model learns the quoting convention."""
+    # Collect the first 30 tool call/result pairs
+    tool_events = []
+    for ev in events:
+        p = ev.get("payload", {})
+        kind = p.get("kind", "")
+        if kind in ("tool_call", "tool_result"):
+            tool_events.append(ev)
+        if len(tool_events) >= 60:
+            break
+
+    if not tool_events:
+        return {"has_startup_data": False}
+
+    # Pair calls with results
+    early_calls = []
+    early_errors = 0
+    call_map = {}
+    for ev in tool_events:
+        p = ev.get("payload", {})
+        kind = p.get("kind", "")
+        if kind == "tool_call":
+            call_map[p.get("call_id", "")] = {
+                "name": p.get("name", ""),
+                "args_preview": str(p.get("arguments", ""))[:100],
+            }
+        elif kind == "tool_result":
+            cid = p.get("call_id", "")
+            call_info = call_map.get(cid, {"name": "?", "args_preview": ""})
+            is_err = p.get("is_error", False)
+            early_calls.append({
+                "name": call_info["name"],
+                "args": call_info["args_preview"],
+                "is_error": is_err,
+                "error_preview": p.get("content", "")[:100] if is_err else "",
+            })
+            if is_err:
+                early_errors += 1
+
+    if not early_calls:
+        return {"has_startup_data": False}
+
+    # Find the first N calls and compute startup error rate
+    first_10 = early_calls[:10]
+    first_10_errors = sum(1 for c in first_10 if c["is_error"])
+
+    # Detect the "agent memory" quoting pattern specifically
+    agent_memory_retries = 0
+    for i, call in enumerate(early_calls[:15]):
+        if "agent" in call["args"].lower() or "memory" in call["args"].lower():
+            if call["is_error"]:
+                agent_memory_retries += 1
+
+    # Compare first-10 error rate to session-wide
+    all_tool_results = [
+        ev for ev in events
+        if ev.get("payload", {}).get("kind") == "tool_result"
+    ]
+    all_errors = sum(
+        1 for ev in all_tool_results
+        if ev.get("payload", {}).get("is_error", False)
+    )
+    overall_rate = all_errors / max(len(all_tool_results), 1)
+    startup_rate = first_10_errors / max(len(first_10), 1)
+
+    return {
+        "has_startup_data": True,
+        "first_10_calls": len(first_10),
+        "first_10_errors": first_10_errors,
+        "startup_error_rate": round(startup_rate, 3),
+        "overall_error_rate": round(overall_rate, 3),
+        "startup_tax_detected": startup_rate > overall_rate * 2 and first_10_errors >= 2,
+        "agent_memory_retries": agent_memory_retries,
+        "first_errors": [
+            {"tool": c["name"], "args": c["args"][:60], "error": c["error_preview"][:80]}
+            for c in first_10 if c["is_error"]
+        ],
+    }
+
+
 def analyze_assistant_patterns(events: list[dict]) -> dict:
     """Analyze assistant message content for behavioral patterns."""
     messages = []
@@ -324,6 +410,7 @@ def generate_report(session_id: str, events: list[dict]) -> dict:
         "retry_loops": detect_retry_loops(events),
         "context_growth": analyze_context_growth(events),
         "turn_productivity": analyze_turn_productivity(events),
+        "startup_tax": analyze_startup_tax(events),
         "assistant_patterns": analyze_assistant_patterns(events),
     }
 
@@ -383,6 +470,22 @@ def format_report_text(report: dict) -> str:
     lines.append(f"  write ratio: {tp['write_ratio']:.1%} | error ratio: {tp['error_ratio']:.1%}")
     if tp["empty_results"]:
         lines.append(f"  empty results: {tp['empty_results']}")
+
+    # Startup tax
+    st = report.get("startup_tax", {})
+    if st.get("has_startup_data"):
+        if st.get("startup_tax_detected"):
+            lines.append("\n── Startup Tax (DETECTED) ──")
+            lines.append(
+                f"  first 10 calls: {st['first_10_errors']}/{st['first_10_calls']} errors "
+                f"({st['startup_error_rate']:.0%} vs {st['overall_error_rate']:.0%} overall)"
+            )
+            if st.get("agent_memory_retries"):
+                lines.append(f"  agent memory retries: {st['agent_memory_retries']}")
+            for err in st.get("first_errors", [])[:5]:
+                lines.append(f"    └ {err['tool']}: {err['error'][:70]}")
+        elif st.get("first_10_errors", 0) > 0:
+            lines.append(f"\n── Startup Tax: {st['first_10_errors']} early errors (below threshold) ──")
 
     # Assistant patterns
     ap = report["assistant_patterns"]

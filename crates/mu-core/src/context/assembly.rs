@@ -269,6 +269,8 @@ mod tests {
             }),
             policy: Default::default(),
         }
+    
+        ..Default::default()
     }
 
     #[test]

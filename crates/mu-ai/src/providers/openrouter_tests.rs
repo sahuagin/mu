@@ -96,6 +96,8 @@ fn b5_translate_tool_spec() {
         description: "Read a file.".into(),
         input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
         policy: Default::default(),
+    
+        ..Default::default()
     };
     let v = translate_tool_spec(&spec);
     assert_eq!(v["type"], "function");
@@ -113,7 +115,11 @@ fn b6_build_request_body_includes_tools() {
         name: "read".into(),
         description: "Read".into(),
         input_schema: json!({"type": "object"}),
+        display: None,
+        when: None,
         policy: Default::default(),
+    
+        ..Default::default()
     }];
     let body = build_request_body("test/model", None, &messages, &tools);
     assert_eq!(body["model"], "test/model");
@@ -235,7 +241,11 @@ fn yqeq6_parity_pure_text_turn() {
         name: "noop".into(),
         description: "no-op".into(),
         input_schema: json!({"type": "object"}),
+        display: None,
+        when: None,
         policy: Default::default(),
+    
+        ..Default::default()
     };
     let messages = vec![
         AgentMessage::User {
@@ -266,6 +276,8 @@ fn yqeq6_parity_single_tool_call() {
             "properties": {"path": {"type": "string"}},
         }),
         policy: Default::default(),
+    
+        ..Default::default()
     };
     let messages = vec![
         AgentMessage::User {
@@ -350,7 +362,11 @@ fn yqeq6_parity_consecutive_tool_results() {
         name: "noop".into(),
         description: "no-op".into(),
         input_schema: json!({"type": "object"}),
+        display: None,
+        when: None,
         policy: Default::default(),
+    
+        ..Default::default()
     };
     parity_compare(None, &messages, &[dummy]);
 }
@@ -446,7 +462,11 @@ fn mu_745h_projected_excludes_tool_schema_from_leading_system_msg() {
         name: "read".into(),
         description: "read a file".into(),
         input_schema: json!({"type": "object"}),
+        display: None,
+        when: None,
         policy: Default::default(),
+    
+        ..Default::default()
     }];
     let messages = vec![AgentMessage::User {
         content: "go".into(),
@@ -483,13 +503,21 @@ fn yqeq6_parity_system_prompt_plus_tools() {
             name: "read".into(),
             description: "read a file".into(),
             input_schema: json!({"type": "object"}),
+            display: None,
+            when: None,
             policy: Default::default(),
+        
+            ..Default::default()
         },
         mu_core::agent::ToolSpec {
             name: "bash".into(),
             description: "run shell".into(),
             input_schema: json!({"type": "object"}),
+            display: None,
+            when: None,
             policy: Default::default(),
+        
+            ..Default::default()
         },
     ];
     let messages = vec![AgentMessage::User {
@@ -540,7 +568,11 @@ fn yqeq6_thinking_blocks_are_skipped_in_projected_wire_output() {
         name: "noop".into(),
         description: "no-op".into(),
         input_schema: json!({"type": "object"}),
+        display: None,
+        when: None,
         policy: Default::default(),
+    
+        ..Default::default()
     };
     parity_compare(None, &messages, &[dummy]);
 }
@@ -822,6 +854,8 @@ mod live_tests {
                 "required": ["text"]
             }),
             policy: Default::default(),
+        
+            ..Default::default()
         };
 
         let messages = vec![AgentMessage::User {

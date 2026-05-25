@@ -71,6 +71,8 @@ fn b1_translate_tool_spec_shape() {
         description: "Read a file".into(),
         input_schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
         policy: Default::default(),
+    
+        ..Default::default()
     };
     assert_eq!(
         translate_tool_spec(&spec),
@@ -166,7 +168,11 @@ fn b4_build_request_body_includes_tools_when_present() {
         name: "read".into(),
         description: "Read a file".into(),
         input_schema: json!({ "type": "object" }),
+        display: None,
+        when: None,
         policy: Default::default(),
+    
+        ..Default::default()
     }];
     let body = build_request_body("claude-test", None, &messages, &tools);
     assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
@@ -200,13 +206,21 @@ fn yqeq8_legacy_build_request_body_emits_no_cache_control() {
             name: "read".into(),
             description: "Read a file".into(),
             input_schema: json!({ "type": "object" }),
+            display: None,
+            when: None,
             policy: Default::default(),
+        
+            ..Default::default()
         },
         ToolSpec {
             name: "grep".into(),
             description: "Search".into(),
             input_schema: json!({ "type": "object" }),
+            display: None,
+            when: None,
             policy: Default::default(),
+        
+            ..Default::default()
         },
     ];
     let body = build_request_body("claude-test", Some("be concise"), &messages, &tools);
@@ -300,19 +314,31 @@ fn yqeq8_projected_emits_cache_control_on_system_and_last_tool() {
             name: "read".into(),
             description: "Read".into(),
             input_schema: json!({ "type": "object" }),
+            display: None,
+            when: None,
             policy: Default::default(),
+        
+            ..Default::default()
         },
         ToolSpec {
             name: "glob".into(),
             description: "Glob".into(),
             input_schema: json!({ "type": "object" }),
+            display: None,
+            when: None,
             policy: Default::default(),
+        
+            ..Default::default()
         },
         ToolSpec {
             name: "grep".into(),
             description: "Grep".into(),
             input_schema: json!({ "type": "object" }),
+            display: None,
+            when: None,
             policy: Default::default(),
+        
+            ..Default::default()
         },
     ];
     let projection = build_projection_with_cache_strategy(Some("be concise"), &messages, &tools);
@@ -377,13 +403,21 @@ fn yqeq8_projected_tools_only_caches_last_tool() {
             name: "read".into(),
             description: "Read".into(),
             input_schema: json!({ "type": "object" }),
+            display: None,
+            when: None,
             policy: Default::default(),
+        
+            ..Default::default()
         },
         ToolSpec {
             name: "grep".into(),
             description: "Grep".into(),
             input_schema: json!({ "type": "object" }),
+            display: None,
+            when: None,
             policy: Default::default(),
+        
+            ..Default::default()
         },
     ];
     let projection = build_projection_with_cache_strategy(None, &messages, &tools);
@@ -406,7 +440,11 @@ fn yqeq8_projected_without_cache_strategy_emits_no_cache_control() {
         name: "read".into(),
         description: "Read".into(),
         input_schema: json!({ "type": "object" }),
+        display: None,
+        when: None,
         policy: Default::default(),
+    
+        ..Default::default()
     }];
     let rope = assemble_rope(Some("be concise"), &messages, &tools);
     let projection =
@@ -495,7 +533,11 @@ fn mu_s855_projected_excludes_tool_schema_from_system_block() {
         name: "read".into(),
         description: "read a file content here".into(),
         input_schema: json!({ "type": "object" }),
+        display: None,
+        when: None,
         policy: Default::default(),
+    
+        ..Default::default()
     }];
     let messages = vec![AgentMessage::User {
         content: "go".into(),
@@ -1158,6 +1200,8 @@ mod live_tests {
                 "required": ["text"]
             }),
             policy: Default::default(),
+        
+            ..Default::default()
         };
 
         let messages = vec![AgentMessage::User {
@@ -1246,6 +1290,8 @@ fn equivalence_fixture() -> (
             "required": ["path"],
         }),
         policy: Default::default(),
+    
+        ..Default::default()
     };
     let messages = vec![
         AgentMessage::User {
@@ -1476,7 +1522,11 @@ fn yqeq4_parity_pure_text_turn() {
         name: "noop".into(),
         description: "no-op".into(),
         input_schema: serde_json::json!({"type": "object"}),
+        display: None,
+        when: None,
         policy: Default::default(),
+    
+        ..Default::default()
     };
     let messages = vec![
         AgentMessage::User {
@@ -1504,6 +1554,8 @@ fn yqeq4_parity_single_tool_call() {
             "properties": {"path": {"type": "string"}},
         }),
         policy: Default::default(),
+    
+        ..Default::default()
     };
     let messages = vec![
         AgentMessage::User {
@@ -1589,7 +1641,11 @@ fn yqeq4_parity_consecutive_tool_results_group_into_one_user_message() {
         name: "noop".into(),
         description: "no-op".into(),
         input_schema: serde_json::json!({"type": "object"}),
+        display: None,
+        when: None,
         policy: Default::default(),
+    
+        ..Default::default()
     };
     parity_compare(None, &messages, &[dummy]);
 }
@@ -1606,13 +1662,21 @@ fn yqeq4_parity_system_prompt_plus_tools() {
             name: "read".into(),
             description: "read a file".into(),
             input_schema: serde_json::json!({"type": "object"}),
+            display: None,
+            when: None,
             policy: Default::default(),
+        
+            ..Default::default()
         },
         mu_core::agent::ToolSpec {
             name: "bash".into(),
             description: "run shell".into(),
             input_schema: serde_json::json!({"type": "object"}),
+            display: None,
+            when: None,
             policy: Default::default(),
+        
+            ..Default::default()
         },
     ];
     let messages = vec![AgentMessage::User {
@@ -1660,7 +1724,11 @@ fn yqeq4_thinking_blocks_are_skipped_in_projected_wire_output() {
         name: "noop".into(),
         description: "no-op".into(),
         input_schema: serde_json::json!({"type": "object"}),
+        display: None,
+        when: None,
         policy: Default::default(),
+    
+        ..Default::default()
     };
     parity_compare(None, &messages, &[dummy]);
 }

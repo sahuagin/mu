@@ -192,8 +192,12 @@ impl Tool for MockTool {
             name: self.name.clone(),
             description: format!("Mock tool: {}", self.name),
             input_schema: json!({"type": "object"}),
+            display: None,
+            when: None,
             policy: self.policy_override.clone().unwrap_or_default(),
         }
+    
+        ..Default::default()
     }
 
     fn validate(&self, _arguments: &Value) -> Result<(), String> {
@@ -1054,7 +1058,6 @@ async fn ask_permission_emits_input_required_and_dispatches_on_approve() {
     let provider = mock_provider_one_tool_call("gated", json!({"x": 1}));
     let tool = MockTool::ok("gated", "tool ran").with_policy(crate::agent::tool::ToolPolicy {
         permission: crate::agent::tool::PermissionLevel::Ask,
-        ..Default::default()
     });
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let cap: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
@@ -1141,7 +1144,6 @@ async fn mu_bkjr_validate_rejection_short_circuits_before_input_required() {
     let tool = MockTool::ok("gated", "tool would have run but...")
         .with_policy(crate::agent::tool::ToolPolicy {
             permission: crate::agent::tool::PermissionLevel::Ask,
-            ..Default::default()
         })
         .with_validate_rejection("mock validate refused: bad argument shape");
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -1212,7 +1214,6 @@ async fn capability_refuses_tool_outside_allowed_set() {
     allowed.insert("echo".to_string());
     let cap: SessionCapability = Arc::new(Mutex::new(Capability {
         allowed_tools: Some(allowed),
-        ..Default::default()
     }));
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let (events_tx, mut events_rx) = mpsc::channel(64);
@@ -1351,7 +1352,6 @@ async fn capability_allows_tool_when_required_aws_capability_is_held() {
             name: "aws.scout.readonly".to_string(),
             session_policy: None,
         }]),
-        ..Default::default()
     }));
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let (events_tx, mut events_rx) = mpsc::channel(64);
@@ -1393,7 +1393,6 @@ async fn ask_permission_deny_synthesizes_error_result_without_running_tool() {
     let tool = MockTool::ok("gated", "this should not appear").with_policy(
         crate::agent::tool::ToolPolicy {
             permission: crate::agent::tool::PermissionLevel::Ask,
-            ..Default::default()
         },
     );
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));

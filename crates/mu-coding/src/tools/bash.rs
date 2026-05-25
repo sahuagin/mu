@@ -202,6 +202,8 @@ impl Tool for BashTool {
                  Output capped at 64KB (stdout+stderr). Default timeout 60s; override via timeout_secs (max 600). \
                  Exit code is reflected in is_error."
             ),
+            display: None,
+            when: None,
             policy,
             input_schema: json!({
                 "type": "object",

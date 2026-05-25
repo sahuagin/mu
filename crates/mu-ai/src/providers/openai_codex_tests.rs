@@ -262,6 +262,8 @@ fn b5_build_request_body_with_tools() {
             "required": ["path"],
         }),
         policy: Default::default(),
+    
+        ..Default::default()
     }];
     let body = build_request_body("gpt-5-codex", "medium", "sys", &messages, &tools);
     let api_tools = body["tools"].as_array().expect("tools array");
@@ -703,7 +705,11 @@ fn yqeq5_parity_pure_text_turn() {
         name: "noop".into(),
         description: "no-op".into(),
         input_schema: json!({"type": "object"}),
+        display: None,
+        when: None,
         policy: Default::default(),
+    
+        ..Default::default()
     };
     let messages = vec![
         AgentMessage::User {
@@ -734,6 +740,8 @@ fn yqeq5_parity_single_tool_call() {
             "properties": {"path": {"type": "string"}},
         }),
         policy: Default::default(),
+    
+        ..Default::default()
     };
     let messages = vec![
         AgentMessage::User {
@@ -818,7 +826,11 @@ fn yqeq5_parity_consecutive_tool_results() {
         name: "noop".into(),
         description: "no-op".into(),
         input_schema: json!({"type": "object"}),
+        display: None,
+        when: None,
         policy: Default::default(),
+    
+        ..Default::default()
     };
     parity_compare(None, &messages, &[dummy]);
 }
@@ -919,7 +931,11 @@ fn mu_2puu_projected_excludes_tool_schema_from_instructions() {
         name: "read".into(),
         description: "read a file".into(),
         input_schema: json!({"type": "object"}),
+        display: None,
+        when: None,
         policy: Default::default(),
+    
+        ..Default::default()
     }];
     let messages = vec![AgentMessage::User {
         content: "go".into(),
@@ -957,13 +973,21 @@ fn yqeq5_parity_system_prompt_plus_tools() {
             name: "read".into(),
             description: "read a file".into(),
             input_schema: json!({"type": "object"}),
+            display: None,
+            when: None,
             policy: Default::default(),
+        
+            ..Default::default()
         },
         ToolSpec {
             name: "bash".into(),
             description: "run shell".into(),
             input_schema: json!({"type": "object"}),
+            display: None,
+            when: None,
             policy: Default::default(),
+        
+            ..Default::default()
         },
     ];
     let messages = vec![AgentMessage::User {
@@ -1020,7 +1044,11 @@ fn yqeq5_thinking_blocks_are_skipped_in_projected_wire_output() {
         name: "noop".into(),
         description: "no-op".into(),
         input_schema: json!({"type": "object"}),
+        display: None,
+        when: None,
         policy: Default::default(),
+    
+        ..Default::default()
     };
     parity_compare(None, &messages, &[dummy]);
 }
@@ -1098,6 +1126,8 @@ mod live_tests {
                 "required": ["text"],
             }),
             policy: Default::default(),
+        
+            ..Default::default()
         };
 
         let messages = vec![AgentMessage::User {

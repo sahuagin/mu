@@ -19,6 +19,15 @@ pub struct ToolSpec {
     /// JSON Schema describing the arguments. The provider feeds this
     /// to the model.
     pub input_schema: Value,
+    /// Human-facing display name for /help, /status, TUI tool lists.
+    /// Falls back to `name` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+    /// Model-facing routing hint: when is this tool the right choice?
+    /// Injected into the tool routing index alongside `description`.
+    /// When absent, `description` serves both purposes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
     /// Runtime-enforced policy. Defaults to a benign "read-only,
     /// always allow, model decides retry" so legacy tools that don't
     /// override it keep working.
@@ -26,11 +35,20 @@ pub struct ToolSpec {
     pub policy: ToolPolicy,
 }
 
+impl Default for ToolSpec {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            input_schema: Value::Object(Default::default()),
+            display: None,
+            when: None,
+            policy: ToolPolicy::default(),
+        }
+    }
+}
+
 impl ToolSpec {
-    /// Convenience constructor for tools that are happy with the
-    /// default policy (ReadOnly + Allow + ModelDecides). Tools with
-    /// mutating side effects or custom retry posture should build
-    /// the struct directly and set `policy` explicitly.
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -40,8 +58,18 @@ impl ToolSpec {
             name: name.into(),
             description: description.into(),
             input_schema,
-            policy: ToolPolicy::default(),
+            ..Default::default()
         }
+    }
+
+    pub fn with_display(mut self, display: impl Into<String>) -> Self {
+        self.display = Some(display.into());
+        self
+    }
+
+    pub fn with_when(mut self, when: impl Into<String>) -> Self {
+        self.when = Some(when.into());
+        self
     }
 
     /// Builder method to attach a custom policy.
@@ -195,6 +223,8 @@ mod tests {
                 "required": ["text"]
             }),
             policy: ToolPolicy::default(),
+        
+            ..Default::default()
         };
 
         let value = serde_json::to_value(&spec)?;

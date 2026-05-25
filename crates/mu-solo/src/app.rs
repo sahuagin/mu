@@ -14,17 +14,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, KeyEventKind};
-use ratatui::backend::Backend;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
-use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde_json::Value;
 
 use crate::client::{Client, Message};
 use crate::input::InputBuffer;
 use crate::picker;
 use crate::render;
+use crate::viewport::DynamicViewport;
 
 /// Known providers offered by the `/provider` picker. Free-form
 /// `/provider <name>` also works for anything not on this list.
@@ -241,6 +240,7 @@ pub struct App {
     /// `emit_streaming` and the closer-emit path to pick the right
     /// label + color. None when no turn is in flight.
     streaming_route: Option<TurnRoute>,
+    bash_yolo: bool,
 }
 
 impl App {
@@ -339,16 +339,17 @@ impl App {
             actual_provider_kind: None,
             actual_model: None,
             renderer_mismatch_warned: false,
+            bash_yolo,
         })
     }
 
     /// Run the event loop. Returns Ok(()) on clean exit (user pressed q).
-    /// Owns the terminal so it can resize the inline viewport dynamically
-    /// as the prompt grows/shrinks.
-    pub fn run(
-        &mut self,
-        mut terminal: Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
-    ) -> Result<()> {
+    /// Uses DynamicViewport for grow/shrink prompt behavior.
+    pub fn run(&mut self) -> Result<()> {
+        let mut vp = DynamicViewport::new(VIEWPORT_HEIGHT)
+            .context("DynamicViewport::new")?;
+        vp.snap_to_bottom()?;
+
         // Initial banner — printed once into scrollback.
         let banner_lines = vec![
             Line::from(Span::styled(
@@ -365,7 +366,7 @@ impl App {
             )),
             Line::from(""),
         ];
-        terminal.insert_before(banner_lines.len() as u16, |buf| {
+        vp.insert_before(banner_lines.len() as u16, |buf| {
             let p = Paragraph::new(banner_lines).wrap(Wrap { trim: false });
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
@@ -375,69 +376,75 @@ impl App {
 
         loop {
             // Drain any notifications that arrived since the last tick.
-            self.drain_notifications(&mut terminal)?;
+            self.drain_notifications(&mut vp)?;
 
-            // Draw the inline viewport (status + input prompt).
-            terminal.draw(|f| {
-                let area = f.area();
-                let w = area.width as usize;
-                let vp_wrap = w.saturating_sub(4);
-                let vp_layout = self.prompt.visual_layout(vp_wrap);
-                let max_prompt_rows = (area.height as usize).saturating_sub(2);
-                let prompt_rows = vp_layout.lines.len().min(max_prompt_rows);
-                let skip = vp_layout.lines.len().saturating_sub(prompt_rows);
-                let mut lines: Vec<Line<'static>> = Vec::new();
-                // Separator line.
-                lines.push(Line::from(Span::styled(
-                    "─".repeat(w),
-                    Style::default().fg(Color::DarkGray),
-                )));
-                // Prompt lines — one per visual row.
-                for (display_idx, vline) in vp_layout.lines.iter().skip(skip).enumerate() {
-                    let row_idx = display_idx + skip;
-                    let prefix = if row_idx == 0 { " > " } else { "   " };
-                    let is_cursor_row = row_idx == vp_layout.cursor_row;
-                    if is_cursor_row {
-                        let before: String =
-                            vline.text.chars().take(vp_layout.cursor_col).collect();
-                        let after: String =
-                            vline.text.chars().skip(vp_layout.cursor_col).collect();
-                        let cursor_char = if after.is_empty() {
-                            " ".to_string()
-                        } else {
-                            after.chars().next().unwrap().to_string()
-                        };
-                        let rest: String = after.chars().skip(1).collect();
-                        lines.push(Line::from(vec![
-                            Span::styled(prefix.to_string(), Style::default().fg(Color::Cyan)),
-                            Span::raw(before),
-                            Span::styled(
-                                cursor_char,
-                                Style::default()
-                                    .fg(Color::Black)
-                                    .bg(Color::Cyan),
-                            ),
-                            Span::raw(rest),
-                        ]));
+            // Compute desired viewport height from prompt content.
+            let w = vp.area().width as usize;
+            let prompt_wrap_width = w.saturating_sub(4);
+            let layout = self.prompt.visual_layout(prompt_wrap_width);
+            let desired_height = (layout.lines.len() as u16 + 2) // +separator +status
+                .max(VIEWPORT_HEIGHT)
+                .min(MAX_VIEWPORT_HEIGHT);
+            if desired_height != vp.area().height {
+                vp.set_height(desired_height)?;
+            }
+
+            // Render the viewport (separator + prompt + status).
+            let area = vp.area();
+            let vp_w = area.width as usize;
+            let vp_wrap = vp_w.saturating_sub(4);
+            let vp_layout = self.prompt.visual_layout(vp_wrap);
+            let max_prompt_rows = (area.height as usize).saturating_sub(2);
+            let prompt_rows = vp_layout.lines.len().min(max_prompt_rows);
+            let skip = vp_layout.lines.len().saturating_sub(prompt_rows);
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            lines.push(Line::from(Span::styled(
+                "─".repeat(vp_w),
+                Style::default().fg(Color::DarkGray),
+            )));
+            for (display_idx, vline) in vp_layout.lines.iter().skip(skip).enumerate() {
+                let row_idx = display_idx + skip;
+                let prefix = if row_idx == 0 { " > " } else { "   " };
+                let is_cursor_row = row_idx == vp_layout.cursor_row;
+                if is_cursor_row {
+                    let before: String =
+                        vline.text.chars().take(vp_layout.cursor_col).collect();
+                    let after: String =
+                        vline.text.chars().skip(vp_layout.cursor_col).collect();
+                    let cursor_char = if after.is_empty() {
+                        " ".to_string()
                     } else {
-                        lines.push(Line::from(vec![
-                            Span::styled(prefix.to_string(), Style::default().fg(Color::Cyan)),
-                            Span::raw(vline.text.clone()),
-                        ]));
-                    }
+                        after.chars().next().unwrap().to_string()
+                    };
+                    let rest: String = after.chars().skip(1).collect();
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix.to_string(), Style::default().fg(Color::Cyan)),
+                        Span::raw(before),
+                        Span::styled(
+                            cursor_char,
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Cyan),
+                        ),
+                        Span::raw(rest),
+                    ]));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix.to_string(), Style::default().fg(Color::Cyan)),
+                        Span::raw(vline.text.clone()),
+                    ]));
                 }
-                // Blank fill if viewport has extra space
-                while lines.len() < (area.height as usize).saturating_sub(1) {
-                    lines.push(Line::from(""));
-                }
-                // Status footer.
-                lines.push(Line::from(Span::styled(
-                    self.status.clone(),
-                    Style::default().fg(Color::DarkGray),
-                )));
-                let p = Paragraph::new(lines);
-                f.render_widget(p, area);
-            })?;
+            }
+            while lines.len() < (area.height as usize).saturating_sub(1) {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(
+                self.status.clone(),
+                Style::default().fg(Color::DarkGray),
+            )));
+            let para = Paragraph::new(lines);
+            vp.render(para);
+            vp.flush()?;
 
             // Wait for input with a tick budget so notifications drain
             // even when the user isn't typing.
@@ -446,8 +453,8 @@ impl App {
             if event::poll(wait)? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if self.handle_key(&mut terminal, key)? {
-                            break; // user requested exit
+                        if self.handle_key(&mut vp, key)? {
+                            break;
                         }
                     }
                     Event::Paste(text) => {
@@ -465,13 +472,11 @@ impl App {
     }
 
     /// Handle one keypress. Returns Ok(true) to exit the loop.
-    fn handle_key<B: Backend>(
+    fn handle_key(
         &mut self,
-        terminal: &mut Terminal<B>,
+        vp: &mut DynamicViewport,
         key: KeyEvent,
     ) -> Result<bool>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
     {
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
@@ -479,7 +484,7 @@ impl App {
                     self.prompt.clear();
                 } else if self.streaming_header_open {
                     // Cancel in-flight turn
-                    self.cmd_cancel(terminal)?;
+                    self.cmd_cancel(vp)?;
                 } else {
                     return Ok(true);
                 }
@@ -490,6 +495,10 @@ impl App {
             // having Esc quit mu-solo turned that into an accidental
             // session kill. Quit paths are now: /q, /quit, Ctrl-C.
             (_, KeyCode::Esc) => {
+                self.prompt.clear();
+            }
+            // Kill line (Ctrl-U) — clear entire prompt
+            (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
                 self.prompt.clear();
             }
             // Word-wise movement (Alt+Left/Right) — must precede bare Left/Right
@@ -527,48 +536,48 @@ impl App {
                 match head {
                     "/q" | "/quit" | "/exit" if tail.is_empty() => return Ok(true),
                     "/status" if tail.is_empty() => {
-                        self.emit_status_lines(terminal)?;
+                        self.emit_status_lines(vp)?;
                         return Ok(false);
                     }
                     "/help" if tail.is_empty() => {
-                        self.emit_help_lines(terminal)?;
+                        self.emit_help_lines(vp)?;
                         return Ok(false);
                     }
                     "/effort" => {
-                        self.cmd_effort(terminal, tail)?;
+                        self.cmd_effort(vp, tail)?;
                         return Ok(false);
                     }
                     "/focus" => {
-                        self.cmd_focus(terminal, tail)?;
+                        self.cmd_focus(vp, tail)?;
                         return Ok(false);
                     }
                     "/btw" => {
-                        self.cmd_btw(terminal, tail)?;
+                        self.cmd_btw(vp, tail)?;
                         return Ok(false);
                     }
                     "/provider" => {
-                        self.cmd_provider(terminal, tail)?;
+                        self.cmd_provider(vp, tail)?;
                         return Ok(false);
                     }
                     "/model" => {
-                        self.cmd_model(terminal, tail)?;
+                        self.cmd_model(vp, tail)?;
                         return Ok(false);
                     }
                     "/cancel" if tail.is_empty() => {
-                        self.cmd_cancel(terminal)?;
+                        self.cmd_cancel(vp)?;
                         return Ok(false);
                     }
                     "/clear" if tail.is_empty() => {
-                        self.cmd_clear(terminal)?;
+                        self.cmd_clear(vp)?;
                         return Ok(false);
                     }
                     _ if head.starts_with('/') => {
-                        self.emit_unknown_command(terminal, head)?;
+                        self.emit_unknown_command(vp, head)?;
                         return Ok(false);
                     }
                     _ => {}
                 }
-                self.send_prompt(terminal, trimmed)?;
+                self.send_prompt(vp, trimmed)?;
             }
             _ => {}
         }
@@ -577,25 +586,28 @@ impl App {
 
     /// Send a user prompt: emit the "you" block to scrollback, then
     /// fire `session.ask`.
-    fn send_prompt<B: Backend>(
+    fn send_prompt(
         &mut self,
-        terminal: &mut Terminal<B>,
+        vp: &mut DynamicViewport,
         text: &str,
     ) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
     {
-        let width = terminal.size()?.width as usize;
+        // Clear the viewport so the raw prompt text doesn't persist
+        // as a ghost in scrollback after push-down.
+        vp.clear_viewport()?;
+
+        let width = vp.area().width as usize;
         let wrap_width = width.saturating_sub(2);
         let lines = render::you_block(text, wrap_width);
         let height = lines.len() as u16;
-        terminal.insert_before(height, |buf| {
-            // No .wrap() — block_lines already pre-wrapped to a
-            // budget that includes safety gutter; double-wrap loses
-            // the "│ " prefix on continuation rows.
+        vp.insert_before(height, |buf| {
             let p = Paragraph::new(lines);
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
+
+        // Snap viewport to bottom so streaming inserts don't trigger
+        // push-downs (which create blank line gaps).
+        vp.snap_to_bottom()?;
 
         // Reset per-turn streaming state.
         self.streaming_text.clear();
@@ -625,13 +637,11 @@ impl App {
     ///
     /// v0 constraint: only one in-flight turn at a time across both
     /// routes. If main is streaming, /btw refuses with a hint to wait.
-    fn cmd_btw<B: Backend>(
+    fn cmd_btw(
         &mut self,
-        terminal: &mut Terminal<B>,
+        vp: &mut DynamicViewport,
         msg: &str,
     ) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
     {
         if msg.is_empty() {
             let lines: Vec<Line<'static>> = vec![
@@ -645,7 +655,7 @@ impl App {
                 Line::from(""),
             ];
             let h = lines.len() as u16;
-            terminal.insert_before(h, |buf| {
+            vp.insert_before(h, |buf| {
                 let p = Paragraph::new(lines);
                 ratatui::widgets::Widget::render(p, buf.area, buf);
             })?;
@@ -662,7 +672,7 @@ impl App {
                 Line::from(""),
             ];
             let h = lines.len() as u16;
-            terminal.insert_before(h, |buf| {
+            vp.insert_before(h, |buf| {
                 let p = Paragraph::new(lines);
                 ratatui::widgets::Widget::render(p, buf.area, buf);
             })?;
@@ -701,7 +711,7 @@ impl App {
 
         // Emit a "you ⋅ btw" block in magenta so it's visually
         // distinct from the main cyan "you" blocks.
-        let width = terminal.size()?.width as usize;
+        let width = vp.area().width as usize;
         let wrap_width = width.saturating_sub(2);
         let route = TurnRoute::Btw;
         let lines = render::block_lines(
@@ -711,7 +721,7 @@ impl App {
             wrap_width,
         );
         let h = lines.len() as u16;
-        terminal.insert_before(h, |buf| {
+        vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
@@ -736,9 +746,7 @@ impl App {
     /// /status — print provider, model, session_id, daemon_id, version
     /// to scrollback. Lets the operator find the daemon's events
     /// directory: ~/.local/share/mu/events/{daemon_id}/session-N.jsonl
-    fn emit_status_lines<B: Backend>(&self, terminal: &mut Terminal<B>) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
+    fn emit_status_lines(&self, vp: &mut DynamicViewport) -> Result<()>
     {
         let lines: Vec<Line<'static>> = vec![
             Line::from(""),
@@ -788,7 +796,7 @@ impl App {
             Line::from(""),
         ];
         let h = lines.len() as u16;
-        terminal.insert_before(h, |buf| {
+        vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
@@ -800,13 +808,11 @@ impl App {
     /// `/effort <level>` sets it. v0 is display-only — the value
     /// surfaces in /status and the banner; once the daemon learns
     /// an effort field on `ask_session`, it will attach here.
-    fn cmd_effort<B: Backend>(
+    fn cmd_effort(
         &mut self,
-        terminal: &mut Terminal<B>,
+        vp: &mut DynamicViewport,
         arg: &str,
     ) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
     {
         let lines: Vec<Line<'static>> = if arg.is_empty() {
             let choices: Vec<String> = EffortLevel::ALL
@@ -850,7 +856,7 @@ impl App {
             ]
         };
         let h = lines.len() as u16;
-        terminal.insert_before(h, |buf| {
+        vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
@@ -862,13 +868,11 @@ impl App {
     /// When on, only the finalized assistant block lands in
     /// scrollback — useful for long autonomous runs where you don't
     /// want to scroll past partial chunks.
-    fn cmd_focus<B: Backend>(
+    fn cmd_focus(
         &mut self,
-        terminal: &mut Terminal<B>,
+        vp: &mut DynamicViewport,
         arg: &str,
     ) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
     {
         let new_value = match arg.trim().to_lowercase().as_str() {
             "" | "toggle" => !self.focus_mode,
@@ -885,7 +889,7 @@ impl App {
                     Line::from(""),
                 ];
                 let h = lines.len() as u16;
-                terminal.insert_before(h, |buf| {
+                vp.insert_before(h, |buf| {
                     let p = Paragraph::new(lines);
                     ratatui::widgets::Widget::render(p, buf.area, buf);
                 })?;
@@ -902,7 +906,7 @@ impl App {
             Line::from(""),
         ];
         let h = lines.len() as u16;
-        terminal.insert_before(h, |buf| {
+        vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
@@ -919,13 +923,11 @@ impl App {
     /// bound to its original provider — there's no session.switch_provider
     /// RPC yet, so live-switch isn't wired. The new value DOES take
     /// effect for future /btw sidecars and for the next process restart.
-    fn cmd_provider<B: Backend>(
+    fn cmd_provider(
         &mut self,
-        terminal: &mut Terminal<B>,
+        vp: &mut DynamicViewport,
         arg: &str,
     ) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
     {
         let new_provider = if arg.is_empty() {
             let items: Vec<String> =
@@ -970,7 +972,7 @@ impl App {
             ]
         };
         let h = lines.len() as u16;
-        terminal.insert_before(h, |buf| {
+        vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
@@ -982,13 +984,11 @@ impl App {
     /// <name>` sets directly. Same stub-first semantics as /provider:
     /// updates App state, applies to new sessions; the current main
     /// session keeps its bound model.
-    fn cmd_model<B: Backend>(
+    fn cmd_model(
         &mut self,
-        terminal: &mut Terminal<B>,
+        vp: &mut DynamicViewport,
         arg: &str,
     ) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
     {
         let new_model = if arg.is_empty() {
             let known = known_models_for(&self.provider);
@@ -1005,7 +1005,7 @@ impl App {
                     Line::from(""),
                 ];
                 let h = lines.len() as u16;
-                terminal.insert_before(h, |buf| {
+                vp.insert_before(h, |buf| {
                     let p = Paragraph::new(lines);
                     ratatui::widgets::Widget::render(p, buf.area, buf);
                 })?;
@@ -1056,7 +1056,7 @@ impl App {
             ]
         };
         let h = lines.len() as u16;
-        terminal.insert_before(h, |buf| {
+        vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
@@ -1069,9 +1069,7 @@ impl App {
     /// /btw sidecar) so cancelling a side question doesn't kill the
     /// main turn or vice versa. Idempotent — if nothing is in flight,
     /// the daemon returns `canceled: false` and we say so.
-    fn cmd_cancel<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
+    fn cmd_cancel(&mut self, vp: &mut DynamicViewport) -> Result<()>
     {
         // Pick the session whose turn is currently streaming. Fall
         // back to the main session if nothing is in flight — the
@@ -1126,7 +1124,7 @@ impl App {
             ]
         };
         let h = lines.len() as u16;
-        terminal.insert_before(h, |buf| {
+        vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
@@ -1136,24 +1134,20 @@ impl App {
     /// /clear — clear the visible scrollback. Doesn't touch the
     /// daemon's event log; this is a display-only reset. The inline
     /// viewport redraws on the next tick.
-    fn cmd_clear<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
+    fn cmd_clear(&mut self, _vp: &mut DynamicViewport) -> Result<()>
     {
-        terminal.clear()?;
+        // TODO: implement viewport clear
         Ok(())
     }
 
     /// Unknown-command stub. Keeps typos from getting sent to the
     /// model as a prompt (which would burn tokens and confuse the
     /// session). Mirrors claude-code's "Unknown slash command" hint.
-    fn emit_unknown_command<B: Backend>(
+    fn emit_unknown_command(
         &self,
-        terminal: &mut Terminal<B>,
+        vp: &mut DynamicViewport,
         head: &str,
     ) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
     {
         let lines: Vec<Line<'static>> = vec![
             Line::from(""),
@@ -1165,7 +1159,7 @@ impl App {
             Line::from(""),
         ];
         let h = lines.len() as u16;
-        terminal.insert_before(h, |buf| {
+        vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
@@ -1173,9 +1167,7 @@ impl App {
     }
 
     /// /help — print the built-in command surface to scrollback.
-    fn emit_help_lines<B: Backend>(&self, terminal: &mut Terminal<B>) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
+    fn emit_help_lines(&self, vp: &mut DynamicViewport) -> Result<()>
     {
         let lines: Vec<Line<'static>> = vec![
             Line::from(""),
@@ -1203,7 +1195,7 @@ impl App {
             Line::from(""),
         ];
         let h = lines.len() as u16;
-        terminal.insert_before(h, |buf| {
+        vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
@@ -1213,24 +1205,22 @@ impl App {
     /// Pull every queued notification, accumulate streaming_text,
     /// emit incremental preview lines via `insert_before`, and handle
     /// session.done / session.error to close the block.
-    fn drain_notifications<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
+    fn drain_notifications(&mut self, vp: &mut DynamicViewport) -> Result<()>
     {
         while let Some(msg) = self.client.try_recv_notification() {
             match msg {
                 Message::Notification { method, params } => {
-                    self.handle_notification(terminal, &method, &params)?;
+                    self.handle_notification(vp, &method, &params)?;
                 }
                 Message::Eof => {
-                    let width = terminal.size()?.width as usize;
+                    let width = vp.area().width as usize;
                     let wrap = width.saturating_sub(2);
                     let lines = render::error_block(
                         "mu serve closed stdout — daemon exited",
                         wrap,
                     );
                     let h = lines.len() as u16;
-                    terminal.insert_before(h, |buf| {
+                    vp.insert_before(h, |buf| {
                         // No .wrap() — pre-wrapped by block_lines.
                         let p = Paragraph::new(lines);
                         ratatui::widgets::Widget::render(p, buf.area, buf);
@@ -1238,11 +1228,11 @@ impl App {
                     anyhow::bail!("daemon exited unexpectedly");
                 }
                 Message::ReaderError(e) => {
-                    let width = terminal.size()?.width as usize;
+                    let width = vp.area().width as usize;
                     let wrap = width.saturating_sub(2);
                     let lines = render::error_block(&format!("reader error: {e}"), wrap);
                     let h = lines.len() as u16;
-                    terminal.insert_before(h, |buf| {
+                    vp.insert_before(h, |buf| {
                         // No .wrap() — pre-wrapped by block_lines.
                         let p = Paragraph::new(lines);
                         ratatui::widgets::Widget::render(p, buf.area, buf);
@@ -1256,7 +1246,7 @@ impl App {
         // matches the route owning the current turn (white for main,
         // magenta for /btw).
         if self.pending_close && self.streaming_header_open {
-            let width = terminal.size()?.width as usize;
+            let width = vp.area().width as usize;
             let wrap_width = width.saturating_sub(2);
             let route = self.streaming_route.unwrap_or(TurnRoute::Main);
             // Flush any trailing chars past the last newline.
@@ -1267,14 +1257,14 @@ impl App {
                     .chars()
                     .skip(self.streaming_chars_emitted)
                     .collect();
-                emit_body_chunk(terminal, &remaining, wrap_width, route.color())?;
+                emit_body_chunk(vp, &remaining, wrap_width, route.color())?;
             }
             // Closer.
             let closer = Line::from(Span::styled(
                 "└─".to_string(),
                 Style::default().fg(route.color()),
             ));
-            terminal.insert_before(2, |buf| {
+            vp.insert_before(2, |buf| {
                 let lines = vec![closer, Line::from("")];
                 let p = Paragraph::new(lines);
                 ratatui::widgets::Widget::render(p, buf.area, buf);
@@ -1294,14 +1284,12 @@ impl App {
     }
 
     /// Dispatch a single notification.
-    fn handle_notification<B: Backend>(
+    fn handle_notification(
         &mut self,
-        terminal: &mut Terminal<B>,
+        vp: &mut DynamicViewport,
         method: &str,
         params: &Value,
     ) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
     {
         // Route notifications to the right turn (main vs sidecar /btw).
         // Notifications without a session_id (rare; some daemon
@@ -1317,7 +1305,7 @@ impl App {
                 return Ok(());
             }
         }
-        let width = terminal.size()?.width as usize;
+        let width = vp.area().width as usize;
         let wrap_width = width.saturating_sub(2);
         match method {
             "session.text_delta" => {
@@ -1329,7 +1317,7 @@ impl App {
                 // Focus mode (§16): accumulate silently; the finalized
                 // event renders the whole block in one shot below.
                 if !self.focus_mode {
-                    self.emit_streaming(terminal, wrap_width)?;
+                    self.emit_streaming(vp, wrap_width)?;
                 }
             }
             "session.assistant_text_finalized" => {
@@ -1355,7 +1343,7 @@ impl App {
                             wrap_width,
                         );
                         let h = lines.len() as u16;
-                        terminal.insert_before(h, |buf| {
+                        vp.insert_before(h, |buf| {
                             let p = Paragraph::new(lines);
                             ratatui::widgets::Widget::render(p, buf.area, buf);
                         })?;
@@ -1367,7 +1355,7 @@ impl App {
                     self.streaming_route = None;
                 } else {
                     if !self.streaming_text.is_empty() {
-                        self.emit_streaming(terminal, wrap_width)?;
+                        self.emit_streaming(vp, wrap_width)?;
                     }
                     // In agent loops this fires per-invocation. Trigger
                     // the close so the block lands in scrollback before
@@ -1378,10 +1366,10 @@ impl App {
                 }
             }
             "session.tool_call_started" => {
-                self.emit_tool_call_started(terminal, params, wrap_width)?;
+                self.emit_tool_call_started(vp, params, wrap_width)?;
             }
             "session.tool_call_completed" => {
-                self.emit_tool_call_completed(terminal, params, wrap_width)?;
+                self.emit_tool_call_completed(vp, params, wrap_width)?;
             }
             "session.done" | "session.error" => {
                 // One-shot renderer-mismatch diagnostic: after the
@@ -1392,7 +1380,7 @@ impl App {
                 if self.actual_renderer.is_none() {
                     self.try_load_actual_renderer();
                     if self.is_renderer_mismatch() && !self.renderer_mismatch_warned {
-                        self.emit_renderer_mismatch_warning(terminal)?;
+                        self.emit_renderer_mismatch_warning(vp)?;
                         self.renderer_mismatch_warned = true;
                     }
                 }
@@ -1416,7 +1404,7 @@ impl App {
                     // turn it killed. Otherwise the close happens
                     // silently and the error is invisible.
                     if let Some(msg) = error_msg.as_deref() {
-                        self.emit_inline_error(terminal, msg, wrap_width)?;
+                        self.emit_inline_error(vp, msg, wrap_width)?;
                     }
                     self.pending_close = true;
                 } else {
@@ -1456,7 +1444,7 @@ impl App {
                         ]
                     };
                     let h = lines.len() as u16;
-                    terminal.insert_before(h, |buf| {
+                    vp.insert_before(h, |buf| {
                         let p = Paragraph::new(lines);
                         ratatui::widgets::Widget::render(p, buf.area, buf);
                     })?;
@@ -1535,12 +1523,10 @@ impl App {
     /// Yellow warning block emitted once after a faux-fallback
     /// detection. Tells the operator what was asked vs. what's
     /// actually running and points at the most likely fix.
-    fn emit_renderer_mismatch_warning<B: Backend>(
+    fn emit_renderer_mismatch_warning(
         &self,
-        terminal: &mut Terminal<B>,
+        vp: &mut DynamicViewport,
     ) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
     {
         let lines: Vec<Line<'static>> = vec![
             Line::from(""),
@@ -1579,7 +1565,7 @@ impl App {
             Line::from(""),
         ];
         let h = lines.len() as u16;
-        terminal.insert_before(h, |buf| {
+        vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
@@ -1592,12 +1578,10 @@ impl App {
     /// still produces a header + closer pair in scrollback. Header
     /// color and label come from `streaming_route` so /btw turns get
     /// magenta "assistant ⋅ btw" framing.
-    fn ensure_streaming_header_open<B: Backend>(
+    fn ensure_streaming_header_open(
         &mut self,
-        terminal: &mut Terminal<B>,
+        vp: &mut DynamicViewport,
     ) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
     {
         if self.streaming_header_open {
             return Ok(());
@@ -1609,7 +1593,7 @@ impl App {
                 .fg(route.color())
                 .add_modifier(Modifier::BOLD),
         ));
-        terminal.insert_before(1, |buf| {
+        vp.insert_before(1, |buf| {
             ratatui::widgets::Widget::render(Paragraph::new(header), buf.area, buf);
         })?;
         self.streaming_header_open = true;
@@ -1623,14 +1607,12 @@ impl App {
     ///
     /// Extracts the "primary arg" per tool type: `command` for bash,
     /// `file_path`/`path` for read/write/edit, `pattern` for grep.
-    fn emit_tool_call_started<B: Backend>(
+    fn emit_tool_call_started(
         &mut self,
-        terminal: &mut Terminal<B>,
+        vp: &mut DynamicViewport,
         params: &Value,
         wrap_width: usize,
     ) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
     {
         let name = params
             .get("tool_name")
@@ -1651,7 +1633,7 @@ impl App {
             };
             format!("● {display_name}({truncated})")
         };
-        self.ensure_streaming_header_open(terminal)?;
+        self.ensure_streaming_header_open(vp)?;
         let route = self.streaming_route.unwrap_or(TurnRoute::Main);
         let line = Line::from(vec![
             Span::styled("│ ", Style::default().fg(route.color())),
@@ -1660,7 +1642,7 @@ impl App {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
         ]);
-        terminal.insert_before(1, |buf| {
+        vp.insert_before(1, |buf| {
             ratatui::widgets::Widget::render(Paragraph::new(line), buf.area, buf);
         })?;
         Ok(())
@@ -1672,14 +1654,12 @@ impl App {
     /// turn just ends silently and you have to grep the events JSONL
     /// to find out (e.g. "google/gemini-pro is not a valid model ID"
     /// for a /btw with a stale picker entry).
-    fn emit_inline_error<B: Backend>(
+    fn emit_inline_error(
         &self,
-        terminal: &mut Terminal<B>,
+        vp: &mut DynamicViewport,
         msg: &str,
         _wrap_width: usize,
     ) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
     {
         let route = self.streaming_route.unwrap_or(TurnRoute::Main);
         // Truncate to keep the scrollback usable. Full message lives
@@ -1693,7 +1673,7 @@ impl App {
             ),
             Span::styled(short, Style::default().fg(Color::Red)),
         ]);
-        terminal.insert_before(1, |buf| {
+        vp.insert_before(1, |buf| {
             ratatui::widgets::Widget::render(Paragraph::new(line), buf.area, buf);
         })?;
         Ok(())
@@ -1708,16 +1688,14 @@ impl App {
     ///     │      … +N lines
     ///
     /// On error, shows the error message in red instead.
-    fn emit_tool_call_completed<B: Backend>(
+    fn emit_tool_call_completed(
         &mut self,
-        terminal: &mut Terminal<B>,
+        vp: &mut DynamicViewport,
         params: &Value,
         wrap_width: usize,
     ) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
     {
-        const PREVIEW_LINES: usize = 4;
+        let preview_lines: usize = if self.bash_yolo { 15 } else { 4 };
 
         let outcome = params.get("outcome");
         let kind = outcome
@@ -1725,7 +1703,7 @@ impl App {
             .and_then(|v| v.as_str())
             .unwrap_or("?");
 
-        self.ensure_streaming_header_open(terminal)?;
+        self.ensure_streaming_header_open(vp)?;
         let route = self.streaming_route.unwrap_or(TurnRoute::Main);
         let bar_style = Style::default().fg(route.color());
         let indent = "│   ";
@@ -1744,13 +1722,13 @@ impl App {
                             Style::default().fg(Color::DarkGray),
                         ),
                     ]);
-                    terminal.insert_before(1, |buf| {
+                    vp.insert_before(1, |buf| {
                         ratatui::widgets::Widget::render(Paragraph::new(line), buf.area, buf);
                     })?;
                 } else {
                     let all_lines: Vec<&str> = result_text.lines().collect();
                     let total = all_lines.len();
-                    let show = total.min(PREVIEW_LINES);
+                    let show = total.min(preview_lines);
                     let max_line_width = wrap_width.saturating_sub(8); // indent + connector
                     let mut output_lines: Vec<Line<'static>> = Vec::new();
                     for (i, &text_line) in all_lines.iter().take(show).enumerate() {
@@ -1760,10 +1738,16 @@ impl App {
                         } else {
                             format!("{indent}   ")
                         };
-                        output_lines.push(Line::from(vec![
-                            Span::styled(prefix, bar_style),
-                            Span::raw(truncated),
-                        ]));
+                        // Parse ANSI escape codes into styled spans
+                        use ansi_to_tui::IntoText;
+                        let styled_line = truncated.into_text().ok()
+                            .and_then(|text| text.into_iter().next())
+                            .unwrap_or_else(|| Line::raw(truncated.clone()));
+                        let mut spans: Vec<Span<'static>> = vec![Span::styled(prefix, bar_style)];
+                        for span in styled_line.spans {
+                            spans.push(span);
+                        }
+                        output_lines.push(Line::from(spans));
                     }
                     if total > show {
                         let remaining = total - show;
@@ -1776,7 +1760,7 @@ impl App {
                         ]));
                     }
                     let h = output_lines.len() as u16;
-                    terminal.insert_before(h, |buf| {
+                    vp.insert_before(h, |buf| {
                         let p = Paragraph::new(output_lines);
                         ratatui::widgets::Widget::render(p, buf.area, buf);
                     })?;
@@ -1789,7 +1773,7 @@ impl App {
                     .unwrap_or("(unknown error)");
                 let all_lines: Vec<&str> = msg.lines().collect();
                 let total = all_lines.len();
-                let show = total.min(PREVIEW_LINES);
+                let show = total.min(preview_lines);
                 let max_line_width = wrap_width.saturating_sub(8);
                 let mut output_lines: Vec<Line<'static>> = Vec::new();
                 for (i, &text_line) in all_lines.iter().take(show).enumerate() {
@@ -1815,7 +1799,7 @@ impl App {
                     ]));
                 }
                 let h = output_lines.len() as u16;
-                terminal.insert_before(h, |buf| {
+                vp.insert_before(h, |buf| {
                     let p = Paragraph::new(output_lines);
                     ratatui::widgets::Widget::render(p, buf.area, buf);
                 })?;
@@ -1828,7 +1812,7 @@ impl App {
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]);
-                terminal.insert_before(1, |buf| {
+                vp.insert_before(1, |buf| {
                     ratatui::widgets::Widget::render(Paragraph::new(line), buf.area, buf);
                 })?;
             }
@@ -1840,18 +1824,16 @@ impl App {
     /// lines up to the last `\n`. Mid-line trailing content stays
     /// buffered until the next newline or until pending_close flushes
     /// it.
-    fn emit_streaming<B: Backend>(
+    fn emit_streaming(
         &mut self,
-        terminal: &mut Terminal<B>,
+        vp: &mut DynamicViewport,
         wrap_width: usize,
     ) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
     {
         if self.streaming_text.is_empty() {
             return Ok(());
         }
-        self.ensure_streaming_header_open(terminal)?;
+        self.ensure_streaming_header_open(vp)?;
         let route = self.streaming_route.unwrap_or(TurnRoute::Main);
         // Emit any new chars up to the last newline.
         let safe_byte_end = self
@@ -1868,7 +1850,7 @@ impl App {
                     .skip(self.streaming_chars_emitted)
                     .take(safe_chars - self.streaming_chars_emitted)
                     .collect();
-                emit_body_chunk(terminal, &chunk, wrap_width, route.color())?;
+                emit_body_chunk(vp, &chunk, wrap_width, route.color())?;
                 self.streaming_chars_emitted = safe_chars;
             }
         }
@@ -1876,14 +1858,12 @@ impl App {
     }
 }
 
-fn emit_body_chunk<B: Backend>(
-    terminal: &mut Terminal<B>,
+fn emit_body_chunk(
+    vp: &mut DynamicViewport,
     body: &str,
     wrap_width: usize,
     color: Color,
 ) -> Result<()>
-where
-    B::Error: std::error::Error + Send + Sync + 'static,
 {
     // Budget: wrap_width is already (terminal_width - 2). Reserve 2
     // more for the "│ " prefix AND 2 more as a safety gutter so the
@@ -1905,7 +1885,7 @@ where
         return Ok(());
     }
     let h = lines.len() as u16;
-    terminal.insert_before(h, |buf| {
+    vp.insert_before(h, |buf| {
         // No Wrap option — we pre-wrapped above. Adding ratatui's
         // wrap on top would re-wrap continuations and lose the "│ "
         // prefix on the new visual rows (same hazard mu-tui's
@@ -1984,20 +1964,7 @@ fn titlecase_tool(name: &str) -> String {
     }
 }
 
-/// Viewport height (separator + 3 prompt lines + status).
+/// Initial viewport height (separator + 3 prompt lines + status).
 const VIEWPORT_HEIGHT: u16 = 5;
-
-pub fn make_inline_terminal(
-) -> Result<Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>> {
-    make_inline_terminal_with_height(VIEWPORT_HEIGHT)
-}
-
-pub fn make_inline_terminal_with_height(
-    height: u16,
-) -> Result<Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>> {
-    let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
-    let opts = TerminalOptions {
-        viewport: Viewport::Inline(height),
-    };
-    Terminal::with_options(backend, opts).context("terminal init")
-}
+/// Maximum viewport height — cap to prevent eating the entire screen.
+const MAX_VIEWPORT_HEIGHT: u16 = 20;

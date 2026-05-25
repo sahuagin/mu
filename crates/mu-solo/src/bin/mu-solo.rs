@@ -11,7 +11,7 @@ use clap::Parser;
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use mu_solo::app::{make_inline_terminal, App};
+use mu_solo::app::App;
 use mu_solo::config::{self, CliOverrides};
 
 /// CLI flags. Every override flag is Optional so we can distinguish
@@ -116,12 +116,11 @@ fn main() -> Result<()> {
     )
     .context("App::new failed (is the mu binary path correct?)")?;
 
-    // Enter raw mode + bracketed paste for ratatui inline rendering.
+    // Enter raw mode + bracketed paste for inline rendering.
     enable_raw_mode().context("enable_raw_mode")?;
     execute!(std::io::stdout(), EnableBracketedPaste)?;
-    let terminal = make_inline_terminal()?;
 
-    let run_result = app.run(terminal);
+    let run_result = app.run();
 
     // Always restore the terminal, even on error.
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);

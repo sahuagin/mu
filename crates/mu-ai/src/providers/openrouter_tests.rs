@@ -2,7 +2,7 @@ use super::*;
 use bytes::Bytes;
 use futures::StreamExt;
 use mu_core::agent::{
-    AgentMessage, AssistantMessage, ContentBlock, MessageInput, StopReason, ToolCall,
+    AgentMessage, AssistantMessage, ContentBlock, MessageInput, StopReason, ToolArgs, ToolCall,
 };
 use serde_json::json;
 
@@ -40,7 +40,7 @@ fn b3_translate_assistant_with_tool_call() {
             ContentBlock::ToolCall(ToolCall {
                 id: "call_x".into(),
                 name: "read".into(),
-                arguments: json!({"path": "/tmp/foo"}),
+                arguments: ToolArgs::new(json!({"path": "/tmp/foo"})).unwrap(),
             }),
         ],
         stop_reason: StopReason::ToolUse,
@@ -228,7 +228,15 @@ fn parity_compare(
 
 #[test]
 fn yqeq6_parity_pure_text_turn() {
-    // User → Assistant text. No tools, no system, no tool calls.
+    // User → Assistant text, no tool calls. Dummy tool supplied so
+    // mu-0q44's no-tools clause doesn't fire (intentional Legacy vs
+    // Projected divergence when tools is empty).
+    let dummy = mu_core::agent::ToolSpec {
+        name: "noop".into(),
+        description: "no-op".into(),
+        input_schema: json!({"type": "object"}),
+        policy: Default::default(),
+    };
     let messages = vec![
         AgentMessage::User {
             content: "hi".into(),
@@ -241,7 +249,7 @@ fn yqeq6_parity_pure_text_turn() {
             usage: None,
         }),
     ];
-    parity_compare(None, &messages, &[]);
+    parity_compare(None, &messages, &[dummy]);
 }
 
 #[test]
@@ -271,7 +279,7 @@ fn yqeq6_parity_single_tool_call() {
                 ContentBlock::ToolCall(ToolCall {
                     id: "call_42".into(),
                     name: "read".into(),
-                    arguments: json!({"path": "/tmp/x"}),
+                    arguments: ToolArgs::new(json!({"path": "/tmp/x"})).unwrap(),
                 }),
             ],
             stop_reason: StopReason::ToolUse,
@@ -305,17 +313,17 @@ fn yqeq6_parity_consecutive_tool_results() {
                 ContentBlock::ToolCall(ToolCall {
                     id: "call_1".into(),
                     name: "read".into(),
-                    arguments: json!({"path": "/a"}),
+                    arguments: ToolArgs::new(json!({"path": "/a"})).unwrap(),
                 }),
                 ContentBlock::ToolCall(ToolCall {
                     id: "call_2".into(),
                     name: "read".into(),
-                    arguments: json!({"path": "/b"}),
+                    arguments: ToolArgs::new(json!({"path": "/b"})).unwrap(),
                 }),
                 ContentBlock::ToolCall(ToolCall {
                     id: "call_3".into(),
                     name: "read".into(),
-                    arguments: json!({"path": "/c"}),
+                    arguments: ToolArgs::new(json!({"path": "/c"})).unwrap(),
                 }),
             ],
             stop_reason: StopReason::ToolUse,
@@ -337,7 +345,14 @@ fn yqeq6_parity_consecutive_tool_results() {
             is_error: false,
         },
     ];
-    parity_compare(None, &messages, &[]);
+    // Dummy tool: mu-0q44's no-tools clause diverges Legacy vs Projected.
+    let dummy = mu_core::agent::ToolSpec {
+        name: "noop".into(),
+        description: "no-op".into(),
+        input_schema: json!({"type": "object"}),
+        policy: Default::default(),
+    };
+    parity_compare(None, &messages, &[dummy]);
 }
 
 #[test]
@@ -519,8 +534,15 @@ fn yqeq6_thinking_blocks_are_skipped_in_projected_wire_output() {
         "non-thinking text was lost: {wire}",
     );
 
-    // Also: parity vs Legacy (which also strips thinking).
-    parity_compare(None, &messages, &[]);
+    // Also: parity vs Legacy (which also strips thinking). Dummy tool
+    // avoids mu-0q44 no-tools clause divergence.
+    let dummy = mu_core::agent::ToolSpec {
+        name: "noop".into(),
+        description: "no-op".into(),
+        input_schema: json!({"type": "object"}),
+        policy: Default::default(),
+    };
+    parity_compare(None, &messages, &[dummy]);
 }
 
 /// Helper: build a stream from raw SSE bytes for tests.
@@ -633,7 +655,7 @@ async fn b8_sse_tool_call_accumulation() {
         ContentBlock::ToolCall(tc) => {
             assert_eq!(tc.id, "call_a");
             assert_eq!(tc.name, "read");
-            assert_eq!(tc.arguments["path"], "/tmp/foo");
+            assert_eq!(tc.arguments.as_value()["path"], "/tmp/foo");
         }
         other => panic!("expected ToolCall, got {other:?}"),
     }
@@ -677,7 +699,7 @@ async fn b9_sse_mixed_text_and_tool_call() {
         ContentBlock::ToolCall(tc) => {
             assert_eq!(tc.id, "call_b");
             assert_eq!(tc.name, "read");
-            assert_eq!(tc.arguments["path"], "/x");
+            assert_eq!(tc.arguments.as_value()["path"], "/x");
         }
         other => panic!("expected ToolCall, got {other:?}"),
     }
@@ -711,8 +733,8 @@ async fn b10_malformed_tool_args_yield_empty_object() {
     };
     match &done.content[0] {
         ContentBlock::ToolCall(tc) => {
-            assert!(tc.arguments.is_object());
-            assert_eq!(tc.arguments.as_object().unwrap().len(), 0);
+            assert!(tc.arguments.as_value().is_object());
+            assert_eq!(tc.arguments.as_value().as_object().unwrap().len(), 0);
         }
         _ => panic!("expected ToolCall"),
     }
@@ -838,8 +860,10 @@ mod live_tests {
             .expect("expected at least one ToolCall");
 
         assert_eq!(tool_call.name, "echo");
-        assert!(tool_call.arguments.is_object());
-        let text_arg = tool_call.arguments["text"].as_str().unwrap_or("");
+        assert!(tool_call.arguments.as_value().is_object());
+        let text_arg = tool_call.arguments.as_value()["text"]
+            .as_str()
+            .unwrap_or("");
         assert!(
             text_arg.to_lowercase().contains("hi"),
             "expected text arg to contain 'hi', got: {text_arg:?}"

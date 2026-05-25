@@ -3,7 +3,8 @@ use base64::Engine;
 use bytes::Bytes;
 use futures::StreamExt;
 use mu_core::agent::{
-    AgentMessage, AssistantMessage, ContentBlock, MessageInput, StopReason, ToolCall, ToolSpec,
+    AgentMessage, AssistantMessage, ContentBlock, MessageInput, StopReason, ToolArgs, ToolCall,
+    ToolSpec,
 };
 use serde_json::json;
 use std::pin::Pin;
@@ -190,7 +191,9 @@ fn instructions_under_cap_unchanged() {
         "gpt-5-codex",
         "medium",
         short,
-        &[AgentMessage::User { content: "hi".into() }],
+        &[AgentMessage::User {
+            content: "hi".into(),
+        }],
         &[],
     );
     assert_eq!(body["instructions"], short);
@@ -213,7 +216,9 @@ fn instructions_over_cap_moved_to_input() {
         "gpt-5-codex",
         "medium",
         &huge,
-        &[AgentMessage::User { content: "hi".into() }],
+        &[AgentMessage::User {
+            content: "hi".into(),
+        }],
         &[],
     );
 
@@ -281,7 +286,7 @@ fn b5_translate_assistant_with_tool_call_produces_two_items() {
             ContentBlock::ToolCall(ToolCall {
                 id: "call_x".into(),
                 name: "read".into(),
-                arguments: json!({"path": "/x"}),
+                arguments: ToolArgs::new(json!({"path": "/x"})).unwrap(),
             }),
         ],
         stop_reason: StopReason::ToolUse,
@@ -443,7 +448,7 @@ async fn b7_sse_tool_call_accumulation() {
         ContentBlock::ToolCall(tc) => {
             assert_eq!(tc.id, "call_a"); // call_id, not item id
             assert_eq!(tc.name, "read");
-            assert_eq!(tc.arguments["path"], "/tmp/foo");
+            assert_eq!(tc.arguments.as_value()["path"], "/tmp/foo");
         }
         other => panic!("expected ToolCall, got {other:?}"),
     }
@@ -493,7 +498,7 @@ async fn b7b_sse_mixed_text_and_tool() {
     match &done.content[1] {
         ContentBlock::ToolCall(tc) => {
             assert_eq!(tc.name, "read");
-            assert_eq!(tc.arguments["path"], "/x");
+            assert_eq!(tc.arguments.as_value()["path"], "/x");
         }
         other => panic!("expected ToolCall, got {other:?}"),
     }
@@ -692,7 +697,14 @@ fn parity_compare(system_prompt: Option<&str>, messages: &[AgentMessage], tools:
 
 #[test]
 fn yqeq5_parity_pure_text_turn() {
-    // User → Assistant text. No tools, no system, no tool calls.
+    // User → Assistant text, no tool calls. Dummy tool supplied so
+    // mu-0q44's no-tools clause doesn't fire.
+    let dummy = ToolSpec {
+        name: "noop".into(),
+        description: "no-op".into(),
+        input_schema: json!({"type": "object"}),
+        policy: Default::default(),
+    };
     let messages = vec![
         AgentMessage::User {
             content: "hi".into(),
@@ -705,7 +717,7 @@ fn yqeq5_parity_pure_text_turn() {
             usage: None,
         }),
     ];
-    parity_compare(None, &messages, &[]);
+    parity_compare(None, &messages, &[dummy]);
 }
 
 #[test]
@@ -735,7 +747,7 @@ fn yqeq5_parity_single_tool_call() {
                 ContentBlock::ToolCall(ToolCall {
                     id: "call_42".into(),
                     name: "read".into(),
-                    arguments: json!({"path": "/tmp/x"}),
+                    arguments: ToolArgs::new(json!({"path": "/tmp/x"})).unwrap(),
                 }),
             ],
             stop_reason: StopReason::ToolUse,
@@ -769,17 +781,17 @@ fn yqeq5_parity_consecutive_tool_results() {
                 ContentBlock::ToolCall(ToolCall {
                     id: "call_1".into(),
                     name: "read".into(),
-                    arguments: json!({"path": "/a"}),
+                    arguments: ToolArgs::new(json!({"path": "/a"})).unwrap(),
                 }),
                 ContentBlock::ToolCall(ToolCall {
                     id: "call_2".into(),
                     name: "read".into(),
-                    arguments: json!({"path": "/b"}),
+                    arguments: ToolArgs::new(json!({"path": "/b"})).unwrap(),
                 }),
                 ContentBlock::ToolCall(ToolCall {
                     id: "call_3".into(),
                     name: "read".into(),
-                    arguments: json!({"path": "/c"}),
+                    arguments: ToolArgs::new(json!({"path": "/c"})).unwrap(),
                 }),
             ],
             stop_reason: StopReason::ToolUse,
@@ -801,7 +813,14 @@ fn yqeq5_parity_consecutive_tool_results() {
             is_error: false,
         },
     ];
-    parity_compare(None, &messages, &[]);
+    // Dummy tool: mu-0q44's no-tools clause diverges Legacy vs Projected.
+    let dummy = ToolSpec {
+        name: "noop".into(),
+        description: "no-op".into(),
+        input_schema: json!({"type": "object"}),
+        policy: Default::default(),
+    };
+    parity_compare(None, &messages, &[dummy]);
 }
 
 #[test]
@@ -995,8 +1014,15 @@ fn yqeq5_thinking_blocks_are_skipped_in_projected_wire_output() {
         "non-thinking text was lost: {wire}",
     );
 
-    // Also: parity vs Legacy (which also strips thinking).
-    parity_compare(None, &messages, &[]);
+    // Also: parity vs Legacy (which also strips thinking). Dummy tool
+    // avoids mu-0q44 no-tools clause divergence.
+    let dummy = ToolSpec {
+        name: "noop".into(),
+        description: "no-op".into(),
+        input_schema: json!({"type": "object"}),
+        policy: Default::default(),
+    };
+    parity_compare(None, &messages, &[dummy]);
 }
 
 // ============================================================================
@@ -1108,6 +1134,6 @@ mod live_tests {
             })
             .expect("expected a ToolCall");
         assert_eq!(tc.name, "echo");
-        assert!(tc.arguments.is_object());
+        assert!(tc.arguments.as_value().is_object());
     }
 }

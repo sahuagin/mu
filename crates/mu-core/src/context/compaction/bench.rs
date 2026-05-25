@@ -360,7 +360,12 @@ mod tests {
         let kinds: Vec<_> = rope.spans().iter().map(|s| s.kind.clone()).collect();
         assert_eq!(
             kinds,
-            vec![SpanKind::User, SpanKind::Assistant, SpanKind::ToolResult]
+            vec![
+                SpanKind::System,
+                SpanKind::User,
+                SpanKind::Assistant,
+                SpanKind::ToolResult
+            ]
         );
     }
 
@@ -393,7 +398,9 @@ mod tests {
         ];
         write_jsonl(&path, &events);
         let (_, rope, _) = load_session_rope(&path).expect("load");
-        assert!(rope.is_empty());
+        // mu-0q44: no-tools clause is always injected when tool_specs is empty
+        assert_eq!(rope.len(), 1);
+        assert_eq!(rope.spans()[0].id(), "no-tools-clause");
     }
 
     #[test]
@@ -401,7 +408,8 @@ mod tests {
         let path = tmpfile("empty");
         std::fs::File::create(&path).expect("create");
         let (sid, rope, malformed) = load_session_rope(&path).expect("load");
-        assert!(rope.is_empty());
+        assert_eq!(rope.len(), 1);
+        assert_eq!(rope.spans()[0].id(), "no-tools-clause");
         assert_eq!(malformed, 0);
         assert_eq!(sid, "empty");
     }
@@ -422,7 +430,7 @@ mod tests {
         let (sid, rope, malformed) = load_session_rope(&path).expect("load");
         assert_eq!(sid, "s-malformed");
         assert_eq!(malformed, 1);
-        assert_eq!(rope.len(), 1);
+        assert_eq!(rope.len(), 2);
     }
 
     #[test]
@@ -478,10 +486,10 @@ mod tests {
         assert_eq!(rows[2].policy_label, "hash-and-summary-v1");
         for r in &rows {
             assert_eq!(r.session_id, sid);
-            assert_eq!(r.spans_before, 3);
+            assert_eq!(r.spans_before, 4);
         }
         // NoCompactionPolicy preserves the rope verbatim.
-        assert_eq!(rows[0].spans_after, 3);
+        assert_eq!(rows[0].spans_after, 4);
         // KeepHalfJudge keeps even-indexed spans (0,2) → 2 kept + 1 summary = 3.
         // (No identity-shortcut here: HashAndSummaryPolicy's compact()
         // ignores target_tokens and always queries the judge.)

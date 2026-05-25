@@ -27,6 +27,7 @@ pub mod forensics;
 pub mod pricing;
 pub mod protocol;
 pub mod skill;
+pub mod lsp_client;
 pub mod tool_registry;
 pub mod transport;
 pub mod usage_history;

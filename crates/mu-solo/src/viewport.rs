@@ -19,6 +19,13 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
 use ratatui::widgets::Widget;
 
+/// A stored line of history content (what insert_before rendered).
+/// Kept so we can replay on viewport shrink.
+#[derive(Clone)]
+struct HistoryLine {
+    cells: Vec<(String, Color, Color, Modifier)>,
+}
+
 /// A minimal terminal that manages a dynamically-sized inline viewport.
 /// Content above the viewport lives in native terminal scrollback.
 pub struct DynamicViewport {
@@ -29,6 +36,8 @@ pub struct DynamicViewport {
     current: usize,
     /// Terminal screen size (columns, rows).
     screen_size: (u16, u16),
+    /// History lines rendered above the viewport via insert_before.
+    history: Vec<HistoryLine>,
 }
 
 impl DynamicViewport {
@@ -57,6 +66,7 @@ impl DynamicViewport {
             buffers: [Buffer::empty(viewport), Buffer::empty(viewport)],
             current: 0,
             screen_size: (cols, rows),
+            history: Vec::new(),
         })
     }
 
@@ -102,9 +112,14 @@ impl DynamicViewport {
             }
             self.viewport.height = new_height;
         } else {
-            // Shrinking: viewport stays pinned at bottom, top moves down.
-            // Freed lines above keep whatever scrollback content is there.
-            self.viewport.y += old_height - new_height;
+            // Shrinking: keep viewport.y the same — blank space goes
+            // below. Conversation content above stays undisturbed.
+            // Clear the old rows below the new smaller viewport.
+            let mut stdout = io::stdout();
+            for row in (self.viewport.y + new_height)..(self.viewport.y + old_height) {
+                queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+            }
+            stdout.flush()?;
             self.viewport.height = new_height;
         }
 
@@ -122,29 +137,61 @@ impl DynamicViewport {
         Ok(())
     }
 
+    /// Clear the viewport area on screen (used before insert_before
+    /// to erase the raw prompt before the formatted "you" block replaces it).
+    pub fn clear_viewport(&self) -> io::Result<()> {
+        let mut stdout = io::stdout();
+        for row in self.viewport.y..(self.viewport.y + self.viewport.height) {
+            queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+        }
+        stdout.flush()
+    }
+
+    /// Move the viewport to the bottom of the screen. Used after sending
+    /// a prompt so that streaming insert_before calls don't trigger
+    /// push-downs (which create blank line gaps).
+    pub fn snap_to_bottom(&mut self) -> io::Result<()> {
+        let (_, screen_rows) = terminal::size()?;
+        let target_y = screen_rows.saturating_sub(self.viewport.height);
+        if self.viewport.y < target_y {
+            // Clear old position
+            let mut stdout = io::stdout();
+            for row in self.viewport.y..(self.viewport.y + self.viewport.height) {
+                queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+            }
+            self.viewport.y = target_y;
+            self.buffers[0].resize(self.viewport);
+            self.buffers[1].resize(self.viewport);
+            self.buffers[1 - self.current].reset();
+            stdout.flush()?;
+        }
+        Ok(())
+    }
+
     /// Render a widget into the viewport's buffer.
     pub fn render<W: Widget>(&mut self, widget: W) {
         let area = self.viewport;
         widget.render(area, self.current_buffer_mut());
     }
 
-    /// Flush changes to the terminal — diffs against previous frame
-    /// and only writes changed cells.
+    /// Flush the viewport to the terminal. Always does a full repaint
+    /// (no diff optimization) to avoid state confusion after insert_before.
+    /// Wrapped in synchronized output brackets to prevent flicker.
     pub fn flush(&mut self) -> io::Result<()> {
         let mut stdout = io::stdout();
+        // Begin synchronized output (terminal buffers until end bracket)
+        write!(stdout, "\x1b[?2026h")?;
         queue!(stdout, Hide)?;
 
         let area = self.viewport;
-        let prev = &self.buffers[1 - self.current];
         let curr = &self.buffers[self.current];
 
         for y in 0..area.height {
             for x in 0..area.width {
                 let idx = (y as usize) * (area.width as usize) + (x as usize);
-                let prev_cell = &prev.content[idx];
                 let curr_cell = &curr.content[idx];
 
-                if curr_cell != prev_cell {
+                {
                     let screen_y = area.y + y;
                     let screen_x = area.x + x;
                     queue!(stdout, MoveTo(screen_x, screen_y))?;
@@ -177,17 +224,18 @@ impl DynamicViewport {
             }
         }
 
-        queue!(stdout, Show)?;
+        // End synchronized output (terminal renders atomically)
+        write!(stdout, "\x1b[?2026l")?;
         stdout.flush()?;
 
-        // Swap buffers
-        self.buffers[1 - self.current].reset();
-        self.current = 1 - self.current;
+        // Reset buffer for next frame (full repaint each time).
+        self.current_buffer_mut().reset();
         Ok(())
     }
 
     /// Insert lines above the viewport (push content into scrollback).
     /// Used for conversation output (assistant responses, tool calls, etc.)
+    /// Also stores the rendered lines in history for replay on shrink.
     pub fn insert_before<F>(&mut self, height: u16, draw_fn: F) -> io::Result<()>
     where
         F: FnOnce(&mut Buffer),
@@ -196,23 +244,48 @@ impl DynamicViewport {
             return Ok(());
         }
 
-        let viewport_top = self.viewport.y;
+        let (_, screen_rows) = terminal::size()?;
         let width = self.viewport.width;
+        let mut stdout = io::stdout();
+
+        // If the viewport isn't at the bottom of the screen (blank space
+        // below from Pi-style shrink), push it DOWN first to make room above.
+        let viewport_bottom = self.viewport.y + self.viewport.height;
+        if viewport_bottom < screen_rows {
+            let push_down = height.min(screen_rows - viewport_bottom);
+            // Scroll the viewport region DOWN using reverse index
+            let region_top = self.viewport.y + 1; // 1-based
+            let region_bottom = screen_rows;
+            write!(
+                stdout,
+                "\x1b[{};{}r\x1b[{}T\x1b[r",
+                region_top, region_bottom, push_down
+            )?;
+            self.viewport.y += push_down;
+            self.buffers[0].resize(self.viewport);
+            self.buffers[1].resize(self.viewport);
+            // Force full redraw since viewport moved
+            self.buffers[1 - self.current].reset();
+        }
+
+        let viewport_top = self.viewport.y;
 
         // Scroll the region above the viewport up to make room
         if viewport_top > 0 {
             let scroll_amount = height.min(viewport_top);
             scroll_region_up(0, viewport_top.saturating_sub(1), scroll_amount)?;
         }
+        stdout.flush()?;
 
         // Draw the new content in the freed space above the viewport
         let draw_area = Rect::new(0, viewport_top.saturating_sub(height), width, height);
         let mut buf = Buffer::empty(draw_area);
         draw_fn(&mut buf);
 
-        // Write the buffer content to the terminal
+        // Write the buffer content to the terminal AND store in history
         let mut stdout = io::stdout();
         for y in 0..draw_area.height {
+            let mut hline = HistoryLine { cells: Vec::new() };
             for x in 0..draw_area.width {
                 let idx = (y as usize) * (draw_area.width as usize) + (x as usize);
                 let cell = &buf.content[idx];
@@ -226,9 +299,23 @@ impl DynamicViewport {
                     }
                     queue!(stdout, Print(cell.symbol()), SetAttribute(Attribute::Reset))?;
                 }
+                hline.cells.push((
+                    cell.symbol().to_string(),
+                    cell.fg,
+                    cell.bg,
+                    cell.modifier,
+                ));
             }
+            self.history.push(hline);
         }
         stdout.flush()?;
+
+        // Cap history to prevent unbounded growth (keep last 1000 lines)
+        const MAX_HISTORY: usize = 1000;
+        if self.history.len() > MAX_HISTORY {
+            let drain = self.history.len() - MAX_HISTORY;
+            self.history.drain(0..drain);
+        }
 
         Ok(())
     }

@@ -36,6 +36,7 @@ figment = { version = "0.10", features = ["toml", "env"] }
 # `dirs` resolves XDG config / home paths cross-platform (rather than
 # hand-rolling $HOME / $XDG_CONFIG_HOME). Tiny crate, transitive-light.
 dirs = "5"
+ansi-to-tui = "8"
 
 [dev-dependencies]
 # Used by config.rs roundtrip tests. figment already pulls in `toml`

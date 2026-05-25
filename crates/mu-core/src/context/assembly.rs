@@ -267,10 +267,8 @@ mod tests {
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
             }),
-            policy: Default::default(),
+            ..Default::default()
         }
-    
-        ..Default::default()
     }
 
     #[test]

@@ -178,7 +178,17 @@ def analyze_context_growth(events: list[dict]) -> dict:
                     })
 
     if not turns:
-        return {"has_usage_data": False}
+        return {
+            "has_usage_data": False,
+            "turn_count": 0,
+            "first_prompt_tokens": 0,
+            "last_prompt_tokens": 0,
+            "peak_prompt_tokens": 0,
+            "avg_growth_per_turn": 0,
+            "total_output_tokens": 0,
+            "likely_compactions": [],
+            "cache_hit_ratio": 0.0,
+        }
 
     prompt_tokens = [t["total_prompt_tokens"] for t in turns]
     output_tokens = [t["output_tokens"] for t in turns]
@@ -296,7 +306,16 @@ def analyze_startup_tax(events: list[dict]) -> dict:
             break
 
     if not tool_events:
-        return {"has_startup_data": False}
+        return {
+            "has_startup_data": False,
+            "first_10_calls": 0,
+            "first_10_errors": 0,
+            "startup_error_rate": 0.0,
+            "overall_error_rate": 0.0,
+            "startup_tax_detected": False,
+            "agent_memory_retries": 0,
+            "first_errors": [],
+        }
 
     # Pair calls with results
     early_calls = []
@@ -379,7 +398,14 @@ def analyze_assistant_patterns(events: list[dict]) -> dict:
             })
 
     if not messages:
-        return {"message_count": 0}
+        return {
+            "message_count": 0,
+            "avg_length": 0,
+            "median_length": 0,
+            "short_responses": 0,
+            "long_responses": 0,
+            "stop_reasons": {},
+        }
 
     lengths = [m["length"] for m in messages]
     stop_reasons = Counter(m["stop_reason"] for m in messages)

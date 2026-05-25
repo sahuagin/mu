@@ -3193,7 +3193,8 @@ where
                 let body_slice = &text[..safe_byte_end];
                 emit_streaming_body_chunk(terminal, body_slice, wrap_width)?;
                 let safe_chars = body_slice.chars().count();
-                app.f3_streaming_chars_emitted.insert(sid.clone(), safe_chars);
+                app.f3_streaming_chars_emitted
+                    .insert(sid.clone(), safe_chars);
             }
         }
         (Some(text), true) => {
@@ -3209,7 +3210,8 @@ where
                         .take(safe_chars - emitted_chars)
                         .collect();
                     emit_streaming_body_chunk(terminal, &new_text, wrap_width)?;
-                    app.f3_streaming_chars_emitted.insert(sid.clone(), safe_chars);
+                    app.f3_streaming_chars_emitted
+                        .insert(sid.clone(), safe_chars);
                 }
             }
         }
@@ -3222,8 +3224,7 @@ where
                 let emitted_chars = *app.f3_streaming_chars_emitted.get(&sid).unwrap_or(&0);
                 let final_chars = final_text.chars().count();
                 if final_chars > emitted_chars {
-                    let remaining: String =
-                        final_text.chars().skip(emitted_chars).collect();
+                    let remaining: String = final_text.chars().skip(emitted_chars).collect();
                     emit_streaming_body_chunk(terminal, &remaining, wrap_width)?;
                 }
             }
@@ -3298,48 +3299,48 @@ where
     //
     // Scoped so the immutable borrow on `app.transcript_events_by_sid`
     // is released before the mutable borrow for `f3_emitted_count_by_sid`.
-    let (lines_to_emit, new_count, pending_consumed) =
-        match app.transcript_events_by_sid.get(&sid) {
-            Some(events) => {
-                let emitted = *app.f3_emitted_count_by_sid.get(&sid).unwrap_or(&0);
-                if events.len() <= emitted {
-                    (Vec::new(), emitted, 0usize)
-                } else {
-                    let slice = &events[emitted..];
-                    let pending = app
-                        .f3_preview_complete_pending
-                        .get(&sid)
-                        .copied()
-                        .unwrap_or(0);
-                    let mut skipped = 0usize;
-                    let filtered: Vec<serde_json::Value> = slice
-                        .iter()
-                        .filter(|ev| {
-                            if skipped < pending {
-                                let is_assistant = ev
-                                    .get("payload")
-                                    .and_then(|p| p.get("kind"))
-                                    .and_then(|k| k.as_str())
-                                    == Some("assistant_message_event");
-                                if is_assistant {
-                                    skipped += 1;
-                                    return false;
-                                }
+    let (lines_to_emit, new_count, pending_consumed) = match app.transcript_events_by_sid.get(&sid)
+    {
+        Some(events) => {
+            let emitted = *app.f3_emitted_count_by_sid.get(&sid).unwrap_or(&0);
+            if events.len() <= emitted {
+                (Vec::new(), emitted, 0usize)
+            } else {
+                let slice = &events[emitted..];
+                let pending = app
+                    .f3_preview_complete_pending
+                    .get(&sid)
+                    .copied()
+                    .unwrap_or(0);
+                let mut skipped = 0usize;
+                let filtered: Vec<serde_json::Value> = slice
+                    .iter()
+                    .filter(|ev| {
+                        if skipped < pending {
+                            let is_assistant = ev
+                                .get("payload")
+                                .and_then(|p| p.get("kind"))
+                                .and_then(|k| k.as_str())
+                                == Some("assistant_message_event");
+                            if is_assistant {
+                                skipped += 1;
+                                return false;
                             }
-                            true
-                        })
-                        .cloned()
-                        .collect();
-                    let lines = if filtered.is_empty() {
-                        Vec::new()
-                    } else {
-                        render_transcript_lines(&filtered, None, Some(wrap_width))
-                    };
-                    (lines, events.len(), skipped)
-                }
+                        }
+                        true
+                    })
+                    .cloned()
+                    .collect();
+                let lines = if filtered.is_empty() {
+                    Vec::new()
+                } else {
+                    render_transcript_lines(&filtered, None, Some(wrap_width))
+                };
+                (lines, events.len(), skipped)
             }
-            None => (Vec::new(), 0, 0),
-        };
+        }
+        None => (Vec::new(), 0, 0),
+    };
 
     if !lines_to_emit.is_empty() {
         let height = lines_to_emit.len() as u16;

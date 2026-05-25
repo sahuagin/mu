@@ -3,6 +3,82 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+// ── ToolArgs newtype (mu-gdwd) ──────────────────────────────────────
+
+/// Validated wrapper around `serde_json::Value` for tool-call arguments.
+///
+/// Rejects `NaN`, `+Inf`, and `-Inf` at construction — these are
+/// prohibited by RFC 8259 §6 and would break `Eq` (IEEE 754:
+/// `NaN != NaN`). With the invariant enforced, `Eq` is safe to derive
+/// on every container that holds `ToolArgs`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "serde_json::Value", into = "serde_json::Value")]
+pub struct ToolArgs(Value);
+
+impl Eq for ToolArgs {}
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ToolArgsError {
+    #[error("tool arguments contain non-finite number at path {path}: {value}")]
+    NonFinite { path: String, value: f64 },
+}
+
+impl ToolArgs {
+    /// Construct a `ToolArgs` from a `Value`, rejecting NaN/Inf at any
+    /// nesting depth.
+    pub fn new(value: Value) -> Result<Self, ToolArgsError> {
+        validate_value(&value, "$")?;
+        Ok(Self(value))
+    }
+
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+}
+
+impl TryFrom<Value> for ToolArgs {
+    type Error = ToolArgsError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<ToolArgs> for Value {
+    fn from(args: ToolArgs) -> Value {
+        args.0
+    }
+}
+
+fn validate_value(v: &Value, path: &str) -> Result<(), ToolArgsError> {
+    match v {
+        Value::Number(n) => {
+            if let Some(f) = n.as_f64() {
+                if f.is_nan() || f.is_infinite() {
+                    return Err(ToolArgsError::NonFinite {
+                        path: path.to_string(),
+                        value: f,
+                    });
+                }
+            }
+            Ok(())
+        }
+        Value::Array(arr) => {
+            for (i, item) in arr.iter().enumerate() {
+                validate_value(item, &format!("{path}[{i}]"))?;
+            }
+            Ok(())
+        }
+        Value::Object(map) => {
+            for (key, val) in map {
+                validate_value(val, &format!("{path}.{key}"))?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Per-conceptual-type alias for ContentBlock text payloads
 /// (mu-yqeq.2). Backing storage is `Arc<str>` so structural assistant
 /// content (Text + Thinking blocks) clones cheaply and can byte-share
@@ -12,7 +88,7 @@ use serde_json::Value;
 pub type BlockText = Arc<str>;
 
 /// One message in an agent's conversation context.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum AgentMessage {
     User {
@@ -27,7 +103,7 @@ pub enum AgentMessage {
 }
 
 /// The model's response on one turn.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssistantMessage {
     pub content: Vec<ContentBlock>,
     pub stop_reason: StopReason,
@@ -89,7 +165,7 @@ impl std::ops::Add for Usage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
@@ -102,11 +178,11 @@ pub enum ContentBlock {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
-    pub arguments: Value,
+    pub arguments: ToolArgs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,7 +319,61 @@ mod tests {
         ToolCall {
             id: "call-1".to_owned(),
             name: "echo".to_owned(),
-            arguments: json!({ "text": "hello" }),
+            arguments: ToolArgs::new(json!({ "text": "hello" })).unwrap(),
         }
+    }
+
+    // ── ToolArgs tests (mu-gdwd) ────────────────────────────────
+
+    #[test]
+    fn tool_args_accepts_finite_numbers() {
+        let v = json!({"x": 1, "y": 2.5, "z": -0.0, "w": 0});
+        assert!(ToolArgs::new(v).is_ok());
+    }
+
+    #[test]
+    fn tool_args_accepts_strings_bools_nulls() {
+        let v = json!({"s": "hello", "b": true, "n": null, "arr": [1, "a", null]});
+        assert!(ToolArgs::new(v).is_ok());
+    }
+
+    #[test]
+    fn tool_args_serde_json_rejects_nan_at_parse_time() {
+        // serde_json::Number::from_f64 returns None for NaN/Inf,
+        // so NaN can never reach ToolArgs through JSON parsing.
+        // This test confirms the serde_json guarantee holds.
+        assert!(serde_json::Number::from_f64(f64::NAN).is_none());
+        assert!(serde_json::Number::from_f64(f64::INFINITY).is_none());
+        assert!(serde_json::Number::from_f64(f64::NEG_INFINITY).is_none());
+    }
+
+    #[test]
+    fn tool_args_try_from_round_trip() {
+        let v = json!({"a": 1.5});
+        let args = ToolArgs::new(v.clone()).unwrap();
+        let back: Value = args.into();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn tool_args_serde_round_trip() {
+        let v = json!({"nested": {"arr": [1, 2, 3], "s": "hi"}});
+        let args = ToolArgs::new(v.clone()).unwrap();
+        let serialized = serde_json::to_value(&args).unwrap();
+        let deserialized: ToolArgs = serde_json::from_value(serialized).unwrap();
+        assert_eq!(deserialized.as_value(), &v);
+    }
+
+    #[test]
+    fn tool_args_eq_is_derived() {
+        let a = ToolArgs::new(json!({"x": 1})).unwrap();
+        let b = ToolArgs::new(json!({"x": 1})).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn tool_args_deeply_nested_valid() {
+        let v = json!({"a": {"b": {"c": {"d": [1, 2, {"e": 1.5}]}}}});
+        assert!(ToolArgs::new(v).is_ok());
     }
 }

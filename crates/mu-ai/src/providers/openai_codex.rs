@@ -309,7 +309,7 @@ pub(crate) const INSTRUCTIONS_SOFT_CAP: usize = 8 * 1024;
 /// At or above → `(DEFAULT_INSTRUCTIONS, Some(actual))`, so the model
 /// still receives a short "you are mu" instruction in the dedicated
 /// field and the long context lands as a regular input message.
-fn split_oversized_instructions<'a>(actual: &'a str) -> (&'a str, Option<&'a str>) {
+fn split_oversized_instructions(actual: &str) -> (&str, Option<&str>) {
     if actual.len() > INSTRUCTIONS_SOFT_CAP {
         (DEFAULT_INSTRUCTIONS, Some(actual))
     } else {
@@ -821,21 +821,28 @@ fn assemble_content(state: &StreamState) -> Vec<ContentBlock> {
     out
 }
 
-fn parse_tool_input(input_json: &str) -> Value {
-    if input_json.is_empty() {
-        return Value::Object(serde_json::Map::new());
-    }
-    match serde_json::from_str::<Value>(input_json) {
-        Ok(v) if v.is_object() => v,
-        Ok(other) => {
-            tracing::warn!(value = %other, "tool input JSON wasn't an object; using empty object");
-            Value::Object(serde_json::Map::new())
+fn parse_tool_input(input_json: &str) -> mu_core::agent::ToolArgs {
+    use mu_core::agent::ToolArgs;
+
+    let value = if input_json.is_empty() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        match serde_json::from_str::<Value>(input_json) {
+            Ok(v) if v.is_object() => v,
+            Ok(other) => {
+                tracing::warn!(value = %other, "tool input JSON wasn't an object; using empty object");
+                Value::Object(serde_json::Map::new())
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, raw = %input_json, "failed to parse tool input JSON; using empty object");
+                Value::Object(serde_json::Map::new())
+            }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, raw = %input_json, "failed to parse tool input JSON; using empty object");
-            Value::Object(serde_json::Map::new())
-        }
-    }
+    };
+    ToolArgs::new(value).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "tool arguments contained non-finite number; using empty object");
+        ToolArgs::new(Value::Object(serde_json::Map::new())).unwrap()
+    })
 }
 
 async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamState)> {

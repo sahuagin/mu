@@ -97,7 +97,7 @@ pub async fn login_flow() -> Result<OAuthToken, AuthError> {
     eprintln!("    {url_str}");
     eprintln!();
     let no_browser = std::env::var("MU_NO_BROWSER")
-        .map(|v| !v.is_empty() && v != "0" && v.to_ascii_lowercase() != "false")
+        .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(false);
     if no_browser {
         eprintln!("MU_NO_BROWSER set — skipping auto-open. Waiting for callback…");

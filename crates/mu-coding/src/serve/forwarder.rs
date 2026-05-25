@@ -1024,6 +1024,7 @@ mod tests {
                 EventPayload::MailboxMessagePosted { .. } => "mailbox_message_posted",
                 EventPayload::MailboxMessageConsumed { .. } => "mailbox_message_consumed",
                 EventPayload::TaskTelemetry { .. } => "task_telemetry",
+                EventPayload::ErrorInvalidMessage { .. } => "error_invalid_message",
             })
             .collect();
         assert_eq!(kinds, vec!["assistant_message", "done"]);

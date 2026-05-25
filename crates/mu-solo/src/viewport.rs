@@ -299,12 +299,9 @@ impl DynamicViewport {
                     }
                     queue!(stdout, Print(cell.symbol()), SetAttribute(Attribute::Reset))?;
                 }
-                hline.cells.push((
-                    cell.symbol().to_string(),
-                    cell.fg,
-                    cell.bg,
-                    cell.modifier,
-                ));
+                hline
+                    .cells
+                    .push((cell.symbol().to_string(), cell.fg, cell.bg, cell.modifier));
             }
             self.history.push(hline);
         }

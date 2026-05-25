@@ -192,7 +192,7 @@ pub enum SpanKind {
 /// constructors below. See spec mu-044 §Encapsulation discipline for
 /// the rationale: insulates external call sites from future field-
 /// type evolution (e.g., the `String → Arc<str>` swap in mu-yqeq.2b).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
     pub(crate) id: SpanId,
     pub(crate) kind: SpanKind,
@@ -305,7 +305,7 @@ impl Span {
 /// the rope to the index of its originating event — even after a
 /// span has been deactivated, [`Self::provenance`] still answers
 /// "where did this span come from?"
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedRope {
     spans: Vec<Span>,
     /// Append-only provenance log. Indexed by `origins` for

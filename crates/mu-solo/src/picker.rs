@@ -54,10 +54,11 @@ fn picker_loop(
     let mut idx = initial.min(items.len().saturating_sub(1));
     loop {
         draw(out, title, items, idx)?;
-        match event::read()? {
-            Event::Key(KeyEvent {
-                code, modifiers, ..
-            }) => match (modifiers, code) {
+        if let Event::Key(KeyEvent {
+            code, modifiers, ..
+        }) = event::read()?
+        {
+            match (modifiers, code) {
                 (KeyModifiers::CONTROL, KeyCode::Char('c')) => return Ok(None),
                 (_, KeyCode::Esc) => return Ok(None),
                 (_, KeyCode::Enter) => return Ok(Some(idx)),
@@ -69,7 +70,6 @@ fn picker_loop(
                 }
                 (_, KeyCode::Home) | (_, KeyCode::Char('g')) => idx = 0,
                 (_, KeyCode::End) | (_, KeyCode::Char('G')) => idx = items.len() - 1,
-                // Number keys 1-9 jump-select.
                 (_, KeyCode::Char(c @ '1'..='9')) => {
                     let pick = c.to_digit(10).unwrap() as usize - 1;
                     if pick < items.len() {
@@ -77,8 +77,7 @@ fn picker_loop(
                     }
                 }
                 _ => {}
-            },
-            _ => {}
+            }
         }
     }
 }

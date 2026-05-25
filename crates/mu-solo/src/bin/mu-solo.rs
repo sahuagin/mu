@@ -89,8 +89,7 @@ impl Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut cfg = config::load(cli.config.as_deref())
-        .context("failed to load mu-solo config")?;
+    let mut cfg = config::load(cli.config.as_deref()).context("failed to load mu-solo config")?;
     config::apply_cli_overrides(&mut cfg, &cli.to_overrides());
 
     // Resolve cwd once: None ⇒ current process cwd. Held here (not in

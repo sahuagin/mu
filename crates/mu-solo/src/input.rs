@@ -25,6 +25,7 @@ struct PasteRegion {
 }
 
 /// A single input buffer with cursor tracking.
+#[derive(Default)]
 pub struct InputBuffer {
     /// The raw text content. May contain newlines (from paste).
     content: String,
@@ -37,11 +38,7 @@ pub struct InputBuffer {
 
 impl InputBuffer {
     pub fn new() -> Self {
-        Self {
-            content: String::new(),
-            cursor: 0,
-            pastes: Vec::new(),
-        }
+        Self::default()
     }
 
     pub fn content(&self) -> &str {
@@ -258,11 +255,13 @@ impl InputBuffer {
                         &mut found_cursor,
                     );
                 }
-                DisplaySegment::CollapsedPaste { start, end, number, line_count } => {
-                    let placeholder = format!(
-                        "[Pasted text #{} +{} lines]",
-                        number, line_count
-                    );
+                DisplaySegment::CollapsedPaste {
+                    start,
+                    end,
+                    number,
+                    line_count,
+                } => {
+                    let placeholder = format!("[Pasted text #{} +{} lines]", number, line_count);
                     let row_idx = lines.len();
                     lines.push(VisualLine {
                         text: placeholder,
@@ -339,6 +338,7 @@ impl InputBuffer {
     }
 
     /// Layout a text segment with word-wrap, updating lines and cursor state.
+    #[allow(clippy::too_many_arguments)]
     fn layout_text_segment(
         &self,
         text: &str,
@@ -398,14 +398,9 @@ impl InputBuffer {
                         byte_start: row_start_byte,
                         byte_end,
                     });
-                    if !*found_cursor
-                        && self.cursor >= row_start_byte
-                        && self.cursor < byte_end
-                    {
+                    if !*found_cursor && self.cursor >= row_start_byte && self.cursor < byte_end {
                         *cursor_row = row_idx;
-                        *cursor_col = self.content[row_start_byte..self.cursor]
-                            .chars()
-                            .count();
+                        *cursor_col = self.content[row_start_byte..self.cursor].chars().count();
                         *found_cursor = true;
                     }
                     row_start_byte = byte_end;
@@ -465,8 +460,16 @@ fn next_boundary(s: &str, pos: usize) -> usize {
 
 /// A segment of the display content — either normal text or a collapsed paste.
 enum DisplaySegment {
-    Text { start: usize, end: usize },
-    CollapsedPaste { start: usize, end: usize, number: usize, line_count: usize },
+    Text {
+        start: usize,
+        end: usize,
+    },
+    CollapsedPaste {
+        start: usize,
+        end: usize,
+        number: usize,
+        line_count: usize,
+    },
 }
 
 /// Result of computing visual layout for the input buffer.

@@ -72,12 +72,10 @@ fn main() -> io::Result<()> {
                         // Simulate conversation output via insert_before
                         history_count += 1;
                         let text = format!("│ assistant message #{history_count}");
-                        let w = vp.area().width;
+                        let _w = vp.area().width;
                         vp.insert_before(1, |buf| {
-                            let line = Line::from(Span::styled(
-                                text,
-                                Style::default().fg(Color::White),
-                            ));
+                            let line =
+                                Line::from(Span::styled(text, Style::default().fg(Color::White)));
                             Paragraph::new(line).render(buf.area, buf);
                         })?;
                         msg = format!("Inserted history #{history_count}");

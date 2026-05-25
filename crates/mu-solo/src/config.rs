@@ -35,22 +35,13 @@ use serde::{Deserialize, Serialize};
 
 /// Root config. Merged from defaults + TOML + env (in that order),
 /// then [`apply_cli_overrides`] applies CLI Options on top.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct SoloConfig {
     #[serde(default)]
     pub tui: TuiConfig,
     #[serde(default)]
     pub session: SessionConfig,
-}
-
-impl Default for SoloConfig {
-    fn default() -> Self {
-        Self {
-            tui: TuiConfig::default(),
-            session: SessionConfig::default(),
-        }
-    }
 }
 
 /// TUI-local settings. These never leave the TUI process.

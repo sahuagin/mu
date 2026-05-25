@@ -981,28 +981,36 @@ fn assemble_content(blocks: &HashMap<u32, BlockBuilder>, block_order: &[u32]) ->
 /// object and log a warning. Tools expect an object of arguments;
 /// passing through arrays/strings/numbers would break the contract
 /// with `Tool::execute`.
-fn parse_tool_input(input_json: &str) -> Value {
-    if input_json.is_empty() {
-        return Value::Object(serde_json::Map::new());
-    }
-    match serde_json::from_str::<Value>(input_json) {
-        Ok(v) if v.is_object() => v,
-        Ok(other) => {
-            tracing::warn!(
-                value = %other,
-                "tool input JSON was valid but not an object; using empty object"
-            );
-            Value::Object(serde_json::Map::new())
+fn parse_tool_input(input_json: &str) -> mu_core::agent::ToolArgs {
+    use mu_core::agent::ToolArgs;
+
+    let value = if input_json.is_empty() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        match serde_json::from_str::<Value>(input_json) {
+            Ok(v) if v.is_object() => v,
+            Ok(other) => {
+                tracing::warn!(
+                    value = %other,
+                    "tool input JSON was valid but not an object; using empty object"
+                );
+                Value::Object(serde_json::Map::new())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    raw = %input_json,
+                    "failed to parse tool input JSON; using empty object"
+                );
+                Value::Object(serde_json::Map::new())
+            }
         }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                raw = %input_json,
-                "failed to parse tool input JSON; using empty object"
-            );
-            Value::Object(serde_json::Map::new())
-        }
-    }
+    };
+    // Safe: serde_json's parser rejects NaN/Inf per RFC 8259.
+    ToolArgs::new(value).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "tool arguments contained non-finite number; using empty object");
+        ToolArgs::new(Value::Object(serde_json::Map::new())).unwrap()
+    })
 }
 
 #[cfg(test)]

@@ -334,12 +334,18 @@ mod tests {
         };
         let mut t1 = telemetry_event();
         t1.id = 3;
-        if let EventPayload::TaskTelemetry { ref mut task_id, .. } = t1.payload {
+        if let EventPayload::TaskTelemetry {
+            ref mut task_id, ..
+        } = t1.payload
+        {
             *task_id = "task-A".to_owned();
         }
         let mut t2 = telemetry_event();
         t2.id = 5;
-        if let EventPayload::TaskTelemetry { ref mut task_id, .. } = t2.payload {
+        if let EventPayload::TaskTelemetry {
+            ref mut task_id, ..
+        } = t2.payload
+        {
             *task_id = "task-B".to_owned();
         }
         let lines = [

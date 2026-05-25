@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::context::{RetentionClass, Span, SpanKind};
 use super::Skill;
+use crate::context::{RetentionClass, Span, SpanKind};
 
 /// Parsed YAML frontmatter from a SKILL.md file.
 #[derive(Debug, Clone, Deserialize)]
@@ -85,9 +85,9 @@ fn parse_skill_md(content: &str, path: &Path) -> Result<(SkillFrontmatter, Strin
 
     // Find the closing --- after the opening one.
     let after_open = &trimmed[3..];
-    let close_pos = after_open.find("\n---").ok_or_else(|| {
-        LoadError::NoFrontmatter(path.to_owned())
-    })?;
+    let close_pos = after_open
+        .find("\n---")
+        .ok_or_else(|| LoadError::NoFrontmatter(path.to_owned()))?;
 
     let yaml_str = &after_open[..close_pos];
     let frontmatter: SkillFrontmatter =
@@ -157,11 +157,10 @@ pub fn load_skill_dir(dir: &Path) -> Result<LoadedSkill, LoadError> {
         ref_files.sort();
 
         for ref_path in ref_files {
-            let ref_content =
-                fs::read_to_string(&ref_path).map_err(|e| LoadError::Io {
-                    path: ref_path.clone(),
-                    source: e,
-                })?;
+            let ref_content = fs::read_to_string(&ref_path).map_err(|e| LoadError::Io {
+                path: ref_path.clone(),
+                source: e,
+            })?;
             let file_name = ref_path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -268,9 +267,7 @@ mod tests {
         fs::create_dir_all(&skill_dir).unwrap();
         fs::write(
             skill_dir.join("SKILL.md"),
-            format!(
-                "---\nname: {name}\ndescription: test skill {name}\n---\n\n{body}\n"
-            ),
+            format!("---\nname: {name}\ndescription: test skill {name}\n---\n\n{body}\n"),
         )
         .unwrap();
     }
@@ -368,10 +365,16 @@ mod tests {
         let skills = discover_skills(&[project.path().to_owned(), user.path().to_owned()]);
         assert_eq!(skills.len(), 2);
 
-        let review = skills.iter().find(|s| s.frontmatter.name == "review").unwrap();
+        let review = skills
+            .iter()
+            .find(|s| s.frontmatter.name == "review")
+            .unwrap();
         assert_eq!(review.source_dir, project.path().join("review"));
 
-        let pm = skills.iter().find(|s| s.frontmatter.name == "postmortem").unwrap();
+        let pm = skills
+            .iter()
+            .find(|s| s.frontmatter.name == "postmortem")
+            .unwrap();
         assert_eq!(pm.source_dir, user.path().join("postmortem"));
     }
 

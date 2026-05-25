@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
@@ -44,11 +44,9 @@ const KNOWN_PROVIDERS: &[&str] = &[
 /// so we can hand them to the picker without allocating.
 fn known_models_for(provider: &str) -> &'static [&'static str] {
     match normalize_provider_kind(provider).as_str() {
-        "anthropic_api" | "anthropic_oauth" => &[
-            "claude-opus-4-7",
-            "claude-sonnet-4-6",
-            "claude-haiku-4-5",
-        ],
+        "anthropic_api" | "anthropic_oauth" => {
+            &["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"]
+        }
         "openai_codex" => &["gpt-5.5"],
         "openai_api" => &["gpt-4o", "gpt-4-turbo"],
         // OpenRouter model IDs drift faster than mu releases; this is
@@ -128,6 +126,7 @@ fn normalize_provider_kind(provider: &str) -> String {
     }
 }
 
+#[allow(clippy::incompatible_msrv)]
 fn truncate_at_word(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_owned();
@@ -174,13 +173,7 @@ impl EffortLevel {
         }
     }
 
-    pub const ALL: &'static [Self] = &[
-        Self::Low,
-        Self::Medium,
-        Self::High,
-        Self::XHigh,
-        Self::Max,
-    ];
+    pub const ALL: &'static [Self] = &[Self::Low, Self::Medium, Self::High, Self::XHigh, Self::Max];
 }
 
 /// User-visible app state. Held across the run loop.
@@ -265,6 +258,7 @@ impl App {
     /// `effort` is parsed via [`EffortLevel::parse`]; invalid values
     /// surface as an error so a typo in `solo.toml` doesn't silently
     /// fall back to Medium. `focus_mode` seeds the /focus toggle.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mu_binary: &str,
         cwd: &std::path::Path,
@@ -276,9 +270,7 @@ impl App {
         focus_mode: bool,
     ) -> Result<Self> {
         let effort = EffortLevel::parse(effort).ok_or_else(|| {
-            anyhow!(
-                "invalid effort {effort:?} (valid: low|medium|high|xhigh|max)"
-            )
+            anyhow!("invalid effort {effort:?} (valid: low|medium|high|xhigh|max)")
         })?;
         let mut client = Client::spawn(mu_binary, cwd, bash_yolo, tools)?;
 
@@ -368,15 +360,16 @@ impl App {
     /// Run the event loop. Returns Ok(()) on clean exit (user pressed q).
     /// Uses DynamicViewport for grow/shrink prompt behavior.
     pub fn run(&mut self) -> Result<()> {
-        let mut vp = DynamicViewport::new(VIEWPORT_HEIGHT)
-            .context("DynamicViewport::new")?;
+        let mut vp = DynamicViewport::new(VIEWPORT_HEIGHT).context("DynamicViewport::new")?;
         vp.snap_to_bottom()?;
 
         // Initial banner — printed once into scrollback.
         let banner_lines = vec![
             Line::from(Span::styled(
                 format!("mu-solo · {} · {}", self.provider, self.model),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 format!(
@@ -405,8 +398,7 @@ impl App {
             let prompt_wrap_width = w.saturating_sub(4);
             let layout = self.prompt.visual_layout(prompt_wrap_width);
             let desired_height = (layout.lines.len() as u16 + 2) // +separator +status
-                .max(VIEWPORT_HEIGHT)
-                .min(MAX_VIEWPORT_HEIGHT);
+                .clamp(VIEWPORT_HEIGHT, MAX_VIEWPORT_HEIGHT);
             if desired_height != vp.area().height {
                 vp.set_height(desired_height)?;
             }
@@ -429,10 +421,8 @@ impl App {
                 let prefix = if row_idx == 0 { " > " } else { "   " };
                 let is_cursor_row = row_idx == vp_layout.cursor_row;
                 if is_cursor_row {
-                    let before: String =
-                        vline.text.chars().take(vp_layout.cursor_col).collect();
-                    let after: String =
-                        vline.text.chars().skip(vp_layout.cursor_col).collect();
+                    let before: String = vline.text.chars().take(vp_layout.cursor_col).collect();
+                    let after: String = vline.text.chars().skip(vp_layout.cursor_col).collect();
                     let cursor_char = if after.is_empty() {
                         " ".to_string()
                     } else {
@@ -444,9 +434,7 @@ impl App {
                         Span::raw(before),
                         Span::styled(
                             cursor_char,
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Cyan),
+                            Style::default().fg(Color::Black).bg(Color::Cyan),
                         ),
                         Span::raw(rest),
                     ]));
@@ -475,6 +463,7 @@ impl App {
             if event::poll(wait)? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        #[allow(clippy::collapsible_match)]
                         if self.handle_key(&mut vp, key)? {
                             break;
                         }
@@ -494,12 +483,7 @@ impl App {
     }
 
     /// Handle one keypress. Returns Ok(true) to exit the loop.
-    fn handle_key(
-        &mut self,
-        vp: &mut DynamicViewport,
-        key: KeyEvent,
-    ) -> Result<bool>
-    {
+    fn handle_key(&mut self, vp: &mut DynamicViewport, key: KeyEvent) -> Result<bool> {
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 if !self.prompt.is_empty() {
@@ -613,23 +597,13 @@ impl App {
 
     /// Send a user prompt: emit the "you" block to scrollback, then
     /// fire `session.ask`.
-    fn send_prompt(
-        &mut self,
-        vp: &mut DynamicViewport,
-        text: &str,
-    ) -> Result<()>
-    {
+    fn send_prompt(&mut self, vp: &mut DynamicViewport, text: &str) -> Result<()> {
         self.emit_you_block(vp, text)?;
         self.fire_ask(vp, text)
     }
 
     /// Show the "you" block in scrollback without sending anything.
-    fn emit_you_block(
-        &self,
-        vp: &mut DynamicViewport,
-        display_text: &str,
-    ) -> Result<()>
-    {
+    fn emit_you_block(&self, vp: &mut DynamicViewport, display_text: &str) -> Result<()> {
         vp.clear_viewport()?;
         let width = vp.area().width as usize;
         let wrap_width = width.saturating_sub(2);
@@ -643,12 +617,7 @@ impl App {
     }
 
     /// Reset streaming state, snap viewport, and fire `ask_session`.
-    fn fire_ask(
-        &mut self,
-        vp: &mut DynamicViewport,
-        wire_text: &str,
-    ) -> Result<()>
-    {
+    fn fire_ask(&mut self, vp: &mut DynamicViewport, wire_text: &str) -> Result<()> {
         vp.snap_to_bottom()?;
         self.streaming_text.clear();
         self.streaming_header_open = false;
@@ -674,18 +643,15 @@ impl App {
     ///
     /// v0 constraint: only one in-flight turn at a time across both
     /// routes. If main is streaming, /btw refuses with a hint to wait.
-    fn cmd_btw(
-        &mut self,
-        vp: &mut DynamicViewport,
-        msg: &str,
-    ) -> Result<()>
-    {
+    fn cmd_btw(&mut self, vp: &mut DynamicViewport, msg: &str) -> Result<()> {
         if msg.is_empty() {
             let lines: Vec<Line<'static>> = vec![
                 Line::from(""),
                 Line::from(Span::styled(
                     "usage: /btw <message>".to_string(),
-                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from("  fires a side question to a sidecar session;"),
                 Line::from("  main session history is unaffected."),
@@ -703,7 +669,9 @@ impl App {
                 Line::from(""),
                 Line::from(Span::styled(
                     "wait — main turn still streaming".to_string(),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from("  retry /btw once the current response finishes."),
                 Line::from(""),
@@ -751,12 +719,7 @@ impl App {
         let width = vp.area().width as usize;
         let wrap_width = width.saturating_sub(2);
         let route = TurnRoute::Btw;
-        let lines = render::block_lines(
-            route.you_label(),
-            route.you_color(),
-            msg,
-            wrap_width,
-        );
+        let lines = render::block_lines(route.you_label(), route.you_color(), msg, wrap_width);
         let h = lines.len() as u16;
         vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);
@@ -783,8 +746,7 @@ impl App {
     /// /status — print provider, model, session_id, daemon_id, version
     /// to scrollback. Lets the operator find the daemon's events
     /// directory: ~/.local/share/mu/events/{daemon_id}/session-N.jsonl
-    fn emit_status_lines(&self, vp: &mut DynamicViewport) -> Result<()>
-    {
+    fn emit_status_lines(&self, vp: &mut DynamicViewport) -> Result<()> {
         let lines: Vec<Line<'static>> = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -845,12 +807,7 @@ impl App {
     /// `/effort <level>` sets it. v0 is display-only — the value
     /// surfaces in /status and the banner; once the daemon learns
     /// an effort field on `ask_session`, it will attach here.
-    fn cmd_effort(
-        &mut self,
-        vp: &mut DynamicViewport,
-        arg: &str,
-    ) -> Result<()>
-    {
+    fn cmd_effort(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
         let lines: Vec<Line<'static>> = if arg.is_empty() {
             let choices: Vec<String> = EffortLevel::ALL
                 .iter()
@@ -860,7 +817,9 @@ impl App {
                 Line::from(""),
                 Line::from(Span::styled(
                     "── /effort ─────────────────────────".to_string(),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(format!("  current:  {}", self.effort.as_str())),
                 Line::from(format!("  choices:  {}", choices.join(" · "))),
@@ -873,7 +832,9 @@ impl App {
                 Line::from(""),
                 Line::from(Span::styled(
                     format!("effort → {}", level.as_str()),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
             ]
@@ -905,12 +866,7 @@ impl App {
     /// When on, only the finalized assistant block lands in
     /// scrollback — useful for long autonomous runs where you don't
     /// want to scroll past partial chunks.
-    fn cmd_focus(
-        &mut self,
-        vp: &mut DynamicViewport,
-        arg: &str,
-    ) -> Result<()>
-    {
+    fn cmd_focus(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
         let new_value = match arg.trim().to_lowercase().as_str() {
             "" | "toggle" => !self.focus_mode,
             "on" | "true" | "1" | "yes" => true,
@@ -938,7 +894,9 @@ impl App {
             Line::from(""),
             Line::from(Span::styled(
                 format!("focus → {}", if new_value { "on" } else { "off" }),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
         ];
@@ -960,15 +918,9 @@ impl App {
     /// bound to its original provider — there's no session.switch_provider
     /// RPC yet, so live-switch isn't wired. The new value DOES take
     /// effect for future /btw sidecars and for the next process restart.
-    fn cmd_provider(
-        &mut self,
-        vp: &mut DynamicViewport,
-        arg: &str,
-    ) -> Result<()>
-    {
+    fn cmd_provider(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
         let new_provider = if arg.is_empty() {
-            let items: Vec<String> =
-                KNOWN_PROVIDERS.iter().map(|s| (*s).to_string()).collect();
+            let items: Vec<String> = KNOWN_PROVIDERS.iter().map(|s| (*s).to_string()).collect();
             let current = items.iter().position(|s| s == &self.provider).unwrap_or(0);
             match picker::run_picker("/provider", &items, current)? {
                 Some(idx) => items[idx].clone(),
@@ -1021,12 +973,7 @@ impl App {
     /// <name>` sets directly. Same stub-first semantics as /provider:
     /// updates App state, applies to new sessions; the current main
     /// session keeps its bound model.
-    fn cmd_model(
-        &mut self,
-        vp: &mut DynamicViewport,
-        arg: &str,
-    ) -> Result<()>
-    {
+    fn cmd_model(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
         let new_model = if arg.is_empty() {
             let known = known_models_for(&self.provider);
             if known.is_empty() {
@@ -1068,8 +1015,9 @@ impl App {
         self.model = new_model.clone();
         self.status = format!(" {} · {} · {} ", self.provider, self.model, self.session_id);
 
-        let lines: Vec<Line<'static>> = if changed {
-            vec![
+        let lines: Vec<Line<'static>> =
+            if changed {
+                vec![
                 Line::from(""),
                 Line::from(Span::styled(
                     format!("model → {new_model}"),
@@ -1082,16 +1030,16 @@ impl App {
                 )),
                 Line::from(""),
             ]
-        } else {
-            vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("model unchanged ({new_model})"),
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(""),
-            ]
-        };
+            } else {
+                vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("model unchanged ({new_model})"),
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    Line::from(""),
+                ]
+            };
         let h = lines.len() as u16;
         vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);
@@ -1106,8 +1054,7 @@ impl App {
     /// /btw sidecar) so cancelling a side question doesn't kill the
     /// main turn or vice versa. Idempotent — if nothing is in flight,
     /// the daemon returns `canceled: false` and we say so.
-    fn cmd_cancel(&mut self, vp: &mut DynamicViewport) -> Result<()>
-    {
+    fn cmd_cancel(&mut self, vp: &mut DynamicViewport) -> Result<()> {
         // Pick the session whose turn is currently streaming. Fall
         // back to the main session if nothing is in flight — the
         // daemon will tell us it was idle.
@@ -1128,7 +1075,10 @@ impl App {
                 }),
             )
             .context("session.cancel_outstanding RPC failed")?;
-        let canceled = resp.get("canceled").and_then(|v| v.as_bool()).unwrap_or(false);
+        let canceled = resp
+            .get("canceled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let was_in = resp
             .get("was_in")
             .and_then(|v| v.as_str())
@@ -1138,7 +1088,9 @@ impl App {
                 Line::from(""),
                 Line::from(Span::styled(
                     "/cancel — provider call aborted".to_string(),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
                     format!("  was_in: {was_in}"),
@@ -1171,8 +1123,7 @@ impl App {
     /// /clear — clear the visible scrollback. Doesn't touch the
     /// daemon's event log; this is a display-only reset. The inline
     /// viewport redraws on the next tick.
-    fn cmd_clear(&mut self, _vp: &mut DynamicViewport) -> Result<()>
-    {
+    fn cmd_clear(&mut self, _vp: &mut DynamicViewport) -> Result<()> {
         // TODO: implement viewport clear
         Ok(())
     }
@@ -1180,19 +1131,15 @@ impl App {
     /// Invoke a discovered skill. Injects the skill body as context
     /// by prepending it to the user's message. If no message was
     /// provided, sends just the skill body with a brief preamble.
-    fn cmd_skill(
-        &mut self,
-        vp: &mut DynamicViewport,
-        skill_name: &str,
-        tail: &str,
-    ) -> Result<()>
-    {
+    fn cmd_skill(&mut self, vp: &mut DynamicViewport, skill_name: &str, tail: &str) -> Result<()> {
         if self.streaming_header_open {
             let lines: Vec<Line<'static>> = vec![
                 Line::from(""),
                 Line::from(Span::styled(
                     "wait — turn still streaming".to_string(),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(format!(
                     "  retry /{skill_name} once the current response finishes."
@@ -1260,12 +1207,7 @@ impl App {
     /// Unknown-command stub. Keeps typos from getting sent to the
     /// model as a prompt (which would burn tokens and confuse the
     /// session). Mirrors claude-code's "Unknown slash command" hint.
-    fn emit_unknown_command(
-        &self,
-        vp: &mut DynamicViewport,
-        head: &str,
-    ) -> Result<()>
-    {
+    fn emit_unknown_command(&self, vp: &mut DynamicViewport, head: &str) -> Result<()> {
         let lines: Vec<Line<'static>> = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -1284,8 +1226,7 @@ impl App {
     }
 
     /// /help — print the built-in command surface to scrollback.
-    fn emit_help_lines(&self, vp: &mut DynamicViewport) -> Result<()>
-    {
+    fn emit_help_lines(&self, vp: &mut DynamicViewport) -> Result<()> {
         let mut lines: Vec<Line<'static>> = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -1322,15 +1263,15 @@ impl App {
             for name in names {
                 if let Some(skill) = self.skills.get(name) {
                     let desc = truncate_at_word(&skill.description, 50);
-                    lines.push(Line::from(format!(
-                        "  /{name:<18} {desc}"
-                    )));
+                    lines.push(Line::from(format!("  /{name:<18} {desc}")));
                 }
             }
         }
 
         lines.push(Line::from(""));
-        lines.push(Line::from("  Anything else is sent to the model as a prompt."));
+        lines.push(Line::from(
+            "  Anything else is sent to the model as a prompt.",
+        ));
         lines.push(Line::from(""));
 
         let h = lines.len() as u16;
@@ -1344,8 +1285,7 @@ impl App {
     /// Pull every queued notification, accumulate streaming_text,
     /// emit incremental preview lines via `insert_before`, and handle
     /// session.done / session.error to close the block.
-    fn drain_notifications(&mut self, vp: &mut DynamicViewport) -> Result<()>
-    {
+    fn drain_notifications(&mut self, vp: &mut DynamicViewport) -> Result<()> {
         while let Some(msg) = self.client.try_recv_notification() {
             match msg {
                 Message::Notification { method, params } => {
@@ -1354,10 +1294,7 @@ impl App {
                 Message::Eof => {
                     let width = vp.area().width as usize;
                     let wrap = width.saturating_sub(2);
-                    let lines = render::error_block(
-                        "mu serve closed stdout — daemon exited",
-                        wrap,
-                    );
+                    let lines = render::error_block("mu serve closed stdout — daemon exited", wrap);
                     let h = lines.len() as u16;
                     vp.insert_before(h, |buf| {
                         // No .wrap() — pre-wrapped by block_lines.
@@ -1428,12 +1365,14 @@ impl App {
         vp: &mut DynamicViewport,
         method: &str,
         params: &Value,
-    ) -> Result<()>
-    {
+    ) -> Result<()> {
         // Route notifications to the right turn (main vs sidecar /btw).
         // Notifications without a session_id (rare; some daemon
         // events) fall through with whatever streaming_route is set.
-        let sid = params.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        let sid = params
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if !sid.is_empty() {
             if sid == self.session_id {
                 // main turn — route already set by send_prompt
@@ -1561,9 +1500,7 @@ impl App {
                             Line::from(""),
                             Line::from(Span::styled(
                                 "× turn ended with error".to_string(),
-                                Style::default()
-                                    .fg(Color::Red)
-                                    .add_modifier(Modifier::BOLD),
+                                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                             )),
                             Line::from(Span::styled(
                                 format!("  {short}"),
@@ -1629,10 +1566,7 @@ impl App {
             if !event_sid.is_empty() && event_sid != self.session_id {
                 continue;
             }
-            self.actual_renderer = p
-                .get("renderer")
-                .and_then(|r| r.as_str())
-                .map(String::from);
+            self.actual_renderer = p.get("renderer").and_then(|r| r.as_str()).map(String::from);
             self.actual_cache_strategy = p
                 .get("cache_strategy")
                 .and_then(|r| r.as_str())
@@ -1662,11 +1596,7 @@ impl App {
     /// Yellow warning block emitted once after a faux-fallback
     /// detection. Tells the operator what was asked vs. what's
     /// actually running and points at the most likely fix.
-    fn emit_renderer_mismatch_warning(
-        &self,
-        vp: &mut DynamicViewport,
-    ) -> Result<()>
-    {
+    fn emit_renderer_mismatch_warning(&self, vp: &mut DynamicViewport) -> Result<()> {
         let lines: Vec<Line<'static>> = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -1675,10 +1605,7 @@ impl App {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(format!(
-                "  asked:    {}/{}",
-                self.provider, self.model
-            )),
+            Line::from(format!("  asked:    {}/{}", self.provider, self.model)),
             Line::from(format!(
                 "  running:  renderer={} · cache={} · provider_kind={}",
                 self.actual_renderer.as_deref().unwrap_or("?"),
@@ -1717,11 +1644,7 @@ impl App {
     /// still produces a header + closer pair in scrollback. Header
     /// color and label come from `streaming_route` so /btw turns get
     /// magenta "assistant ⋅ btw" framing.
-    fn ensure_streaming_header_open(
-        &mut self,
-        vp: &mut DynamicViewport,
-    ) -> Result<()>
-    {
+    fn ensure_streaming_header_open(&mut self, vp: &mut DynamicViewport) -> Result<()> {
         if self.streaming_header_open {
             return Ok(());
         }
@@ -1742,7 +1665,9 @@ impl App {
     /// Render a `session.tool_call_started` notification showing the
     /// tool name and primary argument:
     ///
+    /// ```text
     ///     │ ● Bash(cargo check -p mu-core)
+    /// ```
     ///
     /// Extracts the "primary arg" per tool type: `command` for bash,
     /// `file_path`/`path` for read/write/edit, `pattern` for grep.
@@ -1751,8 +1676,7 @@ impl App {
         vp: &mut DynamicViewport,
         params: &Value,
         wrap_width: usize,
-    ) -> Result<()>
-    {
+    ) -> Result<()> {
         let name = params
             .get("tool_name")
             .and_then(|v| v.as_str())
@@ -1765,7 +1689,10 @@ impl App {
         } else {
             let max_arg_len = wrap_width.saturating_sub(display_name.len() + 5); // "│ ● Name()"
             let truncated = if primary_arg.chars().count() > max_arg_len {
-                let short: String = primary_arg.chars().take(max_arg_len.saturating_sub(1)).collect();
+                let short: String = primary_arg
+                    .chars()
+                    .take(max_arg_len.saturating_sub(1))
+                    .collect();
                 format!("{short}…")
             } else {
                 primary_arg
@@ -1778,7 +1705,9 @@ impl App {
             Span::styled("│ ", Style::default().fg(route.color())),
             Span::styled(
                 header_text,
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]);
         vp.insert_before(1, |buf| {
@@ -1798,8 +1727,7 @@ impl App {
         vp: &mut DynamicViewport,
         msg: &str,
         _wrap_width: usize,
-    ) -> Result<()>
-    {
+    ) -> Result<()> {
         let route = self.streaming_route.unwrap_or(TurnRoute::Main);
         // Truncate to keep the scrollback usable. Full message lives
         // in the daemon's event log if you need to inspect it.
@@ -1821,10 +1749,12 @@ impl App {
     /// Render a `session.tool_call_completed` notification with a
     /// bounded output preview:
     ///
+    /// ```text
     ///     │   ⎿  first line of output
     ///     │      second line
     ///     │      third line
     ///     │      … +N lines
+    /// ```
     ///
     /// On error, shows the error message in red instead.
     fn emit_tool_call_completed(
@@ -1832,8 +1762,7 @@ impl App {
         vp: &mut DynamicViewport,
         params: &Value,
         wrap_width: usize,
-    ) -> Result<()>
-    {
+    ) -> Result<()> {
         let preview_lines: usize = if self.bash_yolo { 15 } else { 4 };
 
         let outcome = params.get("outcome");
@@ -1879,7 +1808,9 @@ impl App {
                         };
                         // Parse ANSI escape codes into styled spans
                         use ansi_to_tui::IntoText;
-                        let styled_line = truncated.into_text().ok()
+                        let styled_line = truncated
+                            .into_text()
+                            .ok()
                             .and_then(|text| text.into_iter().next())
                             .unwrap_or_else(|| Line::raw(truncated.clone()));
                         let mut spans: Vec<Span<'static>> = vec![Span::styled(prefix, bar_style)];
@@ -1946,10 +1877,7 @@ impl App {
             _ => {
                 let line = Line::from(vec![
                     Span::styled(indent.to_string(), bar_style),
-                    Span::styled(
-                        format!("⎿  ({kind})"),
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(format!("⎿  ({kind})"), Style::default().fg(Color::DarkGray)),
                 ]);
                 vp.insert_before(1, |buf| {
                     ratatui::widgets::Widget::render(Paragraph::new(line), buf.area, buf);
@@ -1963,23 +1891,14 @@ impl App {
     /// lines up to the last `\n`. Mid-line trailing content stays
     /// buffered until the next newline or until pending_close flushes
     /// it.
-    fn emit_streaming(
-        &mut self,
-        vp: &mut DynamicViewport,
-        wrap_width: usize,
-    ) -> Result<()>
-    {
+    fn emit_streaming(&mut self, vp: &mut DynamicViewport, wrap_width: usize) -> Result<()> {
         if self.streaming_text.is_empty() {
             return Ok(());
         }
         self.ensure_streaming_header_open(vp)?;
         let route = self.streaming_route.unwrap_or(TurnRoute::Main);
         // Emit any new chars up to the last newline.
-        let safe_byte_end = self
-            .streaming_text
-            .rfind('\n')
-            .map(|p| p + 1)
-            .unwrap_or(0);
+        let safe_byte_end = self.streaming_text.rfind('\n').map(|p| p + 1).unwrap_or(0);
         if safe_byte_end > 0 {
             let safe_chars = self.streaming_text[..safe_byte_end].chars().count();
             if safe_chars > self.streaming_chars_emitted {
@@ -2002,8 +1921,7 @@ fn emit_body_chunk(
     body: &str,
     wrap_width: usize,
     color: Color,
-) -> Result<()>
-{
+) -> Result<()> {
     // Budget: wrap_width is already (terminal_width - 2). Reserve 2
     // more for the "│ " prefix AND 2 more as a safety gutter so the
     // pre-wrapped content provably fits in the destination width
@@ -2062,14 +1980,8 @@ fn extract_primary_arg(tool_name: &str, arguments: Option<&Value>) -> String {
             .unwrap_or("")
             .to_string(),
         "grep" => {
-            let pattern = args
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let path = args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             if path.is_empty() {
                 pattern.to_string()
             } else {

@@ -1227,7 +1227,7 @@ mod tests {
             ContentBlock::ToolCall(ToolCall {
                 id: "toolu_kept".into(),
                 name: "read".into(),
-                arguments: serde_json::json!({"path": "/x"}),
+                arguments: crate::agent::ToolArgs::new(serde_json::json!({"path": "/x"})).unwrap(),
             }),
         ];
         // Build a rope by hand: sys + an assistant span carrying blocks

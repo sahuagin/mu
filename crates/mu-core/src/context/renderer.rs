@@ -133,7 +133,7 @@ impl From<&SpanKind> for ProviderRole {
 /// Fields are `pub(crate)` so in-crate renderers can construct via
 /// struct literals while external crates use [`ProviderMessage::new`]
 /// + accessor methods. See spec mu-044 §Encapsulation discipline.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderMessage {
     pub(crate) role: ProviderRole,
     pub(crate) content: MessageText,
@@ -254,7 +254,7 @@ pub enum CacheMarker {
 ///    spec's signature (see lines 597-603).
 ///
 /// [`CacheStrategy::annotate`]: super::cache::CacheStrategy::annotate
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderMessages {
     pub messages: Vec<ProviderMessage>,
     /// Echo of the target projection this was rendered for. Helps

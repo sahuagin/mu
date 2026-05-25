@@ -117,6 +117,15 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         context_refs: Vec<String>,
     },
+    /// mu-gdwd: a provider message failed boundary validation
+    /// (e.g., tool-call arguments contained NaN/Inf). The raw
+    /// payload is preserved verbatim (capped at 64 KiB) for
+    /// postmortem analysis. The turn is aborted.
+    ErrorInvalidMessage {
+        provider: String,
+        raw_message: String,
+        validation_error: String,
+    },
     /// Session closed (via `close_session` RPC or daemon shutdown).
     SessionClosed,
     /// Record of the prompt assembled for a provider call (mu-032).

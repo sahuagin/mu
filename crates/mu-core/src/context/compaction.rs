@@ -147,7 +147,7 @@ pub trait CompactionPolicy: Send + Sync {
 /// wall-clock time. The audit log is what
 /// `AgentEvent::CompactionAssembly` will project onto the operator
 /// view (mu-kgu.4).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactionResult {
     /// The compacted rope. For [`NoCompactionPolicy`] this is an
     /// identity clone of the input.

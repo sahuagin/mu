@@ -121,7 +121,7 @@ pub(crate) async fn handle_execute_tools(
             .send(AgentEvent::ToolCallStarted {
                 tool_call_id: call.id.clone(),
                 tool_name: call.name.clone(),
-                arguments: call.arguments.clone(),
+                arguments: call.arguments.clone().into(),
             })
             .await;
 
@@ -157,7 +157,7 @@ pub(crate) async fn handle_execute_tools(
                 let policy = t.spec().policy;
                 if !matches!(policy.retry, RetryPolicy::Never) {
                     None
-                } else if history.errored_match(&call.name, &call.arguments) {
+                } else if history.errored_match(&call.name, call.arguments.as_value()) {
                     Some("exact-match retry of a previously-errored call")
                 } else if history.consecutive_errors_for(&call.name) >= RETRY_STREAK_LIMIT {
                     Some("error streak — the last several calls to this tool all errored")
@@ -180,7 +180,7 @@ pub(crate) async fn handle_execute_tools(
         let validate_refusal_reason: Option<String> =
             if capability_refusal_reason.is_none() && retry_refusal_reason.is_none() {
                 tool.as_ref()
-                    .and_then(|t| t.validate(&call.arguments).err())
+                    .and_then(|t| t.validate(call.arguments.as_value()).err())
             } else {
                 None
             };
@@ -203,7 +203,7 @@ pub(crate) async fn handle_execute_tools(
                                 request_id: request_id.clone(),
                                 tool_call_id: call.id.clone(),
                                 tool_name: call.name.clone(),
-                                arguments: call.arguments.clone(),
+                                arguments: call.arguments.clone().into(),
                                 summary: format!(
                                     "{}({})",
                                     call.name,
@@ -325,7 +325,8 @@ pub(crate) async fn handle_execute_tools(
             match tool {
                 Some(t) => {
                     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-                    let mut execute_fut = Box::pin(t.execute(call.arguments.clone(), cancel_rx));
+                    let mut execute_fut =
+                        Box::pin(t.execute(call.arguments.clone().into(), cancel_rx));
 
                     let tool_call_started_at = Instant::now();
                     let tool_state_started_unix_ms = now_unix_ms();
@@ -383,7 +384,11 @@ pub(crate) async fn handle_execute_tools(
             }
         };
 
-        history.record(call.name.clone(), call.arguments.clone(), result.is_error);
+        history.record(
+            call.name.clone(),
+            call.arguments.clone().into(),
+            result.is_error,
+        );
 
         let _ = events
             .send(AgentEvent::ToolCallCompleted {

@@ -142,7 +142,10 @@ mod tests {
     #[test]
     fn system_prompt_max_bytes_lookup() {
         assert_eq!(
-            SystemPromptCapability::TopLevelField { max_bytes: Some(8 * 1024) }.max_bytes(),
+            SystemPromptCapability::TopLevelField {
+                max_bytes: Some(8 * 1024)
+            }
+            .max_bytes(),
             Some(8 * 1024)
         );
         assert_eq!(

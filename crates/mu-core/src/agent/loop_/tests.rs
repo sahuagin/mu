@@ -240,11 +240,12 @@ fn assistant_text(text: &str) -> AssistantMessage {
 }
 
 fn assistant_tool_call(id: &str, name: &str, args: Value) -> AssistantMessage {
+    use crate::agent::ToolArgs;
     AssistantMessage {
         content: vec![ContentBlock::ToolCall(ToolCall {
             id: id.to_owned(),
             name: name.to_owned(),
-            arguments: args,
+            arguments: ToolArgs::new(args).unwrap(),
         })],
         stop_reason: StopReason::ToolUse,
         usage: None,
@@ -807,11 +808,12 @@ fn assistant_text_msg(text: &str) -> AssistantMessage {
 }
 
 fn assistant_tool_msg(id: &str, name: &str) -> AssistantMessage {
+    use crate::agent::ToolArgs;
     AssistantMessage {
         content: vec![ContentBlock::ToolCall(ToolCall {
             id: id.to_owned(),
             name: name.to_owned(),
-            arguments: serde_json::json!({}),
+            arguments: ToolArgs::new(serde_json::json!({})).unwrap(),
         })],
         stop_reason: StopReason::ToolUse,
         usage: None,
@@ -1018,10 +1020,11 @@ fn tool_history_streak_skips_other_tools_without_breaking() {
 /// Build a MockProvider scripted to issue a single tool call then
 /// stop. Useful for end-to-end Ask-flow tests.
 fn mock_provider_one_tool_call(tool_name: &str, args: Value) -> MockProvider {
+    use crate::agent::ToolArgs;
     let call = ToolCall {
         id: "call_under_test".to_string(),
         name: tool_name.to_string(),
-        arguments: args,
+        arguments: ToolArgs::new(args).unwrap(),
     };
     // First provider call: emit the tool call.
     let first_turn = vec![ProviderEvent::Done(AssistantMessage {

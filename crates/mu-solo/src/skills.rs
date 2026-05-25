@@ -38,6 +38,8 @@ struct SkillMeta {
     display: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    categories: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -83,6 +85,9 @@ pub struct DiscoveredSkill {
     pub when_to_use: Option<String>,
     /// If true, model can't see or suggest this skill — user-only.
     pub manual_only: bool,
+    /// Categories for filtering/grouping (e.g., "coding", "vcs",
+    /// "operations").  Used by `/mode` to load/unload skill groups.
+    pub categories: Vec<String>,
     /// Full instructions loaded on demand.
     pub body: String,
     /// Reference file contents: (filename, content).
@@ -129,12 +134,9 @@ fn load_native(dir: &Path) -> Option<DiscoveredSkill> {
     });
 
     let name = &parsed.skill.name;
-    let command = parsed.skill.command
-        .unwrap_or_else(|| name.clone());
-    let display = parsed.skill.display
-        .unwrap_or_else(|| name.clone());
-    let description = parsed.skill.description
-        .unwrap_or_else(|| display.clone());
+    let command = parsed.skill.command.unwrap_or_else(|| name.clone());
+    let display = parsed.skill.display.unwrap_or_else(|| name.clone());
+    let description = parsed.skill.description.unwrap_or_else(|| display.clone());
 
     // Load body + reference files per the [context].files list.
     let mut body = String::new();
@@ -143,11 +145,7 @@ fn load_native(dir: &Path) -> Option<DiscoveredSkill> {
     for pattern in &ctx.files {
         // Simple glob: if it contains '*', expand; otherwise literal.
         if pattern.contains('*') {
-            let parent = dir.join(
-                Path::new(pattern)
-                    .parent()
-                    .unwrap_or(Path::new("")),
-            );
+            let parent = dir.join(Path::new(pattern).parent().unwrap_or(Path::new("")));
             if parent.is_dir() {
                 let mut matched: Vec<PathBuf> = fs::read_dir(&parent)
                     .into_iter()
@@ -157,13 +155,14 @@ fn load_native(dir: &Path) -> Option<DiscoveredSkill> {
                     .filter(|p| {
                         p.extension()
                             .and_then(|e| e.to_str())
-                            .map_or(false, |e| e == "md" || e == "toml" || e == "txt")
+                            .is_some_and(|e| e == "md" || e == "toml" || e == "txt")
                     })
                     .collect();
                 matched.sort();
                 for p in matched {
                     if let Ok(c) = fs::read_to_string(&p) {
-                        let fname = p.file_name()
+                        let fname = p
+                            .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("unknown")
                             .to_owned();
@@ -178,7 +177,8 @@ fn load_native(dir: &Path) -> Option<DiscoveredSkill> {
                 if body.is_empty() {
                     body = c;
                 } else {
-                    let fname = path.file_name()
+                    let fname = path
+                        .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("unknown")
                         .to_owned();
@@ -195,6 +195,7 @@ fn load_native(dir: &Path) -> Option<DiscoveredSkill> {
         description,
         when_to_use: routing.when_to_use,
         manual_only: routing.manual_only,
+        categories: parsed.skill.categories,
         body,
         references,
         format: SkillFormat::Native,
@@ -222,7 +223,8 @@ fn load_legacy(dir: &Path) -> Option<DiscoveredSkill> {
         ref_files.sort();
         for p in ref_files {
             if let Ok(c) = fs::read_to_string(&p) {
-                let fname = p.file_name()
+                let fname = p
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("unknown.md")
                     .to_owned();
@@ -238,6 +240,7 @@ fn load_legacy(dir: &Path) -> Option<DiscoveredSkill> {
         description: fm.description,
         when_to_use: fm.when_to_use,
         manual_only: fm.disable_model_invocation,
+        categories: Vec::new(),
         body,
         references,
         format: SkillFormat::Legacy,
@@ -333,9 +336,7 @@ pub fn routing_index(skills: &HashMap<String, DiscoveredSkill>) -> Option<String
 
     entries.sort_by_key(|(cmd, _)| *cmd);
 
-    let mut out = String::from(
-        "Available skills (invoke via /<name> or suggest when relevant):\n",
-    );
+    let mut out = String::from("Available skills (invoke via /<name> or suggest when relevant):\n");
     for (cmd, trigger) in &entries {
         out.push_str(&format!("- /{cmd} — {trigger}\n"));
     }

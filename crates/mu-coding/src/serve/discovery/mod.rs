@@ -171,7 +171,10 @@ pub fn derive_status_from_events(
             | EventPayload::MailboxMessageConsumed { .. }
             // mu-5g7i: TaskTelemetry is a derived projection of Done;
             // status derivation already handles Done above.
-            | EventPayload::TaskTelemetry { .. } => {}
+            | EventPayload::TaskTelemetry { .. }
+            // mu-gdwd: boundary-validation errors are logged but don't
+            // drive session-status derivation.
+            | EventPayload::ErrorInvalidMessage { .. } => {}
         }
         last_kind = Some(&ev.payload);
     }

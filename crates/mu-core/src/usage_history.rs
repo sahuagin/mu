@@ -236,7 +236,10 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
             // mu-5g7i: TaskTelemetry is the forensics-axis projection.
             // Its tokens are sourced from the same Done events we
             // already aggregate above, so re-counting here would double.
-            | EventPayload::TaskTelemetry { .. } => {}
+            | EventPayload::TaskTelemetry { .. }
+            // mu-gdwd: boundary-validation failures are logged for
+            // postmortem but don't carry usage-history signal.
+            | EventPayload::ErrorInvalidMessage { .. } => {}
         }
     }
 

@@ -32,7 +32,7 @@ use crate::context::{RetainedRope, Span};
 /// (e.g., `skill:<id>:<file>`) so provenance lookups are
 /// deterministic. The manager does not enforce a particular id
 /// shape — callers pick the convention.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Skill {
     pub id: String,
     pub spans: Vec<Span>,

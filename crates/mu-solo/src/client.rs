@@ -91,8 +91,8 @@ impl Client {
         //     appended there (good for RUST_LOG=mu_ai=debug runs).
         //     Otherwise the bytes are read and discarded so the
         //     pipe stays drained.
-        let log_path: Option<std::path::PathBuf> = std::env::var_os("MU_SOLO_DAEMON_LOG")
-            .map(std::path::PathBuf::from);
+        let log_path: Option<std::path::PathBuf> =
+            std::env::var_os("MU_SOLO_DAEMON_LOG").map(std::path::PathBuf::from);
         thread::Builder::new()
             .name("mu-solo-daemon-stderr".into())
             .spawn(move || {

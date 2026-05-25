@@ -17,6 +17,8 @@
 //! mechanism — skill activation IS pointer-set membership." This
 //! file is the realization of that principle.
 
+pub mod loader;
+
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};

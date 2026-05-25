@@ -37,9 +37,5 @@ figment = { version = "0.10", features = ["toml", "env"] }
 # hand-rolling $HOME / $XDG_CONFIG_HOME). Tiny crate, transitive-light.
 dirs = "5"
 ansi-to-tui = "8"
-
-[dev-dependencies]
-# Used by config.rs roundtrip tests. figment already pulls in `toml`
-# transitively for its TOML provider; we depend on it directly here to
-# (de)serialize SoloConfig in tests without going through figment.
+serde_yaml = { workspace = true }
 toml = { workspace = true }

@@ -28,6 +28,7 @@ async-trait = "0.1"
 # by the rope's Arc<str> content/id storage (mu-yqeq.2).
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+serde_yaml = "0.9"
 toml = "0.8"
 
 # storage

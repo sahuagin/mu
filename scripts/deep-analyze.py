@@ -158,53 +158,61 @@ def analyze_context_growth(events: list[dict]) -> dict:
         if p.get("kind") == "assistant_message_event":
             msg = p.get("message", {})
             usage = msg.get("usage")
-            if usage and usage.get("input_tokens", 0) > 0:
-                turns.append({
-                    "id": ev["id"],
-                    "ts": ev.get("timestamp_unix_ms", 0),
-                    "input_tokens": usage.get("input_tokens", 0),
-                    "output_tokens": usage.get("output_tokens", 0),
-                    "cache_read": usage.get("cache_read_input_tokens", 0),
-                    "cache_creation": usage.get("cache_creation_input_tokens", 0),
-                })
+            if usage:
+                # Total prompt size = input_tokens + cache_read + cache_creation.
+                # claude-code's input_tokens is only the non-cached portion;
+                # the real context size includes cached spans.
+                raw_input = usage.get("input_tokens", 0)
+                cache_read = usage.get("cache_read_input_tokens", 0)
+                cache_creation = usage.get("cache_creation_input_tokens", 0)
+                total_prompt = raw_input + cache_read + cache_creation
+                if total_prompt > 0:
+                    turns.append({
+                        "id": ev["id"],
+                        "ts": ev.get("timestamp_unix_ms", 0),
+                        "total_prompt_tokens": total_prompt,
+                        "raw_input_tokens": raw_input,
+                        "output_tokens": usage.get("output_tokens", 0),
+                        "cache_read": cache_read,
+                        "cache_creation": cache_creation,
+                    })
 
     if not turns:
         return {"has_usage_data": False}
 
-    input_tokens = [t["input_tokens"] for t in turns]
+    prompt_tokens = [t["total_prompt_tokens"] for t in turns]
     output_tokens = [t["output_tokens"] for t in turns]
 
-    # Detect growth rate: linear regression slope approximation
-    n = len(input_tokens)
+    n = len(prompt_tokens)
     if n >= 2:
-        avg_growth_per_turn = (input_tokens[-1] - input_tokens[0]) / max(n - 1, 1)
+        avg_growth_per_turn = (prompt_tokens[-1] - prompt_tokens[0]) / max(n - 1, 1)
     else:
         avg_growth_per_turn = 0
 
     # Detect token drops (likely compaction)
     drops = []
-    for i in range(1, len(input_tokens)):
-        if input_tokens[i] < input_tokens[i - 1] * 0.7:
+    for i in range(1, len(prompt_tokens)):
+        prev = prompt_tokens[i - 1]
+        curr = prompt_tokens[i]
+        if prev > 1000 and curr < prev * 0.7:
             drops.append({
                 "turn": i,
-                "before": input_tokens[i - 1],
-                "after": input_tokens[i],
-                "reduction_pct": round(
-                    (1 - input_tokens[i] / input_tokens[i - 1]) * 100, 1
-                ),
+                "before": prev,
+                "after": curr,
+                "reduction_pct": round((1 - curr / prev) * 100, 1),
             })
 
-    # Cache hit ratio
+    # Cache hit ratio: cache_read / total_prompt across all turns
     total_cache_read = sum(t["cache_read"] for t in turns)
-    total_input = sum(t["input_tokens"] for t in turns)
-    cache_hit_ratio = round(total_cache_read / max(total_input, 1), 3)
+    total_prompt_all = sum(t["total_prompt_tokens"] for t in turns)
+    cache_hit_ratio = round(total_cache_read / max(total_prompt_all, 1), 3)
 
     return {
         "has_usage_data": True,
         "turn_count": n,
-        "first_input_tokens": input_tokens[0] if input_tokens else 0,
-        "last_input_tokens": input_tokens[-1] if input_tokens else 0,
-        "peak_input_tokens": max(input_tokens) if input_tokens else 0,
+        "first_prompt_tokens": prompt_tokens[0] if prompt_tokens else 0,
+        "last_prompt_tokens": prompt_tokens[-1] if prompt_tokens else 0,
+        "peak_prompt_tokens": max(prompt_tokens) if prompt_tokens else 0,
         "avg_growth_per_turn": round(avg_growth_per_turn),
         "total_output_tokens": sum(output_tokens),
         "likely_compactions": drops,
@@ -351,10 +359,10 @@ def format_report_text(report: dict) -> str:
 
     # Context growth
     cg = report["context_growth"]
-    lines.append(f"\n── Context Growth ──")
+    lines.append("\n── Context Growth ──")
     if cg.get("has_usage_data"):
-        lines.append(f"  {cg['first_input_tokens']:,} → {cg['last_input_tokens']:,} tokens ({cg['turn_count']} turns)")
-        lines.append(f"  peak: {cg['peak_input_tokens']:,} | growth: ~{cg['avg_growth_per_turn']:,}/turn")
+        lines.append(f"  {cg['first_prompt_tokens']:,} → {cg['last_prompt_tokens']:,} tokens ({cg['turn_count']} turns)")
+        lines.append(f"  peak: {cg['peak_prompt_tokens']:,} | growth: ~{cg['avg_growth_per_turn']:,}/turn")
         lines.append(f"  cache hit ratio: {cg['cache_hit_ratio']:.1%}")
         if cg["likely_compactions"]:
             lines.append(f"  likely compactions: {len(cg['likely_compactions'])}")

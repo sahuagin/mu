@@ -1,0 +1,161 @@
+# Forensic detector catalog — shared schema for Rust + Python.
+#
+# Each [[detector]] defines a pattern the forensic tools look for.
+# Both mu-core/forensics.rs and scripts/deep-analyze.py read this
+# manifest. The fields list is the contract: every detector returns
+# ALL listed fields regardless of whether the pattern was found
+# (zeros/empty for not-detected, actual values for detected).
+#
+# Promotion pipeline: new detectors start as Python-only (impl = "python"),
+# graduate to Rust when stable (impl = "rust"), exported to Python via
+# PyO3 (mu-fr02). The Python API stays the same either way.
+
+# ── Task-level classifiers (Rust, in mu-core/forensics.rs) ─────────
+
+[[detector]]
+name = "task_outcome"
+description = "Classify a completed task: clean success, cosmetic failure, bug, hollow commit, lying state, etc."
+impl = "rust"
+category = "task"
+fields = [
+    "outcome",           # Outcome enum value
+    "confidence",        # Definite | Probable | Inferred
+    "rationale",         # human-readable one-liner
+]
+
+[[detector]]
+name = "commit_claims"
+description = "Extract and validate file-path claims from commit messages against the actual diff."
+impl = "rust"
+category = "task"
+fields = [
+    "claimed_files",     # list of paths claimed in commit message
+    "diff_files",        # list of paths actually changed
+    "unclaimed_changes", # files changed but not claimed
+    "hollow_claims",     # files claimed but not changed
+]
+
+# ── Session-level analyzers (Python, in scripts/deep-analyze.py) ───
+
+[[detector]]
+name = "tool_errors"
+description = "Tool error patterns: which tools fail, error message clustering, error rate."
+impl = "python"
+category = "session"
+fields = [
+    "total_tool_calls",
+    "total_errors",
+    "error_rate",        # float 0.0-1.0
+    "errors_by_tool",    # {tool_name: count}
+    "error_clusters",    # {tool_name: [{message, count}]}
+]
+
+[[detector]]
+name = "retry_loops"
+description = "Sequences where the same tool is called with similar arguments, suggesting retry-after-failure."
+impl = "python"
+category = "session"
+fields = [
+    # Returns a list of loop records; empty list = none detected
+    # Each: {tool, length, start_id, end_id, arg_preview, duration_ms}
+]
+
+[[detector]]
+name = "context_growth"
+description = "Track prompt token growth per turn, detect compactions, measure cache hit ratio."
+impl = "python"
+category = "session"
+fields = [
+    "has_usage_data",
+    "turn_count",
+    "first_prompt_tokens",
+    "last_prompt_tokens",
+    "peak_prompt_tokens",
+    "avg_growth_per_turn",
+    "total_output_tokens",
+    "likely_compactions",  # list of {turn, before, after, reduction_pct}
+    "cache_hit_ratio",     # float 0.0-1.0
+]
+
+[[detector]]
+name = "turn_productivity"
+description = "Classify tool calls as productive (writes), exploratory (reads), or wasted (errors)."
+impl = "python"
+category = "session"
+fields = [
+    "total_tool_calls",
+    "write_calls",
+    "read_calls",
+    "error_calls",
+    "other_calls",
+    "empty_results",
+    "write_ratio",       # float 0.0-1.0
+    "error_ratio",       # float 0.0-1.0
+]
+
+[[detector]]
+name = "startup_tax"
+description = "Early-session error patterns: first 10 tool calls compared to session-wide error rate. Detects the agent memory quoting pattern."
+impl = "python"
+category = "session"
+fields = [
+    "has_startup_data",
+    "first_10_calls",
+    "first_10_errors",
+    "startup_error_rate",   # float 0.0-1.0
+    "overall_error_rate",   # float 0.0-1.0
+    "startup_tax_detected", # bool
+    "agent_memory_retries",
+    "first_errors",         # list of {tool, args, error}
+]
+thresholds = { startup_rate_multiplier = 2.0, min_errors = 2 }
+
+[[detector]]
+name = "assistant_patterns"
+description = "Assistant message content analysis: length distribution, stop reasons, short/long response counts."
+impl = "python"
+category = "session"
+fields = [
+    "message_count",
+    "avg_length",
+    "median_length",
+    "short_responses",   # <50 chars
+    "long_responses",    # >5000 chars
+    "stop_reasons",      # {reason: count}
+]
+
+# ── Planned detectors (not yet implemented) ────────────────────────
+
+[[detector]]
+name = "compaction_quality"
+description = "Compare session behavior before and after compaction: does error rate increase? Does the model lose context about prior work?"
+impl = "planned"
+category = "session"
+fields = [
+    "compaction_count",
+    "pre_compaction_error_rate",
+    "post_compaction_error_rate",
+    "quality_degradation_detected",
+]
+
+[[detector]]
+name = "hallucinated_tool_calls"
+description = "Detect tool calls that reference non-existent tools, files, or APIs — the model inventing capabilities."
+impl = "planned"
+category = "session"
+fields = [
+    "hallucinated_count",
+    "tools_attempted",    # list of tool names that don't exist
+    "files_referenced",   # list of files that don't exist
+]
+
+[[detector]]
+name = "cost_efficiency"
+description = "Tokens spent per productive action (file write, commit, bead close). Higher = less efficient."
+impl = "planned"
+category = "session"
+fields = [
+    "total_tokens",
+    "productive_actions",
+    "tokens_per_action",
+]

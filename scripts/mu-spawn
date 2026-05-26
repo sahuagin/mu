@@ -27,7 +27,6 @@ SOCK="$HOME/.local/share/mu/mcp.sock"
 MCP_CONFIG_HOST="/tmp/mu-mcp-${POT_NAME}.json"
 MCP_CONFIG_IN_POT="/compat/linux/tmp/mu-mcp-${POT_NAME}.json"
 POT_SOCK="/usr/home/tcovert/.local/share/mu/mcp.sock"
-OAUTH_TOKEN_FILE="$HOME/.config/claude-code/headless-oauth-token.disabled"
 
 # ─── Ensure mu serve is running ───────────────────────────────────────
 
@@ -91,14 +90,6 @@ cat > "$MCP_CONFIG_HOST" << EOF
 }
 EOF
 
-# ─── Prepare OAuth token ──────────────────────────────────────────────
-
-if [[ ! -r "$OAUTH_TOKEN_FILE" ]]; then
-    echo "[mu-spawn] ERROR: OAuth token not found at $OAUTH_TOKEN_FILE" >&2
-    exit 1
-fi
-TOKEN_B64=$(base64 < "$OAUTH_TOKEN_FILE" | tr -d '\n')
-
 # ─── Get daemon info for the system prompt ────────────────────────────
 
 DAEMON_ID=$(echo '{"jsonrpc":"2.0","id":0,"method":"tools/call","params":{"name":"mu_daemon_info","arguments":{}}}' \
@@ -130,12 +121,16 @@ echo "[mu-spawn] Ctrl-C to exit" >&2
 sudo jexec -U "$POT_USER" "$POT_NAME" /bin/sh -c "
     unset ANTHROPIC_API_KEY
     unset ANTHROPIC_BASE_URL
+    unset CLAUDE_CODE_OAUTH_TOKEN
     export HOME=/usr/home/tcovert
     export LANG=C.UTF-8
-    TOKEN_DECODED=\$(echo '$TOKEN_B64' | base64 -d)
-    export CLAUDE_CODE_OAUTH_TOKEN=\"\$TOKEN_DECODED\"
+    export CLAUDE_CONFIG_DIR=/usr/home/tcovert/.claude-personal
+    export MU_DAEMON_ID='$DAEMON_ID'
+    export MU_SESSION_ID='session-1'
+    export MU_POT_NAME='$POT_NAME'
     exec /usr/local/bin/claude \
         --dangerously-skip-permissions \
+        --model claude-opus-4-7 \
         --mcp-config '$MCP_CONFIG_IN_POT' \
         --append-system-prompt '$SYSTEM_APPEND'
 "

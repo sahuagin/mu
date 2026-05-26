@@ -16,7 +16,6 @@ use mu_core::capability::Capability;
 use mu_core::event_log::SessionEventLog;
 use mu_core::protocol::{ApprovalDecision, OutstandingCall};
 
-#[cfg(test)]
 use super::mailbox::MailboxState;
 use super::mailbox::MailboxStateHandle;
 use super::provider_status::{ProviderCallState, ProviderStatusTracker};
@@ -78,6 +77,7 @@ struct SessionState {
 struct RehydratedSession {
     event_log: Arc<SessionEventLog>,
     parent_session_id: Option<String>,
+    mailbox: MailboxStateHandle,
 }
 
 /// In-memory session registry. Cheap to clone (Arc-backed).
@@ -174,12 +174,33 @@ impl Sessions {
         event_log: Arc<SessionEventLog>,
         parent_session_id: Option<String>,
     ) {
+        // Reconstruct mailbox state from the event log so rehydrated
+        // sessions can participate in peer.hello and receive messages.
+        let mailbox = {
+            let ms = MailboxState::new();
+            let mut max_seq: u64 = 0;
+            for ev in event_log.snapshot().iter() {
+                if let mu_core::event_log::EventPayload::MailboxMessagePosted { seq, .. } =
+                    &ev.payload
+                {
+                    if *seq > max_seq {
+                        max_seq = *seq;
+                    }
+                }
+            }
+            if max_seq > 0 {
+                ms.next_seq
+                    .store(max_seq + 1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Arc::new(ms)
+        };
         if let Ok(mut map) = self.rehydrated.lock() {
             map.insert(
                 id,
                 RehydratedSession {
                     event_log,
                     parent_session_id,
+                    mailbox,
                 },
             );
         }
@@ -272,7 +293,14 @@ impl Sessions {
     /// dispatch handlers can hold it across awaits without keeping
     /// the registry lock.
     pub fn mailbox(&self, id: &str) -> Option<MailboxStateHandle> {
-        self.inner.lock().ok()?.get(id).map(|s| s.mailbox.clone())
+        if let Some(m) = self.inner.lock().ok()?.get(id).map(|s| s.mailbox.clone()) {
+            return Some(m);
+        }
+        self.rehydrated
+            .lock()
+            .ok()?
+            .get(id)
+            .map(|s| s.mailbox.clone())
     }
 
     /// Snapshot the session's live provider-call state (mu-035 Phase
@@ -429,12 +457,15 @@ mod tests {
 
         assert!(sessions.event_log(&id).is_some());
 
-        // Live-state queries must NOT see rehydrated sessions —
+        // Agent-loop queries must NOT see rehydrated sessions —
         // ask_session against a ghost ID will fall through to the
         // standard "session not found" error.
         assert!(sessions.input_sender(&id).is_none());
         assert!(sessions.capability(&id).is_none());
-        assert!(sessions.mailbox(&id).is_none());
+        // Mailbox IS available for rehydrated sessions — they can
+        // participate in peer.hello and receive messages without
+        // needing a live agent loop.
+        assert!(sessions.mailbox(&id).is_some());
     }
 
     #[tokio::test]

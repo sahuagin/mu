@@ -253,6 +253,19 @@ pub struct App {
     skills: HashMap<String, DiscoveredSkill>,
     /// Active inline menu (slash-command picker, etc). None when closed.
     inline_menu: Option<InlineMenu>,
+    /// What the inline menu is being used for — determines what
+    /// happens on selection.
+    menu_context: MenuContext,
+}
+
+/// What the inline menu is selecting.
+#[derive(Default)]
+enum MenuContext {
+    /// Slash-command picker: selection inserts the command into the prompt.
+    #[default]
+    SlashCommand,
+    /// Effort-level picker: selection applies the effort level directly.
+    Effort,
 }
 
 impl App {
@@ -359,6 +372,7 @@ impl App {
             bash_yolo,
             skills,
             inline_menu: None,
+            menu_context: MenuContext::default(),
         })
     }
 
@@ -551,23 +565,34 @@ impl App {
             match menu.handle_key(key) {
                 MenuAction::Continue => return Ok(false),
                 MenuAction::Select(idx) => {
-                    let items = self.build_slash_menu_items();
-                    if let Some(item) = items.get(idx) {
-                        self.prompt.clear();
-                        let cmd = if item.name.starts_with('/') {
-                            item.name.clone()
-                        } else {
-                            format!("/{}", item.name)
-                        };
-                        for c in cmd.chars() {
-                            self.prompt.insert_char(c);
+                    match self.menu_context {
+                        MenuContext::SlashCommand => {
+                            let items = self.build_slash_menu_items();
+                            if let Some(item) = items.get(idx) {
+                                self.prompt.clear();
+                                let cmd = if item.name.starts_with('/') {
+                                    item.name.clone()
+                                } else {
+                                    format!("/{}", item.name)
+                                };
+                                for c in cmd.chars() {
+                                    self.prompt.insert_char(c);
+                                }
+                            }
+                        }
+                        MenuContext::Effort => {
+                            if let Some(level) = EffortLevel::ALL.get(idx) {
+                                self.effort = *level;
+                            }
                         }
                     }
                     self.inline_menu = None;
+                    self.menu_context = MenuContext::default();
                     return Ok(false);
                 }
                 MenuAction::Dismiss => {
                     self.inline_menu = None;
+                    self.menu_context = MenuContext::default();
                     self.prompt.clear();
                     return Ok(false);
                 }
@@ -905,23 +930,26 @@ impl App {
     /// an effort field on `ask_session`, it will attach here.
     fn cmd_effort(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
         let lines: Vec<Line<'static>> = if arg.is_empty() {
-            let choices: Vec<String> = EffortLevel::ALL
+            let items: Vec<MenuItem> = EffortLevel::ALL
                 .iter()
-                .map(|e| e.as_str().to_string())
+                .map(|e| {
+                    let current = if *e == self.effort { " (current)" } else { "" };
+                    MenuItem::new(
+                        e.as_str(),
+                        format!("{}{current}", match e {
+                            EffortLevel::Low => "Quick, concise responses",
+                            EffortLevel::Medium => "Balanced depth and speed",
+                            EffortLevel::High => "Thorough, detailed work",
+                            EffortLevel::XHigh => "Extra thorough, multi-angle",
+                            EffortLevel::Max => "Maximum depth, no shortcuts",
+                        }),
+                    )
+                })
                 .collect();
-            vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "── /effort ─────────────────────────".to_string(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(format!("  current:  {}", self.effort.as_str())),
-                Line::from(format!("  choices:  {}", choices.join(" · "))),
-                Line::from("  usage:    /effort <level>"),
-                Line::from(""),
-            ]
+            let max_visible = vp.area().height.saturating_sub(3) as usize;
+            self.inline_menu = Some(InlineMenu::new(items, max_visible.max(5)));
+            self.menu_context = MenuContext::Effort;
+            return Ok(());
         } else if let Some(level) = EffortLevel::parse(arg) {
             self.effort = level;
             vec![

@@ -74,6 +74,14 @@ pub struct NotificationWriter {
 }
 
 impl NotificationWriter {
+    /// Create a no-op writer whose notifications are silently dropped.
+    /// Used by the MCP server surface where notifications don't need to
+    /// be forwarded to the MCP client.
+    pub fn sink() -> Self {
+        let (tx, _rx) = mpsc::channel(1);
+        Self { tx }
+    }
+
     /// Emit a notification. Returns `Ok(())` even if the channel is
     /// closed — see §INV-5.
     pub async fn emit<P: Serialize>(&self, method: &str, params: P) -> Result<(), TransportError> {

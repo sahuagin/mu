@@ -157,6 +157,28 @@ pub struct MailboxMessageView {
     pub expires_at_unix_ms: Option<u64>,
 }
 
+/// `mailbox.read` request — fetch the full body of a single message
+/// by seq. Separates body retrieval from `mailbox.list` so list can
+/// return metadata-only (subject, kind, seq, consumed) without
+/// stuffing potentially large bodies into every list call.
+/// Self-access doesn't require a handle; cross-session read does.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MailboxReadRequest {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_handle: Option<String>,
+    pub seq: u64,
+}
+
+impl MailboxReadRequest {
+    pub const METHOD: &'static str = "mailbox.read";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MailboxReadResponse {
+    pub message: Option<MailboxMessageView>,
+}
+
 /// `mailbox.consume` request — mark a list of `seq`s as consumed.
 /// Idempotent: consuming an already-consumed seq is a no-op (not an
 /// error). Consuming an unknown seq is silently skipped.

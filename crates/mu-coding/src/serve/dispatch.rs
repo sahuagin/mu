@@ -13,7 +13,8 @@ use mu_core::protocol::{
     AskSessionRequest, AuthInitiateRequest, AuthOfferRequest, CancelOutstandingRequest,
     CancelSessionRequest, CloseSessionRequest, CreateSessionRequest, DaemonOutstandingCallsRequest,
     DaemonStatsRequest, DaemonUsageHistoryRequest, DelegateSessionRequest, MailboxConsumeRequest,
-    MailboxListRequest, MailboxPostRequest, PeerHelloRequest, PingRequest, Request,
+    MailboxListRequest, MailboxPostRequest, MailboxReadRequest, PeerHelloRequest, PingRequest,
+    Request,
     RespondToInputRequiredRequest, Response, ScheduleWakeupRequest, SessionEventsRequest,
     SessionListRequest, SessionStatsRequest, StartAutonomousRequest,
 };
@@ -145,6 +146,7 @@ pub async fn dispatch(
             handle_mailbox_post(request, sessions, notif.clone(), daemon_info.clone()).await
         }
         MailboxListRequest::METHOD => handle_mailbox_list(request, sessions),
+        MailboxReadRequest::METHOD => handle_mailbox_read(request, sessions),
         MailboxConsumeRequest::METHOD => handle_mailbox_consume(request, sessions),
         // mu-036 Phase A.2: wire surface ready, dispatch stubs return
         // a structured "not yet implemented" until Phase B (mu-3ao /

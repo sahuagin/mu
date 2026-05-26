@@ -1,0 +1,50 @@
+#!/usr/local/bin/zsh
+# mu-mcp-bridge — lazy-start mu serve + bridge stdio to MCP socket.
+# Used as the command in --mcp-config for claude-code.
+
+SOCK="${MU_MCP_SOCKET:-$HOME/.local/share/mu/mcp.sock}"
+MU_BIN="${MU_BINARY:-$HOME/src/public_github/mu/target/release/mu}"
+
+socket_alive() {
+    [[ -S "$SOCK" ]] && echo '{"jsonrpc":"2.0","id":0,"method":"ping","params":{}}' \
+        | socat -T1 - UNIX-CONNECT:"$SOCK" >/dev/null 2>&1
+}
+
+if ! socket_alive; then
+    rm -f "$SOCK"
+
+    if [[ ! -x "$MU_BIN" ]]; then
+        MU_BIN="$HOME/src/public_github/mu/target/debug/mu"
+    fi
+    if [[ ! -x "$MU_BIN" ]]; then
+        echo "mu binary not found" >&2
+        exit 1
+    fi
+
+    # Open /dev/null in read mode — mu serve's stdin gets EOF immediately
+    # but the MCP socket (tokio::spawn) stays alive because the serve
+    # function only returns when the main transport::serve loop exits AND
+    # all spawned tasks complete. The MCP listener task loops forever on
+    # accept(), keeping the process alive even after stdin EOF.
+    #
+    # ... except that's not how it works today. The transport::serve loop
+    # exits on stdin EOF and the process drops. We need to fix that in mu.
+    # For now: use a long-lived pipe from a backgrounded process.
+    { while true; do sleep 86400 || break; done } | \
+        MU_BEARER_TOKEN="${MU_BEARER_TOKEN:-mu-mcp-bridge}" \
+        "$MU_BIN" serve >/dev/null 2>>"$HOME/.local/share/mu/serve.log" &
+    disown %1 2>/dev/null
+
+    for i in $(seq 1 12); do
+        socket_alive && break
+        sleep 0.5
+    done
+
+    if ! socket_alive; then
+        echo "mu serve did not create socket within 6s" >&2
+        tail -5 "$HOME/.local/share/mu/serve.log" >&2 2>/dev/null
+        exit 1
+    fi
+fi
+
+exec socat STDIO UNIX-CONNECT:"$SOCK"

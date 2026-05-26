@@ -1,0 +1,18 @@
+[package]
+name = "mu-bridge"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "PyO3 bridge: claude-code JSONL parsing + mu event conversion + forensic analysis"
+
+[lib]
+name = "mu_bridge"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+serde.workspace = true
+serde_json.workspace = true

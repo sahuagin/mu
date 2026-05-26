@@ -6,6 +6,7 @@ members = [
     "crates/mu-coding",
     "crates/mu-tui",
     "crates/mu-solo",
+    "crates/mu-bridge",
 ]
 
 [workspace.package]

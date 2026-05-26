@@ -251,6 +251,37 @@ async fn l1_two_sessions_exchange_mailbox_message_round_trip() {
     assert_eq!(messages[0]["subject"], "first contact");
     assert_eq!(messages[0]["body"]["note"], "hi B from A");
 
+    // Step 6b: mailbox.read for seq 1 — returns full message.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 11, "method": "mailbox.read",
+        "params": { "session_id": session_b, "seq": 1 }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 11).await;
+    let read_msg = &resp["result"]["message"];
+    assert_eq!(read_msg["seq"], 1);
+    assert_eq!(read_msg["subject"], "first contact");
+    assert_eq!(read_msg["body"]["note"], "hi B from A");
+    assert_eq!(read_msg["consumed"], false);
+
+    // Step 6c: mailbox.read for nonexistent seq → message is null.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 12, "method": "mailbox.read",
+        "params": { "session_id": session_b, "seq": 999 }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 12).await;
+    assert!(
+        resp["result"]["message"].is_null(),
+        "nonexistent seq should return null message"
+    );
+
     // Step 7: B consumes the message.
     let req = json!({
         "jsonrpc": "2.0", "id": 7, "method": "mailbox.consume",

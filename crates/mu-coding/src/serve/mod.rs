@@ -16,6 +16,7 @@ pub mod factory;
 mod forwarder;
 mod handlers;
 mod mailbox;
+pub mod mcp;
 mod provider_status;
 mod sessions;
 
@@ -242,6 +243,23 @@ where
         )),
         None => local,
     };
+    // mu-mb02: start MCP server on a unix socket if MU_MCP_SOCKET is
+    // set or if the default socket path's parent exists. The MCP surface
+    // shares Sessions + DaemonInfo with the primary JSON-RPC loop so
+    // mailbox operations are consistent across both surfaces.
+    let mcp_socket_path = std::env::var("MU_MCP_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| mcp::default_mcp_socket_path());
+    if mcp_socket_path.parent().map(|p| p.exists()).unwrap_or(false) {
+        let mcp_sessions = sessions.clone();
+        let mcp_daemon_info = daemon_info.clone();
+        tokio::spawn(async move {
+            if let Err(e) = mcp::serve_mcp_socket(mcp_socket_path, mcp_sessions, mcp_daemon_info).await {
+                tracing::error!("MCP server exited: {e:#}");
+            }
+        });
+    }
+
     // Wrap tools in Arc so cloning per request is a single pointer
     // copy regardless of tools list size.
     let tools = Arc::new(tools);

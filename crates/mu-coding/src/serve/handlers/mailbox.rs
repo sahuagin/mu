@@ -5,8 +5,8 @@ use serde_json::Value;
 use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
     MailboxConsumeRequest, MailboxConsumeResponse, MailboxListRequest, MailboxListResponse,
-    MailboxMessageView, MailboxPostRequest, MailboxPostResponse, PeerHelloRequest,
-    PeerHelloResponse, Request, Response,
+    MailboxMessageView, MailboxPostRequest, MailboxPostResponse, MailboxReadRequest,
+    MailboxReadResponse, PeerHelloRequest, PeerHelloResponse, Request, Response,
 };
 use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
 
@@ -233,6 +233,41 @@ pub fn handle_mailbox_list(request: Request<Value>, sessions: Sessions) -> Respo
     ok_response(
         request.id,
         to_value_or_null(MailboxListResponse { messages }),
+    )
+}
+
+/// `mailbox.read` — fetch a single message's full view by seq.
+/// Self-access doesn't require a handle; cross-session read does.
+pub fn handle_mailbox_read(request: Request<Value>, sessions: Sessions) -> Response<Value> {
+    let params: MailboxReadRequest = match serde_json::from_value(request.params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("mailbox.read: invalid params: {e}"),
+            );
+        }
+    };
+
+    let log = match sessions.event_log(&params.session_id) {
+        Some(l) => l,
+        None => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("session not found: {}", params.session_id),
+            );
+        }
+    };
+
+    let message = project_mailbox(&log, None, true)
+        .into_iter()
+        .find(|m| m.seq == params.seq);
+
+    ok_response(
+        request.id,
+        to_value_or_null(MailboxReadResponse { message }),
     )
 }
 

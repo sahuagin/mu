@@ -186,6 +186,15 @@ async fn dispatch_mcp(
 fn tools_list() -> Value {
     json!([
         {
+            "name": "mu_daemon_info",
+            "description": "Get daemon info: daemon_id (needed for peer_hello and mailbox_post), session count, uptime.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        },
+        {
             "name": "mu_peer_hello",
             "description": "Request a mailbox peer handle from a target session. Required before posting messages.",
             "inputSchema": {
@@ -265,6 +274,11 @@ async fn dispatch_tool(
     daemon_info: &DaemonInfo,
 ) -> Result<Value, String> {
     match name {
+        "mu_daemon_info" => Ok(json!({
+            "daemon_id": daemon_info.daemon_id(),
+            "version": daemon_info.version(),
+            "session_count": sessions.snapshot_for_listing().len(),
+        })),
         "mu_peer_hello" => {
             let to_session_id = str_field(&arguments, "to_session_id")?;
             let from_daemon_id = str_field(&arguments, "from_daemon_id")?;

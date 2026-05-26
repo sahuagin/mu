@@ -1,0 +1,141 @@
+#!/usr/local/bin/zsh
+# mu-spawn — launch an interactive claude-code session inside a pot,
+# connected to mu via MCP mailbox.
+#
+# Usage:
+#   mu-spawn [pot-name]        # interactive session (subscription billing)
+#   mu-spawn -p [pot-name]     # headless with prompt on stdin (credit pool)
+#
+# The pot must already be running with:
+#   - claude binary accessible
+#   - linuxulator mounts
+#   - ~/.local/share/mu/ nullfs-mounted (for MCP socket)
+#   - socat installed
+#
+# If no pot-name given, defaults to mu-slat-test.
+# If the pot isn't running, attempts to clone+start from agent-runtime.
+
+set -e
+
+# ─── Config ───────────────────────────────────────────────────────────
+
+POT_NAME="${1:-mu-slat-test}"
+POT_IP="${MU_SPAWN_IP:-10.1.1.220}"
+POT_USER="${MU_SPAWN_USER:-tcovert}"
+POT_TEMPLATE="${MU_SPAWN_TEMPLATE:-agent-runtime}"
+SOCK="$HOME/.local/share/mu/mcp.sock"
+MCP_CONFIG_HOST="/tmp/mu-mcp-${POT_NAME}.json"
+MCP_CONFIG_IN_POT="/compat/linux/tmp/mu-mcp-${POT_NAME}.json"
+POT_SOCK="/usr/home/tcovert/.local/share/mu/mcp.sock"
+OAUTH_TOKEN_FILE="$HOME/.config/claude-code/headless-oauth-token.disabled"
+
+# ─── Ensure mu serve is running ───────────────────────────────────────
+
+if ! echo '{"jsonrpc":"2.0","id":0,"method":"ping","params":{}}' \
+    | socat -T1 - UNIX-CONNECT:"$SOCK" >/dev/null 2>&1; then
+    echo "[mu-spawn] Starting mu serve..." >&2
+    ~/.local/bin/mu-mcp-bridge <<< '{"jsonrpc":"2.0","id":0,"method":"ping","params":{}}' >/dev/null 2>&1
+fi
+
+# ─── Ensure pot is running ────────────────────────────────────────────
+
+POT_ACTIVE=$(sudo pot ls 2>/dev/null | grep -A3 "pot name : $POT_NAME" | grep 'active' | awk '{print $3}')
+
+if [[ "$POT_ACTIVE" != "true" ]]; then
+    echo "[mu-spawn] Pot $POT_NAME not running. Setting up..." >&2
+
+    # Check if pot exists but is stopped
+    if sudo pot ls 2>/dev/null | grep -q "pot name : $POT_NAME"; then
+        echo "[mu-spawn] Starting existing pot $POT_NAME..." >&2
+        sudo pot start "$POT_NAME" 2>&1 | tail -1 >&2
+    else
+        echo "[mu-spawn] Cloning $POT_TEMPLATE → $POT_NAME at $POT_IP..." >&2
+        sudo pot clone -P "$POT_TEMPLATE" -p "$POT_NAME" -i "$POT_IP" -d off 2>&1 >&2
+
+        # Mount mu state dir for MCP socket
+        sudo pot mount-in -p "$POT_NAME" \
+            -d "$HOME/.local/share/mu" \
+            -m /usr/home/tcovert/.local/share/mu 2>&1 >&2
+
+        sudo pot start "$POT_NAME" 2>&1 | tail -1 >&2
+    fi
+
+    # Fix DNS
+    sudo sh -c "echo 'nameserver 10.1.1.1' > /opt/pot/jails/$POT_NAME/m/etc/resolv.conf"
+
+    # Ensure socat is available
+    if ! sudo jexec "$POT_NAME" which socat >/dev/null 2>&1; then
+        echo "[mu-spawn] Installing socat in $POT_NAME..." >&2
+        sudo jexec "$POT_NAME" pkg install -y socat 2>&1 | tail -1 >&2
+    fi
+
+    # Verify claude is accessible
+    if ! sudo jexec "$POT_NAME" /usr/local/bin/claude --version >/dev/null 2>&1; then
+        echo "[mu-spawn] ERROR: claude not available in $POT_NAME" >&2
+        exit 1
+    fi
+fi
+
+echo "[mu-spawn] Pot $POT_NAME ready" >&2
+
+# ─── Write MCP config (shared via /tmp ↔ /compat/linux/tmp) ──────────
+
+cat > "$MCP_CONFIG_HOST" << EOF
+{
+  "mcpServers": {
+    "mu-mailbox": {
+      "command": "/usr/local/bin/socat",
+      "args": ["STDIO", "UNIX-CONNECT:$POT_SOCK"]
+    }
+  }
+}
+EOF
+
+# ─── Prepare OAuth token ──────────────────────────────────────────────
+
+if [[ ! -r "$OAUTH_TOKEN_FILE" ]]; then
+    echo "[mu-spawn] ERROR: OAuth token not found at $OAUTH_TOKEN_FILE" >&2
+    exit 1
+fi
+TOKEN_B64=$(base64 < "$OAUTH_TOKEN_FILE" | tr -d '\n')
+
+# ─── Get daemon info for the system prompt ────────────────────────────
+
+DAEMON_ID=$(echo '{"jsonrpc":"2.0","id":0,"method":"tools/call","params":{"name":"mu_daemon_info","arguments":{}}}' \
+    | socat -T2 - UNIX-CONNECT:"$SOCK" 2>/dev/null \
+    | python3 -c "import sys,json; r=json.loads(json.loads(sys.stdin.read())['result']['content'][0]['text']); print(r['daemon_id'])" 2>/dev/null)
+
+# ─── Build system prompt appendix ─────────────────────────────────────
+
+SYSTEM_APPEND="You are running inside a FreeBSD pot (jail: $POT_NAME). You have access to mu-mailbox MCP tools for coordinating with the mu orchestrator on the host.
+
+Available mu-mailbox tools:
+- mu_daemon_info: get daemon_id and session info
+- mu_peer_hello: get a mailbox handle (needed before posting)
+- mu_mailbox_list: list messages in a session's mailbox
+- mu_mailbox_read: read a message's full body
+- mu_mailbox_post: post a message to a session's mailbox
+- mu_mailbox_consume: mark messages as consumed
+
+When posting messages, use daemon_id '$DAEMON_ID'.
+
+You have full tool access. Use agent-teams, subagents, /goal, and all other capabilities normally. Everything runs inside the jail."
+
+# ─── Launch ───────────────────────────────────────────────────────────
+
+echo "[mu-spawn] Launching interactive claude in $POT_NAME (subscription billing)" >&2
+echo "[mu-spawn] MCP mailbox connected (daemon $DAEMON_ID)" >&2
+echo "[mu-spawn] Ctrl-C to exit" >&2
+
+sudo jexec -U "$POT_USER" "$POT_NAME" /bin/sh -c "
+    unset ANTHROPIC_API_KEY
+    unset ANTHROPIC_BASE_URL
+    export HOME=/usr/home/tcovert
+    export LANG=C.UTF-8
+    TOKEN_DECODED=\$(echo '$TOKEN_B64' | base64 -d)
+    export CLAUDE_CODE_OAUTH_TOKEN=\"\$TOKEN_DECODED\"
+    exec /usr/local/bin/claude \
+        --dangerously-skip-permissions \
+        --mcp-config '$MCP_CONFIG_IN_POT' \
+        --append-system-prompt '$SYSTEM_APPEND'
+"

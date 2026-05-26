@@ -30,10 +30,7 @@ impl ContextTracker {
     /// Updates internal token accounting if the event is an assistant
     /// message with usage data.
     pub fn feed(&mut self, cc_event: &Value) {
-        let cc_type = cc_event
-            .get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("");
+        let cc_type = cc_event.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         if cc_type != "assistant" {
             return;

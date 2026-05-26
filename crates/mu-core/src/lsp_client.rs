@@ -51,9 +51,7 @@ impl LspClient {
     /// Connect to an LSP server at the given TCP address and perform
     /// the initialize handshake.
     pub async fn connect(addr: &str) -> Result<Self> {
-        let stream = TcpStream::connect(addr)
-            .await
-            .map_err(LspError::Connect)?;
+        let stream = TcpStream::connect(addr).await.map_err(LspError::Connect)?;
         let (read, write) = stream.into_split();
         let mut client = Self {
             reader: Mutex::new(BufReader::new(read)),
@@ -92,10 +90,7 @@ impl LspClient {
     /// Send a workspace/symbol query and return parsed results.
     pub async fn workspace_symbol(&self, query: &str, limit: usize) -> Result<Vec<SymbolResult>> {
         let resp = self
-            .request(
-                "workspace/symbol",
-                json!({"query": query}),
-            )
+            .request("workspace/symbol", json!({"query": query}))
             .await?;
 
         let symbols = resp.as_array().cloned().unwrap_or_default();

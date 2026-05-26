@@ -51,7 +51,7 @@ impl Tool for IndexRecallTool {
         .with_display("Code index search")
         .with_when(
             "Investigating a codebase, finding where a concept is implemented, \
-             locating symbols or types, orienting in an unfamiliar project."
+             locating symbols or types, orienting in an unfamiliar project.",
         )
     }
 
@@ -105,4 +105,3 @@ impl Tool for IndexRecallTool {
         }
     }
 }
-

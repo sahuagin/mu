@@ -940,13 +940,16 @@ impl App {
                     let current = if *e == self.effort { " (current)" } else { "" };
                     MenuItem::new(
                         e.as_str(),
-                        format!("{}{current}", match e {
-                            EffortLevel::Low => "Quick, concise responses",
-                            EffortLevel::Medium => "Balanced depth and speed",
-                            EffortLevel::High => "Thorough, detailed work",
-                            EffortLevel::XHigh => "Extra thorough, multi-angle",
-                            EffortLevel::Max => "Maximum depth, no shortcuts",
-                        }),
+                        format!(
+                            "{}{current}",
+                            match e {
+                                EffortLevel::Low => "Quick, concise responses",
+                                EffortLevel::Medium => "Balanced depth and speed",
+                                EffortLevel::High => "Thorough, detailed work",
+                                EffortLevel::XHigh => "Extra thorough, multi-angle",
+                                EffortLevel::Max => "Maximum depth, no shortcuts",
+                            }
+                        ),
                     )
                 })
                 .collect();
@@ -1362,7 +1365,10 @@ impl App {
             MenuItem::new("/focus", "Toggle focus mode (suppress streaming preview)"),
             MenuItem::new("/provider ›", "Select provider"),
             MenuItem::new("/model ›", "Select model"),
-            MenuItem::new("/btw", "Side question via sidecar (main history unaffected)"),
+            MenuItem::new(
+                "/btw",
+                "Side question via sidecar (main history unaffected)",
+            ),
             MenuItem::new("/cancel", "Abort the in-flight provider call"),
             MenuItem::new("/clear", "Clear the visible scrollback"),
             MenuItem::new("/q", "Leave the session"),
@@ -1371,10 +1377,7 @@ impl App {
         skill_names.sort();
         for name in skill_names {
             if let Some(skill) = self.skills.get(name) {
-                items.push(MenuItem::new(
-                    format!("/{name}"),
-                    skill.description.clone(),
-                ));
+                items.push(MenuItem::new(format!("/{name}"), skill.description.clone()));
             }
         }
         items

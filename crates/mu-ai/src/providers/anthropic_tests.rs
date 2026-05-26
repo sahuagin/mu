@@ -71,7 +71,7 @@ fn b1_translate_tool_spec_shape() {
         description: "Read a file".into(),
         input_schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
         policy: Default::default(),
-    
+
         ..Default::default()
     };
     assert_eq!(
@@ -171,7 +171,7 @@ fn b4_build_request_body_includes_tools_when_present() {
         display: None,
         when: None,
         policy: Default::default(),
-    
+
         ..Default::default()
     }];
     let body = build_request_body("claude-test", None, &messages, &tools);
@@ -209,7 +209,7 @@ fn yqeq8_legacy_build_request_body_emits_no_cache_control() {
             display: None,
             when: None,
             policy: Default::default(),
-        
+
             ..Default::default()
         },
         ToolSpec {
@@ -219,7 +219,7 @@ fn yqeq8_legacy_build_request_body_emits_no_cache_control() {
             display: None,
             when: None,
             policy: Default::default(),
-        
+
             ..Default::default()
         },
     ];
@@ -317,7 +317,7 @@ fn yqeq8_projected_emits_cache_control_on_system_and_last_tool() {
             display: None,
             when: None,
             policy: Default::default(),
-        
+
             ..Default::default()
         },
         ToolSpec {
@@ -327,7 +327,7 @@ fn yqeq8_projected_emits_cache_control_on_system_and_last_tool() {
             display: None,
             when: None,
             policy: Default::default(),
-        
+
             ..Default::default()
         },
         ToolSpec {
@@ -337,7 +337,7 @@ fn yqeq8_projected_emits_cache_control_on_system_and_last_tool() {
             display: None,
             when: None,
             policy: Default::default(),
-        
+
             ..Default::default()
         },
     ];
@@ -406,7 +406,7 @@ fn yqeq8_projected_tools_only_caches_last_tool() {
             display: None,
             when: None,
             policy: Default::default(),
-        
+
             ..Default::default()
         },
         ToolSpec {
@@ -416,7 +416,7 @@ fn yqeq8_projected_tools_only_caches_last_tool() {
             display: None,
             when: None,
             policy: Default::default(),
-        
+
             ..Default::default()
         },
     ];
@@ -443,7 +443,7 @@ fn yqeq8_projected_without_cache_strategy_emits_no_cache_control() {
         display: None,
         when: None,
         policy: Default::default(),
-    
+
         ..Default::default()
     }];
     let rope = assemble_rope(Some("be concise"), &messages, &tools);
@@ -536,7 +536,7 @@ fn mu_s855_projected_excludes_tool_schema_from_system_block() {
         display: None,
         when: None,
         policy: Default::default(),
-    
+
         ..Default::default()
     }];
     let messages = vec![AgentMessage::User {
@@ -1200,7 +1200,7 @@ mod live_tests {
                 "required": ["text"]
             }),
             policy: Default::default(),
-        
+
             ..Default::default()
         };
 
@@ -1290,7 +1290,7 @@ fn equivalence_fixture() -> (
             "required": ["path"],
         }),
         policy: Default::default(),
-    
+
         ..Default::default()
     };
     let messages = vec![
@@ -1525,7 +1525,7 @@ fn yqeq4_parity_pure_text_turn() {
         display: None,
         when: None,
         policy: Default::default(),
-    
+
         ..Default::default()
     };
     let messages = vec![
@@ -1554,7 +1554,7 @@ fn yqeq4_parity_single_tool_call() {
             "properties": {"path": {"type": "string"}},
         }),
         policy: Default::default(),
-    
+
         ..Default::default()
     };
     let messages = vec![
@@ -1644,7 +1644,7 @@ fn yqeq4_parity_consecutive_tool_results_group_into_one_user_message() {
         display: None,
         when: None,
         policy: Default::default(),
-    
+
         ..Default::default()
     };
     parity_compare(None, &messages, &[dummy]);
@@ -1665,7 +1665,7 @@ fn yqeq4_parity_system_prompt_plus_tools() {
             display: None,
             when: None,
             policy: Default::default(),
-        
+
             ..Default::default()
         },
         mu_core::agent::ToolSpec {
@@ -1675,7 +1675,7 @@ fn yqeq4_parity_system_prompt_plus_tools() {
             display: None,
             when: None,
             policy: Default::default(),
-        
+
             ..Default::default()
         },
     ];
@@ -1727,7 +1727,7 @@ fn yqeq4_thinking_blocks_are_skipped_in_projected_wire_output() {
         display: None,
         when: None,
         policy: Default::default(),
-    
+
         ..Default::default()
     };
     parity_compare(None, &messages, &[dummy]);

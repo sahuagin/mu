@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tracing::{debug, info, warn};
@@ -64,9 +64,7 @@ pub fn default_mcp_socket_path() -> PathBuf {
         return PathBuf::from(dir).join("mcp.sock");
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home)
-        .join(".local/share/mu")
-        .join("mcp.sock")
+    PathBuf::from(home).join(".local/share/mu").join("mcp.sock")
 }
 
 async fn handle_mcp_connection(
@@ -165,7 +163,11 @@ async fn dispatch_mcp(
         "notifications/initialized" => None,
         "tools/list" => Some(mcp_ok(id, json!({"tools": tools_list()}))),
         "tools/call" => {
-            let name = req.params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let name = req
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let arguments = req.params.get("arguments").cloned().unwrap_or(Value::Null);
             let result = dispatch_tool(name, arguments, sessions, daemon_info).await;
             match result {
@@ -382,4 +384,3 @@ fn extract_result(response: Response<Value>) -> Result<Value, String> {
         Response::Err { error, .. } => Err(format!("{}: {}", error.code, error.message)),
     }
 }
-

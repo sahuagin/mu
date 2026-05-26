@@ -18,6 +18,8 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
+
+use crate::menu::{InlineMenu, MenuAction, MenuItem};
 use serde_json::Value;
 
 use crate::client::{Client, Message};
@@ -249,6 +251,8 @@ pub struct App {
     bash_yolo: bool,
     /// Discovered skills from SKILL.md files on disk.
     skills: HashMap<String, DiscoveredSkill>,
+    /// Active inline menu (slash-command picker, etc). None when closed.
+    inline_menu: Option<InlineMenu>,
 }
 
 impl App {
@@ -354,6 +358,7 @@ impl App {
             renderer_mismatch_warned: false,
             bash_yolo,
             skills,
+            inline_menu: None,
         })
     }
 
@@ -397,7 +402,13 @@ impl App {
             let w = vp.area().width as usize;
             let prompt_wrap_width = w.saturating_sub(4);
             let layout = self.prompt.visual_layout(prompt_wrap_width);
-            let desired_height = (layout.lines.len() as u16 + 2) // +separator +status
+            let menu_rows = if let Some(ref menu) = self.inline_menu {
+                let (visible, _, has_above, has_below) = menu.visible_items();
+                visible.len() + has_above as usize + has_below as usize
+            } else {
+                0
+            };
+            let desired_height = (layout.lines.len() as u16 + 2 + menu_rows as u16) // +separator +status +menu
                 .clamp(VIEWPORT_HEIGHT, MAX_VIEWPORT_HEIGHT);
             if desired_height != vp.area().height {
                 vp.set_height(desired_height)?;
@@ -416,6 +427,57 @@ impl App {
                 "─".repeat(vp_w),
                 Style::default().fg(Color::DarkGray),
             )));
+            // Inline menu (slash-command picker) renders between
+            // separator and prompt when active.
+            if let Some(ref menu) = self.inline_menu {
+                let (visible, cursor_pos, has_above, has_below) = menu.visible_items();
+                if has_above {
+                    lines.push(Line::from(Span::styled(
+                        "  ↑ more".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                for (vi, (_orig_idx, item)) in visible.iter().enumerate() {
+                    let is_selected = vi == cursor_pos;
+                    let name_width = 24.min(vp_w / 3);
+                    let desc_width = vp_w.saturating_sub(name_width + 4);
+                    let name_padded = format!("{:<width$}", item.name, width = name_width);
+                    let desc_trunc = if item.description.len() > desc_width {
+                        format!("{}…", &item.description[..desc_width.saturating_sub(1)])
+                    } else {
+                        item.description.clone()
+                    };
+                    if is_selected {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("  {name_padded}"),
+                                Style::default().fg(Color::Black).bg(Color::Cyan),
+                            ),
+                            Span::styled(
+                                format!(" {desc_trunc}"),
+                                Style::default().fg(Color::DarkGray).bg(Color::Cyan),
+                            ),
+                        ]));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("  {name_padded}"),
+                                Style::default().fg(Color::White),
+                            ),
+                            Span::styled(
+                                format!(" {desc_trunc}"),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ]));
+                    }
+                }
+                if has_below {
+                    lines.push(Line::from(Span::styled(
+                        "  ↓ more".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
             for (display_idx, vline) in vp_layout.lines.iter().skip(skip).enumerate() {
                 let row_idx = display_idx + skip;
                 let prefix = if row_idx == 0 { " > " } else { "   " };
@@ -484,6 +546,34 @@ impl App {
 
     /// Handle one keypress. Returns Ok(true) to exit the loop.
     fn handle_key(&mut self, vp: &mut DynamicViewport, key: KeyEvent) -> Result<bool> {
+        // If an inline menu is open, route keys there first.
+        if let Some(ref mut menu) = self.inline_menu {
+            match menu.handle_key(key) {
+                MenuAction::Continue => return Ok(false),
+                MenuAction::Select(idx) => {
+                    let items = self.build_slash_menu_items();
+                    if let Some(item) = items.get(idx) {
+                        self.prompt.clear();
+                        let cmd = if item.name.starts_with('/') {
+                            item.name.clone()
+                        } else {
+                            format!("/{}", item.name)
+                        };
+                        for c in cmd.chars() {
+                            self.prompt.insert_char(c);
+                        }
+                    }
+                    self.inline_menu = None;
+                    return Ok(false);
+                }
+                MenuAction::Dismiss => {
+                    self.inline_menu = None;
+                    self.prompt.clear();
+                    return Ok(false);
+                }
+            }
+        }
+
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 if !self.prompt.is_empty() {
@@ -523,6 +613,12 @@ impl App {
             }
             (_, KeyCode::Delete) => {
                 self.prompt.delete_after();
+            }
+            (_, KeyCode::Char('/')) if self.prompt.is_empty() => {
+                self.prompt.insert_char('/');
+                let items = self.build_slash_menu_items();
+                let max_visible = vp.area().height.saturating_sub(3) as usize;
+                self.inline_menu = Some(InlineMenu::new(items, max_visible.max(5)));
             }
             (_, KeyCode::Char(c)) => self.prompt.insert_char(c),
             (_, KeyCode::Enter) => {
@@ -1226,6 +1322,32 @@ impl App {
     }
 
     /// /help — print the built-in command surface to scrollback.
+    fn build_slash_menu_items(&self) -> Vec<MenuItem> {
+        let mut items = vec![
+            MenuItem::new("/status", "Current provider / model / session / daemon"),
+            MenuItem::new("/help", "Show help for commands"),
+            MenuItem::new("/effort", "Show or set effort: low|medium|high|xhigh|max"),
+            MenuItem::new("/focus", "Toggle focus mode (suppress streaming preview)"),
+            MenuItem::new("/provider", "List-picker or set provider directly"),
+            MenuItem::new("/model", "List-picker or set model directly"),
+            MenuItem::new("/btw", "Side question via sidecar (main history unaffected)"),
+            MenuItem::new("/cancel", "Abort the in-flight provider call"),
+            MenuItem::new("/clear", "Clear the visible scrollback"),
+            MenuItem::new("/q", "Leave the session"),
+        ];
+        let mut skill_names: Vec<&str> = self.skills.keys().map(|s| s.as_str()).collect();
+        skill_names.sort();
+        for name in skill_names {
+            if let Some(skill) = self.skills.get(name) {
+                items.push(MenuItem::new(
+                    format!("/{name}"),
+                    skill.description.clone(),
+                ));
+            }
+        }
+        items
+    }
+
     fn emit_help_lines(&self, vp: &mut DynamicViewport) -> Result<()> {
         let mut lines: Vec<Line<'static>> = vec![
             Line::from(""),

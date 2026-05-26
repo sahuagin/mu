@@ -23,6 +23,7 @@ pub mod capability;
 pub mod config;
 pub mod context;
 pub mod context_attribution;
+pub mod context_renderer;
 pub mod event_log;
 pub mod forensics;
 pub mod lsp_client;

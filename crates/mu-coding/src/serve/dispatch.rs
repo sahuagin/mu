@@ -14,8 +14,7 @@ use mu_core::protocol::{
     CancelSessionRequest, CloseSessionRequest, CreateSessionRequest, DaemonOutstandingCallsRequest,
     DaemonStatsRequest, DaemonUsageHistoryRequest, DelegateSessionRequest, MailboxConsumeRequest,
     MailboxListRequest, MailboxPostRequest, MailboxReadRequest, PeerHelloRequest, PingRequest,
-    Request,
-    RespondToInputRequiredRequest, Response, ScheduleWakeupRequest, SessionEventsRequest,
+    Request, RespondToInputRequiredRequest, Response, ScheduleWakeupRequest, SessionEventsRequest,
     SessionListRequest, SessionStatsRequest, StartAutonomousRequest,
 };
 use mu_core::transport::{codes, err_response, NotificationWriter};

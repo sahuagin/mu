@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd \"$CLAUDE_PROJECT_DIR\" 2>/dev/null && cargo fmt 2>/dev/null; true"
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" 2>/dev/null && cargo fmt --check 2>/dev/null || cargo fmt 2>/dev/null; true"
           }
         ]
       }

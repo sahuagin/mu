@@ -262,7 +262,7 @@ fn b5_build_request_body_with_tools() {
             "required": ["path"],
         }),
         policy: Default::default(),
-    
+
         ..Default::default()
     }];
     let body = build_request_body("gpt-5-codex", "medium", "sys", &messages, &tools);
@@ -708,7 +708,7 @@ fn yqeq5_parity_pure_text_turn() {
         display: None,
         when: None,
         policy: Default::default(),
-    
+
         ..Default::default()
     };
     let messages = vec![
@@ -740,7 +740,7 @@ fn yqeq5_parity_single_tool_call() {
             "properties": {"path": {"type": "string"}},
         }),
         policy: Default::default(),
-    
+
         ..Default::default()
     };
     let messages = vec![
@@ -829,7 +829,7 @@ fn yqeq5_parity_consecutive_tool_results() {
         display: None,
         when: None,
         policy: Default::default(),
-    
+
         ..Default::default()
     };
     parity_compare(None, &messages, &[dummy]);
@@ -934,7 +934,7 @@ fn mu_2puu_projected_excludes_tool_schema_from_instructions() {
         display: None,
         when: None,
         policy: Default::default(),
-    
+
         ..Default::default()
     }];
     let messages = vec![AgentMessage::User {
@@ -976,7 +976,7 @@ fn yqeq5_parity_system_prompt_plus_tools() {
             display: None,
             when: None,
             policy: Default::default(),
-        
+
             ..Default::default()
         },
         ToolSpec {
@@ -986,7 +986,7 @@ fn yqeq5_parity_system_prompt_plus_tools() {
             display: None,
             when: None,
             policy: Default::default(),
-        
+
             ..Default::default()
         },
     ];
@@ -1047,7 +1047,7 @@ fn yqeq5_thinking_blocks_are_skipped_in_projected_wire_output() {
         display: None,
         when: None,
         policy: Default::default(),
-    
+
         ..Default::default()
     };
     parity_compare(None, &messages, &[dummy]);
@@ -1126,7 +1126,7 @@ mod live_tests {
                 "required": ["text"],
             }),
             policy: Default::default(),
-        
+
             ..Default::default()
         };
 

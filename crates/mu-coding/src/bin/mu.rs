@@ -227,8 +227,8 @@ async fn main() -> Result<()> {
 
             // Try to connect to code-index-lsp for index_recall tool.
             // Non-fatal: if no server is available, we just don't register the tool.
-            let lsp_addr = std::env::var("CODE_INDEX_LSP")
-                .unwrap_or_else(|_| "127.0.0.1:7621".to_string());
+            let lsp_addr =
+                std::env::var("CODE_INDEX_LSP").unwrap_or_else(|_| "127.0.0.1:7621".to_string());
             match mu_core::lsp_client::LspClient::connect(&lsp_addr).await {
                 Ok(client) => {
                     let client = std::sync::Arc::new(client);
@@ -237,9 +237,9 @@ async fn main() -> Result<()> {
                         addr = %lsp_addr,
                         "connected to code-index-lsp; registering index_recall tool"
                     );
-                    tool_vec.push(std::sync::Arc::new(
-                        mu_coding::tools::IndexRecallTool::new(client),
-                    ));
+                    tool_vec.push(std::sync::Arc::new(mu_coding::tools::IndexRecallTool::new(
+                        client,
+                    )));
                 }
                 Err(e) => {
                     tracing::debug!(

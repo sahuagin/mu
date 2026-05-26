@@ -223,7 +223,7 @@ mod tests {
                 "required": ["text"]
             }),
             policy: ToolPolicy::default(),
-        
+
             ..Default::default()
         };
 

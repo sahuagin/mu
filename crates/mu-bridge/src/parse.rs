@@ -11,9 +11,12 @@ pub fn convert_session(cc_events: &[Value], session_id: &str) -> Vec<MuEvent> {
     let mut out = Vec::with_capacity(cc_events.len() * 2);
     let mut next_id: u64 = 1;
 
-    let first_envelope = cc_events
-        .iter()
-        .find(|e| matches!(e.get("type").and_then(|t| t.as_str()), Some("user" | "assistant")));
+    let first_envelope = cc_events.iter().find(|e| {
+        matches!(
+            e.get("type").and_then(|t| t.as_str()),
+            Some("user" | "assistant")
+        )
+    });
 
     let model = first_envelope
         .and_then(|e| e.get("message"))
@@ -92,10 +95,7 @@ pub fn convert_session(cc_events: &[Value], session_id: &str) -> Vec<MuEvent> {
 
 /// Convert a single claude-code event. May produce 0..N mu events.
 pub fn convert_one_event(cc_event: &Value, start_id: u64) -> Vec<MuEvent> {
-    let cc_type = cc_event
-        .get("type")
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
+    let cc_type = cc_event.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
     match cc_type {
         "user" => convert_user_event(cc_event, start_id),
@@ -232,7 +232,10 @@ fn convert_assistant_event(cc_event: &Value, start_id: u64) -> Vec<MuEvent> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let arguments = block.get("input").cloned().unwrap_or(Value::Object(Default::default()));
+            let arguments = block
+                .get("input")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default()));
 
             out.push(MuEvent {
                 id: next_id,
@@ -253,9 +256,12 @@ fn convert_assistant_event(cc_event: &Value, start_id: u64) -> Vec<MuEvent> {
     let has_tool_calls = blocks
         .iter()
         .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
-    let has_thinking = blocks
-        .iter()
-        .any(|b| matches!(b.get("type").and_then(|t| t.as_str()), Some("thinking" | "redacted_thinking")));
+    let has_thinking = blocks.iter().any(|b| {
+        matches!(
+            b.get("type").and_then(|t| t.as_str()),
+            Some("thinking" | "redacted_thinking")
+        )
+    });
 
     if !text.trim().is_empty() || (!has_tool_calls && !has_thinking) {
         out.push(MuEvent {
@@ -461,8 +467,14 @@ fn extract_tool_result_content(block: &Value) -> String {
 fn parse_usage(usage_val: &Value) -> Option<Usage> {
     let obj = usage_val.as_object()?;
     Some(Usage {
-        input_tokens: obj.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-        output_tokens: obj.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+        input_tokens: obj
+            .get("input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        output_tokens: obj
+            .get("output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
         cache_creation_input_tokens: obj
             .get("cache_creation_input_tokens")
             .and_then(|v| v.as_u64())

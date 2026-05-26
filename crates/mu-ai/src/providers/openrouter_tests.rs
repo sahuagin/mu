@@ -96,7 +96,7 @@ fn b5_translate_tool_spec() {
         description: "Read a file.".into(),
         input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
         policy: Default::default(),
-    
+
         ..Default::default()
     };
     let v = translate_tool_spec(&spec);
@@ -118,7 +118,7 @@ fn b6_build_request_body_includes_tools() {
         display: None,
         when: None,
         policy: Default::default(),
-    
+
         ..Default::default()
     }];
     let body = build_request_body("test/model", None, &messages, &tools);
@@ -244,7 +244,7 @@ fn yqeq6_parity_pure_text_turn() {
         display: None,
         when: None,
         policy: Default::default(),
-    
+
         ..Default::default()
     };
     let messages = vec![
@@ -276,7 +276,7 @@ fn yqeq6_parity_single_tool_call() {
             "properties": {"path": {"type": "string"}},
         }),
         policy: Default::default(),
-    
+
         ..Default::default()
     };
     let messages = vec![
@@ -365,7 +365,7 @@ fn yqeq6_parity_consecutive_tool_results() {
         display: None,
         when: None,
         policy: Default::default(),
-    
+
         ..Default::default()
     };
     parity_compare(None, &messages, &[dummy]);
@@ -465,7 +465,7 @@ fn mu_745h_projected_excludes_tool_schema_from_leading_system_msg() {
         display: None,
         when: None,
         policy: Default::default(),
-    
+
         ..Default::default()
     }];
     let messages = vec![AgentMessage::User {
@@ -506,7 +506,7 @@ fn yqeq6_parity_system_prompt_plus_tools() {
             display: None,
             when: None,
             policy: Default::default(),
-        
+
             ..Default::default()
         },
         mu_core::agent::ToolSpec {
@@ -516,7 +516,7 @@ fn yqeq6_parity_system_prompt_plus_tools() {
             display: None,
             when: None,
             policy: Default::default(),
-        
+
             ..Default::default()
         },
     ];
@@ -571,7 +571,7 @@ fn yqeq6_thinking_blocks_are_skipped_in_projected_wire_output() {
         display: None,
         when: None,
         policy: Default::default(),
-    
+
         ..Default::default()
     };
     parity_compare(None, &messages, &[dummy]);
@@ -854,7 +854,7 @@ mod live_tests {
                 "required": ["text"]
             }),
             policy: Default::default(),
-        
+
             ..Default::default()
         };
 

@@ -155,7 +155,6 @@ impl InlineMenu {
                     true
                 } else {
                     item.name.to_lowercase().contains(&lower_filter)
-                        || item.description.to_lowercase().contains(&lower_filter)
                 }
             })
             .map(|(i, _)| i)

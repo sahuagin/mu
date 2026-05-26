@@ -565,19 +565,25 @@ impl App {
             match menu.handle_key(key) {
                 MenuAction::Continue => return Ok(false),
                 MenuAction::Select(idx) => {
-                    match self.menu_context {
+                    self.inline_menu = None;
+                    let ctx = std::mem::take(&mut self.menu_context);
+                    match ctx {
                         MenuContext::SlashCommand => {
                             let items = self.build_slash_menu_items();
                             if let Some(item) = items.get(idx) {
-                                self.prompt.clear();
-                                let cmd = if item.name.starts_with('/') {
-                                    item.name.clone()
+                                let raw = item.name.trim_end_matches(" ›");
+                                let cmd = if raw.starts_with('/') {
+                                    raw.to_string()
                                 } else {
-                                    format!("/{}", item.name)
+                                    format!("/{raw}")
                                 };
+                                self.prompt.clear();
                                 for c in cmd.chars() {
                                     self.prompt.insert_char(c);
                                 }
+                                // Synthesize Enter to execute the command immediately.
+                                let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+                                return self.handle_key(vp, enter);
                             }
                         }
                         MenuContext::Effort => {
@@ -586,8 +592,6 @@ impl App {
                             }
                         }
                     }
-                    self.inline_menu = None;
-                    self.menu_context = MenuContext::default();
                     return Ok(false);
                 }
                 MenuAction::Dismiss => {
@@ -1354,10 +1358,10 @@ impl App {
         let mut items = vec![
             MenuItem::new("/status", "Current provider / model / session / daemon"),
             MenuItem::new("/help", "Show help for commands"),
-            MenuItem::new("/effort", "Show or set effort: low|medium|high|xhigh|max"),
+            MenuItem::new("/effort ›", "Select effort level"),
             MenuItem::new("/focus", "Toggle focus mode (suppress streaming preview)"),
-            MenuItem::new("/provider", "List-picker or set provider directly"),
-            MenuItem::new("/model", "List-picker or set model directly"),
+            MenuItem::new("/provider ›", "Select provider"),
+            MenuItem::new("/model ›", "Select model"),
             MenuItem::new("/btw", "Side question via sidecar (main history unaffected)"),
             MenuItem::new("/cancel", "Abort the in-flight provider call"),
             MenuItem::new("/clear", "Clear the visible scrollback"),

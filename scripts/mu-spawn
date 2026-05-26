@@ -51,22 +51,13 @@ if [[ "$POT_ACTIVE" != "true" ]]; then
         echo "[mu-spawn] Cloning $POT_TEMPLATE → $POT_NAME at $POT_IP..." >&2
         sudo pot clone -P "$POT_TEMPLATE" -p "$POT_NAME" -i "$POT_IP" -d off 2>&1 >&2
 
-        # Mount mu state dir for MCP socket
-        sudo pot mount-in -p "$POT_NAME" \
-            -d "$HOME/.local/share/mu" \
-            -m /usr/home/tcovert/.local/share/mu 2>&1 >&2
-
+        # ~/.local/share (including mu/ with MCP socket) is in the
+        # template's fscomp.conf — no per-pot mount-in needed.
         sudo pot start "$POT_NAME" 2>&1 | tail -1 >&2
     fi
 
     # Fix DNS
     sudo sh -c "echo 'nameserver 10.1.1.1' > /opt/pot/jails/$POT_NAME/m/etc/resolv.conf"
-
-    # Ensure socat is available
-    if ! sudo jexec "$POT_NAME" which socat >/dev/null 2>&1; then
-        echo "[mu-spawn] Installing socat in $POT_NAME..." >&2
-        sudo jexec "$POT_NAME" pkg install -y socat 2>&1 | tail -1 >&2
-    fi
 
     # Verify claude is accessible
     if ! sudo jexec "$POT_NAME" /usr/local/bin/claude --version >/dev/null 2>&1; then
@@ -124,6 +115,7 @@ sudo jexec -U "$POT_USER" "$POT_NAME" /bin/sh -c "
     unset CLAUDE_CODE_OAUTH_TOKEN
     export HOME=/usr/home/tcovert
     export LANG=C.UTF-8
+    export PATH=/usr/local/pot-bin:/usr/home/tcovert/.local/bin:\$PATH
     export CLAUDE_CONFIG_DIR=/usr/home/tcovert/.claude-personal
     export MU_DAEMON_ID='$DAEMON_ID'
     export MU_SESSION_ID='session-1'

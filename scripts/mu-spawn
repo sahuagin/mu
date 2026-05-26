@@ -115,8 +115,9 @@ sudo jexec -U "$POT_USER" "$POT_NAME" /bin/sh -c "
     unset CLAUDE_CODE_OAUTH_TOKEN
     export HOME=/usr/home/tcovert
     export LANG=C.UTF-8
-    export PATH=/usr/local/pot-bin:/usr/home/tcovert/.local/bin:\$PATH
+    export PATH=/usr/local/pot-bin:/usr/home/tcovert/.cargo/bin:/usr/home/tcovert/.local/bin:\$PATH
     export CLAUDE_CONFIG_DIR=/usr/home/tcovert/.claude-personal
+    export SSH_AUTH_SOCK=/compat/linux${SSH_AUTH_SOCK}
     export MU_DAEMON_ID='$DAEMON_ID'
     export MU_SESSION_ID='session-1'
     export MU_POT_NAME='$POT_NAME'

@@ -13,6 +13,6 @@ name = "mu_bridge"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3 = { version = "0.25", features = ["extension-module"] }
 serde.workspace = true
 serde_json.workspace = true

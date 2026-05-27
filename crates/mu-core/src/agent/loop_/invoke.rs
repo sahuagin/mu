@@ -141,7 +141,8 @@ pub(crate) async fn handle_invoke_llm(
                     return Err(Outcome::OutstandingCancelled { reason });
                 }
                 Some(input @ AgentInput::UserMessage(_))
-                | Some(input @ AgentInput::StartAutonomous { .. }) => {
+                | Some(input @ AgentInput::StartAutonomous { .. })
+                | Some(input @ AgentInput::SwitchProvider { .. }) => {
                     buffered.push(input);
                 }
                 None => {

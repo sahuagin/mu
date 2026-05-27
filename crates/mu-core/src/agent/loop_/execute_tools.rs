@@ -228,7 +228,8 @@ pub(crate) async fn handle_execute_tools(
                                     return Err(Outcome::OutstandingCancelled { reason });
                                 }
                                 Some(AgentInput::UserMessage(_))
-                                | Some(AgentInput::StartAutonomous { .. }) => {
+                                | Some(AgentInput::StartAutonomous { .. })
+                                | Some(AgentInput::SwitchProvider { .. }) => {
                                     if let Ok(mut pending) = pending_approvals.lock() {
                                         pending.remove(&request_id);
                                     }
@@ -354,7 +355,8 @@ pub(crate) async fn handle_execute_tools(
                                     return Err(Outcome::OutstandingCancelled { reason });
                                 }
                                 Some(input @ AgentInput::UserMessage(_))
-                                | Some(input @ AgentInput::StartAutonomous { .. }) => {
+                                | Some(input @ AgentInput::StartAutonomous { .. })
+                                | Some(input @ AgentInput::SwitchProvider { .. }) => {
                                     buffered.push(input);
                                 }
                                 None => {

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::pricing;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteEntry {
     pub provider_kind: Arc<str>,
     pub model: Arc<str>,

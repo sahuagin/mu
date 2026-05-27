@@ -219,7 +219,8 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
         | AgentEvent::MessageStart { .. }
         | AgentEvent::MessageEnd { .. }
         | AgentEvent::ContextAssembly { .. }
-        | AgentEvent::CompactionAssembly { .. } => None,
+        | AgentEvent::CompactionAssembly { .. }
+        | AgentEvent::ProviderSwitched { .. } => None,
     }
 }
 
@@ -688,6 +689,22 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
         // per-span decision audit. No durable-log surface needed
         // until a consumer (TUI / inspector) requires it.
         | AgentEvent::CompactionAssembly { .. } => None,
+        AgentEvent::ProviderSwitched {
+            old_provider_kind,
+            old_model,
+            new_provider_kind,
+            new_model,
+        } => Some((
+            EventActor::System,
+            EventPayload::ProviderSwitched {
+                old_provider_kind: old_provider_kind.clone(),
+                old_model: old_model.clone(),
+                new_provider_kind: new_provider_kind.clone(),
+                new_model: new_model.clone(),
+                context_soft_limit: None,
+                context_hard_limit: None,
+            },
+        )),
     }
 }
 
@@ -1129,6 +1146,7 @@ mod tests {
                 EventPayload::MailboxMessageConsumed { .. } => "mailbox_message_consumed",
                 EventPayload::TaskTelemetry { .. } => "task_telemetry",
                 EventPayload::ErrorInvalidMessage { .. } => "error_invalid_message",
+                EventPayload::ProviderSwitched { .. } => "provider_switched",
             })
             .collect();
         assert_eq!(kinds, vec!["assistant_message", "done"]);

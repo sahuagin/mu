@@ -12,10 +12,11 @@ use mu_core::agent::Tool;
 use mu_core::protocol::{
     AskSessionRequest, AuthInitiateRequest, AuthOfferRequest, CancelOutstandingRequest,
     CancelSessionRequest, CloseSessionRequest, CreateSessionRequest, DaemonOutstandingCallsRequest,
-    DaemonStatsRequest, DaemonUsageHistoryRequest, DelegateSessionRequest, MailboxConsumeRequest,
+    DaemonListRoutesRequest, DaemonStatsRequest, DaemonUsageHistoryRequest,
+    DelegateSessionRequest, MailboxConsumeRequest,
     MailboxListRequest, MailboxPostRequest, MailboxReadRequest, PeerHelloRequest, PingRequest,
     Request, RespondToInputRequiredRequest, Response, ScheduleWakeupRequest, SessionEventsRequest,
-    SessionListRequest, SessionStatsRequest, StartAutonomousRequest,
+    SessionListRequest, SessionStatsRequest, SetRouteRequest, StartAutonomousRequest,
 };
 use mu_core::transport::{codes, err_response, NotificationWriter};
 
@@ -155,6 +156,10 @@ pub async fn dispatch(
         RespondToInputRequiredRequest::METHOD => {
             handle_respond_to_input_required(request, sessions)
         }
+        SetRouteRequest::METHOD => {
+            handle_set_route(request, sessions, factory).await
+        }
+        DaemonListRoutesRequest::METHOD => handle_list_routes(request, daemon_info),
         other => err_response(
             request.id,
             codes::METHOD_NOT_FOUND,

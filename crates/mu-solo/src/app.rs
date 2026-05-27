@@ -1243,71 +1243,57 @@ impl App {
         Ok(())
     }
 
-    /// /provider [name] — show or change the selected provider. Bare
-    /// `/provider` opens a modal picker (KNOWN_PROVIDERS); `/provider
-    /// <name>` sets directly without the picker (useful for any
-    /// provider not on the curated list).
-    ///
-    /// v0 stub-first semantics (memory 85cf7400): updates App state +
-    /// banner + /status. The currently-running main session stays
-    /// bound to its original provider — there's no session.switch_provider
-    /// RPC yet, so live-switch isn't wired. The new value DOES take
-    /// effect for future /btw sidecars and for the next process restart.
+    /// /provider [name] — switch the session's provider. Bare
+    /// `/provider` opens a modal picker; `/provider <name>` sets
+    /// directly. Sends `session.set_route` to the daemon; the switch
+    /// takes effect on the next turn.
     fn cmd_provider(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
         let new_provider = if arg.is_empty() {
             let items: Vec<String> = KNOWN_PROVIDERS.iter().map(|s| (*s).to_string()).collect();
             let current = items.iter().position(|s| s == &self.provider).unwrap_or(0);
             match picker::run_picker("/provider", &items, current)? {
                 Some(idx) => items[idx].clone(),
-                None => return Ok(()), // cancelled
+                None => return Ok(()),
             }
         } else {
             arg.to_string()
         };
 
-        let changed = new_provider != self.provider;
-        self.provider = new_provider.clone();
+        let kind = normalize_provider_kind(&new_provider);
+        let models = known_models_for(&kind);
+        let default_model = models.first().map(|s| s.to_string()).unwrap_or_else(|| self.model.clone());
 
-        let lines: Vec<Line<'static>> = if changed {
-            vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("provider → {new_provider}"),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    "  applies to new sessions (e.g. /btw); current session keeps its bound provider"
-                        .to_string(),
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(""),
-            ]
-        } else {
-            vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("provider unchanged ({new_provider})"),
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(""),
-            ]
-        };
-        let h = lines.len() as u16;
-        vp.insert_before(h, |buf| {
-            let p = Paragraph::new(lines);
-            ratatui::widgets::Widget::render(p, buf.area, buf);
-        })?;
+        match self.send_set_route(vp, &kind, &default_model) {
+            Ok(()) => {
+                self.provider = new_provider;
+                self.model = default_model;
+            }
+            Err(e) => {
+                let lines = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("provider switch failed: {e}"),
+                        Style::default().fg(Color::Red),
+                    )),
+                    Line::from(""),
+                ];
+                let h = lines.len() as u16;
+                vp.insert_before(h, |buf| {
+                    let p = Paragraph::new(lines);
+                    ratatui::widgets::Widget::render(p, buf.area, buf);
+                })?;
+            }
+        }
         Ok(())
     }
 
-    /// /model [name] — show or change the selected model. Bare
-    /// `/model` opens a picker scoped to the current provider; `/model
-    /// <name>` sets directly. Same stub-first semantics as /provider:
-    /// updates App state, applies to new sessions; the current main
-    /// session keeps its bound model.
+    /// /model [name] — switch the session's model. Bare `/model` opens
+    /// a picker scoped to the current provider; `/model <name>` sets
+    /// directly. Sends `session.set_route` to the daemon.
     fn cmd_model(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
         let new_model = if arg.is_empty() {
-            let known = known_models_for(&self.provider);
+            let kind = normalize_provider_kind(&self.provider);
+            let known = known_models_for(&kind);
             if known.is_empty() {
                 let lines: Vec<Line<'static>> = vec![
                     Line::from(""),
@@ -1327,8 +1313,6 @@ impl App {
                 })?;
                 return Ok(());
             }
-            // If the current model is not in the known list, prepend
-            // it so the picker doesn't pretend it doesn't exist.
             let mut items: Vec<String> = Vec::with_capacity(known.len() + 1);
             if !known.iter().any(|m| *m == self.model) {
                 items.push(self.model.clone());
@@ -1343,40 +1327,67 @@ impl App {
             arg.to_string()
         };
 
-        let changed = new_model != self.model;
-        self.model = new_model.clone();
-
-        let lines: Vec<Line<'static>> =
-            if changed {
-                vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("model → {new_model}"),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    "  applies to new sessions (e.g. /btw); current session keeps its bound model"
-                        .to_string(),
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(""),
-            ]
-            } else {
-                vec![
+        let kind = normalize_provider_kind(&self.provider);
+        match self.send_set_route(vp, &kind, &new_model) {
+            Ok(()) => {
+                self.model = new_model;
+            }
+            Err(e) => {
+                let lines = vec![
                     Line::from(""),
                     Line::from(Span::styled(
-                        format!("model unchanged ({new_model})"),
-                        Style::default().fg(Color::DarkGray),
+                        format!("model switch failed: {e}"),
+                        Style::default().fg(Color::Red),
                     )),
                     Line::from(""),
-                ]
-            };
-        let h = lines.len() as u16;
-        vp.insert_before(h, |buf| {
-            let p = Paragraph::new(lines);
-            ratatui::widgets::Widget::render(p, buf.area, buf);
-        })?;
+                ];
+                let h = lines.len() as u16;
+                vp.insert_before(h, |buf| {
+                    let p = Paragraph::new(lines);
+                    ratatui::widgets::Widget::render(p, buf.area, buf);
+                })?;
+            }
+        }
         Ok(())
+    }
+
+    /// Send `session.set_route` to the daemon and emit a success banner
+    /// on success. Returns Err with the error message on failure.
+    fn send_set_route(
+        &mut self,
+        vp: &mut DynamicViewport,
+        provider_kind: &str,
+        model: &str,
+    ) -> Result<(), String> {
+        let selector = serde_json::json!({
+            "kind": provider_kind,
+            "model": model,
+        });
+        let params = serde_json::json!({
+            "session_id": self.session_id,
+            "provider": selector,
+        });
+        match self.client.request("session.set_route", params) {
+            Ok(_resp) => {
+                let lines = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("switched → {provider_kind} / {model}"),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                ];
+                let h = lines.len() as u16;
+                let _ = vp.insert_before(h, |buf| {
+                    let p = Paragraph::new(lines);
+                    ratatui::widgets::Widget::render(p, buf.area, buf);
+                });
+                Ok(())
+            }
+            Err(e) => Err(format!("{e}")),
+        }
     }
 
     /// /cancel — abort the in-flight provider call without ending the

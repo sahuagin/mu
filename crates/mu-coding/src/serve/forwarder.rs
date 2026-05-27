@@ -30,6 +30,7 @@ use mu_core::protocol::{
     DoneEvent, ErrorEvent, InputRequiredEvent, ProviderStatusEvent, TextDeltaEvent,
     ToolCallCompletedEvent, ToolCallStartedEvent, ToolOutcome,
 };
+use mu_core::session_status::SessionStatus;
 use mu_core::transport::NotificationWriter;
 
 use super::provider_status::{ProviderCallState, ProviderStatusTracker};
@@ -274,6 +275,8 @@ pub async fn forward_events(
     notif: NotificationWriter,
     event_log: Arc<SessionEventLog>,
     provider_status: Arc<Mutex<ProviderStatusTracker>>,
+    daemon_id: String,
+    status_watch_tx: Option<tokio::sync::watch::Sender<Option<SessionStatus>>>,
 ) {
     while let Some(event) = events_rx.recv().await {
         // mu-035 Phase D: mirror provider-call lifecycle into the
@@ -282,6 +285,8 @@ pub async fn forward_events(
         // The lock is held only for the sync mutate; no `.await`
         // runs while it's held.
         update_provider_status(&event, &provider_status);
+
+        let recompute_status = should_recompute_status(&event);
 
         // Durable projection: append significant events to the log.
         // Streaming deltas + lifecycle ticks are dropped.
@@ -312,11 +317,71 @@ pub async fn forward_events(
         {
             event_log.append(EventActor::System, telemetry);
         }
+
+        // MCP status projection: recompute SessionStatus and push
+        // to watch subscribers on status-changing events.
+        if recompute_status {
+            if let Some(ref tx) = status_watch_tx {
+                let status = compute_status(
+                    &session_id,
+                    &daemon_id,
+                    &event_log,
+                    &provider_status,
+                );
+                let _ = tx.send(Some(status));
+            }
+        }
+
         // Wire projection: translate to mu-001 notification surface.
         if let Some((method, params)) = translate_event(&session_id, event) {
             let _ = notif.emit(method, params).await;
         }
     }
+}
+
+fn should_recompute_status(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::ProviderStatus { .. }
+            | AgentEvent::Done { .. }
+            | AgentEvent::Error { .. }
+            | AgentEvent::ToolCallStarted { .. }
+            | AgentEvent::ToolCallCompleted { .. }
+    )
+}
+
+fn compute_status(
+    session_id: &str,
+    daemon_id: &str,
+    event_log: &Arc<SessionEventLog>,
+    provider_status: &Arc<Mutex<ProviderStatusTracker>>,
+) -> SessionStatus {
+    let (provider_kind, model) = event_log.provider_info().unwrap_or_default();
+    let usage = event_log.cumulative_usage();
+    let snap = provider_status
+        .lock()
+        .ok()
+        .and_then(|t| t.snapshot())
+        .map(|s| mu_core::session_status::ProviderSnapshot {
+            kind: s.kind,
+            started_at_unix_ms: s.started_at_unix_ms,
+            now_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        });
+
+    SessionStatus::compute(mu_core::session_status::StatusInputs {
+        session_id,
+        daemon_id,
+        provider_kind: &provider_kind,
+        model: &model,
+        cumulative_usage: usage.as_ref(),
+        ask_count: event_log.ask_count(),
+        tool_call_count: event_log.tool_call_count(),
+        elapsed_total_ms: event_log.elapsed_total_ms(),
+        provider_status: snap,
+    })
 }
 
 /// mu-5g7i: build a `TaskTelemetry` payload for terminal `AgentEvent`s

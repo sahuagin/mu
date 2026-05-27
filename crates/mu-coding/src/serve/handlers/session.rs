@@ -275,12 +275,15 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     let agent_handle = tokio::spawn(async move {
         let _ = agent.join().await;
     });
+    let (status_tx, status_rx) = tokio::sync::watch::channel(None);
     let forwarder_handle = tokio::spawn(forward_events(
         session_id.clone(),
         events_rx,
         notif.clone(),
         event_log.clone(),
         provider_status.clone(),
+        daemon_info.daemon_id().to_string(),
+        Some(status_tx),
     ));
 
     sessions.insert(
@@ -295,6 +298,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             capability: capability_handle,
             provider_status,
             mailbox,
+            status_watch: Some(status_rx),
         },
     );
 

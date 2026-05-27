@@ -15,6 +15,7 @@ use mu_core::agent::AgentInput;
 use mu_core::capability::Capability;
 use mu_core::event_log::SessionEventLog;
 use mu_core::protocol::{ApprovalDecision, OutstandingCall};
+use mu_core::session_status::SessionStatus;
 
 use super::mailbox::MailboxState;
 use super::mailbox::MailboxStateHandle;
@@ -64,6 +65,10 @@ struct SessionState {
     /// Mailbox messages themselves live in the session's event log;
     /// this struct is the coordination state around them.
     mailbox: MailboxStateHandle,
+    /// MCP status subscription: watch receiver for live SessionStatus
+    /// updates. The forwarder sends on status-changing events; MCP
+    /// subscribers clone this receiver and watch for changes.
+    status_watch: Option<tokio::sync::watch::Receiver<Option<SessionStatus>>>,
 }
 
 /// A session loaded from disk at daemon startup (mu-u1ld). The
@@ -112,6 +117,7 @@ pub struct NewSession {
     pub capability: Arc<Mutex<Capability>>,
     pub provider_status: Arc<Mutex<ProviderStatusTracker>>,
     pub mailbox: MailboxStateHandle,
+    pub status_watch: Option<tokio::sync::watch::Receiver<Option<SessionStatus>>>,
 }
 
 impl Sessions {
@@ -147,6 +153,7 @@ impl Sessions {
                     capability: new.capability,
                     provider_status: new.provider_status,
                     mailbox: new.mailbox,
+                    status_watch: new.status_watch,
                 },
             );
         }
@@ -319,6 +326,19 @@ impl Sessions {
         snap
     }
 
+    /// Get a clone of the status watch receiver for MCP subscriptions.
+    pub fn status_watch(
+        &self,
+        id: &str,
+    ) -> Option<tokio::sync::watch::Receiver<Option<SessionStatus>>> {
+        self.inner
+            .lock()
+            .ok()?
+            .get(id)?
+            .status_watch
+            .clone()
+    }
+
     /// Snapshot every outstanding provider call across all sessions
     /// (mu-035 Phase D). Returns one [`OutstandingCall`] per session
     /// currently in a non-idle state. Sessions that are between asks
@@ -430,6 +450,7 @@ mod tests {
                 capability: cap,
                 provider_status: tracker,
                 mailbox: Arc::new(MailboxState::new()),
+                status_watch: None,
             },
         );
         assert!(sessions.input_sender(&id).is_some());
@@ -508,6 +529,7 @@ mod tests {
                 capability: Arc::new(Mutex::new(Capability::root())),
                 provider_status: Arc::new(Mutex::new(ProviderStatusTracker::new())),
                 mailbox: Arc::new(MailboxState::new()),
+                status_watch: None,
             },
         );
 
@@ -557,6 +579,7 @@ mod tests {
                 capability: cap,
                 provider_status: tracker,
                 mailbox: Arc::new(MailboxState::new()),
+                status_watch: None,
             },
         );
 
@@ -620,6 +643,7 @@ mod tests {
                 capability: Arc::new(Mutex::new(Capability::root())),
                 provider_status: tracker.clone(),
                 mailbox: Arc::new(MailboxState::new()),
+                status_watch: None,
             },
         );
         (log, tracker)

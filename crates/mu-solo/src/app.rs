@@ -559,7 +559,7 @@ impl App {
         } else {
             0
         };
-        let desired_height = (layout.lines.len() as u16 + 2 + menu_rows as u16)
+        let desired_height = (layout.lines.len() as u16 + 3 + menu_rows as u16) // +separator +status +info
             .clamp(VIEWPORT_HEIGHT, MAX_VIEWPORT_HEIGHT);
         if desired_height != vp.area().height {
             vp.set_height(desired_height)?;
@@ -655,10 +655,11 @@ impl App {
                 ]));
             }
         }
-        while lines.len() < (area.height as usize).saturating_sub(1) {
+        while lines.len() < (area.height as usize).saturating_sub(2) {
             lines.push(Line::from(""));
         }
         lines.push(self.format_status_line(vp_w));
+        lines.push(self.format_info_line(vp_w));
         let para = Paragraph::new(lines);
         vp.render(para);
         vp.flush()?;
@@ -1675,6 +1676,45 @@ impl App {
         ])
     }
 
+    /// Bottom info line: user@host:project | model | ctx:%
+    fn format_info_line(&self, width: usize) -> Line<'static> {
+        let user = std::env::var("USER").unwrap_or_else(|_| "?".into());
+        let host = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("HOST"))
+            .unwrap_or_else(|_| "?".into());
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "?".into());
+
+        let left = format!("  {user}@{host}:{cwd}");
+
+        let ctx_part = if let Some(ref status) = self.mcp_status {
+            if let Some(pct) = status.context_pressure_pct {
+                format!("ctx:{pct:.0}%")
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        let right = if ctx_part.is_empty() {
+            format!("{} · {}", self.provider, self.model)
+        } else {
+            format!("{} · {} · {ctx_part}", self.provider, self.model)
+        };
+
+        let gap = width.saturating_sub(left.len() + right.len() + 2);
+        let padding = " ".repeat(gap.max(1));
+
+        Line::from(vec![
+            Span::styled(left, Style::default().fg(Color::DarkGray)),
+            Span::styled(padding, Style::default()),
+            Span::styled(right, Style::default().fg(Color::DarkGray)),
+        ])
+    }
+
     /// Inline cost computation (mirrors mu-core pricing.rs). Returns
     /// 0.0 for unknown (provider, model) pairs.
     fn compute_cost(&self) -> f64 {
@@ -2474,7 +2514,7 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
-/// Initial viewport height (separator + 3 prompt lines + status).
-const VIEWPORT_HEIGHT: u16 = 5;
+/// Initial viewport height (separator + 3 prompt lines + status + info).
+const VIEWPORT_HEIGHT: u16 = 6;
 /// Maximum viewport height — cap to prevent eating the entire screen.
 const MAX_VIEWPORT_HEIGHT: u16 = 20;

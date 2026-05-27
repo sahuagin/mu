@@ -1147,6 +1147,10 @@ mod tests {
                 EventPayload::TaskTelemetry { .. } => "task_telemetry",
                 EventPayload::ErrorInvalidMessage { .. } => "error_invalid_message",
                 EventPayload::ProviderSwitched { .. } => "provider_switched",
+                EventPayload::WorkerSpawned { .. } => "worker_spawned",
+                EventPayload::WorkerExited { .. } => "worker_exited",
+                EventPayload::WorkerFailed { .. } => "worker_failed",
+                EventPayload::WorkerTimeout { .. } => "worker_timeout",
             })
             .collect();
         assert_eq!(kinds, vec!["assistant_message", "done"]);

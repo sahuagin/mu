@@ -177,7 +177,13 @@ pub fn derive_status_from_events(
             | EventPayload::ErrorInvalidMessage { .. }
             // mu-k56u: provider switch is an identity change, not
             // a status-driving event.
-            | EventPayload::ProviderSwitched { .. } => {}
+            | EventPayload::ProviderSwitched { .. }
+            // mu-slat: worker lifecycle events are supervisor-side
+            // bookkeeping, not session-status-driving.
+            | EventPayload::WorkerSpawned { .. }
+            | EventPayload::WorkerExited { .. }
+            | EventPayload::WorkerFailed { .. }
+            | EventPayload::WorkerTimeout { .. } => {}
         }
         last_kind = Some(&ev.payload);
     }

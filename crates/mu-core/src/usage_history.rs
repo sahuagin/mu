@@ -240,7 +240,13 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
             // mu-gdwd: boundary-validation failures are logged for
             // postmortem but don't carry usage-history signal.
             | EventPayload::ErrorInvalidMessage { .. }
-            | EventPayload::ProviderSwitched { .. } => {}
+            | EventPayload::ProviderSwitched { .. }
+            // mu-slat: worker lifecycle events are supervisor-side
+            // bookkeeping, not per-call usage signals.
+            | EventPayload::WorkerSpawned { .. }
+            | EventPayload::WorkerExited { .. }
+            | EventPayload::WorkerFailed { .. }
+            | EventPayload::WorkerTimeout { .. } => {}
         }
     }
 

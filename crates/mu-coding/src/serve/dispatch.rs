@@ -16,7 +16,8 @@ use mu_core::protocol::{
     DelegateSessionRequest, MailboxConsumeRequest,
     MailboxListRequest, MailboxPostRequest, MailboxReadRequest, PeerHelloRequest, PingRequest,
     Request, RespondToInputRequiredRequest, Response, ScheduleWakeupRequest, SessionEventsRequest,
-    SessionListRequest, SessionStatsRequest, SetRouteRequest, StartAutonomousRequest,
+    SessionListRequest, SessionStatsRequest, SetRouteRequest, SpawnWorkerRequest,
+    StartAutonomousRequest,
 };
 use mu_core::transport::{codes, err_response, NotificationWriter};
 
@@ -160,6 +161,9 @@ pub async fn dispatch(
             handle_set_route(request, sessions, factory, daemon_info.clone()).await
         }
         DaemonListRoutesRequest::METHOD => handle_list_routes(request, daemon_info),
+        SpawnWorkerRequest::METHOD => {
+            handle_spawn_worker(request, sessions, daemon_info.clone()).await
+        }
         other => err_response(
             request.id,
             codes::METHOD_NOT_FOUND,

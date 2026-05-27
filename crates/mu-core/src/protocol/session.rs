@@ -387,3 +387,39 @@ pub struct SetRouteResponse {
     pub provider_kind: String,
     pub model: String,
 }
+
+// ── mu-slat: pot-hosted worker sessions ──────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpawnWorkerRequest {
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pot_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pot_template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+}
+
+impl SpawnWorkerRequest {
+    pub const METHOD: &'static str = "session.spawn_worker";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpawnWorkerResponse {
+    pub session_id: String,
+    pub pot_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerStatus {
+    Spawning,
+    Running,
+    Done { exit_code: i32, elapsed_ms: u64 },
+    Failed { reason: String },
+}

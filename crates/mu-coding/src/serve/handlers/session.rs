@@ -17,7 +17,7 @@ use mu_core::protocol::{
     CancelSessionRequest, CancelSessionResponse, CloseSessionRequest, CloseSessionResponse,
     CreateSessionRequest, CreateSessionResponse, DelegateSessionRequest, DelegateSessionResponse,
     PingResponse, ProviderSelector, Request, RespondToInputRequiredRequest, SetRouteRequest,
-    SetRouteResponse,
+    SetRouteResponse, SpawnWorkerRequest, SpawnWorkerResponse,
     RespondToInputRequiredResponse, Response, ScheduleWakeupRequest, SessionEventsRequest,
     SessionEventsResponse, SessionListRequest, SessionListResponse, SessionStatsRequest,
     SessionStatsResponse, StartAutonomousRequest, StartAutonomousResponse,
@@ -968,6 +968,48 @@ fn payload_kind_str(p: &EventPayload) -> &'static str {
         EventPayload::TaskTelemetry { .. } => "task_telemetry",
         EventPayload::ErrorInvalidMessage { .. } => "error_invalid_message",
         EventPayload::ProviderSwitched { .. } => "provider_switched",
+        EventPayload::WorkerSpawned { .. } => "worker_spawned",
+        EventPayload::WorkerExited { .. } => "worker_exited",
+        EventPayload::WorkerFailed { .. } => "worker_failed",
+        EventPayload::WorkerTimeout { .. } => "worker_timeout",
+    }
+}
+
+// ── mu-slat: spawn_worker ────────────────────────────────────────────
+
+pub async fn handle_spawn_worker(
+    request: Request<Value>,
+    sessions: Sessions,
+    daemon_info: DaemonInfo,
+) -> Response<Value> {
+    let req: SpawnWorkerRequest = match serde_json::from_value(request.params) {
+        Ok(r) => r,
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("bad SpawnWorkerRequest: {e}"),
+            );
+        }
+    };
+
+    let config = crate::serve::worker::SpawnWorkerConfig {
+        prompt: req.prompt.clone(),
+        model: req.model,
+        pot_name: req.pot_name,
+        timeout_secs: req.timeout_secs,
+        parent_session_id: req.parent_session_id,
+    };
+
+    match crate::serve::worker::spawn_worker(config, sessions, daemon_info).await {
+        Ok(result) => {
+            let resp = SpawnWorkerResponse {
+                session_id: result.session_id,
+                pot_name: result.pot_name,
+            };
+            ok_response(request.id, to_value_or_null(resp))
+        }
+        Err(e) => err_response(request.id, codes::INTERNAL_ERROR, e),
     }
 }
 

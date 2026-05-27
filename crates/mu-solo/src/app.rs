@@ -11,7 +11,6 @@
 //! land next.
 
 use std::collections::HashMap;
-use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -277,7 +276,7 @@ pub struct App {
     /// MCP status subscription receiver. When connected, receives
     /// SessionStatus pushes from the daemon via the MCP socket.
     /// Falls back to inline accumulation when not connected.
-    mcp_status_rx: Option<std_mpsc::Receiver<SessionStatus>>,
+    mcp_status_rx: Option<tokio::sync::mpsc::UnboundedReceiver<SessionStatus>>,
     /// Latest SessionStatus from the MCP subscription.
     mcp_status: Option<SessionStatus>,
 }
@@ -454,10 +453,10 @@ impl App {
 
     /// Run the async event loop. Returns Ok(()) on clean exit.
     ///
-    /// Uses `tokio::select!` to multiplex three event sources:
+    /// Uses `tokio::select!` to multiplex four event sources:
     /// - Keyboard/paste events via crossterm's `EventStream`
     /// - Daemon notifications via tokio mpsc (from the reader thread)
-    /// - MCP session status via std mpsc (from the MCP subscriber thread)
+    /// - MCP session status via tokio mpsc (from rmcp client task)
     /// - Periodic render tick for elapsed-time display updates
     pub async fn run(&mut self) -> Result<()> {
         let mut vp = DynamicViewport::new(VIEWPORT_HEIGHT).context("DynamicViewport::new")?;
@@ -494,11 +493,11 @@ impl App {
 
         let mut event_stream = EventStream::new();
         let mut render_interval = tokio::time::interval(Duration::from_millis(100));
+        let mut mcp_rx = self.mcp_status_rx.take();
 
         loop {
-            // Drain any buffered notifications + MCP status before render.
+            // Drain any buffered notifications before render.
             self.drain_buffered_notifications(&mut vp)?;
-            self.drain_mcp_status();
             self.render_viewport(&mut vp)?;
 
             tokio::select! {
@@ -516,7 +515,6 @@ impl App {
                             while let Ok(msg) = notif_rx.try_recv() {
                                 self.handle_message(&mut vp, msg)?;
                             }
-                            self.drain_mcp_status();
                         }
                         None => {
                             let width = vp.area().width as usize;
@@ -530,6 +528,16 @@ impl App {
                             break;
                         }
                     }
+                }
+                // MCP session status — wakes immediately on push from
+                // the rmcp client task (no polling).
+                Some(status) = async {
+                    match mcp_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.apply_mcp_status(status);
                 }
                 // Keyboard / paste events
                 maybe_event = event_stream.next() => {
@@ -550,11 +558,8 @@ impl App {
                         _ => {}
                     }
                 }
-                // Periodic render tick — updates elapsed time display
-                // and polls MCP status even when no other events fire.
-                _ = render_interval.tick() => {
-                    self.drain_mcp_status();
-                }
+                // Periodic render tick — updates elapsed time display.
+                _ = render_interval.tick() => {}
             }
         }
         Ok(())
@@ -1800,31 +1805,24 @@ impl App {
         (inp * in_rate + cw * in_rate * 1.25 + cr * in_rate * 0.10 + out * out_rate) / 1_000_000.0
     }
 
-    /// Drain MCP status updates from the subscription channel. Updates
-    /// the cached status and syncs the inline accumulators so both the
-    /// status line and /status command reflect the latest data.
-    fn drain_mcp_status(&mut self) {
-        let rx = match self.mcp_status_rx.as_ref() {
-            Some(rx) => rx,
-            None => return,
+    /// Apply a single MCP status update. Syncs the inline accumulators
+    /// so both the status line and /status command reflect the latest data.
+    fn apply_mcp_status(&mut self, status: SessionStatus) {
+        self.session_phase = match status.phase.as_str() {
+            "idle" => SessionPhase::Idle,
+            "awaiting_first_token" => SessionPhase::AwaitingFirstToken,
+            "streaming" => SessionPhase::Streaming,
+            "thinking" => SessionPhase::AwaitingFirstToken,
+            "tool_executing" | "awaiting_tool_result" => SessionPhase::ToolExecuting,
+            _ => self.session_phase,
         };
-        while let Ok(status) = rx.try_recv() {
-            self.session_phase = match status.phase.as_str() {
-                "idle" => SessionPhase::Idle,
-                "awaiting_first_token" => SessionPhase::AwaitingFirstToken,
-                "streaming" => SessionPhase::Streaming,
-                "thinking" => SessionPhase::AwaitingFirstToken,
-                "tool_executing" | "awaiting_tool_result" => SessionPhase::ToolExecuting,
-                _ => self.session_phase,
-            };
-            self.phase_elapsed_ms = status.phase_elapsed_ms;
-            self.cumulative_input_tokens = status.input_tokens;
-            self.cumulative_output_tokens = status.output_tokens;
-            self.cumulative_cache_read = status.cache_read_tokens.unwrap_or(0);
-            self.cumulative_cache_creation = status.cache_creation_tokens.unwrap_or(0);
-            self.ask_count = status.ask_count;
-            self.mcp_status = Some(status);
-        }
+        self.phase_elapsed_ms = status.phase_elapsed_ms;
+        self.cumulative_input_tokens = status.input_tokens;
+        self.cumulative_output_tokens = status.output_tokens;
+        self.cumulative_cache_read = status.cache_read_tokens.unwrap_or(0);
+        self.cumulative_cache_creation = status.cache_creation_tokens.unwrap_or(0);
+        self.ask_count = status.ask_count;
+        self.mcp_status = Some(status);
     }
 
     /// Flush trailing streaming text and emit the closer line for

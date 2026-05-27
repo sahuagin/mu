@@ -100,10 +100,20 @@ impl InlineMenu {
                     MenuAction::Dismiss
                 }
             }
+            (_, KeyCode::Char(' ')) if self.filtered.len() == 1 => {
+                // Space with a unique match: select the item so the
+                // caller can insert command + space for arg entry.
+                let idx = self.filtered[0];
+                MenuAction::Select(idx)
+            }
             (_, KeyCode::Char(c)) => {
                 self.filter.push(c);
                 self.refilter();
-                MenuAction::Continue
+                if self.filtered.is_empty() {
+                    MenuAction::Dismiss
+                } else {
+                    MenuAction::Continue
+                }
             }
             _ => MenuAction::Continue,
         }

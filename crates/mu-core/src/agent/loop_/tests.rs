@@ -576,6 +576,7 @@ async fn b3_iteration_cap() {
         system_prompt: None,
         compaction_threshold: None,
         project_context: None,
+        compaction_policy_override: None,
     };
     let (loop_, events_rx) = spawn_loop(provider, tools, config);
 
@@ -627,6 +628,7 @@ async fn mu_779s_iteration_cap_done_event_uses_iteration_cap_stop_reason() {
         system_prompt: None,
         compaction_threshold: None,
         project_context: None,
+        compaction_policy_override: None,
     };
     let (loop_, events_rx) = spawn_loop(provider, tools, config);
 
@@ -1858,7 +1860,8 @@ async fn kgu4_evict_half_policy_fires_compaction_assembly_when_threshold_crossed
     // estimator easily exceeds 1 token.
     let config = AgentConfig {
         compaction_threshold: Some(1),
-        ..AgentConfig::default()
+        compaction_policy_override: None,
+            ..AgentConfig::default()
     };
     let (loop_, events_rx) = spawn_loop_with_provider(provider, config);
     loop_
@@ -1949,7 +1952,8 @@ async fn kgu4_evict_half_policy_does_not_fire_when_threshold_not_crossed() {
     });
     let config = AgentConfig {
         compaction_threshold: Some(1_000_000),
-        ..AgentConfig::default()
+        compaction_policy_override: None,
+            ..AgentConfig::default()
     };
     let (loop_, events_rx) = spawn_loop_with_provider(provider, config);
     loop_

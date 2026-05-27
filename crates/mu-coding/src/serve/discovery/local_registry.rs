@@ -136,6 +136,7 @@ mod tests {
                 capability: cap,
                 provider_status,
                 mailbox: Arc::new(crate::serve::mailbox::MailboxState::new()),
+                status_watch: None,
             },
         );
         log

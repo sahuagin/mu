@@ -90,13 +90,10 @@ pub async fn serve_mcp_socket(
 struct MuMcpHandler {
     sessions: Sessions,
     daemon_info: DaemonInfo,
-    subscriptions: Arc<Mutex<HashMap<String, Vec<SubscriptionEntry>>>>,
-}
-
-struct SubscriptionEntry {
-    // Peer handle stored for future notification push.
-    // Phase 5 will use this; for now we just track the URIs.
-    _uri: String,
+    /// Active subscription tasks keyed by resource URI. Each entry
+    /// holds a JoinHandle that watches the session's status channel
+    /// and pushes notifications to the peer. Dropped on unsubscribe.
+    watch_tasks: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
 }
 
 impl MuMcpHandler {
@@ -104,7 +101,7 @@ impl MuMcpHandler {
         Self {
             sessions,
             daemon_info,
-            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            watch_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -254,15 +251,61 @@ impl ServerHandler for MuMcpHandler {
     fn subscribe(
         &self,
         request: SubscribeRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
         async move {
             let uri = request.uri.as_str().to_string();
             info!(uri = %uri, "MCP subscribe");
-            let mut subs = self.subscriptions.lock().await;
-            subs.entry(uri.clone())
-                .or_default()
-                .push(SubscriptionEntry { _uri: uri });
+
+            // Extract session_id from URI and get the watch channel.
+            let session_id = uri
+                .strip_prefix("mu://session/")
+                .and_then(|rest| rest.strip_suffix("/status"))
+                .map(|s| s.to_string());
+
+            if let Some(ref sid) = session_id {
+                if let Some(mut rx) = self.sessions.status_watch(sid) {
+                    let peer = context.peer.clone();
+                    let uri_clone = uri.clone();
+                    let task = tokio::spawn(async move {
+                        while rx.changed().await.is_ok() {
+                            let status = rx.borrow().clone();
+                            if let Some(ref status) = status {
+                                // Push the standard resource_updated notification
+                                let _ = peer
+                                    .send_notification(ServerNotification::ResourceUpdatedNotification(
+                                        ResourceUpdatedNotification::new(
+                                            ResourceUpdatedNotificationParam {
+                                                uri: uri_clone.clone().into(),
+                                            },
+                                        ),
+                                    ))
+                                    .await;
+                                // Push our custom inline notification with full payload
+                                if let Ok(payload) = serde_json::to_value(status) {
+                                    let _ = peer
+                                        .send_notification(
+                                            ServerNotification::CustomNotification(
+                                                CustomNotification::new(
+                                                    "mu/session_status",
+                                                    Some(payload),
+                                                ),
+                                            ),
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                    });
+                    let mut tasks = self.watch_tasks.lock().await;
+                    if let Some(old) = tasks.insert(uri, task) {
+                        old.abort();
+                    }
+                    return Ok(());
+                }
+            }
+
+            // For URIs we can't subscribe to, accept silently (no-op).
             Ok(())
         }
     }
@@ -275,8 +318,10 @@ impl ServerHandler for MuMcpHandler {
         async move {
             let uri = request.uri.as_str().to_string();
             info!(uri = %uri, "MCP unsubscribe");
-            let mut subs = self.subscriptions.lock().await;
-            subs.remove(&uri);
+            let mut tasks = self.watch_tasks.lock().await;
+            if let Some(task) = tasks.remove(&uri) {
+                task.abort();
+            }
             Ok(())
         }
     }

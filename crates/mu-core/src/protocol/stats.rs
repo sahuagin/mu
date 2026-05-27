@@ -155,3 +155,16 @@ pub struct DaemonOutstandingCallsResponse {
     pub calls: Vec<OutstandingCall>,
     pub snapshot_at_unix_ms: u64,
 }
+
+/// mu-k56u: list all available provider×model routes with properties.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonListRoutesRequest {}
+
+impl DaemonListRoutesRequest {
+    pub const METHOD: &'static str = "daemon.list_routes";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonListRoutesResponse {
+    pub routes: Vec<crate::route_catalog::RouteEntry>,
+}

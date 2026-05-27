@@ -149,3 +149,15 @@ pub fn handle_daemon_usage_history(request: Request<Value>, sessions: Sessions) 
     };
     ok_response(request.id, to_value_or_null(resp))
 }
+
+/// mu-k56u: return the route catalog — available provider×model combinations.
+pub fn handle_list_routes(
+    request: Request<Value>,
+    daemon_info: DaemonInfo,
+) -> Response<Value> {
+    let catalog = daemon_info.route_catalog();
+    let resp = mu_core::protocol::DaemonListRoutesResponse {
+        routes: catalog.entries().to_vec(),
+    };
+    ok_response(request.id, to_value_or_null(resp))
+}

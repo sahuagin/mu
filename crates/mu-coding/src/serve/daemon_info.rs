@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use mu_core::config::Config;
 use mu_core::context::RecallProvider;
+use mu_core::route_catalog::RouteCatalog;
 
 #[derive(Debug, Clone)]
 pub struct DaemonInfo {
@@ -44,6 +45,7 @@ struct DaemonInfoInner {
     /// wires up [`SubprocessRecallProvider`] +
     /// [`ProjectFileRecallProvider`] via [`with_recall_providers`].
     recall_providers: Arc<Vec<Arc<dyn RecallProvider>>>,
+    route_catalog: Arc<RouteCatalog>,
 }
 
 impl DaemonInfo {
@@ -64,6 +66,7 @@ impl DaemonInfo {
                 events_dir: None,
                 config: Arc::new(Config::default()),
                 recall_providers: Arc::new(Vec::new()),
+                route_catalog: Arc::new(RouteCatalog::from_env()),
             }),
         }
     }
@@ -131,6 +134,10 @@ impl DaemonInfo {
         &self.inner.recall_providers
     }
 
+    pub fn route_catalog(&self) -> &RouteCatalog {
+        &self.inner.route_catalog
+    }
+
     /// Test helper: deterministic id, no events_dir.
     #[cfg(test)]
     pub fn test_with_id(id: impl Into<String>, version: impl Into<String>) -> Self {
@@ -142,6 +149,7 @@ impl DaemonInfo {
                 events_dir: None,
                 config: Arc::new(Config::default()),
                 recall_providers: Arc::new(Vec::new()),
+                route_catalog: Arc::new(RouteCatalog::from_env()),
             }),
         }
     }

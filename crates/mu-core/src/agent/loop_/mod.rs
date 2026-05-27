@@ -71,7 +71,7 @@ pub type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDe
 pub type SessionCapability = Arc<Mutex<Capability>>;
 
 /// External inputs callers push to a running agent loop.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum AgentInput {
     /// Add a message to the conversation. Loop runs the LLM after.
     UserMessage(AgentMessage),
@@ -93,6 +93,36 @@ pub enum AgentInput {
         goal: String,
         options: AutonomyOptions,
     },
+    /// mu-k56u: replace the provider between turns. The loop swaps
+    /// its local provider variable and emits a ProviderSwitched event.
+    /// Carries provider_kind + model alongside the provider instance
+    /// because the Provider trait doesn't expose the model name.
+    SwitchProvider {
+        provider: Arc<dyn Provider>,
+        provider_kind: Arc<str>,
+        model: Arc<str>,
+    },
+}
+
+impl std::fmt::Debug for AgentInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UserMessage(m) => f.debug_tuple("UserMessage").field(m).finish(),
+            Self::Cancel => write!(f, "Cancel"),
+            Self::CancelOutstanding { reason } => {
+                f.debug_struct("CancelOutstanding").field("reason", reason).finish()
+            }
+            Self::StartAutonomous { goal, options } => {
+                f.debug_struct("StartAutonomous")
+                    .field("goal", goal)
+                    .field("options", options)
+                    .finish()
+            }
+            Self::SwitchProvider { provider_kind, model, .. } => {
+                write!(f, "SwitchProvider({provider_kind}/{model})")
+            }
+        }
+    }
 }
 
 /// Output events emitted by the loop. Mirrors mu-001's `session.*`
@@ -310,6 +340,15 @@ pub enum AgentEvent {
     /// RunMode::Idle and is addressable via ask_session again.
     AutonomousTerminated {
         reason: AutonomousTerminationReason,
+    },
+    /// mu-k56u: provider/model switched mid-session. Emitted by the
+    /// agent loop after replacing its local provider. The forwarder
+    /// translates to `EventPayload::ProviderSwitched`.
+    ProviderSwitched {
+        old_provider_kind: Arc<str>,
+        old_model: Arc<str>,
+        new_provider_kind: Arc<str>,
+        new_model: Arc<str>,
     },
 }
 
@@ -550,6 +589,8 @@ impl AgentLoop {
     /// decision.
     pub fn spawn(
         provider: Arc<dyn Provider>,
+        provider_kind: Arc<str>,
+        model: Arc<str>,
         tools: Vec<Arc<dyn Tool>>,
         config: AgentConfig,
         events: mpsc::Sender<AgentEvent>,
@@ -559,6 +600,8 @@ impl AgentLoop {
         let (tx, rx) = mpsc::channel(32);
         let handle = tokio::spawn(run(
             provider,
+            provider_kind,
+            model,
             tools,
             config,
             events,
@@ -603,7 +646,9 @@ impl AgentLoop {
 }
 
 async fn run(
-    provider: Arc<dyn Provider>,
+    mut provider: Arc<dyn Provider>,
+    mut current_provider_kind: Arc<str>,
+    mut current_model: Arc<str>,
     tools: Vec<Arc<dyn Tool>>,
     config: AgentConfig,
     events: mpsc::Sender<AgentEvent>,
@@ -632,6 +677,19 @@ async fn run(
             match input {
                 AgentInput::Cancel => return Outcome::Cancelled,
                 AgentInput::CancelOutstanding { .. } => {}
+                AgentInput::SwitchProvider { provider: new, provider_kind: new_kind, model: new_model } => {
+                    let old_kind: Arc<str> = Arc::from(current_provider_kind.as_ref());
+                    let old_model: Arc<str> = Arc::from(current_model.as_ref());
+                    provider = new;
+                    current_provider_kind = new_kind.clone();
+                    current_model = new_model.clone();
+                    let _ = events.send(AgentEvent::ProviderSwitched {
+                        old_provider_kind: old_kind,
+                        old_model,
+                        new_provider_kind: new_kind,
+                        new_model,
+                    }).await;
+                }
                 AgentInput::UserMessage(_) | AgentInput::StartAutonomous { .. } => {
                     queue.push_back(Action::External(input));
                 }
@@ -644,6 +702,20 @@ async fn run(
             match input_rx.recv().await {
                 Some(AgentInput::Cancel) => return Outcome::Cancelled,
                 Some(AgentInput::CancelOutstanding { .. }) => {
+                    continue;
+                }
+                Some(AgentInput::SwitchProvider { provider: new, provider_kind: new_kind, model: new_model }) => {
+                    let old_kind: Arc<str> = Arc::from(current_provider_kind.as_ref());
+                    let old_model: Arc<str> = Arc::from(current_model.as_ref());
+                    provider = new;
+                    current_provider_kind = new_kind.clone();
+                    current_model = new_model.clone();
+                    let _ = events.send(AgentEvent::ProviderSwitched {
+                        old_provider_kind: old_kind,
+                        old_model,
+                        new_provider_kind: new_kind,
+                        new_model,
+                    }).await;
                     continue;
                 }
                 Some(input) => Action::External(input),
@@ -669,6 +741,10 @@ async fn run(
             }
             Action::External(AgentInput::CancelOutstanding { .. }) => {
                 continue;
+            }
+            Action::External(AgentInput::SwitchProvider { .. }) => {
+                // Already handled in try_recv/recv above; should not
+                // reach the action queue. No-op if it somehow does.
             }
             Action::External(AgentInput::StartAutonomous { goal, options }) => {
                 let autonomy_snapshot = capability
@@ -1029,6 +1105,19 @@ async fn run(
                     match input {
                         AgentInput::Cancel => return Outcome::Cancelled,
                         AgentInput::CancelOutstanding { .. } => {}
+                        AgentInput::SwitchProvider { provider: new, provider_kind: new_kind, model: new_model } => {
+                            let old_kind: Arc<str> = Arc::from(current_provider_kind.as_ref());
+                            let old_model: Arc<str> = Arc::from(current_model.as_ref());
+                            provider = new;
+                            current_provider_kind = new_kind.clone();
+                            current_model = new_model.clone();
+                            let _ = events.send(AgentEvent::ProviderSwitched {
+                                old_provider_kind: old_kind,
+                                old_model,
+                                new_provider_kind: new_kind,
+                                new_model,
+                            }).await;
+                        }
                         AgentInput::UserMessage(_) | AgentInput::StartAutonomous { .. } => {
                             queue.push_back(Action::External(input));
                         }

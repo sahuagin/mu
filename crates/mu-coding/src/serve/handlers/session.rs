@@ -16,7 +16,8 @@ use mu_core::protocol::{
     AskSessionRequest, AskSessionResponse, CancelOutstandingRequest, CancelOutstandingResponse,
     CancelSessionRequest, CancelSessionResponse, CloseSessionRequest, CloseSessionResponse,
     CreateSessionRequest, CreateSessionResponse, DelegateSessionRequest, DelegateSessionResponse,
-    PingResponse, ProviderSelector, Request, RespondToInputRequiredRequest,
+    PingResponse, ProviderSelector, Request, RespondToInputRequiredRequest, SetRouteRequest,
+    SetRouteResponse,
     RespondToInputRequiredResponse, Response, ScheduleWakeupRequest, SessionEventsRequest,
     SessionEventsResponse, SessionListRequest, SessionListResponse, SessionStatsRequest,
     SessionStatsResponse, StartAutonomousRequest, StartAutonomousResponse,
@@ -225,6 +226,8 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     }
 
     let (kind_str, model_str) = describe_selector(selector);
+    let kind_arc: Arc<str> = Arc::from(kind_str.as_str());
+    let model_arc: Arc<str> = Arc::from(model_str.as_str());
     // mu-779s: per-provider max_turns default. OpenAI/openrouter models
     // are chattier than Anthropic on tool-heavy reads and routinely hit
     // the default 20-turn cap; bump them so the common case stays
@@ -265,6 +268,8 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     };
     let agent = AgentLoop::spawn(
         provider,
+        kind_arc,
+        model_arc,
         session_tools,
         AgentConfig {
             system_prompt: system_prompt.map(SpanText::from),
@@ -851,6 +856,71 @@ pub fn handle_schedule_wakeup(request: Request<Value>, sessions: Sessions) -> Re
         "session.schedule_wakeup: wire surface ready (Phase A.2); \
          agent-loop integration is Phase C (bead mu-7zn)."
             .to_string(),
+    )
+}
+
+/// mu-k56u: swap the provider+model on a live session between turns.
+pub async fn handle_set_route(
+    request: Request<Value>,
+    sessions: Sessions,
+    factory: ProviderFactory,
+) -> Response<Value> {
+    let params: SetRouteRequest = match serde_json::from_value(request.params) {
+        Ok(p) => p,
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("invalid set_route params: {e}"),
+            )
+        }
+    };
+
+    let provider = match factory(&params.provider) {
+        Ok(p) => p,
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INTERNAL_ERROR,
+                format!("could not build provider: {e}"),
+            )
+        }
+    };
+
+    let (kind_str, model_str) = describe_selector(&params.provider);
+
+    let input_tx = match sessions.input_sender(&params.session_id) {
+        Some(tx) => tx,
+        None => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("session not found: {}", params.session_id),
+            )
+        }
+    };
+
+    let input = AgentInput::SwitchProvider {
+        provider,
+        provider_kind: Arc::from(kind_str.as_str()),
+        model: Arc::from(model_str.as_str()),
+    };
+
+    if input_tx.send(input).await.is_err() {
+        return err_response(
+            request.id,
+            codes::INTERNAL_ERROR,
+            "session agent loop has terminated".to_string(),
+        );
+    }
+
+    ok_response(
+        request.id,
+        serde_json::to_value(SetRouteResponse {
+            provider_kind: kind_str,
+            model: model_str,
+        })
+        .unwrap_or_default(),
     )
 }
 

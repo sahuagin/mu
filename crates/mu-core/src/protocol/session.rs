@@ -368,3 +368,22 @@ pub struct RespondToInputRequiredResponse {
     /// answered, timed out, or never existed).
     pub accepted: bool,
 }
+
+/// mu-k56u: switch provider+model on an existing session between turns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetRouteRequest {
+    pub session_id: String,
+    pub provider: ProviderSelector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_hash: Option<String>,
+}
+
+impl SetRouteRequest {
+    pub const METHOD: &'static str = "session.set_route";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetRouteResponse {
+    pub provider_kind: String,
+    pub model: String,
+}

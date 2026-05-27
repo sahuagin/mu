@@ -313,7 +313,7 @@ pub enum AgentEvent {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentConfig {
     /// Cap on assistant-message turns. The loop emits
     /// `AgentEvent::Done(EndTurn)` and returns `Outcome::IterationCap`
@@ -356,6 +356,26 @@ pub struct AgentConfig {
     /// span and the ToolSchema spans, via
     /// [`crate::context::assemble_rope_with_context`].
     pub project_context: Option<ProjectContext>,
+    /// Override the provider's default compaction policy. When Some,
+    /// the agent loop uses this policy instead of
+    /// `provider.compaction_policy()`. Wired from daemon config's
+    /// `compaction.default_policy` at session creation.
+    pub compaction_policy_override: Option<Arc<dyn crate::context::compaction::CompactionPolicy>>,
+}
+
+impl std::fmt::Debug for AgentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentConfig")
+            .field("max_turns", &self.max_turns)
+            .field("system_prompt", &self.system_prompt.is_some())
+            .field("compaction_threshold", &self.compaction_threshold)
+            .field("project_context", &self.project_context.is_some())
+            .field(
+                "compaction_policy_override",
+                &self.compaction_policy_override.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl Default for AgentConfig {
@@ -365,6 +385,7 @@ impl Default for AgentConfig {
             system_prompt: None,
             compaction_threshold: None,
             project_context: None,
+            compaction_policy_override: None,
         }
     }
 }
@@ -801,7 +822,10 @@ async fn run(
                     .compaction_threshold
                     .unwrap_or(DEFAULT_COMPACTION_THRESHOLD);
                 let rope = if pre_compaction_tokens > compaction_threshold {
-                    let policy = provider.compaction_policy();
+                    let policy = config
+                        .compaction_policy_override
+                        .clone()
+                        .unwrap_or_else(|| provider.compaction_policy());
                     let target_tokens = compaction_threshold / 2;
                     if policy.is_async() && bg_compaction.can_start() {
                         bg_compaction.start(

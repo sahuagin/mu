@@ -254,17 +254,24 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     let mailbox = Arc::new(super::super::mailbox::MailboxState::new());
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
     let session_tools: Vec<Arc<dyn Tool>> = (*tools).clone();
+    let compaction_cfg = &daemon_info.config().compaction;
+    let compaction_policy_override: Option<
+        Arc<dyn mu_core::context::compaction::CompactionPolicy>,
+    > = match compaction_cfg.default_policy.as_str() {
+        "heuristic" => Some(Arc::new(
+            mu_core::context::compaction::heuristic::SpanFamilyDropPolicy::new(),
+        )),
+        _ => None,
+    };
     let agent = AgentLoop::spawn(
         provider,
         session_tools,
         AgentConfig {
-            // mu-kn7a (mu-yqeq.2 cleanup): convert wire-layer Option<String>
-            // to Option<SpanText> (Arc<str>) here, at the boundary between
-            // the JSON-RPC layer and the config layer. Downstream rope
-            // construction works directly on SpanText, no further allocs.
             system_prompt: system_prompt.map(SpanText::from),
             max_turns,
             project_context,
+            compaction_threshold: Some(compaction_cfg.trigger_threshold_tokens),
+            compaction_policy_override,
             ..AgentConfig::default()
         },
         events_tx,

@@ -12,15 +12,15 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc as std_mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use futures::StreamExt;
 use mu_core::session_status::SessionStatus;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
-
 use crate::mcp_status;
 use crate::menu::{InlineMenu, MenuAction, MenuItem};
 use serde_json::Value;
@@ -446,9 +446,14 @@ impl App {
         })
     }
 
-    /// Run the event loop. Returns Ok(()) on clean exit (user pressed q).
-    /// Uses DynamicViewport for grow/shrink prompt behavior.
-    pub fn run(&mut self) -> Result<()> {
+    /// Run the async event loop. Returns Ok(()) on clean exit.
+    ///
+    /// Uses `tokio::select!` to multiplex three event sources:
+    /// - Keyboard/paste events via crossterm's `EventStream`
+    /// - Daemon notifications via tokio mpsc (from the reader thread)
+    /// - MCP session status via std mpsc (from the MCP subscriber thread)
+    /// - Periodic render tick for elapsed-time display updates
+    pub async fn run(&mut self) -> Result<()> {
         let mut vp = DynamicViewport::new(VIEWPORT_HEIGHT).context("DynamicViewport::new")?;
         vp.snap_to_bottom()?;
 
@@ -475,153 +480,232 @@ impl App {
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
 
-        let tick = Duration::from_millis(100);
-        let mut last_tick = Instant::now();
+        // Take the async notification receiver from the client.
+        let mut notif_rx = self
+            .client
+            .take_notification_rx()
+            .expect("notification rx already taken");
+
+        let mut event_stream = EventStream::new();
+        let mut render_interval = tokio::time::interval(Duration::from_millis(100));
 
         loop {
-            // Drain any notifications that arrived since the last tick.
-            self.drain_notifications(&mut vp)?;
+            // Drain any buffered notifications from request() calls
+            // that happened before the async loop started.
+            self.drain_buffered_notifications(&mut vp)?;
             self.drain_mcp_status();
 
-            // Compute desired viewport height from prompt content.
-            let w = vp.area().width as usize;
-            let prompt_wrap_width = w.saturating_sub(4);
-            let layout = self.prompt.visual_layout(prompt_wrap_width);
-            let menu_rows = if let Some(ref menu) = self.inline_menu {
-                let (visible, _, has_above, has_below) = menu.visible_items();
-                visible.len() + has_above as usize + has_below as usize
-            } else {
-                0
-            };
-            let desired_height = (layout.lines.len() as u16 + 2 + menu_rows as u16) // +separator +status +menu
-                .clamp(VIEWPORT_HEIGHT, MAX_VIEWPORT_HEIGHT);
-            if desired_height != vp.area().height {
-                vp.set_height(desired_height)?;
-            }
+            // Render
+            self.render_viewport(&mut vp)?;
 
-            // Render the viewport (separator + prompt + status).
-            let area = vp.area();
-            let vp_w = area.width as usize;
-            let vp_wrap = vp_w.saturating_sub(4);
-            let vp_layout = self.prompt.visual_layout(vp_wrap);
-            let max_prompt_rows = (area.height as usize).saturating_sub(2);
-            let prompt_rows = vp_layout.lines.len().min(max_prompt_rows);
-            let skip = vp_layout.lines.len().saturating_sub(prompt_rows);
-            let mut lines: Vec<Line<'static>> = Vec::new();
-            lines.push(Line::from(Span::styled(
-                "─".repeat(vp_w),
-                Style::default().fg(Color::DarkGray),
-            )));
-            // Inline menu (slash-command picker) renders between
-            // separator and prompt when active.
-            if let Some(ref menu) = self.inline_menu {
-                let (visible, cursor_pos, has_above, has_below) = menu.visible_items();
-                if has_above {
-                    lines.push(Line::from(Span::styled(
-                        "  ↑ more".to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-                for (vi, (_orig_idx, item)) in visible.iter().enumerate() {
-                    let is_selected = vi == cursor_pos;
-                    let name_width = 24.min(vp_w / 3);
-                    let desc_width = vp_w.saturating_sub(name_width + 4);
-                    let name_padded = format!("{:<width$}", item.name, width = name_width);
-                    let desc_trunc = if item.description.len() > desc_width {
-                        format!("{}…", &item.description[..desc_width.saturating_sub(1)])
-                    } else {
-                        item.description.clone()
-                    };
-                    if is_selected {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                format!("  {name_padded}"),
-                                Style::default().fg(Color::Black).bg(Color::Cyan),
-                            ),
-                            Span::styled(
-                                format!(" {desc_trunc}"),
-                                Style::default().fg(Color::DarkGray).bg(Color::Cyan),
-                            ),
-                        ]));
-                    } else {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                format!("  {name_padded}"),
-                                Style::default().fg(Color::White),
-                            ),
-                            Span::styled(
-                                format!(" {desc_trunc}"),
-                                Style::default().fg(Color::DarkGray),
-                            ),
-                        ]));
+            tokio::select! {
+                // Keyboard / paste events
+                maybe_event = event_stream.next() => {
+                    match maybe_event {
+                        Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                            if self.handle_key(&mut vp, key)? {
+                                break;
+                            }
+                        }
+                        Some(Ok(Event::Paste(text))) => {
+                            self.paste_count += 1;
+                            self.prompt.insert_paste(&text, self.paste_count);
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!("crossterm event error: {e}");
+                        }
+                        None => break, // terminal closed
+                        _ => {}
                     }
                 }
-                if has_below {
-                    lines.push(Line::from(Span::styled(
-                        "  ↓ more".to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-            }
-            for (display_idx, vline) in vp_layout.lines.iter().skip(skip).enumerate() {
-                let row_idx = display_idx + skip;
-                let prefix = if row_idx == 0 { " > " } else { "   " };
-                let is_cursor_row = row_idx == vp_layout.cursor_row;
-                if is_cursor_row {
-                    let before: String = vline.text.chars().take(vp_layout.cursor_col).collect();
-                    let after: String = vline.text.chars().skip(vp_layout.cursor_col).collect();
-                    let cursor_char = if after.is_empty() {
-                        " ".to_string()
-                    } else {
-                        after.chars().next().unwrap().to_string()
-                    };
-                    let rest: String = after.chars().skip(1).collect();
-                    lines.push(Line::from(vec![
-                        Span::styled(prefix.to_string(), Style::default().fg(Color::Cyan)),
-                        Span::raw(before),
-                        Span::styled(
-                            cursor_char,
-                            Style::default().fg(Color::Black).bg(Color::Cyan),
-                        ),
-                        Span::raw(rest),
-                    ]));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::styled(prefix.to_string(), Style::default().fg(Color::Cyan)),
-                        Span::raw(vline.text.clone()),
-                    ]));
-                }
-            }
-            while lines.len() < (area.height as usize).saturating_sub(1) {
-                lines.push(Line::from(""));
-            }
-            lines.push(self.format_status_line(vp_w));
-            let para = Paragraph::new(lines);
-            vp.render(para);
-            vp.flush()?;
-
-            // Wait for input with a tick budget so notifications drain
-            // even when the user isn't typing.
-            let elapsed = last_tick.elapsed();
-            let wait = tick.saturating_sub(elapsed);
-            if event::poll(wait)? {
-                match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        #[allow(clippy::collapsible_match)]
-                        if self.handle_key(&mut vp, key)? {
+                // Daemon notifications (streaming text, tool calls, done, etc.)
+                maybe_notif = notif_rx.recv() => {
+                    match maybe_notif {
+                        Some(msg) => {
+                            self.handle_message(&mut vp, msg)?;
+                        }
+                        None => {
+                            // Reader thread closed — daemon exited.
+                            let width = vp.area().width as usize;
+                            let wrap = width.saturating_sub(2);
+                            let lines = render::error_block("daemon exited", wrap);
+                            let h = lines.len() as u16;
+                            vp.insert_before(h, |buf| {
+                                let p = Paragraph::new(lines);
+                                ratatui::widgets::Widget::render(p, buf.area, buf);
+                            })?;
                             break;
                         }
                     }
-                    Event::Paste(text) => {
-                        self.paste_count += 1;
-                        self.prompt.insert_paste(&text, self.paste_count);
-                    }
-                    _ => {}
+                }
+                // Periodic render tick (updates elapsed time in status line)
+                _ = render_interval.tick() => {
+                    // Just re-render — the select loop will cycle back
+                    // to render_viewport at the top.
                 }
             }
-            if last_tick.elapsed() >= tick {
-                last_tick = Instant::now();
+        }
+        Ok(())
+    }
+
+    /// Render the viewport (separator + menu + prompt + status line).
+    fn render_viewport(&mut self, vp: &mut DynamicViewport) -> Result<()> {
+        let w = vp.area().width as usize;
+        let prompt_wrap_width = w.saturating_sub(4);
+        let layout = self.prompt.visual_layout(prompt_wrap_width);
+        let menu_rows = if let Some(ref menu) = self.inline_menu {
+            let (visible, _, has_above, has_below) = menu.visible_items();
+            visible.len() + has_above as usize + has_below as usize
+        } else {
+            0
+        };
+        let desired_height = (layout.lines.len() as u16 + 2 + menu_rows as u16)
+            .clamp(VIEWPORT_HEIGHT, MAX_VIEWPORT_HEIGHT);
+        if desired_height != vp.area().height {
+            vp.set_height(desired_height)?;
+        }
+
+        let area = vp.area();
+        let vp_w = area.width as usize;
+        let vp_wrap = vp_w.saturating_sub(4);
+        let vp_layout = self.prompt.visual_layout(vp_wrap);
+        let max_prompt_rows = (area.height as usize).saturating_sub(2);
+        let prompt_rows = vp_layout.lines.len().min(max_prompt_rows);
+        let skip = vp_layout.lines.len().saturating_sub(prompt_rows);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            "─".repeat(vp_w),
+            Style::default().fg(Color::DarkGray),
+        )));
+        if let Some(ref menu) = self.inline_menu {
+            let (visible, cursor_pos, has_above, has_below) = menu.visible_items();
+            if has_above {
+                lines.push(Line::from(Span::styled(
+                    "  ↑ more".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )));
             }
+            for (vi, (_orig_idx, item)) in visible.iter().enumerate() {
+                let is_selected = vi == cursor_pos;
+                let name_width = 24.min(vp_w / 3);
+                let desc_width = vp_w.saturating_sub(name_width + 4);
+                let name_padded = format!("{:<width$}", item.name, width = name_width);
+                let desc_trunc = if item.description.len() > desc_width {
+                    format!("{}…", &item.description[..desc_width.saturating_sub(1)])
+                } else {
+                    item.description.clone()
+                };
+                if is_selected {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("  {name_padded}"),
+                            Style::default().fg(Color::Black).bg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            format!(" {desc_trunc}"),
+                            Style::default().fg(Color::DarkGray).bg(Color::Cyan),
+                        ),
+                    ]));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("  {name_padded}"),
+                            Style::default().fg(Color::White),
+                        ),
+                        Span::styled(
+                            format!(" {desc_trunc}"),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
+            }
+            if has_below {
+                lines.push(Line::from(Span::styled(
+                    "  ↓ more".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+        for (display_idx, vline) in vp_layout.lines.iter().skip(skip).enumerate() {
+            let row_idx = display_idx + skip;
+            let prefix = if row_idx == 0 { " > " } else { "   " };
+            let is_cursor_row = row_idx == vp_layout.cursor_row;
+            if is_cursor_row {
+                let before: String = vline.text.chars().take(vp_layout.cursor_col).collect();
+                let after: String = vline.text.chars().skip(vp_layout.cursor_col).collect();
+                let cursor_char = if after.is_empty() {
+                    " ".to_string()
+                } else {
+                    after.chars().next().unwrap().to_string()
+                };
+                let rest: String = after.chars().skip(1).collect();
+                lines.push(Line::from(vec![
+                    Span::styled(prefix.to_string(), Style::default().fg(Color::Cyan)),
+                    Span::raw(before),
+                    Span::styled(
+                        cursor_char,
+                        Style::default().fg(Color::Black).bg(Color::Cyan),
+                    ),
+                    Span::raw(rest),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(prefix.to_string(), Style::default().fg(Color::Cyan)),
+                    Span::raw(vline.text.clone()),
+                ]));
+            }
+        }
+        while lines.len() < (area.height as usize).saturating_sub(1) {
+            lines.push(Line::from(""));
+        }
+        lines.push(self.format_status_line(vp_w));
+        let para = Paragraph::new(lines);
+        vp.render(para);
+        vp.flush()?;
+        Ok(())
+    }
+
+    /// Handle a single message from the daemon notification stream.
+    fn handle_message(&mut self, vp: &mut DynamicViewport, msg: Message) -> Result<()> {
+        match msg {
+            Message::Notification { method, params } => {
+                self.handle_notification(vp, &method, &params)?;
+            }
+            Message::Eof => {
+                let width = vp.area().width as usize;
+                let wrap = width.saturating_sub(2);
+                let lines = render::error_block("mu serve closed stdout — daemon exited", wrap);
+                let h = lines.len() as u16;
+                vp.insert_before(h, |buf| {
+                    let p = Paragraph::new(lines);
+                    ratatui::widgets::Widget::render(p, buf.area, buf);
+                })?;
+                anyhow::bail!("daemon exited unexpectedly");
+            }
+            Message::ReaderError(e) => {
+                let width = vp.area().width as usize;
+                let wrap = width.saturating_sub(2);
+                let lines = render::error_block(&format!("reader error: {e}"), wrap);
+                let h = lines.len() as u16;
+                vp.insert_before(h, |buf| {
+                    let p = Paragraph::new(lines);
+                    ratatui::widgets::Widget::render(p, buf.area, buf);
+                })?;
+            }
+            Message::Response { .. } => {}
+        }
+        // Phase 2 closer: if streaming ended, flush trailing text + closer.
+        if self.pending_close && self.streaming_header_open {
+            self.flush_streaming_close(vp)?;
+        }
+        Ok(())
+    }
+
+    /// Drain notifications that were buffered in the client during
+    /// synchronous request() calls (before the async loop started).
+    fn drain_buffered_notifications(&mut self, vp: &mut DynamicViewport) -> Result<()> {
+        while let Some(msg) = self.client.try_recv_notification() {
+            self.handle_message(vp, msg)?;
         }
         Ok(())
     }
@@ -1614,80 +1698,37 @@ impl App {
         }
     }
 
-    /// Pull every queued notification, accumulate streaming_text,
-    /// emit incremental preview lines via `insert_before`, and handle
-    /// session.done / session.error to close the block.
-    fn drain_notifications(&mut self, vp: &mut DynamicViewport) -> Result<()> {
-        while let Some(msg) = self.client.try_recv_notification() {
-            match msg {
-                Message::Notification { method, params } => {
-                    self.handle_notification(vp, &method, &params)?;
-                }
-                Message::Eof => {
-                    let width = vp.area().width as usize;
-                    let wrap = width.saturating_sub(2);
-                    let lines = render::error_block("mu serve closed stdout — daemon exited", wrap);
-                    let h = lines.len() as u16;
-                    vp.insert_before(h, |buf| {
-                        // No .wrap() — pre-wrapped by block_lines.
-                        let p = Paragraph::new(lines);
-                        ratatui::widgets::Widget::render(p, buf.area, buf);
-                    })?;
-                    anyhow::bail!("daemon exited unexpectedly");
-                }
-                Message::ReaderError(e) => {
-                    let width = vp.area().width as usize;
-                    let wrap = width.saturating_sub(2);
-                    let lines = render::error_block(&format!("reader error: {e}"), wrap);
-                    let h = lines.len() as u16;
-                    vp.insert_before(h, |buf| {
-                        // No .wrap() — pre-wrapped by block_lines.
-                        let p = Paragraph::new(lines);
-                        ratatui::widgets::Widget::render(p, buf.area, buf);
-                    })?;
-                }
-                Message::Response { .. } => {} // ignore late responses
-            }
+    /// Flush trailing streaming text and emit the closer line for
+    /// an assistant block that just finished. Called after any
+    /// notification that sets pending_close.
+    fn flush_streaming_close(&mut self, vp: &mut DynamicViewport) -> Result<()> {
+        let width = vp.area().width as usize;
+        let wrap_width = width.saturating_sub(2);
+        let route = self.streaming_route.unwrap_or(TurnRoute::Main);
+        let total = self.streaming_text.chars().count();
+        if total > self.streaming_chars_emitted {
+            let remaining: String = self
+                .streaming_text
+                .chars()
+                .skip(self.streaming_chars_emitted)
+                .collect();
+            emit_body_chunk(vp, &remaining, wrap_width, route.color())?;
         }
-        // Phase 2: if streaming ended (pending_close) and we have an
-        // open header, flush trailing buffer and emit closer. Color
-        // matches the route owning the current turn (white for main,
-        // magenta for /btw).
-        if self.pending_close && self.streaming_header_open {
-            let width = vp.area().width as usize;
-            let wrap_width = width.saturating_sub(2);
-            let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-            // Flush any trailing chars past the last newline.
-            let total = self.streaming_text.chars().count();
-            if total > self.streaming_chars_emitted {
-                let remaining: String = self
-                    .streaming_text
-                    .chars()
-                    .skip(self.streaming_chars_emitted)
-                    .collect();
-                emit_body_chunk(vp, &remaining, wrap_width, route.color())?;
-            }
-            // Closer.
-            let closer = Line::from(Span::styled(
-                "└─".to_string(),
-                Style::default().fg(route.color()),
-            ));
-            vp.insert_before(2, |buf| {
-                let lines = vec![closer, Line::from("")];
-                let p = Paragraph::new(lines);
-                ratatui::widgets::Widget::render(p, buf.area, buf);
-            })?;
-            // Mark next AssistantMessage commit for skip (not used in
-            // v0 since we render only from streaming; placeholder for
-            // when we add committed-event rendering).
-            self.pending_skip_assistant += 1;
-            // Reset.
-            self.streaming_text.clear();
-            self.streaming_header_open = false;
-            self.streaming_chars_emitted = 0;
-            self.pending_close = false;
-            self.streaming_route = None;
-        }
+        let closer = Line::from(Span::styled(
+            "└─".to_string(),
+            Style::default().fg(route.color()),
+        ));
+        vp.insert_before(2, |buf| {
+            let lines = vec![closer, Line::from("")];
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
+        self.pending_skip_assistant += 1;
+        self.streaming_text.clear();
+        self.streaming_header_open = false;
+        self.streaming_chars_emitted = 0;
+        self.pending_close = false;
+        self.streaming_route = None;
         Ok(())
     }
 

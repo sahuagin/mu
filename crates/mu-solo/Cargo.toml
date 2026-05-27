@@ -20,6 +20,7 @@ name = "mu-solo"
 path = "src/bin/mu-solo.rs"
 
 [dependencies]
+mu-core = { path = "../mu-core" }
 ratatui = "0.30"
 crossterm = "0.28"
 anyhow = { workspace = true }

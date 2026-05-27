@@ -1,8 +1,10 @@
 //! JSON-RPC client for `mu serve`. Spawns the daemon as a child process
-//! and communicates via stdin/stdout. Synchronous (`std::thread` +
-//! `mpsc`) — matches the surface of mu-tui's `mu_client.rs` but trimmed
-//! to what mu-solo actually needs. Will share-via-extract with mu-tui's
-//! client when both are stable.
+//! and communicates via stdin/stdout.
+//!
+//! Hybrid sync/async: `request()` is synchronous (called during session
+//! setup and ask firing). Notifications flow through a
+//! `tokio::sync::mpsc::UnboundedReceiver` so the async event loop can
+//! `select!` on them without polling.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
@@ -15,6 +17,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use rand::RngCore;
 use serde_json::Value;
+
+use tokio::sync::mpsc as tokio_mpsc;
 
 /// One message read off the daemon's stdout. Either a response to a
 /// request we sent (id present) or a notification (method present, no
@@ -39,10 +43,17 @@ pub struct Client {
     #[allow(dead_code)]
     child: Child,
     stdin: ChildStdin,
-    rx: mpsc::Receiver<Message>,
+    /// Synchronous receiver for request/response pairing. The reader
+    /// thread sends all messages here; `request()` drains it looking
+    /// for the matching response id, stashing notifications aside.
+    rx: std::sync::mpsc::Receiver<Message>,
     pending_notifications: VecDeque<Message>,
     next_id: AtomicI64,
     default_read_timeout: Duration,
+    /// Async notification stream for the tokio event loop. Notifications
+    /// that arrive during `request()` are also forwarded here.
+    notif_tx: tokio_mpsc::UnboundedSender<Message>,
+    notif_rx: Option<tokio_mpsc::UnboundedReceiver<Message>>,
 }
 
 impl Client {
@@ -153,6 +164,7 @@ impl Client {
             })
             .context("spawning stdout reader thread")?;
 
+        let (notif_tx, notif_rx) = tokio_mpsc::unbounded_channel();
         let mut client = Self {
             child,
             stdin,
@@ -160,6 +172,8 @@ impl Client {
             pending_notifications: VecDeque::new(),
             next_id: AtomicI64::new(1),
             default_read_timeout: Duration::from_secs(120),
+            notif_tx,
+            notif_rx: Some(notif_rx),
         };
 
         // Authenticate immediately. Daemon rejects every protected RPC
@@ -224,6 +238,7 @@ impl Client {
                     continue;
                 }
                 Ok(msg @ Message::Notification { .. }) => {
+                    let _ = self.notif_tx.send(msg.clone());
                     self.pending_notifications.push_back(msg);
                 }
                 Ok(Message::Eof) => return Err(anyhow!("daemon closed stdout")),
@@ -249,6 +264,14 @@ impl Client {
             Ok(Message::Response { .. }) => None, // stale; drop
             Err(_) => None,
         }
+    }
+
+    /// Take the async notification receiver. Called once during App
+    /// setup to hand ownership to the tokio event loop. After this,
+    /// notifications flow through the async channel; `try_recv_notification`
+    /// still works for any that were buffered during `request()`.
+    pub fn take_notification_rx(&mut self) -> Option<tokio_mpsc::UnboundedReceiver<Message>> {
+        self.notif_rx.take()
     }
 }
 

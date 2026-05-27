@@ -87,7 +87,8 @@ impl Cli {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut cfg = config::load(cli.config.as_deref()).context("failed to load mu-solo config")?;
     config::apply_cli_overrides(&mut cfg, &cli.to_overrides());
@@ -119,7 +120,7 @@ fn main() -> Result<()> {
     enable_raw_mode().context("enable_raw_mode")?;
     execute!(std::io::stdout(), EnableBracketedPaste)?;
 
-    let run_result = app.run();
+    let run_result = app.run().await;
 
     // Always restore the terminal, even on error.
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);

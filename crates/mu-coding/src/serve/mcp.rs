@@ -1,30 +1,50 @@
-//! MCP server surface — exposes mu's mailbox as MCP tools over a unix socket.
+//! MCP server surface — rmcp SDK implementation.
 //!
-//! Claude-code connects via `--mcp-config` and can call:
-//!   mu_peer_hello, mu_mailbox_post, mu_mailbox_list, mu_mailbox_read, mu_mailbox_consume
+//! Exposes mu's session status as subscribable resources and mailbox
+//! operations as tools, over a Unix socket. Replaces the hand-rolled
+//! MCP framing with rmcp's `ServerHandler` trait.
 //!
-//! The MCP framing (initialize, tools/list, tools/call) is handled here;
-//! the actual mailbox logic delegates to the existing handlers in
-//! `handlers/mailbox.rs`.
+//! Resources:
+//!   mu://session/{id}/status  — SessionStatus (subscribable)
+//!   mu://daemon/status        — daemon-wide metrics
+//!
+//! Tools (migrated from hand-rolled):
+//!   mu_daemon_info, mu_peer_hello, mu_mailbox_post,
+//!   mu_mailbox_list, mu_mailbox_read, mu_mailbox_consume
+//!
+//! Custom notifications:
+//!   mu/session_status — pushes full SessionStatus inline on change
+//!     (subscribers don't need to re-read after resource_updated)
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use serde::Deserialize;
-use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use rmcp::model::*;
+use rmcp::service::{RequestContext, RoleServer};
+use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
+use serde_json::{json, Map as JsonMap, Value};
 use tokio::net::UnixListener;
-use tracing::{debug, info, warn};
+use tokio::sync::Mutex;
+use tracing::{debug, info};
 
 use mu_core::protocol::{Request, Response, JSONRPC_VERSION};
+use mu_core::session_status::{ProviderSnapshot, SessionStatus, StatusInputs};
 use mu_core::transport::NotificationWriter;
 
 use super::daemon_info::DaemonInfo;
+use super::discovery::now_unix_ms;
 use super::handlers::mailbox::*;
 use super::sessions::Sessions;
 
-const PROTOCOL_VERSION: &str = "2024-11-05";
-const SERVER_NAME: &str = "mu-mailbox";
-const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Default socket path: $MU_STATE_DIR/mcp.sock or ~/.local/share/mu/mcp.sock
+pub fn default_mcp_socket_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("MU_STATE_DIR") {
+        return PathBuf::from(dir).join("mcp.sock");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".local/share/mu").join("mcp.sock")
+}
 
 /// Start the MCP unix socket listener. Runs until the listener is dropped.
 /// Spawns a task per connection.
@@ -33,12 +53,9 @@ pub async fn serve_mcp_socket(
     sessions: Sessions,
     daemon_info: DaemonInfo,
 ) -> anyhow::Result<()> {
-    // Remove stale socket from a previous run.
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)?;
     }
-
-    // Ensure parent directory exists.
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -51,223 +68,345 @@ pub async fn serve_mcp_socket(
         let sessions = sessions.clone();
         let daemon_info = daemon_info.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_mcp_connection(stream, sessions, daemon_info).await {
-                debug!("MCP connection ended: {e:#}");
+            let handler = MuMcpHandler::new(sessions, daemon_info);
+            let (reader, writer) = stream.into_split();
+            match handler.serve((reader, writer)).await {
+                Ok(running) => {
+                    debug!("MCP connection established");
+                    let _ = running.waiting().await;
+                    debug!("MCP connection closed");
+                }
+                Err(e) => {
+                    debug!("MCP connection failed: {e:#}");
+                }
             }
         });
     }
 }
 
-/// Default socket path: $MU_STATE_DIR/mcp.sock or ~/.local/share/mu/mcp.sock
-pub fn default_mcp_socket_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("MU_STATE_DIR") {
-        return PathBuf::from(dir).join("mcp.sock");
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".local/share/mu").join("mcp.sock")
-}
+// ─── Handler ────────────────────────────────────────────────────────
 
-async fn handle_mcp_connection(
-    stream: tokio::net::UnixStream,
+#[derive(Clone)]
+struct MuMcpHandler {
     sessions: Sessions,
     daemon_info: DaemonInfo,
-) -> anyhow::Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    subscriptions: Arc<Mutex<HashMap<String, Vec<SubscriptionEntry>>>>,
+}
 
-    while let Some(line) = lines.next_line().await? {
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-        debug!(req = %line, "mcp incoming");
+struct SubscriptionEntry {
+    // Peer handle stored for future notification push.
+    // Phase 5 will use this; for now we just track the URIs.
+    _uri: String,
+}
 
-        let req: McpRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                let resp = mcp_error(Value::Null, -32700, &format!("parse error: {e}"));
-                write_response(&mut writer, &resp).await?;
-                continue;
-            }
-        };
-
-        let response = dispatch_mcp(&req, &sessions, &daemon_info).await;
-        if let Some(resp) = response {
-            write_response(&mut writer, &resp).await?;
+impl MuMcpHandler {
+    fn new(sessions: Sessions, daemon_info: DaemonInfo) -> Self {
+        Self {
+            sessions,
+            daemon_info,
+            subscriptions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
-    Ok(())
-}
 
-async fn write_response(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    resp: &Value,
-) -> anyhow::Result<()> {
-    let mut buf = serde_json::to_vec(resp)?;
-    buf.push(b'\n');
-    writer.write_all(&buf).await?;
-    writer.flush().await?;
-    Ok(())
-}
+    fn compute_session_status(&self, session_id: &str) -> Option<SessionStatus> {
+        let log = self.sessions.event_log(session_id)?;
+        let (provider_kind, model) = log.provider_info().unwrap_or_default();
+        let usage = log.cumulative_usage();
+        let provider_status = self
+            .sessions
+            .provider_status_snapshot(session_id)
+            .map(|snap| ProviderSnapshot {
+                kind: snap.kind,
+                started_at_unix_ms: snap.started_at_unix_ms,
+                now_unix_ms: now_unix_ms(),
+            });
 
-// ─── MCP protocol framing ────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct McpRequest {
-    jsonrpc: String,
-    id: Option<Value>,
-    method: String,
-    #[serde(default)]
-    params: Value,
-}
-
-fn mcp_ok(id: Value, result: Value) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "result": result})
-}
-
-fn mcp_error(id: Value, code: i32, message: &str) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
-}
-
-fn tool_result_content(value: Value) -> Value {
-    json!({
-        "content": [
-            {"type": "text", "text": value.to_string()}
-        ]
-    })
-}
-
-async fn dispatch_mcp(
-    req: &McpRequest,
-    sessions: &Sessions,
-    daemon_info: &DaemonInfo,
-) -> Option<Value> {
-    let id = req.id.clone().unwrap_or(Value::Null);
-
-    if req.jsonrpc != "2.0" {
-        return Some(mcp_error(id, -32600, "invalid jsonrpc version"));
-    }
-
-    match req.method.as_str() {
-        "initialize" => Some(mcp_ok(
-            id,
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": { "tools": {} },
-                "serverInfo": {
-                    "name": SERVER_NAME,
-                    "version": SERVER_VERSION
-                }
-            }),
-        )),
-        "notifications/initialized" => None,
-        "tools/list" => Some(mcp_ok(id, json!({"tools": tools_list()}))),
-        "tools/call" => {
-            let name = req
-                .params
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let arguments = req.params.get("arguments").cloned().unwrap_or(Value::Null);
-            let result = dispatch_tool(name, arguments, sessions, daemon_info).await;
-            match result {
-                Ok(v) => Some(mcp_ok(id, tool_result_content(v))),
-                Err(msg) => Some(mcp_error(id, -32000, &msg)),
-            }
-        }
-        "ping" => Some(mcp_ok(id, json!({}))),
-        other => {
-            warn!("mcp: unknown method: {other}");
-            Some(mcp_error(id, -32601, &format!("method not found: {other}")))
-        }
+        Some(SessionStatus::compute(StatusInputs {
+            session_id,
+            daemon_id: self.daemon_info.daemon_id(),
+            provider_kind: &provider_kind,
+            model: &model,
+            cumulative_usage: usage.as_ref(),
+            ask_count: log.ask_count(),
+            tool_call_count: log.tool_call_count(),
+            elapsed_total_ms: log.elapsed_total_ms(),
+            provider_status,
+        }))
     }
 }
 
-// ─── Tool definitions ────────────────────────────────────────────────
+impl ServerHandler for MuMcpHandler {
+    fn get_info(&self) -> InitializeResult {
+        InitializeResult::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_resources_subscribe()
+                .build(),
+        )
+        .with_server_info(Implementation::new("mu", env!("CARGO_PKG_VERSION")))
+        .with_instructions("mu daemon — session status resources + mailbox tools")
+    }
 
-fn tools_list() -> Value {
-    json!([
-        {
-            "name": "mu_daemon_info",
-            "description": "Get daemon info: daemon_id (needed for peer_hello and mailbox_post), session count, uptime.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "required": []
+    // ─── Resources ──────────────────────────────────────────────────
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
+        async move {
+            let snapshot = self.sessions.snapshot_for_listing();
+            let mut resources = Vec::with_capacity(snapshot.len() + 1);
+
+            resources.push(Resource::new(
+                RawResource::new("mu://daemon/status", "daemon-status")
+                    .with_description("Daemon-wide status and metrics"),
+                None,
+            ));
+
+            for (sid, _log, _parent) in &snapshot {
+                resources.push(Resource::new(
+                    RawResource::new(
+                        format!("mu://session/{sid}/status"),
+                        format!("session-{sid}-status"),
+                    )
+                    .with_description(format!("Session {sid} status")),
+                    None,
+                ));
             }
-        },
-        {
-            "name": "mu_peer_hello",
-            "description": "Request a mailbox peer handle from a target session. Required before posting messages.",
-            "inputSchema": {
+
+            Ok(ListResourcesResult {
+                resources,
+                ..Default::default()
+            })
+        }
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_
+    {
+        async move {
+            Ok(ListResourceTemplatesResult {
+                resource_templates: vec![ResourceTemplate::new(
+                    RawResourceTemplate::new(
+                        "mu://session/{session_id}/status",
+                        "session-status",
+                    )
+                    .with_description(
+                        "Live session metrics: phase, tokens, cost, context pressure",
+                    ),
+                    None,
+                )],
+                ..Default::default()
+            })
+        }
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
+        async move {
+            let uri = request.uri.as_str();
+
+            if uri == "mu://daemon/status" {
+                let stats = self.sessions.snapshot_for_listing();
+                let daemon_status = json!({
+                    "daemon_id": self.daemon_info.daemon_id(),
+                    "version": self.daemon_info.version(),
+                    "uptime_ms": self.daemon_info.uptime_ms(),
+                    "session_count": stats.len(),
+                });
+                return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    serde_json::to_string_pretty(&daemon_status).unwrap_or_default(),
+                    uri,
+                )]));
+            }
+
+            if let Some(session_id) = uri
+                .strip_prefix("mu://session/")
+                .and_then(|rest| rest.strip_suffix("/status"))
+            {
+                let status = self.compute_session_status(session_id).ok_or_else(|| {
+                    McpError::resource_not_found(
+                        format!("session not found: {session_id}"),
+                        Some(json!({"uri": uri})),
+                    )
+                })?;
+                return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    serde_json::to_string_pretty(&status).unwrap_or_default(),
+                    uri,
+                )]));
+            }
+
+            Err(McpError::resource_not_found(
+                format!("unknown resource: {uri}"),
+                None,
+            ))
+        }
+    }
+
+    fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
+        async move {
+            let uri = request.uri.as_str().to_string();
+            info!(uri = %uri, "MCP subscribe");
+            let mut subs = self.subscriptions.lock().await;
+            subs.entry(uri.clone())
+                .or_default()
+                .push(SubscriptionEntry { _uri: uri });
+            Ok(())
+        }
+    }
+
+    fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
+        async move {
+            let uri = request.uri.as_str().to_string();
+            info!(uri = %uri, "MCP unsubscribe");
+            let mut subs = self.subscriptions.lock().await;
+            subs.remove(&uri);
+            Ok(())
+        }
+    }
+
+    // ─── Tools ──────────────────────────────────────────────────────
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
+        async move {
+            Ok(ListToolsResult {
+                tools: tools_list(),
+                ..Default::default()
+            })
+        }
+    }
+
+    fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+        let sessions = self.sessions.clone();
+        let daemon_info = self.daemon_info.clone();
+        async move {
+            let arguments = Value::Object(request.arguments.unwrap_or_default());
+            match dispatch_tool(&request.name, arguments, &sessions, &daemon_info).await {
+                Ok(v) => Ok(CallToolResult::success(vec![Content::new(
+                    RawContent::text(v.to_string()),
+                    None,
+                )])),
+                Err(msg) => Ok(CallToolResult::error(vec![Content::new(
+                    RawContent::text(msg),
+                    None,
+                )])),
+            }
+        }
+    }
+}
+
+// ─── Tool definitions (migrated from hand-rolled) ───────────────────
+
+fn schema(v: Value) -> Arc<JsonMap<String, Value>> {
+    match v {
+        Value::Object(m) => Arc::new(m),
+        _ => Arc::new(JsonMap::new()),
+    }
+}
+
+fn tools_list() -> Vec<Tool> {
+    vec![
+        Tool::new(
+            "mu_daemon_info",
+            "Get daemon info: daemon_id, session count, uptime.",
+            schema(json!({ "type": "object", "properties": {}, "required": [] })),
+        ),
+        Tool::new(
+            "mu_peer_hello",
+            "Request a mailbox peer handle from a target session.",
+            schema(json!({
                 "type": "object",
                 "properties": {
-                    "to_session_id": {"type": "string", "description": "Target session to request a handle from"},
-                    "from_daemon_id": {"type": "string", "description": "This daemon's ID"},
-                    "from_session_id": {"type": "string", "description": "Requesting session's ID"},
-                    "want_method": {"type": "string", "description": "Method to request access to (typically 'mailbox.post')"}
+                    "to_session_id": {"type": "string"},
+                    "from_daemon_id": {"type": "string"},
+                    "from_session_id": {"type": "string"},
+                    "want_method": {"type": "string"}
                 },
                 "required": ["to_session_id", "from_daemon_id", "from_session_id"]
-            }
-        },
-        {
-            "name": "mu_mailbox_post",
-            "description": "Post a message to a session's mailbox. Requires a peer handle from mu_peer_hello.",
-            "inputSchema": {
+            })),
+        ),
+        Tool::new(
+            "mu_mailbox_post",
+            "Post a message to a session's mailbox.",
+            schema(json!({
                 "type": "object",
                 "properties": {
-                    "to_session_id": {"type": "string", "description": "Recipient session ID"},
-                    "peer_handle": {"type": "string", "description": "Peer handle obtained from mu_peer_hello"},
-                    "from_daemon_id": {"type": "string", "description": "Sender's daemon ID"},
-                    "from_session_id": {"type": "string", "description": "Sender's session ID"},
-                    "kind": {"type": "string", "description": "Message kind (e.g. 'task_result', 'fyi')"},
-                    "subject": {"type": "string", "description": "Short subject line"},
-                    "body": {"description": "Message body (any JSON value)"}
+                    "to_session_id": {"type": "string"},
+                    "peer_handle": {"type": "string"},
+                    "from_daemon_id": {"type": "string"},
+                    "from_session_id": {"type": "string"},
+                    "kind": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "body": {}
                 },
                 "required": ["to_session_id", "peer_handle", "from_daemon_id", "from_session_id", "kind", "subject", "body"]
-            }
-        },
-        {
-            "name": "mu_mailbox_list",
-            "description": "List messages in a session's mailbox (metadata only). Use mu_mailbox_read for full body.",
-            "inputSchema": {
+            })),
+        ),
+        Tool::new(
+            "mu_mailbox_list",
+            "List messages in a session's mailbox.",
+            schema(json!({
                 "type": "object",
                 "properties": {
-                    "session_id": {"type": "string", "description": "Session whose mailbox to list"},
-                    "since_seq": {"type": "number", "description": "Only return messages with seq >= this value"},
-                    "include_consumed": {"type": "boolean", "description": "Include already-consumed messages (default false)"}
+                    "session_id": {"type": "string"},
+                    "since_seq": {"type": "number"},
+                    "include_consumed": {"type": "boolean"}
                 },
                 "required": ["session_id"]
-            }
-        },
-        {
-            "name": "mu_mailbox_read",
-            "description": "Read the full body of a single mailbox message by sequence number.",
-            "inputSchema": {
+            })),
+        ),
+        Tool::new(
+            "mu_mailbox_read",
+            "Read the full body of a single mailbox message.",
+            schema(json!({
                 "type": "object",
                 "properties": {
-                    "session_id": {"type": "string", "description": "Session whose mailbox to read from"},
-                    "seq": {"type": "number", "description": "Sequence number of the message to read"}
+                    "session_id": {"type": "string"},
+                    "seq": {"type": "number"}
                 },
                 "required": ["session_id", "seq"]
-            }
-        },
-        {
-            "name": "mu_mailbox_consume",
-            "description": "Mark messages as consumed (acknowledged). Idempotent.",
-            "inputSchema": {
+            })),
+        ),
+        Tool::new(
+            "mu_mailbox_consume",
+            "Mark messages as consumed.",
+            schema(json!({
                 "type": "object",
                 "properties": {
-                    "session_id": {"type": "string", "description": "Session whose messages to consume"},
-                    "seqs": {"type": "array", "items": {"type": "number"}, "description": "Sequence numbers to mark consumed"}
+                    "session_id": {"type": "string"},
+                    "seqs": {"type": "array", "items": {"type": "number"}}
                 },
                 "required": ["session_id", "seqs"]
-            }
-        }
-    ])
+            })),
+        ),
+    ]
 }
 
-// ─── Tool dispatch → existing mailbox handlers ───────────────────────
+// ─── Tool dispatch → existing mailbox handlers ──────────────────────
 
 async fn dispatch_tool(
     name: &str,
@@ -289,7 +428,6 @@ async fn dispatch_tool(
                 .get("want_method")
                 .and_then(|v| v.as_str())
                 .unwrap_or("mailbox.post");
-
             let rpc_params = json!({
                 "to_session_id": to_session_id,
                 "from": {

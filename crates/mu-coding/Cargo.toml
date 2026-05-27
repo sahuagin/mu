@@ -34,6 +34,8 @@ rand = { workspace = true }
 thiserror = { workspace = true }
 # mu-upb: home directory for on-disk event log path
 dirs = { workspace = true }
+# MCP server (rmcp SDK) for session status resources + mailbox tools
+rmcp = { workspace = true, features = ["server"] }
 
 [dev-dependencies]
 futures = { workspace = true }

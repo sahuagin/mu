@@ -173,10 +173,28 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
         }
 
         // Tier 2: ToolCall/ToolResult clusters (adjacent), oldest cluster first.
+        // CRITICAL: also drop the Assistant span immediately preceding each
+        // cluster — it contains the tool_use block that references the call
+        // IDs in the cluster. Leaving it orphaned produces an invalid
+        // conversation (model sees tool_use with no matching tool_result).
         let clusters = tool_clusters(spans);
         for cluster in &clusters {
             if tokens_after <= target_tokens {
                 break;
+            }
+            // Find the Assistant span preceding this cluster.
+            if let Some(&first_idx) = cluster.first() {
+                if first_idx > 0 && spans[first_idx - 1].kind == SpanKind::Assistant {
+                    record_drop(
+                        first_idx - 1,
+                        "assistant with orphaned tool_use (evicted with tool cluster)",
+                        spans,
+                        &sizes,
+                        &mut dropped,
+                        &mut tokens_after,
+                        &mut decisions,
+                    );
+                }
             }
             for &idx in cluster {
                 record_drop(
@@ -192,6 +210,9 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
         }
 
         // Tier 3: old Assistant turns (not in preserved-recent set).
+        // When dropping an Assistant span that has tool_use content (the
+        // next span is ToolCall/ToolResult), also drop the tool cluster
+        // to avoid orphaned tool_results in the conversation.
         for i in 0..n {
             if tokens_after <= target_tokens {
                 break;
@@ -206,6 +227,22 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
                     &mut tokens_after,
                     &mut decisions,
                 );
+                // Drop trailing tool cluster if present.
+                let mut j = i + 1;
+                while j < n
+                    && matches!(spans[j].kind, SpanKind::ToolCall | SpanKind::ToolResult)
+                {
+                    record_drop(
+                        j,
+                        "tool cluster orphaned by assistant drop",
+                        spans,
+                        &sizes,
+                        &mut dropped,
+                        &mut tokens_after,
+                        &mut decisions,
+                    );
+                    j += 1;
+                }
             }
         }
 
@@ -356,23 +393,68 @@ mod tests {
 
     #[test]
     fn tool_call_and_result_drop_as_a_cluster() {
-        // No FileLoad to drain; tool cluster is the only droppable tier.
-        // a1/a2 are the two most recent assistants → preserved.
-        // Target forces a moderate drop that requires the tool cluster.
+        // Tool cluster preceded by its assistant (which has tool_use).
+        // a2/a3 are the two most recent assistants → preserved.
+        // Target forces eviction through tier 2.
         let rope = RetainedRope::from_spans(vec![
             span("sys", SpanKind::System, "sys"),
+            span("a_tooluse", SpanKind::Assistant, "[tool_call:read({})]"),
             span("tc1", SpanKind::ToolCall, "0123456789"),
             span("tr1", SpanKind::ToolResult, "0123456789"),
-            span("a1", SpanKind::Assistant, "0123456789"),
             span("a2", SpanKind::Assistant, "0123456789"),
+            span("a3", SpanKind::Assistant, "0123456789"),
         ]);
-        let target = target_from_rope(&rope, 0.7);
+        let target = target_from_rope(&rope, 0.6);
         let r = SpanFamilyDropPolicy::new().compact(&rope, target);
         let drops = dropped_ids(&r);
         assert!(drops.contains(&"tc1"), "tc1 dropped");
         assert!(drops.contains(&"tr1"), "tr1 dropped");
+        assert!(
+            drops.contains(&"a_tooluse"),
+            "assistant with tool_use must be dropped with its cluster"
+        );
         let survivors = surviving_ids(&r);
-        assert_eq!(survivors, vec!["sys", "a1", "a2"]);
+        assert_eq!(survivors, vec!["sys", "a2", "a3"]);
+    }
+
+    #[test]
+    fn tool_cluster_drop_never_orphans_assistant_tool_use() {
+        // Reproducer for the compaction→400 bug: dropping a tool cluster
+        // without its assistant leaves an orphaned tool_use block in the
+        // conversation, causing the model to 400 with "No tool output
+        // found for function call."
+        let rope = RetainedRope::from_spans(vec![
+            span("sys", SpanKind::System, "system prompt"),
+            span("u1", SpanKind::User, "hello"),
+            span("a1_tools", SpanKind::Assistant, "[tool_call:bash({cmd:pwd})]"),
+            span("tc1", SpanKind::ToolCall, "bash pwd"),
+            span("tr1", SpanKind::ToolResult, "/home/user"),
+            span("a2_text", SpanKind::Assistant, "You are in /home/user"),
+            span("u2", SpanKind::User, "do more stuff"),
+            span("a3_tools", SpanKind::Assistant, "[tool_call:read({path:f})]"),
+            span("tc2", SpanKind::ToolCall, "read f"),
+            span("tr2", SpanKind::ToolResult, "file contents here"),
+            span("a4_text", SpanKind::Assistant, "The file contains..."),
+        ]);
+        // Aggressive target to force tier 2 drops.
+        let target = target_from_rope(&rope, 0.4);
+        let r = SpanFamilyDropPolicy::new().compact(&rope, target);
+        let survivors = surviving_ids(&r);
+        // Key invariant: no surviving Assistant span should have a
+        // tool_use block whose tool cluster was dropped.
+        for (i, s) in r.rope.spans().iter().enumerate() {
+            if s.kind == SpanKind::Assistant && s.content().contains("[tool_call:") {
+                // The next span must be a ToolCall/ToolResult cluster.
+                let next = r.rope.spans().get(i + 1);
+                assert!(
+                    next.is_some_and(|n| matches!(n.kind, SpanKind::ToolCall | SpanKind::ToolResult)),
+                    "Assistant span {:?} has tool_use but no following tool cluster — \
+                     this would cause a provider 400 error. Survivors: {:?}",
+                    s.id(),
+                    survivors,
+                );
+            }
+        }
     }
 
     #[test]
@@ -399,10 +481,12 @@ mod tests {
     #[test]
     fn drops_recorded_with_specific_reasons() {
         // One of each droppable kind; tiny target forces multi-tier drops.
-        // Three Assistants so KEEP_RECENT_ASSISTANT=2 preserves a_mid +
-        // a_keep and a_old is exposed for the Tier 3 reason check.
+        // The tool cluster (tc/tr) is preceded by an assistant that acts
+        // as the tool_use originator. Three more assistants so
+        // KEEP_RECENT_ASSISTANT=2 preserves a_mid + a_keep.
         let rope = RetainedRope::from_spans(vec![
             span("f", SpanKind::FileLoad, "xxxxx"),
+            span("a_tool", SpanKind::Assistant, "[tool_call:x({})]"),
             span("tc", SpanKind::ToolCall, "xxxxx"),
             span("tr", SpanKind::ToolResult, "xxxxx"),
             span("a_old", SpanKind::Assistant, "xxxxx"),
@@ -411,7 +495,6 @@ mod tests {
             span("sk", SpanKind::SkillActivation, "xxxxx"),
         ]);
         let r = SpanFamilyDropPolicy::new().compact(&rope, 0);
-        // Every reason string contains the tier marker phrase.
         let reasons: Vec<String> = r
             .decisions
             .iter()
@@ -424,6 +507,7 @@ mod tests {
             .collect();
         let joined = reasons.join("|");
         assert!(joined.contains("f=stale file-load"));
+        assert!(joined.contains("a_tool=assistant with orphaned tool_use"));
         assert!(joined.contains("tc=old tool call/result cluster"));
         assert!(joined.contains("tr=old tool call/result cluster"));
         assert!(joined.contains("a_old=old assistant turn"));

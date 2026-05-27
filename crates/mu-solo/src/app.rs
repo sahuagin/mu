@@ -736,11 +736,18 @@ impl App {
                                 } else {
                                     format!("/{raw}")
                                 };
+                                let takes_arg = matches!(
+                                    cmd.as_str(),
+                                    "/btw" | "/effort" | "/provider" | "/model" | "/focus"
+                                ) || self.skills.contains_key(cmd.trim_start_matches('/'));
                                 self.prompt.clear();
                                 for c in cmd.chars() {
                                     self.prompt.insert_char(c);
                                 }
-                                // Synthesize Enter to execute the command immediately.
+                                if takes_arg {
+                                    self.prompt.insert_char(' ');
+                                    return Ok(false);
+                                }
                                 let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
                                 return self.handle_key(vp, enter);
                             }

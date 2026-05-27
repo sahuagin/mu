@@ -761,9 +761,20 @@ impl App {
                     return Ok(false);
                 }
                 MenuAction::Dismiss => {
+                    let filter = menu.filter().to_string();
                     self.inline_menu = None;
                     self.menu_context = MenuContext::default();
-                    self.prompt.clear();
+                    if filter.is_empty() {
+                        self.prompt.clear();
+                    } else {
+                        // Keep the typed text — the user was typing a
+                        // command that didn't match the menu filter.
+                        // Prompt already has "/" from the trigger; add
+                        // the filter chars.
+                        for c in filter.chars() {
+                            self.prompt.insert_char(c);
+                        }
+                    }
                     return Ok(false);
                 }
             }

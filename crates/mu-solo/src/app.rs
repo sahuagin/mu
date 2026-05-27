@@ -576,7 +576,7 @@ impl App {
         } else {
             0
         };
-        let desired_height = (layout.lines.len() as u16 + 3 + menu_rows as u16) // +separator +status +info
+        let desired_height = (layout.lines.len() as u16 + 4 + menu_rows as u16) // +separator +prompt +separator +status +info
             .clamp(VIEWPORT_HEIGHT, MAX_VIEWPORT_HEIGHT);
         if desired_height != vp.area().height {
             vp.set_height(desired_height)?;
@@ -586,7 +586,7 @@ impl App {
         let vp_w = area.width as usize;
         let vp_wrap = vp_w.saturating_sub(4);
         let vp_layout = self.prompt.visual_layout(vp_wrap);
-        let max_prompt_rows = (area.height as usize).saturating_sub(2);
+        let max_prompt_rows = (area.height as usize).saturating_sub(4);
         let prompt_rows = vp_layout.lines.len().min(max_prompt_rows);
         let skip = vp_layout.lines.len().saturating_sub(prompt_rows);
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -672,9 +672,10 @@ impl App {
                 ]));
             }
         }
-        while lines.len() < (area.height as usize).saturating_sub(2) {
-            lines.push(Line::from(""));
-        }
+        lines.push(Line::from(Span::styled(
+            "─".repeat(vp_w),
+            Style::default().fg(Color::DarkGray),
+        )));
         lines.push(self.format_status_line(vp_w));
         lines.push(self.format_info_line(vp_w));
         let para = Paragraph::new(lines);
@@ -1659,12 +1660,13 @@ impl App {
         spans.push(Span::styled(phase_text.clone(), Style::default().fg(phase.color())));
 
         // Build metrics from MCP status or inline accumulators
-        let (in_tok, out_tok, cache_read, cost, ctx_pct, ctx_window) =
+        let (in_tok, out_tok, cache_read, cache_creation, cost, ctx_pct, ctx_window) =
             if let Some(ref s) = self.mcp_status {
                 (
                     s.input_tokens,
                     s.output_tokens,
                     s.cache_read_tokens.unwrap_or(0),
+                    s.cache_creation_tokens.unwrap_or(0),
                     s.cost_usd,
                     s.context_pressure_pct,
                     s.context_window_size,
@@ -1674,6 +1676,7 @@ impl App {
                     self.cumulative_input_tokens,
                     self.cumulative_output_tokens,
                     self.cumulative_cache_read,
+                    self.cumulative_cache_creation,
                     self.compute_cost(),
                     None,
                     None,
@@ -1695,7 +1698,12 @@ impl App {
             spans.push(Span::styled(out_s, arrow_style));
 
             if cache_read > 0 {
-                let cs = format!(" C{}", format_tokens(cache_read));
+                let cs = format!(" Cr{}", format_tokens(cache_read));
+                metrics_text_len += cs.len();
+                spans.push(Span::styled(cs, dim));
+            }
+            if cache_creation > 0 {
+                let cs = format!(" Cw{}", format_tokens(cache_creation));
                 metrics_text_len += cs.len();
                 spans.push(Span::styled(cs, dim));
             }
@@ -1705,9 +1713,17 @@ impl App {
                 spans.push(Span::styled(cs, dim));
             }
             if let (Some(pct), Some(window)) = (ctx_pct, ctx_window) {
-                let cs = format!(" {pct:.1}%/{}", format_tokens(window));
+                let used = (pct / 100.0 * window as f64) as u64;
+                let cs = format!(" {}/{}", format_tokens(used), format_tokens(window));
                 metrics_text_len += cs.len();
-                spans.push(Span::styled(cs, dim));
+                let ctx_style = if pct >= 90.0 {
+                    Style::default().fg(Color::Red)
+                } else if pct >= 70.0 {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    dim
+                };
+                spans.push(Span::styled(cs, ctx_style));
             }
         }
 
@@ -1754,20 +1770,21 @@ impl App {
 
         let left = format!("  {user}@{host}:{cwd}");
 
-        let ctx_part = if let Some(ref status) = self.mcp_status {
+        let (right, right_style) = if let Some(ref status) = self.mcp_status {
             if let Some(pct) = status.context_pressure_pct {
-                format!("ctx:{pct:.0}%")
+                let style = if pct >= 90.0 {
+                    Style::default().fg(Color::Red)
+                } else if pct >= 70.0 {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                (format!("ctx:{pct:.0}%"), style)
             } else {
-                String::new()
+                (String::new(), Style::default().fg(Color::DarkGray))
             }
         } else {
-            String::new()
-        };
-
-        let right = if ctx_part.is_empty() {
-            format!("{} · {}", self.provider, self.model)
-        } else {
-            format!("{} · {} · {ctx_part}", self.provider, self.model)
+            (String::new(), Style::default().fg(Color::DarkGray))
         };
 
         let gap = width.saturating_sub(left.len() + right.len() + 2);
@@ -1776,7 +1793,7 @@ impl App {
         Line::from(vec![
             Span::styled(left, Style::default().fg(Color::DarkGray)),
             Span::styled(padding, Style::default()),
-            Span::styled(right, Style::default().fg(Color::DarkGray)),
+            Span::styled(right, right_style),
         ])
     }
 
@@ -2575,7 +2592,7 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
-/// Initial viewport height (separator + 3 prompt lines + status + info).
-const VIEWPORT_HEIGHT: u16 = 6;
+/// Minimum viewport height (separator + prompt + separator + status + info).
+const VIEWPORT_HEIGHT: u16 = 5;
 /// Maximum viewport height — cap to prevent eating the entire screen.
 const MAX_VIEWPORT_HEIGHT: u16 = 20;

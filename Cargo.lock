@@ -1570,6 +1570,7 @@ dependencies = [
  "crossterm 0.28.1",
  "dirs",
  "figment",
+ "mu-core",
  "rand 0.8.6",
  "ratatui",
  "serde",

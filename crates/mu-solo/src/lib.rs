@@ -18,6 +18,7 @@ pub mod app;
 pub mod client;
 pub mod config;
 pub mod input;
+pub mod mcp_status;
 pub mod menu;
 pub mod picker;
 pub mod render;

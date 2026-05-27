@@ -11,14 +11,17 @@
 //! land next.
 
 use std::collections::HashMap;
+use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use mu_core::session_status::SessionStatus;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use crate::mcp_status;
 use crate::menu::{InlineMenu, MenuAction, MenuItem};
 use serde_json::Value;
 
@@ -266,6 +269,12 @@ pub struct App {
     cumulative_cache_creation: u64,
     /// Completed ask count (incremented on session.done).
     ask_count: u32,
+    /// MCP status subscription receiver. When connected, receives
+    /// SessionStatus pushes from the daemon via the MCP socket.
+    /// Falls back to inline accumulation when not connected.
+    mcp_status_rx: Option<std_mpsc::Receiver<SessionStatus>>,
+    /// Latest SessionStatus from the MCP subscription.
+    mcp_status: Option<SessionStatus>,
 }
 
 /// What the inline menu is selecting.
@@ -395,6 +404,8 @@ impl App {
                 .join("session-1.jsonl")
         });
 
+        let mcp_status_rx = Some(mcp_status::spawn_status_subscriber(session_id.clone()));
+
         Ok(Self {
             client,
             session_id,
@@ -430,6 +441,8 @@ impl App {
             cumulative_cache_read: 0,
             cumulative_cache_creation: 0,
             ask_count: 0,
+            mcp_status_rx,
+            mcp_status: None,
         })
     }
 
@@ -468,6 +481,7 @@ impl App {
         loop {
             // Drain any notifications that arrived since the last tick.
             self.drain_notifications(&mut vp)?;
+            self.drain_mcp_status();
 
             // Compute desired viewport height from prompt content.
             let w = vp.area().width as usize;
@@ -1571,6 +1585,33 @@ impl App {
         let cw = self.cumulative_cache_creation as f64;
         let cr = self.cumulative_cache_read as f64;
         (inp * in_rate + cw * in_rate * 1.25 + cr * in_rate * 0.10 + out * out_rate) / 1_000_000.0
+    }
+
+    /// Drain MCP status updates from the subscription channel. Updates
+    /// the cached status and syncs the inline accumulators so both the
+    /// status line and /status command reflect the latest data.
+    fn drain_mcp_status(&mut self) {
+        let rx = match self.mcp_status_rx.as_ref() {
+            Some(rx) => rx,
+            None => return,
+        };
+        while let Ok(status) = rx.try_recv() {
+            self.session_phase = match status.phase.as_str() {
+                "idle" => SessionPhase::Idle,
+                "awaiting_first_token" => SessionPhase::AwaitingFirstToken,
+                "streaming" => SessionPhase::Streaming,
+                "thinking" => SessionPhase::AwaitingFirstToken,
+                "tool_executing" | "awaiting_tool_result" => SessionPhase::ToolExecuting,
+                _ => self.session_phase,
+            };
+            self.phase_elapsed_ms = status.phase_elapsed_ms;
+            self.cumulative_input_tokens = status.input_tokens;
+            self.cumulative_output_tokens = status.output_tokens;
+            self.cumulative_cache_read = status.cache_read_tokens.unwrap_or(0);
+            self.cumulative_cache_creation = status.cache_creation_tokens.unwrap_or(0);
+            self.ask_count = status.ask_count;
+            self.mcp_status = Some(status);
+        }
     }
 
     /// Pull every queued notification, accumulate streaming_text,

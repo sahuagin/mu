@@ -17,7 +17,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Mutex,
+    Arc, Mutex,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -125,6 +125,19 @@ pub enum EventPayload {
         provider: String,
         raw_message: String,
         validation_error: String,
+    },
+    /// Provider/model switched mid-session (mu-k56u). Logged by the
+    /// agent loop when it receives `AgentInput::SwitchProvider`.
+    /// Properties are snapshotted from the route catalog at switch time.
+    ProviderSwitched {
+        old_provider_kind: Arc<str>,
+        old_model: Arc<str>,
+        new_provider_kind: Arc<str>,
+        new_model: Arc<str>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_soft_limit: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_hard_limit: Option<u64>,
     },
     /// Session closed (via `close_session` RPC or daemon shutdown).
     SessionClosed,
@@ -687,14 +700,19 @@ impl SessionEventLog {
     /// constructed manually without going through dispatch).
     pub fn provider_info(&self) -> Option<(String, String)> {
         let events = self.events.lock().ok()?;
-        for ev in events.iter() {
-            if let EventPayload::SessionCreated {
-                provider_kind,
-                model,
-                ..
-            } = &ev.payload
-            {
-                return Some((provider_kind.clone(), model.clone()));
+        for ev in events.iter().rev() {
+            match &ev.payload {
+                EventPayload::ProviderSwitched {
+                    new_provider_kind,
+                    new_model,
+                    ..
+                } => return Some((new_provider_kind.to_string(), new_model.to_string())),
+                EventPayload::SessionCreated {
+                    provider_kind,
+                    model,
+                    ..
+                } => return Some((provider_kind.clone(), model.clone())),
+                _ => {}
             }
         }
         None

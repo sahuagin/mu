@@ -239,7 +239,8 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
             | EventPayload::TaskTelemetry { .. }
             // mu-gdwd: boundary-validation failures are logged for
             // postmortem but don't carry usage-history signal.
-            | EventPayload::ErrorInvalidMessage { .. } => {}
+            | EventPayload::ErrorInvalidMessage { .. }
+            | EventPayload::ProviderSwitched { .. } => {}
         }
     }
 

@@ -174,7 +174,10 @@ pub fn derive_status_from_events(
             | EventPayload::TaskTelemetry { .. }
             // mu-gdwd: boundary-validation errors are logged but don't
             // drive session-status derivation.
-            | EventPayload::ErrorInvalidMessage { .. } => {}
+            | EventPayload::ErrorInvalidMessage { .. }
+            // mu-k56u: provider switch is an identity change, not
+            // a status-driving event.
+            | EventPayload::ProviderSwitched { .. } => {}
         }
         last_kind = Some(&ev.payload);
     }

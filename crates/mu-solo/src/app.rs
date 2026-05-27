@@ -496,15 +496,41 @@ impl App {
         let mut render_interval = tokio::time::interval(Duration::from_millis(100));
 
         loop {
-            // Drain any buffered notifications from request() calls
-            // that happened before the async loop started.
+            // Drain any buffered notifications + MCP status before render.
             self.drain_buffered_notifications(&mut vp)?;
             self.drain_mcp_status();
-
-            // Render
             self.render_viewport(&mut vp)?;
 
             tokio::select! {
+                biased;
+
+                // Daemon notifications — highest priority so streaming
+                // text renders immediately.
+                maybe_notif = notif_rx.recv() => {
+                    match maybe_notif {
+                        Some(msg) => {
+                            self.handle_message(&mut vp, msg)?;
+                            // Drain any additional queued notifications
+                            // so we batch-process bursts and don't
+                            // re-render between each text_delta.
+                            while let Ok(msg) = notif_rx.try_recv() {
+                                self.handle_message(&mut vp, msg)?;
+                            }
+                            self.drain_mcp_status();
+                        }
+                        None => {
+                            let width = vp.area().width as usize;
+                            let wrap = width.saturating_sub(2);
+                            let lines = render::error_block("daemon exited", wrap);
+                            let h = lines.len() as u16;
+                            vp.insert_before(h, |buf| {
+                                let p = Paragraph::new(lines);
+                                ratatui::widgets::Widget::render(p, buf.area, buf);
+                            })?;
+                            break;
+                        }
+                    }
+                }
                 // Keyboard / paste events
                 maybe_event = event_stream.next() => {
                     match maybe_event {
@@ -520,34 +546,14 @@ impl App {
                         Some(Err(e)) => {
                             tracing::warn!("crossterm event error: {e}");
                         }
-                        None => break, // terminal closed
+                        None => break,
                         _ => {}
                     }
                 }
-                // Daemon notifications (streaming text, tool calls, done, etc.)
-                maybe_notif = notif_rx.recv() => {
-                    match maybe_notif {
-                        Some(msg) => {
-                            self.handle_message(&mut vp, msg)?;
-                        }
-                        None => {
-                            // Reader thread closed — daemon exited.
-                            let width = vp.area().width as usize;
-                            let wrap = width.saturating_sub(2);
-                            let lines = render::error_block("daemon exited", wrap);
-                            let h = lines.len() as u16;
-                            vp.insert_before(h, |buf| {
-                                let p = Paragraph::new(lines);
-                                ratatui::widgets::Widget::render(p, buf.area, buf);
-                            })?;
-                            break;
-                        }
-                    }
-                }
-                // Periodic render tick (updates elapsed time in status line)
+                // Periodic render tick — updates elapsed time display
+                // and polls MCP status even when no other events fire.
                 _ = render_interval.tick() => {
-                    // Just re-render — the select loop will cycle back
-                    // to render_viewport at the top.
+                    self.drain_mcp_status();
                 }
             }
         }

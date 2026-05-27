@@ -335,6 +335,30 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tz: Option<String>,
     },
+    /// mu-slat: a pot-hosted claude-code worker was spawned as a
+    /// subprocess session. Emitted once by the supervisor when the
+    /// worker process starts successfully.
+    WorkerSpawned {
+        pot_name: String,
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_summary: Option<String>,
+    },
+    /// mu-slat: worker process exited normally.
+    WorkerExited {
+        exit_code: i32,
+        elapsed_ms: u64,
+    },
+    /// mu-slat: worker process failed (spawn error, signal, etc).
+    WorkerFailed {
+        reason: String,
+    },
+    /// mu-slat: worker killed by timeout.
+    WorkerTimeout {
+        elapsed_ms: u64,
+    },
 }
 
 /// Categorical exit reason for a task — what brought the task to its

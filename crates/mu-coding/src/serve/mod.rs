@@ -19,6 +19,7 @@ mod mailbox;
 pub mod mcp;
 mod provider_status;
 mod sessions;
+pub(crate) mod worker;
 
 pub use daemon_info::DaemonInfo;
 pub use discovery::{FileBackend, LocalRegistryBackend, SessionDiscovery};

@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use mu_core::agent::AgentInput;
 use mu_core::capability::Capability;
 use mu_core::event_log::SessionEventLog;
-use mu_core::protocol::{ApprovalDecision, OutstandingCall};
+use mu_core::protocol::{ApprovalDecision, OutstandingCall, WorkerStatus};
 use mu_core::session_status::SessionStatus;
 
 use super::mailbox::MailboxState;
@@ -85,20 +85,40 @@ struct RehydratedSession {
     mailbox: MailboxStateHandle,
 }
 
+/// mu-slat: a pot-hosted claude-code subprocess session. Has an event
+/// log and mailbox (can participate in peer.hello and receive messages)
+/// but no agent loop or provider — the agent runs inside the pot as a
+/// separate claude-code process. The supervisor monitors the child and
+/// records lifecycle events.
+#[allow(dead_code)] // Fields used by worker.rs (Task 4).
+pub(crate) struct SubprocessSession {
+    pub event_log: Arc<SessionEventLog>,
+    pub mailbox: MailboxStateHandle,
+    pub parent_session_id: Option<String>,
+    pub pot_name: String,
+    pub status: Mutex<WorkerStatus>,
+    pub started_at_unix_ms: u64,
+    pub child_handle: Option<JoinHandle<()>>,
+}
+
 /// In-memory session registry. Cheap to clone (Arc-backed).
 ///
-/// Two parallel maps:
+/// Three parallel maps:
 /// - `inner` — fully live sessions (agent loop running, input channel
 ///   open). Created by `insert`.
+/// - `workers` (mu-slat) — pot-hosted subprocess sessions. No agent loop;
+///   monitored by a supervisor task. Created by `insert_worker`.
 /// - `rehydrated` (mu-u1ld) — read-only ghost sessions loaded from the
 ///   on-disk event log at daemon startup. Created by `insert_rehydrated`.
 ///
-/// Listing and event-log queries see both maps (live wins on ID
-/// collision); live-state queries (input sender, capability, mailbox,
-/// provider status) see only `inner`. Removal hits both.
+/// Listing and event-log queries see all three maps (inner > workers >
+/// rehydrated on ID collision); live-state queries (input sender,
+/// capability, provider status) see only `inner`. Mailbox sees inner +
+/// workers + rehydrated. Removal hits all three.
 #[derive(Clone)]
 pub struct Sessions {
     inner: Arc<Mutex<HashMap<String, SessionState>>>,
+    workers: Arc<Mutex<HashMap<String, SubprocessSession>>>,
     rehydrated: Arc<Mutex<HashMap<String, RehydratedSession>>>,
 }
 
@@ -124,6 +144,7 @@ impl Sessions {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            workers: Arc::new(Mutex::new(HashMap::new())),
             rehydrated: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -230,7 +251,16 @@ impl Sessions {
     /// pattern as the other accessors.
     pub fn snapshot_for_listing(&self) -> Vec<(String, Arc<SessionEventLog>, Option<String>)> {
         let mut out: HashMap<String, (Arc<SessionEventLog>, Option<String>)> = HashMap::new();
+        // Priority: rehydrated < workers < inner (last insert wins).
         if let Ok(map) = self.rehydrated.lock() {
+            for (sid, s) in map.iter() {
+                out.insert(
+                    sid.clone(),
+                    (s.event_log.clone(), s.parent_session_id.clone()),
+                );
+            }
+        }
+        if let Ok(map) = self.workers.lock() {
             for (sid, s) in map.iter() {
                 out.insert(
                     sid.clone(),
@@ -257,6 +287,9 @@ impl Sessions {
     /// `input_sender`.
     pub fn event_log(&self, id: &str) -> Option<Arc<SessionEventLog>> {
         if let Some(log) = self.inner.lock().ok()?.get(id).map(|s| s.event_log.clone()) {
+            return Some(log);
+        }
+        if let Some(log) = self.workers.lock().ok()?.get(id).map(|s| s.event_log.clone()) {
             return Some(log);
         }
         self.rehydrated
@@ -301,6 +334,9 @@ impl Sessions {
     /// the registry lock.
     pub fn mailbox(&self, id: &str) -> Option<MailboxStateHandle> {
         if let Some(m) = self.inner.lock().ok()?.get(id).map(|s| s.mailbox.clone()) {
+            return Some(m);
+        }
+        if let Some(m) = self.workers.lock().ok()?.get(id).map(|s| s.mailbox.clone()) {
             return Some(m);
         }
         self.rehydrated
@@ -399,11 +435,32 @@ impl Sessions {
             Ok(mut map) => map.remove(id).is_some(),
             Err(_) => false,
         };
+        let worker = match self.workers.lock() {
+            Ok(mut map) => map.remove(id).is_some(),
+            Err(_) => false,
+        };
         let ghost = match self.rehydrated.lock() {
             Ok(mut map) => map.remove(id).is_some(),
             Err(_) => false,
         };
-        live || ghost
+        live || worker || ghost
+    }
+
+    /// mu-slat: insert a subprocess (pot-hosted worker) session.
+    pub(crate) fn insert_worker(&self, id: String, session: SubprocessSession) {
+        if let Ok(mut map) = self.workers.lock() {
+            map.insert(id, session);
+        }
+    }
+
+    /// mu-slat: look up a worker's status. Returns None if the session
+    /// isn't a worker.
+    pub fn worker_status(&self, id: &str) -> Option<WorkerStatus> {
+        self.workers
+            .lock()
+            .ok()?
+            .get(id)
+            .and_then(|s| s.status.lock().ok().map(|st| st.clone()))
     }
 }
 

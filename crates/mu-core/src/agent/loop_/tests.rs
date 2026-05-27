@@ -427,32 +427,56 @@ async fn s5h_done_propagates_end_turn_when_provider_reports_end_turn() {
     assert_eq!(done, StopReason::EndTurn);
 }
 
-/// B-6 (run before B-2 so we trust the error path before stacking tools).
+/// B-6: provider error is recoverable — loop emits Error + Done(Error)
+/// and stays alive for the next ask_session.
 #[tokio::test]
-async fn b6_provider_error_terminates() {
-    let provider = MockProvider::new(vec![vec![ProviderEvent::Error("rate limit".into())]]);
-    let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
+async fn b6_provider_error_recoverable() {
+    let provider = MockProvider::new(vec![
+        vec![ProviderEvent::Error("rate limit".into())],
+        vec![
+            ProviderEvent::TextDelta("ok".into()),
+            ProviderEvent::Done(assistant_text("ok")),
+        ],
+    ]);
+    let (loop_, mut events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
 
     loop_
         .send(AgentInput::UserMessage(user_msg("hello")))
         .await
         .expect("send");
-    let events_handle = tokio::spawn(collect_events(events_rx));
-    let outcome = loop_.join().await;
-    let events = events_handle.await.expect("events drain");
 
-    assert_eq!(outcome, Outcome::Error("rate limit".into()));
+    // Drain events until we see Done from the error recovery.
+    let mut saw_error = false;
+    let mut saw_done_error = false;
+    loop {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            events_rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(AgentEvent::Error { message })) if message == "rate limit" => {
+                saw_error = true;
+            }
+            Ok(Some(AgentEvent::Done {
+                stop_reason: StopReason::Error,
+                ..
+            })) => {
+                saw_done_error = true;
+                break;
+            }
+            Ok(Some(_)) => {}
+            _ => panic!("timed out waiting for error recovery events"),
+        }
+    }
+    assert!(saw_error, "should emit Error event");
+    assert!(saw_done_error, "should emit Done(Error) after error");
 
-    // Should see an error event before termination.
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Error { message } if message == "rate limit")),
-        "missing error event in {:?}",
-        events.iter().map(kind).collect::<Vec<_>>()
-    );
-    // Should NOT see Done.
-    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Done { .. })));
+    // Loop is still alive — send another message.
+    loop_
+        .send(AgentInput::UserMessage(user_msg("try again")))
+        .await
+        .expect("loop should still be alive for second ask");
 }
 
 /// B-2: single tool call followed by a text response.

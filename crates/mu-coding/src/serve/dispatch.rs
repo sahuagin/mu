@@ -157,7 +157,7 @@ pub async fn dispatch(
             handle_respond_to_input_required(request, sessions)
         }
         SetRouteRequest::METHOD => {
-            handle_set_route(request, sessions, factory).await
+            handle_set_route(request, sessions, factory, daemon_info.clone()).await
         }
         DaemonListRoutesRequest::METHOD => handle_list_routes(request, daemon_info),
         other => err_response(

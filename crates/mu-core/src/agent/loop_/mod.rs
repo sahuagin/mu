@@ -1029,10 +1029,27 @@ async fn run(
                         queue.clear();
                         continue;
                     }
+                    Err(Outcome::Error(m)) => {
+                        let _ = events
+                            .send(AgentEvent::Error { message: m })
+                            .await;
+                        let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
+                        let _ = events
+                            .send(AgentEvent::Done {
+                                stop_reason: StopReason::Error,
+                                turn_count,
+                                usage: aggregated_usage.take(),
+                                elapsed_ms,
+                            })
+                            .await;
+                        started_at = None;
+                        turn_count = 0;
+                        tool_history.clear();
+                        last_stop_reason = None;
+                        queue.clear();
+                        continue;
+                    }
                     Err(outcome) => {
-                        if let Outcome::Error(ref m) = outcome {
-                            let _ = events.send(AgentEvent::Error { message: m.clone() }).await;
-                        }
                         return outcome;
                     }
                 }

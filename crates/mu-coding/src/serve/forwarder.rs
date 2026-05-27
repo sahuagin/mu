@@ -347,6 +347,7 @@ fn should_recompute_status(event: &AgentEvent) -> bool {
             | AgentEvent::Error { .. }
             | AgentEvent::ToolCallStarted { .. }
             | AgentEvent::ToolCallCompleted { .. }
+            | AgentEvent::MessageEnd { .. }
     )
 }
 
@@ -357,7 +358,10 @@ fn compute_status(
     provider_status: &Arc<Mutex<ProviderStatusTracker>>,
 ) -> SessionStatus {
     let (provider_kind, model) = event_log.provider_info().unwrap_or_default();
-    let usage = event_log.cumulative_usage();
+    // Use live_usage (per-model-call) for real-time token counts,
+    // rather than cumulative_usage (per-ask Done) which only updates
+    // when the full ask completes.
+    let (usage, last_call_input) = event_log.live_usage();
     let snap = provider_status
         .lock()
         .ok()
@@ -371,7 +375,7 @@ fn compute_status(
                 .unwrap_or(0),
         });
 
-    SessionStatus::compute(mu_core::session_status::StatusInputs {
+    let mut status = SessionStatus::compute(mu_core::session_status::StatusInputs {
         session_id,
         daemon_id,
         provider_kind: &provider_kind,
@@ -381,7 +385,42 @@ fn compute_status(
         tool_call_count: event_log.tool_call_count(),
         elapsed_total_ms: event_log.elapsed_total_ms(),
         provider_status: snap,
-    })
+    });
+
+    // Context pressure from the last model call's total input tokens.
+    if let Some(last_input) = last_call_input {
+        status.last_call_context_tokens = Some(last_input);
+        let window = context_window_for(&provider_kind, &model);
+        if let Some(w) = window {
+            status.context_window_size = Some(w);
+            status.context_pressure_pct = Some((last_input as f64 / w as f64) * 100.0);
+        }
+    }
+
+    status
+}
+
+fn context_window_for(provider_kind: &str, model: &str) -> Option<u64> {
+    match provider_kind {
+        "anthropic_api" | "anthropic_oauth" => Some(200_000),
+        "openai_codex" => {
+            if model.contains("gpt-5") {
+                Some(1_000_000)
+            } else {
+                Some(128_000)
+            }
+        }
+        "openrouter" => {
+            if model.contains("claude") {
+                Some(200_000)
+            } else if model.contains("gpt-5") {
+                Some(1_000_000)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// mu-5g7i: build a `TaskTelemetry` payload for terminal `AgentEvent`s

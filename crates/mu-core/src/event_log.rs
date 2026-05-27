@@ -558,6 +558,32 @@ impl SessionEventLog {
         acc
     }
 
+    /// Sum usage across all `AssistantMessageEvent` events — gives
+    /// real-time token totals that update per model call, not just per
+    /// completed ask. Returns the last model call's input tokens
+    /// separately (for context pressure calculation).
+    pub fn live_usage(&self) -> (Option<Usage>, Option<u64>) {
+        let Ok(events) = self.events.lock() else {
+            return (None, None);
+        };
+        let mut acc: Option<Usage> = None;
+        let mut last_input: Option<u64> = None;
+        for ev in events.iter() {
+            if let EventPayload::AssistantMessageEvent { message } = &ev.payload {
+                if let Some(u) = message.usage {
+                    let total_input =
+                        u.input_tokens + u.cache_read_input_tokens.unwrap_or(0) + u.cache_creation_input_tokens.unwrap_or(0);
+                    last_input = Some(total_input);
+                    acc = Some(match acc {
+                        Some(prev) => prev + u,
+                        None => u,
+                    });
+                }
+            }
+        }
+        (acc, last_input)
+    }
+
     /// Total turns across all asks. Sums `Done.turn_count`.
     pub fn total_turn_count(&self) -> u32 {
         self.events

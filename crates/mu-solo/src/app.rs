@@ -207,8 +207,6 @@ pub struct App {
     /// the committed AssistantMessage." Decremented when phase 1 skips
     /// a matching event.
     pending_skip_assistant: usize,
-    /// Status line at the bottom (provider/model/cost/etc).
-    status: String,
     /// Daemon ID (per daemon.stats at startup). Surfaced via /status.
     daemon_id: String,
     /// Daemon version string. Surfaced via /status.
@@ -256,6 +254,18 @@ pub struct App {
     /// What the inline menu is being used for — determines what
     /// happens on selection.
     menu_context: MenuContext,
+    /// Provider-status-driven session phase for the status line.
+    session_phase: SessionPhase,
+    /// Elapsed ms in the current provider-status phase. Updated by
+    /// `session.provider_status` notifications; reset on phase transitions.
+    phase_elapsed_ms: u64,
+    /// Cumulative token usage across all completed asks (from session.done).
+    cumulative_input_tokens: u64,
+    cumulative_output_tokens: u64,
+    cumulative_cache_read: u64,
+    cumulative_cache_creation: u64,
+    /// Completed ask count (incremented on session.done).
+    ask_count: u32,
 }
 
 /// What the inline menu is selecting.
@@ -266,6 +276,48 @@ enum MenuContext {
     SlashCommand,
     /// Effort-level picker: selection applies the effort level directly.
     Effort,
+}
+
+/// Provider-status-driven session phase for the status line. Tracks
+/// the daemon's ProviderStatusKind via `session.provider_status`
+/// notifications. Falls back to inference from other notifications
+/// when provider_status isn't available (e.g. faux provider).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SessionPhase {
+    #[default]
+    Idle,
+    AwaitingFirstToken,
+    Streaming,
+    ToolExecuting,
+}
+
+impl SessionPhase {
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Idle => "○",
+            Self::AwaitingFirstToken => "◉",
+            Self::Streaming => "●",
+            Self::ToolExecuting => "⚙",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::AwaitingFirstToken => "thinking",
+            Self::Streaming => "streaming",
+            Self::ToolExecuting => "tool",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Self::Idle => Color::DarkGray,
+            Self::AwaitingFirstToken => Color::Cyan,
+            Self::Streaming => Color::Green,
+            Self::ToolExecuting => Color::Yellow,
+        }
+    }
 }
 
 impl App {
@@ -332,7 +384,6 @@ impl App {
             .unwrap_or("(unknown)")
             .to_string();
 
-        let status = format!(" {provider} · {model} · {session_id} ");
         // Construct the events log path before moving daemon_id into
         // the struct. dirs::data_dir() returns None only on
         // pathological setups (no $HOME / no equivalent); in that
@@ -356,7 +407,6 @@ impl App {
             streaming_chars_emitted: 0,
             pending_close: false,
             pending_skip_assistant: 0,
-            status,
             daemon_id,
             daemon_version,
             effort,
@@ -373,6 +423,13 @@ impl App {
             skills,
             inline_menu: None,
             menu_context: MenuContext::default(),
+            session_phase: SessionPhase::default(),
+            phase_elapsed_ms: 0,
+            cumulative_input_tokens: 0,
+            cumulative_output_tokens: 0,
+            cumulative_cache_read: 0,
+            cumulative_cache_creation: 0,
+            ask_count: 0,
         })
     }
 
@@ -524,10 +581,7 @@ impl App {
             while lines.len() < (area.height as usize).saturating_sub(1) {
                 lines.push(Line::from(""));
             }
-            lines.push(Line::from(Span::styled(
-                self.status.clone(),
-                Style::default().fg(Color::DarkGray),
-            )));
+            lines.push(self.format_status_line(vp_w));
             let para = Paragraph::new(lines);
             vp.render(para);
             vp.flush()?;
@@ -904,6 +958,20 @@ impl App {
                 "  focus:       {} (suppress streaming preview)",
                 if self.focus_mode { "on" } else { "off" }
             )),
+            Line::from(format!(
+                "  tokens:      {}k in · {}k out (asks: {})",
+                self.cumulative_input_tokens / 1000,
+                self.cumulative_output_tokens / 1000,
+                self.ask_count,
+            )),
+            {
+                let cost = self.compute_cost();
+                if cost > 0.0 {
+                    Line::from(format!("  cost:        ${cost:.4}"))
+                } else {
+                    Line::from("  cost:        (unknown — no pricing for this provider/model)")
+                }
+            },
             Line::from(format!("  session_id:  {}", self.session_id)),
             Line::from(format!(
                 "  sidecar:     {} (/btw)",
@@ -1063,9 +1131,6 @@ impl App {
 
         let changed = new_provider != self.provider;
         self.provider = new_provider.clone();
-        // Refresh the bottom-of-viewport status string so the next
-        // draw shows the new provider immediately.
-        self.status = format!(" {} · {} · {} ", self.provider, self.model, self.session_id);
 
         let lines: Vec<Line<'static>> = if changed {
             vec![
@@ -1144,7 +1209,6 @@ impl App {
 
         let changed = new_model != self.model;
         self.model = new_model.clone();
-        self.status = format!(" {} · {} · {} ", self.provider, self.model, self.session_id);
 
         let lines: Vec<Line<'static>> =
             if changed {
@@ -1439,6 +1503,76 @@ impl App {
         Ok(())
     }
 
+    /// Build the dynamic status line. Left side shows session phase +
+    /// token usage + cost; right side shows provider · model · effort.
+    /// Mirrors pi's two-segment layout but in a single row.
+    fn format_status_line(&self, width: usize) -> Line<'static> {
+        let phase = self.session_phase;
+        let phase_text = if phase == SessionPhase::Idle {
+            format!("{} {}", phase.icon(), phase.label())
+        } else if self.phase_elapsed_ms > 0 {
+            let secs = self.phase_elapsed_ms as f64 / 1000.0;
+            format!("{} {} ({secs:.1}s)", phase.icon(), phase.label())
+        } else {
+            format!("{} {}", phase.icon(), phase.label())
+        };
+
+        let in_k = self.cumulative_input_tokens / 1000;
+        let out_k = self.cumulative_output_tokens / 1000;
+        let cost = self.compute_cost();
+        let tokens_cost = if self.ask_count == 0 {
+            String::new()
+        } else if cost > 0.0 {
+            format!("  {in_k}k/{out_k}k · ${cost:.2}")
+        } else {
+            format!("  {in_k}k/{out_k}k")
+        };
+
+        let left = format!("{phase_text}{tokens_cost}");
+        let right = format!(
+            "{} · {} · {}",
+            self.provider,
+            self.model,
+            self.effort.as_str()
+        );
+
+        let gap = width.saturating_sub(left.len() + right.len() + 2);
+        let padding = " ".repeat(gap.max(1));
+
+        Line::from(vec![
+            Span::styled(" ".to_string(), Style::default()),
+            Span::styled(phase_text, Style::default().fg(phase.color())),
+            Span::styled(tokens_cost, Style::default().fg(Color::DarkGray)),
+            Span::styled(padding, Style::default()),
+            Span::styled(right, Style::default().fg(Color::DarkGray)),
+        ])
+    }
+
+    /// Inline cost computation (mirrors mu-core pricing.rs). Returns
+    /// 0.0 for unknown (provider, model) pairs.
+    fn compute_cost(&self) -> f64 {
+        let kind = normalize_provider_kind(&self.provider);
+        let (in_rate, out_rate) = match kind.as_str() {
+            "anthropic_api" | "anthropic_oauth" => {
+                if self.model.starts_with("claude-opus-4") {
+                    (5.00_f64, 25.00_f64)
+                } else if self.model.starts_with("claude-sonnet-4") {
+                    (3.00, 15.00)
+                } else if self.model.starts_with("claude-haiku-4") {
+                    (1.00, 5.00)
+                } else {
+                    return 0.0;
+                }
+            }
+            _ => return 0.0,
+        };
+        let inp = self.cumulative_input_tokens as f64;
+        let out = self.cumulative_output_tokens as f64;
+        let cw = self.cumulative_cache_creation as f64;
+        let cr = self.cumulative_cache_read as f64;
+        (inp * in_rate + cw * in_rate * 1.25 + cr * in_rate * 0.10 + out * out_rate) / 1_000_000.0
+    }
+
     /// Pull every queued notification, accumulate streaming_text,
     /// emit incremental preview lines via `insert_before`, and handle
     /// session.done / session.error to close the block.
@@ -1606,7 +1740,51 @@ impl App {
             "session.tool_call_completed" => {
                 self.emit_tool_call_completed(vp, params, wrap_width)?;
             }
+            "session.provider_status" => {
+                let kind = params
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("idle");
+                let elapsed = params
+                    .get("elapsed_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let new_phase = match kind {
+                    "awaiting_first_token" => SessionPhase::AwaitingFirstToken,
+                    "streaming" => SessionPhase::Streaming,
+                    "tool_executing" | "awaiting_tool_result" => SessionPhase::ToolExecuting,
+                    "idle" => SessionPhase::Idle,
+                    _ => self.session_phase,
+                };
+                self.session_phase = new_phase;
+                self.phase_elapsed_ms = elapsed;
+            }
             "session.done" | "session.error" => {
+                self.session_phase = SessionPhase::Idle;
+                self.phase_elapsed_ms = 0;
+
+                if method == "session.done" {
+                    self.ask_count += 1;
+                    if let Some(usage) = params.get("usage") {
+                        self.cumulative_input_tokens += usage
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        self.cumulative_output_tokens += usage
+                            .get("output_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        self.cumulative_cache_read += usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        self.cumulative_cache_creation += usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                    }
+                }
+
                 // One-shot renderer-mismatch diagnostic: after the
                 // first turn lands a context_assembly into the events
                 // log, scan for it and surface a warning if the

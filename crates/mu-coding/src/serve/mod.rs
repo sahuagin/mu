@@ -28,6 +28,16 @@ pub use factory::{
 };
 pub use sessions::Sessions;
 
+struct AbortOnDrop(std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.lock().unwrap().take() {
+            h.abort();
+        }
+    }
+}
+
 /// Default on-disk events directory used by the production binary
 /// (mu-upb). `None` means "don't write events to disk." Tests
 /// explicitly pass `None` to avoid polluting the developer's
@@ -247,29 +257,40 @@ where
     // set or if the default socket path's parent exists. The MCP surface
     // shares Sessions + DaemonInfo with the primary JSON-RPC loop so
     // mailbox operations are consistent across both surfaces.
+    //
+    // The MCP task holds a Sessions clone. transport::serve's shutdown
+    // cascade (drop handler → drop sessions → agent loops exit →
+    // NotificationWriters drop → writer_task completes) deadlocks if
+    // any external clone keeps sessions alive. AbortOnDrop is captured
+    // by the handler closure so that dropping the handler aborts the
+    // MCP task first, releasing its sessions clone.
     let mcp_socket_path = std::env::var("MU_MCP_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(|_| mcp::default_mcp_socket_path());
-    if mcp_socket_path
+    let mcp_guard = if mcp_socket_path
         .parent()
         .map(|p| p.exists())
         .unwrap_or(false)
     {
         let mcp_sessions = sessions.clone();
         let mcp_daemon_info = daemon_info.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) =
                 mcp::serve_mcp_socket(mcp_socket_path, mcp_sessions, mcp_daemon_info).await
             {
                 tracing::error!("MCP server exited: {e:#}");
             }
         });
-    }
+        Some(AbortOnDrop(std::sync::Mutex::new(Some(handle))))
+    } else {
+        None
+    };
 
     // Wrap tools in Arc so cloning per request is a single pointer
     // copy regardless of tools list size.
     let tools = Arc::new(tools);
     mu_core::transport::serve(reader, writer, move |req, notif| {
+        let _ = &mcp_guard;
         let sessions = sessions.clone();
         let factory = factory.clone();
         let tools = tools.clone();

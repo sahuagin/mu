@@ -205,6 +205,11 @@ pub struct App {
     /// Set when streaming_text was just cleared and we still owe a
     /// closer. Phase 2 of the tick emits it.
     pending_close: bool,
+    /// True if any visible output (text or tool call) has been emitted
+    /// for the current ask. Prevents spurious "(turn ended, no output)"
+    /// when session.done arrives after flush_streaming_close has already
+    /// rendered and reset the header state.
+    ask_had_output: bool,
     /// Set when an assistant_text_finalized was seen — used to detect
     /// "we already showed equivalent text as preview, don't render
     /// the committed AssistantMessage." Decremented when phase 1 skips
@@ -417,6 +422,7 @@ impl App {
             streaming_header_open: false,
             streaming_chars_emitted: 0,
             pending_close: false,
+            ask_had_output: false,
             pending_skip_assistant: 0,
             daemon_id,
             daemon_version,
@@ -901,6 +907,7 @@ impl App {
         self.streaming_header_open = false;
         self.streaming_chars_emitted = 0;
         self.pending_close = false;
+        self.ask_had_output = false;
         self.streaming_route = Some(TurnRoute::Main);
 
         let _ = self.client.request(
@@ -1602,12 +1609,13 @@ impl App {
         Ok(())
     }
 
-    /// Build the dynamic status line. Format inspired by pi:
-    /// `↑12k ↓3k R0 $0.18 6.0%/200k (high)          (anthropic) claude-opus-4-7`
+    /// Build the dynamic status line with colored spans. Format:
+    /// `◉ thinking (3.2s)  ↑12k ↓3k C8.5k $0.18 6.0%/200k    (openai-codex) gpt-5.5 · medium`
     fn format_status_line(&self, width: usize) -> Line<'static> {
         let phase = self.session_phase;
+        let dim = Style::default().fg(Color::DarkGray);
+        let not_idle = phase != SessionPhase::Idle;
 
-        // Phase segment with elapsed time
         let phase_text = if phase == SessionPhase::Idle {
             format!("{} {}", phase.icon(), phase.label())
         } else if self.phase_elapsed_ms > 0 {
@@ -1617,46 +1625,63 @@ impl App {
             format!("{} {}", phase.icon(), phase.label())
         };
 
-        // Token/cost/context segment (only after first model call)
-        let metrics = if let Some(ref status) = self.mcp_status {
-            let mut parts: Vec<String> = Vec::new();
-            parts.push(format!(
-                "↑{} ↓{}",
-                format_tokens(status.input_tokens),
-                format_tokens(status.output_tokens),
-            ));
-            // Cache info
-            let cr = status.cache_read_tokens.unwrap_or(0);
-            if cr > 0 {
-                parts.push(format!("C{}", format_tokens(cr)));
-            }
-            // Cost
-            if status.cost_usd > 0.0 {
-                parts.push(format!("${:.2}", status.cost_usd));
-            }
-            // Context pressure
-            if let (Some(pct), Some(window)) =
-                (status.context_pressure_pct, status.context_window_size)
-            {
-                parts.push(format!("{:.1}%/{}", pct, format_tokens(window)));
-            }
-            format!("  {}", parts.join(" "))
-        } else if self.cumulative_input_tokens > 0 || self.cumulative_output_tokens > 0 {
-            let cost = self.compute_cost();
-            let mut parts = vec![format!(
-                "↑{} ↓{}",
-                format_tokens(self.cumulative_input_tokens),
-                format_tokens(self.cumulative_output_tokens),
-            )];
-            if cost > 0.0 {
-                parts.push(format!("${cost:.2}"));
-            }
-            format!("  {}", parts.join(" "))
-        } else {
-            String::new()
-        };
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled(" ".to_string(), dim));
+        spans.push(Span::styled(phase_text.clone(), Style::default().fg(phase.color())));
 
-        let left = format!("{phase_text}{metrics}");
+        // Build metrics from MCP status or inline accumulators
+        let (in_tok, out_tok, cache_read, cost, ctx_pct, ctx_window) =
+            if let Some(ref s) = self.mcp_status {
+                (
+                    s.input_tokens,
+                    s.output_tokens,
+                    s.cache_read_tokens.unwrap_or(0),
+                    s.cost_usd,
+                    s.context_pressure_pct,
+                    s.context_window_size,
+                )
+            } else {
+                (
+                    self.cumulative_input_tokens,
+                    self.cumulative_output_tokens,
+                    self.cumulative_cache_read,
+                    self.compute_cost(),
+                    None,
+                    None,
+                )
+            };
+
+        let mut metrics_text_len = 0;
+        if in_tok > 0 || out_tok > 0 {
+            let in_s = format!("  ↑{}", format_tokens(in_tok));
+            let out_s = format!(" ↓{}", format_tokens(out_tok));
+            metrics_text_len += in_s.len() + out_s.len();
+            // Color arrows based on activity: cyan when streaming, dim when idle
+            let arrow_style = if not_idle {
+                Style::default().fg(Color::Cyan)
+            } else {
+                dim
+            };
+            spans.push(Span::styled(in_s, arrow_style));
+            spans.push(Span::styled(out_s, arrow_style));
+
+            if cache_read > 0 {
+                let cs = format!(" C{}", format_tokens(cache_read));
+                metrics_text_len += cs.len();
+                spans.push(Span::styled(cs, dim));
+            }
+            if cost > 0.0 {
+                let cs = format!(" ${cost:.2}");
+                metrics_text_len += cs.len();
+                spans.push(Span::styled(cs, dim));
+            }
+            if let (Some(pct), Some(window)) = (ctx_pct, ctx_window) {
+                let cs = format!(" {pct:.1}%/{}", format_tokens(window));
+                metrics_text_len += cs.len();
+                spans.push(Span::styled(cs, dim));
+            }
+        }
+
         let right = format!(
             "({}) {} · {}",
             self.provider,
@@ -1664,16 +1689,14 @@ impl App {
             self.effort.as_str()
         );
 
-        let gap = width.saturating_sub(left.len() + right.len() + 2);
+        let left_len = 1 + phase_text.len() + metrics_text_len;
+        let gap = width.saturating_sub(left_len + right.len() + 1);
         let padding = " ".repeat(gap.max(1));
 
-        Line::from(vec![
-            Span::styled(" ".to_string(), Style::default()),
-            Span::styled(phase_text, Style::default().fg(phase.color())),
-            Span::styled(metrics, Style::default().fg(Color::DarkGray)),
-            Span::styled(padding, Style::default()),
-            Span::styled(right, Style::default().fg(Color::DarkGray)),
-        ])
+        spans.push(Span::styled(padding, dim));
+        spans.push(Span::styled(right, dim));
+
+        Line::from(spans)
     }
 
     /// Bottom info line: user@host:project | model | ctx:%
@@ -1681,7 +1704,20 @@ impl App {
         let user = std::env::var("USER").unwrap_or_else(|_| "?".into());
         let host = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("HOST"))
-            .unwrap_or_else(|_| "?".into());
+            .or_else(|_| {
+                std::fs::read_to_string("/etc/hostname")
+                    .map(|s| s.trim().to_string())
+            })
+            .unwrap_or_else(|_| {
+                // Last resort: short hostname from sysctl on FreeBSD
+                std::process::Command::new("hostname")
+                    .arg("-s")
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|| "?".into())
+            });
         let cwd = std::env::current_dir()
             .ok()
             .and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
@@ -1971,12 +2007,8 @@ impl App {
                         self.emit_inline_error(vp, msg, wrap_width)?;
                     }
                     self.pending_close = true;
-                } else {
-                    // Turn ended with no text AND no tool calls.
-                    // Without this marker the user has no visual proof
-                    // the turn ever ended — they sent a prompt, then
-                    // staring into silence. For error turns we ALSO
-                    // include the daemon-supplied message.
+                } else if !self.ask_had_output || error_msg.is_some() {
+                    // Turn ended with no visible output, or with an error.
                     let lines: Vec<Line<'static>> = if let Some(msg) = error_msg.as_deref() {
                         // Truncate ridiculously long messages to keep
                         // the scrollback usable; the full text lives
@@ -2011,6 +2043,12 @@ impl App {
                         ratatui::widgets::Widget::render(p, buf.area, buf);
                     })?;
                     // Reset per-turn state so the next turn starts clean.
+                    self.streaming_text.clear();
+                    self.streaming_chars_emitted = 0;
+                    self.streaming_route = None;
+                } else {
+                    // Output was already rendered and flushed; just
+                    // clean up per-turn state silently.
                     self.streaming_text.clear();
                     self.streaming_chars_emitted = 0;
                     self.streaming_route = None;
@@ -2145,6 +2183,7 @@ impl App {
             ratatui::widgets::Widget::render(Paragraph::new(header), buf.area, buf);
         })?;
         self.streaming_header_open = true;
+        self.ask_had_output = true;
         Ok(())
     }
 

@@ -864,6 +864,7 @@ pub async fn handle_set_route(
     request: Request<Value>,
     sessions: Sessions,
     factory: ProviderFactory,
+    daemon_info: DaemonInfo,
 ) -> Response<Value> {
     let params: SetRouteRequest = match serde_json::from_value(request.params) {
         Ok(p) => p,
@@ -876,6 +877,27 @@ pub async fn handle_set_route(
         }
     };
 
+    let (kind_str, model_str) = describe_selector(&params.provider);
+
+    let catalog = daemon_info.route_catalog();
+    if catalog.find(&kind_str, &model_str).is_none() {
+        let available: Vec<String> = catalog
+            .configured_entries()
+            .filter(|e| e.provider_kind.as_ref() == kind_str)
+            .map(|e| e.model.to_string())
+            .collect();
+        let suggestion = if available.is_empty() {
+            format!("no configured models for provider {kind_str}")
+        } else {
+            format!("available models for {kind_str}: {}", available.join(", "))
+        };
+        return err_response(
+            request.id,
+            codes::INVALID_PARAMS,
+            format!("unknown route {kind_str}/{model_str}. {suggestion}"),
+        );
+    }
+
     let provider = match factory(&params.provider) {
         Ok(p) => p,
         Err(e) => {
@@ -886,8 +908,6 @@ pub async fn handle_set_route(
             )
         }
     };
-
-    let (kind_str, model_str) = describe_selector(&params.provider);
 
     let input_tx = match sessions.input_sender(&params.session_id) {
         Some(tx) => tx,

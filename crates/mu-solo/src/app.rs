@@ -1601,11 +1601,12 @@ impl App {
         Ok(())
     }
 
-    /// Build the dynamic status line. Left side shows session phase +
-    /// token usage + cost; right side shows provider · model · effort.
-    /// Mirrors pi's two-segment layout but in a single row.
+    /// Build the dynamic status line. Format inspired by pi:
+    /// `↑12k ↓3k R0 $0.18 6.0%/200k (high)          (anthropic) claude-opus-4-7`
     fn format_status_line(&self, width: usize) -> Line<'static> {
         let phase = self.session_phase;
+
+        // Phase segment with elapsed time
         let phase_text = if phase == SessionPhase::Idle {
             format!("{} {}", phase.icon(), phase.label())
         } else if self.phase_elapsed_ms > 0 {
@@ -1615,20 +1616,48 @@ impl App {
             format!("{} {}", phase.icon(), phase.label())
         };
 
-        let in_k = self.cumulative_input_tokens / 1000;
-        let out_k = self.cumulative_output_tokens / 1000;
-        let cost = self.compute_cost();
-        let tokens_cost = if self.ask_count == 0 {
-            String::new()
-        } else if cost > 0.0 {
-            format!("  {in_k}k/{out_k}k · ${cost:.2}")
+        // Token/cost/context segment (only after first model call)
+        let metrics = if let Some(ref status) = self.mcp_status {
+            let mut parts: Vec<String> = Vec::new();
+            parts.push(format!(
+                "↑{} ↓{}",
+                format_tokens(status.input_tokens),
+                format_tokens(status.output_tokens),
+            ));
+            // Cache info
+            let cr = status.cache_read_tokens.unwrap_or(0);
+            if cr > 0 {
+                parts.push(format!("C{}", format_tokens(cr)));
+            }
+            // Cost
+            if status.cost_usd > 0.0 {
+                parts.push(format!("${:.2}", status.cost_usd));
+            }
+            // Context pressure
+            if let (Some(pct), Some(window)) =
+                (status.context_pressure_pct, status.context_window_size)
+            {
+                parts.push(format!("{:.1}%/{}", pct, format_tokens(window)));
+            }
+            format!("  {}", parts.join(" "))
+        } else if self.cumulative_input_tokens > 0 || self.cumulative_output_tokens > 0 {
+            let cost = self.compute_cost();
+            let mut parts = vec![format!(
+                "↑{} ↓{}",
+                format_tokens(self.cumulative_input_tokens),
+                format_tokens(self.cumulative_output_tokens),
+            )];
+            if cost > 0.0 {
+                parts.push(format!("${cost:.2}"));
+            }
+            format!("  {}", parts.join(" "))
         } else {
-            format!("  {in_k}k/{out_k}k")
+            String::new()
         };
 
-        let left = format!("{phase_text}{tokens_cost}");
+        let left = format!("{phase_text}{metrics}");
         let right = format!(
-            "{} · {} · {}",
+            "({}) {} · {}",
             self.provider,
             self.model,
             self.effort.as_str()
@@ -1640,7 +1669,7 @@ impl App {
         Line::from(vec![
             Span::styled(" ".to_string(), Style::default()),
             Span::styled(phase_text, Style::default().fg(phase.color())),
-            Span::styled(tokens_cost, Style::default().fg(Color::DarkGray)),
+            Span::styled(metrics, Style::default().fg(Color::DarkGray)),
             Span::styled(padding, Style::default()),
             Span::styled(right, Style::default().fg(Color::DarkGray)),
         ])
@@ -2429,6 +2458,19 @@ fn titlecase_tool(name: &str) -> String {
     match chars.next() {
         None => String::new(),
         Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+/// Format token count compactly: 0, 500, 1.2k, 200k, 1.0M
+fn format_tokens(n: u64) -> String {
+    if n < 1_000 {
+        format!("{n}")
+    } else if n < 10_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else if n < 1_000_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
     }
 }
 

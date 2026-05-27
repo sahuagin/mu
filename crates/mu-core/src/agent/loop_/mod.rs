@@ -666,6 +666,8 @@ async fn run(
     let mut tool_history = ToolHistory::default();
     let mut model_call_id: u32 = 0;
 
+    let session_started_at = Instant::now();
+
     let mut bg_compaction =
         crate::context::BackgroundCompactionState::new(crate::context::CompactionQuota::default());
     let mut compaction_baseline: Option<CompactionBaseline> = None;
@@ -966,9 +968,14 @@ async fn run(
                     })
                     .await;
 
+                let effective_system_prompt = build_effective_system_prompt(
+                    config.system_prompt.as_deref(),
+                    &session_started_at,
+                );
+
                 match handle_invoke_llm(
                     provider.as_ref(),
-                    config.system_prompt.as_deref(),
+                    effective_system_prompt.as_deref(),
                     &projection,
                     &tool_specs,
                     &mut input_rx,
@@ -1379,6 +1386,36 @@ pub(crate) fn extract_goal_status(text: &str) -> Option<(bool, String)> {
         return Some((false, "marker: goal_status:not_satisfied".to_owned()));
     }
     None
+}
+
+/// mu-c4cz: append wall-clock time and session elapsed to the system
+/// prompt so the model knows when it is and how long it's been running.
+fn build_effective_system_prompt(
+    base: Option<&str>,
+    session_started_at: &Instant,
+) -> Option<String> {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let hours = (secs / 3600) % 24;
+    let mins = (secs / 60) % 60;
+    let elapsed = session_started_at.elapsed();
+    let elapsed_mins = elapsed.as_secs() / 60;
+
+    let time_line = format!(
+        "\n\nCurrent time: {:02}:{:02} UTC. Session has been running for {} minute{}.",
+        hours,
+        mins,
+        elapsed_mins,
+        if elapsed_mins == 1 { "" } else { "s" },
+    );
+
+    match base {
+        Some(s) => Some(format!("{s}{time_line}")),
+        None => Some(time_line.trim_start().to_string()),
+    }
 }
 
 #[cfg(test)]

@@ -63,7 +63,7 @@ ratatui = "0.30"
 crossterm = "0.28"
 
 # MCP (used for built-in MCP servers and client; later)
-rmcp = "0.1"
+rmcp = { version = "1", default-features = false }
 
 [profile.release]
 lto = "thin"

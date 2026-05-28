@@ -103,6 +103,8 @@ pub(crate) async fn spawn_worker(
             status: Mutex::new(WorkerStatus::Spawning),
             started_at_unix_ms: started_at,
             child_handle: None,
+            killer: Mutex::new(None),
+            reaped: std::sync::atomic::AtomicBool::new(false),
         },
     );
 
@@ -166,6 +168,10 @@ pub(crate) async fn spawn_worker(
         reply_to: reply_to.clone(),
         kickstart: std::env::var("MU_KICKSTART").unwrap_or_else(|_| "go".into()),
     })?;
+
+    // mu-slat Phase 3: register a host-side killer so the mailbox
+    // handler can reap this worker when it posts its result.
+    sessions.set_worker_killer(&session_id, pty_worker.clone_killer());
 
     event_log.append(
         EventActor::System,
@@ -255,49 +261,53 @@ async fn monitor_worker(
     };
 
     let elapsed = now_unix_ms().saturating_sub(started_at);
+    // An intentional reap (worker posted its result, we killed idle
+    // claude) exits via signal — non-zero — but is a success.
+    let reaped = sessions.worker_was_reaped(&session_id);
     match exit {
-        PtyExit::Exited { success: true, code } => {
-            tracing::info!(session_id = %session_id, elapsed_ms = elapsed, "worker exited normally");
-            event_log.append(
-                EventActor::System,
-                EventPayload::WorkerExited {
-                    exit_code: code,
-                    elapsed_ms: elapsed,
-                },
-            );
-            if let Ok(mut s) = status.lock() {
-                *s = WorkerStatus::Done {
-                    exit_code: code,
-                    elapsed_ms: elapsed,
-                };
+        PtyExit::Exited { success, code } => {
+            if success || reaped {
+                tracing::info!(session_id = %session_id, elapsed_ms = elapsed, reaped, "worker completed");
+                event_log.append(
+                    EventActor::System,
+                    EventPayload::WorkerExited {
+                        exit_code: code,
+                        elapsed_ms: elapsed,
+                    },
+                );
+                if let Ok(mut s) = status.lock() {
+                    *s = WorkerStatus::Done {
+                        exit_code: code,
+                        elapsed_ms: elapsed,
+                    };
+                }
+                notify_parent(
+                    &sessions,
+                    &reply_to,
+                    &session_id,
+                    &format!("Worker completed ({}ms)", elapsed),
+                );
+            } else {
+                tracing::warn!(session_id = %session_id, exit_code = code, elapsed_ms = elapsed, "worker failed");
+                event_log.append(
+                    EventActor::System,
+                    EventPayload::WorkerFailed {
+                        reason: format!("exit code {}", code),
+                    },
+                );
+                if let Ok(mut s) = status.lock() {
+                    *s = WorkerStatus::Failed {
+                        reason: format!("exit code {}", code),
+                    };
+                }
+                log_final_screen(&session_id, &pty_worker);
+                notify_parent(
+                    &sessions,
+                    &reply_to,
+                    &session_id,
+                    &format!("Worker failed (exit code {})", code),
+                );
             }
-            notify_parent(
-                &sessions,
-                &reply_to,
-                &session_id,
-                &format!("Worker exited normally (code {}, {}ms)", code, elapsed),
-            );
-        }
-        PtyExit::Exited { success: false, code } => {
-            tracing::warn!(session_id = %session_id, exit_code = code, elapsed_ms = elapsed, "worker failed");
-            event_log.append(
-                EventActor::System,
-                EventPayload::WorkerFailed {
-                    reason: format!("exit code {}", code),
-                },
-            );
-            if let Ok(mut s) = status.lock() {
-                *s = WorkerStatus::Failed {
-                    reason: format!("exit code {}", code),
-                };
-            }
-            log_final_screen(&session_id, &pty_worker);
-            notify_parent(
-                &sessions,
-                &reply_to,
-                &session_id,
-                &format!("Worker failed (exit code {})", code),
-            );
         }
         PtyExit::Error { reason } => {
             tracing::error!(session_id = %session_id, error = %reason, "worker pty wait failed");

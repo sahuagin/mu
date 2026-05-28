@@ -5,7 +5,7 @@
 //! lock-then-clone-then-drop pattern.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, oneshot};
@@ -99,6 +99,16 @@ pub(crate) struct SubprocessSession {
     pub status: Mutex<WorkerStatus>,
     pub started_at_unix_ms: u64,
     pub child_handle: Option<JoinHandle<()>>,
+    /// mu-slat Phase 3: host-side pty killer. Set after the pty is
+    /// spawned (None until then). The mailbox handler calls this to
+    /// reap the worker when it posts its result — host-side kill works
+    /// where the in-pot hook can't (linuxulator pkill blindness).
+    pub killer: Mutex<Option<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
+    /// mu-slat Phase 3: set when we kill the worker intentionally
+    /// (because it posted its result). The monitor reads this so an
+    /// intentional reap is logged as a clean exit, not a signal-kill
+    /// "failure" — the worker succeeded; we just terminated idle claude.
+    pub reaped: AtomicBool,
 }
 
 /// In-memory session registry. Cheap to clone (Arc-backed).
@@ -461,6 +471,56 @@ impl Sessions {
             .ok()?
             .get(id)
             .and_then(|s| s.status.lock().ok().map(|st| st.clone()))
+    }
+
+    /// mu-slat Phase 3: attach the host-side pty killer to a worker
+    /// after its pty is spawned. No-op if the id isn't a worker.
+    pub(crate) fn set_worker_killer(
+        &self,
+        id: &str,
+        killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    ) {
+        if let Ok(map) = self.workers.lock() {
+            if let Some(s) = map.get(id) {
+                if let Ok(mut k) = s.killer.lock() {
+                    *k = Some(killer);
+                }
+            }
+        }
+    }
+
+    /// mu-slat Phase 3: reap a worker host-side. Called by the mailbox
+    /// handler when a worker posts its result. Killing the pty child
+    /// makes claude exit → pty EOF → `monitor_worker`'s normal exit
+    /// path runs. Returns true if the id was a worker with a killer set.
+    pub fn reap_worker(&self, id: &str) -> bool {
+        let Ok(map) = self.workers.lock() else {
+            return false;
+        };
+        let Some(s) = map.get(id) else {
+            return false;
+        };
+        let Ok(mut k) = s.killer.lock() else {
+            return false;
+        };
+        if let Some(killer) = k.as_mut() {
+            s.reaped.store(true, Ordering::SeqCst);
+            let _ = killer.kill();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// mu-slat Phase 3: did we intentionally reap this worker (after it
+    /// posted its result)? The monitor uses this to log the resulting
+    /// signal-kill as a clean exit rather than a failure.
+    pub fn worker_was_reaped(&self, id: &str) -> bool {
+        self.workers
+            .lock()
+            .ok()
+            .and_then(|m| m.get(id).map(|s| s.reaped.load(Ordering::SeqCst)))
+            .unwrap_or(false)
     }
 }
 

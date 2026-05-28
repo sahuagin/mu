@@ -18,6 +18,7 @@ use mu_core::protocol::WorkerStatus;
 
 use super::daemon_info::DaemonInfo;
 use super::mailbox::MailboxState;
+use super::pty_spawn::{self, PtyExit, PtyWorker};
 use super::sessions::{Sessions, SubprocessSession};
 
 /// Everything the caller needs to know after a successful spawn.
@@ -130,29 +131,48 @@ pub(crate) async fn spawn_worker(
         },
     );
 
-    // Now spawn mu-spawn — the task is already in the mailbox.
+    // Phase 1: pot setup via mu-spawn in setup-only mode. This does the
+    // gnarly, battle-tested pot lifecycle (clone/start/vnet/DHCP/devfs +
+    // MCP config + system prompt files) and exits before launching
+    // claude. We then take over the claude launch under a Rust-owned pty.
     let mut cmd = Command::new("mu-spawn");
     cmd.arg(&pot_name)
         .env("MU_SPAWN_MODEL", &model)
+        .env("MU_SPAWN_SETUP_ONLY", "1")
         .env("MU_DAEMON_ID", daemon_info.daemon_id())
         .env("MU_SESSION_ID", &session_id)
         .env("MU_REPLY_TO", &reply_to)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::null());
 
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn mu-spawn: {}", e))?;
+    let setup_out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("failed to run mu-spawn setup: {}", e))?;
+    if !setup_out.status.success() {
+        return Err(format!(
+            "mu-spawn setup failed (exit {:?})",
+            setup_out.status.code()
+        ));
+    }
 
-    let pid = child.id();
+    // Phase 2: launch claude under a Rust-owned pty + vt100 driver.
+    let pty_worker = pty_spawn::spawn_pty_worker(pty_spawn::PtyWorkerConfig {
+        pot_name: pot_name.clone(),
+        model: model.clone(),
+        daemon_id: daemon_id_str.clone(),
+        session_id: session_id.clone(),
+        reply_to: reply_to.clone(),
+        kickstart: std::env::var("MU_KICKSTART").unwrap_or_else(|_| "go".into()),
+    })?;
 
     event_log.append(
         EventActor::System,
         EventPayload::WorkerSpawned {
             pot_name: pot_name.clone(),
             model: model.clone(),
-            pid,
+            pid: None,
             prompt_summary: Some(truncate(&config.prompt, 200)),
         },
     );
@@ -169,7 +189,7 @@ pub(crate) async fn spawn_worker(
     let monitor_reply_to = reply_to.clone();
     tokio::spawn(async move {
         monitor_worker(
-            child,
+            pty_worker,
             monitor_log,
             monitor_status,
             monitor_session_id,
@@ -188,7 +208,7 @@ pub(crate) async fn spawn_worker(
 }
 
 async fn monitor_worker(
-    mut child: tokio::process::Child,
+    mut pty_worker: PtyWorker,
     event_log: Arc<SessionEventLog>,
     status: Arc<Mutex<WorkerStatus>>,
     session_id: String,
@@ -200,8 +220,10 @@ async fn monitor_worker(
     let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
     tokio::pin!(deadline);
 
-    let wait_result = tokio::select! {
-        result = child.wait() => result,
+    let exit = tokio::select! {
+        result = &mut pty_worker.exit_rx => result.unwrap_or(PtyExit::Error {
+            reason: "pty waiter dropped without reporting".into(),
+        }),
         _ = &mut deadline => {
             let elapsed = now_unix_ms().saturating_sub(started_at);
             tracing::warn!(
@@ -210,7 +232,7 @@ async fn monitor_worker(
                 timeout_secs = timeout_secs,
                 "worker exceeded deadline, killing",
             );
-            let _ = child.kill().await;
+            pty_worker.kill();
             event_log.append(
                 EventActor::System,
                 EventPayload::WorkerTimeout { elapsed_ms: elapsed },
@@ -220,6 +242,8 @@ async fn monitor_worker(
                     reason: format!("deadline exceeded ({}s)", timeout_secs),
                 };
             }
+            // Scrape the final screen so the operator sees where it stalled.
+            log_final_screen(&session_id, &pty_worker);
             notify_parent(
                 &sessions,
                 &reply_to,
@@ -230,74 +254,89 @@ async fn monitor_worker(
         }
     };
 
-    match wait_result {
-        Ok(exit_status) => {
-            let elapsed = now_unix_ms().saturating_sub(started_at);
-            let code = exit_status.code().unwrap_or(-1);
-
-            if exit_status.success() {
-                tracing::info!(session_id = %session_id, elapsed_ms = elapsed, "worker exited normally");
-                event_log.append(
-                    EventActor::System,
-                    EventPayload::WorkerExited {
-                        exit_code: code,
-                        elapsed_ms: elapsed,
-                    },
-                );
-                if let Ok(mut s) = status.lock() {
-                    *s = WorkerStatus::Done {
-                        exit_code: code,
-                        elapsed_ms: elapsed,
-                    };
-                }
-                notify_parent(
-                    &sessions,
-                    &reply_to,
-                    &session_id,
-                    &format!("Worker exited normally (code {}, {}ms)", code, elapsed),
-                );
-            } else {
-                tracing::warn!(session_id = %session_id, exit_code = code, elapsed_ms = elapsed, "worker failed");
-                event_log.append(
-                    EventActor::System,
-                    EventPayload::WorkerFailed {
-                        reason: format!("exit code {}", code),
-                    },
-                );
-                if let Ok(mut s) = status.lock() {
-                    *s = WorkerStatus::Failed {
-                        reason: format!("exit code {}", code),
-                    };
-                }
-                notify_parent(
-                    &sessions,
-                    &reply_to,
-                    &session_id,
-                    &format!("Worker failed (exit code {})", code),
-                );
-            }
-        }
-        Err(e) => {
-            tracing::error!(session_id = %session_id, error = %e, "worker process wait failed");
+    let elapsed = now_unix_ms().saturating_sub(started_at);
+    match exit {
+        PtyExit::Exited { success: true, code } => {
+            tracing::info!(session_id = %session_id, elapsed_ms = elapsed, "worker exited normally");
             event_log.append(
                 EventActor::System,
-                EventPayload::WorkerFailed {
-                    reason: format!("wait error: {}", e),
+                EventPayload::WorkerExited {
+                    exit_code: code,
+                    elapsed_ms: elapsed,
                 },
             );
             if let Ok(mut s) = status.lock() {
-                *s = WorkerStatus::Failed {
-                    reason: format!("wait error: {}", e),
+                *s = WorkerStatus::Done {
+                    exit_code: code,
+                    elapsed_ms: elapsed,
                 };
             }
             notify_parent(
                 &sessions,
                 &reply_to,
                 &session_id,
-                &format!("Worker process error: {}", e),
+                &format!("Worker exited normally (code {}, {}ms)", code, elapsed),
+            );
+        }
+        PtyExit::Exited { success: false, code } => {
+            tracing::warn!(session_id = %session_id, exit_code = code, elapsed_ms = elapsed, "worker failed");
+            event_log.append(
+                EventActor::System,
+                EventPayload::WorkerFailed {
+                    reason: format!("exit code {}", code),
+                },
+            );
+            if let Ok(mut s) = status.lock() {
+                *s = WorkerStatus::Failed {
+                    reason: format!("exit code {}", code),
+                };
+            }
+            log_final_screen(&session_id, &pty_worker);
+            notify_parent(
+                &sessions,
+                &reply_to,
+                &session_id,
+                &format!("Worker failed (exit code {})", code),
+            );
+        }
+        PtyExit::Error { reason } => {
+            tracing::error!(session_id = %session_id, error = %reason, "worker pty wait failed");
+            event_log.append(
+                EventActor::System,
+                EventPayload::WorkerFailed {
+                    reason: format!("pty wait error: {}", reason),
+                },
+            );
+            if let Ok(mut s) = status.lock() {
+                *s = WorkerStatus::Failed {
+                    reason: format!("pty wait error: {}", reason),
+                };
+            }
+            notify_parent(
+                &sessions,
+                &reply_to,
+                &session_id,
+                &format!("Worker pty error: {}", reason),
             );
         }
     }
+}
+
+/// Scrape the worker's final rendered screen and log it. Observability
+/// for the case where a worker stalls or fails without posting results
+/// — the operator can see what the TUI last showed.
+fn log_final_screen(session_id: &str, pty_worker: &PtyWorker) {
+    let screen = pty_worker.scrape();
+    let tail: String = screen
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    tracing::info!(
+        session_id = %session_id,
+        screen = %truncate(&tail, 500),
+        "worker final screen",
+    );
 }
 
 fn notify_parent(

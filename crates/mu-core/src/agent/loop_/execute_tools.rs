@@ -229,7 +229,8 @@ pub(crate) async fn handle_execute_tools(
                                 }
                                 Some(AgentInput::UserMessage(_))
                                 | Some(AgentInput::StartAutonomous { .. })
-                                | Some(AgentInput::SwitchProvider { .. }) => {
+                                | Some(AgentInput::SwitchProvider { .. })
+                                | Some(AgentInput::MailboxMessage { .. }) => {
                                     if let Ok(mut pending) = pending_approvals.lock() {
                                         pending.remove(&request_id);
                                     }
@@ -356,7 +357,8 @@ pub(crate) async fn handle_execute_tools(
                                 }
                                 Some(input @ AgentInput::UserMessage(_))
                                 | Some(input @ AgentInput::StartAutonomous { .. })
-                                | Some(input @ AgentInput::SwitchProvider { .. }) => {
+                                | Some(input @ AgentInput::SwitchProvider { .. })
+                                | Some(input @ AgentInput::MailboxMessage { .. }) => {
                                     buffered.push(input);
                                 }
                                 None => {

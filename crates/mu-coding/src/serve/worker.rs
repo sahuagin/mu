@@ -57,7 +57,7 @@ pub(crate) async fn spawn_worker(
     let pot_name = config
         .pot_name
         .unwrap_or_else(|| format!("mu-worker-{}", &session_id));
-    let _timeout_secs = config.timeout_secs.unwrap_or(3600);
+    let timeout_secs = config.timeout_secs.unwrap_or(3600);
 
     let event_log = Arc::new(SessionEventLog::new(session_id.clone()));
 
@@ -108,21 +108,22 @@ pub(crate) async fn spawn_worker(
     // Post the task to the worker's own mailbox so it's waiting when
     // the worker starts and checks. The worker's system prompt tells
     // it to read mailbox on startup.
+    let reply_to = config
+        .parent_session_id
+        .clone()
+        .unwrap_or_else(|| "supervisor".into());
     let task_seq = mailbox.allocate_seq();
     event_log.append(
         EventActor::System,
         EventPayload::MailboxMessagePosted {
             seq: task_seq,
             from_daemon_id: daemon_id_str.clone(),
-            from_session_id: config
-                .parent_session_id
-                .clone()
-                .unwrap_or_else(|| "supervisor".into()),
+            from_session_id: reply_to.clone(),
             message_kind: "task".into(),
             subject: truncate(&config.prompt, 100),
             body: serde_json::json!({
                 "instruction": config.prompt,
-                "parent_session_id": config.parent_session_id,
+                "reply_to": reply_to,
                 "daemon_id": daemon_id_str,
             }),
             expires_at_unix_ms: None,
@@ -135,6 +136,7 @@ pub(crate) async fn spawn_worker(
         .env("MU_SPAWN_MODEL", &model)
         .env("MU_DAEMON_ID", daemon_info.daemon_id())
         .env("MU_SESSION_ID", &session_id)
+        .env("MU_REPLY_TO", &reply_to)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -164,6 +166,7 @@ pub(crate) async fn spawn_worker(
     let monitor_status = Arc::new(Mutex::new(WorkerStatus::Running));
     let monitor_session_id = session_id.clone();
     let monitor_sessions = sessions.clone();
+    let monitor_reply_to = reply_to.clone();
     tokio::spawn(async move {
         monitor_worker(
             child,
@@ -172,6 +175,8 @@ pub(crate) async fn spawn_worker(
             monitor_session_id,
             monitor_sessions,
             started_at,
+            timeout_secs,
+            monitor_reply_to,
         )
         .await;
     });
@@ -187,10 +192,45 @@ async fn monitor_worker(
     event_log: Arc<SessionEventLog>,
     status: Arc<Mutex<WorkerStatus>>,
     session_id: String,
-    _sessions: Sessions,
+    sessions: Sessions,
     started_at: u64,
+    timeout_secs: u64,
+    reply_to: String,
 ) {
-    match child.wait().await {
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
+    tokio::pin!(deadline);
+
+    let wait_result = tokio::select! {
+        result = child.wait() => result,
+        _ = &mut deadline => {
+            let elapsed = now_unix_ms().saturating_sub(started_at);
+            tracing::warn!(
+                session_id = %session_id,
+                elapsed_ms = elapsed,
+                timeout_secs = timeout_secs,
+                "worker exceeded deadline, killing",
+            );
+            let _ = child.kill().await;
+            event_log.append(
+                EventActor::System,
+                EventPayload::WorkerTimeout { elapsed_ms: elapsed },
+            );
+            if let Ok(mut s) = status.lock() {
+                *s = WorkerStatus::Failed {
+                    reason: format!("deadline exceeded ({}s)", timeout_secs),
+                };
+            }
+            notify_parent(
+                &sessions,
+                &reply_to,
+                &session_id,
+                &format!("Worker timed out after {}s", timeout_secs),
+            );
+            return;
+        }
+    };
+
+    match wait_result {
         Ok(exit_status) => {
             let elapsed = now_unix_ms().saturating_sub(started_at);
             let code = exit_status.code().unwrap_or(-1);
@@ -210,17 +250,12 @@ async fn monitor_worker(
                         elapsed_ms: elapsed,
                     };
                 }
-            } else if code == 124 {
-                tracing::warn!(session_id = %session_id, elapsed_ms = elapsed, "worker timed out");
-                event_log.append(
-                    EventActor::System,
-                    EventPayload::WorkerTimeout { elapsed_ms: elapsed },
+                notify_parent(
+                    &sessions,
+                    &reply_to,
+                    &session_id,
+                    &format!("Worker exited normally (code {}, {}ms)", code, elapsed),
                 );
-                if let Ok(mut s) = status.lock() {
-                    *s = WorkerStatus::Failed {
-                        reason: format!("timeout after {}ms", elapsed),
-                    };
-                }
             } else {
                 tracing::warn!(session_id = %session_id, exit_code = code, elapsed_ms = elapsed, "worker failed");
                 event_log.append(
@@ -234,10 +269,15 @@ async fn monitor_worker(
                         reason: format!("exit code {}", code),
                     };
                 }
+                notify_parent(
+                    &sessions,
+                    &reply_to,
+                    &session_id,
+                    &format!("Worker failed (exit code {})", code),
+                );
             }
         }
         Err(e) => {
-            let _elapsed = now_unix_ms().saturating_sub(started_at);
             tracing::error!(session_id = %session_id, error = %e, "worker process wait failed");
             event_log.append(
                 EventActor::System,
@@ -250,7 +290,29 @@ async fn monitor_worker(
                     reason: format!("wait error: {}", e),
                 };
             }
+            notify_parent(
+                &sessions,
+                &reply_to,
+                &session_id,
+                &format!("Worker process error: {}", e),
+            );
         }
+    }
+}
+
+fn notify_parent(
+    sessions: &Sessions,
+    reply_to: &str,
+    worker_session_id: &str,
+    subject: &str,
+) {
+    if let Some(tx) = sessions.input_sender(reply_to) {
+        let _ = tx.try_send(mu_core::agent::AgentInput::MailboxMessage {
+            from_session_id: worker_session_id.to_string(),
+            message_kind: "worker_status".into(),
+            subject: subject.to_string(),
+            seq: 0,
+        });
     }
 }
 

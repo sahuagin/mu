@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
 
 use mu_core::agent::Tool;
+use mu_core::event_log::SessionEventLog;
 
 pub mod auth;
 pub mod daemon_info;
@@ -237,6 +238,21 @@ where
         .with_events_dir(events_dir)
         .with_config(config)
         .with_recall_providers(recall_providers);
+    // mu-slat: register the well-known "supervisor" session so workers
+    // always have a stable mailbox target for posting results back.
+    // Only in production (events_dir set) — tests don't spawn workers.
+    if let Some(dir) = daemon_info.events_dir() {
+        let sup_id = String::from("supervisor");
+        let sup_log = Arc::new(SessionEventLog::new(sup_id.clone()));
+        let path = dir
+            .join(daemon_info.daemon_id())
+            .join("supervisor.jsonl");
+        if let Err(e) = sup_log.attach_disk_writer(&path) {
+            tracing::warn!(error = %e, "supervisor: could not attach disk writer");
+        }
+        sessions.insert_rehydrated(sup_id, sup_log, None);
+        tracing::info!(daemon_id = %daemon_info.daemon_id(), "registered supervisor mailbox");
+    }
     // mu-935: when events_dir is configured (mu-upb's on-disk JSONL
     // path), wrap the local backend with FileBackend so session.list
     // with include_remote=true picks up peer daemons' sessions from
@@ -287,8 +303,16 @@ where
         None
     };
 
-    // Wrap tools in Arc so cloning per request is a single pointer
-    // copy regardless of tools list size.
+    // mu-slat Phase 2: inject the spawn_worker tool so the LLM can
+    // delegate work to pot-hosted workers. Only when events_dir is set
+    // (production) — tests don't have pot infrastructure.
+    let mut tools = tools;
+    if daemon_info.events_dir().is_some() {
+        tools.push(Arc::new(crate::tools::SpawnWorkerTool::new(
+            sessions.clone(),
+            daemon_info.clone(),
+        )));
+    }
     let tools = Arc::new(tools);
     mu_core::transport::serve(reader, writer, move |req, notif| {
         let _ = &mcp_guard;

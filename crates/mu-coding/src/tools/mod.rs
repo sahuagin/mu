@@ -6,6 +6,7 @@ pub mod grep;
 pub mod index_recall;
 pub mod ls;
 pub mod read;
+pub mod spawn_worker;
 pub mod write;
 
 pub use aws_recon::AwsReconTool;
@@ -16,4 +17,5 @@ pub use grep::GrepTool;
 pub use index_recall::IndexRecallTool;
 pub use ls::LsTool;
 pub use read::ReadTool;
+pub use spawn_worker::SpawnWorkerTool;
 pub use write::WriteTool;

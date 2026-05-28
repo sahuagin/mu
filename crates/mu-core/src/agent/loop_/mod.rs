@@ -102,6 +102,16 @@ pub enum AgentInput {
         provider_kind: Arc<str>,
         model: Arc<str>,
     },
+    /// mu-slat Phase 2: a mailbox message arrived for this session.
+    /// Injected by the mailbox.post handler when the target is a live
+    /// session. The loop synthesizes a UserMessage and queues InvokeLlm
+    /// so the LLM can read and act on it.
+    MailboxMessage {
+        from_session_id: String,
+        message_kind: String,
+        subject: String,
+        seq: u64,
+    },
 }
 
 impl std::fmt::Debug for AgentInput {
@@ -120,6 +130,9 @@ impl std::fmt::Debug for AgentInput {
             }
             Self::SwitchProvider { provider_kind, model, .. } => {
                 write!(f, "SwitchProvider({provider_kind}/{model})")
+            }
+            Self::MailboxMessage { from_session_id, seq, .. } => {
+                write!(f, "MailboxMessage(from={from_session_id}, seq={seq})")
             }
         }
     }
@@ -692,7 +705,7 @@ async fn run(
                         new_model,
                     }).await;
                 }
-                AgentInput::UserMessage(_) | AgentInput::StartAutonomous { .. } => {
+                AgentInput::UserMessage(_) | AgentInput::StartAutonomous { .. } | AgentInput::MailboxMessage { .. } => {
                     queue.push_back(Action::External(input));
                 }
             }
@@ -747,6 +760,30 @@ async fn run(
             Action::External(AgentInput::SwitchProvider { .. }) => {
                 // Already handled in try_recv/recv above; should not
                 // reach the action queue. No-op if it somehow does.
+            }
+            Action::External(AgentInput::MailboxMessage {
+                from_session_id,
+                message_kind,
+                subject,
+                seq,
+            }) => {
+                let notification = format!(
+                    "[Mailbox] New {message_kind} message (seq {seq}) from session {from_session_id}: {subject}\n\
+                     Read it with mu_mailbox_read, then act on it."
+                );
+                let msg = AgentMessage::User {
+                    content: notification,
+                };
+                let _ = events
+                    .send(AgentEvent::MessageStart {
+                        message: msg.clone(),
+                    })
+                    .await;
+                messages.push(msg.clone());
+                let _ = events.send(AgentEvent::MessageEnd { message: msg }).await;
+                if should_push_invoke_llm(&queue) {
+                    queue.push_back(Action::InvokeLlm);
+                }
             }
             Action::External(AgentInput::StartAutonomous { goal, options }) => {
                 let autonomy_snapshot = capability
@@ -1142,7 +1179,7 @@ async fn run(
                                 new_model,
                             }).await;
                         }
-                        AgentInput::UserMessage(_) | AgentInput::StartAutonomous { .. } => {
+                        AgentInput::UserMessage(_) | AgentInput::StartAutonomous { .. } | AgentInput::MailboxMessage { .. } => {
                             queue.push_back(Action::External(input));
                         }
                     }

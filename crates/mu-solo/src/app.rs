@@ -115,6 +115,43 @@ impl TurnRoute {
     }
 }
 
+/// The in-flight assistant turn (mu-d04a Phase 1). Built incrementally by
+/// `handle_notification` from wire events and re-rendered from scratch each
+/// frame via `render::render_turn`; committed to scrollback (with closer)
+/// on `session.done` / `session.error`, then dropped. Phase 1 holds a
+/// single turn; Phase 2 makes this a per-session map keyed by session_id
+/// so a `/btw` sidecar can stream concurrently.
+#[derive(Debug, Clone)]
+pub struct Turn {
+    pub route: TurnRoute,
+    pub items: Vec<render::TurnItem>,
+}
+
+impl Turn {
+    fn new(route: TurnRoute) -> Self {
+        Self { route, items: Vec::new() }
+    }
+
+    /// Append a text delta: extend the trailing `Text` item if the last
+    /// item is text, else push a new one. This is what makes streamed
+    /// prose accumulate in place instead of committing per-newline.
+    fn push_text(&mut self, delta: &str) {
+        match self.items.last_mut() {
+            Some(render::TurnItem::Text(s)) => s.push_str(delta),
+            _ => self.items.push(render::TurnItem::Text(delta.to_string())),
+        }
+    }
+
+    /// True if any item carries visible content (replaces the old
+    /// `ask_had_output` flag for the live turn).
+    fn has_output(&self) -> bool {
+        self.items.iter().any(|it| match it {
+            render::TurnItem::Text(s) => !s.is_empty(),
+            _ => true,
+        })
+    }
+}
+
 /// Normalize a provider string to the daemon's wire enum
 /// (`ProviderSelector::kind`, snake_case). Accept the common spellings
 /// users type at the CLI. Shared between session create and
@@ -192,28 +229,6 @@ pub struct App {
     prompt: InputBuffer,
     /// Session-wide paste counter for collapse display.
     paste_count: usize,
-    /// Streaming-text accumulator for the in-flight assistant turn.
-    /// Cleared on `session.done` / `session.error`.
-    streaming_text: String,
-    /// Whether the `┌─ assistant ` header has been emitted to scrollback
-    /// for the current in-flight turn (cleared when the closer emits).
-    streaming_header_open: bool,
-    /// Number of chars from `streaming_text` already emitted to
-    /// scrollback as body. Char-based (UTF-8 safe).
-    streaming_chars_emitted: usize,
-    /// Set when streaming_text was just cleared and we still owe a
-    /// closer. Phase 2 of the tick emits it.
-    pending_close: bool,
-    /// True if any visible output (text or tool call) has been emitted
-    /// for the current ask. Prevents spurious "(turn ended, no output)"
-    /// when session.done arrives after flush_streaming_close has already
-    /// rendered and reset the header state.
-    ask_had_output: bool,
-    /// Set when an assistant_text_finalized was seen — used to detect
-    /// "we already showed equivalent text as preview, don't render
-    /// the committed AssistantMessage." Decremented when phase 1 skips
-    /// a matching event.
-    pending_skip_assistant: usize,
     /// Daemon ID (per daemon.stats at startup). Surfaced via /status.
     daemon_id: String,
     /// Daemon version string. Surfaced via /status.
@@ -248,11 +263,15 @@ pub struct App {
     /// fires at most once per process to avoid spamming scrollback if
     /// the user keeps sending prompts to a faux session.
     renderer_mismatch_warned: bool,
-    /// Which session owns the currently-streaming turn. Set when an
-    /// ask is fired (Main on /send, Btw on /btw); used by
-    /// `emit_streaming` and the closer-emit path to pick the right
-    /// label + color. None when no turn is in flight.
+    /// Which session owns the currently-streaming turn. Set when an ask
+    /// is fired (Main on /send, Btw on /btw); kept in sync with
+    /// `live_turn.route` and used by `/cancel` to route to the right
+    /// session. None when no turn is in flight.
     streaming_route: Option<TurnRoute>,
+    /// The in-flight assistant turn as a structured model (mu-d04a).
+    /// Built by `handle_notification`, rendered live in the viewport each
+    /// frame, committed to scrollback on done/error. None when idle.
+    live_turn: Option<Turn>,
     bash_yolo: bool,
     /// Discovered skills from SKILL.md files on disk.
     skills: HashMap<String, DiscoveredSkill>,
@@ -417,18 +436,13 @@ impl App {
             model: model.to_string(),
             prompt: InputBuffer::new(),
             paste_count: 0,
-            streaming_text: String::new(),
-            streaming_header_open: false,
-            streaming_chars_emitted: 0,
-            pending_close: false,
-            ask_had_output: false,
-            pending_skip_assistant: 0,
             daemon_id,
             daemon_version,
             effort,
             focus_mode,
             sidecar_session_id: None,
             streaming_route: None,
+            live_turn: None,
             events_file,
             actual_renderer: None,
             actual_cache_strategy: None,
@@ -576,7 +590,32 @@ impl App {
         } else {
             0
         };
-        let desired_height = (layout.lines.len() as u16 + 4 + menu_rows as u16) // +separator +prompt +separator +status +info
+        // mu-d04a: render the in-flight turn live, above the prompt,
+        // tail-truncated so the prompt always stays visible; the full turn
+        // lands in scrollback on commit (session.done/error). focus_mode
+        // suppresses the preview — the model is still built and committed.
+        let preview: Vec<Line<'static>> = match (self.focus_mode, self.live_turn.as_ref()) {
+            (false, Some(turn)) => {
+                let tool_preview = if self.bash_yolo { 15 } else { 4 };
+                let full = render::render_turn(
+                    turn.route.header_label(),
+                    turn.route.color(),
+                    &turn.items,
+                    w.saturating_sub(2),
+                    tool_preview,
+                );
+                // Reserve chrome (2 separators + status + info = 4) + menu +
+                // up to 3 prompt rows; the preview gets the rest up to MAX,
+                // which guarantees ≥1 (up to 3) prompt rows stay visible.
+                let reserve = 4 + menu_rows + layout.lines.len().min(3);
+                let budget = (MAX_VIEWPORT_HEIGHT as usize).saturating_sub(reserve);
+                render::tail_truncate(full, budget)
+            }
+            _ => Vec::new(),
+        };
+        let preview_rows = preview.len();
+
+        let desired_height = (preview_rows as u16 + layout.lines.len() as u16 + 4 + menu_rows as u16) // +preview +separator +prompt +separator +status +info
             .clamp(VIEWPORT_HEIGHT, MAX_VIEWPORT_HEIGHT);
         if desired_height != vp.area().height {
             vp.set_height(desired_height)?;
@@ -586,10 +625,11 @@ impl App {
         let vp_w = area.width as usize;
         let vp_wrap = vp_w.saturating_sub(4);
         let vp_layout = self.prompt.visual_layout(vp_wrap);
-        let max_prompt_rows = (area.height as usize).saturating_sub(4);
+        let max_prompt_rows = (area.height as usize).saturating_sub(4 + menu_rows + preview_rows);
         let prompt_rows = vp_layout.lines.len().min(max_prompt_rows);
         let skip = vp_layout.lines.len().saturating_sub(prompt_rows);
         let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.extend(preview);
         lines.push(Line::from(Span::styled(
             "─".repeat(vp_w),
             Style::default().fg(Color::DarkGray),
@@ -713,10 +753,6 @@ impl App {
             }
             Message::Response { .. } => {}
         }
-        // Phase 2 closer: if streaming ended, flush trailing text + closer.
-        if self.pending_close && self.streaming_header_open {
-            self.flush_streaming_close(vp)?;
-        }
         Ok(())
     }
 
@@ -796,7 +832,7 @@ impl App {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 if !self.prompt.is_empty() {
                     self.prompt.clear();
-                } else if self.streaming_header_open {
+                } else if self.live_turn.is_some() {
                     // Cancel in-flight turn
                     self.cmd_cancel(vp)?;
                 } else {
@@ -933,12 +969,8 @@ impl App {
     /// Reset streaming state, snap viewport, and fire `ask_session`.
     fn fire_ask(&mut self, vp: &mut DynamicViewport, wire_text: &str) -> Result<()> {
         vp.snap_to_bottom()?;
-        self.streaming_text.clear();
-        self.streaming_header_open = false;
-        self.streaming_chars_emitted = 0;
-        self.pending_close = false;
-        self.ask_had_output = false;
         self.streaming_route = Some(TurnRoute::Main);
+        self.live_turn = Some(Turn::new(TurnRoute::Main));
 
         let _ = self.client.request(
             "ask_session",
@@ -979,7 +1011,7 @@ impl App {
             })?;
             return Ok(());
         }
-        if self.streaming_header_open {
+        if self.live_turn.is_some() {
             let lines: Vec<Line<'static>> = vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -1041,12 +1073,9 @@ impl App {
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
 
-        // Reset per-turn streaming state and route this turn to btw.
-        self.streaming_text.clear();
-        self.streaming_header_open = false;
-        self.streaming_chars_emitted = 0;
-        self.pending_close = false;
+        // Route this turn to the sidecar and start a fresh live turn.
         self.streaming_route = Some(route);
+        self.live_turn = Some(Turn::new(route));
 
         let _ = self.client.request(
             "ask_session",
@@ -1474,7 +1503,7 @@ impl App {
     /// by prepending it to the user's message. If no message was
     /// provided, sends just the skill body with a brief preamble.
     fn cmd_skill(&mut self, vp: &mut DynamicViewport, skill_name: &str, tail: &str) -> Result<()> {
-        if self.streaming_header_open {
+        if self.live_turn.is_some() {
             let lines: Vec<Line<'static>> = vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -1853,40 +1882,6 @@ impl App {
         self.mcp_status = Some(status);
     }
 
-    /// Flush trailing streaming text and emit the closer line for
-    /// an assistant block that just finished. Called after any
-    /// notification that sets pending_close.
-    fn flush_streaming_close(&mut self, vp: &mut DynamicViewport) -> Result<()> {
-        let width = vp.area().width as usize;
-        let wrap_width = width.saturating_sub(2);
-        let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-        let total = self.streaming_text.chars().count();
-        if total > self.streaming_chars_emitted {
-            let remaining: String = self
-                .streaming_text
-                .chars()
-                .skip(self.streaming_chars_emitted)
-                .collect();
-            emit_body_chunk(vp, &remaining, wrap_width, route.color())?;
-        }
-        let closer = Line::from(Span::styled(
-            "└─".to_string(),
-            Style::default().fg(route.color()),
-        ));
-        vp.insert_before(2, |buf| {
-            let lines = vec![closer, Line::from("")];
-            let p = Paragraph::new(lines);
-            ratatui::widgets::Widget::render(p, buf.area, buf);
-        })?;
-        self.pending_skip_assistant += 1;
-        self.streaming_text.clear();
-        self.streaming_header_open = false;
-        self.streaming_chars_emitted = 0;
-        self.pending_close = false;
-        self.streaming_route = None;
-        Ok(())
-    }
-
     /// Dispatch a single notification.
     fn handle_notification(
         &mut self,
@@ -1915,67 +1910,72 @@ impl App {
         let wrap_width = width.saturating_sub(2);
         match method {
             "session.text_delta" => {
+                // Build the model only; the live preview is painted by
+                // render_viewport each tick (focus_mode suppresses the
+                // preview there — the model is still built and committed).
                 let delta = params.get("delta").and_then(|v| v.as_str()).unwrap_or("");
                 if delta.is_empty() {
                     return Ok(());
                 }
-                self.streaming_text.push_str(delta);
-                // Focus mode (§16): accumulate silently; the finalized
-                // event renders the whole block in one shot below.
-                if !self.focus_mode {
-                    self.emit_streaming(vp, wrap_width)?;
-                }
+                let route = self.streaming_route.unwrap_or(TurnRoute::Main);
+                self.live_turn
+                    .get_or_insert_with(|| Turn::new(route))
+                    .push_text(delta);
             }
             "session.assistant_text_finalized" => {
-                // Replace accumulator with canonical (matches mu-tui's
-                // `mu-wk2` invariant: this notification's `text` is
-                // what the AssistantMessage will commit).
+                // Replace the current segment's streamed text with the
+                // canonical text (mu-wk2 invariant: this notification's
+                // `text` is what the AssistantMessage commits). In agent
+                // loops this fires once per invocation; each segment is a
+                // distinct Text item, separated by any intervening tool
+                // calls, all inside the one live turn.
                 let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 if !text.is_empty() {
-                    self.streaming_text = text.to_string();
-                }
-                if self.focus_mode {
-                    // Render the entire assistant turn as one block —
-                    // bypasses the header/body/closer streaming
-                    // pipeline so we don't have to fix up partial
-                    // emission state. Route-aware so /btw turns
-                    // render as magenta "assistant ⋅ btw" blocks.
-                    if !self.streaming_text.is_empty() {
-                        let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-                        let lines = render::block_lines(
-                            route.header_label(),
-                            route.color(),
-                            &self.streaming_text,
-                            wrap_width,
-                        );
-                        let h = lines.len() as u16;
-                        vp.insert_before(h, |buf| {
-                            let p = Paragraph::new(lines);
-                            ratatui::widgets::Widget::render(p, buf.area, buf);
-                        })?;
-                    }
-                    self.streaming_text.clear();
-                    self.streaming_header_open = false;
-                    self.streaming_chars_emitted = 0;
-                    self.pending_close = false;
-                    self.streaming_route = None;
-                } else {
-                    if !self.streaming_text.is_empty() {
-                        self.emit_streaming(vp, wrap_width)?;
-                    }
-                    // In agent loops this fires per-invocation. Trigger
-                    // the close so the block lands in scrollback before
-                    // any subsequent tool calls / next invocation render.
-                    if self.streaming_header_open {
-                        self.pending_close = true;
+                    let route = self.streaming_route.unwrap_or(TurnRoute::Main);
+                    let turn = self.live_turn.get_or_insert_with(|| Turn::new(route));
+                    match turn.items.last_mut() {
+                        Some(render::TurnItem::Text(s)) => *s = text.to_string(),
+                        _ => turn.items.push(render::TurnItem::Text(text.to_string())),
                     }
                 }
             }
             "session.tool_call_started" => {
-                self.emit_tool_call_started(vp, params, wrap_width)?;
+                // Titlecase + primary-arg extraction happen here (build
+                // time) so the renderer stays pure.
+                let name = params.get("tool_name").and_then(|v| v.as_str()).unwrap_or("?");
+                let primary_arg = extract_primary_arg(name, params.get("arguments"));
+                let display_name = titlecase_tool(name);
+                let route = self.streaming_route.unwrap_or(TurnRoute::Main);
+                self.live_turn
+                    .get_or_insert_with(|| Turn::new(route))
+                    .items
+                    .push(render::TurnItem::ToolCall { display_name, primary_arg });
             }
             "session.tool_call_completed" => {
-                self.emit_tool_call_completed(vp, params, wrap_width)?;
+                let outcome = params.get("outcome");
+                let kind = outcome
+                    .and_then(|o| o.get("kind"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let text = match kind.as_str() {
+                    "ok" => outcome
+                        .and_then(|o| o.get("result"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    "err" => outcome
+                        .and_then(|o| o.get("message"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    _ => String::new(),
+                };
+                let route = self.streaming_route.unwrap_or(TurnRoute::Main);
+                self.live_turn
+                    .get_or_insert_with(|| Turn::new(route))
+                    .items
+                    .push(render::TurnItem::ToolResult { kind, text });
             }
             "session.provider_status" => {
                 let kind = params
@@ -2048,61 +2048,70 @@ impl App {
                 } else {
                     None
                 };
-                if self.streaming_header_open {
-                    // Emit the error inline before the closer fires so
-                    // the operator sees the message attached to the
-                    // turn it killed. Otherwise the close happens
-                    // silently and the error is invisible.
-                    if let Some(msg) = error_msg.as_deref() {
-                        self.emit_inline_error(vp, msg, wrap_width)?;
+                // Commit the in-flight turn to scrollback. Its content
+                // streamed into the live viewport region; now it lands as
+                // one block (header + items + closer) in arrival order. A
+                // `session.error` message attaches as a trailing inline
+                // Error item so it reads as part of the turn it killed.
+                let preview_lines = if self.bash_yolo { 15 } else { 4 };
+                match self.live_turn.take() {
+                    Some(mut t) if t.has_output() || error_msg.is_some() => {
+                        if let Some(msg) = error_msg.as_deref() {
+                            t.items.push(render::TurnItem::Error(msg.to_string()));
+                        }
+                        let mut lines = render::render_turn(
+                            t.route.header_label(),
+                            t.route.color(),
+                            &t.items,
+                            wrap_width,
+                            preview_lines,
+                        );
+                        lines.extend(render::turn_closer(t.route.color()));
+                        let h = lines.len() as u16;
+                        vp.insert_before(h, |buf| {
+                            let p = Paragraph::new(lines);
+                            ratatui::widgets::Widget::render(p, buf.area, buf);
+                        })?;
                     }
-                    self.pending_close = true;
-                } else if !self.ask_had_output || error_msg.is_some() {
-                    // Turn ended with no visible output, or with an error.
-                    let lines: Vec<Line<'static>> = if let Some(msg) = error_msg.as_deref() {
-                        // Truncate ridiculously long messages to keep
-                        // the scrollback usable; the full text lives
-                        // in the events JSONL if you need it.
-                        let short: String = msg.chars().take(400).collect();
-                        vec![
-                            Line::from(""),
-                            Line::from(Span::styled(
-                                "× turn ended with error".to_string(),
-                                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                            )),
-                            Line::from(Span::styled(
-                                format!("  {short}"),
-                                Style::default().fg(Color::Red),
-                            )),
-                            Line::from(""),
-                        ]
-                    } else {
-                        vec![
-                            Line::from(Span::styled(
-                                "  (turn ended, no output)".to_string(),
-                                Style::default()
-                                    .fg(Color::DarkGray)
-                                    .add_modifier(Modifier::ITALIC),
-                            )),
-                            Line::from(""),
-                        ]
-                    };
-                    let h = lines.len() as u16;
-                    vp.insert_before(h, |buf| {
-                        let p = Paragraph::new(lines);
-                        ratatui::widgets::Widget::render(p, buf.area, buf);
-                    })?;
-                    // Reset per-turn state so the next turn starts clean.
-                    self.streaming_text.clear();
-                    self.streaming_chars_emitted = 0;
-                    self.streaming_route = None;
-                } else {
-                    // Output was already rendered and flushed; just
-                    // clean up per-turn state silently.
-                    self.streaming_text.clear();
-                    self.streaming_chars_emitted = 0;
-                    self.streaming_route = None;
+                    _ => {
+                        // No visible output (empty turn or none), and any
+                        // error has no turn to attach to: stand-alone block.
+                        let lines: Vec<Line<'static>> = if let Some(msg) = error_msg.as_deref() {
+                            // Truncate ridiculously long messages to keep
+                            // the scrollback usable; the full text lives
+                            // in the events JSONL if you need it.
+                            let short: String = msg.chars().take(400).collect();
+                            vec![
+                                Line::from(""),
+                                Line::from(Span::styled(
+                                    "× turn ended with error".to_string(),
+                                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                                )),
+                                Line::from(Span::styled(
+                                    format!("  {short}"),
+                                    Style::default().fg(Color::Red),
+                                )),
+                                Line::from(""),
+                            ]
+                        } else {
+                            vec![
+                                Line::from(Span::styled(
+                                    "  (turn ended, no output)".to_string(),
+                                    Style::default()
+                                        .fg(Color::DarkGray)
+                                        .add_modifier(Modifier::ITALIC),
+                                )),
+                                Line::from(""),
+                            ]
+                        };
+                        let h = lines.len() as u16;
+                        vp.insert_before(h, |buf| {
+                            let p = Paragraph::new(lines);
+                            ratatui::widgets::Widget::render(p, buf.area, buf);
+                        })?;
+                    }
                 }
+                self.streaming_route = None;
             }
             _ => {} // ignore unhandled notifications for v0
         }
@@ -2212,320 +2221,6 @@ impl App {
         Ok(())
     }
 
-    /// Open the assistant block header if it isn't already. Shared
-    /// between the streaming-text path (`emit_streaming`) and the
-    /// tool-call rendering paths so a turn that only fires tool calls
-    /// still produces a header + closer pair in scrollback. Header
-    /// color and label come from `streaming_route` so /btw turns get
-    /// magenta "assistant ⋅ btw" framing.
-    fn ensure_streaming_header_open(&mut self, vp: &mut DynamicViewport) -> Result<()> {
-        if self.streaming_header_open {
-            return Ok(());
-        }
-        let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-        let header = Line::from(Span::styled(
-            format!("┌─ {} ", route.header_label()),
-            Style::default()
-                .fg(route.color())
-                .add_modifier(Modifier::BOLD),
-        ));
-        vp.insert_before(1, |buf| {
-            ratatui::widgets::Widget::render(Paragraph::new(header), buf.area, buf);
-        })?;
-        self.streaming_header_open = true;
-        self.ask_had_output = true;
-        Ok(())
-    }
-
-    /// Render a `session.tool_call_started` notification showing the
-    /// tool name and primary argument:
-    ///
-    /// ```text
-    ///     │ ● Bash(cargo check -p mu-core)
-    /// ```
-    ///
-    /// Extracts the "primary arg" per tool type: `command` for bash,
-    /// `file_path`/`path` for read/write/edit, `pattern` for grep.
-    fn emit_tool_call_started(
-        &mut self,
-        vp: &mut DynamicViewport,
-        params: &Value,
-        wrap_width: usize,
-    ) -> Result<()> {
-        let name = params
-            .get("tool_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        let arguments = params.get("arguments");
-        let primary_arg = extract_primary_arg(name, arguments);
-        let display_name = titlecase_tool(name);
-        let header_text = if primary_arg.is_empty() {
-            format!("● {display_name}")
-        } else {
-            let max_arg_len = wrap_width.saturating_sub(display_name.len() + 5); // "│ ● Name()"
-            let truncated = if primary_arg.chars().count() > max_arg_len {
-                let short: String = primary_arg
-                    .chars()
-                    .take(max_arg_len.saturating_sub(1))
-                    .collect();
-                format!("{short}…")
-            } else {
-                primary_arg
-            };
-            format!("● {display_name}({truncated})")
-        };
-        self.ensure_streaming_header_open(vp)?;
-        let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-        let line = Line::from(vec![
-            Span::styled("│ ", Style::default().fg(route.color())),
-            Span::styled(
-                header_text,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]);
-        vp.insert_before(1, |buf| {
-            ratatui::widgets::Widget::render(Paragraph::new(line), buf.area, buf);
-        })?;
-        Ok(())
-    }
-
-    /// Emit a `× error: <message>` line inside an already-open
-    /// assistant block, so when `session.error` lands the operator
-    /// sees what failed before the closer fires. Without this the
-    /// turn just ends silently and you have to grep the events JSONL
-    /// to find out (e.g. "google/gemini-pro is not a valid model ID"
-    /// for a /btw with a stale picker entry).
-    fn emit_inline_error(
-        &self,
-        vp: &mut DynamicViewport,
-        msg: &str,
-        _wrap_width: usize,
-    ) -> Result<()> {
-        let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-        // Truncate to keep the scrollback usable. Full message lives
-        // in the daemon's event log if you need to inspect it.
-        let short: String = msg.chars().take(400).collect();
-        let line = Line::from(vec![
-            Span::styled("│ ", Style::default().fg(route.color())),
-            Span::styled(
-                "× ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(short, Style::default().fg(Color::Red)),
-        ]);
-        vp.insert_before(1, |buf| {
-            ratatui::widgets::Widget::render(Paragraph::new(line), buf.area, buf);
-        })?;
-        Ok(())
-    }
-
-    /// Render a `session.tool_call_completed` notification with a
-    /// bounded output preview:
-    ///
-    /// ```text
-    ///     │   ⎿  first line of output
-    ///     │      second line
-    ///     │      third line
-    ///     │      … +N lines
-    /// ```
-    ///
-    /// On error, shows the error message in red instead.
-    fn emit_tool_call_completed(
-        &mut self,
-        vp: &mut DynamicViewport,
-        params: &Value,
-        wrap_width: usize,
-    ) -> Result<()> {
-        let preview_lines: usize = if self.bash_yolo { 15 } else { 4 };
-
-        let outcome = params.get("outcome");
-        let kind = outcome
-            .and_then(|o| o.get("kind"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-
-        self.ensure_streaming_header_open(vp)?;
-        let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-        let bar_style = Style::default().fg(route.color());
-        let indent = "│   ";
-
-        match kind {
-            "ok" => {
-                let result_text = outcome
-                    .and_then(|o| o.get("result"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if result_text.is_empty() {
-                    let line = Line::from(vec![
-                        Span::styled(indent.to_string(), bar_style),
-                        Span::styled(
-                            "⎿  (no output)".to_string(),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]);
-                    vp.insert_before(1, |buf| {
-                        ratatui::widgets::Widget::render(Paragraph::new(line), buf.area, buf);
-                    })?;
-                } else {
-                    let all_lines: Vec<&str> = result_text.lines().collect();
-                    let total = all_lines.len();
-                    let show = total.min(preview_lines);
-                    let max_line_width = wrap_width.saturating_sub(8); // indent + connector
-                    let mut output_lines: Vec<Line<'static>> = Vec::new();
-                    for (i, &text_line) in all_lines.iter().take(show).enumerate() {
-                        let truncated: String = text_line.chars().take(max_line_width).collect();
-                        let prefix = if i == 0 {
-                            format!("{indent}⎿  ")
-                        } else {
-                            format!("{indent}   ")
-                        };
-                        // Parse ANSI escape codes into styled spans
-                        use ansi_to_tui::IntoText;
-                        let styled_line = truncated
-                            .into_text()
-                            .ok()
-                            .and_then(|text| text.into_iter().next())
-                            .unwrap_or_else(|| Line::raw(truncated.clone()));
-                        let mut spans: Vec<Span<'static>> = vec![Span::styled(prefix, bar_style)];
-                        for span in styled_line.spans {
-                            spans.push(span);
-                        }
-                        output_lines.push(Line::from(spans));
-                    }
-                    if total > show {
-                        let remaining = total - show;
-                        output_lines.push(Line::from(vec![
-                            Span::styled(format!("{indent}   "), bar_style),
-                            Span::styled(
-                                format!("… +{remaining} lines"),
-                                Style::default().fg(Color::DarkGray),
-                            ),
-                        ]));
-                    }
-                    let h = output_lines.len() as u16;
-                    vp.insert_before(h, |buf| {
-                        let p = Paragraph::new(output_lines);
-                        ratatui::widgets::Widget::render(p, buf.area, buf);
-                    })?;
-                }
-            }
-            "err" => {
-                let msg = outcome
-                    .and_then(|o| o.get("message"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(unknown error)");
-                let all_lines: Vec<&str> = msg.lines().collect();
-                let total = all_lines.len();
-                let show = total.min(preview_lines);
-                let max_line_width = wrap_width.saturating_sub(8);
-                let mut output_lines: Vec<Line<'static>> = Vec::new();
-                for (i, &text_line) in all_lines.iter().take(show).enumerate() {
-                    let truncated: String = text_line.chars().take(max_line_width).collect();
-                    let prefix = if i == 0 {
-                        format!("{indent}⎿  ")
-                    } else {
-                        format!("{indent}   ")
-                    };
-                    output_lines.push(Line::from(vec![
-                        Span::styled(prefix, bar_style),
-                        Span::styled(truncated, Style::default().fg(Color::Red)),
-                    ]));
-                }
-                if total > show {
-                    let remaining = total - show;
-                    output_lines.push(Line::from(vec![
-                        Span::styled(format!("{indent}   "), bar_style),
-                        Span::styled(
-                            format!("… +{remaining} lines"),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]));
-                }
-                let h = output_lines.len() as u16;
-                vp.insert_before(h, |buf| {
-                    let p = Paragraph::new(output_lines);
-                    ratatui::widgets::Widget::render(p, buf.area, buf);
-                })?;
-            }
-            _ => {
-                let line = Line::from(vec![
-                    Span::styled(indent.to_string(), bar_style),
-                    Span::styled(format!("⎿  ({kind})"), Style::default().fg(Color::DarkGray)),
-                ]);
-                vp.insert_before(1, |buf| {
-                    ratatui::widgets::Widget::render(Paragraph::new(line), buf.area, buf);
-                })?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Emit the streaming preview header (if not yet) and any new body
-    /// lines up to the last `\n`. Mid-line trailing content stays
-    /// buffered until the next newline or until pending_close flushes
-    /// it.
-    fn emit_streaming(&mut self, vp: &mut DynamicViewport, wrap_width: usize) -> Result<()> {
-        if self.streaming_text.is_empty() {
-            return Ok(());
-        }
-        self.ensure_streaming_header_open(vp)?;
-        let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-        // Emit any new chars up to the last newline.
-        let safe_byte_end = self.streaming_text.rfind('\n').map(|p| p + 1).unwrap_or(0);
-        if safe_byte_end > 0 {
-            let safe_chars = self.streaming_text[..safe_byte_end].chars().count();
-            if safe_chars > self.streaming_chars_emitted {
-                let chunk: String = self
-                    .streaming_text
-                    .chars()
-                    .skip(self.streaming_chars_emitted)
-                    .take(safe_chars - self.streaming_chars_emitted)
-                    .collect();
-                emit_body_chunk(vp, &chunk, wrap_width, route.color())?;
-                self.streaming_chars_emitted = safe_chars;
-            }
-        }
-        Ok(())
-    }
-}
-
-fn emit_body_chunk(
-    vp: &mut DynamicViewport,
-    body: &str,
-    wrap_width: usize,
-    color: Color,
-) -> Result<()> {
-    // Budget: wrap_width is already (terminal_width - 2). Reserve 2
-    // more for the "│ " prefix AND 2 more as a safety gutter so the
-    // pre-wrapped content provably fits in the destination width
-    // without provoking ratatui's wrap to re-wrap and strip our
-    // prefix. 4 columns of margin is the empirical safe number for
-    // ratatui 0.30 + crossterm on narrow zellij panes.
-    let inner = wrap_width.saturating_sub(4).max(1);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for raw in body.lines() {
-        for row in render::wrap_line(raw, inner) {
-            lines.push(Line::from(vec![
-                Span::styled("│ ", Style::default().fg(color)),
-                Span::raw(row),
-            ]));
-        }
-    }
-    if lines.is_empty() {
-        return Ok(());
-    }
-    let h = lines.len() as u16;
-    vp.insert_before(h, |buf| {
-        // No Wrap option — we pre-wrapped above. Adding ratatui's
-        // wrap on top would re-wrap continuations and lose the "│ "
-        // prefix on the new visual rows (same hazard mu-tui's
-        // push_block / mu-2zs comment documents).
-        let p = Paragraph::new(lines);
-        ratatui::widgets::Widget::render(p, buf.area, buf);
-    })?;
-    Ok(())
 }
 
 /// Extract the "primary argument" from a tool call's arguments JSON

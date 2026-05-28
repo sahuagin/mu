@@ -57,6 +57,15 @@ impl PtyWorker {
         let _ = self.killer.kill();
     }
 
+    /// An independent killer handle for this worker. Stored in the
+    /// session registry so the mailbox handler can reap the worker
+    /// host-side (FreeBSD authority) when it posts its result — the
+    /// in-pot hook can't (it runs under linuxulator where pkill can't
+    /// see the process).
+    pub fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        self.killer.clone_killer()
+    }
+
     /// Scrape the current rendered screen — what a human would see.
     /// Used for observability (e.g. capturing the last screen on exit).
     pub fn scrape(&self) -> String {

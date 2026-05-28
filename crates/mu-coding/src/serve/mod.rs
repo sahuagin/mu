@@ -19,6 +19,7 @@ mod handlers;
 mod mailbox;
 pub mod mcp;
 mod provider_status;
+pub(crate) mod pty_spawn;
 mod sessions;
 pub(crate) mod worker;
 

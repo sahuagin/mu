@@ -197,6 +197,19 @@ pub async fn handle_mailbox_post(
             .await;
     }
 
+    // mu-slat Phase 2: if the target is a live session with an agent
+    // loop, inject a MailboxMessage input so the LLM wakes up and
+    // processes the message. No polling needed — the post IS the trigger.
+    if let Some(tx) = sessions.input_sender(&params.to_session_id) {
+        let _ = tx
+            .try_send(mu_core::agent::AgentInput::MailboxMessage {
+                from_session_id: params.from.session_id.clone(),
+                message_kind: params.kind.clone(),
+                subject: params.subject.clone(),
+                seq,
+            });
+    }
+
     ok_response(
         request.id,
         to_value_or_null(MailboxPostResponse { posted: true, seq }),

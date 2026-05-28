@@ -19,14 +19,46 @@ use crate::serve::worker::{SpawnWorkerConfig, spawn_worker};
 pub struct SpawnWorkerTool {
     sessions: Sessions,
     daemon_info: DaemonInfo,
+    /// Session that owns this tool instance — the worker's results are
+    /// routed back here via mailbox. `None` falls back to the
+    /// "supervisor" alias (no live session), so this should be set to
+    /// the calling session's id for results to reach the operator.
+    parent_session_id: Option<String>,
 }
 
 impl SpawnWorkerTool {
-    pub fn new(sessions: Sessions, daemon_info: DaemonInfo) -> Self {
+    pub fn new(
+        sessions: Sessions,
+        daemon_info: DaemonInfo,
+        parent_session_id: Option<String>,
+    ) -> Self {
         Self {
             sessions,
             daemon_info,
+            parent_session_id,
         }
+    }
+
+    /// Build the spawn config from the model's tool arguments, stamping
+    /// in THIS tool's `parent_session_id` as the worker's reply_to so
+    /// results route back to the calling session. Factored out of
+    /// `execute` so the wiring is unit-testable without spawning a pot.
+    fn build_config(&self, arguments: &Value) -> Result<SpawnWorkerConfig, String> {
+        let prompt = arguments
+            .get("prompt")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "missing required argument: prompt".to_string())?
+            .to_string();
+        Ok(SpawnWorkerConfig {
+            prompt,
+            model: arguments
+                .get("model")
+                .and_then(Value::as_str)
+                .map(String::from),
+            pot_name: None,
+            timeout_secs: arguments.get("timeout_secs").and_then(Value::as_u64),
+            parent_session_id: self.parent_session_id.clone(),
+        })
     }
 }
 
@@ -67,35 +99,19 @@ impl Tool for SpawnWorkerTool {
         'life0: 'async_trait,
         Self: 'async_trait,
     {
+        let config_result = self.build_config(&arguments);
         let sessions = self.sessions.clone();
         let daemon_info = self.daemon_info.clone();
 
         Box::pin(async move {
-            let prompt = match arguments.get("prompt").and_then(Value::as_str) {
-                Some(p) => p.to_string(),
-                None => {
+            let config = match config_result {
+                Ok(c) => c,
+                Err(e) => {
                     return ToolResult {
-                        content: "missing required argument: prompt".into(),
+                        content: e,
                         is_error: true,
                     };
                 }
-            };
-
-            let model = arguments
-                .get("model")
-                .and_then(Value::as_str)
-                .map(String::from);
-
-            let timeout_secs = arguments
-                .get("timeout_secs")
-                .and_then(Value::as_u64);
-
-            let config = SpawnWorkerConfig {
-                prompt: prompt.clone(),
-                model,
-                pot_name: None,
-                timeout_secs,
-                parent_session_id: None,
             };
 
             let spawn_fut = spawn_worker(config, sessions, daemon_info);
@@ -124,5 +140,63 @@ impl Tool for SpawnWorkerTool {
                 },
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tool(parent: Option<&str>) -> SpawnWorkerTool {
+        SpawnWorkerTool::new(
+            Sessions::new(),
+            DaemonInfo::new("test"),
+            parent.map(String::from),
+        )
+    }
+
+    // The crux of the mu-slat fix: the tool stamps ITS OWN
+    // parent_session_id (the calling session) into the spawn config's
+    // reply_to. Without this the worker's results route to the dead
+    // "supervisor" ghost instead of waking the caller.
+    #[test]
+    fn build_config_uses_caller_session_id_as_reply_to() {
+        let cfg = tool(Some("session-7"))
+            .build_config(&json!({ "prompt": "do the thing" }))
+            .expect("config builds");
+        assert_eq!(cfg.parent_session_id.as_deref(), Some("session-7"));
+        assert_eq!(cfg.prompt, "do the thing");
+        assert!(cfg.model.is_none());
+        assert!(cfg.timeout_secs.is_none());
+    }
+
+    #[test]
+    fn build_config_parses_optional_model_and_timeout() {
+        let cfg = tool(Some("session-1"))
+            .build_config(&json!({
+                "prompt": "p",
+                "model": "claude-sonnet-4-6",
+                "timeout_secs": 42
+            }))
+            .expect("config builds");
+        assert_eq!(cfg.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(cfg.timeout_secs, Some(42));
+    }
+
+    #[test]
+    fn build_config_missing_prompt_is_error() {
+        assert!(tool(Some("session-1")).build_config(&json!({})).is_err());
+    }
+
+    #[test]
+    fn build_config_no_caller_falls_back_to_none() {
+        // A tool with no caller id yields parent_session_id: None, which
+        // spawn_worker maps to the "supervisor" fallback. This is the
+        // pre-fix behavior, kept only for the (non-session) edge case.
+        let cfg = tool(None)
+            .build_config(&json!({ "prompt": "p" }))
+            .expect("config builds");
+        assert!(cfg.parent_session_id.is_none());
     }
 }

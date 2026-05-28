@@ -304,16 +304,10 @@ where
         None
     };
 
-    // mu-slat Phase 2: inject the spawn_worker tool so the LLM can
-    // delegate work to pot-hosted workers. Only when events_dir is set
-    // (production) — tests don't have pot infrastructure.
-    let mut tools = tools;
-    if daemon_info.events_dir().is_some() {
-        tools.push(Arc::new(crate::tools::SpawnWorkerTool::new(
-            sessions.clone(),
-            daemon_info.clone(),
-        )));
-    }
+    // mu-slat: the spawn_worker tool is injected per-session in
+    // build_and_register_session (handlers/session.rs), not here — it
+    // needs the calling session's id so worker results route back to
+    // the right mailbox. A daemon-global instance can't know its caller.
     let tools = Arc::new(tools);
     mu_core::transport::serve(reader, writer, move |req, notif| {
         let _ = &mcp_guard;

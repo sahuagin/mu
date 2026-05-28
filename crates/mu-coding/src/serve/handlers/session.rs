@@ -183,6 +183,28 @@ struct BuildSessionRequest<'a> {
     daemon_info: &'a DaemonInfo,
 }
 
+/// Per-session tool list: the daemon's base tools plus a `spawn_worker`
+/// tool scoped to THIS session, so a worker's results route back to this
+/// session's mailbox (waking it) rather than the dead "supervisor" ghost.
+/// The spawn_worker tool is only added in production (events_dir set) —
+/// tests have no pot infrastructure. (mu-slat)
+fn session_spawn_tools(
+    base: &[Arc<dyn Tool>],
+    sessions: &Sessions,
+    daemon_info: &DaemonInfo,
+    session_id: &str,
+) -> Vec<Arc<dyn Tool>> {
+    let mut tools = base.to_vec();
+    if daemon_info.events_dir().is_some() {
+        tools.push(Arc::new(crate::tools::SpawnWorkerTool::new(
+            sessions.clone(),
+            daemon_info.clone(),
+            Some(session_id.to_string()),
+        )));
+    }
+    tools
+}
+
 /// Shared session-creation logic for both `create_session` (root) and
 /// `session.delegate` (child). Returns the new session_id on success
 /// or a human-readable error on provider-construction failure.
@@ -256,7 +278,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     ));
     let mailbox = Arc::new(super::super::mailbox::MailboxState::new());
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
-    let session_tools: Vec<Arc<dyn Tool>> = (*tools).clone();
+    let session_tools = session_spawn_tools(tools.as_slice(), &sessions, daemon_info, &session_id);
     let compaction_cfg = &daemon_info.config().compaction;
     let compaction_policy_override: Option<
         Arc<dyn mu_core::context::compaction::CompactionPolicy>,
@@ -1028,6 +1050,35 @@ mod tests {
     use mu_core::event_log::SessionEventLog;
     use mu_core::protocol::JSONRPC_VERSION;
     use serde_json::json;
+
+    // mu-slat: per-session injection of the spawn_worker tool. In
+    // production every session gets one scoped to its own id (so worker
+    // results wake the caller); in tests/ephemeral mode (no events_dir)
+    // it must be absent.
+    #[test]
+    fn session_spawn_tools_injects_spawn_worker_in_production() {
+        let base: Vec<Arc<dyn Tool>> = vec![];
+        let sessions = Sessions::new();
+        let di = DaemonInfo::new("test")
+            .with_events_dir(Some(std::path::PathBuf::from("/tmp/mu-test-events")));
+        let tools = session_spawn_tools(&base, &sessions, &di, "session-42");
+        assert!(
+            tools.iter().any(|t| t.spec().name == "spawn_worker"),
+            "production session should get a spawn_worker tool",
+        );
+    }
+
+    #[test]
+    fn session_spawn_tools_omits_spawn_worker_without_events_dir() {
+        let base: Vec<Arc<dyn Tool>> = vec![];
+        let sessions = Sessions::new();
+        let di = DaemonInfo::new("test"); // no events_dir (tests / ephemeral)
+        let tools = session_spawn_tools(&base, &sessions, &di, "session-42");
+        assert!(
+            !tools.iter().any(|t| t.spec().name == "spawn_worker"),
+            "no events_dir => no spawn_worker tool",
+        );
+    }
 
     fn rehydrated_session_with_events(session_id: &str) -> Sessions {
         let sessions = Sessions::new();

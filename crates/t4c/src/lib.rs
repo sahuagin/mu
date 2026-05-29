@@ -24,6 +24,7 @@
 //! so it builds and publishes standalone while mu links it in-process. See the
 //! invariant comment in `Cargo.toml`.
 
+pub mod bench;
 pub mod capability;
 pub mod catalog;
 pub mod chain;

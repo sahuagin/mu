@@ -25,6 +25,7 @@
 //! invariant comment in `Cargo.toml`.
 
 pub mod capability;
+pub mod catalog;
 pub mod cli;
 pub mod path;
 pub mod rank;
@@ -32,6 +33,7 @@ pub mod registry;
 pub mod source;
 
 pub use capability::{Capability, HelpAiDoc, HelpSpec};
+pub use catalog::EnvCatalogSource;
 pub use path::CapPath;
 pub use rank::{LexicalRanker, Ranked, Ranker};
 pub use registry::{Registry, Tree};

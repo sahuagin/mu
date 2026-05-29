@@ -5,7 +5,7 @@
 use crate::capability::{Capability, HelpAiDoc, HelpSpec};
 use crate::path::CapPath;
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -92,6 +92,28 @@ impl TomlConfigSource {
         }
         Ok(caps)
     }
+
+    /// Serialize capabilities back to the config TOML (the inverse of
+    /// [`Self::parse_str`]), so `discover` can persist a self-configured registry.
+    pub fn to_toml(caps: &[Capability]) -> Result<String> {
+        let file = TomlFile {
+            capability: caps
+                .iter()
+                .map(|c| TomlCap {
+                    path: c.path.to_string(),
+                    summary: c.summary.clone(),
+                    keywords: c.keywords.clone(),
+                    invoke: c.invoke.clone(),
+                    requires: c.requires.clone(),
+                    help: c.help.as_ref().map(|h| TomlHelp {
+                        argv: h.argv.clone(),
+                        ai: h.ai,
+                    }),
+                })
+                .collect(),
+        };
+        toml::to_string_pretty(&file).context("serializing t4c registry to TOML")
+    }
 }
 
 impl RegistrySource for TomlConfigSource {
@@ -105,13 +127,13 @@ impl RegistrySource for TomlConfigSource {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct TomlFile {
     #[serde(default)]
     capability: Vec<TomlCap>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct TomlCap {
     path: String,
     #[serde(default)]
@@ -122,11 +144,11 @@ struct TomlCap {
     invoke: Vec<String>,
     #[serde(default)]
     requires: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     help: Option<TomlHelp>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct TomlHelp {
     argv: Vec<String>,
     #[serde(default)]

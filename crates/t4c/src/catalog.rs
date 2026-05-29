@@ -8,6 +8,7 @@
 //! present/absent, and persists the intersection as a self-configured registry.
 
 use crate::capability::{Capability, HelpSpec};
+use crate::chain::Chain;
 use crate::path::CapPath;
 use crate::source::RegistrySource;
 use anyhow::Result;
@@ -52,30 +53,6 @@ pub fn curated() -> Vec<Capability> {
             true,
         ),
         cap(
-            "bash.rg",
-            "ripgrep — fast literal/regex search across files (exact strings/patterns)",
-            &["grep", "regex", "literal", "text", "pattern", "string", "fast"],
-            &["rg"],
-            &["rg", "--help"],
-            false,
-        ),
-        cap(
-            "bash.fd",
-            "fd — find files/dirs by name or glob (paths, not contents)",
-            &["find", "file", "filename", "path", "glob", "locate", "directory"],
-            &["fd"],
-            &["fd", "--help"],
-            false,
-        ),
-        cap(
-            "bash.grep",
-            "POSIX grep — line search (fallback; prefer rg or code-index)",
-            &["grep", "line", "match", "text"],
-            &["grep"],
-            &["grep", "--help"],
-            false,
-        ),
-        cap(
             "bash.jj.status",
             "jujutsu — working-copy and parent status",
             &["vcs", "version", "diff", "working", "copy", "commit", "jujutsu"],
@@ -106,6 +83,46 @@ pub fn curated() -> Vec<Capability> {
             &["t4c"],
             &["t4c", "--help-ai"],
             true,
+        ),
+    ]
+}
+
+/// Curated preference chains — interchangeable-impl slots resolved against the
+/// host at `discover` time (mu-d2iy.2). These supersede the flat per-tool entries
+/// (rg/fd/grep) that used to live in `curated()`.
+pub fn default_chains() -> Vec<Chain> {
+    fn ch(slot: &str, summary: &str, kw: &[&str], impls: &[&str]) -> Chain {
+        Chain {
+            slot: slot.to_string(),
+            summary: summary.to_string(),
+            keywords: kw.iter().map(|s| s.to_string()).collect(),
+            impls: impls.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+    vec![
+        ch(
+            "bash.search",
+            "search file contents for a pattern or regex",
+            &["search", "grep", "regex", "pattern", "string", "text"],
+            &["rg", "grep"],
+        ),
+        ch(
+            "bash.find-files",
+            "find files and directories by name or glob",
+            &["find", "file", "filename", "path", "glob", "locate", "directory"],
+            &["fd", "find"],
+        ),
+        ch(
+            "bash.ls",
+            "list directory contents",
+            &["list", "ls", "directory", "files", "tree"],
+            &["eza", "exa", "ls"],
+        ),
+        ch(
+            "bash.compress",
+            "compress or archive data",
+            &["compress", "archive", "zip", "gzip", "tar"],
+            &["zstd", "pixz", "xz", "gzip"],
         ),
     ]
 }

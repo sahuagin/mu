@@ -12,9 +12,9 @@ use mu_core::agent::{Tool, ToolResult, ToolSpec};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
+use crate::serve::worker::{spawn_worker, SpawnWorkerConfig};
 use crate::serve::DaemonInfo;
 use crate::serve::Sessions;
-use crate::serve::worker::{SpawnWorkerConfig, spawn_worker};
 
 pub struct SpawnWorkerTool {
     sessions: Sessions,

@@ -189,13 +189,10 @@ impl ServerHandler for MuMcpHandler {
         async move {
             Ok(ListResourceTemplatesResult {
                 resource_templates: vec![ResourceTemplate::new(
-                    RawResourceTemplate::new(
-                        "mu://session/{session_id}/status",
-                        "session-status",
-                    )
-                    .with_description(
-                        "Live session metrics: phase, tokens, cost, context pressure",
-                    ),
+                    RawResourceTemplate::new("mu://session/{session_id}/status", "session-status")
+                        .with_description(
+                            "Live session metrics: phase, tokens, cost, context pressure",
+                        ),
                     None,
                 )],
                 ..Default::default()
@@ -273,25 +270,25 @@ impl ServerHandler for MuMcpHandler {
                             if let Some(ref status) = status {
                                 // Push the standard resource_updated notification
                                 let _ = peer
-                                    .send_notification(ServerNotification::ResourceUpdatedNotification(
-                                        ResourceUpdatedNotification::new(
-                                            ResourceUpdatedNotificationParam {
-                                                uri: uri_clone.clone().into(),
-                                            },
+                                    .send_notification(
+                                        ServerNotification::ResourceUpdatedNotification(
+                                            ResourceUpdatedNotification::new(
+                                                ResourceUpdatedNotificationParam {
+                                                    uri: uri_clone.clone().into(),
+                                                },
+                                            ),
                                         ),
-                                    ))
+                                    )
                                     .await;
                                 // Push our custom inline notification with full payload
                                 if let Ok(payload) = serde_json::to_value(status) {
                                     let _ = peer
-                                        .send_notification(
-                                            ServerNotification::CustomNotification(
-                                                CustomNotification::new(
-                                                    "mu/session_status",
-                                                    Some(payload),
-                                                ),
+                                        .send_notification(ServerNotification::CustomNotification(
+                                            CustomNotification::new(
+                                                "mu/session_status",
+                                                Some(payload),
                                             ),
-                                        )
+                                        ))
                                         .await;
                                 }
                             }

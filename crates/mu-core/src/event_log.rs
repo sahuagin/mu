@@ -347,18 +347,11 @@ pub enum EventPayload {
         prompt_summary: Option<String>,
     },
     /// mu-slat: worker process exited normally.
-    WorkerExited {
-        exit_code: i32,
-        elapsed_ms: u64,
-    },
+    WorkerExited { exit_code: i32, elapsed_ms: u64 },
     /// mu-slat: worker process failed (spawn error, signal, etc).
-    WorkerFailed {
-        reason: String,
-    },
+    WorkerFailed { reason: String },
     /// mu-slat: worker killed by timeout.
-    WorkerTimeout {
-        elapsed_ms: u64,
-    },
+    WorkerTimeout { elapsed_ms: u64 },
 }
 
 /// Categorical exit reason for a task — what brought the task to its
@@ -608,8 +601,9 @@ impl SessionEventLog {
         for ev in events.iter() {
             if let EventPayload::AssistantMessageEvent { message } = &ev.payload {
                 if let Some(u) = message.usage {
-                    let total_input =
-                        u.input_tokens + u.cache_read_input_tokens.unwrap_or(0) + u.cache_creation_input_tokens.unwrap_or(0);
+                    let total_input = u.input_tokens
+                        + u.cache_read_input_tokens.unwrap_or(0)
+                        + u.cache_creation_input_tokens.unwrap_or(0);
                     last_input = Some(total_input);
                     acc = Some(match acc {
                         Some(prev) => prev + u,

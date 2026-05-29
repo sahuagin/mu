@@ -349,12 +349,7 @@ fn log_final_screen(session_id: &str, pty_worker: &PtyWorker) {
     );
 }
 
-fn notify_parent(
-    sessions: &Sessions,
-    reply_to: &str,
-    worker_session_id: &str,
-    subject: &str,
-) {
+fn notify_parent(sessions: &Sessions, reply_to: &str, worker_session_id: &str, subject: &str) {
     if let Some(tx) = sessions.input_sender(reply_to) {
         let _ = tx.try_send(mu_core::agent::AgentInput::MailboxMessage {
             from_session_id: worker_session_id.to_string(),

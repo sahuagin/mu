@@ -59,7 +59,13 @@ impl RouteCatalog {
         let mut entries = Vec::new();
 
         for (model, soft, hard) in ANTHROPIC_MODELS {
-            entries.push(build_entry("anthropic_api", model, anthropic_key, *soft, *hard));
+            entries.push(build_entry(
+                "anthropic_api",
+                model,
+                anthropic_key,
+                *soft,
+                *hard,
+            ));
         }
 
         for (model, soft, hard) in OPENAI_CODEX_MODELS {
@@ -67,7 +73,13 @@ impl RouteCatalog {
         }
 
         for (model, soft, hard) in OPENROUTER_MODELS {
-            entries.push(build_entry("openrouter", model, openrouter_key, *soft, *hard));
+            entries.push(build_entry(
+                "openrouter",
+                model,
+                openrouter_key,
+                *soft,
+                *hard,
+            ));
         }
 
         entries.push(build_entry("faux", "faux", true, 128_000, 128_000));
@@ -148,9 +160,7 @@ const ANTHROPIC_MODELS: &[(&str, u64, u64)] = &[
     ("claude-haiku-4-5", 200_000, 200_000),
 ];
 
-const OPENAI_CODEX_MODELS: &[(&str, u64, u64)] = &[
-    ("gpt-5.5", 1_000_000, 1_000_000),
-];
+const OPENAI_CODEX_MODELS: &[(&str, u64, u64)] = &[("gpt-5.5", 1_000_000, 1_000_000)];
 
 const OPENROUTER_MODELS: &[(&str, u64, u64)] = &[
     ("anthropic/claude-opus-4.7", 200_000, 1_000_000),

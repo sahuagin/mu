@@ -7,11 +7,12 @@
 //! `--json`; and we flush "what I ran" before a child writes, so a piped reader
 //! never reads results blind.
 
-use crate::capability::{Capability, HelpSpec};
+use crate::capability::Capability;
+use crate::catalog;
 use crate::path::CapPath;
 use crate::rank::{LexicalRanker, Ranker};
 use crate::registry::{Registry, Tree};
-use crate::source::{StaticSource, TomlConfigSource};
+use crate::source::TomlConfigSource;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -45,8 +46,15 @@ pub enum Cmd {
     },
     /// Walk a subtree, terse (one line per node). No prefix = the whole tree.
     Walk { prefix: Option<String> },
-    /// List the whole tree (alias for `walk` with no prefix).
+    /// List the curated catalog with present/absent markers (what you could have
+    /// vs. what's installed here).
     List,
+    /// Scan the curated catalog against this host (catalog ∩ installed), report
+    /// present/absent, and persist a self-configured registry (unless --dry-run).
+    Discover {
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show a capability's help (terse by default; `--full` for all, `--schema`
     /// for the raw `--help-ai --json` document).
     Help {
@@ -113,12 +121,11 @@ pub fn route_bare(tree: &Tree, tokens: &[String]) -> BareAction {
     }
 }
 
-/// Build the default registry: a built-in catalog, optionally overridden by a
-/// TOML config at `$T4C_CONFIG` or `~/.config/t4c/registry.toml`. (Filtering the
-/// catalog by what's actually installed is mu-kex4.4's `discover`.)
+/// Build the default registry: the curated catalog ∩ installed env, optionally
+/// overridden by a TOML config at `$T4C_CONFIG` or `~/.config/t4c/registry.toml`.
 pub fn build_registry() -> Registry {
     let mut reg = Registry::new();
-    reg.add_source(Box::new(StaticSource::new("catalog", default_catalog())));
+    reg.add_source(Box::new(catalog::EnvCatalogSource));
     if let Some(cfg) = config_path() {
         if cfg.exists() {
             reg.add_source(Box::new(TomlConfigSource::new(cfg)));
@@ -136,66 +143,99 @@ fn config_path() -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(".config/t4c/registry.toml"))
 }
 
-fn default_catalog() -> Vec<Capability> {
-    fn c(path: &str, summary: &str, kw: &[&str], invoke: &[&str], help: &[&str], ai: bool) -> Capability {
-        Capability {
-            path: CapPath::parse(path).expect("static catalog path is valid"),
-            summary: summary.to_string(),
-            keywords: kw.iter().map(|s| s.to_string()).collect(),
-            invoke: invoke.iter().map(|s| s.to_string()).collect(),
-            help: if help.is_empty() {
-                None
-            } else {
-                Some(HelpSpec {
-                    argv: help.iter().map(|s| s.to_string()).collect(),
-                    ai,
-                })
-            },
-            requires: vec![],
+/// `list` — the full curated catalog with present/absent markers (what you
+/// *could* have vs. what's installed here). Unlike `walk`, which shows only the
+/// live installed tree.
+fn do_list(json: bool) -> Result<i32> {
+    let all = catalog::curated();
+    if json {
+        #[derive(Serialize)]
+        struct Entry {
+            path: String,
+            summary: String,
+            installed: bool,
         }
+        let rows: Vec<Entry> = all
+            .iter()
+            .map(|c| Entry {
+                path: c.path.to_string(),
+                summary: c.summary.clone(),
+                installed: catalog::is_installed(c),
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(0);
     }
-    vec![
-        c(
-            "mcp.code-index.recall",
-            "semantic + lexical code search over an indexed repo (best first pass for 'where is X')",
-            &["code", "search", "semantic", "symbol", "recall", "function", "struct", "where"],
-            &["code-index", "recall"],
-            &["code-index", "--help-ai"],
-            true,
-        ),
-        c(
-            "bash.agent.memory",
-            "search persistent agent memory (decisions, feedback, project state, references)",
-            &["memory", "remember", "know", "decision", "feedback", "why", "prior", "history", "context"],
-            &["agent", "memory", "search"],
-            &["agent", "memory", "--help-ai"],
-            true,
-        ),
-        c(
-            "bash.rg",
-            "ripgrep — fast literal/regex search across files (exact strings/patterns)",
-            &["grep", "regex", "literal", "text", "pattern", "string", "fast"],
-            &["rg"],
-            &["rg", "--help"],
-            false,
-        ),
-        c(
-            "bash.fd",
-            "fd — find files/dirs by name or glob (paths, not contents)",
-            &["find", "file", "filename", "path", "glob", "locate", "directory"],
-            &["fd"],
-            &["fd", "--help"],
-            false,
-        ),
-        c(
-            "bash.grep",
-            "POSIX grep — line search (fallback; prefer rg or code-index)",
-            &["grep", "line", "match", "text"],
-            &["grep"],
-            &["grep", "--help"],
-            false,
-        ),
-    ]
+    for c in &all {
+        let mark = if catalog::is_installed(c) { "✓" } else { "·" };
+        println!("  {mark} {:<28} {}", c.path.to_string(), c.summary);
+    }
+    println!("\n(✓ installed · absent — `t4c discover` to persist the installed set)");
+    Ok(0)
+}
+
+/// `discover` — catalog ∩ env: report present/absent and persist the installed
+/// set as a self-configured registry (unless `--dry-run`). Note: probing
+/// `--help-ai` is deliberately deferred to the first `help` call, not done here,
+/// so discovery never spawns N subprocesses just to enumerate.
+fn do_discover(json: bool, dry_run: bool) -> Result<i32> {
+    let (present, absent): (Vec<Capability>, Vec<Capability>) =
+        catalog::curated().into_iter().partition(catalog::is_installed);
+
+    let wrote = if dry_run {
+        None
+    } else {
+        Some(write_registry(&present)?)
+    };
+
+    if json {
+        #[derive(Serialize)]
+        struct Disc {
+            present: Vec<String>,
+            absent: Vec<String>,
+            wrote: Option<String>,
+            dry_run: bool,
+        }
+        let d = Disc {
+            present: present.iter().map(|c| c.path.to_string()).collect(),
+            absent: absent.iter().map(|c| c.path.to_string()).collect(),
+            wrote: wrote.as_ref().map(|p| p.display().to_string()),
+            dry_run,
+        };
+        println!("{}", serde_json::to_string_pretty(&d)?);
+        return Ok(0);
+    }
+
+    println!(
+        "discovered {} present, {} absent (of {} catalogued)",
+        present.len(),
+        absent.len(),
+        present.len() + absent.len()
+    );
+    for c in &present {
+        println!("  ✓ {:<28} {}", c.path.to_string(), c.summary);
+    }
+    for c in &absent {
+        println!("  · {:<28} {}  (not installed)", c.path.to_string(), c.summary);
+    }
+    match &wrote {
+        Some(p) => println!("\nwrote self-configured registry: {}", p.display()),
+        None => println!("\n(dry-run — no registry written)"),
+    }
+    Ok(0)
+}
+
+/// Persist a capability set to the config path as TOML (the self-configuring
+/// half of `discover`).
+fn write_registry(caps: &[Capability]) -> Result<PathBuf> {
+    let path = config_path().context("no config path (set HOME or T4C_CONFIG)")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating config dir {}", parent.display()))?;
+    }
+    let text = TomlConfigSource::to_toml(caps)?;
+    std::fs::write(&path, text).with_context(|| format!("writing registry {}", path.display()))?;
+    Ok(path)
 }
 
 /// Dispatch a parsed [`Cli`] to its handler. Returns the process exit code.
@@ -208,7 +248,8 @@ pub fn run(cli: Cli) -> Result<i32> {
         }
         Some(Cmd::Find { intent }) => do_find(&tree, &intent.join(" "), cli.json),
         Some(Cmd::Walk { prefix }) => do_walk(&tree, prefix.as_deref(), cli.json),
-        Some(Cmd::List) => do_walk(&tree, None, cli.json),
+        Some(Cmd::List) => do_list(cli.json),
+        Some(Cmd::Discover { dry_run }) => do_discover(cli.json, dry_run),
         Some(Cmd::Help { path, full, schema }) => do_help(&tree, &path, full, schema, cli.json),
         Some(Cmd::Run { path, args }) => do_run(&tree, &path, &args),
         Some(Cmd::Bare(tokens)) => match route_bare(&tree, &tokens) {
@@ -480,10 +521,11 @@ fn do_run(tree: &Tree, path_str: &str, extra: &[String]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::StaticSource;
 
     fn tree() -> Tree {
         let mut reg = Registry::new();
-        reg.add_source(Box::new(StaticSource::new("c", default_catalog())));
+        reg.add_source(Box::new(StaticSource::new("c", crate::catalog::curated())));
         reg.build().unwrap()
     }
 
@@ -555,6 +597,7 @@ mod tests {
     fn catalog_builds_into_tree() {
         let t = tree();
         assert!(t.get(&CapPath::parse("mcp.code-index.recall").unwrap()).is_some());
-        assert_eq!(t.walk(&CapPath::parse("bash").unwrap()).len(), 4);
+        assert!(t.walk(&CapPath::parse("bash").unwrap()).len() >= 4);
+        assert!(t.get(&CapPath::parse("bash.rg").unwrap()).is_some());
     }
 }

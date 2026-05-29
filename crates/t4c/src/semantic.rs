@@ -34,11 +34,7 @@ impl VectorCache {
     pub fn build<E: Embedder>(embedder: &E, model: &str, caps: &[&Capability]) -> Result<Self> {
         let texts: Vec<String> = caps.iter().map(|c| cap_text(c)).collect();
         let vecs = embedder.embed(&texts)?;
-        let by_path = caps
-            .iter()
-            .map(|c| c.path.to_string())
-            .zip(vecs)
-            .collect();
+        let by_path = caps.iter().map(|c| c.path.to_string()).zip(vecs).collect();
         Ok(Self {
             model: model.to_string(),
             by_path,
@@ -85,7 +81,10 @@ impl<E: Embedder> Ranker for SemanticRanker<E> {
             _ => return self.fallback.rank(intent, caps), // embed failed -> lexical
         };
         // If nothing in this cap set is cached, all-zeros is useless — fall back.
-        if !caps.iter().any(|c| self.cache.contains_key(&c.path.to_string())) {
+        if !caps
+            .iter()
+            .any(|c| self.cache.contains_key(&c.path.to_string()))
+        {
             return self.fallback.rank(intent, caps);
         }
         let mut out: Vec<Ranked> = caps
@@ -142,7 +141,11 @@ mod tests {
 
     #[test]
     fn ranks_matching_cap_first() {
-        let ci = cap("mcp.code-index.recall", "semantic code search symbols", &["code"]);
+        let ci = cap(
+            "mcp.code-index.recall",
+            "semantic code search symbols",
+            &["code"],
+        );
         let jq = cap("bash.jq", "query and transform json data", &["json"]);
         let caps = vec![&ci, &jq];
         let emb = FakeEmbedder::new();
@@ -155,7 +158,11 @@ mod tests {
 
     #[test]
     fn empty_cache_falls_back_to_lexical() {
-        let rg = cap("bash.search", "search files for a regex", &["grep", "regex"]);
+        let rg = cap(
+            "bash.search",
+            "search files for a regex",
+            &["grep", "regex"],
+        );
         let caps = vec![&rg];
         // empty cache -> nothing cached -> lexical fallback still ranks
         let ranker = SemanticRanker::new(FakeEmbedder::new(), HashMap::new());

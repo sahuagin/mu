@@ -104,13 +104,15 @@ impl ConfigEmbedder {
             .unwrap_or_else(|_| format!("{home}/.config/agent/config.toml"));
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading agent config {path}"))?;
-        let provider = std::env::var("T4C_EMBED_PROVIDER").unwrap_or_else(|_| "openrouter".to_string());
+        let provider =
+            std::env::var("T4C_EMBED_PROVIDER").unwrap_or_else(|_| "openrouter".to_string());
         let api_key = Self::api_key_from(&text, &provider)?;
         Ok(Self {
             endpoint: std::env::var("T4C_EMBED_ENDPOINT")
                 .unwrap_or_else(|_| Self::DEFAULT_ENDPOINT.to_string()),
             api_key,
-            model: std::env::var("T4C_EMBED_MODEL").unwrap_or_else(|_| Self::DEFAULT_MODEL.to_string()),
+            model: std::env::var("T4C_EMBED_MODEL")
+                .unwrap_or_else(|_| Self::DEFAULT_MODEL.to_string()),
         })
     }
 

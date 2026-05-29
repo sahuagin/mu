@@ -127,8 +127,14 @@ mod tests {
     #[test]
     fn later_source_overrides_on_collision() {
         let mut reg = Registry::new();
-        reg.add_source(Box::new(StaticSource::new("a", vec![cap("bash.x", "from a")])));
-        reg.add_source(Box::new(StaticSource::new("b", vec![cap("bash.x", "from b")])));
+        reg.add_source(Box::new(StaticSource::new(
+            "a",
+            vec![cap("bash.x", "from a")],
+        )));
+        reg.add_source(Box::new(StaticSource::new(
+            "b",
+            vec![cap("bash.x", "from b")],
+        )));
         let t = reg.build().unwrap();
         assert_eq!(t.len(), 1);
         assert_eq!(

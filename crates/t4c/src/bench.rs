@@ -66,7 +66,14 @@ pub fn fixture_catalog() -> Vec<Capability> {
         cap(
             "mcp.code-index.recall",
             "find where a concept or symbol is implemented in source code",
-            &["concept", "symbol", "implemented", "where", "source", "function"],
+            &[
+                "concept",
+                "symbol",
+                "implemented",
+                "where",
+                "source",
+                "function",
+            ],
         ),
         cap(
             "bash.jq",
@@ -84,18 +91,42 @@ pub fn fixture_catalog() -> Vec<Capability> {
 /// Intent-sets with known-right answers.
 pub fn cases() -> Vec<Case> {
     vec![
-        Case { intent: "compare two files and see the differences", expect: "bash.diff" },
-        Case { intent: "three-way merge reconciling versions", expect: "bash.diff3" },
-        Case { intent: "show a colorized side-by-side highlighted diff", expect: "bash.diff-pretty" },
-        Case { intent: "compress a folder into an archive", expect: "bash.compress" },
-        Case { intent: "search file contents for a regex pattern", expect: "bash.search" },
-        Case { intent: "where is this function implemented in source", expect: "mcp.code-index.recall" },
-        Case { intent: "query a json document", expect: "bash.jq" },
+        Case {
+            intent: "compare two files and see the differences",
+            expect: "bash.diff",
+        },
+        Case {
+            intent: "three-way merge reconciling versions",
+            expect: "bash.diff3",
+        },
+        Case {
+            intent: "show a colorized side-by-side highlighted diff",
+            expect: "bash.diff-pretty",
+        },
+        Case {
+            intent: "compress a folder into an archive",
+            expect: "bash.compress",
+        },
+        Case {
+            intent: "search file contents for a regex pattern",
+            expect: "bash.search",
+        },
+        Case {
+            intent: "where is this function implemented in source",
+            expect: "mcp.code-index.recall",
+        },
+        Case {
+            intent: "query a json document",
+            expect: "bash.jq",
+        },
         // ADVERSARIAL (the discriminator): the intent shares no tokens with the
         // target's description/keywords, so a lexical / hashed-BoW ranker CANNOT
         // route it (fake misses this). The gate asks whether real embeddings can —
         // i.e. whether semantic ranking earns `find` its front door (mu-d33g).
-        Case { intent: "locate the bug in this module", expect: "mcp.code-index.recall" },
+        Case {
+            intent: "locate the bug in this module",
+            expect: "mcp.code-index.recall",
+        },
     ]
 }
 
@@ -169,7 +200,11 @@ mod tests {
             "fake baseline moved: {}/{} ({:?})",
             a.passed,
             a.total,
-            a.results.iter().filter(|r| !r.ok).map(|r| (&r.intent, &r.got)).collect::<Vec<_>>()
+            a.results
+                .iter()
+                .filter(|r| !r.ok)
+                .map(|r| (&r.intent, &r.got))
+                .collect::<Vec<_>>()
         );
         // the adversarial case is the one that misses lexically
         assert!(a.results.last().is_some_and(|r| !r.ok));

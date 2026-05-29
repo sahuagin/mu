@@ -213,6 +213,7 @@ pub(crate) async fn spawn_worker(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn monitor_worker(
     mut pty_worker: PtyWorker,
     event_log: Arc<SessionEventLog>,

@@ -1,3 +1,7 @@
+// Fixture builders specify every field then add `..Default::default()`; the
+// trailing update is harmless test noise, not worth churning each literal.
+#![allow(clippy::needless_update)]
+
 use super::*;
 use base64::Engine;
 use bytes::Bytes;

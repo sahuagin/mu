@@ -29,3 +29,7 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+# mu-d2iy.3: ConfigEmbedder POSTs to an OpenAI-style /embeddings endpoint.
+# `blocking` added on top of the workspace features (t4c's CLI path is one-shot).
+# Third-party only — leaf invariant intact.
+reqwest = { workspace = true, features = ["blocking"] }

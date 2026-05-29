@@ -1560,6 +1560,7 @@ dependencies = [
 name = "mu-core"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "async-trait",
  "blake3",
  "dirs",
@@ -1567,6 +1568,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "t4c",
  "tempfile",
  "thiserror 1.0.69",
  "tiktoken-rs",

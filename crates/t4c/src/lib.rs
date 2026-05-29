@@ -25,6 +25,7 @@
 //! invariant comment in `Cargo.toml`.
 
 pub mod capability;
+pub mod cli;
 pub mod path;
 pub mod rank;
 pub mod registry;

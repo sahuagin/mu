@@ -60,6 +60,12 @@ pub enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Run the find-quality benchmark (known-answer intent-sets). `--fake` =
+    /// deterministic baseline; default = the live embedder (the mu-d2iy.6 gate).
+    Bench {
+        #[arg(long)]
+        fake: bool,
+    },
     /// Show a capability's help (terse by default; `--full` for all, `--schema`
     /// for the raw `--help-ai --json` document).
     Help {
@@ -340,6 +346,43 @@ fn do_discover(json: bool, dry_run: bool) -> Result<i32> {
     Ok(0)
 }
 
+/// `bench` — run the find-quality benchmark. `--fake` uses the deterministic
+/// embedder (CI baseline); default uses the live embedder (the mu-d2iy.6 gate).
+fn do_bench(json: bool, fake: bool) -> Result<i32> {
+    let report = if fake {
+        crate::bench::run(crate::embedder::FakeEmbedder::new())?
+    } else {
+        match crate::embedder::ConfigEmbedder::from_config() {
+            Ok(e) => crate::bench::run(e)?,
+            Err(_) => {
+                eprintln!(
+                    "no embedder configured (~/.config/agent/config.toml); \
+                     use `t4c bench --fake` for the deterministic baseline"
+                );
+                return Ok(2);
+            }
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(0);
+    }
+    let kind = if fake { "fake (deterministic baseline)" } else { "live embedder" };
+    println!(
+        "find benchmark [{kind}]: {}/{} correct\n",
+        report.passed, report.total
+    );
+    for r in &report.results {
+        let mark = if r.ok { "✓" } else { "✗" };
+        if r.ok {
+            println!("  {mark} {:<46} -> {}", r.intent, r.got);
+        } else {
+            println!("  {mark} {:<46} -> {}  (expected {})", r.intent, r.got, r.expect);
+        }
+    }
+    Ok(if report.passed == report.total { 0 } else { 1 })
+}
+
 /// Persist a capability set to the config path as TOML (the self-configuring
 /// half of `discover`).
 fn write_registry(caps: &[Capability]) -> Result<PathBuf> {
@@ -371,6 +414,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         Some(Cmd::Walk { prefix }) => do_walk(&tree, prefix.as_deref(), cli.json),
         Some(Cmd::List) => do_list(cli.json),
         Some(Cmd::Discover { dry_run }) => do_discover(cli.json, dry_run),
+        Some(Cmd::Bench { fake }) => do_bench(cli.json, fake),
         Some(Cmd::Help { path, full, schema }) => do_help(&tree, &path, full, schema, cli.json),
         Some(Cmd::Run { path, args }) => do_run(&tree, &path, &args),
         Some(Cmd::Bare(tokens)) => match route_bare(&tree, &tokens) {

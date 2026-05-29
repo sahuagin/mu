@@ -1,7 +1,7 @@
 //! The unit of the registry: a [`Capability`] — one addressable, invokable node.
 
 use crate::path::CapPath;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// One discoverable capability: where it lives ([`CapPath`]), what it is for
 /// (summary + keywords), how to run it (`invoke` argv), how to learn it
@@ -32,7 +32,7 @@ pub struct HelpSpec {
 /// This is the de-facto schema the probe consumes. mu-kex4.5 turns it into the
 /// published standard and ships emitters (a clap derive + a shell template) so
 /// any tool can produce conforming output for free.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelpAiDoc {
     pub name: String,
     #[serde(default)]
@@ -44,7 +44,7 @@ pub struct HelpAiDoc {
 }
 
 /// One subcommand entry within a [`HelpAiDoc`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelpAiSub {
     pub name: String,
     #[serde(default)]

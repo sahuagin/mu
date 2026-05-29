@@ -24,6 +24,18 @@
 //! so it builds and publishes standalone while mu links it in-process. See the
 //! invariant comment in `Cargo.toml`.
 
+pub mod capability;
+pub mod path;
+pub mod rank;
+pub mod registry;
+pub mod source;
+
+pub use capability::{Capability, HelpAiDoc, HelpSpec};
+pub use path::CapPath;
+pub use rank::{LexicalRanker, Ranked, Ranker};
+pub use registry::{Registry, Tree};
+pub use source::{HelpAiProbeSource, RegistrySource, StaticSource, TomlConfigSource};
+
 /// Crate version, surfaced by the CLI (`t4c --version`) and any embedding host.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

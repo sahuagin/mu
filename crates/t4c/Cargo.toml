@@ -1,0 +1,28 @@
+[package]
+name = "t4c"
+description = "tools4claude — a discovery/capability surface for agents: find tools by intent, learn how to call them, and invoke them."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# LEAF CRATE INVARIANT (goal mu-kex4): t4c depends ONLY on published crates,
+# NEVER on workspace siblings (mu-core, mu-ai, …). The dependency arrow points
+# mu -> t4c, never t4c -> mu, so this builds and publishes as a standalone
+# external library while mu links it in-process. `workspace = true` below
+# inherits third-party VERSIONS from the workspace table — it does not create a
+# path-dependency on any sibling crate.
+
+[lib]
+name = "t4c"
+path = "src/lib.rs"
+
+[[bin]]
+name = "t4c"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }

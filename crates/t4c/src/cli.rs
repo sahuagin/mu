@@ -131,6 +131,7 @@ pub fn route_bare(tree: &Tree, tokens: &[String]) -> BareAction {
 pub fn build_registry() -> Registry {
     let mut reg = Registry::new();
     reg.add_source(Box::new(catalog::EnvCatalogSource));
+    reg.add_source(Box::new(crate::chain::ChainSource::new(catalog::default_chains())));
     if let Some(cfg) = config_path() {
         if cfg.exists() {
             reg.add_source(Box::new(TomlConfigSource::new(cfg)));
@@ -148,34 +149,86 @@ fn config_path() -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(".config/t4c/registry.toml"))
 }
 
-/// `list` — the full curated catalog with present/absent markers (what you
-/// *could* have vs. what's installed here). Unlike `walk`, which shows only the
-/// live installed tree.
+/// `list` — preference chains resolved 3-state (active / superseded / absent),
+/// plus the distinct catalog (installed / absent). Unlike `walk`, which shows
+/// only the live installed tree.
 fn do_list(json: bool) -> Result<i32> {
-    let all = catalog::curated();
+    let chains = catalog::default_chains();
+    let (_winners, resolved) = crate::chain::resolve_chains(&chains, |c| catalog::which(c))?;
+    let curated = catalog::curated();
+
     if json {
         #[derive(Serialize)]
-        struct Entry {
+        struct ChainRow {
+            slot: String,
+            impl_cmd: String,
+            state: String,
+            behind: Option<String>,
+        }
+        #[derive(Serialize)]
+        struct CatRow {
             path: String,
             summary: String,
             installed: bool,
         }
-        let rows: Vec<Entry> = all
+        #[derive(Serialize)]
+        struct Out {
+            chains: Vec<ChainRow>,
+            catalog: Vec<CatRow>,
+        }
+        let chain_rows = resolved
             .iter()
-            .map(|c| Entry {
+            .map(|r| {
+                let (state, behind) = match &r.state {
+                    crate::chain::ImplState::Active => ("active".to_string(), None),
+                    crate::chain::ImplState::Superseded { behind } => {
+                        ("superseded".to_string(), Some(behind.clone()))
+                    }
+                    crate::chain::ImplState::Absent => ("absent".to_string(), None),
+                };
+                ChainRow {
+                    slot: r.slot.clone(),
+                    impl_cmd: r.impl_cmd.clone(),
+                    state,
+                    behind,
+                }
+            })
+            .collect();
+        let cat_rows = curated
+            .iter()
+            .map(|c| CatRow {
                 path: c.path.to_string(),
                 summary: c.summary.clone(),
                 installed: catalog::is_installed(c),
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Out {
+                chains: chain_rows,
+                catalog: cat_rows
+            })?
+        );
         return Ok(0);
     }
-    for c in &all {
-        let mark = if catalog::is_installed(c) { "✓" } else { "·" };
-        println!("  {mark} {:<28} {}", c.path.to_string(), c.summary);
+
+    println!("chains (preference-resolved):");
+    for r in &resolved {
+        let (mark, note) = match &r.state {
+            crate::chain::ImplState::Active => ("✓", String::new()),
+            crate::chain::ImplState::Superseded { behind } => {
+                ("⊘", format!("  (superseded by {behind})"))
+            }
+            crate::chain::ImplState::Absent => ("·", "  (absent)".to_string()),
+        };
+        println!("  {mark} {:<16} {:<8}{}", r.slot, r.impl_cmd, note);
     }
-    println!("\n(✓ installed · absent — `t4c discover` to persist the installed set)");
+    println!("\ncatalog (distinct tools):");
+    for c in &curated {
+        let mark = if catalog::is_installed(c) { "✓" } else { "·" };
+        println!("  {mark} {:<26} {}", c.path.to_string(), c.summary);
+    }
+    println!("\n(✓ active/installed  ⊘ superseded  · absent — `t4c discover` to persist)");
     Ok(0)
 }
 
@@ -548,9 +601,9 @@ mod tests {
     fn bare_exact_path_runs() {
         let t = tree();
         assert_eq!(
-            route_bare(&t, &toks("bash.rg foo")),
+            route_bare(&t, &toks("bash.jq foo")),
             BareAction::Run {
-                path: CapPath::parse("bash.rg").unwrap(),
+                path: CapPath::parse("bash.jq").unwrap(),
                 args: vec!["foo".to_string()],
             }
         );
@@ -578,9 +631,9 @@ mod tests {
             }
         );
         assert_eq!(
-            route_bare(&t, &toks("bash.rg --schema")),
+            route_bare(&t, &toks("bash.jq --schema")),
             BareAction::Help {
-                path: CapPath::parse("bash.rg").unwrap(),
+                path: CapPath::parse("bash.jq").unwrap(),
                 schema: true,
             }
         );
@@ -609,6 +662,6 @@ mod tests {
         let t = tree();
         assert!(t.get(&CapPath::parse("mcp.code-index.recall").unwrap()).is_some());
         assert!(t.walk(&CapPath::parse("bash").unwrap()).len() >= 4);
-        assert!(t.get(&CapPath::parse("bash.rg").unwrap()).is_some());
+        assert!(t.get(&CapPath::parse("bash.jq").unwrap()).is_some());
     }
 }

@@ -119,19 +119,27 @@ impl std::fmt::Debug for AgentInput {
         match self {
             Self::UserMessage(m) => f.debug_tuple("UserMessage").field(m).finish(),
             Self::Cancel => write!(f, "Cancel"),
-            Self::CancelOutstanding { reason } => {
-                f.debug_struct("CancelOutstanding").field("reason", reason).finish()
-            }
-            Self::StartAutonomous { goal, options } => {
-                f.debug_struct("StartAutonomous")
-                    .field("goal", goal)
-                    .field("options", options)
-                    .finish()
-            }
-            Self::SwitchProvider { provider_kind, model, .. } => {
+            Self::CancelOutstanding { reason } => f
+                .debug_struct("CancelOutstanding")
+                .field("reason", reason)
+                .finish(),
+            Self::StartAutonomous { goal, options } => f
+                .debug_struct("StartAutonomous")
+                .field("goal", goal)
+                .field("options", options)
+                .finish(),
+            Self::SwitchProvider {
+                provider_kind,
+                model,
+                ..
+            } => {
                 write!(f, "SwitchProvider({provider_kind}/{model})")
             }
-            Self::MailboxMessage { from_session_id, seq, .. } => {
+            Self::MailboxMessage {
+                from_session_id,
+                seq,
+                ..
+            } => {
                 write!(f, "MailboxMessage(from={from_session_id}, seq={seq})")
             }
         }
@@ -692,20 +700,28 @@ async fn run(
             match input {
                 AgentInput::Cancel => return Outcome::Cancelled,
                 AgentInput::CancelOutstanding { .. } => {}
-                AgentInput::SwitchProvider { provider: new, provider_kind: new_kind, model: new_model } => {
+                AgentInput::SwitchProvider {
+                    provider: new,
+                    provider_kind: new_kind,
+                    model: new_model,
+                } => {
                     let old_kind: Arc<str> = Arc::from(current_provider_kind.as_ref());
                     let old_model: Arc<str> = Arc::from(current_model.as_ref());
                     provider = new;
                     current_provider_kind = new_kind.clone();
                     current_model = new_model.clone();
-                    let _ = events.send(AgentEvent::ProviderSwitched {
-                        old_provider_kind: old_kind,
-                        old_model,
-                        new_provider_kind: new_kind,
-                        new_model,
-                    }).await;
+                    let _ = events
+                        .send(AgentEvent::ProviderSwitched {
+                            old_provider_kind: old_kind,
+                            old_model,
+                            new_provider_kind: new_kind,
+                            new_model,
+                        })
+                        .await;
                 }
-                AgentInput::UserMessage(_) | AgentInput::StartAutonomous { .. } | AgentInput::MailboxMessage { .. } => {
+                AgentInput::UserMessage(_)
+                | AgentInput::StartAutonomous { .. }
+                | AgentInput::MailboxMessage { .. } => {
                     queue.push_back(Action::External(input));
                 }
             }
@@ -719,18 +735,24 @@ async fn run(
                 Some(AgentInput::CancelOutstanding { .. }) => {
                     continue;
                 }
-                Some(AgentInput::SwitchProvider { provider: new, provider_kind: new_kind, model: new_model }) => {
+                Some(AgentInput::SwitchProvider {
+                    provider: new,
+                    provider_kind: new_kind,
+                    model: new_model,
+                }) => {
                     let old_kind: Arc<str> = Arc::from(current_provider_kind.as_ref());
                     let old_model: Arc<str> = Arc::from(current_model.as_ref());
                     provider = new;
                     current_provider_kind = new_kind.clone();
                     current_model = new_model.clone();
-                    let _ = events.send(AgentEvent::ProviderSwitched {
-                        old_provider_kind: old_kind,
-                        old_model,
-                        new_provider_kind: new_kind,
-                        new_model,
-                    }).await;
+                    let _ = events
+                        .send(AgentEvent::ProviderSwitched {
+                            old_provider_kind: old_kind,
+                            old_model,
+                            new_provider_kind: new_kind,
+                            new_model,
+                        })
+                        .await;
                     continue;
                 }
                 Some(input) => Action::External(input),
@@ -1074,9 +1096,7 @@ async fn run(
                         continue;
                     }
                     Err(Outcome::Error(m)) => {
-                        let _ = events
-                            .send(AgentEvent::Error { message: m })
-                            .await;
+                        let _ = events.send(AgentEvent::Error { message: m }).await;
                         let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
                         let _ = events
                             .send(AgentEvent::Done {
@@ -1166,20 +1186,28 @@ async fn run(
                     match input {
                         AgentInput::Cancel => return Outcome::Cancelled,
                         AgentInput::CancelOutstanding { .. } => {}
-                        AgentInput::SwitchProvider { provider: new, provider_kind: new_kind, model: new_model } => {
+                        AgentInput::SwitchProvider {
+                            provider: new,
+                            provider_kind: new_kind,
+                            model: new_model,
+                        } => {
                             let old_kind: Arc<str> = Arc::from(current_provider_kind.as_ref());
                             let old_model: Arc<str> = Arc::from(current_model.as_ref());
                             provider = new;
                             current_provider_kind = new_kind.clone();
                             current_model = new_model.clone();
-                            let _ = events.send(AgentEvent::ProviderSwitched {
-                                old_provider_kind: old_kind,
-                                old_model,
-                                new_provider_kind: new_kind,
-                                new_model,
-                            }).await;
+                            let _ = events
+                                .send(AgentEvent::ProviderSwitched {
+                                    old_provider_kind: old_kind,
+                                    old_model,
+                                    new_provider_kind: new_kind,
+                                    new_model,
+                                })
+                                .await;
                         }
-                        AgentInput::UserMessage(_) | AgentInput::StartAutonomous { .. } | AgentInput::MailboxMessage { .. } => {
+                        AgentInput::UserMessage(_)
+                        | AgentInput::StartAutonomous { .. }
+                        | AgentInput::MailboxMessage { .. } => {
                             queue.push_back(Action::External(input));
                         }
                     }

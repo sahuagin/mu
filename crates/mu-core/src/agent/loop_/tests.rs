@@ -266,7 +266,16 @@ fn spawn_loop(
         .collect();
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
-    let loop_ = AgentLoop::spawn(provider, Arc::from("faux"), Arc::from("faux"), tools, config, events_tx, approvals, capability);
+    let loop_ = AgentLoop::spawn(
+        provider,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        tools,
+        config,
+        events_tx,
+        approvals,
+        capability,
+    );
     (loop_, events_rx)
 }
 
@@ -449,12 +458,7 @@ async fn b6_provider_error_recoverable() {
     let mut saw_error = false;
     let mut saw_done_error = false;
     loop {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            events_rx.recv(),
-        )
-        .await
-        {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv()).await {
             Ok(Some(AgentEvent::Error { message })) if message == "rate limit" => {
                 saw_error = true;
             }
@@ -1522,7 +1526,16 @@ fn spawn_loop_with_autonomy(
     let mut cap = crate::capability::Capability::root();
     cap.autonomy = autonomy;
     let capability: SessionCapability = Arc::new(Mutex::new(cap));
-    let loop_ = AgentLoop::spawn(provider, Arc::from("faux"), Arc::from("faux"), tools, config, events_tx, approvals, capability);
+    let loop_ = AgentLoop::spawn(
+        provider,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        tools,
+        config,
+        events_tx,
+        approvals,
+        capability,
+    );
     (loop_, events_rx)
 }
 
@@ -1828,7 +1841,16 @@ fn spawn_loop_with_provider(
     let (events_tx, events_rx) = mpsc::channel(64);
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
-    let loop_ = AgentLoop::spawn(provider, Arc::from("faux"), Arc::from("faux"), vec![], config, events_tx, approvals, capability);
+    let loop_ = AgentLoop::spawn(
+        provider,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        vec![],
+        config,
+        events_tx,
+        approvals,
+        capability,
+    );
     (loop_, events_rx)
 }
 
@@ -1898,7 +1920,7 @@ async fn kgu4_evict_half_policy_fires_compaction_assembly_when_threshold_crossed
     let config = AgentConfig {
         compaction_threshold: Some(1),
         compaction_policy_override: None,
-            ..AgentConfig::default()
+        ..AgentConfig::default()
     };
     let (loop_, events_rx) = spawn_loop_with_provider(provider, config);
     loop_
@@ -1990,7 +2012,7 @@ async fn kgu4_evict_half_policy_does_not_fire_when_threshold_not_crossed() {
     let config = AgentConfig {
         compaction_threshold: Some(1_000_000),
         compaction_policy_override: None,
-            ..AgentConfig::default()
+        ..AgentConfig::default()
     };
     let (loop_, events_rx) = spawn_loop_with_provider(provider, config);
     loop_

@@ -299,7 +299,13 @@ impl Sessions {
         if let Some(log) = self.inner.lock().ok()?.get(id).map(|s| s.event_log.clone()) {
             return Some(log);
         }
-        if let Some(log) = self.workers.lock().ok()?.get(id).map(|s| s.event_log.clone()) {
+        if let Some(log) = self
+            .workers
+            .lock()
+            .ok()?
+            .get(id)
+            .map(|s| s.event_log.clone())
+        {
             return Some(log);
         }
         self.rehydrated
@@ -377,12 +383,7 @@ impl Sessions {
         &self,
         id: &str,
     ) -> Option<tokio::sync::watch::Receiver<Option<SessionStatus>>> {
-        self.inner
-            .lock()
-            .ok()?
-            .get(id)?
-            .status_watch
-            .clone()
+        self.inner.lock().ok()?.get(id)?.status_watch.clone()
     }
 
     /// Snapshot every outstanding provider call across all sessions

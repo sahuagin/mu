@@ -13,6 +13,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::mcp_status;
+use crate::menu::{InlineMenu, MenuAction, MenuItem};
 use anyhow::{anyhow, Context, Result};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
@@ -20,8 +22,6 @@ use mu_core::session_status::SessionStatus;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
-use crate::mcp_status;
-use crate::menu::{InlineMenu, MenuAction, MenuItem};
 use serde_json::Value;
 
 use crate::client::{Client, Message};
@@ -129,7 +129,10 @@ pub struct Turn {
 
 impl Turn {
     fn new(route: TurnRoute) -> Self {
-        Self { route, items: Vec::new() }
+        Self {
+            route,
+            items: Vec::new(),
+        }
     }
 
     /// Append a text delta: extend the trailing `Text` item if the last
@@ -615,8 +618,9 @@ impl App {
         };
         let preview_rows = preview.len();
 
-        let desired_height = (preview_rows as u16 + layout.lines.len() as u16 + 4 + menu_rows as u16) // +preview +separator +prompt +separator +status +info
-            .clamp(VIEWPORT_HEIGHT, MAX_VIEWPORT_HEIGHT);
+        let desired_height =
+            (preview_rows as u16 + layout.lines.len() as u16 + 4 + menu_rows as u16) // +preview +separator +prompt +separator +status +info
+                .clamp(VIEWPORT_HEIGHT, MAX_VIEWPORT_HEIGHT);
         if desired_height != vp.area().height {
             vp.set_height(desired_height)?;
         }
@@ -784,10 +788,11 @@ impl App {
                                 } else {
                                     format!("/{raw}")
                                 };
-                                let takes_arg = matches!(
-                                    cmd.as_str(),
-                                    "/btw" | "/effort" | "/provider" | "/model" | "/focus"
-                                ) || self.skills.contains_key(cmd.trim_start_matches('/'));
+                                let takes_arg =
+                                    matches!(
+                                        cmd.as_str(),
+                                        "/btw" | "/effort" | "/provider" | "/model" | "/focus"
+                                    ) || self.skills.contains_key(cmd.trim_start_matches('/'));
                                 self.prompt.clear();
                                 for c in cmd.chars() {
                                     self.prompt.insert_char(c);
@@ -1290,7 +1295,10 @@ impl App {
 
         let kind = normalize_provider_kind(&new_provider);
         let models = known_models_for(&kind);
-        let default_model = models.first().map(|s| s.to_string()).unwrap_or_else(|| self.model.clone());
+        let default_model = models
+            .first()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.model.clone());
 
         match self.send_set_route(vp, &kind, &default_model) {
             Ok(()) => {
@@ -1697,7 +1705,10 @@ impl App {
 
         let mut spans: Vec<Span<'static>> = Vec::new();
         spans.push(Span::styled(" ".to_string(), dim));
-        spans.push(Span::styled(phase_text.clone(), Style::default().fg(phase.color())));
+        spans.push(Span::styled(
+            phase_text.clone(),
+            Style::default().fg(phase.color()),
+        ));
 
         // Build metrics from MCP status or inline accumulators
         let (in_tok, out_tok, cache_read, cache_creation, cost, ctx_pct, ctx_window) =
@@ -1789,10 +1800,7 @@ impl App {
         let user = std::env::var("USER").unwrap_or_else(|_| "?".into());
         let host = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("HOST"))
-            .or_else(|_| {
-                std::fs::read_to_string("/etc/hostname")
-                    .map(|s| s.trim().to_string())
-            })
+            .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
             .unwrap_or_else(|_| {
                 // Last resort: short hostname from sysctl on FreeBSD
                 std::process::Command::new("hostname")
@@ -1942,14 +1950,20 @@ impl App {
             "session.tool_call_started" => {
                 // Titlecase + primary-arg extraction happen here (build
                 // time) so the renderer stays pure.
-                let name = params.get("tool_name").and_then(|v| v.as_str()).unwrap_or("?");
+                let name = params
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
                 let primary_arg = extract_primary_arg(name, params.get("arguments"));
                 let display_name = titlecase_tool(name);
                 let route = self.streaming_route.unwrap_or(TurnRoute::Main);
                 self.live_turn
                     .get_or_insert_with(|| Turn::new(route))
                     .items
-                    .push(render::TurnItem::ToolCall { display_name, primary_arg });
+                    .push(render::TurnItem::ToolCall {
+                        display_name,
+                        primary_arg,
+                    });
             }
             "session.tool_call_completed" => {
                 let outcome = params.get("outcome");
@@ -2220,7 +2234,6 @@ impl App {
         })?;
         Ok(())
     }
-
 }
 
 /// Extract the "primary argument" from a tool call's arguments JSON

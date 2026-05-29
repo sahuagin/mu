@@ -245,9 +245,7 @@ where
     if let Some(dir) = daemon_info.events_dir() {
         let sup_id = String::from("supervisor");
         let sup_log = Arc::new(SessionEventLog::new(sup_id.clone()));
-        let path = dir
-            .join(daemon_info.daemon_id())
-            .join("supervisor.jsonl");
+        let path = dir.join(daemon_info.daemon_id()).join("supervisor.jsonl");
         if let Err(e) = sup_log.attach_disk_writer(&path) {
             tracing::warn!(error = %e, "supervisor: could not attach disk writer");
         }

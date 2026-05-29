@@ -25,7 +25,9 @@ const ROWS: u16 = 50;
 const COLS: u16 = 120;
 
 fn main() {
-    let pot = std::env::args().nth(1).unwrap_or_else(|| "mu-slat-test".into());
+    let pot = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "mu-slat-test".into());
     let model = std::env::var("MU_SPAWN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".into());
 
     eprintln!("[probe] pot={pot} model={model}");

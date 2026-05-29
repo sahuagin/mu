@@ -323,12 +323,7 @@ pub async fn forward_events(
         // to watch subscribers on status-changing events.
         if recompute_status {
             if let Some(ref tx) = status_watch_tx {
-                let status = compute_status(
-                    &session_id,
-                    &daemon_id,
-                    &event_log,
-                    &provider_status,
-                );
+                let status = compute_status(&session_id, &daemon_id, &event_log, &provider_status);
                 let _ = tx.send(Some(status));
             }
         }

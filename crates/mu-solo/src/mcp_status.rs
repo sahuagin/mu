@@ -23,10 +23,7 @@ impl ClientHandler for StatusHandler {
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         let method = notification.method.clone();
         let status = if method == "mu/session_status" {
-            notification
-                .params_as::<SessionStatus>()
-                .ok()
-                .flatten()
+            notification.params_as::<SessionStatus>().ok().flatten()
         } else {
             None
         };
@@ -100,9 +97,11 @@ async fn run_subscriber(
     let handler = StatusHandler { tx };
     let running = handler.serve((reader, writer)).await?;
 
-    running.subscribe(SubscribeRequestParams::new(format!(
-        "mu://session/{session_id}/status"
-    ))).await?;
+    running
+        .subscribe(SubscribeRequestParams::new(format!(
+            "mu://session/{session_id}/status"
+        )))
+        .await?;
 
     debug!(session_id, "MCP status subscription active");
 

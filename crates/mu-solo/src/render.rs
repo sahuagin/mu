@@ -126,7 +126,10 @@ pub enum TurnItem {
     /// Streamed assistant prose. Appended-to in place as deltas arrive.
     Text(String),
     /// A model tool call: `● Name(primary_arg)`.
-    ToolCall { display_name: String, primary_arg: String },
+    ToolCall {
+        display_name: String,
+        primary_arg: String,
+    },
     /// A tool result. `kind` is the outcome kind ("ok" | "err" | other);
     /// `text` is the result body (ok) or message (err).
     ToolResult { kind: String, text: String },
@@ -154,7 +157,12 @@ pub fn render_turn(
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )));
     for item in items {
-        out.extend(render_turn_item(item, color, wrap_width, tool_preview_lines));
+        out.extend(render_turn_item(
+            item,
+            color,
+            wrap_width,
+            tool_preview_lines,
+        ));
     }
     out
 }
@@ -190,15 +198,20 @@ pub fn render_turn_item(
             }
             lines
         }
-        TurnItem::ToolCall { display_name, primary_arg } => {
+        TurnItem::ToolCall {
+            display_name,
+            primary_arg,
+        } => {
             let header_text = if primary_arg.is_empty() {
                 format!("● {display_name}")
             } else {
                 // "│ ● Name()" overhead = display_name.len() + 5.
                 let max_arg_len = wrap_width.saturating_sub(display_name.len() + 5);
                 let arg = if primary_arg.chars().count() > max_arg_len {
-                    let short: String =
-                        primary_arg.chars().take(max_arg_len.saturating_sub(1)).collect();
+                    let short: String = primary_arg
+                        .chars()
+                        .take(max_arg_len.saturating_sub(1))
+                        .collect();
                     format!("{short}…")
                 } else {
                     primary_arg.clone()
@@ -209,7 +222,9 @@ pub fn render_turn_item(
                 Span::styled("│ ", Style::default().fg(color)),
                 Span::styled(
                     header_text,
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ])]
         }
@@ -220,7 +235,10 @@ pub fn render_turn_item(
             let short: String = msg.chars().take(400).collect();
             vec![Line::from(vec![
                 Span::styled("│ ", Style::default().fg(color)),
-                Span::styled("× ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "× ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(short, Style::default().fg(Color::Red)),
             ])]
         }
@@ -242,7 +260,10 @@ fn render_tool_result(
     match kind {
         "ok" if text.is_empty() => vec![Line::from(vec![
             Span::styled(indent.to_string(), bar_style),
-            Span::styled("⎿  (no output)".to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "⎿  (no output)".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
         ])],
         "ok" => {
             let all: Vec<&str> = text.lines().collect();
@@ -252,7 +273,11 @@ fn render_tool_result(
             let mut out: Vec<Line<'static>> = Vec::new();
             for (i, &tl) in all.iter().take(show).enumerate() {
                 let truncated: String = tl.chars().take(max_w).collect();
-                let prefix = if i == 0 { format!("{indent}⎿  ") } else { format!("{indent}   ") };
+                let prefix = if i == 0 {
+                    format!("{indent}⎿  ")
+                } else {
+                    format!("{indent}   ")
+                };
                 use ansi_to_tui::IntoText;
                 let styled = truncated
                     .clone()
@@ -276,7 +301,11 @@ fn render_tool_result(
             out
         }
         "err" => {
-            let msg = if text.is_empty() { "(unknown error)" } else { text };
+            let msg = if text.is_empty() {
+                "(unknown error)"
+            } else {
+                text
+            };
             let all: Vec<&str> = msg.lines().collect();
             let total = all.len();
             let show = total.min(preview_lines);
@@ -284,7 +313,11 @@ fn render_tool_result(
             let mut out: Vec<Line<'static>> = Vec::new();
             for (i, &tl) in all.iter().take(show).enumerate() {
                 let truncated: String = tl.chars().take(max_w).collect();
-                let prefix = if i == 0 { format!("{indent}⎿  ") } else { format!("{indent}   ") };
+                let prefix = if i == 0 {
+                    format!("{indent}⎿  ")
+                } else {
+                    format!("{indent}   ")
+                };
                 out.push(Line::from(vec![
                     Span::styled(prefix, bar_style),
                     Span::styled(truncated, Style::default().fg(Color::Red)),
@@ -303,7 +336,10 @@ fn render_tool_result(
         }
         other => vec![Line::from(vec![
             Span::styled(indent.to_string(), bar_style),
-            Span::styled(format!("⎿  ({other})"), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("⎿  ({other})"),
+                Style::default().fg(Color::DarkGray),
+            ),
         ])],
     }
 }
@@ -364,7 +400,12 @@ mod tests {
     fn plain(lines: &[Line<'static>]) -> Vec<String> {
         lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
             .collect()
     }
 
@@ -391,9 +432,15 @@ mod tests {
 
     #[test]
     fn render_tool_result_ok_bounds_and_overflow_marker() {
-        let body = (1..=10).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        let body = (1..=10)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let lines = render_turn_item(
-            &TurnItem::ToolResult { kind: "ok".into(), text: body },
+            &TurnItem::ToolResult {
+                kind: "ok".into(),
+                text: body,
+            },
             Color::White,
             80,
             4,
@@ -407,7 +454,10 @@ mod tests {
     #[test]
     fn render_tool_result_no_output() {
         let lines = render_turn_item(
-            &TurnItem::ToolResult { kind: "ok".into(), text: String::new() },
+            &TurnItem::ToolResult {
+                kind: "ok".into(),
+                text: String::new(),
+            },
             Color::White,
             80,
             4,
@@ -424,14 +474,23 @@ mod tests {
 
     #[test]
     fn tail_truncate_passthrough_when_short() {
-        let full = render_turn("assistant", Color::White, &[TurnItem::Text("a\nb".into())], 80, 4);
+        let full = render_turn(
+            "assistant",
+            Color::White,
+            &[TurnItem::Text("a\nb".into())],
+            80,
+            4,
+        );
         let truncated = tail_truncate(full.clone(), 50);
         assert_eq!(plain(&full), plain(&truncated));
     }
 
     #[test]
     fn tail_truncate_keeps_tail_with_marker() {
-        let body = (1..=20).map(|n| format!("row {n}")).collect::<Vec<_>>().join("\n");
+        let body = (1..=20)
+            .map(|n| format!("row {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let full = render_turn("assistant", Color::White, &[TurnItem::Text(body)], 80, 4);
         let max_rows = 6;
         let truncated = tail_truncate(full.clone(), max_rows);

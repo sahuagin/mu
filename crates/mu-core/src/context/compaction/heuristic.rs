@@ -229,9 +229,7 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
                 );
                 // Drop trailing tool cluster if present.
                 let mut j = i + 1;
-                while j < n
-                    && matches!(spans[j].kind, SpanKind::ToolCall | SpanKind::ToolResult)
-                {
+                while j < n && matches!(spans[j].kind, SpanKind::ToolCall | SpanKind::ToolResult) {
                     record_drop(
                         j,
                         "tool cluster orphaned by assistant drop",
@@ -426,12 +424,20 @@ mod tests {
         let rope = RetainedRope::from_spans(vec![
             span("sys", SpanKind::System, "system prompt"),
             span("u1", SpanKind::User, "hello"),
-            span("a1_tools", SpanKind::Assistant, "[tool_call:bash({cmd:pwd})]"),
+            span(
+                "a1_tools",
+                SpanKind::Assistant,
+                "[tool_call:bash({cmd:pwd})]",
+            ),
             span("tc1", SpanKind::ToolCall, "bash pwd"),
             span("tr1", SpanKind::ToolResult, "/home/user"),
             span("a2_text", SpanKind::Assistant, "You are in /home/user"),
             span("u2", SpanKind::User, "do more stuff"),
-            span("a3_tools", SpanKind::Assistant, "[tool_call:read({path:f})]"),
+            span(
+                "a3_tools",
+                SpanKind::Assistant,
+                "[tool_call:read({path:f})]",
+            ),
             span("tc2", SpanKind::ToolCall, "read f"),
             span("tr2", SpanKind::ToolResult, "file contents here"),
             span("a4_text", SpanKind::Assistant, "The file contains..."),
@@ -447,7 +453,10 @@ mod tests {
                 // The next span must be a ToolCall/ToolResult cluster.
                 let next = r.rope.spans().get(i + 1);
                 assert!(
-                    next.is_some_and(|n| matches!(n.kind, SpanKind::ToolCall | SpanKind::ToolResult)),
+                    next.is_some_and(|n| matches!(
+                        n.kind,
+                        SpanKind::ToolCall | SpanKind::ToolResult
+                    )),
                     "Assistant span {:?} has tool_use but no following tool cluster — \
                      this would cause a provider 400 error. Survivors: {:?}",
                     s.id(),

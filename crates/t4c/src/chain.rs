@@ -152,7 +152,7 @@ impl RegistrySource for ChainSource {
         "chains"
     }
     fn capabilities(&self) -> Result<Vec<Capability>> {
-        let (caps, _tombstones) = resolve_chains(&self.chains, |cmd| crate::catalog::which(cmd))?;
+        let (caps, _tombstones) = resolve_chains(&self.chains, crate::catalog::which)?;
         Ok(caps)
     }
 }
@@ -172,12 +172,19 @@ mod tests {
 
     #[test]
     fn resolve_first_installed_wins_rest_superseded() {
-        let (cap, states) = chain("bash.search", &["rg", "grep"]).resolve(|_| true).unwrap();
+        let (cap, states) = chain("bash.search", &["rg", "grep"])
+            .resolve(|_| true)
+            .unwrap();
         let cap = cap.unwrap();
         assert_eq!(cap.path.to_string(), "bash.search");
         assert_eq!(cap.invoke, vec!["rg".to_string()]); // preferred impl, addressed by familiar slot
         assert_eq!(states[0].state, ImplState::Active);
-        assert_eq!(states[1].state, ImplState::Superseded { behind: "rg".to_string() });
+        assert_eq!(
+            states[1].state,
+            ImplState::Superseded {
+                behind: "rg".to_string()
+            }
+        );
     }
 
     #[test]
@@ -193,7 +200,9 @@ mod tests {
 
     #[test]
     fn resolve_none_installed_no_winner() {
-        let (cap, states) = chain("bash.compress", &["zstd", "xz"]).resolve(|_| false).unwrap();
+        let (cap, states) = chain("bash.compress", &["zstd", "xz"])
+            .resolve(|_| false)
+            .unwrap();
         assert!(cap.is_none());
         assert!(states.iter().all(|r| r.state == ImplState::Absent));
     }

@@ -14,7 +14,14 @@ use crate::source::RegistrySource;
 use anyhow::Result;
 use std::path::Path;
 
-fn cap(path: &str, summary: &str, kw: &[&str], invoke: &[&str], help: &[&str], ai: bool) -> Capability {
+fn cap(
+    path: &str,
+    summary: &str,
+    kw: &[&str],
+    invoke: &[&str],
+    help: &[&str],
+    ai: bool,
+) -> Capability {
     Capability {
         path: CapPath::parse(path).expect("curated catalog path is valid"),
         summary: summary.to_string(),
@@ -109,7 +116,15 @@ pub fn default_chains() -> Vec<Chain> {
         ch(
             "bash.find-files",
             "find files and directories by name or glob",
-            &["find", "file", "filename", "path", "glob", "locate", "directory"],
+            &[
+                "find",
+                "file",
+                "filename",
+                "path",
+                "glob",
+                "locate",
+                "directory",
+            ],
             &["fd", "find"],
         ),
         ch(

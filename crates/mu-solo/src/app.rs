@@ -559,11 +559,10 @@ impl App {
                 // Keyboard / paste events
                 maybe_event = event_stream.next() => {
                     match maybe_event {
-                        Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                            if self.handle_key(&mut vp, key)? {
+                        Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press
+                            && self.handle_key(&mut vp, key)? => {
                                 break;
                             }
-                        }
                         Some(Ok(Event::Paste(text))) => {
                             self.paste_count += 1;
                             self.prompt.insert_paste(&text, self.paste_count);

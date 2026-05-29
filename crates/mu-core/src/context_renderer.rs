@@ -216,8 +216,8 @@ fn render_region_tree(out: &mut String, attr: &ContextAttribution, w: usize, tot
         .saturating_sub(pct_col_width)
         .max(5);
 
-    let total_for_pct = if attr.window_max.is_some() {
-        attr.window_max.unwrap()
+    let total_for_pct = if let Some(window_max) = attr.window_max {
+        window_max
     } else {
         total_input.max(1)
     };
@@ -277,6 +277,7 @@ fn render_region_tree(out: &mut String, attr: &ContextAttribution, w: usize, tot
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_region_line(
     out: &mut String,
     prefix: &str,

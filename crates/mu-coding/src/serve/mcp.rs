@@ -16,6 +16,10 @@
 //!   mu/session_status — pushes full SessionStatus inline on change
 //!     (subscribers don't need to re-read after resource_updated)
 
+// rmcp's ServerHandler trait wants `impl Future` return types in several
+// places, so these can't all become `async fn` without fighting the SDK shape.
+#![allow(clippy::manual_async_fn)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -274,7 +278,7 @@ impl ServerHandler for MuMcpHandler {
                                         ServerNotification::ResourceUpdatedNotification(
                                             ResourceUpdatedNotification::new(
                                                 ResourceUpdatedNotificationParam {
-                                                    uri: uri_clone.clone().into(),
+                                                    uri: uri_clone.clone(),
                                                 },
                                             ),
                                         ),

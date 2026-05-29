@@ -299,7 +299,6 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             project_context,
             compaction_threshold: Some(compaction_cfg.trigger_threshold_tokens),
             compaction_policy_override,
-            ..AgentConfig::default()
         },
         events_tx,
         pending_approvals.clone(),

@@ -104,10 +104,8 @@ pub fn attribute(events: &[SessionEvent]) -> ContextAttribution {
                 provider_kind,
                 model,
                 ..
-            } => {
-                if provider_model.is_none() {
-                    provider_model = Some((provider_kind.clone(), model.clone()));
-                }
+            } if provider_model.is_none() => {
+                provider_model = Some((provider_kind.clone(), model.clone()));
             }
 
             EventPayload::UserMessage { .. } => {
@@ -155,18 +153,16 @@ pub fn attribute(events: &[SessionEvent]) -> ContextAttribution {
                 current_assembly_id = Some(*model_call_id);
             }
 
-            EventPayload::Done { usage, .. } => {
-                if let Some(u) = usage {
-                    total_input += u.input_tokens;
-                    total_output += u.output_tokens;
-                    cache_read += u.cache_read_input_tokens.unwrap_or(0);
-                    cache_creation += u.cache_creation_input_tokens.unwrap_or(0);
+            EventPayload::Done { usage: Some(u), .. } => {
+                total_input += u.input_tokens;
+                total_output += u.output_tokens;
+                cache_read += u.cache_read_input_tokens.unwrap_or(0);
+                cache_creation += u.cache_creation_input_tokens.unwrap_or(0);
 
-                    // Pair with the most recent unpaired ContextAssembly.
-                    if let Some(ca_id) = current_assembly_id.take() {
-                        if let Some(attr) = assemblies.get_mut(&ca_id) {
-                            attr.usage = Some(*u);
-                        }
+                // Pair with the most recent unpaired ContextAssembly.
+                if let Some(ca_id) = current_assembly_id.take() {
+                    if let Some(attr) = assemblies.get_mut(&ca_id) {
+                        attr.usage = Some(*u);
                     }
                 }
             }
@@ -220,7 +216,7 @@ pub fn attribute(events: &[SessionEvent]) -> ContextAttribution {
 
     // Sort tool attribution by call count descending for "top consumers."
     let mut tool_attribution: Vec<ToolAttribution> = tool_stats.into_values().collect();
-    tool_attribution.sort_by(|a, b| b.call_count.cmp(&a.call_count));
+    tool_attribution.sort_by_key(|t| std::cmp::Reverse(t.call_count));
 
     ContextAttribution {
         window_max: None,

@@ -201,13 +201,12 @@ pub async fn handle_mailbox_post(
     // loop, inject a MailboxMessage input so the LLM wakes up and
     // processes the message. No polling needed — the post IS the trigger.
     if let Some(tx) = sessions.input_sender(&params.to_session_id) {
-        let _ = tx
-            .try_send(mu_core::agent::AgentInput::MailboxMessage {
-                from_session_id: params.from.session_id.clone(),
-                message_kind: params.kind.clone(),
-                subject: params.subject.clone(),
-                seq,
-            });
+        let _ = tx.try_send(mu_core::agent::AgentInput::MailboxMessage {
+            from_session_id: params.from.session_id.clone(),
+            message_kind: params.kind.clone(),
+            subject: params.subject.clone(),
+            seq,
+        });
     }
 
     // mu-slat Phase 3: if the SENDER is a pot worker reporting its

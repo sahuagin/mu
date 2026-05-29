@@ -32,6 +32,7 @@ pub mod protocol;
 pub mod route_catalog;
 pub mod session_status;
 pub mod skill;
+pub mod t4c_source; // mu-kex4.6 phase 3: project tools+skills into t4c's RegistrySource
 pub mod tool_registry;
 pub mod transport;
 pub mod usage_history;

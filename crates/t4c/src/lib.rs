@@ -26,6 +26,7 @@
 
 pub mod capability;
 pub mod catalog;
+pub mod chain;
 pub mod cli;
 pub mod helpai;
 pub mod path;
@@ -35,6 +36,7 @@ pub mod source;
 
 pub use capability::{Capability, HelpAiDoc, HelpSpec};
 pub use catalog::EnvCatalogSource;
+pub use chain::Chain;
 pub use path::CapPath;
 pub use rank::{LexicalRanker, Ranked, Ranker};
 pub use registry::{Registry, Tree};

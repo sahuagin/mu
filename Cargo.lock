@@ -2390,6 +2390,7 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",
@@ -2933,6 +2934,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "reqwest",
  "serde",
  "serde_json",
  "toml",

@@ -2928,6 +2928,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "t4c"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+]
+
+[[package]]
 name = "target-lexicon"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

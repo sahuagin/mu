@@ -13,6 +13,9 @@
 //! semantic ranker, never folded together. The author's only per-group judgment
 //! is "synonyms, or neighbors?"
 
+use crate::capability::{Capability, HelpSpec};
+use crate::path::CapPath;
+use crate::source::RegistrySource;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -46,9 +49,172 @@ pub fn parse_chains(text: &str) -> Result<Vec<Chain>> {
     Ok(file.chain)
 }
 
+/// State of a chain impl after resolution against the environment — the
+/// 3-state tombstone model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImplState {
+    /// Installed and preferred — this impl wins the slot.
+    Active,
+    /// Installed, but a more-preferred impl already won the slot.
+    Superseded { behind: String },
+    /// Not installed.
+    Absent,
+}
+
+/// One chain impl after resolution: its slot, command, and state. Active impls
+/// become [`Capability`] nodes; Superseded/Absent are tombstones that `list`
+/// surfaces but `find` never ranks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    pub slot: String,
+    pub impl_cmd: String,
+    pub state: ImplState,
+}
+
+impl Chain {
+    /// Resolve against an availability predicate. The first installed impl is
+    /// [`ImplState::Active`] and becomes the slot's [`Capability`] (path = the
+    /// familiar slot, invoke = the preferred impl); later installed impls are
+    /// [`ImplState::Superseded`]; uninstalled impls are [`ImplState::Absent`].
+    pub fn resolve<F: Fn(&str) -> bool>(
+        &self,
+        installed: F,
+    ) -> Result<(Option<Capability>, Vec<Resolved>)> {
+        let mut states = Vec::with_capacity(self.impls.len());
+        let mut winner: Option<String> = None;
+        for cmd in &self.impls {
+            let state = if !installed(cmd) {
+                ImplState::Absent
+            } else if let Some(w) = &winner {
+                ImplState::Superseded { behind: w.clone() }
+            } else {
+                winner = Some(cmd.clone());
+                ImplState::Active
+            };
+            states.push(Resolved {
+                slot: self.slot.clone(),
+                impl_cmd: cmd.clone(),
+                state,
+            });
+        }
+        let cap = match &winner {
+            Some(cmd) => Some(Capability {
+                path: CapPath::parse(&self.slot)
+                    .with_context(|| format!("chain slot {:?} is not a valid path", self.slot))?,
+                summary: self.summary.clone(),
+                keywords: self.keywords.clone(),
+                invoke: vec![cmd.clone()],
+                help: Some(HelpSpec {
+                    argv: vec![cmd.clone(), "--help".to_string()],
+                    ai: false,
+                }),
+                requires: vec![],
+            }),
+            None => None,
+        };
+        Ok((cap, states))
+    }
+}
+
+/// Resolve a set of chains: returns the active winner capabilities and the full
+/// per-impl resolution (for `list`'s 3-state view).
+pub fn resolve_chains<F: Fn(&str) -> bool + Copy>(
+    chains: &[Chain],
+    installed: F,
+) -> Result<(Vec<Capability>, Vec<Resolved>)> {
+    let mut caps = Vec::new();
+    let mut all = Vec::new();
+    for chain in chains {
+        let (cap, states) = chain.resolve(installed)?;
+        if let Some(c) = cap {
+            caps.push(c);
+        }
+        all.extend(states);
+    }
+    Ok((caps, all))
+}
+
+/// A [`RegistrySource`] backed by preference chains: yields the active winner of
+/// each chain (resolved against `$PATH`). Superseded/absent impls are NOT emitted
+/// into the tree — they are tombstones, surfaced only by `list`.
+pub struct ChainSource {
+    chains: Vec<Chain>,
+}
+
+impl ChainSource {
+    pub fn new(chains: Vec<Chain>) -> Self {
+        Self { chains }
+    }
+}
+
+impl RegistrySource for ChainSource {
+    fn name(&self) -> &str {
+        "chains"
+    }
+    fn capabilities(&self) -> Result<Vec<Capability>> {
+        let (caps, _tombstones) = resolve_chains(&self.chains, |cmd| crate::catalog::which(cmd))?;
+        Ok(caps)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chain(slot: &str, impls: &[&str]) -> Chain {
+        Chain {
+            slot: slot.to_string(),
+            summary: String::new(),
+            keywords: vec![],
+            impls: impls.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn resolve_first_installed_wins_rest_superseded() {
+        let (cap, states) = chain("bash.search", &["rg", "grep"]).resolve(|_| true).unwrap();
+        let cap = cap.unwrap();
+        assert_eq!(cap.path.to_string(), "bash.search");
+        assert_eq!(cap.invoke, vec!["rg".to_string()]); // preferred impl, addressed by familiar slot
+        assert_eq!(states[0].state, ImplState::Active);
+        assert_eq!(states[1].state, ImplState::Superseded { behind: "rg".to_string() });
+    }
+
+    #[test]
+    fn resolve_skips_absent_to_next_installed() {
+        let (cap, states) = chain("bash.ls", &["eza", "exa", "ls"])
+            .resolve(|cmd| cmd == "ls")
+            .unwrap();
+        assert_eq!(cap.unwrap().invoke, vec!["ls".to_string()]);
+        assert_eq!(states[0].state, ImplState::Absent);
+        assert_eq!(states[1].state, ImplState::Absent);
+        assert_eq!(states[2].state, ImplState::Active);
+    }
+
+    #[test]
+    fn resolve_none_installed_no_winner() {
+        let (cap, states) = chain("bash.compress", &["zstd", "xz"]).resolve(|_| false).unwrap();
+        assert!(cap.is_none());
+        assert!(states.iter().all(|r| r.state == ImplState::Absent));
+    }
+
+    #[test]
+    fn resolve_chains_collects_winners_and_tombstones() {
+        let chains = vec![
+            chain("bash.search", &["rg", "grep"]),
+            chain("bash.ls", &["eza", "ls"]),
+        ];
+        let (caps, all) = resolve_chains(&chains, |cmd| cmd != "eza").unwrap();
+        assert_eq!(caps.len(), 2);
+        assert_eq!(all.len(), 4);
+        let superseded = all
+            .iter()
+            .filter(|r| matches!(r.state, ImplState::Superseded { .. }))
+            .count();
+        let absent = all.iter().filter(|r| r.state == ImplState::Absent).count();
+        assert_eq!(superseded, 1); // grep behind rg
+        assert_eq!(absent, 1); // eza absent
+    }
 
     #[test]
     fn parses_chains_with_defaults() {

@@ -10,7 +10,7 @@
 use crate::capability::Capability;
 use crate::catalog;
 use crate::path::CapPath;
-use crate::rank::{LexicalRanker, Ranker};
+use crate::rank::{LexicalRanker, Ranked, Ranker};
 use crate::registry::{Registry, Tree};
 use crate::source::TomlConfigSource;
 use anyhow::{Context, Result};
@@ -149,6 +149,51 @@ fn config_path() -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(".config/t4c/registry.toml"))
 }
 
+/// Where the catalog vector cache lives (`$T4C_VECTORS` or `~/.cache/t4c/vectors.json`).
+fn vectors_path() -> PathBuf {
+    if let Ok(p) = std::env::var("T4C_VECTORS") {
+        return PathBuf::from(p);
+    }
+    std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".cache/t4c/vectors.json"))
+        .unwrap_or_else(|_| PathBuf::from("vectors.json"))
+}
+
+/// Rank with semantic embeddings when a vector cache AND a live embedder are both
+/// available; otherwise lexical. `find` never re-embeds the catalog — the cache
+/// was built at `discover`; only the intent is embedded here (one call).
+fn rank_caps<'a>(intent: &str, caps: &[&'a Capability]) -> Vec<Ranked<'a>> {
+    if let Ok(cache) = crate::semantic::VectorCache::load(&vectors_path()) {
+        if let Ok(emb) = crate::embedder::ConfigEmbedder::from_config() {
+            return crate::semantic::SemanticRanker::new(emb, cache.by_path).rank(intent, caps);
+        }
+    }
+    LexicalRanker.rank(intent, caps)
+}
+
+/// Embed the active catalog and persist the vector cache (the compile step for
+/// semantic `find`). Returns the cache path if written; `None` if no embedder is
+/// configured or the endpoint is unreachable (find then stays lexical — the live
+/// endpoint is the mu-d2iy.6 gate).
+fn build_vector_cache() -> Result<Option<PathBuf>> {
+    let emb = match crate::embedder::ConfigEmbedder::from_config() {
+        Ok(e) => e,
+        Err(_) => return Ok(None),
+    };
+    let tree = build_registry().build()?;
+    let caps: Vec<&Capability> = tree.all().collect();
+    let model = std::env::var("T4C_EMBED_MODEL")
+        .unwrap_or_else(|_| crate::embedder::ConfigEmbedder::DEFAULT_MODEL.to_string());
+    match crate::semantic::VectorCache::build(&emb, &model, &caps) {
+        Ok(cache) => {
+            let path = vectors_path();
+            cache.save(&path)?;
+            Ok(Some(path))
+        }
+        Err(_) => Ok(None), // endpoint down/wrong — the gate fixes the endpoint
+    }
+}
+
 /// `list` — preference chains resolved 3-state (active / superseded / absent),
 /// plus the distinct catalog (installed / absent). Unlike `walk`, which shows
 /// only the live installed tree.
@@ -245,6 +290,11 @@ fn do_discover(json: bool, dry_run: bool) -> Result<i32> {
     } else {
         Some(write_registry(&present)?)
     };
+    let cache_wrote = if dry_run {
+        None
+    } else {
+        build_vector_cache().unwrap_or(None)
+    };
 
     if json {
         #[derive(Serialize)]
@@ -279,6 +329,13 @@ fn do_discover(json: bool, dry_run: bool) -> Result<i32> {
     match &wrote {
         Some(p) => println!("\nwrote self-configured registry: {}", p.display()),
         None => println!("\n(dry-run — no registry written)"),
+    }
+    if dry_run {
+        println!("(dry-run — vector cache not built)");
+    } else if let Some(p) = &cache_wrote {
+        println!("embedded + cached catalog vectors: {}", p.display());
+    } else {
+        println!("(no live embedder/endpoint — semantic find disabled; lexical fallback)");
     }
     Ok(0)
 }
@@ -361,7 +418,7 @@ struct HelpPtr {
 
 fn do_find(tree: &Tree, intent: &str, json: bool) -> Result<i32> {
     let caps: Vec<&Capability> = tree.all().collect();
-    let ranked = LexicalRanker.rank(intent, &caps);
+    let ranked = rank_caps(intent, &caps);
     let hits: Vec<Hit> = ranked
         .iter()
         .take(8)

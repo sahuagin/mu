@@ -456,6 +456,10 @@ async fn b6_provider_error_recoverable() {
 
     // Drain events until we see Done from the error recovery.
     let mut saw_error = false;
+    // The loop's only non-panic exit is the Done(Error) break below, which sets
+    // this true first, so the `false` init is always overwritten before the
+    // assert reads it. Kept for the documenting assert.
+    #[allow(unused_assignments)]
     let mut saw_done_error = false;
     loop {
         match tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv()).await {

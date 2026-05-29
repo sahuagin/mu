@@ -101,7 +101,9 @@ pub enum BareAction {
 /// after an exact path redirect to help (meta-ops are flags, not path segments).
 pub fn route_bare(tree: &Tree, tokens: &[String]) -> BareAction {
     let Some((first, rest)) = tokens.split_first() else {
-        return BareAction::Find { intent: String::new() };
+        return BareAction::Find {
+            intent: String::new(),
+        };
     };
     let wants_help = rest.iter().any(|t| t == "--help-ai" || t == "--help");
     let wants_schema = rest.iter().any(|t| t == "--schema");
@@ -137,7 +139,9 @@ pub fn route_bare(tree: &Tree, tokens: &[String]) -> BareAction {
 pub fn build_registry() -> Registry {
     let mut reg = Registry::new();
     reg.add_source(Box::new(catalog::EnvCatalogSource));
-    reg.add_source(Box::new(crate::chain::ChainSource::new(catalog::default_chains())));
+    reg.add_source(Box::new(crate::chain::ChainSource::new(
+        catalog::default_chains(),
+    )));
     if let Some(cfg) = config_path() {
         if cfg.exists() {
             reg.add_source(Box::new(TomlConfigSource::new(cfg)));
@@ -205,7 +209,7 @@ fn build_vector_cache() -> Result<Option<PathBuf>> {
 /// only the live installed tree.
 fn do_list(json: bool) -> Result<i32> {
     let chains = catalog::default_chains();
-    let (_winners, resolved) = crate::chain::resolve_chains(&chains, |c| catalog::which(c))?;
+    let (_winners, resolved) = crate::chain::resolve_chains(&chains, catalog::which)?;
     let curated = catalog::curated();
 
     if json {
@@ -276,7 +280,11 @@ fn do_list(json: bool) -> Result<i32> {
     }
     println!("\ncatalog (distinct tools):");
     for c in &curated {
-        let mark = if catalog::is_installed(c) { "✓" } else { "·" };
+        let mark = if catalog::is_installed(c) {
+            "✓"
+        } else {
+            "·"
+        };
         println!("  {mark} {:<26} {}", c.path.to_string(), c.summary);
     }
     println!("\n(✓ active/installed  ⊘ superseded  · absent — `t4c discover` to persist)");
@@ -288,8 +296,9 @@ fn do_list(json: bool) -> Result<i32> {
 /// `--help-ai` is deliberately deferred to the first `help` call, not done here,
 /// so discovery never spawns N subprocesses just to enumerate.
 fn do_discover(json: bool, dry_run: bool) -> Result<i32> {
-    let (present, absent): (Vec<Capability>, Vec<Capability>) =
-        catalog::curated().into_iter().partition(catalog::is_installed);
+    let (present, absent): (Vec<Capability>, Vec<Capability>) = catalog::curated()
+        .into_iter()
+        .partition(catalog::is_installed);
 
     let wrote = if dry_run {
         None
@@ -330,7 +339,11 @@ fn do_discover(json: bool, dry_run: bool) -> Result<i32> {
         println!("  ✓ {:<28} {}", c.path.to_string(), c.summary);
     }
     for c in &absent {
-        println!("  · {:<28} {}  (not installed)", c.path.to_string(), c.summary);
+        println!(
+            "  · {:<28} {}  (not installed)",
+            c.path.to_string(),
+            c.summary
+        );
     }
     match &wrote {
         Some(p) => println!("\nwrote self-configured registry: {}", p.display()),
@@ -367,7 +380,11 @@ fn do_bench(json: bool, fake: bool) -> Result<i32> {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(0);
     }
-    let kind = if fake { "fake (deterministic baseline)" } else { "live embedder" };
+    let kind = if fake {
+        "fake (deterministic baseline)"
+    } else {
+        "live embedder"
+    };
     println!(
         "find benchmark [{kind}]: {}/{} correct\n",
         report.passed, report.total
@@ -377,7 +394,10 @@ fn do_bench(json: bool, fake: bool) -> Result<i32> {
         if r.ok {
             println!("  {mark} {:<46} -> {}", r.intent, r.got);
         } else {
-            println!("  {mark} {:<46} -> {}  (expected {})", r.intent, r.got, r.expect);
+            println!(
+                "  {mark} {:<46} -> {}  (expected {})",
+                r.intent, r.got, r.expect
+            );
         }
     }
     Ok(if report.passed == report.total { 0 } else { 1 })
@@ -420,7 +440,9 @@ pub fn run(cli: Cli) -> Result<i32> {
         Some(Cmd::Bare(tokens)) => match route_bare(&tree, &tokens) {
             BareAction::Run { path, args } => do_run(&tree, &path.to_string(), &args),
             BareAction::Walk { prefix } => do_walk(&tree, Some(&prefix.to_string()), cli.json),
-            BareAction::Help { path, schema } => do_help(&tree, &path.to_string(), false, schema, cli.json),
+            BareAction::Help { path, schema } => {
+                do_help(&tree, &path.to_string(), false, schema, cli.json)
+            }
             BareAction::Find { intent } => do_find(&tree, &intent, cli.json),
         },
     }
@@ -761,7 +783,9 @@ mod tests {
     #[test]
     fn catalog_builds_into_tree() {
         let t = tree();
-        assert!(t.get(&CapPath::parse("mcp.code-index.recall").unwrap()).is_some());
+        assert!(t
+            .get(&CapPath::parse("mcp.code-index.recall").unwrap())
+            .is_some());
         assert!(t.walk(&CapPath::parse("bash").unwrap()).len() >= 4);
         assert!(t.get(&CapPath::parse("bash.jq").unwrap()).is_some());
     }

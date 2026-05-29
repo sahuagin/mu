@@ -608,6 +608,7 @@ impl AgentLoop {
     /// daemon's dispatch handler for `session.respond_to_input_required`
     /// is responsible for taking the oneshot out and sending the
     /// decision.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         provider: Arc<dyn Provider>,
         provider_kind: Arc<str>,
@@ -666,6 +667,7 @@ impl AgentLoop {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     mut provider: Arc<dyn Provider>,
     mut current_provider_kind: Arc<str>,

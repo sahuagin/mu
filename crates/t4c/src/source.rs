@@ -86,7 +86,10 @@ impl TomlConfigSource {
                 summary: c.summary,
                 keywords: c.keywords,
                 invoke,
-                help: c.help.map(|h| HelpSpec { argv: h.argv, ai: h.ai }),
+                help: c.help.map(|h| HelpSpec {
+                    argv: h.argv,
+                    ai: h.ai,
+                }),
                 requires: c.requires,
             });
         }

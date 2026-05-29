@@ -11,9 +11,9 @@ use crate::capability::Capability;
 /// ranks on "jj"/"status", not on "where"/"is"/"the". (Ported from the t4c
 /// prototype, which found that framing words otherwise dominate the score.)
 const STOPWORDS: &[&str] = &[
-    "find", "where", "search", "look", "locate", "show", "get", "a", "an",
-    "the", "is", "are", "was", "in", "on", "of", "for", "to", "this", "that",
-    "how", "do", "i", "me", "my", "want", "need", "with", "it", "and",
+    "find", "where", "search", "look", "locate", "show", "get", "a", "an", "the", "is", "are",
+    "was", "in", "on", "of", "for", "to", "this", "that", "how", "do", "i", "me", "my", "want",
+    "need", "with", "it", "and",
 ];
 
 /// A capability with its relevance score for some intent.
@@ -45,8 +45,12 @@ impl LexicalRanker {
     /// Lowercased match terms for a capability: its path segments, summary
     /// words, and explicit keywords.
     fn haystack(cap: &Capability) -> Vec<String> {
-        let mut words: Vec<String> =
-            cap.path.segments().iter().map(|s| s.to_lowercase()).collect();
+        let mut words: Vec<String> = cap
+            .path
+            .segments()
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
         words.extend(cap.summary.split_whitespace().map(normalize));
         words.extend(cap.keywords.iter().map(|k| k.to_lowercase()));
         words.retain(|w| !w.is_empty());
@@ -78,7 +82,8 @@ impl Ranker for LexicalRanker {
 
 /// Lowercase and strip surrounding non-alphanumerics from a token.
 fn normalize(tok: &str) -> String {
-    tok.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()
+    tok.trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase()
 }
 
 #[cfg(test)]

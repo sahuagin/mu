@@ -27,6 +27,7 @@
 pub mod capability;
 pub mod catalog;
 pub mod cli;
+pub mod helpai;
 pub mod path;
 pub mod rank;
 pub mod registry;

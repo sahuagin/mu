@@ -99,6 +99,14 @@ pub fn curated() -> Vec<Capability> {
             &["jq", "--help"],
             false,
         ),
+        cap(
+            "bash.t4c",
+            "tools4claude — discover, learn, and invoke tools by intent (this tool, self-registered)",
+            &["discover", "tool", "find", "capability", "help", "registry", "meta"],
+            &["t4c"],
+            &["t4c", "--help-ai"],
+            true,
+        ),
     ]
 }
 

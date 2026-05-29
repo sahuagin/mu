@@ -31,6 +31,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Emit t4c's own --help-ai document and exit — t4c is a tool in its own
+    /// registry (turtles). Conforming form: `t4c --help-ai --json`.
+    #[arg(long = "help-ai", global = true)]
+    pub help_ai: bool,
+
     #[command(subcommand)]
     pub cmd: Option<Cmd>,
 }
@@ -240,6 +245,12 @@ fn write_registry(caps: &[Capability]) -> Result<PathBuf> {
 
 /// Dispatch a parsed [`Cli`] to its handler. Returns the process exit code.
 pub fn run(cli: Cli) -> Result<i32> {
+    if cli.help_ai {
+        // Self-registration: t4c describes itself via the same standard it consumes.
+        let doc = crate::helpai::from_clap(&<Cli as clap::CommandFactory>::command());
+        println!("{}", crate::helpai::to_json(&doc)?);
+        return Ok(0);
+    }
     let tree = build_registry().build()?;
     match cli.cmd {
         None => {

@@ -74,6 +74,31 @@ pub struct Config {
     pub budget: BudgetConfig,
     /// `[auth]` — connect-time SASL-shaped handshake config (mu-7rk).
     pub auth: AuthConfig,
+    /// `[recall]` — session-start context injection toggle.
+    pub recall: RecallConfig,
+}
+
+/// `[recall]` section. Controls session-start context injection — the
+/// `SubprocessRecallProvider` (agent memory) + `ProjectFileRecallProvider`
+/// (CLAUDE.md / AGENTS.md hierarchy) that front-load context at session start.
+///
+/// `enabled = false` (or the `MU_NO_RECALL` env override) turns OFF all
+/// front-loaded recall, so the agent discovers context on demand instead — the
+/// leaner "discover-on-demand" posture (mu's analog of claude-basic's
+/// `CLAUDE_BASIC_MEM` dial). Default `true` preserves existing behavior; it also
+/// keeps work context out of unrelated sessions, since nothing is pulled until a
+/// task asks for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecallConfig {
+    /// Run the session-start recall providers. `false` => no front-load.
+    pub enabled: bool,
+}
+
+impl Default for RecallConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// `[compaction]` section. Maps to the agent loop's threshold-cross
@@ -350,6 +375,22 @@ impl Config {
         }
         Self::load(&paths)
     }
+
+    /// Whether session-start recall injection should run: the `[recall].enabled`
+    /// flag, unless the `MU_NO_RECALL` env var force-disables it. This is the
+    /// single switch the serve loop consults before constructing the recall
+    /// providers (mu's discover-on-demand dial).
+    pub fn recall_enabled(&self) -> bool {
+        self.recall.enabled
+            && !Self::env_disables_recall(std::env::var("MU_NO_RECALL").ok().as_deref())
+    }
+
+    /// Pure parse of the `MU_NO_RECALL` override: a truthy value force-disables
+    /// recall regardless of config. Split out so it's testable without touching
+    /// process env.
+    pub fn env_disables_recall(v: Option<&str>) -> bool {
+        matches!(v.map(str::trim), Some("1" | "true" | "yes" | "on"))
+    }
 }
 
 /// Recursive deep-merge of TOML values. Tables merge field-by-field
@@ -405,6 +446,27 @@ mod tests {
     fn empty_toml_parses_to_default() {
         let c: Config = toml::from_str("").expect("empty TOML must parse");
         assert_eq!(c, Config::default());
+    }
+
+    #[test]
+    fn recall_defaults_on_and_toml_can_disable() {
+        // default preserves existing always-inject behavior
+        assert!(Config::default().recall.enabled);
+        // operators opt into discover-on-demand via TOML
+        let c: Config = toml::from_str("[recall]\nenabled = false\n").expect("parse");
+        assert!(!c.recall.enabled);
+    }
+
+    #[test]
+    fn mu_no_recall_env_override_is_truthy_only() {
+        // truthy values force-disable; everything else is a no-op
+        for v in ["1", "true", "yes", "on", " true "] {
+            assert!(Config::env_disables_recall(Some(v)), "{v:?} should disable");
+        }
+        for v in ["0", "false", "no", "off", "", "maybe"] {
+            assert!(!Config::env_disables_recall(Some(v)), "{v:?} should not");
+        }
+        assert!(!Config::env_disables_recall(None));
     }
 
     #[test]

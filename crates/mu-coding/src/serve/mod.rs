@@ -231,10 +231,23 @@ where
     // mu-phl v0 (mu-0bxv): wire up the canonical session-start recall
     // provider chain. Tests construct DaemonInfo without these (empty
     // vec) to skip recall; production runs both.
-    let recall_providers: Vec<Arc<dyn mu_core::context::RecallProvider>> = vec![
-        Arc::new(mu_core::context::recall::SubprocessRecallProvider::default()),
-        Arc::new(mu_core::context::recall::ProjectFileRecallProvider::default()),
-    ];
+    // mu recall dial: `[recall].enabled = false` (or env `MU_NO_RECALL`) turns
+    // off session-start context injection so the agent discovers on demand —
+    // the analog of claude-basic's `CLAUDE_BASIC_MEM`. Default keeps the
+    // providers wired (existing behavior).
+    let recall_providers: Vec<Arc<dyn mu_core::context::RecallProvider>> =
+        if config.recall_enabled() {
+            vec![
+                Arc::new(mu_core::context::recall::SubprocessRecallProvider::default()),
+                Arc::new(mu_core::context::recall::ProjectFileRecallProvider::default()),
+            ]
+        } else {
+            tracing::info!(
+                "recall disabled ([recall].enabled=false or MU_NO_RECALL) — \
+                 discover-on-demand mode; no session-start context injection"
+            );
+            vec![]
+        };
     let daemon_info = DaemonInfo::new(env!("CARGO_PKG_VERSION"))
         .with_events_dir(events_dir)
         .with_config(config)

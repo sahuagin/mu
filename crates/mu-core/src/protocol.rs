@@ -11,6 +11,7 @@
 
 mod auth;
 mod autonomy;
+mod discovery;
 mod events;
 mod jsonrpc;
 mod mailbox;
@@ -18,6 +19,7 @@ mod session;
 mod stats;
 pub use auth::*;
 pub use autonomy::*;
+pub use discovery::*;
 pub use events::*;
 pub use jsonrpc::*;
 pub use mailbox::*;
@@ -257,6 +259,24 @@ mod tests {
         assert_eq!(DoneEvent::METHOD, "session.done");
         assert_eq!(ErrorEvent::METHOD, "session.error");
         assert_eq!(CalloutEvent::METHOD, "session.callout");
+        assert_eq!(CapabilitiesDiscoverRequest::METHOD, "capabilities/discover");
+    }
+
+    #[test]
+    fn capabilities_discover_request_round_trip() -> Result<(), serde_json::Error> {
+        let req = CapabilitiesDiscoverRequest {
+            session_id: "s1".into(),
+            intent: "search file contents".into(),
+            limit: Some(5),
+        };
+        let value = serde_json::to_value(&req)?;
+        let decoded: CapabilitiesDiscoverRequest = serde_json::from_value(value)?;
+        assert_eq!(decoded, req);
+        // limit omitted => None
+        let no_limit: CapabilitiesDiscoverRequest =
+            serde_json::from_value(json!({ "session_id": "s1", "intent": "x" }))?;
+        assert_eq!(no_limit.limit, None);
+        Ok(())
     }
 
     #[test]

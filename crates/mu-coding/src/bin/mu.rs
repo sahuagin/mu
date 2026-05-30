@@ -131,6 +131,28 @@ enum Command {
         #[command(subcommand)]
         cmd: AnalyticsCmd,
     },
+    /// Discover capabilities by intent — the in-process Layer-1 `t4c find`
+    /// over mu's manifest (registered tools + discovered skills). Standalone:
+    /// builds the manifest in-process, no running daemon required (mu-kex4.6.4).
+    Capabilities {
+        #[command(subcommand)]
+        cmd: CapabilitiesCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CapabilitiesCmd {
+    /// Rank the manifest against a free-text intent, best-first (JSON).
+    Discover {
+        /// Free-text intent, e.g. "search file contents" or "track an issue".
+        intent: String,
+        /// Top-k results.
+        #[arg(long, default_value = "10")]
+        limit: usize,
+        /// Comma-separated tools to include in the manifest.
+        #[arg(long, default_value = "read,write,ls,edit,grep,glob,bash")]
+        tools: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -270,6 +292,46 @@ async fn main() -> Result<()> {
             )
         }
         Command::Analytics { cmd } => run_analytics(cmd),
+        Command::Capabilities { cmd } => run_capabilities(cmd),
+    }
+}
+
+/// `mu capabilities discover <intent>` — build mu's capability manifest
+/// in-process (registered tools + discovered skills) and rank it by intent,
+/// best-first, as JSON. Standalone: no daemon, no session, so the manifest is
+/// un-attenuated (everything the named tool set + discovered skills can offer).
+/// The session-attenuated form lives behind the `capabilities/discover` RPC
+/// (mu-kex4.6.4).
+fn run_capabilities(cmd: CapabilitiesCmd) -> Result<()> {
+    match cmd {
+        CapabilitiesCmd::Discover {
+            intent,
+            limit,
+            tools,
+        } => {
+            let tool_names = mu_coding::serve::parse_tools_csv(&tools);
+            let bash_settings = mu_coding::serve::BashSettings {
+                yolo: false,
+                extra_allow: Vec::new(),
+                prompt: false,
+            };
+            let tool_vec = mu_coding::serve::build_tools(&tool_names, &bash_settings)?;
+
+            let project_root = std::env::current_dir().ok();
+            let mut dirs = mu_core::skill::loader::default_search_dirs(project_root.as_deref());
+            if let Ok(extra) = std::env::var("MU_SKILLS_DIR") {
+                if !extra.is_empty() {
+                    dirs.push(std::path::PathBuf::from(extra));
+                }
+            }
+            let skills = mu_core::skill::loader::discover_skills(&dirs);
+
+            let registry = mu_core::t4c_source::build_manifest(&tool_vec, &skills);
+            let tree = registry.build()?;
+            let results = mu_core::t4c_source::discover_view(&tree, &intent, limit);
+            println!("{}", serde_json::to_string_pretty(&results)?);
+            Ok(())
+        }
     }
 }
 

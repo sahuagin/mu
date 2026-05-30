@@ -307,11 +307,27 @@ where
     // needs the calling session's id so worker results route back to
     // the right mailbox. A daemon-global instance can't know its caller.
     let tools = Arc::new(tools);
+    // mu-kex4.6.4: discover skills once at startup so `capabilities/discover`
+    // can project them alongside tools (the daemon previously knew only tools;
+    // skills were the gap the cold-dogfood proved, mu-kex4.6.2). Search dirs:
+    // project-local `.mu/skills` under cwd + `~/.config/mu/skills` + the
+    // claude-personal compat dir, plus `$MU_SKILLS_DIR` if set.
+    let skills = {
+        let project_root = std::env::current_dir().ok();
+        let mut dirs = mu_core::skill::loader::default_search_dirs(project_root.as_deref());
+        if let Ok(extra) = std::env::var("MU_SKILLS_DIR") {
+            if !extra.is_empty() {
+                dirs.push(PathBuf::from(extra));
+            }
+        }
+        Arc::new(mu_core::skill::loader::discover_skills(&dirs))
+    };
     mu_core::transport::serve(reader, writer, move |req, notif| {
         let _ = &mcp_guard;
         let sessions = sessions.clone();
         let factory = factory.clone();
         let tools = tools.clone();
+        let skills = skills.clone();
         let daemon_info = daemon_info.clone();
         let discovery = discovery.clone();
         let auth_registry = auth_registry.clone();
@@ -323,6 +339,7 @@ where
                 sessions,
                 factory,
                 tools,
+                skills,
                 daemon_info,
                 discovery,
                 auth_registry,

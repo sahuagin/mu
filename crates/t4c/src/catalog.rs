@@ -8,7 +8,7 @@
 //! present/absent, and persists the intersection as a self-configured registry.
 
 use crate::capability::{Capability, HelpSpec};
-use crate::chain::Chain;
+use crate::chain::{Chain, Impl};
 use crate::path::CapPath;
 use crate::source::RegistrySource;
 use anyhow::Result;
@@ -99,12 +99,12 @@ pub fn curated() -> Vec<Capability> {
 /// host at `discover` time (mu-d2iy.2). These supersede the flat per-tool entries
 /// (rg/fd/grep) that used to live in `curated()`.
 pub fn default_chains() -> Vec<Chain> {
-    fn ch(slot: &str, summary: &str, kw: &[&str], impls: &[&str]) -> Chain {
+    fn ch(slot: &str, summary: &str, kw: &[&str], impls: Vec<Impl>) -> Chain {
         Chain {
             slot: slot.to_string(),
             summary: summary.to_string(),
             keywords: kw.iter().map(|s| s.to_string()).collect(),
-            impls: impls.iter().map(|s| s.to_string()).collect(),
+            impls,
         }
     }
     vec![
@@ -112,7 +112,9 @@ pub fn default_chains() -> Vec<Chain> {
             "bash.search",
             "search file contents for a pattern or regex",
             &["search", "grep", "regex", "pattern", "string", "text"],
-            &["rg", "grep"],
+            // rg/grep both auto-disable color when stdout isn't a tty (the agent
+            // case), so no mandatory flag is needed to keep output clean.
+            vec![Impl::bare("rg"), Impl::bare("grep")],
         ),
         ch(
             "bash.find-files",
@@ -126,19 +128,39 @@ pub fn default_chains() -> Vec<Chain> {
                 "locate",
                 "directory",
             ],
-            &["fd", "find"],
+            // Confine to one filesystem so a search never crawls the ~12TB NFS
+            // mount on this host. fd spells it `--one-file-system`; BSD find
+            // spells it `-x` (a global option before the path). t4c-notes data
+            // point 2 / mu-kex4.6.7.
+            vec![
+                Impl::with_flags("fd", &["--one-file-system"]),
+                Impl::with_flags("find", &["-x"]),
+            ],
         ),
         ch(
             "bash.ls",
             "list directory contents",
             &["list", "ls", "directory", "files", "tree"],
-            &["eza", "exa", "ls"],
+            // eza/exa emit ANSI under a color-forcing alias/env; `--color=never`
+            // overrides it so a path capture isn't mangled. BSD `ls` has no
+            // `--color` flag (it would error) and defaults to no color, so it
+            // carries none — the per-impl divergence this field exists for.
+            vec![
+                Impl::with_flags("eza", &["--color=never"]),
+                Impl::with_flags("exa", &["--color=never"]),
+                Impl::bare("ls"),
+            ],
         ),
         ch(
             "bash.compress",
             "compress or archive data",
             &["compress", "archive", "zip", "gzip", "tar"],
-            &["zstd", "pixz", "xz", "gzip"],
+            vec![
+                Impl::bare("zstd"),
+                Impl::bare("pixz"),
+                Impl::bare("xz"),
+                Impl::bare("gzip"),
+            ],
         ),
     ]
 }

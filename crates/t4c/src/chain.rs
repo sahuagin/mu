@@ -31,9 +31,95 @@ pub struct Chain {
     /// Extra match terms for ranking.
     #[serde(default)]
     pub keywords: Vec<String>,
-    /// Ordered best-first: the command names of the interchangeable impls.
-    /// First *installed* one wins the slot; the rest are tombstoned (mu-d2iy.2).
-    pub impls: Vec<String>,
+    /// Ordered best-first: the interchangeable impls. First *installed* one wins
+    /// the slot; the rest are tombstoned (mu-d2iy.2). Each impl carries its own
+    /// mandatory safe-default flags (mu-kex4.6.7).
+    pub impls: Vec<Impl>,
+}
+
+/// One interchangeable implementation of a chain slot: the command name plus the
+/// mandatory safety/correctness flags that must always be applied when it runs.
+///
+/// Flags are **per-impl** because synonyms diverge: `fd` takes
+/// `--one-file-system`, BSD `find` takes `-x`; `eza`/`exa` take `--color=never`
+/// to keep ANSI escapes out of agent-parsed output — but BSD `ls` has no such
+/// flag and would *error* on it (it defaults to no color), so it carries none.
+/// Baking the *right* per-impl flag in is the whole point: a flag that's safe
+/// for one synonym breaks another (tcovert + cold-agent session c9ecd980,
+/// mu-kex4.6.7 — an `ls --color=always` alias once mangled a path capture).
+///
+/// Deserializes from either a bare command string (no flags) or a
+/// `{ cmd, flags }` table, so existing `impls = ["rg", "grep"]` configs keep
+/// parsing unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ImplRepr", into = "ImplRepr")]
+pub struct Impl {
+    /// The command name (also the installed-on-`$PATH` probe key).
+    pub cmd: String,
+    /// Mandatory flags prepended to the invocation — always applied so the
+    /// agent never gets broken output (ANSI, cross-filesystem crawl, …).
+    pub mandatory_flags: Vec<String>,
+}
+
+impl Impl {
+    /// An impl with no mandatory flags.
+    pub fn bare(cmd: impl Into<String>) -> Self {
+        Self {
+            cmd: cmd.into(),
+            mandatory_flags: Vec::new(),
+        }
+    }
+
+    /// An impl carrying mandatory safe-default flags.
+    pub fn with_flags(cmd: impl Into<String>, flags: &[&str]) -> Self {
+        Self {
+            cmd: cmd.into(),
+            mandatory_flags: flags.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+}
+
+/// Serde wire form for [`Impl`]: a bare string (no flags) or a `{ cmd, flags }`
+/// table. Keeps `impls = ["rg", "grep"]` valid while allowing
+/// `impls = [{ cmd = "fd", flags = ["--one-file-system"] }]`.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum ImplRepr {
+    Bare(String),
+    Full {
+        cmd: String,
+        #[serde(default)]
+        flags: Vec<String>,
+    },
+}
+
+impl From<ImplRepr> for Impl {
+    fn from(r: ImplRepr) -> Self {
+        match r {
+            ImplRepr::Bare(cmd) => Impl {
+                cmd,
+                mandatory_flags: Vec::new(),
+            },
+            ImplRepr::Full { cmd, flags } => Impl {
+                cmd,
+                mandatory_flags: flags,
+            },
+        }
+    }
+}
+
+impl From<Impl> for ImplRepr {
+    fn from(i: Impl) -> Self {
+        // Serialize back to the compact bare form when there are no flags.
+        if i.mandatory_flags.is_empty() {
+            ImplRepr::Bare(i.cmd)
+        } else {
+            ImplRepr::Full {
+                cmd: i.cmd,
+                flags: i.mandatory_flags,
+            }
+        }
+    }
 }
 
 /// Parse the `[[chain]]` array from a t4c config TOML. Unknown sections (e.g.
@@ -82,35 +168,44 @@ impl Chain {
     ) -> Result<(Option<Capability>, Vec<Resolved>)> {
         let mut states = Vec::with_capacity(self.impls.len());
         let mut winner: Option<String> = None;
-        for cmd in &self.impls {
-            let state = if !installed(cmd) {
+        let mut winner_flags: Vec<String> = Vec::new();
+        for imp in &self.impls {
+            let state = if !installed(&imp.cmd) {
                 ImplState::Absent
             } else if let Some(w) = &winner {
                 ImplState::Superseded { behind: w.clone() }
             } else {
-                winner = Some(cmd.clone());
+                winner = Some(imp.cmd.clone());
+                winner_flags = imp.mandatory_flags.clone();
                 ImplState::Active
             };
             states.push(Resolved {
                 slot: self.slot.clone(),
-                impl_cmd: cmd.clone(),
+                impl_cmd: imp.cmd.clone(),
                 state,
             });
         }
         let cap = match &winner {
-            Some(cmd) => Some(Capability {
-                path: CapPath::parse(&self.slot)
-                    .with_context(|| format!("chain slot {:?} is not a valid path", self.slot))?,
-                summary: self.summary.clone(),
-                keywords: self.keywords.clone(),
-                invoke: vec![cmd.clone()],
-                help: Some(HelpSpec {
-                    argv: vec![cmd.clone(), "--help".to_string()],
-                    ai: false,
-                }),
-                requires: vec![],
-                effects: None,
-            }),
+            Some(cmd) => {
+                // invoke = the winning impl + its mandatory safe-default flags,
+                // so `t4c run <slot>` is always safe. help/probe use the bare cmd.
+                let mut invoke = vec![cmd.clone()];
+                invoke.extend(winner_flags.iter().cloned());
+                Some(Capability {
+                    path: CapPath::parse(&self.slot).with_context(|| {
+                        format!("chain slot {:?} is not a valid path", self.slot)
+                    })?,
+                    summary: self.summary.clone(),
+                    keywords: self.keywords.clone(),
+                    invoke,
+                    help: Some(HelpSpec {
+                        argv: vec![cmd.clone(), "--help".to_string()],
+                        ai: false,
+                    }),
+                    requires: vec![],
+                    effects: None,
+                })
+            }
             None => None,
         };
         Ok((cap, states))
@@ -167,7 +262,7 @@ mod tests {
             slot: slot.to_string(),
             summary: String::new(),
             keywords: vec![],
-            impls: impls.iter().map(|s| s.to_string()).collect(),
+            impls: impls.iter().map(|s| Impl::bare(*s)).collect(),
         }
     }
 
@@ -242,13 +337,83 @@ mod tests {
         let chains = parse_chains(text).unwrap();
         assert_eq!(chains.len(), 2);
         assert_eq!(chains[0].slot, "bash.search");
-        assert_eq!(chains[0].impls, vec!["rg".to_string(), "grep".to_string()]);
+        // bare-string impls parse as flagless Impls (backward compatibility)
+        assert_eq!(chains[0].impls, vec![Impl::bare("rg"), Impl::bare("grep")]);
         // summary/keywords default when omitted
         assert_eq!(chains[1].slot, "bash.ls");
         assert!(chains[1].summary.is_empty());
         assert_eq!(
             chains[1].impls,
-            vec!["eza".to_string(), "exa".to_string(), "ls".to_string()]
+            vec![Impl::bare("eza"), Impl::bare("exa"), Impl::bare("ls")]
+        );
+    }
+
+    #[test]
+    fn parses_impls_with_mandatory_flags_and_bare_mixed() {
+        // the `{ cmd, flags }` table form coexists with the bare-string form
+        let text = r#"
+            [[chain]]
+            slot = "bash.find-files"
+            impls = [{ cmd = "fd", flags = ["--one-file-system"] }, "find"]
+        "#;
+        let chains = parse_chains(text).unwrap();
+        assert_eq!(chains.len(), 1);
+        assert_eq!(
+            chains[0].impls,
+            vec![
+                Impl::with_flags("fd", &["--one-file-system"]),
+                Impl::bare("find")
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_bakes_winning_impls_mandatory_flags_into_invoke() {
+        // fd wins and its --one-file-system flag is baked into invoke so
+        // `t4c run` applies it automatically; help still uses the bare cmd.
+        let chain = Chain {
+            slot: "bash.find-files".to_string(),
+            summary: String::new(),
+            keywords: vec![],
+            impls: vec![
+                Impl::with_flags("fd", &["--one-file-system"]),
+                Impl::with_flags("find", &["-x"]),
+            ],
+        };
+        let (cap, _) = chain.resolve(|cmd| cmd == "fd").unwrap();
+        let cap = cap.unwrap();
+        assert_eq!(
+            cap.invoke,
+            vec!["fd".to_string(), "--one-file-system".to_string()]
+        );
+        // help/probe key is the bare command, not the flagged invoke
+        assert_eq!(cap.help.unwrap().argv[0], "fd");
+    }
+
+    #[test]
+    fn impl_round_trips_through_toml_compactly() {
+        // a flagless impl serializes back to a bare string; a flagged one to a table
+        let chains = vec![Chain {
+            slot: "bash.ls".to_string(),
+            summary: String::new(),
+            keywords: vec![],
+            impls: vec![
+                Impl::with_flags("eza", &["--color=never"]),
+                Impl::bare("ls"),
+            ],
+        }];
+        #[derive(serde::Serialize)]
+        struct Wrap {
+            chain: Vec<Chain>,
+        }
+        let text = toml::to_string(&Wrap { chain: chains }).unwrap();
+        let back = parse_chains(&text).unwrap();
+        assert_eq!(
+            back[0].impls,
+            vec![
+                Impl::with_flags("eza", &["--color=never"]),
+                Impl::bare("ls")
+            ]
         );
     }
 
@@ -270,7 +435,7 @@ mod tests {
         "#;
         let c = parse_chains(text).unwrap();
         assert_eq!(c.len(), 1);
-        assert_eq!(c[0].impls.first().unwrap(), "zstd");
+        assert_eq!(c[0].impls.first().unwrap().cmd, "zstd");
         assert_eq!(c[0].impls.len(), 4);
     }
 }

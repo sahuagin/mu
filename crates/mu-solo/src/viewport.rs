@@ -269,43 +269,64 @@ impl DynamicViewport {
         }
 
         let viewport_top = self.viewport.y;
-
-        // Scroll the region above the viewport up to make room
-        if viewport_top > 0 {
-            let scroll_amount = height.min(viewport_top);
-            scroll_region_up(0, viewport_top.saturating_sub(1), scroll_amount)?;
+        if viewport_top == 0 {
+            // No scrollback region is visible. This should be rare because
+            // set_height leaves one row above the viewport, but don't risk
+            // drawing over the live input area if the terminal is tiny.
+            return Ok(());
         }
-        stdout.flush()?;
 
-        // Draw the new content in the freed space above the viewport
-        let draw_area = Rect::new(0, viewport_top.saturating_sub(height), width, height);
+        // SCROLLBACK FIX — "mu-solo text doesn't persist" regression.
+        // The previous code made room with `scroll_region_up(0, …)`, i.e.
+        // DECSTBM + SU (`CSI S`). Lines that scroll off the TOP of a margined
+        // region via SU are discarded by the terminal — they NEVER enter
+        // native scrollback — so once a session filled the screen the
+        // committed transcript vanished on scroll-up (invisible at full
+        // terminal height, fatal at real heights; an agent driving the TUI
+        // never noticed because it reads each frame live). Use the codex-rs
+        // pattern instead: restrict DECSTBM to the history region, park the
+        // cursor at the bottom of that region, then emit CRLF + one rendered
+        // row per logical row. Newline-scrolling at the bottom of a
+        // top-margin-1 region DOES feed native scrollback, so the full payload
+        // is saved and only the tail of an oversized payload stays visible
+        // above the viewport. Draw into a 0,0-anchored off-screen buffer:
+        // mapping it onto y=0..height would overlap the live viewport when
+        // height > viewport_top and corrupt the prompt.
+        let draw_area = Rect::new(0, 0, width, height);
         let mut buf = Buffer::empty(draw_area);
         draw_fn(&mut buf);
 
-        // Write the buffer content to the terminal AND store in history
-        let mut stdout = io::stdout();
+        // Begin synchronized output so a multi-line history insert + viewport
+        // redraw does not visibly tear on terminals that support the extension.
+        write!(stdout, "\x1b[?2026h")?;
+        // ANSI scroll-region coordinates are 1-based and inclusive. The
+        // history region is terminal rows 0..viewport_top (exclusive), so the
+        // bottom row is `viewport_top` in 1-based coordinates.
+        write!(stdout, "\x1b[1;{}r", viewport_top)?;
+        queue!(stdout, MoveTo(0, viewport_top - 1))?;
+
         for y in 0..draw_area.height {
+            queue!(stdout, Print("\r\n"))?;
+            write_buffer_row(&mut stdout, &buf, y)?;
+
             let mut hline = HistoryLine { cells: Vec::new() };
             for x in 0..draw_area.width {
                 let idx = (y as usize) * (draw_area.width as usize) + (x as usize);
                 let cell = &buf.content[idx];
-                if cell.symbol() != " " || cell.fg != Color::Reset || cell.bg != Color::Reset {
-                    queue!(stdout, MoveTo(draw_area.x + x, draw_area.y + y))?;
-                    let fg = to_crossterm_color(cell.fg);
-                    let bg = to_crossterm_color(cell.bg);
-                    queue!(stdout, SetForegroundColor(fg), SetBackgroundColor(bg))?;
-                    if cell.modifier.contains(Modifier::BOLD) {
-                        queue!(stdout, SetAttribute(Attribute::Bold))?;
-                    }
-                    queue!(stdout, Print(cell.symbol()), SetAttribute(Attribute::Reset))?;
-                }
                 hline
                     .cells
                     .push((cell.symbol().to_string(), cell.fg, cell.bg, cell.modifier));
             }
             self.history.push(hline);
         }
+
+        // Reset scroll region and leave cursor in the viewport; the next
+        // `flush` repaints the viewport from scratch.
+        write!(stdout, "\x1b[r")?;
+        queue!(stdout, MoveTo(self.viewport.x, self.viewport.y))?;
+        write!(stdout, "\x1b[?2026l")?;
         stdout.flush()?;
+        self.buffers[1 - self.current].reset();
 
         // Cap history to prevent unbounded growth (keep last 1000 lines)
         const MAX_HISTORY: usize = 1000;
@@ -320,6 +341,40 @@ impl DynamicViewport {
     fn current_buffer_mut(&mut self) -> &mut Buffer {
         &mut self.buffers[self.current]
     }
+}
+
+/// Render one row of an off-screen `Buffer` at the cursor's current position,
+/// preserving fg/bg/modifiers. Used by `insert_before` to emit history rows
+/// into the DECSTBM scroll region (CRLF advances; this paints the new row).
+fn write_buffer_row<W: Write>(stdout: &mut W, buf: &Buffer, y: u16) -> io::Result<()> {
+    queue!(stdout, Clear(ClearType::CurrentLine))?;
+    for x in 0..buf.area.width {
+        let idx = (y as usize) * (buf.area.width as usize) + (x as usize);
+        let cell = &buf.content[idx];
+        let fg = to_crossterm_color(cell.fg);
+        let bg = to_crossterm_color(cell.bg);
+        queue!(stdout, SetForegroundColor(fg), SetBackgroundColor(bg))?;
+
+        let mods = cell.modifier;
+        if mods.contains(Modifier::BOLD) {
+            queue!(stdout, SetAttribute(Attribute::Bold))?;
+        }
+        if mods.contains(Modifier::DIM) {
+            queue!(stdout, SetAttribute(Attribute::Dim))?;
+        }
+        if mods.contains(Modifier::ITALIC) {
+            queue!(stdout, SetAttribute(Attribute::Italic))?;
+        }
+        if mods.contains(Modifier::UNDERLINED) {
+            queue!(stdout, SetAttribute(Attribute::Underlined))?;
+        }
+        if mods.contains(Modifier::REVERSED) {
+            queue!(stdout, SetAttribute(Attribute::Reverse))?;
+        }
+
+        queue!(stdout, Print(cell.symbol()), SetAttribute(Attribute::Reset))?;
+    }
+    Ok(())
 }
 
 /// Scroll a region of the terminal up using DECSTBM.

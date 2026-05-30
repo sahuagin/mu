@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use std::path::PathBuf;
 
-use mu_core::agent::{AgentConfig, AgentInput, AgentLoop, AgentMessage, Tool};
+use mu_core::agent::{AgentConfig, AgentInput, AgentLoop, AgentMessage, SpawnArgs, Tool};
 use mu_core::capability::Capability;
 use mu_core::context::rope::SpanText;
 use mu_core::context::{ProjectContext, RecalledItem};
@@ -288,22 +288,22 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         )),
         _ => None,
     };
-    let agent = AgentLoop::spawn(
+    let agent = AgentLoop::spawn(SpawnArgs {
         provider,
-        kind_arc,
-        model_arc,
-        session_tools,
-        AgentConfig {
+        provider_kind: kind_arc,
+        model: model_arc,
+        tools: session_tools,
+        config: AgentConfig {
             system_prompt: system_prompt.map(SpanText::from),
             max_turns,
             project_context,
             compaction_threshold: Some(compaction_cfg.trigger_threshold_tokens),
             compaction_policy_override,
         },
-        events_tx,
-        pending_approvals.clone(),
-        capability_handle.clone(),
-    );
+        events: events_tx,
+        pending_approvals: pending_approvals.clone(),
+        capability: capability_handle.clone(),
+    });
     let input_tx = agent.sender();
     let agent_handle = tokio::spawn(async move {
         let _ = agent.join().await;

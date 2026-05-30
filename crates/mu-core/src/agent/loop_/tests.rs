@@ -17,6 +17,32 @@ use crate::agent::provider::{MessageInput, Provider, ProviderError, ProviderEven
 use crate::agent::tool::{Tool, ToolResult, ToolSpec};
 use crate::agent::types::{AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolCall};
 
+/// Test shim: build [`SpawnArgs`] from positional args so the existing call
+/// sites convert with a single rename. Test-only ergonomics; production uses
+/// the struct directly, so the lint allow lives here, on test code.
+#[allow(clippy::too_many_arguments)]
+fn loop_with(
+    provider: Arc<dyn Provider>,
+    provider_kind: Arc<str>,
+    model: Arc<str>,
+    tools: Vec<Arc<dyn Tool>>,
+    config: AgentConfig,
+    events: mpsc::Sender<AgentEvent>,
+    pending_approvals: PendingApprovals,
+    capability: SessionCapability,
+) -> AgentLoop {
+    AgentLoop::spawn(SpawnArgs {
+        provider,
+        provider_kind,
+        model,
+        tools,
+        config,
+        events,
+        pending_approvals,
+        capability,
+    })
+}
+
 // ============================================================================
 // MockProvider
 // ============================================================================
@@ -266,7 +292,7 @@ fn spawn_loop(
         .collect();
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
-    let loop_ = AgentLoop::spawn(
+    let loop_ = loop_with(
         provider,
         Arc::from("faux"),
         Arc::from("faux"),
@@ -1095,7 +1121,7 @@ async fn ask_permission_emits_input_required_and_dispatches_on_approve() {
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let cap: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
     let (events_tx, mut events_rx) = mpsc::channel(64);
-    let loop_ = AgentLoop::spawn(
+    let loop_ = loop_with(
         Arc::new(provider),
         Arc::from("faux"),
         Arc::from("faux"),
@@ -1185,7 +1211,7 @@ async fn mu_bkjr_validate_rejection_short_circuits_before_input_required() {
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let cap: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
     let (events_tx, events_rx) = mpsc::channel(64);
-    let loop_ = AgentLoop::spawn(
+    let loop_ = loop_with(
         Arc::new(provider),
         Arc::from("faux"),
         Arc::from("faux"),
@@ -1256,7 +1282,7 @@ async fn capability_refuses_tool_outside_allowed_set() {
     }));
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let (events_tx, mut events_rx) = mpsc::channel(64);
-    let loop_ = AgentLoop::spawn(
+    let loop_ = loop_with(
         Arc::new(provider),
         Arc::from("faux"),
         Arc::from("faux"),
@@ -1326,7 +1352,7 @@ async fn capability_refuses_tool_missing_required_aws_capability() {
     let cap: SessionCapability = Arc::new(Mutex::new(Capability::root()));
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let (events_tx, mut events_rx) = mpsc::channel(64);
-    let loop_ = AgentLoop::spawn(
+    let loop_ = loop_with(
         Arc::new(provider),
         Arc::from("faux"),
         Arc::from("faux"),
@@ -1399,7 +1425,7 @@ async fn capability_allows_tool_when_required_aws_capability_is_held() {
     }));
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let (events_tx, mut events_rx) = mpsc::channel(64);
-    let loop_ = AgentLoop::spawn(
+    let loop_ = loop_with(
         Arc::new(provider),
         Arc::from("faux"),
         Arc::from("faux"),
@@ -1445,7 +1471,7 @@ async fn ask_permission_deny_synthesizes_error_result_without_running_tool() {
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let cap: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
     let (events_tx, mut events_rx) = mpsc::channel(64);
-    let loop_ = AgentLoop::spawn(
+    let loop_ = loop_with(
         Arc::new(provider),
         Arc::from("faux"),
         Arc::from("faux"),
@@ -1530,7 +1556,7 @@ fn spawn_loop_with_autonomy(
     let mut cap = crate::capability::Capability::root();
     cap.autonomy = autonomy;
     let capability: SessionCapability = Arc::new(Mutex::new(cap));
-    let loop_ = AgentLoop::spawn(
+    let loop_ = loop_with(
         provider,
         Arc::from("faux"),
         Arc::from("faux"),
@@ -1845,7 +1871,7 @@ fn spawn_loop_with_provider(
     let (events_tx, events_rx) = mpsc::channel(64);
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
-    let loop_ = AgentLoop::spawn(
+    let loop_ = loop_with(
         provider,
         Arc::from("faux"),
         Arc::from("faux"),
@@ -2150,7 +2176,7 @@ async fn yqeq8_phase_d_smoke_tool_call_round_trip_uses_projected_path() {
     let (events_tx, events_rx) = mpsc::channel(64);
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
-    let loop_ = AgentLoop::spawn(
+    let loop_ = loop_with(
         provider as Arc<dyn Provider>,
         Arc::from("faux"),
         Arc::from("faux"),

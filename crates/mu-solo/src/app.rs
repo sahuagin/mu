@@ -170,7 +170,6 @@ fn normalize_provider_kind(provider: &str) -> String {
     }
 }
 
-#[allow(clippy::incompatible_msrv)]
 fn truncate_at_word(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_owned();

@@ -16,7 +16,9 @@ edition = "2021"
 license-file = "LICENSE"
 repository = "https://github.com/sahuagin/mu"
 authors = ["Thaddeus Covert <tcovert@sahuagin.net>"]
-rust-version = "1.80"
+# 1.91: str::floor_char_boundary (used in mu-solo) stabilized here. Bumped from
+# 1.80 to be honest about the real minimum rather than #[allow]-ing the lint.
+rust-version = "1.91"
 
 [workspace.dependencies]
 # runtime + I/O

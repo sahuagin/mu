@@ -88,6 +88,7 @@ mod tests {
             keywords: vec![],
             help: None,
             requires: vec![],
+            effects: None,
         }
     }
 

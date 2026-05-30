@@ -109,6 +109,7 @@ impl Chain {
                     ai: false,
                 }),
                 requires: vec![],
+                effects: None,
             }),
             None => None,
         };

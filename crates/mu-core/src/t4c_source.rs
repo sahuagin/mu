@@ -136,6 +136,26 @@ pub fn build_manifest_for(
     build_manifest(&registry.attenuate_with(cap), skills)
 }
 
+/// Like [`build_manifest_for`], but attenuate a tool *slice* directly instead of
+/// a [`ToolRegistry`]. The daemon (`mu serve`) holds its tools as a
+/// `Vec<Arc<dyn Tool>>`, not a registry, and building a registry just to
+/// attenuate would need a `RetainedRope`; this filters the slice by the
+/// session's capability in place (the same `check_allow` predicate
+/// `ToolRegistry::attenuate_with` uses), keeping discovery permission-tracking
+/// without that detour (mu-kex4.6.4).
+pub fn build_manifest_for_tools(
+    tools: &[Arc<dyn Tool>],
+    cap: &MuCapability,
+    skills: &[LoadedSkill],
+) -> Registry {
+    let permitted: Vec<Arc<dyn Tool>> = tools
+        .iter()
+        .filter(|t| cap.check_allow(&t.spec().name).is_allowed())
+        .cloned()
+        .collect();
+    build_manifest(&permitted, skills)
+}
+
 /// Rank a built manifest's capabilities against a free-text intent, best-first —
 /// the in-process `find`, lexical floor. Always available (no embedder needed);
 /// [`discover_semantic`] is the semantic upgrade when an embedder is present.
@@ -167,7 +187,7 @@ pub fn discover_semantic<'a, E: Embedder>(
 /// the borrow-free, `Serialize`-able fields the model needs to pick + adapt a
 /// call: the path, what it's for, its keywords, the match score, its effects
 /// (mu-kex4.6.6), and whether the session's constraints permit it.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CapabilityView {
     pub path: String,
     pub summary: String,
@@ -175,22 +195,29 @@ pub struct CapabilityView {
     pub score: f64,
     /// What invoking this does to the world, when known. `None` = unannotated
     /// (e.g. a skill), deliberately distinct from a known-benign effect set.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effects: Option<Effects>,
     /// False when the capability is installed + permitted but inappropriate
     /// this session (e.g. a writer under a read-only session). Separates
     /// "installed" from "appropriate" — the discovery surface shows it rather
     /// than hiding it, so the model learns *why* it can't use it.
+    #[serde(default = "default_allowed")]
     pub allowed_by_session: bool,
     /// Why the session disallows it, when `allowed_by_session` is false.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disallowed_reason: Option<String>,
     /// Where this capability came from — the source name that produced the
     /// winning entry (mu-kex4.6.8). Lets the model tell "live MCP says loaded"
     /// from "curated catalog says installed". `None` only if the tree lost the
     /// path's provenance (shouldn't happen for a ranked result).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+}
+
+/// A view deserialized without an explicit `allowed_by_session` defaults to
+/// allowed — the conservative reading for a result that omitted the flag.
+fn default_allowed() -> bool {
+    true
 }
 
 /// Rank the manifest and project the top `limit` results into serializable
@@ -473,6 +500,43 @@ mod tests {
         let json = serde_json::to_string(&views[0]).expect("serialize");
         assert!(json.contains("tool.code_recall"));
         assert!(json.contains("\"source\":\"test\""));
+    }
+
+    #[test]
+    fn capability_view_round_trips_over_the_wire() {
+        // the RPC response is Vec<CapabilityView>; a client must deserialize it
+        // back. Omitted optionals (effects/disallowed_reason/source) and an
+        // absent allowed_by_session default sanely (mu-kex4.6.4).
+        let minimal: CapabilityView = serde_json::from_str(
+            r#"{"path":"tool.read","summary":"read a file","keywords":[],"score":1.0}"#,
+        )
+        .expect("deserialize minimal");
+        assert_eq!(minimal.path, "tool.read");
+        assert!(minimal.allowed_by_session); // defaults to allowed when omitted
+        assert!(minimal.effects.is_none());
+        assert!(minimal.source.is_none());
+
+        // full round-trip preserves every field
+        let full = CapabilityView {
+            path: "tool.write".to_string(),
+            summary: "write a file".to_string(),
+            keywords: vec!["fs".to_string()],
+            score: 0.5,
+            effects: Some(t4c::Effects {
+                filesystem: t4c::FsEffect::Write,
+                ..t4c::Effects::default()
+            }),
+            allowed_by_session: false,
+            disallowed_reason: Some("read-only session".to_string()),
+            source: Some("mu-tools".to_string()),
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        let back: CapabilityView = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.path, full.path);
+        assert_eq!(back.effects, full.effects);
+        assert!(!back.allowed_by_session);
+        assert_eq!(back.disallowed_reason.as_deref(), Some("read-only session"));
+        assert_eq!(back.source.as_deref(), Some("mu-tools"));
     }
 
     #[test]

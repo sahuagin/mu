@@ -36,6 +36,7 @@ fn cap(
             })
         },
         requires: vec![],
+        effects: None,
     }
 }
 

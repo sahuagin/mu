@@ -2,7 +2,7 @@
 //! manifest as just another source; the CLI uses a TOML config, a `--help-ai`
 //! probe, and small in-code defaults.
 
-use crate::capability::{Capability, HelpAiDoc, HelpSpec};
+use crate::capability::{Capability, Effects, HelpAiDoc, HelpSpec};
 use crate::path::CapPath;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -91,6 +91,7 @@ impl TomlConfigSource {
                     ai: h.ai,
                 }),
                 requires: c.requires,
+                effects: c.effects,
             });
         }
         Ok(caps)
@@ -112,6 +113,7 @@ impl TomlConfigSource {
                         argv: h.argv.clone(),
                         ai: h.ai,
                     }),
+                    effects: c.effects.clone(),
                 })
                 .collect(),
         };
@@ -149,6 +151,8 @@ struct TomlCap {
     requires: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     help: Option<TomlHelp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effects: Option<Effects>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -190,6 +194,7 @@ impl HelpAiProbeSource {
                 ai: true,
             }),
             requires: vec![],
+            effects: None,
         });
         for sub in doc.subcommands {
             let path = CapPath::parse(&format!("{source_class}.{}.{}", doc.name, sub.name))?;
@@ -203,6 +208,7 @@ impl HelpAiProbeSource {
                     ai: true,
                 }),
                 requires: vec![],
+                effects: None,
             });
         }
         Ok(caps)

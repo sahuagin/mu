@@ -598,39 +598,45 @@ pub struct AgentLoop {
     handle: JoinHandle<Outcome>,
 }
 
+/// Inputs to construct an agent loop, bundled so [`AgentLoop::spawn`] and the
+/// internal `run` task take one argument instead of nine. Built by the caller
+/// (the daemon's session manager) and consumed on spawn.
+pub struct SpawnArgs {
+    pub provider: Arc<dyn Provider>,
+    pub provider_kind: Arc<str>,
+    pub model: Arc<str>,
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub config: AgentConfig,
+    pub events: mpsc::Sender<AgentEvent>,
+    pub pending_approvals: PendingApprovals,
+    pub capability: SessionCapability,
+}
+
+impl std::fmt::Debug for SpawnArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `provider`/`tools` are trait objects without Debug; show the
+        // identifying, printable fields and elide the rest.
+        f.debug_struct("SpawnArgs")
+            .field("provider_kind", &self.provider_kind)
+            .field("model", &self.model)
+            .field("tools", &self.tools.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl AgentLoop {
     /// Spawn a new agent loop on the current tokio runtime.
     ///
-    /// `pending_approvals` is the shared registry the loop uses when
+    /// `SpawnArgs::pending_approvals` is the shared registry the loop uses when
     /// dispatching tools with `PermissionLevel::Ask`: it inserts a
     /// fresh oneshot under a generated `request_id`, emits
     /// `AgentEvent::InputRequired`, then awaits the oneshot. The
     /// daemon's dispatch handler for `session.respond_to_input_required`
     /// is responsible for taking the oneshot out and sending the
     /// decision.
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn(
-        provider: Arc<dyn Provider>,
-        provider_kind: Arc<str>,
-        model: Arc<str>,
-        tools: Vec<Arc<dyn Tool>>,
-        config: AgentConfig,
-        events: mpsc::Sender<AgentEvent>,
-        pending_approvals: PendingApprovals,
-        capability: SessionCapability,
-    ) -> Self {
+    pub fn spawn(args: SpawnArgs) -> Self {
         let (tx, rx) = mpsc::channel(32);
-        let handle = tokio::spawn(run(
-            provider,
-            provider_kind,
-            model,
-            tools,
-            config,
-            events,
-            rx,
-            pending_approvals,
-            capability,
-        ));
+        let handle = tokio::spawn(run(args, rx));
         Self { tx, handle }
     }
 
@@ -667,18 +673,20 @@ impl AgentLoop {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run(
-    mut provider: Arc<dyn Provider>,
-    mut current_provider_kind: Arc<str>,
-    mut current_model: Arc<str>,
-    tools: Vec<Arc<dyn Tool>>,
-    config: AgentConfig,
-    events: mpsc::Sender<AgentEvent>,
-    mut input_rx: mpsc::Receiver<AgentInput>,
-    pending_approvals: PendingApprovals,
-    capability: SessionCapability,
-) -> Outcome {
+async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outcome {
+    let SpawnArgs {
+        provider,
+        provider_kind,
+        model,
+        tools,
+        config,
+        events,
+        pending_approvals,
+        capability,
+    } = args;
+    let mut provider = provider;
+    let mut current_provider_kind = provider_kind;
+    let mut current_model = model;
     let mut messages: Vec<AgentMessage> = Vec::new();
     let mut queue: VecDeque<Action> = VecDeque::new();
     let mut turn_count: u32 = 0;

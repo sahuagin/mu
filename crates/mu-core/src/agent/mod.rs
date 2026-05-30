@@ -6,7 +6,8 @@ pub mod types;
 
 pub use capabilities::{ProviderCapabilities, SystemPromptCapability};
 pub use loop_::{
-    AgentConfig, AgentEvent, AgentInput, AgentLoop, Outcome, DEFAULT_COMPACTION_THRESHOLD,
+    AgentConfig, AgentEvent, AgentInput, AgentLoop, Outcome, SpawnArgs,
+    DEFAULT_COMPACTION_THRESHOLD,
 };
 pub use provider::{MessageInput, Provider, ProviderError, ProviderEvent};
 pub use tool::{PermissionLevel, RetryPolicy, SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec};

@@ -39,7 +39,7 @@ pub mod source;
 
 pub use capability::{Capability, Effects, FsEffect, HelpAiDoc, HelpSpec, SessionConstraints};
 pub use catalog::EnvCatalogSource;
-pub use chain::Chain;
+pub use chain::{Chain, Impl};
 pub use embedder::{cosine, ConfigEmbedder, Embedder, FakeEmbedder};
 pub use path::CapPath;
 pub use rank::{LexicalRanker, Ranked, Ranker};

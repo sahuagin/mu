@@ -194,16 +194,16 @@ pub(crate) async fn spawn_worker(
     let monitor_sessions = sessions.clone();
     let monitor_reply_to = reply_to.clone();
     tokio::spawn(async move {
-        monitor_worker(
+        monitor_worker(MonitorArgs {
             pty_worker,
-            monitor_log,
-            monitor_status,
-            monitor_session_id,
-            monitor_sessions,
+            event_log: monitor_log,
+            status: monitor_status,
+            session_id: monitor_session_id,
+            sessions: monitor_sessions,
             started_at,
             timeout_secs,
-            monitor_reply_to,
-        )
+            reply_to: monitor_reply_to,
+        })
         .await;
     });
 
@@ -213,9 +213,10 @@ pub(crate) async fn spawn_worker(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn monitor_worker(
-    mut pty_worker: PtyWorker,
+/// Inputs to [`monitor_worker`], bundled so the spawned task takes one struct
+/// instead of eight positional args.
+struct MonitorArgs {
+    pty_worker: PtyWorker,
     event_log: Arc<SessionEventLog>,
     status: Arc<Mutex<WorkerStatus>>,
     session_id: String,
@@ -223,7 +224,19 @@ async fn monitor_worker(
     started_at: u64,
     timeout_secs: u64,
     reply_to: String,
-) {
+}
+
+async fn monitor_worker(args: MonitorArgs) {
+    let MonitorArgs {
+        mut pty_worker,
+        event_log,
+        status,
+        session_id,
+        sessions,
+        started_at,
+        timeout_secs,
+        reply_to,
+    } = args;
     let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
     tokio::pin!(deadline);
 

@@ -66,19 +66,36 @@ const PRE_AUTH_METHODS: &[&str] = &[
     "peer.auth_response",
 ];
 
-#[allow(clippy::too_many_arguments)]
+/// Daemon-wide handles threaded to every dispatched request — bundled so
+/// `dispatch` takes the per-request `(request, notif)` plus one context struct
+/// rather than ten positional args. Built per request by the serve loop (the
+/// handles are cheap `Arc`/clone-able).
+pub struct DispatchCtx {
+    pub sessions: Sessions,
+    pub factory: ProviderFactory,
+    pub tools: Arc<Vec<Arc<dyn Tool>>>,
+    pub skills: Arc<Vec<LoadedSkill>>,
+    pub daemon_info: DaemonInfo,
+    pub discovery: Arc<dyn SessionDiscovery>,
+    pub auth_registry: Arc<AuthRegistry>,
+    pub auth_state: AuthStateHandle,
+}
+
 pub async fn dispatch(
     request: Request<Value>,
     notif: NotificationWriter,
-    sessions: Sessions,
-    factory: ProviderFactory,
-    tools: Arc<Vec<Arc<dyn Tool>>>,
-    skills: Arc<Vec<LoadedSkill>>,
-    daemon_info: DaemonInfo,
-    discovery: Arc<dyn SessionDiscovery>,
-    auth_registry: Arc<AuthRegistry>,
-    auth_state: AuthStateHandle,
+    ctx: DispatchCtx,
 ) -> Response<Value> {
+    let DispatchCtx {
+        sessions,
+        factory,
+        tools,
+        skills,
+        daemon_info,
+        discovery,
+        auth_registry,
+        auth_state,
+    } = ctx;
     // mu-fnn enforcement gate. Snapshot the AuthState (lock + clone +
     // drop) so the rest of the dispatcher doesn't hold a Mutex across
     // .await points. A poisoned lock fails closed: snapshot becomes a

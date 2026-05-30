@@ -4,6 +4,7 @@
 //! by domain (session, daemon, mailbox, peer).
 
 pub mod auth;
+pub mod capabilities;
 pub mod daemon;
 pub mod mailbox;
 pub mod session;

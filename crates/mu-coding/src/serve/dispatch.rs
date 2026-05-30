@@ -11,13 +11,15 @@ use serde_json::Value;
 use mu_core::agent::Tool;
 use mu_core::protocol::{
     AskSessionRequest, AuthInitiateRequest, AuthOfferRequest, CancelOutstandingRequest,
-    CancelSessionRequest, CloseSessionRequest, CreateSessionRequest, DaemonListRoutesRequest,
-    DaemonOutstandingCallsRequest, DaemonStatsRequest, DaemonUsageHistoryRequest,
-    DelegateSessionRequest, MailboxConsumeRequest, MailboxListRequest, MailboxPostRequest,
-    MailboxReadRequest, PeerHelloRequest, PingRequest, Request, RespondToInputRequiredRequest,
-    Response, ScheduleWakeupRequest, SessionEventsRequest, SessionListRequest, SessionStatsRequest,
-    SetRouteRequest, SpawnWorkerRequest, StartAutonomousRequest,
+    CancelSessionRequest, CapabilitiesDiscoverRequest, CloseSessionRequest, CreateSessionRequest,
+    DaemonListRoutesRequest, DaemonOutstandingCallsRequest, DaemonStatsRequest,
+    DaemonUsageHistoryRequest, DelegateSessionRequest, MailboxConsumeRequest, MailboxListRequest,
+    MailboxPostRequest, MailboxReadRequest, PeerHelloRequest, PingRequest, Request,
+    RespondToInputRequiredRequest, Response, ScheduleWakeupRequest, SessionEventsRequest,
+    SessionListRequest, SessionStatsRequest, SetRouteRequest, SpawnWorkerRequest,
+    StartAutonomousRequest,
 };
+use mu_core::skill::loader::LoadedSkill;
 use mu_core::transport::{codes, err_response, NotificationWriter};
 
 use super::auth::{AuthRegistry, AuthState, AuthStateHandle};
@@ -25,6 +27,7 @@ use super::daemon_info::DaemonInfo;
 use super::discovery::SessionDiscovery;
 use super::factory::ProviderFactory;
 use super::handlers::auth::{handle_auth_initiate, handle_auth_offer};
+use super::handlers::capabilities::handle_capabilities_discover;
 use super::handlers::{daemon::*, mailbox::*, session::*};
 use super::sessions::Sessions;
 
@@ -70,6 +73,7 @@ pub async fn dispatch(
     sessions: Sessions,
     factory: ProviderFactory,
     tools: Arc<Vec<Arc<dyn Tool>>>,
+    skills: Arc<Vec<LoadedSkill>>,
     daemon_info: DaemonInfo,
     discovery: Arc<dyn SessionDiscovery>,
     auth_registry: Arc<AuthRegistry>,
@@ -111,6 +115,11 @@ pub async fn dispatch(
 
     match method {
         PingRequest::METHOD => handle_ping(request),
+        // mu-kex4.6.4: in-process Layer-1 `t4c find` over RPC — rank the
+        // session's permission-attenuated manifest (tools + skills) by intent.
+        CapabilitiesDiscoverRequest::METHOD => {
+            handle_capabilities_discover(request, sessions, tools, skills)
+        }
         // mu-7rk (mu-yox): connect-time SASL-shaped auth handshake.
         AuthOfferRequest::METHOD => handle_auth_offer(request, &auth_registry),
         AuthInitiateRequest::METHOD => handle_auth_initiate(request, &auth_registry, &auth_state),

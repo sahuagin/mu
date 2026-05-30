@@ -30,6 +30,7 @@ fn cap(path: &str, summary: &str, kw: &[&str]) -> Capability {
         invoke: vec![],
         help: None,
         requires: vec![],
+        effects: None,
     }
 }
 

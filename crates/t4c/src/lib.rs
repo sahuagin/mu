@@ -37,7 +37,7 @@ pub mod registry;
 pub mod semantic;
 pub mod source;
 
-pub use capability::{Capability, HelpAiDoc, HelpSpec};
+pub use capability::{Capability, Effects, FsEffect, HelpAiDoc, HelpSpec, SessionConstraints};
 pub use catalog::EnvCatalogSource;
 pub use chain::Chain;
 pub use embedder::{cosine, ConfigEmbedder, Embedder, FakeEmbedder};

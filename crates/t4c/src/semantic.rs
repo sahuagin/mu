@@ -122,6 +122,7 @@ mod tests {
             invoke: vec![],
             help: None,
             requires: vec![],
+            effects: None,
         }
     }
 

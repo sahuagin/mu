@@ -48,9 +48,12 @@ const KNOWN_PROVIDERS: &[&str] = &[
 /// so we can hand them to the picker without allocating.
 fn known_models_for(provider: &str) -> &'static [&'static str] {
     match normalize_provider_kind(provider).as_str() {
-        "anthropic_api" | "anthropic_oauth" => {
-            &["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"]
-        }
+        "anthropic_api" | "anthropic_oauth" => &[
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+        ],
         "openai_codex" => &["gpt-5.5"],
         "openai_api" => &["gpt-4o", "gpt-4-turbo"],
         // OpenRouter model IDs drift faster than mu releases; this is

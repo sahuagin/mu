@@ -61,6 +61,14 @@ pub fn for_model(provider_kind: &str, model: &str) -> Option<ModelPricing> {
 const MODEL_RATES: &[(&str, &str, ModelPricing)] = &[
     (
         "anthropic_api",
+        "claude-opus-4-8",
+        ModelPricing {
+            input_per_mtok: 5.00,
+            output_per_mtok: 25.00,
+        },
+    ),
+    (
+        "anthropic_api",
         "claude-opus-4-7",
         ModelPricing {
             input_per_mtok: 5.00,

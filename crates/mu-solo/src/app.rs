@@ -354,6 +354,20 @@ impl SessionPhase {
     }
 }
 
+/// Startup options for [`App::new`] — bundled so the constructor takes one
+/// borrowed struct instead of eight positional args. Borrows from the parsed
+/// config/CLI; no allocation at startup.
+pub struct AppOptions<'a> {
+    pub mu_binary: &'a str,
+    pub cwd: &'a std::path::Path,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub bash_yolo: bool,
+    pub tools: &'a str,
+    pub effort: &'a str,
+    pub focus_mode: bool,
+}
+
 impl App {
     /// Spawn `mu serve`, authenticate, create a session, and return an
     /// App ready to run.
@@ -361,17 +375,17 @@ impl App {
     /// `effort` is parsed via [`EffortLevel::parse`]; invalid values
     /// surface as an error so a typo in `solo.toml` doesn't silently
     /// fall back to Medium. `focus_mode` seeds the /focus toggle.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        mu_binary: &str,
-        cwd: &std::path::Path,
-        provider: &str,
-        model: &str,
-        bash_yolo: bool,
-        tools: &str,
-        effort: &str,
-        focus_mode: bool,
-    ) -> Result<Self> {
+    pub fn new(opts: AppOptions) -> Result<Self> {
+        let AppOptions {
+            mu_binary,
+            cwd,
+            provider,
+            model,
+            bash_yolo,
+            tools,
+            effort,
+            focus_mode,
+        } = opts;
         let effort = EffortLevel::parse(effort).ok_or_else(|| {
             anyhow!("invalid effort {effort:?} (valid: low|medium|high|xhigh|max)")
         })?;

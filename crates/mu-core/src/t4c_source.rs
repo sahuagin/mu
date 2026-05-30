@@ -185,6 +185,12 @@ pub struct CapabilityView {
     /// Why the session disallows it, when `allowed_by_session` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disallowed_reason: Option<String>,
+    /// Where this capability came from — the source name that produced the
+    /// winning entry (mu-kex4.6.8). Lets the model tell "live MCP says loaded"
+    /// from "curated catalog says installed". `None` only if the tree lost the
+    /// path's provenance (shouldn't happen for a ranked result).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Rank the manifest and project the top `limit` results into serializable
@@ -220,6 +226,7 @@ pub fn discover_view_constrained(
                 effects,
                 allowed_by_session: disallowed_reason.is_none(),
                 disallowed_reason,
+                source: tree.source_of(&r.cap.path).map(str::to_string),
             }
         })
         .collect()
@@ -460,9 +467,12 @@ mod tests {
         assert!(!views[0].summary.is_empty());
         // unconstrained => allowed, and an unannotated cap omits effects on the wire
         assert!(views[0].allowed_by_session);
+        // provenance: the source name that produced the entry (mu-kex4.6.8)
+        assert_eq!(views[0].source.as_deref(), Some("test"));
         // serializes to JSON (the wire shape)
         let json = serde_json::to_string(&views[0]).expect("serialize");
         assert!(json.contains("tool.code_recall"));
+        assert!(json.contains("\"source\":\"test\""));
     }
 
     #[test]

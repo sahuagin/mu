@@ -27,15 +27,22 @@ impl Registry {
         self
     }
 
-    /// Collect every source's capabilities into one tree.
+    /// Collect every source's capabilities into one tree, recording each path's
+    /// provenance (the [`RegistrySource::name`] that produced the winning entry).
+    /// Because later sources win on collision, the recorded provenance is always
+    /// the *authoritative* one — "live MCP says loaded" overwrites "curated
+    /// catalog" overwrites a stale probe (mu-kex4.6.8).
     pub fn build(&self) -> Result<Tree> {
         let mut nodes: BTreeMap<String, Capability> = BTreeMap::new();
+        let mut provenance: BTreeMap<String, String> = BTreeMap::new();
         for source in &self.sources {
             for cap in source.capabilities()? {
-                nodes.insert(cap.path.to_string(), cap);
+                let path = cap.path.to_string();
+                provenance.insert(path.clone(), source.name().to_string());
+                nodes.insert(path, cap);
             }
         }
-        Ok(Tree { nodes })
+        Ok(Tree { nodes, provenance })
     }
 }
 
@@ -43,6 +50,8 @@ impl Registry {
 /// keeps iteration ordered so walks and listings are stable.
 pub struct Tree {
     nodes: BTreeMap<String, Capability>,
+    /// path -> the source that produced the winning entry (provenance).
+    provenance: BTreeMap<String, String>,
 }
 
 impl Tree {
@@ -57,6 +66,14 @@ impl Tree {
     /// Exact-path lookup.
     pub fn get(&self, path: &CapPath) -> Option<&Capability> {
         self.nodes.get(&path.to_string())
+    }
+
+    /// Provenance of a path: the [`RegistrySource::name`] that produced the
+    /// winning entry. `None` if the path isn't in the tree. Lets a consumer
+    /// tell "live MCP says loaded" from "curated catalog says installed"
+    /// (mu-kex4.6.8).
+    pub fn source_of(&self, path: &CapPath) -> Option<&str> {
+        self.provenance.get(&path.to_string()).map(String::as_str)
     }
 
     /// Every capability, in stable path order.
@@ -142,5 +159,32 @@ mod tests {
             t.get(&CapPath::parse("bash.x").unwrap()).unwrap().summary,
             "from b"
         );
+    }
+
+    #[test]
+    fn provenance_records_the_winning_source() {
+        let mut reg = Registry::new();
+        reg.add_source(Box::new(StaticSource::new(
+            "curated",
+            vec![cap("bash.x", "from curated"), cap("bash.y", "only curated")],
+        )));
+        reg.add_source(Box::new(StaticSource::new(
+            "mcp-live",
+            vec![cap("bash.x", "from live")],
+        )));
+        let t = reg.build().unwrap();
+        // bash.x collided: the later (authoritative) source wins both the entry
+        // AND the recorded provenance.
+        assert_eq!(
+            t.source_of(&CapPath::parse("bash.x").unwrap()),
+            Some("mcp-live")
+        );
+        // bash.y only came from curated.
+        assert_eq!(
+            t.source_of(&CapPath::parse("bash.y").unwrap()),
+            Some("curated")
+        );
+        // absent path has no provenance.
+        assert_eq!(t.source_of(&CapPath::parse("bash.nope").unwrap()), None);
     }
 }

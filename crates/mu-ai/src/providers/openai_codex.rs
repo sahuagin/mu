@@ -591,7 +591,6 @@ pub(crate) fn build_request_body_from_projection(
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 enum SseFrame {
     #[serde(rename = "response.output_text.delta")]
     OutputTextDelta { delta: String },

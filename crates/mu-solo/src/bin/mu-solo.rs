@@ -11,7 +11,7 @@ use clap::Parser;
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use mu_solo::app::App;
+use mu_solo::app::{App, AppOptions};
 use mu_solo::config::{self, CliOverrides};
 
 /// CLI flags. Every override flag is Optional so we can distinguish
@@ -104,16 +104,16 @@ async fn main() -> Result<()> {
 
     // Build the app FIRST (spawns daemon, creates session). Errors
     // here shouldn't leave the terminal in a weird state.
-    let mut app = App::new(
-        &cfg.session.mu_binary,
-        &cwd,
-        &cfg.session.provider,
-        &cfg.session.model,
-        cfg.session.bash_yolo,
-        &cfg.session.tools,
-        &cfg.tui.effort,
-        cfg.tui.focus_mode,
-    )
+    let mut app = App::new(AppOptions {
+        mu_binary: &cfg.session.mu_binary,
+        cwd: &cwd,
+        provider: &cfg.session.provider,
+        model: &cfg.session.model,
+        bash_yolo: cfg.session.bash_yolo,
+        tools: &cfg.session.tools,
+        effort: &cfg.tui.effort,
+        focus_mode: cfg.tui.focus_mode,
+    })
     .context("App::new failed (is the mu binary path correct?)")?;
 
     // Enter raw mode + bracketed paste for inline rendering.

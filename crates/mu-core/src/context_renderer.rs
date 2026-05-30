@@ -238,12 +238,13 @@ fn render_region_tree(out: &mut String, attr: &ContextAttribution, w: usize, tot
             &region.label,
             region.tokens,
             region.is_free,
-            label_width,
-            bar_budget,
-            token_col_width,
-            max_tokens,
-            total_for_pct,
-            pct_col_width,
+            LineLayout {
+                label_width,
+                bar_budget,
+                token_col_width,
+                max_tokens,
+                total_for_pct,
+            },
         );
 
         // Children
@@ -266,31 +267,44 @@ fn render_region_tree(out: &mut String, attr: &ContextAttribution, w: usize, tot
                 &child.label,
                 child.tokens,
                 false,
-                label_width.saturating_sub(3),
-                bar_budget,
-                token_col_width,
-                max_tokens,
-                total_for_pct,
-                pct_col_width,
+                LineLayout {
+                    label_width: label_width.saturating_sub(3),
+                    bar_budget,
+                    token_col_width,
+                    max_tokens,
+                    total_for_pct,
+                },
             );
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Column dimensions for [`render_region_line`], bundled to keep the line
+/// renderer under the positional-arg limit. `Copy` — all small scalars.
+#[derive(Clone, Copy)]
+struct LineLayout {
+    label_width: usize,
+    bar_budget: usize,
+    token_col_width: usize,
+    max_tokens: u64,
+    total_for_pct: u64,
+}
+
 fn render_region_line(
     out: &mut String,
     prefix: &str,
     label: &str,
     tokens: u64,
     is_free: bool,
-    label_width: usize,
-    bar_budget: usize,
-    token_col_width: usize,
-    max_tokens: u64,
-    total_for_pct: u64,
-    _pct_col_width: usize,
+    layout: LineLayout,
 ) {
+    let LineLayout {
+        label_width,
+        bar_budget,
+        token_col_width,
+        max_tokens,
+        total_for_pct,
+    } = layout;
     let bar_len = if max_tokens > 0 {
         ((tokens as f64 / max_tokens as f64) * bar_budget as f64)
             .round()

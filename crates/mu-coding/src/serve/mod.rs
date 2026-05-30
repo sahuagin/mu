@@ -349,14 +349,16 @@ where
             dispatch::dispatch(
                 req,
                 notif,
-                sessions,
-                factory,
-                tools,
-                skills,
-                daemon_info,
-                discovery,
-                auth_registry,
-                auth_state,
+                dispatch::DispatchCtx {
+                    sessions,
+                    factory,
+                    tools,
+                    skills,
+                    daemon_info,
+                    discovery,
+                    auth_registry,
+                    auth_state,
+                },
             )
             .await
         }

@@ -756,14 +756,15 @@ impl App {
         //    without flooding the dispatch path.
         self.refresh_session_list();
         self.poll_tick_counter = self.poll_tick_counter.wrapping_add(1);
-        if self.poll_tick_counter % 4 == 0 {
+        if self.poll_tick_counter.is_multiple_of(4) {
             self.refresh_daemon_stats();
         }
         // Transcript refresh: only when on the SessionDetail (F3)
         // view and a session is selected. Polls every 2 ticks
         // (~500ms) so live conversation feels responsive without
         // flooding session.events on quiet sessions.
-        if matches!(self.mode, ViewMode::SessionDetail) && self.poll_tick_counter % 2 == 0 {
+        if matches!(self.mode, ViewMode::SessionDetail) && self.poll_tick_counter.is_multiple_of(2)
+        {
             self.refresh_transcript_for_selection();
         }
         // mu-xln F5: refresh whenever a session.done landed this tick,
@@ -772,7 +773,7 @@ impl App {
         // Outside F5 we skip the interval refresh — event-triggered
         // refresh is the only update path, which is essentially free.
         if refresh_usage_after_drain
-            || (matches!(self.mode, ViewMode::Usage) && self.poll_tick_counter % 4 == 0)
+            || (matches!(self.mode, ViewMode::Usage) && self.poll_tick_counter.is_multiple_of(4))
         {
             self.refresh_usage_history();
         }

@@ -36,6 +36,16 @@ pub struct InputBuffer {
     pastes: Vec<PasteRegion>,
 }
 
+/// Cursor-location accumulator threaded through line layout: the row/col the
+/// cursor lands on, and whether it's been located yet. Bundled so the layout
+/// helper doesn't take three separate `&mut` outputs.
+#[derive(Default)]
+struct CursorLoc {
+    row: usize,
+    col: usize,
+    found: bool,
+}
+
 impl InputBuffer {
     pub fn new() -> Self {
         Self::default()
@@ -233,9 +243,7 @@ impl InputBuffer {
     pub fn visual_layout(&self, wrap_width: usize) -> VisualLayout {
         let wrap_width = wrap_width.max(1);
         let mut lines: Vec<VisualLine> = Vec::new();
-        let mut cursor_row: usize = 0;
-        let mut cursor_col: usize = 0;
-        let mut found_cursor = false;
+        let mut cursor = CursorLoc::default();
 
         // Build segments: chunks of content that are either normal text
         // or collapsed paste placeholders.
@@ -245,15 +253,7 @@ impl InputBuffer {
             match seg {
                 DisplaySegment::Text { start, end } => {
                     let text = &self.content[*start..*end];
-                    self.layout_text_segment(
-                        text,
-                        *start,
-                        wrap_width,
-                        &mut lines,
-                        &mut cursor_row,
-                        &mut cursor_col,
-                        &mut found_cursor,
-                    );
+                    self.layout_text_segment(text, *start, wrap_width, &mut lines, &mut cursor);
                 }
                 DisplaySegment::CollapsedPaste {
                     start,
@@ -270,10 +270,10 @@ impl InputBuffer {
                     });
                     // If cursor is inside the collapsed paste, place it
                     // at the end of the placeholder line.
-                    if !found_cursor && self.cursor >= *start && self.cursor <= *end {
-                        cursor_row = row_idx;
-                        cursor_col = 0; // beginning of placeholder
-                        found_cursor = true;
+                    if !cursor.found && self.cursor >= *start && self.cursor <= *end {
+                        cursor.row = row_idx;
+                        cursor.col = 0; // beginning of placeholder
+                        cursor.found = true;
                     }
                 }
             }
@@ -286,14 +286,14 @@ impl InputBuffer {
                 byte_start: 0,
                 byte_end: 0,
             });
-            cursor_row = 0;
-            cursor_col = 0;
+            cursor.row = 0;
+            cursor.col = 0;
         }
 
         VisualLayout {
             lines,
-            cursor_row,
-            cursor_col,
+            cursor_row: cursor.row,
+            cursor_col: cursor.col,
         }
     }
 
@@ -338,16 +338,13 @@ impl InputBuffer {
     }
 
     /// Layout a text segment with word-wrap, updating lines and cursor state.
-    #[allow(clippy::too_many_arguments)]
     fn layout_text_segment(
         &self,
         text: &str,
         byte_offset: usize,
         wrap_width: usize,
         lines: &mut Vec<VisualLine>,
-        cursor_row: &mut usize,
-        cursor_col: &mut usize,
-        found_cursor: &mut bool,
+        cursor: &mut CursorLoc,
     ) {
         for (logical_idx, logical_line) in text.split('\n').enumerate() {
             let line_start = if logical_idx == 0 {
@@ -368,10 +365,10 @@ impl InputBuffer {
                     byte_start: line_start,
                     byte_end: line_start,
                 });
-                if !*found_cursor && self.cursor == line_start {
-                    *cursor_row = row_idx;
-                    *cursor_col = 0;
-                    *found_cursor = true;
+                if !cursor.found && self.cursor == line_start {
+                    cursor.row = row_idx;
+                    cursor.col = 0;
+                    cursor.found = true;
                 }
                 continue;
             }
@@ -398,10 +395,10 @@ impl InputBuffer {
                         byte_start: row_start_byte,
                         byte_end,
                     });
-                    if !*found_cursor && self.cursor >= row_start_byte && self.cursor < byte_end {
-                        *cursor_row = row_idx;
-                        *cursor_col = self.content[row_start_byte..self.cursor].chars().count();
-                        *found_cursor = true;
+                    if !cursor.found && self.cursor >= row_start_byte && self.cursor < byte_end {
+                        cursor.row = row_idx;
+                        cursor.col = self.content[row_start_byte..self.cursor].chars().count();
+                        cursor.found = true;
                     }
                     row_start_byte = byte_end;
                     row_start_char = ci;
@@ -409,10 +406,10 @@ impl InputBuffer {
                 }
                 col += 1;
 
-                if !*found_cursor && self.cursor == char_byte_pos {
-                    *cursor_row = lines.len();
-                    *cursor_col = col - 1;
-                    *found_cursor = true;
+                if !cursor.found && self.cursor == char_byte_pos {
+                    cursor.row = lines.len();
+                    cursor.col = col - 1;
+                    cursor.found = true;
                 }
             }
 
@@ -425,10 +422,10 @@ impl InputBuffer {
                 byte_start: row_start_byte,
                 byte_end,
             });
-            if !*found_cursor && self.cursor >= row_start_byte && self.cursor <= byte_end {
-                *cursor_row = row_idx;
-                *cursor_col = self.content[row_start_byte..self.cursor].chars().count();
-                *found_cursor = true;
+            if !cursor.found && self.cursor >= row_start_byte && self.cursor <= byte_end {
+                cursor.row = row_idx;
+                cursor.col = self.content[row_start_byte..self.cursor].chars().count();
+                cursor.found = true;
             }
         }
     }

@@ -1280,6 +1280,7 @@ async fn index_recall_tool_wired_from_config_mu_re0s() {
         },
         index: IndexConfig {
             lsp_addr: Some(lsp_addr.to_string()),
+            ..Default::default()
         },
         ..Default::default()
     };

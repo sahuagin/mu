@@ -36,6 +36,12 @@ pub struct DiscoverTool {
     /// attenuation is reflected. Fails closed to the default capability
     /// on a poisoned lock rather than leaking a stale snapshot.
     capability: Arc<Mutex<Capability>>,
+    /// mu-kex4.6.3: when true, rank semantically (t4c `SemanticRanker` over a
+    /// config-resolved embedder) with a lexical fallback on any embedder
+    /// failure; when false, lexical only. Sourced from `[index].semantic_discover`
+    /// (default false). `discover` is a rare orientation call, so the per-call
+    /// embed cost is acceptable when enabled.
+    semantic: bool,
 }
 
 impl DiscoverTool {
@@ -43,11 +49,13 @@ impl DiscoverTool {
         tools: Arc<Vec<Arc<dyn Tool>>>,
         skills: Arc<Vec<LoadedSkill>>,
         capability: Arc<Mutex<Capability>>,
+        semantic: bool,
     ) -> Self {
         Self {
             tools,
             skills,
             capability,
+            semantic,
         }
     }
 }
@@ -109,6 +117,57 @@ impl Tool for DiscoverTool {
             .lock()
             .map(|c| c.clone())
             .unwrap_or_default();
+
+        // mu-kex4.6.3: semantic ranking (opt-in via [index].semantic_discover).
+        // `discover` is a rare orientation call, so the per-call embed cost is
+        // acceptable when enabled. The embed is a blocking HTTP call, so it runs
+        // on a blocking thread. ANY failure (no embedder configured, network /
+        // Ollama down, embed error) falls through to the lexical floor below —
+        // enabling semantic never breaks discovery.
+        if self.semantic {
+            // Bind the build result to a `let` so the non-Send `Registry`
+            // temporary (it holds `Box<dyn RegistrySource>`) is dropped here,
+            // not held across the `.await` below — which would make this
+            // future non-Send.
+            let built =
+                mu_core::t4c_source::build_manifest_for_tools(&self.tools, &cap, &self.skills)
+                    .build();
+            match built {
+                Ok(tree) => {
+                    let intent_owned = intent.to_owned();
+                    match tokio::task::spawn_blocking(move || {
+                        mu_core::t4c_source::discover_view_semantic(&tree, &intent_owned, limit)
+                    })
+                    .await
+                    {
+                        Ok(Ok(results)) => {
+                            return ToolResult {
+                                content: format_results(intent, &results),
+                                is_error: false,
+                            };
+                        }
+                        Ok(Err(e)) => tracing::info!(
+                            error = %e,
+                            "discover: semantic ranking unavailable; using lexical floor"
+                        ),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "discover: semantic ranking task failed; using lexical floor"
+                        ),
+                    }
+                }
+                Err(e) => {
+                    return ToolResult {
+                        content: format!("discover: building capability manifest failed: {e}"),
+                        is_error: true,
+                    };
+                }
+            }
+        }
+
+        // Lexical floor — the default path, and the fallback when semantic
+        // ranking is disabled or unavailable. Rebuild the manifest (cheap,
+        // in-memory projection) since a semantic attempt consumes the tree.
         let registry =
             mu_core::t4c_source::build_manifest_for_tools(&self.tools, &cap, &self.skills);
         let tree = match registry.build() {

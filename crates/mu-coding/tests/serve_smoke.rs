@@ -8,9 +8,11 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
-use mu_ai::FauxProvider;
+use mu_ai::{FauxProvider, FauxResponse};
 use mu_coding::serve;
-use mu_core::agent::Provider;
+use mu_core::agent::{
+    AssistantMessage, ContentBlock, Provider, ProviderEvent, StopReason, Tool, ToolArgs, ToolCall,
+};
 use mu_core::config::{AuthConfig, Config};
 
 /// Shared bearer token used by the test harness. The dispatcher's
@@ -26,6 +28,21 @@ const TEST_BEARER_TOKEN: &str = "smoke-test-token";
 /// handshaking.
 async fn spawn_server(
     provider: Arc<dyn Provider>,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    spawn_server_with_tools(provider, Vec::new()).await
+}
+
+/// Like [`spawn_server`], but seeds the daemon with a session tool set.
+/// `tools` is handed to every session the daemon builds, so tests can
+/// exercise tool-dispatch paths — e.g. the in-loop `discover` tool
+/// (mu-onq8), which the daemon registers per session alongside whatever
+/// base tools are configured here.
+async fn spawn_server_with_tools(
+    provider: Arc<dyn Provider>,
+    tools: Vec<Arc<dyn Tool>>,
 ) -> (
     tokio::io::DuplexStream,
     tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -51,7 +68,7 @@ async fn spawn_server(
         server_buf,
         server_write,
         factory,
-        Vec::new(),
+        tools,
         None,
         config,
     ));
@@ -998,6 +1015,128 @@ async fn b14_create_session_with_system_prompt() {
             saw_done = true;
         }
     }
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}
+
+/// mu-onq8: the in-loop `discover` tool is exposed to the agent and is
+/// invokable end-to-end. `capabilities/discover` (mu-kex4.6.4) ranks a
+/// session's permission-attenuated manifest by intent — but only over
+/// the RPC surface. The in-loop agent's only path to that ranking was a
+/// bash shell-out the strict allowlist blocks. mu-onq8 registered a
+/// native `DiscoverTool` per session in `build_and_register_session`.
+///
+/// This drives a faux-scripted `discover` tool call through the real
+/// daemon session path and asserts the agent invokes the native tool
+/// and it completes successfully — i.e. discovery is a first-class
+/// in-loop tool, not a blocked bash call. The acceptance smoke named in
+/// the mu-onq8 bead.
+#[tokio::test]
+async fn discover_tool_invoked_in_loop_mu_onq8() {
+    use mu_coding::tools::ReadTool;
+
+    // Two scripted turns: (1) the model calls `discover` with an intent
+    // that should rank the session's `read` tool; (2) once the tool
+    // result returns, the model emits text and ends the turn.
+    let discover_call = ProviderEvent::Done(AssistantMessage {
+        content: vec![ContentBlock::ToolCall(ToolCall {
+            id: "tc-discover-1".into(),
+            name: "discover".into(),
+            arguments: ToolArgs::new(json!({ "intent": "read a file from disk" }))
+                .expect("valid tool args"),
+        })],
+        stop_reason: StopReason::ToolUse,
+        usage: None,
+    });
+    let final_turn = vec![
+        ProviderEvent::TextDelta("found it".into()),
+        ProviderEvent::Done(AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: "found it".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        }),
+    ];
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::scripted(vec![
+        FauxResponse::Script(vec![discover_call]),
+        FauxResponse::Script(final_turn),
+    ]));
+
+    // Seed the daemon with a real sibling tool so `discover` has
+    // something to rank. The daemon additionally registers `discover`
+    // itself per session (the mu-onq8 wiring under test).
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ReadTool::new())];
+    let (mut client, server_handle) = spawn_server_with_tools(provider, tools).await;
+
+    // create_session (root → unrestricted capability, so `read` is in
+    // the discoverable manifest).
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "create_session",
+        "params": { "provider": { "kind": "anthropic_api", "model": "irrelevant" } }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write create");
+    let resp = read_line(&mut client).await;
+    let session_id = resp["result"]["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    // ask_session — the scripted provider responds with a `discover` call.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "ask_session",
+        "params": { "session_id": session_id, "user_message": "what can I use to read a file?" }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write ask");
+
+    // Drain until we've seen the discover tool start, its completion (by
+    // id), and the terminal done.
+    let mut started: Option<Value> = None;
+    let mut completed: Option<Value> = None;
+    let mut saw_done = false;
+    while !(started.is_some() && completed.is_some() && saw_done) {
+        let line = read_line(&mut client).await;
+        match line["method"].as_str() {
+            Some("session.tool_call_started") if line["params"]["tool_name"] == "discover" => {
+                started = Some(line.clone());
+            }
+            Some("session.tool_call_completed")
+                if line["params"]["tool_call_id"] == "tc-discover-1" =>
+            {
+                completed = Some(line.clone());
+            }
+            Some("session.done") => saw_done = true,
+            _ => {}
+        }
+    }
+
+    let started = started.expect("discover tool_call_started");
+    assert_eq!(started["params"]["tool_name"], "discover");
+    assert_eq!(started["params"]["session_id"], session_id);
+
+    // The discover call must SUCCEED in-loop (outcome kind == "ok"),
+    // proving the agent used the native tool rather than the blocked
+    // bash path.
+    let completed = completed.expect("discover tool_call_completed");
+    assert_eq!(
+        completed["params"]["outcome"]["kind"], "ok",
+        "discover should complete ok, got: {completed}"
+    );
+    let result = completed["params"]["outcome"]["result"]
+        .as_str()
+        .expect("ok result is a string");
+    // The ranked manifest should surface the session's `read` tool.
+    assert!(
+        result.contains("read"),
+        "discover result should rank the read tool: {result:?}"
+    );
 
     drop(client);
     let _ = timeout(Duration::from_millis(500), server_handle).await;

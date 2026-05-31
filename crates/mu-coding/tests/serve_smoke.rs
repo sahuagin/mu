@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
 use mu_ai::{FauxProvider, FauxResponse};
@@ -13,7 +13,7 @@ use mu_coding::serve;
 use mu_core::agent::{
     AssistantMessage, ContentBlock, Provider, ProviderEvent, StopReason, Tool, ToolArgs, ToolCall,
 };
-use mu_core::config::{AuthConfig, Config};
+use mu_core::config::{AuthConfig, Config, IndexConfig};
 
 /// Shared bearer token used by the test harness. The dispatcher's
 /// mu-fnn enforcement gate (mu-7rk-c) rejects every protected RPC
@@ -47,6 +47,28 @@ async fn spawn_server_with_tools(
     tokio::io::DuplexStream,
     tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
+    let config = Config {
+        auth: AuthConfig::Bearer {
+            tokens: vec![TEST_BEARER_TOKEN.to_string()],
+        },
+        ..Default::default()
+    };
+    spawn_server_with_config(provider, tools, config).await
+}
+
+/// Like [`spawn_server_with_tools`], but takes an explicit `Config` so a test
+/// can exercise config-driven daemon-startup behavior — e.g. mu-re0s's
+/// `[index].lsp_addr`, which makes the daemon connect to a code-index LSP at
+/// startup and register the `index_recall` tool. The caller must set `auth` to
+/// the bearer token the harness authenticates with (`TEST_BEARER_TOKEN`).
+async fn spawn_server_with_config(
+    provider: Arc<dyn Provider>,
+    tools: Vec<Arc<dyn Tool>>,
+    config: Config,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     let (server_read, server_write) = tokio::io::split(server);
     let server_buf = BufReader::new(server_read);
@@ -55,12 +77,6 @@ async fn spawn_server_with_tools(
     // (one provider for all sessions) under the new factory API.
     let factory: serve::ProviderFactory =
         std::sync::Arc::new(move |_selector| Ok(provider.clone()));
-    let config = Config {
-        auth: AuthConfig::Bearer {
-            tokens: vec![TEST_BEARER_TOKEN.to_string()],
-        },
-        ..Default::default()
-    };
     // events_dir=None: integration tests do NOT write to disk
     // (mu-upb). Setting Some(<path>) would pollute the developer's
     // ~/.local/share/mu/events with test fixtures.
@@ -1136,6 +1152,199 @@ async fn discover_tool_invoked_in_loop_mu_onq8() {
     assert!(
         result.contains("read"),
         "discover result should rank the read tool: {result:?}"
+    );
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}
+
+/// Minimal stub code-index LSP server for the mu-re0s test. Binds
+/// 127.0.0.1:0, accepts ONE connection, and speaks just enough LSP
+/// (Content-Length framed JSON-RPC) for `mu_core::lsp_client::LspClient`:
+/// answers `initialize` and returns a single fixed symbol for any
+/// `workspace/symbol` query. Returns the bound address; the server task runs
+/// until the client connection closes.
+async fn spawn_stub_index_lsp(symbol_name: &'static str) -> std::net::SocketAddr {
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub lsp");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let (sock, _) = match listener.accept().await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let (read, mut write) = sock.into_split();
+        let mut reader = BufReader::new(read);
+        loop {
+            // Read one Content-Length framed message.
+            let mut header = String::new();
+            if reader.read_line(&mut header).await.unwrap_or(0) == 0 {
+                break; // EOF
+            }
+            let len: usize = match header.trim().strip_prefix("Content-Length:") {
+                Some(n) => n.trim().parse().unwrap_or(0),
+                None => continue,
+            };
+            let mut sep = String::new(); // blank separator line
+            let _ = reader.read_line(&mut sep).await;
+            let mut body = vec![0u8; len];
+            if reader.read_exact(&mut body).await.is_err() {
+                break;
+            }
+            let msg: Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            let id = msg.get("id").cloned();
+            let result = match method {
+                "initialize" => {
+                    Some(json!({"capabilities": {}, "serverInfo": {"name": "stub-index"}}))
+                }
+                "workspace/symbol" => Some(json!([{
+                    "name": symbol_name,
+                    "kind": 12,
+                    "location": {
+                        "uri": "file:///repo/src/lib.rs",
+                        "range": {
+                            "start": {"line": 41, "character": 0},
+                            "end": {"line": 60, "character": 0}
+                        }
+                    }
+                }])),
+                "shutdown" => Some(Value::Null),
+                _ => None, // notifications (initialized / exit) get no response
+            };
+            if let (Some(id), Some(result)) = (id, result) {
+                let resp = json!({"jsonrpc": "2.0", "id": id, "result": result});
+                let body = serde_json::to_string(&resp).expect("serialize stub resp");
+                let framed = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+                if write.write_all(framed.as_bytes()).await.is_err() {
+                    break;
+                }
+                let _ = write.flush().await;
+            }
+        }
+    });
+    addr
+}
+
+/// mu-re0s: the `index_recall` tool (code-index / code_recall search — the
+/// highest-value instance of Friction B) is wired into the in-loop agent when
+/// `[index].lsp_addr` is configured. The tool exists in the registry but was
+/// never constructed/registered anywhere; mu-re0s connects to the code-index
+/// LSP at daemon startup and registers it.
+///
+/// This drives the full path: config → daemon connects to a stub LSP →
+/// registers `index_recall` → a scripted agent invokes it → LSP round-trip →
+/// result. Asserts the agent invokes the native tool (not a grep fallback) and
+/// it completes ok with the LSP's symbol.
+#[tokio::test]
+async fn index_recall_tool_wired_from_config_mu_re0s() {
+    // Stub code-index LSP returning a known symbol for any query.
+    let lsp_addr = spawn_stub_index_lsp("build_and_register_session").await;
+
+    // FauxProvider scripted to call index_recall, then end the turn.
+    let call = ProviderEvent::Done(AssistantMessage {
+        content: vec![ContentBlock::ToolCall(ToolCall {
+            id: "tc-idx-1".into(),
+            name: "index_recall".into(),
+            arguments: ToolArgs::new(json!({"query": "where are sessions built", "limit": 5}))
+                .expect("valid tool args"),
+        })],
+        stop_reason: StopReason::ToolUse,
+        usage: None,
+    });
+    let final_turn = vec![
+        ProviderEvent::TextDelta("done".into()),
+        ProviderEvent::Done(AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        }),
+    ];
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::scripted(vec![
+        FauxResponse::Script(vec![call]),
+        FauxResponse::Script(final_turn),
+    ]));
+
+    // Config points the daemon at the stub LSP → connect at startup + register
+    // index_recall (mu-re0s). No base tools needed; the daemon adds the tool.
+    let config = Config {
+        auth: AuthConfig::Bearer {
+            tokens: vec![TEST_BEARER_TOKEN.to_string()],
+        },
+        index: IndexConfig {
+            lsp_addr: Some(lsp_addr.to_string()),
+        },
+        ..Default::default()
+    };
+    let (mut client, server_handle) = spawn_server_with_config(provider, Vec::new(), config).await;
+
+    // create_session
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "create_session",
+        "params": { "provider": { "kind": "anthropic_api", "model": "irrelevant" } }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write create");
+    let resp = read_line(&mut client).await;
+    let session_id = resp["result"]["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    // ask_session — the scripted provider responds with an index_recall call.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "ask_session",
+        "params": { "session_id": session_id, "user_message": "where is a session built?" }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write ask");
+
+    let mut started: Option<Value> = None;
+    let mut completed: Option<Value> = None;
+    let mut saw_done = false;
+    while !(started.is_some() && completed.is_some() && saw_done) {
+        let line = read_line(&mut client).await;
+        match line["method"].as_str() {
+            Some("session.tool_call_started") if line["params"]["tool_name"] == "index_recall" => {
+                started = Some(line.clone());
+            }
+            Some("session.tool_call_completed") if line["params"]["tool_call_id"] == "tc-idx-1" => {
+                completed = Some(line.clone());
+            }
+            Some("session.done") => saw_done = true,
+            _ => {}
+        }
+    }
+
+    let started = started.expect("index_recall tool_call_started");
+    assert_eq!(started["params"]["tool_name"], "index_recall");
+    assert_eq!(started["params"]["session_id"], session_id);
+
+    // Must complete ok (outcome.kind == "ok"), proving the daemon connected to
+    // the LSP, registered the tool, and the agent invoked it in-loop.
+    let completed = completed.expect("index_recall tool_call_completed");
+    assert_eq!(
+        completed["params"]["outcome"]["kind"], "ok",
+        "index_recall should complete ok, got: {completed}"
+    );
+    let result = completed["params"]["outcome"]["result"]
+        .as_str()
+        .expect("ok result is a string");
+    // The LSP's symbol must surface in the tool result.
+    assert!(
+        result.contains("build_and_register_session"),
+        "index_recall result should contain the LSP symbol: {result:?}"
     );
 
     drop(client);

@@ -99,6 +99,16 @@ pub struct IndexConfig {
     /// `None` => don't connect; the `index_recall` tool is not registered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lsp_addr: Option<String>,
+    /// mu-kex4.6.3: rank the in-loop `discover` tool's results semantically
+    /// (t4c `SemanticRanker` over an embedder) instead of the `LexicalRanker`
+    /// floor. Opt-in (`false` default) because semantic ranking resolves an
+    /// embedder (`ConfigEmbedder::from_config` — network/paid by default,
+    /// pointable at a local Ollama via `T4C_EMBED_ENDPOINT`); `discover` is a
+    /// rare orientation action, so the per-call embed cost is acceptable when
+    /// enabled. On any embedder failure the tool falls back to the lexical
+    /// floor, so enabling this never breaks discovery. Default `false` keeps
+    /// prior behavior and keeps tests offline.
+    pub semantic_discover: bool,
 }
 
 /// `[recall]` section. Controls session-start context injection — the
@@ -528,8 +538,13 @@ mod tests {
     #[test]
     fn index_defaults_to_no_addr_and_toml_can_set() {
         assert_eq!(Config::default().index.lsp_addr, None);
-        let c: Config = toml::from_str("[index]\nlsp_addr = \"127.0.0.1:9257\"\n").expect("parse");
+        // mu-kex4.6.3: semantic discover is opt-in, default off (keeps tests offline).
+        assert!(!Config::default().index.semantic_discover);
+        let c: Config =
+            toml::from_str("[index]\nlsp_addr = \"127.0.0.1:9257\"\nsemantic_discover = true\n")
+                .expect("parse");
         assert_eq!(c.index.lsp_addr.as_deref(), Some("127.0.0.1:9257"));
+        assert!(c.index.semantic_discover);
     }
 
     #[test]

@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # verify-claims-test.sh — exercise scripts/verify-claims.sh against synthetic
-# commits in a throwaway git repo.
+# commits in a throwaway repo.
 #
-# bead: mu-b5kl. Runs zero-dependency: pure git + bash + the gate script.
+# bead: mu-b5kl. The gate is VCS-agnostic (jj when invoked from a jj workspace,
+# git otherwise), so the SAME case suite runs against BOTH a throwaway git repo
+# and a throwaway jj repo, forcing the backend via MU_VERIFY_VCS. The git suite
+# is zero-dependency (git + bash); the jj suite is skipped with a note if `jj`
+# is not installed.
 #
-# Run from any cwd; the test creates its own tmpdir.
+# Run from any cwd; each suite creates its own tmpdir.
 
 set -u
 set -o pipefail
@@ -29,7 +33,7 @@ FAIL=0
 assert_gate() {
   local name="$1" expected_rc="$2" expected_grep="$3" commit="$4"
   shift 4
-  local out rc grep_rc=0
+  local out rc
   out=$(env "$@" "$GATE" "$commit" 2>&1)
   rc=$?
   if [ "$rc" -ne "$expected_rc" ]; then
@@ -49,49 +53,36 @@ assert_gate() {
   PASS=$((PASS + 1))
 }
 
-# --- temp repo ------------------------------------------------------------
-
-TMP="$(mktemp -d -t verify-claims-test.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
-
-cd "$TMP"
-git init -q -b main
-git config user.email "test@example.com"
-git config user.name  "test"
-
-# Seed commit so HEAD~1 exists for diff-tree consistency.
-echo "seed" > seed.txt
-git add seed.txt
-git commit -q -m "seed"
-
-# Helper: make a commit with given filesystem changes and a given message.
+# --- backend-parametrized commit construction ----------------------------
+#
+# Each suite sets VCS (jj|git) and REV (commit-ish for "the commit just made").
+# apply_actions mutates the working tree; mk_commit wraps it in a commit.
+#
 #   make_commit <message-file> <action>...
 # where each action is one of:
-#   add  <path> <bytes>
-#   mod  <path> <bytes>          (append bytes)
+#   add  <path> <bytes>          (create with <bytes> lines)
+#   mod  <path> <bytes>          (append <bytes> lines)
 #   del  <path>
-make_commit() {
-  local msgfile="$1"; shift
+
+apply_actions() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       add)
-        local p="$2" b="$3"
+        local p="$2" b="$3" i=0
         mkdir -p "$(dirname "$p")"
         : > "$p"
-        local i=0
-        while [ "$i" -lt "$b" ]; do echo "line $i" >> "$p"; i=$((i+1)); done
-        git add "$p"
+        while [ "$i" -lt "$b" ]; do echo "line $i" >> "$p"; i=$((i + 1)); done
+        [ "$VCS" = git ] && git add "$p"
         shift 3
         ;;
       mod)
-        local p="$2" b="$3"
-        local i=0
-        while [ "$i" -lt "$b" ]; do echo "added $i" >> "$p"; i=$((i+1)); done
-        git add "$p"
+        local p="$2" b="$3" i=0
+        while [ "$i" -lt "$b" ]; do echo "added $i" >> "$p"; i=$((i + 1)); done
+        [ "$VCS" = git ] && git add "$p"
         shift 3
         ;;
       del)
-        git rm -q "$2"
+        if [ "$VCS" = git ]; then git rm -q "$2"; else rm -f "$2"; fi
         shift 2
         ;;
       *)
@@ -100,12 +91,49 @@ make_commit() {
         ;;
     esac
   done
-  git commit -q -F "$msgfile"
 }
 
-# --- case 1: matching block → pass ---------------------------------------
+make_commit() {
+  local msgfile="$1"; shift
+  if [ "$VCS" = git ]; then
+    apply_actions "$@"
+    git commit -q -F "$msgfile"
+  else
+    # advance to a fresh empty change off the previous commit, then fill it
+    jj new >/dev/null 2>&1
+    apply_actions "$@"
+    jj describe -m "$(cat "$msgfile")" >/dev/null 2>&1
+  fi
+}
 
-cat > /tmp/msg.$$ <<'EOF'
+setup_repo() {
+  local tmp
+  tmp="$(mktemp -d -t verify-claims-test.XXXXXX)"
+  SUITE_TMP="$tmp"
+  cd "$tmp"
+  if [ "$VCS" = git ]; then
+    git init -q -b main
+    git config user.email "test@example.com"
+    git config user.name  "test"
+    echo "seed" > seed.txt
+    git add seed.txt
+    git commit -q -m "seed"
+  else
+    jj git init >/dev/null 2>&1
+    jj config set --repo user.name  "test"               >/dev/null 2>&1
+    jj config set --repo user.email "test@example.com"   >/dev/null 2>&1
+    echo "seed" > seed.txt
+    jj describe -m "seed" >/dev/null 2>&1   # seed into the initial working-copy change
+  fi
+}
+
+# --- the case suite (identical for both backends) ------------------------
+
+run_cases() {
+  local M="$SUITE_TMP/msg"
+
+  # case 1: matching block → pass
+  cat > "$M" <<'EOF'
 feat: matching case
 
 This commit's claim matches the diff.
@@ -113,13 +141,11 @@ This commit's claim matches the diff.
 ## Files
 A foo.txt +5
 EOF
-make_commit /tmp/msg.$$ add foo.txt 5
-rm /tmp/msg.$$
-assert_gate "matching block passes" 0 "matches diff" HEAD
+  make_commit "$M" add foo.txt 5
+  assert_gate "[$VCS] matching block passes" 0 "matches diff" "$REV" "MU_VERIFY_VCS=$VCS"
 
-# --- case 2: claimed file not in diff → fail -----------------------------
-
-cat > /tmp/msg.$$ <<'EOF'
+  # case 2: claimed file not in diff → fail
+  cat > "$M" <<'EOF'
 feat: fictional claim
 
 Claims a file that's not in the diff (the PR #52 failure pattern).
@@ -128,13 +154,11 @@ Claims a file that's not in the diff (the PR #52 failure pattern).
 A bar.txt +10
 A imaginary.rs +500
 EOF
-make_commit /tmp/msg.$$ add bar.txt 10
-rm /tmp/msg.$$
-assert_gate "claimed-but-missing fails" 1 "claimed file not in diff: imaginary.rs" HEAD
+  make_commit "$M" add bar.txt 10
+  assert_gate "[$VCS] claimed-but-missing fails" 1 "claimed file not in diff: imaginary.rs" "$REV" "MU_VERIFY_VCS=$VCS"
 
-# --- case 3: file in diff but not claimed → fail -------------------------
-
-cat > /tmp/msg.$$ <<'EOF'
+  # case 3: file in diff but not claimed → fail
+  cat > "$M" <<'EOF'
 feat: incomplete claim
 
 Touches two files but only claims one.
@@ -142,13 +166,11 @@ Touches two files but only claims one.
 ## Files
 M foo.txt +3
 EOF
-make_commit /tmp/msg.$$ mod foo.txt 3 mod bar.txt 2
-rm /tmp/msg.$$
-assert_gate "unclaimed diff fails" 1 "diff touched bar.txt but it was not claimed" HEAD
+  make_commit "$M" mod foo.txt 3 mod bar.txt 2
+  assert_gate "[$VCS] unclaimed diff fails" 1 "diff touched bar.txt but it was not claimed" "$REV" "MU_VERIFY_VCS=$VCS"
 
-# --- case 4: status mismatch (A vs M) → fail -----------------------------
-
-cat > /tmp/msg.$$ <<'EOF'
+  # case 4: status mismatch (A vs M) → fail
+  cat > "$M" <<'EOF'
 feat: status lies
 
 Claims A but the file already existed (M).
@@ -156,13 +178,11 @@ Claims A but the file already existed (M).
 ## Files
 A foo.txt +1
 EOF
-make_commit /tmp/msg.$$ mod foo.txt 1
-rm /tmp/msg.$$
-assert_gate "status mismatch fails" 1 "status mismatch for foo.txt: claim=A actual=M" HEAD
+  make_commit "$M" mod foo.txt 1
+  assert_gate "[$VCS] status mismatch fails" 1 "status mismatch for foo.txt: claim=A actual=M" "$REV" "MU_VERIFY_VCS=$VCS"
 
-# --- case 5: LOC drift >20% → warn (exit 0) ------------------------------
-
-cat > /tmp/msg.$$ <<'EOF'
+  # case 5: LOC drift >20% → warn (exit 0)
+  cat > "$M" <<'EOF'
 feat: loc drift
 
 Claim is off by >20% on LOC counts; should warn but exit 0.
@@ -170,44 +190,36 @@ Claim is off by >20% on LOC counts; should warn but exit 0.
 ## Files
 M foo.txt +100
 EOF
-make_commit /tmp/msg.$$ mod foo.txt 5
-rm /tmp/msg.$$
-assert_gate "LOC drift warns (exit 0)" 0 "WARN.*added LOC drift" HEAD
+  make_commit "$M" mod foo.txt 5
+  assert_gate "[$VCS] LOC drift warns (exit 0)" 0 "WARN.*added LOC drift" "$REV" "MU_VERIFY_VCS=$VCS"
 
-# --- case 6: no ## Files block → exit 0 with note ------------------------
-
-cat > /tmp/msg.$$ <<'EOF'
+  # case 6: no ## Files block → exit 0 with note
+  cat > "$M" <<'EOF'
 feat: legacy commit, no claim block
 
 This commit has no ## Files section — opt-in strictness means we skip.
 EOF
-make_commit /tmp/msg.$$ mod foo.txt 1
-rm /tmp/msg.$$
-assert_gate "no block exits 0 with note" 0 "no .## Files. block — skipping" HEAD
+  make_commit "$M" mod foo.txt 1
+  assert_gate "[$VCS] no block exits 0 with note" 0 "no .## Files. block — skipping" "$REV" "MU_VERIFY_VCS=$VCS"
 
-# --- case 7: MU_SKIP_CLAIM_CHECK=1 bypasses -----------------------------
-
-# Make a commit that WOULD fail without the bypass.
-cat > /tmp/msg.$$ <<'EOF'
+  # case 7: MU_SKIP_CLAIM_CHECK=1 bypasses
+  cat > "$M" <<'EOF'
 feat: would fail without bypass
 
 ## Files
 A nonexistent-file.rs +999
 EOF
-make_commit /tmp/msg.$$ mod foo.txt 1
-rm /tmp/msg.$$
-assert_gate "bypass env var skips" 0 "MU_SKIP_CLAIM_CHECK=1" HEAD MU_SKIP_CLAIM_CHECK=1
+  make_commit "$M" mod foo.txt 1
+  assert_gate "[$VCS] bypass env var skips" 0 "MU_SKIP_CLAIM_CHECK=1" "$REV" "MU_VERIFY_VCS=$VCS" "MU_SKIP_CLAIM_CHECK=1"
 
-# --- case 8: bad commit ref → exit 2 ------------------------------------
+  # case 8: bad commit ref → exit 2
+  assert_gate "[$VCS] bad commit ref returns 2" 2 "is not a commit" "definitely-not-a-commit" "MU_VERIFY_VCS=$VCS"
 
-assert_gate "bad commit ref returns 2" 2 "is not a commit" "definitely-not-a-commit"
-
-# --- case 9: git trailers after ## Files block are ignored (mu-d33g) ----
-# Regression: before the fix, lines like "Co-Authored-By: Claude ..." after
-# the ## Files block were parsed as Files entries with status=C path=Claude,
-# causing "claimed file not in diff" failures on any commit with git trailers.
-
-cat > /tmp/msg.$$ <<'EOF'
+  # case 9: git trailers after ## Files block are ignored (mu-d33g)
+  # Regression: before the fix, lines like "Co-Authored-By: ..." after the
+  # ## Files block were parsed as Files entries (status=C path=Claude),
+  # causing "claimed file not in diff" failures on any trailer-bearing commit.
+  cat > "$M" <<'EOF'
 feat: trailers after files block must be ignored
 
 Regression test for mu-d33g. Git trailer lines (Co-Authored-By,
@@ -223,9 +235,37 @@ Co-Authored-By: Someone Else <someone@example.com>
 Signed-off-by: Maintainer Mantis <maint@example.com>
 Reviewed-by: A Reviewer <review@example.com>
 EOF
-make_commit /tmp/msg.$$ add trailer-test.txt 5
-rm /tmp/msg.$$
-assert_gate "trailers after files block ignored" 0 "matches diff" HEAD
+  make_commit "$M" add trailer-test.txt 5
+  assert_gate "[$VCS] trailers after files block ignored" 0 "matches diff" "$REV" "MU_VERIFY_VCS=$VCS"
+}
+
+# --- run a suite for one backend -----------------------------------------
+
+# Run all cases against one backend. Cases run inline (not in a subshell) so the
+# PASS/FAIL counters accumulate across both suites.
+run_suite() {
+  VCS="$1"
+  case "$VCS" in
+    git) REV="HEAD" ;;
+    jj)  REV="@" ;;
+  esac
+  printf "\n==== suite: %s ====\n" "$VCS"
+  local start_dir="$PWD"
+  setup_repo
+  run_cases
+  cd "$start_dir"
+  [ -n "${SUITE_TMP:-}" ] && rm -rf "$SUITE_TMP"
+}
+
+# --- main -----------------------------------------------------------------
+
+run_suite git
+
+if command -v jj >/dev/null 2>&1; then
+  run_suite jj
+else
+  printf "\n==== suite: jj — SKIPPED (jj not installed) ====\n"
+fi
 
 # --- summary -------------------------------------------------------------
 

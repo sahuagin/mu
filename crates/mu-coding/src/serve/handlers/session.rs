@@ -280,14 +280,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
     let session_tools = session_spawn_tools(tools.as_slice(), &sessions, daemon_info, &session_id);
     let compaction_cfg = &daemon_info.config().compaction;
-    let compaction_policy_override: Option<
-        Arc<dyn mu_core::context::compaction::CompactionPolicy>,
-    > = match compaction_cfg.default_policy.as_str() {
-        "heuristic" => Some(Arc::new(
-            mu_core::context::compaction::heuristic::SpanFamilyDropPolicy::new(),
-        )),
-        _ => None,
-    };
+    let compaction_policy_override = resolve_compaction_policy(compaction_cfg);
     let agent = AgentLoop::spawn(SpawnArgs {
         provider,
         provider_kind: kind_arc,
@@ -1034,6 +1027,61 @@ pub async fn handle_spawn_worker(
     }
 }
 
+/// Resolve the per-session compaction policy from config, with legible
+/// diagnostics. Closes mu-8bkf: the previous inline match wired only
+/// `"heuristic"` and silently fell through to a no-op for every other
+/// value — including the documented `"hash-and-summary"` — so a configured
+/// `trigger_threshold_tokens` produced no compaction with no signal.
+fn resolve_compaction_policy(
+    cfg: &mu_core::config::CompactionConfig,
+) -> Option<Arc<dyn mu_core::context::compaction::CompactionPolicy>> {
+    use mu_core::context::compaction::heuristic::SpanFamilyDropPolicy;
+    let heuristic = || -> Arc<dyn mu_core::context::compaction::CompactionPolicy> {
+        Arc::new(SpanFamilyDropPolicy::new())
+    };
+    match cfg.default_policy.as_str() {
+        "heuristic" => {
+            tracing::info!(
+                threshold = cfg.trigger_threshold_tokens,
+                "compaction: heuristic span-family drop active"
+            );
+            Some(heuristic())
+        }
+        "hash-and-summary" | "hash_summary" => {
+            // The judge-backed HashAndSummaryPolicy needs a provider built
+            // from [compaction.judge]; that wiring isn't on the serve path
+            // yet (mu-8bkf follow-up). Fall back to heuristic drop so
+            // compaction still runs — and say so, rather than silently
+            // degrading to a no-op.
+            tracing::warn!(
+                threshold = cfg.trigger_threshold_tokens,
+                "compaction: judge-backed hash-and-summary is not wired into the serve \
+                 path yet; using heuristic span-family drop instead (mu-8bkf)"
+            );
+            Some(heuristic())
+        }
+        other => {
+            if !matches!(other, "no-compaction" | "none" | "") {
+                tracing::warn!(
+                    default_policy = %other,
+                    "compaction: unknown default_policy; running with NO compaction \
+                     (valid: heuristic, hash-and-summary, no-compaction)"
+                );
+            }
+            if cfg.trigger_threshold_tokens > 0 {
+                tracing::warn!(
+                    threshold = cfg.trigger_threshold_tokens,
+                    default_policy = %other,
+                    "compaction: trigger_threshold_tokens is set but default_policy \
+                     resolves to a no-op — context will NOT be compacted. Set \
+                     [compaction].default_policy = \"heuristic\" to enable (mu-8bkf)."
+                );
+            }
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! mu-u1ld phase B: verify that read-only queries against
@@ -1049,6 +1097,28 @@ mod tests {
     use mu_core::event_log::SessionEventLog;
     use mu_core::protocol::JSONRPC_VERSION;
     use serde_json::json;
+
+    // mu-8bkf: compaction policy resolution from config. The previous
+    // inline match silently no-op'd every value but "heuristic"; this
+    // pins that real policies resolve and unknown/none resolve to None.
+    #[test]
+    fn compaction_policy_resolves_per_config_value() {
+        use mu_core::config::CompactionConfig;
+        let cfg = |p: &str| CompactionConfig {
+            default_policy: p.to_string(),
+            trigger_threshold_tokens: 150_000,
+            ..Default::default()
+        };
+        // Real policies resolve to Some (hash-and-summary falls back to heuristic).
+        assert!(resolve_compaction_policy(&cfg("heuristic")).is_some());
+        assert!(resolve_compaction_policy(&cfg("hash-and-summary")).is_some());
+        assert!(resolve_compaction_policy(&cfg("hash_summary")).is_some());
+        // Explicit no-op and unknown resolve to None.
+        assert!(resolve_compaction_policy(&cfg("no-compaction")).is_none());
+        assert!(resolve_compaction_policy(&cfg("none")).is_none());
+        assert!(resolve_compaction_policy(&cfg("")).is_none());
+        assert!(resolve_compaction_policy(&cfg("bogus")).is_none());
+    }
 
     // mu-slat: per-session injection of the spawn_worker tool. In
     // production every session gets one scoped to its own id (so worker

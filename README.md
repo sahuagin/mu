@@ -184,10 +184,11 @@ The architectural contract is the protocol and event model, not a particular UI.
 
 ## Development
 
-A top-level `justfile` collects the common workflows. `just --list` for the menu; recipes wrap the underlying `cargo` and `scripts/` invocations.
+A top-level `justfile` collects the common workflows. `just --list` for the menu; recipes wrap the underlying `cargo` and `scripts/` invocations. `just ci` mirrors [`.github/workflows/ci.yml`](.github/workflows/ci.yml) verbatim — a green `just ci` means a green CI, so run it before pushing.
 
 ```sh
-just check         # full pre-PR check (fmt + clippy + test)
+just ci            # exactly what CI runs: fmt-check + clippy + test (fail-fast)
+just check         # full pre-PR check: the ci checks + verify-claims, with timing
 just smoke         # mu ask against the faux provider — no API key needed
 just pr <branch>   # push current jj @ as <branch> and open a PR
 ```

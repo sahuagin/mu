@@ -12,8 +12,8 @@
 # (sh / dash) is too lean for the pr recipe's positional-args forwarding.
 set shell := ["bash", "-cu"]
 
-# Default recipe: list everything.
-_default:
+# Default recipe: list every available recipe (same as bare `just`).
+list:
     @just --list
 
 # ── pre-PR gate ────────────────────────────────────────────────────────────
@@ -25,6 +25,9 @@ check:
 # Quick pre-PR check: fmt + clippy only (skip tests). Good for fast loops.
 check-quick:
     PRE_PR_QUICK=1 ./scripts/pre-pr-check.sh
+
+# Exactly what CI runs: fmt-check + clippy + test, fail-fast in CI order (mirrors .github/workflows/ci.yml; fmt is check-only, never edits files). bead: mu-608b
+ci: fmt-check clippy test
 
 # ── individual cargo steps ────────────────────────────────────────────────
 

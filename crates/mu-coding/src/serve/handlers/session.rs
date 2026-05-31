@@ -278,7 +278,21 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     ));
     let mailbox = Arc::new(super::super::mailbox::MailboxState::new());
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
-    let session_tools = session_spawn_tools(tools.as_slice(), &sessions, daemon_info, &session_id);
+    let mut session_tools =
+        session_spawn_tools(tools.as_slice(), &sessions, daemon_info, &session_id);
+    // mu-onq8: always-on in-loop capability discovery. Ranks the session's
+    // sibling tools (attenuated by this session's capability) against a
+    // free-text intent, so the agent can find the right tool in-loop instead
+    // of shelling out to the allowlist-blocked bash path. Built over a
+    // snapshot of the siblings (excludes itself). Skills are not yet threaded
+    // here (tools-only v1); the daemon's discovered skills join in the mu-onq8
+    // follow-up (pairs with mu-re0s).
+    let discover_siblings = Arc::new(session_tools.clone());
+    session_tools.push(Arc::new(crate::tools::DiscoverTool::new(
+        discover_siblings,
+        Arc::new(Vec::<mu_core::skill::loader::LoadedSkill>::new()),
+        capability_handle.clone(),
+    )));
     let compaction_cfg = &daemon_info.config().compaction;
     let compaction_policy_override = resolve_compaction_policy(compaction_cfg);
     let agent = AgentLoop::spawn(SpawnArgs {

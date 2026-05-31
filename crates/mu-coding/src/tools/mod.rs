@@ -1,5 +1,6 @@
 pub mod aws_recon;
 pub mod bash;
+pub mod discover;
 pub mod edit;
 pub mod glob;
 pub mod grep;
@@ -11,6 +12,7 @@ pub mod write;
 
 pub use aws_recon::AwsReconTool;
 pub use bash::{BashMode, BashTool};
+pub use discover::DiscoverTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;

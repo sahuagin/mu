@@ -295,13 +295,22 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     )));
     let compaction_cfg = &daemon_info.config().compaction;
     let compaction_policy_override = resolve_compaction_policy(compaction_cfg);
+    // mu-k011: discovery-bootstrap default. When session-start recall is
+    // disabled (MU_NO_RECALL / `[recall].enabled = false`), an uninstructed
+    // model declines instead of discovering; inject a short bootstrap so it
+    // searches memory + calls the native `discover` tool (mu-onq8) on demand.
+    // Conservative: applies only when the operator supplied no system prompt
+    // of their own — see compose_system_prompt for the design rationale.
+    let recall_enabled = daemon_info.config().recall_enabled();
+    let effective_system_prompt =
+        super::super::discovery_bootstrap::compose_system_prompt(system_prompt, recall_enabled);
     let agent = AgentLoop::spawn(SpawnArgs {
         provider,
         provider_kind: kind_arc,
         model: model_arc,
         tools: session_tools,
         config: AgentConfig {
-            system_prompt: system_prompt.map(SpanText::from),
+            system_prompt: effective_system_prompt.map(SpanText::from),
             max_turns,
             project_context,
             compaction_threshold: Some(compaction_cfg.trigger_threshold_tokens),

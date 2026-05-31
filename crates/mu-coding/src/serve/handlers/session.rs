@@ -292,6 +292,8 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         discover_siblings,
         Arc::new(Vec::<mu_core::skill::loader::LoadedSkill>::new()),
         capability_handle.clone(),
+        // mu-kex4.6.3: semantic ranking is opt-in via [index].semantic_discover.
+        daemon_info.config().index.semantic_discover,
     )));
     let compaction_cfg = &daemon_info.config().compaction;
     let compaction_policy_override = resolve_compaction_policy(compaction_cfg);

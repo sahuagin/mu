@@ -18,8 +18,8 @@
 use std::sync::Arc;
 
 use t4c::{
-    CapPath, Capability, Effects, Embedder, FsEffect, LexicalRanker, Ranked, Ranker, Registry,
-    RegistrySource, SemanticRanker, SessionConstraints, Tree, VectorCache,
+    CapPath, Capability, ConfigEmbedder, Effects, Embedder, FsEffect, LexicalRanker, Ranked,
+    Ranker, Registry, RegistrySource, SemanticRanker, SessionConstraints, Tree, VectorCache,
 };
 
 use crate::agent::tool::{SideEffects, Tool, ToolPolicy};
@@ -239,7 +239,20 @@ pub fn discover_view_constrained(
     limit: usize,
     constraints: &SessionConstraints,
 ) -> Vec<CapabilityView> {
-    discover(tree, intent)
+    project_ranked(discover(tree, intent), tree, limit, constraints)
+}
+
+/// Project ranked capabilities into serializable [`CapabilityView`]s, applying
+/// the session's [`SessionConstraints`]. Shared back-end of
+/// [`discover_view_constrained`] and the semantic variants so the projection
+/// (effects, allowed-by-session, provenance) stays in one place.
+fn project_ranked<'a>(
+    ranked: impl IntoIterator<Item = Ranked<'a>>,
+    tree: &Tree,
+    limit: usize,
+    constraints: &SessionConstraints,
+) -> Vec<CapabilityView> {
+    ranked
         .into_iter()
         .take(limit)
         .map(|r| {
@@ -257,6 +270,48 @@ pub fn discover_view_constrained(
             }
         })
         .collect()
+}
+
+/// Semantic counterpart of [`discover_view`] (mu-kex4.6.3): rank with t4c's
+/// [`SemanticRanker`] over `embedder` instead of the lexical floor, then
+/// project. Returns `Err` if embedding fails — callers fall back to
+/// [`discover_view`] (the lexical floor) so discovery never breaks. Generic
+/// over the embedder so it unit-tests with `FakeEmbedder` without a network.
+pub fn discover_view_semantic_with<E: Embedder>(
+    tree: &Tree,
+    intent: &str,
+    limit: usize,
+    embedder: E,
+    model: &str,
+) -> anyhow::Result<Vec<CapabilityView>> {
+    let ranked = discover_semantic(tree, intent, embedder, model)?;
+    Ok(project_ranked(
+        ranked,
+        tree,
+        limit,
+        &SessionConstraints::default(),
+    ))
+}
+
+/// [`discover_view_semantic_with`] using the config-resolved [`ConfigEmbedder`]
+/// (mu-kex4.6.3). Resolves the embedder via [`ConfigEmbedder::from_config`]
+/// (reads `~/.config/agent/config.toml` + the `T4C_EMBED_*` env — so it can be
+/// pointed at a local Ollama). Returns `Err` when no embedder is configured OR
+/// embedding fails; the in-loop `discover` tool then falls back to the lexical
+/// floor. **Blocking** (synchronous HTTP embed call) — async callers must wrap
+/// it in `spawn_blocking`.
+pub fn discover_view_semantic(
+    tree: &Tree,
+    intent: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<CapabilityView>> {
+    discover_view_semantic_with(
+        tree,
+        intent,
+        limit,
+        ConfigEmbedder::from_config()?,
+        "mu-discover",
+    )
 }
 
 /// Build one capability under `<source>.<name>`. Returns `None` when `name`
@@ -472,6 +527,54 @@ mod tests {
         .expect("semantic discover");
         assert_eq!(ranked.len(), 3);
         assert_eq!(ranked[0].cap.path.segments()[1], "code_recall");
+    }
+
+    #[test]
+    fn discover_view_semantic_with_projects_and_ranks_via_embedder() {
+        // mu-kex4.6.3: the projected (CapabilityView) semantic path — same
+        // FakeEmbedder fixture as above, but through discover_view_semantic_with
+        // so the projection + limit are covered. Offline + deterministic.
+        let caps = vec![
+            tool(
+                "grep",
+                "line search for exact strings",
+                Some("exact string matches"),
+            ),
+            tool(
+                "code_recall",
+                "semantic code search",
+                Some("find where something is implemented in the codebase"),
+            ),
+        ];
+        let mut reg = Registry::new();
+        reg.add_source(Box::new(t4c::StaticSource::new("test", caps)));
+        let tree = reg.build().expect("build manifest");
+
+        let views = discover_view_semantic_with(
+            &tree,
+            "where is this implemented in the code",
+            10,
+            t4c::FakeEmbedder::new(),
+            "fake",
+        )
+        .expect("semantic view");
+        assert_eq!(views.len(), 2);
+        assert!(
+            views[0].path.ends_with("code_recall"),
+            "semantic projection should rank code_recall first: {:?}",
+            views[0].path
+        );
+
+        // limit is respected.
+        let one = discover_view_semantic_with(
+            &tree,
+            "exact string match",
+            1,
+            t4c::FakeEmbedder::new(),
+            "fake",
+        )
+        .expect("semantic view limit");
+        assert_eq!(one.len(), 1);
     }
 
     #[test]

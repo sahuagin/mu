@@ -26,12 +26,17 @@ use mu_core::context::{
 use super::sse::{SseEvent, SseStream};
 
 const OPENROUTER_API_BASE: &str = "https://openrouter.ai";
+/// Default chat-completions path. OpenRouter nests under `/api/v1`; the
+/// OpenAI-compatible endpoints exposed by ollama / LM Studio / vLLM serve
+/// `/v1/chat/completions` directly, so the path is overridable (mu-spawn).
+const OPENROUTER_API_PATH: &str = "/api/v1/chat/completions";
 
 pub struct OpenRouterProvider {
     client: reqwest::Client,
     api_key: String,
     model: String,
     api_base: String,
+    api_path: String,
 }
 
 impl OpenRouterProvider {
@@ -41,21 +46,59 @@ impl OpenRouterProvider {
             api_key,
             model,
             api_base: OPENROUTER_API_BASE.to_string(),
+            api_path: OPENROUTER_API_PATH.to_string(),
         }
     }
 
-    /// API key from `OPENROUTER_API_KEY`. Fails if unset or empty.
+    /// Construct from env, supporting OpenAI-compatible local backends.
+    ///
+    /// `OPENROUTER_API_BASE` overrides the base URL (default
+    /// `https://openrouter.ai`) and `OPENROUTER_API_PATH` overrides the
+    /// chat-completions path (default `/api/v1/chat/completions`). Pointing
+    /// at a local ollama box means
+    /// `OPENROUTER_API_BASE=http://10.1.1.143:11434` +
+    /// `OPENROUTER_API_PATH=/v1/chat/completions`.
+    ///
+    /// `OPENROUTER_API_KEY` is required only when the base is the real
+    /// OpenRouter endpoint; local backends (ollama) ignore the key, so an
+    /// overridden base relaxes the requirement — mirroring AnthropicProvider's
+    /// `ANTHROPIC_BASE_URL` handling.
     pub fn from_env(model: String) -> Result<Self, ProviderError> {
+        let api_base = std::env::var("OPENROUTER_API_BASE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| OPENROUTER_API_BASE.to_string());
+        let api_path = std::env::var("OPENROUTER_API_PATH")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| OPENROUTER_API_PATH.to_string());
         let api_key = std::env::var("OPENROUTER_API_KEY")
             .ok()
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| ProviderError::Other("OPENROUTER_API_KEY not set or empty".into()))?;
-        Ok(Self::new(api_key, model))
+            .unwrap_or_default();
+        if api_key.is_empty() && api_base == OPENROUTER_API_BASE {
+            return Err(ProviderError::Other(
+                "OPENROUTER_API_KEY not set or empty (required when OPENROUTER_API_BASE points at openrouter.ai)".into(),
+            ));
+        }
+        Ok(Self {
+            client: reqwest::Client::new(),
+            api_key,
+            model,
+            api_base,
+            api_path,
+        })
     }
 
     /// Test hook: override the API base URL.
     pub fn with_api_base(mut self, base: String) -> Self {
         self.api_base = base;
+        self
+    }
+
+    /// Override the chat-completions path (default `/api/v1/chat/completions`).
+    pub fn with_api_path(mut self, path: String) -> Self {
+        self.api_path = path;
         self
     }
 }
@@ -98,7 +141,7 @@ impl Provider for OpenRouterProvider {
         };
         let resp = self
             .client
-            .post(format!("{}/api/v1/chat/completions", self.api_base))
+            .post(format!("{}{}", self.api_base, self.api_path))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .header("X-Title", "mu")

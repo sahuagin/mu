@@ -777,6 +777,30 @@ async fn b10_malformed_tool_args_yield_empty_object() {
 }
 
 // ============================================================================
+// Base/path override (mu-spawn: OpenAI-compatible local backends, e.g. ollama)
+// ============================================================================
+
+#[test]
+fn local_backend_overrides_base_and_path() {
+    // Default points at OpenRouter with the nested /api/v1 path.
+    let def = OpenRouterProvider::new("k".into(), "m".into());
+    assert_eq!(def.api_base, "https://openrouter.ai");
+    assert_eq!(def.api_path, "/api/v1/chat/completions");
+
+    // Pointed at a local ollama box: bare /v1 path, no /api prefix.
+    let local = OpenRouterProvider::new("local-nokey".into(), "qwen3-coder:30b".into())
+        .with_api_base("http://10.1.1.143:11434".into())
+        .with_api_path("/v1/chat/completions".into());
+    assert_eq!(local.api_base, "http://10.1.1.143:11434");
+    assert_eq!(local.api_path, "/v1/chat/completions");
+    // The composed URL is the ollama OpenAI-compatible endpoint.
+    assert_eq!(
+        format!("{}{}", local.api_base, local.api_path),
+        "http://10.1.1.143:11434/v1/chat/completions"
+    );
+}
+
+// ============================================================================
 // Live integration tests (gated on MU_LIVE_OPENROUTER=1)
 // ============================================================================
 

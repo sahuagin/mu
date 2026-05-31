@@ -63,6 +63,20 @@ In this repo:
 
 Codex strikes (per default criterion #5) reset between subtasks within this repo.
 
+## mu-native worker orchestration
+
+When a `/goal` session running *in mu* dispatches workers, it has a native
+in-loop path distinct from the skill's host-side `agent-spawn-v2` + `claude -p`
+model: the `spawn_worker` tool spawns an interactive (subscription-billed)
+Claude under a pty, the worker posts its result back through the mailbox to the
+calling session (waking its loop directly), and the host reaps on result.
+
+**Canonical reference:** [`specs/architecture/worker-orchestration.md`](../architecture/worker-orchestration.md)
+(as-built) — read it instead of re-deriving from the code + `mu-slat-design.md`
++ scattered memories. Note its **dead-letter gap**: a result posted to a dead
+session is silently lost, so a worker's `reply_to` (calling) session must stay
+live until the result lands.
+
 ## Capability-invariant quick reference
 
 For the stop-criterion #8 check during the session:

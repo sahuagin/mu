@@ -320,6 +320,36 @@ where
     // build_and_register_session (handlers/session.rs), not here — it
     // needs the calling session's id so worker results route back to
     // the right mailbox. A daemon-global instance can't know its caller.
+    // mu-re0s: wire the code-index `index_recall` tool when a code-index LSP
+    // address is configured. The agent's first-class path to symbol/concept
+    // search (the highest-value instance of Friction B, "folkloric
+    // capabilities") — without it the in-loop agent falls back to
+    // token-expensive grep. Best-effort connect at startup, mirroring the
+    // recall-provider posture above: an unset or unreachable address simply
+    // means the tool is not registered (graceful degradation, never a startup
+    // failure). Once registered it's a base session tool, so the mu-onq8
+    // `discover` tool ranks it alongside everything else.
+    let mut tools = tools;
+    if let Some(addr) = daemon_info.config().index_lsp_addr() {
+        match mu_core::lsp_client::LspClient::connect(&addr).await {
+            Ok(client) => {
+                tracing::info!(
+                    addr = %addr,
+                    "code-index LSP connected; registering index_recall tool"
+                );
+                tools.push(Arc::new(crate::tools::IndexRecallTool::new(Arc::new(
+                    client,
+                ))));
+            }
+            Err(e) => {
+                tracing::info!(
+                    addr = %addr,
+                    error = %e,
+                    "code-index LSP unreachable; index_recall tool not registered"
+                );
+            }
+        }
+    }
     let tools = Arc::new(tools);
     // mu-kex4.6.4: discover skills once at startup so `capabilities/discover`
     // can project them alongside tools (the daemon previously knew only tools;

@@ -76,6 +76,29 @@ pub struct Config {
     pub auth: AuthConfig,
     /// `[recall]` — session-start context injection toggle.
     pub recall: RecallConfig,
+    /// `[index]` — code-index LSP integration (mu-re0s).
+    pub index: IndexConfig,
+}
+
+/// `[index]` section (mu-re0s). Controls the code-index integration that
+/// exposes the in-loop `index_recall` tool — the agent's first-class path to
+/// `code_recall`-style symbol/concept search, the highest-value instance of
+/// Friction B ("folkloric capabilities"). Without it the in-loop agent falls
+/// back to token-expensive grep.
+///
+/// `lsp_addr = "127.0.0.1:9257"` points the daemon at a running code-index-lsp
+/// server; the daemon connects best-effort at startup and registers the
+/// `index_recall` tool only on success (an unset / unreachable address simply
+/// means the tool is absent — graceful degradation, no startup failure). The
+/// `MU_INDEX_LSP_ADDR` env var overrides the config value. Default `None`
+/// preserves prior behavior (no index tool).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IndexConfig {
+    /// TCP address of the code-index LSP server (e.g. `"127.0.0.1:9257"`).
+    /// `None` => don't connect; the `index_recall` tool is not registered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lsp_addr: Option<String>,
 }
 
 /// `[recall]` section. Controls session-start context injection — the
@@ -391,6 +414,28 @@ impl Config {
     pub fn env_disables_recall(v: Option<&str>) -> bool {
         matches!(v.map(str::trim), Some("1" | "true" | "yes" | "on"))
     }
+
+    /// Resolve the code-index LSP address the daemon should connect to (mu-re0s):
+    /// the `MU_INDEX_LSP_ADDR` env var if set and non-empty, else `[index].lsp_addr`.
+    /// `None` => the daemon does not connect and the `index_recall` tool is not
+    /// registered. The pure resolution (`resolve_index_lsp_addr`) is split out so
+    /// it's testable without touching process env.
+    pub fn index_lsp_addr(&self) -> Option<String> {
+        Self::resolve_index_lsp_addr(
+            std::env::var("MU_INDEX_LSP_ADDR").ok().as_deref(),
+            self.index.lsp_addr.as_deref(),
+        )
+    }
+
+    /// Pure resolution of the code-index LSP address: a non-empty env override
+    /// wins over the configured value; both are trimmed; empty/whitespace is
+    /// treated as unset. Split out for env-free unit testing.
+    pub fn resolve_index_lsp_addr(env: Option<&str>, configured: Option<&str>) -> Option<String> {
+        env.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or(configured.map(str::trim).filter(|s| !s.is_empty()))
+            .map(str::to_owned)
+    }
 }
 
 /// Recursive deep-merge of TOML values. Tables merge field-by-field
@@ -455,6 +500,36 @@ mod tests {
         // operators opt into discover-on-demand via TOML
         let c: Config = toml::from_str("[recall]\nenabled = false\n").expect("parse");
         assert!(!c.recall.enabled);
+    }
+
+    #[test]
+    fn index_lsp_addr_resolution_env_wins_and_trims() {
+        // Default: unset everywhere.
+        assert_eq!(Config::resolve_index_lsp_addr(None, None), None);
+        // Configured only.
+        assert_eq!(
+            Config::resolve_index_lsp_addr(None, Some("127.0.0.1:9257")),
+            Some("127.0.0.1:9257".to_owned())
+        );
+        // Env overrides config; both trimmed.
+        assert_eq!(
+            Config::resolve_index_lsp_addr(Some("  10.0.0.1:1 "), Some("127.0.0.1:9257")),
+            Some("10.0.0.1:1".to_owned())
+        );
+        // Empty/whitespace env is treated as unset → falls back to config.
+        assert_eq!(
+            Config::resolve_index_lsp_addr(Some("   "), Some("127.0.0.1:9257")),
+            Some("127.0.0.1:9257".to_owned())
+        );
+        // Empty config + empty env → None.
+        assert_eq!(Config::resolve_index_lsp_addr(Some(""), Some("")), None);
+    }
+
+    #[test]
+    fn index_defaults_to_no_addr_and_toml_can_set() {
+        assert_eq!(Config::default().index.lsp_addr, None);
+        let c: Config = toml::from_str("[index]\nlsp_addr = \"127.0.0.1:9257\"\n").expect("parse");
+        assert_eq!(c.index.lsp_addr.as_deref(), Some("127.0.0.1:9257"));
     }
 
     #[test]

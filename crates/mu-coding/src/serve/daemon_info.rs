@@ -114,6 +114,21 @@ impl DaemonInfo {
         }
     }
 
+    /// Builder-style setter for the route catalog. Production
+    /// `serve::run` uses this to install a catalog augmented with
+    /// dynamically-discovered ollama models (the best-effort startup
+    /// probe); tests and the default path keep `RouteCatalog::from_env`
+    /// as built in [`new`]. (bead mu-818c)
+    pub fn with_route_catalog(self, route_catalog: RouteCatalog) -> Self {
+        let inner = (*self.inner).clone();
+        Self {
+            inner: Arc::new(DaemonInfoInner {
+                route_catalog: Arc::new(route_catalog),
+                ..inner
+            }),
+        }
+    }
+
     pub fn events_dir(&self) -> Option<&std::path::Path> {
         self.inner.events_dir.as_deref()
     }

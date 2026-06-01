@@ -8,11 +8,13 @@
 //! `codex`), `bedrock`.
 
 pub mod anthropic;
+pub mod ollama;
 pub mod openai_codex;
 pub mod openrouter;
 pub mod output_limits;
 pub mod sse;
 
 pub use anthropic::AnthropicProvider;
+pub use ollama::OllamaProvider;
 pub use openai_codex::OpenaiCodexProvider;
 pub use openrouter::OpenRouterProvider;

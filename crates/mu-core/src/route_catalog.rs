@@ -87,6 +87,34 @@ impl RouteCatalog {
         Self { entries }
     }
 
+    /// Merge dynamically-discovered ollama models into the catalog.
+    ///
+    /// HTTP-free by design: `mu-core` has no HTTP client, so the caller
+    /// (the daemon's startup probe in `serve::run`) fetches model names
+    /// via `mu_ai::OllamaProvider::discover_models` and passes them in
+    /// here. `configured = true` for every entry, because the names
+    /// only exist if the endpoint answered `/api/tags`. Context limits
+    /// use a conservative placeholder ([`OLLAMA_DEFAULT_CONTEXT`]) since
+    /// `/api/tags` doesn't report context windows; per-model enrichment
+    /// via `/api/show` is a follow-up. Pricing is `None` (local = free).
+    /// (bead mu-818c)
+    pub fn with_ollama_models<I, S>(mut self, models: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for m in models {
+            self.entries.push(build_entry(
+                "ollama",
+                m.as_ref(),
+                true,
+                OLLAMA_DEFAULT_CONTEXT,
+                OLLAMA_DEFAULT_CONTEXT,
+            ));
+        }
+        self
+    }
+
     pub fn entries(&self) -> &[RouteEntry] {
         &self.entries
     }
@@ -163,6 +191,11 @@ const ANTHROPIC_MODELS: &[(&str, u64, u64)] = &[
 
 const OPENAI_CODEX_MODELS: &[(&str, u64, u64)] = &[("gpt-5.5", 1_000_000, 1_000_000)];
 
+/// Conservative placeholder context window for ollama models, applied
+/// to both soft and hard limits. `/api/tags` doesn't report context
+/// windows; per-model `/api/show` enrichment is a follow-up. (mu-818c)
+const OLLAMA_DEFAULT_CONTEXT: u64 = 32_768;
+
 const OPENROUTER_MODELS: &[(&str, u64, u64)] = &[
     ("anthropic/claude-opus-4.7", 200_000, 1_000_000),
     ("anthropic/claude-sonnet-4.6", 200_000, 200_000),
@@ -218,5 +251,30 @@ mod tests {
         let catalog = RouteCatalog::from_env();
         let faux = catalog.find("faux", "faux").unwrap();
         assert!(faux.configured, "faux is always configured");
+    }
+
+    #[test]
+    fn with_ollama_models_merges_configured_entries() {
+        let catalog =
+            RouteCatalog::from_env().with_ollama_models(["qwen3-coder:30b", "deepseek-r1:32b"]);
+        let q = catalog
+            .find("ollama", "qwen3-coder:30b")
+            .expect("ollama model should be present");
+        assert!(q.configured, "discovered ollama models are configured");
+        assert_eq!(q.context_soft_limit, Some(OLLAMA_DEFAULT_CONTEXT));
+        // Local inference: no pricing.
+        assert_eq!(q.pricing_input_per_mtok, None);
+        assert_eq!(q.pricing_output_per_mtok, None);
+        assert!(catalog.find("ollama", "deepseek-r1:32b").is_some());
+    }
+
+    #[test]
+    fn with_ollama_models_empty_is_noop() {
+        let base = RouteCatalog::from_env().entries().len();
+        let merged = RouteCatalog::from_env()
+            .with_ollama_models(Vec::<String>::new())
+            .entries()
+            .len();
+        assert_eq!(base, merged);
     }
 }

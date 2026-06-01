@@ -30,7 +30,7 @@ pub use factory::{
     build_provider_from_selector, build_tools, make_provider_factory, parse_tools_csv,
     selector_from_cli, BashSettings, ProviderFactory,
 };
-pub use sessions::Sessions;
+pub use sessions::{Sessions, WeakSessions};
 
 struct AbortOnDrop(std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>);
 

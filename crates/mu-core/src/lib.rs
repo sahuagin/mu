@@ -18,6 +18,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod agent;
+pub mod auditor;
 pub mod aws;
 pub mod capability;
 pub mod config;

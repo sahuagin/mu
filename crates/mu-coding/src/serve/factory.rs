@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use mu_ai::{AnthropicProvider, FauxProvider, OpenRouterProvider, OpenaiCodexProvider};
+use mu_ai::{
+    AnthropicProvider, FauxProvider, OllamaProvider, OpenRouterProvider, OpenaiCodexProvider,
+};
 use mu_core::agent::{Provider, Tool};
 use mu_core::protocol::ProviderSelector;
 
@@ -103,6 +105,10 @@ pub fn build_provider_from_selector(
             log_thinking_ignored("openrouter", thinking);
             Ok(Arc::new(OpenRouterProvider::from_env(model.clone())?))
         }
+        ProviderSelector::Ollama { model } => {
+            log_thinking_ignored("ollama", thinking);
+            Ok(Arc::new(OllamaProvider::from_env(model.clone())?))
+        }
     }
 }
 
@@ -126,8 +132,11 @@ pub fn selector_from_cli(name: &str, model: Option<&str>) -> Result<ProviderSele
         "openrouter" => Ok(ProviderSelector::Openrouter {
             model: model.unwrap_or("anthropic/claude-haiku-4.5").to_string(),
         }),
+        "ollama" => Ok(ProviderSelector::Ollama {
+            model: model.unwrap_or("qwen3-coder:30b").to_string(),
+        }),
         other => anyhow::bail!(
-            "unknown provider: {other} (expected: faux, anthropic-api, openai-codex, openrouter)"
+            "unknown provider: {other} (expected: faux, anthropic-api, openai-codex, openrouter, ollama)"
         ),
     }
 }
@@ -282,6 +291,32 @@ mod tests {
             }
             _ => panic!("expected Openrouter"),
         }
+
+        // ollama: default model + explicit override (mu-818c).
+        let s = selector_from_cli("ollama", None).unwrap();
+        assert_eq!(
+            s,
+            ProviderSelector::Ollama {
+                model: "qwen3-coder:30b".into()
+            }
+        );
+        let s = selector_from_cli("ollama", Some("deepseek-r1:32b")).unwrap();
+        assert_eq!(
+            s,
+            ProviderSelector::Ollama {
+                model: "deepseek-r1:32b".into()
+            }
+        );
+    }
+
+    #[test]
+    fn build_from_selector_ollama_constructs() {
+        // Ollama needs no API key; construction must succeed with the
+        // baked-in default base (mu-818c).
+        let sel = ProviderSelector::Ollama {
+            model: "qwen3-coder:30b".into(),
+        };
+        assert!(build_provider_from_selector(&sel, false, None).is_ok());
     }
 
     #[test]

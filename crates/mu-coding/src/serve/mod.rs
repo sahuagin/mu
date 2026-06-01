@@ -249,10 +249,40 @@ where
             );
             vec![]
         };
+    // mu-818c: best-effort ollama discovery → route catalog. Only in
+    // production (events_dir set) so tests stay hermetic and fast. A
+    // short timeout bounds startup, so a down/absent ollama box can't
+    // stall the daemon; any failure means "no ollama routes", logged at
+    // debug. `mu ask` (ephemeral, no events_dir) skips the probe — it
+    // resolves ollama via the selector, not the catalog.
+    let route_catalog = {
+        let mut catalog = mu_core::route_catalog::RouteCatalog::from_env();
+        if events_dir.is_some() {
+            let base = mu_ai::providers::ollama::base_from_env();
+            match mu_ai::OllamaProvider::discover_models(&base, std::time::Duration::from_secs(2))
+                .await
+            {
+                Ok(models) if !models.is_empty() => {
+                    tracing::info!(
+                        count = models.len(),
+                        %base,
+                        "ollama: discovered models for route catalog"
+                    );
+                    catalog = catalog.with_ollama_models(models);
+                }
+                Ok(_) => tracing::debug!(%base, "ollama: reachable but reported no models"),
+                Err(e) => {
+                    tracing::debug!(%base, error = %e, "ollama: discovery skipped (not reachable)")
+                }
+            }
+        }
+        catalog
+    };
     let daemon_info = DaemonInfo::new(env!("CARGO_PKG_VERSION"))
         .with_events_dir(events_dir)
         .with_config(config)
-        .with_recall_providers(recall_providers);
+        .with_recall_providers(recall_providers)
+        .with_route_catalog(route_catalog);
     // mu-slat: register the well-known "supervisor" session so workers
     // always have a stable mailbox target for posting results back.
     // Only in production (events_dir set) — tests don't spawn workers.

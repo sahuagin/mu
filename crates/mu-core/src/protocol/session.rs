@@ -48,11 +48,27 @@ pub struct CreateSessionResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderSelector {
-    AnthropicApi { model: String },
-    AnthropicOauth { model: String },
-    OpenaiApi { model: String },
-    OpenaiCodex { model: String },
-    Openrouter { model: String },
+    AnthropicApi {
+        model: String,
+    },
+    AnthropicOauth {
+        model: String,
+    },
+    OpenaiApi {
+        model: String,
+    },
+    OpenaiCodex {
+        model: String,
+    },
+    Openrouter {
+        model: String,
+    },
+    /// Local ollama server (OpenAI-compatible). Wire kind `"ollama"`.
+    /// Endpoint defaults to the LAN box (`http://10.1.1.143:11434`),
+    /// overridable via `OLLAMA_API_BASE`. (bead mu-818c)
+    Ollama {
+        model: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

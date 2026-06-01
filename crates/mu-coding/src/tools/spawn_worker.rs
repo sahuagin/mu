@@ -14,10 +14,16 @@ use tokio::sync::oneshot;
 
 use crate::serve::worker::{spawn_worker, SpawnWorkerConfig};
 use crate::serve::DaemonInfo;
-use crate::serve::Sessions;
+use crate::serve::WeakSessions;
 
 pub struct SpawnWorkerTool {
-    sessions: Sessions,
+    /// Non-owning handle to the registry (mu-qc08). MUST be `Weak`: this
+    /// tool lives in its owning session's tool list, so a strong clone
+    /// would keep alive the map holding that session's own `input_tx`,
+    /// deadlocking shutdown (the loop can't exit until `input_tx` drops,
+    /// but the loop's own tool keeps it alive). Upgraded transiently in
+    /// `execute`.
+    sessions: WeakSessions,
     daemon_info: DaemonInfo,
     /// Session that owns this tool instance — the worker's results are
     /// routed back here via mailbox. `None` falls back to the
@@ -28,7 +34,7 @@ pub struct SpawnWorkerTool {
 
 impl SpawnWorkerTool {
     pub fn new(
-        sessions: Sessions,
+        sessions: WeakSessions,
         daemon_info: DaemonInfo,
         parent_session_id: Option<String>,
     ) -> Self {
@@ -100,7 +106,7 @@ impl Tool for SpawnWorkerTool {
         Self: 'async_trait,
     {
         let config_result = self.build_config(&arguments);
-        let sessions = self.sessions.clone();
+        let weak_sessions = self.sessions.clone();
         let daemon_info = self.daemon_info.clone();
 
         Box::pin(async move {
@@ -109,6 +115,21 @@ impl Tool for SpawnWorkerTool {
                 Err(e) => {
                     return ToolResult {
                         content: e,
+                        is_error: true,
+                    };
+                }
+            };
+
+            // mu-qc08: upgrade the weak registry handle only now, at
+            // point-of-use. `None` means the daemon is tearing down —
+            // surface it as a clean tool error, never a panic.
+            let sessions = match weak_sessions.upgrade() {
+                Some(s) => s,
+                None => {
+                    return ToolResult {
+                        content:
+                            "spawn_worker: session registry unavailable (daemon shutting down)"
+                                .into(),
                         is_error: true,
                     };
                 }
@@ -146,11 +167,14 @@ impl Tool for SpawnWorkerTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serve::Sessions;
     use serde_json::json;
 
     fn tool(parent: Option<&str>) -> SpawnWorkerTool {
+        // Tests only exercise `build_config` (no `execute`/`upgrade`), so a
+        // dead weak from the dropped temporary is fine here.
         SpawnWorkerTool::new(
-            Sessions::new(),
+            Sessions::new().downgrade(),
             DaemonInfo::new("test"),
             parent.map(String::from),
         )
@@ -198,5 +222,30 @@ mod tests {
             .build_config(&json!({ "prompt": "p" }))
             .expect("config builds");
         assert!(cfg.parent_session_id.is_none());
+    }
+
+    // mu-qc08 regression guard: the tool must hold a WEAK handle so it
+    // never keeps the session registry alive. If this reverts to a strong
+    // clone, dropping the last `Sessions` would NOT free the registry,
+    // the per-session `input_tx` would never drop, the agent loop would
+    // never exit, and `transport::serve` would deadlock on shutdown
+    // (the `mu serve did not exit within 5 seconds; killed` symptom).
+    #[test]
+    fn tool_holds_weak_registry_and_does_not_pin_it() {
+        let sessions = Sessions::new();
+        let t = SpawnWorkerTool::new(
+            sessions.downgrade(),
+            DaemonInfo::new("test"),
+            Some("s1".into()),
+        );
+        // While a strong ref lives, the tool can upgrade.
+        assert!(t.sessions.upgrade().is_some());
+        // Drop the last strong ref: a Weak handle must now fail to
+        // upgrade (proving the tool was NOT pinning the registry).
+        drop(sessions);
+        assert!(
+            t.sessions.upgrade().is_none(),
+            "SpawnWorkerTool is keeping the registry alive — shutdown will deadlock (mu-qc08)"
+        );
     }
 }

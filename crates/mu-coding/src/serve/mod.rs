@@ -227,8 +227,21 @@ where
     // handle is freshly allocated here so cross-connection auth state
     // never leaks.
     let auth_registry = Arc::new(auth::registry_from_config(&config.auth));
-    let auth_state: auth::AuthStateHandle =
-        Arc::new(std::sync::Mutex::new(auth::AuthState::default()));
+    // mu-ddua: auth is opt-in. When no configured mechanism actually
+    // enforces (the default config registers BEARER with an empty
+    // allowlist, which can never authenticate anyone), gating
+    // `create_session` would lock out every client with no way back in.
+    // Start such connections pre-authenticated under root — mirroring a
+    // successful BEARER handshake — so a default `mu serve` is usable
+    // out-of-box. The gate enforces only once `[auth]` tokens are set.
+    let initial_auth_state = if auth_registry.is_auth_required() {
+        auth::AuthState::Unauthenticated
+    } else {
+        auth::AuthState::Authenticated {
+            capability: mu_core::capability::Capability::root(),
+        }
+    };
+    let auth_state: auth::AuthStateHandle = Arc::new(std::sync::Mutex::new(initial_auth_state));
     // mu-phl v0 (mu-0bxv): wire up the canonical session-start recall
     // provider chain. Tests construct DaemonInfo without these (empty
     // vec) to skip recall; production runs both.

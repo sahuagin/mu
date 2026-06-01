@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -132,6 +132,38 @@ pub struct Sessions {
     rehydrated: Arc<Mutex<HashMap<String, RehydratedSession>>>,
 }
 
+/// A non-owning handle to the session registry (mu-qc08).
+///
+/// Long-lived per-session structures that need the registry only
+/// *occasionally* — notably [`SpawnWorkerTool`](crate::tools::SpawnWorkerTool),
+/// which lives inside a session's own tool list — must hold this
+/// instead of a strong [`Sessions`] clone. A strong clone there is a
+/// shutdown deadlock: the agent loop owns its tools, the tool would own
+/// a strong ref to the map that holds the loop's *own* `input_tx`, so on
+/// stdin-EOF the channel never closes, `input_rx.recv()` never returns
+/// `None`, the loop never exits, and `transport::serve` hangs forever
+/// (then `mu ask` SIGKILLs the daemon → non-zero exit). Holding a `Weak`
+/// and upgrading only at point-of-use breaks the cycle.
+#[derive(Clone)]
+pub struct WeakSessions {
+    inner: Weak<Mutex<HashMap<String, SessionState>>>,
+    workers: Weak<Mutex<HashMap<String, SubprocessSession>>>,
+    rehydrated: Weak<Mutex<HashMap<String, RehydratedSession>>>,
+}
+
+impl WeakSessions {
+    /// Upgrade to a strong [`Sessions`]. Returns `None` if the registry
+    /// has already been dropped (daemon shutting down) — callers should
+    /// surface that as a clean error rather than panicking.
+    pub fn upgrade(&self) -> Option<Sessions> {
+        Some(Sessions {
+            inner: self.inner.upgrade()?,
+            workers: self.workers.upgrade()?,
+            rehydrated: self.rehydrated.upgrade()?,
+        })
+    }
+}
+
 /// Input bundle for [`Sessions::insert`]. Mirrors `SessionState`'s
 /// fields without exposing the inner struct; the caller fills this
 /// in and hands ownership off. The two `JoinHandle`s are conceptually
@@ -156,6 +188,17 @@ impl Sessions {
             inner: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
             rehydrated: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Create a non-owning [`WeakSessions`] handle (mu-qc08). Use this
+    /// for references stored inside per-session structures that must not
+    /// keep the registry alive (see [`WeakSessions`]).
+    pub fn downgrade(&self) -> WeakSessions {
+        WeakSessions {
+            inner: Arc::downgrade(&self.inner),
+            workers: Arc::downgrade(&self.workers),
+            rehydrated: Arc::downgrade(&self.rehydrated),
         }
     }
 

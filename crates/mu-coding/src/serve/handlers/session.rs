@@ -197,7 +197,9 @@ fn session_spawn_tools(
     let mut tools = base.to_vec();
     if daemon_info.events_dir().is_some() {
         tools.push(Arc::new(crate::tools::SpawnWorkerTool::new(
-            sessions.clone(),
+            // mu-qc08: a WEAK handle — a strong clone here deadlocks
+            // shutdown (the tool lives in this session's own tool list).
+            sessions.downgrade(),
             daemon_info.clone(),
             Some(session_id.to_string()),
         )));

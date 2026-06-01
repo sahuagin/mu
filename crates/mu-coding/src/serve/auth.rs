@@ -97,6 +97,16 @@ pub trait AuthMechanismHandler {
             reason: "multi-step exchange not supported by this mechanism".into(),
         }
     }
+
+    /// Whether this mechanism actually gates access — i.e. it has
+    /// credentials configured and *can* authenticate someone. A
+    /// mechanism that can never succeed (e.g. BEARER with an empty
+    /// allowlist) is NOT enforcing; the daemon then treats auth as
+    /// disabled rather than locking out every client (mu-ddua). Defaults
+    /// to `true`: a registered mechanism enforces unless it says so.
+    fn is_enforcing(&self) -> bool {
+        true
+    }
 }
 
 /// BEARER (RFC 7628) handler.
@@ -159,6 +169,14 @@ impl AuthMechanismHandler for BearerHandler {
                 reason: "BEARER token rejected".into(),
             }
         }
+    }
+
+    /// BEARER enforces only when at least one token is allowlisted. An
+    /// empty allowlist (the default, unconfigured `[auth]`) can never
+    /// authenticate anyone, so it is treated as "auth disabled" rather
+    /// than "deny everyone" (mu-ddua).
+    fn is_enforcing(&self) -> bool {
+        !self.digests.is_empty()
     }
 }
 
@@ -226,6 +244,16 @@ impl AuthRegistry {
     pub fn offered(&self) -> Vec<AuthMechanism> {
         self.order.clone()
     }
+
+    /// True iff at least one registered mechanism actually enforces auth
+    /// (has credentials configured). When this is false — e.g. the
+    /// default config registers BEARER with an empty allowlist, which
+    /// can never authenticate anyone — gating every RPC would lock out
+    /// all clients, so the daemon runs with auth *disabled* and starts
+    /// connections pre-authenticated (mu-ddua).
+    pub fn is_auth_required(&self) -> bool {
+        self.handlers.values().any(|h| h.is_enforcing())
+    }
 }
 
 /// Per-connection auth state. Until the connection completes a
@@ -283,4 +311,37 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(bytes);
     h.finalize().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bearer_with_tokens_is_enforcing() {
+        assert!(BearerHandler::new(vec!["secret".into()]).is_enforcing());
+    }
+
+    #[test]
+    fn bearer_with_empty_allowlist_is_not_enforcing() {
+        // The default, unconfigured case: no tokens -> cannot authenticate
+        // anyone -> not enforcing (auth disabled), not deny-everyone.
+        assert!(!BearerHandler::new(vec![]).is_enforcing());
+    }
+
+    #[test]
+    fn registry_from_empty_config_does_not_require_auth() {
+        // mu-ddua: default config (BEARER, no tokens) must leave the gate
+        // open, otherwise a default `mu serve` rejects every create_session.
+        let reg = registry_from_config(&AuthConfig::Bearer { tokens: vec![] });
+        assert!(!reg.is_auth_required());
+    }
+
+    #[test]
+    fn registry_with_tokens_requires_auth() {
+        let reg = registry_from_config(&AuthConfig::Bearer {
+            tokens: vec!["secret".into()],
+        });
+        assert!(reg.is_auth_required());
+    }
 }

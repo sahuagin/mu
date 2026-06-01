@@ -138,6 +138,15 @@ enum Command {
         #[command(subcommand)]
         cmd: CapabilitiesCmd,
     },
+    /// Run deterministic process-layer auditors (mu-pr6r.1) over a
+    /// session event-log JSONL and print findings. Offline; reads the
+    /// file directly (no daemon).
+    Audit {
+        /// Path to a session event-log JSONL
+        /// (~/.local/share/mu/events/<daemon_id>/<session_id>.jsonl).
+        #[arg(value_name = "LOG")]
+        log: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -230,6 +239,7 @@ async fn main() -> Result<()> {
             println!("mu-coding  {}", mu_coding::version());
             Ok(())
         }
+        Command::Audit { log } => run_audit(&log),
         Command::Serve {
             tools,
             ephemeral,
@@ -451,6 +461,37 @@ fn exec_mu_tui(args: Vec<String>) -> Result<()> {
         "could not exec mu-tui: {err}. Make sure the `mu-tui` binary is installed \
          alongside `mu` (e.g. via `cargo install --path crates/mu-tui`) or available on `$PATH`."
     )
+}
+
+/// mu-pr6r.1: run the deterministic process-layer auditors over a
+/// session event-log JSONL and print findings. Offline, no daemon.
+fn run_audit(log: &std::path::Path) -> Result<()> {
+    let (event_log, malformed) = mu_core::event_log::SessionEventLog::from_jsonl(log)
+        .map_err(|e| anyhow::anyhow!("reading event log {}: {e}", log.display()))?;
+    if malformed > 0 {
+        eprintln!(
+            "audit: skipped {malformed} malformed line(s) in {}",
+            log.display()
+        );
+    }
+    let events = event_log.snapshot();
+    let findings = mu_core::auditor::audit_session(&events);
+    if findings.is_empty() {
+        println!("audit: no findings ({} events)", events.len());
+    } else {
+        println!(
+            "audit: {} finding(s) over {} events:",
+            findings.len(),
+            events.len()
+        );
+        for f in &findings {
+            println!(
+                "  [{:?}] {} @event {}: {}",
+                f.severity, f.invariant, f.event_id, f.detail
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn run_login(provider: &str) -> Result<()> {

@@ -69,6 +69,30 @@ async fn spawn_server_with_config(
     tokio::io::DuplexStream,
     tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
+    // events_dir=None: integration tests do NOT write to disk (mu-upb).
+    // Setting Some(<path>) would pollute the developer's
+    // ~/.local/share/mu/events with test fixtures.
+    spawn_server_full(provider, tools, config, None).await
+}
+
+/// Like [`spawn_server_with_config`] but with an explicit `events_dir`.
+///
+/// mu-wnsp: the daemon-shutdown lifecycle test (a mu-qc08 regression guard)
+/// needs `events_dir = Some(..)`, because the per-session `spawn_worker`
+/// tool — the structure whose strong `Sessions` clone caused the shutdown
+/// deadlock — is injected ONLY in production (events_dir set, see
+/// `session_spawn_tools`). With `None` that tool never exists and the
+/// deadlock cannot reproduce, which is precisely why the other smoke tests
+/// missed it.
+async fn spawn_server_full(
+    provider: Arc<dyn Provider>,
+    tools: Vec<Arc<dyn Tool>>,
+    config: Config,
+    events_dir: Option<std::path::PathBuf>,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     let (server_read, server_write) = tokio::io::split(server);
     let server_buf = BufReader::new(server_read);
@@ -77,15 +101,12 @@ async fn spawn_server_with_config(
     // (one provider for all sessions) under the new factory API.
     let factory: serve::ProviderFactory =
         std::sync::Arc::new(move |_selector| Ok(provider.clone()));
-    // events_dir=None: integration tests do NOT write to disk
-    // (mu-upb). Setting Some(<path>) would pollute the developer's
-    // ~/.local/share/mu/events with test fixtures.
     let handle = tokio::spawn(serve::serve_with_io_with_config(
         server_buf,
         server_write,
         factory,
         tools,
-        None,
+        events_dir,
         config,
     ));
     authenticate(&mut client).await;
@@ -1350,4 +1371,95 @@ async fn index_recall_tool_wired_from_config_mu_re0s() {
 
     drop(client);
     let _ = timeout(Duration::from_millis(500), server_handle).await;
+}
+
+/// A unique throwaway directory under the system temp dir for the
+/// lifecycle test's `events_dir`. Avoids a `tempfile` dev-dep (none is
+/// configured) and avoids polluting the developer's `~/.local/share/mu`.
+/// Uniqueness = pid + a process-local counter, enough to keep parallel
+/// tests from colliding on the same path.
+fn unique_events_dir() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("mu-wnsp-lifecycle-{}-{}", std::process::id(), n))
+}
+
+/// mu-wnsp / mu-qc08 regression: `mu serve` must exit cleanly on stdin-EOF
+/// even when a live session's agent loop holds the per-session
+/// `spawn_worker` tool.
+///
+/// Before the fix, `SpawnWorkerTool` held a STRONG `Sessions` clone. The
+/// agent loop owns its tools, so that clone kept the registry map — and
+/// thus the loop's own `input_tx` — alive; on stdin-EOF the input channel
+/// never closed, `input_rx.recv()` never returned `None`, the loop never
+/// exited, and `serve_with_io_with_config` hung forever. `mu ask` then
+/// SIGKILLed the daemon after 5s and exited non-zero, which made
+/// agent-spawn misreport every worker as failed (mu-qc08, fixed by holding
+/// a `Weak<Sessions>` in PR #150).
+///
+/// The other smoke tests run with `events_dir = None`, so the spawn tool is
+/// never injected and the deadlock cannot reproduce — the whole
+/// shutdown-lifecycle test class was absent. This closes that gap:
+/// `events_dir = Some(..)` to inject the tool, a real created session to
+/// hold it, then stdin-EOF, then ASSERT the server future returns within
+/// the same 5s window `mu ask` uses. A strong clone times out here; the
+/// `Weak` fix exits promptly. (Verified to fail on a re-pinned registry —
+/// see the bead's verification note.)
+#[tokio::test]
+async fn serve_exits_on_eof_with_spawn_worker_session_mu_qc08() {
+    // A real (throwaway) events dir so `session_spawn_tools` actually
+    // injects the per-session SpawnWorkerTool (it is gated on
+    // `events_dir.is_some()`).
+    let events_dir = unique_events_dir();
+    std::fs::create_dir_all(&events_dir).expect("create events dir");
+
+    let config = Config {
+        auth: AuthConfig::Bearer {
+            tokens: vec![TEST_BEARER_TOKEN.to_string()],
+        },
+        ..Default::default()
+    };
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) =
+        spawn_server_full(provider, Vec::new(), config, Some(events_dir.clone())).await;
+
+    // Create a session: its agent loop registers `input_tx` in the Sessions
+    // map and its tool list includes the per-session SpawnWorkerTool — the
+    // exact shape that used to deadlock shutdown.
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "create_session",
+        "params": { "provider": { "kind": "anthropic_api", "model": "irrelevant" } }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write create_session");
+    let resp = read_line(&mut client).await;
+    let session_id = resp["result"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("create_session did not return a session_id: {resp}"));
+    assert!(
+        session_id.starts_with("session-"),
+        "unexpected create_session response: {resp}"
+    );
+
+    // stdin-EOF: drop the client so the server's reader sees end-of-stream.
+    drop(client);
+
+    // The crux: the daemon must SHUT DOWN, not hang. 5s mirrors `mu ask`'s
+    // real kill window; the fixed daemon exits in well under that.
+    let outcome = timeout(Duration::from_secs(5), server_handle).await;
+    // Best-effort cleanup of the throwaway dir regardless of outcome.
+    let _ = std::fs::remove_dir_all(&events_dir);
+
+    let joined = outcome.expect(
+        "mu-qc08 regression: `mu serve` did NOT exit within 5s on stdin-EOF — \
+         a session-held strong `Sessions` clone is deadlocking shutdown",
+    );
+    joined
+        .expect("server task panicked")
+        .expect("serve_with_io_with_config returned an error");
 }

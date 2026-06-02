@@ -1,0 +1,73 @@
+name: beads-orphans
+
+# Informational, PR-scoped nudge: surfaces beads that this PR's commits
+# reference but leave OPEN, so they can be closed in-PR (atomic with the merge)
+# instead of needing a second PR. This check NEVER blocks a merge — it is not a
+# required status check and every step is best-effort. Pure Python: it reads the
+# tracked .beads/issues.jsonl and `git log`, so it needs no `br` and no build.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write # single sticky nudge comment; upserted, never spammed
+
+concurrency:
+  group: beads-orphans-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  orphans:
+    name: beads orphans (PR-scoped, informational)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need base..head commits to scan for bead references
+
+      - name: Detect PR-scoped open beads
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -u
+          body="$(python3 scripts/beads_orphans_prscope.py "$BASE_SHA" "$HEAD_SHA")"
+          if [ -n "$body" ]; then
+            printf '%s\n' "$body" >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo 'found=true'
+              echo 'comment<<BEADS_EOF'
+              printf '%s\n' "$body"
+              echo '<!-- beads-orphans -->'
+              echo 'BEADS_EOF'
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo 'found=false' >> "$GITHUB_OUTPUT"
+            echo '✅ No PR-scoped open beads referenced by this PR.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upsert sticky nudge comment
+        continue-on-error: true # commenting must never fail an informational check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          FOUND: ${{ steps.scope.outputs.found }}
+          COMMENT: ${{ steps.scope.outputs.comment }}
+        run: |
+          set -u
+          marker='<!-- beads-orphans -->'
+          existing="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq "map(select(.body | contains(\"$marker\"))) | .[0].id // empty")"
+          if [ "$FOUND" = "true" ]; then
+            if [ -n "$existing" ]; then
+              gh api -X PATCH "repos/$REPO/issues/comments/$existing" -f body="$COMMENT" >/dev/null
+            else
+              printf '%s' "$COMMENT" | gh pr comment "$PR" --repo "$REPO" --body-file -
+            fi
+          elif [ -n "$existing" ]; then
+            # PR no longer has scoped orphans — clear the stale nudge.
+            gh api -X DELETE "repos/$REPO/issues/comments/$existing" >/dev/null
+          fi

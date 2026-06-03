@@ -59,9 +59,10 @@ pub struct TuiConfig {
     pub effort: String,
     /// Whether to start with `/focus` mode on (§16). Default off.
     pub focus_mode: bool,
-    /// Optional clipboard command for `/copy`, run via the shell with the
-    /// selected text on stdin. Example: `xclip -selection clipboard`.
-    pub clipboard_command: Option<String>,
+    /// Optional clipboard command fallback for `/copy`, as argv (no shell).
+    /// The selected text is written to stdin after the native clipboard
+    /// library path fails. Example: `["xclip", "-selection", "clipboard"]`.
+    pub clipboard_command: Option<Vec<String>>,
 }
 
 impl Default for TuiConfig {
@@ -163,7 +164,7 @@ pub struct CliOverrides {
     pub cwd: Option<PathBuf>,
     pub effort: Option<String>,
     pub focus_mode: Option<bool>,
-    pub clipboard_command: Option<String>,
+    pub clipboard_command: Option<Vec<String>>,
 }
 
 /// Apply CLI Options on top of an already-loaded config. Some fields

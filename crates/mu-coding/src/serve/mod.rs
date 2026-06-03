@@ -19,6 +19,7 @@ mod forwarder;
 mod handlers;
 mod mailbox;
 pub mod mcp;
+pub mod mcp_client;
 mod provider_status;
 pub(crate) mod pty_spawn;
 mod sessions;
@@ -363,34 +364,26 @@ where
     // build_and_register_session (handlers/session.rs), not here — it
     // needs the calling session's id so worker results route back to
     // the right mailbox. A daemon-global instance can't know its caller.
-    // mu-re0s: wire the code-index `index_recall` tool when a code-index LSP
-    // address is configured. The agent's first-class path to symbol/concept
-    // search (the highest-value instance of Friction B, "folkloric
-    // capabilities") — without it the in-loop agent falls back to
-    // token-expensive grep. Best-effort connect at startup, mirroring the
-    // recall-provider posture above: an unset or unreachable address simply
-    // means the tool is not registered (graceful degradation, never a startup
-    // failure). Once registered it's a base session tool, so the mu-onq8
-    // `discover` tool ranks it alongside everything else.
+    // mu-yc6: import tools from configured `[[mcp.servers]]` (outbound MCP
+    // client). This is how code_recall reaches the in-loop agent — the
+    // first-class path to symbol/concept search (the highest-value instance
+    // of Friction B, "folkloric capabilities"); without it the agent falls
+    // back to token-expensive grep. Best-effort connect at startup, mirroring
+    // the recall-provider posture above: an unreachable server simply
+    // contributes no tools (graceful degradation, never a startup failure).
+    // Once registered they're base session tools, so the mu-onq8 `discover`
+    // tool ranks them alongside everything else.
     let mut tools = tools;
-    if let Some(addr) = daemon_info.config().index_lsp_addr() {
-        match mu_core::lsp_client::LspClient::connect(&addr).await {
-            Ok(client) => {
-                tracing::info!(
-                    addr = %addr,
-                    "code-index LSP connected; registering index_recall tool"
-                );
-                tools.push(Arc::new(crate::tools::IndexRecallTool::new(Arc::new(
-                    client,
-                ))));
-            }
-            Err(e) => {
-                tracing::info!(
-                    addr = %addr,
-                    error = %e,
-                    "code-index LSP unreachable; index_recall tool not registered"
-                );
-            }
+    let imported = mcp_client::import_remote_tools(&daemon_info.config().mcp.servers).await;
+    for tool in imported {
+        let name = tool.spec().name;
+        if tools.iter().any(|t| t.spec().name == name) {
+            tracing::warn!(
+                tool = %name,
+                "MCP-imported tool collides with an existing tool; skipping"
+            );
+        } else {
+            tools.push(tool);
         }
     }
     let tools = Arc::new(tools);

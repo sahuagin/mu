@@ -76,29 +76,18 @@ pub struct Config {
     pub auth: AuthConfig,
     /// `[recall]` — session-start context injection toggle.
     pub recall: RecallConfig,
-    /// `[index]` — code-index LSP integration (mu-re0s).
+    /// `[index]` — in-loop discovery/recall knobs.
     pub index: IndexConfig,
+    /// `[mcp]` — outbound MCP client: servers whose tools the daemon
+    /// imports at startup (mu-yc6).
+    pub mcp: McpConfig,
 }
 
-/// `[index]` section (mu-re0s). Controls the code-index integration that
-/// exposes the in-loop `index_recall` tool — the agent's first-class path to
-/// `code_recall`-style symbol/concept search, the highest-value instance of
-/// Friction B ("folkloric capabilities"). Without it the in-loop agent falls
-/// back to token-expensive grep.
-///
-/// `lsp_addr = "127.0.0.1:9257"` points the daemon at a running code-index-lsp
-/// server; the daemon connects best-effort at startup and registers the
-/// `index_recall` tool only on success (an unset / unreachable address simply
-/// means the tool is absent — graceful degradation, no startup failure). The
-/// `MU_INDEX_LSP_ADDR` env var overrides the config value. Default `None`
-/// preserves prior behavior (no index tool).
+/// `[index]` section. Knobs for the in-loop discovery surface. (Code-index
+/// recall itself is imported over MCP — see [`McpConfig`].)
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IndexConfig {
-    /// TCP address of the code-index LSP server (e.g. `"127.0.0.1:9257"`).
-    /// `None` => don't connect; the `index_recall` tool is not registered.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lsp_addr: Option<String>,
     /// mu-kex4.6.3: rank the in-loop `discover` tool's results semantically
     /// (t4c `SemanticRanker` over an embedder) instead of the `LexicalRanker`
     /// floor. Opt-in (`false` default) because semantic ranking resolves an
@@ -109,6 +98,44 @@ pub struct IndexConfig {
     /// floor, so enabling this never breaks discovery. Default `false` keeps
     /// prior behavior and keeps tests offline.
     pub semantic_discover: bool,
+}
+
+/// `[mcp]` section (mu-yc6). Outbound MCP client: at startup the daemon
+/// connects to each `[[mcp.servers]]` entry over rmcp Streamable HTTP, lists
+/// its tools, and imports them as in-loop tools alongside the built-ins. Same
+/// graceful-degradation posture as the rest of this file: an unreachable
+/// server logs a warning and contributes nothing — never a startup failure.
+///
+/// ```toml
+/// [[mcp.servers]]
+/// name  = "code-index"
+/// url   = "http://10.1.1.172:7622/mcp"
+/// tools = ["code_recall", "code_status"]  # optional allowlist; omit = all
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpConfig {
+    /// Servers to connect to at daemon startup.
+    pub servers: Vec<McpServerConfig>,
+}
+
+/// One outbound MCP server (`[[mcp.servers]]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerConfig {
+    /// Label used in logs and (optionally) tool-name prefixes.
+    pub name: String,
+    /// Streamable HTTP endpoint, e.g. `"http://10.1.1.172:7622/mcp"`.
+    /// The only transport in v1; stdio / unix-socket servers are future work.
+    pub url: String,
+    /// Import allowlist of remote tool names. `None` imports every tool the
+    /// server lists. Discovery != trust: prefer listing daily drivers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    /// Prefix prepended to imported tool names (e.g. `"code_index."`).
+    /// `None`/empty imports unprefixed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
 }
 
 /// `[recall]` section. Controls session-start context injection — the
@@ -424,28 +451,6 @@ impl Config {
     pub fn env_disables_recall(v: Option<&str>) -> bool {
         matches!(v.map(str::trim), Some("1" | "true" | "yes" | "on"))
     }
-
-    /// Resolve the code-index LSP address the daemon should connect to (mu-re0s):
-    /// the `MU_INDEX_LSP_ADDR` env var if set and non-empty, else `[index].lsp_addr`.
-    /// `None` => the daemon does not connect and the `index_recall` tool is not
-    /// registered. The pure resolution (`resolve_index_lsp_addr`) is split out so
-    /// it's testable without touching process env.
-    pub fn index_lsp_addr(&self) -> Option<String> {
-        Self::resolve_index_lsp_addr(
-            std::env::var("MU_INDEX_LSP_ADDR").ok().as_deref(),
-            self.index.lsp_addr.as_deref(),
-        )
-    }
-
-    /// Pure resolution of the code-index LSP address: a non-empty env override
-    /// wins over the configured value; both are trimmed; empty/whitespace is
-    /// treated as unset. Split out for env-free unit testing.
-    pub fn resolve_index_lsp_addr(env: Option<&str>, configured: Option<&str>) -> Option<String> {
-        env.map(str::trim)
-            .filter(|s| !s.is_empty())
-            .or(configured.map(str::trim).filter(|s| !s.is_empty()))
-            .map(str::to_owned)
-    }
 }
 
 /// Recursive deep-merge of TOML values. Tables merge field-by-field
@@ -513,38 +518,29 @@ mod tests {
     }
 
     #[test]
-    fn index_lsp_addr_resolution_env_wins_and_trims() {
-        // Default: unset everywhere.
-        assert_eq!(Config::resolve_index_lsp_addr(None, None), None);
-        // Configured only.
-        assert_eq!(
-            Config::resolve_index_lsp_addr(None, Some("127.0.0.1:9257")),
-            Some("127.0.0.1:9257".to_owned())
-        );
-        // Env overrides config; both trimmed.
-        assert_eq!(
-            Config::resolve_index_lsp_addr(Some("  10.0.0.1:1 "), Some("127.0.0.1:9257")),
-            Some("10.0.0.1:1".to_owned())
-        );
-        // Empty/whitespace env is treated as unset → falls back to config.
-        assert_eq!(
-            Config::resolve_index_lsp_addr(Some("   "), Some("127.0.0.1:9257")),
-            Some("127.0.0.1:9257".to_owned())
-        );
-        // Empty config + empty env → None.
-        assert_eq!(Config::resolve_index_lsp_addr(Some(""), Some("")), None);
+    fn index_semantic_discover_defaults_off_and_toml_can_set() {
+        // mu-kex4.6.3: semantic discover is opt-in, default off (keeps tests offline).
+        assert!(!Config::default().index.semantic_discover);
+        let c: Config = toml::from_str("[index]\nsemantic_discover = true\n").expect("parse");
+        assert!(c.index.semantic_discover);
     }
 
     #[test]
-    fn index_defaults_to_no_addr_and_toml_can_set() {
-        assert_eq!(Config::default().index.lsp_addr, None);
-        // mu-kex4.6.3: semantic discover is opt-in, default off (keeps tests offline).
-        assert!(!Config::default().index.semantic_discover);
-        let c: Config =
-            toml::from_str("[index]\nlsp_addr = \"127.0.0.1:9257\"\nsemantic_discover = true\n")
-                .expect("parse");
-        assert_eq!(c.index.lsp_addr.as_deref(), Some("127.0.0.1:9257"));
-        assert!(c.index.semantic_discover);
+    fn mcp_servers_default_empty_and_toml_can_configure() {
+        assert!(Config::default().mcp.servers.is_empty());
+        let c: Config = toml::from_str(
+            "[[mcp.servers]]\n\
+             name = \"code-index\"\n\
+             url = \"http://10.1.1.172:7622/mcp\"\n\
+             tools = [\"code_recall\"]\n",
+        )
+        .expect("parse");
+        assert_eq!(c.mcp.servers.len(), 1);
+        let s = &c.mcp.servers[0];
+        assert_eq!(s.name, "code-index");
+        assert_eq!(s.url, "http://10.1.1.172:7622/mcp");
+        assert_eq!(s.tools.as_deref(), Some(&["code_recall".to_owned()][..]));
+        assert_eq!(s.prefix, None);
     }
 
     #[test]

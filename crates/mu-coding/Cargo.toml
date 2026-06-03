@@ -34,11 +34,21 @@ rand = { workspace = true }
 thiserror = { workspace = true }
 # mu-upb: home directory for on-disk event log path
 dirs = { workspace = true }
-# MCP server (rmcp SDK) for session status resources + mailbox tools
-rmcp = { workspace = true, features = ["server"] }
+# MCP server (rmcp SDK) for session status resources + mailbox tools, and
+# MCP client (mu-yc6) for importing tools from external servers over
+# Streamable HTTP (code-index et al.)
+rmcp = { workspace = true, features = [
+    "server",
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }
 # mu-slat Phase 3: Rust-owned pty + vt100 screen scraping for pot workers
 portable-pty = { workspace = true }
 vt100 = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }
+# mu-yc6 smoke tests: stub MCP server over Streamable HTTP (mirrors how
+# code-index-mcp serves; axum hosts rmcp's tower StreamableHttpService)
+axum = "0.8"
+rmcp = { workspace = true, features = ["transport-streamable-http-server"] }

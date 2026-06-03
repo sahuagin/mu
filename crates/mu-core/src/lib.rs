@@ -27,7 +27,6 @@ pub mod context_attribution;
 pub mod context_renderer;
 pub mod event_log;
 pub mod forensics;
-pub mod lsp_client;
 pub mod pricing;
 pub mod protocol;
 pub mod route_catalog;

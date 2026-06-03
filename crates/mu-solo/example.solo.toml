@@ -36,6 +36,12 @@ effort = "medium"
 # emitted to scrollback. Useful for long autonomous runs.
 focus_mode = false
 
+# Clipboard command for /copy. The selected semantic text is written to
+# stdin. If unset or failing, mu-solo tries common Unix clipboard tools
+# (`xclip -selection clipboard`, `xsel --clipboard --input`, `wl-copy`,
+# `pbcopy`) and finally writes a temp file.
+# clipboard_command = "xclip -selection clipboard"
+
 # ──────────────────────────────────────────────────────────
 # [session] — forwarded to the daemon
 # ──────────────────────────────────────────────────────────

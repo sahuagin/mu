@@ -83,6 +83,7 @@ impl Cli {
             cwd: self.cwd.clone(),
             effort: self.effort.clone(),
             focus_mode: if self.focus { Some(true) } else { None },
+            clipboard_command: None,
         }
     }
 }
@@ -113,6 +114,7 @@ async fn main() -> Result<()> {
         tools: &cfg.session.tools,
         effort: &cfg.tui.effort,
         focus_mode: cfg.tui.focus_mode,
+        clipboard_command: cfg.tui.clipboard_command.as_deref(),
     })
     .context("App::new failed (is the mu binary path correct?)")?;
 

@@ -29,6 +29,7 @@ use crate::input::InputBuffer;
 use crate::picker;
 use crate::render;
 use crate::skills::{self, DiscoveredSkill};
+use crate::transcript::{Transcript, TranscriptBlock, TranscriptKind};
 use crate::viewport::DynamicViewport;
 
 /// Known providers offered by the `/provider` picker. Free-form
@@ -245,6 +246,9 @@ pub struct App {
     /// previews and render the assistant block in one shot on
     /// `assistant_text_finalized`. Default off.
     focus_mode: bool,
+    /// Optional configured clipboard command for `/copy`, as argv (no shell).
+    /// This is an explicit operator escape hatch after native clipboard fails.
+    clipboard_command: Option<Vec<String>>,
     /// Sidecar session for `/btw` side questions (§13). Created
     /// lazily on first `/btw` via `session.delegate`. Persists across
     /// /btw calls so follow-ups stay coherent; main session history
@@ -277,6 +281,9 @@ pub struct App {
     /// Built by `handle_notification`, rendered live in the viewport each
     /// frame, committed to scrollback on done/error. None when idle.
     live_turn: Option<Turn>,
+    /// Semantic transcript independent of rendered terminal cells. Copy /
+    /// export commands read this, not ratatui scrollback.
+    transcript: Transcript,
     bash_yolo: bool,
     /// Discovered skills from SKILL.md files on disk.
     skills: HashMap<String, DiscoveredSkill>,
@@ -369,6 +376,7 @@ pub struct AppOptions<'a> {
     pub tools: &'a str,
     pub effort: &'a str,
     pub focus_mode: bool,
+    pub clipboard_command: Option<&'a [String]>,
 }
 
 impl App {
@@ -388,6 +396,7 @@ impl App {
             tools,
             effort,
             focus_mode,
+            clipboard_command,
         } = opts;
         let effort = EffortLevel::parse(effort).ok_or_else(|| {
             anyhow!("invalid effort {effort:?} (valid: low|medium|high|xhigh|max)")
@@ -459,9 +468,11 @@ impl App {
             daemon_version,
             effort,
             focus_mode,
+            clipboard_command: clipboard_command.map(<[String]>::to_vec),
             sidecar_session_id: None,
             streaming_route: None,
             live_turn: None,
+            transcript: Transcript::new(),
             events_file,
             actual_renderer: None,
             actual_cache_strategy: None,
@@ -947,6 +958,14 @@ impl App {
                         self.cmd_clear(vp)?;
                         return Ok(false);
                     }
+                    "/transcript" => {
+                        self.cmd_transcript(vp, tail)?;
+                        return Ok(false);
+                    }
+                    "/copy" => {
+                        self.cmd_copy(vp, tail)?;
+                        return Ok(false);
+                    }
                     _ if head.starts_with('/') => {
                         let skill_name = &head[1..];
                         if self.skills.contains_key(skill_name) {
@@ -968,6 +987,8 @@ impl App {
     /// Send a user prompt: emit the "you" block to scrollback, then
     /// fire `session.ask`.
     fn send_prompt(&mut self, vp: &mut DynamicViewport, text: &str) -> Result<()> {
+        self.transcript
+            .push(TranscriptBlock::user(TurnRoute::Main, text.to_string()));
         self.emit_you_block(vp, text)?;
         self.fire_ask(vp, text)
     }
@@ -1086,6 +1107,8 @@ impl App {
         let width = vp.area().width as usize;
         let wrap_width = width.saturating_sub(2);
         let route = TurnRoute::Btw;
+        self.transcript
+            .push(TranscriptBlock::user(route, msg.to_string()));
         let lines = render::block_lines(route.you_label(), route.you_color(), msg, wrap_width);
         let h = lines.len() as u16;
         vp.insert_before(h, |buf| {
@@ -1522,6 +1545,96 @@ impl App {
         Ok(())
     }
 
+    /// /transcript [PATH] — write the semantic transcript projection to a file.
+    /// Bare command writes to a temp file and prints the path. This reads the
+    /// in-memory semantic record, not rendered terminal cells.
+    fn cmd_transcript(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
+        let path = if arg.is_empty() {
+            std::env::temp_dir().join(format!(
+                "mu-solo-transcript-{}-{}.md",
+                std::process::id(),
+                self.ask_count
+            ))
+        } else {
+            std::path::PathBuf::from(arg)
+        };
+        let text = self.transcript.render_all_plain();
+        std::fs::write(&path, text).with_context(|| format!("write transcript to {path:?}"))?;
+        let lines: Vec<Line<'static>> = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "transcript written".to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("  {}", path.display())),
+            Line::from(""),
+        ];
+        let h = lines.len() as u16;
+        vp.insert_before(h, |buf| {
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
+        Ok(())
+    }
+
+    /// /copy [last|assistant|user|all] — copy semantic transcript content.
+    fn cmd_copy(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
+        let selector = if arg.is_empty() { "last" } else { arg };
+        let text = match selector {
+            "last" => self.transcript.last().map(|b| b.body.clone()),
+            "assistant" | "answer" => self
+                .transcript
+                .last_matching(TranscriptKind::Assistant)
+                .map(|b| b.body.clone()),
+            "user" | "prompt" => self
+                .transcript
+                .last_matching(TranscriptKind::User)
+                .map(|b| b.body.clone()),
+            "all" => Some(self.transcript.render_all_plain()),
+            _ => None,
+        };
+        let Some(text) = text else {
+            let lines: Vec<Line<'static>> = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("nothing to copy for selector {selector:?}"),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from("  usage: /copy [last|assistant|user|all]"),
+                Line::from(""),
+            ];
+            let h = lines.len() as u16;
+            vp.insert_before(h, |buf| {
+                let p = Paragraph::new(lines);
+                ratatui::widgets::Widget::render(p, buf.area, buf);
+            })?;
+            return Ok(());
+        };
+
+        let outcome = copy_to_clipboard_or_file(&text, self.clipboard_command.as_deref())?;
+        let lines: Vec<Line<'static>> = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("copied {selector}"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("  {outcome}")),
+            Line::from(""),
+        ];
+        let h = lines.len() as u16;
+        vp.insert_before(h, |buf| {
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
+        Ok(())
+    }
+
     /// Invoke a discovered skill. Injects the skill body as context
     /// by prepending it to the user's message. If no message was
     /// provided, sends just the skill body with a brief preamble.
@@ -1634,6 +1747,8 @@ impl App {
             ),
             MenuItem::new("/cancel", "Abort the in-flight provider call"),
             MenuItem::new("/clear", "Clear the visible scrollback"),
+            MenuItem::new("/transcript", "Write semantic transcript to a file"),
+            MenuItem::new("/copy", "Copy last/assistant/user/all semantic content"),
             MenuItem::new("/q", "Leave the session"),
         ];
         let mut skill_names: Vec<&str> = self.skills.keys().map(|s| s.as_str()).collect();
@@ -1664,6 +1779,8 @@ impl App {
             Line::from("  /btw <message>     side question via sidecar (main history unaffected)"),
             Line::from("  /cancel            abort the in-flight provider call"),
             Line::from("  /clear             clear the visible scrollback"),
+            Line::from("  /transcript [PATH] write semantic transcript to PATH/tempfile"),
+            Line::from("  /copy [WHAT]       copy last|assistant|user|all semantically"),
             Line::from("  /q, /quit, /exit   leave the session"),
             Line::from(""),
             Line::from("  Esc                clear the current prompt"),
@@ -2088,6 +2205,8 @@ impl App {
                         if let Some(msg) = error_msg.as_deref() {
                             t.items.push(render::TurnItem::Error(msg.to_string()));
                         }
+                        self.transcript
+                            .push(TranscriptBlock::assistant(t.route, &t.items));
                         let mut lines = render::render_turn(
                             t.route.header_label(),
                             t.route.color(),
@@ -2249,6 +2368,100 @@ impl App {
         })?;
         Ok(())
     }
+}
+
+fn copy_to_clipboard_or_file(text: &str, configured: Option<&[String]>) -> Result<String> {
+    if text.is_empty() {
+        return Ok("empty selection".to_string());
+    }
+
+    if let Some(outcome) = copy_via_arboard(text) {
+        return Ok(outcome);
+    }
+
+    if let Some(argv) = configured.filter(|argv| !argv.is_empty()) {
+        if run_clipboard_command(argv, text).is_ok() {
+            return Ok(format!("{} bytes via {}", text.len(), argv.join(" ")));
+        }
+    }
+
+    // Unix clipboard command path. Prefer explicit config/env above; v0
+    // auto-detects common tools as argv (no shell) and falls back to a file.
+    for argv in [
+        &["xclip", "-selection", "clipboard"][..],
+        &["xsel", "--clipboard", "--input"][..],
+        &["wl-copy"][..],
+        &["pbcopy"][..],
+    ] {
+        let argv: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+        if run_clipboard_command(&argv, text).is_ok() {
+            return Ok(format!("{} bytes via {}", text.len(), argv.join(" ")));
+        }
+    }
+
+    let path = std::env::temp_dir().join(format!(
+        "mu-solo-copy-{}-{}.txt",
+        std::process::id(),
+        unix_timestamp_secs()
+    ));
+    std::fs::write(&path, text).with_context(|| {
+        format!(
+            "write copy fallback ({} bytes) to {}",
+            text.len(),
+            path.display()
+        )
+    })?;
+    Ok(format!(
+        "clipboard unavailable; wrote {} bytes to {}",
+        text.len(),
+        path.display()
+    ))
+}
+
+fn copy_via_arboard(text: &str) -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    clipboard.set_text(text.to_string()).ok()?;
+    Some(format!("{} bytes via native clipboard", text.len()))
+}
+
+fn run_clipboard_command(argv: &[String], text: &str) -> Result<()> {
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| anyhow!("empty clipboard command"))?;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawn clipboard command {argv:?}"))?;
+
+    let Some(mut stdin) = child.stdin.take() else {
+        anyhow::bail!("clipboard command {argv:?} has no stdin");
+    };
+    use std::io::Write;
+    stdin
+        .write_all(text.as_bytes())
+        .with_context(|| format!("write {} bytes to clipboard command {argv:?}", text.len()))?;
+    drop(stdin);
+
+    let status = child
+        .wait()
+        .with_context(|| format!("wait for clipboard command {argv:?}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("clipboard command {argv:?} exited with {status}");
+    }
+}
+
+fn unix_timestamp_secs() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    secs.to_string()
 }
 
 /// Extract the "primary argument" from a tool call's arguments JSON

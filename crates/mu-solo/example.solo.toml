@@ -36,6 +36,13 @@ effort = "medium"
 # emitted to scrollback. Useful for long autonomous runs.
 focus_mode = false
 
+# Clipboard command fallback for /copy, as argv (no shell). mu-solo first
+# tries the native clipboard library path. If that fails, the selected
+# semantic text is written to this command's stdin. If unset or failing,
+# mu-solo tries common Unix clipboard tools as argv and finally writes a
+# temp file.
+# clipboard_command = ["xclip", "-selection", "clipboard"]
+
 # ──────────────────────────────────────────────────────────
 # [session] — forwarded to the daemon
 # ──────────────────────────────────────────────────────────

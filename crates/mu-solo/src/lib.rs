@@ -69,4 +69,5 @@ pub mod menu;
 pub mod picker;
 pub mod render;
 pub mod skills;
+pub mod transcript;
 pub mod viewport;

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
 use mu_ai::{FauxProvider, FauxResponse};
@@ -13,7 +13,7 @@ use mu_coding::serve;
 use mu_core::agent::{
     AssistantMessage, ContentBlock, Provider, ProviderEvent, StopReason, Tool, ToolArgs, ToolCall,
 };
-use mu_core::config::{AuthConfig, Config, IndexConfig};
+use mu_core::config::{AuthConfig, Config, McpConfig, McpServerConfig};
 
 /// Shared bearer token used by the test harness. The dispatcher's
 /// mu-fnn enforcement gate (mu-7rk-c) rejects every protected RPC
@@ -57,9 +57,9 @@ async fn spawn_server_with_tools(
 }
 
 /// Like [`spawn_server_with_tools`], but takes an explicit `Config` so a test
-/// can exercise config-driven daemon-startup behavior — e.g. mu-re0s's
-/// `[index].lsp_addr`, which makes the daemon connect to a code-index LSP at
-/// startup and register the `index_recall` tool. The caller must set `auth` to
+/// can exercise config-driven daemon-startup behavior — e.g. mu-yc6's
+/// `[[mcp.servers]]`, which makes the daemon connect to MCP servers at
+/// startup and import their tools. The caller must set `auth` to
 /// the bearer token the harness authenticates with (`TEST_BEARER_TOKEN`).
 async fn spawn_server_with_config(
     provider: Arc<dyn Provider>,
@@ -1179,100 +1179,120 @@ async fn discover_tool_invoked_in_loop_mu_onq8() {
     let _ = timeout(Duration::from_millis(500), server_handle).await;
 }
 
-/// Minimal stub code-index LSP server for the mu-re0s test. Binds
-/// 127.0.0.1:0, accepts ONE connection, and speaks just enough LSP
-/// (Content-Length framed JSON-RPC) for `mu_core::lsp_client::LspClient`:
-/// answers `initialize` and returns a single fixed symbol for any
-/// `workspace/symbol` query. Returns the bound address; the server task runs
-/// until the client connection closes.
-async fn spawn_stub_index_lsp(symbol_name: &'static str) -> std::net::SocketAddr {
-    use tokio::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind stub lsp");
-    let addr = listener.local_addr().expect("local_addr");
-    tokio::spawn(async move {
-        let (sock, _) = match listener.accept().await {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        let (read, mut write) = sock.into_split();
-        let mut reader = BufReader::new(read);
-        loop {
-            // Read one Content-Length framed message.
-            let mut header = String::new();
-            if reader.read_line(&mut header).await.unwrap_or(0) == 0 {
-                break; // EOF
-            }
-            let len: usize = match header.trim().strip_prefix("Content-Length:") {
-                Some(n) => n.trim().parse().unwrap_or(0),
-                None => continue,
-            };
-            let mut sep = String::new(); // blank separator line
-            let _ = reader.read_line(&mut sep).await;
-            let mut body = vec![0u8; len];
-            if reader.read_exact(&mut body).await.is_err() {
-                break;
-            }
-            let msg: Value = match serde_json::from_slice(&body) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
-            let id = msg.get("id").cloned();
-            let result = match method {
-                "initialize" => {
-                    Some(json!({"capabilities": {}, "serverInfo": {"name": "stub-index"}}))
-                }
-                "workspace/symbol" => Some(json!([{
-                    "name": symbol_name,
-                    "kind": 12,
-                    "location": {
-                        "uri": "file:///repo/src/lib.rs",
-                        "range": {
-                            "start": {"line": 41, "character": 0},
-                            "end": {"line": 60, "character": 0}
-                        }
-                    }
-                }])),
-                "shutdown" => Some(Value::Null),
-                _ => None, // notifications (initialized / exit) get no response
-            };
-            if let (Some(id), Some(result)) = (id, result) {
-                let resp = json!({"jsonrpc": "2.0", "id": id, "result": result});
-                let body = serde_json::to_string(&resp).expect("serialize stub resp");
-                let framed = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-                if write.write_all(framed.as_bytes()).await.is_err() {
-                    break;
-                }
-                let _ = write.flush().await;
+/// Minimal stub MCP server for the mu-yc6 tests. Serves ONE tool
+/// (`code_recall`) over rmcp Streamable HTTP (axum hosting rmcp's tower
+/// `StreamableHttpService` — the same shape code-index-mcp serves in
+/// production). Any call returns a fixed text containing `symbol_name`.
+/// Returns the `http://…/mcp` URL; the server task runs for the test's
+/// lifetime.
+async fn spawn_stub_mcp_http(symbol_name: &'static str) -> String {
+    use rmcp::model::{
+        CallToolRequestParams, CallToolResult, Content, ListToolsResult, PaginatedRequestParams,
+        ServerCapabilities, ServerInfo,
+    };
+    use rmcp::service::{RequestContext, RoleServer};
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, tower::StreamableHttpService,
+    };
+    use rmcp::{ErrorData as McpError, ServerHandler};
+
+    #[derive(Clone)]
+    struct StubMcpServer {
+        symbol: &'static str,
+    }
+
+    impl ServerHandler for StubMcpServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        // rmcp's ServerHandler declares these as `fn -> impl Future` (not
+        // `async fn`), so implementing them mirrors that shape — same
+        // allowance as serve/mcp.rs.
+        #[allow(clippy::manual_async_fn)]
+        fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_
+        {
+            async move {
+                let schema = match json!({
+                    "type": "object",
+                    "properties": { "query": { "type": "string" } },
+                    "required": ["query"]
+                }) {
+                    Value::Object(m) => Arc::new(m),
+                    _ => unreachable!(),
+                };
+                Ok(ListToolsResult {
+                    tools: vec![rmcp::model::Tool::new(
+                        "code_recall",
+                        "stub hybrid retrieval",
+                        schema,
+                    )],
+                    ..Default::default()
+                })
             }
         }
+
+        #[allow(clippy::manual_async_fn)]
+        fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_
+        {
+            let symbol = self.symbol;
+            async move {
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "## {symbol} (0.91) — src/lib.rs:42-60"
+                ))]))
+            }
+        }
+    }
+
+    let service: StreamableHttpService<StubMcpServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || {
+                Ok(StubMcpServer {
+                    symbol: symbol_name,
+                })
+            },
+            Default::default(),
+            Default::default(),
+        );
+    let app = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub mcp");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
     });
-    addr
+    format!("http://{addr}/mcp")
 }
 
-/// mu-re0s: the `index_recall` tool (code-index / code_recall search — the
-/// highest-value instance of Friction B) is wired into the in-loop agent when
-/// `[index].lsp_addr` is configured. The tool exists in the registry but was
-/// never constructed/registered anywhere; mu-re0s connects to the code-index
-/// LSP at daemon startup and registers it.
+/// mu-yc6: tools from a configured `[[mcp.servers]]` entry are imported at
+/// daemon startup and callable by the in-loop agent. `code_recall` (the
+/// highest-value instance of Friction B) is the motivating tool.
 ///
-/// This drives the full path: config → daemon connects to a stub LSP →
-/// registers `index_recall` → a scripted agent invokes it → LSP round-trip →
-/// result. Asserts the agent invokes the native tool (not a grep fallback) and
-/// it completes ok with the LSP's symbol.
+/// This drives the full path: config → daemon connects to a stub MCP server
+/// over Streamable HTTP → initialize + tools/list → registers `code_recall` →
+/// a scripted agent invokes it → tools/call round-trip → result. Asserts the
+/// agent invokes the native tool (not a grep fallback) and it completes ok
+/// with the server's text.
 #[tokio::test]
-async fn index_recall_tool_wired_from_config_mu_re0s() {
-    // Stub code-index LSP returning a known symbol for any query.
-    let lsp_addr = spawn_stub_index_lsp("build_and_register_session").await;
+async fn mcp_tools_imported_from_config_mu_yc6() {
+    // Stub MCP server returning a known symbol for any code_recall call.
+    let url = spawn_stub_mcp_http("build_and_register_session").await;
 
-    // FauxProvider scripted to call index_recall, then end the turn.
+    // FauxProvider scripted to call code_recall, then end the turn.
     let call = ProviderEvent::Done(AssistantMessage {
         content: vec![ContentBlock::ToolCall(ToolCall {
-            id: "tc-idx-1".into(),
-            name: "index_recall".into(),
-            arguments: ToolArgs::new(json!({"query": "where are sessions built", "limit": 5}))
+            id: "tc-mcp-1".into(),
+            name: "code_recall".into(),
+            arguments: ToolArgs::new(json!({"query": "where are sessions built"}))
                 .expect("valid tool args"),
         })],
         stop_reason: StopReason::ToolUse,
@@ -1293,15 +1313,19 @@ async fn index_recall_tool_wired_from_config_mu_re0s() {
         FauxResponse::Script(final_turn),
     ]));
 
-    // Config points the daemon at the stub LSP → connect at startup + register
-    // index_recall (mu-re0s). No base tools needed; the daemon adds the tool.
+    // Config points the daemon at the stub MCP server → connect at startup +
+    // import code_recall (mu-yc6). No base tools needed; the daemon imports.
     let config = Config {
         auth: AuthConfig::Bearer {
             tokens: vec![TEST_BEARER_TOKEN.to_string()],
         },
-        index: IndexConfig {
-            lsp_addr: Some(lsp_addr.to_string()),
-            ..Default::default()
+        mcp: McpConfig {
+            servers: vec![McpServerConfig {
+                name: "stub-code-index".into(),
+                url,
+                tools: Some(vec!["code_recall".into()]),
+                prefix: None,
+            }],
         },
         ..Default::default()
     };
@@ -1322,7 +1346,7 @@ async fn index_recall_tool_wired_from_config_mu_re0s() {
         .expect("session_id")
         .to_string();
 
-    // ask_session — the scripted provider responds with an index_recall call.
+    // ask_session — the scripted provider responds with a code_recall call.
     let req = json!({
         "jsonrpc": "2.0", "id": 2, "method": "ask_session",
         "params": { "session_id": session_id, "user_message": "where is a session built?" }
@@ -1338,10 +1362,10 @@ async fn index_recall_tool_wired_from_config_mu_re0s() {
     while !(started.is_some() && completed.is_some() && saw_done) {
         let line = read_line(&mut client).await;
         match line["method"].as_str() {
-            Some("session.tool_call_started") if line["params"]["tool_name"] == "index_recall" => {
+            Some("session.tool_call_started") if line["params"]["tool_name"] == "code_recall" => {
                 started = Some(line.clone());
             }
-            Some("session.tool_call_completed") if line["params"]["tool_call_id"] == "tc-idx-1" => {
+            Some("session.tool_call_completed") if line["params"]["tool_call_id"] == "tc-mcp-1" => {
                 completed = Some(line.clone());
             }
             Some("session.done") => saw_done = true,
@@ -1349,24 +1373,77 @@ async fn index_recall_tool_wired_from_config_mu_re0s() {
         }
     }
 
-    let started = started.expect("index_recall tool_call_started");
-    assert_eq!(started["params"]["tool_name"], "index_recall");
+    let started = started.expect("code_recall tool_call_started");
+    assert_eq!(started["params"]["tool_name"], "code_recall");
     assert_eq!(started["params"]["session_id"], session_id);
 
-    // Must complete ok (outcome.kind == "ok"), proving the daemon connected to
-    // the LSP, registered the tool, and the agent invoked it in-loop.
-    let completed = completed.expect("index_recall tool_call_completed");
+    // Must complete ok (outcome.kind == "ok"), proving the daemon imported the
+    // tool over MCP and the agent invoked it in-loop.
+    let completed = completed.expect("code_recall tool_call_completed");
     assert_eq!(
         completed["params"]["outcome"]["kind"], "ok",
-        "index_recall should complete ok, got: {completed}"
+        "code_recall should complete ok, got: {completed}"
     );
     let result = completed["params"]["outcome"]["result"]
         .as_str()
         .expect("ok result is a string");
-    // The LSP's symbol must surface in the tool result.
+    // The MCP server's text must surface in the tool result.
     assert!(
         result.contains("build_and_register_session"),
-        "index_recall result should contain the LSP symbol: {result:?}"
+        "code_recall result should contain the server's symbol: {result:?}"
+    );
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}
+
+/// mu-yc6 graceful degradation: an unreachable `[[mcp.servers]]` entry must
+/// not break daemon startup or session creation — it just contributes no
+/// tools (warning logged; bounded by the importer's per-server timeout).
+#[tokio::test]
+async fn mcp_unreachable_server_degrades_gracefully_mu_yc6() {
+    let provider: Arc<dyn Provider> =
+        Arc::new(FauxProvider::scripted(vec![FauxResponse::Script(vec![
+            ProviderEvent::TextDelta("hello".into()),
+            ProviderEvent::Done(AssistantMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            }),
+        ])]));
+
+    let config = Config {
+        auth: AuthConfig::Bearer {
+            tokens: vec![TEST_BEARER_TOKEN.to_string()],
+        },
+        mcp: McpConfig {
+            servers: vec![McpServerConfig {
+                name: "ghost".into(),
+                // Port 1 on loopback: nothing listens; connect fails fast.
+                url: "http://127.0.0.1:1/mcp".into(),
+                tools: None,
+                prefix: None,
+            }],
+        },
+        ..Default::default()
+    };
+    let (mut client, server_handle) = spawn_server_with_config(provider, Vec::new(), config).await;
+
+    // The daemon must still create sessions and answer normally.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "create_session",
+        "params": { "provider": { "kind": "anthropic_api", "model": "irrelevant" } }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write create");
+    let resp = read_line(&mut client).await;
+    assert!(
+        resp["result"]["session_id"].is_string(),
+        "create_session must succeed with an unreachable MCP server: {resp}"
     );
 
     drop(client);

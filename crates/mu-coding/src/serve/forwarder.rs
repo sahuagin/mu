@@ -586,6 +586,7 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
             assistant_message_count,
             tool_result_count,
             tool_count,
+            context_sizes,
             renderer,
             cache_strategy,
             span_count,
@@ -619,7 +620,13 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
                     assistant_message_count: *assistant_message_count,
                     tool_result_count: *tool_result_count,
                     tool_count: *tool_count,
-                    token_count_estimate: None,
+                    // mu-heqf: total + per-section estimate measured
+                    // by the loop's renderer at assembly time.
+                    token_count_estimate: context_sizes.as_ref().map(|s| s.total),
+                    token_breakdown: context_sizes
+                        .as_ref()
+                        .map(|s| s.by_kind.clone())
+                        .unwrap_or_default(),
                     provider_kind: String::new(),
                     model: String::new(),
                     renderer: renderer.clone(),

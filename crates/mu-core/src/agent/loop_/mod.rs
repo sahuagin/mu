@@ -247,6 +247,13 @@ pub enum AgentEvent {
         assistant_message_count: u32,
         tool_result_count: u32,
         tool_count: u32,
+        /// mu-heqf: total + per-`SpanKind` token estimate of the
+        /// rope as rendered for this call (post-compaction when one
+        /// ran), under the renderer's own measure — the same scale
+        /// the compaction trigger uses. The forwarder lands it in
+        /// the durable `ContextAssembly` payload so "what does the
+        /// rope hold?" is answerable from the JSONL.
+        context_sizes: Option<crate::context::ContextSizes>,
         /// mu-fb0: provider's `renderer().provider_label()`-style tag.
         /// Surfaces which `ProviderRenderer` projected the rope for
         /// this call (e.g., `"anthropic"`, `"faux"`).
@@ -1021,6 +1028,10 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                 model_call_id += 1;
                 let (user_count, assistant_count, tool_result_count) =
                     count_message_roles(&messages);
+                // mu-heqf: size the rope actually being rendered for
+                // this call (post-compaction when one ran) section by
+                // section, on the renderer's own token scale.
+                let context_sizes = renderer.context_sizes(&rope);
                 let _ = events
                     .send(AgentEvent::ContextAssembly {
                         model_call_id,
@@ -1029,6 +1040,7 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                         assistant_message_count: assistant_count,
                         tool_result_count,
                         tool_count: tool_specs.len() as u32,
+                        context_sizes: Some(context_sizes),
                         renderer: Some(provider_label.clone()),
                         cache_strategy: Some(provider_label),
                         span_count: Some(span_count),

@@ -751,11 +751,16 @@ a `RetainedRope` and runs it through the provider's declared
 ```text
 assemble_rope(system_prompt, messages, tool_specs)
   → provider.renderer().render(rope, AgentView)
-  → provider.cache_strategy().boundaries(rope) + annotate(messages)
+  → provider.cache_strategy().boundaries(rope) + annotate(projection)
   → emit ContextAssembly { renderer, cache_strategy, span_count,
                            cache_boundary_count, first_span_ids, … }
-  → provider.stream(system_prompt, &messages, &tool_specs, cancel)
+  → provider.stream(system_prompt, MessageInput::Projected(&projection),
+                    &tool_specs, cancel)
 ```
+
+> Diagram reflects the mu-yqeq.8 Phase D cutover (2026-05-21). At
+> mu-fb0 time the final call still passed the un-projected
+> `&messages`; see "Wire cutover" below.
 
 The `Provider` trait gained three additive methods (mu-fb0):
 
@@ -774,8 +779,9 @@ compile unchanged. `AnthropicProvider` overrides to return
 
 1. **Rope storage** — per-turn projection from `messages`. The
    `messages: Vec<AgentMessage>` field remains the canonical
-   session state (external input lands there, the wire `stream()`
-   signature still consumes it). The rope is a *projection function*
+   session state (external input lands there; the wire `stream()`
+   signature consumed it directly until the mu-yqeq.8 cutover —
+   it now receives the rope projection). The rope is a *projection function*
    applied per model call, matching the spec's thesis that context,
    transcript, and memory are projections. Storing the rope as a
    field is correct in the long term when events become first-class;
@@ -813,6 +819,11 @@ compile unchanged. `AnthropicProvider` overrides to return
    `stream()` is left as a separate bead once the operator wants
    the wire-shape change.
 
+   > **Superseded (mu-yqeq.8, 2026-05-21):** that separate bead
+   > happened — the wire request now IS the rope projection. See
+   > "Wire cutover" below. The paragraph above stands as the record
+   > of the mu-fb0 transitional state.
+
 ### Equivalence guarantee
 
 `crates/mu-ai/src/providers/anthropic_tests.rs` adds five
@@ -820,7 +831,34 @@ fb0-tagged tests asserting the rope projection's role sequence,
 content surfaces, span count, and cache-boundary placement match
 what `build_request_body` produces for the wire body. These
 augment the existing 100+ Anthropic and agent-loop tests, which
-remain green byte-for-byte (the wire path is untouched).
+remain green byte-for-byte (the wire path was untouched at mu-fb0;
+the cutover below is what changed it, leaning on exactly this
+equivalence guarantee).
+
+## Wire cutover (mu-yqeq.8 Phase D)
+
+As of commit `9ae824d` (PR #114, 2026-05-21) the rope projection is
+no longer merely observed — it IS the wire request:
+
+- `Provider::stream()` takes a sealed `MessageInput<'a>` enum
+  (`crates/mu-core/src/agent/provider.rs`):
+  `Legacy(&[AgentMessage])` (pre-cutover input, retained for tests
+  and bisection) and `Projected(&ProviderMessages)` (rope-derived,
+  cache-annotated).
+- The live loop's call site (`crates/mu-core/src/agent/loop_/invoke.rs`)
+  passes `MessageInput::Projected(&projection)`. Anthropic and
+  OpenRouter adapters consume it via
+  `build_request_body_from_projection`, producing byte-equivalent
+  wire JSON to the pre-cutover Legacy path.
+- Anthropic `cache_control` annotation consolidated onto
+  `AnthropicCacheStrategy` as the sole source (the unconditional
+  body-side emission from the mu-i6j/mu-n48 era is retired). Cache
+  placement is now driven by the projection's `cache_marker` flags.
+
+Net: the mu-fb0 "Resolved design questions" #1 and #4 above are
+historical — `messages` remains canonical session state, but what
+goes on the wire is the rendered, cache-annotated rope projection,
+per this spec's thesis.
 
 ## Changelog
 
@@ -839,3 +877,10 @@ remain green byte-for-byte (the wire path is untouched).
   recording the `Provider` trait extension, the per-call rope
   projection pipeline, the resolved design questions, and the
   equivalence guarantee preserving the existing wire request body.
+- 2026-06-03 — amendment (mu-drz0): "Wire cutover" section recording
+  mu-yqeq.8 Phase D (PR #114, 2026-05-21 — `MessageInput::Projected`
+  as the live wire path); supersession notes on the mu-fb0 claims it
+  obsoleted. Drift surfaced by the self-hosted architecture audit
+  (session 013ff06b4b86046b): the doc still said threading
+  `ProviderMessages` into `stream()` was future work two weeks after
+  it shipped.

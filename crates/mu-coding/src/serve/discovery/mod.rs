@@ -153,6 +153,8 @@ pub fn derive_status_from_events(
             }
             EventPayload::SessionClosed => return SessionStatusSummary::Idle,
             EventPayload::ContextAssembly { .. } => {}
+            // mu-za92: compaction audit record; not status-driving.
+            EventPayload::CompactionAssembly { .. } => {}
             // ProviderStatusUpdate is a lifecycle marker (mu-pex
             // Phase 1.5), not a session-status-driving event. The
             // tracker has its own derivation via the live wire

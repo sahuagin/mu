@@ -1981,7 +1981,7 @@ async fn kgu4_evict_half_policy_fires_compaction_assembly_when_threshold_crossed
         policy_id,
         tokens_before,
         tokens_after,
-        decisions_count,
+        decisions,
         ..
     } = compaction_events[0]
     else {
@@ -1997,8 +1997,9 @@ async fn kgu4_evict_half_policy_fires_compaction_assembly_when_threshold_crossed
         "evict-half must not grow the rope ({tokens_after} > {tokens_before})"
     );
     assert!(
-        *decisions_count > 0,
-        "evict-half drops at least one span on a non-trivial rope; got {decisions_count}"
+        !decisions.is_empty(),
+        "evict-half drops at least one span on a non-trivial rope; got {} decisions",
+        decisions.len()
     );
 
     // CompactionAssembly precedes ContextAssembly on the wire (their

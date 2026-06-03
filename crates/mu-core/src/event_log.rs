@@ -7,11 +7,13 @@
 //! ticks) do NOT go in the log — they're projection details for the
 //! wire layer.
 //!
-//! v1 is in-memory only. Future work (per architecture doc
-//! `specs/architecture/event-sourced-context.md`): JSONL/SQLite
-//! persistence, `ContextAssembly` events, `MemoryWrite` events,
-//! `Compaction` events, branching/lineage via `parent_event_ids`.
+//! v1 was in-memory only; JSONL persistence, `ContextAssembly`
+//! events (mu-032), and `CompactionAssembly` events (mu-za92) have
+//! since landed. Remaining future work (per architecture doc
+//! `specs/architecture/event-sourced-context.md`): `MemoryWrite`
+//! events, branching/lineage via `parent_event_ids`.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -162,11 +164,21 @@ pub enum EventPayload {
         tool_result_count: u32,
         /// Number of tool specs in the request.
         tool_count: u32,
-        /// Token count estimate, when available. v1 leaves None
-        /// (no tokenizer wired); future provider-specific hooks
-        /// can populate.
+        /// Renderer-estimated token count of the assembled rope —
+        /// the same measure the compaction trigger compares against
+        /// its threshold. `None` only for pre-mu-heqf sessions (v1
+        /// left this unwired; the live loop now populates it from
+        /// `ProviderRenderer::context_sizes`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_count_estimate: Option<u64>,
+        /// mu-heqf: per-section breakdown of `token_count_estimate`,
+        /// keyed by `SpanKind::label()` (`"system"`, `"user"`,
+        /// `"tool_result"`, `"file_load"`, …). Sections sum to the
+        /// total by construction. Empty for pre-mu-heqf sessions.
+        /// Answers "where is the context going?" straight from the
+        /// JSONL — the instrumentation mu-u6hc's region map reads.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        token_breakdown: BTreeMap<String, u64>,
         /// Provider + model from the session's selector.
         provider_kind: String,
         model: String,
@@ -190,6 +202,37 @@ pub enum EventPayload {
         /// breadcrumb without the full rope dump).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         first_span_ids: Vec<String>,
+    },
+    /// mu-za92: a compaction policy ran (mu-kgu.4). Durable record of
+    /// what was ejected and kept — pre-mu-za92 this lived only on the
+    /// in-process event surface and the in-memory rope log, both of
+    /// which vanish on process exit, leaving compaction invisible in
+    /// the source-of-truth JSONL (the gap that made the
+    /// mu-compaction-not-firing-self-hosted-ooil investigation
+    /// require transcript archaeology instead of one grep).
+    ///
+    /// Emitted BEFORE the matching `ContextAssembly` for the same
+    /// `model_call_id`: this event says what the policy did; that one
+    /// says what was then rendered.
+    CompactionAssembly {
+        /// Joins with `ContextAssembly::model_call_id`.
+        model_call_id: u32,
+        /// `CompactionPolicy::policy_label()` of the policy that ran.
+        policy_id: String,
+        /// Renderer-estimated tokens before compaction — the value
+        /// the threshold check saw.
+        tokens_before: u64,
+        /// Renderer-estimated tokens after. Best-effort; may exceed
+        /// the policy's target.
+        tokens_after: u64,
+        /// Full per-span audit log: kept / dropped(reason) /
+        /// summarized / failed(reason). Empty = identity result
+        /// (fail-closed path) — the event still lands so an
+        /// attempted-but-no-op compaction is visible.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        decisions: Vec<crate::context::CompactionDecision>,
+        /// Wall-clock duration of `policy.compact()` in microseconds.
+        wall_clock_us: u64,
     },
     /// mu-036: autonomous loop iteration began. `iteration` is
     /// 0-indexed across the run; `motivation` is the model-reported
@@ -865,6 +908,7 @@ mod tests {
                 tool_result_count: 0,
                 tool_count: 0,
                 token_count_estimate: None,
+                token_breakdown: Default::default(),
                 provider_kind: "anthropic_api".into(),
                 model: "x".into(),
                 renderer: None,
@@ -893,6 +937,7 @@ mod tests {
                 tool_result_count: 0,
                 tool_count: 0,
                 token_count_estimate: None,
+                token_breakdown: Default::default(),
                 provider_kind: "anthropic_api".into(),
                 model: "x".into(),
                 renderer: None,
@@ -923,6 +968,7 @@ mod tests {
                 tool_result_count: 1,
                 tool_count: 3,
                 token_count_estimate: Some(2048),
+                token_breakdown: Default::default(),
                 provider_kind: "openai_codex".into(),
                 model: "gpt-5.5".into(),
                 renderer: None,

@@ -240,6 +240,9 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
             // mu-gdwd: boundary-validation failures are logged for
             // postmortem but don't carry usage-history signal.
             | EventPayload::ErrorInvalidMessage { .. }
+            // mu-za92: compaction audit is context-composition
+            // signal, not usage/timing signal.
+            | EventPayload::CompactionAssembly { .. }
             | EventPayload::ProviderSwitched { .. }
             // mu-slat: worker lifecycle events are supervisor-side
             // bookkeeping, not per-call usage signals.

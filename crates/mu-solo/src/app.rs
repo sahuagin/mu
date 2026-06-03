@@ -32,6 +32,13 @@ use crate::skills::{self, DiscoveredSkill};
 use crate::transcript::{Transcript, TranscriptBlock, TranscriptKind};
 use crate::viewport::DynamicViewport;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockAction {
+    Copy,
+    Prompt,
+    Maximize,
+}
+
 /// Known providers offered by the `/provider` picker. Free-form
 /// `/provider <name>` also works for anything not on this list.
 const KNOWN_PROVIDERS: &[&str] = &[
@@ -284,6 +291,10 @@ pub struct App {
     /// Semantic transcript independent of rendered terminal cells. Copy /
     /// export commands read this, not ratatui scrollback.
     transcript: Transcript,
+    /// Selected semantic transcript block. This is a cursor over the record,
+    /// not over terminal cells; it survives scrollback repainting and feeds
+    /// block copy / prompt-yank / maximize actions.
+    selected_block: Option<usize>,
     bash_yolo: bool,
     /// Discovered skills from SKILL.md files on disk.
     skills: HashMap<String, DiscoveredSkill>,
@@ -473,6 +484,7 @@ impl App {
             streaming_route: None,
             live_turn: None,
             transcript: Transcript::new(),
+            selected_block: None,
             events_file,
             actual_renderer: None,
             actual_cache_strategy: None,
@@ -642,11 +654,15 @@ impl App {
             }
             _ => Vec::new(),
         };
+        let selection_rows = if self.selected_block.is_some() { 2 } else { 0 };
         let preview_rows = preview.len();
 
-        let desired_height =
-            (preview_rows as u16 + layout.lines.len() as u16 + 4 + menu_rows as u16) // +preview +separator +prompt +separator +status +info
-                .clamp(VIEWPORT_HEIGHT, MAX_VIEWPORT_HEIGHT);
+        let desired_height = (preview_rows as u16
+            + layout.lines.len() as u16
+            + 4
+            + menu_rows as u16
+            + selection_rows as u16) // +preview +separator +prompt +selection +separator +status +info
+            .clamp(VIEWPORT_HEIGHT, MAX_VIEWPORT_HEIGHT);
         if desired_height != vp.area().height {
             vp.set_height(desired_height)?;
         }
@@ -655,7 +671,8 @@ impl App {
         let vp_w = area.width as usize;
         let vp_wrap = vp_w.saturating_sub(4);
         let vp_layout = self.prompt.visual_layout(vp_wrap);
-        let max_prompt_rows = (area.height as usize).saturating_sub(4 + menu_rows + preview_rows);
+        let max_prompt_rows =
+            (area.height as usize).saturating_sub(4 + menu_rows + preview_rows + selection_rows);
         let prompt_rows = vp_layout.lines.len().min(max_prompt_rows);
         let skip = vp_layout.lines.len().saturating_sub(prompt_rows);
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -740,6 +757,34 @@ impl App {
                     Span::styled(prefix.to_string(), Style::default().fg(Color::Cyan)),
                     Span::raw(vline.text.clone()),
                 ]));
+            }
+        }
+        if let Some(selected) = self.selected_block {
+            if let Some(block) = self.transcript.get(selected) {
+                let marker = format!(
+                    " ◆ block {}/{}: {}",
+                    selected + 1,
+                    self.transcript.len(),
+                    block.label
+                );
+                let preview = block
+                    .body
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or("");
+                lines.push(Line::from(Span::styled(
+                    truncate_at_word(&marker, vp_w.saturating_sub(1)),
+                    Style::default().fg(Color::Yellow),
+                )));
+                lines.push(Line::from(vec![
+                    Span::styled("   ".to_string(), Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        truncate_at_word(preview, vp_w.saturating_sub(4)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            } else {
+                self.selected_block = None;
             }
         }
         lines.push(Line::from(Span::styled(
@@ -860,6 +905,24 @@ impl App {
         }
 
         match (key.modifiers, key.code) {
+            (KeyModifiers::ALT, KeyCode::Up) | (KeyModifiers::ALT, KeyCode::Char('k')) => {
+                self.move_selected_block(-1)
+            }
+            (KeyModifiers::ALT, KeyCode::Down) | (KeyModifiers::ALT, KeyCode::Char('j')) => {
+                self.move_selected_block(1)
+            }
+            (_, KeyCode::Char('c')) if self.prompt.is_empty() && self.selected_block.is_some() => {
+                self.apply_block_action(vp, BlockAction::Copy)?;
+            }
+            (_, KeyCode::Char('p')) if self.prompt.is_empty() && self.selected_block.is_some() => {
+                self.apply_block_action(vp, BlockAction::Prompt)?;
+            }
+            (_, KeyCode::Char('m')) if self.prompt.is_empty() && self.selected_block.is_some() => {
+                self.apply_block_action(vp, BlockAction::Maximize)?;
+            }
+            (_, KeyCode::Enter) if self.prompt.is_empty() && self.selected_block.is_some() => {
+                self.emit_block_action_menu(vp)?;
+            }
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 if !self.prompt.is_empty() {
                     self.prompt.clear();
@@ -877,6 +940,7 @@ impl App {
             // session kill. Quit paths are now: /q, /quit, Ctrl-C.
             (_, KeyCode::Esc) => {
                 self.prompt.clear();
+                self.selected_block = None;
             }
             // Kill line (Ctrl-U) — clear entire prompt
             (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
@@ -900,12 +964,16 @@ impl App {
                 self.prompt.delete_after();
             }
             (_, KeyCode::Char('/')) if self.prompt.is_empty() => {
+                self.selected_block = None;
                 self.prompt.insert_char('/');
                 let items = self.build_slash_menu_items();
                 let max_visible = vp.area().height.saturating_sub(3) as usize;
                 self.inline_menu = Some(InlineMenu::new(items, max_visible.max(5)));
             }
-            (_, KeyCode::Char(c)) => self.prompt.insert_char(c),
+            (_, KeyCode::Char(c)) => {
+                self.selected_block = None;
+                self.prompt.insert_char(c)
+            }
             (_, KeyCode::Enter) => {
                 let text = self.prompt.take();
                 let trimmed = text.trim();
@@ -984,9 +1052,144 @@ impl App {
         Ok(false)
     }
 
+    fn move_selected_block(&mut self, delta: isize) {
+        let len = self.transcript.len();
+        if len == 0 {
+            self.selected_block = None;
+            return;
+        }
+        let current = self
+            .selected_block
+            .unwrap_or_else(|| if delta < 0 { len } else { 0 });
+        let next = if delta < 0 {
+            current.saturating_sub(1)
+        } else {
+            current.saturating_add(1).min(len - 1)
+        };
+        self.selected_block = Some(next);
+    }
+
+    fn selected_block(&self) -> Option<&TranscriptBlock> {
+        self.selected_block.and_then(|idx| self.transcript.get(idx))
+    }
+
+    fn apply_block_action(&mut self, vp: &mut DynamicViewport, action: BlockAction) -> Result<()> {
+        let Some(block) = self.selected_block().cloned() else {
+            return Ok(());
+        };
+        match action {
+            BlockAction::Copy => {
+                let outcome =
+                    copy_to_clipboard_or_file(&block.body, self.clipboard_command.as_deref())?;
+                self.emit_block_notice(vp, format!("copied selected block"), outcome)?;
+            }
+            BlockAction::Prompt => {
+                if !self.prompt.is_empty() {
+                    self.prompt.insert_char('\n');
+                }
+                self.prompt.insert_str(&block.body);
+            }
+            BlockAction::Maximize => self.emit_maximized_block(vp, &block)?,
+        }
+        Ok(())
+    }
+
+    fn emit_block_action_menu(&self, vp: &mut DynamicViewport) -> Result<()> {
+        let Some(block) = self.selected_block() else {
+            return Ok(());
+        };
+        let first = block.body.lines().next().unwrap_or("");
+        let lines: Vec<Line<'static>> = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("selected block: {}", block.label),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("  {}", truncate_at_word(first, 90))),
+            Line::from("  c copy · p copy into prompt · m maximize · Esc clear selection"),
+            Line::from(""),
+        ];
+        let h = lines.len() as u16;
+        vp.insert_before(h, |buf| {
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
+        Ok(())
+    }
+
+    fn emit_block_notice(
+        &self,
+        vp: &mut DynamicViewport,
+        title: String,
+        detail: String,
+    ) -> Result<()> {
+        let lines: Vec<Line<'static>> = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                title,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("  {detail}")),
+            Line::from(""),
+        ];
+        let h = lines.len() as u16;
+        vp.insert_before(h, |buf| {
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
+        Ok(())
+    }
+
+    fn emit_maximized_block(
+        &self,
+        vp: &mut DynamicViewport,
+        block: &TranscriptBlock,
+    ) -> Result<()> {
+        let width = vp.area().width as usize;
+        let wrap_width = width.saturating_sub(4).max(20);
+        let mut lines: Vec<Line<'static>> = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("── block: {} ──", block.label),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        ];
+        for logical in block.body.lines() {
+            if logical.is_empty() {
+                lines.push(Line::from(""));
+                continue;
+            }
+            let mut rest = logical;
+            while !rest.is_empty() {
+                let take = rest.floor_char_boundary(wrap_width.min(rest.len()));
+                let (head, tail) = rest.split_at(take);
+                lines.push(Line::from(format!("  {head}")));
+                rest = tail;
+            }
+        }
+        lines.push(Line::from(Span::styled(
+            "  c copy · p copy into prompt · Esc returns".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+        let h = lines.len() as u16;
+        vp.insert_before(h, |buf| {
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
+        Ok(())
+    }
+
     /// Send a user prompt: emit the "you" block to scrollback, then
     /// fire `session.ask`.
     fn send_prompt(&mut self, vp: &mut DynamicViewport, text: &str) -> Result<()> {
+        self.selected_block = None;
         self.transcript
             .push(TranscriptBlock::user(TurnRoute::Main, text.to_string()));
         self.emit_you_block(vp, text)?;
@@ -1781,6 +1984,8 @@ impl App {
             Line::from("  /clear             clear the visible scrollback"),
             Line::from("  /transcript [PATH] write semantic transcript to PATH/tempfile"),
             Line::from("  /copy [WHAT]       copy last|assistant|user|all semantically"),
+            Line::from("  Alt-Up/Down or Alt-k/j select previous/next semantic block"),
+            Line::from("  c / p / m          copy / copy into prompt / maximize selection"),
             Line::from("  /q, /quit, /exit   leave the session"),
             Line::from(""),
             Line::from("  Esc                clear the current prompt"),

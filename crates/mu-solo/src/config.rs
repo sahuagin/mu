@@ -59,6 +59,9 @@ pub struct TuiConfig {
     pub effort: String,
     /// Whether to start with `/focus` mode on (§16). Default off.
     pub focus_mode: bool,
+    /// Optional clipboard command for `/copy`, run via the shell with the
+    /// selected text on stdin. Example: `xclip -selection clipboard`.
+    pub clipboard_command: Option<String>,
 }
 
 impl Default for TuiConfig {
@@ -66,6 +69,7 @@ impl Default for TuiConfig {
         Self {
             effort: "medium".into(),
             focus_mode: false,
+            clipboard_command: None,
         }
     }
 }
@@ -159,6 +163,7 @@ pub struct CliOverrides {
     pub cwd: Option<PathBuf>,
     pub effort: Option<String>,
     pub focus_mode: Option<bool>,
+    pub clipboard_command: Option<String>,
 }
 
 /// Apply CLI Options on top of an already-loaded config. Some fields
@@ -188,6 +193,9 @@ pub fn apply_cli_overrides(config: &mut SoloConfig, cli: &CliOverrides) {
     }
     if let Some(v) = cli.focus_mode {
         config.tui.focus_mode = v;
+    }
+    if let Some(v) = &cli.clipboard_command {
+        config.tui.clipboard_command = Some(v.clone());
     }
 }
 

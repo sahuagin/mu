@@ -246,6 +246,8 @@ pub struct App {
     /// previews and render the assistant block in one shot on
     /// `assistant_text_finalized`. Default off.
     focus_mode: bool,
+    /// Optional configured clipboard command for `/copy`.
+    clipboard_command: Option<String>,
     /// Sidecar session for `/btw` side questions (§13). Created
     /// lazily on first `/btw` via `session.delegate`. Persists across
     /// /btw calls so follow-ups stay coherent; main session history
@@ -373,6 +375,7 @@ pub struct AppOptions<'a> {
     pub tools: &'a str,
     pub effort: &'a str,
     pub focus_mode: bool,
+    pub clipboard_command: Option<&'a str>,
 }
 
 impl App {
@@ -392,6 +395,7 @@ impl App {
             tools,
             effort,
             focus_mode,
+            clipboard_command,
         } = opts;
         let effort = EffortLevel::parse(effort).ok_or_else(|| {
             anyhow!("invalid effort {effort:?} (valid: low|medium|high|xhigh|max)")
@@ -463,6 +467,7 @@ impl App {
             daemon_version,
             effort,
             focus_mode,
+            clipboard_command: clipboard_command.map(str::to_string),
             sidecar_session_id: None,
             streaming_route: None,
             live_turn: None,
@@ -1609,7 +1614,7 @@ impl App {
             return Ok(());
         };
 
-        let outcome = copy_to_clipboard_or_file(&text)?;
+        let outcome = copy_to_clipboard_or_file(&text, self.clipboard_command.as_deref())?;
         let lines: Vec<Line<'static>> = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -2364,48 +2369,42 @@ impl App {
     }
 }
 
-fn copy_to_clipboard_or_file(text: &str) -> Result<String> {
+fn copy_to_clipboard_or_file(text: &str, configured: Option<&str>) -> Result<String> {
     if text.is_empty() {
         return Ok("empty selection".to_string());
     }
 
-    // Unix clipboard command path. Prefer explicit config/env in a future
-    // commit; v0 uses common tools and falls back to a file.
-    for (cmd, args) in [
-        ("xclip", &["-selection", "clipboard"][..]),
-        ("xsel", &["--clipboard", "--input"][..]),
-        ("wl-copy", &[][..]),
-        ("pbcopy", &[][..]),
-    ] {
-        let mut child = match std::process::Command::new(cmd)
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(_) => continue,
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            if stdin.write_all(text.as_bytes()).is_err() {
-                continue;
-            }
+    if let Some(cmdline) = configured.filter(|s| !s.trim().is_empty()) {
+        if run_clipboard_command(cmdline, text).is_ok() {
+            return Ok(format!("{} bytes via {cmdline}", text.len()));
         }
-        if let Ok(status) = child.wait() {
-            if status.success() {
-                return Ok(format!("{} bytes via {cmd}", text.len()));
-            }
+    }
+
+    // Unix clipboard command path. Prefer explicit config/env above; v0
+    // auto-detects common tools and falls back to a file.
+    for cmdline in [
+        "xclip -selection clipboard",
+        "xsel --clipboard --input",
+        "wl-copy",
+        "pbcopy",
+    ] {
+        if run_clipboard_command(cmdline, text).is_ok() {
+            return Ok(format!("{} bytes via {cmdline}", text.len()));
         }
     }
 
     let path = std::env::temp_dir().join(format!(
         "mu-solo-copy-{}-{}.txt",
         std::process::id(),
-        chrono_like_timestamp()
+        unix_timestamp_secs()
     ));
-    std::fs::write(&path, text).with_context(|| format!("write copy fallback to {path:?}"))?;
+    std::fs::write(&path, text).with_context(|| {
+        format!(
+            "write copy fallback ({} bytes) to {}",
+            text.len(),
+            path.display()
+        )
+    })?;
     Ok(format!(
         "clipboard unavailable; wrote {} bytes to {}",
         text.len(),
@@ -2413,7 +2412,39 @@ fn copy_to_clipboard_or_file(text: &str) -> Result<String> {
     ))
 }
 
-fn chrono_like_timestamp() -> String {
+fn run_clipboard_command(cmdline: &str, text: &str) -> Result<()> {
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmdline)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawn clipboard command {cmdline:?}"))?;
+
+    let Some(mut stdin) = child.stdin.take() else {
+        anyhow::bail!("clipboard command {cmdline:?} has no stdin");
+    };
+    use std::io::Write;
+    stdin.write_all(text.as_bytes()).with_context(|| {
+        format!(
+            "write {} bytes to clipboard command {cmdline:?}",
+            text.len()
+        )
+    })?;
+    drop(stdin);
+
+    let status = child
+        .wait()
+        .with_context(|| format!("wait for clipboard command {cmdline:?}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("clipboard command {cmdline:?} exited with {status}");
+    }
+}
+
+fn unix_timestamp_secs() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)

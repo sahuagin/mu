@@ -207,12 +207,10 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
             },
         ),
         // Lifecycle events not in mu-001's notification surface.
-        // ContextAssembly lands only in the durable event log
-        // (mu-032 v1); wire-level exposure is a future TUI/web-ui
-        // feature when there's a consumer. mu-kgu.4's
-        // CompactionAssembly follows the same pattern — the rope's
-        // own decision-log carries the audit detail; the event
-        // surface is for in-process consumers (TUI / inspector).
+        // ContextAssembly and CompactionAssembly land only in the
+        // durable event log (mu-032 v1 / mu-za92 — see to_log_event);
+        // wire-level exposure is a future TUI/web-ui feature when
+        // there's a consumer.
         AgentEvent::AgentStart
         | AgentEvent::TurnStart
         | AgentEvent::TurnEnd
@@ -685,12 +683,29 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
         // InputRequired is a transient wire-level prompt; the
         // resulting ToolCall (approved) or ToolResult (denied)
         // already lands in the log.
-        | AgentEvent::InputRequired { .. }
-        // mu-kgu.4: CompactionAssembly is an in-process operator
-        // event; the rope's own RopeEvent log already carries the
-        // per-span decision audit. No durable-log surface needed
-        // until a consumer (TUI / inspector) requires it.
-        | AgentEvent::CompactionAssembly { .. } => None,
+        | AgentEvent::InputRequired { .. } => None,
+        // mu-za92: compaction lands durably, decisions and all. The
+        // in-memory rope log this used to defer to vanishes on
+        // process exit — the JSONL is the only record that survives
+        // to answer "what was ejected and kept?"
+        AgentEvent::CompactionAssembly {
+            model_call_id,
+            policy_id,
+            tokens_before,
+            tokens_after,
+            decisions,
+            wall_clock_us,
+        } => Some((
+            EventActor::System,
+            EventPayload::CompactionAssembly {
+                model_call_id: *model_call_id,
+                policy_id: policy_id.clone(),
+                tokens_before: *tokens_before as u64,
+                tokens_after: *tokens_after as u64,
+                decisions: decisions.clone(),
+                wall_clock_us: *wall_clock_us,
+            },
+        )),
         AgentEvent::ProviderSwitched {
             old_provider_kind,
             old_model,
@@ -1137,6 +1152,7 @@ mod tests {
                 EventPayload::Callout { .. } => "callout",
                 EventPayload::SessionClosed => "session_closed",
                 EventPayload::ContextAssembly { .. } => "context_assembly",
+                EventPayload::CompactionAssembly { .. } => "compaction_assembly",
                 EventPayload::ProviderStatusUpdate { .. } => "provider_status_update",
                 EventPayload::AutonomousIterationStarted { .. } => "autonomous_iteration_started",
                 EventPayload::AutonomousIterationCompleted { .. } => {

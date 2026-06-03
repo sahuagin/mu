@@ -1000,6 +1000,7 @@ fn payload_kind_str(p: &EventPayload) -> &'static str {
         EventPayload::Callout { .. } => "callout",
         EventPayload::SessionClosed => "session_closed",
         EventPayload::ContextAssembly { .. } => "context_assembly",
+        EventPayload::CompactionAssembly { .. } => "compaction_assembly",
         EventPayload::ProviderStatusUpdate { .. } => "provider_status_update",
         EventPayload::AutonomousIterationStarted { .. } => "autonomous_iteration_started",
         EventPayload::AutonomousIterationCompleted { .. } => "autonomous_iteration_completed",

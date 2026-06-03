@@ -290,10 +290,13 @@ pub enum AgentEvent {
     /// POST-compaction rope, so the two events together describe
     /// "what was compacted" and "what was rendered."
     ///
-    /// Carries summary fields only; the full per-span audit log
-    /// ([`CompactionDecision`]s) lives on the event-sourced rope log
-    /// and is reachable via session replay. `decisions_count` is the
-    /// summary cardinality.
+    /// Carries the full per-span audit log (mu-za92): the
+    /// [`CompactionDecision`]s say exactly which spans were kept,
+    /// dropped (and why), or summarized. Pre-mu-za92 this event
+    /// carried only a count and the audit lived solely on the
+    /// in-memory rope log — which vanishes on process exit; the
+    /// forwarder now lands the decisions in the durable session
+    /// event log so "what disappeared and why?" survives restarts.
     ///
     /// [`CompactionPolicy`]: crate::context::CompactionPolicy
     /// [`CompactionDecision`]: crate::context::CompactionDecision
@@ -315,13 +318,14 @@ pub enum AgentEvent {
         ///
         /// [`CompactionPolicy::compact`]: crate::context::CompactionPolicy::compact
         tokens_after: usize,
-        /// Number of [`CompactionDecision`] entries in the policy's
-        /// audit log. 0 means the policy returned identity (e.g.,
+        /// The policy's per-span audit log: kept / dropped(reason) /
+        /// summarized / failed(reason), one entry per touched span.
+        /// Empty means the policy returned identity (e.g., the
         /// fail-closed path); the loop still emits this event so
         /// the operator sees that compaction was attempted.
         ///
         /// [`CompactionDecision`]: crate::context::CompactionDecision
-        decisions_count: u32,
+        decisions: Vec<crate::context::CompactionDecision>,
         /// Wall-clock duration of `policy.compact()` in milliseconds.
         wall_clock_us: u64,
     },
@@ -946,7 +950,7 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                                 policy_id: policy_label,
                                 tokens_before: complete.result.tokens_before,
                                 tokens_after,
-                                decisions_count: complete.result.decisions.len() as u32,
+                                decisions: complete.result.decisions.clone(),
                                 wall_clock_us: complete.result.wall_clock_us,
                             })
                             .await;
@@ -997,7 +1001,7 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                                 policy_id: policy.policy_label().to_owned(),
                                 tokens_before: pre_compaction_tokens,
                                 tokens_after: renderer.estimate_tokens(&result.rope),
-                                decisions_count: result.decisions.len() as u32,
+                                decisions: result.decisions.clone(),
                                 wall_clock_us: result.wall_clock_us,
                             })
                             .await;

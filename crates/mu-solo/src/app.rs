@@ -1060,7 +1060,7 @@ impl App {
         }
         let current = self
             .selected_block
-            .unwrap_or_else(|| if delta < 0 { len } else { 0 });
+            .unwrap_or(if delta < 0 { len } else { 0 });
         let next = if delta < 0 {
             current.saturating_sub(1)
         } else {
@@ -1081,7 +1081,7 @@ impl App {
             BlockAction::Copy => {
                 let outcome =
                     copy_to_clipboard_or_file(&block.body, self.clipboard_command.as_deref())?;
-                self.emit_block_notice(vp, format!("copied selected block"), outcome)?;
+                self.emit_block_notice(vp, "copied selected block".to_string(), outcome)?;
             }
             BlockAction::Prompt => {
                 if !self.prompt.is_empty() {

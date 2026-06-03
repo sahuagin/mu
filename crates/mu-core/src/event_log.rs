@@ -12,6 +12,7 @@
 //! persistence, `ContextAssembly` events, `MemoryWrite` events,
 //! `Compaction` events, branching/lineage via `parent_event_ids`.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -162,11 +163,21 @@ pub enum EventPayload {
         tool_result_count: u32,
         /// Number of tool specs in the request.
         tool_count: u32,
-        /// Token count estimate, when available. v1 leaves None
-        /// (no tokenizer wired); future provider-specific hooks
-        /// can populate.
+        /// Renderer-estimated token count of the assembled rope —
+        /// the same measure the compaction trigger compares against
+        /// its threshold. `None` only for pre-mu-heqf sessions (v1
+        /// left this unwired; the live loop now populates it from
+        /// `ProviderRenderer::context_sizes`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_count_estimate: Option<u64>,
+        /// mu-heqf: per-section breakdown of `token_count_estimate`,
+        /// keyed by `SpanKind::label()` (`"system"`, `"user"`,
+        /// `"tool_result"`, `"file_load"`, …). Sections sum to the
+        /// total by construction. Empty for pre-mu-heqf sessions.
+        /// Answers "where is the context going?" straight from the
+        /// JSONL — the instrumentation mu-u6hc's region map reads.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        token_breakdown: BTreeMap<String, u64>,
         /// Provider + model from the session's selector.
         provider_kind: String,
         model: String,
@@ -865,6 +876,7 @@ mod tests {
                 tool_result_count: 0,
                 tool_count: 0,
                 token_count_estimate: None,
+                token_breakdown: Default::default(),
                 provider_kind: "anthropic_api".into(),
                 model: "x".into(),
                 renderer: None,
@@ -893,6 +905,7 @@ mod tests {
                 tool_result_count: 0,
                 tool_count: 0,
                 token_count_estimate: None,
+                token_breakdown: Default::default(),
                 provider_kind: "anthropic_api".into(),
                 model: "x".into(),
                 renderer: None,
@@ -923,6 +936,7 @@ mod tests {
                 tool_result_count: 1,
                 tool_count: 3,
                 token_count_estimate: Some(2048),
+                token_breakdown: Default::default(),
                 provider_kind: "openai_codex".into(),
                 model: "gpt-5.5".into(),
                 renderer: None,

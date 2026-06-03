@@ -75,6 +75,13 @@ impl DynamicViewport {
         self.viewport
     }
 
+    /// Resize the viewport to a full-screen-style overlay, leaving one row
+    /// above so insert_before still has a safe history region on tiny terms.
+    pub fn maximize_height(&mut self) -> io::Result<()> {
+        let (_, rows) = terminal::size()?;
+        self.set_height(rows.saturating_sub(1).max(1))
+    }
+
     /// Resize the viewport to a new height. If growing, scrolls the
     /// content above the viewport up to make room. If shrinking,
     /// clears the freed lines.

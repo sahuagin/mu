@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::rope::{RetainedRope, Span, SpanId, SpanKind};
+use super::rope::{ContextSizes, RetainedRope, Span, SpanId, SpanKind};
 use crate::agent::types::ContentBlock;
 
 /// Per-conceptual-type alias for provider-message text payloads
@@ -325,11 +325,37 @@ pub trait ProviderRenderer: Send + Sync {
     /// [`AgentView`]: ProjectionTarget::AgentView
     /// [`CompactionPolicy::compact`]: super::compaction::CompactionPolicy::compact
     fn estimate_tokens(&self, rope: &RetainedRope) -> usize {
+        // Expressed as the sum of per-span estimates (mu-heqf) so the
+        // whole-rope number and the per-section breakdown from
+        // [`Self::context_sizes`] cannot disagree. Truncation now
+        // happens per span instead of once over the sum — at chars/4
+        // that shifts the estimate by at most 1 token per span,
+        // immaterial against compaction thresholds.
         rope.spans()
             .iter()
-            .map(|s| s.content.chars().count())
-            .sum::<usize>()
-            / 4
+            .map(|s| self.estimate_span_tokens(s))
+            .sum()
+    }
+
+    /// Per-span counterpart of [`Self::estimate_tokens`] (mu-heqf).
+    /// Same coarse `chars / 4` default, same caveats; renderers that
+    /// override `estimate_tokens` with a real tokenizer SHOULD
+    /// override this too so section breakdowns stay on the same
+    /// scale as the whole-rope estimate.
+    fn estimate_span_tokens(&self, span: &Span) -> usize {
+        span.content.chars().count() / 4
+    }
+
+    /// Section-by-section size view of the rope under this
+    /// renderer's token measure (mu-heqf): total plus per-
+    /// [`SpanKind`] estimated tokens, computed in one pass so
+    /// `total == Σ sections` by construction. This is the same
+    /// measure the compaction trigger compares against the
+    /// threshold, broken down by where the tokens live — the durable
+    /// `ContextAssembly` event carries it so context composition is
+    /// answerable from the JSONL without scouring transcripts.
+    fn context_sizes(&self, rope: &RetainedRope) -> ContextSizes {
+        rope.token_sizes(|s| self.estimate_span_tokens(s))
     }
 }
 

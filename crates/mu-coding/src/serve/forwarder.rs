@@ -207,12 +207,10 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
             },
         ),
         // Lifecycle events not in mu-001's notification surface.
-        // ContextAssembly lands only in the durable event log
-        // (mu-032 v1); wire-level exposure is a future TUI/web-ui
-        // feature when there's a consumer. mu-kgu.4's
-        // CompactionAssembly follows the same pattern — the rope's
-        // own decision-log carries the audit detail; the event
-        // surface is for in-process consumers (TUI / inspector).
+        // ContextAssembly and CompactionAssembly land only in the
+        // durable event log (mu-032 v1 / mu-za92 — see to_log_event);
+        // wire-level exposure is a future TUI/web-ui feature when
+        // there's a consumer.
         AgentEvent::AgentStart
         | AgentEvent::TurnStart
         | AgentEvent::TurnEnd
@@ -586,6 +584,7 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
             assistant_message_count,
             tool_result_count,
             tool_count,
+            context_sizes,
             renderer,
             cache_strategy,
             span_count,
@@ -619,7 +618,13 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
                     assistant_message_count: *assistant_message_count,
                     tool_result_count: *tool_result_count,
                     tool_count: *tool_count,
-                    token_count_estimate: None,
+                    // mu-heqf: total + per-section estimate measured
+                    // by the loop's renderer at assembly time.
+                    token_count_estimate: context_sizes.as_ref().map(|s| s.total),
+                    token_breakdown: context_sizes
+                        .as_ref()
+                        .map(|s| s.by_kind.clone())
+                        .unwrap_or_default(),
                     provider_kind: String::new(),
                     model: String::new(),
                     renderer: renderer.clone(),
@@ -678,12 +683,29 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
         // InputRequired is a transient wire-level prompt; the
         // resulting ToolCall (approved) or ToolResult (denied)
         // already lands in the log.
-        | AgentEvent::InputRequired { .. }
-        // mu-kgu.4: CompactionAssembly is an in-process operator
-        // event; the rope's own RopeEvent log already carries the
-        // per-span decision audit. No durable-log surface needed
-        // until a consumer (TUI / inspector) requires it.
-        | AgentEvent::CompactionAssembly { .. } => None,
+        | AgentEvent::InputRequired { .. } => None,
+        // mu-za92: compaction lands durably, decisions and all. The
+        // in-memory rope log this used to defer to vanishes on
+        // process exit — the JSONL is the only record that survives
+        // to answer "what was ejected and kept?"
+        AgentEvent::CompactionAssembly {
+            model_call_id,
+            policy_id,
+            tokens_before,
+            tokens_after,
+            decisions,
+            wall_clock_us,
+        } => Some((
+            EventActor::System,
+            EventPayload::CompactionAssembly {
+                model_call_id: *model_call_id,
+                policy_id: policy_id.clone(),
+                tokens_before: *tokens_before as u64,
+                tokens_after: *tokens_after as u64,
+                decisions: decisions.clone(),
+                wall_clock_us: *wall_clock_us,
+            },
+        )),
         AgentEvent::ProviderSwitched {
             old_provider_kind,
             old_model,
@@ -1130,6 +1152,7 @@ mod tests {
                 EventPayload::Callout { .. } => "callout",
                 EventPayload::SessionClosed => "session_closed",
                 EventPayload::ContextAssembly { .. } => "context_assembly",
+                EventPayload::CompactionAssembly { .. } => "compaction_assembly",
                 EventPayload::ProviderStatusUpdate { .. } => "provider_status_update",
                 EventPayload::AutonomousIterationStarted { .. } => "autonomous_iteration_started",
                 EventPayload::AutonomousIterationCompleted { .. } => {
@@ -1378,6 +1401,115 @@ mod tests {
                 assert_eq!(model, "");
             }
             other => panic!("expected TaskTelemetry, got {other:?}"),
+        }
+    }
+
+    // ─── mu-za92 / mu-heqf: compaction + context-size durability ─────────
+
+    /// CompactionAssembly reaches the durable log with the full
+    /// decision audit — the mu-za92 fix. Pre-fix, to_log_event
+    /// mapped it to None and compaction was invisible in the JSONL
+    /// (the mu-compaction-not-firing-self-hosted-ooil trap: absence
+    /// of compaction events proved nothing).
+    #[test]
+    fn mu_za92_compaction_assembly_lands_durably_with_decisions() {
+        use mu_core::context::CompactionDecision;
+
+        let ev = AgentEvent::CompactionAssembly {
+            model_call_id: 7,
+            policy_id: "heuristic-span-family-drop".into(),
+            tokens_before: 160_000,
+            tokens_after: 78_000,
+            decisions: vec![
+                CompactionDecision::Kept {
+                    span_id: "sys-1".into(),
+                },
+                CompactionDecision::Dropped {
+                    span_id: "file-load-3".into(),
+                    reason: "stale file-load".into(),
+                },
+            ],
+            wall_clock_us: 1234,
+        };
+        let (actor, payload) = to_log_event(&ev).expect("CompactionAssembly → durable log");
+        assert_eq!(actor, EventActor::System);
+        match payload {
+            EventPayload::CompactionAssembly {
+                model_call_id,
+                policy_id,
+                tokens_before,
+                tokens_after,
+                decisions,
+                wall_clock_us,
+            } => {
+                assert_eq!(model_call_id, 7);
+                assert_eq!(policy_id, "heuristic-span-family-drop");
+                assert_eq!(tokens_before, 160_000);
+                assert_eq!(tokens_after, 78_000);
+                assert_eq!(wall_clock_us, 1234);
+                assert_eq!(decisions.len(), 2, "full audit, not a count");
+                match &decisions[1] {
+                    CompactionDecision::Dropped { span_id, reason } => {
+                        assert_eq!(span_id, "file-load-3");
+                        assert_eq!(reason, "stale file-load");
+                    }
+                    other => panic!("expected Dropped, got {other:?}"),
+                }
+            }
+            other => panic!("expected CompactionAssembly, got {other:?}"),
+        }
+        // Durable JSONL encoding: tagged kind + tagged decision
+        // actions, so log scanners can grep for what was ejected.
+        let json = serde_json::to_value(to_log_event(&ev).unwrap().1).unwrap();
+        assert_eq!(json["kind"], "compaction_assembly");
+        assert_eq!(json["decisions"][1]["action"], "dropped");
+        assert_eq!(json["decisions"][1]["reason"], "stale file-load");
+    }
+
+    /// ContextAssembly's durable payload now carries the renderer's
+    /// token estimate (total + per-SpanKind breakdown) — mu-heqf.
+    /// token_count_estimate existed since v1 but was always None.
+    #[test]
+    fn mu_heqf_context_assembly_carries_token_sizes() {
+        use std::collections::BTreeMap;
+
+        let mut by_kind = BTreeMap::new();
+        by_kind.insert("system".to_owned(), 1_200u64);
+        by_kind.insert("tool_result".to_owned(), 14_000u64);
+        by_kind.insert("user".to_owned(), 800u64);
+        let ev = AgentEvent::ContextAssembly {
+            model_call_id: 3,
+            message_count: 5,
+            user_message_count: 2,
+            assistant_message_count: 2,
+            tool_result_count: 1,
+            tool_count: 10,
+            context_sizes: Some(mu_core::context::ContextSizes {
+                total: 16_000,
+                by_kind: by_kind.clone(),
+            }),
+            renderer: Some("faux".into()),
+            cache_strategy: Some("faux".into()),
+            span_count: Some(17),
+            cache_boundary_count: Some(0),
+            first_span_ids: vec!["sys-1".into()],
+        };
+        let (_actor, payload) = to_log_event(&ev).expect("ContextAssembly → durable log");
+        match payload {
+            EventPayload::ContextAssembly {
+                token_count_estimate,
+                token_breakdown,
+                ..
+            } => {
+                assert_eq!(token_count_estimate, Some(16_000));
+                assert_eq!(token_breakdown, by_kind);
+                assert_eq!(
+                    token_count_estimate.unwrap(),
+                    token_breakdown.values().sum::<u64>(),
+                    "sections sum to the total"
+                );
+            }
+            other => panic!("expected ContextAssembly, got {other:?}"),
         }
     }
 }

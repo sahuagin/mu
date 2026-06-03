@@ -56,4 +56,4 @@ pub use renderer::{
     CacheMarker, FauxProviderRenderer, ProjectionTarget, ProviderMessage, ProviderMessages,
     ProviderRenderer, ProviderRole,
 };
-pub use rope::{RetainedRope, RetentionClass, Span, SpanId, SpanKind, SpanText};
+pub use rope::{ContextSizes, RetainedRope, RetentionClass, Span, SpanId, SpanKind, SpanText};

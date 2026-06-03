@@ -45,7 +45,7 @@
 //! [`deactivate_skill`]: RetainedRope::deactivate_skill
 //! [`unregister_tool_schema`]: RetainedRope::unregister_tool_schema
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -177,6 +177,46 @@ pub enum SpanKind {
         /// operator view group compaction events by policy.
         policy_id: String,
     },
+}
+
+impl SpanKind {
+    /// Short stable identifier for this kind, matching the serde
+    /// `snake_case` wire name of the variant. Used as the section
+    /// key in [`ContextSizes::by_kind`] so the durable event log and
+    /// in-memory breakdowns agree on naming without a serde
+    /// round-trip.
+    pub fn label(&self) -> &'static str {
+        match self {
+            SpanKind::System => "system",
+            SpanKind::User => "user",
+            SpanKind::Assistant => "assistant",
+            SpanKind::ToolResult => "tool_result",
+            SpanKind::ToolCall => "tool_call",
+            SpanKind::ToolSchema => "tool_schema",
+            SpanKind::SkillActivation => "skill_activation",
+            SpanKind::MemoryInjection => "memory_injection",
+            SpanKind::Compaction => "compaction",
+            SpanKind::FileLoad => "file_load",
+            SpanKind::CompactionSummary { .. } => "compaction_summary",
+        }
+    }
+}
+
+/// Per-section token sizes for a rope: the answer to "what do we
+/// hold in the rope RIGHT NOW, and where is it going?" without
+/// scouring logs (mu-heqf; feeds mu-u6hc's context region map).
+///
+/// `total` is the sum of `by_kind` values by construction — both are
+/// computed from the same per-span estimator in one pass, so the
+/// whole and the sections cannot drift apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSizes {
+    /// Estimated tokens across the whole rope.
+    pub total: u64,
+    /// Estimated tokens per [`SpanKind`], keyed by
+    /// [`SpanKind::label`]. Kinds with no spans are absent (not 0) —
+    /// keeps the durable-event encoding compact.
+    pub by_kind: BTreeMap<String, u64>,
 }
 
 /// One retained span in the rope.
@@ -365,6 +405,32 @@ impl RetainedRope {
     /// Iterate spans in retained order.
     pub fn iter(&self) -> std::slice::Iter<'_, Span> {
         self.spans.iter()
+    }
+
+    /// Per-section size view of the rope (mu-heqf): total estimated
+    /// tokens plus a per-[`SpanKind`] breakdown, both computed from
+    /// the caller-supplied per-span estimator in a single pass —
+    /// `total == by_kind.values().sum()` by construction.
+    ///
+    /// The estimator is a parameter (rather than baked in) so the
+    /// breakdown uses the SAME measure as whoever is asking: the
+    /// agent loop passes `ProviderRenderer::estimate_span_tokens`
+    /// (the compaction-trigger measure; see
+    /// [`ProviderRenderer::context_sizes`]), benches can pass the
+    /// cl100k counter from [`super::compaction::estimate_tokens`].
+    ///
+    /// [`ProviderRenderer::context_sizes`]: super::renderer::ProviderRenderer::context_sizes
+    pub fn token_sizes(&self, per_span: impl Fn(&Span) -> usize) -> ContextSizes {
+        let mut sizes = ContextSizes::default();
+        for span in &self.spans {
+            let tokens = per_span(span) as u64;
+            sizes.total += tokens;
+            *sizes
+                .by_kind
+                .entry(span.kind.label().to_owned())
+                .or_insert(0) += tokens;
+        }
+        sizes
     }
 
     /// The append-only provenance event log.
@@ -868,5 +934,58 @@ mod tests {
         // No provenance events: from_spans is the bypass path.
         assert!(rope.events().is_empty());
         assert!(rope.provenance("u1").is_none());
+    }
+
+    #[test]
+    fn token_sizes_total_equals_sum_of_sections() {
+        // mu-heqf invariant: total and by_kind come from one pass
+        // over the same estimator — the whole always equals the sum
+        // of the sections, for any estimator.
+        let rope = RetainedRope::from_spans(vec![
+            Span::new(
+                "s1",
+                SpanKind::System,
+                "you are mu",
+                RetentionClass::Startup,
+            ),
+            Span::new("u1", SpanKind::User, "hello there", RetentionClass::Hot),
+            Span::new("u2", SpanKind::User, "second message", RetentionClass::Hot),
+            Span::new(
+                "t1",
+                SpanKind::ToolResult,
+                "result payload",
+                RetentionClass::Warm,
+            ),
+        ]);
+        let sizes = rope.token_sizes(|s| s.content().chars().count());
+        assert_eq!(sizes.total, sizes.by_kind.values().sum::<u64>());
+        // Two user spans aggregate under one section key.
+        assert_eq!(
+            sizes.by_kind.get("user").copied(),
+            Some(("hello there".len() + "second message".len()) as u64)
+        );
+        // Kinds with no spans are absent, not zero.
+        assert!(!sizes.by_kind.contains_key("assistant"));
+    }
+
+    #[test]
+    fn span_kind_labels_match_serde_wire_names() {
+        // SpanKind::label is documented as the serde snake_case wire
+        // name; pin the unit variants so drift breaks the build.
+        for kind in [
+            SpanKind::System,
+            SpanKind::User,
+            SpanKind::Assistant,
+            SpanKind::ToolResult,
+            SpanKind::ToolCall,
+            SpanKind::ToolSchema,
+            SpanKind::SkillActivation,
+            SpanKind::MemoryInjection,
+            SpanKind::Compaction,
+            SpanKind::FileLoad,
+        ] {
+            let wire = serde_json::to_value(&kind).expect("serialize");
+            assert_eq!(wire.as_str().expect("unit variant"), kind.label());
+        }
     }
 }

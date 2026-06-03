@@ -112,15 +112,22 @@ impl DynamicViewport {
             }
             self.viewport.height = new_height;
         } else {
-            // Shrinking: keep viewport.y the same — blank space goes
-            // below. Conversation content above stays undisturbed.
-            // Clear the old rows below the new smaller viewport.
+            // Shrinking: keep the viewport bottom anchored to the bottom of the
+            // terminal. The live assistant preview grows upward while a turn is
+            // streaming; when it collapses after commit, leaving `viewport.y`
+            // unchanged strands the prompt/status mid-screen with blank space
+            // below and the next refresh visibly jumps. Tail-follow mode should
+            // behave like a chat client: the input chrome stays at the bottom.
+            let old_y = self.viewport.y;
+            let new_y = rows.saturating_sub(new_height);
             let mut stdout = io::stdout();
-            for row in (self.viewport.y + new_height)..(self.viewport.y + old_height) {
+            for row in old_y..(old_y + old_height) {
                 queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
             }
-            stdout.flush()?;
+            self.viewport.y = new_y;
             self.viewport.height = new_height;
+            self.repaint_history_tail(&mut stdout)?;
+            stdout.flush()?;
         }
 
         self.viewport.width = cols;
@@ -341,6 +348,55 @@ impl DynamicViewport {
     fn current_buffer_mut(&mut self) -> &mut Buffer {
         &mut self.buffers[self.current]
     }
+
+    /// Repaint the visible history tail above the viewport from the in-memory
+    /// rendered-line cache. Used after moving the viewport down on shrink: the
+    /// terminal rows exposed between the old and new viewport positions are
+    /// blank unless we redraw the committed transcript tail into them.
+    fn repaint_history_tail<W: Write>(&self, stdout: &mut W) -> io::Result<()> {
+        let visible_rows = self.viewport.y as usize;
+        let start = self.history.len().saturating_sub(visible_rows);
+        let rows_to_draw = self.history.len() - start;
+        let top = visible_rows.saturating_sub(rows_to_draw);
+
+        for row in 0..self.viewport.y {
+            queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+        }
+
+        for (i, hline) in self.history[start..].iter().enumerate() {
+            let y = (top + i) as u16;
+            queue!(stdout, MoveTo(0, y), Clear(ClearType::CurrentLine))?;
+            write_history_line(stdout, hline)?;
+        }
+        Ok(())
+    }
+}
+
+fn write_history_line<W: Write>(stdout: &mut W, line: &HistoryLine) -> io::Result<()> {
+    for (symbol, fg, bg, modifier) in &line.cells {
+        queue!(
+            stdout,
+            SetForegroundColor(to_crossterm_color(*fg)),
+            SetBackgroundColor(to_crossterm_color(*bg))
+        )?;
+        if modifier.contains(Modifier::BOLD) {
+            queue!(stdout, SetAttribute(Attribute::Bold))?;
+        }
+        if modifier.contains(Modifier::DIM) {
+            queue!(stdout, SetAttribute(Attribute::Dim))?;
+        }
+        if modifier.contains(Modifier::ITALIC) {
+            queue!(stdout, SetAttribute(Attribute::Italic))?;
+        }
+        if modifier.contains(Modifier::UNDERLINED) {
+            queue!(stdout, SetAttribute(Attribute::Underlined))?;
+        }
+        if modifier.contains(Modifier::REVERSED) {
+            queue!(stdout, SetAttribute(Attribute::Reverse))?;
+        }
+        queue!(stdout, Print(symbol), SetAttribute(Attribute::Reset))?;
+    }
+    Ok(())
 }
 
 /// Render one row of an off-screen `Buffer` at the cursor's current position,

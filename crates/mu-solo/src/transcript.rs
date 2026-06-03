@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use crate::app::TurnRoute;
 use crate::render::TurnItem;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptKind {
     User,
     Assistant,
@@ -69,6 +69,14 @@ impl Transcript {
 
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub fn get(&self, idx: usize) -> Option<&TranscriptBlock> {
+        self.blocks.get(idx)
     }
 
     pub fn last(&self) -> Option<&TranscriptBlock> {

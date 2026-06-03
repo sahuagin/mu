@@ -39,6 +39,12 @@ enum BlockAction {
     Maximize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MaximizedBlock {
+    index: usize,
+    scroll: usize,
+}
+
 /// Known providers offered by the `/provider` picker. Free-form
 /// `/provider <name>` also works for anything not on this list.
 const KNOWN_PROVIDERS: &[&str] = &[
@@ -295,6 +301,9 @@ pub struct App {
     /// not over terminal cells; it survives scrollback repainting and feeds
     /// block copy / prompt-yank / maximize actions.
     selected_block: Option<usize>,
+    /// Focused single-block pager. This is another semantic transcript
+    /// projection, not a dump into terminal scrollback.
+    maximized_block: Option<MaximizedBlock>,
     bash_yolo: bool,
     /// Discovered skills from SKILL.md files on disk.
     skills: HashMap<String, DiscoveredSkill>,
@@ -485,6 +494,7 @@ impl App {
             live_turn: None,
             transcript: Transcript::new(),
             selected_block: None,
+            maximized_block: None,
             events_file,
             actual_renderer: None,
             actual_cache_strategy: None,
@@ -622,6 +632,9 @@ impl App {
 
     /// Render the viewport (separator + menu + prompt + status line).
     fn render_viewport(&mut self, vp: &mut DynamicViewport) -> Result<()> {
+        if self.maximized_block.is_some() {
+            return self.render_maximized_block(vp);
+        }
         let w = vp.area().width as usize;
         let prompt_wrap_width = w.saturating_sub(4);
         let layout = self.prompt.visual_layout(prompt_wrap_width);
@@ -842,6 +855,10 @@ impl App {
 
     /// Handle one keypress. Returns Ok(true) to exit the loop.
     fn handle_key(&mut self, vp: &mut DynamicViewport, key: KeyEvent) -> Result<bool> {
+        if self.maximized_block.is_some() {
+            return self.handle_maximized_key(vp, key);
+        }
+
         // If an inline menu is open, route keys there first.
         if let Some(ref mut menu) = self.inline_menu {
             match menu.handle_key(key) {
@@ -1089,9 +1106,157 @@ impl App {
                 }
                 self.prompt.insert_str(&block.body);
             }
-            BlockAction::Maximize => self.emit_maximized_block(vp, &block)?,
+            BlockAction::Maximize => {
+                if let Some(index) = self.selected_block {
+                    self.maximized_block = Some(MaximizedBlock { index, scroll: 0 });
+                    vp.clear_viewport()?;
+                }
+            }
         }
         Ok(())
+    }
+
+    fn render_maximized_block(&mut self, vp: &mut DynamicViewport) -> Result<()> {
+        vp.maximize_height()?;
+        let width = vp.area().width as usize;
+        let height = vp.area().height as usize;
+        let Some(state) = self.maximized_block else {
+            return Ok(());
+        };
+        let Some(block) = self.transcript.get(state.index) else {
+            self.maximized_block = None;
+            return Ok(());
+        };
+
+        let body_width = width.saturating_sub(2).max(1);
+        let mut body_rows: Vec<String> = Vec::new();
+        for logical in block.body.lines() {
+            if logical.is_empty() {
+                body_rows.push(String::new());
+            } else {
+                body_rows.extend(render::wrap_line(logical, body_width));
+            }
+        }
+        if body_rows.is_empty() {
+            body_rows.push(String::new());
+        }
+
+        let body_height = height.saturating_sub(3).max(1);
+        let max_scroll = body_rows.len().saturating_sub(body_height);
+        let scroll = state.scroll.min(max_scroll);
+        if scroll != state.scroll {
+            self.maximized_block = Some(MaximizedBlock {
+                index: state.index,
+                scroll,
+            });
+        }
+
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
+        let title = format!(
+            " block {}/{}: {} ",
+            state.index + 1,
+            self.transcript.len(),
+            block.label
+        );
+        lines.push(Line::from(vec![
+            Span::styled("╭".to_string(), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                truncate_at_word(&title, width.saturating_sub(2)),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        for row in body_rows.iter().skip(scroll).take(body_height) {
+            lines.push(Line::from(vec![
+                Span::styled("│ ".to_string(), Style::default().fg(Color::Yellow)),
+                Span::raw(row.clone()),
+            ]));
+        }
+        while lines.len() < height.saturating_sub(1) {
+            lines.push(Line::from(Span::styled(
+                "│".to_string(),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+
+        let footer = format!(
+            " ↑/↓ PgUp/PgDn scroll · c copy · p prompt · Esc close · {}/{} ",
+            scroll + 1,
+            max_scroll + 1
+        );
+        lines.push(Line::from(vec![
+            Span::styled("╰".to_string(), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                truncate_at_word(&footer, width.saturating_sub(2)),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+
+        let para = Paragraph::new(lines);
+        vp.render(para);
+        vp.flush()?;
+        Ok(())
+    }
+
+    fn handle_maximized_key(&mut self, vp: &mut DynamicViewport, key: KeyEvent) -> Result<bool> {
+        let Some(mut state) = self.maximized_block else {
+            return Ok(false);
+        };
+        let page = vp.area().height.saturating_sub(4).max(1) as usize;
+        match (key.modifiers, key.code) {
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) => return Ok(true),
+            (_, KeyCode::Esc) | (_, KeyCode::Char('q')) => {
+                self.maximized_block = None;
+                vp.set_height(VIEWPORT_HEIGHT)?;
+            }
+            (_, KeyCode::Up) | (KeyModifiers::ALT, KeyCode::Char('k')) => {
+                state.scroll = state.scroll.saturating_sub(1);
+                self.maximized_block = Some(state);
+            }
+            (_, KeyCode::Down) | (KeyModifiers::ALT, KeyCode::Char('j')) => {
+                state.scroll = state.scroll.saturating_add(1);
+                self.maximized_block = Some(state);
+            }
+            (_, KeyCode::PageUp) => {
+                state.scroll = state.scroll.saturating_sub(page);
+                self.maximized_block = Some(state);
+            }
+            (_, KeyCode::PageDown) | (_, KeyCode::Char(' ')) => {
+                state.scroll = state.scroll.saturating_add(page);
+                self.maximized_block = Some(state);
+            }
+            (_, KeyCode::Home) => {
+                state.scroll = 0;
+                self.maximized_block = Some(state);
+            }
+            (_, KeyCode::End) => {
+                state.scroll = usize::MAX;
+                self.maximized_block = Some(state);
+            }
+            (_, KeyCode::Char('c')) => {
+                if let Some(block) = self.transcript.get(state.index) {
+                    let outcome =
+                        copy_to_clipboard_or_file(&block.body, self.clipboard_command.as_deref())?;
+                    self.maximized_block = None;
+                    vp.set_height(VIEWPORT_HEIGHT)?;
+                    self.emit_block_notice(vp, "copied selected block".to_string(), outcome)?;
+                }
+            }
+            (_, KeyCode::Char('p')) => {
+                if let Some(block) = self.transcript.get(state.index) {
+                    if !self.prompt.is_empty() {
+                        self.prompt.insert_char('\n');
+                    }
+                    self.prompt.insert_str(&block.body);
+                }
+                self.maximized_block = None;
+                vp.set_height(VIEWPORT_HEIGHT)?;
+            }
+            _ => {}
+        }
+        Ok(false)
     }
 
     fn emit_block_action_menu(&self, vp: &mut DynamicViewport) -> Result<()> {
@@ -1136,48 +1301,6 @@ impl App {
             Line::from(format!("  {detail}")),
             Line::from(""),
         ];
-        let h = lines.len() as u16;
-        vp.insert_before(h, |buf| {
-            let p = Paragraph::new(lines);
-            ratatui::widgets::Widget::render(p, buf.area, buf);
-        })?;
-        Ok(())
-    }
-
-    fn emit_maximized_block(
-        &self,
-        vp: &mut DynamicViewport,
-        block: &TranscriptBlock,
-    ) -> Result<()> {
-        let width = vp.area().width as usize;
-        let wrap_width = width.saturating_sub(4).max(20);
-        let mut lines: Vec<Line<'static>> = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                format!("── block: {} ──", block.label),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )),
-        ];
-        for logical in block.body.lines() {
-            if logical.is_empty() {
-                lines.push(Line::from(""));
-                continue;
-            }
-            let mut rest = logical;
-            while !rest.is_empty() {
-                let take = rest.floor_char_boundary(wrap_width.min(rest.len()));
-                let (head, tail) = rest.split_at(take);
-                lines.push(Line::from(format!("  {head}")));
-                rest = tail;
-            }
-        }
-        lines.push(Line::from(Span::styled(
-            "  c copy · p copy into prompt · Esc returns".to_string(),
-            Style::default().fg(Color::DarkGray),
-        )));
-        lines.push(Line::from(""));
         let h = lines.len() as u16;
         vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);
@@ -1986,6 +2109,7 @@ impl App {
             Line::from("  /copy [WHAT]       copy last|assistant|user|all semantically"),
             Line::from("  Alt-Up/Down or Alt-k/j select previous/next semantic block"),
             Line::from("  c / p / m          copy / copy into prompt / maximize selection"),
+            Line::from("  maximized block    ↑/↓ PgUp/PgDn scroll · c copy · p prompt · Esc close"),
             Line::from("  /q, /quit, /exit   leave the session"),
             Line::from(""),
             Line::from("  Esc                clear the current prompt"),

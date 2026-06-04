@@ -15,7 +15,7 @@
 #
 # Env:
 #   MU_REVIEW_PROVIDER          reviewer provider (default: ollama; codex = openai-codex)
-#   MU_REVIEW_MODEL             reviewer model    (default: qwen3-coder:30b)
+#   MU_REVIEW_MODEL             reviewer model    (default: gpt-oss:20b)
 #   MU_REVIEW_TOOLS             reviewer tools, e.g. "read,grep" (default: none, single-shot)
 #   MU_REVIEW_BASE              base ref to diff against (default: main)
 #   MU_REVIEW_OVERRIDE=1        operator override: proceed despite REJECT (logged)
@@ -34,8 +34,12 @@ set -o pipefail
 # select it with MU_REVIEW_PROVIDER=openai-codex MU_REVIEW_MODEL=gpt-5.5, and/or
 # use it as the escalation target (MU_REVIEW_ESCALATE_PROVIDER). It is NOT the
 # default because its OAuth refresh was failing at build time (cf. bead mu-cea).
+# Default model gpt-oss:20b: scored 0.954 (12/12 recall, 119 tok/s) on
+# code-review-bench 2026-06-04, vs 0.700 for the previous default
+# qwen3-coder:30b. Kept warm on the box with qwen3-embedding:8b (both fit
+# 48GB). See ~/src/public_github/code-review-bench/reports/NOTES.md.
 PROVIDER="${MU_REVIEW_PROVIDER:-ollama}"
-MODEL="${MU_REVIEW_MODEL:-qwen3-coder:30b}"
+MODEL="${MU_REVIEW_MODEL:-gpt-oss:20b}"
 TOOLS="${MU_REVIEW_TOOLS:-}"   # empty = single-shot (default); e.g. "read,grep" lets the reviewer inspect surrounding code (slower, multi-turn)
 BASE="${MU_REVIEW_BASE:-main}"
 LOG="${MU_REVIEW_LOG:-$HOME/.local/share/mu/review-events.jsonl}"

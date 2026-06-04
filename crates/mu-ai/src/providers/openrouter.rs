@@ -179,13 +179,19 @@ impl Provider for OpenRouterProvider {
     ///   default is false until per-model overrides exist.
     /// - No `developer` role in the chat-completions shape.
     fn capabilities(&self) -> mu_core::agent::capabilities::ProviderCapabilities {
-        use mu_core::agent::capabilities::{ProviderCapabilities, SystemPromptCapability};
+        use mu_core::agent::capabilities::{
+            ProviderCapabilities, SystemPromptCapability, UsageSemantics,
+        };
         ProviderCapabilities {
             system_prompt: SystemPromptCapability::MessageRole,
             supports_prompt_caching: false,
             supports_developer_role: false,
             max_tools: None,
             context_window_tokens: None,
+            // OpenAI chat-completions accounting: prompt_tokens is
+            // the total (prompt_tokens_details.cached_tokens subset).
+            // Ollama inherits this via its inner provider.
+            usage_semantics: UsageSemantics::openai_style(),
         }
     }
 }

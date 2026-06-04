@@ -381,6 +381,10 @@ pub enum AgentEvent {
         old_model: Arc<str>,
         new_provider_kind: Arc<str>,
         new_model: Arc<str>,
+        /// mu-rf9x: the NEW provider's token-accounting convention,
+        /// re-registered at the switch so durable-log readers can
+        /// interpret usage records from this point on.
+        usage_semantics: crate::agent::capabilities::UsageSemantics,
     },
 }
 
@@ -737,6 +741,9 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                             old_model,
                             new_provider_kind: new_kind,
                             new_model,
+                            // mu-rf9x: re-register the accounting
+                            // convention for the provider now in force.
+                            usage_semantics: provider.capabilities().usage_semantics,
                         })
                         .await;
                 }
@@ -772,6 +779,9 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                             old_model,
                             new_provider_kind: new_kind,
                             new_model,
+                            // mu-rf9x: re-register the accounting
+                            // convention for the provider now in force.
+                            usage_semantics: provider.capabilities().usage_semantics,
                         })
                         .await;
                     continue;
@@ -1228,6 +1238,9 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                                     old_model,
                                     new_provider_kind: new_kind,
                                     new_model,
+                                    // mu-rf9x: re-register the accounting
+                                    // convention for the provider now in force.
+                                    usage_semantics: provider.capabilities().usage_semantics,
                                 })
                                 .await;
                         }

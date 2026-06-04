@@ -1217,7 +1217,9 @@ impl Provider for OpenaiCodexProvider {
     /// - Context window varies by model — left as None pending
     ///   per-model capability lookup.
     fn capabilities(&self) -> mu_core::agent::capabilities::ProviderCapabilities {
-        use mu_core::agent::capabilities::{ProviderCapabilities, SystemPromptCapability};
+        use mu_core::agent::capabilities::{
+            ProviderCapabilities, SystemPromptCapability, UsageSemantics,
+        };
         ProviderCapabilities {
             system_prompt: SystemPromptCapability::TopLevelField {
                 max_bytes: Some(INSTRUCTIONS_SOFT_CAP),
@@ -1226,6 +1228,10 @@ impl Provider for OpenaiCodexProvider {
             supports_developer_role: true,
             max_tools: None,
             context_window_tokens: None,
+            // Responses API: input_tokens is the total prompt
+            // (input_tokens_details.cached_tokens is a subset);
+            // output_tokens includes reasoning.
+            usage_semantics: UsageSemantics::openai_style(),
         }
     }
 }

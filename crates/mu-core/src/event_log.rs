@@ -76,6 +76,13 @@ pub enum EventPayload {
         parent_session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         branched_at_parent_event_id: Option<u64>,
+        /// mu-rf9x: the provider's token-accounting convention,
+        /// stamped at registration so log readers can interpret every
+        /// subsequent usage record without provider-specific
+        /// arithmetic. In force until a `ProviderSwitched` event
+        /// restates it. `None` for pre-mu-rf9x logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage_semantics: Option<crate::agent::capabilities::UsageSemantics>,
     },
     /// User-side input message arrived.
     UserMessage { content: String },
@@ -140,6 +147,12 @@ pub enum EventPayload {
         context_soft_limit: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_hard_limit: Option<u64>,
+        /// mu-rf9x: the NEW provider's token-accounting convention —
+        /// re-registration restates the interpretation in force for
+        /// usage records from this point on. `None` for pre-mu-rf9x
+        /// logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage_semantics: Option<crate::agent::capabilities::UsageSemantics>,
     },
     /// Session closed (via `close_session` RPC or daemon shutdown).
     SessionClosed,
@@ -633,26 +646,55 @@ impl SessionEventLog {
 
     /// Sum usage across all `AssistantMessageEvent` events — gives
     /// real-time token totals that update per model call, not just per
-    /// completed ask. Returns the last model call's input tokens
+    /// completed ask. Returns the last model call's prompt-total tokens
     /// separately (for context pressure calculation).
+    ///
+    /// mu-rf9x: the prompt total is interpreted under the
+    /// [`UsageSemantics`](crate::agent::capabilities::UsageSemantics)
+    /// registered by the log's `SessionCreated` event (and restated by
+    /// any `ProviderSwitched`) — the convention in force is folded
+    /// forward, so an OpenAI-shaped provider's cache reads are no
+    /// longer double-counted (the 2026-06-03 "93k vs 55.6k" status-bar
+    /// incident). Pre-mu-rf9x logs carry no declaration; they fall
+    /// back to the legacy additive sum, which was correct for
+    /// Anthropic logs and stays wrong-but-unchanged for old OpenAI
+    /// logs (those age out).
     pub fn live_usage(&self) -> (Option<Usage>, Option<u64>) {
         let Ok(events) = self.events.lock() else {
             return (None, None);
         };
         let mut acc: Option<Usage> = None;
         let mut last_input: Option<u64> = None;
+        let mut semantics: Option<crate::agent::capabilities::UsageSemantics> = None;
         for ev in events.iter() {
-            if let EventPayload::AssistantMessageEvent { message } = &ev.payload {
-                if let Some(u) = message.usage {
-                    let total_input = u.input_tokens
-                        + u.cache_read_input_tokens.unwrap_or(0)
-                        + u.cache_creation_input_tokens.unwrap_or(0);
-                    last_input = Some(total_input);
-                    acc = Some(match acc {
-                        Some(prev) => prev + u,
-                        None => u,
-                    });
+            match &ev.payload {
+                EventPayload::SessionCreated {
+                    usage_semantics, ..
                 }
+                | EventPayload::ProviderSwitched {
+                    usage_semantics, ..
+                } => {
+                    if usage_semantics.is_some() {
+                        semantics = *usage_semantics;
+                    }
+                }
+                EventPayload::AssistantMessageEvent { message } => {
+                    if let Some(u) = message.usage {
+                        let legacy_sum = u.input_tokens
+                            + u.cache_read_input_tokens.unwrap_or(0)
+                            + u.cache_creation_input_tokens.unwrap_or(0);
+                        last_input = Some(
+                            semantics
+                                .and_then(|s| s.prompt_total(&u))
+                                .unwrap_or(legacy_sum),
+                        );
+                        acc = Some(match acc {
+                            Some(prev) => prev + u,
+                            None => u,
+                        });
+                    }
+                }
+                _ => {}
             }
         }
         (acc, last_input)
@@ -1141,5 +1183,107 @@ mod tests {
         assert_eq!(v["payload"]["kind"], "done");
         assert_eq!(v["actor"]["kind"], "agent");
         Ok(())
+    }
+
+    // ─── mu-rf9x: live_usage interprets under registered semantics ───
+
+    use crate::agent::capabilities::UsageSemantics;
+
+    fn append_session_created(log: &SessionEventLog, semantics: Option<UsageSemantics>) {
+        log.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "p".into(),
+                model: "m".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: semantics,
+            },
+        );
+    }
+
+    fn append_assistant_usage(log: &SessionEventLog, u: Usage) {
+        log.append(
+            EventActor::Agent,
+            EventPayload::AssistantMessageEvent {
+                message: crate::agent::AssistantMessage {
+                    content: vec![ContentBlock::Text { text: "ok".into() }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: Some(u),
+                },
+            },
+        );
+    }
+
+    fn cached_usage(input: u64, cache_read: u64) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: 10,
+            cache_read_input_tokens: Some(cache_read),
+            cache_creation_input_tokens: None,
+            reasoning_tokens: None,
+        }
+    }
+
+    /// The status-bar incident, end to end: codex semantics
+    /// registered at SessionCreated → cache reads are NOT added on
+    /// top of input_tokens. (Pre-fix this returned 93,209.)
+    #[test]
+    fn live_usage_openai_semantics_no_double_count() {
+        let log = SessionEventLog::new("s1");
+        append_session_created(&log, Some(UsageSemantics::openai_style()));
+        append_assistant_usage(&log, cached_usage(55_577, 37_632));
+        let (_, last_input) = log.live_usage();
+        assert_eq!(last_input, Some(55_577));
+    }
+
+    #[test]
+    fn live_usage_anthropic_semantics_sums_disjoint_buckets() {
+        let log = SessionEventLog::new("s1");
+        append_session_created(&log, Some(UsageSemantics::anthropic_style()));
+        append_assistant_usage(&log, cached_usage(1_000, 20_000));
+        let (_, last_input) = log.live_usage();
+        assert_eq!(last_input, Some(21_000));
+    }
+
+    /// Pre-mu-rf9x logs (no declaration) keep the legacy additive
+    /// sum — unchanged behavior for old sessions.
+    #[test]
+    fn live_usage_unstamped_log_falls_back_to_legacy_sum() {
+        let log = SessionEventLog::new("s1");
+        append_session_created(&log, None);
+        append_assistant_usage(&log, cached_usage(55_577, 37_632));
+        let (_, last_input) = log.live_usage();
+        assert_eq!(last_input, Some(55_577 + 37_632));
+    }
+
+    /// A mid-session ProviderSwitched re-registers the convention:
+    /// usage records after the switch are interpreted under the NEW
+    /// provider's semantics.
+    #[test]
+    fn live_usage_provider_switch_changes_interpretation() {
+        let log = SessionEventLog::new("s1");
+        append_session_created(&log, Some(UsageSemantics::anthropic_style()));
+        append_assistant_usage(&log, cached_usage(1_000, 20_000));
+        assert_eq!(log.live_usage().1, Some(21_000), "anthropic: disjoint sum");
+
+        log.append(
+            EventActor::System,
+            EventPayload::ProviderSwitched {
+                old_provider_kind: "anthropic".into(),
+                old_model: "m1".into(),
+                new_provider_kind: "openai_codex".into(),
+                new_model: "m2".into(),
+                context_soft_limit: None,
+                context_hard_limit: None,
+                usage_semantics: Some(UsageSemantics::openai_style()),
+            },
+        );
+        append_assistant_usage(&log, cached_usage(50_000, 40_000));
+        assert_eq!(
+            log.live_usage().1,
+            Some(50_000),
+            "post-switch: openai total, cache subset not re-added"
+        );
     }
 }

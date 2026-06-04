@@ -320,6 +320,7 @@ mod tests {
                     model: "test".into(),
                     parent_session_id: None,
                     branched_at_parent_event_id: None,
+                    usage_semantics: None,
                 },
             ),
             ev(
@@ -383,6 +384,7 @@ mod tests {
                     model: "test".into(),
                     parent_session_id: None,
                     branched_at_parent_event_id: None,
+                    usage_semantics: None,
                 },
             ),
             ev(

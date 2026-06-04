@@ -264,6 +264,10 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             model: model_str,
             parent_session_id: parent_session_id.clone(),
             branched_at_parent_event_id,
+            // mu-rf9x: register the provider's token-accounting
+            // convention so log readers can interpret every usage
+            // record in this session without provider arithmetic.
+            usage_semantics: Some(provider.capabilities().usage_semantics),
         },
     );
 
@@ -1188,6 +1192,7 @@ mod tests {
                 model: "haiku".into(),
                 parent_session_id: None,
                 branched_at_parent_event_id: None,
+                usage_semantics: None,
             },
         );
         log.append(

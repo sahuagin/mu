@@ -590,6 +590,8 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
             span_count,
             cache_boundary_count,
             first_span_ids,
+            prefix_hash,
+            prefix_span_hashes,
         } => {
             // ContextAssembly is recorded with the session's
             // provider/model from the log's SessionCreated event.
@@ -632,6 +634,8 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
                     span_count: *span_count,
                     cache_boundary_count: *cache_boundary_count,
                     first_span_ids: first_span_ids.clone(),
+                    prefix_hash: prefix_hash.clone(),
+                    prefix_span_hashes: prefix_span_hashes.clone(),
                 },
             ))
         }
@@ -1497,6 +1501,8 @@ mod tests {
             span_count: Some(17),
             cache_boundary_count: Some(0),
             first_span_ids: vec!["sys-1".into()],
+            prefix_hash: None,
+            prefix_span_hashes: Vec::new(),
         };
         let (_actor, payload) = to_log_event(&ev).expect("ContextAssembly → durable log");
         match payload {

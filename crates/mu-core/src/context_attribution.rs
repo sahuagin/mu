@@ -300,6 +300,8 @@ mod tests {
                 span_count: Some(12),
                 cache_boundary_count: Some(2),
                 first_span_ids: vec!["sys-0".into()],
+                prefix_hash: None,
+                prefix_span_hashes: Vec::new(),
             },
         );
 
@@ -369,6 +371,8 @@ mod tests {
                 span_count: Some(15),
                 cache_boundary_count: Some(2),
                 first_span_ids: vec!["sys-0".into()],
+                prefix_hash: None,
+                prefix_span_hashes: Vec::new(),
             },
         );
 
@@ -513,6 +517,8 @@ mod tests {
                 span_count: None,
                 cache_boundary_count: None,
                 first_span_ids: Vec::new(),
+                prefix_hash: None,
+                prefix_span_hashes: Vec::new(),
             },
         );
         log.append(
@@ -593,6 +599,8 @@ mod tests {
                 span_count: None,
                 cache_boundary_count: None,
                 first_span_ids: Vec::new(),
+                prefix_hash: None,
+                prefix_span_hashes: Vec::new(),
             },
         );
         log.append(
@@ -653,6 +661,8 @@ mod tests {
                     span_count: None,
                     cache_boundary_count: None,
                     first_span_ids: Vec::new(),
+                    prefix_hash: None,
+                    prefix_span_hashes: Vec::new(),
                 },
             );
             log.append(

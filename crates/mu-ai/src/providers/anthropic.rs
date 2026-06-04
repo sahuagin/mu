@@ -174,13 +174,18 @@ impl Provider for AnthropicProvider {
     ///   system content blocks and message content.
     /// - No `developer` role; uses standard system/user/assistant.
     fn capabilities(&self) -> mu_core::agent::capabilities::ProviderCapabilities {
-        use mu_core::agent::capabilities::{ProviderCapabilities, SystemPromptCapability};
+        use mu_core::agent::capabilities::{
+            ProviderCapabilities, SystemPromptCapability, UsageSemantics,
+        };
         ProviderCapabilities {
             system_prompt: SystemPromptCapability::TopLevelField { max_bytes: None },
             supports_prompt_caching: true,
             supports_developer_role: false,
             max_tools: None,
             context_window_tokens: None,
+            // Messages API: input/cache_read/cache_creation are
+            // disjoint buckets; thinking bills inside output_tokens.
+            usage_semantics: UsageSemantics::anthropic_style(),
         }
     }
 }

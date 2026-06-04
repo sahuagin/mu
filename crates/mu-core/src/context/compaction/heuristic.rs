@@ -27,6 +27,14 @@
 //! [`KEEP_RECENT_ASSISTANT`] most-recent `Assistant` spans,
 //! `MemoryInjection`, `User`, `Compaction`.
 //!
+//! mu-tlri: additionally, ANY span whose retention is `Startup` or
+//! `Pinned` is never an eviction candidate, regardless of kind — the
+//! standing zones (project-context CLAUDE.md/AGENTS.md file-loads,
+//! operator pins, skill bodies). See [`evictable`] for the incident
+//! rationale and the deliberate exclusion of `Hot` from the guard.
+//! A pass may therefore finish above `target_tokens`; over budget
+//! beats self-lobotomy.
+//!
 //! ## Token measurement (v1)
 //!
 //! No tokenizer is wired into mu-core today; the policy uses
@@ -47,7 +55,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use super::{CompactionDecision, CompactionPolicy, CompactionResult};
-use crate::context::rope::{RetainedRope, Span, SpanKind};
+use crate::context::rope::{RetainedRope, RetentionClass, Span, SpanKind};
 
 /// Number of most-recent `Assistant` spans preserved across a
 /// compaction pass. Hardcoded for v1 per the bead's "Out" list
@@ -65,6 +73,35 @@ impl SpanFamilyDropPolicy {
     pub fn new() -> Self {
         Self
     }
+}
+
+/// mu-tlri: standing spans are never eviction candidates.
+///
+/// `Startup` and `Pinned` are the session's standing zones — system
+/// prompt, project-context file-loads (CLAUDE.md/AGENTS.md), memory
+/// injections, operator pins, skill bodies. They sit at the front of
+/// the rope, i.e., inside the stable prefix the cache strategy marks;
+/// the incident behind this bead (session c76f6949) showed dropping
+/// them is wrong THREE ways at once: the agent loses its operating
+/// rules mid-session, the prefix cache invalidates at position ~0
+/// (ejecting ~6K of rules cost ~20× what retaining them would have),
+/// and "oldest first" is exactly backwards for cache discipline —
+/// oldest = front-of-rope = most stable = cheapest to keep.
+///
+/// Deliberately NOT `!retention().is_stable()`: `Hot` is "stable" for
+/// cache-prefix purposes but conversational — tiers 2/3 must still
+/// evict old Hot turns. The guard is about *standing* content, not
+/// stability.
+///
+/// Consequence: a policy pass may finish above `target_tokens` when
+/// only standing spans remain. That is the intended trade — better
+/// over budget than self-lobotomized (no-self-lobotomy guard,
+/// decision #1 in the compaction design).
+fn evictable(span: &Span) -> bool {
+    !matches!(
+        span.retention(),
+        RetentionClass::Startup | RetentionClass::Pinned
+    )
 }
 
 /// Per-span token estimate via the shared [`super::estimate_tokens`]
@@ -155,11 +192,14 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
             .collect();
 
         // Tier 1: stale FileLoad, oldest (smallest index) first.
+        // mu-tlri: project-context file-loads (CLAUDE.md/AGENTS.md)
+        // are Startup — standing, not stale — and skip this tier.
+        // Mid-session file reads (Hot/Warm) remain candidates.
         for i in 0..n {
             if tokens_after <= target_tokens {
                 break;
             }
-            if spans[i].kind == SpanKind::FileLoad {
+            if spans[i].kind == SpanKind::FileLoad && evictable(&spans[i]) {
                 record_drop(
                     i,
                     "stale file-load (v1: oldest first)",
@@ -181,6 +221,17 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
         for cluster in &clusters {
             if tokens_after <= target_tokens {
                 break;
+            }
+            // mu-tlri: the assistant+cluster unit drops together or
+            // not at all — a standing member anywhere in the unit
+            // (theoretical today; tool spans are Hot) would otherwise
+            // leave an orphaned tool_use/tool_result pairing.
+            let preceding_standing = cluster
+                .first()
+                .filter(|&&first| first > 0 && spans[first - 1].kind == SpanKind::Assistant)
+                .is_some_and(|&first| !evictable(&spans[first - 1]));
+            if preceding_standing || cluster.iter().any(|&idx| !evictable(&spans[idx])) {
+                continue;
             }
             // Find the Assistant span preceding this cluster.
             if let Some(&first_idx) = cluster.first() {
@@ -217,7 +268,23 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
             if tokens_after <= target_tokens {
                 break;
             }
-            if spans[i].kind == SpanKind::Assistant && !preserved_assistants.contains(&i) {
+            if spans[i].kind == SpanKind::Assistant
+                && !preserved_assistants.contains(&i)
+                && evictable(&spans[i])
+            {
+                // mu-tlri: assistant + trailing tool cluster drop as a
+                // unit or not at all (mirrors tier 2's pairing rule) —
+                // a standing cluster member would otherwise be
+                // orphaned by the assistant drop.
+                let cluster_end = (i + 1..n)
+                    .take_while(|&j| {
+                        matches!(spans[j].kind, SpanKind::ToolCall | SpanKind::ToolResult)
+                    })
+                    .last()
+                    .map_or(i, |j| j);
+                if (i + 1..=cluster_end).any(|j| !evictable(&spans[j])) {
+                    continue;
+                }
                 record_drop(
                     i,
                     "old assistant turn",
@@ -227,9 +294,9 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
                     &mut tokens_after,
                     &mut decisions,
                 );
-                // Drop trailing tool cluster if present.
-                let mut j = i + 1;
-                while j < n && matches!(spans[j].kind, SpanKind::ToolCall | SpanKind::ToolResult) {
+                // Drop trailing tool cluster if present (empty range
+                // when cluster_end == i, i.e., no trailing cluster).
+                for j in i + 1..=cluster_end {
                     record_drop(
                         j,
                         "tool cluster orphaned by assistant drop",
@@ -239,7 +306,6 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
                         &mut tokens_after,
                         &mut decisions,
                     );
-                    j += 1;
                 }
             }
         }
@@ -249,7 +315,11 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
             if tokens_after <= target_tokens {
                 break;
             }
-            if spans[i].kind == SpanKind::SkillActivation {
+            // mu-tlri: live skill bodies are Pinned (skill/loader.rs),
+            // so this tier only reaches non-standing activations —
+            // consistent with the module doc's "mostly a no-op until
+            // provenance-driven staleness lands".
+            if spans[i].kind == SpanKind::SkillActivation && evictable(&spans[i]) {
                 record_drop(
                     i,
                     "stale skill activation (v1: oldest first)",
@@ -578,5 +648,149 @@ mod tests {
         let rope = RetainedRope::from_spans(vec![span("sys", SpanKind::System, "y")]);
         let r = policy.compact(&rope, 1_000);
         assert_eq!(r.rope.spans().len(), 1);
+    }
+
+    // ── mu-tlri: standing spans are not eviction candidates ──────
+
+    /// The incident shape (session c76f6949): project-context
+    /// file-loads (Startup, front of rope) were dropped as 'stale
+    /// file-load' while the agent ran on, ruleless. They must
+    /// survive every pressure level; mid-session file reads
+    /// (non-standing) remain tier-1 candidates.
+    #[test]
+    fn standing_file_loads_survive_while_stale_ones_drop() {
+        let rope = RetainedRope::from_spans(vec![
+            Span::new(
+                "sys",
+                SpanKind::System,
+                "you are mu",
+                RetentionClass::Startup,
+            ),
+            Span::new(
+                "project-file:/repo/CLAUDE.md",
+                SpanKind::FileLoad,
+                "operating rules operating rules",
+                RetentionClass::Startup,
+            ),
+            Span::new(
+                "project-file:/home/AGENTS.md",
+                SpanKind::FileLoad,
+                "more standing rules here too",
+                RetentionClass::Startup,
+            ),
+            span("u1", SpanKind::User, "hi"),
+            span(
+                "file:/tmp/scratch.txt",
+                SpanKind::FileLoad,
+                "a mid-session read, droppable",
+            ),
+            span("a1", SpanKind::Assistant, "hello"),
+        ]);
+        // Target 1 forces maximum pressure — every tier drains.
+        let result = SpanFamilyDropPolicy::new().compact(&rope, 1);
+
+        let survivors: Vec<&str> = result.rope.spans().iter().map(|s| s.id()).collect();
+        assert!(
+            survivors.contains(&"project-file:/repo/CLAUDE.md"),
+            "standing file-load must survive max pressure; got {survivors:?}"
+        );
+        assert!(survivors.contains(&"project-file:/home/AGENTS.md"));
+        let dropped_ids: Vec<&str> = result
+            .decisions
+            .iter()
+            .filter_map(|d| match d {
+                CompactionDecision::Dropped { span_id, .. } => Some(span_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            dropped_ids.contains(&"file:/tmp/scratch.txt"),
+            "non-standing file-load stays a tier-1 candidate; dropped: {dropped_ids:?}"
+        );
+        assert!(
+            !dropped_ids.iter().any(|id| id.starts_with("project-file:")),
+            "no decision may name a standing span; dropped: {dropped_ids:?}"
+        );
+    }
+
+    /// Pinned skill bodies (skill/loader.rs pins them) survive
+    /// tier 4; a hypothetical non-standing activation still drops.
+    #[test]
+    fn pinned_skill_activation_survives_tier_4() {
+        let rope = RetainedRope::from_spans(vec![
+            Span::new(
+                "skill:rust:SKILL.md",
+                SpanKind::SkillActivation,
+                "pinned skill body",
+                RetentionClass::Pinned,
+            ),
+            span("sk-old", SpanKind::SkillActivation, "stale warm activation"),
+            span("u1", SpanKind::User, "hi"),
+        ]);
+        let result = SpanFamilyDropPolicy::new().compact(&rope, 1);
+        let survivors: Vec<&str> = result.rope.spans().iter().map(|s| s.id()).collect();
+        assert!(survivors.contains(&"skill:rust:SKILL.md"));
+        assert!(!survivors.contains(&"sk-old"));
+    }
+
+    /// Over-budget beats self-lobotomy: when only standing spans
+    /// remain, the pass returns above target rather than dropping
+    /// them.
+    #[test]
+    fn all_standing_rope_compacts_over_target_without_drops() {
+        let rope = RetainedRope::from_spans(vec![
+            Span::new(
+                "sys",
+                SpanKind::System,
+                "you are mu",
+                RetentionClass::Startup,
+            ),
+            Span::new(
+                "project-file:/repo/CLAUDE.md",
+                SpanKind::FileLoad,
+                "rules rules rules rules rules",
+                RetentionClass::Startup,
+            ),
+        ]);
+        let result = SpanFamilyDropPolicy::new().compact(&rope, 1);
+        assert_eq!(
+            result.rope.spans().len(),
+            2,
+            "nothing evictable, nothing dropped"
+        );
+        assert!(
+            result.tokens_after > 1,
+            "pass ends over budget by design (no-self-lobotomy)"
+        );
+        assert!(result
+            .decisions
+            .iter()
+            .all(|d| !matches!(d, CompactionDecision::Dropped { .. })));
+    }
+
+    /// Tier-2/3 pairing: a standing member anywhere in an
+    /// assistant+cluster unit keeps the WHOLE unit (no orphaned
+    /// tool_use/tool_result halves).
+    #[test]
+    fn standing_cluster_member_keeps_the_whole_unit() {
+        let rope = RetainedRope::from_spans(vec![
+            span("a1", SpanKind::Assistant, "calls a tool"),
+            Span::new(
+                "t1",
+                SpanKind::ToolResult,
+                "pinned tool result",
+                RetentionClass::Pinned,
+            ),
+            span("u1", SpanKind::User, "hi"),
+            span("a2", SpanKind::Assistant, "x"),
+            span("a3", SpanKind::Assistant, "y"),
+            span("a4", SpanKind::Assistant, "z"),
+        ]);
+        let result = SpanFamilyDropPolicy::new().compact(&rope, 1);
+        let survivors: Vec<&str> = result.rope.spans().iter().map(|s| s.id()).collect();
+        assert!(
+            survivors.contains(&"a1") && survivors.contains(&"t1"),
+            "assistant+cluster unit with a standing member survives intact; got {survivors:?}"
+        );
     }
 }

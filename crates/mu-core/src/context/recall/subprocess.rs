@@ -38,6 +38,14 @@ use super::{RecallProvider, RecallSource, RecalledItem};
 #[derive(Debug)]
 pub struct SubprocessRecallProvider {
     binary_path: PathBuf,
+    /// mu-zk2i: injection tier passed as `--tier <this>` to the CLI.
+    /// `"identity"` (the [`Default`]) requests the small kernel —
+    /// user-first identity rows + identity-tagged rules, with task
+    /// detail demoted to the `memory_recall` tool; `"full"` requests
+    /// the classic four-section wall. The CLI owns tier semantics and
+    /// ordering (user-first is rendered there — mu-42x8 lever a); mu
+    /// passes the dial through verbatim from `[recall].tier`.
+    tier: String,
     /// AtomicBool so the "binary not found" warning logs only once per
     /// session even though `recall()` may be called multiple times. The
     /// recall trait is `Send + Sync`, so plain mutation isn't an option.
@@ -50,14 +58,22 @@ impl SubprocessRecallProvider {
     pub fn with_binary(binary_path: impl Into<PathBuf>) -> Self {
         Self {
             binary_path: binary_path.into(),
+            tier: "identity".to_string(),
             warned_about_missing_binary: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// mu-zk2i: override the injection tier (from `[recall].tier`).
+    pub fn with_tier(mut self, tier: impl Into<String>) -> Self {
+        self.tier = tier.into();
+        self
     }
 }
 
 impl Default for SubprocessRecallProvider {
     /// Default binary path: `~/.local/bin/agent`. Falls back to bare
-    /// `agent` if `$HOME` is unset (rare).
+    /// `agent` if `$HOME` is unset (rare). Tier defaults to
+    /// `"identity"` (the small kernel).
     fn default() -> Self {
         let path = dirs::home_dir()
             .map(|h| h.join(".local").join("bin").join("agent"))
@@ -73,6 +89,8 @@ impl RecallProvider for SubprocessRecallProvider {
             .arg("context")
             .arg("--cwd")
             .arg(cwd)
+            .arg("--tier")
+            .arg(&self.tier)
             .output()
         {
             Ok(o) => o,
@@ -223,5 +241,40 @@ mod tests {
         let provider = SubprocessRecallProvider::with_binary(&script);
         let items = provider.recall(Path::new("/tmp"), &Capability::root());
         assert!(items.is_empty());
+    }
+
+    // ── mu-zk2i: injection tier ───────────────────────────────────
+
+    /// Stub that echoes its argv so the test can assert exactly what
+    /// reached the CLI.
+    fn argv_echo_provider(name: &str) -> SubprocessRecallProvider {
+        let script = write_stub_binary(name, "#!/bin/sh\necho \"argv: $@\"\n");
+        SubprocessRecallProvider::with_binary(&script)
+    }
+
+    #[test]
+    fn default_tier_is_identity_and_reaches_argv() {
+        let provider = argv_echo_provider("tier-default-agent");
+        let items = provider.recall(Path::new("/tmp"), &Capability::root());
+        assert_eq!(items.len(), 1);
+        assert!(
+            items[0]
+                .content
+                .contains("memory context --cwd /tmp --tier identity"),
+            "small kernel is the default; got: {}",
+            items[0].content
+        );
+    }
+
+    #[test]
+    fn with_tier_full_restores_the_wall() {
+        let provider = argv_echo_provider("tier-full-agent").with_tier("full");
+        let items = provider.recall(Path::new("/tmp"), &Capability::root());
+        assert_eq!(items.len(), 1);
+        assert!(
+            items[0].content.contains("--tier full"),
+            "[recall].tier = \"full\" must pass through verbatim; got: {}",
+            items[0].content
+        );
     }
 }

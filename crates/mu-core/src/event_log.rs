@@ -177,11 +177,13 @@ pub enum EventPayload {
         tool_result_count: u32,
         /// Number of tool specs in the request.
         tool_count: u32,
-        /// Renderer-estimated token count of the assembled rope —
-        /// the same measure the compaction trigger compares against
-        /// its threshold. `None` only for pre-mu-heqf sessions (v1
-        /// left this unwired; the live loop now populates it from
-        /// `ProviderRenderer::context_sizes`).
+        /// Renderer-estimated token count of the assembled rope.
+        /// `None` only for pre-mu-heqf sessions (v1 left this
+        /// unwired; the live loop now populates it from
+        /// `ProviderRenderer::context_sizes`). mu-wsgx: the live
+        /// compaction trigger no longer compares this raw estimate —
+        /// it predicts the prompt total from the previous call's
+        /// provider-reported usage plus the estimate delta.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_count_estimate: Option<u64>,
         /// mu-heqf: per-section breakdown of `token_count_estimate`,

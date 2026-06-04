@@ -42,6 +42,56 @@ use crate::context::{ProjectContext, ProjectionTarget, ProviderMessages, Retaine
 /// policy without specifying a threshold experiences the same
 /// trigger shape as Claude Code's native compaction.
 pub const DEFAULT_COMPACTION_THRESHOLD: usize = 150_000;
+
+/// mu-wsgx: structural overhead added to the raw renderer estimate
+/// when no feedback anchor is available (first call of a session, or
+/// first call after the rope lineage changed). Covers what the rope
+/// estimate is structurally blind to: system content sent outside
+/// the rope (the effective-prompt time line) and per-message /
+/// per-tool-schema request framing.
+///
+/// Sized from the measured gap on session c76f6949 (sonnet, 61–67
+/// calls): linear fit `gap = 7,612 + 0.121 × estimate`. The constant
+/// half is this overhead; the multiplicative 12.1% residual is
+/// tokenizer bias (chars/4 vs Anthropic BPE), which the feedback
+/// anchor absorbs from call 2 onward (median |error| 316 tokens vs
+/// 20,982 for the raw estimate) — so it is deliberately NOT applied
+/// here. Operator decision on mu-wsgx: no tokenizer dependency;
+/// better is the enemy of good.
+const ESTIMATE_FALLBACK_OVERHEAD_TOKENS: usize = 8_000;
+
+/// mu-wsgx: feedback anchor — pairs the provider-reported prompt
+/// total of the most recent model call (via the stamped
+/// [`UsageSemantics::prompt_total`]) with the renderer estimate of
+/// the rope that was sent on that same call. The compaction-trigger
+/// measure is then `actual + (current_estimate − anchor_estimate)`:
+/// exact provider accounting for everything already sent, chars/4
+/// only for the (small) delta of new spans — self-calibrating across
+/// providers with zero tokenizer dependency.
+///
+/// [`UsageSemantics::prompt_total`]: crate::agent::capabilities::UsageSemantics::prompt_total
+struct FeedbackAnchor {
+    /// Exact prompt total the provider reported for the last call.
+    actual_prompt_total: u64,
+    /// Renderer estimate of the rope sent on that same call.
+    rope_estimate: usize,
+}
+
+/// mu-wsgx: the compaction-trigger measure. With a valid anchor,
+/// predict the next prompt total from provider feedback plus the
+/// estimate delta of spans added since. Without one — first call, or
+/// the rope SHRANK below the anchor's estimate (a compaction landed
+/// between, changing the lineage; the anchor's actual would
+/// over-predict) — fall back to the raw estimate plus the structural
+/// overhead constant.
+fn predicted_prompt_total(anchor: Option<&FeedbackAnchor>, rope_estimate: usize) -> usize {
+    match anchor {
+        Some(a) if rope_estimate >= a.rope_estimate => {
+            a.actual_prompt_total as usize + (rope_estimate - a.rope_estimate)
+        }
+        _ => rope_estimate + ESTIMATE_FALLBACK_OVERHEAD_TOKENS,
+    }
+}
 use crate::protocol::{
     ApprovalDecision, AutonomousIterationOutcome, AutonomousTerminationReason, AutonomyOptions,
 };
@@ -323,7 +373,10 @@ pub enum AgentEvent {
         /// override). Surfaces "which policy ran" in the event stream.
         policy_id: String,
         /// Renderer-estimated token count of the rope BEFORE
-        /// compaction. Matches the value used in the threshold check.
+        /// compaction. mu-wsgx: the threshold check itself compares
+        /// a feedback-predicted prompt total (see
+        /// [`predicted_prompt_total`]); this field stays on the
+        /// renderer-estimate scale, describing the rope.
         tokens_before: usize,
         /// Renderer-estimated token count of the post-compaction
         /// rope. May exceed `target_tokens` — policies are
@@ -425,12 +478,15 @@ pub struct AgentConfig {
     /// mu-kgu.4: per-session token threshold above which the agent
     /// loop dispatches `Provider::compaction_policy().compact(...)`
     /// on the rope before each provider call. `None` uses
-    /// [`DEFAULT_COMPACTION_THRESHOLD`] (150k tokens). The check is
-    /// renderer-estimated (`ProviderRenderer::estimate_tokens`), not
-    /// wire-accurate; policies that don't trigger (e.g.
-    /// `NoCompactionPolicy`) return identity and the loop proceeds
-    /// with the original rope — compaction failure never blocks a
-    /// turn.
+    /// [`DEFAULT_COMPACTION_THRESHOLD`] (150k tokens). mu-wsgx: the
+    /// check compares a feedback-predicted prompt total — the
+    /// provider's exact reported total for the previous call plus the
+    /// renderer-estimated delta of spans added since (see
+    /// [`predicted_prompt_total`]); before any usage feedback it is
+    /// the raw renderer estimate plus a structural-overhead constant.
+    /// Policies that don't trigger (e.g. `NoCompactionPolicy`) return
+    /// identity and the loop proceeds with the original rope —
+    /// compaction failure never blocks a turn.
     pub compaction_threshold: Option<usize>,
     /// mu-phl v0 (bead mu-vm81): pre-built recall context to inject at
     /// session start. Built by the daemon at create-session time
@@ -730,6 +786,10 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
     let mut bg_compaction =
         crate::context::BackgroundCompactionState::new(crate::context::CompactionQuota::default());
     let mut compaction_baseline: Option<CompactionBaseline> = None;
+    // mu-wsgx: feedback anchor for the compaction-trigger measure.
+    // None until the first provider-reported usage; reset on provider
+    // switch (different tokenizer + accounting convention).
+    let mut feedback_anchor: Option<FeedbackAnchor> = None;
 
     let _ = events.send(AgentEvent::AgentStart).await;
 
@@ -748,6 +808,9 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                     provider = new;
                     current_provider_kind = new_kind.clone();
                     current_model = new_model.clone();
+                    // mu-wsgx: the old provider's actuals don't
+                    // transfer (different tokenizer + accounting).
+                    feedback_anchor = None;
                     let _ = events
                         .send(AgentEvent::ProviderSwitched {
                             old_provider_kind: old_kind,
@@ -786,6 +849,9 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                     provider = new;
                     current_provider_kind = new_kind.clone();
                     current_model = new_model.clone();
+                    // mu-wsgx: the old provider's actuals don't
+                    // transfer (different tokenizer + accounting).
+                    feedback_anchor = None;
                     let _ = events
                         .send(AgentEvent::ProviderSwitched {
                             old_provider_kind: old_kind,
@@ -1002,7 +1068,17 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                 let compaction_threshold = config
                     .compaction_threshold
                     .unwrap_or(DEFAULT_COMPACTION_THRESHOLD);
-                let rope = if pre_compaction_tokens > compaction_threshold {
+                // mu-wsgx: the trigger compares a feedback-predicted
+                // prompt total, not the raw estimate. The incident
+                // measure (session c76f6949): raw estimate ran ~15%
+                // low (uncounted request framing + chars/4 vs BPE),
+                // so the 150K trigger actually fired at ~176K provider
+                // tokens — 88% of the window. The predictor anchors on
+                // the provider's exact accounting and only estimates
+                // the delta.
+                let predicted_tokens =
+                    predicted_prompt_total(feedback_anchor.as_ref(), pre_compaction_tokens);
+                let rope = if predicted_tokens > compaction_threshold {
                     let policy = config
                         .compaction_policy_override
                         .clone()
@@ -1064,6 +1140,10 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                 // this call (post-compaction when one ran) section by
                 // section, on the renderer's own token scale.
                 let context_sizes = renderer.context_sizes(&rope);
+                // mu-wsgx: remember what this call's rope estimated
+                // at, so the provider's actual for THIS call can be
+                // paired with it when usage arrives below.
+                let rope_estimate_sent = context_sizes.total as usize;
                 let _ = events
                     .send(AgentEvent::ContextAssembly {
                         model_call_id,
@@ -1104,6 +1184,20 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                                 Some(prev) => prev + u,
                                 None => u,
                             });
+                            // mu-wsgx: re-anchor the trigger predictor
+                            // on this call's exact prompt total. None
+                            // when the provider's accounting convention
+                            // is unknown AND cache buckets make the
+                            // total ambiguous — then the previous
+                            // anchor (or fallback) stays in force.
+                            if let Some(total) =
+                                provider.capabilities().usage_semantics.prompt_total(&u)
+                            {
+                                feedback_anchor = Some(FeedbackAnchor {
+                                    actual_prompt_total: total,
+                                    rope_estimate: rope_estimate_sent,
+                                });
+                            }
                         }
                         last_stop_reason = Some(assistant_msg.stop_reason);
                         let assistant = AgentMessage::Assistant(assistant_msg.clone());

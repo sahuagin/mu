@@ -711,6 +711,7 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
             old_model,
             new_provider_kind,
             new_model,
+            usage_semantics,
         } => Some((
             EventActor::System,
             EventPayload::ProviderSwitched {
@@ -720,6 +721,9 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
                 new_model: new_model.clone(),
                 context_soft_limit: None,
                 context_hard_limit: None,
+                // mu-rf9x: the new provider's accounting convention,
+                // re-registered durably at the switch.
+                usage_semantics: Some(*usage_semantics),
             },
         )),
     }

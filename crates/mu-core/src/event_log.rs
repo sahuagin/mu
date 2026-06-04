@@ -76,6 +76,13 @@ pub enum EventPayload {
         parent_session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         branched_at_parent_event_id: Option<u64>,
+        /// mu-rf9x: the provider's token-accounting convention,
+        /// stamped at registration so log readers can interpret every
+        /// subsequent usage record without provider-specific
+        /// arithmetic. In force until a `ProviderSwitched` event
+        /// restates it. `None` for pre-mu-rf9x logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage_semantics: Option<crate::agent::capabilities::UsageSemantics>,
     },
     /// User-side input message arrived.
     UserMessage { content: String },
@@ -140,6 +147,12 @@ pub enum EventPayload {
         context_soft_limit: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_hard_limit: Option<u64>,
+        /// mu-rf9x: the NEW provider's token-accounting convention —
+        /// re-registration restates the interpretation in force for
+        /// usage records from this point on. `None` for pre-mu-rf9x
+        /// logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage_semantics: Option<crate::agent::capabilities::UsageSemantics>,
     },
     /// Session closed (via `close_session` RPC or daemon shutdown).
     SessionClosed,

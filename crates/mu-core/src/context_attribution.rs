@@ -269,6 +269,7 @@ mod tests {
                 model: "claude-opus-4-7".into(),
                 parent_session_id: None,
                 branched_at_parent_event_id: None,
+                usage_semantics: None,
             },
         );
 
@@ -565,6 +566,7 @@ mod tests {
                 model: "claude-opus-4-7".into(),
                 parent_session_id: None,
                 branched_at_parent_event_id: None,
+                usage_semantics: None,
             },
         );
         log.append(

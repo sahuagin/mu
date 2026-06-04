@@ -114,6 +114,11 @@ cargo build --workspace --release               # release build (verify before s
 
 ## On-stop briefing — mu addendum
 
+**Briefing location (2026-06-04):** briefings are written to `~/mu-briefings/MORNING_<date>.md`,
+NOT the repo root. This repo is public; briefings carry operator context that does not belong in
+it (history was rewritten 2026-06-04 to remove the old in-repo briefings — `.gitignore` now
+blocks `MORNING*.md` as a backstop). This overrides the skill's default repo-root location.
+
 Beyond the skill's default briefing format, mu briefings should include:
 
 ```

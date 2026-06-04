@@ -282,6 +282,19 @@ pub enum AgentEvent {
         /// identity + reason_included form the source map).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         first_span_ids: Vec<String>,
+        /// mu-814o: blake3 digest (16 hex) of the RENDERED cacheable
+        /// prefix — role + content of every message up to the last
+        /// cache boundary. A change between consecutive calls with no
+        /// compaction = the prefix mutated = full cache invalidation.
+        /// `None` when the strategy placed no boundaries.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix_hash: Option<String>,
+        /// mu-814o: per-span `"<id>=<blake3 8hex>"` digests of ROPE
+        /// content over the same prefix range — names WHICH span
+        /// mutated. See `context::cache::prefix_forensics` for the
+        /// diagnosis table.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        prefix_span_hashes: Vec<String>,
     },
     /// mu-kgu.4: a [`CompactionPolicy`] just produced a new rope
     /// because the pre-render token estimate crossed the configured
@@ -1029,6 +1042,11 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                     renderer.render(&rope, ProjectionTarget::AgentView);
                 let cache_boundaries = cache_strategy.boundaries(&rope);
                 cache_strategy.annotate(&mut projection, &cache_boundaries);
+                // mu-814o: digest the cacheable prefix so a full
+                // cache invalidation is diagnosable from the JSONL —
+                // which call, which span, or renderer drift.
+                let (prefix_hash, prefix_span_hashes) =
+                    crate::context::prefix_forensics(&projection, &cache_boundaries, &rope);
                 let span_count = rope.len() as u32;
                 let cache_boundary_count = cache_boundaries.len() as u32;
                 let first_span_ids: Vec<String> = rope
@@ -1060,6 +1078,8 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                         span_count: Some(span_count),
                         cache_boundary_count: Some(cache_boundary_count),
                         first_span_ids,
+                        prefix_hash,
+                        prefix_span_hashes,
                     })
                     .await;
 

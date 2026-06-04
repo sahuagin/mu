@@ -46,8 +46,8 @@ use mu_core::context::compaction::hash_summary::{
 };
 use mu_core::context::compaction::CompactionPolicy;
 use mu_core::context::{
-    CacheBoundary, CacheMarker, CacheStrategy, ProjectionTarget, ProviderRenderer, RetainedRope,
-    RetentionClass, Span, SpanKind,
+    prefix_forensics, CacheBoundary, CacheMarker, CacheStrategy, ProjectionTarget,
+    ProviderRenderer, RetainedRope, RetentionClass, Span, SpanKind,
 };
 
 use super::{AnthropicCacheStrategy, AnthropicProviderRenderer};
@@ -635,5 +635,72 @@ fn real_hash_and_summary_policy_produces_cacheable_summary_span() {
             expected,
             "message {i}: expected {expected:?}",
         );
+    }
+}
+
+/// mu-814o: prefix forensics against the REAL Anthropic renderer +
+/// strategy pair, simulating the incident's prime suspect — a
+/// project-file FileLoad span whose content changes on rehydration
+/// while its `project-file:<path>` id stays put. The session-log diff
+/// must (a) flag the invalidation via `prefix_hash`, (b) name the
+/// mutated span via its `"<id>=<hash>"` entry, and (c) leave every
+/// other span hash untouched.
+#[test]
+fn prefix_forensics_names_a_rehydration_mutation() {
+    let rope_with = |claude_md: &str| {
+        RetainedRope::from_spans(vec![
+            Span::new(
+                "system-prompt",
+                SpanKind::System,
+                "you are mu",
+                RetentionClass::Startup,
+            ),
+            Span::new(
+                "project-file:/repo/CLAUDE.md",
+                SpanKind::FileLoad,
+                claude_md,
+                RetentionClass::Startup,
+            ),
+            Span::new(
+                "memory-recall:abc123",
+                SpanKind::MemoryInjection,
+                "remembered fact",
+                RetentionClass::Startup,
+            ),
+            Span::new("u1", SpanKind::User, "hi", RetentionClass::Hot),
+        ])
+    };
+
+    let forensics = |rope: &RetainedRope| {
+        let renderer = AnthropicProviderRenderer::new();
+        let strategy = AnthropicCacheStrategy::new();
+        let bounds = strategy.boundaries(rope);
+        assert!(
+            !bounds.is_empty(),
+            "sanity: the stable prefix must produce boundaries"
+        );
+        let mut rendered = renderer.render(rope, ProjectionTarget::AgentView);
+        strategy.annotate(&mut rendered, &bounds);
+        prefix_forensics(&rendered, &bounds, rope)
+    };
+
+    let (h_before, s_before) = forensics(&rope_with("# rules v1"));
+    // Same content → bit-identical forensics across calls.
+    let (h_same, s_same) = forensics(&rope_with("# rules v1"));
+    assert_eq!(h_before, h_same);
+    assert_eq!(s_before, s_same);
+
+    // The rehydration mutation: same id, new bytes.
+    let (h_after, s_after) = forensics(&rope_with("# rules v2 (file changed on disk)"));
+
+    assert!(h_before.is_some());
+    assert_ne!(h_before, h_after, "prefix_hash must flag the invalidation");
+    assert_eq!(s_before.len(), s_after.len(), "boundary did not move");
+    for (b, a) in s_before.iter().zip(s_after.iter()) {
+        if b.starts_with("project-file:/repo/CLAUDE.md=") {
+            assert_ne!(b, a, "mutated FileLoad span must be named");
+        } else {
+            assert_eq!(b, a, "untouched span hashes must be stable");
+        }
     }
 }

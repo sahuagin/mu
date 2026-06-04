@@ -215,6 +215,18 @@ pub enum EventPayload {
         /// breadcrumb without the full rope dump).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         first_span_ids: Vec<String>,
+        /// mu-814o: blake3 digest (16 hex) of the rendered cacheable
+        /// prefix (messages up to the last cache boundary). Diffing
+        /// consecutive calls makes a mid-session full prefix-cache
+        /// invalidation a one-grep diagnosis. `None` when no
+        /// boundaries / pre-mu-814o sessions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix_hash: Option<String>,
+        /// mu-814o: per-span `"<id>=<blake3 8hex>"` rope-content
+        /// digests over the same prefix range — names which span
+        /// mutated under a stable id.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        prefix_span_hashes: Vec<String>,
     },
     /// mu-za92: a compaction policy ran (mu-kgu.4). Durable record of
     /// what was ejected and kept — pre-mu-za92 this lived only on the
@@ -958,6 +970,8 @@ mod tests {
                 span_count: None,
                 cache_boundary_count: None,
                 first_span_ids: Vec::new(),
+                prefix_hash: None,
+                prefix_span_hashes: Vec::new(),
             },
         );
         log.append(
@@ -987,6 +1001,8 @@ mod tests {
                 span_count: None,
                 cache_boundary_count: None,
                 first_span_ids: Vec::new(),
+                prefix_hash: None,
+                prefix_span_hashes: Vec::new(),
             },
         );
         assert_eq!(log.context_assembly_count(), 2);
@@ -1018,6 +1034,8 @@ mod tests {
                 span_count: None,
                 cache_boundary_count: None,
                 first_span_ids: Vec::new(),
+                prefix_hash: None,
+                prefix_span_hashes: Vec::new(),
             },
         };
         let v = serde_json::to_value(&ev)?;

@@ -134,6 +134,70 @@ impl CacheStrategy for NoCacheStrategy {
     }
 }
 
+/// mu-814o: hex length of the rendered-prefix digest. One hash
+/// compared across calls — generous 64 bits.
+pub const PREFIX_HASH_CHARS: usize = 16;
+/// mu-814o: hex length of per-span digests. Matches the mu-kgu.3
+/// short-hash convention (8 hex = 32 bits, ample at prefix scale).
+pub const SPAN_HASH_CHARS: usize = 8;
+
+/// mu-814o: cache-forensics digest of the cacheable prefix.
+///
+/// Returns `(prefix_hash, prefix_span_hashes)` for the rope/render
+/// pair of one model call:
+///
+/// - `prefix_hash` — blake3 (truncated to [`PREFIX_HASH_CHARS`] hex)
+///   over the RENDERED content (role + flat text, length-framed) of
+///   `projection.messages[..=last_boundary]`. Cache validity is a
+///   property of wire bytes, so this observes the same layer the
+///   provider's cache does. `None` when the strategy placed no
+///   boundaries (nothing is cacheable, nothing to diagnose).
+/// - `prefix_span_hashes` — one `"<span-id>=<hash>"` entry per ROPE
+///   span in the same range (blake3 of `span.content()`, truncated
+///   to [`SPAN_HASH_CHARS`] hex). Relies on the [`CacheStrategy`]
+///   contract that spans-to-messages preserve index correspondence.
+///
+/// Diffing consecutive calls turns a full-prefix cache invalidation
+/// into a one-diff diagnosis:
+/// - a span hash changed → that span mutated under a stable id
+///   (the FileLoad-rehydration / recall-regeneration class);
+/// - `prefix_hash` changed but every span hash is identical → the
+///   renderer's projection of unchanged rope content drifted;
+/// - the span-hash list length changed → the boundary itself moved.
+pub fn prefix_forensics(
+    projection: &ProviderMessages,
+    boundaries: &[CacheBoundary],
+    rope: &RetainedRope,
+) -> (Option<String>, Vec<String>) {
+    let Some(last) = boundaries.iter().map(|b| b.message_index).max() else {
+        return (None, Vec::new());
+    };
+
+    let mut hasher = blake3::Hasher::new();
+    for msg in projection.messages.iter().take(last + 1) {
+        // Length-framed role + content: unambiguous concatenation.
+        let role = format!("{:?}", msg.role());
+        hasher.update(&(role.len() as u64).to_le_bytes());
+        hasher.update(role.as_bytes());
+        let content = msg.content();
+        hasher.update(&(content.len() as u64).to_le_bytes());
+        hasher.update(content.as_bytes());
+    }
+    let prefix_hash = hasher.finalize().to_hex()[..PREFIX_HASH_CHARS].to_string();
+
+    let span_hashes = rope
+        .spans()
+        .iter()
+        .take(last + 1)
+        .map(|s| {
+            let h = blake3::hash(s.content().as_bytes());
+            format!("{}={}", s.id(), &h.to_hex()[..SPAN_HASH_CHARS])
+        })
+        .collect();
+
+    (Some(prefix_hash), span_hashes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +272,91 @@ mod tests {
 
         assert!(boundaries.is_empty());
         assert_eq!(rendered, snapshot);
+    }
+
+    // ── mu-814o: prefix forensics ─────────────────────────────────
+
+    fn forensics_for(rope: &RetainedRope, boundary: usize) -> (Option<String>, Vec<String>) {
+        let projection = FauxProviderRenderer::new().render(rope, ProjectionTarget::AgentView);
+        prefix_forensics(&projection, &[CacheBoundary::at(boundary)], rope)
+    }
+
+    #[test]
+    fn no_boundaries_means_no_forensics() {
+        let rope = sample_rope();
+        let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+        let (hash, spans) = prefix_forensics(&projection, &[], &rope);
+        assert!(hash.is_none());
+        assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn forensics_are_deterministic_and_scoped_to_prefix() {
+        let rope = sample_rope();
+        let (h1, s1) = forensics_for(&rope, 1);
+        let (h2, s2) = forensics_for(&rope, 1);
+        assert_eq!(h1, h2);
+        assert_eq!(s1, s2);
+        assert_eq!(h1.as_deref().map(str::len), Some(PREFIX_HASH_CHARS));
+        // boundary at 1 → spans 0..=1 hashed, suffix excluded
+        assert_eq!(s1.len(), 2);
+        assert!(s1[0].starts_with("sys="));
+        assert!(s1[1].starts_with("u1="));
+        // mutating content AFTER the boundary changes nothing
+        let mut spans: Vec<Span> = sample_rope().spans().to_vec();
+        spans[3] = Span::new("u2", SpanKind::User, "DIFFERENT", RetentionClass::Warm);
+        let (h3, s3) = forensics_for(&RetainedRope::from_spans(spans), 1);
+        assert_eq!(h1, h3);
+        assert_eq!(s1, s3);
+    }
+
+    #[test]
+    fn span_mutation_under_stable_id_is_named() {
+        // The mu-814o incident class: an early span's content changes
+        // while its id stays put. The span hash must name it.
+        let (h_before, s_before) = forensics_for(&sample_rope(), 1);
+        let mut spans: Vec<Span> = sample_rope().spans().to_vec();
+        spans[1] = Span::new(
+            "u1",
+            SpanKind::User,
+            "hi (rehydrated, changed)",
+            RetentionClass::Hot,
+        );
+        let (h_after, s_after) = forensics_for(&RetainedRope::from_spans(spans), 1);
+
+        assert_ne!(h_before, h_after, "prefix hash must flag the invalidation");
+        assert_eq!(s_before[0], s_after[0], "untouched span hash stable");
+        assert_ne!(s_before[1], s_after[1], "mutated span hash must change");
+        assert!(s_after[1].starts_with("u1="), "id names the culprit");
+    }
+
+    #[test]
+    fn renderer_drift_changes_prefix_hash_but_not_span_hashes() {
+        // Same rope, different rendered bytes — the projection-drift
+        // suspect. prefix_hash observes the wire layer; span hashes
+        // observe the rope. Divergence between the two IS the signal.
+        let rope = sample_rope();
+        let mut projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+        let boundaries = [CacheBoundary::at(1)];
+        let (h_clean, s_clean) = prefix_forensics(&projection, &boundaries, &rope);
+
+        projection.messages[0].content = "you are mu (drifted projection)".into();
+        let (h_drift, s_drift) = prefix_forensics(&projection, &boundaries, &rope);
+
+        assert_ne!(h_clean, h_drift);
+        assert_eq!(
+            s_clean, s_drift,
+            "rope-side hashes must NOT move on render drift"
+        );
+    }
+
+    #[test]
+    fn boundary_move_changes_span_hash_count() {
+        let rope = sample_rope();
+        let (_, s1) = forensics_for(&rope, 1);
+        let (_, s2) = forensics_for(&rope, 2);
+        assert_eq!(s1.len(), 2);
+        assert_eq!(s2.len(), 3);
+        assert_eq!(s1[..], s2[..2], "shared prefix hashes agree");
     }
 }

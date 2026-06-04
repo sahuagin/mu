@@ -45,7 +45,7 @@ pub use assembly::{
     append_messages_to_baseline, assemble_rope, assemble_rope_with_context,
     extract_call_id_from_span_id,
 };
-pub use cache::{CacheBoundary, CacheStrategy, NoCacheStrategy};
+pub use cache::{prefix_forensics, CacheBoundary, CacheStrategy, NoCacheStrategy};
 pub use compaction::{
     BackgroundCompactionState, CompactionDecision, CompactionPolicy, CompactionQuota,
     CompactionResult, NoCompactionPolicy,

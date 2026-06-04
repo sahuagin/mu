@@ -2248,3 +2248,119 @@ async fn yqeq8_phase_d_smoke_tool_call_round_trip_uses_projected_path() {
         ],
     );
 }
+
+// =============================================================================
+// mu-wsgx: feedback-predictor compaction trigger
+// =============================================================================
+//
+// The raw renderer estimate ran ~15% low on Anthropic (uncounted
+// request framing + chars/4 vs BPE), so the 150K trigger fired at
+// ~176K actual provider tokens. The trigger measure is now
+// `predicted_prompt_total`: the provider's exact reported total for
+// the previous call plus the renderer-estimate delta of new spans.
+
+#[test]
+fn wsgx_predictor_without_anchor_is_estimate_plus_overhead() {
+    assert_eq!(
+        predicted_prompt_total(None, 10_000),
+        10_000 + ESTIMATE_FALLBACK_OVERHEAD_TOKENS
+    );
+}
+
+#[test]
+fn wsgx_predictor_anchors_on_actual_plus_delta() {
+    let anchor = FeedbackAnchor {
+        actual_prompt_total: 170_000,
+        rope_estimate: 150_000,
+    };
+    // 2K of new spans since the anchor call → actual + 2K.
+    assert_eq!(predicted_prompt_total(Some(&anchor), 152_000), 172_000);
+    // Unchanged rope → exactly the provider's number.
+    assert_eq!(predicted_prompt_total(Some(&anchor), 150_000), 170_000);
+}
+
+#[test]
+fn wsgx_predictor_shrunk_rope_falls_back_to_estimate() {
+    // A compaction landed between calls: the rope now estimates BELOW
+    // the anchor's estimate, so the anchor's (pre-compaction) actual
+    // would over-predict and re-trigger a compaction storm. Fall back.
+    let anchor = FeedbackAnchor {
+        actual_prompt_total: 170_000,
+        rope_estimate: 150_000,
+    };
+    assert_eq!(
+        predicted_prompt_total(Some(&anchor), 80_000),
+        80_000 + ESTIMATE_FALLBACK_OVERHEAD_TOKENS
+    );
+}
+
+/// End-to-end: provider-reported usage drives the trigger. Call 1's
+/// response reports a 200K prompt total (way above the tiny rope's
+/// raw estimate). The tool follow-up call must therefore cross the
+/// 150K threshold and fire compaction — even though the raw estimate
+/// never gets anywhere near it. Raw-estimate triggering would NEVER
+/// fire here; only the feedback anchor can.
+#[tokio::test]
+async fn wsgx_provider_feedback_triggers_compaction_raw_estimate_would_not() {
+    let mut call1 = assistant_tool_call("c1", "echo", serde_json::json!({}));
+    call1.usage = Some(Usage {
+        input_tokens: 200_000,
+        output_tokens: 5,
+        ..Default::default()
+    });
+    let inner = MockProvider::new(vec![
+        vec![ProviderEvent::Done(call1)],
+        vec![
+            ProviderEvent::TextDelta("done".into()),
+            ProviderEvent::Done(assistant_text("done")),
+        ],
+    ]);
+    let provider: Arc<dyn Provider> = Arc::new(MockProviderWithCompaction {
+        inner,
+        policy: Arc::new(EvictHalfPolicy),
+    });
+    let config = AgentConfig {
+        compaction_threshold: Some(150_000),
+        ..AgentConfig::default()
+    };
+
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool::ok("echo", "echoed"))];
+    let loop_ = loop_with(
+        provider,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        tools,
+        config,
+        events_tx,
+        approvals,
+        capability,
+    );
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("use the tool")))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+
+    let compactions: Vec<u32> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::CompactionAssembly { model_call_id, .. } => Some(*model_call_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        compactions,
+        vec![2],
+        "exactly one compaction, on the tool follow-up call, anchored \
+         on call 1's 200K reported prompt total; events: {:?}",
+        events.iter().map(kind).collect::<Vec<_>>(),
+    );
+}

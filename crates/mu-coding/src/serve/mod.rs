@@ -253,7 +253,13 @@ where
     let recall_providers: Vec<Arc<dyn mu_core::context::RecallProvider>> =
         if config.recall_enabled() {
             vec![
-                Arc::new(mu_core::context::recall::SubprocessRecallProvider::default()),
+                // mu-zk2i: tier from `[recall].tier` — "identity"
+                // (default) injects the small kernel; "full" restores
+                // the four-section wall.
+                Arc::new(
+                    mu_core::context::recall::SubprocessRecallProvider::default()
+                        .with_tier(&config.recall.tier),
+                ),
                 Arc::new(mu_core::context::recall::ProjectFileRecallProvider::default()),
             ]
         } else {

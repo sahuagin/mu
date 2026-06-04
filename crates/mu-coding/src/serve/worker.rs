@@ -87,9 +87,7 @@ pub(crate) async fn spawn_worker(
             branched_at_parent_event_id: None,
             // mu-rf9x: claude-code subprocesses report
             // Anthropic-convention usage in their JSONL.
-            usage_semantics: Some(
-                mu_core::agent::capabilities::UsageSemantics::anthropic_style(),
-            ),
+            usage_semantics: Some(mu_core::agent::capabilities::UsageSemantics::anthropic_style()),
         },
     );
 

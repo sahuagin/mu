@@ -149,10 +149,10 @@ impl UsageSemantics {
             (self.cache_creation_in_input, u.cache_creation_input_tokens),
         ] {
             match (flag, bucket.unwrap_or(0)) {
-                (_, 0) => {}                       // bucket absent/empty: moot
-                (Some(true), _) => {}              // already inside input_tokens
-                (Some(false), n) => total += n,    // disjoint: add it
-                (None, _) => return None,          // unknown + material: don't guess
+                (_, 0) => {}                    // bucket absent/empty: moot
+                (Some(true), _) => {}           // already inside input_tokens
+                (Some(false), n) => total += n, // disjoint: add it
+                (None, _) => return None,       // unknown + material: don't guess
             }
         }
         Some(total)
@@ -162,7 +162,10 @@ impl UsageSemantics {
     /// convention, when computable. The complement of cache reads
     /// within [`Self::prompt_total`].
     pub fn fresh_input(&self, u: &crate::agent::Usage) -> Option<u64> {
-        match (self.cache_read_in_input, u.cache_read_input_tokens.unwrap_or(0)) {
+        match (
+            self.cache_read_in_input,
+            u.cache_read_input_tokens.unwrap_or(0),
+        ) {
             (_, 0) => Some(u.input_tokens),
             (Some(true), n) => Some(u.input_tokens.saturating_sub(n)),
             (Some(false), _) => Some(u.input_tokens),
@@ -264,7 +267,11 @@ mod tests {
         assert_eq!(SystemPromptCapability::Unknown.max_bytes(), None);
     }
 
-    fn usage(input: u64, cache_read: Option<u64>, cache_creation: Option<u64>) -> crate::agent::Usage {
+    fn usage(
+        input: u64,
+        cache_read: Option<u64>,
+        cache_creation: Option<u64>,
+    ) -> crate::agent::Usage {
         crate::agent::Usage {
             input_tokens: input,
             output_tokens: 100,

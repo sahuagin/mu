@@ -28,7 +28,7 @@ enum Command {
     /// sessions on this daemon.
     Serve {
         /// Comma-separated list of tools to enable. Values: read,
-        /// write, ls, edit, grep, glob, bash.
+        /// write, ls, edit, grep, glob, memory_recall, bash.
         #[arg(long, default_value = "")]
         tools: String,
         /// For OAuth providers (openai-codex): load stored token but

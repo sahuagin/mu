@@ -518,6 +518,8 @@ mod tests {
                     span_count: None,
                     cache_boundary_count: None,
                     first_span_ids: Vec::new(),
+                    prefix_hash: None,
+                    prefix_span_hashes: Vec::new(),
                 },
             ),
             ev(
@@ -551,6 +553,8 @@ mod tests {
                     span_count: None,
                     cache_boundary_count: None,
                     first_span_ids: Vec::new(),
+                    prefix_hash: None,
+                    prefix_span_hashes: Vec::new(),
                 },
             ),
             ev(

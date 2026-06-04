@@ -1,3 +1,4 @@
+pub mod action_recall;
 pub mod aws_recon;
 pub mod bash;
 pub mod discover;

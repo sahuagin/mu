@@ -114,6 +114,7 @@ mod tests {
                 model: model.into(),
                 parent_session_id: parent.clone(),
                 branched_at_parent_event_id: None,
+                usage_semantics: None,
             },
         );
         let (tx, _rx) = mpsc::channel(1);

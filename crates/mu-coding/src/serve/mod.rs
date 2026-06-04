@@ -500,6 +500,7 @@ mod tests {
                 model: model.into(),
                 parent_session_id: parent.map(|s| s.into()),
                 branched_at_parent_event_id: None,
+                usage_semantics: None,
             },
         );
     }

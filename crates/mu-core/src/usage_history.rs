@@ -436,6 +436,7 @@ mod tests {
                 model: "claude-haiku-4-5".into(),
                 parent_session_id: None,
                 branched_at_parent_event_id: None,
+                usage_semantics: None,
             },
         )];
         let m = extract_per_session_metrics(&events).expect("session_created drives identity");
@@ -457,6 +458,7 @@ mod tests {
                     model: "m".into(),
                     parent_session_id: None,
                     branched_at_parent_event_id: None,
+                    usage_semantics: None,
                 },
             ),
             ev(
@@ -494,6 +496,7 @@ mod tests {
                     model: "m".into(),
                     parent_session_id: None,
                     branched_at_parent_event_id: None,
+                    usage_semantics: None,
                 },
             ),
             ev(
@@ -577,6 +580,7 @@ mod tests {
                     model: "m".into(),
                     parent_session_id: None,
                     branched_at_parent_event_id: None,
+                    usage_semantics: None,
                 },
             ),
             ev(
@@ -647,6 +651,7 @@ mod tests {
                 model: "haiku".into(),
                 parent_session_id: None,
                 branched_at_parent_event_id: None,
+                usage_semantics: None,
             },
         )
     }

@@ -149,23 +149,86 @@ def detect_retry_loops(events: list[dict]) -> list[dict]:
 
 # ── Context growth analysis ───────────────────────────────────────
 
+# Provider-kind fallback for logs that predate the mu-rf9x stamps
+# (PR #164). OpenAI-shaped accounting: input_tokens is the TOTAL
+# prompt, cache_read a subset. Anthropic (and claude-code JSONL):
+# input/cache_read/cache_creation are disjoint buckets that sum.
+_OPENAI_STYLE_KINDS = ("openai", "openrouter", "ollama")
+_ANTHROPIC_STYLE_KINDS = ("anthropic", "claude")
+
+
+def _semantics_from_provider_kind(kind: str) -> dict | None:
+    k = (kind or "").lower()
+    if any(k.startswith(p) for p in _OPENAI_STYLE_KINDS):
+        return {"cache_read_in_input": True, "cache_creation_in_input": True}
+    if any(k.startswith(p) for p in _ANTHROPIC_STYLE_KINDS):
+        return {"cache_read_in_input": False, "cache_creation_in_input": False}
+    return None
+
+
+def _prompt_total(usage: dict, semantics: dict | None) -> int:
+    """Mirror of mu-core UsageSemantics::prompt_total (mu-rf9x):
+    start from input_tokens; add a cache bucket only when the
+    semantics declare it disjoint. Unknown semantics + material
+    cache fields → legacy additive sum (flagged via accounting
+    source by the caller), so old unattributable logs keep their
+    historical numbers."""
+    total = usage.get("input_tokens", 0) or 0
+    for flag_key, bucket_key in (
+        ("cache_read_in_input", "cache_read_input_tokens"),
+        ("cache_creation_in_input", "cache_creation_input_tokens"),
+    ):
+        bucket = usage.get(bucket_key, 0) or 0
+        if bucket == 0:
+            continue
+        in_input = (semantics or {}).get(flag_key)
+        if in_input is None or in_input is False:
+            # disjoint (or unknown → legacy additive)
+            total += bucket
+    return total
+
+
 def analyze_context_growth(events: list[dict]) -> dict:
-    """Track input token growth per assistant turn.
-    Only works for sessions that have usage data."""
+    """Track prompt-total token growth per assistant turn, interpreted
+    under the provider's declared usage semantics (mu-rf9x stamps on
+    session_created/provider_switched). Fallback chain for older logs:
+    provider_kind heuristic, then legacy additive. Only works for
+    sessions that have usage data."""
     turns = []
+    compaction_events = []
+    semantics = None
+    accounting_source = "legacy-additive"
     for ev in events:
         p = ev.get("payload", {})
-        if p.get("kind") == "assistant_message_event":
+        kind = p.get("kind")
+        if kind in ("session_created", "provider_switched"):
+            stamped = p.get("usage_semantics")
+            if stamped is not None:
+                semantics = stamped
+                accounting_source = "stamped"
+            else:
+                pk = p.get("provider_kind") or p.get("new_provider_kind") or ""
+                inferred = _semantics_from_provider_kind(pk)
+                if inferred is not None:
+                    semantics = inferred
+                    accounting_source = f"provider-kind heuristic ({pk})"
+        elif kind == "compaction_assembly":
+            # mu-za92 (PR #161): the ground truth — no inference needed.
+            compaction_events.append({
+                "model_call_id": p.get("model_call_id"),
+                "policy_id": p.get("policy_id"),
+                "before": p.get("tokens_before", 0),
+                "after": p.get("tokens_after", 0),
+                "decisions": len(p.get("decisions", [])),
+            })
+        elif kind == "assistant_message_event":
             msg = p.get("message", {})
             usage = msg.get("usage")
             if usage:
-                # Total prompt size = input_tokens + cache_read + cache_creation.
-                # claude-code's input_tokens is only the non-cached portion;
-                # the real context size includes cached spans.
                 raw_input = usage.get("input_tokens", 0)
-                cache_read = usage.get("cache_read_input_tokens", 0)
-                cache_creation = usage.get("cache_creation_input_tokens", 0)
-                total_prompt = raw_input + cache_read + cache_creation
+                cache_read = usage.get("cache_read_input_tokens", 0) or 0
+                cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
+                total_prompt = _prompt_total(usage, semantics)
                 if total_prompt > 0:
                     turns.append({
                         "id": ev["id"],
@@ -187,7 +250,9 @@ def analyze_context_growth(events: list[dict]) -> dict:
             "avg_growth_per_turn": 0,
             "total_output_tokens": 0,
             "likely_compactions": [],
+            "compaction_events": [],
             "cache_hit_ratio": 0.0,
+            "accounting_source": "n/a",
         }
 
     prompt_tokens = [t["total_prompt_tokens"] for t in turns]
@@ -199,18 +264,24 @@ def analyze_context_growth(events: list[dict]) -> dict:
     else:
         avg_growth_per_turn = 0
 
-    # Detect token drops (likely compaction)
+    # Infer token drops (possible compactions) — fallback only.
+    # Post-PR#161 logs carry durable compaction_assembly events; when
+    # those exist they are the answer and inference is skipped (the
+    # pre-fix double-count made cache-miss turns look like ~45% drops,
+    # which is how this heuristic once reported 5 phantom compactions
+    # on a session that had none).
     drops = []
-    for i in range(1, len(prompt_tokens)):
-        prev = prompt_tokens[i - 1]
-        curr = prompt_tokens[i]
-        if prev > 1000 and curr < prev * 0.7:
-            drops.append({
-                "turn": i,
-                "before": prev,
-                "after": curr,
-                "reduction_pct": round((1 - curr / prev) * 100, 1),
-            })
+    if not compaction_events:
+        for i in range(1, len(prompt_tokens)):
+            prev = prompt_tokens[i - 1]
+            curr = prompt_tokens[i]
+            if prev > 1000 and curr < prev * 0.7:
+                drops.append({
+                    "turn": i,
+                    "before": prev,
+                    "after": curr,
+                    "reduction_pct": round((1 - curr / prev) * 100, 1),
+                })
 
     # Cache hit ratio: cache_read / total_prompt across all turns
     total_cache_read = sum(t["cache_read"] for t in turns)
@@ -226,7 +297,9 @@ def analyze_context_growth(events: list[dict]) -> dict:
         "avg_growth_per_turn": round(avg_growth_per_turn),
         "total_output_tokens": sum(output_tokens),
         "likely_compactions": drops,
+        "compaction_events": compaction_events,
         "cache_hit_ratio": cache_hit_ratio,
+        "accounting_source": accounting_source,
     }
 
 
@@ -477,8 +550,16 @@ def format_report_text(report: dict) -> str:
         lines.append(f"  {cg['first_prompt_tokens']:,} → {cg['last_prompt_tokens']:,} tokens ({cg['turn_count']} turns)")
         lines.append(f"  peak: {cg['peak_prompt_tokens']:,} | growth: ~{cg['avg_growth_per_turn']:,}/turn")
         lines.append(f"  cache hit ratio: {cg['cache_hit_ratio']:.1%}")
-        if cg["likely_compactions"]:
-            lines.append(f"  likely compactions: {len(cg['likely_compactions'])}")
+        lines.append(f"  accounting: {cg.get('accounting_source', 'legacy-additive')}")
+        if cg.get("compaction_events"):
+            lines.append(f"  compactions (from event log): {len(cg['compaction_events'])}")
+            for c in cg["compaction_events"][:5]:
+                lines.append(
+                    f"    call {c['model_call_id']}: {c['before']:,} → {c['after']:,} "
+                    f"({c['policy_id']}, {c['decisions']} decisions)"
+                )
+        elif cg["likely_compactions"]:
+            lines.append(f"  inferred compactions (no events; heuristic): {len(cg['likely_compactions'])}")
             for d in cg["likely_compactions"][:5]:
                 lines.append(
                     f"    turn {d['turn']}: {d['before']:,} → {d['after']:,} ({d['reduction_pct']}% drop)"

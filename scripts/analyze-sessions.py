@@ -137,8 +137,14 @@ def classify_session(profile: dict) -> list[str]:
         tags.append("short-session")
     if profile["errors"] > 0:
         tags.append("had-errors")
+    # NOTE (mu-3b5c): total_input_tokens is a session-cumulative
+    # BILLING aggregate (sum across every model call), not a context
+    # size — a 12-turn codex session re-sends its prompt every call,
+    # so this crosses 500k while actual context sits under 60k. The
+    # tag means "expensive", not "big context"; per-call context
+    # lives in deep-analyze.py's context-growth section.
     if profile["total_input_tokens"] > 500000:
-        tags.append("high-context")
+        tags.append("high-cumulative-input")
     if profile["user_messages"] == 0:
         tags.append("no-user-input")
 

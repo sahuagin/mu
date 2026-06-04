@@ -15,7 +15,8 @@ use mu_core::agent::{Provider, Tool};
 use mu_core::protocol::ProviderSelector;
 
 use crate::tools::{
-    AwsReconTool, BashMode, BashTool, EditTool, GlobTool, GrepTool, LsTool, ReadTool, WriteTool,
+    AwsReconTool, BashMode, BashTool, EditTool, GlobTool, GrepTool, LsTool, MemoryRecallTool,
+    ReadTool, WriteTool,
 };
 
 /// Settings that parameterize how the `bash` tool is built.
@@ -168,9 +169,14 @@ pub fn build_tools(names: &[String], bash: &BashSettings) -> Result<Vec<Arc<dyn 
             "edit" => Ok(Arc::new(EditTool::new()) as Arc<dyn Tool>),
             "grep" => Ok(Arc::new(GrepTool::new()) as Arc<dyn Tool>),
             "glob" => Ok(Arc::new(GlobTool::new()) as Arc<dyn Tool>),
-            "aws_recon" => Ok(Arc::new(
-                AwsReconTool::from_env().map_err(|e| anyhow::anyhow!(e))?,
-            ) as Arc<dyn Tool>),
+            // mu-oee9: recall-on-demand over the operator's memory
+            // store — the discoverable tail that the small-kernel
+            // injection (mu-zk2i) demotes everything into.
+            "memory_recall" => Ok(Arc::new(MemoryRecallTool::new()) as Arc<dyn Tool>),
+            "aws_recon" => Ok(
+                Arc::new(AwsReconTool::from_env().map_err(|e| anyhow::anyhow!(e))?)
+                    as Arc<dyn Tool>,
+            ),
             "bash" => {
                 let mode = if bash.yolo {
                     tracing::warn!(
@@ -187,7 +193,8 @@ pub fn build_tools(names: &[String], bash: &BashSettings) -> Result<Vec<Arc<dyn 
                 Ok(Arc::new(BashTool::new(mode)) as Arc<dyn Tool>)
             }
             other => anyhow::bail!(
-                "unknown tool: {other} (expected: read, write, ls, edit, grep, glob, aws_recon, bash)"
+                "unknown tool: {other} (expected: read, write, ls, edit, grep, glob, \
+                 memory_recall, aws_recon, bash)"
             ),
         })
         .collect()

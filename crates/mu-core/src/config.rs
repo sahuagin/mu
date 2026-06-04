@@ -153,11 +153,22 @@ pub struct McpServerConfig {
 pub struct RecallConfig {
     /// Run the session-start recall providers. `false` => no front-load.
     pub enabled: bool,
+    /// mu-zk2i: which memory-injection tier the agent-memory provider
+    /// requests (`agent memory context --tier <this>`). `"identity"`
+    /// (default) injects the small kernel — user-first identity rows +
+    /// identity-tagged rules, ~1K tokens — with everything else
+    /// reachable via the `memory_recall` tool (mu-oee9). `"full"`
+    /// restores the pre-mu-zk2i four-section wall (measured 15.9K
+    /// tokens = 21% of post-compaction context, session c76f6949).
+    pub tier: String,
 }
 
 impl Default for RecallConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            tier: "identity".to_string(),
+        }
     }
 }
 
@@ -515,6 +526,16 @@ mod tests {
         // operators opt into discover-on-demand via TOML
         let c: Config = toml::from_str("[recall]\nenabled = false\n").expect("parse");
         assert!(!c.recall.enabled);
+    }
+
+    #[test]
+    fn recall_tier_defaults_to_identity_and_toml_can_restore_full() {
+        // mu-zk2i: the small kernel is the new default posture.
+        assert_eq!(Config::default().recall.tier, "identity");
+        let c: Config = toml::from_str("[recall]\ntier = \"full\"\n").expect("parse");
+        assert_eq!(c.recall.tier, "full");
+        // tier composes with enabled untouched
+        assert!(c.recall.enabled);
     }
 
     #[test]

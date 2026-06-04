@@ -139,11 +139,28 @@ impl BashMode {
 #[derive(Debug)]
 pub struct BashTool {
     mode: BashMode,
+    /// mu-8puo: point-of-action memory advisory (see
+    /// [`crate::tools::action_recall`]). Arc because `execute`'s
+    /// async block must own a handle independent of `&self`.
+    action_recall: std::sync::Arc<crate::tools::action_recall::ActionRecall>,
 }
 
 impl BashTool {
     pub fn new(mode: BashMode) -> Self {
-        Self { mode }
+        Self {
+            mode,
+            action_recall: std::sync::Arc::new(crate::tools::action_recall::ActionRecall::default()),
+        }
+    }
+
+    /// mu-8puo test hook: substitute the advisory engine (stub binary
+    /// or disabled).
+    pub fn with_action_recall(
+        mut self,
+        action_recall: crate::tools::action_recall::ActionRecall,
+    ) -> Self {
+        self.action_recall = std::sync::Arc::new(action_recall);
+        self
     }
 }
 
@@ -200,7 +217,11 @@ impl Tool for BashTool {
             description: format!(
                 "Run a shell command. {mode_note} \
                  Output capped at 64KB (stdout+stderr). Default timeout 60s; override via timeout_secs (max 600). \
-                 Exit code is reflected in is_error."
+                 Exit code is reflected in is_error. \
+                 NOTE: some destructive commands (rm, git push --force, jj abandon, …) may return a \
+                 one-time memory advisory INSTEAD of executing — a standing operator rule surfaced at \
+                 the point of action. Read it; if the command is still appropriate, re-issue it \
+                 verbatim and it will run."
             ),
             display: None,
             when: None,
@@ -260,10 +281,23 @@ impl Tool for BashTool {
             });
         }
         let mode = self.mode.clone();
+        let action_recall = std::sync::Arc::clone(&self.action_recall);
         Box::pin(async move {
             // validate() succeeded — parse_command_arg cannot fail now.
             let command = parse_command_arg(&arguments)
                 .expect("parse_command_arg succeeded in validate() just above");
+
+            // mu-8puo: point-of-action memory advisory. Fires at most
+            // once per command; the advisory result is is_error:false
+            // ON PURPOSE — strict mode's RetryPolicy::Never refuses
+            // identical retries of errored calls, and the whole point
+            // is that an identical re-issue proceeds.
+            if let Some(advice) = action_recall.advisory_for(&command).await {
+                return ToolResult {
+                    content: advice,
+                    is_error: false,
+                };
+            }
 
             let timeout_secs = arguments
                 .get("timeout_secs")
@@ -470,7 +504,13 @@ mod tests {
 
     async fn execute_bash(mode: BashMode, args: Value) -> ToolResult {
         let (_cancel_tx, cancel_rx) = oneshot::channel();
-        BashTool::new(mode).execute(args, cancel_rx).await
+        // mu-8puo: advisory disabled so tests never consult the REAL
+        // operator memory store (hermetic + deterministic). The
+        // advisory path has its own stub-driven tests below.
+        BashTool::new(mode)
+            .with_action_recall(crate::tools::action_recall::ActionRecall::disabled())
+            .execute(args, cancel_rx)
+            .await
     }
 
     #[test]
@@ -747,5 +787,61 @@ mod tests {
         assert!(truncated.contains("truncated"));
         // Should not panic, should produce valid UTF-8.
         assert!(truncated.is_char_boundary(truncated.find('…').unwrap_or(0)));
+    }
+
+    // ── mu-8puo: point-of-action memory advisory ──────────────────
+
+    /// End-to-end through BashTool: the first dangerous command
+    /// returns the advisory WITHOUT executing; the identical
+    /// re-issue executes. Yolo mode + a marker file prove execution
+    /// state at each step.
+    #[tokio::test]
+    async fn advisory_intercepts_then_reissue_executes() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("mu-8puo-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Stub memory CLI: always returns one labeled rule.
+        let stub = dir.join("agent-stub.sh");
+        {
+            let mut f = std::fs::File::create(&stub).unwrap();
+            writeln!(
+                f,
+                "#!/bin/sh\necho '[838c3bf4] (feedback) never-batch-destructive — rule  [2026-06-04]'"
+            )
+            .unwrap();
+            let mut perms = f.metadata().unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub, perms).unwrap();
+        }
+        let marker = dir.join("marker");
+        std::fs::write(&marker, "x").unwrap();
+
+        let tool = BashTool::new(BashMode::Yolo).with_action_recall(
+            crate::tools::action_recall::ActionRecall::with_binary(&stub),
+        );
+        let cmd = format!("rm {}", marker.display());
+
+        // First call: advisory, NOT executed, NOT an error (strict
+        // mode's RetryPolicy::Never must not eat the re-issue).
+        let (_t1, rx1) = oneshot::channel();
+        let first = tool.execute(json!({"command": cmd}), rx1).await;
+        assert!(
+            !first.is_error,
+            "advisory is not an error: {}",
+            first.content
+        );
+        assert!(first.content.contains("NOT executed"));
+        assert!(first.content.contains("never-batch-destructive"));
+        assert!(marker.exists(), "command must not have run");
+
+        // Identical re-issue: executes.
+        let (_t2, rx2) = oneshot::channel();
+        let second = tool.execute(json!({"command": cmd}), rx2).await;
+        assert!(!second.is_error, "{}", second.content);
+        assert!(!marker.exists(), "re-issue must actually run the command");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

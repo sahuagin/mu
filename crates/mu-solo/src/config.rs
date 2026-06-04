@@ -113,7 +113,11 @@ impl Default for SessionConfig {
         Self {
             provider: "openai-codex".into(),
             model: "gpt-5.5".into(),
-            tools: "read,write,edit,glob,grep,bash".into(),
+            // mu-oee9: memory_recall is default-on — the small-kernel
+            // injection (mu-zk2i) demotes everything but the identity
+            // kernel to recall-only; without this tool that tail is
+            // unreachable mid-session.
+            tools: "read,write,edit,glob,grep,memory_recall,bash".into(),
             bash_yolo: false,
             mu_binary: "./target/release/mu".into(),
             cwd: None,

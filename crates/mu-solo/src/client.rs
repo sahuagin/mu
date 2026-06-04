@@ -6,7 +6,6 @@
 //! `tokio::sync::mpsc::UnboundedReceiver` so the async event loop can
 //! `select!` on them without polling.
 
-use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -43,17 +42,43 @@ pub struct Client {
     #[allow(dead_code)]
     child: Child,
     stdin: ChildStdin,
-    /// Synchronous receiver for request/response pairing. The reader
-    /// thread sends all messages here; `request()` drains it looking
-    /// for the matching response id, stashing notifications aside.
+    /// Synchronous receiver for request/response pairing. mu-9x4j:
+    /// the reader thread routes ONLY responses (plus Eof/ReaderError)
+    /// here — notifications never touch this channel, so `request()`
+    /// has nothing to stash and nothing can be delivered twice.
     rx: std::sync::mpsc::Receiver<Message>,
-    pending_notifications: VecDeque<Message>,
     next_id: AtomicI64,
     default_read_timeout: Duration,
-    /// Async notification stream for the tokio event loop. Notifications
-    /// that arrive during `request()` are also forwarded here.
-    notif_tx: tokio_mpsc::UnboundedSender<Message>,
+    /// Async notification stream for the tokio event loop — the ONLY
+    /// delivery path for notifications (exactly-once by construction).
     notif_rx: Option<tokio_mpsc::UnboundedReceiver<Message>>,
+}
+
+/// mu-9x4j: single routing point for everything the reader thread
+/// pulls off the daemon's stdout. Notifications go to the async
+/// channel only; responses go to the sync channel only; Eof and
+/// ReaderError fan out to BOTH (an in-flight `request()` must fail
+/// fast, and the event loop must see the daemon die even when no
+/// request is pending). Errors when both destinations are gone —
+/// the reader thread uses that as its exit signal.
+fn route_message(
+    msg: Message,
+    resp_tx: &mpsc::Sender<Message>,
+    notif_tx: &tokio_mpsc::UnboundedSender<Message>,
+) -> Result<(), ()> {
+    match msg {
+        Message::Notification { .. } => notif_tx.send(msg).map_err(|_| ()),
+        Message::Response { .. } => resp_tx.send(msg).map_err(|_| ()),
+        Message::Eof | Message::ReaderError(_) => {
+            let a = resp_tx.send(msg.clone()).is_ok();
+            let b = notif_tx.send(msg).is_ok();
+            if a || b {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+    }
 }
 
 impl Client {
@@ -133,9 +158,18 @@ impl Client {
             .context("spawning daemon-stderr drain thread")?;
 
         let (tx, rx) = mpsc::channel::<Message>();
+        let (notif_tx, notif_rx) = tokio_mpsc::unbounded_channel();
 
         // Stdout reader thread. Parses each line as a JSON-RPC message
-        // and forwards via mpsc.
+        // and routes it: notifications to the async channel, responses
+        // to the sync channel (mu-9x4j: the split lives HERE so each
+        // message has exactly one delivery path — the previous design
+        // had request() forwarding notifications to BOTH the async
+        // channel and a sync buffer, and the app consumed both, so
+        // every notification arriving during a synchronous RPC window
+        // was processed twice: replayed scrollback blocks, double-
+        // counted session.done usage).
+        let reader_notif_tx = notif_tx.clone();
         thread::Builder::new()
             .name("mu-solo-stdout".into())
             .spawn(move || {
@@ -144,35 +178,37 @@ impl Client {
                     match line {
                         Ok(raw) => match parse_message(&raw) {
                             Ok(msg) => {
-                                if tx.send(msg).is_err() {
+                                if route_message(msg, &tx, &reader_notif_tx).is_err() {
                                     return;
                                 }
                             }
                             Err(e) => {
-                                let _ = tx.send(Message::ReaderError(format!(
-                                    "stdout parse: {e}: {raw:?}"
-                                )));
+                                let _ = route_message(
+                                    Message::ReaderError(format!("stdout parse: {e}: {raw:?}")),
+                                    &tx,
+                                    &reader_notif_tx,
+                                );
                             }
                         },
                         Err(e) => {
-                            let _ = tx.send(Message::ReaderError(format!("stdout read: {e}")));
+                            let _ = route_message(
+                                Message::ReaderError(format!("stdout read: {e}")),
+                                &tx,
+                                &reader_notif_tx,
+                            );
                             return;
                         }
                     }
                 }
-                let _ = tx.send(Message::Eof);
+                let _ = route_message(Message::Eof, &tx, &reader_notif_tx);
             })
             .context("spawning stdout reader thread")?;
-
-        let (notif_tx, notif_rx) = tokio_mpsc::unbounded_channel();
         let mut client = Self {
             child,
             stdin,
             rx,
-            pending_notifications: VecDeque::new(),
             next_id: AtomicI64::new(1),
             default_read_timeout: Duration::from_secs(120),
-            notif_tx,
             notif_rx: Some(notif_rx),
         };
 
@@ -237,9 +273,13 @@ impl Client {
                     // sequentially. Log and continue waiting.
                     continue;
                 }
-                Ok(msg @ Message::Notification { .. }) => {
-                    let _ = self.notif_tx.send(msg.clone());
-                    self.pending_notifications.push_back(msg);
+                Ok(Message::Notification { .. }) => {
+                    // mu-9x4j: structurally unreachable — the reader
+                    // thread routes notifications to the async channel
+                    // only. Tolerate rather than panic if it ever
+                    // regresses; the notification is dropped HERE
+                    // rather than delivered twice.
+                    continue;
                 }
                 Ok(Message::Eof) => return Err(anyhow!("daemon closed stdout")),
                 Ok(Message::ReaderError(e)) => return Err(anyhow!("reader error: {e}")),
@@ -251,25 +291,12 @@ impl Client {
         }
     }
 
-    /// Non-blocking notification poll. Returns one buffered or
-    /// fresh-from-the-wire notification if available, else None.
-    pub fn try_recv_notification(&mut self) -> Option<Message> {
-        if let Some(msg) = self.pending_notifications.pop_front() {
-            return Some(msg);
-        }
-        match self.rx.try_recv() {
-            Ok(msg @ Message::Notification { .. }) => Some(msg),
-            Ok(Message::Eof) => Some(Message::Eof),
-            Ok(Message::ReaderError(e)) => Some(Message::ReaderError(e)),
-            Ok(Message::Response { .. }) => None, // stale; drop
-            Err(_) => None,
-        }
-    }
-
     /// Take the async notification receiver. Called once during App
-    /// setup to hand ownership to the tokio event loop. After this,
-    /// notifications flow through the async channel; `try_recv_notification`
-    /// still works for any that were buffered during `request()`.
+    /// setup to hand ownership to the tokio event loop. mu-9x4j: this
+    /// is the ONLY notification delivery path — anything that arrived
+    /// during setup `request()` calls is already queued on it in
+    /// arrival order (the channel is unbounded and buffers until the
+    /// receiver is consumed).
     pub fn take_notification_rx(&mut self) -> Option<tokio_mpsc::UnboundedReceiver<Message>> {
         self.notif_rx.take()
     }
@@ -297,4 +324,100 @@ fn generate_bearer_token() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notif(method: &str) -> Message {
+        Message::Notification {
+            method: method.into(),
+            params: Value::Null,
+        }
+    }
+
+    fn channels() -> (
+        mpsc::Sender<Message>,
+        mpsc::Receiver<Message>,
+        tokio_mpsc::UnboundedSender<Message>,
+        tokio_mpsc::UnboundedReceiver<Message>,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        let (ntx, nrx) = tokio_mpsc::unbounded_channel();
+        (tx, rx, ntx, nrx)
+    }
+
+    /// mu-9x4j: the incident invariant. A notification reaches the
+    /// async channel EXACTLY once and the sync channel NEVER — the
+    /// double-processing bug was a notification landing on both.
+    #[test]
+    fn notifications_route_to_async_channel_only() {
+        let (tx, rx, ntx, mut nrx) = channels();
+        route_message(notif("session.done"), &tx, &ntx).unwrap();
+
+        let delivered = nrx.try_recv().expect("async channel got the notification");
+        assert!(
+            matches!(delivered, Message::Notification { ref method, .. } if method == "session.done")
+        );
+        assert!(nrx.try_recv().is_err(), "exactly once on the async channel");
+        assert!(
+            rx.try_recv().is_err(),
+            "sync (response) channel must never see a notification"
+        );
+    }
+
+    #[test]
+    fn responses_route_to_sync_channel_only() {
+        let (tx, rx, ntx, mut nrx) = channels();
+        route_message(
+            Message::Response {
+                id: 7,
+                result: Some(Value::Null),
+                error: None,
+            },
+            &tx,
+            &ntx,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            rx.try_recv().expect("sync channel got the response"),
+            Message::Response { id: 7, .. }
+        ));
+        assert!(
+            nrx.try_recv().is_err(),
+            "async (notification) channel must never see a response"
+        );
+    }
+
+    /// Eof/ReaderError fan out to BOTH: an in-flight request() must
+    /// fail fast AND the event loop must see the daemon die when no
+    /// request is pending.
+    #[test]
+    fn eof_and_reader_errors_fan_out_to_both() {
+        let (tx, rx, ntx, mut nrx) = channels();
+        route_message(Message::Eof, &tx, &ntx).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), Message::Eof));
+        assert!(matches!(nrx.try_recv().unwrap(), Message::Eof));
+
+        route_message(Message::ReaderError("boom".into()), &tx, &ntx).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), Message::ReaderError(_)));
+        assert!(matches!(nrx.try_recv().unwrap(), Message::ReaderError(_)));
+    }
+
+    /// The reader thread exits when nobody is listening: routing
+    /// errors only when ALL destinations for the message are gone.
+    #[test]
+    fn route_errors_only_when_all_receivers_dropped() {
+        let (tx, rx, ntx, nrx) = channels();
+        drop(nrx);
+        // Notification with async receiver gone → error (its only path).
+        assert!(route_message(notif("session.delta"), &tx, &ntx).is_err());
+        // Eof still deliverable via the surviving sync channel.
+        assert!(route_message(Message::Eof, &tx, &ntx).is_ok());
+        drop(rx);
+        // Now every destination is gone.
+        assert!(route_message(Message::Eof, &tx, &ntx).is_err());
+    }
 }

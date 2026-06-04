@@ -562,8 +562,6 @@ impl App {
         let mut mcp_rx = self.mcp_status_rx.take();
 
         loop {
-            // Drain any buffered notifications before render.
-            self.drain_buffered_notifications(&mut vp)?;
             self.render_viewport(&mut vp)?;
 
             tokio::select! {
@@ -840,15 +838,6 @@ impl App {
                 })?;
             }
             Message::Response { .. } => {}
-        }
-        Ok(())
-    }
-
-    /// Drain notifications that were buffered in the client during
-    /// synchronous request() calls (before the async loop started).
-    fn drain_buffered_notifications(&mut self, vp: &mut DynamicViewport) -> Result<()> {
-        while let Some(msg) = self.client.try_recv_notification() {
-            self.handle_message(vp, msg)?;
         }
         Ok(())
     }

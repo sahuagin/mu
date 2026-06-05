@@ -69,6 +69,11 @@ pub struct TuiConfig {
     /// (`~/.local/share/mu/events/`).  Default: true (on).
     /// Set to `false` in `[tui]` to disable.
     pub renderer_journal: bool,
+    /// Desktop notifications via terminal escape (OSC 99) when a turn
+    /// completes or errors while the terminal is unfocused — the
+    /// enclosing terminal (kitty/wezterm/iTerm2) raises the popup.
+    /// Default: true (on). Set to `false` in `[tui]` to disable.
+    pub notifications: bool,
 }
 
 impl Default for TuiConfig {
@@ -78,6 +83,7 @@ impl Default for TuiConfig {
             focus_mode: false,
             clipboard_command: None,
             renderer_journal: true,
+            notifications: true,
         }
     }
 }

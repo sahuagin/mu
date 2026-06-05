@@ -688,6 +688,17 @@ struct AnthropicMessageMeta {
     usage: Option<AnthropicUsage>,
 }
 
+/// Per-tier breakdown from Anthropic's `usage.cache_creation` object.
+/// Present only when the response was written into a named TTL tier
+/// (ephemeral-5m or ephemeral-1h). mu-cache-write-tier-split-umq6.
+#[derive(Debug, Deserialize, Default, Clone)]
+struct AnthropicCacheCreation {
+    #[serde(default)]
+    ephemeral_5m_input_tokens: Option<u64>,
+    #[serde(default)]
+    ephemeral_1h_input_tokens: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, Default, Clone)]
 #[allow(dead_code)]
 struct AnthropicUsage {
@@ -695,10 +706,17 @@ struct AnthropicUsage {
     input_tokens: Option<u64>,
     #[serde(default)]
     output_tokens: Option<u64>,
+    /// Flat total cache-write tokens (legacy field; always present when
+    /// any cache write occurred). The `cache_creation` breakdown object
+    /// carries the per-tier split when available.
     #[serde(default)]
     cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
     cache_read_input_tokens: Option<u64>,
+    /// Per-TTL-tier write breakdown. Present when the request used a
+    /// named TTL (ephemeral-5m / ephemeral-1h). mu-cache-write-tier-split-umq6.
+    #[serde(default)]
+    cache_creation: Option<AnthropicCacheCreation>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -828,17 +846,30 @@ impl AnthropicUsage {
         if other.cache_read_input_tokens.is_some() {
             self.cache_read_input_tokens = other.cache_read_input_tokens;
         }
+        // Merge per-tier breakdown: prefer whichever event carries it.
+        // In practice message_start carries input/cache stats; if either
+        // event surfaces the breakdown we take it. mu-cache-write-tier-split-umq6.
+        if other.cache_creation.is_some() {
+            self.cache_creation = other.cache_creation.clone();
+        }
     }
 
     fn to_usage(&self) -> Option<Usage> {
         if self.input_tokens.is_none() && self.output_tokens.is_none() {
             return None;
         }
+        let (cache_5m, cache_1h) = self
+            .cache_creation
+            .as_ref()
+            .map(|cc| (cc.ephemeral_5m_input_tokens, cc.ephemeral_1h_input_tokens))
+            .unwrap_or((None, None));
         Some(Usage {
             input_tokens: self.input_tokens.unwrap_or(0),
             output_tokens: self.output_tokens.unwrap_or(0),
             cache_read_input_tokens: self.cache_read_input_tokens,
             cache_creation_input_tokens: self.cache_creation_input_tokens,
+            cache_creation_5m_input_tokens: cache_5m,
+            cache_creation_1h_input_tokens: cache_1h,
             reasoning_tokens: None,
         })
     }

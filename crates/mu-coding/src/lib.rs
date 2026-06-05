@@ -26,6 +26,7 @@
 
 pub mod analytics;
 pub mod ask;
+pub mod console;
 pub mod serve;
 pub mod skills;
 pub mod tools;

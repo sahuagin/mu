@@ -1197,7 +1197,7 @@ fn resolve_hash_and_summary_policy(
                 pj = pj.with_timeout(Duration::from_secs(cfg.judge.timeout_secs));
             }
             tracing::info!(
-                threshold = cfg.judge.timeout_secs,
+                timeout_secs = cfg.judge.timeout_secs,
                 output_mode = %cfg.judge.output_mode,
                 "compaction: hash-and-summary policy active with live judge"
             );

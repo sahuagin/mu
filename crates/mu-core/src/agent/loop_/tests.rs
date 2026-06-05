@@ -2074,6 +2074,16 @@ async fn kgu4_evict_half_policy_does_not_fire_when_threshold_not_crossed() {
 /// resolve_compaction_policy and directly exercises the loop's compaction
 /// dispatch with the wired policy type.  The serve-path selector arm
 /// is tested separately in mu_coding::serve::handlers::session::tests.
+///
+/// Two-turn structure (mu-8bkf fix-round): HashAndSummaryPolicy.is_async()==true,
+/// so the loop SPAWNS the compact() call as a background task in turn 1 and
+/// only picks up the CompactionAssembly result at the START of turn 2 via
+/// bg_compaction.try_take().  A single-turn test can therefore never observe
+/// the event.  We drive two turns by watching for TurnEnd on the event stream
+/// and only then sending the second UserMessage, guaranteeing it arrives after
+/// the loop has gone back to blocking recv (i.e., truly a separate turn).
+/// KeepHalfJudge is pure-CPU / synchronous, so the background tokio task
+/// completes well before the loop begins turn 2.
 #[tokio::test]
 async fn mu_8bkf_hash_and_summary_policy_fires_compaction_assembly_with_correct_policy_id() {
     use crate::context::compaction::bench::KeepHalfJudge;
@@ -2083,16 +2093,24 @@ async fn mu_8bkf_hash_and_summary_policy_fires_compaction_assembly_with_correct_
     let hash_and_summary: Arc<dyn crate::context::CompactionPolicy> =
         Arc::new(HashAndSummaryPolicy::new(judge));
 
-    let inner = MockProvider::new(vec![vec![
-        ProviderEvent::TextDelta("response".into()),
-        ProviderEvent::Done(assistant_text("response")),
-    ]]);
+    // Two scripted responses: turn 1 triggers bg compaction; turn 2 picks
+    // it up and fires CompactionAssembly before calling the provider.
+    let inner = MockProvider::new(vec![
+        vec![
+            ProviderEvent::TextDelta("response one".into()),
+            ProviderEvent::Done(assistant_text("response one")),
+        ],
+        vec![
+            ProviderEvent::TextDelta("response two".into()),
+            ProviderEvent::Done(assistant_text("response two")),
+        ],
+    ]);
     let provider: Arc<dyn Provider> = Arc::new(MockProviderWithCompaction {
         inner,
-        // MockProviderWithCompaction.compaction_policy() is NOT used here;
-        // we pass the policy via compaction_policy_override instead so we can
-        // use the HashAndSummaryPolicy whose is_async() == true.  The loop
-        // must still fire CompactionAssembly via the override path.
+        // MockProviderWithCompaction.compaction_policy() drives the label
+        // returned by the loop's try_take() path (line ~1034 of loop_/mod.rs:
+        // `provider.compaction_policy().policy_label()`).  Wire the same
+        // hash_and_summary so that path also returns DEFAULT_POLICY_ID.
         policy: Arc::clone(&hash_and_summary),
     });
 
@@ -2103,30 +2121,78 @@ async fn mu_8bkf_hash_and_summary_policy_fires_compaction_assembly_with_correct_
         ..AgentConfig::default()
     };
 
-    let (loop_, events_rx) = spawn_loop_with_provider(provider, config);
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let loop_ = loop_with(
+        provider,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        vec![],
+        config,
+        events_tx,
+        approvals,
+        capability,
+    );
+
+    // Send message 1 immediately.
     loop_
         .send(AgentInput::UserMessage(user_msg(
-            "this message is long enough to guarantee at least one token and trigger compaction",
+            "first message: long enough to guarantee at least one token and trigger compaction",
         )))
         .await
-        .expect("send");
+        .expect("send first");
 
-    let events_handle = tokio::spawn(collect_events(events_rx));
-    let outcome = loop_.join().await;
-    let events = events_handle.await.expect("events drain");
+    // Spawn a task that watches the event stream for TurnEnd (turn 1
+    // complete) and then sends message 2 on the loop's input channel.
+    // This ensures message 2 arrives AFTER the loop has returned to
+    // blocking recv — guaranteeing a genuine second turn.
+    let loop_tx = loop_.sender();
+    let watcher = tokio::spawn(async move {
+        let mut rx = events_rx;
+        let mut events = Vec::new();
+        let mut loop_tx_opt = Some(loop_tx);
+        while let Some(e) = rx.recv().await {
+            if let Some(tx) = loop_tx_opt.take() {
+                if matches!(e, AgentEvent::TurnEnd) {
+                    // Turn 1 is done; send message 2, then DROP the sender
+                    // so the loop sees channel-close after processing msg 2.
+                    let _ = tx
+                        .send(AgentInput::UserMessage(user_msg(
+                            "second message: turn 2 picks up bg compaction",
+                        )))
+                        .await;
+                    // tx is dropped here — loop_tx_opt.take() consumed it.
+                } else {
+                    // TurnEnd not yet; put the sender back.
+                    loop_tx_opt = Some(tx);
+                }
+            }
+            events.push(e);
+        }
+        events
+    });
+
+    let outcome = timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("loop did not complete within 5 seconds");
+    let events = watcher.await.expect("watcher drain");
 
     assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
 
-    // HashAndSummaryPolicy.is_async() == true, so it goes through the
-    // background-spawn path and the CompactionAssembly is delivered on the
-    // NEXT turn (or on loop drain).  The single-message sequence means the
-    // loop may or may not have a next turn to flush it, depending on timing.
-    // Collect all CompactionAssembly events — we need at least zero (async
-    // path may defer) but we must not see a wrong policy_id if any fired.
+    // Turn 2 must have picked up the bg compaction result and emitted
+    // CompactionAssembly.  Collect all such events — we expect at least one.
     let compaction_events: Vec<&AgentEvent> = events
         .iter()
         .filter(|e| matches!(e, AgentEvent::CompactionAssembly { .. }))
         .collect();
+
+    assert!(
+        !compaction_events.is_empty(),
+        "expected at least one CompactionAssembly event after two turns with \
+         HashAndSummaryPolicy+threshold=1; saw zero.  Events: {:?}",
+        events.iter().map(kind).collect::<Vec<_>>(),
+    );
 
     for ev in &compaction_events {
         if let AgentEvent::CompactionAssembly { policy_id, .. } = ev {

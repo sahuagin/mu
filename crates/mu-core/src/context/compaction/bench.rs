@@ -224,11 +224,21 @@ impl Judge for KeepHalfJudge {
         if let Ok(mut p) = self.prompts.lock() {
             p.push(prompt.to_string());
         }
+        // HashAndSummaryPolicy::build_prompt emits span-header lines of the
+        // form `#N hash=<hash> kind=<kind> id=<id>` — the `hash=` token is
+        // mid-line, NOT at the start of the line.  Scan every whitespace-
+        // delimited token in every line so the parser finds hashes regardless
+        // of prefix (e.g. `#1 hash=abc12345 ...`).  Tokens must be non-empty
+        // after stripping the `hash=` prefix.  Backward-compatible with hand-
+        // crafted bench-test prompts that happen to start a line with `hash=`:
+        // those are also found by the token scan.
         let hashes: Vec<&str> = prompt
             .lines()
-            .filter_map(|l| l.strip_prefix("hash="))
-            .map(|rest| rest.split_whitespace().next().unwrap_or(""))
-            .filter(|h| !h.is_empty())
+            .flat_map(|l| {
+                l.split_whitespace()
+                    .filter_map(|t| t.strip_prefix("hash="))
+                    .filter(|h| !h.is_empty())
+            })
             .collect();
         let keep: Vec<&&str> = hashes.iter().step_by(2).collect();
         let keep_quoted: Vec<String> = keep.iter().map(|h| format!("\"{h}\"")).collect();
@@ -507,6 +517,85 @@ mod tests {
         assert!(raw.contains("\"ccc\""));
         assert!(!raw.contains("\"bbb\""));
         assert!(judge.prompts.lock().map(|p| p.len()).unwrap_or(0) == 1);
+    }
+
+    /// Regression: KeepHalfJudge must parse hashes from REAL
+    /// HashAndSummaryPolicy prompts, where `hash=` appears mid-line
+    /// as `#N hash=<hash> kind=<kind> id=<id>` (not at line start).
+    ///
+    /// Drives a full compact() round-trip: 4-span rope → KeepHalfJudge
+    /// → surgery → kept spans = 2 (even-indexed: span 0 and span 2).
+    /// Before the parser fix, keep=[] so ALL spans were absorbed into
+    /// one summary → spans_after == 1.  After the fix, spans_after == 3
+    /// (2 kept + 1 CompactionSummary for the 2 absorbed spans).
+    #[test]
+    fn keep_half_judge_parses_real_hash_and_summary_policy_prompt() {
+        use crate::agent::types::AgentMessage;
+        use crate::context::assemble_rope;
+        use crate::context::compaction::CompactionPolicy;
+
+        // Build a 4-span rope: no-tools-clause (from tool_specs=&[])
+        // + 3 user message spans = 4 spans total.
+        let messages: Vec<AgentMessage> = vec![
+            AgentMessage::User {
+                content: "first user message".into(),
+            },
+            AgentMessage::User {
+                content: "second user message".into(),
+            },
+            AgentMessage::User {
+                content: "third user message".into(),
+            },
+        ];
+        let rope = assemble_rope(None, &messages, &[]);
+        assert_eq!(rope.len(), 4, "expected 4 spans: no-tools-clause + 3 user");
+
+        let judge = Arc::new(KeepHalfJudge::new());
+        let judge_dyn: Arc<dyn crate::context::compaction::hash_summary::Judge> =
+            Arc::clone(&judge) as _;
+        let policy = HashAndSummaryPolicy::new(judge_dyn);
+
+        // compact() with target_tokens=0 (HashAndSummaryPolicy ignores
+        // target_tokens and always calls the judge).
+        let result = policy.compact(&rope, 0);
+
+        // Judge must have been called exactly once.
+        let call_count = judge.prompts.lock().map(|p| p.len()).unwrap_or(0);
+        assert_eq!(
+            call_count, 1,
+            "KeepHalfJudge must be called exactly once by compact()"
+        );
+
+        // With 4 input spans, KeepHalfJudge keeps even-indexed (0, 2) → 2 kept.
+        // The 2 absorbed spans become 1 CompactionSummary span.
+        // Result: 2 kept + 1 summary = 3 spans.
+        assert_eq!(
+            result.rope.len(),
+            3,
+            "4-span rope through KeepHalfJudge must produce 3 spans \
+             (2 kept + 1 CompactionSummary); got {} — parser likely \
+             parsed 0 hashes from a real prompt (mid-line hash= bug)",
+            result.rope.len(),
+        );
+
+        // Verify exactly 2 Kept decisions and 1 Summarized decision
+        // (covering the 2 absorbed spans).
+        use crate::context::compaction::CompactionDecision;
+        let kept_count = result
+            .decisions
+            .iter()
+            .filter(|d| matches!(d, CompactionDecision::Kept { .. }))
+            .count();
+        let summarized_count = result
+            .decisions
+            .iter()
+            .filter(|d| matches!(d, CompactionDecision::Summarized { .. }))
+            .count();
+        assert_eq!(kept_count, 2, "expected 2 Kept decisions; got {kept_count}");
+        assert_eq!(
+            summarized_count, 1,
+            "expected 1 Summarized decision for the 2 absorbed spans; got {summarized_count}"
+        );
     }
 
     #[test]

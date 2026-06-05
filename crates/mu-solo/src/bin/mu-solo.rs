@@ -8,7 +8,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use mu_solo::app::{App, AppOptions};
@@ -123,10 +126,23 @@ async fn main() -> Result<()> {
     // Enter raw mode + bracketed paste for inline rendering.
     enable_raw_mode().context("enable_raw_mode")?;
     execute!(std::io::stdout(), EnableBracketedPaste)?;
+    // mu-solo-shift-enter-62tx: opt into the Kitty Keyboard Protocol so
+    // modified Enter (Shift-Enter etc.) reaches the app as a distinct
+    // key instead of collapsing to plain CR at the terminal layer.
+    // Terminals without the feature silently ignore the push, so this
+    // is benign everywhere (mu-tui precedent: enter_terminal_mode).
+    let _ = execute!(
+        std::io::stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
 
     let run_result = app.run().await;
 
-    // Always restore the terminal, even on error.
+    // Always restore the terminal, even on error. Pop the keyboard
+    // protocol BEFORE disabling raw mode (mu-tui precedent:
+    // leave_terminal_mode); errors ignored — terminals that no-op'd
+    // the push no-op the pop too.
+    let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = disable_raw_mode();
     let _ = execute!(std::io::stdout(), crossterm::cursor::Show);

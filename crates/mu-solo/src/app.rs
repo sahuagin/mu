@@ -981,6 +981,24 @@ impl App {
             (_, KeyCode::Char('m')) if self.prompt.is_empty() && self.selected_block.is_some() => {
                 self.apply_block_action(vp, BlockAction::Maximize)?;
             }
+            // Plain Enter submits (chat-TUI convention). Any modified
+            // Enter — Shift, Alt, Ctrl, Meta — inserts a newline so
+            // multi-line prompts work regardless of which terminal-
+            // specific binding the user reaches for (mu-tui precedent,
+            // mu-solo-shift-enter-62tx). Needs the kitty-keyboard-
+            // protocol push in bin/mu-solo.rs for the modifier to
+            // survive the terminal layer; Ctrl-J below is the legacy-
+            // terminal fallback (0x0A arrives as Ctrl+'j'). This arm
+            // must precede the block-action-menu Enter arm: modified
+            // Enter ALWAYS means newline, even with a block selected.
+            (m, KeyCode::Enter) if !m.is_empty() => {
+                self.selected_block = None;
+                self.prompt.insert_char('\n');
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('j')) => {
+                self.selected_block = None;
+                self.prompt.insert_char('\n');
+            }
             (_, KeyCode::Enter) if self.prompt.is_empty() && self.selected_block.is_some() => {
                 self.emit_block_action_menu(vp)?;
             }

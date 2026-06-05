@@ -33,6 +33,17 @@ const MAX_BODY_CHARS: usize = 160;
 /// The body is sanitized: control characters (incl. ESC and BEL,
 /// which would terminate or corrupt the sequence) are replaced with
 /// spaces, and the result is capped at [`MAX_BODY_CHARS`].
+///
+/// Metadata `o=invisible`: kitty displays the notification only when
+/// the emitting window "is in an inactive tab or its OS window is
+/// not currently active" (spec) — i.e., KITTY does the focus
+/// judging. This replaced the app-side crossterm focus gate after
+/// the operator measured (mu-solo-notify-occasion-56h0) that zellij
+/// forwards no focus reporting at all (?1004 produced no ^[[I/^[[O
+/// even on pane switches), so an app-side gate is permanently stuck
+/// "focused" under a multiplexer. Resulting semantics, operator-
+/// specified: zellij pane switches stay silent (kitty window still
+/// active), kitty tab switches and app switches notify.
 pub fn notify(body: &str) {
     let clean: String = body
         .chars()
@@ -40,11 +51,10 @@ pub fn notify(body: &str) {
         .take(MAX_BODY_CHARS)
         .collect();
     let mut out = std::io::stdout();
-    // ST-terminated OSC 99 with empty metadata — the single-shot
-    // form (payload renders as the notification title). OSC
-    // sequences don't move the cursor, so emitting between ratatui
-    // frames is layout-safe.
-    let _ = write!(out, "\x1b]99;;{clean}\x1b\\");
+    // ST-terminated OSC 99; payload renders as the notification
+    // title. OSC sequences don't move the cursor, so emitting
+    // between ratatui frames is layout-safe.
+    let _ = write!(out, "\x1b]99;o=invisible;{clean}\x1b\\");
     let _ = out.flush();
 }
 

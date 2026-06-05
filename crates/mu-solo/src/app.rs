@@ -2572,13 +2572,19 @@ impl App {
                 self.phase_elapsed_ms = 0;
 
                 // mu-solo-osc-notify-mbmn: surface main-session turn
-                // boundaries as desktop notifications when the
-                // terminal is unfocused (the enclosing terminal —
-                // kitty/wezterm/iTerm2 — raises the popup via OSC 99).
-                // Sidecar (/btw) turns are background by design and
-                // stay silent; notifying the focused terminal is
-                // noise.
-                if self.notifications && !self.terminal_focused && sid == self.session_id {
+                // boundaries as desktop notifications. Sidecar (/btw)
+                // turns are background by design and stay silent.
+                // mu-solo-notify-occasion-56h0: emit UNCONDITIONALLY
+                // on focus — the OSC 99 carries o=invisible, so KITTY
+                // suppresses the popup while the window is visible
+                // and active. The previous app-side
+                // !terminal_focused gate was permanently stuck under
+                // zellij (forwards no ?1004 focus reporting at all —
+                // operator-measured), which silenced every
+                // notification. terminal_focused tracking stays for
+                // terminals that do report; it just no longer gates
+                // emission.
+                if self.notifications && sid == self.session_id {
                     if method == "session.done" {
                         crate::notify::notify(&format!(
                             "mu ({}) is waiting for your input",

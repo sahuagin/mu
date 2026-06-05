@@ -35,6 +35,10 @@ pub struct AskOptions {
     /// `--append-system-prompt <FILE>` (file content read by the
     /// binary, not here, so this layer stays I/O-free).
     pub system_prompt: Option<String>,
+    /// Hermetic session: forwarded as `--bare` to the spawned
+    /// `mu serve` — no recall injection, no discovery bootstrap.
+    /// (mu-mu-bare-flag-fxc8)
+    pub bare: bool,
 }
 
 /// Run a single `mu ask` invocation. Flags (`provider`, `model`,
@@ -59,6 +63,7 @@ pub async fn run(opts: AskOptions) -> Result<()> {
         opts.bash_yolo,
         &opts.bash_allow,
         opts.bash_prompt,
+        opts.bare,
         &bearer_token,
     )?;
     let mut stdin = child.stdin.take().context("child stdin not captured")?;
@@ -158,6 +163,7 @@ async fn authenticate(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors the CLI flag bundle 1:1
 fn spawn_serve(
     tools: &str,
     ephemeral: bool,
@@ -165,6 +171,7 @@ fn spawn_serve(
     bash_yolo: bool,
     bash_allow: &[String],
     bash_prompt: bool,
+    bare: bool,
     bearer_token: &str,
 ) -> Result<tokio::process::Child> {
     // MU_BINARY env override allows integration tests to point at a
@@ -204,6 +211,9 @@ fn spawn_serve(
     }
     if bash_prompt {
         cmd.arg("--bash-prompt");
+    }
+    if bare {
+        cmd.arg("--bare");
     }
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

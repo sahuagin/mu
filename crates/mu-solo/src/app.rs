@@ -290,6 +290,12 @@ pub struct App {
     /// `live_turn.route` and used by `/cancel` to route to the right
     /// session. None when no turn is in flight.
     streaming_route: Option<TurnRoute>,
+    /// mu-d3v6: request ids of asks fired via `request_nowait`,
+    /// awaiting their end-of-turn responses on the async channel.
+    /// Almost always 0 or 1 entries (main ask; /btw can add a second).
+    /// Used to surface RPC-level ask errors; success responses are
+    /// no-ops (session.done already drove the turn commit).
+    pending_ask_ids: std::collections::HashSet<i64>,
     /// The in-flight assistant turn as a structured model (mu-d04a).
     /// Built by `handle_notification`, rendered live in the viewport each
     /// frame, committed to scrollback on done/error. None when idle.
@@ -491,6 +497,7 @@ impl App {
             clipboard_command: clipboard_command.map(<[String]>::to_vec),
             sidecar_session_id: None,
             streaming_route: None,
+            pending_ask_ids: std::collections::HashSet::new(),
             live_turn: None,
             transcript: Transcript::new(),
             selected_block: None,
@@ -837,7 +844,31 @@ impl App {
                     ratatui::widgets::Widget::render(p, buf.area, buf);
                 })?;
             }
-            Message::Response { .. } => {}
+            Message::Response { id, error, .. } => {
+                // mu-d3v6: end-of-turn response for an ask fired via
+                // request_nowait. Success is a no-op — session.done
+                // already committed the turn. An RPC-level error means
+                // the daemon refused/aborted the ask (bad session,
+                // provider construction failure): no done will come,
+                // so surface the error and clear the streaming state
+                // the fire site set up.
+                if self.pending_ask_ids.remove(&id) {
+                    if let Some(err) = error {
+                        self.streaming_route = None;
+                        self.live_turn = None;
+                        let width = vp.area().width as usize;
+                        let wrap = width.saturating_sub(2);
+                        let lines = render::error_block(&format!("ask failed: {err}"), wrap);
+                        let h = lines.len() as u16;
+                        vp.insert_before(h, |buf| {
+                            let p = Paragraph::new(lines);
+                            ratatui::widgets::Widget::render(p, buf.area, buf);
+                        })?;
+                    }
+                }
+                // Unknown response ids: tolerate silently (defensive —
+                // structurally everything else is sync-routed).
+            }
         }
         Ok(())
     }
@@ -1328,13 +1359,20 @@ impl App {
         self.streaming_route = Some(TurnRoute::Main);
         self.live_turn = Some(Turn::new(TurnRoute::Main));
 
-        let _ = self.client.request(
+        // mu-d3v6: fire WITHOUT blocking. ask_session's response only
+        // arrives when the turn completes; waiting here parked the
+        // event loop for the whole turn (no delta rendering, and turns
+        // longer than the RPC timeout spuriously errored). The
+        // response is delivered to the select loop as a
+        // Message::Response and handled in handle_message.
+        let id = self.client.request_nowait(
             "ask_session",
             serde_json::json!({
                 "session_id": self.session_id,
                 "user_message": wire_text,
             }),
         )?;
+        self.pending_ask_ids.insert(id);
         Ok(())
     }
 
@@ -1435,13 +1473,15 @@ impl App {
         self.streaming_route = Some(route);
         self.live_turn = Some(Turn::new(route));
 
-        let _ = self.client.request(
+        // mu-d3v6: non-blocking, same as fire_ask.
+        let id = self.client.request_nowait(
             "ask_session",
             serde_json::json!({
                 "session_id": sid,
                 "user_message": msg,
             }),
         )?;
+        self.pending_ask_ids.insert(id);
         Ok(())
     }
 

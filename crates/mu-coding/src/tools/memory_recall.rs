@@ -221,6 +221,24 @@ mod tests {
         path
     }
 
+    /// mu-d3v6 drive-by: execute against a freshly written stub,
+    /// retrying on the Unix ETXTBSY fork/exec race. Parallel tests in
+    /// this binary fork (spawn_blocking → Command) while another
+    /// test's stub write-fd is briefly open; the forked child inherits
+    /// the fd and the stub's exec fails with "Text file busy". Load-
+    /// dependent — surfaced only under pre-pr-check's full-workspace
+    /// runs, twice, misattributed by cargo's rerun footer both times.
+    async fn execute_stub_retrying(tool: &MemoryRecallTool, args: Value) -> ToolResult {
+        for _ in 0..3 {
+            let result = tool.execute(args.clone(), never_cancelled()).await;
+            if !result.content.contains("Text file busy") {
+                return result;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tool.execute(args, never_cancelled()).await
+    }
+
     #[test]
     fn validate_rejects_missing_or_empty_query() {
         let tool = MemoryRecallTool::new();
@@ -243,12 +261,8 @@ echo '[0.812] [abc12345] (feedback) some-rule — desc  [2026-06-04]'
 echo '  recorded 2026-06-04 · never verified'"#,
         );
         let tool = MemoryRecallTool::with_binary(&stub);
-        let result = tool
-            .execute(
-                json!({"query": "push convention", "k": 3}),
-                never_cancelled(),
-            )
-            .await;
+        let result =
+            execute_stub_retrying(&tool, json!({"query": "push convention", "k": 3})).await;
         assert!(!result.is_error, "{}", result.content);
         assert!(
             result
@@ -270,14 +284,14 @@ echo '  recorded 2026-06-04 · never verified'"#,
         std::fs::create_dir_all(&dir).unwrap();
         let stub = stub_script(&dir, r#"echo "argv: $@""#);
         let tool = MemoryRecallTool::with_binary(&stub);
-        let result = tool
-            .execute(
-                json!({"query": "q", "k": 999, "full": true}),
-                never_cancelled(),
-            )
-            .await;
-        assert!(result.content.contains("--k 20"), "k must clamp to MAX_K");
-        assert!(result.content.contains("--full"));
+        let result =
+            execute_stub_retrying(&tool, json!({"query": "q", "k": 999, "full": true})).await;
+        assert!(
+            result.content.contains("--k 20"),
+            "k must clamp to MAX_K; got: {}",
+            result.content
+        );
+        assert!(result.content.contains("--full"), "got: {}", result.content);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

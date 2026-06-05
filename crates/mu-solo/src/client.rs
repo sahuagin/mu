@@ -1,15 +1,20 @@
 //! JSON-RPC client for `mu serve`. Spawns the daemon as a child process
 //! and communicates via stdin/stdout.
 //!
-//! Hybrid sync/async: `request()` is synchronous (called during session
-//! setup and ask firing). Notifications flow through a
+//! Hybrid sync/async: `request()` is synchronous, for short setup RPCs
+//! (auth, create_session). Long-lived RPCs whose response arrives much
+//! later (`ask_session` — end of turn) go through `request_nowait`
+//! (mu-d3v6), which delivers the response on the async channel instead
+//! of blocking. Notifications flow through a
 //! `tokio::sync::mpsc::UnboundedReceiver` so the async event loop can
 //! `select!` on them without polling.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -52,23 +57,45 @@ pub struct Client {
     /// Async notification stream for the tokio event loop — the ONLY
     /// delivery path for notifications (exactly-once by construction).
     notif_rx: Option<tokio_mpsc::UnboundedReceiver<Message>>,
+    /// mu-d3v6: request ids registered by `request_nowait` whose
+    /// responses must be routed to the ASYNC channel instead of the
+    /// sync one. Shared with the reader thread's router. Each id is
+    /// one-shot: routing a response removes it.
+    async_pending: Arc<Mutex<HashSet<i64>>>,
 }
 
 /// mu-9x4j: single routing point for everything the reader thread
 /// pulls off the daemon's stdout. Notifications go to the async
-/// channel only; responses go to the sync channel only; Eof and
-/// ReaderError fan out to BOTH (an in-flight `request()` must fail
-/// fast, and the event loop must see the daemon die even when no
-/// request is pending). Errors when both destinations are gone —
-/// the reader thread uses that as its exit signal.
+/// channel only; responses go to the sync channel only — EXCEPT
+/// responses whose id was registered via `request_nowait` (mu-d3v6),
+/// which go to the async channel so the event loop can keep rendering
+/// while a long-lived RPC (ask_session: the response lands at END of
+/// turn) is in flight. Each message still has exactly one delivery
+/// path, decided here. Eof and ReaderError fan out to BOTH (an
+/// in-flight `request()` must fail fast, and the event loop must see
+/// the daemon die even when no request is pending). Errors when both
+/// destinations are gone — the reader thread uses that as its exit
+/// signal.
 fn route_message(
     msg: Message,
     resp_tx: &mpsc::Sender<Message>,
     notif_tx: &tokio_mpsc::UnboundedSender<Message>,
+    async_pending: &Mutex<HashSet<i64>>,
 ) -> Result<(), ()> {
     match msg {
         Message::Notification { .. } => notif_tx.send(msg).map_err(|_| ()),
-        Message::Response { .. } => resp_tx.send(msg).map_err(|_| ()),
+        Message::Response { id, .. } => {
+            // One-shot: a registered id is consumed by its response.
+            let is_async = async_pending
+                .lock()
+                .map(|mut s| s.remove(&id))
+                .unwrap_or(false);
+            if is_async {
+                notif_tx.send(msg).map_err(|_| ())
+            } else {
+                resp_tx.send(msg).map_err(|_| ())
+            }
+        }
         Message::Eof | Message::ReaderError(_) => {
             let a = resp_tx.send(msg.clone()).is_ok();
             let b = notif_tx.send(msg).is_ok();
@@ -170,6 +197,8 @@ impl Client {
         // was processed twice: replayed scrollback blocks, double-
         // counted session.done usage).
         let reader_notif_tx = notif_tx.clone();
+        let async_pending = Arc::new(Mutex::new(HashSet::new()));
+        let reader_async_pending = Arc::clone(&async_pending);
         thread::Builder::new()
             .name("mu-solo-stdout".into())
             .spawn(move || {
@@ -178,7 +207,9 @@ impl Client {
                     match line {
                         Ok(raw) => match parse_message(&raw) {
                             Ok(msg) => {
-                                if route_message(msg, &tx, &reader_notif_tx).is_err() {
+                                if route_message(msg, &tx, &reader_notif_tx, &reader_async_pending)
+                                    .is_err()
+                                {
                                     return;
                                 }
                             }
@@ -187,6 +218,7 @@ impl Client {
                                     Message::ReaderError(format!("stdout parse: {e}: {raw:?}")),
                                     &tx,
                                     &reader_notif_tx,
+                                    &reader_async_pending,
                                 );
                             }
                         },
@@ -195,12 +227,13 @@ impl Client {
                                 Message::ReaderError(format!("stdout read: {e}")),
                                 &tx,
                                 &reader_notif_tx,
+                                &reader_async_pending,
                             );
                             return;
                         }
                     }
                 }
-                let _ = route_message(Message::Eof, &tx, &reader_notif_tx);
+                let _ = route_message(Message::Eof, &tx, &reader_notif_tx, &reader_async_pending);
             })
             .context("spawning stdout reader thread")?;
         let mut client = Self {
@@ -210,6 +243,7 @@ impl Client {
             next_id: AtomicI64::new(1),
             default_read_timeout: Duration::from_secs(120),
             notif_rx: Some(notif_rx),
+            async_pending,
         };
 
         // Authenticate immediately. Daemon rejects every protected RPC
@@ -291,6 +325,44 @@ impl Client {
         }
     }
 
+    /// mu-d3v6: send a JSON-RPC request WITHOUT waiting for the
+    /// response. The response will be delivered on the async
+    /// notification channel as a `Message::Response`, so the tokio
+    /// event loop keeps rendering while the RPC is in flight. Use for
+    /// `ask_session`, whose response only arrives when the whole turn
+    /// completes — waiting synchronously freezes streaming (and a
+    /// turn longer than the read timeout would spuriously error).
+    /// Returns the request id so the caller can correlate the
+    /// eventual response.
+    pub fn request_nowait(&mut self, method: &str, params: Value) -> Result<i64> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // Register BEFORE writing so the response cannot race past the
+        // router unregistered.
+        if let Ok(mut s) = self.async_pending.lock() {
+            s.insert(id);
+        }
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let line = serde_json::to_string(&req).context("serialize request")? + "\n";
+        let written = self
+            .stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| self.stdin.flush());
+        if let Err(e) = written {
+            // Nothing was (reliably) sent — unregister so a future id
+            // collision can't misroute.
+            if let Ok(mut s) = self.async_pending.lock() {
+                s.remove(&id);
+            }
+            return Err(anyhow!("write request to daemon: {e}"));
+        }
+        Ok(id)
+    }
+
     /// Take the async notification receiver. Called once during App
     /// setup to hand ownership to the tokio event loop. mu-9x4j: this
     /// is the ONLY notification delivery path — anything that arrived
@@ -348,13 +420,17 @@ mod tests {
         (tx, rx, ntx, nrx)
     }
 
+    fn no_pending() -> Mutex<HashSet<i64>> {
+        Mutex::new(HashSet::new())
+    }
+
     /// mu-9x4j: the incident invariant. A notification reaches the
     /// async channel EXACTLY once and the sync channel NEVER — the
     /// double-processing bug was a notification landing on both.
     #[test]
     fn notifications_route_to_async_channel_only() {
         let (tx, rx, ntx, mut nrx) = channels();
-        route_message(notif("session.done"), &tx, &ntx).unwrap();
+        route_message(notif("session.done"), &tx, &ntx, &no_pending()).unwrap();
 
         let delivered = nrx.try_recv().expect("async channel got the notification");
         assert!(
@@ -378,6 +454,7 @@ mod tests {
             },
             &tx,
             &ntx,
+            &no_pending(),
         )
         .unwrap();
 
@@ -391,17 +468,86 @@ mod tests {
         );
     }
 
+    /// mu-d3v6: a response whose id was registered via
+    /// `request_nowait` routes to the ASYNC channel exactly once and
+    /// never to the sync channel — the event loop owns it.
+    #[test]
+    fn nowait_responses_route_to_async_channel_only() {
+        let (tx, rx, ntx, mut nrx) = channels();
+        let pending = Mutex::new(HashSet::from([9i64]));
+        route_message(
+            Message::Response {
+                id: 9,
+                result: Some(Value::Null),
+                error: None,
+            },
+            &tx,
+            &ntx,
+            &pending,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            nrx.try_recv()
+                .expect("async channel got the nowait response"),
+            Message::Response { id: 9, .. }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "sync channel must never see a nowait response"
+        );
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "registration is one-shot — consumed by routing"
+        );
+    }
+
+    /// mu-d3v6: registration is per-id. An unregistered response in
+    /// the presence of OTHER registered ids still routes sync.
+    #[test]
+    fn unregistered_responses_still_route_sync() {
+        let (tx, rx, ntx, mut nrx) = channels();
+        let pending = Mutex::new(HashSet::from([9i64]));
+        route_message(
+            Message::Response {
+                id: 10,
+                result: Some(Value::Null),
+                error: None,
+            },
+            &tx,
+            &ntx,
+            &pending,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            rx.try_recv().expect("sync channel got the response"),
+            Message::Response { id: 10, .. }
+        ));
+        assert!(nrx.try_recv().is_err());
+        assert!(
+            pending.lock().unwrap().contains(&9),
+            "unrelated registration untouched"
+        );
+    }
+
     /// Eof/ReaderError fan out to BOTH: an in-flight request() must
     /// fail fast AND the event loop must see the daemon die when no
     /// request is pending.
     #[test]
     fn eof_and_reader_errors_fan_out_to_both() {
         let (tx, rx, ntx, mut nrx) = channels();
-        route_message(Message::Eof, &tx, &ntx).unwrap();
+        route_message(Message::Eof, &tx, &ntx, &no_pending()).unwrap();
         assert!(matches!(rx.try_recv().unwrap(), Message::Eof));
         assert!(matches!(nrx.try_recv().unwrap(), Message::Eof));
 
-        route_message(Message::ReaderError("boom".into()), &tx, &ntx).unwrap();
+        route_message(
+            Message::ReaderError("boom".into()),
+            &tx,
+            &ntx,
+            &no_pending(),
+        )
+        .unwrap();
         assert!(matches!(rx.try_recv().unwrap(), Message::ReaderError(_)));
         assert!(matches!(nrx.try_recv().unwrap(), Message::ReaderError(_)));
     }
@@ -413,11 +559,11 @@ mod tests {
         let (tx, rx, ntx, nrx) = channels();
         drop(nrx);
         // Notification with async receiver gone → error (its only path).
-        assert!(route_message(notif("session.delta"), &tx, &ntx).is_err());
+        assert!(route_message(notif("session.delta"), &tx, &ntx, &no_pending()).is_err());
         // Eof still deliverable via the surviving sync channel.
-        assert!(route_message(Message::Eof, &tx, &ntx).is_ok());
+        assert!(route_message(Message::Eof, &tx, &ntx, &no_pending()).is_ok());
         drop(rx);
         // Now every destination is gone.
-        assert!(route_message(Message::Eof, &tx, &ntx).is_err());
+        assert!(route_message(Message::Eof, &tx, &ntx, &no_pending()).is_err());
     }
 }

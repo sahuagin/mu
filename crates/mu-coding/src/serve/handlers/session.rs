@@ -1132,16 +1132,19 @@ fn resolve_compaction_policy(
 /// [`build_and_register_session`] uses — so there is no parallel provider-
 /// construction surface.
 ///
-/// ## Empty ranking / all-unavailable
+/// ## Empty ranking vs all-unavailable
 ///
-/// When `ranking` is empty OR every entry fails to construct, fall back to
-/// the bench canned judge ([`mu_core::context::compaction::bench::KeepHalfJudge`]).
-/// This satisfies the documented contract in `CompactionJudgeConfig`: "falls
-/// back to its hard-coded canned judge (mu-kgu.3 behavior)" and means
-/// `hash-and-summary` works out-of-the-box with no model spend.
+/// EMPTY `ranking` is the deliberate zero-config path: fall back to the
+/// canned judge ([`mu_core::context::compaction::bench::KeepHalfJudge`]),
+/// per the documented contract in `CompactionJudgeConfig` ("falls back to
+/// its hard-coded canned judge (mu-kgu.3 behavior)") — `hash-and-summary`
+/// works out-of-the-box with no model spend.
 ///
-/// The canned judge fallback is always constructible (pure in-process struct),
-/// so this function never fails and never falls back further to heuristic.
+/// A NON-EMPTY ranking where every entry fails to construct is
+/// configured-intent-failed: warn and degrade to the heuristic
+/// span-family drop policy instead (the smarter no-model policy), never
+/// a silent no-op. This function never fails — every path yields a
+/// working policy.
 fn resolve_hash_and_summary_policy(
     cfg: &mu_core::config::CompactionConfig,
 ) -> Arc<dyn mu_core::context::compaction::CompactionPolicy> {
@@ -1204,10 +1207,14 @@ fn resolve_hash_and_summary_policy(
             HashAndSummaryPolicy::new(Arc::new(pj)).with_output_mode(output_mode)
         }
         None => {
-            // No provider available — fall back to the bench canned judge
-            // (KeepHalfJudge: deterministic, no-network, keeps every other span).
-            // This satisfies the config contract "falls back to canned judge
-            // (mu-kgu.3 behavior)" when ranking is empty or all unavailable.
+            // No provider available. Two distinct cases (mu-8bkf judge
+            // round): EMPTY ranking is the deliberate zero-config path —
+            // the config contract says fall back to the canned judge
+            // (KeepHalfJudge: deterministic, no-network, keeps every
+            // other span; mu-kgu.3 behavior). A NON-EMPTY ranking that
+            // produced no judge is configured-intent-failed — degrade to
+            // the heuristic span-family drop (the smarter no-model
+            // policy), not the bench mock, and say so loudly.
             let ranking_count = cfg.judge.ranking.len();
             if ranking_count == 0 {
                 tracing::info!(
@@ -1215,15 +1222,18 @@ fn resolve_hash_and_summary_policy(
                     "compaction: hash-and-summary active with canned judge (no ranking \
                      configured; zero model spend)"
                 );
-            } else {
-                tracing::warn!(
-                    ranking_count,
-                    output_mode = %cfg.judge.output_mode,
-                    "compaction: all judge ranking entries unavailable; \
-                     hash-and-summary falling back to canned judge (zero model spend)"
+                return Arc::new(
+                    HashAndSummaryPolicy::new(Arc::new(KeepHalfJudge::new()))
+                        .with_output_mode(output_mode),
                 );
             }
-            HashAndSummaryPolicy::new(Arc::new(KeepHalfJudge::new())).with_output_mode(output_mode)
+            tracing::warn!(
+                ranking_count,
+                "compaction: all judge ranking entries unavailable; falling back to \
+                 heuristic span-family drop (configure a constructible \
+                 [compaction.judge] ranking entry to enable the judge)"
+            );
+            return Arc::new(mu_core::context::compaction::heuristic::SpanFamilyDropPolicy::new());
         }
     };
 
@@ -1314,6 +1324,50 @@ mod tests {
         assert!(resolve_compaction_policy(&cfg("none")).is_none());
         assert!(resolve_compaction_policy(&cfg("")).is_none());
         assert!(resolve_compaction_policy(&cfg("bogus")).is_none());
+    }
+
+    // mu-8bkf judge round: a NON-EMPTY ranking where no entry is
+    // constructible is configured-intent-failed and must degrade to the
+    // heuristic span-family drop — not the canned bench judge, which is
+    // reserved for the deliberate zero-config (empty-ranking) path.
+    #[test]
+    fn all_unavailable_ranking_falls_back_to_heuristic_not_canned() {
+        use mu_core::config::{CompactionConfig, CompactionJudgeConfig, JudgeRankingEntry};
+        use mu_core::context::compaction::hash_summary::DEFAULT_POLICY_ID;
+
+        let cfg = CompactionConfig {
+            default_policy: "hash-and-summary".to_string(),
+            trigger_threshold_tokens: 150_000,
+            judge: CompactionJudgeConfig {
+                ranking: vec![JudgeRankingEntry {
+                    provider: "not-a-real-provider".to_string(),
+                    model: "irrelevant".to_string(),
+                    auth: "api_key".to_string(),
+                }],
+                ..Default::default()
+            },
+        };
+        let policy = resolve_compaction_policy(&cfg)
+            .expect("hash-and-summary with failed ranking must still resolve to Some");
+        assert_eq!(
+            policy.policy_label(),
+            "span-family-drop",
+            "configured-but-unconstructible ranking must degrade to heuristic"
+        );
+
+        // Contrast: the deliberate empty-ranking path stays hash-and-summary.
+        let zero_config = CompactionConfig {
+            default_policy: "hash-and-summary".to_string(),
+            trigger_threshold_tokens: 150_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_compaction_policy(&zero_config)
+                .unwrap()
+                .policy_label(),
+            DEFAULT_POLICY_ID,
+            "empty ranking keeps the canned-judge hash-and-summary path"
+        );
     }
 
     // mu-8bkf: ranking_entry_to_selector maps known provider strings

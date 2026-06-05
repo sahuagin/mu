@@ -58,8 +58,24 @@ impl ModelPricing {
         let inp = usage.input_tokens as f64;
         let out = usage.output_tokens as f64;
 
-        // Cache-write cost: use tier-specific multipliers when the split
-        // is present; fall back to the flat total at 1.25× otherwise.
+        // Cache-write cost: use tier-specific multipliers when BOTH tier
+        // fields are present; fall back to the flat total at 1.25× otherwise.
+        //
+        // Why partial Some/None is safe to treat as flat-fallback:
+        // `AnthropicCacheCreation.ephemeral_5m_input_tokens` and
+        // `ephemeral_1h_input_tokens` are both `Option<u64>` with
+        // `#[serde(default)]`, so a missing key deserialises to `None` (not
+        // 0).  In practice the Anthropic API sends either the entire
+        // `cache_creation` object (with both tier keys populated) or omits the
+        // object entirely, so partial pairs should not appear from a live API
+        // response.  However, because the field type is `Option<u64>` rather
+        // than `u64`, a partial pair is theoretically reachable (wire sends
+        // only one tier key, or a hand-constructed / legacy value supplies only
+        // one field).  We treat it conservatively: without a complete split we
+        // cannot price the 1h tier at 2.0× without risk of undercharging on
+        // whatever tokens ended up in the 1h tier, so we fall back to the flat
+        // total at the safe 1.25× rate.  This is a deliberate undercharge-safe
+        // choice, not an assertion of structural unreachability.
         let cw_cost = match (
             usage.cache_creation_5m_input_tokens,
             usage.cache_creation_1h_input_tokens,
@@ -272,6 +288,36 @@ mod tests {
         assert!(
             (cost - expected).abs() < 1e-9,
             "partial breakdown should fall back to flat: cost {cost} ≠ {expected}"
+        );
+    }
+
+    /// Mirror partial case: (None, Some(1h)) — only the 1h tier field is
+    /// present. This can arise from a hand-constructed value or a hypothetical
+    /// future API variant that emits only the 1h key. Without a complete split
+    /// we cannot safely apply the 2.0× rate (risk of undercharging flat tokens
+    /// at 1.25× if they were in the 1h tier), so we fall back to the flat
+    /// total at 1.25×. The scenario is an undercharge (~37.5% undercount for
+    /// a pure-1h session) but it is safe-conservative and avoids overcharging
+    /// the caller. mu-cache-write-tier-split-umq6.
+    #[test]
+    fn umq6_partial_tier_none_some_1h_falls_back_to_flat() {
+        let pricing = for_model("anthropic_api", "claude-opus-4-7").unwrap();
+        let in_rate = pricing.input_per_mtok;
+        let usage_only_1h = Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: Some(1_000_000),
+            cache_creation_5m_input_tokens: None, // absent
+            cache_creation_1h_input_tokens: Some(800_000), // present but incomplete split
+            reasoning_tokens: None,
+        };
+        let cost = pricing.cost(&usage_only_1h);
+        // Expected: flat total 1M × $5 × 1.25 / 1M = $6.25  (NOT 2.0×)
+        let expected = 1_000_000_f64 * in_rate * 1.25 / 1_000_000.0;
+        assert!(
+            (cost - expected).abs() < 1e-9,
+            "(None, Some(1h)) should fall back to flat 1.25×: cost {cost} ≠ {expected}"
         );
     }
 }

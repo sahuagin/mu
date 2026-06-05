@@ -1394,6 +1394,62 @@ mod tests {
         }
     }
 
+    /// Done with per-tier cache write tokens → TaskTelemetry carries
+    /// cache_write_5m_tokens / cache_write_1h_tokens. Exercises the
+    /// Some-path through `task_telemetry_for` that the None-only fixtures
+    /// above leave untested. mu-cache-write-tier-split-umq6.
+    #[test]
+    fn mu_umq6_telemetry_done_carries_per_tier_cache_write_tokens() {
+        use mu_core::agent::{StopReason, Usage};
+        use mu_core::event_log::TaskExitReason;
+
+        let event = AgentEvent::Done {
+            stop_reason: StopReason::EndTurn,
+            turn_count: 1,
+            usage: Some(Usage {
+                input_tokens: 1_000,
+                output_tokens: 50,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: Some(300),
+                cache_creation_5m_input_tokens: Some(100),
+                cache_creation_1h_input_tokens: Some(200),
+                reasoning_tokens: None,
+            }),
+            elapsed_ms: Some(500),
+        };
+        let payload = task_telemetry_for(
+            "session-tier",
+            &event,
+            Some(("anthropic_api".to_owned(), "claude-sonnet-4-6".to_owned())),
+        )
+        .expect("Done should yield TaskTelemetry");
+
+        match payload {
+            EventPayload::TaskTelemetry {
+                exit_reason,
+                cache_write_5m_tokens,
+                cache_write_1h_tokens,
+                cache_write_tokens,
+                ..
+            } => {
+                assert_eq!(exit_reason, TaskExitReason::Done);
+                assert_eq!(
+                    cache_write_5m_tokens,
+                    Some(100),
+                    "cache_write_5m_tokens should be Some(100)"
+                );
+                assert_eq!(
+                    cache_write_1h_tokens,
+                    Some(200),
+                    "cache_write_1h_tokens should be Some(200)"
+                );
+                // Flat total still threaded through (legacy field).
+                assert_eq!(cache_write_tokens, Some(300));
+            }
+            other => panic!("expected TaskTelemetry, got {other:?}"),
+        }
+    }
+
     /// Non-terminal events return None — no spurious telemetry emission.
     #[test]
     fn mu_5g7i_telemetry_skips_non_terminal_events() {

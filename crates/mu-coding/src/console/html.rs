@@ -71,6 +71,10 @@ pub(crate) fn td(s: &str) -> String {
     format!("<td>{}</td>", esc(s))
 }
 
+pub(crate) fn td_time(v: Option<u64>) -> String {
+    format!("<td>{}</td>", fmt_unix_ms(v))
+}
+
 pub(crate) fn td_code(s: &str) -> String {
     format!("<td><code>{}</code></td>", esc(s))
 }
@@ -117,15 +121,46 @@ pub(crate) fn fmt_opt_u32(v: Option<u32>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "—".into())
 }
 
-pub(crate) fn fmt_ms(v: Option<u64>) -> String {
-    fmt_unix_ms(v)
+pub(crate) fn fmt_unix_ms(v: Option<u64>) -> String {
+    v.map(time_tag).unwrap_or_else(|| "—".into())
 }
 
-pub(crate) fn fmt_unix_ms(v: Option<u64>) -> String {
-    let Some(ms) = v else {
-        return "—".into();
-    };
-    format!("{}.{:03}s", ms / 1000, ms % 1000)
+pub(crate) fn time_tag(ms: u64) -> String {
+    format!(
+        "<time datetime=\"{}\" data-epoch-ms=\"{}\">{}.{:03}s</time>",
+        esc_attr(&epoch_ms_to_iso_utc(ms)),
+        ms,
+        ms / 1000,
+        ms % 1000
+    )
+}
+
+fn epoch_ms_to_iso_utc(ms: u64) -> String {
+    let secs = (ms / 1000) as i64;
+    let millis = ms % 1000;
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = sod / 3600;
+    let minute = (sod % 3600) / 60;
+    let second = sod % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+fn civil_from_days(days_since_unix_epoch: i64) -> (i64, u32, u32) {
+    // Howard Hinnant's civil-from-days algorithm. Keeps mu-console dependency-free;
+    // the browser localizes the resulting RFC3339-ish timestamp for display.
+    let z = days_since_unix_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    (year, m as u32, d as u32)
 }
 
 pub(crate) fn truncated_details(label: &str, text: &str, max: usize) -> String {
@@ -191,6 +226,36 @@ function setTranscriptBodyScroll(enabled) {
       el.classList.remove('scrollbox');
     }
   });
+}
+function localizeTimes() {
+  const times = Array.from(document.querySelectorAll('time[data-epoch-ms]'));
+  if (times.length === 0) return;
+  const first = Number(times[0].dataset.epochMs);
+  times.forEach(el => {
+    const ms = Number(el.dataset.epochMs);
+    if (!Number.isFinite(ms)) return;
+    const date = new Date(ms);
+    const elapsed = ms >= first ? '+' + formatElapsed(ms - first) : '';
+    const absolute = date.toLocaleString(undefined, {
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      fractionalSecondDigits: 3,
+      hour12: false,
+    });
+    el.textContent = elapsed ? absolute + ' · ' + elapsed : absolute;
+    el.title = date.toISOString();
+  });
+}
+function formatElapsed(deltaMs) {
+  const ms = deltaMs % 1000;
+  let seconds = Math.floor(deltaMs / 1000);
+  const hours = Math.floor(seconds / 3600);
+  seconds -= hours * 3600;
+  const minutes = Math.floor(seconds / 60);
+  seconds -= minutes * 60;
+  if (hours > 0) return hours + 'h ' + minutes + 'm ' + seconds + '.' + String(ms).padStart(3, '0') + 's';
+  if (minutes > 0) return minutes + 'm ' + seconds + '.' + String(ms).padStart(3, '0') + 's';
+  return seconds + '.' + String(ms).padStart(3, '0') + 's';
 }
 "#;
 

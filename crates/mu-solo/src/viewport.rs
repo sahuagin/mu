@@ -46,6 +46,13 @@ struct HistoryLine {
     cells: Vec<(String, Color, Color, Modifier)>,
 }
 
+/// Cap on retained `history` lines — `insert_before` drains the oldest
+/// entries past this. `pub(crate)` so the finalize-mismatch check in
+/// `app.rs` can compute the drain-aware expected length
+/// `min(before + h, MAX_HISTORY)` instead of false-alarming whenever a
+/// drain fires (8hva judge finding).
+pub(crate) const MAX_HISTORY: usize = 1000;
+
 /// A minimal terminal that manages a dynamically-sized inline viewport.
 /// Content above the viewport lives in native terminal scrollback.
 pub struct DynamicViewport {
@@ -405,14 +412,7 @@ impl DynamicViewport {
         let vp_top = self.viewport.y as usize;
         self.scrollback_committed = self.history.len().saturating_sub(vp_top);
 
-        // Emit one journal line per commit (cheap append, never to the
-        // semantic event store).
-        let offset_start = self.history.len().saturating_sub(height as usize);
-        let offset_end = self.history.len();
-        self.journal_commit(offset_start, offset_end, height, "insert_before");
-
-        // Cap history to prevent unbounded growth (keep last 1000 lines)
-        const MAX_HISTORY: usize = 1000;
+        // Cap history to prevent unbounded growth (keep last MAX_HISTORY lines)
         if self.history.len() > MAX_HISTORY {
             let drain = self.history.len() - MAX_HISTORY;
             // Adjust scrollback_committed for the drain so the
@@ -420,6 +420,15 @@ impl DynamicViewport {
             self.scrollback_committed = self.scrollback_committed.saturating_sub(drain);
             self.history.drain(0..drain);
         }
+
+        // Emit one journal line per commit (cheap append, never to the
+        // semantic event store). AFTER the drain on purpose: the logged
+        // offsets index into `self.history`, and pre-drain values would
+        // leave the journal stale exactly when a drain fires (8hva
+        // verifier finding).
+        let offset_start = self.history.len().saturating_sub(height as usize);
+        let offset_end = self.history.len();
+        self.journal_commit(offset_start, offset_end, height, "insert_before");
 
         Ok(())
     }

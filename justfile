@@ -111,6 +111,20 @@ solo *args:
             --mu-binary ./target/release/mu \
             {{args}}
 
+# Same as `just solo`, but the debugrelease profile (release speed +
+# debug info/assertions) for chasing timing-sensitive rendering bugs
+# at full speed. See [profile.debugrelease] in Cargo.toml.
+solo-debugrelease *args:
+    cargo build --profile debugrelease --bin mu --bin mu-solo
+    ANTHROPIC_API_KEY=$(tq -f ~/.config/agent/config.toml -r anthropic.api_key 2>/dev/null || true) \
+    OPENROUTER_API_KEY=$(tq -f ~/.config/agent/config.toml -r openrouter.api_key 2>/dev/null || true) \
+        ./target/debugrelease/mu-solo \
+            --provider {{provider}} \
+            --model {{model}} \
+            --bash-yolo \
+            --mu-binary ./target/debugrelease/mu \
+            {{args}}
+
 # ── PR flow (jj-aware) ────────────────────────────────────────────────────
 
 # scripts/gh-wrapper auto-runs pre-pr-check.sh at `gh pr create`, so don't

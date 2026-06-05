@@ -2620,11 +2620,15 @@ impl App {
                             let p = Paragraph::new(lines);
                             ratatui::widgets::Widget::render(p, buf.area, buf);
                         })?;
-                        // Post-insert mismatch check: the render should
-                        // have added exactly h lines to history.
+                        // Post-insert mismatch check: history should have
+                        // grown to exactly min(before + h, MAX_HISTORY) —
+                        // the cap-aware form, so a MAX_HISTORY drain does
+                        // not false-alarm (8hva judge finding).
                         let history_after = vp.history_len();
-                        let actually_committed = history_after.saturating_sub(history_before);
-                        if actually_committed != h as usize {
+                        let expected_after =
+                            (history_before + h as usize).min(crate::viewport::MAX_HISTORY);
+                        if history_after != expected_after {
+                            let actually_committed = history_after.saturating_sub(history_before);
                             vp.journal_finalize_mismatch(actually_committed, committed_text_len);
                         }
                     }

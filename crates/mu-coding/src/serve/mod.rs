@@ -150,7 +150,16 @@ pub fn resolve_events_dir(config: &mu_core::config::Config) -> Option<PathBuf> {
 /// child): the parent generates a token, exports it to the child, and
 /// presents the same token in `peer.auth_initiate`. The env override
 /// is intentionally one-shot and not persisted to disk.
-pub async fn run(factory: ProviderFactory, tools: Vec<Arc<dyn Tool>>) -> anyhow::Result<()> {
+///
+/// mu-mu-bare-flag-fxc8: `bare = true` (the `--bare` CLI flag) forces a
+/// hermetic daemon regardless of config file or env: recall providers
+/// off AND the discovery bootstrap suppressed, by rewriting the loaded
+/// `[recall]` section before anything downstream reads it.
+pub async fn run(
+    factory: ProviderFactory,
+    tools: Vec<Arc<dyn Tool>>,
+    bare: bool,
+) -> anyhow::Result<()> {
     let mut config = mu_core::config::Config::load_default();
     if let Ok(token) = std::env::var("MU_BEARER_TOKEN") {
         if !token.is_empty() {
@@ -158,6 +167,10 @@ pub async fn run(factory: ProviderFactory, tools: Vec<Arc<dyn Tool>>) -> anyhow:
                 tokens: vec![token],
             };
         }
+    }
+    if bare {
+        config.recall.enabled = false;
+        config.recall.bare = true;
     }
     let events_dir = resolve_events_dir(&config);
     let stdin = BufReader::new(tokio::io::stdin());

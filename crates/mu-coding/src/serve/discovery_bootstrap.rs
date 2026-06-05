@@ -57,14 +57,26 @@ first. Don't guess, and don't ask prematurely.";
 /// Pure (takes `recall_enabled` as an argument rather than reading the
 /// `MU_NO_RECALL` env itself) so it is unit-testable without touching process
 /// env — the caller passes `daemon_info.config().recall_enabled()`.
-pub fn compose_system_prompt(operator: Option<String>, recall_enabled: bool) -> Option<String> {
-    match (operator, recall_enabled) {
-        // Operator set an explicit prompt (either recall state) → respect it.
-        (Some(p), _) => Some(p),
+///
+/// mu-mu-bare-flag-fxc8: `bare` trumps the recall-off bootstrap. A bare
+/// session (`--bare` / `[recall].bare = true`) is hermetic by contract:
+/// no recall injection AND no injected default of any kind — with no
+/// operator prompt it gets NO system prompt. Operator prompts are still
+/// respected (bare controls what mu adds, not what the operator says).
+pub fn compose_system_prompt(
+    operator: Option<String>,
+    recall_enabled: bool,
+    bare: bool,
+) -> Option<String> {
+    match (operator, recall_enabled, bare) {
+        // Operator set an explicit prompt (any state) → respect it.
+        (Some(p), _, _) => Some(p),
+        // Bare, no operator prompt → truly nothing.
+        (None, _, true) => None,
         // Recall on, no operator prompt → no system prompt (pre-mu-k011).
-        (None, true) => None,
-        // Recall off, no operator prompt → the discovery bootstrap default.
-        (None, false) => Some(DISCOVERY_BOOTSTRAP.to_owned()),
+        (None, true, false) => None,
+        // Recall off (non-bare), no operator prompt → discovery bootstrap.
+        (None, false, false) => Some(DISCOVERY_BOOTSTRAP.to_owned()),
     }
 }
 
@@ -74,13 +86,13 @@ mod tests {
 
     #[test]
     fn recall_on_no_operator_prompt_injects_nothing() {
-        assert_eq!(compose_system_prompt(None, true), None);
+        assert_eq!(compose_system_prompt(None, true, false), None);
     }
 
     #[test]
     fn recall_off_no_operator_prompt_injects_bootstrap() {
         assert_eq!(
-            compose_system_prompt(None, false),
+            compose_system_prompt(None, false, false),
             Some(DISCOVERY_BOOTSTRAP.to_owned())
         );
     }
@@ -91,11 +103,30 @@ mod tests {
         // appended to, in either recall state.
         let custom = "you are a focused code reviewer".to_owned();
         assert_eq!(
-            compose_system_prompt(Some(custom.clone()), true),
+            compose_system_prompt(Some(custom.clone()), true, false),
             Some(custom.clone())
         );
         assert_eq!(
-            compose_system_prompt(Some(custom.clone()), false),
+            compose_system_prompt(Some(custom.clone()), false, false),
+            Some(custom)
+        );
+    }
+
+    /// mu-mu-bare-flag-fxc8: bare = hermetic. No bootstrap even though
+    /// recall is off; no system prompt at all without an operator one.
+    #[test]
+    fn bare_no_operator_prompt_injects_nothing_at_all() {
+        assert_eq!(compose_system_prompt(None, false, true), None);
+        // Defensive: bare with recall nominally on (shouldn't occur — the
+        // CLI forces recall off) still injects nothing.
+        assert_eq!(compose_system_prompt(None, true, true), None);
+    }
+
+    #[test]
+    fn bare_respects_operator_prompt() {
+        let custom = "you are a hermetic review gate".to_owned();
+        assert_eq!(
+            compose_system_prompt(Some(custom.clone()), false, true),
             Some(custom)
         );
     }

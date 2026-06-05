@@ -153,6 +153,15 @@ pub struct McpServerConfig {
 pub struct RecallConfig {
     /// Run the session-start recall providers. `false` => no front-load.
     pub enabled: bool,
+    /// mu-mu-bare-flag-fxc8: hermetic-session mode. `bare = true` goes
+    /// one step beyond `enabled = false`: recall is off AND the
+    /// discovery bootstrap is suppressed, so a session with no operator
+    /// system prompt gets NO system prompt at all. For gate scripts,
+    /// benches, and delegated workers that must not inherit operator
+    /// identity or any injected default. Set via `mu ask/serve --bare`
+    /// (which also forces `enabled = false`); settable in config for
+    /// completeness.
+    pub bare: bool,
     /// mu-zk2i: which memory-injection tier the agent-memory provider
     /// requests (`agent memory context --tier <this>`). `"identity"`
     /// (default) injects the small kernel — user-first identity rows +
@@ -167,6 +176,7 @@ impl Default for RecallConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            bare: false,
             tier: "identity".to_string(),
         }
     }

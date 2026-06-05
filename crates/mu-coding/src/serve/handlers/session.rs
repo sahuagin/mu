@@ -321,8 +321,14 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     // Conservative: applies only when the operator supplied no system prompt
     // of their own — see compose_system_prompt for the design rationale.
     let recall_enabled = daemon_info.config().recall_enabled();
-    let effective_system_prompt =
-        super::super::discovery_bootstrap::compose_system_prompt(system_prompt, recall_enabled);
+    // mu-mu-bare-flag-fxc8: bare sessions suppress the bootstrap too —
+    // hermetic means mu injects nothing the operator didn't supply.
+    let bare = daemon_info.config().recall.bare;
+    let effective_system_prompt = super::super::discovery_bootstrap::compose_system_prompt(
+        system_prompt,
+        recall_enabled,
+        bare,
+    );
     let agent = AgentLoop::spawn(SpawnArgs {
         provider,
         provider_kind: kind_arc,

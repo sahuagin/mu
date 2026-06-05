@@ -57,6 +57,14 @@ enum Command {
         /// command. Ignored when --bash-yolo is set.
         #[arg(long)]
         bash_prompt: bool,
+        /// Hermetic daemon: disable session-start recall injection
+        /// (memory + project files) AND the discovery bootstrap, so
+        /// sessions get no system content mu added on its own. For
+        /// gate scripts, benches, and delegated workers. Supersedes
+        /// the MU_NO_RECALL env var (which disables recall only).
+        /// (mu-mu-bare-flag-fxc8)
+        #[arg(long)]
+        bare: bool,
     },
     /// One-shot ask — spawn the daemon, single roundtrip, exit.
     Ask {
@@ -95,6 +103,12 @@ enum Command {
         /// changing flags. Errors if FILE cannot be read (mu-x83o).
         #[arg(long = "append-system-prompt", value_name = "FILE")]
         append_system_prompt: Option<std::path::PathBuf>,
+        /// Hermetic session: forwarded as `--bare` to the spawned
+        /// `mu serve` — no recall injection, no discovery bootstrap;
+        /// the session's system prompt is exactly what (if anything)
+        /// --append-system-prompt supplies. (mu-mu-bare-flag-fxc8)
+        #[arg(long)]
+        bare: bool,
     },
     /// Interactive terminal UI. Delegates to the `mu-tui` binary
     /// (resolved next to the `mu` binary, falling back to `$PATH`).
@@ -262,6 +276,7 @@ async fn main() -> Result<()> {
             bash_yolo,
             bash_allow,
             bash_prompt,
+            bare,
         } => {
             let factory = mu_coding::serve::make_provider_factory(ephemeral, thinking);
             let tool_names = mu_coding::serve::parse_tools_csv(&tools);
@@ -272,7 +287,7 @@ async fn main() -> Result<()> {
             };
             let tool_vec = mu_coding::serve::build_tools(&tool_names, &bash_settings)?;
 
-            mu_coding::serve::run(factory, tool_vec).await
+            mu_coding::serve::run(factory, tool_vec, bare).await
         }
         Command::Ask {
             prompt,
@@ -285,6 +300,7 @@ async fn main() -> Result<()> {
             bash_allow,
             bash_prompt,
             append_system_prompt,
+            bare,
         } => {
             let system_prompt = match append_system_prompt {
                 Some(path) => Some(std::fs::read_to_string(&path).with_context(|| {
@@ -303,6 +319,7 @@ async fn main() -> Result<()> {
                 bash_allow,
                 bash_prompt,
                 system_prompt,
+                bare,
             })
             .await
         }

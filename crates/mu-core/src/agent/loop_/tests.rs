@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
+use futures::StreamExt as _;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
@@ -49,6 +50,11 @@ fn loop_with(
 
 enum MockResponse {
     Events(Vec<ProviderEvent>),
+    /// Events released only after the paired gate fires. Lets a test
+    /// hold a stream open while it injects input (which lands in
+    /// handle_invoke_llm's `buffered`), then complete the stream
+    /// deterministically (mu-wf5w).
+    GatedEvents(Vec<ProviderEvent>, oneshot::Receiver<()>),
     /// Stream that never produces events. Used to simulate a long-
     /// running provider call for cancel and queue-ordering tests.
     Pending,
@@ -71,6 +77,27 @@ impl MockProvider {
         Self {
             responses: Mutex::new(q),
         }
+    }
+
+    /// First response is gated on the returned sender; subsequent
+    /// responses stream immediately. Used to hold an ask's final
+    /// stream open while the test races a follow-up input in (mu-wf5w).
+    fn gated_first(
+        first: Vec<ProviderEvent>,
+        rest: Vec<Vec<ProviderEvent>>,
+    ) -> (Self, oneshot::Sender<()>) {
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let mut q = VecDeque::new();
+        q.push_back(MockResponse::GatedEvents(first, gate_rx));
+        for events in rest {
+            q.push_back(MockResponse::Events(events));
+        }
+        (
+            Self {
+                responses: Mutex::new(q),
+            },
+            gate_tx,
+        )
     }
 
     /// MockProvider that returns the same response repeatedly. Used
@@ -99,6 +126,13 @@ impl Provider for MockProvider {
         let chunk = self.responses.lock().expect("mutex poisoned").pop_front();
         match chunk {
             Some(MockResponse::Events(events)) => Ok(Box::pin(stream::iter(events))),
+            Some(MockResponse::GatedEvents(events, gate)) => Ok(Box::pin(
+                stream::once(async move {
+                    let _ = gate.await;
+                    stream::iter(events)
+                })
+                .flatten(),
+            )),
             Some(MockResponse::Pending) => Ok(Box::pin(stream::pending())),
             None => Ok(Box::pin(stream::iter(Vec::<ProviderEvent>::new()))),
         }
@@ -857,6 +891,93 @@ async fn b7_user_message_during_tool_pushes_to_back() {
 // ============================================================================
 //
 // These hit the queue-mediated logic without spawning anything.
+/// mu-wf5w: a follow-up user message buffered during the FINAL
+/// (no-tool-call) provider stream must not suppress the completed
+/// ask's `done` terminus. Pre-fix, plan_post_invoke_llm skipped
+/// MaybeFinish when buffered UMs existed, so the first ask emitted no
+/// Done at all (verified in the wild, session 1a7812f064510d91: the
+/// client's live block never committed and the whole turn was lost
+/// from scrollback) — and started_at / turn_count / aggregated_usage
+/// leaked into the follow-up ask's Done.
+#[tokio::test]
+async fn wf5w_buffered_um_does_not_suppress_done() {
+    let (provider, gate) = MockProvider::gated_first(
+        vec![
+            ProviderEvent::TextDelta("first".into()),
+            ProviderEvent::Done(assistant_text("first")),
+        ],
+        vec![vec![
+            ProviderEvent::TextDelta("second".into()),
+            ProviderEvent::Done(assistant_text("second")),
+        ]],
+    );
+    let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("ask one")))
+        .await
+        .expect("send 1");
+    // Let the loop enter the (gated) provider stream, then race the
+    // follow-up in: it lands in handle_invoke_llm's `buffered`.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    loop_
+        .send(AgentInput::UserMessage(user_msg("ask two")))
+        .await
+        .expect("send 2");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = gate.send(());
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    let dones: Vec<(StopReason, u32)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Done {
+                stop_reason,
+                turn_count,
+                ..
+            } => Some((*stop_reason, *turn_count)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dones.len(),
+        2,
+        "each ask must emit its own done terminus; got {dones:?}"
+    );
+    assert_eq!(dones[0], (StopReason::EndTurn, 1));
+    // Per-ask state reset: the second ask's Done must not inherit the
+    // first ask's turn_count.
+    assert_eq!(dones[1], (StopReason::EndTurn, 1));
+
+    // Ordering: ask one's done precedes ask two's user message_start.
+    let kinds: Vec<&str> = events.iter().map(kind).collect();
+    let first_done = kinds
+        .iter()
+        .position(|k| *k == "done")
+        .expect("no done event");
+    let second_user_start = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            matches!(
+                e,
+                AgentEvent::MessageStart {
+                    message: AgentMessage::User { .. }
+                }
+            )
+        })
+        .nth(1)
+        .map(|(i, _)| i)
+        .expect("no second user message_start");
+    assert!(
+        first_done < second_user_start,
+        "done must precede the follow-up ask's message_start; kinds={kinds:?}"
+    );
+}
+
 // Behavior tests (B-1..B-7 above) cover the integrated flow with
 // mock providers/tools. These complement by hitting the planning
 // logic directly with edge-case inputs.
@@ -894,12 +1015,16 @@ fn plan_post_invoke_llm_text_only_no_buffered() {
 fn plan_post_invoke_llm_text_only_with_buffered() {
     let buffered = vec![AgentInput::UserMessage(user_msg("more"))];
     let plan = plan_post_invoke_llm(&assistant_text_msg("ok"), buffered);
-    // Even with text-only, buffered UMs go into the queue. No
-    // MaybeFinish — the UM handler will push InvokeLlm.
+    // mu-wf5w: MaybeFinish comes FIRST so the completed ask emits its
+    // `done` terminus before the buffered UM starts the next ask. The
+    // pre-fix shape (External only, no MaybeFinish) suppressed the
+    // terminus entirely — the client's live block never committed and
+    // the whole turn was lost from scrollback.
     assert!(plan.emit_turn_end);
-    assert_eq!(plan.actions.len(), 1);
+    assert_eq!(plan.actions.len(), 2);
+    assert!(matches!(plan.actions[0], Action::MaybeFinish));
     assert!(matches!(
-        plan.actions[0],
+        plan.actions[1],
         Action::External(AgentInput::UserMessage(_))
     ));
 }

@@ -625,19 +625,24 @@ fn plan_post_invoke_llm(
         })
         .collect();
 
-    let had_buffered = !buffered.is_empty();
     let mut actions = Vec::new();
 
     if tool_calls.is_empty() {
-        // No tool calls — TurnEnd here, then drain buffered. Push
-        // MaybeFinish only if no buffered UMs; if there ARE buffered
-        // ones, their handlers will push InvokeLlm and the loop
-        // continues naturally.
+        // No tool calls — the ask's turn-chain is complete. TurnEnd
+        // here, then ALWAYS MaybeFinish FIRST: the per-ask `Done`
+        // terminus is emitted there, and it must land before any
+        // buffered UserMessage starts the next ask. (mu-wf5w: the old
+        // shape skipped MaybeFinish entirely when buffered UMs
+        // existed — "the loop continues naturally" — so the completed
+        // ask never emitted `done`. Verified consequence in session
+        // 1a7812f064510d91: the client's live block never committed
+        // and the whole turn vanished from scrollback. The skip also
+        // leaked started_at / turn_count / aggregated_usage into the
+        // next ask, inflating its Done and marching turn_count toward
+        // IterationCap across asks.)
+        actions.push(Action::MaybeFinish);
         for input in buffered {
             actions.push(Action::External(input));
-        }
-        if !had_buffered {
-            actions.push(Action::MaybeFinish);
         }
         PostInvokeLlmPlan {
             emit_turn_end: true,
@@ -1366,11 +1371,15 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                     }
                 }
 
-                if !queue.is_empty() {
-                    continue;
-                }
-
                 if let RunMode::Autonomous { .. } = &mode {
+                    // Autonomous mode owns its own continuation /
+                    // termination semantics: queued input defers the
+                    // goal-check to the next MaybeFinish, exactly as
+                    // before (a per-iteration continuation must NOT
+                    // emit Done).
+                    if !queue.is_empty() {
+                        continue;
+                    }
                     let (
                         current_iteration,
                         current_options,
@@ -1529,6 +1538,14 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                     continue;
                 }
 
+                // Idle mode: the ask that queued this MaybeFinish is
+                // complete — emit its Done terminus NOW, even when
+                // follow-up input is already queued. (mu-wf5w: the old
+                // early-`continue` on a non-empty queue suppressed the
+                // terminus — see plan_post_invoke_llm.) The queued
+                // follow-up then starts a FRESH ask on the next queue
+                // pass: per-ask state is reset here, so its Done
+                // reports its own turn_count / usage / elapsed.
                 let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
                 let stop_reason = last_stop_reason.take().unwrap_or(StopReason::EndTurn);
                 let _ = events

@@ -43,6 +43,12 @@ MODEL="${MU_REVIEW_MODEL:-gpt-oss:20b}"
 TOOLS="${MU_REVIEW_TOOLS:-}"   # empty = single-shot (default); e.g. "read,grep" lets the reviewer inspect surrounding code (slower, multi-turn)
 BASE="${MU_REVIEW_BASE:-main}"
 LOG="${MU_REVIEW_LOG:-$HOME/.local/share/mu/review-events.jsonl}"
+# Minimal reviewer system prompt (mu-ai-review-minimal-sysprompt-9esh).
+# Without this, `mu ask` sessions get the daemon-default system prompt —
+# ~28KB of operator memory kernel, a pure distractor for a review gate
+# and the prime suspect for persona-bleed verdicts. --append-system-prompt
+# OVERRIDES the daemon default (mu-x83o semantics), which is what we want.
+SYSPROMPT="${MU_REVIEW_SYSTEM_PROMPT:-$(dirname "$0")/ai-review-system-prompt.txt}"
 ERRLOG="${TMPDIR:-/tmp}/ai-review-stderr.$$"   # reviewer stderr kept (not discarded) so silent failures (e.g. provider auth) are diagnosable
 
 if [ -t 1 ] && [ -z "${MU_REVIEW_NO_COLOR:-}" ]; then
@@ -91,16 +97,27 @@ DIFF:
 $DIFF"
 
 run_review() { # $1=provider $2=model — prints reviewer stdout; stderr -> $ERRLOG
+  # The reviewer session must be hermetic: the minimal system prompt
+  # replaces the daemon default, and MU_NO_RECALL=1 stops the daemon's
+  # session-start memory/project-file injection from appending the
+  # ~28KB operator kernel after it (verified on the wire: without this,
+  # messages[0] starts with our prompt and carries the kernel anyway).
+  # shellcheck disable=SC2086 — $SYS_FLAGS intentionally word-splits
+  SYS_FLAGS=""
+  [ -r "$SYSPROMPT" ] && SYS_FLAGS="--append-system-prompt $SYSPROMPT"
   if [ -n "$TOOLS" ]; then
-    timeout 300 "$MU" ask --provider "$1" --model "$2" --thinking low --tools "$TOOLS" "$PROMPT" 2>>"$ERRLOG"
+    MU_NO_RECALL=1 timeout 300 "$MU" ask --provider "$1" --model "$2" --thinking low $SYS_FLAGS --tools "$TOOLS" "$PROMPT" 2>>"$ERRLOG"
   else
-    timeout 300 "$MU" ask --provider "$1" --model "$2" --thinking low "$PROMPT" 2>>"$ERRLOG"
+    MU_NO_RECALL=1 timeout 300 "$MU" ask --provider "$1" --model "$2" --thinking low $SYS_FLAGS "$PROMPT" 2>>"$ERRLOG"
   fi
 }
 verdict_of() { # stdin -> APPROVE | REJECT | UNCLEAR
   local out; out="$(cat)"
-  if   printf '%s' "$out" | grep -qiE 'VERDICT:[[:space:]]*REJECT';  then echo REJECT
-  elif printf '%s' "$out" | grep -qiE 'VERDICT:[[:space:]]*APPROVE'; then echo APPROVE
+  # Tolerate markdown-dressed verdicts ("**Verdict:** APPROVE") — models
+  # flake on the literal format; up to a few non-letter chars may sit
+  # between VERDICT and the word (observed live 2026-06-05, was UNCLEAR).
+  if   printf '%s' "$out" | grep -qiE 'VERDICT[^A-Za-z]{1,8}REJECT';  then echo REJECT
+  elif printf '%s' "$out" | grep -qiE 'VERDICT[^A-Za-z]{1,8}APPROVE'; then echo APPROVE
   else echo UNCLEAR; fi
 }
 log_event() { # $1=verdict $2=override(true/false) $3=escalated(true/false) [$4=provider $5=model]

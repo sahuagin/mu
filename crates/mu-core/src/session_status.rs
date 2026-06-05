@@ -107,6 +107,8 @@ impl SessionStatus {
                     output_tokens,
                     cache_read_input_tokens: cache_read,
                     cache_creation_input_tokens: cache_creation,
+                    cache_creation_5m_input_tokens: None,
+                    cache_creation_1h_input_tokens: None,
                     reasoning_tokens: None,
                 })
             })
@@ -165,6 +167,8 @@ mod tests {
             output_tokens: 2_000,
             cache_read_input_tokens: Some(5_000),
             cache_creation_input_tokens: Some(1_000),
+            cache_creation_5m_input_tokens: None,
+            cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
         };
         let status = SessionStatus::compute(StatusInputs {

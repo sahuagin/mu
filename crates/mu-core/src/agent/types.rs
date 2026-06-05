@@ -120,9 +120,17 @@ pub struct AssistantMessage {
 /// usage is reported at all. The remaining fields are provider-
 /// specific opt-ins:
 /// - `cache_read_input_tokens`: prompt cache hit (Anthropic + OpenAI)
-/// - `cache_creation_input_tokens`: prompt cache write (Anthropic)
+/// - `cache_creation_input_tokens`: prompt cache write total (Anthropic)
+/// - `cache_creation_5m_input_tokens`: ephemeral-5m tier write tokens (Anthropic, mu-cache-write-tier-split-umq6)
+/// - `cache_creation_1h_input_tokens`: ephemeral-1h tier write tokens (Anthropic, mu-cache-write-tier-split-umq6)
 /// - `reasoning_tokens`: hidden reasoning tokens (OpenAI o-series,
 ///   Codex; Anthropic extended thinking doesn't report this yet)
+///
+/// The tier fields (`_5m` / `_1h`) are present only when the provider
+/// returns a `cache_creation` breakdown object. When absent the cost
+/// formula falls back to the flat `cache_creation_input_tokens` total.
+/// Invariant: when both tier fields are present,
+/// `5m + 1h == cache_creation_input_tokens`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
@@ -131,6 +139,14 @@ pub struct Usage {
     pub cache_read_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
+    /// Ephemeral-5m cache write tokens (1.25× write premium). Present only
+    /// when the provider returns the per-tier breakdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_5m_input_tokens: Option<u64>,
+    /// Ephemeral-1h cache write tokens (2.0× write premium). Present only
+    /// when the provider returns the per-tier breakdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u64>,
 }
@@ -159,6 +175,14 @@ impl std::ops::Add for Usage {
             cache_creation_input_tokens: add_opt(
                 self.cache_creation_input_tokens,
                 other.cache_creation_input_tokens,
+            ),
+            cache_creation_5m_input_tokens: add_opt(
+                self.cache_creation_5m_input_tokens,
+                other.cache_creation_5m_input_tokens,
+            ),
+            cache_creation_1h_input_tokens: add_opt(
+                self.cache_creation_1h_input_tokens,
+                other.cache_creation_1h_input_tokens,
             ),
             reasoning_tokens: add_opt(self.reasoning_tokens, other.reasoning_tokens),
         }

@@ -277,6 +277,8 @@ mod tests {
             output_tokens: 100,
             cache_read_input_tokens: cache_read,
             cache_creation_input_tokens: cache_creation,
+            cache_creation_5m_input_tokens: None,
+            cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
         }
     }

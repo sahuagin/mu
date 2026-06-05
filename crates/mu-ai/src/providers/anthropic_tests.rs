@@ -1825,3 +1825,183 @@ fn f1a0_cache_ttl_serde_wire_values() {
     );
     assert_eq!(CacheTtl::default(), CacheTtl::FiveMinutes);
 }
+
+// ─── mu-cache-write-tier-split-umq6: per-tier cache-write tests ──────────────
+
+/// Wire fixture: message_start with both tier fields nonzero. The parsed
+/// Usage must carry the breakdown and the tier sum must equal the flat total.
+#[tokio::test]
+async fn umq6_streaming_wire_both_tiers_nonzero_parsed_and_sum_to_total() {
+    // Anthropic API response with cache_creation object carrying both tiers.
+    // Total cache_creation_input_tokens = 5m(300) + 1h(700) = 1000.
+    let raw = concat!(
+        r#"event: message_start"#,
+        "\n",
+        r#"data: {"type":"message_start","message":{"id":"m_1","role":"assistant","usage":{"input_tokens":2000,"output_tokens":1,"cache_read_input_tokens":500,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":300,"ephemeral_1h_input_tokens":700}}}}"#,
+        "\n\n",
+        r#"event: content_block_start"#,
+        "\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"event: content_block_delta"#,
+        "\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"reply"}}"#,
+        "\n\n",
+        r#"event: content_block_stop"#,
+        "\n",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        r#"event: message_delta"#,
+        "\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":12}}"#,
+        "\n\n",
+        r#"event: message_stop"#,
+        "\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+        raw.as_bytes(),
+    ))]);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let mut stream = test_events_stream(bytes, rx);
+
+    let mut events = Vec::new();
+    while let Some(e) = stream.next().await {
+        events.push(e);
+    }
+
+    let done = events
+        .into_iter()
+        .rev()
+        .find(|e| matches!(e, ProviderEvent::Done(_)))
+        .expect("stream emits a Done event");
+    let ProviderEvent::Done(msg) = done else {
+        unreachable!()
+    };
+    let usage = msg.usage.expect("Done carries usage");
+
+    // Flat total preserved.
+    assert_eq!(usage.cache_creation_input_tokens, Some(1000));
+    // Tier breakdown present.
+    assert_eq!(
+        usage.cache_creation_5m_input_tokens,
+        Some(300),
+        "5m tier should be 300"
+    );
+    assert_eq!(
+        usage.cache_creation_1h_input_tokens,
+        Some(700),
+        "1h tier should be 700"
+    );
+    // Tiers sum to total.
+    let tier_sum = usage.cache_creation_5m_input_tokens.unwrap()
+        + usage.cache_creation_1h_input_tokens.unwrap();
+    assert_eq!(
+        tier_sum,
+        usage.cache_creation_input_tokens.unwrap(),
+        "tier sum must equal flat total"
+    );
+}
+
+/// Streaming merge: tier breakdown from message_start survives the
+/// message_delta merge (which only carries output_tokens).
+#[tokio::test]
+async fn umq6_streaming_merge_preserves_both_tiers() {
+    // message_start carries the tier breakdown; message_delta carries only
+    // output_tokens. After merge, tier fields must be intact.
+    let raw = concat!(
+        r#"event: message_start"#,
+        "\n",
+        r#"data: {"type":"message_start","message":{"id":"m_2","role":"assistant","usage":{"input_tokens":1000,"output_tokens":1,"cache_creation_input_tokens":500,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":500}}}}"#,
+        "\n\n",
+        r#"event: content_block_start"#,
+        "\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"event: message_delta"#,
+        "\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":99}}"#,
+        "\n\n",
+        r#"event: message_stop"#,
+        "\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+        raw.as_bytes(),
+    ))]);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let mut stream = test_events_stream(bytes, rx);
+
+    let mut events = Vec::new();
+    while let Some(e) = stream.next().await {
+        events.push(e);
+    }
+
+    let done = events
+        .into_iter()
+        .rev()
+        .find(|e| matches!(e, ProviderEvent::Done(_)))
+        .expect("stream emits a Done event");
+    let ProviderEvent::Done(msg) = done else {
+        unreachable!()
+    };
+    let usage = msg.usage.expect("Done carries usage");
+
+    // output_tokens came from message_delta.
+    assert_eq!(usage.output_tokens, 99);
+    // Tier fields from message_start survived the merge.
+    assert_eq!(usage.cache_creation_5m_input_tokens, Some(0));
+    assert_eq!(usage.cache_creation_1h_input_tokens, Some(500));
+}
+
+/// When no cache_creation object is present (old-style response with flat
+/// field only), tier fields remain None — no regression on existing wire.
+#[tokio::test]
+async fn umq6_streaming_no_tier_object_fields_remain_none() {
+    // Same wire format as pre-umq6 (no cache_creation object).
+    let raw = concat!(
+        r#"event: message_start"#,
+        "\n",
+        r#"data: {"type":"message_start","message":{"id":"m_3","role":"assistant","usage":{"input_tokens":800,"output_tokens":1,"cache_creation_input_tokens":200}}}"#,
+        "\n\n",
+        r#"event: message_delta"#,
+        "\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20}}"#,
+        "\n\n",
+        r#"event: message_stop"#,
+        "\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+        raw.as_bytes(),
+    ))]);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let mut stream = test_events_stream(bytes, rx);
+
+    let mut events = Vec::new();
+    while let Some(e) = stream.next().await {
+        events.push(e);
+    }
+
+    let done = events
+        .into_iter()
+        .rev()
+        .find(|e| matches!(e, ProviderEvent::Done(_)))
+        .expect("stream emits a Done event");
+    let ProviderEvent::Done(msg) = done else {
+        unreachable!()
+    };
+    let usage = msg.usage.expect("Done carries usage");
+
+    // Flat field present.
+    assert_eq!(usage.cache_creation_input_tokens, Some(200));
+    // Tier fields absent — no regression.
+    assert!(
+        usage.cache_creation_5m_input_tokens.is_none(),
+        "no tier breakdown when cache_creation object absent"
+    );
+    assert!(usage.cache_creation_1h_input_tokens.is_none());
+}

@@ -336,6 +336,8 @@ pub struct App {
     mcp_status_rx: Option<tokio::sync::mpsc::UnboundedReceiver<SessionStatus>>,
     /// Latest SessionStatus from the MCP subscription.
     mcp_status: Option<SessionStatus>,
+    /// mu-solo-scrollback-dup-recommit-8hva: write a renderer journal.
+    renderer_journal: bool,
 }
 
 /// What the inline menu is selecting.
@@ -405,6 +407,9 @@ pub struct AppOptions<'a> {
     /// mu-f1a0: cache TTL tier ("5m" | "1h") for the initial session.
     pub cache_ttl: &'a str,
     pub clipboard_command: Option<&'a [String]>,
+    /// mu-solo-scrollback-dup-recommit-8hva: enable the renderer journal.
+    /// Written to `~/.local/share/mu/solo/renderer.jsonl`.
+    pub renderer_journal: bool,
 }
 
 impl App {
@@ -426,6 +431,7 @@ impl App {
             focus_mode,
             clipboard_command,
             cache_ttl,
+            renderer_journal,
         } = opts;
         let effort = EffortLevel::parse(effort).ok_or_else(|| {
             anyhow!("invalid effort {effort:?} (valid: low|medium|high|xhigh|max)")
@@ -529,6 +535,7 @@ impl App {
             ask_count: 0,
             mcp_status_rx,
             mcp_status: None,
+            renderer_journal,
         })
     }
 
@@ -540,7 +547,16 @@ impl App {
     /// - MCP session status via tokio mpsc (from rmcp client task)
     /// - Periodic render tick for elapsed-time display updates
     pub async fn run(&mut self) -> Result<()> {
-        let mut vp = DynamicViewport::new(VIEWPORT_HEIGHT).context("DynamicViewport::new")?;
+        // Resolve journal path: ~/.local/share/mu/solo/renderer.jsonl.
+        // Strictly separate from the semantic event store
+        // (~/.local/share/mu/events/).
+        let journal_path: Option<std::path::PathBuf> = if self.renderer_journal {
+            dirs::data_dir().map(|p| p.join("mu").join("solo").join("renderer.jsonl"))
+        } else {
+            None
+        };
+        let mut vp = DynamicViewport::new(VIEWPORT_HEIGHT, journal_path.as_deref())
+            .context("DynamicViewport::new")?;
         vp.snap_to_bottom()?;
 
         // Initial banner — printed once into scrollback.
@@ -2571,6 +2587,12 @@ impl App {
                         if let Some(msg) = error_msg.as_deref() {
                             t.items.push(render::TurnItem::Error(msg.to_string()));
                         }
+                        // Finalize-mismatch check: compare committed
+                        // history lines against the rendered line count
+                        // that's about to be inserted. A mismatch here
+                        // means the live preview and the final commit
+                        // diverged — log to the journal and warn.
+                        let history_before = vp.history_len();
                         self.transcript
                             .push(TranscriptBlock::assistant(t.route, &t.items));
                         let mut lines = render::render_turn(
@@ -2582,10 +2604,29 @@ impl App {
                         );
                         lines.extend(render::turn_closer(t.route.color()));
                         let h = lines.len() as u16;
+                        // Compute committed text length for the mismatch check.
+                        let committed_text_len: usize = t
+                            .items
+                            .iter()
+                            .map(|item| {
+                                if let render::TurnItem::Text(s) = item {
+                                    s.len()
+                                } else {
+                                    0
+                                }
+                            })
+                            .sum();
                         vp.insert_before(h, |buf| {
                             let p = Paragraph::new(lines);
                             ratatui::widgets::Widget::render(p, buf.area, buf);
                         })?;
+                        // Post-insert mismatch check: the render should
+                        // have added exactly h lines to history.
+                        let history_after = vp.history_len();
+                        let actually_committed = history_after.saturating_sub(history_before);
+                        if actually_committed != h as usize {
+                            vp.journal_finalize_mismatch(actually_committed, committed_text_len);
+                        }
                     }
                     _ => {
                         // No visible output (empty turn or none), and any

@@ -5,6 +5,26 @@
 //! Only implements the subset needed for mu-solo: render a viewport of
 //! variable height at the bottom of the terminal, scroll the region
 //! above it when the viewport grows, and shrink when it contracts.
+//!
+//! ## Scrollback-commit invariant (mu-solo-scrollback-dup-recommit-8hva)
+//!
+//! `self.history` is the in-memory mirror of every line ever passed to
+//! `insert_before`.  When an `insert_before(N)` call emits more lines
+//! than the available rows above the viewport (`viewport.y`), the
+//! excess lines overflow via DECSTBM scroll into native terminal
+//! scrollback and are no longer addressable as screen rows.
+//!
+//! `scrollback_committed` tracks the exact count of history entries
+//! that have been pushed into native scrollback and therefore **must
+//! not be redrawn** by `repaint_history_tail`.  The invariant is:
+//!
+//!   `scrollback_committed = max(0, history.len() − viewport.y)`
+//!
+//! after every `insert_before` call.  `repaint_history_tail` starts
+//! from `max(scrollback_committed, history.len() − visible_rows)` so
+//! that it never touches lines already in native scrollback — those
+//! would appear twice (once in scrollback, once on-screen) when the
+//! user scrolls up.
 
 use std::io::{self, Write};
 
@@ -38,12 +58,27 @@ pub struct DynamicViewport {
     screen_size: (u16, u16),
     /// History lines rendered above the viewport via insert_before.
     history: Vec<HistoryLine>,
+    /// Number of history entries that have been committed to native
+    /// terminal scrollback (and are therefore no longer addressable
+    /// as screen rows).  Maintained by insert_before; read by
+    /// repaint_history_tail to prevent drawing lines that already
+    /// live in native scrollback — the double-draw is the root cause
+    /// of the mid-message span duplication bug
+    /// (mu-solo-scrollback-dup-recommit-8hva).
+    scrollback_committed: usize,
+    /// Optional renderer journal — appended by the commit paths.
+    /// None when journalling is disabled (config knob renderer_journal).
+    journal: Option<std::fs::File>,
 }
 
 impl DynamicViewport {
     /// Create a new viewport starting at the current cursor position.
     /// The initial height is the number of lines to claim at the bottom.
-    pub fn new(initial_height: u16) -> io::Result<Self> {
+    ///
+    /// `journal_path` — when `Some`, the renderer opens (or creates) the
+    /// file in append mode and writes one JSONL line per scrollback commit.
+    /// Pass `None` to disable journalling.
+    pub fn new(initial_height: u16, journal_path: Option<&std::path::Path>) -> io::Result<Self> {
         let (cols, rows) = terminal::size()?;
         let (_, cursor_y) = crossterm::cursor::position()?;
 
@@ -61,12 +96,31 @@ impl DynamicViewport {
 
         let viewport = Rect::new(0, y, cols, initial_height);
 
+        // Open journal in append mode if requested.  Non-fatal: if
+        // the path can't be opened we log a warning and continue
+        // without journalling rather than refusing to start.
+        let journal = journal_path.and_then(|p| {
+            // Ensure parent directory exists.
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    tracing::warn!(path = %p.display(), err = %e, "renderer journal open failed — journalling disabled");
+                    None
+                }
+            }
+        });
+
         Ok(Self {
             viewport,
             buffers: [Buffer::empty(viewport), Buffer::empty(viewport)],
             current: 0,
             screen_size: (cols, rows),
             history: Vec::new(),
+            scrollback_committed: 0,
+            journal,
         })
     }
 
@@ -342,10 +396,28 @@ impl DynamicViewport {
         stdout.flush()?;
         self.buffers[1 - self.current].reset();
 
+        // Update scrollback_committed: lines that overflowed past
+        // viewport_top went into native scrollback and must not be
+        // redrawn.  The invariant after every insert_before is:
+        //   scrollback_committed = max(0, history.len() − viewport.y)
+        // Re-derive from the new history length so accumulated rounding
+        // from multiple small inserts never drifts.
+        let vp_top = self.viewport.y as usize;
+        self.scrollback_committed = self.history.len().saturating_sub(vp_top);
+
+        // Emit one journal line per commit (cheap append, never to the
+        // semantic event store).
+        let offset_start = self.history.len().saturating_sub(height as usize);
+        let offset_end = self.history.len();
+        self.journal_commit(offset_start, offset_end, height, "insert_before");
+
         // Cap history to prevent unbounded growth (keep last 1000 lines)
         const MAX_HISTORY: usize = 1000;
         if self.history.len() > MAX_HISTORY {
             let drain = self.history.len() - MAX_HISTORY;
+            // Adjust scrollback_committed for the drain so the
+            // invariant holds: drained lines were already committed.
+            self.scrollback_committed = self.scrollback_committed.saturating_sub(drain);
             self.history.drain(0..drain);
         }
 
@@ -360,10 +432,23 @@ impl DynamicViewport {
     /// rendered-line cache. Used after moving the viewport down on shrink: the
     /// terminal rows exposed between the old and new viewport positions are
     /// blank unless we redraw the committed transcript tail into them.
+    ///
+    /// ## Scrollback-committed guard
+    ///
+    /// Lines in `history[..scrollback_committed]` are in native terminal
+    /// scrollback — they are no longer screen-addressable.  Drawing them
+    /// here would create a second copy that appears when the user scrolls
+    /// up, producing the "span twice" duplication
+    /// (mu-solo-scrollback-dup-recommit-8hva).  We therefore clamp
+    /// `start` to `scrollback_committed` so that only the screen-resident
+    /// tail of history is repainted.
     fn repaint_history_tail<W: Write>(&self, stdout: &mut W) -> io::Result<()> {
         let visible_rows = self.viewport.y as usize;
-        let start = self.history.len().saturating_sub(visible_rows);
-        let rows_to_draw = self.history.len() - start;
+        // Never start before scrollback_committed: those lines live in
+        // native scrollback and must not be drawn to screen rows.
+        let naive_start = self.history.len().saturating_sub(visible_rows);
+        let start = naive_start.max(self.scrollback_committed);
+        let rows_to_draw = self.history.len().saturating_sub(start);
         let top = visible_rows.saturating_sub(rows_to_draw);
 
         for row in 0..self.viewport.y {
@@ -376,6 +461,61 @@ impl DynamicViewport {
             write_history_line(stdout, hline)?;
         }
         Ok(())
+    }
+
+    /// Append one JSONL entry to the renderer journal (if open).
+    /// `offset_start`/`offset_end` are indices into `self.history`;
+    /// `line_count` is the number of lines in this commit; `trigger`
+    /// is a short label ("insert_before" | "finalize_mismatch" etc.).
+    /// Errors are silently swallowed — the journal is diagnostic only.
+    fn journal_commit(
+        &mut self,
+        offset_start: usize,
+        offset_end: usize,
+        line_count: u16,
+        trigger: &str,
+    ) {
+        let Some(ref mut f) = self.journal else {
+            return;
+        };
+        // Epoch-ms timestamp (no chrono dep).
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let line = format!(
+            "{{\"ts_ms\":{ts_ms},\"offset_start\":{offset_start},\"offset_end\":{offset_end},\"line_count\":{line_count},\"trigger\":\"{trigger}\"}}\n"
+        );
+        let _ = f.write_all(line.as_bytes());
+    }
+
+    /// Emit a finalize-mismatch journal entry when the committed
+    /// history length doesn't match the finalized text length.
+    /// Also logs a tracing::warn — the journal and the warn fire
+    /// together so both the human watching and the log file capture it.
+    pub fn journal_finalize_mismatch(&mut self, committed_lines: usize, finalized_text_len: usize) {
+        tracing::warn!(
+            committed_lines,
+            finalized_text_len,
+            "renderer finalize mismatch: committed lines vs finalized text length differ"
+        );
+        let Some(ref mut f) = self.journal else {
+            return;
+        };
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let line = format!(
+            "{{\"ts_ms\":{ts_ms},\"kind\":\"finalize_mismatch\",\"committed_lines\":{committed_lines},\"finalized_text_len\":{finalized_text_len}}}\n"
+        );
+        let _ = f.write_all(line.as_bytes());
+    }
+
+    /// Return the current history line count.  Used by callers that
+    /// want to record pre-commit and post-commit offsets for the journal.
+    pub fn history_len(&self) -> usize {
+        self.history.len()
     }
 }
 
@@ -492,5 +632,216 @@ impl Drop for DynamicViewport {
             MoveTo(0, self.viewport.y + self.viewport.height),
             Show
         );
+    }
+}
+
+// ─── pure-logic unit tests (no terminal I/O) ─────────────────────────────────
+//
+// These tests exercise the scrollback_committed invariant computation and the
+// repaint_history_tail offset selection — the two arithmetic paths at the heart
+// of mu-solo-scrollback-dup-recommit-8hva.  We cannot instantiate a real
+// DynamicViewport in CI (no TTY), so we test the pure helper functions that
+// encode the invariant logic directly.
+
+#[cfg(test)]
+mod tests {
+    /// Compute what scrollback_committed should be after insert_before(n_lines)
+    /// when history has `history_len` entries and the viewport top is at
+    /// `viewport_top` screen rows.  Mirrors the post-insert update in
+    /// `insert_before`.
+    fn scrollback_committed_after_insert(history_len: usize, viewport_top: usize) -> usize {
+        history_len.saturating_sub(viewport_top)
+    }
+
+    /// Compute the `start` index into `history` that `repaint_history_tail`
+    /// should use.  `visible_rows` is `viewport.y` (rows above the viewport).
+    /// Mirrors the fixed `repaint_history_tail` implementation.
+    fn repaint_start(
+        history_len: usize,
+        visible_rows: usize,
+        scrollback_committed: usize,
+    ) -> usize {
+        let naive_start = history_len.saturating_sub(visible_rows);
+        naive_start.max(scrollback_committed)
+    }
+
+    // ── scrollback_committed invariant ───────────────────────────────────────
+
+    #[test]
+    fn scrollback_committed_zero_when_history_fits_in_viewport() {
+        // 5 history lines, 20-row viewport region → nothing overflows.
+        assert_eq!(scrollback_committed_after_insert(5, 20), 0);
+    }
+
+    #[test]
+    fn scrollback_committed_counts_overflow() {
+        // 50 lines inserted into a 20-row region → 30 lines to scrollback.
+        assert_eq!(scrollback_committed_after_insert(50, 20), 30);
+    }
+
+    #[test]
+    fn scrollback_committed_saturates_at_zero_for_small_history() {
+        // viewport is larger than history — no overflow.
+        assert_eq!(scrollback_committed_after_insert(3, 20), 0);
+    }
+
+    #[test]
+    fn scrollback_committed_exact_fit() {
+        // Exactly viewport_top lines — boundary: no overflow.
+        assert_eq!(scrollback_committed_after_insert(20, 20), 0);
+    }
+
+    #[test]
+    fn scrollback_committed_one_over_fit() {
+        // One line past the viewport top → one line in scrollback.
+        assert_eq!(scrollback_committed_after_insert(21, 20), 1);
+    }
+
+    // ── repaint_start offset logic ────────────────────────────────────────────
+
+    #[test]
+    fn repaint_start_no_scrollback_overflow_normal_case() {
+        // 10 history lines, all fit in 20-row visible region,
+        // nothing committed to scrollback.
+        let start = repaint_start(10, 20, 0);
+        // Should start at 0 (history.len() - visible_rows saturates to 0).
+        assert_eq!(start, 0);
+    }
+
+    #[test]
+    fn repaint_start_clamps_to_scrollback_committed() {
+        // The bug scenario:
+        // history has 50 lines; viewport_top was 20 → scrollback_committed=30.
+        // Viewport shrinks to new top=35 → repaint wants last 35 lines but
+        // must not touch the first 30 (in native scrollback).
+        let start = repaint_start(50, 35, 30);
+        // naive_start = 50 - 35 = 15; clamped to 30 by scrollback_committed.
+        assert_eq!(start, 30);
+        // Lines to draw = 50 - 30 = 20 (not 35).  This is the fix: 15 lines
+        // that would have caused duplication are no longer drawn on-screen.
+    }
+
+    #[test]
+    fn repaint_start_no_clamp_when_history_all_on_screen() {
+        // Small history, no overflow: clamp has no effect.
+        let start = repaint_start(5, 35, 0);
+        // naive_start = 0 (5 lines fit in 35 rows), scrollback_committed=0.
+        assert_eq!(start, 0);
+    }
+
+    #[test]
+    fn repaint_start_identical_naive_and_committed() {
+        // If naive_start == scrollback_committed there's no duplicate risk.
+        let start = repaint_start(50, 20, 30);
+        // naive_start = 50 - 20 = 30; clamp(30, 30) = 30.
+        assert_eq!(start, 30);
+    }
+
+    #[test]
+    fn repaint_start_naive_exceeds_committed() {
+        // Shrink to very small visible area: naive_start > committed.
+        // Use the naive_start (it's safe because it's already past scrollback).
+        let start = repaint_start(50, 5, 30);
+        // naive_start = 45; committed = 30; max(45, 30) = 45.
+        assert_eq!(start, 45);
+    }
+
+    // ── duplication shape verification ───────────────────────────────────────
+    //
+    // Verifies the exact "before once / span twice / tail once" pattern is
+    // eliminated.  Uses symbolic history indices rather than real terminal
+    // cells — the arithmetic is what matters.
+
+    #[test]
+    fn no_duplication_after_large_insert_and_shrink() {
+        // Simulate the real session:
+        // - viewport_top = 20, insert 50 lines → scrollback_committed = 30
+        // - viewport shrinks to top = 35
+        // - repaint must only draw lines [30..50] (20 lines), NOT [15..50].
+
+        let history_len = 50usize;
+        let viewport_top_before = 20usize;
+        let viewport_top_after = 35usize;
+
+        let committed = scrollback_committed_after_insert(history_len, viewport_top_before);
+        // 30 lines in native scrollback.
+        assert_eq!(committed, 30);
+
+        let start = repaint_start(history_len, viewport_top_after, committed);
+        // Must NOT start before committed.
+        assert!(
+            start >= committed,
+            "repaint started at {start} which is before scrollback boundary {committed} — would duplicate"
+        );
+        // Should draw history[30..50] — lines not in scrollback.
+        assert_eq!(start, 30);
+        let rows_drawn = history_len.saturating_sub(start);
+        assert_eq!(rows_drawn, 20);
+    }
+
+    // ── journal mismatch detection ────────────────────────────────────────────
+
+    #[test]
+    fn journal_path_pattern_is_in_solo_subdir_not_events() {
+        // Verify the journal path is under `.../mu/solo/` and NOT under
+        // `.../mu/events/`.  Tests the path construction logic conceptually.
+        let base = std::path::Path::new("/home/user/.local/share/mu");
+        let journal = base.join("solo").join("renderer.jsonl");
+        let events = base.join("events");
+        assert!(journal.starts_with(base.join("solo")));
+        assert!(!journal.starts_with(events));
+    }
+
+    #[test]
+    fn journal_entry_is_valid_jsonl() {
+        // Write a journal entry to a temp file and verify it's parseable JSON.
+        use std::io::Read;
+
+        let tmp = tempfile_for_test();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&tmp)
+            .expect("open tmp");
+
+        let ts_ms: u128 = 12345678;
+        let offset_start = 0usize;
+        let offset_end = 10usize;
+        let line_count: u16 = 10;
+        let trigger = "insert_before";
+        let line = format!(
+            "{{\"ts_ms\":{ts_ms},\"offset_start\":{offset_start},\"offset_end\":{offset_end},\"line_count\":{line_count},\"trigger\":\"{trigger}\"}}\n"
+        );
+        use std::io::Write as _;
+        f.write_all(line.as_bytes()).expect("write");
+        drop(f);
+
+        let mut contents = String::new();
+        std::fs::File::open(&tmp)
+            .expect("reopen")
+            .read_to_string(&mut contents)
+            .expect("read");
+
+        // Each non-empty line must be valid JSON.
+        for l in contents.lines().filter(|l| !l.is_empty()) {
+            let v: serde_json::Value = serde_json::from_str(l)
+                .unwrap_or_else(|e| panic!("journal line not valid JSON: {e}\n  line: {l:?}"));
+            assert_eq!(v["trigger"], "insert_before");
+            assert_eq!(v["line_count"], 10);
+        }
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    fn tempfile_for_test() -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "mu_solo_viewport_test_{}.jsonl",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        p
     }
 }

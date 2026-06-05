@@ -2,6 +2,7 @@ pub mod capabilities;
 pub mod loop_;
 pub mod provider;
 pub mod tool;
+pub mod tool_result_filter;
 pub mod types;
 
 pub use capabilities::{ProviderCapabilities, SystemPromptCapability};

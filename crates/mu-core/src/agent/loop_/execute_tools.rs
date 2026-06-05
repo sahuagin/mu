@@ -394,17 +394,37 @@ pub(crate) async fn handle_execute_tools(
             result.is_error,
         );
 
+        // mu-2e0h tier 1: deterministic ingestion hygiene (ANSI strip,
+        // repeat collapse, line cap, dump truncation) applied ONCE,
+        // here — so the provider context, the durable event log, and
+        // the wire all carry the same content. Event-log-decides
+        // depends on the log being the truth of what the model saw;
+        // filtering only the context entry would silently diverge
+        // them. Clean content passes through borrowed (no copy).
+        // Tools that declare `verbatim_result` (read-like tools whose
+        // output must stay byte-identical to disk for exact-match
+        // editing) bypass the filter entirely.
+        let verbatim = tool.map(|t| t.spec().verbatim_result).unwrap_or(false);
+        let content = if verbatim {
+            result.content
+        } else {
+            match super::super::tool_result_filter::filter_tool_result(&result.content) {
+                std::borrow::Cow::Borrowed(_) => result.content,
+                std::borrow::Cow::Owned(filtered) => filtered,
+            }
+        };
+
         let _ = events
             .send(AgentEvent::ToolCallCompleted {
                 tool_call_id: call.id.clone(),
-                content: result.content.clone(),
+                content: content.clone(),
                 is_error: result.is_error,
             })
             .await;
 
         tool_messages.push(AgentMessage::ToolResult {
             call_id: call.id,
-            content: result.content,
+            content,
             is_error: result.is_error,
         });
     }

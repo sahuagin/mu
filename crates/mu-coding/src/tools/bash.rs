@@ -226,6 +226,10 @@ impl Tool for BashTool {
             display: None,
             when: None,
             policy,
+            // mu-2e0h: bash output is logs/test/grep territory — the
+            // tier-1 ingestion filter applies (ANSI strip, repeat
+            // collapse, line cap, truncation past its own 64KB cap).
+            verbatim_result: false,
             input_schema: json!({
                 "type": "object",
                 "properties": {

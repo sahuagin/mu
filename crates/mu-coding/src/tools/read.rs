@@ -23,6 +23,10 @@ impl Default for ReadTool {
 impl Tool for ReadTool {
     fn spec(&self) -> ToolSpec {
         // ReadOnly + Allow + ModelDecides is the default policy.
+        // verbatim_result: read output is the model's belief about
+        // disk truth — exact-match `edit` builds on it, so the tier-1
+        // ingestion filter (mu-2e0h) must never collapse/cap/truncate
+        // it.
         ToolSpec::new(
             "read",
             "Read a file. Returns the file's contents as text. Use for inspecting source code, configs, or any text file the agent needs to consider.",
@@ -37,6 +41,7 @@ impl Tool for ReadTool {
                 "required": ["path"]
             }),
         )
+        .with_verbatim_result()
     }
 
     fn execute<'life0, 'async_trait>(

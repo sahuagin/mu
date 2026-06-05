@@ -92,6 +92,28 @@ pub fn curated() -> Vec<Capability> {
             &["t4c", "--help-ai"],
             true,
         ),
+        // Personal agent-infra, same precedent as bash.agent.memory:
+        // curated here, present/absent resolved per-host by `discover`.
+        cap(
+            "bash.antagonist-log",
+            "verdict journal for review antagonists (verifier/judge/gate) — record runs, adjudicate findings, catch/false-alarm stats",
+            &[
+                "verdict",
+                "verifier",
+                "judge",
+                "review",
+                "gate",
+                "false-alarm",
+                "catch",
+                "stats",
+                "adjudicate",
+                "antagonist",
+                "finding",
+            ],
+            &["antagonist_log", "recent"],
+            &["antagonist_log", "--help"],
+            false,
+        ),
     ]
 }
 

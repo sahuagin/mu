@@ -17,7 +17,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
+use futures::stream::{BoxStream, StreamExt};
 use serde::Deserialize;
 use tokio::sync::oneshot;
 
@@ -110,9 +110,23 @@ impl Provider for OllamaProvider {
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
         // Identical wire protocol to OpenRouter; delegate wholesale.
-        self.inner
+        let inner = self
+            .inner
             .stream(system_prompt, input, tools, cancel_rx)
-            .await
+            .await?;
+        // Locally-served models flakily emit tool calls as plain text
+        // in their training-native dialect, and ollama's template
+        // parser doesn't always recover them. Rewrite the terminal
+        // message when that happens (mu-ollama-qwen-tool-dialect-yfl0).
+        let specs: Vec<ToolSpec> = tools.to_vec();
+        Ok(inner
+            .map(move |ev| match ev {
+                ProviderEvent::Done(msg) => {
+                    ProviderEvent::Done(super::tool_dialect::rescue_assistant_message(msg, &specs))
+                }
+                other => other,
+            })
+            .boxed())
     }
 
     /// Label as `"ollama"` (not the inner `"openrouter"`) so events,

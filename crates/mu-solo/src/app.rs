@@ -338,6 +338,15 @@ pub struct App {
     mcp_status: Option<SessionStatus>,
     /// mu-solo-scrollback-dup-recommit-8hva: write a renderer journal.
     renderer_journal: bool,
+    /// mu-solo-osc-notify-mbmn: desktop notifications (OSC 99) on main-
+    /// session turn done/error while the terminal is unfocused.
+    notifications: bool,
+    /// Terminal focus state, tracked via crossterm FocusGained/
+    /// FocusLost events (bin enables EnableFocusChange). Starts true:
+    /// mu-solo is foreground at launch, and a terminal that never
+    /// reports focus events then never notifies — the conservative
+    /// failure mode (silence, not spam).
+    terminal_focused: bool,
 }
 
 /// What the inline menu is selecting.
@@ -410,6 +419,9 @@ pub struct AppOptions<'a> {
     /// mu-solo-scrollback-dup-recommit-8hva: enable the renderer journal.
     /// Written to `~/.local/share/mu/solo/renderer.jsonl`.
     pub renderer_journal: bool,
+    /// mu-solo-osc-notify-mbmn: desktop notifications via OSC 99 on
+    /// main-session turn done/error while the terminal is unfocused.
+    pub notifications: bool,
 }
 
 impl App {
@@ -432,6 +444,7 @@ impl App {
             clipboard_command,
             cache_ttl,
             renderer_journal,
+            notifications,
         } = opts;
         let effort = EffortLevel::parse(effort).ok_or_else(|| {
             anyhow!("invalid effort {effort:?} (valid: low|medium|high|xhigh|max)")
@@ -536,6 +549,8 @@ impl App {
             mcp_status_rx,
             mcp_status: None,
             renderer_journal,
+            notifications,
+            terminal_focused: true,
         })
     }
 
@@ -644,6 +659,16 @@ impl App {
                         Some(Ok(Event::Paste(text))) => {
                             self.paste_count += 1;
                             self.prompt.insert_paste(&text, self.paste_count);
+                        }
+                        // mu-solo-osc-notify-mbmn: focus tracking for
+                        // notification gating (bin enables
+                        // EnableFocusChange; terminals that don't
+                        // report focus simply never deliver these).
+                        Some(Ok(Event::FocusGained)) => {
+                            self.terminal_focused = true;
+                        }
+                        Some(Ok(Event::FocusLost)) => {
+                            self.terminal_focused = false;
                         }
                         Some(Err(e)) => {
                             tracing::warn!("crossterm event error: {e}");
@@ -2545,6 +2570,27 @@ impl App {
             "session.done" | "session.error" => {
                 self.session_phase = SessionPhase::Idle;
                 self.phase_elapsed_ms = 0;
+
+                // mu-solo-osc-notify-mbmn: surface main-session turn
+                // boundaries as desktop notifications when the
+                // terminal is unfocused (the enclosing terminal —
+                // kitty/wezterm/iTerm2 — raises the popup via OSC 99).
+                // Sidecar (/btw) turns are background by design and
+                // stay silent; notifying the focused terminal is
+                // noise.
+                if self.notifications && !self.terminal_focused && sid == self.session_id {
+                    if method == "session.done" {
+                        crate::notify::notify(&format!(
+                            "mu ({}) is waiting for your input",
+                            self.model
+                        ));
+                    } else {
+                        crate::notify::notify(&format!(
+                            "mu ({}): turn ended with an error",
+                            self.model
+                        ));
+                    }
+                }
 
                 if method == "session.done" {
                     self.ask_count += 1;

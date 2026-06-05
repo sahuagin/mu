@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -120,6 +120,7 @@ async fn main() -> Result<()> {
         cache_ttl: &cfg.session.cache_ttl,
         clipboard_command: cfg.tui.clipboard_command.as_deref(),
         renderer_journal: cfg.tui.renderer_journal,
+        notifications: cfg.tui.notifications,
     })
     .context("App::new failed (is the mu binary path correct?)")?;
 
@@ -135,6 +136,11 @@ async fn main() -> Result<()> {
         std::io::stdout(),
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
+    // mu-solo-osc-notify-mbmn: focus reporting gates desktop
+    // notifications (notify only when unfocused). Terminals without
+    // the feature ignore the request and the app stays silent —
+    // terminal_focused starts true and never flips.
+    let _ = execute!(std::io::stdout(), EnableFocusChange);
 
     let run_result = app.run().await;
 
@@ -142,6 +148,7 @@ async fn main() -> Result<()> {
     // protocol BEFORE disabling raw mode (mu-tui precedent:
     // leave_terminal_mode); errors ignored — terminals that no-op'd
     // the push no-op the pop too.
+    let _ = execute!(std::io::stdout(), DisableFocusChange);
     let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = disable_raw_mode();

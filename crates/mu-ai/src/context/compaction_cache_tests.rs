@@ -275,9 +275,14 @@ fn absorb_volatile_prefix_creates_cacheable_prefix() {
     assert_eq!(post_rope.spans()[1].id(), "a1");
 
     let post = boundaries(&post_rope);
+    // mu-chiw: the summary span (0) is the intro-prefix end — the
+    // Assistant span (1) is a conversation span, so the intro stops
+    // before it — and (1) is the conversation run-end anchor. Both
+    // marked: compaction still CREATED a cacheable prefix where none
+    // existed, now with the conversation anchor on top.
     assert_eq!(
         post,
-        vec![CacheBoundary::at(1)],
+        vec![CacheBoundary::at(0), CacheBoundary::at(1)],
         "compaction CREATED a cacheable prefix that did not exist pre-compaction",
     );
 }

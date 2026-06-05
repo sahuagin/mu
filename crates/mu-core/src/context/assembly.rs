@@ -182,20 +182,31 @@ pub fn append_messages_to_baseline(
 }
 
 fn message_to_span(idx: usize, message: &AgentMessage) -> Span {
+    // mu-chiw: conversation spans are CACHEABLE. Their content is
+    // verbatim-stable once in the rope (deterministic ids, append-only
+    // between compactions), which is exactly what Anthropic's prefix
+    // cache matches on. The previous `false` predates conversation
+    // cache anchors — the two-marker strategy could never mark past
+    // the intro prefix, so the flag was moot; with mu-chiw's anchors
+    // it gated ~45% of session cost (607,865 uncached input tokens on
+    // the 2026-06-04 replay benchmark vs claude-code's 110).
+    // Retention classes are unchanged — cacheable ≠ stable; a span a
+    // future compaction drops simply misses the cache, which was the
+    // status quo for every conversation span anyway.
     match message {
         AgentMessage::User { content } => Span::with_cacheable(
             format!("msg-{idx}-user"),
             SpanKind::User,
             content.clone(),
             RetentionClass::Hot,
-            false,
+            true,
         ),
         AgentMessage::Assistant(assistant) => Span::with_cacheable(
             format!("msg-{idx}-assistant"),
             SpanKind::Assistant,
             flatten_assistant(&assistant.content),
             RetentionClass::Hot,
-            false,
+            true,
         )
         .with_blocks(assistant.content.clone()),
         AgentMessage::ToolResult {
@@ -213,7 +224,7 @@ fn message_to_span(idx: usize, message: &AgentMessage) -> Span {
                 SpanKind::ToolResult,
                 body,
                 RetentionClass::Warm,
-                false,
+                true,
             )
         }
     }
@@ -314,12 +325,15 @@ mod tests {
             }],
             &[sample_tool()],
         );
-        // First two spans (system + tool schema) are stable+cacheable;
-        // the user message is not. mu-bn4's AnthropicCacheStrategy
-        // boundary lands at index 1 (the last tool schema).
+        // First two spans (system + tool schema) are stable+cacheable.
+        // mu-chiw: the user message is ALSO cacheable now — its
+        // content is verbatim-stable in the rope, and the strategy's
+        // conversation anchors need the flag. (It remains a
+        // conversation-kind span, so the intro-prefix boundary still
+        // stops at index 1, the last tool schema.)
         assert!(rope.spans()[0].retention.is_stable() && rope.spans()[0].cacheable);
         assert!(rope.spans()[1].retention.is_stable() && rope.spans()[1].cacheable);
-        assert!(!rope.spans()[2].cacheable);
+        assert!(rope.spans()[2].cacheable);
     }
 
     #[test]

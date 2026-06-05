@@ -21,29 +21,36 @@
 //!
 //! ## Cache strategy
 //!
-//! [`AnthropicCacheStrategy`] places up to TWO
-//! [`CacheMarker::Ephemeral`] boundaries — matching the pattern the
-//! pre-mu-yqeq.8 live-loop annotation used (system block + last tool
-//! spec):
+//! [`AnthropicCacheStrategy`] places up to FOUR
+//! [`CacheMarker::Ephemeral`] boundaries (the Anthropic per-request
+//! cap) — mu-chiw extended the original two-marker intro-prefix rule
+//! with two conversation anchors:
 //!
 //! 1. The first [`SpanKind::System`] span in the consecutive
 //!    stable+cacheable prefix, when present.
 //! 2. The last span in the consecutive stable+cacheable prefix,
 //!    when it differs from (1).
+//! 3. The last cacheable span BEFORE the latest User span — the
+//!    cross-call anchor: the previous turn's history re-matches here
+//!    even though the new user message extends the suffix.
+//! 4. The last cacheable span in the rope — the within-turn anchor:
+//!    in an agent loop, call N+1 = call N + one tool result, so
+//!    marking the rope end lets each loop iteration re-read the
+//!    turn-so-far at cache-read rates.
 //!
-//! Anthropic supports up to four `cache_control` markers per
-//! request; this strategy uses at most two. Two markers (vs one)
-//! create two independently-cacheable prefixes: the system prompt
-//! stays cached even when tools change, and the tools-end is the
-//! second cacheable prefix. With one marker, a tools change would
-//! invalidate the system prefix too.
+//! (1)/(2) keep the original semantics: the intro prefix stops at
+//! the first span failing the stable or cacheable predicate (spec
+//! lines 567-578; `specs/mu-044-provider-messages-cutover.md`
+//! §"Cache-annotation consolidation (Phase D)"). (3)/(4) gate on
+//! `cacheable()` ONLY — stability is not required for reuse, because
+//! Anthropic caching matches content-identical prefixes: a volatile
+//! span that later compacts away merely misses the cache, which is
+//! the pre-chiw status quo for every conversation span anyway.
 //!
-//! See spec lines 567-578 for the boundary rule, and
-//! `specs/mu-044-provider-messages-cutover.md`
-//! §"Cache-annotation consolidation (Phase D)" for the
-//! two-marker pre-condition. The cacheable prefix stops at the
-//! first non-cacheable position: as soon as a span fails either
-//! the stable or the cacheable predicate, the prefix has ended.
+//! Why this matters (measured, 2026-06-04 replay benchmark): with
+//! only the intro markers, the entire conversation re-billed at full
+//! input rate every call — 607,865 uncached tokens (~45% of session
+//! cost) vs claude-code's 110 on the same workload (bead mu-chiw).
 //!
 //! Phase D (mu-yqeq.8) made this strategy the SOLE source of
 //! Anthropic cache_control emission. The previously-unconditional
@@ -105,24 +112,15 @@ impl ProviderRenderer for AnthropicProviderRenderer {
     }
 }
 
-/// Anthropic ephemeral-cache strategy (mu-bn4).
+/// Anthropic ephemeral-cache strategy (mu-bn4; extended mu-chiw).
 ///
-/// Places up to two [`CacheBoundary`]s in the consecutive
-/// stable+cacheable prefix: one on the first
-/// [`SpanKind::System`] span (when present) and one on the last
-/// span in the prefix (when different from the system span).
-///
-/// Per spec lines 567-578, the cacheable prefix ends at the FIRST
-/// span that is either non-stable or marked uncacheable. Boundary
-/// placement is restricted to spans within that contiguous prefix
-/// — a span that becomes stable+cacheable again AFTER the prefix
-/// break doesn't qualify.
-///
-/// The two-marker shape mirrors the pre-mu-yqeq.8 live-loop
-/// annotation: it cached `body.system` and `body.tools.last()`
-/// independently so a tools-change wouldn't invalidate the system
-/// cache. Phase D made this strategy the sole source; matching the
-/// pre-cutover marker count avoids a cache-effectiveness regression.
+/// Places up to four [`CacheBoundary`]s: two in the consecutive
+/// stable+cacheable intro prefix (first [`SpanKind::System`] span +
+/// last span of the prefix — the original mu-bn4 rule, spec lines
+/// 567-578), and two conversation anchors (last cacheable span
+/// before the latest User span; last cacheable span in the rope).
+/// See the module docs for the full rationale and the measured cost
+/// of the two-marker shape this replaces.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AnthropicCacheStrategy;
 
@@ -134,15 +132,22 @@ impl AnthropicCacheStrategy {
 
 impl CacheStrategy for AnthropicCacheStrategy {
     fn boundaries(&self, rope: &RetainedRope) -> Vec<CacheBoundary> {
-        // Walk the rope once; track the first System-kind index and
-        // the last index encountered within the consecutive
-        // stable+cacheable prefix. Stop at the first span that fails
-        // either predicate (a single mid-prefix hole ends the
-        // cacheable prefix; later stable+cacheable spans don't count).
+        // Intro prefix: track the first System-kind index and the
+        // last index within the consecutive stable+cacheable prefix.
+        // mu-chiw: also stop at the first CONVERSATION-kind span —
+        // pre-chiw, conversation spans were uncacheable so the prefix
+        // ended there implicitly; now that they're cacheable the stop
+        // must be explicit, or this boundary drifts into the
+        // conversation and stops protecting system+tools from
+        // conversation-driven invalidation.
         let mut system_idx: Option<usize> = None;
         let mut last_in_prefix: Option<usize> = None;
         for (idx, span) in rope.iter().enumerate() {
-            if span.retention().is_stable() && span.cacheable() {
+            let is_conversation = matches!(
+                span.kind(),
+                SpanKind::User | SpanKind::Assistant | SpanKind::ToolResult
+            );
+            if !is_conversation && span.retention().is_stable() && span.cacheable() {
                 if matches!(span.kind(), SpanKind::System) && system_idx.is_none() {
                     system_idx = Some(idx);
                 }
@@ -151,16 +156,48 @@ impl CacheStrategy for AnthropicCacheStrategy {
                 break;
             }
         }
-        let mut out: Vec<CacheBoundary> = Vec::new();
-        if let Some(s) = system_idx {
-            out.push(CacheBoundary::at(s));
+
+        // Conversation anchors (mu-chiw): placed within the
+        // CONTIGUOUS cacheable run from index 0 — stability is not
+        // required (see module docs), but an anchor past an
+        // uncacheable hole would write cache prefixes that can never
+        // re-match (the hole's content varies call-to-call), so the
+        // run ends at the first uncacheable span.
+        let mut run_end: Option<usize> = None;
+        for (idx, span) in rope.iter().enumerate() {
+            if !span.cacheable() {
+                break;
+            }
+            run_end = Some(idx);
         }
-        if let Some(last) = last_in_prefix {
-            if Some(last) != system_idx {
-                out.push(CacheBoundary::at(last));
+        // Latest User span within the run.
+        let last_user_idx: Option<usize> = run_end.and_then(|end| {
+            rope.iter()
+                .enumerate()
+                .take(end + 1)
+                .rev()
+                .find(|(_, s)| matches!(s.kind(), SpanKind::User))
+                .map(|(i, _)| i)
+        });
+        // Cross-call anchor: span just before the latest User span
+        // (= everything up to the previous turn re-matches here even
+        // though the new user message extends the suffix).
+        let pre_turn: Option<usize> =
+            last_user_idx.and_then(|u| if u > 0 { Some(u - 1) } else { None });
+
+        // Dedup while preserving ≤4 by construction (2 intro + 2
+        // conversation candidates). Within-turn anchor = run end.
+        let mut idxs: Vec<usize> = Vec::new();
+        for cand in [system_idx, last_in_prefix, pre_turn, run_end]
+            .into_iter()
+            .flatten()
+        {
+            if !idxs.contains(&cand) {
+                idxs.push(cand);
             }
         }
-        out
+        idxs.sort_unstable();
+        idxs.into_iter().map(CacheBoundary::at).collect()
     }
 
     fn annotate(&self, messages: &mut ProviderMessages, boundaries: &[CacheBoundary]) {
@@ -284,18 +321,26 @@ mod tests {
 
     #[test]
     fn boundary_at_first_system_and_last_index_when_entire_rope_is_stable() {
-        // mu-yqeq.8: with TWO System spans + 1 User (all
-        // stable+cacheable), the strategy marks the FIRST System
-        // (index 0) and the last span in the prefix (index 2). The
-        // second System span (index 1) is NOT marked — only the
-        // first.
+        // mu-chiw: with TWO System spans + 1 User (all
+        // stable+cacheable), the intro prefix now stops BEFORE the
+        // User span (conversation kind), marking the first System (0)
+        // and the prefix end (1, the second System — pre_turn lands
+        // there too and dedups). The User span (2) is the
+        // conversation run-end anchor.
         let rope = RetainedRope::from_spans(vec![
             Span::new("a", SpanKind::System, "s", RetentionClass::Startup),
             Span::new("b", SpanKind::System, "s2", RetentionClass::Pinned),
             Span::new("c", SpanKind::User, "u", RetentionClass::Hot),
         ]);
         let boundaries = AnthropicCacheStrategy::new().boundaries(&rope);
-        assert_eq!(boundaries, vec![CacheBoundary::at(0), CacheBoundary::at(2)]);
+        assert_eq!(
+            boundaries,
+            vec![
+                CacheBoundary::at(0),
+                CacheBoundary::at(1),
+                CacheBoundary::at(2)
+            ]
+        );
     }
 
     #[test]
@@ -323,6 +368,68 @@ mod tests {
         ]);
         let boundaries = AnthropicCacheStrategy::new().boundaries(&rope);
         assert_eq!(boundaries, vec![CacheBoundary::at(0), CacheBoundary::at(1)]);
+    }
+
+    #[test]
+    fn chiw_conversation_anchors_mark_pre_turn_and_rope_end() {
+        // Canonical agent-loop rope: intro (system, schema) + a prior
+        // turn (user, assistant) + the current turn (user,
+        // tool_result). All four anchors distinct: system (0), intro
+        // end (1), pre_turn (3 — the span just before the latest
+        // User, i.e. the whole prior conversation re-matches there),
+        // run end (5 — the within-turn anchor that lets loop call
+        // N+1 re-read the turn-so-far at cache-read rates).
+        let rope = RetainedRope::from_spans(vec![
+            Span::new("sys", SpanKind::System, "s", RetentionClass::Startup),
+            Span::new("schema", SpanKind::ToolSchema, "t", RetentionClass::Startup),
+            Span::with_cacheable("u1", SpanKind::User, "q1", RetentionClass::Hot, true),
+            Span::with_cacheable("a1", SpanKind::Assistant, "r1", RetentionClass::Hot, true),
+            Span::with_cacheable("u2", SpanKind::User, "q2", RetentionClass::Hot, true),
+            Span::with_cacheable(
+                "tr",
+                SpanKind::ToolResult,
+                "out",
+                RetentionClass::Warm,
+                true,
+            ),
+        ]);
+        let boundaries = AnthropicCacheStrategy::new().boundaries(&rope);
+        assert_eq!(
+            boundaries,
+            vec![
+                CacheBoundary::at(0),
+                CacheBoundary::at(1),
+                CacheBoundary::at(3),
+                CacheBoundary::at(5),
+            ],
+            "four distinct anchors: system, intro end, pre-turn, rope end"
+        );
+    }
+
+    #[test]
+    fn chiw_uncacheable_hole_caps_conversation_anchors() {
+        // An uncacheable span mid-conversation ends the contiguous
+        // cacheable run: anchors past it would write cache prefixes
+        // that can never re-match (the hole's content varies
+        // call-to-call).
+        let rope = RetainedRope::from_spans(vec![
+            Span::new("sys", SpanKind::System, "s", RetentionClass::Startup),
+            Span::with_cacheable("u1", SpanKind::User, "q1", RetentionClass::Hot, true),
+            Span::with_cacheable(
+                "vol",
+                SpanKind::System,
+                "now: 12:34",
+                RetentionClass::Hot,
+                false,
+            ),
+            Span::with_cacheable("u2", SpanKind::User, "q2", RetentionClass::Hot, true),
+        ]);
+        let boundaries = AnthropicCacheStrategy::new().boundaries(&rope);
+        assert_eq!(
+            boundaries,
+            vec![CacheBoundary::at(0), CacheBoundary::at(1)],
+            "run ends at the hole; u2 (index 3) must NOT be marked"
+        );
     }
 
     #[test]

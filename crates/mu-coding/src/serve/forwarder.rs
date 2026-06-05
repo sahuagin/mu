@@ -480,6 +480,8 @@ pub(crate) fn task_telemetry_for(
         completion_tokens: usage.map(|u| u.output_tokens),
         cache_read_tokens: usage.and_then(|u| u.cache_read_input_tokens),
         cache_write_tokens: usage.and_then(|u| u.cache_creation_input_tokens),
+        cache_write_5m_tokens: usage.and_then(|u| u.cache_creation_5m_input_tokens),
+        cache_write_1h_tokens: usage.and_then(|u| u.cache_creation_1h_input_tokens),
         tools_granted: Vec::new(),
         tools_actually_called: Vec::new(),
         exit_reason,
@@ -936,6 +938,8 @@ mod tests {
                 output_tokens: 5,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                cache_creation_5m_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
                 reasoning_tokens: None,
             }),
         };
@@ -1077,6 +1081,8 @@ mod tests {
                 output_tokens: 50,
                 cache_read_input_tokens: Some(15),
                 cache_creation_input_tokens: None,
+                cache_creation_5m_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
                 reasoning_tokens: None,
             }),
             elapsed_ms: Some(1234),
@@ -1121,6 +1127,8 @@ mod tests {
                         output_tokens: 7,
                         cache_read_input_tokens: None,
                         cache_creation_input_tokens: None,
+                        cache_creation_5m_input_tokens: None,
+                        cache_creation_1h_input_tokens: None,
                         reasoning_tokens: None,
                     }),
                 }),
@@ -1134,6 +1142,8 @@ mod tests {
                     output_tokens: 7,
                     cache_read_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    cache_creation_5m_input_tokens: None,
+                    cache_creation_1h_input_tokens: None,
                     reasoning_tokens: None,
                 }),
                 elapsed_ms: Some(123),
@@ -1204,6 +1214,8 @@ mod tests {
                     output_tokens: output,
                     cache_read_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    cache_creation_5m_input_tokens: None,
+                    cache_creation_1h_input_tokens: None,
                     reasoning_tokens: None,
                 }),
                 elapsed_ms: Some(elapsed),
@@ -1235,6 +1247,8 @@ mod tests {
                 output_tokens: 17,
                 cache_read_input_tokens: Some(100),
                 cache_creation_input_tokens: Some(50),
+                cache_creation_5m_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
                 reasoning_tokens: None,
             }),
             elapsed_ms: Some(1234),
@@ -1258,6 +1272,8 @@ mod tests {
                 completion_tokens,
                 cache_read_tokens,
                 cache_write_tokens,
+                cache_write_5m_tokens,
+                cache_write_1h_tokens,
                 provider_kind,
                 model,
                 task_id,
@@ -1280,6 +1296,9 @@ mod tests {
                 assert_eq!(completion_tokens, Some(17));
                 assert_eq!(cache_read_tokens, Some(100));
                 assert_eq!(cache_write_tokens, Some(50));
+                // No tier breakdown in this fixture (no cache_creation object).
+                assert_eq!(cache_write_5m_tokens, None);
+                assert_eq!(cache_write_1h_tokens, None);
                 assert_eq!(provider_kind, "openrouter");
                 assert_eq!(model, "deepseek/deepseek-v4-flash");
                 assert!(task_id.starts_with("task-"), "task_id: {task_id}");

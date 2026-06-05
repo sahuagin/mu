@@ -1902,6 +1902,8 @@ fn session_row_from_info_value(v: &serde_json::Value) -> Option<SessionRow> {
                 cache_creation_input_tokens: u
                     .get("cache_creation_input_tokens")
                     .and_then(|x| x.as_u64()),
+                cache_creation_5m_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
                 reasoning_tokens: u.get("reasoning_tokens").and_then(|x| x.as_u64()),
             };
             Some(pricing.cost(&usage) as f32)

@@ -562,6 +562,8 @@ impl OpenAiUsage {
                 .as_ref()
                 .and_then(|d| d.cached_tokens),
             cache_creation_input_tokens: None,
+            cache_creation_5m_input_tokens: None,
+            cache_creation_1h_input_tokens: None,
             reasoning_tokens: self
                 .completion_tokens_details
                 .as_ref()

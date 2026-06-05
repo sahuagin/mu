@@ -863,6 +863,8 @@ mod tests {
             output_tokens: output,
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
+            cache_creation_5m_input_tokens: None,
+            cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
         }
     }
@@ -1249,6 +1251,8 @@ mod tests {
             output_tokens: 10,
             cache_read_input_tokens: Some(cache_read),
             cache_creation_input_tokens: None,
+            cache_creation_5m_input_tokens: None,
+            cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
         }
     }

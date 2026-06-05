@@ -133,6 +133,8 @@ mod tests {
             output_tokens: 6_960,
             cache_creation_input_tokens: Some(21_772),
             cache_read_input_tokens: Some(58_084),
+            cache_creation_5m_input_tokens: None,
+            cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
         };
         let pricing = for_model("anthropic_api", "claude-opus-4-7").unwrap();
@@ -158,6 +160,8 @@ mod tests {
             output_tokens: 100_000,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            cache_creation_5m_input_tokens: None,
+            cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
         };
         let pricing = for_model("anthropic_api", "claude-opus-4-7").unwrap();

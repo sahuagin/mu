@@ -252,6 +252,8 @@ mod tests {
                 completion_tokens: Some(17),
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                cache_write_5m_tokens: None,
+                cache_write_1h_tokens: None,
                 tools_granted: vec![],
                 tools_actually_called: vec![],
                 exit_reason: TaskExitReason::Done,

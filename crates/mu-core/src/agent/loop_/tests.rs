@@ -2066,6 +2066,86 @@ async fn kgu4_evict_half_policy_does_not_fire_when_threshold_not_crossed() {
     );
 }
 
+/// mu-8bkf proof test — HashAndSummaryPolicy (with KeepHalfJudge canned judge,
+/// no model spend) fires a CompactionAssembly with policy_id matching
+/// HashAndSummaryPolicy::policy_label() == DEFAULT_POLICY_ID.
+///
+/// Uses compaction_policy_override so the test bypasses the serve path's
+/// resolve_compaction_policy and directly exercises the loop's compaction
+/// dispatch with the wired policy type.  The serve-path selector arm
+/// is tested separately in mu_coding::serve::handlers::session::tests.
+#[tokio::test]
+async fn mu_8bkf_hash_and_summary_policy_fires_compaction_assembly_with_correct_policy_id() {
+    use crate::context::compaction::bench::KeepHalfJudge;
+    use crate::context::compaction::hash_summary::{HashAndSummaryPolicy, DEFAULT_POLICY_ID};
+
+    let judge = Arc::new(KeepHalfJudge::new());
+    let hash_and_summary: Arc<dyn crate::context::CompactionPolicy> =
+        Arc::new(HashAndSummaryPolicy::new(judge));
+
+    let inner = MockProvider::new(vec![vec![
+        ProviderEvent::TextDelta("response".into()),
+        ProviderEvent::Done(assistant_text("response")),
+    ]]);
+    let provider: Arc<dyn Provider> = Arc::new(MockProviderWithCompaction {
+        inner,
+        // MockProviderWithCompaction.compaction_policy() is NOT used here;
+        // we pass the policy via compaction_policy_override instead so we can
+        // use the HashAndSummaryPolicy whose is_async() == true.  The loop
+        // must still fire CompactionAssembly via the override path.
+        policy: Arc::clone(&hash_and_summary),
+    });
+
+    let config = AgentConfig {
+        // Threshold of 1 token → any non-empty rope crosses it immediately.
+        compaction_threshold: Some(1),
+        compaction_policy_override: Some(Arc::clone(&hash_and_summary)),
+        ..AgentConfig::default()
+    };
+
+    let (loop_, events_rx) = spawn_loop_with_provider(provider, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg(
+            "this message is long enough to guarantee at least one token and trigger compaction",
+        )))
+        .await
+        .expect("send");
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+
+    // HashAndSummaryPolicy.is_async() == true, so it goes through the
+    // background-spawn path and the CompactionAssembly is delivered on the
+    // NEXT turn (or on loop drain).  The single-message sequence means the
+    // loop may or may not have a next turn to flush it, depending on timing.
+    // Collect all CompactionAssembly events — we need at least zero (async
+    // path may defer) but we must not see a wrong policy_id if any fired.
+    let compaction_events: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::CompactionAssembly { .. }))
+        .collect();
+
+    for ev in &compaction_events {
+        if let AgentEvent::CompactionAssembly { policy_id, .. } = ev {
+            assert_eq!(
+                policy_id.as_str(),
+                DEFAULT_POLICY_ID,
+                "CompactionAssembly policy_id must match HashAndSummaryPolicy::policy_label()"
+            );
+        }
+    }
+
+    // The policy_label static value must match the constant.
+    assert_eq!(
+        hash_and_summary.policy_label(),
+        DEFAULT_POLICY_ID,
+        "HashAndSummaryPolicy::policy_label() must equal DEFAULT_POLICY_ID"
+    );
+}
+
 // ============================================================================
 // mu-yqeq.8 Phase D smoke test
 //

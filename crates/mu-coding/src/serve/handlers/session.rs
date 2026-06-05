@@ -1097,19 +1097,7 @@ fn resolve_compaction_policy(
             );
             Some(heuristic())
         }
-        "hash-and-summary" | "hash_summary" => {
-            // The judge-backed HashAndSummaryPolicy needs a provider built
-            // from [compaction.judge]; that wiring isn't on the serve path
-            // yet (mu-8bkf follow-up). Fall back to heuristic drop so
-            // compaction still runs — and say so, rather than silently
-            // degrading to a no-op.
-            tracing::warn!(
-                threshold = cfg.trigger_threshold_tokens,
-                "compaction: judge-backed hash-and-summary is not wired into the serve \
-                 path yet; using heuristic span-family drop instead (mu-8bkf)"
-            );
-            Some(heuristic())
-        }
+        "hash-and-summary" | "hash_summary" => Some(resolve_hash_and_summary_policy(cfg)),
         other => {
             if !matches!(other, "no-compaction" | "none" | "") {
                 tracing::warn!(
@@ -1118,15 +1106,157 @@ fn resolve_compaction_policy(
                      (valid: heuristic, hash-and-summary, no-compaction)"
                 );
             }
-            if cfg.trigger_threshold_tokens > 0 {
+            if cfg.trigger_threshold_tokens > 0 && matches!(other, "no-compaction" | "none" | "") {
                 tracing::warn!(
                     threshold = cfg.trigger_threshold_tokens,
                     default_policy = %other,
-                    "compaction: trigger_threshold_tokens is set but default_policy \
-                     resolves to a no-op — context will NOT be compacted. Set \
-                     [compaction].default_policy = \"heuristic\" to enable (mu-8bkf)."
+                    "compaction: trigger_threshold_tokens is set but default_policy is \
+                     explicitly \"no-compaction\" — context will NOT be compacted. \
+                     Remove the explicit no-compaction override to use the default \
+                     heuristic policy, or set [compaction].default_policy = \
+                     \"hash-and-summary\" for judge-backed compaction (mu-8bkf)."
                 );
             }
+            None
+        }
+    }
+}
+
+/// Build a [`HashAndSummaryPolicy`] from the `[compaction.judge]` section.
+///
+/// ## Judge selection (mu-kgu.11 walk)
+///
+/// Walk `cfg.judge.ranking` in order; the first entry whose `(provider, auth)`
+/// can be constructed wins.  Construction goes through
+/// [`crate::serve::factory::build_provider_from_selector`] — the same path
+/// [`build_and_register_session`] uses — so there is no parallel provider-
+/// construction surface.
+///
+/// ## Empty ranking / all-unavailable
+///
+/// When `ranking` is empty OR every entry fails to construct, fall back to
+/// the bench canned judge ([`mu_core::context::compaction::bench::KeepHalfJudge`]).
+/// This satisfies the documented contract in `CompactionJudgeConfig`: "falls
+/// back to its hard-coded canned judge (mu-kgu.3 behavior)" and means
+/// `hash-and-summary` works out-of-the-box with no model spend.
+///
+/// The canned judge fallback is always constructible (pure in-process struct),
+/// so this function never fails and never falls back further to heuristic.
+fn resolve_hash_and_summary_policy(
+    cfg: &mu_core::config::CompactionConfig,
+) -> Arc<dyn mu_core::context::compaction::CompactionPolicy> {
+    use std::time::Duration;
+
+    use mu_core::context::compaction::bench::KeepHalfJudge;
+    use mu_core::context::compaction::hash_summary::{HashAndSummaryPolicy, KeepListMode};
+    use mu_core::context::compaction::provider_judge::ProviderJudge;
+    use mu_core::context::CacheTtl;
+
+    use crate::serve::factory::build_provider_from_selector;
+
+    // Walk the ranking list; first constructible entry wins.
+    let judge_provider: Option<Arc<dyn mu_core::agent::Provider>> =
+        cfg.judge.ranking.iter().find_map(|entry| {
+            // Map the ranking entry to a ProviderSelector.  Only the
+            // currently-implemented provider kinds are attempted; an
+            // unrecognised provider string is logged and skipped.
+            let selector = ranking_entry_to_selector(entry)?;
+            match build_provider_from_selector(&selector, false, None, CacheTtl::default()) {
+                Ok(p) => {
+                    tracing::info!(
+                        provider = %entry.provider,
+                        model = %entry.model,
+                        auth = %entry.auth,
+                        "compaction: selected judge provider from ranking"
+                    );
+                    Some(p)
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        provider = %entry.provider,
+                        model = %entry.model,
+                        auth = %entry.auth,
+                        error = %e,
+                        "compaction: ranking entry unavailable; trying next"
+                    );
+                    None
+                }
+            }
+        });
+
+    let output_mode = match cfg.judge.output_mode.as_str() {
+        "index_keep" => KeepListMode::IndexKeep,
+        _ => KeepListMode::HashKeep,
+    };
+
+    let policy = match judge_provider {
+        Some(provider) => {
+            // Build ProviderJudge from the winning provider.
+            let mut pj = ProviderJudge::new(provider);
+            if cfg.judge.timeout_secs > 0 {
+                pj = pj.with_timeout(Duration::from_secs(cfg.judge.timeout_secs));
+            }
+            tracing::info!(
+                threshold = cfg.judge.timeout_secs,
+                output_mode = %cfg.judge.output_mode,
+                "compaction: hash-and-summary policy active with live judge"
+            );
+            HashAndSummaryPolicy::new(Arc::new(pj)).with_output_mode(output_mode)
+        }
+        None => {
+            // No provider available — fall back to the bench canned judge
+            // (KeepHalfJudge: deterministic, no-network, keeps every other span).
+            // This satisfies the config contract "falls back to canned judge
+            // (mu-kgu.3 behavior)" when ranking is empty or all unavailable.
+            let ranking_count = cfg.judge.ranking.len();
+            if ranking_count == 0 {
+                tracing::info!(
+                    output_mode = %cfg.judge.output_mode,
+                    "compaction: hash-and-summary active with canned judge (no ranking \
+                     configured; zero model spend)"
+                );
+            } else {
+                tracing::warn!(
+                    ranking_count,
+                    output_mode = %cfg.judge.output_mode,
+                    "compaction: all judge ranking entries unavailable; \
+                     hash-and-summary falling back to canned judge (zero model spend)"
+                );
+            }
+            HashAndSummaryPolicy::new(Arc::new(KeepHalfJudge::new())).with_output_mode(output_mode)
+        }
+    };
+
+    Arc::new(policy)
+}
+
+/// Convert a [`mu_core::config::JudgeRankingEntry`] to a
+/// [`mu_core::protocol::ProviderSelector`] for the compaction judge path.
+///
+/// Only provider kinds that `build_provider_from_selector` can actually
+/// construct are attempted; others return `None` (the walk skips them).
+fn ranking_entry_to_selector(
+    entry: &mu_core::config::JudgeRankingEntry,
+) -> Option<mu_core::protocol::ProviderSelector> {
+    use mu_core::protocol::ProviderSelector;
+    match entry.provider.as_str() {
+        "anthropic" | "anthropic_api" | "anthropic-api" => Some(ProviderSelector::AnthropicApi {
+            model: entry.model.clone(),
+        }),
+        "openrouter" => Some(ProviderSelector::Openrouter {
+            model: entry.model.clone(),
+        }),
+        "openai_codex" | "openai-codex" | "codex" => Some(ProviderSelector::OpenaiCodex {
+            model: entry.model.clone(),
+        }),
+        "ollama" => Some(ProviderSelector::Ollama {
+            model: entry.model.clone(),
+        }),
+        other => {
+            tracing::debug!(
+                provider = %other,
+                "compaction: judge ranking entry uses unsupported provider kind; skipping"
+            );
             None
         }
     }
@@ -1148,26 +1278,106 @@ mod tests {
     use mu_core::protocol::JSONRPC_VERSION;
     use serde_json::json;
 
-    // mu-8bkf: compaction policy resolution from config. The previous
-    // inline match silently no-op'd every value but "heuristic"; this
-    // pins that real policies resolve and unknown/none resolve to None.
+    // mu-8bkf: compaction policy resolution from config.  Pins that
+    // all named policies resolve to Some (hash-and-summary now wires the
+    // real policy or canned judge fallback) and that unknown/explicit-none
+    // values still resolve to None.
     #[test]
     fn compaction_policy_resolves_per_config_value() {
         use mu_core::config::CompactionConfig;
+        use mu_core::context::compaction::hash_summary::DEFAULT_POLICY_ID;
         let cfg = |p: &str| CompactionConfig {
             default_policy: p.to_string(),
             trigger_threshold_tokens: 150_000,
             ..Default::default()
         };
-        // Real policies resolve to Some (hash-and-summary falls back to heuristic).
+        // Heuristic resolves to Some(SpanFamilyDropPolicy).
         assert!(resolve_compaction_policy(&cfg("heuristic")).is_some());
-        assert!(resolve_compaction_policy(&cfg("hash-and-summary")).is_some());
-        assert!(resolve_compaction_policy(&cfg("hash_summary")).is_some());
+
+        // hash-and-summary now wires the real policy (with canned judge
+        // fallback when ranking is empty, as in the default config).
+        let hns = resolve_compaction_policy(&cfg("hash-and-summary"));
+        assert!(hns.is_some(), "hash-and-summary must resolve to Some");
+        let hns = resolve_compaction_policy(&cfg("hash_summary"));
+        assert!(hns.is_some(), "hash_summary alias must resolve to Some");
+        // Policy label should match HashAndSummaryPolicy's DEFAULT_POLICY_ID.
+        assert_eq!(
+            resolve_compaction_policy(&cfg("hash-and-summary"))
+                .unwrap()
+                .policy_label(),
+            DEFAULT_POLICY_ID,
+            "hash-and-summary policy_label must be DEFAULT_POLICY_ID"
+        );
+
         // Explicit no-op and unknown resolve to None.
         assert!(resolve_compaction_policy(&cfg("no-compaction")).is_none());
         assert!(resolve_compaction_policy(&cfg("none")).is_none());
         assert!(resolve_compaction_policy(&cfg("")).is_none());
         assert!(resolve_compaction_policy(&cfg("bogus")).is_none());
+    }
+
+    // mu-8bkf: ranking_entry_to_selector maps known provider strings
+    // to the correct ProviderSelector variants (including aliases), and
+    // returns None for unsupported provider strings.
+    #[test]
+    fn ranking_entry_to_selector_maps_known_providers() {
+        use mu_core::config::JudgeRankingEntry;
+        use mu_core::protocol::ProviderSelector;
+
+        let entry = |p: &str, m: &str| JudgeRankingEntry {
+            provider: p.to_string(),
+            model: m.to_string(),
+            auth: "api_key".to_string(),
+        };
+
+        // anthropic aliases
+        let sel = ranking_entry_to_selector(&entry("anthropic", "claude-haiku-4-5"));
+        assert!(
+            matches!(sel, Some(ProviderSelector::AnthropicApi { model }) if model == "claude-haiku-4-5"),
+            "anthropic → AnthropicApi"
+        );
+        let sel = ranking_entry_to_selector(&entry("anthropic_api", "haiku"));
+        assert!(
+            matches!(sel, Some(ProviderSelector::AnthropicApi { .. })),
+            "anthropic_api → AnthropicApi"
+        );
+        let sel = ranking_entry_to_selector(&entry("anthropic-api", "haiku"));
+        assert!(
+            matches!(sel, Some(ProviderSelector::AnthropicApi { .. })),
+            "anthropic-api → AnthropicApi"
+        );
+
+        // openrouter
+        let sel = ranking_entry_to_selector(&entry("openrouter", "anthropic/claude-haiku-4.5"));
+        assert!(
+            matches!(sel, Some(ProviderSelector::Openrouter { .. })),
+            "openrouter → Openrouter"
+        );
+
+        // codex aliases
+        let sel = ranking_entry_to_selector(&entry("openai_codex", "gpt-4o"));
+        assert!(
+            matches!(sel, Some(ProviderSelector::OpenaiCodex { .. })),
+            "openai_codex → OpenaiCodex"
+        );
+        let sel = ranking_entry_to_selector(&entry("codex", "gpt-4o"));
+        assert!(
+            matches!(sel, Some(ProviderSelector::OpenaiCodex { .. })),
+            "codex → OpenaiCodex"
+        );
+
+        // ollama
+        let sel = ranking_entry_to_selector(&entry("ollama", "qwen3"));
+        assert!(
+            matches!(sel, Some(ProviderSelector::Ollama { .. })),
+            "ollama → Ollama"
+        );
+
+        // unknown → None
+        assert!(
+            ranking_entry_to_selector(&entry("magic-ai", "model")).is_none(),
+            "unknown provider → None"
+        );
     }
 
     // mu-slat: per-session injection of the spawn_worker tool. In

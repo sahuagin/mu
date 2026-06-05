@@ -80,10 +80,13 @@ impl<E: Embedder> Ranker for SemanticRanker<E> {
             Ok(mut v) if !v.is_empty() => v.remove(0),
             _ => return self.fallback.rank(intent, caps), // embed failed -> lexical
         };
-        // If nothing in this cap set is cached, all-zeros is useless — fall back.
+        // A partial cache is stale (catalog changed since `t4c discover`). Do
+        // NOT assign missing capabilities score 0.0: that silently hides new
+        // entries such as bash.gh.pr behind old cached neighbors. Fall back to
+        // lexical until discover rebuilds the vector cache.
         if !caps
             .iter()
-            .any(|c| self.cache.contains_key(&c.path.to_string()))
+            .all(|c| self.cache.contains_key(&c.path.to_string()))
         {
             return self.fallback.rank(intent, caps);
         }
@@ -165,10 +168,29 @@ mod tests {
             &["grep", "regex"],
         );
         let caps = vec![&rg];
-        // empty cache -> nothing cached -> lexical fallback still ranks
+        // empty cache -> missing cap vector -> lexical fallback still ranks
         let ranker = SemanticRanker::new(FakeEmbedder::new(), HashMap::new());
         let ranked = ranker.rank("regex search", &caps);
         assert_eq!(ranked.len(), 1);
         assert!(ranked[0].score > 0.0); // lexical found the overlap
+    }
+
+    #[test]
+    fn partial_cache_falls_back_to_lexical_so_new_caps_are_not_hidden() {
+        let gh = cap(
+            "bash.gh.pr",
+            "GitHub CLI for PRs/issues. In jj sibling workspaces use -R owner/repo",
+            &["github", "gh", "pr", "pull-request", "jj", "workspace"],
+        );
+        let jj = cap("bash.jj.status", "jujutsu status", &["jj"]);
+        let caps = vec![&gh, &jj];
+        // Stale cache has only the older jj entry. Semantic scoring would give gh
+        // 0.0 and hide it; correct behavior is lexical fallback over all caps.
+        let emb = FakeEmbedder::new();
+        let cache = VectorCache::build(&emb, "fake", &[&jj]).unwrap();
+        let ranker = SemanticRanker::new(emb, cache.by_path);
+        let ranked = ranker.rank("create github pr in jj workspace", &caps);
+        assert_eq!(ranked[0].cap.path.to_string(), "bash.gh.pr");
+        assert!(ranked[0].score > ranked[1].score);
     }
 }

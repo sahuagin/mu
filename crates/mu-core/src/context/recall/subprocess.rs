@@ -84,39 +84,58 @@ impl Default for SubprocessRecallProvider {
 
 impl RecallProvider for SubprocessRecallProvider {
     fn recall(&self, cwd: &Path, _capability: &Capability) -> Vec<RecalledItem> {
-        let output = match Command::new(&self.binary_path)
-            .arg("memory")
-            .arg("context")
-            .arg("--cwd")
-            .arg(cwd)
-            .arg("--tier")
-            .arg(&self.tier)
-            .output()
-        {
-            Ok(o) => o,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if !self
-                    .warned_about_missing_binary
-                    .swap(true, Ordering::Relaxed)
-                {
+        // Retry up to 3 times on ETXTBSY (text-file-busy).  The fork/exec
+        // race: a parallel test thread may hold an open write-fd to this
+        // stub binary at the moment we fork; the forked child inherits the
+        // fd and the kernel rejects the exec with ETXTBSY.  Same pattern
+        // as mu-d3v6 / PR #176 (memory_recall tool).  Bounded backoff is
+        // safe in production too — ETXTBSY on a real `agent` binary is
+        // equally transient and retrying is correct behaviour.
+        let mut attempts = 0u8;
+        let output = loop {
+            attempts += 1;
+            match Command::new(&self.binary_path)
+                .arg("memory")
+                .arg("context")
+                .arg("--cwd")
+                .arg(cwd)
+                .arg("--tier")
+                .arg(&self.tier)
+                .output()
+            {
+                Ok(o) => break o,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if !self
+                        .warned_about_missing_binary
+                        .swap(true, Ordering::Relaxed)
+                    {
+                        tracing::warn!(
+                            binary = %self.binary_path.display(),
+                            cwd = %cwd.display(),
+                            "SubprocessRecallProvider: agent CLI not found; session-start \
+                             memory recall disabled. install ~/.local/bin/agent or supply \
+                             a custom binary path to silence.",
+                        );
+                    }
+                    return Vec::new();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 4 => {
+                    tracing::debug!(
+                        binary = %self.binary_path.display(),
+                        attempt = attempts,
+                        "SubprocessRecallProvider: ETXTBSY — retrying after fork/exec race",
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => {
                     tracing::warn!(
                         binary = %self.binary_path.display(),
                         cwd = %cwd.display(),
-                        "SubprocessRecallProvider: agent CLI not found; session-start \
-                         memory recall disabled. install ~/.local/bin/agent or supply \
-                         a custom binary path to silence.",
+                        error = %e,
+                        "SubprocessRecallProvider: failed to spawn agent CLI",
                     );
+                    return Vec::new();
                 }
-                return Vec::new();
-            }
-            Err(e) => {
-                tracing::warn!(
-                    binary = %self.binary_path.display(),
-                    cwd = %cwd.display(),
-                    error = %e,
-                    "SubprocessRecallProvider: failed to spawn agent CLI",
-                );
-                return Vec::new();
             }
         };
 

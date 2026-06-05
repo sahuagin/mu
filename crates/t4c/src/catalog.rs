@@ -77,6 +77,36 @@ pub fn curated() -> Vec<Capability> {
             false,
         ),
         cap(
+            "bash.gh.pr",
+            "GitHub CLI for PRs/issues. In jj sibling workspaces there is no .git: always pass `-R owner/repo` (e.g. `gh pr create -R sahuagin/mu ...`). Avoid `gh pr merge -d`; merge, then `jj git fetch`.",
+            &[
+                "github",
+                "gh",
+                "pr",
+                "pull-request",
+                "review",
+                "merge",
+                "issue",
+                "jj",
+                "workspace",
+                "not-a-git-repository",
+                "repository",
+            ],
+            &[
+                "gh",
+                "pr",
+                "create",
+                "-R",
+                "OWNER/REPO",
+                "--base",
+                "main",
+                "--head",
+                "BRANCH",
+            ],
+            &["gh", "pr", "--help"],
+            false,
+        ),
+        cap(
             "bash.jq",
             "jq — query and transform JSON",
             &["json", "query", "filter", "transform", "parse"],
@@ -234,6 +264,19 @@ mod tests {
     #[test]
     fn curated_is_nonempty() {
         assert!(!curated().is_empty());
+    }
+
+    #[test]
+    fn curated_contains_gh_pr_jj_workspace_guidance() {
+        let caps = curated();
+        let gh = caps
+            .iter()
+            .find(|c| c.path.to_string() == "bash.gh.pr")
+            .expect("gh PR capability missing");
+        assert!(gh.summary.contains("-R owner/repo"));
+        assert!(gh.summary.contains("jj sibling workspaces"));
+        assert!(gh.summary.contains("Avoid `gh pr merge -d`"));
+        assert_eq!(gh.invoke[..4], ["gh", "pr", "create", "-R"]);
     }
 
     #[test]

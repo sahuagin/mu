@@ -9,8 +9,9 @@ use mu_core::{
 use crate::console::{
     data::{load_events, scan_sessions, AppState},
     html::{
-        breakdown_table, esc, esc_attr, event_anchor, fmt_ms, fmt_opt_u32, fmt_opt_u64, kv, page,
-        payload_kind, td, td_code, td_num, transcript_block, truncate, truncated_details, urlish,
+        breakdown_table, esc, esc_attr, event_anchor, fmt_opt_u32, fmt_opt_u64, kv, page,
+        payload_kind, td, td_code, td_num, td_time, transcript_block, truncate, truncated_details,
+        urlish,
     },
 };
 
@@ -51,7 +52,7 @@ pub(crate) fn render_sessions_index(state: Arc<AppState>) -> Html<String> {
             urlish(&s.session_id)
         ));
         body.push_str("<tr>");
-        body.push_str(&td(&fmt_ms(s.last_activity_unix_ms)));
+        body.push_str(&td_time(s.last_activity_unix_ms));
         body.push_str(&td_code(&s.daemon_id));
         body.push_str(&format!(
             "<td><a href=\"{}\"><code>{}</code></a></td>",
@@ -402,7 +403,7 @@ fn render_events(events: &[SessionEvent]) -> String {
     for ev in events {
         out.push_str(&format!("<tr id=\"event-{}\">", ev.id));
         out.push_str(&format!("<td>{}</td>", event_anchor(ev.id)));
-        out.push_str(&td(&fmt_ms(Some(ev.timestamp_unix_ms))));
+        out.push_str(&td_time(Some(ev.timestamp_unix_ms)));
         out.push_str(&td_code(&format!("{:?}", ev.actor)));
         out.push_str(&td_code(payload_kind(&ev.payload)));
         let json = serde_json::to_string_pretty(ev).unwrap_or_else(|_| format!("{ev:#?}"));

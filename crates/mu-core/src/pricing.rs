@@ -6,7 +6,19 @@
 //!
 //! ```text
 //! cost($) = (input × in_rate
-//!         +  cache_creation × in_rate × 1.25
+//!         +  cache_creation × in_rate × 1.25   (flat fallback)
+//!         +  cache_read × in_rate × 0.10
+//!         +  output × out_rate) / 1_000_000
+//! ```
+//!
+//! When the per-tier split is present (mu-cache-write-tier-split-umq6) the
+//! flat `cache_creation_input_tokens` field is replaced by tier-specific
+//! rates — 1.25x for ephemeral-5m, 2.0x for ephemeral-1h:
+//!
+//! ```text
+//! cost($) = (input × in_rate
+//!         +  write_5m × in_rate × 1.25
+//!         +  write_1h × in_rate × 2.00
 //!         +  cache_read × in_rate × 0.10
 //!         +  output × out_rate) / 1_000_000
 //! ```
@@ -34,14 +46,34 @@ pub struct ModelPricing {
 impl ModelPricing {
     /// Cost in USD for one [`Usage`] sample. Missing cache fields are
     /// treated as zero (partial reporting is normal — see [`Usage`]).
+    ///
+    /// When the per-tier split (`cache_creation_5m_input_tokens` /
+    /// `cache_creation_1h_input_tokens`) is present, tier-specific
+    /// rates are used (1.25× for 5m, 2.0× for 1h). When absent, the
+    /// flat total in `cache_creation_input_tokens` is priced at the
+    /// conservative 1.25× fallback. mu-cache-write-tier-split-umq6.
     pub fn cost(&self, usage: &Usage) -> f64 {
         let in_rate = self.input_per_mtok;
-        let cw = usage.cache_creation_input_tokens.unwrap_or(0) as f64;
         let cr = usage.cache_read_input_tokens.unwrap_or(0) as f64;
         let inp = usage.input_tokens as f64;
         let out = usage.output_tokens as f64;
-        (inp * in_rate + cw * in_rate * 1.25 + cr * in_rate * 0.10 + out * self.output_per_mtok)
-            / 1_000_000.0
+
+        // Cache-write cost: use tier-specific multipliers when the split
+        // is present; fall back to the flat total at 1.25× otherwise.
+        let cw_cost = match (
+            usage.cache_creation_5m_input_tokens,
+            usage.cache_creation_1h_input_tokens,
+        ) {
+            (Some(w5m), Some(w1h)) => {
+                w5m as f64 * in_rate * 1.25 + w1h as f64 * in_rate * 2.00
+            }
+            _ => {
+                // Flat fallback: assume 1.25× (5m tier) when no breakdown.
+                usage.cache_creation_input_tokens.unwrap_or(0) as f64 * in_rate * 1.25
+            }
+        };
+
+        (inp * in_rate + cw_cost + cr * in_rate * 0.10 + out * self.output_per_mtok) / 1_000_000.0
     }
 }
 

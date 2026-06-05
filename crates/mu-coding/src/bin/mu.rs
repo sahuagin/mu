@@ -123,6 +123,21 @@ enum Command {
         #[arg(long, default_value = "openai-codex")]
         provider: String,
     },
+    /// Read-only web operator console over mu event logs.
+    Console {
+        /// Address to bind. Defaults to loopback only.
+        #[arg(long, default_value = "127.0.0.1:8765")]
+        bind: std::net::SocketAddr,
+        /// Base path when served behind a reverse proxy (e.g. /mu-console/).
+        #[arg(long, default_value = "/")]
+        base_path: String,
+        /// Path to the events directory. Default: ~/.local/share/mu/events/.
+        #[arg(long, value_name = "PATH")]
+        events_dir: Option<std::path::PathBuf>,
+        /// Path to analytics DB. Default: ~/.local/share/mu/telemetry.sqlite.
+        #[arg(long, value_name = "PATH")]
+        analytics_db: Option<std::path::PathBuf>,
+    },
     /// Print the version of each crate (smoke test for the workspace).
     Versions,
     /// Telemetry projection + preset analytics queries over the
@@ -300,6 +315,30 @@ async fn main() -> Result<()> {
                  The interactive TUI is available via `mu tui` (delegates \
                  to the `mu-tui` binary)."
             )
+        }
+        Command::Console {
+            bind,
+            base_path,
+            events_dir,
+            analytics_db,
+        } => {
+            let events_dir = match events_dir {
+                Some(p) => p,
+                None => mu_coding::serve::default_events_dir().context(
+                    "could not resolve default events dir; pass --events-dir PATH explicitly",
+                )?,
+            };
+            let analytics_db = match analytics_db {
+                Some(p) => Some(p),
+                None => mu_coding::analytics::default_db_path(),
+            };
+            mu_coding::console::run(mu_coding::console::ConsoleOptions {
+                bind,
+                base_path,
+                events_dir,
+                analytics_db,
+            })
+            .await
         }
         Command::Analytics { cmd } => run_analytics(cmd),
         Command::Capabilities { cmd } => run_capabilities(cmd),

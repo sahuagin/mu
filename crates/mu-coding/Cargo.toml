@@ -45,10 +45,11 @@ rmcp = { workspace = true, features = [
 # mu-slat Phase 3: Rust-owned pty + vt100 screen scraping for pot workers
 portable-pty = { workspace = true }
 vt100 = { workspace = true }
+# mu-console web operator console (read-only v1).
+axum = "0.8"
 
 [dev-dependencies]
 futures = { workspace = true }
 # mu-yc6 smoke tests: stub MCP server over Streamable HTTP (mirrors how
 # code-index-mcp serves; axum hosts rmcp's tower StreamableHttpService)
-axum = "0.8"
 rmcp = { workspace = true, features = ["transport-streamable-http-server"] }

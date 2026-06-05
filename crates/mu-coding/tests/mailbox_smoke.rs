@@ -32,7 +32,7 @@ async fn spawn_server(
     let (server_read, server_write) = tokio::io::split(server);
     let server_buf = BufReader::new(server_read);
     let factory: serve::ProviderFactory =
-        std::sync::Arc::new(move |_selector| Ok(provider.clone()));
+        std::sync::Arc::new(move |_selector, _cache_ttl| Ok(provider.clone()));
     let config = Config {
         auth: AuthConfig::Bearer {
             tokens: vec![TEST_BEARER_TOKEN.to_string()],

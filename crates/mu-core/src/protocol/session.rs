@@ -26,6 +26,15 @@ pub struct CreateSessionRequest {
     /// (back-compat with pre-mu-phl clients).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<std::path::PathBuf>,
+    /// mu-f1a0: prompt-cache TTL tier for providers with tiered
+    /// caching (Anthropic: "5m" default / "1h" extended). None → 5m.
+    /// Interactive frontends want "1h" — human gaps >5min dominated
+    /// cache-write cost on measured sessions (74% of baseline writes
+    /// were expiry re-writes); batch and delegated-worker sessions
+    /// stay on "5m" (gap-free, the 2x write premium is pure cost).
+    /// The daemon's delegate path pins workers to 5m regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<crate::context::CacheTtl>,
 }
 
 impl CreateSessionRequest {

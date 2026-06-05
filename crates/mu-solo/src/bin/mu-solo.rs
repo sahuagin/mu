@@ -114,6 +114,7 @@ async fn main() -> Result<()> {
         tools: &cfg.session.tools,
         effort: &cfg.tui.effort,
         focus_mode: cfg.tui.focus_mode,
+        cache_ttl: &cfg.session.cache_ttl,
         clipboard_command: cfg.tui.clipboard_command.as_deref(),
     })
     .context("App::new failed (is the mu binary path correct?)")?;

@@ -33,6 +33,15 @@ pub struct ToolSpec {
     /// override it keep working.
     #[serde(default)]
     pub policy: ToolPolicy,
+    /// mu-2e0h: when true, this tool's results bypass the tier-1
+    /// ingestion filter (ANSI strip / repeat collapse / line cap /
+    /// truncation). Set by read-like tools whose output the model
+    /// must treat as verbatim disk truth — exact-match `edit` builds
+    /// on what `read` showed, so the filter must never alter the
+    /// model's belief about file contents. Defaults to false: tool
+    /// output gets hygiene unless the tool declares otherwise.
+    #[serde(default)]
+    pub verbatim_result: bool,
 }
 
 impl Default for ToolSpec {
@@ -44,6 +53,7 @@ impl Default for ToolSpec {
             display: None,
             when: None,
             policy: ToolPolicy::default(),
+            verbatim_result: false,
         }
     }
 }
@@ -69,6 +79,14 @@ impl ToolSpec {
 
     pub fn with_when(mut self, when: impl Into<String>) -> Self {
         self.when = Some(when.into());
+        self
+    }
+
+    /// Builder method: results bypass the tier-1 ingestion filter
+    /// (mu-2e0h) — for read-like tools whose output is verbatim disk
+    /// truth.
+    pub fn with_verbatim_result(mut self) -> Self {
+        self.verbatim_result = true;
         self
     }
 

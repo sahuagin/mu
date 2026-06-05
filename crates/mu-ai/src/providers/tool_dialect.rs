@@ -243,6 +243,7 @@ mod tests {
             display: None,
             when: None,
             policy: Default::default(),
+            verbatim_result: false,
         }
     }
 

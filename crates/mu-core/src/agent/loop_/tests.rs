@@ -156,6 +156,9 @@ struct MockTool {
     /// dispatcher's pre-flight gate short-circuits without firing
     /// the approval round-trip.
     validate_rejection: Option<String>,
+    /// mu-2e0h: when true the spec declares verbatim_result, so the
+    /// tier-1 ingestion filter must bypass this tool's output.
+    verbatim_result: bool,
 }
 
 impl MockTool {
@@ -173,6 +176,7 @@ impl MockTool {
             responses: Mutex::new(q),
             policy_override: None,
             validate_rejection: None,
+            verbatim_result: false,
         }
     }
 
@@ -190,6 +194,7 @@ impl MockTool {
             responses: Mutex::new(q),
             policy_override: None,
             validate_rejection: None,
+            verbatim_result: false,
         }
     }
 
@@ -209,6 +214,7 @@ impl MockTool {
             responses: Mutex::new(q),
             policy_override: None,
             validate_rejection: None,
+            verbatim_result: false,
         }
     }
 
@@ -227,6 +233,13 @@ impl MockTool {
         self
     }
 
+    /// mu-2e0h: declare verbatim_result in the spec so the tier-1
+    /// ingestion filter bypasses this tool's output.
+    fn with_verbatim_result(mut self) -> Self {
+        self.verbatim_result = true;
+        self
+    }
+
     fn delayed(name: &str, content: &str, delay: Duration) -> Self {
         let mut q = VecDeque::new();
         q.push_back((
@@ -241,6 +254,7 @@ impl MockTool {
             responses: Mutex::new(q),
             policy_override: None,
             validate_rejection: None,
+            verbatim_result: false,
         }
     }
 }
@@ -253,6 +267,7 @@ impl Tool for MockTool {
             description: format!("Mock tool: {}", self.name),
             input_schema: json!({"type": "object"}),
             policy: self.policy_override.clone().unwrap_or_default(),
+            verbatim_result: self.verbatim_result,
             ..Default::default()
         }
     }
@@ -976,6 +991,66 @@ async fn wf5w_buffered_um_does_not_suppress_done() {
         first_done < second_user_start,
         "done must precede the follow-up ask's message_start; kinds={kinds:?}"
     );
+}
+
+/// mu-2e0h: tool results pass through the tier-1 ingestion filter at
+/// the execute_tools seam — the SAME filtered content reaches the
+/// ToolCallCompleted event (log + wire) and the ToolResult message
+/// (provider context). A spammy result collapses; a tool that
+/// declares verbatim_result bypasses the filter entirely.
+#[tokio::test]
+async fn mu_2e0h_tool_result_filter_applies_unless_verbatim() {
+    let spammy = "spam\nspam\nspam\nspam\ndone";
+    for (verbatim, expected) in [
+        (false, "spam\n[line repeated 3 more times]\ndone"),
+        (true, spammy),
+    ] {
+        let provider = MockProvider::new(vec![
+            vec![ProviderEvent::Done(assistant_tool_call(
+                "t1",
+                "echo",
+                json!({}),
+            ))],
+            vec![
+                ProviderEvent::TextDelta("ok".into()),
+                ProviderEvent::Done(assistant_text("ok")),
+            ],
+        ]);
+        let tool = if verbatim {
+            MockTool::ok("echo", spammy).with_verbatim_result()
+        } else {
+            MockTool::ok("echo", spammy)
+        };
+        let (loop_, events_rx) = spawn_loop(provider, vec![tool], AgentConfig::default());
+        loop_
+            .send(AgentInput::UserMessage(user_msg("go")))
+            .await
+            .expect("send");
+        let events_handle = tokio::spawn(collect_events(events_rx));
+        let _ = loop_.join().await;
+        let events = events_handle.await.expect("events drain");
+
+        let event_content = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolCallCompleted { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("no ToolCallCompleted");
+        assert_eq!(event_content, expected, "verbatim={verbatim} (event)");
+
+        let msg_content = events.iter().find_map(|e| match e {
+            AgentEvent::MessageEnd {
+                message: AgentMessage::ToolResult { content, .. },
+            } => Some(content.clone()),
+            _ => None,
+        });
+        // ToolResult messages may not surface via MessageEnd; the
+        // event is the log of record. When present, it must match.
+        if let Some(m) = msg_content {
+            assert_eq!(m, expected, "verbatim={verbatim} (message)");
+        }
+    }
 }
 
 // Behavior tests (B-1..B-7 above) cover the integrated flow with

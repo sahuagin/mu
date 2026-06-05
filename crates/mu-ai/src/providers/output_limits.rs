@@ -28,6 +28,14 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
         8192
     } else if m.starts_with("gpt-5") || m.starts_with("o4") || m.starts_with("o3") {
         16384
+    } else if m.starts_with("gpt-oss") || m.starts_with("deepseek-r1") {
+        // ollama-served reasoning models: thinking arrives on the
+        // reasoning channel and counts against max_tokens. Measured
+        // 2026-06-05: gpt-oss:20b reviewing a ~500-line diff burned all
+        // 4096 tokens reasoning (finish=length, content EMPTY); at 16384
+        // the same prompt finished with room to spare. A 4k cap starves
+        // these models of any visible output on non-trivial prompts.
+        16384
     } else {
         4096
     }
@@ -71,5 +79,14 @@ mod tests {
     fn openai_reasoning_models_get_16k() {
         assert_eq!(max_tokens_for_model("gpt-5"), 16384);
         assert_eq!(max_tokens_for_model("o4-mini"), 16384);
+    }
+
+    #[test]
+    fn ollama_reasoning_models_get_16k() {
+        assert_eq!(max_tokens_for_model("gpt-oss:20b"), 16384);
+        assert_eq!(max_tokens_for_model("gpt-oss:120b"), 16384);
+        assert_eq!(max_tokens_for_model("deepseek-r1:32b"), 16384);
+        // Non-reasoning local models keep the conservative default.
+        assert_eq!(max_tokens_for_model("qwen3-coder:30b"), 4096);
     }
 }

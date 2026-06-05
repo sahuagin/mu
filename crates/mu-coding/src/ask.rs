@@ -286,7 +286,14 @@ async fn ask_and_drain(
     });
     write_line(stdin, &req).await?;
 
-    let mut text = String::new();
+    // Per-turn assembly: deltas stream into `current`; each turn's
+    // `session.assistant_text_finalized` (mu-wk2) replaces that turn's
+    // accumulated deltas with the authoritative final text. The two can
+    // differ — e.g. the ollama provider's text-dialect tool-call rescue
+    // (mu-ollama-qwen-tool-dialect-yfl0) strips leaked markup from the
+    // final message that already went out as deltas.
+    let mut finalized = String::new();
+    let mut current = String::new();
     let mut got_done = false;
     let mut got_response = false;
 
@@ -296,7 +303,15 @@ async fn ask_and_drain(
             Some("session.text_delta") => {
                 if line["params"]["session_id"] == session_id {
                     if let Some(delta) = line["params"]["delta"].as_str() {
-                        text.push_str(delta);
+                        current.push_str(delta);
+                    }
+                }
+            }
+            Some("session.assistant_text_finalized") => {
+                if line["params"]["session_id"] == session_id {
+                    if let Some(text) = line["params"]["text"].as_str() {
+                        finalized.push_str(text);
+                        current.clear();
                     }
                 }
             }
@@ -323,7 +338,11 @@ async fn ask_and_drain(
             }
         }
         if got_done && got_response {
-            return Ok(text);
+            // `current` is normally empty here (every turn finalizes);
+            // keep it as a defensive fallback for providers/paths that
+            // never emit assistant_text_finalized.
+            finalized.push_str(&current);
+            return Ok(finalized);
         }
     }
 }

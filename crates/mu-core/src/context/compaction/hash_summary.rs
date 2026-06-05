@@ -225,6 +225,13 @@ struct JudgeOutputIndex {
 }
 
 impl CompactionPolicy for HashAndSummaryPolicy {
+    /// Returns the stable policy label for `AgentEvent::CompactionAssembly`.
+    /// Matches [`DEFAULT_POLICY_ID`] so callers can distinguish this policy
+    /// from the heuristic drop policy and the no-op in event logs.
+    fn policy_label(&self) -> &'static str {
+        DEFAULT_POLICY_ID
+    }
+
     fn compact(&self, rope: &RetainedRope, _target_tokens: usize) -> CompactionResult {
         let start = Instant::now();
         let spans = rope.spans();

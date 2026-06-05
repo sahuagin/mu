@@ -179,9 +179,17 @@ impl Default for RecallConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct CompactionConfig {
     /// Identifier of the policy to instantiate at session creation.
-    /// `"no-compaction"` keeps pre-mu-kgu behavior; `"heuristic"`
-    /// selects [`crate::context::compaction::heuristic`];
-    /// `"hash-and-summary"` selects [`crate::context::compaction::hash_summary`].
+    ///
+    /// - `"heuristic"` (default) — [`crate::context::compaction::heuristic::SpanFamilyDropPolicy`];
+    ///   drops low-retention spans when the threshold is crossed.  Best choice when no
+    ///   judge model is configured.
+    /// - `"hash-and-summary"` — [`crate::context::compaction::hash_summary::HashAndSummaryPolicy`];
+    ///   calls a configured judge model (see [`CompactionJudgeConfig`]) to produce a
+    ///   content-aware keep-list and summary span.  Falls back to the bench canned judge
+    ///   (`KeepHalfJudge`) when `[compaction.judge].ranking` is empty, so no model spend
+    ///   is required if you omit judge config.
+    /// - `"no-compaction"` — explicit identity (pre-mu-kgu behavior); context is never
+    ///   compacted regardless of threshold.
     pub default_policy: String,
     /// Token threshold above which the agent loop runs
     /// `compaction_policy().compact(...)` between turns. Matches
@@ -194,7 +202,14 @@ pub struct CompactionConfig {
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
-            default_policy: "no-compaction".to_string(),
+            // mu-8bkf operator decision 2026-06-05: "default-and-warn beats
+            // nothing-and-warn".  The previous "no-compaction" default meant
+            // that a threshold set but no policy configured silently did nothing.
+            // "heuristic" is always constructible (no judge needed) and is the
+            // right safe-default for operators who set trigger_threshold_tokens
+            // without reading the full compaction docs.  Explicit "no-compaction"
+            // remains selectable.
+            default_policy: "heuristic".to_string(),
             trigger_threshold_tokens: crate::agent::DEFAULT_COMPACTION_THRESHOLD,
             judge: CompactionJudgeConfig::default(),
         }
@@ -499,9 +514,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_matches_pre_l1z_behavior() {
+    fn default_config_compaction_is_heuristic() {
+        // mu-8bkf: default_policy flipped from "no-compaction" to "heuristic"
+        // so a threshold-configured daemon runs real compaction out of the box.
         let c = Config::default();
-        assert_eq!(c.compaction.default_policy, "no-compaction");
+        assert_eq!(c.compaction.default_policy, "heuristic");
         assert_eq!(
             c.compaction.trigger_threshold_tokens,
             crate::agent::DEFAULT_COMPACTION_THRESHOLD
@@ -587,8 +604,8 @@ mod tests {
         // Specified fields use the TOML value.
         assert_eq!(c.ui.tui.default_provider, "openrouter");
         assert_eq!(c.ui.tui.default_model, "deepseek-chat");
-        // Untouched fields stay at code defaults.
-        assert_eq!(c.compaction.default_policy, "no-compaction");
+        // Untouched fields stay at code defaults (mu-8bkf: now "heuristic").
+        assert_eq!(c.compaction.default_policy, "heuristic");
     }
 
     #[test]

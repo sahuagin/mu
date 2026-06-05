@@ -2066,6 +2066,152 @@ async fn kgu4_evict_half_policy_does_not_fire_when_threshold_not_crossed() {
     );
 }
 
+/// mu-8bkf proof test — HashAndSummaryPolicy (with KeepHalfJudge canned judge,
+/// no model spend) fires a CompactionAssembly with policy_id matching
+/// HashAndSummaryPolicy::policy_label() == DEFAULT_POLICY_ID.
+///
+/// Uses compaction_policy_override so the test bypasses the serve path's
+/// resolve_compaction_policy and directly exercises the loop's compaction
+/// dispatch with the wired policy type.  The serve-path selector arm
+/// is tested separately in mu_coding::serve::handlers::session::tests.
+///
+/// Two-turn structure (mu-8bkf fix-round): HashAndSummaryPolicy.is_async()==true,
+/// so the loop SPAWNS the compact() call as a background task in turn 1 and
+/// only picks up the CompactionAssembly result at the START of turn 2 via
+/// bg_compaction.try_take().  A single-turn test can therefore never observe
+/// the event.  We drive two turns by watching for TurnEnd on the event stream
+/// and only then sending the second UserMessage, guaranteeing it arrives after
+/// the loop has gone back to blocking recv (i.e., truly a separate turn).
+/// KeepHalfJudge is pure-CPU / synchronous, so the background tokio task
+/// completes well before the loop begins turn 2.
+#[tokio::test]
+async fn mu_8bkf_hash_and_summary_policy_fires_compaction_assembly_with_correct_policy_id() {
+    use crate::context::compaction::bench::KeepHalfJudge;
+    use crate::context::compaction::hash_summary::{HashAndSummaryPolicy, DEFAULT_POLICY_ID};
+
+    let judge = Arc::new(KeepHalfJudge::new());
+    let hash_and_summary: Arc<dyn crate::context::CompactionPolicy> =
+        Arc::new(HashAndSummaryPolicy::new(judge));
+
+    // Two scripted responses: turn 1 triggers bg compaction; turn 2 picks
+    // it up and fires CompactionAssembly before calling the provider.
+    let inner = MockProvider::new(vec![
+        vec![
+            ProviderEvent::TextDelta("response one".into()),
+            ProviderEvent::Done(assistant_text("response one")),
+        ],
+        vec![
+            ProviderEvent::TextDelta("response two".into()),
+            ProviderEvent::Done(assistant_text("response two")),
+        ],
+    ]);
+    let provider: Arc<dyn Provider> = Arc::new(MockProviderWithCompaction {
+        inner,
+        // MockProviderWithCompaction.compaction_policy() drives the label
+        // returned by the loop's try_take() path (line ~1034 of loop_/mod.rs:
+        // `provider.compaction_policy().policy_label()`).  Wire the same
+        // hash_and_summary so that path also returns DEFAULT_POLICY_ID.
+        policy: Arc::clone(&hash_and_summary),
+    });
+
+    let config = AgentConfig {
+        // Threshold of 1 token → any non-empty rope crosses it immediately.
+        compaction_threshold: Some(1),
+        compaction_policy_override: Some(Arc::clone(&hash_and_summary)),
+        ..AgentConfig::default()
+    };
+
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let loop_ = loop_with(
+        provider,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        vec![],
+        config,
+        events_tx,
+        approvals,
+        capability,
+    );
+
+    // Send message 1 immediately.
+    loop_
+        .send(AgentInput::UserMessage(user_msg(
+            "first message: long enough to guarantee at least one token and trigger compaction",
+        )))
+        .await
+        .expect("send first");
+
+    // Spawn a task that watches the event stream for TurnEnd (turn 1
+    // complete) and then sends message 2 on the loop's input channel.
+    // This ensures message 2 arrives AFTER the loop has returned to
+    // blocking recv — guaranteeing a genuine second turn.
+    let loop_tx = loop_.sender();
+    let watcher = tokio::spawn(async move {
+        let mut rx = events_rx;
+        let mut events = Vec::new();
+        let mut loop_tx_opt = Some(loop_tx);
+        while let Some(e) = rx.recv().await {
+            if let Some(tx) = loop_tx_opt.take() {
+                if matches!(e, AgentEvent::TurnEnd) {
+                    // Turn 1 is done; send message 2, then DROP the sender
+                    // so the loop sees channel-close after processing msg 2.
+                    let _ = tx
+                        .send(AgentInput::UserMessage(user_msg(
+                            "second message: turn 2 picks up bg compaction",
+                        )))
+                        .await;
+                    // tx is dropped here — loop_tx_opt.take() consumed it.
+                } else {
+                    // TurnEnd not yet; put the sender back.
+                    loop_tx_opt = Some(tx);
+                }
+            }
+            events.push(e);
+        }
+        events
+    });
+
+    let outcome = timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("loop did not complete within 5 seconds");
+    let events = watcher.await.expect("watcher drain");
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+
+    // Turn 2 must have picked up the bg compaction result and emitted
+    // CompactionAssembly.  Collect all such events — we expect at least one.
+    let compaction_events: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::CompactionAssembly { .. }))
+        .collect();
+
+    assert!(
+        !compaction_events.is_empty(),
+        "expected at least one CompactionAssembly event after two turns with \
+         HashAndSummaryPolicy+threshold=1; saw zero.  Events: {:?}",
+        events.iter().map(kind).collect::<Vec<_>>(),
+    );
+
+    for ev in &compaction_events {
+        if let AgentEvent::CompactionAssembly { policy_id, .. } = ev {
+            assert_eq!(
+                policy_id.as_str(),
+                DEFAULT_POLICY_ID,
+                "CompactionAssembly policy_id must match HashAndSummaryPolicy::policy_label()"
+            );
+        }
+    }
+
+    // The policy_label static value must match the constant.
+    assert_eq!(
+        hash_and_summary.policy_label(),
+        DEFAULT_POLICY_ID,
+        "HashAndSummaryPolicy::policy_label() must equal DEFAULT_POLICY_ID"
+    );
+}
+
 // ============================================================================
 // mu-yqeq.8 Phase D smoke test
 //

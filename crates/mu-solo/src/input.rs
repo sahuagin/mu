@@ -518,6 +518,25 @@ mod tests {
     }
 
     #[test]
+    fn newline_insert_at_cursor() {
+        // mu-solo-shift-enter-62tx: Shift+Enter / Ctrl-J path —
+        // a '\n' inserted via insert_char mid-buffer splits the
+        // visual layout and lands the cursor at the start of the
+        // new line.
+        let mut buf = InputBuffer::new();
+        buf.insert_str("ab");
+        buf.move_left();
+        buf.insert_char('\n');
+        assert_eq!(buf.content(), "a\nb");
+        let layout = buf.visual_layout(80);
+        assert_eq!(layout.lines.len(), 2);
+        assert_eq!(layout.lines[0].text, "a");
+        assert_eq!(layout.lines[1].text, "b");
+        assert_eq!(layout.cursor_row, 1);
+        assert_eq!(layout.cursor_col, 0);
+    }
+
+    #[test]
     fn paste_with_newlines() {
         let mut buf = InputBuffer::new();
         buf.insert_str("line one\nline two\nline three");

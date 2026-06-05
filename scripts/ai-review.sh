@@ -97,18 +97,18 @@ DIFF:
 $DIFF"
 
 run_review() { # $1=provider $2=model — prints reviewer stdout; stderr -> $ERRLOG
-  # The reviewer session must be hermetic: the minimal system prompt
-  # replaces the daemon default, and MU_NO_RECALL=1 stops the daemon's
-  # session-start memory/project-file injection from appending the
-  # ~28KB operator kernel after it (verified on the wire: without this,
-  # messages[0] starts with our prompt and carries the kernel anyway).
+  # The reviewer session must be hermetic: --bare (PR #187) guarantees
+  # mu injects nothing — no session-start memory/project-file recall,
+  # no discovery bootstrap — so the session's system prompt is exactly
+  # the minimal reviewer prompt below (and nothing at all if the file
+  # is missing). Replaces the MU_NO_RECALL=1 env spelling from #185.
   # shellcheck disable=SC2086 — $SYS_FLAGS intentionally word-splits
   SYS_FLAGS=""
   [ -r "$SYSPROMPT" ] && SYS_FLAGS="--append-system-prompt $SYSPROMPT"
   if [ -n "$TOOLS" ]; then
-    MU_NO_RECALL=1 timeout 300 "$MU" ask --provider "$1" --model "$2" --thinking low $SYS_FLAGS --tools "$TOOLS" "$PROMPT" 2>>"$ERRLOG"
+    timeout 300 "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS --tools "$TOOLS" "$PROMPT" 2>>"$ERRLOG"
   else
-    MU_NO_RECALL=1 timeout 300 "$MU" ask --provider "$1" --model "$2" --thinking low $SYS_FLAGS "$PROMPT" 2>>"$ERRLOG"
+    timeout 300 "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS "$PROMPT" 2>>"$ERRLOG"
   fi
 }
 verdict_of() { # stdin -> APPROVE | REJECT | UNCLEAR

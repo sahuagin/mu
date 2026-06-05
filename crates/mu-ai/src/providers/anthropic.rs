@@ -372,6 +372,12 @@ fn translate_provider_messages(pmsgs: &ProviderMessages) -> (Vec<Value>, Option<
     let mut system_text: Option<String> = None;
 
     for msg in &pmsgs.messages {
+        // mu-chiw: conversation-anchor markers land on User /
+        // Assistant / ToolResult messages and emit `cache_control` on
+        // a content block at the marked position. System-role markers
+        // are handled separately (detect_cache_targets → body.system
+        // / body.tools), unchanged.
+        let marked = msg.cache_marker() == Some(CacheMarker::Ephemeral);
         match msg.role() {
             ProviderRole::System => {
                 let is_tool_schema = msg
@@ -395,18 +401,44 @@ fn translate_provider_messages(pmsgs: &ProviderMessages) -> (Vec<Value>, Option<
                 }
             }
             ProviderRole::ToolResult => {
-                tool_result_buf.push(translate_provider_tool_result(msg));
+                let mut block = translate_provider_tool_result(msg);
+                if marked {
+                    block["cache_control"] = json!({ "type": "ephemeral" });
+                }
+                tool_result_buf.push(block);
             }
             ProviderRole::User => {
                 flush_tool_result_buf(&mut out, &mut tool_result_buf);
-                out.push(json!({
-                    "role": "user",
-                    "content": msg.content(),
-                }));
+                if marked {
+                    // cache_control needs a content BLOCK; the plain
+                    // string form stays for unmarked messages (wire
+                    // parity with the legacy path).
+                    out.push(json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": msg.content(),
+                            "cache_control": { "type": "ephemeral" },
+                        }],
+                    }));
+                } else {
+                    out.push(json!({
+                        "role": "user",
+                        "content": msg.content(),
+                    }));
+                }
             }
             ProviderRole::Assistant => {
                 flush_tool_result_buf(&mut out, &mut tool_result_buf);
-                if let Some(translated) = translate_provider_assistant(msg) {
+                if let Some(mut translated) = translate_provider_assistant(msg) {
+                    if marked {
+                        if let Some(last) = translated["content"]
+                            .as_array_mut()
+                            .and_then(|blocks| blocks.last_mut())
+                        {
+                            last["cache_control"] = json!({ "type": "ephemeral" });
+                        }
+                    }
                     out.push(translated);
                 }
             }

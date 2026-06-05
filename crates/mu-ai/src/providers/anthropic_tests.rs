@@ -1424,30 +1424,45 @@ fn fb0_cache_boundaries_land_on_system_and_last_tool_schema() {
     let boundaries = strategy.boundaries(&rope);
     strategy.annotate(&mut projection, &boundaries);
 
-    // Two boundaries: system (0) + last-in-prefix (1, the tool schema).
-    assert_eq!(boundaries.len(), 2);
+    // mu-chiw: THREE boundaries — system (0), last-in-prefix (1, the
+    // tool schema), and the conversation run-end anchor (last span).
+    // The pre_turn anchor dedups into (1) for this fixture.
+    assert_eq!(boundaries.len(), 3);
     assert_eq!(boundaries[0].message_index, 0);
     assert_eq!(boundaries[1].message_index, 1);
+    assert_eq!(boundaries[2].message_index, rope.len() - 1);
     assert_eq!(rope.spans()[0].kind(), &SpanKind::System);
     assert_eq!(rope.spans()[1].kind(), &SpanKind::ToolSchema);
 
-    // Annotations land on both messages.
-    assert_eq!(
-        projection.messages[0].cache_marker(),
-        Some(CacheMarker::Ephemeral)
-    );
-    assert_eq!(
-        projection.messages[1].cache_marker(),
-        Some(CacheMarker::Ephemeral)
-    );
+    // Annotations land on all three messages.
+    for b in &boundaries {
+        assert_eq!(
+            projection.messages[b.message_index].cache_marker(),
+            Some(CacheMarker::Ephemeral),
+            "marker missing at boundary index {}",
+            b.message_index
+        );
+    }
 
-    // Projected wire body picks up both markers: system block and
-    // last tool spec both carry cache_control.
+    // Projected wire body picks up the markers: system block, last
+    // tool spec, and (mu-chiw) a cache_control on the content block
+    // of the marked conversation message somewhere in messages.
     let wire = build_request_body_from_projection("claude-test", &projection, &tools);
     let sys = &wire["system"].as_array().unwrap()[0];
     assert_eq!(sys["cache_control"], json!({ "type": "ephemeral" }));
     let last_tool = wire["tools"].as_array().unwrap().last().unwrap();
     assert_eq!(last_tool["cache_control"], json!({ "type": "ephemeral" }));
+    let message_marks = wire["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+        .filter(|block| block.get("cache_control").is_some())
+        .count();
+    assert_eq!(
+        message_marks, 1,
+        "exactly one conversation content block carries cache_control"
+    );
 
     // Legacy wire body no longer emits cache_control (mu-yqeq.8).
     let legacy = build_request_body("claude-test", system_prompt.as_deref(), &messages, &tools);

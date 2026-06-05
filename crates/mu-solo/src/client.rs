@@ -1,8 +1,11 @@
 //! JSON-RPC client for `mu serve`. Spawns the daemon as a child process
 //! and communicates via stdin/stdout.
 //!
-//! Hybrid sync/async: `request()` is synchronous (called during session
-//! setup and ask firing). Notifications flow through a
+//! Hybrid sync/async: `request()` is synchronous, for short setup RPCs
+//! (auth, create_session). Long-lived RPCs whose response arrives much
+//! later (`ask_session` — end of turn) go through `request_nowait`
+//! (mu-d3v6), which delivers the response on the async channel instead
+//! of blocking. Notifications flow through a
 //! `tokio::sync::mpsc::UnboundedReceiver` so the async event loop can
 //! `select!` on them without polling.
 

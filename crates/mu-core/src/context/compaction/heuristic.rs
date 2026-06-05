@@ -157,6 +157,15 @@ fn tool_clusters(spans: &[Span]) -> Vec<Vec<usize>> {
 }
 
 impl CompactionPolicy for SpanFamilyDropPolicy {
+    /// Stable policy label for `AgentEvent::CompactionAssembly`. Without
+    /// this override the heuristic fell through to the trait default
+    /// "compaction-policy", making it indistinguishable from any other
+    /// non-overriding policy in event logs and the by-policy stats views
+    /// (found while wiring hash-and-summary's label for mu-8bkf).
+    fn policy_label(&self) -> &'static str {
+        "span-family-drop"
+    }
+
     fn compact(&self, rope: &RetainedRope, target_tokens: usize) -> CompactionResult {
         let start = Instant::now();
         let spans = rope.spans();

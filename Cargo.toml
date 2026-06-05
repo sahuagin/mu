@@ -76,3 +76,13 @@ rmcp = { version = "1", default-features = false }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Bug-chasing profile (operator pattern, memory 7bc10cf4): release-grade
+# optimization + threading so timing-sensitive bugs (TUI rendering races,
+# scrollback commits) still reproduce, with debug info + assertions for
+# diagnosis. Use via `just solo-debugrelease` or
+# `cargo run --profile debugrelease --bin mu-solo`.
+[profile.debugrelease]
+inherits = "release"
+debug = true
+debug-assertions = true

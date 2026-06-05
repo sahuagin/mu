@@ -21,7 +21,7 @@ fn main() -> io::Result<()> {
         println!("  scrollback line {i}");
     }
 
-    let mut vp = DynamicViewport::new(3)?;
+    let mut vp = DynamicViewport::new(3, None)?;
     let mut height: u16 = 3;
     let mut msg = String::from("Up/Down=resize, i=insert history, q=quit");
     let mut history_count = 0u32;

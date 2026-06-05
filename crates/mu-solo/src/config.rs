@@ -63,6 +63,12 @@ pub struct TuiConfig {
     /// The selected text is written to stdin after the native clipboard
     /// library path fails. Example: `["xclip", "-selection", "clipboard"]`.
     pub clipboard_command: Option<Vec<String>>,
+    /// Renderer journal — one JSONL line per scrollback commit written
+    /// to `~/.local/share/mu/solo/renderer.jsonl`.  Projection telemetry
+    /// only; NEVER written to the semantic event store
+    /// (`~/.local/share/mu/events/`).  Default: true (on).
+    /// Set to `false` in `[tui]` to disable.
+    pub renderer_journal: bool,
 }
 
 impl Default for TuiConfig {
@@ -71,6 +77,7 @@ impl Default for TuiConfig {
             effort: "medium".into(),
             focus_mode: false,
             clipboard_command: None,
+            renderer_journal: true,
         }
     }
 }

@@ -64,9 +64,7 @@ impl ModelPricing {
             usage.cache_creation_5m_input_tokens,
             usage.cache_creation_1h_input_tokens,
         ) {
-            (Some(w5m), Some(w1h)) => {
-                w5m as f64 * in_rate * 1.25 + w1h as f64 * in_rate * 2.00
-            }
+            (Some(w5m), Some(w1h)) => w5m as f64 * in_rate * 1.25 + w1h as f64 * in_rate * 2.00,
             _ => {
                 // Flat fallback: assume 1.25× (5m tier) when no breakdown.
                 usage.cache_creation_input_tokens.unwrap_or(0) as f64 * in_rate * 1.25
@@ -199,5 +197,81 @@ mod tests {
         let pricing = for_model("anthropic_api", "claude-opus-4-7").unwrap();
         // 1M input × $5 + 100k output × $25 = $5 + $2.50 = $7.50
         assert!((pricing.cost(&usage) - 7.50).abs() < 1e-9);
+    }
+
+    // ─── mu-cache-write-tier-split-umq6: per-tier pricing tests ─────────────
+
+    /// When both tier fields are present, tier-specific rates apply:
+    /// 5m tier at 1.25× and 1h tier at 2.0×. No flat total is consulted.
+    #[test]
+    fn umq6_tier_split_uses_per_tier_rates() {
+        let pricing = for_model("anthropic_api", "claude-opus-4-7").unwrap();
+        let in_rate = pricing.input_per_mtok; // $5.00
+        let usage = Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: None,
+            // Flat total (should NOT be consulted when tier fields present).
+            cache_creation_input_tokens: Some(99_999),
+            cache_creation_5m_input_tokens: Some(500_000),
+            cache_creation_1h_input_tokens: Some(1_000_000),
+            reasoning_tokens: None,
+        };
+        let cost = pricing.cost(&usage);
+        // Expected: (500k × $5 × 1.25 + 1M × $5 × 2.0) / 1M
+        //         = (3_125_000 + 10_000_000) / 1_000_000 ≈ $13.125
+        let expected =
+            (500_000_f64 * in_rate * 1.25 + 1_000_000_f64 * in_rate * 2.00) / 1_000_000.0;
+        assert!(
+            (cost - expected).abs() < 1e-9,
+            "cost {cost} should be {expected} (tier rates applied)"
+        );
+    }
+
+    /// Fallback: when only the flat total is present (no tier fields),
+    /// pricing uses the conservative 1.25× rate.
+    #[test]
+    fn umq6_flat_fallback_uses_conservative_rate() {
+        let pricing = for_model("anthropic_api", "claude-opus-4-7").unwrap();
+        let in_rate = pricing.input_per_mtok;
+        let usage = Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: Some(1_000_000),
+            cache_creation_5m_input_tokens: None,
+            cache_creation_1h_input_tokens: None,
+            reasoning_tokens: None,
+        };
+        let cost = pricing.cost(&usage);
+        // Expected: 1M × $5 × 1.25 / 1M = $6.25
+        let expected = 1_000_000_f64 * in_rate * 1.25 / 1_000_000.0;
+        assert!(
+            (cost - expected).abs() < 1e-9,
+            "cost {cost} should be {expected} (flat fallback at 1.25×)"
+        );
+    }
+
+    /// Only one tier field present → still falls back to flat (partial
+    /// breakdown is not trusted for pricing).
+    #[test]
+    fn umq6_partial_tier_falls_back_to_flat() {
+        let pricing = for_model("anthropic_api", "claude-opus-4-7").unwrap();
+        let in_rate = pricing.input_per_mtok;
+        let usage_only_5m = Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: Some(1_000_000),
+            cache_creation_5m_input_tokens: Some(400_000),
+            cache_creation_1h_input_tokens: None, // absent → flat fallback
+            reasoning_tokens: None,
+        };
+        let cost = pricing.cost(&usage_only_5m);
+        let expected = 1_000_000_f64 * in_rate * 1.25 / 1_000_000.0;
+        assert!(
+            (cost - expected).abs() < 1e-9,
+            "partial breakdown should fall back to flat: cost {cost} ≠ {expected}"
+        );
     }
 }

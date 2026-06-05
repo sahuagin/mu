@@ -1318,4 +1318,134 @@ mod tests {
             "post-switch: openai total, cache subset not re-added"
         );
     }
+
+    // ─── mu-cache-write-tier-split-umq6: TaskTelemetry serde tests ───────────
+
+    /// TaskTelemetry with tier fields present round-trips through JSON
+    /// and the tier fields are serialized (non-None) while present.
+    #[test]
+    fn umq6_task_telemetry_tier_fields_roundtrip() {
+        let payload = EventPayload::TaskTelemetry {
+            task_id: "task-00000000000000000042".to_owned(),
+            session_id: "s1".to_owned(),
+            parent_task_id: None,
+            provider_kind: "anthropic_api".to_owned(),
+            model: "claude-opus-4-7".to_owned(),
+            model_version: None,
+            started_at_unix_ms: None,
+            ended_at_unix_ms: 1_700_000_000_000,
+            wall_clock_ms: Some(2000),
+            prompt_tokens: Some(1000),
+            completion_tokens: Some(50),
+            cache_read_tokens: Some(100),
+            cache_write_tokens: Some(800),
+            cache_write_5m_tokens: Some(300),
+            cache_write_1h_tokens: Some(500),
+            tools_granted: vec![],
+            tools_actually_called: vec![],
+            exit_reason: TaskExitReason::Done,
+            max_budget_usd: None,
+            actual_spend_usd: None,
+            local_hour: None,
+            day_of_week: None,
+            tz: None,
+        };
+
+        let json = serde_json::to_value(&payload).expect("TaskTelemetry serializes");
+
+        // Tier fields appear in the JSON output.
+        assert_eq!(json["cache_write_5m_tokens"], serde_json::json!(300));
+        assert_eq!(json["cache_write_1h_tokens"], serde_json::json!(500));
+
+        // Roundtrip: deserialize back and the fields survive.
+        let rt: EventPayload = serde_json::from_value(json.clone()).expect("deserializes back");
+        match rt {
+            EventPayload::TaskTelemetry {
+                cache_write_5m_tokens,
+                cache_write_1h_tokens,
+                ..
+            } => {
+                assert_eq!(cache_write_5m_tokens, Some(300));
+                assert_eq!(cache_write_1h_tokens, Some(500));
+            }
+            other => panic!("expected TaskTelemetry, got {other:?}"),
+        }
+    }
+
+    /// Old events without tier fields deserialize with None (serde default).
+    /// Tests the backwards-compat contract — this is the "no migration" guarantee.
+    #[test]
+    fn umq6_task_telemetry_old_event_no_tier_fields_deserializes_as_none() {
+        // JSON that represents a pre-umq6 TaskTelemetry (no tier fields).
+        // EventPayload uses `tag = "kind"` in snake_case.
+        let old_json = serde_json::json!({
+            "kind": "task_telemetry",
+            "task_id": "task-00000000000000000001",
+            "session_id": "s1",
+            "provider_kind": "anthropic_api",
+            "model": "claude-opus-4-7",
+            "ended_at_unix_ms": 1_700_000_000_000u64,
+            "exit_reason": "done",
+            "cache_write_tokens": 200
+            // no cache_write_5m_tokens / cache_write_1h_tokens fields
+        });
+        let payload: EventPayload =
+            serde_json::from_value(old_json).expect("old event deserializes");
+        match payload {
+            EventPayload::TaskTelemetry {
+                cache_write_tokens,
+                cache_write_5m_tokens,
+                cache_write_1h_tokens,
+                ..
+            } => {
+                assert_eq!(cache_write_tokens, Some(200), "flat total preserved");
+                assert!(
+                    cache_write_5m_tokens.is_none(),
+                    "absent tier field defaults to None"
+                );
+                assert!(cache_write_1h_tokens.is_none());
+            }
+            other => panic!("expected TaskTelemetry, got {other:?}"),
+        }
+    }
+
+    /// When tier fields are None, they are NOT serialized (skip_serializing_if
+    /// = "Option::is_none"). This keeps old-style event JSON compact.
+    #[test]
+    fn umq6_task_telemetry_none_tier_fields_not_serialized() {
+        let payload = EventPayload::TaskTelemetry {
+            task_id: "task-00000000000000000001".to_owned(),
+            session_id: "s1".to_owned(),
+            parent_task_id: None,
+            provider_kind: "anthropic_api".to_owned(),
+            model: "claude-opus-4-7".to_owned(),
+            model_version: None,
+            started_at_unix_ms: None,
+            ended_at_unix_ms: 1_700_000_000_000,
+            wall_clock_ms: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: Some(100),
+            cache_write_5m_tokens: None,
+            cache_write_1h_tokens: None,
+            tools_granted: vec![],
+            tools_actually_called: vec![],
+            exit_reason: TaskExitReason::Done,
+            max_budget_usd: None,
+            actual_spend_usd: None,
+            local_hour: None,
+            day_of_week: None,
+            tz: None,
+        };
+        let json = serde_json::to_string(&payload).expect("serializes");
+        assert!(
+            !json.contains("cache_write_5m_tokens"),
+            "absent tier field must not appear in JSON: {json}"
+        );
+        assert!(
+            !json.contains("cache_write_1h_tokens"),
+            "absent tier field must not appear in JSON: {json}"
+        );
+    }
 }

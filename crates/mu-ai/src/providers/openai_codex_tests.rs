@@ -394,6 +394,148 @@ async fn b6_sse_text_only() {
 }
 
 // ============================================================================
+// mu-s545: two message output items in one response must not fuse
+// ============================================================================
+
+/// One response carrying TWO message output items (observed in the
+/// wild when the model answers a backlog of user messages left
+/// unanswered by errored asks — daemon 2f270bcba43f305d, event 2515:
+/// "...or hold.No worries..." jammed without whitespace). The adapter
+/// must insert a paragraph break between message items, both in the
+/// final assembled text and as a streamed TextDelta (so the live
+/// preview matches the finalized text — mu-wk2 invariant).
+#[tokio::test]
+async fn s545_two_message_items_get_paragraph_break() {
+    let raw = concat!(
+        r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_text.delta","delta":"take one, or hold."}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1"}}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_2"}}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_text.delta","delta":"No worries, take two."}"#,
+        "\n\n",
+        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
+        "\n\n",
+    );
+    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+        raw.as_bytes(),
+    ))]);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let mut stream = test_events_stream(bytes, rx);
+
+    let mut events = Vec::new();
+    while let Some(e) = stream.next().await {
+        events.push(e);
+    }
+
+    // delta("take one, or hold."), delta("\n\n"), delta("No worries,
+    // take two."), Done.
+    let deltas: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::TextDelta(d) => Some(d.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deltas,
+        vec!["take one, or hold.", "\n\n", "No worries, take two."],
+        "separator must also stream as a TextDelta"
+    );
+    match events.last().expect("no events") {
+        ProviderEvent::Done(msg) => {
+            assert_eq!(msg.content.len(), 1);
+            match &msg.content[0] {
+                ContentBlock::Text { text } => assert_eq!(
+                    text.as_ref(),
+                    "take one, or hold.\n\nNo worries, take two.",
+                    "message items must not fuse without a boundary"
+                ),
+                other => panic!("expected Text, got {other:?}"),
+            }
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+/// A message item following only TOOL CALLS (accumulator empty) must
+/// NOT get a leading separator — the guard keys on accumulated text,
+/// not item count.
+#[tokio::test]
+async fn s545_message_after_toolcall_no_leading_separator() {
+    let raw = concat!(
+        r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_a","name":"read","arguments":"{}"}}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_a","name":"read","arguments":"{}"}}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_1"}}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_text.delta","delta":"after tool"}"#,
+        "\n\n",
+        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
+        "\n\n",
+    );
+    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+        raw.as_bytes(),
+    ))]);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let mut stream = test_events_stream(bytes, rx);
+
+    let mut events = Vec::new();
+    while let Some(e) = stream.next().await {
+        events.push(e);
+    }
+    match events.last().expect("no events") {
+        ProviderEvent::Done(msg) => {
+            let text = msg
+                .content
+                .iter()
+                .find_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_ref()),
+                    _ => None,
+                })
+                .expect("no text block");
+            assert_eq!(text, "after tool", "no separator when accumulator is empty");
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+/// A single message item must NOT grow a leading or trailing
+/// separator from its own `output_item.added` frame.
+#[tokio::test]
+async fn s545_single_message_item_unchanged() {
+    let raw = concat!(
+        r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_text.delta","delta":"only take"}"#,
+        "\n\n",
+        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
+        "\n\n",
+    );
+    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+        raw.as_bytes(),
+    ))]);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let mut stream = test_events_stream(bytes, rx);
+
+    let mut events = Vec::new();
+    while let Some(e) = stream.next().await {
+        events.push(e);
+    }
+    match events.last().expect("no events") {
+        ProviderEvent::Done(msg) => match &msg.content[0] {
+            ContentBlock::Text { text } => assert_eq!(text.as_ref(), "only take"),
+            other => panic!("expected Text, got {other:?}"),
+        },
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+// ============================================================================
 // B-7: SSE → ProviderEvent — tool call accumulation
 // ============================================================================
 

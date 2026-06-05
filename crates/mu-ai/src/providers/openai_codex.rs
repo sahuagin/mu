@@ -960,34 +960,55 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 }
             }
             SseFrame::OutputItemAdded { output_index, item } => {
-                if let OutputItem::FunctionCall {
-                    id,
-                    call_id,
-                    name,
-                    arguments,
-                } = item
-                {
-                    let entry = state.tool_calls.entry(output_index).or_insert_with(|| {
-                        state.tool_call_order.push(output_index);
-                        ToolCallBuilder::default()
-                    });
-                    if let Some(v) = id {
-                        entry._item_id = v;
-                    }
-                    if let Some(v) = call_id {
-                        entry.call_id = v;
-                    }
-                    if let Some(v) = name {
-                        entry.name = v;
-                    }
-                    if let Some(v) = arguments {
-                        if !v.is_empty() {
-                            entry.args_json.push_str(&v);
+                match item {
+                    OutputItem::FunctionCall {
+                        id,
+                        call_id,
+                        name,
+                        arguments,
+                    } => {
+                        let entry = state.tool_calls.entry(output_index).or_insert_with(|| {
+                            state.tool_call_order.push(output_index);
+                            ToolCallBuilder::default()
+                        });
+                        if let Some(v) = id {
+                            entry._item_id = v;
+                        }
+                        if let Some(v) = call_id {
+                            entry.call_id = v;
+                        }
+                        if let Some(v) = name {
+                            entry.name = v;
+                        }
+                        if let Some(v) = arguments {
+                            if !v.is_empty() {
+                                entry.args_json.push_str(&v);
+                            }
                         }
                     }
+                    // mu-s545: one response can carry MULTIPLE message
+                    // output items (observed in the wild: the model
+                    // answering a backlog of user messages left
+                    // unanswered by errored asks — daemon
+                    // 2f270bcba43f305d, event 2515). All output_text
+                    // deltas funnel into the single accumulator, so
+                    // without a boundary the items fuse without
+                    // whitespace ("...or hold.No worries..."). Insert
+                    // a paragraph break between message items — in the
+                    // accumulator AND on the wire, so the streamed
+                    // preview matches the finalized text (mu-wk2
+                    // invariant). Guarded: a first/only message item
+                    // (empty accumulator — incl. message-after-
+                    // toolcall) gets no separator.
+                    OutputItem::Message { .. } if !state.accumulated_text.is_empty() => {
+                        state.accumulated_text.push_str("\n\n");
+                        return Some((ProviderEvent::TextDelta("\n\n".into()), state));
+                    }
+                    // First message item, reasoning, and unknown items
+                    // carry nothing to accumulate here; function_call
+                    // items get their entry above or on `done`.
+                    _ => {}
                 }
-                // Non-function_call items get an entry on `done`,
-                // not here.
             }
             SseFrame::FunctionCallArgumentsDelta {
                 output_index,

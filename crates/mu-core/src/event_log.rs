@@ -389,6 +389,14 @@ pub enum EventPayload {
         cache_read_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_write_tokens: Option<u64>,
+        /// Ephemeral-5m cache write tokens (1.25× premium). Present only when
+        /// the provider returns the per-tier breakdown. mu-cache-write-tier-split-umq6.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_write_5m_tokens: Option<u64>,
+        /// Ephemeral-1h cache write tokens (2.0× premium). Present only when
+        /// the provider returns the per-tier breakdown. mu-cache-write-tier-split-umq6.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_write_1h_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tools_granted: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

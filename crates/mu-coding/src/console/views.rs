@@ -9,8 +9,8 @@ use mu_core::{
 use crate::console::{
     data::{load_events, scan_sessions, AppState},
     html::{
-        block, breakdown_table, esc, esc_attr, fmt_ms, fmt_opt_u32, fmt_opt_u64, fmt_usage_short,
-        kv, page, payload_kind, td, td_code, td_num, truncate, urlish,
+        breakdown_table, esc, esc_attr, event_anchor, fmt_ms, fmt_opt_u32, fmt_opt_u64, kv, page,
+        payload_kind, td, td_code, td_num, transcript_block, truncate, truncated_details, urlish,
     },
 };
 
@@ -43,7 +43,7 @@ pub(crate) fn render_sessions_index(state: Arc<AppState>) -> Html<String> {
             scan.skipped_entries, scan.malformed_files
         ));
     }
-    body.push_str("<table><thead><tr><th>last</th><th>daemon</th><th>session</th><th>provider</th><th>model</th><th>asks</th><th>calls</th><th>tools</th><th>tokens</th></tr></thead><tbody>");
+    body.push_str("<table><thead><tr><th>last</th><th>daemon</th><th>session</th><th>provider</th><th>model</th><th>asks</th><th>calls</th><th>tools</th><th>input</th><th>output</th><th>cache read</th><th>cache write</th></tr></thead><tbody>");
     for s in scan.sessions {
         let href = state.href(&format!(
             "/sessions/{}/{}",
@@ -63,7 +63,17 @@ pub(crate) fn render_sessions_index(state: Arc<AppState>) -> Html<String> {
         body.push_str(&td_num(s.ask_count));
         body.push_str(&td_num(s.context_assembly_count));
         body.push_str(&td_num(s.tool_call_count));
-        body.push_str(&td(&fmt_usage_short(s.usage)));
+        if let Some(usage) = s.usage {
+            body.push_str(&td_num(usage.input_tokens));
+            body.push_str(&td_num(usage.output_tokens));
+            body.push_str(&td(&fmt_opt_u64(usage.cache_read_input_tokens)));
+            body.push_str(&td(&fmt_opt_u64(usage.cache_creation_input_tokens)));
+        } else {
+            body.push_str(&td("—"));
+            body.push_str(&td("—"));
+            body.push_str(&td("—"));
+            body.push_str(&td("—"));
+        }
         body.push_str("</tr>");
     }
     body.push_str("</tbody></table>");
@@ -297,10 +307,29 @@ fn session_nav(state: &AppState, daemon_id: &str, session_id: &str) -> String {
 }
 
 fn render_transcript(events: &[SessionEvent]) -> String {
-    let mut out = String::from("<h2>transcript</h2>");
+    let mut out = String::from(
+        "<h2>transcript</h2>\
+         <div class=toolbar>\
+           <label><input type=checkbox checked onchange=\"toggleRole('user', this.checked)\"> user</label>\
+           <label><input type=checkbox checked onchange=\"toggleRole('assistant', this.checked)\"> assistant</label>\
+           <label><input type=checkbox checked onchange=\"toggleRole('tool', this.checked)\"> tools</label>\
+           <button type=button onclick=\"expandAll('#transcript')\">expand all</button>\
+           <button type=button onclick=\"collapseAll('#transcript')\">collapse all</button>\
+           <label><input type=checkbox checked onchange=\"setTranscriptBodyScroll(this.checked)\"> scroll bodies</label>\
+         </div><div id=transcript>",
+    );
     for ev in events {
         match &ev.payload {
-            EventPayload::UserMessage { content } => block(&mut out, "user", content),
+            EventPayload::UserMessage { content } => {
+                transcript_block(
+                    &mut out,
+                    ev.id,
+                    ev.timestamp_unix_ms,
+                    "user",
+                    content,
+                    false,
+                );
+            }
             EventPayload::AssistantMessageEvent { message } => {
                 let mut text = String::new();
                 for block in &message.content {
@@ -324,17 +353,27 @@ fn render_transcript(events: &[SessionEvent]) -> String {
                         }
                     }
                 }
-                block(&mut out, "assistant", &text);
+                transcript_block(
+                    &mut out,
+                    ev.id,
+                    ev.timestamp_unix_ms,
+                    "assistant",
+                    &text,
+                    false,
+                );
             }
             EventPayload::ToolCall {
                 call_id,
                 name,
                 arguments,
             } => {
-                block(
+                transcript_block(
                     &mut out,
-                    "tool call",
+                    ev.id,
+                    ev.timestamp_unix_ms,
+                    "tool",
                     &format!("{name} {call_id}\n{arguments}"),
+                    true,
                 );
             }
             EventPayload::ToolResult {
@@ -342,34 +381,34 @@ fn render_transcript(events: &[SessionEvent]) -> String {
                 content,
                 is_error,
             } => {
-                block(
+                transcript_block(
                     &mut out,
-                    if *is_error {
-                        "tool error"
-                    } else {
-                        "tool result"
-                    },
-                    &format!("{call_id}\n{}", truncate(content, 20_000)),
+                    ev.id,
+                    ev.timestamp_unix_ms,
+                    "tool",
+                    &format!("{call_id}\n{}", truncate(content, 60_000)),
+                    !*is_error,
                 );
             }
             _ => {}
         }
     }
+    out.push_str("</div>");
     out
 }
 
 fn render_events(events: &[SessionEvent]) -> String {
-    let mut out = String::from("<h2>event timeline</h2><table><thead><tr><th>id</th><th>time</th><th>actor</th><th>kind</th><th>details</th></tr></thead><tbody>");
+    let mut out = String::from("<h2>event timeline</h2><div class=toolbar><button type=button onclick=\"expandAll('#events')\">expand json</button><button type=button onclick=\"collapseAll('#events')\">collapse json</button></div><table id=events><thead><tr><th>id</th><th>time</th><th>actor</th><th>kind</th><th>details</th></tr></thead><tbody>");
     for ev in events {
-        out.push_str("<tr>");
-        out.push_str(&td_num(ev.id));
+        out.push_str(&format!("<tr id=\"event-{}\">", ev.id));
+        out.push_str(&format!("<td>{}</td>", event_anchor(ev.id)));
         out.push_str(&td(&fmt_ms(Some(ev.timestamp_unix_ms))));
         out.push_str(&td_code(&format!("{:?}", ev.actor)));
         out.push_str(&td_code(payload_kind(&ev.payload)));
         let json = serde_json::to_string_pretty(ev).unwrap_or_else(|_| format!("{ev:#?}"));
         out.push_str(&format!(
-            "<td><details><summary>json</summary><pre>{}</pre></details></td>",
-            esc(&truncate(&json, 40_000))
+            "<td>{}</td>",
+            truncated_details("json", &json, 40_000)
         ));
         out.push_str("</tr>");
     }

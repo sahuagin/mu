@@ -1,20 +1,45 @@
 use std::collections::BTreeMap;
 
 use axum::response::Html;
-use mu_core::{agent::Usage, event_log::EventPayload};
+use mu_core::event_log::EventPayload;
 
 use crate::console::data::AppState;
 
 pub(crate) fn page(state: &AppState, title: &str, body: &str) -> Html<String> {
     Html(format!(
-        "<!doctype html><html><head><meta charset=utf-8><title>{}</title>{}</head><body><header><a href=\"{}\">μ console</a></header><main>{}</main></body></html>",
+        "<!doctype html><html><head><meta charset=utf-8><title>{}</title>{}<script>{}</script></head><body><header><a href=\"{}\">μ console</a></header><main>{}</main></body></html>",
         esc(title),
         STYLE,
+        SCRIPT,
         esc_attr(&state.href("/sessions")),
         body
     ))
 }
 
+pub(crate) fn transcript_block(
+    out: &mut String,
+    event_id: u64,
+    timestamp_unix_ms: u64,
+    role: &str,
+    text: &str,
+    open: bool,
+) {
+    let classes = format!("block role-{role}");
+    let ts = fmt_unix_ms(Some(timestamp_unix_ms));
+    let open_attr = if open { " open" } else { "" };
+    out.push_str(&format!(
+        "<section id=\"event-{event_id}\" class=\"{}\"><details{}><summary><span class=role>{}</span> <a class=anchor href=\"#event-{}\">#{}</a> <span class=muted>{}</span></summary><pre class=scrollbox>{}</pre></details></section>",
+        esc_attr(&classes),
+        open_attr,
+        esc(role),
+        event_id,
+        event_id,
+        esc(&ts),
+        esc(&truncate(text, 60_000))
+    ));
+}
+
+#[allow(dead_code)]
 pub(crate) fn block(out: &mut String, who: &str, text: &str) {
     out.push_str(&format!(
         "<section class=block><h3>{}</h3><pre>{}</pre></section>",
@@ -84,19 +109,6 @@ pub(crate) fn payload_kind(payload: &EventPayload) -> &'static str {
     }
 }
 
-pub(crate) fn fmt_usage_short(u: Option<Usage>) -> String {
-    match u {
-        Some(u) => format!(
-            "in {} / out {} / read {} / write {}",
-            u.input_tokens,
-            u.output_tokens,
-            fmt_opt_u64(u.cache_read_input_tokens),
-            fmt_opt_u64(u.cache_creation_input_tokens)
-        ),
-        None => "—".into(),
-    }
-}
-
 pub(crate) fn fmt_opt_u64(v: Option<u64>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "—".into())
 }
@@ -106,7 +118,34 @@ pub(crate) fn fmt_opt_u32(v: Option<u32>) -> String {
 }
 
 pub(crate) fn fmt_ms(v: Option<u64>) -> String {
-    v.map(|n| n.to_string()).unwrap_or_else(|| "—".into())
+    fmt_unix_ms(v)
+}
+
+pub(crate) fn fmt_unix_ms(v: Option<u64>) -> String {
+    let Some(ms) = v else {
+        return "—".into();
+    };
+    format!("{}.{:03}s", ms / 1000, ms % 1000)
+}
+
+pub(crate) fn truncated_details(label: &str, text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return format!("<pre>{}</pre>", esc(text));
+    }
+    format!(
+        "<details><summary>{} — showing first {} of {} byte(s)</summary><pre>{}</pre></details>",
+        esc(label),
+        max,
+        text.len(),
+        esc(&truncate(text, max))
+    )
+}
+
+pub(crate) fn event_anchor(event_id: u64) -> String {
+    format!(
+        "<a class=anchor href=\"#event-{}\">#{}</a>",
+        event_id, event_id
+    )
 }
 
 pub(crate) fn truncate(s: &str, max: usize) -> String {
@@ -132,19 +171,53 @@ pub(crate) fn esc_attr(s: &str) -> String {
     esc(s)
 }
 
+const SCRIPT: &str = r#"
+function toggleRole(role, checked) {
+  document.querySelectorAll('.role-' + role).forEach(el => {
+    el.style.display = checked ? '' : 'none';
+  });
+}
+function expandAll(selector) {
+  document.querySelectorAll(selector + ' details').forEach(el => el.open = true);
+}
+function collapseAll(selector) {
+  document.querySelectorAll(selector + ' details').forEach(el => el.open = false);
+}
+function setTranscriptBodyScroll(enabled) {
+  document.querySelectorAll('#transcript pre').forEach(el => {
+    if (enabled) {
+      el.classList.add('scrollbox');
+    } else {
+      el.classList.remove('scrollbox');
+    }
+  });
+}
+"#;
+
 const STYLE: &str = r#"<style>
 :root { color-scheme: dark light; --bg:#0f1117; --fg:#e6edf3; --muted:#8b949e; --line:#30363d; --link:#79c0ff; --warn:#f2cc60; --err:#ff7b72; }
 body { margin:0; font:14px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
-header { padding:10px 18px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); }
+:target { outline:2px solid var(--link); outline-offset:3px; }
+header { padding:10px 18px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:10; }
 main { padding:18px; max-width:1400px; }
 a { color:var(--link); text-decoration:none; } a:hover { text-decoration:underline; }
+.anchor { color:var(--muted); font-size:12px; }
+.toolbar { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin:10px 0 16px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:#161b22; position:sticky; top:44px; z-index:9; }
+.toolbar button { color:var(--fg); background:#21262d; border:1px solid var(--line); border-radius:6px; padding:3px 8px; }
 table { border-collapse:collapse; width:100%; margin:12px 0 24px; font-size:13px; }
 th, td { border:1px solid var(--line); padding:6px 8px; vertical-align:top; }
 th { text-align:left; background:#161b22; position:sticky; top:42px; }
 .num { text-align:right; font-variant-numeric:tabular-nums; }
 code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 pre { white-space:pre-wrap; overflow:auto; background:#161b22; border:1px solid var(--line); padding:10px; border-radius:6px; }
+pre.scrollbox { max-height:65vh; }
+summary { cursor:pointer; color:var(--link); }
 .block { border:1px solid var(--line); border-radius:8px; padding:0 12px 12px; margin:12px 0; }
+.block details { padding:10px 0; }
+.block .role { text-transform:uppercase; letter-spacing:.05em; color:var(--muted); font-size:12px; }
+.role-user { border-left:3px solid #58a6ff; }
+.role-assistant { border-left:3px solid #a5d6ff; }
+.role-tool { border-left:3px solid #d29922; }
 .block h3 { color:var(--muted); }
 .muted { color:var(--muted); } .warn { color:var(--warn); } .err { color:var(--err); }
 .tabs { display:flex; gap:8px; margin:12px 0 18px; flex-wrap:wrap; }

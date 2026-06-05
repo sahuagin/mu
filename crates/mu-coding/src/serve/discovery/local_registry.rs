@@ -133,6 +133,7 @@ mod tests {
                 agent,
                 event_log: log.clone(),
                 pending_approvals: approvals,
+                cache_ttl: mu_core::context::CacheTtl::default(),
                 parent_session_id: parent,
                 capability: cap,
                 provider_status,

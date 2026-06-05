@@ -4,6 +4,7 @@
 
 use super::*;
 use mu_core::agent::{MessageInput, ToolArgs, ToolCall};
+use mu_core::context::CacheTtl;
 use mu_core::context::{
     assemble_rope, CacheMarker, CacheStrategy, ProjectionTarget, ProviderRenderer, ProviderRole,
     SpanKind,
@@ -346,7 +347,8 @@ fn yqeq8_projected_emits_cache_control_on_system_and_last_tool() {
         },
     ];
     let projection = build_projection_with_cache_strategy(Some("be concise"), &messages, &tools);
-    let body = build_request_body_from_projection("claude-test", &projection, &tools);
+    let body =
+        build_request_body_from_projection("claude-test", &projection, &tools, CacheTtl::default());
 
     // System carries cache_control.
     let sys = &body["system"].as_array().expect("system array")[0];
@@ -376,7 +378,8 @@ fn yqeq8_projected_no_system_no_tools_emits_no_cache_control() {
         content: "hi".into(),
     }];
     let projection = build_projection_with_cache_strategy(None, &messages, &[]);
-    let body = build_request_body_from_projection("claude-test", &projection, &[]);
+    let body =
+        build_request_body_from_projection("claude-test", &projection, &[], CacheTtl::default());
     let sys = body["system"].as_array().expect("mu-0q44 system block");
     assert!(sys[0]["text"]
         .as_str()
@@ -391,7 +394,8 @@ fn yqeq8_projected_system_only_caches_system() {
         content: "hi".into(),
     }];
     let projection = build_projection_with_cache_strategy(Some("be concise"), &messages, &[]);
-    let body = build_request_body_from_projection("claude-test", &projection, &[]);
+    let body =
+        build_request_body_from_projection("claude-test", &projection, &[], CacheTtl::default());
     let sys = &body["system"].as_array().expect("system array")[0];
     assert_eq!(sys["cache_control"], json!({ "type": "ephemeral" }));
     assert!(body.get("tools").is_none());
@@ -425,7 +429,8 @@ fn yqeq8_projected_tools_only_caches_last_tool() {
         },
     ];
     let projection = build_projection_with_cache_strategy(None, &messages, &tools);
-    let body = build_request_body_from_projection("claude-test", &projection, &tools);
+    let body =
+        build_request_body_from_projection("claude-test", &projection, &tools, CacheTtl::default());
     assert!(body.get("system").is_none());
     let tool_arr = body["tools"].as_array().expect("tools array");
     assert!(tool_arr[0].get("cache_control").is_none());
@@ -453,7 +458,8 @@ fn yqeq8_projected_without_cache_strategy_emits_no_cache_control() {
     let rope = assemble_rope(Some("be concise"), &messages, &tools);
     let projection =
         crate::context::AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
-    let body = build_request_body_from_projection("claude-test", &projection, &tools);
+    let body =
+        build_request_body_from_projection("claude-test", &projection, &tools, CacheTtl::default());
     let sys = &body["system"].as_array().expect("system array")[0];
     assert!(sys.get("cache_control").is_none());
     let tool_arr = body["tools"].as_array().expect("tools array");
@@ -507,7 +513,8 @@ fn mu_s855_projected_concatenates_memory_injection_and_file_load_into_system_blo
         assemble_rope_with_context(Some("you are mu"), Some(&project_context), &messages, &[]);
     let projection =
         crate::context::AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
-    let body = build_request_body_from_projection("claude-test", &projection, &[]);
+    let body =
+        build_request_body_from_projection("claude-test", &projection, &[], CacheTtl::default());
 
     let sys_arr = body.get("system").and_then(|v| v.as_array()).unwrap();
     assert_eq!(sys_arr.len(), 1, "expect one consolidated system block");
@@ -549,7 +556,8 @@ fn mu_s855_projected_excludes_tool_schema_from_system_block() {
     let rope = assemble_rope(Some("system-only-text"), &messages, &tools);
     let projection =
         crate::context::AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
-    let body = build_request_body_from_projection("claude-test", &projection, &tools);
+    let body =
+        build_request_body_from_projection("claude-test", &projection, &tools, CacheTtl::default());
 
     let sys_arr = body.get("system").and_then(|v| v.as_array()).unwrap();
     let sys_text = sys_arr[0]["text"].as_str().unwrap_or("");
@@ -603,7 +611,8 @@ fn mu_s855_cache_marker_on_recall_span_triggers_system_cache_control() {
     let strategy = crate::context::AnthropicCacheStrategy::new();
     let boundaries = strategy.boundaries(&rope);
     strategy.annotate(&mut projection, &boundaries);
-    let body = build_request_body_from_projection("claude-test", &projection, &[]);
+    let body =
+        build_request_body_from_projection("claude-test", &projection, &[], CacheTtl::default());
 
     let sys = &body["system"].as_array().expect("system array")[0];
     assert_eq!(
@@ -1447,7 +1456,8 @@ fn fb0_cache_boundaries_land_on_system_and_last_tool_schema() {
     // Projected wire body picks up the markers: system block, last
     // tool spec, and (mu-chiw) a cache_control on the content block
     // of the marked conversation message somewhere in messages.
-    let wire = build_request_body_from_projection("claude-test", &projection, &tools);
+    let wire =
+        build_request_body_from_projection("claude-test", &projection, &tools, CacheTtl::default());
     let sys = &wire["system"].as_array().unwrap()[0];
     assert_eq!(sys["cache_control"], json!({ "type": "ephemeral" }));
     let last_tool = wire["tools"].as_array().unwrap().last().unwrap();
@@ -1524,7 +1534,8 @@ fn parity_compare(
     let rope = assemble_rope(system_prompt, messages, tools);
     let projection =
         crate::context::AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
-    let projected = build_request_body_from_projection("claude-test", &projection, tools);
+    let projected =
+        build_request_body_from_projection("claude-test", &projection, tools, CacheTtl::default());
 
     assert_eq!(
         legacy, projected,
@@ -1725,7 +1736,8 @@ fn yqeq4_thinking_blocks_are_skipped_in_projected_wire_output() {
     let rope = assemble_rope(None, &messages, &[]);
     let projection =
         crate::context::AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
-    let projected = build_request_body_from_projection("claude-test", &projection, &[]);
+    let projected =
+        build_request_body_from_projection("claude-test", &projection, &[], CacheTtl::default());
 
     let wire = serde_json::to_string(&projected).expect("serialize");
     assert!(
@@ -1750,4 +1762,66 @@ fn yqeq4_thinking_blocks_are_skipped_in_projected_wire_output() {
         ..Default::default()
     };
     parity_compare(None, &messages, &[dummy]);
+}
+
+#[test]
+fn f1a0_one_hour_ttl_reaches_every_cache_control_site() {
+    // mu-f1a0: with CacheTtl::OneHour, every cache_control emission
+    // (system block, last tool spec, conversation content block)
+    // carries `"ttl": "1h"`; with the default FiveMinutes the wire is
+    // byte-identical to pre-f1a0 (bare ephemeral, no ttl key).
+    let (system_prompt, messages, tools) = equivalence_fixture();
+    let rope = assemble_rope(system_prompt.as_deref(), &messages, &tools);
+    let renderer = crate::context::AnthropicProviderRenderer::new();
+    let strategy = crate::context::AnthropicCacheStrategy::new();
+    let mut projection = renderer.render(&rope, ProjectionTarget::AgentView);
+    let boundaries = strategy.boundaries(&rope);
+    strategy.annotate(&mut projection, &boundaries);
+
+    let wire =
+        build_request_body_from_projection("claude-test", &projection, &tools, CacheTtl::OneHour);
+    let expected = serde_json::json!({ "type": "ephemeral", "ttl": "1h" });
+    assert_eq!(
+        wire["system"].as_array().unwrap()[0]["cache_control"],
+        expected
+    );
+    assert_eq!(
+        wire["tools"].as_array().unwrap().last().unwrap()["cache_control"],
+        expected
+    );
+    let conversation_marks: Vec<_> = wire["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+        .filter_map(|b| b.get("cache_control").cloned())
+        .collect();
+    assert_eq!(conversation_marks, vec![expected.clone()]);
+
+    // Default tier: no ttl key anywhere (wire parity with pre-f1a0).
+    let wire_5m = build_request_body_from_projection(
+        "claude-test",
+        &projection,
+        &tools,
+        CacheTtl::FiveMinutes,
+    );
+    assert_eq!(
+        wire_5m["system"].as_array().unwrap()[0]["cache_control"],
+        serde_json::json!({ "type": "ephemeral" })
+    );
+}
+
+#[test]
+fn f1a0_cache_ttl_serde_wire_values() {
+    use mu_core::context::CacheTtl;
+    assert_eq!(
+        serde_json::to_string(&CacheTtl::FiveMinutes).unwrap(),
+        "\"5m\""
+    );
+    assert_eq!(serde_json::to_string(&CacheTtl::OneHour).unwrap(), "\"1h\"");
+    assert_eq!(
+        serde_json::from_str::<CacheTtl>("\"1h\"").unwrap(),
+        CacheTtl::OneHour
+    );
+    assert_eq!(CacheTtl::default(), CacheTtl::FiveMinutes);
 }

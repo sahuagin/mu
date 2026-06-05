@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 
 use mu_core::agent::AgentInput;
 use mu_core::capability::Capability;
+use mu_core::context::CacheTtl;
 use mu_core::event_log::SessionEventLog;
 use mu_core::protocol::{ApprovalDecision, OutstandingCall, WorkerStatus};
 use mu_core::session_status::SessionStatus;
@@ -53,6 +54,10 @@ struct SessionState {
     /// for delegates). But check_allow returns a structured result
     /// so the agent loop can refuse with a specific reason.
     capability: Arc<Mutex<Capability>>,
+    /// mu-f1a0: the prompt-cache TTL tier this session was created
+    /// with. Read by session.set_route so a live provider/model swap
+    /// preserves the tier instead of silently downgrading to 5m.
+    cache_ttl: CacheTtl,
     /// Live provider-call state (mu-035 Phase D). The forwarder
     /// mirrors `AgentEvent::ProviderStatus` into this on every emit
     /// and clears it on Done/Error. Dispatch reads it to assemble
@@ -177,6 +182,8 @@ pub struct NewSession {
     pub pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>,
     pub parent_session_id: Option<String>,
     pub capability: Arc<Mutex<Capability>>,
+    /// mu-f1a0: cache TTL tier the session was created with.
+    pub cache_ttl: CacheTtl,
     pub provider_status: Arc<Mutex<ProviderStatusTracker>>,
     pub mailbox: MailboxStateHandle,
     pub status_watch: Option<tokio::sync::watch::Receiver<Option<SessionStatus>>>,
@@ -225,6 +232,7 @@ impl Sessions {
                     pending_approvals: new.pending_approvals,
                     parent_session_id: new.parent_session_id,
                     capability: new.capability,
+                    cache_ttl: new.cache_ttl,
                     provider_status: new.provider_status,
                     mailbox: new.mailbox,
                     status_watch: new.status_watch,
@@ -371,6 +379,15 @@ impl Sessions {
         let state = map.get(session_id)?;
         let mut pending = state.pending_approvals.lock().ok()?;
         pending.remove(request_id)
+    }
+
+    /// mu-f1a0: the cache TTL tier the session was created with.
+    /// None when the session doesn't exist (or is rehydrated-only).
+    pub fn cache_ttl(&self, id: &str) -> Option<CacheTtl> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|map| map.get(id).map(|s| s.cache_ttl))
     }
 
     /// Look up a session's capability handle. Returns None if the
@@ -609,6 +626,7 @@ mod tests {
                 pending_approvals: approvals,
                 parent_session_id: None,
                 capability: cap,
+                cache_ttl: CacheTtl::default(),
                 provider_status: tracker,
                 mailbox: Arc::new(MailboxState::new()),
                 status_watch: None,
@@ -688,6 +706,7 @@ mod tests {
                 pending_approvals: Arc::new(Mutex::new(HashMap::new())),
                 parent_session_id: Some("live-parent".into()),
                 capability: Arc::new(Mutex::new(Capability::root())),
+                cache_ttl: CacheTtl::default(),
                 provider_status: Arc::new(Mutex::new(ProviderStatusTracker::new())),
                 mailbox: Arc::new(MailboxState::new()),
                 status_watch: None,
@@ -738,6 +757,7 @@ mod tests {
                 pending_approvals: approvals,
                 parent_session_id: None,
                 capability: cap,
+                cache_ttl: CacheTtl::default(),
                 provider_status: tracker,
                 mailbox: Arc::new(MailboxState::new()),
                 status_watch: None,
@@ -803,6 +823,7 @@ mod tests {
                 pending_approvals: Arc::new(Mutex::new(HashMap::new())),
                 parent_session_id: None,
                 capability: Arc::new(Mutex::new(Capability::root())),
+                cache_ttl: CacheTtl::default(),
                 provider_status: tracker.clone(),
                 mailbox: Arc::new(MailboxState::new()),
                 status_watch: None,

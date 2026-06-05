@@ -22,8 +22,8 @@ use mu_core::agent::{
     ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
 };
 use mu_core::context::{
-    extract_call_id_from_span_id, CacheMarker, CacheStrategy, ProviderMessage, ProviderMessages,
-    ProviderRenderer, ProviderRole,
+    extract_call_id_from_span_id, CacheMarker, CacheStrategy, CacheTtl, ProviderMessage,
+    ProviderMessages, ProviderRenderer, ProviderRole,
 };
 
 use crate::context::{AnthropicCacheStrategy, AnthropicProviderRenderer};
@@ -40,6 +40,11 @@ pub struct AnthropicProvider {
     api_key: String,
     model: String,
     api_base: String,
+    /// mu-f1a0: cache TTL tier applied to every `cache_control`
+    /// emission. FiveMinutes = bare ephemeral (wire-identical to
+    /// pre-f1a0); OneHour adds `"ttl": "1h"` (2.0x write billing,
+    /// survives human thinking gaps).
+    cache_ttl: CacheTtl,
 }
 
 impl AnthropicProvider {
@@ -49,7 +54,15 @@ impl AnthropicProvider {
             api_key,
             model,
             api_base: ANTHROPIC_API_BASE.to_string(),
+            cache_ttl: CacheTtl::default(),
         }
+    }
+
+    /// mu-f1a0: select the prompt-cache TTL tier for this provider's
+    /// requests. Builder-style, applied at session construction.
+    pub fn with_cache_ttl(mut self, ttl: CacheTtl) -> Self {
+        self.cache_ttl = ttl;
+        self
     }
 
     /// API key from `ANTHROPIC_API_KEY`, base URL from
@@ -81,6 +94,7 @@ impl AnthropicProvider {
             api_key,
             model,
             api_base,
+            cache_ttl: CacheTtl::default(),
         })
     }
 
@@ -122,7 +136,7 @@ impl Provider for AnthropicProvider {
                 // Legacy-path channel; in the Projected path we
                 // source from the projection itself for
                 // self-containedness, ignoring the parameter.
-                build_request_body_from_projection(&self.model, pmsgs, tools)
+                build_request_body_from_projection(&self.model, pmsgs, tools, self.cache_ttl)
             }
             _ => {
                 return Err(ProviderError::Other(
@@ -366,7 +380,20 @@ pub(crate) fn build_request_body(
 /// rules, with consecutive `ToolResult` messages batched into a
 /// single user message — Anthropic's tool-use protocol requires that
 /// grouping.
-fn translate_provider_messages(pmsgs: &ProviderMessages) -> (Vec<Value>, Option<String>) {
+/// mu-f1a0: the one place the TTL tier becomes wire JSON. FiveMinutes
+/// omits the `ttl` field — byte-identical to the pre-f1a0 emission, so
+/// the default path needs no parity re-verification.
+fn cache_control_value(ttl: CacheTtl) -> Value {
+    match ttl {
+        CacheTtl::FiveMinutes => json!({ "type": "ephemeral" }),
+        CacheTtl::OneHour => json!({ "type": "ephemeral", "ttl": "1h" }),
+    }
+}
+
+fn translate_provider_messages(
+    pmsgs: &ProviderMessages,
+    ttl: CacheTtl,
+) -> (Vec<Value>, Option<String>) {
     let mut out: Vec<Value> = Vec::with_capacity(pmsgs.messages.len());
     let mut tool_result_buf: Vec<Value> = Vec::new();
     let mut system_text: Option<String> = None;
@@ -403,7 +430,7 @@ fn translate_provider_messages(pmsgs: &ProviderMessages) -> (Vec<Value>, Option<
             ProviderRole::ToolResult => {
                 let mut block = translate_provider_tool_result(msg);
                 if marked {
-                    block["cache_control"] = json!({ "type": "ephemeral" });
+                    block["cache_control"] = cache_control_value(ttl);
                 }
                 tool_result_buf.push(block);
             }
@@ -418,7 +445,7 @@ fn translate_provider_messages(pmsgs: &ProviderMessages) -> (Vec<Value>, Option<
                         "content": [{
                             "type": "text",
                             "text": msg.content(),
-                            "cache_control": { "type": "ephemeral" },
+                            "cache_control": cache_control_value(ttl),
                         }],
                     }));
                 } else {
@@ -436,7 +463,7 @@ fn translate_provider_messages(pmsgs: &ProviderMessages) -> (Vec<Value>, Option<
                             .as_array_mut()
                             .and_then(|blocks| blocks.last_mut())
                         {
-                            last["cache_control"] = json!({ "type": "ephemeral" });
+                            last["cache_control"] = cache_control_value(ttl);
                         }
                     }
                     out.push(translated);
@@ -534,8 +561,9 @@ pub(crate) fn build_request_body_from_projection(
     model: &str,
     pmsgs: &ProviderMessages,
     tools: &[ToolSpec],
+    ttl: CacheTtl,
 ) -> Value {
-    let (api_messages, hoisted_system) = translate_provider_messages(pmsgs);
+    let (api_messages, hoisted_system) = translate_provider_messages(pmsgs, ttl);
     let (system_should_cache, tools_should_cache) = detect_cache_targets(pmsgs);
     let mut body = json!({
         "model": model,
@@ -550,7 +578,7 @@ pub(crate) fn build_request_body_from_projection(
                 "text": s,
             });
             if system_should_cache {
-                system_block["cache_control"] = json!({ "type": "ephemeral" });
+                system_block["cache_control"] = cache_control_value(ttl);
             }
             body["system"] = json!([system_block]);
         }
@@ -559,7 +587,7 @@ pub(crate) fn build_request_body_from_projection(
         let mut tool_specs: Vec<Value> = tools.iter().map(translate_tool_spec).collect();
         if tools_should_cache {
             if let Some(last) = tool_specs.last_mut() {
-                last["cache_control"] = json!({ "type": "ephemeral" });
+                last["cache_control"] = cache_control_value(ttl);
             }
         }
         body["tools"] = json!(tool_specs);

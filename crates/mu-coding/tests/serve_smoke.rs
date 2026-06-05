@@ -100,7 +100,7 @@ async fn spawn_server_full(
     // that just hands out clones — preserves the smoke-test semantic
     // (one provider for all sessions) under the new factory API.
     let factory: serve::ProviderFactory =
-        std::sync::Arc::new(move |_selector| Ok(provider.clone()));
+        std::sync::Arc::new(move |_selector, _cache_ttl| Ok(provider.clone()));
     let handle = tokio::spawn(serve::serve_with_io_with_config(
         server_buf,
         server_write,

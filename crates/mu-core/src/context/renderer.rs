@@ -243,6 +243,28 @@ pub enum CacheMarker {
     Ephemeral,
 }
 
+/// Cache time-to-live tier for providers with tiered prompt caching
+/// (mu-f1a0). Anthropic semantics: 5-minute writes bill at 1.25x the
+/// input rate, 1-hour writes at 2.0x; reads are 0.10x for both, and
+/// both TTLs slide (refresh on every hit).
+///
+/// Which tier wins is a workload property, measured on the 2026-06-04
+/// baseline session: 74% of its cache writes were expiry re-writes
+/// from >5-minute human gaps — 1h would have cut that session ~20%.
+/// Gap-free batch runs (replays, delegated workers) are the opposite:
+/// the 2x write premium is pure cost. Hence a per-session knob with
+/// workers pinned to FiveMinutes (see serve's delegate path).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CacheTtl {
+    /// Anthropic default tier — no `ttl` field on the wire.
+    #[default]
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    /// Extended tier — `"ttl": "1h"` on the wire, 2.0x write billing.
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
 /// Thin wrapper carrying an ordered list of [`ProviderMessage`]s.
 ///
 /// The wrapper exists (rather than `Vec<ProviderMessage>` directly)

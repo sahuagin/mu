@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use mu_core::agent::{AgentConfig, AgentInput, AgentLoop, AgentMessage, SpawnArgs, Tool};
 use mu_core::capability::Capability;
 use mu_core::context::rope::SpanText;
+use mu_core::context::CacheTtl;
 use mu_core::context::{ProjectContext, RecalledItem};
 use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
@@ -66,6 +67,7 @@ pub fn handle_create_session(
         parent_session_id: None,             // no parent — this is a root session
         branched_at_parent_event_id: None,
         capability: Capability::root(), // root session: unrestricted
+        cache_ttl: params.cache_ttl.unwrap_or_default(), // mu-f1a0
         notif,
         sessions,
         factory,
@@ -140,6 +142,11 @@ pub fn handle_delegate_session(
         parent_session_id: Some(params.parent_session_id.clone()),
         branched_at_parent_event_id: params.branched_at_parent_event_id,
         capability: child_capability,
+        // mu-f1a0: delegated workers are PINNED to the 5m tier
+        // regardless of the parent's — they run gap-free tool loops,
+        // so the 1h tier's 2x write premium is pure cost (operator
+        // requirement, bead body).
+        cache_ttl: CacheTtl::FiveMinutes,
         notif,
         sessions,
         factory,
@@ -175,6 +182,8 @@ struct BuildSessionRequest<'a> {
     parent_session_id: Option<String>,
     branched_at_parent_event_id: Option<u64>,
     capability: Capability,
+    /// mu-f1a0: prompt-cache TTL tier for this session's provider.
+    cache_ttl: CacheTtl,
     // runtime deps (daemon-global)
     notif: NotificationWriter,
     sessions: Sessions,
@@ -223,8 +232,10 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         factory,
         tools,
         daemon_info,
+        cache_ttl,
     } = req;
-    let provider = factory(selector).map_err(|e| format!("could not build provider: {e}"))?;
+    let provider =
+        factory(selector, cache_ttl).map_err(|e| format!("could not build provider: {e}"))?;
 
     let session_id = Sessions::next_id();
     let event_log = Arc::new(SessionEventLog::new(session_id.clone()));
@@ -353,6 +364,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             pending_approvals,
             parent_session_id,
             capability: capability_handle,
+            cache_ttl,
             provider_status,
             mailbox,
             status_watch: Some(status_rx),
@@ -944,7 +956,12 @@ pub async fn handle_set_route(
         );
     }
 
-    let provider = match factory(&params.provider) {
+    // mu-f1a0: a live route swap must preserve the session's cache
+    // TTL tier — silently dropping an interactive session to 5m on a
+    // model switch would re-introduce the expiry re-pays the tier
+    // exists to prevent.
+    let route_ttl = sessions.cache_ttl(&params.session_id).unwrap_or_default();
+    let provider = match factory(&params.provider, route_ttl) {
         Ok(p) => p,
         Err(e) => {
             return err_response(

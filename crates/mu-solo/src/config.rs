@@ -106,6 +106,13 @@ pub struct SessionConfig {
     /// Working directory passed to the spawned daemon. None = use
     /// the current process cwd at startup time.
     pub cwd: Option<PathBuf>,
+    /// mu-f1a0: prompt-cache TTL tier ("5m" | "1h") forwarded in
+    /// create_session. Solo defaults to "1h": interactive sessions
+    /// are gap-heavy (74% of the measured baseline's cache writes
+    /// were >5min-gap expiry re-writes; 1h would have cut that
+    /// session ~20%). Set "5m" for batch-shaped usage. Only the
+    /// Anthropic provider consumes it today.
+    pub cache_ttl: String,
 }
 
 impl Default for SessionConfig {
@@ -121,6 +128,7 @@ impl Default for SessionConfig {
             bash_yolo: false,
             mu_binary: "./target/release/mu".into(),
             cwd: None,
+            cache_ttl: "1h".into(),
         }
     }
 }

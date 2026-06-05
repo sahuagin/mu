@@ -53,7 +53,7 @@ pub use compaction::{
 pub use event::RopeEvent;
 pub use recall::{ProjectContext, RecallProvider, RecallSource, RecalledItem};
 pub use renderer::{
-    CacheMarker, FauxProviderRenderer, ProjectionTarget, ProviderMessage, ProviderMessages,
-    ProviderRenderer, ProviderRole,
+    CacheMarker, CacheTtl, FauxProviderRenderer, ProjectionTarget, ProviderMessage,
+    ProviderMessages, ProviderRenderer, ProviderRole,
 };
 pub use rope::{ContextSizes, RetainedRope, RetentionClass, Span, SpanId, SpanKind, SpanText};

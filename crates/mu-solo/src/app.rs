@@ -402,6 +402,8 @@ pub struct AppOptions<'a> {
     pub tools: &'a str,
     pub effort: &'a str,
     pub focus_mode: bool,
+    /// mu-f1a0: cache TTL tier ("5m" | "1h") for the initial session.
+    pub cache_ttl: &'a str,
     pub clipboard_command: Option<&'a [String]>,
 }
 
@@ -423,6 +425,7 @@ impl App {
             effort,
             focus_mode,
             clipboard_command,
+            cache_ttl,
         } = opts;
         let effort = EffortLevel::parse(effort).ok_or_else(|| {
             anyhow!("invalid effort {effort:?} (valid: low|medium|high|xhigh|max)")
@@ -439,13 +442,18 @@ impl App {
         // (mirrors mu-tui's accept-anything mapping in create_session).
         let kind = normalize_provider_kind(provider);
 
+        // mu-f1a0: forward the configured cache TTL tier. Omit the
+        // field entirely when it isn't one of the wire values so an
+        // older daemon (or a typo) degrades to the 5m default rather
+        // than failing session creation.
+        let mut create_params = serde_json::json!({
+            "provider": { "kind": kind, "model": model },
+        });
+        if matches!(cache_ttl, "5m" | "1h") {
+            create_params["cache_ttl"] = serde_json::json!(cache_ttl);
+        }
         let resp = client
-            .request(
-                "create_session",
-                serde_json::json!({
-                    "provider": { "kind": kind, "model": model },
-                }),
-            )
+            .request("create_session", create_params)
             .context("create_session failed")?;
         let session_id = resp
             .get("session_id")

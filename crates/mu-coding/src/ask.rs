@@ -236,6 +236,9 @@ async fn create_session(
         provider: selector.clone(),
         system_prompt: system_prompt.map(str::to_owned),
         cwd,
+        // mu-f1a0: `mu ask` is a batch-shaped one-shot — the 5m
+        // default tier is correct (no human gaps to survive).
+        cache_ttl: None,
     };
     let req = json!({
         "jsonrpc": "2.0",

@@ -12,6 +12,7 @@ use mu_ai::{
     AnthropicProvider, FauxProvider, OllamaProvider, OpenRouterProvider, OpenaiCodexProvider,
 };
 use mu_core::agent::{Provider, Tool};
+use mu_core::context::CacheTtl;
 use mu_core::protocol::ProviderSelector;
 
 use crate::tools::{
@@ -41,13 +42,13 @@ pub struct BashSettings {
 /// (`ephemeral`, `thinking`) that parameterize *how* providers get
 /// built, while the selector picks *which* provider.
 pub type ProviderFactory =
-    Arc<dyn Fn(&ProviderSelector) -> Result<Arc<dyn Provider>> + Send + Sync>;
+    Arc<dyn Fn(&ProviderSelector, CacheTtl) -> Result<Arc<dyn Provider>> + Send + Sync>;
 
 /// Construct a `ProviderFactory` from daemon flags. Each session
 /// gets its own `Arc<dyn Provider>` built by this closure.
 pub fn make_provider_factory(ephemeral: bool, thinking: Option<String>) -> ProviderFactory {
-    Arc::new(move |selector: &ProviderSelector| {
-        build_provider_from_selector(selector, ephemeral, thinking.as_deref())
+    Arc::new(move |selector: &ProviderSelector, cache_ttl: CacheTtl| {
+        build_provider_from_selector(selector, ephemeral, thinking.as_deref(), cache_ttl)
     })
 }
 
@@ -60,6 +61,9 @@ pub fn build_provider_from_selector(
     selector: &ProviderSelector,
     ephemeral: bool,
     thinking: Option<&str>,
+    // mu-f1a0: per-session cache TTL tier. Only the Anthropic arm
+    // consumes it — other providers have no tiered caching surface.
+    cache_ttl: CacheTtl,
 ) -> Result<Arc<dyn Provider>> {
     match selector {
         // Faux is encoded on the wire as `anthropic_api`-with-a-known
@@ -74,7 +78,9 @@ pub fn build_provider_from_selector(
             if model == "faux" {
                 return Ok(Arc::new(FauxProvider::echo()));
             }
-            Ok(Arc::new(AnthropicProvider::from_env(model.clone())?))
+            Ok(Arc::new(
+                AnthropicProvider::from_env(model.clone())?.with_cache_ttl(cache_ttl),
+            ))
         }
         ProviderSelector::AnthropicOauth { .. } => {
             anyhow::bail!(
@@ -243,16 +249,18 @@ mod tests {
         let sel = ProviderSelector::AnthropicApi {
             model: "faux".into(),
         };
-        assert!(build_provider_from_selector(&sel, false, None).is_ok());
+        assert!(build_provider_from_selector(&sel, false, None, CacheTtl::default()).is_ok());
         // ephemeral / thinking are tolerated even though faux ignores
         // them.
-        assert!(build_provider_from_selector(&sel, true, Some("high")).is_ok());
+        assert!(
+            build_provider_from_selector(&sel, true, Some("high"), CacheTtl::default()).is_ok()
+        );
     }
 
     #[test]
     fn build_from_selector_anthropic_oauth_errors() {
         let sel = ProviderSelector::AnthropicOauth { model: "x".into() };
-        match build_provider_from_selector(&sel, false, None) {
+        match build_provider_from_selector(&sel, false, None, CacheTtl::default()) {
             Ok(_) => panic!("anthropic_oauth should not be implemented"),
             Err(e) => assert!(
                 e.to_string().contains("not yet implemented")
@@ -266,7 +274,7 @@ mod tests {
         let sel = ProviderSelector::OpenaiApi {
             model: "gpt-5".into(),
         };
-        match build_provider_from_selector(&sel, false, None) {
+        match build_provider_from_selector(&sel, false, None, CacheTtl::default()) {
             Ok(_) => panic!("openai_api should not be implemented"),
             Err(e) => assert!(e.to_string().contains("not yet implemented")),
         }
@@ -323,7 +331,7 @@ mod tests {
         let sel = ProviderSelector::Ollama {
             model: "qwen3-coder:30b".into(),
         };
-        assert!(build_provider_from_selector(&sel, false, None).is_ok());
+        assert!(build_provider_from_selector(&sel, false, None, CacheTtl::default()).is_ok());
     }
 
     #[test]
@@ -344,8 +352,8 @@ mod tests {
         let sel_b = ProviderSelector::AnthropicApi {
             model: "faux".into(),
         };
-        let a = factory(&sel_a).expect("first construction");
-        let b = factory(&sel_b).expect("second construction");
+        let a = factory(&sel_a, CacheTtl::default()).expect("first construction");
+        let b = factory(&sel_b, CacheTtl::default()).expect("second construction");
         // Each call returns a fresh Arc; pointer equality is not
         // guaranteed but each should be alive.
         assert!(Arc::strong_count(&a) >= 1);

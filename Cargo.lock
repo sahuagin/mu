@@ -1701,6 +1701,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "dirs",
+ "figment",
  "futures",
  "serde",
  "serde_json",

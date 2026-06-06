@@ -1,0 +1,100 @@
+# Built-in provider/model catalog. User overrides live at ~/.config/mu/models.toml.
+
+[providers.anthropic_api]
+kind = "anthropic_api"
+label = "Anthropic API"
+requires_api_key = true
+usage_semantics = "anthropic_style"
+
+[providers.openai_codex]
+kind = "openai_codex"
+label = "OpenAI Codex"
+requires_api_key = true
+usage_semantics = "openai_style"
+
+[providers.openrouter]
+kind = "openrouter"
+label = "OpenRouter"
+requires_api_key = true
+usage_semantics = "openai_style"
+
+[providers.ollama]
+kind = "ollama"
+label = "Ollama"
+aliases = ["local"]
+requires_api_key = false
+usage_semantics = "openai_style"
+quirks = ["local_openai_compatible"]
+
+[models.claude_opus_4_7]
+model = "claude-opus-4-7"
+family = "claude-opus-4"
+label = "Claude Opus 4.7"
+context_soft_limit = 200000
+context_hard_limit = 1000000
+max_output_tokens = 16384
+
+[models.claude_opus_4_8]
+model = "claude-opus-4-8"
+family = "claude-opus-4"
+label = "Claude Opus 4.8"
+context_soft_limit = 200000
+context_hard_limit = 1000000
+max_output_tokens = 16384
+
+[models.claude_sonnet_4_6]
+model = "claude-sonnet-4-6"
+family = "claude-sonnet-4"
+label = "Claude Sonnet 4.6"
+context_soft_limit = 200000
+context_hard_limit = 200000
+max_output_tokens = 8192
+
+[models.claude_haiku_4_5]
+model = "claude-haiku-4-5"
+family = "claude-haiku-4"
+label = "Claude Haiku 4.5"
+context_soft_limit = 200000
+context_hard_limit = 200000
+max_output_tokens = 8192
+
+[models.gpt_5_5]
+model = "gpt-5.5"
+family = "gpt-5"
+label = "GPT 5.5"
+context_soft_limit = 1000000
+context_hard_limit = 1000000
+max_output_tokens = 16384
+
+[model_rules.claude_opus_4]
+prefix = "claude-opus-4"
+max_output_tokens = 16384
+
+[model_rules.claude_sonnet_haiku_4]
+prefixes = ["claude-sonnet-4", "claude-haiku-4"]
+max_output_tokens = 8192
+
+[model_rules.openrouter_anthropic_opus]
+prefix = "anthropic/claude-opus-4."
+max_output_tokens = 16384
+
+[model_rules.openrouter_anthropic_sonnet_haiku]
+prefixes = ["anthropic/claude-sonnet-4.", "anthropic/claude-haiku-4"]
+max_output_tokens = 8192
+
+[model_rules.openai_reasoning]
+prefixes = ["gpt-5", "o4", "o3"]
+max_output_tokens = 16384
+
+[model_rules.ollama_reasoning]
+prefixes = ["gpt-oss", "deepseek-r1", "qwen3.6:"]
+max_output_tokens = 16384
+reasoning_in_output = true
+quirks = ["thinking_counts_against_max_tokens", "may_return_empty_visible_output_at_low_max_tokens"]
+
+[favorites.local_qwen36]
+provider = "ollama"
+model = "qwen3.6:35b-a3b-q8_0"
+label = "Local Qwen 3.6 35B"
+aliases = ["qwen36", "local-reasoner"]
+default_effort = "medium"

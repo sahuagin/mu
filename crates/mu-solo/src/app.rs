@@ -2574,17 +2574,17 @@ impl App {
                 // mu-solo-osc-notify-mbmn: surface main-session turn
                 // boundaries as desktop notifications. Sidecar (/btw)
                 // turns are background by design and stay silent.
-                // mu-solo-notify-occasion-56h0: emit UNCONDITIONALLY
-                // on focus — the OSC 99 carries o=invisible, so KITTY
-                // suppresses the popup while the window is visible
-                // and active. The previous app-side
-                // !terminal_focused gate was permanently stuck under
-                // zellij (forwards no ?1004 focus reporting at all —
-                // operator-measured), which silenced every
-                // notification. terminal_focused tracking stays for
-                // terminals that do report; it just no longer gates
-                // emission.
-                if self.notifications && sid == self.session_id {
+                // mu-solo-notify-pane-focus-jqnp: gate on PANE focus
+                // (terminal_focused, fed by zellij-proxied DECSET 1004)
+                // and emit o=always so kitty shows it regardless of
+                // its window focus. This reverses 56h0's o=invisible
+                // hand-off: kitty can't tell zellij panes apart, so it
+                // only ever notified on app/tab switches — never on a
+                // pane switch within the same kitty window. The layer
+                // with pane-level focus knowledge makes the decision.
+                if crate::notify::should_notify(self.notifications, self.terminal_focused)
+                    && sid == self.session_id
+                {
                     if method == "session.done" {
                         crate::notify::notify(&format!(
                             "mu ({}) is waiting for your input",

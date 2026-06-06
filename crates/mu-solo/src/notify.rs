@@ -18,10 +18,25 @@
 //! add — not a reason to emit both (terminals supporting both would
 //! double-pop).
 //!
-//! Policy lives in the caller (App): notify only when the terminal
-//! is UNFOCUSED (crossterm focus events) and only for the main
-//! session's turn boundaries — a notification about the terminal
-//! you're already looking at is noise.
+//! WHO DECIDES whether to show — the layer with the focus info
+//! (mu-solo-notify-pane-focus-jqnp):
+//!   * Earlier (mu-solo-notify-occasion-56h0) the escape carried
+//!     `o=invisible`, handing the show/suppress decision UP to kitty.
+//!     But kitty only sees its OS window — it cannot tell one zellij
+//!     pane from another inside the same window. So every in-window
+//!     pane switch reads as "focused" and kitty stays silent; only
+//!     app/tab switches ever notified. That was the bug.
+//!   * zellij DOES proxy DECSET 1004 focus reporting per pane
+//!     (operator re-measured 2026-06-06; the 56h0 "no ?1004" reading
+//!     was wrong). mu-solo therefore has pane-granular focus via
+//!     crossterm FocusGained/FocusLost (`App::terminal_focused`).
+//!   * Fix: emit `o=always` so kitty shows the popup regardless of
+//!     ITS window focus, and gate emission in the caller on
+//!     `terminal_focused` — the layer that actually knows pane focus
+//!     makes the decision (see [`should_notify`]). Resulting
+//!     semantics, operator-specified: working in another zellij pane
+//!     (same kitty window) notifies; sitting in the mu-solo pane
+//!     stays silent.
 
 use std::io::Write;
 
@@ -29,32 +44,49 @@ use std::io::Write;
 /// short keeps the popup readable.
 const MAX_BODY_CHARS: usize = 160;
 
-/// Emit an OSC 99 (kitty notification protocol) escape on stdout.
+/// Whether a turn-boundary notification should be emitted, given the
+/// `tui.notifications` setting and the current PANE focus state.
+///
+/// This is the gate the bug turned on: notify only when the operator
+/// is NOT looking at the mu-solo pane. `terminal_focused` is fed by
+/// crossterm focus events, which zellij proxies per pane — so this is
+/// a pane-level decision, not the window-level one kitty can make.
+/// Paired with the `o=always` escape from [`format_notification`],
+/// kitty shows whatever this lets through.
+pub fn should_notify(notifications_enabled: bool, terminal_focused: bool) -> bool {
+    notifications_enabled && !terminal_focused
+}
+
+/// Build the OSC 99 (kitty notification protocol) escape for `body`.
 /// The body is sanitized: control characters (incl. ESC and BEL,
 /// which would terminate or corrupt the sequence) are replaced with
 /// spaces, and the result is capped at [`MAX_BODY_CHARS`].
 ///
-/// Metadata `o=invisible`: kitty displays the notification only when
-/// the emitting window "is in an inactive tab or its OS window is
-/// not currently active" (spec) — i.e., KITTY does the focus
-/// judging. This replaced the app-side crossterm focus gate after
-/// the operator measured (mu-solo-notify-occasion-56h0) that zellij
-/// forwards no focus reporting at all (?1004 produced no ^[[I/^[[O
-/// even on pane switches), so an app-side gate is permanently stuck
-/// "focused" under a multiplexer. Resulting semantics, operator-
-/// specified: zellij pane switches stay silent (kitty window still
-/// active), kitty tab switches and app switches notify.
-pub fn notify(body: &str) {
+/// Metadata `o=always`: kitty shows the notification regardless of
+/// whether the emitting window is focused. The show/suppress decision
+/// is made one layer down by [`should_notify`] using pane-level focus
+/// — the layer that has the information kitty lacks (which zellij pane
+/// is active). Returned as an owned `String` so the exact bytes are
+/// unit-testable.
+fn format_notification(body: &str) -> String {
     let clean: String = body
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .take(MAX_BODY_CHARS)
         .collect();
-    let mut out = std::io::stdout();
     // ST-terminated OSC 99; payload renders as the notification
     // title. OSC sequences don't move the cursor, so emitting
     // between ratatui frames is layout-safe.
-    let _ = write!(out, "\x1b]99;o=invisible;{clean}\x1b\\");
+    format!("\x1b]99;o=always;{clean}\x1b\\")
+}
+
+/// Emit an OSC 99 notification escape for `body` on stdout.
+///
+/// Callers must already have decided emission is wanted (see
+/// [`should_notify`]); this only formats and writes the bytes.
+pub fn notify(body: &str) {
+    let mut out = std::io::stdout();
+    let _ = out.write_all(format_notification(body).as_bytes());
     let _ = out.flush();
 }
 
@@ -63,23 +95,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn emits_osc99_with_o_always() {
+        let seq = format_notification("mu (claude-opus-4-8) is waiting for your input");
+        // kitty path carries o=always so the popup shows regardless
+        // of kitty window focus (mu-solo-notify-pane-focus-jqnp).
+        assert!(seq.contains("o=always"), "missing o=always in {seq:?}");
+        assert!(!seq.contains("o=invisible"), "stale o=invisible in {seq:?}");
+        // Well-formed OSC 99: ESC ] 99 ; ... ST.
+        assert!(seq.starts_with("\x1b]99;"));
+        assert!(seq.ends_with("\x1b\\"));
+        assert!(seq.contains("is waiting for your input"));
+    }
+
+    #[test]
     fn sanitize_strips_control_chars() {
-        let body = "done\x1b]9;injected\x07\nnext";
-        let clean: String = body
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .take(MAX_BODY_CHARS)
-            .collect();
-        assert!(!clean.contains('\x1b'));
-        assert!(!clean.contains('\x07'));
-        assert!(!clean.contains('\n'));
-        assert!(clean.contains("]9;injected"));
+        let seq = format_notification("done\x1b]9;injected\x07\nnext");
+        // Only the framing ESC...ST may contain ESC; the body's
+        // injected ESC/BEL/newline must be scrubbed to spaces.
+        let body = seq
+            .strip_prefix("\x1b]99;o=always;")
+            .and_then(|s| s.strip_suffix("\x1b\\"))
+            .expect("framed OSC 99");
+        assert!(!body.contains('\x1b'));
+        assert!(!body.contains('\x07'));
+        assert!(!body.contains('\n'));
+        assert!(body.contains("]9;injected"));
     }
 
     #[test]
     fn sanitize_caps_length() {
-        let body = "x".repeat(MAX_BODY_CHARS + 50);
-        let clean: String = body.chars().take(MAX_BODY_CHARS).collect();
-        assert_eq!(clean.chars().count(), MAX_BODY_CHARS);
+        let seq = format_notification(&"x".repeat(MAX_BODY_CHARS + 50));
+        let body = seq
+            .strip_prefix("\x1b]99;o=always;")
+            .and_then(|s| s.strip_suffix("\x1b\\"))
+            .expect("framed OSC 99");
+        assert_eq!(body.chars().count(), MAX_BODY_CHARS);
+    }
+
+    #[test]
+    fn gating_silent_when_pane_focused() {
+        // Operator is looking at the mu-solo pane: stay silent.
+        assert!(!should_notify(true, true));
+    }
+
+    #[test]
+    fn gating_emits_when_pane_unfocused() {
+        // Operator is in another pane/app: notify.
+        assert!(should_notify(true, false));
+    }
+
+    #[test]
+    fn gating_respects_disable() {
+        // tui.notifications off: never notify, focused or not.
+        assert!(!should_notify(false, false));
+        assert!(!should_notify(false, true));
     }
 }

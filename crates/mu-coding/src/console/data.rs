@@ -13,6 +13,11 @@ pub(crate) struct AppState {
     /// mu-cc-sessions-console-lqqt.1: claude-code projects dir to merge
     /// into the index, or `None` to scan only mu's native event logs.
     pub(crate) cc_projects_dir: Option<PathBuf>,
+    /// mu-cc-sessions-console-lqqt.3: task_log sidecar DB holding cc
+    /// session marks. Populates the index mark column for cc rows and
+    /// receives the console mark POST's cc storage path. `None` keeps cc
+    /// marks unread/unwritten.
+    pub(crate) cc_marks_db: Option<PathBuf>,
     pub(crate) base_path: String,
 }
 
@@ -56,10 +61,24 @@ pub(crate) struct SessionSummary {
 /// scans claude-code transcripts and merges both corpora into one
 /// last-activity-sorted list. The two scanners are independent and
 /// best-effort, so their malformed/skipped counts simply add.
-pub(crate) fn scan_all(events_dir: &Path, cc_projects_dir: Option<&Path>) -> ScanResult {
+pub(crate) fn scan_all(
+    events_dir: &Path,
+    cc_projects_dir: Option<&Path>,
+    cc_marks_db: Option<&Path>,
+) -> ScanResult {
     let mut result = scan_sessions(events_dir);
     if let Some(dir) = cc_projects_dir {
-        let cc = crate::console::cc_data::scan_cc_sessions(dir);
+        let mut cc = crate::console::cc_data::scan_cc_sessions(dir);
+        // mu-cc-sessions-console-lqqt.3: cc marks live in the task_log
+        // sidecar, not the transcript — populate the index mark column
+        // from there (latest row wins). mu sessions already carry their
+        // mark from the OperatorMark event in scan_sessions above.
+        if let Some(db) = cc_marks_db {
+            let marks = crate::console::mark::cc_marks_by_session(db);
+            for s in &mut cc.sessions {
+                s.mark = marks.get(&s.session_id).copied();
+            }
+        }
         result.sessions.extend(cc.sessions);
         result.malformed_files += cc.malformed_files;
         result.skipped_entries += cc.skipped_entries;

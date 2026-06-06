@@ -8,10 +8,13 @@
 //! goes through the same event-log append path as everything else;
 //! the console itself still renders only what the log says.
 
+mod cc_data;
 mod data;
 mod html;
 pub mod mark;
 mod views;
+
+pub use cc_data::default_cc_projects_dir;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
@@ -38,6 +41,10 @@ pub struct ConsoleOptions {
     pub base_path: String,
     pub events_dir: PathBuf,
     pub analytics_db: Option<PathBuf>,
+    /// mu-cc-sessions-console-lqqt.1: when set, also scan this
+    /// claude-code projects dir and merge cc sessions into the index.
+    /// `None` keeps cc scanning off (explicit opt-in).
+    pub cc_projects_dir: Option<PathBuf>,
 }
 
 pub async fn run(opts: ConsoleOptions) -> Result<()> {
@@ -45,6 +52,7 @@ pub async fn run(opts: ConsoleOptions) -> Result<()> {
     let state = Arc::new(AppState {
         events_dir: opts.events_dir,
         analytics_db: opts.analytics_db,
+        cc_projects_dir: opts.cc_projects_dir,
         base_path: base_path.clone(),
     });
 

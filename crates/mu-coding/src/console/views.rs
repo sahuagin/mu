@@ -7,7 +7,7 @@ use mu_core::{
 };
 
 use crate::console::{
-    data::{load_events, scan_sessions, AppState},
+    data::{load_events, scan_all, AppState},
     html::{
         breakdown_table, esc, esc_attr, event_anchor, fmt_opt_u32, fmt_opt_u64, kv, page,
         payload_kind, td, td_code, td_num, td_time, transcript_block, truncate, truncated_details,
@@ -25,7 +25,7 @@ pub(crate) enum DetailTab {
 }
 
 pub(crate) fn render_sessions_index(state: Arc<AppState>) -> Html<String> {
-    let scan = scan_sessions(&state.events_dir);
+    let scan = scan_all(&state.events_dir, state.cc_projects_dir.as_deref());
     let mut body = String::new();
     body.push_str("<h1>mu sessions</h1>");
     body.push_str(&format!(
@@ -36,6 +36,14 @@ pub(crate) fn render_sessions_index(state: Arc<AppState>) -> Html<String> {
         body.push_str(&format!(
             "<p class=muted>analytics: <code>{}</code></p>",
             esc(&db.display().to_string())
+        ));
+    }
+    // mu-cc-sessions-console-lqqt.1: signal when claude-code sessions
+    // are merged into the index so the merged corpus isn't a surprise.
+    if let Some(cc) = &state.cc_projects_dir {
+        body.push_str(&format!(
+            "<p class=muted>claude-code: <code>{}</code></p>",
+            esc(&cc.display().to_string())
         ));
     }
     if scan.malformed_files > 0 || scan.skipped_entries > 0 {

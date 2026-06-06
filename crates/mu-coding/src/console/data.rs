@@ -10,6 +10,9 @@ use mu_core::{
 pub(crate) struct AppState {
     pub(crate) events_dir: PathBuf,
     pub(crate) analytics_db: Option<PathBuf>,
+    /// mu-cc-sessions-console-lqqt.1: claude-code projects dir to merge
+    /// into the index, or `None` to scan only mu's native event logs.
+    pub(crate) cc_projects_dir: Option<PathBuf>,
     pub(crate) base_path: String,
 }
 
@@ -46,6 +49,25 @@ pub(crate) struct SessionSummary {
     /// mu-index-mark-column-auiv: latest operator-mark rating, so the
     /// index shows which sessions are already covered.
     pub(crate) mark: Option<u8>,
+}
+
+/// mu-cc-sessions-console-lqqt.1: the index's scan entry point. Always
+/// scans mu's native event logs; when `cc_projects_dir` is `Some`, also
+/// scans claude-code transcripts and merges both corpora into one
+/// last-activity-sorted list. The two scanners are independent and
+/// best-effort, so their malformed/skipped counts simply add.
+pub(crate) fn scan_all(events_dir: &Path, cc_projects_dir: Option<&Path>) -> ScanResult {
+    let mut result = scan_sessions(events_dir);
+    if let Some(dir) = cc_projects_dir {
+        let cc = crate::console::cc_data::scan_cc_sessions(dir);
+        result.sessions.extend(cc.sessions);
+        result.malformed_files += cc.malformed_files;
+        result.skipped_entries += cc.skipped_entries;
+        result
+            .sessions
+            .sort_by_key(|s| std::cmp::Reverse(s.last_activity_unix_ms.unwrap_or(0)));
+    }
+    result
 }
 
 pub(crate) fn scan_sessions(events_dir: &Path) -> ScanResult {

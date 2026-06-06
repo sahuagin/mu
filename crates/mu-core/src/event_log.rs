@@ -816,6 +816,17 @@ impl SessionEventLog {
             .unwrap_or(0)
     }
 
+    /// mu-index-mark-column-auiv: the session's current operator mark —
+    /// latest `OperatorMark` by event id (re-marking appends; latest
+    /// wins). None if the session has never been marked.
+    pub fn latest_operator_mark(&self) -> Option<(u8, Option<String>)> {
+        let events = self.events.lock().ok()?;
+        events.iter().rev().find_map(|ev| match &ev.payload {
+            EventPayload::OperatorMark { rating, note } => Some((*rating, note.clone())),
+            _ => None,
+        })
+    }
+
     /// Timestamp of the first event (typically `SessionCreated`).
     /// None if the log is empty.
     pub fn started_at_unix_ms(&self) -> Option<u64> {

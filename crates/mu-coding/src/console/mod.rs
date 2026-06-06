@@ -31,8 +31,8 @@ use serde::Deserialize;
 use self::{
     data::{normalize_base_path, AppState},
     views::{
-        compare_placeholder, render_compaction_one, render_context_one, render_session_page,
-        render_sessions_index, DetailTab,
+        compare_placeholder, render_cc_session_page, render_compaction_one, render_context_one,
+        render_session_page, render_sessions_index, CcDetailTab, DetailTab,
     },
 };
 
@@ -91,6 +91,16 @@ pub async fn run(opts: ConsoleOptions) -> Result<()> {
             "/sessions/{daemon_id}/{session_id}/mark",
             post(session_mark),
         )
+        // mu-cc-sessions-console-lqqt.2: claude-code detail view. A
+        // distinct route prefix keeps cc sessions (read from the cc
+        // projects dir) off the event-log detail path; the index links
+        // cc rows here.
+        .route("/cc/{project_dir}/{session_id}", get(cc_session_detail))
+        .route(
+            "/cc/{project_dir}/{session_id}/events",
+            get(cc_session_events),
+        )
+        .route("/cc/{project_dir}/{session_id}/cost", get(cc_session_cost))
         .route("/compare", get(compare))
         .with_state(state);
 
@@ -176,6 +186,27 @@ async fn session_compaction_one(
     AxumPath((daemon_id, session_id, model_call_id)): AxumPath<(String, String, u32)>,
 ) -> Html<String> {
     render_compaction_one(state, daemon_id, session_id, model_call_id)
+}
+
+async fn cc_session_detail(
+    State(state): State<Arc<AppState>>,
+    AxumPath((project_dir, session_id)): AxumPath<(String, String)>,
+) -> Html<String> {
+    render_cc_session_page(state, project_dir, session_id, CcDetailTab::Transcript)
+}
+
+async fn cc_session_events(
+    State(state): State<Arc<AppState>>,
+    AxumPath((project_dir, session_id)): AxumPath<(String, String)>,
+) -> Html<String> {
+    render_cc_session_page(state, project_dir, session_id, CcDetailTab::Events)
+}
+
+async fn cc_session_cost(
+    State(state): State<Arc<AppState>>,
+    AxumPath((project_dir, session_id)): AxumPath<(String, String)>,
+) -> Html<String> {
+    render_cc_session_page(state, project_dir, session_id, CcDetailTab::Cost)
 }
 
 #[derive(Debug, Deserialize)]

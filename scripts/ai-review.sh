@@ -1,45 +1,78 @@
 #!/usr/bin/env bash
-# ai-review.sh — pre-PR cross-provider review gate (bead mu-6qst).
+# ai-review.sh — pre-PR two-reviewer PANEL gate (beads mu-6qst, mu-ai-review-panel-lrwq).
 #
-# A SEPARATE-provider model reviews the working diff before a PR — a third
-# check on top of CI and the two humans/agent. Run it via `just ci-aipr`,
+# Two LOCAL reviewer models form a panel that reviews the working diff before a
+# PR — a third check on top of CI and the human/agent. Run it via `just ci-aipr`,
 # which runs `just ci` first and only reviews green code.
 #
-# The verdict is read from the reviewer's STDOUT, NOT its process exit code:
-# a reviewer's process exit != its verdict, and `mu ask` historically exits
-# non-zero on a shutdown wart (mu-qc08) even on success — so the exit code is
-# not load-bearing here.
+# WHY A PANEL (not a single champion): the two reviewers have complementary,
+# inverted strengths — gpt-oss:20b leads single-shot review but trails
+# agentically; qwen3-coder:30b is the reverse (code-review-bench + agentic-bench,
+# 2026-06-04..06). A single-reviewer gate inherits one model's blind spots. On
+# 2026-06-06 gpt-oss:20b APPROVEd a correct PR (#200) and REJECTed an equally
+# correct one (#201) on a false premise (a hypothetical non-Copy compile error on
+# the very line that fixes it), contradicted by the green `just ci` in the same
+# recipe run. The panel exists to absorb exactly that single-reviewer miss: keep
+# BOTH on the gate, treat them like a team, never optimize to one winner.
+# (Operator-ratified: memory d88e133e / reviewer-models-as-team, 2026-06-06.)
+#
+# PANEL SEMANTICS (the verdict of each reviewer is read from its STDOUT, NOT its
+# process exit code — `mu ask` historically exits non-zero on a shutdown wart
+# (mu-qc08) even on success, so the exit code is not load-bearing here):
+#
+#   both APPROVE            → PASS     (exit 0)
+#   both REJECT             → BLOCK    (exit 1)  — a real design/correctness call
+#   split / any UNCLEAR     → ESCALATE (exit 3)  — operator decides; NOT self-overridden
+#
+# The two non-pass outcomes have DISTINCT exit codes (1 vs 3) and distinct,
+# verdict-naming messages so a split is never confused with a unanimous block.
+# MU_REVIEW_OVERRIDE=1 is the operator's override on BLOCK *or* ESCALATE: it
+# proceeds (exit 0) and is logged as a calibration signal.
+#
+# This panel REPLACES the old single-reviewer + opt-in escalation-ladder shape
+# (MU_REVIEW_ESCALATE_PROVIDER/_MODEL): the second reviewer IS the differential,
+# always-on rather than only-on-reject.
 #
 # Design: ~/.claude-personal/notes/design-prepr-review-and-degradation-gate.md
 # Process-layer auditors / correlation: bead mu-pr6r.
 #
 # Env:
-#   MU_REVIEW_PROVIDER          reviewer provider (default: ollama; codex = openai-codex)
-#   MU_REVIEW_MODEL             reviewer model    (default: gpt-oss:20b)
-#   MU_REVIEW_TOOLS             reviewer tools, e.g. "read,grep" (default: none, single-shot)
-#   MU_REVIEW_BASE              base ref to diff against (default: main)
-#   MU_REVIEW_OVERRIDE=1        operator override: proceed despite REJECT (logged)
-#   MU_REVIEW_ESCALATE_PROVIDER on REJECT, re-review with this provider; the
-#                               spread is a differential diagnosis (all-fail =
-#                               design problem; any-pass = capacity datapoint).
-#   MU_REVIEW_ESCALATE_MODEL    model for the escalation (default: MU_REVIEW_MODEL)
-#   MU_REVIEW_LOG               event log (default: ~/.local/share/mu/review-events.jsonl)
-#   MU_REVIEW_NO_COLOR          disable color
+#   Reviewer 1 (default ollama / qwen3-coder:30b):
+#     MU_REVIEW_PROVIDER        provider (default: ollama; codex = openai-codex)
+#     MU_REVIEW_MODEL           model    (default: qwen3-coder:30b)
+#   Reviewer 2 (default ollama / gpt-oss:20b):
+#     MU_REVIEW_PROVIDER_2      provider (default: ollama)
+#     MU_REVIEW_MODEL_2         model    (default: gpt-oss:20b)
+#   Shared:
+#     MU_REVIEW_TOOLS           reviewer tools, e.g. "read,grep" (default: none, single-shot)
+#     MU_REVIEW_BASE            base ref to diff against (default: main)
+#     MU_REVIEW_FULL_FILES      1 = append full content of each changed file to the
+#                               prompt so reviewers see definitions outside the diff
+#                               window (default: 1; set 0 for diff-only)
+#     MU_REVIEW_CONTEXT_MAX_BYTES  cap on appended full-file context (default: 200000)
+#     MU_REVIEW_OVERRIDE=1      operator override: proceed despite BLOCK/ESCALATE (logged)
+#     MU_REVIEW_SYSTEM_PROMPT   reviewer system-prompt file (default: ai-review-system-prompt.txt)
+#     MU_REVIEW_LOG             event log (default: ~/.local/share/mu/review-events.jsonl)
+#     MU_REVIEW_NO_COLOR        disable color
+#
+# The log carries BOTH reviewers' verdicts: one {"event":"reviewer",...} line per
+# reviewer plus one {"event":"panel",...} summary line with the panel outcome.
 
 set -u
 set -o pipefail
 
-# Default reviewer = local ollama: free, reliable, and a non-Claude second
-# opinion. codex/gpt-5.5 is a stronger reviewer when its OAuth is healthy —
-# select it with MU_REVIEW_PROVIDER=openai-codex MU_REVIEW_MODEL=gpt-5.5, and/or
-# use it as the escalation target (MU_REVIEW_ESCALATE_PROVIDER). It is NOT the
-# default because its OAuth refresh was failing at build time (cf. bead mu-cea).
-# Default model gpt-oss:20b: scored 0.954 (12/12 recall, 119 tok/s) on
-# code-review-bench 2026-06-04, vs 0.700 for the previous default
-# qwen3-coder:30b. Kept warm on the box with qwen3-embedding:8b (both fit
-# 48GB). See ~/src/public_github/code-review-bench/reports/NOTES.md.
+# Both reviewers default to local ollama: free, reliable, non-Claude second/third
+# opinions, both warm on the box (24h keep-alive, memory 3d973420) and co-resident
+# in 48GB. qwen3-coder:30b and gpt-oss:20b have inverted strengths (see header) —
+# the panel keeps both. codex/gpt-5.5 is a stronger reviewer when its OAuth is
+# healthy; point either slot at it with MU_REVIEW_PROVIDER[_2]=openai-codex
+# MU_REVIEW_MODEL[_2]=gpt-5.5. It is NOT a default because its OAuth refresh was
+# failing at build time (bead mu-cea). Bench provenance:
+# ~/src/public_github/code-review-bench/reports/NOTES.md.
 PROVIDER="${MU_REVIEW_PROVIDER:-ollama}"
-MODEL="${MU_REVIEW_MODEL:-gpt-oss:20b}"
+MODEL="${MU_REVIEW_MODEL:-qwen3-coder:30b}"
+PROVIDER2="${MU_REVIEW_PROVIDER_2:-ollama}"
+MODEL2="${MU_REVIEW_MODEL_2:-gpt-oss:20b}"
 TOOLS="${MU_REVIEW_TOOLS:-}"   # empty = single-shot (default); e.g. "read,grep" lets the reviewer inspect surrounding code (slower, multi-turn)
 BASE="${MU_REVIEW_BASE:-main}"
 LOG="${MU_REVIEW_LOG:-$HOME/.local/share/mu/review-events.jsonl}"
@@ -77,7 +110,33 @@ if [ -z "${DIFF//[[:space:]]/}" ]; then
   exit 0
 fi
 FILES=$(printf '%s\n' "$DIFF" | grep -c '^diff --git ')
-ESC_BOOL=false; [ -n "${MU_REVIEW_ESCALATE_PROVIDER:-}" ] && ESC_BOOL=true
+
+# Full content of each changed file, appended to the prompt as CONTEXT. A thin
+# (-U3) diff hides definitions/guards that live outside the changed hunks, so
+# single-shot reviewers false-positive on "undefined variable X" when X is
+# defined ~100 lines away in unchanged code. Observed live 2026-06-06: both
+# panel reviewers wrongly REJECTed this very script claiming ERRLOG was
+# undefined — it is defined (line 81), just not inside the diff window. Giving
+# them the full files lets them check before reporting. Disable with
+# MU_REVIEW_FULL_FILES=0; cap appended bytes with MU_REVIEW_CONTEXT_MAX_BYTES.
+CONTEXT=""
+if [ "${MU_REVIEW_FULL_FILES:-1}" = "1" ]; then
+  while IFS= read -r _f; do
+    case "$_f" in ""|/dev/null) continue ;; esac   # skip blanks + pure deletions
+    [ -f "$_f" ] || continue
+    CONTEXT="$CONTEXT
+
+===== FULL CONTENT: $_f =====
+$(cat "$_f")"
+  done <<EOF_CTX
+$(printf '%s\n' "$DIFF" | sed -n 's#^+++ b/##p')
+EOF_CTX
+  _max="${MU_REVIEW_CONTEXT_MAX_BYTES:-200000}"
+  if [ "${#CONTEXT}" -gt "$_max" ]; then
+    CONTEXT="$(printf '%s' "$CONTEXT" | head -c "$_max")
+... [changed-file context truncated at ${_max} bytes — review the diff above]"
+  fi
+fi
 
 # --- reviewer client = freshly-built mu, never the (possibly stale) installed one
 cargo build --bin mu -q 2>/dev/null || true
@@ -91,10 +150,11 @@ if [ -n "$TOOLS" ]; then
 else
   TOOL_CLAUSE="Review the diff exactly as given below — do NOT call any tools and do NOT emit any function-call or tool-call syntax; respond with prose only."
 fi
-PROMPT="You are a strict pre-PR code reviewer. Review the diff below for: correctness bugs; concurrency / lifecycle hazards (e.g. a held reference that blocks shutdown, a clone that outlives its owner); missing error handling; and safeguards that nearby code already applies but this diff omits. $TOOL_CLAUSE Be concise and specific; cite file:line. Your reply's LAST line MUST be exactly 'VERDICT: APPROVE' or 'VERDICT: REJECT' (those literal words). List the most important findings first.
+PROMPT="You are a strict pre-PR code reviewer. The DIFF below shows exactly what changed; review ONLY that change for: correctness bugs; concurrency / lifecycle hazards (e.g. a held reference that blocks shutdown, a clone that outlives its owner); missing error handling; and safeguards that nearby code already applies but this diff omits. The FULL CONTENT of each changed file is included after the diff so you can see definitions, helpers, and guards that live OUTSIDE the changed hunks — a variable or function used in the diff is often defined there, so CHECK the full content before reporting anything as undefined/unset, and do NOT raise findings about unchanged code. $TOOL_CLAUSE Be concise and specific; cite file:line. Your reply's LAST line MUST be exactly 'VERDICT: APPROVE' or 'VERDICT: REJECT' (those literal words). List the most important findings first.
 
 DIFF:
-$DIFF"
+$DIFF
+$CONTEXT"
 
 run_review() { # $1=provider $2=model — prints reviewer stdout; stderr -> $ERRLOG
   # The reviewer session must be hermetic: --bare (PR #187) guarantees
@@ -120,50 +180,68 @@ verdict_of() { # stdin -> APPROVE | REJECT | UNCLEAR
   elif printf '%s' "$out" | grep -qiE 'VERDICT[^A-Za-z]{1,8}APPROVE'; then echo APPROVE
   else echo UNCLEAR; fi
 }
-log_event() { # $1=verdict $2=override(true/false) $3=escalated(true/false) [$4=provider $5=model]
-  local p="${4:-$PROVIDER}" m="${5:-$MODEL}"
+log_reviewer() { # $1=role $2=provider $3=model $4=verdict
   mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
-  printf '{"ts":"%s","provider":"%s","model":"%s","verdict":"%s","base":"%s","files_changed":%s,"override":%s,"escalated":%s}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$p" "$m" "$1" "$BASE" "$FILES" "$2" "$3" >> "$LOG"
+  printf '{"ts":"%s","event":"reviewer","role":"%s","provider":"%s","model":"%s","verdict":"%s","base":"%s","files_changed":%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" "$4" "$BASE" "$FILES" >> "$LOG"
+}
+log_panel() { # $1=outcome(PASS|BLOCK|ESCALATE) $2=override(true|false)
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+  printf '{"ts":"%s","event":"panel","outcome":"%s","r1_provider":"%s","r1_model":"%s","r1_verdict":"%s","r2_provider":"%s","r2_model":"%s","r2_verdict":"%s","base":"%s","files_changed":%s,"override":%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$PROVIDER" "$MODEL" "$V1" "$PROVIDER2" "$MODEL2" "$V2" "$BASE" "$FILES" "$2" >> "$LOG"
 }
 
-echo "${C_DIM}ai-review: $PROVIDER/$MODEL reviewing $FILES file(s) vs $BASE …${C_OFF}"
-REVIEW="$(run_review "$PROVIDER" "$MODEL")"
-printf '%s\n' "$REVIEW"
-VERDICT="$(printf '%s' "$REVIEW" | verdict_of)"
+# --- run the panel: both reviewers, same diff, sequentially ----------------
+echo "${C_DIM}ai-review: PANEL reviewing $FILES file(s) vs $BASE — reviewers: $PROVIDER/$MODEL + $PROVIDER2/$MODEL2${C_OFF}"
 
-if [ "$VERDICT" = "APPROVE" ]; then
-  log_event APPROVE false false
-  echo "${C_GREEN}ai-review: APPROVE${C_OFF}"
+echo "${C_DIM}── reviewer 1: $PROVIDER/$MODEL ─────────────────────────────${C_OFF}"
+REVIEW1="$(run_review "$PROVIDER" "$MODEL")"
+printf '%s\n' "$REVIEW1"
+V1="$(printf '%s' "$REVIEW1" | verdict_of)"
+log_reviewer r1 "$PROVIDER" "$MODEL" "$V1"
+echo "${C_DIM}  → reviewer 1 ($MODEL): $V1${C_OFF}"
+
+echo "${C_DIM}── reviewer 2: $PROVIDER2/$MODEL2 ─────────────────────────────${C_OFF}"
+REVIEW2="$(run_review "$PROVIDER2" "$MODEL2")"
+printf '%s\n' "$REVIEW2"
+V2="$(printf '%s' "$REVIEW2" | verdict_of)"
+log_reviewer r2 "$PROVIDER2" "$MODEL2" "$V2"
+echo "${C_DIM}  → reviewer 2 ($MODEL2): $V2${C_OFF}"
+
+if [ "$V1" = UNCLEAR ] || [ "$V2" = UNCLEAR ]; then
+  echo "${C_DIM}  (an UNCLEAR verdict means no VERDICT line parsed — reviewer may have erred; stderr: $ERRLOG)${C_OFF}"
+fi
+
+# --- panel verdict ---------------------------------------------------------
+OVERRIDE_BOOL=false; [ "${MU_REVIEW_OVERRIDE:-}" = "1" ] && OVERRIDE_BOOL=true
+
+if [ "$V1" = APPROVE ] && [ "$V2" = APPROVE ]; then
+  log_panel PASS false
+  echo "${C_GREEN}ai-review: PANEL PASS — both reviewers APPROVE ($MODEL + $MODEL2).${C_OFF}"
   exit 0
 fi
 
-# REJECT or UNCLEAR from here.
-echo "${C_YEL}ai-review: $PROVIDER returned $VERDICT${C_OFF}"
-[ "$VERDICT" = "UNCLEAR" ] && echo "${C_DIM}  (no VERDICT line parsed — reviewer may have erred; stderr: $ERRLOG)${C_OFF}"
-
-# --- escalation ladder = differential diagnosis (opt-in) -------------------
-if [ -n "${MU_REVIEW_ESCALATE_PROVIDER:-}" ]; then
-  EP="$MU_REVIEW_ESCALATE_PROVIDER"; EM="${MU_REVIEW_ESCALATE_MODEL:-$MODEL}"
-  echo "${C_DIM}ai-review: escalating to $EP/$EM for differential …${C_OFF}"
-  REVIEW2="$(run_review "$EP" "$EM")"
-  printf '%s\n' "$REVIEW2"
-  V2="$(printf '%s' "$REVIEW2" | verdict_of)"
-  log_event "$V2" false true "$EP" "$EM"
-  if [ "$V2" = "APPROVE" ]; then
-    echo "${C_YEL}ai-review: DIFFERENTIAL — $PROVIDER said $VERDICT but $EP APPROVED.${C_OFF}"
-    echo "  → likely a $PROVIDER dip, not a defect. Proceeding; logged as a capacity datapoint."
+if [ "$V1" = REJECT ] && [ "$V2" = REJECT ]; then
+  # Unanimous block: a real design/correctness call.
+  if [ "$OVERRIDE_BOOL" = true ]; then
+    log_panel BLOCK true
+    echo "${C_YEL}ai-review: PANEL BLOCK ($MODEL=REJECT, $MODEL2=REJECT) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
     exit 0
   fi
-  echo "${C_RED}ai-review: UNANIMOUS non-approval across providers → treat as a real design/correctness problem.${C_OFF}"
+  log_panel BLOCK false
+  echo "${C_RED}ai-review: PANEL BLOCK — both reviewers REJECT ($MODEL=REJECT, $MODEL2=REJECT). Set MU_REVIEW_OVERRIDE=1 to proceed if you disagree.${C_OFF}" >&2
+  exit 1
 fi
 
-# --- gate (override is logged, and is itself a calibration signal) ---------
-if [ "${MU_REVIEW_OVERRIDE:-}" = "1" ]; then
-  log_event "$VERDICT" true "$ESC_BOOL"
-  echo "${C_YEL}ai-review: $VERDICT overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
+# Split (one APPROVE one REJECT) or any UNCLEAR: escalate to the operator.
+# The panel does NOT self-override a split — that is the operator's call.
+if [ "$OVERRIDE_BOOL" = true ]; then
+  log_panel ESCALATE true
+  echo "${C_YEL}ai-review: PANEL SPLIT → ESCALATE ($MODEL=$V1, $MODEL2=$V2) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
   exit 0
 fi
-log_event "$VERDICT" false "$ESC_BOOL"
-echo "${C_RED}ai-review: gate BLOCKED ($VERDICT). Set MU_REVIEW_OVERRIDE=1 to proceed if you disagree.${C_OFF}" >&2
-exit 1
+log_panel ESCALATE false
+echo "${C_YEL}ai-review: PANEL SPLIT → ESCALATE — reviewers disagree: $MODEL=$V1, $MODEL2=$V2.${C_OFF}" >&2
+echo "${C_YEL}  → operator decision required. This is NOT a unanimous block; do not self-override.${C_OFF}" >&2
+echo "${C_DIM}  Set MU_REVIEW_OVERRIDE=1 to proceed once you've adjudicated.${C_OFF}" >&2
+exit 3

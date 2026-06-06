@@ -312,6 +312,269 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
+// ── mu-cc-sessions-console-lqqt.2: full-transcript reader ──────────────
+//
+// Where `scan_cc_sessions` folds a whole file down to one index row, the
+// detail view needs every line back as a renderable entry. The reader
+// stays defensive to the same standard as the scanner: a line that fails
+// to parse is counted, never fatal; an envelope shape we don't recognize
+// degrades to a `Meta` entry whose raw JSON is preserved for drilldown.
+// It is strictly READ-ONLY over `~/.claude-personal` — it opens the file
+// for reading and never writes.
+
+/// Which transcript lane a cc envelope renders into. Maps onto the same
+/// `role-{user,assistant,tool}` CSS the native transcript uses; `Meta`
+/// is the catch-all for non-message envelopes (summary/attachment/…) and
+/// unknown shapes, so unrecognized lines stay visible rather than vanish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CcRole {
+    User,
+    Assistant,
+    Tool,
+    Meta,
+}
+
+impl CcRole {
+    /// The CSS role token (the native transcript styles `user`,
+    /// `assistant`, `tool`; `meta` falls through to the default block
+    /// style — still rendered, just without a colored left border).
+    pub(crate) fn css(self) -> &'static str {
+        match self {
+            CcRole::User => "user",
+            CcRole::Assistant => "assistant",
+            CcRole::Tool => "tool",
+            CcRole::Meta => "meta",
+        }
+    }
+}
+
+/// One parsed transcript line, ready to render. `text` is the
+/// human-readable projection of the content blocks; `raw` is the
+/// pretty-printed JSON for the raw-drilldown (events) tab. `usage` /
+/// `model` are populated only for assistant turns.
+#[derive(Debug)]
+pub(crate) struct CcEntry {
+    /// 1-based index among successfully-parsed lines; the anchor id.
+    pub(crate) seq: usize,
+    pub(crate) timestamp_unix_ms: Option<u64>,
+    /// The envelope `type` field verbatim (or `"<no type>"`).
+    pub(crate) envelope_type: String,
+    pub(crate) role: CcRole,
+    pub(crate) text: String,
+    pub(crate) raw: String,
+    pub(crate) usage: Option<Usage>,
+    pub(crate) model: Option<String>,
+}
+
+/// A whole cc transcript, parsed line-by-line for the detail view.
+#[derive(Debug, Default)]
+pub(crate) struct CcTranscript {
+    pub(crate) entries: Vec<CcEntry>,
+    /// Lines that failed to parse as JSON (surfaced, never fatal).
+    pub(crate) malformed_lines: usize,
+    /// Last non-empty `message.model` seen, for the header.
+    pub(crate) model: Option<String>,
+    /// Latest timestamp across all envelopes.
+    pub(crate) last_activity_unix_ms: Option<u64>,
+}
+
+/// Read one cc transcript file into renderable [`CcEntry`] rows. Returns
+/// an `io::Error` only when the file itself can't be read; malformed
+/// *lines* inside a readable file are counted, not surfaced as errors.
+pub(crate) fn read_cc_transcript(path: &Path) -> std::io::Result<CcTranscript> {
+    let text = std::fs::read_to_string(path)?;
+    let mut out = CcTranscript::default();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => v,
+            Err(_) => {
+                out.malformed_lines += 1;
+                continue;
+            }
+        };
+        let ts = v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(parse_rfc3339_ms);
+        if let Some(ms) = ts {
+            out.last_activity_unix_ms =
+                Some(out.last_activity_unix_ms.map_or(ms, |cur| cur.max(ms)));
+        }
+        let envelope_type = v
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("<no type>")
+            .to_string();
+        let raw = serde_json::to_string_pretty(&v).unwrap_or_else(|_| line.to_string());
+        let (role, body, usage, model) = project_entry(&envelope_type, &v);
+        if let Some(m) = &model {
+            out.model = Some(m.clone());
+        }
+        out.entries.push(CcEntry {
+            seq: out.entries.len() + 1,
+            timestamp_unix_ms: ts,
+            envelope_type,
+            role,
+            text: body,
+            raw,
+            usage,
+            model,
+        });
+    }
+    Ok(out)
+}
+
+/// Map one envelope to `(role, rendered-text, usage, model)`. Assistant
+/// and user message envelopes render their content blocks; everything
+/// else is `Meta` (the raw JSON carries the detail in the events tab).
+fn project_entry(
+    envelope_type: &str,
+    v: &serde_json::Value,
+) -> (CcRole, String, Option<Usage>, Option<String>) {
+    match envelope_type {
+        "assistant" => {
+            let message = v.get("message");
+            let mut body = String::new();
+            if let Some(content) = message.and_then(|m| m.get("content")) {
+                render_content(content, &mut body);
+            }
+            let usage = message.and_then(|m| m.get("usage")).map(parse_usage);
+            let model = message
+                .and_then(|m| m.get("model"))
+                .and_then(|m| m.as_str())
+                .filter(|m| !m.is_empty())
+                .map(|m| m.to_string());
+            (CcRole::Assistant, body, usage, model)
+        }
+        "user" => {
+            let content = v.get("message").and_then(|m| m.get("content"));
+            // A user envelope whose content is entirely `tool_result`
+            // blocks is the agent loop feeding results back, not an
+            // operator ask — render it in the tool lane.
+            let role = match content {
+                Some(serde_json::Value::Array(blocks)) if !blocks.is_empty() => {
+                    if blocks
+                        .iter()
+                        .all(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                    {
+                        CcRole::Tool
+                    } else {
+                        CcRole::User
+                    }
+                }
+                _ => CcRole::User,
+            };
+            let mut body = String::new();
+            if let Some(content) = content {
+                render_content(content, &mut body);
+            }
+            (role, body, None, None)
+        }
+        // summary / attachment / queue-operation / last-prompt / unknown:
+        // keep the line visible as a Meta block; raw JSON has the detail.
+        _ => (CcRole::Meta, String::new(), None, None),
+    }
+}
+
+/// Render a `message.content` value (bare string or block array) into
+/// `out`. Unknown shapes degrade to a labeled raw-JSON line rather than
+/// disappearing.
+fn render_content(content: &serde_json::Value, out: &mut String) {
+    match content {
+        serde_json::Value::String(s) => {
+            out.push_str(s);
+            out.push('\n');
+        }
+        serde_json::Value::Array(blocks) => {
+            for b in blocks {
+                render_block(b, out);
+            }
+        }
+        serde_json::Value::Null => {}
+        other => {
+            out.push_str("[unknown content] ");
+            out.push_str(&other.to_string());
+            out.push('\n');
+        }
+    }
+}
+
+/// Render one content block. `text` / `thinking` / `tool_use` /
+/// `tool_result` / `image` map to readable lines; any other `type` (or a
+/// block with no `type`) degrades visibly to its raw JSON.
+fn render_block(b: &serde_json::Value, out: &mut String) {
+    let str_field = |key: &str| b.get(key).and_then(|x| x.as_str());
+    match b.get("type").and_then(|t| t.as_str()) {
+        Some("text") => {
+            if let Some(t) = str_field("text") {
+                out.push_str(t);
+                out.push('\n');
+            }
+        }
+        Some("thinking") => {
+            out.push_str("[thinking] ");
+            out.push_str(
+                str_field("thinking")
+                    .or_else(|| str_field("text"))
+                    .unwrap_or(""),
+            );
+            out.push('\n');
+        }
+        Some("tool_use") => {
+            let id = str_field("id").unwrap_or("");
+            let name = str_field("name").unwrap_or("");
+            let input = b
+                .get("input")
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            out.push_str(&format!("[tool_use {id} {name}] {input}\n"));
+        }
+        Some("tool_result") => {
+            let id = str_field("tool_use_id").unwrap_or("");
+            let err = b.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+            let tag = if err {
+                "tool_result ERR"
+            } else {
+                "tool_result"
+            };
+            out.push_str(&format!("[{tag} {id}] "));
+            render_tool_result_content(b.get("content"), out);
+            out.push('\n');
+        }
+        Some("image") => {
+            out.push_str("[image]\n");
+        }
+        Some(other) => {
+            out.push_str(&format!("[unknown block: {other}] {b}\n"));
+        }
+        None => {
+            out.push_str(&format!("[block] {b}\n"));
+        }
+    }
+}
+
+/// A `tool_result.content` is either a bare string or an array of text
+/// blocks. Anything else degrades to raw JSON.
+fn render_tool_result_content(content: Option<&serde_json::Value>, out: &mut String) {
+    match content {
+        Some(serde_json::Value::String(s)) => out.push_str(s),
+        Some(serde_json::Value::Array(parts)) => {
+            for p in parts {
+                if let Some(t) = p.get("text").and_then(|x| x.as_str()) {
+                    out.push_str(t);
+                } else {
+                    out.push_str(&p.to_string());
+                }
+            }
+        }
+        Some(other) => out.push_str(&other.to_string()),
+        None => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,5 +748,93 @@ mod tests {
             "the unreadable .jsonl entry is counted, scan does not panic"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Write `lines` to a single `.jsonl` and return its path, for the
+    /// transcript-reader tests (which read one file, not a tree).
+    fn transcript_fixture(tag: &str, lines: &[&str]) -> PathBuf {
+        let root = tmp(tag);
+        let path = root.join("session.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for l in lines {
+            writeln!(f, "{l}").unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn reads_transcript_mapping_blocks_to_roles() {
+        let path = transcript_fixture(
+            "tx-happy",
+            &[
+                r#"{"type":"summary","summary":"prior session"}"#,
+                r#"{"type":"user","timestamp":"2026-06-06T07:31:20.000Z","message":{"content":"hello there"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-06-06T07:31:25.500Z","message":{"model":"claude-opus-4-8","content":[{"type":"thinking","thinking":"hm"},{"type":"text","text":"working on it"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":100,"output_tokens":50}}}"#,
+                r#"{"type":"user","timestamp":"2026-06-06T07:31:30.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"file.txt"}]}}"#,
+                r#"{"type":"assistant","timestamp":"2026-06-06T07:31:35.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":200,"output_tokens":20}}}"#,
+            ],
+        );
+        let tx = read_cc_transcript(&path).unwrap();
+        assert_eq!(tx.malformed_lines, 0);
+        assert_eq!(tx.entries.len(), 5, "every line becomes an entry");
+        assert_eq!(tx.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(
+            tx.last_activity_unix_ms,
+            parse_rfc3339_ms("2026-06-06T07:31:35.000Z")
+        );
+        // summary envelope -> Meta lane, raw preserved, no rendered text.
+        assert_eq!(tx.entries[0].role, CcRole::Meta);
+        assert_eq!(tx.entries[0].envelope_type, "summary");
+        assert!(tx.entries[0].raw.contains("prior session"));
+        // string-content user -> User lane.
+        assert_eq!(tx.entries[1].role, CcRole::User);
+        assert!(tx.entries[1].text.contains("hello there"));
+        // assistant blocks render thinking/text/tool_use; usage captured.
+        let a = &tx.entries[2];
+        assert_eq!(a.role, CcRole::Assistant);
+        assert!(a.text.contains("[thinking] hm"));
+        assert!(a.text.contains("working on it"));
+        assert!(a.text.contains("[tool_use t1 Bash]"));
+        assert!(a.text.contains("\"command\":\"ls\""));
+        assert_eq!(a.usage.as_ref().map(|u| u.input_tokens), Some(100));
+        assert_eq!(a.model.as_deref(), Some("claude-opus-4-8"));
+        // tool_result-only user envelope -> Tool lane.
+        assert_eq!(tx.entries[3].role, CcRole::Tool);
+        assert!(tx.entries[3].text.contains("[tool_result t1] file.txt"));
+        // seq is 1-based and dense.
+        assert_eq!(tx.entries[0].seq, 1);
+        assert_eq!(tx.entries[4].seq, 5);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn unknown_shapes_degrade_visibly_not_panic() {
+        let path = transcript_fixture(
+            "tx-unknown",
+            &[
+                r#"not valid json"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"redacted_thinking","data":"xx"},{"foo":"bar"}]}}"#,
+                r#"{"type":"some-future-envelope","payload":{"a":1}}"#,
+            ],
+        );
+        let tx = read_cc_transcript(&path).unwrap();
+        assert_eq!(tx.malformed_lines, 1, "the non-JSON line is counted");
+        assert_eq!(tx.entries.len(), 2, "two parseable lines remain");
+        // Unknown block type and type-less block both degrade to raw.
+        let a = &tx.entries[0];
+        assert_eq!(a.role, CcRole::Assistant);
+        assert!(a.text.contains("[unknown block: redacted_thinking]"));
+        assert!(a.text.contains("[block]"));
+        assert!(a.text.contains("\"foo\":\"bar\""));
+        // Unknown envelope -> Meta, raw retained.
+        assert_eq!(tx.entries[1].role, CcRole::Meta);
+        assert_eq!(tx.entries[1].envelope_type, "some-future-envelope");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn read_transcript_missing_file_is_err_not_panic() {
+        let err = read_cc_transcript(Path::new("/nonexistent/cc/x.jsonl"));
+        assert!(err.is_err(), "missing file surfaces as io::Error");
     }
 }

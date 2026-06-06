@@ -53,3 +53,6 @@ futures = { workspace = true }
 # mu-yc6 smoke tests: stub MCP server over Streamable HTTP (mirrors how
 # code-index-mcp serves; axum hosts rmcp's tower StreamableHttpService)
 rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
+# mu-operator-mark-5mwr: isolated event dirs for mark_session tests
+# (same crate+major mu-core's tests already use).
+tempfile = "3"

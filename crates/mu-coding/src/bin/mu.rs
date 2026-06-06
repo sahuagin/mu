@@ -152,6 +152,21 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         analytics_db: Option<std::path::PathBuf>,
     },
+    /// Append an operator quality mark (1-5) to a session's event log.
+    /// Quit-time capture for degraded (or excellent) sessions — the
+    /// mark is an ordinary event; projections (console header, the
+    /// mu-stats session_marks view) take the latest. mu-operator-mark-5mwr.
+    Mark {
+        /// Session id, or an unambiguous prefix of one.
+        session: String,
+        /// Quality rating, 1 (unusable) to 5 (excellent).
+        rating: u8,
+        /// Optional free-form note, e.g. "relitigated settled decisions".
+        note: Option<String>,
+        /// Path to the events directory. Default: ~/.local/share/mu/events/.
+        #[arg(long, value_name = "PATH")]
+        events_dir: Option<std::path::PathBuf>,
+    },
     /// Print the version of each crate (smoke test for the workspace).
     Versions,
     /// Telemetry projection + preset analytics queries over the
@@ -356,6 +371,26 @@ async fn main() -> Result<()> {
                 analytics_db,
             })
             .await
+        }
+        Command::Mark {
+            session,
+            rating,
+            note,
+            events_dir,
+        } => {
+            let events_dir = match events_dir {
+                Some(p) => p,
+                None => mu_coding::serve::default_events_dir().context(
+                    "could not resolve default events dir; pass --events-dir PATH explicitly",
+                )?,
+            };
+            let outcome =
+                mu_coding::console::mark::mark_session(&events_dir, &session, rating, note)?;
+            println!(
+                "marked {}/{} rating={} (event {})",
+                outcome.daemon_id, outcome.session_id, outcome.rating, outcome.event_id
+            );
+            Ok(())
         }
         Command::Analytics { cmd } => run_analytics(cmd),
         Command::Capabilities { cmd } => run_capabilities(cmd),

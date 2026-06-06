@@ -430,6 +430,19 @@ pub enum EventPayload {
     WorkerFailed { reason: String },
     /// mu-slat: worker killed by timeout.
     WorkerTimeout { elapsed_ms: u64 },
+    /// mu-operator-mark-5mwr: operator-assigned session quality mark,
+    /// captured from the console or the `mu mark` CLI. Append-only —
+    /// re-marking appends a newer event and projections take the
+    /// latest by event id. Exists so degraded sessions can be
+    /// labeled at the moment of judgment and later queried as
+    /// replay-probe fixtures (projection side: mu-mucm
+    /// `session_marks` view — field names locked between them).
+    OperatorMark {
+        /// 1 (unusable) ..= 5 (excellent).
+        rating: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
 }
 
 /// Categorical exit reason for a task — what brought the task to its
@@ -1447,5 +1460,49 @@ mod tests {
             !json.contains("cache_write_1h_tokens"),
             "absent tier field must not appear in JSON: {json}"
         );
+    }
+
+    /// mu-operator-mark-5mwr: the on-disk shape is the contract with
+    /// the mu-mucm `session_marks` projection — kind tag and field
+    /// names are load-bearing, and an absent note must not appear.
+    #[test]
+    fn operator_mark_roundtrip_and_wire_shape() {
+        let payload = EventPayload::OperatorMark {
+            rating: 2,
+            note: Some("relitigated settled decisions".into()),
+        };
+        let json = serde_json::to_string(&payload).expect("serializes");
+        assert!(json.contains(r#""kind":"operator_mark""#), "{json}");
+        assert!(json.contains(r#""rating":2"#), "{json}");
+        let back: EventPayload = serde_json::from_str(&json).expect("roundtrips");
+        assert_eq!(back, payload);
+
+        let bare = serde_json::to_string(&EventPayload::OperatorMark {
+            rating: 5,
+            note: None,
+        })
+        .expect("serializes");
+        assert!(
+            !bare.contains("note"),
+            "absent note must be skipped: {bare}"
+        );
+
+        // Appends like any other event; latest-by-id is the re-mark rule.
+        let log = SessionEventLog::new("s1");
+        log.append(
+            EventActor::User,
+            EventPayload::OperatorMark {
+                rating: 2,
+                note: None,
+            },
+        );
+        let id = log.append(
+            EventActor::User,
+            EventPayload::OperatorMark {
+                rating: 3,
+                note: Some("on reflection".into()),
+            },
+        );
+        assert_eq!(id, 2);
     }
 }

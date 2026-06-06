@@ -1,20 +1,25 @@
-//! mu-console: read-only web operator console over mu event logs.
+//! mu-console: web operator console over mu event logs.
 //!
 //! V1 is deliberately boring: Axum + server-rendered HTML, reading
 //! `~/.local/share/mu/events/<daemon_id>/<session_id>.jsonl` directly.
-//! It is an inspection projection, not a control surface.
+//! It is an inspection projection, not a control surface — with one
+//! deliberate exception: POST `/sessions/{d}/{s}/mark` appends an
+//! `OperatorMark` quality event (mu-operator-mark-5mwr). That write
+//! goes through the same event-log append path as everything else;
+//! the console itself still renders only what the log says.
 
 mod data;
 mod html;
+pub mod mark;
 mod views;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Path as AxumPath, Query, State},
+    extract::{Form, Path as AxumPath, Query, State},
     response::{Html, IntoResponse, Redirect},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use serde::Deserialize;
@@ -68,6 +73,10 @@ pub async fn run(opts: ConsoleOptions) -> Result<()> {
         .route(
             "/sessions/{daemon_id}/{session_id}/compactions/{model_call_id}",
             get(session_compaction_one),
+        )
+        .route(
+            "/sessions/{daemon_id}/{session_id}/mark",
+            post(session_mark),
         )
         .route("/compare", get(compare))
         .with_state(state);
@@ -167,4 +176,39 @@ async fn compare(
     Query(q): Query<CompareQuery>,
 ) -> Html<String> {
     compare_placeholder(state, q.left, q.right)
+}
+
+#[derive(Debug, Deserialize)]
+struct MarkForm {
+    rating: u8,
+    note: Option<String>,
+}
+
+/// mu-operator-mark-5mwr: append an operator quality mark, then bounce
+/// back to the session page (which re-reads the log and shows it).
+/// The GET routes pass ids straight into a path join; this route
+/// writes, so it additionally refuses path-ish id segments outright.
+async fn session_mark(
+    State(state): State<Arc<AppState>>,
+    AxumPath((daemon_id, session_id)): AxumPath<(String, String)>,
+    Form(form): Form<MarkForm>,
+) -> axum::response::Response {
+    let id_ok = |s: &str| !s.is_empty() && !s.contains(['/', '\\']) && !s.contains("..");
+    if !id_ok(&daemon_id) || !id_ok(&session_id) {
+        return Html("<h1>bad request</h1><p class=err>invalid session path</p>".to_string())
+            .into_response();
+    }
+    let path = state
+        .events_dir
+        .join(&daemon_id)
+        .join(format!("{session_id}.jsonl"));
+    match mark::mark_session_file(&path, form.rating, form.note) {
+        Ok(_event_id) => Redirect::to(&state.href(&format!("/sessions/{daemon_id}/{session_id}")))
+            .into_response(),
+        Err(e) => Html(format!(
+            "<h1>mark failed</h1><p class=err>{}</p>",
+            html::esc(&e.to_string())
+        ))
+        .into_response(),
+    }
 }

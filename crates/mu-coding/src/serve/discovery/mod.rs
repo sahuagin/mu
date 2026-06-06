@@ -185,7 +185,10 @@ pub fn derive_status_from_events(
             | EventPayload::WorkerSpawned { .. }
             | EventPayload::WorkerExited { .. }
             | EventPayload::WorkerFailed { .. }
-            | EventPayload::WorkerTimeout { .. } => {}
+            | EventPayload::WorkerTimeout { .. }
+            // mu-operator-mark-5mwr: operator judgment, not
+            // session-status-driving.
+            | EventPayload::OperatorMark { .. } => {}
         }
         last_kind = Some(&ev.payload);
     }

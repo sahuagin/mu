@@ -249,7 +249,10 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
             | EventPayload::WorkerSpawned { .. }
             | EventPayload::WorkerExited { .. }
             | EventPayload::WorkerFailed { .. }
-            | EventPayload::WorkerTimeout { .. } => {}
+            | EventPayload::WorkerTimeout { .. }
+            // mu-operator-mark-5mwr: operator quality judgment, not a
+            // usage/timing signal.
+            | EventPayload::OperatorMark { .. } => {}
         }
     }
 

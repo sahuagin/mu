@@ -1042,6 +1042,7 @@ fn payload_kind_str(p: &EventPayload) -> &'static str {
         EventPayload::WorkerExited { .. } => "worker_exited",
         EventPayload::WorkerFailed { .. } => "worker_failed",
         EventPayload::WorkerTimeout { .. } => "worker_timeout",
+        EventPayload::OperatorMark { .. } => "operator_mark",
     }
 }
 

@@ -1187,6 +1187,7 @@ mod tests {
                 EventPayload::WorkerExited { .. } => "worker_exited",
                 EventPayload::WorkerFailed { .. } => "worker_failed",
                 EventPayload::WorkerTimeout { .. } => "worker_timeout",
+                EventPayload::OperatorMark { .. } => "operator_mark",
             })
             .collect();
         assert_eq!(kinds, vec!["assistant_message", "done"]);

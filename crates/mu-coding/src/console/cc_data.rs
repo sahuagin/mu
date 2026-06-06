@@ -24,7 +24,31 @@
 //! skip-and-count, never panic. A line that fails to parse marks its
 //! file malformed; a file or dir entry that can't be read bumps the
 //! skipped-entries counter; neither aborts the scan.
+//!
+//! mu-y5hz (cc-schema edge cases) — applied consistently to BOTH
+//! projections in this module (the index scanner [`scan_cc_sessions`] and
+//! the detail-view reader [`read_cc_transcript`]):
+//!
+//! - **Sidechain (subagent) turns.** cc tags every envelope with a
+//!   top-level `isSidechain` bool; subagent turns carry `true`. They are
+//!   the agent loop's nested work, not the parent operator's, so they are
+//!   EXCLUDED from every parent-session rollup — the index counts/usage
+//!   (`scan_cc_sessions`) AND the cost-tab summed total (`read_cc_transcript`
+//!   → `render_cc_cost`) — and surfaced via a `sidechain_entries` counter
+//!   rather than silently dropped. The detail transcript still RENDERS
+//!   each sidechain line (flagged, not vanished). (Terrain note,
+//!   2026-06-06: on the current cc format these turns live in a
+//!   `subagents/agent-*.jsonl` subdirectory that the scanner does not
+//!   descend into, so the inline exclusion is defensive — it guards
+//!   older inline-format transcripts and any future re-inlining, and is
+//!   a no-op on today's main session files.)
+//! - **Model switching.** A session can switch models mid-run. The index
+//!   keeps last-model-wins for the `model` column (the most recent
+//!   *non-sidechain* assistant model), and ALSO reports the count of
+//!   distinct models via `SessionSummary::models_seen` so a switch isn't
+//!   invisible.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use mu_core::agent::Usage;
@@ -130,23 +154,51 @@ fn scan_one_file(
 #[derive(Default)]
 struct CcAccumulator {
     saw_message: bool,
+    /// Last non-sidechain assistant model seen (last-model-wins column).
     model: Option<String>,
+    /// Distinct non-sidechain assistant models seen across the session.
+    /// `model` above keeps the last for the column; this captures how
+    /// many appeared so a mid-run model switch isn't invisible (mu-y5hz).
+    models: BTreeSet<String>,
     last_activity_unix_ms: Option<u64>,
     ask_count: u32,
     assistant_count: u32,
     tool_call_count: u32,
     usage: Option<Usage>,
+    /// mu-y5hz: subagent (isSidechain:true) message turns excluded from
+    /// the rollups above, surfaced rather than silently dropped.
+    sidechain_entries: u32,
 }
 
 impl CcAccumulator {
     fn ingest(&mut self, v: &serde_json::Value) {
         // Every envelope can carry a timestamp; track the latest across
-        // all types so sort order reflects real last activity.
+        // all types — including sidechain turns — so sort order reflects
+        // real session liveness. last_activity is a max, not a sum, so a
+        // subagent turn can't inflate it the way it would a rollup count.
         if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()) {
             if let Some(ms) = parse_rfc3339_ms(ts) {
                 self.last_activity_unix_ms =
                     Some(self.last_activity_unix_ms.map_or(ms, |cur| cur.max(ms)));
             }
+        }
+        // mu-y5hz policy (a): subagent (isSidechain:true) message turns
+        // are the agent loop's nested work, not the parent operator's, so
+        // they're EXCLUDED from this session's ask/assistant/tool/usage
+        // rollups (and from model detection) and counted separately. Only
+        // user/assistant sidechain envelopes are tallied — metadata
+        // envelopes never count toward rollups regardless of sidechain.
+        // A pure-sidechain file therefore never sets `saw_message` and is
+        // not projected as a session (correct: subagent transcripts are
+        // not standalone operator sessions).
+        if is_sidechain(v) {
+            if matches!(
+                v.get("type").and_then(|t| t.as_str()),
+                Some("user") | Some("assistant")
+            ) {
+                self.sidechain_entries = self.sidechain_entries.saturating_add(1);
+            }
+            return;
         }
         match v.get("type").and_then(|t| t.as_str()) {
             Some("user") => self.ingest_user(v),
@@ -187,7 +239,10 @@ impl CcAccumulator {
         };
         if let Some(model) = message.get("model").and_then(|m| m.as_str()) {
             if !model.is_empty() {
+                // last-model-wins for the index column …
                 self.model = Some(model.to_string());
+                // … and record distinctness for models_seen (mu-y5hz).
+                self.models.insert(model.to_string());
             }
         }
         if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
@@ -209,6 +264,10 @@ impl CcAccumulator {
             session_id: session_id.to_string(),
             provider: Some("claude-code".to_string()),
             model: self.model,
+            // Distinct assistant models, saturated into the u8 surface.
+            // 0 when no assistant turn carried a model (last-wins `model`
+            // is then None too); ≥2 flags a mid-run model switch.
+            models_seen: u8::try_from(self.models.len()).unwrap_or(u8::MAX),
             last_activity_unix_ms: self.last_activity_unix_ms,
             ask_count: self.ask_count,
             // cc has no ContextAssembly event; an assistant turn is the
@@ -222,8 +281,20 @@ impl CcAccumulator {
             // Marks for cc sessions live in a task_log sidecar (bead .3);
             // we never read OperatorMark events out of cc transcripts.
             mark: None,
+            // mu-y5hz: subagent turns excluded from the rollups above.
+            sidechain_entries: self.sidechain_entries,
         }
     }
+}
+
+/// mu-y5hz: is this envelope a subagent (sidechain) turn? cc tags every
+/// envelope with a top-level `isSidechain` bool; a missing/false field
+/// means a parent-session turn. Shared by the index scanner and the
+/// detail-view reader so both treat sidechain identically.
+fn is_sidechain(v: &serde_json::Value) -> bool {
+    v.get("isSidechain")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false)
 }
 
 /// Project one cc `message.usage` object into [`Usage`]. Missing fields
@@ -364,6 +435,11 @@ pub(crate) struct CcEntry {
     pub(crate) raw: String,
     pub(crate) usage: Option<Usage>,
     pub(crate) model: Option<String>,
+    /// mu-y5hz: this line is a subagent (isSidechain:true) turn. The
+    /// transcript still renders it (flagged, not dropped), but the cost
+    /// tab excludes its usage from the summed total — the same exclusion
+    /// the index scanner applies (policy a).
+    pub(crate) is_sidechain: bool,
 }
 
 /// A whole cc transcript, parsed line-by-line for the detail view.
@@ -372,10 +448,15 @@ pub(crate) struct CcTranscript {
     pub(crate) entries: Vec<CcEntry>,
     /// Lines that failed to parse as JSON (surfaced, never fatal).
     pub(crate) malformed_lines: usize,
-    /// Last non-empty `message.model` seen, for the header.
+    /// Last non-empty `message.model` from a NON-sidechain assistant turn,
+    /// for the header (mu-y5hz: sidechain models don't pollute it).
     pub(crate) model: Option<String>,
     /// Latest timestamp across all envelopes.
     pub(crate) last_activity_unix_ms: Option<u64>,
+    /// mu-y5hz: count of subagent (isSidechain:true) message turns in this
+    /// transcript. They stay rendered but are excluded from the cost-tab
+    /// summed total; this surfaces how many, rather than dropping silently.
+    pub(crate) sidechain_entries: usize,
 }
 
 /// Read one cc transcript file into renderable [`CcEntry`] rows. Returns
@@ -409,9 +490,18 @@ pub(crate) fn read_cc_transcript(path: &Path) -> std::io::Result<CcTranscript> {
             .unwrap_or("<no type>")
             .to_string();
         let raw = serde_json::to_string_pretty(&v).unwrap_or_else(|_| line.to_string());
+        let sidechain = is_sidechain(&v);
         let (role, body, usage, model) = project_entry(&envelope_type, &v);
+        // mu-y5hz: a sidechain (subagent) model must not pollute the
+        // header's last-model-wins; only parent turns update it. Count
+        // sidechain message turns so the view can surface the exclusion.
         if let Some(m) = &model {
-            out.model = Some(m.clone());
+            if !sidechain {
+                out.model = Some(m.clone());
+            }
+        }
+        if sidechain && matches!(envelope_type.as_str(), "user" | "assistant") {
+            out.sidechain_entries += 1;
         }
         out.entries.push(CcEntry {
             seq: out.entries.len() + 1,
@@ -422,6 +512,7 @@ pub(crate) fn read_cc_transcript(path: &Path) -> std::io::Result<CcTranscript> {
             raw,
             usage,
             model,
+            is_sidechain: sidechain,
         });
     }
     Ok(out)
@@ -836,5 +927,159 @@ mod tests {
     fn read_transcript_missing_file_is_err_not_panic() {
         let err = read_cc_transcript(Path::new("/nonexistent/cc/x.jsonl"));
         assert!(err.is_err(), "missing file surfaces as io::Error");
+    }
+
+    // ── mu-y5hz: sidechain exclusion + model-switch (scanner) ──────────
+
+    #[test]
+    fn excludes_sidechain_turns_from_rollups() {
+        // mu-y5hz policy (a): isSidechain:true subagent turns must NOT
+        // inflate the parent session's ask/assistant/tool/usage rollups
+        // or its model detection; they're counted in sidechain_entries.
+        let root = tmp("sidechain");
+        fixture(
+            &root,
+            "proj",
+            "sess-side",
+            &[
+                // Parent operator ask.
+                r#"{"type":"user","isSidechain":false,"timestamp":"2026-06-06T07:31:20.000Z","message":{"content":"do the thing"}}"#,
+                // Parent assistant: model A, one tool_use, usage.
+                r#"{"type":"assistant","isSidechain":false,"timestamp":"2026-06-06T07:31:25.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"t1","name":"Task"}],"usage":{"input_tokens":100,"output_tokens":50}}}"#,
+                // Sidechain user ask — EXCLUDED, counted.
+                r#"{"type":"user","isSidechain":true,"timestamp":"2026-06-06T07:31:26.000Z","message":{"content":"subagent prompt"}}"#,
+                // Sidechain assistant: different model, 2 tool_use, big
+                // usage — ALL excluded (must not touch model/models_seen/
+                // tool_call_count/usage).
+                r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-06-06T07:31:28.000Z","message":{"model":"sub-agent-model","content":[{"type":"tool_use","id":"s1","name":"Grep"},{"type":"tool_use","id":"s2","name":"Read"}],"usage":{"input_tokens":9999,"output_tokens":9999}}}"#,
+                // Parent assistant again: model A, more usage.
+                r#"{"type":"assistant","isSidechain":false,"timestamp":"2026-06-06T07:31:35.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":200,"output_tokens":20}}}"#,
+            ],
+        );
+        let scan = scan_cc_sessions(&root);
+        assert_eq!(scan.sessions.len(), 1);
+        let s = &scan.sessions[0];
+        // Only the parent ask counts.
+        assert_eq!(s.ask_count, 1, "sidechain ask excluded");
+        // Only the two parent assistant turns.
+        assert_eq!(s.context_assembly_count, 2, "sidechain assistant excluded");
+        // Only the parent tool_use; the sidechain's two are excluded.
+        assert_eq!(s.tool_call_count, 1, "sidechain tool_use excluded");
+        // Usage summed over parent turns only (100+200 / 50+20).
+        let u = s.usage.expect("usage summed from parent turns");
+        assert_eq!(u.input_tokens, 300, "sidechain usage excluded");
+        assert_eq!(u.output_tokens, 70, "sidechain usage excluded");
+        // Model detection ignores the sidechain model entirely.
+        assert_eq!(s.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(s.models_seen, 1, "sidechain model not counted");
+        // Both sidechain message turns surfaced, not dropped.
+        assert_eq!(s.sidechain_entries, 2);
+        // last_activity still reflects the latest envelope overall
+        // (a max, immune to sidechain inflation).
+        assert_eq!(
+            s.last_activity_unix_ms,
+            parse_rfc3339_ms("2026-06-06T07:31:35.000Z")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn counts_distinct_models_when_switching() {
+        // mu-y5hz policy (b): a session that switches models mid-run keeps
+        // last-model-wins for the `model` column AND reports models_seen.
+        let root = tmp("modelswitch");
+        fixture(
+            &root,
+            "proj",
+            "sess-switch",
+            &[
+                r#"{"type":"user","message":{"content":"hi"}}"#,
+                r#"{"type":"assistant","message":{"model":"claude-opus-4-8","content":[],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+                r#"{"type":"assistant","message":{"model":"claude-sonnet-4-6","content":[],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+                // Back to the first model: dedup means models_seen stays 2,
+                // and last-wins makes `model` opus again.
+                r#"{"type":"assistant","message":{"model":"claude-opus-4-8","content":[],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            ],
+        );
+        let scan = scan_cc_sessions(&root);
+        assert_eq!(scan.sessions.len(), 1);
+        let s = &scan.sessions[0];
+        assert_eq!(
+            s.model.as_deref(),
+            Some("claude-opus-4-8"),
+            "last-model-wins"
+        );
+        assert_eq!(s.models_seen, 2, "two distinct models despite three turns");
+        assert_eq!(s.sidechain_entries, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pure_sidechain_file_is_not_a_session() {
+        // A file containing ONLY subagent (sidechain) turns is not a
+        // standalone operator session — it must not project a row. (On the
+        // current cc format these live in a `subagents/` subdir the scanner
+        // doesn't descend into; this guards the inline case defensively.)
+        let root = tmp("puresidechain");
+        fixture(
+            &root,
+            "proj",
+            "agent-sub",
+            &[
+                r#"{"type":"user","isSidechain":true,"message":{"content":"subagent prompt"}}"#,
+                r#"{"type":"assistant","isSidechain":true,"message":{"model":"sub-agent-model","content":[{"type":"tool_use","id":"s1","name":"Read"}],"usage":{"input_tokens":5,"output_tokens":5}}}"#,
+            ],
+        );
+        let scan = scan_cc_sessions(&root);
+        assert!(
+            scan.sessions.is_empty(),
+            "a pure-sidechain transcript is not projected as a session"
+        );
+        assert_eq!(scan.malformed_files, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── mu-y5hz: sidechain handling in the detail-view reader ──────────
+
+    #[test]
+    fn reader_flags_sidechain_and_keeps_header_model_clean() {
+        // The detail reader RENDERS every line (sidechain included) but
+        // flags sidechain entries, counts them, and must not let a
+        // sidechain model pollute the header's last-model-wins.
+        let path = transcript_fixture(
+            "tx-sidechain",
+            &[
+                r#"{"type":"user","isSidechain":false,"timestamp":"2026-06-06T07:31:20.000Z","message":{"content":"do the thing"}}"#,
+                r#"{"type":"assistant","isSidechain":false,"timestamp":"2026-06-06T07:31:25.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"text","text":"on it"}],"usage":{"input_tokens":100,"output_tokens":50}}}"#,
+                // Sidechain user + assistant: rendered, flagged, counted;
+                // the sidechain model must NOT become the header model.
+                r#"{"type":"user","isSidechain":true,"timestamp":"2026-06-06T07:31:26.000Z","message":{"content":"subagent prompt"}}"#,
+                r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-06-06T07:31:28.000Z","message":{"model":"sub-agent-model","content":[{"type":"text","text":"sub work"}],"usage":{"input_tokens":9999,"output_tokens":9999}}}"#,
+            ],
+        );
+        let tx = read_cc_transcript(&path).unwrap();
+        // Every line is still rendered — nothing dropped.
+        assert_eq!(
+            tx.entries.len(),
+            4,
+            "all lines rendered, sidechain included"
+        );
+        // Two subagent message turns counted.
+        assert_eq!(tx.sidechain_entries, 2);
+        // Per-entry sidechain flags.
+        assert!(!tx.entries[0].is_sidechain);
+        assert!(!tx.entries[1].is_sidechain);
+        assert!(tx.entries[2].is_sidechain);
+        assert!(tx.entries[3].is_sidechain);
+        // Header model is the PARENT model, not the sidechain's.
+        assert_eq!(tx.model.as_deref(), Some("claude-opus-4-8"));
+        // The sidechain assistant still carries its own usage/model on the
+        // entry (so the cost tab can list-but-exclude it).
+        assert_eq!(tx.entries[3].model.as_deref(), Some("sub-agent-model"));
+        assert_eq!(
+            tx.entries[3].usage.as_ref().map(|u| u.input_tokens),
+            Some(9999)
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

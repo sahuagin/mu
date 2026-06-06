@@ -172,12 +172,22 @@ run_review() { # $1=provider $2=model — prints reviewer stdout; stderr -> $ERR
   fi
 }
 verdict_of() { # stdin -> APPROVE | REJECT | UNCLEAR
-  local out; out="$(cat)"
-  # Tolerate markdown-dressed verdicts ("**Verdict:** APPROVE") — models
-  # flake on the literal format; up to a few non-letter chars may sit
-  # between VERDICT and the word (observed live 2026-06-05, was UNCLEAR).
-  if   printf '%s' "$out" | grep -qiE 'VERDICT[^A-Za-z]{1,8}REJECT';  then echo REJECT
-  elif printf '%s' "$out" | grep -qiE 'VERDICT[^A-Za-z]{1,8}APPROVE'; then echo APPROVE
+  local out last; out="$(cat)"
+  # The verdict is the reviewer's LAST line ("VERDICT: APPROVE"/"REJECT" per the
+  # prompt). Parse only the LAST VERDICT-bearing line, not the whole output:
+  # reviewers sometimes QUOTE the opposite token earlier while explaining the
+  # format, and grepping the whole output mis-classifies those. Observed live
+  # 2026-06-06: a reviewer ending in 'VERDICT: APPROVE' but quoting
+  # '"VERDICT: REJECT"' mid-prose was read as REJECT, producing a false panel
+  # split. Fall back to the whole output if no line mentions VERDICT.
+  # (bead mu-pnqr)
+  last="$(printf '%s\n' "$out" | grep -iE 'VERDICT' | tail -n 1)"
+  [ -n "$last" ] || last="$out"
+  # Tolerate markdown-dressed verdicts ("**Verdict:** APPROVE") — models flake
+  # on the literal format; up to a few non-letter chars may sit between VERDICT
+  # and the word (observed live 2026-06-05, was UNCLEAR).
+  if   printf '%s' "$last" | grep -qiE 'VERDICT[^A-Za-z]{1,8}REJECT';  then echo REJECT
+  elif printf '%s' "$last" | grep -qiE 'VERDICT[^A-Za-z]{1,8}APPROVE'; then echo APPROVE
   else echo UNCLEAR; fi
 }
 # Escape a value for embedding inside a JSON string (no surrounding quotes

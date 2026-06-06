@@ -336,7 +336,7 @@ fn mark_line(
         urlish(daemon_id),
         urlish(session_id)
     ));
-    let selected = current.map(|(r, _)| r);
+    let selected = current.as_ref().map(|(r, _)| *r);
     let mut options = String::new();
     for (value, label) in [
         (1u8, "1 — unusable"),
@@ -354,10 +354,17 @@ fn mark_line(
             }
         ));
     }
+    // mu-mark-note-prefill-gjm6: carry the current note into the form
+    // so a re-rank doesn't silently clear it — each OperatorMark event
+    // stays complete, the operator just doesn't retype.
+    let note_value = current
+        .and_then(|(_, note)| note)
+        .map(|n| format!(" value=\"{}\"", esc_attr(&n)))
+        .unwrap_or_default();
     out.push_str(&format!(
         "<form class=toolbar method=post action=\"{}\">\
            <label>rate <select name=rating>{options}</select></label> \
-           <input type=text name=note placeholder=\"optional note\" size=40 maxlength=400> \
+           <input type=text name=note placeholder=\"optional note\"{note_value} size=40 maxlength=400> \
            <button type=submit>mark</button>\
          </form>",
         esc_attr(&action)

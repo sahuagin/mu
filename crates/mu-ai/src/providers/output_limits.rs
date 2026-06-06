@@ -21,6 +21,12 @@
 /// `claude-haiku-4-5-...` from accidentally hitting a generic
 /// `claude-*` rule.
 pub fn max_tokens_for_model(model: &str) -> u32 {
+    if let Some(v) = mu_core::model_catalog::global()
+        .resolve_model(model)
+        .max_output_tokens
+    {
+        return v;
+    }
     let m = model.to_ascii_lowercase();
     if m.starts_with("claude-opus-4") {
         16384
@@ -28,7 +34,8 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
         8192
     } else if m.starts_with("gpt-5") || m.starts_with("o4") || m.starts_with("o3") {
         16384
-    } else if m.starts_with("gpt-oss") || m.starts_with("deepseek-r1") {
+    } else if m.starts_with("gpt-oss") || m.starts_with("deepseek-r1") || m.starts_with("qwen3.6:")
+    {
         // ollama-served reasoning models: thinking arrives on the
         // reasoning channel and counts against max_tokens. Measured
         // 2026-06-05: gpt-oss:20b reviewing a ~500-line diff burned all
@@ -86,6 +93,7 @@ mod tests {
         assert_eq!(max_tokens_for_model("gpt-oss:20b"), 16384);
         assert_eq!(max_tokens_for_model("gpt-oss:120b"), 16384);
         assert_eq!(max_tokens_for_model("deepseek-r1:32b"), 16384);
+        assert_eq!(max_tokens_for_model("qwen3.6:35b-a3b-q8_0"), 16384);
         // Non-reasoning local models keep the conservative default.
         assert_eq!(max_tokens_for_model("qwen3-coder:30b"), 4096);
     }

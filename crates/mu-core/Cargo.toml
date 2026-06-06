@@ -20,6 +20,7 @@ blake3 = { workspace = true }
 tiktoken-rs = "0.11"  # mu-kgu.10: real-tokenizer proxy for estimate_tokens; cl100k_base ≈ Anthropic's BPE
 serde_yaml = { workspace = true }
 toml = { workspace = true }  # mu-l1z: layered config TOML loader
+figment = { workspace = true }  # config-backed provider/model catalog
 dirs = { workspace = true }  # mu-l1z: resolves ~/.config and platform-specific paths
 t4c = { path = "../t4c" }  # mu-kex4.6 phase 3: project mu's live tools+skills into t4c (leaf: mu-core -> t4c only)
 anyhow = { workspace = true }  # impl t4c::RegistrySource — its capabilities() returns anyhow::Result

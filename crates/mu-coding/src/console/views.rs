@@ -68,6 +68,19 @@ pub(crate) fn render_sessions_index(state: Arc<AppState>) -> Html<String> {
             scan.skipped_entries, scan.malformed_files
         ));
     }
+    // mu-y5hz: subagent (sidechain) turns are excluded from per-session
+    // rollups; surface the corpus total so the exclusion is visible and
+    // not a silent drop. One muted line, only when non-zero (no column).
+    let sidechain_total: u64 = scan
+        .sessions
+        .iter()
+        .map(|s| u64::from(s.sidechain_entries))
+        .sum();
+    if sidechain_total > 0 {
+        body.push_str(&format!(
+            "<p class=muted>Excluded {sidechain_total} subagent (sidechain) turn(s) from session rollups.</p>"
+        ));
+    }
     body.push_str("<table><thead><tr><th>last</th><th>daemon</th><th>session</th><th>mark</th><th>provider</th><th>model</th><th>asks</th><th>calls</th><th>tools</th><th>input</th><th>output</th><th>cache read</th><th>cache write</th></tr></thead><tbody>");
     for s in scan.sessions {
         // mu-cc-sessions-console-lqqt.2: claude-code rows open the cc
@@ -93,7 +106,21 @@ pub(crate) fn render_sessions_index(state: Arc<AppState>) -> Html<String> {
         // sessions already carry an operator mark.
         body.push_str(&td(&s.mark.map(stars).unwrap_or_else(|| "—".into())));
         body.push_str(&td(&s.provider.unwrap_or_else(|| "—".into())));
-        body.push_str(&td(&s.model.unwrap_or_else(|| "—".into())));
+        // mu-y5hz: the model column is last-model-wins; annotate inline
+        // (no extra column) when a session switched models mid-run so the
+        // earlier model isn't invisible.
+        let model_cell = match s.model {
+            Some(m) if s.models_seen > 1 => {
+                format!(
+                    "{} <span class=muted>({} models)</span>",
+                    esc(&m),
+                    s.models_seen
+                )
+            }
+            Some(m) => esc(&m),
+            None => "—".into(),
+        };
+        body.push_str(&format!("<td>{model_cell}</td>"));
         body.push_str(&td_num(s.ask_count));
         body.push_str(&td_num(s.context_assembly_count));
         body.push_str(&td_num(s.tool_call_count));
@@ -769,6 +796,14 @@ fn cc_session_header(
             tx.malformed_lines
         ));
     }
+    // mu-y5hz: subagent (sidechain) turns stay rendered in the transcript
+    // but are excluded from the cost-tab total; note their presence here.
+    if tx.sidechain_entries > 0 {
+        out.push_str(&format!(
+            "<p class=muted>{} subagent (sidechain) turn(s) present — rendered below, excluded from cost totals.</p>",
+            tx.sidechain_entries
+        ));
+    }
     // cc marks live in a task_log sidecar (bead .3), never in the
     // transcript file. Until that seam lands the line is a placeholder;
     // the director wires it at merge.
@@ -867,10 +902,22 @@ fn render_cc_cost(tx: &CcTranscript) -> String {
     for e in &tx.entries {
         let Some(u) = e.usage else { continue };
         any = true;
-        total = total + u;
+        // mu-y5hz policy (a): a sidechain (subagent) turn's usage is
+        // excluded from the summed total — same exclusion the index
+        // scanner applies — but the row stays visible (marked) rather than
+        // dropped, so the per-turn detail is still inspectable.
+        if !e.is_sidechain {
+            total = total + u;
+        }
         out.push_str("<tr>");
         out.push_str(&td_num(e.seq));
-        out.push_str(&td(e.model.as_deref().unwrap_or("—")));
+        let model_cell = match e.model.as_deref() {
+            Some(m) if e.is_sidechain => format!("{} (sidechain)", esc(m)),
+            Some(m) => esc(m),
+            None if e.is_sidechain => "— (sidechain)".to_string(),
+            None => "—".to_string(),
+        };
+        out.push_str(&format!("<td>{model_cell}</td>"));
         out.push_str(&td_num(u.input_tokens));
         out.push_str(&td_num(u.output_tokens));
         out.push_str(&td(&fmt_opt_u64(u.cache_read_input_tokens)));
@@ -907,6 +954,14 @@ fn render_cc_cost(tx: &CcTranscript) -> String {
         out.push_str("</dl>");
     } else {
         out.push_str("<p class=warn>No usage records found in this transcript.</p>");
+    }
+    // mu-y5hz: make the exclusion explicit so the summed total reading
+    // lower than the per-row sum isn't a surprise.
+    if tx.sidechain_entries > 0 {
+        out.push_str(&format!(
+            "<p class=muted>{} subagent (sidechain) turn(s) shown above are excluded from the summed total.</p>",
+            tx.sidechain_entries
+        ));
     }
     out
 }

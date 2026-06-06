@@ -45,7 +45,15 @@ pub(crate) struct SessionSummary {
     pub(crate) daemon_id: String,
     pub(crate) session_id: String,
     pub(crate) provider: Option<String>,
+    /// The session's model. For sessions that switch models mid-run this
+    /// is last-model-wins (the most recent assistant model); `models_seen`
+    /// records how many distinct models appeared so the switch is visible
+    /// (mu-y5hz).
     pub(crate) model: Option<String>,
+    /// mu-y5hz: count of distinct models seen across the session. 1 for a
+    /// normal single-model session, ≥2 flags a mid-run model switch, 0
+    /// when no model could be resolved (then `model` is `None` too).
+    pub(crate) models_seen: u8,
     pub(crate) last_activity_unix_ms: Option<u64>,
     pub(crate) ask_count: u32,
     pub(crate) context_assembly_count: u32,
@@ -54,6 +62,11 @@ pub(crate) struct SessionSummary {
     /// mu-index-mark-column-auiv: latest operator-mark rating, so the
     /// index shows which sessions are already covered.
     pub(crate) mark: Option<u8>,
+    /// mu-y5hz: subagent (isSidechain:true) message turns excluded from
+    /// this session's ask/assistant/tool/usage rollups and surfaced here
+    /// rather than silently dropped. Always 0 for native mu sessions,
+    /// which have no sidechain concept.
+    pub(crate) sidechain_entries: u32,
 }
 
 /// mu-cc-sessions-console-lqqt.1: the index's scan entry point. Always
@@ -124,6 +137,11 @@ pub(crate) fn scan_sessions(events_dir: &Path) -> ScanResult {
                         daemon_id: daemon_id.clone(),
                         session_id: log.session_id().to_owned(),
                         provider,
+                        // Native mu sessions report a single provider/model
+                        // pair; 1 when resolved, 0 otherwise. The mid-run
+                        // model-switch case (models_seen ≥ 2) is a cc-only
+                        // concern today (mu-y5hz).
+                        models_seen: u8::from(model.is_some()),
                         model,
                         last_activity_unix_ms: log.last_activity_unix_ms(),
                         ask_count: log.ask_count(),
@@ -131,6 +149,8 @@ pub(crate) fn scan_sessions(events_dir: &Path) -> ScanResult {
                         tool_call_count: log.tool_call_count(),
                         usage: log.live_usage().0.or_else(|| log.cumulative_usage()),
                         mark: log.latest_operator_mark().map(|(rating, _)| rating),
+                        // Native mu sessions have no sidechain concept.
+                        sidechain_entries: 0,
                     });
                 }
                 Err(_) => result.malformed_files += 1,

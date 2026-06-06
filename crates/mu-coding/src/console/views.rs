@@ -283,6 +283,68 @@ fn session_header(
             "<p class=warn>{malformed} malformed line(s) skipped while reading this log.</p>"
         ));
     }
+    out.push_str(&mark_line(state, daemon_id, session_id, events));
+    out
+}
+
+/// mu-operator-mark-5mwr: current operator mark (latest `OperatorMark`
+/// by event id wins) plus the inline re-mark form. The form POSTs to
+/// the console's one write route; the page re-render then shows
+/// whatever the log says.
+fn mark_line(
+    state: &AppState,
+    daemon_id: &str,
+    session_id: &str,
+    events: &[SessionEvent],
+) -> String {
+    let current = events.iter().rev().find_map(|ev| match &ev.payload {
+        EventPayload::OperatorMark { rating, note } => Some((*rating, note.clone())),
+        _ => None,
+    });
+    let mut out = String::from("<p class=muted>mark: ");
+    match &current {
+        Some((rating, note)) => {
+            out.push_str(&"★".repeat(usize::from(*rating).min(5)));
+            out.push_str(&"☆".repeat(5usize.saturating_sub(usize::from(*rating))));
+            out.push_str(&format!(" {rating}/5"));
+            if let Some(note) = note {
+                out.push_str(&format!(" — {}", esc(note)));
+            }
+        }
+        None => out.push_str("unmarked"),
+    }
+    out.push_str("</p>");
+    let action = state.href(&format!(
+        "/sessions/{}/{}/mark",
+        urlish(daemon_id),
+        urlish(session_id)
+    ));
+    let selected = current.map(|(r, _)| r);
+    let mut options = String::new();
+    for (value, label) in [
+        (1u8, "1 — unusable"),
+        (2, "2 — poor"),
+        (3, "3 — ok"),
+        (4, "4 — good"),
+        (5, "5 — excellent"),
+    ] {
+        options.push_str(&format!(
+            "<option value={value}{}>{label}</option>",
+            if selected == Some(value) {
+                " selected"
+            } else {
+                ""
+            }
+        ));
+    }
+    out.push_str(&format!(
+        "<form class=toolbar method=post action=\"{}\">\
+           <label>rate <select name=rating>{options}</select></label> \
+           <input type=text name=note placeholder=\"optional note\" size=40 maxlength=400> \
+           <button type=submit>mark</button>\
+         </form>",
+        esc_attr(&action)
+    ));
     out
 }
 

@@ -1482,7 +1482,10 @@ mod tests {
             note: None,
         })
         .expect("serializes");
-        assert!(!bare.contains("note"), "absent note must be skipped: {bare}");
+        assert!(
+            !bare.contains("note"),
+            "absent note must be skipped: {bare}"
+        );
 
         // Appends like any other event; latest-by-id is the re-mark rule.
         let log = SessionEventLog::new("s1");

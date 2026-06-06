@@ -1684,6 +1684,7 @@ dependencies = [
  "sha2",
  "shlex",
  "subtle",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "toml",

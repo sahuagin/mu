@@ -7,6 +7,7 @@ use mu_core::{
 };
 
 use crate::console::{
+    cc_data::{read_cc_transcript, CcRole, CcTranscript},
     data::{load_events, scan_all, AppState},
     html::{
         breakdown_table, esc, esc_attr, event_anchor, fmt_opt_u32, fmt_opt_u64, kv, page,
@@ -22,6 +23,17 @@ pub(crate) enum DetailTab {
     Cost,
     Context,
     Compactions,
+}
+
+/// mu-cc-sessions-console-lqqt.2: tabs for the claude-code detail view.
+/// cc transcripts have no ContextAssembly/Compaction events, so the cc
+/// view carries only the transcript, a raw-JSON drilldown, and a cost
+/// tab fed by per-assistant-turn `message.usage`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CcDetailTab {
+    Transcript,
+    Events,
+    Cost,
 }
 
 pub(crate) fn render_sessions_index(state: Arc<AppState>) -> Html<String> {
@@ -54,8 +66,14 @@ pub(crate) fn render_sessions_index(state: Arc<AppState>) -> Html<String> {
     }
     body.push_str("<table><thead><tr><th>last</th><th>daemon</th><th>session</th><th>mark</th><th>provider</th><th>model</th><th>asks</th><th>calls</th><th>tools</th><th>input</th><th>output</th><th>cache read</th><th>cache write</th></tr></thead><tbody>");
     for s in scan.sessions {
+        // mu-cc-sessions-console-lqqt.2: claude-code rows open the cc
+        // detail route (a separate reader over the cc projects dir);
+        // native mu rows keep the event-log detail route.
+        let is_cc = s.provider.as_deref() == Some("claude-code");
+        let detail_root = if is_cc { "/cc" } else { "/sessions" };
         let href = state.href(&format!(
-            "/sessions/{}/{}",
+            "{}/{}/{}",
+            detail_root,
             urlish(&s.daemon_id),
             urlish(&s.session_id)
         ));
@@ -652,6 +670,239 @@ fn render_compaction_list(
     out.push_str("</tbody></table>");
     if n == 0 {
         out.push_str("<p class=warn>No CompactionAssembly events found.</p>");
+    }
+    out
+}
+
+// ── mu-cc-sessions-console-lqqt.2: claude-code detail view ────────────
+//
+// The native detail view (`render_session_page`) reads mu's typed event
+// log from `events_dir`. cc sessions live elsewhere (the cc projects
+// dir) and have a different on-disk shape, so they get a parallel render
+// path that maps cc content blocks onto the same `transcript_block`
+// primitive. The header's mark line is a placeholder: cc marks land in a
+// task_log sidecar (bead .3), wired at merge — never appended to the cc
+// transcript file (READ-ONLY invariant).
+
+/// Reject path-ish id segments before joining them into a filesystem
+/// path under the cc projects dir — the cc reader walks into
+/// `~/.claude-personal`, so a `..` segment must never escape it.
+fn cc_id_ok(s: &str) -> bool {
+    !s.is_empty() && !s.contains(['/', '\\']) && !s.contains("..")
+}
+
+pub(crate) fn render_cc_session_page(
+    state: Arc<AppState>,
+    project_dir: String,
+    session_id: String,
+    tab: CcDetailTab,
+) -> Html<String> {
+    if !cc_id_ok(&project_dir) || !cc_id_ok(&session_id) {
+        return page(
+            &state,
+            "bad request",
+            "<h1>bad request</h1><p class=err>invalid session path</p>",
+        );
+    }
+    let Some(projects_dir) = state.cc_projects_dir.clone() else {
+        return page(
+            &state,
+            "session not found",
+            "<h1>session not found</h1><p class=err>claude-code scanning is not enabled on this console.</p>",
+        );
+    };
+    let path = projects_dir
+        .join(&project_dir)
+        .join(format!("{session_id}.jsonl"));
+    match read_cc_transcript(&path) {
+        Ok(tx) => {
+            let mut body = cc_session_header(&state, &project_dir, &session_id, &tx);
+            body.push_str(&cc_session_nav(&state, &project_dir, &session_id));
+            match tab {
+                CcDetailTab::Transcript => body.push_str(&render_cc_transcript(&tx)),
+                CcDetailTab::Events => body.push_str(&render_cc_events(&tx)),
+                CcDetailTab::Cost => body.push_str(&render_cc_cost(&tx)),
+            }
+            page(&state, &session_id, &body)
+        }
+        Err(e) => page(
+            &state,
+            "session not found",
+            &format!(
+                "<h1>session not found</h1><p class=err>{}</p>",
+                esc(&e.to_string())
+            ),
+        ),
+    }
+}
+
+fn cc_session_header(
+    state: &AppState,
+    project_dir: &str,
+    session_id: &str,
+    tx: &CcTranscript,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "<p><a href=\"{}\">← sessions</a></p>",
+        esc_attr(&state.href("/sessions"))
+    ));
+    out.push_str(&format!(
+        "<h1><code>{}</code></h1><p class=muted>claude-code · project <code>{}</code> · {} entr(ies)</p>",
+        esc(session_id),
+        esc(project_dir),
+        tx.entries.len()
+    ));
+    if let Some(model) = &tx.model {
+        out.push_str(&format!(
+            "<p class=muted>model <code>{}</code></p>",
+            esc(model)
+        ));
+    }
+    if tx.malformed_lines > 0 {
+        out.push_str(&format!(
+            "<p class=warn>{} malformed line(s) skipped while reading this transcript.</p>",
+            tx.malformed_lines
+        ));
+    }
+    // cc marks live in a task_log sidecar (bead .3), never in the
+    // transcript file. Until that seam lands the line is a placeholder;
+    // the director wires it at merge.
+    out.push_str(
+        "<p class=muted>mark: — <span class=muted>(claude-code marks land via the task_log sidecar — bead mu-cc-sessions-console-lqqt.3)</span></p>",
+    );
+    out
+}
+
+fn cc_session_nav(state: &AppState, project_dir: &str, session_id: &str) -> String {
+    let root = format!("/cc/{}/{}", urlish(project_dir), urlish(session_id));
+    let items = [
+        ("overview", root.clone()),
+        ("raw json", format!("{root}/events")),
+        ("cost", format!("{root}/cost")),
+    ];
+    let mut out = String::from("<nav class=tabs>");
+    for (label, path) in items {
+        out.push_str(&format!(
+            "<a href=\"{}\">{}</a>",
+            esc_attr(&state.href(&path)),
+            esc(label)
+        ));
+    }
+    out.push_str("</nav>");
+    out
+}
+
+fn render_cc_transcript(tx: &CcTranscript) -> String {
+    let mut out = String::from(
+        "<h2>transcript</h2>\
+         <div class=toolbar>\
+           <label><input type=checkbox checked onchange=\"toggleRole('user', this.checked)\"> user</label>\
+           <label><input type=checkbox checked onchange=\"toggleRole('assistant', this.checked)\"> assistant</label>\
+           <label><input type=checkbox checked onchange=\"toggleRole('tool', this.checked)\"> tools</label>\
+           <button type=button onclick=\"expandAll('#transcript')\">expand all</button>\
+           <button type=button onclick=\"collapseAll('#transcript')\">collapse all</button>\
+           <label><input type=checkbox checked onchange=\"setTranscriptBodyScroll(this.checked)\"> scroll bodies</label>\
+         </div><div id=transcript>",
+    );
+    for e in &tx.entries {
+        // Meta envelopes (summary/attachment/unknown) have no rendered
+        // text — show their raw JSON so the line degrades visibly rather
+        // than vanishing. Open tool_result/meta blocks by default? No —
+        // keep all collapsed, matching the native transcript.
+        let text = if e.role == CcRole::Meta {
+            format!("[{}]\n{}", e.envelope_type, e.raw)
+        } else {
+            e.text.clone()
+        };
+        transcript_block(
+            &mut out,
+            e.seq as u64,
+            e.timestamp_unix_ms.unwrap_or(0),
+            e.role.css(),
+            &text,
+            false,
+        );
+    }
+    out.push_str("</div>");
+    if tx.entries.is_empty() {
+        out.push_str("<p class=warn>No transcript entries in this file.</p>");
+    }
+    out
+}
+
+fn render_cc_events(tx: &CcTranscript) -> String {
+    let mut out = String::from("<h2>raw transcript lines</h2><div class=toolbar><button type=button onclick=\"expandAll('#events')\">expand json</button><button type=button onclick=\"collapseAll('#events')\">collapse json</button></div><table id=events><thead><tr><th>#</th><th>time</th><th>type</th><th>role</th><th>json</th></tr></thead><tbody>");
+    for e in &tx.entries {
+        out.push_str(&format!("<tr id=\"event-{}\">", e.seq));
+        out.push_str(&format!("<td>{}</td>", event_anchor(e.seq as u64)));
+        out.push_str(&td_time(e.timestamp_unix_ms));
+        out.push_str(&td_code(&e.envelope_type));
+        out.push_str(&td(e.role.css()));
+        out.push_str(&format!(
+            "<td>{}</td>",
+            truncated_details("json", &e.raw, 40_000)
+        ));
+        out.push_str("</tr>");
+    }
+    out.push_str("</tbody></table>");
+    if tx.malformed_lines > 0 {
+        out.push_str(&format!(
+            "<p class=warn>{} malformed line(s) could not be parsed and are not shown.</p>",
+            tx.malformed_lines
+        ));
+    }
+    out
+}
+
+fn render_cc_cost(tx: &CcTranscript) -> String {
+    let mut out = String::from("<h2>cost/cache</h2><p class=muted>Per-assistant-turn usage from <code>message.usage</code>. cache-read inflates across turns (re-read each call), same as the native cost view's sum.</p>");
+    let mut total = Usage::default();
+    let mut any = false;
+    out.push_str("<table><thead><tr><th>#</th><th>model</th><th>input</th><th>output</th><th>cache read</th><th>cache write</th><th>5m write</th><th>1h write</th></tr></thead><tbody>");
+    for e in &tx.entries {
+        let Some(u) = e.usage else { continue };
+        any = true;
+        total = total + u;
+        out.push_str("<tr>");
+        out.push_str(&td_num(e.seq));
+        out.push_str(&td(e.model.as_deref().unwrap_or("—")));
+        out.push_str(&td_num(u.input_tokens));
+        out.push_str(&td_num(u.output_tokens));
+        out.push_str(&td(&fmt_opt_u64(u.cache_read_input_tokens)));
+        out.push_str(&td(&fmt_opt_u64(u.cache_creation_input_tokens)));
+        out.push_str(&td(&fmt_opt_u64(u.cache_creation_5m_input_tokens)));
+        out.push_str(&td(&fmt_opt_u64(u.cache_creation_1h_input_tokens)));
+        out.push_str("</tr>");
+    }
+    out.push_str("</tbody></table>");
+    if any {
+        out.push_str("<h3>summed buckets</h3><dl class=kv>");
+        kv(&mut out, "input", &total.input_tokens.to_string());
+        kv(&mut out, "output", &total.output_tokens.to_string());
+        kv(
+            &mut out,
+            "cache read",
+            &fmt_opt_u64(total.cache_read_input_tokens),
+        );
+        kv(
+            &mut out,
+            "cache write",
+            &fmt_opt_u64(total.cache_creation_input_tokens),
+        );
+        kv(
+            &mut out,
+            "5m write",
+            &fmt_opt_u64(total.cache_creation_5m_input_tokens),
+        );
+        kv(
+            &mut out,
+            "1h write",
+            &fmt_opt_u64(total.cache_creation_1h_input_tokens),
+        );
+        out.push_str("</dl>");
+    } else {
+        out.push_str("<p class=warn>No usage records found in this transcript.</p>");
     }
     out
 }

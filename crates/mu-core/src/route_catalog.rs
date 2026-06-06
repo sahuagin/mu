@@ -13,13 +13,44 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::pricing;
+use crate::{model_catalog, pricing};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouteFavorite {
+    pub name: Arc<str>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<Arc<str>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<Arc<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<Arc<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Arc<str>>>,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteEntry {
     pub provider_kind: Arc<str>,
     pub model: Arc<str>,
     pub configured: bool,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_label: Option<Arc<str>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_aliases: Vec<Arc<str>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_quirks: Vec<Arc<str>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<Arc<str>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<Arc<str>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quirks: Vec<Arc<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub favorites: Vec<RouteFavorite>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_soft_limit: Option<u64>,
@@ -141,7 +172,27 @@ fn build_entry(
     context_soft: u64,
     context_hard: u64,
 ) -> RouteEntry {
+    let catalog = model_catalog::global();
     let pricing = pricing::for_model(provider_kind, model);
+    let model_settings = catalog.resolve_model(model);
+    let provider_settings = catalog.provider(provider_kind);
+
+    let context_soft = model_settings.context_soft_limit.unwrap_or(context_soft);
+    let context_hard = model_settings.context_hard_limit.unwrap_or(context_hard);
+    let favorites = catalog
+        .favorites_for(provider_kind, model)
+        .into_iter()
+        .map(|(name, fav)| RouteFavorite {
+            name: Arc::from(name),
+            label: fav.label.clone().map(Arc::from),
+            aliases: fav.aliases.iter().cloned().map(Arc::from).collect(),
+            default_effort: fav.default_effort.clone().map(Arc::from),
+            tools: fav
+                .tools
+                .clone()
+                .map(|tools| tools.into_iter().map(Arc::from).collect()),
+        })
+        .collect();
 
     let valid_effort = match provider_kind {
         "anthropic_api" | "anthropic_oauth" => Some(vec![
@@ -172,6 +223,20 @@ fn build_entry(
         provider_kind: Arc::from(provider_kind),
         model: Arc::from(model),
         configured,
+        provider_label: provider_settings
+            .and_then(|p| p.label.clone())
+            .map(Arc::from),
+        provider_aliases: provider_settings
+            .map(|p| p.aliases.iter().cloned().map(Arc::from).collect())
+            .unwrap_or_default(),
+        provider_quirks: provider_settings
+            .map(|p| p.quirks.iter().cloned().map(Arc::from).collect())
+            .unwrap_or_default(),
+        label: model_settings.label.map(Arc::from),
+        aliases: model_settings.aliases.into_iter().map(Arc::from).collect(),
+        quirks: model_settings.quirks.into_iter().map(Arc::from).collect(),
+        max_output_tokens: model_settings.max_output_tokens,
+        favorites,
         context_soft_limit: Some(context_soft),
         context_hard_limit: Some(context_hard),
         valid_effort_levels: valid_effort,
@@ -224,8 +289,20 @@ mod tests {
 
     #[test]
     fn hash_changes_with_limits() {
-        let a = build_entry("anthropic_api", "claude-opus-4-7", true, 200_000, 1_000_000);
-        let b = build_entry("anthropic_api", "claude-opus-4-7", true, 500_000, 1_000_000);
+        let a = build_entry(
+            "anthropic_api",
+            "claude-test-hash",
+            true,
+            200_000,
+            1_000_000,
+        );
+        let b = build_entry(
+            "anthropic_api",
+            "claude-test-hash",
+            true,
+            500_000,
+            1_000_000,
+        );
         assert_ne!(a.hash, b.hash);
     }
 
@@ -266,6 +343,23 @@ mod tests {
         assert_eq!(q.pricing_input_per_mtok, None);
         assert_eq!(q.pricing_output_per_mtok, None);
         assert!(catalog.find("ollama", "deepseek-r1:32b").is_some());
+    }
+
+    #[test]
+    fn ollama_qwen36_route_is_catalog_enriched() {
+        let catalog = RouteCatalog::from_env().with_ollama_models(["qwen3.6:35b-a3b-q8_0"]);
+        let q = catalog
+            .find("ollama", "qwen3.6:35b-a3b-q8_0")
+            .expect("discovered qwen3.6 route should be present");
+        assert_eq!(q.max_output_tokens, Some(16384));
+        assert!(q
+            .quirks
+            .iter()
+            .any(|q| q.as_ref() == "thinking_counts_against_max_tokens"));
+        assert!(q
+            .favorites
+            .iter()
+            .any(|f| f.name.as_ref() == "local_qwen36"));
     }
 
     #[test]

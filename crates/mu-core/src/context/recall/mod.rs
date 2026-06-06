@@ -70,6 +70,15 @@ pub enum RecallSource {
     /// session start. Maps to [`super::rope::SpanKind::FileLoad`].
     /// Path is absolute (canonicalized).
     ProjectFile { path: PathBuf },
+    /// mu-recall-bootloader-flag-nxpo: the first-position startup-orientation
+    /// preamble. Emitted by [`BootloaderRecallProvider`] BEFORE every other
+    /// provider when `[recall].bootloader` (or `MU_RECALL_BOOTLOADER=1`) is
+    /// on. A distinct variant (rather than reusing `Memory`) so the assembler
+    /// gives it a greppable `bootloader:` span id and the A/B experiment can
+    /// verify first-span position. Maps to
+    /// [`super::rope::SpanKind::MemoryInjection`] (same Startup retention +
+    /// cacheable prefix as the other recall spans).
+    Bootloader,
 }
 
 /// Bundle of recalled items handed to
@@ -111,8 +120,10 @@ pub trait RecallProvider: Send + Sync + std::fmt::Debug {
     fn recall(&self, cwd: &Path, capability: &Capability) -> Vec<RecalledItem>;
 }
 
+pub mod bootloader;
 pub mod project_files;
 pub mod subprocess;
 
+pub use bootloader::BootloaderRecallProvider;
 pub use project_files::ProjectFileRecallProvider;
 pub use subprocess::SubprocessRecallProvider;

@@ -258,30 +258,8 @@ where
     let auth_state: auth::AuthStateHandle = Arc::new(std::sync::Mutex::new(initial_auth_state));
     // mu-phl v0 (mu-0bxv): wire up the canonical session-start recall
     // provider chain. Tests construct DaemonInfo without these (empty
-    // vec) to skip recall; production runs both.
-    // mu recall dial: `[recall].enabled = false` (or env `MU_NO_RECALL`) turns
-    // off session-start context injection so the agent discovers on demand —
-    // the analog of claude-basic's `CLAUDE_BASIC_MEM`. Default keeps the
-    // providers wired (existing behavior).
-    let recall_providers: Vec<Arc<dyn mu_core::context::RecallProvider>> =
-        if config.recall_enabled() {
-            vec![
-                // mu-zk2i: tier from `[recall].tier` — "identity"
-                // (default) injects the small kernel; "full" restores
-                // the four-section wall.
-                Arc::new(
-                    mu_core::context::recall::SubprocessRecallProvider::default()
-                        .with_tier(&config.recall.tier),
-                ),
-                Arc::new(mu_core::context::recall::ProjectFileRecallProvider::default()),
-            ]
-        } else {
-            tracing::info!(
-                "recall disabled ([recall].enabled=false or MU_NO_RECALL) — \
-                 discover-on-demand mode; no session-start context injection"
-            );
-            vec![]
-        };
+    // vec) to skip recall; production runs the full chain.
+    let recall_providers = build_recall_providers(&config);
     // mu-818c: best-effort ollama discovery → route catalog. Only in
     // production (events_dir set) so tests stay hermetic and fast. A
     // short timeout bounds startup, so a down/absent ollama box can't
@@ -451,6 +429,52 @@ where
     })
     .await
     .map_err(Into::into)
+}
+
+/// Build the ordered session-start recall provider chain from config.
+///
+/// mu recall dial: `[recall].enabled = false` (or env `MU_NO_RECALL`) turns
+/// off session-start context injection entirely — the agent discovers on
+/// demand, the analog of claude-basic's `CLAUDE_BASIC_MEM`. Default keeps
+/// the providers wired (existing behavior).
+///
+/// mu-recall-bootloader-flag-nxpo: when recall is enabled AND the bootloader
+/// is on (`[recall].bootloader` or `MU_RECALL_BOOTLOADER=1`), a
+/// [`BootloaderRecallProvider`] is pushed to the FRONT of the chain, so its
+/// preamble is the first recall segment ahead of the memory + project-file
+/// providers. With the bootloader off the chain is byte-identical to today
+/// (the experiment's A condition); `--bare` forces `recall_enabled()` false,
+/// so it suppresses the bootloader along with everything else.
+fn build_recall_providers(
+    config: &mu_core::config::Config,
+) -> Vec<Arc<dyn mu_core::context::RecallProvider>> {
+    use mu_core::context::recall::{
+        BootloaderRecallProvider, ProjectFileRecallProvider, SubprocessRecallProvider,
+    };
+
+    if !config.recall_enabled() {
+        tracing::info!(
+            "recall disabled ([recall].enabled=false or MU_NO_RECALL) — \
+             discover-on-demand mode; no session-start context injection"
+        );
+        return Vec::new();
+    }
+
+    let mut providers: Vec<Arc<dyn mu_core::context::RecallProvider>> = Vec::new();
+    if config.bootloader_enabled() {
+        // FIRST segment, before all providers: orientation-about-the-
+        // orientation precedes the orientation.
+        providers.push(Arc::new(BootloaderRecallProvider::new(
+            config.bootloader_text().to_string(),
+        )));
+    }
+    // mu-zk2i: tier from `[recall].tier` — "identity" (default) injects the
+    // small kernel; "full" restores the four-section wall.
+    providers.push(Arc::new(
+        SubprocessRecallProvider::default().with_tier(&config.recall.tier),
+    ));
+    providers.push(Arc::new(ProjectFileRecallProvider::default()));
+    providers
 }
 
 #[cfg(test)]
@@ -625,5 +649,117 @@ mod tests {
             path.ends_with(".local/share/mu/events"),
             "expected default events dir, got {path:?}",
         );
+    }
+
+    // mu-recall-bootloader-flag-nxpo: serialize the env-sensitive recall
+    // tests — they all read the process-global `MU_RECALL_BOOTLOADER`, so
+    // running them concurrently would let one test's set_var leak into
+    // another's read. Lock + drop the guard around every such test.
+    static BOOTLOADER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_bootloader_env() -> std::sync::MutexGuard<'static, ()> {
+        BOOTLOADER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Run `f` with `MU_RECALL_BOOTLOADER` unset, restoring any prior value.
+    fn with_bootloader_env_clear<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = lock_bootloader_env();
+        let prev = std::env::var("MU_RECALL_BOOTLOADER").ok();
+        std::env::remove_var("MU_RECALL_BOOTLOADER");
+        let out = f();
+        match prev {
+            Some(v) => std::env::set_var("MU_RECALL_BOOTLOADER", v),
+            None => std::env::remove_var("MU_RECALL_BOOTLOADER"),
+        }
+        out
+    }
+
+    // Whether `providers[0]` is the bootloader provider, by its `Debug`
+    // type name — hermetic (no fs/subprocess), unlike running `recall()`.
+    fn first_is_bootloader(providers: &[Arc<dyn mu_core::context::RecallProvider>]) -> bool {
+        providers
+            .first()
+            .map(|p| format!("{p:?}").starts_with("BootloaderRecallProvider"))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn build_recall_providers_default_omits_bootloader() {
+        // Flag-off identity: default config => the exact pre-bootloader
+        // chain (subprocess + project-file), bootloader NOT present.
+        with_bootloader_env_clear(|| {
+            let config = Config::default();
+            assert!(!config.recall.bootloader);
+            let providers = build_recall_providers(&config);
+            assert_eq!(
+                providers.len(),
+                2,
+                "default chain is subprocess + project-file"
+            );
+            assert!(!first_is_bootloader(&providers));
+        });
+    }
+
+    #[test]
+    fn build_recall_providers_flag_on_puts_bootloader_first() {
+        with_bootloader_env_clear(|| {
+            let mut config = Config::default();
+            config.recall.bootloader = true;
+            let providers = build_recall_providers(&config);
+            assert_eq!(providers.len(), 3, "bootloader prepended to the chain");
+            assert!(first_is_bootloader(&providers));
+            // Terrain check: the first provider actually emits a Bootloader
+            // item carrying the resolved (default) preamble text.
+            let items = providers[0].recall(
+                std::path::Path::new("/tmp"),
+                &mu_core::capability::Capability::root(),
+            );
+            assert_eq!(items.len(), 1);
+            assert!(matches!(
+                items[0].source,
+                mu_core::context::RecallSource::Bootloader
+            ));
+            assert_eq!(&*items[0].content, config.bootloader_text());
+        });
+    }
+
+    #[test]
+    fn build_recall_providers_env_override_beats_config_both_ways() {
+        let _guard = lock_bootloader_env();
+        // MU_RECALL_BOOTLOADER=1 forces the bootloader ON even though config
+        // has it off (the experiment default).
+        std::env::set_var("MU_RECALL_BOOTLOADER", "1");
+        let mut off = Config::default();
+        off.recall.bootloader = false;
+        assert!(first_is_bootloader(&build_recall_providers(&off)));
+
+        // MU_RECALL_BOOTLOADER=0 forces it OFF even though config has it on.
+        std::env::set_var("MU_RECALL_BOOTLOADER", "0");
+        let mut on = Config::default();
+        on.recall.bootloader = true;
+        let providers = build_recall_providers(&on);
+        assert!(!first_is_bootloader(&providers));
+        assert_eq!(providers.len(), 2);
+
+        std::env::remove_var("MU_RECALL_BOOTLOADER");
+    }
+
+    #[test]
+    fn build_recall_providers_bare_suppresses_bootloader() {
+        // Bare suppresses everything incl. the bootloader: bare forces
+        // recall_enabled() false, so the chain is empty even with the
+        // bootloader flag (and env override) on.
+        let _guard = lock_bootloader_env();
+        std::env::set_var("MU_RECALL_BOOTLOADER", "1");
+        let mut config = Config::default();
+        config.recall.bare = true;
+        config.recall.enabled = false; // bare implies recall off (mu ask/serve --bare)
+        config.recall.bootloader = true;
+        assert!(!config.recall_enabled());
+        let providers = build_recall_providers(&config);
+        assert!(providers.is_empty(), "bare => no providers at all");
+        std::env::remove_var("MU_RECALL_BOOTLOADER");
     }
 }

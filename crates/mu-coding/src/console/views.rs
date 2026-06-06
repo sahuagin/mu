@@ -25,7 +25,11 @@ pub(crate) enum DetailTab {
 }
 
 pub(crate) fn render_sessions_index(state: Arc<AppState>) -> Html<String> {
-    let scan = scan_all(&state.events_dir, state.cc_projects_dir.as_deref());
+    let scan = scan_all(
+        &state.events_dir,
+        state.cc_projects_dir.as_deref(),
+        state.cc_marks_db.as_deref(),
+    );
     let mut body = String::new();
     body.push_str("<h1>mu sessions</h1>");
     body.push_str(&format!(

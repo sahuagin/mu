@@ -159,6 +159,11 @@ enum Command {
         /// --cc-sessions. Default with --cc-sessions: ~/.claude-personal/projects.
         #[arg(long, value_name = "PATH")]
         cc_projects_dir: Option<std::path::PathBuf>,
+        /// mu-cc-sessions-console-lqqt.3: task_log sidecar DB for cc
+        /// session marks. Default with --cc-sessions:
+        /// ~/.local/share/task_log.sqlite.
+        #[arg(long, value_name = "PATH")]
+        cc_marks_db: Option<std::path::PathBuf>,
     },
     /// Append an operator quality mark (1-5) to a session's event log.
     /// Quit-time capture for degraded (or excellent) sessions — the
@@ -363,6 +368,7 @@ async fn main() -> Result<()> {
             analytics_db,
             cc_sessions,
             cc_projects_dir,
+            cc_marks_db,
         } => {
             let events_dir = match events_dir {
                 Some(p) => p,
@@ -386,12 +392,21 @@ async fn main() -> Result<()> {
                 }
                 None => None,
             };
+            // mu-cc-sessions-console-lqqt.3: the cc marks sidecar follows
+            // cc scanning — default it on whenever cc sessions are merged,
+            // unless explicitly overridden.
+            let cc_marks_db = match cc_marks_db {
+                Some(p) => Some(p),
+                None if cc_projects_dir.is_some() => mu_coding::console::default_cc_marks_db(),
+                None => None,
+            };
             mu_coding::console::run(mu_coding::console::ConsoleOptions {
                 bind,
                 base_path,
                 events_dir,
                 analytics_db,
                 cc_projects_dir,
+                cc_marks_db,
             })
             .await
         }

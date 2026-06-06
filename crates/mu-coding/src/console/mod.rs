@@ -15,6 +15,7 @@ pub mod mark;
 mod views;
 
 pub use cc_data::default_cc_projects_dir;
+pub use mark::default_cc_marks_db;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
@@ -45,6 +46,9 @@ pub struct ConsoleOptions {
     /// claude-code projects dir and merge cc sessions into the index.
     /// `None` keeps cc scanning off (explicit opt-in).
     pub cc_projects_dir: Option<PathBuf>,
+    /// mu-cc-sessions-console-lqqt.3: task_log sidecar DB for cc session
+    /// marks (index column + mark POST). `None` keeps cc marks off.
+    pub cc_marks_db: Option<PathBuf>,
 }
 
 pub async fn run(opts: ConsoleOptions) -> Result<()> {
@@ -53,6 +57,7 @@ pub async fn run(opts: ConsoleOptions) -> Result<()> {
         events_dir: opts.events_dir,
         analytics_db: opts.analytics_db,
         cc_projects_dir: opts.cc_projects_dir,
+        cc_marks_db: opts.cc_marks_db,
         base_path: base_path.clone(),
     });
 
@@ -190,11 +195,18 @@ async fn compare(
 struct MarkForm {
     rating: u8,
     note: Option<String>,
+    /// mu-cc-sessions-console-lqqt.3: the cc detail form sends
+    /// `provider=claude-code` so the POST routes to the task_log sidecar
+    /// instead of an OperatorMark event. Absent → mu session (default).
+    provider: Option<String>,
 }
 
-/// mu-operator-mark-5mwr: append an operator quality mark, then bounce
-/// back to the session page (which re-reads the log and shows it).
-/// The GET routes pass ids straight into a path join; this route
+/// mu-operator-mark-5mwr / mu-cc-sessions-console-lqqt.3: append an
+/// operator quality mark, then bounce back to the session page (which
+/// re-reads the mark and shows it). mu sessions append an `OperatorMark`
+/// event; claude-code sessions write a task_log sidecar row instead —
+/// their transcripts are claude-code's files and must never be appended
+/// to. The GET routes pass ids straight into a path join; this route
 /// writes, so it additionally refuses path-ish id segments outright.
 async fn session_mark(
     State(state): State<Arc<AppState>>,
@@ -206,12 +218,40 @@ async fn session_mark(
         return Html("<h1>bad request</h1><p class=err>invalid session path</p>".to_string())
             .into_response();
     }
-    let path = state
+
+    // Provider-keyed dispatch. A session is cc when the form says so, or
+    // (defensively, if the detail form omits the hint) when no mu event
+    // log exists for it but a cc transcript does. Filesystem detection
+    // keeps the POST self-contained rather than trusting the form alone.
+    let mu_path = state
         .events_dir
         .join(&daemon_id)
         .join(format!("{session_id}.jsonl"));
-    match mark::mark_session_file(&path, form.rating, form.note) {
-        Ok(_event_id) => Redirect::to(&state.href(&format!("/sessions/{daemon_id}/{session_id}")))
+    let is_cc = form.provider.as_deref() == Some("claude-code")
+        || (!mu_path.exists()
+            && state
+                .cc_projects_dir
+                .as_ref()
+                .map(|d| {
+                    d.join(&daemon_id)
+                        .join(format!("{session_id}.jsonl"))
+                        .exists()
+                })
+                .unwrap_or(false));
+
+    let result = if is_cc {
+        match state.cc_marks_db.as_deref() {
+            Some(db) => mark::mark_cc_session(db, &session_id, form.rating, form.note).map(|_| ()),
+            None => Err(anyhow::anyhow!(
+                "cc marks unavailable: no task_log sidecar configured"
+            )),
+        }
+    } else {
+        mark::mark_session_file(&mu_path, form.rating, form.note).map(|_| ())
+    };
+
+    match result {
+        Ok(()) => Redirect::to(&state.href(&format!("/sessions/{daemon_id}/{session_id}")))
             .into_response(),
         Err(e) => Html(format!(
             "<h1>mark failed</h1><p class=err>{}</p>",

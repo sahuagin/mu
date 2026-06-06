@@ -9,6 +9,7 @@ pub mod ls;
 pub mod memory_recall;
 pub mod read;
 pub mod spawn_worker;
+pub mod watch;
 pub mod write;
 
 pub use aws_recon::AwsReconTool;
@@ -21,4 +22,5 @@ pub use ls::LsTool;
 pub use memory_recall::MemoryRecallTool;
 pub use read::ReadTool;
 pub use spawn_worker::SpawnWorkerTool;
+pub use watch::WatchTool;
 pub use write::WriteTool;

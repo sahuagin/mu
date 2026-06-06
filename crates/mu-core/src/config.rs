@@ -170,6 +170,20 @@ pub struct RecallConfig {
     /// restores the pre-mu-zk2i four-section wall (measured 15.9K
     /// tokens = 21% of post-compaction context, session c76f6949).
     pub tier: String,
+    /// mu-recall-bootloader-flag-nxpo: emit a first-position startup-
+    /// orientation preamble as the FIRST recall segment, ahead of the memory
+    /// and project-file providers. `false` (default) => byte-identical
+    /// context to today (the experiment's A condition). Toggled per-session
+    /// without editing config via the `MU_RECALL_BOOTLOADER=0/1` env override
+    /// — the A/B knob for experiment bootloader-startup-ab-2026-06-06. Gated
+    /// by [`Config::recall_enabled`] at the call site, so `--bare` and
+    /// `MU_NO_RECALL` suppress it too. See [`DEFAULT_BOOTLOADER_TEXT`].
+    pub bootloader: bool,
+    /// Override text for the bootloader preamble. `None` (default) =>
+    /// [`DEFAULT_BOOTLOADER_TEXT`], the operator-approved v1 wording. Only
+    /// consulted when `bootloader` (or the env override) is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootloader_text: Option<String>,
 }
 
 impl Default for RecallConfig {
@@ -178,9 +192,19 @@ impl Default for RecallConfig {
             enabled: true,
             bare: false,
             tier: "identity".to_string(),
+            bootloader: false,
+            bootloader_text: None,
         }
     }
 }
+
+/// Operator-approved v1 bootloader preamble (bead
+/// mu-recall-bootloader-flag-nxpo; experiment bootloader-startup-ab-2026-06-06).
+/// Emitted verbatim as the first recall segment when `[recall].bootloader`
+/// (or `MU_RECALL_BOOTLOADER=1`) is on and recall is enabled. Used when
+/// `[recall].bootloader_text` is unset. Do NOT reword without operator
+/// sign-off — the experiment's calibration depends on the exact wording.
+pub const DEFAULT_BOOTLOADER_TEXT: &str = "## Bootloader\nStartup orientation, not the current task. Load it silently — do not answer or rehearse it. The next user message is the prompt. This dossier is a continuity artifact from prior sessions: testimony, not memory. Verify before relying on it; don't claim lived recollection.";
 
 /// `[compaction]` section. Maps to the agent loop's threshold-cross
 /// policy dispatch (mu-kgu.4). v1 supplies the threshold; mu-kgu.11
@@ -487,6 +511,40 @@ impl Config {
     pub fn env_disables_recall(v: Option<&str>) -> bool {
         matches!(v.map(str::trim), Some("1" | "true" | "yes" | "on"))
     }
+
+    /// Whether the first-position bootloader preamble should be emitted:
+    /// the `[recall].bootloader` flag, with the `MU_RECALL_BOOTLOADER` env
+    /// var overriding it in BOTH directions (`1` forces on, `0` forces off)
+    /// so the experiment's A/B toggles per session without editing config.
+    /// Callers still gate on [`recall_enabled`](Self::recall_enabled), so
+    /// `--bare` / `MU_NO_RECALL` suppress the bootloader regardless of this.
+    pub fn bootloader_enabled(&self) -> bool {
+        Self::env_bootloader_override(std::env::var("MU_RECALL_BOOTLOADER").ok().as_deref())
+            .unwrap_or(self.recall.bootloader)
+    }
+
+    /// Pure parse of the `MU_RECALL_BOOTLOADER` override. Unlike
+    /// `MU_NO_RECALL` (disable-only), this is tri-state: a truthy value
+    /// forces the bootloader ON, a falsy value forces it OFF, and an absent
+    /// or unrecognized value (`None`) defers to config. Split out so it's
+    /// testable without touching process env.
+    pub fn env_bootloader_override(v: Option<&str>) -> Option<bool> {
+        match v.map(str::trim) {
+            Some("1" | "true" | "yes" | "on") => Some(true),
+            Some("0" | "false" | "no" | "off") => Some(false),
+            _ => None,
+        }
+    }
+
+    /// The resolved bootloader preamble text: the operator-configured
+    /// `[recall].bootloader_text` override, or [`DEFAULT_BOOTLOADER_TEXT`]
+    /// when unset.
+    pub fn bootloader_text(&self) -> &str {
+        self.recall
+            .bootloader_text
+            .as_deref()
+            .unwrap_or(DEFAULT_BOOTLOADER_TEXT)
+    }
 }
 
 /// Recursive deep-merge of TOML values. Tables merge field-by-field
@@ -601,6 +659,71 @@ mod tests {
             assert!(!Config::env_disables_recall(Some(v)), "{v:?} should not");
         }
         assert!(!Config::env_disables_recall(None));
+    }
+
+    #[test]
+    fn mu_recall_bootloader_env_override_is_tristate() {
+        // truthy forces on, falsy forces off, anything else defers (None)
+        for v in ["1", "true", "yes", "on", " true "] {
+            assert_eq!(
+                Config::env_bootloader_override(Some(v)),
+                Some(true),
+                "{v:?} should force on"
+            );
+        }
+        for v in ["0", "false", "no", "off", " 0 "] {
+            assert_eq!(
+                Config::env_bootloader_override(Some(v)),
+                Some(false),
+                "{v:?} should force off"
+            );
+        }
+        for v in ["", "maybe", "2"] {
+            assert_eq!(
+                Config::env_bootloader_override(Some(v)),
+                None,
+                "{v:?} should defer to config"
+            );
+        }
+        assert_eq!(Config::env_bootloader_override(None), None);
+    }
+
+    #[test]
+    fn bootloader_defaults_off_with_canonical_text() {
+        // The experiment's A condition: default config has the bootloader
+        // OFF, so default sessions are byte-identical to today.
+        let c = Config::default();
+        assert!(!c.recall.bootloader);
+        assert_eq!(c.recall.bootloader_text, None);
+        // None override resolves to the operator-approved v1 wording.
+        assert_eq!(c.bootloader_text(), DEFAULT_BOOTLOADER_TEXT);
+        assert!(c.bootloader_text().starts_with("## Bootloader\n"));
+    }
+
+    #[test]
+    fn bootloader_text_override_wins_over_default() {
+        let mut c = Config::default();
+        c.recall.bootloader_text = Some("custom preamble".to_string());
+        assert_eq!(c.bootloader_text(), "custom preamble");
+    }
+
+    #[test]
+    fn recall_section_parses_bootloader_fields() {
+        let c: Config = toml::from_str(
+            r#"
+            [recall]
+            enabled = true
+            bootloader = true
+            bootloader_text = "hi"
+            "#,
+        )
+        .expect("parse");
+        assert!(c.recall.bootloader);
+        assert_eq!(c.recall.bootloader_text.as_deref(), Some("hi"));
+        // Omitting the [recall] keys leaves the defaults (off / None).
+        let d: Config = toml::from_str("[recall]\nenabled = true\n").expect("parse");
+        assert!(!d.recall.bootloader);
+        assert_eq!(d.recall.bootloader_text, None);
     }
 
     #[test]

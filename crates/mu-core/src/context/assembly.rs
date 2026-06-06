@@ -102,13 +102,22 @@ pub fn assemble_rope_with_context(
         ));
     }
 
-    // Recall spans (Memory + ProjectFile) between System and ToolSchemas.
-    // Both kinds get RetentionClass::Startup (stable + cacheable), so
-    // they extend the cacheable prefix downstream cache strategies
-    // can mark — see mu-bn4's AnthropicCacheStrategy.
+    // Recall spans (Bootloader + Memory + ProjectFile) between System and
+    // ToolSchemas. All kinds get RetentionClass::Startup (stable +
+    // cacheable), so they extend the cacheable prefix downstream cache
+    // strategies can mark — see mu-bn4's AnthropicCacheStrategy. Item
+    // order is the provider order from build_recall_providers, so a
+    // Bootloader item (when present) is items[0] → the first recall span.
     if let Some(ctx) = project_context {
         for item in &ctx.items {
             let (kind, id) = match &item.source {
+                // mu-recall-bootloader-flag-nxpo: distinct `bootloader:` id
+                // (greppable for the A/B first-span check) over the shared
+                // MemoryInjection span kind.
+                RecallSource::Bootloader => (
+                    SpanKind::MemoryInjection,
+                    format!("bootloader:{}", item.stable_id),
+                ),
                 RecallSource::Memory => (
                     SpanKind::MemoryInjection,
                     format!("memory-recall:{}", item.stable_id),
@@ -560,6 +569,62 @@ mod tests {
             );
             assert!(spans[idx].cacheable, "recall span {idx} must be cacheable",);
         }
+    }
+
+    #[test]
+    fn assemble_rope_with_context_bootloader_is_first_recall_span() {
+        // mu-recall-bootloader-flag-nxpo acceptance (terrain check): when a
+        // Bootloader item leads the ProjectContext (as build_recall_providers
+        // arranges when the flag is on), the FIRST recall span — index 1,
+        // right after the System span — is the bootloader, with a greppable
+        // `bootloader:` id, ahead of the memory + file segments.
+        use super::super::recall::{ProjectContext, RecallSource, RecalledItem};
+        use std::path::PathBuf;
+
+        let project_context = ProjectContext {
+            items: vec![
+                RecalledItem {
+                    source: RecallSource::Bootloader,
+                    content: "## Bootloader\norientation".into(),
+                    stable_id: "boot01".into(),
+                },
+                RecalledItem {
+                    source: RecallSource::Memory,
+                    content: "## Active Memory Context\n…".into(),
+                    stable_id: "abc123".into(),
+                },
+                RecalledItem {
+                    source: RecallSource::ProjectFile {
+                        path: PathBuf::from("/home/u/CLAUDE.md"),
+                    },
+                    content: "# CLAUDE.md\nsome content".into(),
+                    stable_id: "def456".into(),
+                },
+            ],
+        };
+
+        let messages = vec![AgentMessage::User {
+            content: "hi".into(),
+        }];
+        let rope = assemble_rope_with_context(
+            Some("you are mu"),
+            Some(&project_context),
+            &messages,
+            &[sample_tool()],
+        );
+
+        let spans = rope.spans();
+        // System is index 0; the bootloader is the first recall span (1).
+        assert_eq!(spans[0].kind, SpanKind::System);
+        assert_eq!(spans[1].kind, SpanKind::MemoryInjection);
+        assert_eq!(spans[1].id(), "bootloader:boot01");
+        assert!(spans[1].content().starts_with("## Bootloader"));
+        // ...and it precedes the memory + file segments.
+        assert_eq!(spans[2].id(), "memory-recall:abc123");
+        assert_eq!(spans[3].kind, SpanKind::FileLoad);
+        // First-position recall span keeps the cacheable Startup prefix.
+        assert!(spans[1].retention.is_stable());
+        assert!(spans[1].cacheable);
     }
 
     #[test]

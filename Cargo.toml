@@ -24,6 +24,14 @@ rust-version = "1.91"
 # runtime + I/O
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# mu-sqn: security floor for rustls-webpki, pulled transitively via reqwest's
+# rustls-tls stack. Clears dependabot GHSA-82j2-j2ch-gfr8 (high, CRL DoS panic,
+# fixed 0.103.13), GHSA-xgp8-3hg3-c2mh + GHSA-965h-392x-2mh5 (low, name-constraint
+# bypasses, fixed 0.103.12). The lockfile already resolves 0.103.13; this direct
+# floor makes that durable so a future `cargo update` can't silently drop below
+# the patched version and reopen the advisories. default-features = false keeps it
+# feature-neutral (features unify with what rustls already requests).
+rustls-webpki = { version = "0.103.13", default-features = false }
 futures = "0.3"
 async-trait = "0.1"
 

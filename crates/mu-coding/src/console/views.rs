@@ -44,7 +44,7 @@ pub(crate) fn render_sessions_index(state: Arc<AppState>) -> Html<String> {
             scan.skipped_entries, scan.malformed_files
         ));
     }
-    body.push_str("<table><thead><tr><th>last</th><th>daemon</th><th>session</th><th>provider</th><th>model</th><th>asks</th><th>calls</th><th>tools</th><th>input</th><th>output</th><th>cache read</th><th>cache write</th></tr></thead><tbody>");
+    body.push_str("<table><thead><tr><th>last</th><th>daemon</th><th>session</th><th>mark</th><th>provider</th><th>model</th><th>asks</th><th>calls</th><th>tools</th><th>input</th><th>output</th><th>cache read</th><th>cache write</th></tr></thead><tbody>");
     for s in scan.sessions {
         let href = state.href(&format!(
             "/sessions/{}/{}",
@@ -59,6 +59,9 @@ pub(crate) fn render_sessions_index(state: Arc<AppState>) -> Html<String> {
             esc_attr(&href),
             esc(&s.session_id)
         ));
+        // mu-index-mark-column-auiv: coverage at a glance — which
+        // sessions already carry an operator mark.
+        body.push_str(&td(&s.mark.map(stars).unwrap_or_else(|| "—".into())));
         body.push_str(&td(&s.provider.unwrap_or_else(|| "—".into())));
         body.push_str(&td(&s.model.unwrap_or_else(|| "—".into())));
         body.push_str(&td_num(s.ask_count));
@@ -291,6 +294,13 @@ fn session_header(
 /// by event id wins) plus the inline re-mark form. The form POSTs to
 /// the console's one write route; the page re-render then shows
 /// whatever the log says.
+/// mu-index-mark-column-auiv: `★★☆☆☆`-style rendering of a 1-5 rating,
+/// shared by the sessions index column and the session-header line.
+fn stars(rating: u8) -> String {
+    let filled = usize::from(rating).min(5);
+    format!("{}{}", "★".repeat(filled), "☆".repeat(5 - filled))
+}
+
 fn mark_line(
     state: &AppState,
     daemon_id: &str,
@@ -304,8 +314,7 @@ fn mark_line(
     let mut out = String::from("<p class=muted>mark: ");
     match &current {
         Some((rating, note)) => {
-            out.push_str(&"★".repeat(usize::from(*rating).min(5)));
-            out.push_str(&"☆".repeat(5usize.saturating_sub(usize::from(*rating))));
+            out.push_str(&stars(*rating));
             out.push_str(&format!(" {rating}/5"));
             if let Some(note) = note {
                 out.push_str(&format!(" — {}", esc(note)));

@@ -43,6 +43,9 @@ pub(crate) struct SessionSummary {
     pub(crate) context_assembly_count: u32,
     pub(crate) tool_call_count: u32,
     pub(crate) usage: Option<Usage>,
+    /// mu-index-mark-column-auiv: latest operator-mark rating, so the
+    /// index shows which sessions are already covered.
+    pub(crate) mark: Option<u8>,
 }
 
 pub(crate) fn scan_sessions(events_dir: &Path) -> ScanResult {
@@ -86,6 +89,7 @@ pub(crate) fn scan_sessions(events_dir: &Path) -> ScanResult {
                         context_assembly_count: log.context_assembly_count(),
                         tool_call_count: log.tool_call_count(),
                         usage: log.live_usage().0.or_else(|| log.cumulative_usage()),
+                        mark: log.latest_operator_mark().map(|(rating, _)| rating),
                     });
                 }
                 Err(_) => result.malformed_files += 1,

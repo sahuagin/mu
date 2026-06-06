@@ -212,6 +212,14 @@ fn session_spawn_tools(
             daemon_info.clone(),
             Some(session_id.to_string()),
         )));
+        // mu-watch-tool-wakeup-o03p: the `watch` tool — spawn a command,
+        // wake THIS session when it exits. Same WEAK-handle discipline as
+        // spawn_worker (it lives in this session's own tool list), and
+        // scoped to this session_id so the wakeup routes back here.
+        tools.push(Arc::new(crate::tools::WatchTool::new(
+            sessions.downgrade(),
+            session_id.to_string(),
+        )));
     }
     tools
 }
@@ -1506,6 +1514,34 @@ mod tests {
         assert!(
             tools.iter().any(|t| t.spec().name == "spawn_worker"),
             "production session should get a spawn_worker tool",
+        );
+    }
+
+    // mu-watch-tool-wakeup-o03p: the watch tool is injected per-session
+    // alongside spawn_worker (production only), scoped to the session id
+    // so a finished watch wakes the caller.
+    #[test]
+    fn session_spawn_tools_injects_watch_in_production() {
+        let base: Vec<Arc<dyn Tool>> = vec![];
+        let sessions = Sessions::new();
+        let di = DaemonInfo::new("test")
+            .with_events_dir(Some(std::path::PathBuf::from("/tmp/mu-test-events")));
+        let tools = session_spawn_tools(&base, &sessions, &di, "session-42");
+        assert!(
+            tools.iter().any(|t| t.spec().name == "watch"),
+            "production session should get a watch tool",
+        );
+    }
+
+    #[test]
+    fn session_spawn_tools_omits_watch_without_events_dir() {
+        let base: Vec<Arc<dyn Tool>> = vec![];
+        let sessions = Sessions::new();
+        let di = DaemonInfo::new("test"); // no events_dir (tests / ephemeral)
+        let tools = session_spawn_tools(&base, &sessions, &di, "session-42");
+        assert!(
+            !tools.iter().any(|t| t.spec().name == "watch"),
+            "no events_dir => no watch tool",
         );
     }
 

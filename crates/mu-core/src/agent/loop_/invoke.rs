@@ -144,6 +144,7 @@ pub(crate) async fn handle_invoke_llm(
                 | Some(input @ AgentInput::StartAutonomous { .. })
                 | Some(input @ AgentInput::ScheduleWakeup { .. })
                 | Some(input @ AgentInput::SwitchProvider { .. })
+                | Some(input @ AgentInput::WatchCompleted { .. })
                 | Some(input @ AgentInput::MailboxMessage { .. }) => {
                     buffered.push(input);
                 }

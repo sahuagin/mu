@@ -174,6 +174,25 @@ pub enum AgentInput {
         subject: String,
         seq: u64,
     },
+    /// mu-watch-tool-wakeup-o03p: a watched command (registered via the
+    /// `watch` tool) has exited (or timed out and was killed). This is
+    /// the EVENT sibling of `ScheduleWakeup`'s TIMER: where the timer
+    /// resumes an autonomous run at N+1 after a wall-clock delay, this
+    /// wakes the session — autonomous OR idle — the moment a process
+    /// it was waiting on finishes. Injected by the watch tool's
+    /// background task over the same input channel (the "wakeup
+    /// channel", spec mu-036 line 59), NOT a parallel bespoke path. The
+    /// loop synthesizes a UserMessage from `note` + `summary` and queues
+    /// InvokeLlm so the result lands as the next turn's motivation. A
+    /// timed-out / killed watch still sends this (with a killed status)
+    /// so silence is impossible: a watch that dies is indistinguishable
+    /// from one still running unless it always wakes the model.
+    WatchCompleted {
+        /// The model-supplied label for the watch (e.g. "CI for PR 42").
+        note: String,
+        /// Human-readable result: exit status line + output tail.
+        summary: String,
+    },
 }
 
 impl std::fmt::Debug for AgentInput {
@@ -211,6 +230,9 @@ impl std::fmt::Debug for AgentInput {
                 ..
             } => {
                 write!(f, "MailboxMessage(from={from_session_id}, seq={seq})")
+            }
+            Self::WatchCompleted { note, .. } => {
+                write!(f, "WatchCompleted(note={note})")
             }
         }
     }
@@ -862,6 +884,7 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                 AgentInput::UserMessage(_)
                 | AgentInput::StartAutonomous { .. }
                 | AgentInput::ScheduleWakeup { .. }
+                | AgentInput::WatchCompleted { .. }
                 | AgentInput::MailboxMessage { .. } => {
                     queue.push_back(Action::External(input));
                 }
@@ -940,6 +963,31 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                     "[Mailbox] New {message_kind} message (seq {seq}) from session {from_session_id}: {subject}\n\
                      Read it with mu_mailbox_read, then act on it."
                 );
+                let msg = AgentMessage::User {
+                    content: notification,
+                };
+                let _ = events
+                    .send(AgentEvent::MessageStart {
+                        message: msg.clone(),
+                    })
+                    .await;
+                messages.push(msg.clone());
+                let _ = events.send(AgentEvent::MessageEnd { message: msg }).await;
+                if should_push_invoke_llm(&queue) {
+                    queue.push_back(Action::InvokeLlm);
+                }
+            }
+            Action::External(AgentInput::WatchCompleted { note, summary }) => {
+                // mu-watch-tool-wakeup-o03p: a watched command finished.
+                // Inject the result as a User message and run the LLM —
+                // the same "external attention wakes an idle session"
+                // shape as MailboxMessage, but the result is carried
+                // INLINE (no go-read-your-mailbox indirection) so it
+                // lands directly as the woken turn's motivation. Works
+                // whether the session was idle (parked on input_rx.recv)
+                // or mid-autonomous-run (queued behind the current work).
+                let notification =
+                    format!("[Watch] '{note}' finished.\n{summary}\n\nAct on this result.");
                 let msg = AgentMessage::User {
                     content: notification,
                 };
@@ -1616,6 +1664,7 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                         AgentInput::UserMessage(_)
                         | AgentInput::StartAutonomous { .. }
                         | AgentInput::ScheduleWakeup { .. }
+                        | AgentInput::WatchCompleted { .. }
                         | AgentInput::MailboxMessage { .. } => {
                             queue.push_back(Action::External(input));
                         }

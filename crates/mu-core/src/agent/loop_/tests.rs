@@ -3014,3 +3014,61 @@ async fn c3_schedule_wakeup_outside_autonomous_is_declined() {
         events.iter().map(kind).collect::<Vec<_>>()
     );
 }
+
+// ============================================================================
+// mu-watch-tool-wakeup-o03p: AgentInput::WatchCompleted
+// ============================================================================
+//
+// The EVENT sibling of ScheduleWakeup's TIMER. A finished watch wakes an
+// IDLE session over the same input channel: the loop synthesizes a user
+// message carrying the watch result INLINE and runs the LLM, so the
+// result lands as the woken turn's motivation (no autonomous run, no
+// go-read-your-mailbox indirection).
+
+/// W-1: a WatchCompleted input wakes an idle session, injects the result
+/// as a user message, and drives exactly one LLM turn.
+#[tokio::test]
+async fn w1_watch_completed_wakes_idle_session_with_inline_result() {
+    let provider = MockProvider::new(vec![vec![
+        ProviderEvent::TextDelta("on it".into()),
+        ProviderEvent::Done(assistant_text("on it")),
+    ]]);
+    let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
+
+    loop_
+        .send(AgentInput::WatchCompleted {
+            note: "CI for PR 42".to_owned(),
+            summary: "Exit status: 0\nstdout:\nall checks passed".to_owned(),
+        })
+        .await
+        .expect("send watch-completed");
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+
+    // The synthesized wake message carries the note + summary inline.
+    let woke_with_result = events.iter().any(|e| match e {
+        AgentEvent::MessageStart {
+            message: AgentMessage::User { content },
+        } => content.contains("CI for PR 42") && content.contains("all checks passed"),
+        _ => false,
+    });
+    assert!(
+        woke_with_result,
+        "watch result must be injected inline as a user message; kinds={:?}",
+        events.iter().map(kind).collect::<Vec<_>>()
+    );
+
+    // The wake drove exactly one provider turn (the loop actually ran the
+    // LLM rather than just buffering the input).
+    let turns = events.iter().filter(|e| kind(e) == "turn_start").count();
+    assert_eq!(turns, 1, "exactly one LLM turn after the wake");
+    if let Some(AgentEvent::Done { turn_count, .. }) = events.last() {
+        assert_eq!(*turn_count, 1);
+    } else {
+        panic!("last event must be Done");
+    }
+}

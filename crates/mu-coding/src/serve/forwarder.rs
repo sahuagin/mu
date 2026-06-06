@@ -211,7 +211,12 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
         // durable event log (mu-032 v1 / mu-za92 — see to_log_event);
         // wire-level exposure is a future TUI/web-ui feature when
         // there's a consumer.
-        AgentEvent::AgentStart
+        // mu-036 Phase C: schedule_wakeup parking lands durably (see
+        // to_log_event) but has no wire-notification method in mu-036's
+        // surface — the next AutonomousIterationStarted on wake carries
+        // the wake reason as its motivation, which clients observe.
+        AgentEvent::AutonomousScheduledWakeup { .. }
+        | AgentEvent::AgentStart
         | AgentEvent::TurnStart
         | AgentEvent::TurnEnd
         | AgentEvent::MessageStart { .. }
@@ -669,6 +674,16 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
             EventPayload::AutonomousIterationCompleted {
                 iteration: *iteration,
                 outcome: outcome.clone(),
+            },
+        )),
+        AgentEvent::AutonomousScheduledWakeup {
+            wake_at_unix_ms,
+            reason,
+        } => Some((
+            EventActor::Agent,
+            EventPayload::AutonomousScheduledWakeup {
+                wake_at_unix_ms: *wake_at_unix_ms,
+                reason: reason.clone(),
             },
         )),
         AgentEvent::AutonomousTerminated { reason } => Some((

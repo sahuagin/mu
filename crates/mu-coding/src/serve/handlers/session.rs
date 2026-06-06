@@ -18,10 +18,10 @@ use mu_core::protocol::{
     CancelSessionRequest, CancelSessionResponse, CloseSessionRequest, CloseSessionResponse,
     CreateSessionRequest, CreateSessionResponse, DelegateSessionRequest, DelegateSessionResponse,
     PingResponse, ProviderSelector, Request, RespondToInputRequiredRequest,
-    RespondToInputRequiredResponse, Response, ScheduleWakeupRequest, SessionEventsRequest,
-    SessionEventsResponse, SessionListRequest, SessionListResponse, SessionStatsRequest,
-    SessionStatsResponse, SetRouteRequest, SetRouteResponse, SpawnWorkerRequest,
-    SpawnWorkerResponse, StartAutonomousRequest, StartAutonomousResponse,
+    RespondToInputRequiredResponse, Response, ScheduleWakeupRequest, ScheduleWakeupResponse,
+    SessionEventsRequest, SessionEventsResponse, SessionListRequest, SessionListResponse,
+    SessionStatsRequest, SessionStatsResponse, SetRouteRequest, SetRouteResponse,
+    SpawnWorkerRequest, SpawnWorkerResponse, StartAutonomousRequest, StartAutonomousResponse,
 };
 use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
 
@@ -855,10 +855,20 @@ pub async fn handle_start_autonomous(
     }
 }
 
-/// mu-036 Phase A.2: stub for session.schedule_wakeup. Same shape
-/// as handle_start_autonomous — wire surface is complete, agent-
-/// loop wiring is Phase C (mu-7zn).
-pub fn handle_schedule_wakeup(request: Request<Value>, sessions: Sessions) -> Response<Value> {
+/// mu-036 Phase C (mu-7zn): session.schedule_wakeup handler.
+///
+/// Validates that exactly one of `wake_at_unix_ms` / `sleep_for_ms`
+/// is set and that the session's capability grants
+/// `allow_schedule_wakeup` (INV-1), resolves the relative
+/// `sleep_for_ms` to an absolute wall-clock instant, then sends
+/// `AgentInput::ScheduleWakeup` into the session's input channel.
+/// The agent loop parks itself in `RunMode::Sleeping` and resumes the
+/// autonomous run at iteration N+1 on wake (INV-5: no model/tool
+/// budget consumed while parked).
+pub async fn handle_schedule_wakeup(
+    request: Request<Value>,
+    sessions: Sessions,
+) -> Response<Value> {
     use mu_core::capability::AutonomyCapability;
 
     let params: ScheduleWakeupRequest = match serde_json::from_value(request.params.clone()) {
@@ -914,13 +924,54 @@ pub fn handle_schedule_wakeup(request: Request<Value>, sessions: Sessions) -> Re
                 .to_string(),
         );
     }
-    err_response(
-        request.id,
-        codes::INTERNAL_ERROR,
-        "session.schedule_wakeup: wire surface ready (Phase A.2); \
-         agent-loop integration is Phase C (bead mu-7zn)."
-            .to_string(),
-    )
+
+    // Resolve to an absolute wall-clock wake time. `sleep_for_ms` is
+    // relative to now; `wake_at_unix_ms` is already absolute. The
+    // exactly-one invariant above guarantees one branch is taken.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let scheduled_for_unix_ms = match (params.wake_at_unix_ms, params.sleep_for_ms) {
+        (Some(at), None) => at,
+        (None, Some(sleep)) => now_ms.saturating_add(sleep),
+        // Unreachable given the exactly-one check above.
+        _ => now_ms,
+    };
+
+    let sender = sessions.input_sender(&params.session_id);
+    match sender {
+        None => err_response(
+            request.id,
+            codes::INVALID_PARAMS,
+            format!(
+                "session.schedule_wakeup: session not found: {}",
+                params.session_id
+            ),
+        ),
+        Some(tx) => {
+            match tx
+                .send(AgentInput::ScheduleWakeup {
+                    wake_at_unix_ms: scheduled_for_unix_ms,
+                    reason: params.reason,
+                })
+                .await
+            {
+                Ok(_) => {
+                    let resp = ScheduleWakeupResponse {
+                        accepted: true,
+                        scheduled_for_unix_ms,
+                    };
+                    ok_response(request.id, to_value_or_null(resp))
+                }
+                Err(_) => err_response(
+                    request.id,
+                    codes::INTERNAL_ERROR,
+                    "session.schedule_wakeup: session loop has terminated",
+                ),
+            }
+        }
+    }
 }
 
 /// mu-k56u: swap the provider+model on a live session between turns.

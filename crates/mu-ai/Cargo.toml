@@ -12,6 +12,11 @@ rust-version.workspace = true
 mu-core = { path = "../mu-core" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
+# mu-sqn: anchors the workspace rustls-webpki security floor (see root
+# Cargo.toml). mu-ai owns the outbound TLS calls (anthropic/openai/openrouter),
+# so the version guard for the rustls-tls cert path lives here. Not imported
+# directly — the floor takes effect by being a resolved direct dependency.
+rustls-webpki = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

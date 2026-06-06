@@ -151,6 +151,14 @@ enum Command {
         /// Path to analytics DB. Default: ~/.local/share/mu/telemetry.sqlite.
         #[arg(long, value_name = "PATH")]
         analytics_db: Option<std::path::PathBuf>,
+        /// mu-cc-sessions-console-lqqt.1: also merge claude-code sessions
+        /// from ~/.claude-personal/projects/ into the index (read-only).
+        #[arg(long)]
+        cc_sessions: bool,
+        /// Override the claude-code projects dir to scan. Implies
+        /// --cc-sessions. Default with --cc-sessions: ~/.claude-personal/projects.
+        #[arg(long, value_name = "PATH")]
+        cc_projects_dir: Option<std::path::PathBuf>,
     },
     /// Append an operator quality mark (1-5) to a session's event log.
     /// Quit-time capture for degraded (or excellent) sessions — the
@@ -353,6 +361,8 @@ async fn main() -> Result<()> {
             base_path,
             events_dir,
             analytics_db,
+            cc_sessions,
+            cc_projects_dir,
         } => {
             let events_dir = match events_dir {
                 Some(p) => p,
@@ -364,11 +374,24 @@ async fn main() -> Result<()> {
                 Some(p) => Some(p),
                 None => mu_coding::analytics::default_db_path(),
             };
+            // mu-cc-sessions-console-lqqt.1: an explicit --cc-projects-dir
+            // implies inclusion; bare --cc-sessions uses the default root.
+            // Without either flag, cc scanning stays off.
+            let cc_projects_dir = match cc_projects_dir {
+                Some(p) => Some(p),
+                None if cc_sessions => {
+                    Some(mu_coding::console::default_cc_projects_dir().context(
+                        "could not resolve default cc projects dir; pass --cc-projects-dir PATH",
+                    )?)
+                }
+                None => None,
+            };
             mu_coding::console::run(mu_coding::console::ConsoleOptions {
                 bind,
                 base_path,
                 events_dir,
                 analytics_db,
+                cc_projects_dir,
             })
             .await
         }

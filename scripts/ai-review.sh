@@ -180,15 +180,32 @@ verdict_of() { # stdin -> APPROVE | REJECT | UNCLEAR
   elif printf '%s' "$out" | grep -qiE 'VERDICT[^A-Za-z]{1,8}APPROVE'; then echo APPROVE
   else echo UNCLEAR; fi
 }
+# Escape a value for embedding inside a JSON string (no surrounding quotes
+# added). Pure bash, no jq dependency — this gate runs on boxes where jq may be
+# absent (pots, fresh hosts), and the script already degrades gracefully on its
+# other tools. Without this, a provider/model/base/verdict value containing a
+# double-quote or backslash would corrupt review-events.jsonl, which the
+# mu-mucm dashboards parse line-by-line. Backslash MUST be escaped first so the
+# escapes added by the later substitutions are not themselves re-escaped.
+# (bead mu-ai-review-log-escaping-augj)
+json_escape() { # $1=raw -> JSON-string-safe text on stdout
+  local s=$1
+  s=${s//\\/\\\\}      # backslash  -> \\   (first, see note above)
+  s=${s//\"/\\\"}      # double quote -> \"
+  s=${s//$'\n'/\\n}    # newline    -> \n
+  s=${s//$'\r'/\\r}    # carriage return -> \r
+  s=${s//$'\t'/\\t}    # tab        -> \t
+  printf '%s' "$s"
+}
 log_reviewer() { # $1=role $2=provider $3=model $4=verdict
   mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
   printf '{"ts":"%s","event":"reviewer","role":"%s","provider":"%s","model":"%s","verdict":"%s","base":"%s","files_changed":%s}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" "$4" "$BASE" "$FILES" >> "$LOG"
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$(json_escape "$2")" "$(json_escape "$3")" "$(json_escape "$4")" "$(json_escape "$BASE")" "$FILES" >> "$LOG"
 }
 log_panel() { # $1=outcome(PASS|BLOCK|ESCALATE) $2=override(true|false)
   mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
   printf '{"ts":"%s","event":"panel","outcome":"%s","r1_provider":"%s","r1_model":"%s","r1_verdict":"%s","r2_provider":"%s","r2_model":"%s","r2_verdict":"%s","base":"%s","files_changed":%s,"override":%s}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$PROVIDER" "$MODEL" "$V1" "$PROVIDER2" "$MODEL2" "$V2" "$BASE" "$FILES" "$2" >> "$LOG"
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$(json_escape "$PROVIDER")" "$(json_escape "$MODEL")" "$(json_escape "$V1")" "$(json_escape "$PROVIDER2")" "$(json_escape "$MODEL2")" "$(json_escape "$V2")" "$(json_escape "$BASE")" "$FILES" "$2" >> "$LOG"
 }
 
 # --- run the panel: both reviewers, same diff, sequentially ----------------

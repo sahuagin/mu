@@ -26,7 +26,7 @@ use execute_tools::ToolHistory;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -143,6 +143,18 @@ pub enum AgentInput {
         goal: String,
         options: AutonomyOptions,
     },
+    /// mu-036 Phase C (mu-7zn): park the autonomous loop until
+    /// `wake_at_unix_ms` (wall-clock). The daemon's
+    /// `handle_schedule_wakeup` constructs this after checking the
+    /// session's `AutonomyCapability::Allowed { allow_schedule_wakeup:
+    /// true }` and resolving `sleep_for_ms` to an absolute time.
+    /// Honored only while the session is in `RunMode::Autonomous`; on
+    /// wake the loop resumes at iteration N+1 with `reason` as the
+    /// motivation (INV-5: no model/tool budget consumed while parked).
+    ScheduleWakeup {
+        wake_at_unix_ms: u64,
+        reason: String,
+    },
     /// mu-k56u: replace the provider between turns. The loop swaps
     /// its local provider variable and emits a ProviderSwitched event.
     /// Carries provider_kind + model alongside the provider instance
@@ -177,6 +189,14 @@ impl std::fmt::Debug for AgentInput {
                 .debug_struct("StartAutonomous")
                 .field("goal", goal)
                 .field("options", options)
+                .finish(),
+            Self::ScheduleWakeup {
+                wake_at_unix_ms,
+                reason,
+            } => f
+                .debug_struct("ScheduleWakeup")
+                .field("wake_at_unix_ms", wake_at_unix_ms)
+                .field("reason", reason)
                 .finish(),
             Self::SwitchProvider {
                 provider_kind,
@@ -432,6 +452,17 @@ pub enum AgentEvent {
     AutonomousIterationCompleted {
         iteration: u32,
         outcome: AutonomousIterationOutcome,
+    },
+    /// mu-036 Phase C (mu-7zn): the autonomous loop parked itself via
+    /// `session.schedule_wakeup` until `wake_at_unix_ms` (wall-clock).
+    /// Durable-only: maps to `EventPayload::AutonomousScheduledWakeup`
+    /// in the event log. mu-036's wire-notification surface does not
+    /// include a scheduled-wakeup method, so the forwarder emits no
+    /// notification for it (the next `AutonomousIterationStarted` on
+    /// wake carries `reason` as its motivation, which clients observe).
+    AutonomousScheduledWakeup {
+        wake_at_unix_ms: u64,
+        reason: String,
     },
     /// mu-036 Phase B: autonomous-mode loop terminated. Always the
     /// final autonomy event for a run (INV-7). Session returns to
@@ -830,6 +861,7 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                 }
                 AgentInput::UserMessage(_)
                 | AgentInput::StartAutonomous { .. }
+                | AgentInput::ScheduleWakeup { .. }
                 | AgentInput::MailboxMessage { .. } => {
                     queue.push_back(Action::External(input));
                 }
@@ -1000,6 +1032,224 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                     .await;
                 queue.push_back(Action::InvokeLlm);
                 let _ = (max_wall_clock_ms, max_total_tool_calls);
+            }
+            Action::External(AgentInput::ScheduleWakeup {
+                wake_at_unix_ms,
+                reason,
+            }) => {
+                // mu-036 Phase C (mu-7zn). schedule_wakeup is only
+                // meaningful mid-autonomous-run: the spec frames
+                // Sleeping as a sub-state of an autonomous loop ("on
+                // wake, return to RunMode::Autonomous"). Outside that
+                // context there is no iteration to resume, so decline
+                // with a warning callout rather than invent a new
+                // "sleep then idle" semantic (spec-boundary discipline).
+                // The dispatch handler already gates the capability.
+                let (iteration, goal, options, auto_started_at, tool_calls_consumed) = match &mode {
+                    RunMode::Autonomous {
+                        iteration,
+                        goal,
+                        options,
+                        started_at,
+                        tool_calls_consumed,
+                    } => (
+                        *iteration,
+                        goal.clone(),
+                        options.clone(),
+                        *started_at,
+                        *tool_calls_consumed,
+                    ),
+                    _ => {
+                        let _ = events
+                            .send(AgentEvent::Callout {
+                                category: "warning".to_owned(),
+                                title: "schedule_wakeup ignored".to_owned(),
+                                body: serde_json::json!({
+                                    "reason": "session is not in autonomous mode; \
+                                               schedule_wakeup is only honored mid-run",
+                                }),
+                                theme: Some("warning".to_owned()),
+                                context_refs: vec!["spec:mu-036".to_owned()],
+                            })
+                            .await;
+                        continue;
+                    }
+                };
+
+                // Resolve the wall-clock wake target to a monotonic
+                // deadline. `wake_at_unix_ms` is already absolute (the
+                // daemon resolved any `sleep_for_ms` before sending).
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let sleep_ms = wake_at_unix_ms.saturating_sub(now_ms);
+                let wake_at = Instant::now() + Duration::from_millis(sleep_ms);
+
+                // INV-6: bracket the current iteration with a Completed
+                // before parking (the iteration's chosen action was "go
+                // to sleep"; it continues logically as N+1 on wake).
+                let _ = events
+                    .send(AgentEvent::AutonomousIterationCompleted {
+                        iteration,
+                        outcome: AutonomousIterationOutcome::Continue,
+                    })
+                    .await;
+                // Durable park marker (INV-5 / audit trail). No wire
+                // notification — not part of mu-036's wire surface.
+                let _ = events
+                    .send(AgentEvent::AutonomousScheduledWakeup {
+                        wake_at_unix_ms,
+                        reason: reason.clone(),
+                    })
+                    .await;
+
+                mode = RunMode::Sleeping {
+                    wake_at,
+                    reason: reason.clone(),
+                    iteration,
+                    goal,
+                    options,
+                    started_at: auto_started_at,
+                    tool_calls_consumed,
+                };
+
+                // Park: hold a tokio sleep future. While here we make no
+                // provider or tool calls (INV-5). A Cancel still
+                // terminates promptly; other inputs are buffered and
+                // replayed after wake. Long sleeps are the whole point
+                // (overnight watchdogs), so the sleep stays cancellable.
+                let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at));
+                tokio::pin!(sleep);
+                let mut buffered: Vec<AgentInput> = Vec::new();
+                let cancelled = loop {
+                    tokio::select! {
+                        _ = &mut sleep => break false,
+                        maybe = input_rx.recv() => match maybe {
+                            Some(AgentInput::Cancel) => break true,
+                            Some(AgentInput::CancelOutstanding { .. }) => {}
+                            Some(other) => buffered.push(other),
+                            None => break true, // channel closed → shut down
+                        }
+                    }
+                };
+
+                if cancelled {
+                    let _ = events
+                        .send(AgentEvent::AutonomousTerminated {
+                            reason: AutonomousTerminationReason::Cancelled,
+                        })
+                        .await;
+                    return Outcome::Cancelled;
+                }
+
+                // Woke naturally. Recover the suspended autonomous
+                // context from the Sleeping mode.
+                let (iteration, goal, options, auto_started_at, tool_calls_consumed) = match mode {
+                    RunMode::Sleeping {
+                        iteration,
+                        goal,
+                        options,
+                        started_at,
+                        tool_calls_consumed,
+                        ..
+                    } => (iteration, goal, options, started_at, tool_calls_consumed),
+                    _ => unreachable!("mode is Sleeping inside the wakeup handler"),
+                };
+
+                // INV-2 / INV-5: re-check bounds on wake. Wall-clock
+                // kept accruing while we slept, so a session that slept
+                // past max_wall_clock_ms terminates here rather than
+                // running another iteration.
+                let next_iter = iteration.saturating_add(1);
+                let (cap_max_iter, cap_max_wall, cap_max_tools) = {
+                    let cap = capability.lock().ok();
+                    match cap.as_ref().map(|c| c.autonomy.clone()) {
+                        Some(AutonomyCapability::Allowed {
+                            max_iterations,
+                            max_wall_clock_ms,
+                            max_total_tool_calls_in_autonomy,
+                            ..
+                        }) => (
+                            max_iterations,
+                            max_wall_clock_ms,
+                            max_total_tool_calls_in_autonomy,
+                        ),
+                        _ => (0, 0, 0),
+                    }
+                };
+                let effective_max_iter = options
+                    .max_iterations
+                    .map(|o| o.min(cap_max_iter))
+                    .unwrap_or(cap_max_iter);
+                let elapsed_ms_total = auto_started_at.elapsed().as_millis() as u64;
+                let terminal_reason: Option<AutonomousTerminationReason> =
+                    if next_iter > effective_max_iter {
+                        Some(AutonomousTerminationReason::IterationCap)
+                    } else if elapsed_ms_total >= cap_max_wall {
+                        Some(AutonomousTerminationReason::WallClockExpired)
+                    } else if tool_calls_consumed >= cap_max_tools {
+                        Some(AutonomousTerminationReason::ToolCallCapExhausted)
+                    } else {
+                        None
+                    };
+
+                // Replay inputs buffered during the sleep so nothing is
+                // lost, whether we resume or terminate.
+                for input in buffered {
+                    queue.push_back(Action::External(input));
+                }
+
+                if let Some(reason_term) = terminal_reason {
+                    let _ = events
+                        .send(AgentEvent::AutonomousTerminated {
+                            reason: reason_term,
+                        })
+                        .await;
+                    mode = RunMode::Idle;
+                    let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
+                    let stop_reason = last_stop_reason.take().unwrap_or(StopReason::EndTurn);
+                    let _ = events
+                        .send(AgentEvent::Done {
+                            stop_reason,
+                            turn_count,
+                            usage: aggregated_usage.take(),
+                            elapsed_ms,
+                        })
+                        .await;
+                    started_at = None;
+                    turn_count = 0;
+                    tool_history.clear();
+                    continue;
+                }
+
+                // Resume the autonomous run at iteration N+1, injecting
+                // the wake reason as the next iteration's motivation
+                // (spec §"Wake-up scheduling").
+                mode = RunMode::Autonomous {
+                    iteration: next_iter,
+                    goal,
+                    options,
+                    started_at: auto_started_at,
+                    tool_calls_consumed,
+                };
+                let _ = events
+                    .send(AgentEvent::AutonomousIterationStarted {
+                        iteration: next_iter,
+                        motivation: reason.clone(),
+                    })
+                    .await;
+                let wake_msg = AgentMessage::User { content: reason };
+                let _ = events
+                    .send(AgentEvent::MessageStart {
+                        message: wake_msg.clone(),
+                    })
+                    .await;
+                messages.push(wake_msg.clone());
+                let _ = events
+                    .send(AgentEvent::MessageEnd { message: wake_msg })
+                    .await;
+                queue.push_back(Action::InvokeLlm);
             }
             Action::InvokeLlm => {
                 if turn_count >= config.max_turns {
@@ -1365,6 +1615,7 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                         }
                         AgentInput::UserMessage(_)
                         | AgentInput::StartAutonomous { .. }
+                        | AgentInput::ScheduleWakeup { .. }
                         | AgentInput::MailboxMessage { .. } => {
                             queue.push_back(Action::External(input));
                         }

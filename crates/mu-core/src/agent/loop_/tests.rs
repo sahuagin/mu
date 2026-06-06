@@ -384,6 +384,7 @@ fn kind(event: &AgentEvent) -> &'static str {
         AgentEvent::ProviderStatus { .. } => "provider_status",
         AgentEvent::AutonomousIterationStarted { .. } => "autonomous_iteration_started",
         AgentEvent::AutonomousIterationCompleted { .. } => "autonomous_iteration_completed",
+        AgentEvent::AutonomousScheduledWakeup { .. } => "autonomous_scheduled_wakeup",
         AgentEvent::AutonomousTerminated { .. } => "autonomous_terminated",
         AgentEvent::ProviderSwitched { .. } => "provider_switched",
     }
@@ -2708,5 +2709,308 @@ async fn wsgx_provider_feedback_triggers_compaction_raw_estimate_would_not() {
         "exactly one compaction, on the tool follow-up call, anchored \
          on call 1's 200K reported prompt total; events: {:?}",
         events.iter().map(kind).collect::<Vec<_>>(),
+    );
+}
+
+// ============================================================================
+// mu-036 Phase C (mu-7zn): schedule_wakeup + RunMode::Sleeping
+// ============================================================================
+//
+// These exercise the agent loop's wakeup-parking path driven by
+// AgentInput::ScheduleWakeup. They verify the spec's Wake-up tests:
+//   - parks the session and resumes the autonomous run at iteration N+1
+//     with the wake reason as that iteration's motivation (INV-5/INV-6)
+//   - no provider call fires before the park (the iteration that chose
+//     to sleep does no model work)
+//   - bounds are re-checked on wake: a session that slept past
+//     max_wall_clock_ms terminates with WallClockExpired instead of
+//     resuming (INV-2/INV-5)
+//   - schedule_wakeup outside autonomous mode is declined with a
+//     warning callout rather than improvising a new semantic
+
+fn autonomy_allowed_wakeup(
+    max_iter: u32,
+    max_wall_clock_ms: u64,
+) -> crate::capability::AutonomyCapability {
+    crate::capability::AutonomyCapability::Allowed {
+        max_iterations: max_iter,
+        max_wall_clock_ms,
+        max_total_tool_calls_in_autonomy: 100,
+        allow_schedule_wakeup: true,
+        allow_delegate_grader: false,
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Drain events, holding the loop alive, until `AutonomousTerminated`
+/// (inclusive) or the events channel closes. Keeping the loop's input
+/// sender alive is what lets the in-flight `schedule_wakeup` sleep fire
+/// naturally rather than being interrupted by channel-close.
+async fn collect_until_terminated(rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        let stop = matches!(ev, AgentEvent::AutonomousTerminated { .. });
+        events.push(ev);
+        if stop {
+            break;
+        }
+    }
+    events
+}
+
+/// C-1: schedule_wakeup parks the autonomous loop and resumes at N+1.
+///
+/// Capability allows wakeup, max_iterations: 2, generous wall-clock.
+/// Iteration 1 immediately schedules a short wakeup (before any model
+/// call). The loop brackets iteration 1 with a Completed, emits
+/// AutonomousScheduledWakeup, parks on a real (short) sleep, then wakes
+/// and resumes at iteration 2 with the wake reason as the motivation.
+/// Iteration 2 runs the provider once and the run terminates at the
+/// iteration cap.
+#[tokio::test]
+async fn c1_schedule_wakeup_parks_and_resumes_at_n_plus_1() {
+    let provider = MockProvider::forever(vec![ProviderEvent::Done(assistant_text("working"))]);
+    let (loop_, mut events_rx) = spawn_loop_with_autonomy(
+        provider,
+        vec![],
+        AgentConfig::default(),
+        autonomy_allowed_wakeup(2, 60_000),
+    );
+
+    loop_
+        .send(AgentInput::StartAutonomous {
+            goal: "watch then continue".to_owned(),
+            options: crate::protocol::AutonomyOptions::default(),
+        })
+        .await
+        .expect("send start");
+    let wake_at = now_unix_ms() + 50;
+    let reason = "recheck CI status".to_owned();
+    loop_
+        .send(AgentInput::ScheduleWakeup {
+            wake_at_unix_ms: wake_at,
+            reason: reason.clone(),
+        })
+        .await
+        .expect("send wakeup");
+
+    let events = timeout(
+        Duration::from_secs(5),
+        collect_until_terminated(&mut events_rx),
+    )
+    .await
+    .expect("loop terminated within timeout");
+    drop(loop_);
+
+    let kinds: Vec<&str> = events.iter().map(kind).collect();
+
+    // Exactly one park marker.
+    let wakeups: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::AutonomousScheduledWakeup { .. }))
+        .collect();
+    assert_eq!(
+        wakeups.len(),
+        1,
+        "expected one scheduled-wakeup; got {kinds:?}"
+    );
+    match wakeups[0] {
+        AgentEvent::AutonomousScheduledWakeup {
+            wake_at_unix_ms,
+            reason: r,
+        } => {
+            assert_eq!(*wake_at_unix_ms, wake_at, "wake time round-trips");
+            assert_eq!(r, &reason, "wake reason round-trips");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // Two iteration starts; the second's motivation is the wake reason.
+    let starts: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::AutonomousIterationStarted { .. }))
+        .collect();
+    assert_eq!(
+        starts.len(),
+        2,
+        "expected 2 iteration starts; got {kinds:?}"
+    );
+    match starts[1] {
+        AgentEvent::AutonomousIterationStarted {
+            iteration,
+            motivation,
+        } => {
+            assert_eq!(*iteration, 2, "resumes at iteration 2");
+            assert_eq!(
+                motivation, &reason,
+                "wake reason becomes iteration 2's motivation"
+            );
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // INV-6: iteration 1 is bracketed with a Completed before the park.
+    let completes: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::AutonomousIterationCompleted { .. }))
+        .collect();
+    assert!(
+        completes.len() >= 2,
+        "both iterations completed; got {kinds:?}"
+    );
+
+    // INV-5 proxy: no provider call (TurnStart) fires before the park —
+    // the iteration that scheduled the wakeup did no model work.
+    let wakeup_idx = kinds
+        .iter()
+        .position(|k| *k == "autonomous_scheduled_wakeup")
+        .expect("scheduled wakeup present");
+    let first_turn_idx = kinds.iter().position(|k| *k == "turn_start");
+    if let Some(turn_idx) = first_turn_idx {
+        assert!(
+            turn_idx > wakeup_idx,
+            "first provider TurnStart must come AFTER the park (no model \
+             work during the sleeping iteration); kinds={kinds:?}"
+        );
+    }
+
+    // Ordering: park marker precedes the resumed iteration's start.
+    let second_start_idx = kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| **k == "autonomous_iteration_started")
+        .map(|(i, _)| i)
+        .nth(1)
+        .expect("two iteration starts");
+    assert!(
+        wakeup_idx < second_start_idx,
+        "scheduled wakeup precedes the resumed iteration start; kinds={kinds:?}"
+    );
+
+    // INV-7: terminates at the iteration cap, and that is the last
+    // autonomy-namespace event.
+    let last = last_autonomy_event(&events).expect("at least one autonomy event");
+    match last {
+        AgentEvent::AutonomousTerminated { reason } => assert!(
+            matches!(reason, AutonomousTerminationReason::IterationCap),
+            "expected IterationCap, got {reason:?}"
+        ),
+        other => panic!("INV-7: last autonomy event must be terminate; got {other:?}"),
+    }
+}
+
+/// C-2: bounds are re-checked on wake — a session that sleeps past
+/// max_wall_clock_ms terminates with WallClockExpired instead of
+/// resuming. With max_wall_clock_ms: 1 and a ~50ms sleep, the wake-time
+/// bound check trips before iteration 2 ever starts.
+#[tokio::test]
+async fn c2_wakeup_past_wall_clock_terminates_on_wake() {
+    let provider = MockProvider::forever(vec![ProviderEvent::Done(assistant_text("working"))]);
+    let (loop_, mut events_rx) = spawn_loop_with_autonomy(
+        provider,
+        vec![],
+        AgentConfig::default(),
+        autonomy_allowed_wakeup(10, 1),
+    );
+
+    loop_
+        .send(AgentInput::StartAutonomous {
+            goal: "sleep past the wall clock".to_owned(),
+            options: crate::protocol::AutonomyOptions::default(),
+        })
+        .await
+        .expect("send start");
+    loop_
+        .send(AgentInput::ScheduleWakeup {
+            wake_at_unix_ms: now_unix_ms() + 50,
+            reason: "should never resume".to_owned(),
+        })
+        .await
+        .expect("send wakeup");
+
+    let events = timeout(
+        Duration::from_secs(5),
+        collect_until_terminated(&mut events_rx),
+    )
+    .await
+    .expect("loop terminated within timeout");
+    drop(loop_);
+
+    let kinds: Vec<&str> = events.iter().map(kind).collect();
+
+    // Parked once, but never resumed: exactly one iteration start.
+    let starts = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::AutonomousIterationStarted { .. }))
+        .count();
+    assert_eq!(
+        starts, 1,
+        "must not resume after wall-clock trips; got {kinds:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AutonomousScheduledWakeup { .. })),
+        "parked once; got {kinds:?}"
+    );
+
+    let last = last_autonomy_event(&events).expect("at least one autonomy event");
+    match last {
+        AgentEvent::AutonomousTerminated { reason } => assert!(
+            matches!(reason, AutonomousTerminationReason::WallClockExpired),
+            "expected WallClockExpired on wake, got {reason:?}"
+        ),
+        other => panic!("expected terminate; got {other:?}"),
+    }
+}
+
+/// C-3: schedule_wakeup outside autonomous mode is declined with a
+/// warning callout (spec-boundary discipline — no improvised
+/// sleep-then-idle semantic), and does not park the session.
+#[tokio::test]
+async fn c3_schedule_wakeup_outside_autonomous_is_declined() {
+    let provider = MockProvider::forever(vec![ProviderEvent::Done(assistant_text("idle"))]);
+    let (loop_, events_rx) = spawn_loop_with_autonomy(
+        provider,
+        vec![],
+        AgentConfig::default(),
+        autonomy_allowed_wakeup(5, 60_000),
+    );
+
+    loop_
+        .send(AgentInput::ScheduleWakeup {
+            wake_at_unix_ms: now_unix_ms() + 1_000,
+            reason: "no autonomous run in progress".to_owned(),
+        })
+        .await
+        .expect("send wakeup");
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AutonomousScheduledWakeup { .. })),
+        "must not park when not autonomous; kinds={:?}",
+        events.iter().map(kind).collect::<Vec<_>>()
+    );
+    let declined = events.iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::Callout { title, .. } if title == "schedule_wakeup ignored"
+        )
+    });
+    assert!(
+        declined,
+        "expected a 'schedule_wakeup ignored' warning callout; kinds={:?}",
+        events.iter().map(kind).collect::<Vec<_>>()
     );
 }

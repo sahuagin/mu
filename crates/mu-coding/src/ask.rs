@@ -272,6 +272,10 @@ async fn create_session(
         // mu-f1a0: `mu ask` is a batch-shaped one-shot — the 5m
         // default tier is correct (no human gaps to survive).
         cache_ttl: None,
+        // mu-7e21: no autonomy grant from `mu ask` yet — a future
+        // `--autonomy` flag fills this (operator-deferred; solo.toml
+        // is the first frontend knob).
+        autonomy: None,
     };
     let req = json!({
         "jsonrpc": "2.0",

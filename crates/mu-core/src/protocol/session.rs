@@ -35,6 +35,17 @@ pub struct CreateSessionRequest {
     /// The daemon's delegate path pins workers to 5m regardless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_ttl: Option<crate::context::CacheTtl>,
+    /// mu-7e21: autonomy grant for this root session. None → the
+    /// INV-1 default (`AutonomyCapability::Disallowed`). The grant
+    /// flows operator → client → daemon at creation time only; the
+    /// model can never widen it (attenuation is intersect-only and no
+    /// agent-facing surface writes capability). Granting here also
+    /// makes the autonomy tools (`start_autonomous`,
+    /// `schedule_wakeup`) appear in the session's tool list — the
+    /// tool list stays capability-honest: a session that can't use
+    /// the surface doesn't see it; one that can, does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autonomy: Option<crate::capability::AutonomyCapability>,
 }
 
 impl CreateSessionRequest {

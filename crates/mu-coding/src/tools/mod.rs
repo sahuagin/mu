@@ -1,4 +1,5 @@
 pub mod action_recall;
+pub mod autonomy;
 pub mod aws_recon;
 pub mod bash;
 pub mod discover;
@@ -12,6 +13,7 @@ pub mod spawn_worker;
 pub mod watch;
 pub mod write;
 
+pub use autonomy::{ScheduleWakeupTool, StartAutonomousTool};
 pub use aws_recon::AwsReconTool;
 pub use bash::{BashMode, BashTool};
 pub use discover::DiscoverTool;

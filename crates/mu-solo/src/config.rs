@@ -42,6 +42,75 @@ pub struct SoloConfig {
     pub tui: TuiConfig,
     #[serde(default)]
     pub session: SessionConfig,
+    #[serde(default)]
+    pub autonomy: AutonomyConfig,
+}
+
+/// mu-7e21: autonomy grant for the solo session, forwarded as
+/// `CreateSessionRequest.autonomy`. Default DISABLED — INV-1's
+/// opt-in posture reaches all the way to the operator's config file.
+/// When enabled, the session's tool list gains `start_autonomous`
+/// (and `schedule_wakeup` if allowed), so the model can accept a goal
+/// in-band; the bounds below are enforced by the DAEMON at every
+/// iteration boundary, never by the model (INV-2).
+///
+/// ```toml
+/// [autonomy]
+/// enabled = true
+/// max_iterations = 25
+/// max_wall_clock_ms = 3600000          # 1h, sleeping included (INV-5)
+/// max_total_tool_calls_in_autonomy = 500
+/// allow_schedule_wakeup = true
+/// allow_delegate_grader = false
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AutonomyConfig {
+    /// Master switch. false ⇒ no grant is sent; the session is
+    /// created with the INV-1 default (autonomy disallowed) and the
+    /// autonomy tools never appear in its tool list.
+    pub enabled: bool,
+    /// Iteration ceiling for an autonomous run.
+    pub max_iterations: u32,
+    /// Wall-clock ceiling (ms), sleeping included (INV-5).
+    pub max_wall_clock_ms: u64,
+    /// Total tool-call ceiling across the autonomous run.
+    pub max_total_tool_calls_in_autonomy: u32,
+    /// Whether the session may park itself via `schedule_wakeup`.
+    pub allow_schedule_wakeup: bool,
+    /// Whether the session may use the DelegateGrader goal-check
+    /// (spawns/asks a sibling session to grade — non-trivial cost).
+    pub allow_delegate_grader: bool,
+}
+
+impl Default for AutonomyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_iterations: 25,
+            max_wall_clock_ms: 3_600_000,
+            max_total_tool_calls_in_autonomy: 500,
+            allow_schedule_wakeup: true,
+            allow_delegate_grader: false,
+        }
+    }
+}
+
+impl AutonomyConfig {
+    /// The wire-shaped grant: None when disabled (field omitted from
+    /// create_session entirely — older daemons never see it).
+    pub fn to_capability(&self) -> Option<mu_core::capability::AutonomyCapability> {
+        if !self.enabled {
+            return None;
+        }
+        Some(mu_core::capability::AutonomyCapability::Allowed {
+            max_iterations: self.max_iterations,
+            max_wall_clock_ms: self.max_wall_clock_ms,
+            max_total_tool_calls_in_autonomy: self.max_total_tool_calls_in_autonomy,
+            allow_schedule_wakeup: self.allow_schedule_wakeup,
+            allow_delegate_grader: self.allow_delegate_grader,
+        })
+    }
 }
 
 /// TUI-local settings. These never leave the TUI process.
@@ -235,6 +304,40 @@ mod tests {
         let s = toml::to_string(&c).expect("serialize");
         let c2: SoloConfig = toml::from_str(&s).expect("deserialize");
         assert_eq!(c, c2);
+    }
+
+    // mu-7e21: the grant is None unless explicitly enabled — INV-1's
+    // opt-in posture reaches the config layer.
+    #[test]
+    fn autonomy_disabled_by_default_sends_no_grant() {
+        let c = SoloConfig::default();
+        assert!(!c.autonomy.enabled);
+        assert_eq!(c.autonomy.to_capability(), None);
+    }
+
+    #[test]
+    fn autonomy_enabled_maps_bounds_to_capability() {
+        let toml = r#"
+            [autonomy]
+            enabled = true
+            max_iterations = 7
+            allow_schedule_wakeup = false
+        "#;
+        let c: SoloConfig = toml::from_str(toml).expect("parse");
+        match c.autonomy.to_capability() {
+            Some(mu_core::capability::AutonomyCapability::Allowed {
+                max_iterations,
+                allow_schedule_wakeup,
+                max_total_tool_calls_in_autonomy,
+                ..
+            }) => {
+                assert_eq!(max_iterations, 7);
+                assert!(!allow_schedule_wakeup);
+                // Unspecified bounds inherit the config defaults.
+                assert_eq!(max_total_tool_calls_in_autonomy, 500);
+            }
+            other => panic!("expected Allowed, got {other:?}"),
+        }
     }
 
     #[test]

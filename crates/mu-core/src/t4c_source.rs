@@ -653,8 +653,10 @@ mod tests {
 
     #[test]
     fn policy_projects_side_effects_onto_the_right_axis() {
-        // read-only => filesystem read, no flags
-        let ro = effects_from_policy(&ToolPolicy::default());
+        // read-only => filesystem read, no flags. mu-cvm5: the benign
+        // posture now lives in read_only(), not default() (which fails
+        // closed to Mutating + Ask).
+        let ro = effects_from_policy(&ToolPolicy::read_only());
         assert_eq!(ro.filesystem, FsEffect::Read);
         assert!(!ro.network && !ro.vcs && !ro.spend);
 

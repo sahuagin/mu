@@ -95,6 +95,8 @@ impl Tool for GlobTool {
                 "required": ["pattern"]
             }),
         )
+        // mu-cvm5: explicit read-only opt-in (default now fails closed).
+        .read_only()
     }
 
     fn execute<'life0, 'async_trait>(

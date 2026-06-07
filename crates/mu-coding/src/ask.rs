@@ -92,7 +92,7 @@ pub async fn run(opts: AskOptions) -> Result<()> {
         invocation_cwd,
     )
     .await?;
-    let text = ask_and_drain(
+    let (text, stop_reason) = ask_and_drain(
         &mut stdin,
         &mut stdout,
         &session_id,
@@ -106,13 +106,36 @@ pub async fn run(opts: AskOptions) -> Result<()> {
     // Closing stdin signals the daemon to exit cleanly.
     drop(stdin);
     match timeout(Duration::from_secs(5), child.wait()).await {
-        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) if status.success() => {}
         Ok(Ok(status)) => bail!("mu serve exited with status {status}"),
-        Ok(Err(e)) => Err(e).context("waiting for child"),
+        Ok(Err(e)) => return Err(e).context("waiting for child"),
         Err(_) => {
             let _ = child.kill().await;
             bail!("mu serve did not exit within 5 seconds; killed")
         }
+    }
+
+    // A truncated response must never exit 0 silently (mu-1mvq): the
+    // ai-review gate spent a night escalating every PR because ollama
+    // truncated oversized prompts to its context window, leaving one
+    // token of generation budget — the model emitted a single word,
+    // the stream ended *cleanly* with finish_reason=length, and no
+    // layer reported anything. The partial text has already been
+    // printed above (it is still data); the nonzero exit + stderr
+    // line make the truncation legible to scripts and humans.
+    match stop_reason.as_deref() {
+        Some("max_tokens") => bail!(
+            "response truncated (stop_reason=max_tokens): the model hit a token \
+             limit — either the output cap, or the prompt filled the model's \
+             context window (ollama silently truncates oversized prompts; see \
+             mu-1mvq). Output above may be a fragment."
+        ),
+        Some("degraded_eof") => bail!(
+            "response degraded (stop_reason=degraded_eof): the provider stream \
+             closed without a terminal stop event (connection drop or upstream \
+             truncation). Output above may be a fragment."
+        ),
+        _ => Ok(()),
     }
 }
 
@@ -276,13 +299,18 @@ async fn create_session(
     }
 }
 
+/// Send the ask and drain notifications until `session.done`. Returns
+/// the assistant text plus the done event's `stop_reason` (None when
+/// the daemon omits it — older daemons or malformed events), so the
+/// caller can distinguish a complete answer from a truncated one
+/// (mu-1mvq).
 async fn ask_and_drain(
     stdin: &mut ChildStdin,
     stdout: &mut BufReader<ChildStdout>,
     session_id: &str,
     prompt: &str,
     next_id: &mut u64,
-) -> Result<String> {
+) -> Result<(String, Option<String>)> {
     let id = *next_id;
     *next_id += 1;
     let req = json!({
@@ -306,6 +334,7 @@ async fn ask_and_drain(
     let mut current = String::new();
     let mut got_done = false;
     let mut got_response = false;
+    let mut stop_reason: Option<String> = None;
 
     loop {
         let line = read_line(stdout).await?;
@@ -328,6 +357,7 @@ async fn ask_and_drain(
             Some("session.done") => {
                 if line["params"]["session_id"] == session_id {
                     got_done = true;
+                    stop_reason = line["params"]["stop_reason"].as_str().map(str::to_owned);
                 }
             }
             Some("session.error") => {
@@ -352,7 +382,7 @@ async fn ask_and_drain(
             // keep it as a defensive fallback for providers/paths that
             // never emit assistant_text_finalized.
             finalized.push_str(&current);
-            return Ok(finalized);
+            return Ok((finalized, stop_reason));
         }
     }
 }

@@ -131,7 +131,16 @@ $(cat "$_f")"
   done <<EOF_CTX
 $(printf '%s\n' "$DIFF" | sed -n 's#^+++ b/##p')
 EOF_CTX
-  _max="${MU_REVIEW_CONTEXT_MAX_BYTES:-200000}"
+  # Default sized to the reviewer models' context window, NOT to "as much
+  # as possible": the panel models run at num_ctx=32768 (~100-130KB of
+  # text), and ollama SILENTLY truncates an oversized prompt down to the
+  # window — when the truncated prompt fills it, generation gets ~1 token
+  # of budget and the reviewer emits a single word ("Based"/"Looking"),
+  # finish_reason=length, exit 0. The old 200000 default did exactly that
+  # to every FULL_FILES review on 2026-06-06: both reviewers UNCLEAR →
+  # every PR escalated. 100000 bytes ≈ 25-30k tokens of context leaves
+  # room for the diff + prompt + a real generated review. (mu-1mvq)
+  _max="${MU_REVIEW_CONTEXT_MAX_BYTES:-100000}"
   if [ "${#CONTEXT}" -gt "$_max" ]; then
     CONTEXT="$(printf '%s' "$CONTEXT" | head -c "$_max")
 ... [changed-file context truncated at ${_max} bytes — review the diff above]"

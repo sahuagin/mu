@@ -131,6 +131,25 @@ pub(crate) async fn handle_execute_tools(
             let cap = capability.lock().ok();
             cap.as_ref().and_then(|c| match c.check_allow(&call.name) {
                 CapabilityCheck::Allowed => {
+                    // mu-n25a: the side-effects gate. Consult the tool's
+                    // DECLARED side_effects against the session's
+                    // max_side_effects ceiling BEFORE the AWS gate and
+                    // BEFORE the permission gate, so a `permission: Allow`
+                    // tool cannot free-ride past a restrictive posture
+                    // (the SELF-CLASSIFIED-AUTHORITY bug class, mu-usfj).
+                    // None ceiling (root default) ⇒ Allowed, so existing
+                    // sessions are unaffected (back-compat).
+                    let declared = tool.as_ref().map(|t| t.spec().policy.side_effects);
+                    if let Some(declared) = declared {
+                        if let CapabilityCheck::DeniedSideEffectsExceeded { declared, ceiling } =
+                            c.check_side_effects(declared)
+                        {
+                            return Some(format!(
+                                "tool declares `{declared:?}` side-effects but this session is \
+                                 capped at `{ceiling:?}` (max_side_effects)"
+                            ));
+                        }
+                    }
                     let required_aws = tool
                         .as_ref()
                         .and_then(|t| t.spec().policy.required_aws_capability.clone());
@@ -148,7 +167,8 @@ pub(crate) async fn handle_execute_tools(
                 CapabilityCheck::DeniedBudgetExhausted => {
                     Some("session capability's tool-call budget exhausted".to_owned())
                 }
-                CapabilityCheck::DeniedAutonomyDisallowed => None,
+                CapabilityCheck::DeniedAutonomyDisallowed
+                | CapabilityCheck::DeniedSideEffectsExceeded { .. } => None,
             })
         };
 

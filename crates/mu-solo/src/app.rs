@@ -425,6 +425,9 @@ pub struct AppOptions<'a> {
     /// mu-7e21: autonomy grant forwarded in create_session. None ⇒
     /// field omitted (INV-1 default: disallowed; no autonomy tools).
     pub autonomy: Option<mu_core::capability::AutonomyCapability>,
+    /// mu-n25a: side-effects ceiling forwarded in create_session. None ⇒
+    /// field omitted (root default: unrestricted, no posture restriction).
+    pub max_side_effects: Option<mu_core::agent::tool::SideEffects>,
 }
 
 impl App {
@@ -449,6 +452,7 @@ impl App {
             renderer_journal,
             notifications,
             autonomy,
+            max_side_effects,
         } = opts;
         let effort = EffortLevel::parse(effort).ok_or_else(|| {
             anyhow!("invalid effort {effort:?} (valid: low|medium|high|xhigh|max)")
@@ -485,6 +489,19 @@ impl App {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "could not serialize autonomy grant; omitting");
+                }
+            }
+        }
+        // mu-n25a: forward the side-effects ceiling when configured. Like
+        // autonomy, omit the field entirely when None so an older daemon
+        // (or an unrestricted session) degrades to today's behavior.
+        if let Some(max_side_effects) = &max_side_effects {
+            match serde_json::to_value(max_side_effects) {
+                Ok(v) => {
+                    create_params["max_side_effects"] = v;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not serialize max_side_effects; omitting");
                 }
             }
         }

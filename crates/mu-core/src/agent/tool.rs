@@ -159,6 +159,62 @@ pub enum SideEffects {
     Execute,
 }
 
+impl SideEffects {
+    /// Danger rank — a total order over the side-effect classes, from
+    /// least to most dangerous. Used by the session-permission gate
+    /// (mu-n25a Phase 2/3) to decide whether a tool's declared
+    /// side-effects EXCEED the session's `max_side_effects` ceiling.
+    ///
+    /// Total order (ascending danger):
+    ///   `ReadOnly` < `Mutating` < `External` < `Destructive` < `Execute`
+    ///
+    /// Rationale for the contested middle ranks:
+    /// - `Mutating` (local writes/edits) below `External` (reaches the
+    ///   network) because exfiltration / remote side-effects leave the
+    ///   blast radius of the local workspace — a network reach is harder
+    ///   to undo and audit than a local edit.
+    /// - `External` below `Destructive` because destructive operations
+    ///   (irreversible deletes, force-pushes) are unrecoverable without
+    ///   backups, the worst outcome short of arbitrary code.
+    /// - `Execute` is the maximum: it SUBSUMES every other class (a shell
+    ///   can read, mutate, network, AND destroy), so nothing may rank
+    ///   above it and no ceiling above it is meaningful.
+    ///
+    /// (DECISION FOR DIRECTOR: the External-vs-Mutating relative order is
+    /// the one genuinely arguable choice; see PR body. The gate only
+    /// needs SOME total order, and ReadOnly-as-min / Execute-as-max are
+    /// the load-bearing endpoints.)
+    pub fn rank(self) -> u8 {
+        match self {
+            SideEffects::ReadOnly => 0,
+            SideEffects::Mutating => 1,
+            SideEffects::External => 2,
+            SideEffects::Destructive => 3,
+            SideEffects::Execute => 4,
+        }
+    }
+
+    /// True iff `self` is at most as dangerous as `ceiling` — i.e. a tool
+    /// declaring `self` side-effects is permitted under a session whose
+    /// `max_side_effects` ceiling is `ceiling`. Equivalent to
+    /// `self.rank() <= ceiling.rank()`.
+    pub fn within(self, ceiling: SideEffects) -> bool {
+        self.rank() <= ceiling.rank()
+    }
+}
+
+impl PartialOrd for SideEffects {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SideEffects {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank().cmp(&other.rank())
+    }
+}
+
 /// Permission posture. v1 only honors `Allow` and `Deny` at the
 /// runtime level; `Ask` / `AskOnce` are reserved for the future
 /// `session.input_required` flow.

@@ -195,6 +195,22 @@ pub struct SessionConfig {
     /// session ~20%). Set "5m" for batch-shaped usage. Only the
     /// Anthropic provider consumes it today.
     pub cache_ttl: String,
+    /// mu-n25a: the session's side-effects CEILING — the permission
+    /// posture an operator's "read only" binds to, forwarded as
+    /// `CreateSessionRequest.max_side_effects`. A tool whose declared
+    /// side-effects exceed this ceiling is refused at the dispatch
+    /// boundary, regardless of its `permission` level — closing the
+    /// gap where `write`/`edit`/`watch` (permission: Allow) sailed
+    /// through despite an intended read-only session.
+    ///
+    /// Valid values (ascending danger):
+    ///   `read_only` < `mutating` < `external` < `destructive` < `execute`.
+    /// Empty string `""` (the DEFAULT) = unrestricted — no ceiling is
+    /// sent, the session behaves exactly as before (back-compat). Set
+    /// `max_side_effects = "read_only"` for a read-only operator session.
+    /// An unrecognized value is a hard config error (so a typo doesn't
+    /// silently fall through to unrestricted).
+    pub max_side_effects: String,
 }
 
 impl Default for SessionConfig {
@@ -211,7 +227,40 @@ impl Default for SessionConfig {
             mu_binary: "./target/release/mu".into(),
             cwd: None,
             cache_ttl: "1h".into(),
+            // mu-n25a: unrestricted by default — opt-in posture, so
+            // existing solo configs are unaffected.
+            max_side_effects: String::new(),
         }
+    }
+}
+
+impl SessionConfig {
+    /// mu-n25a: parse the configured `max_side_effects` string into the
+    /// wire-shaped ceiling. `Ok(None)` = unrestricted (empty string ⇒
+    /// the field is omitted from create_session entirely, so an older
+    /// daemon never sees it). `Err` on an unrecognized value so a typo
+    /// surfaces instead of silently degrading to unrestricted.
+    pub fn max_side_effects_capability(&self) -> Result<Option<mu_core::agent::tool::SideEffects>> {
+        use mu_core::agent::tool::SideEffects;
+        let v = self.max_side_effects.trim();
+        if v.is_empty() {
+            return Ok(None);
+        }
+        let parsed = match v {
+            "read_only" => SideEffects::ReadOnly,
+            "mutating" => SideEffects::Mutating,
+            "external" => SideEffects::External,
+            "destructive" => SideEffects::Destructive,
+            "execute" => SideEffects::Execute,
+            other => {
+                anyhow::bail!(
+                    "invalid [session] max_side_effects {other:?} \
+                     (valid: read_only|mutating|external|destructive|execute, \
+                     or empty for unrestricted)"
+                )
+            }
+        };
+        Ok(Some(parsed))
     }
 }
 
@@ -313,6 +362,76 @@ mod tests {
         let c = SoloConfig::default();
         assert!(!c.autonomy.enabled);
         assert_eq!(c.autonomy.to_capability(), None);
+    }
+
+    // ── mu-n25a: max_side_effects ───────────────────────────────
+
+    #[test]
+    fn max_side_effects_unrestricted_by_default() {
+        let c = SoloConfig::default();
+        assert_eq!(c.session.max_side_effects, "");
+        assert_eq!(
+            c.session.max_side_effects_capability().expect("ok"),
+            None,
+            "empty config → no ceiling sent (back-compat)"
+        );
+    }
+
+    #[test]
+    fn max_side_effects_read_only_maps_to_capability() {
+        let toml = r#"
+            [session]
+            max_side_effects = "read_only"
+        "#;
+        let c: SoloConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(
+            c.session.max_side_effects_capability().expect("ok"),
+            Some(mu_core::agent::tool::SideEffects::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn max_side_effects_all_levels_round_trip() {
+        use mu_core::agent::tool::SideEffects;
+        for (s, want) in [
+            ("read_only", SideEffects::ReadOnly),
+            ("mutating", SideEffects::Mutating),
+            ("external", SideEffects::External),
+            ("destructive", SideEffects::Destructive),
+            ("execute", SideEffects::Execute),
+        ] {
+            let cfg = SessionConfig {
+                max_side_effects: s.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(
+                cfg.max_side_effects_capability().expect("ok"),
+                Some(want),
+                "value {s:?} should map to {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn max_side_effects_invalid_value_is_an_error() {
+        let cfg = SessionConfig {
+            max_side_effects: "readonly".to_string(), // typo: missing underscore
+            ..Default::default()
+        };
+        let err = cfg
+            .max_side_effects_capability()
+            .expect_err("typo must be a hard error, not a silent unrestricted");
+        assert!(err.to_string().contains("invalid"));
+    }
+
+    #[test]
+    fn solo_config_round_trips_with_max_side_effects() {
+        let mut c = SoloConfig::default();
+        c.session.max_side_effects = "read_only".into();
+        let s = toml::to_string(&c).expect("serialize");
+        let c2: SoloConfig = toml::from_str(&s).expect("deserialize");
+        assert_eq!(c, c2);
+        assert_eq!(c2.session.max_side_effects, "read_only");
     }
 
     #[test]

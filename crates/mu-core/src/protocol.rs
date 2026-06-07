@@ -413,6 +413,7 @@ mod tests {
                 max_tool_calls: Some(10),
                 autonomy: crate::capability::AutonomyCapability::default(),
                 aws: None,
+                max_side_effects: None,
             }),
             cwd: None,
         };

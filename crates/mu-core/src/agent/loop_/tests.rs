@@ -1660,6 +1660,158 @@ async fn capability_allows_tool_when_required_aws_capability_is_held() {
     assert_eq!(completed_content.as_deref(), Some("aws recon ran"));
 }
 
+// ── mu-n25a: side-effects ceiling enforcement at dispatch ─────────
+
+/// Run one scripted tool call under a given capability and return
+/// `(saw_capability_callout, completed_content, completed_is_error)`.
+/// The tool declares `declared` side-effects but `permission: Allow`
+/// (the free-ride shape the gate must close) — so if it runs, the gate
+/// failed.
+async fn run_one_tool_with_side_effects(
+    cap: crate::capability::Capability,
+    declared: crate::agent::tool::SideEffects,
+    tool_body: &str,
+) -> (bool, Option<String>, bool) {
+    use crate::agent::tool::{PermissionLevel, RetryPolicy, ToolPolicy};
+
+    let provider = mock_provider_one_tool_call("effecter", json!({"x": 1}));
+    let tool = MockTool::ok("effecter", tool_body).with_policy(ToolPolicy {
+        side_effects: declared,
+        permission: PermissionLevel::Allow, // would free-ride without the gate
+        retry: RetryPolicy::ModelDecides,
+        required_aws_capability: None,
+        idempotent: false,
+    });
+    let cap: SessionCapability = Arc::new(Mutex::new(cap));
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let loop_ = loop_with(
+        Arc::new(provider),
+        Arc::from("faux"),
+        Arc::from("faux"),
+        vec![Arc::new(tool) as Arc<dyn Tool>],
+        AgentConfig::default(),
+        events_tx,
+        approvals,
+        cap,
+    );
+    loop_
+        .send(AgentInput::UserMessage(user_msg("call effecter")))
+        .await
+        .unwrap();
+
+    let mut saw_callout = false;
+    let mut completed_content: Option<String> = None;
+    let mut completed_is_error = false;
+    while let Some(ev) = events_rx.recv().await {
+        match ev {
+            AgentEvent::Callout {
+                category, title, ..
+            } if category == "warning" && title.contains("capability refused") => {
+                saw_callout = true;
+            }
+            AgentEvent::ToolCallCompleted {
+                content, is_error, ..
+            } => {
+                completed_content = Some(content);
+                completed_is_error = is_error;
+            }
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+    (saw_callout, completed_content, completed_is_error)
+}
+
+#[tokio::test]
+async fn read_only_ceiling_refuses_execute_tool() {
+    use crate::agent::tool::SideEffects;
+    use crate::capability::Capability;
+
+    let cap = Capability {
+        max_side_effects: Some(SideEffects::ReadOnly),
+        ..Default::default()
+    };
+    let (callout, content, is_error) =
+        run_one_tool_with_side_effects(cap, SideEffects::Execute, "DANGER: this should not run")
+            .await;
+
+    assert!(callout, "expected a capability-refused callout");
+    let content = content.expect("ToolCallCompleted should fire");
+    assert!(is_error, "side-effects refusal => is_error");
+    assert!(
+        content.contains("side-effects") && content.contains("max_side_effects"),
+        "refusal should name the side-effects ceiling; got: {content}"
+    );
+    assert!(
+        !content.contains("DANGER"),
+        "the Execute tool body must NOT have executed; got: {content}"
+    );
+}
+
+#[tokio::test]
+async fn read_only_ceiling_refuses_mutating_tool() {
+    use crate::agent::tool::SideEffects;
+    use crate::capability::Capability;
+
+    let cap = Capability {
+        max_side_effects: Some(SideEffects::ReadOnly),
+        ..Default::default()
+    };
+    let (callout, content, is_error) =
+        run_one_tool_with_side_effects(cap, SideEffects::Mutating, "wrote a file").await;
+
+    assert!(callout, "expected a capability-refused callout");
+    let content = content.expect("ToolCallCompleted should fire");
+    assert!(is_error, "Mutating > ReadOnly ceiling => refused");
+    assert!(
+        !content.contains("wrote a file"),
+        "the Mutating tool body must NOT have executed; got: {content}"
+    );
+}
+
+#[tokio::test]
+async fn root_ceiling_allows_execute_and_mutating_tools() {
+    use crate::agent::tool::SideEffects;
+    use crate::capability::Capability;
+
+    // root() has max_side_effects: None (unrestricted) — back-compat.
+    let (callout, content, is_error) =
+        run_one_tool_with_side_effects(Capability::root(), SideEffects::Execute, "exec ran").await;
+    assert!(!callout, "root session must NOT be refused");
+    assert!(!is_error, "root ceiling allows Execute");
+    assert_eq!(content.as_deref(), Some("exec ran"));
+
+    let (callout, content, is_error) =
+        run_one_tool_with_side_effects(Capability::root(), SideEffects::Mutating, "mutated").await;
+    assert!(!callout, "root session must NOT be refused");
+    assert!(!is_error, "root ceiling allows Mutating");
+    assert_eq!(content.as_deref(), Some("mutated"));
+}
+
+#[tokio::test]
+async fn mutating_ceiling_allows_mutating_but_refuses_execute() {
+    use crate::agent::tool::SideEffects;
+    use crate::capability::Capability;
+
+    let mutating_cap = || Capability {
+        max_side_effects: Some(SideEffects::Mutating),
+        ..Default::default()
+    };
+
+    // At the ceiling: allowed.
+    let (_, content, is_error) =
+        run_one_tool_with_side_effects(mutating_cap(), SideEffects::Mutating, "edit ok").await;
+    assert!(!is_error, "Mutating == ceiling is allowed");
+    assert_eq!(content.as_deref(), Some("edit ok"));
+
+    // Above the ceiling: refused.
+    let (callout, content, is_error) =
+        run_one_tool_with_side_effects(mutating_cap(), SideEffects::Execute, "nope").await;
+    assert!(callout && is_error, "Execute > Mutating ceiling => refused");
+    assert!(!content.unwrap().contains("nope"));
+}
+
 #[tokio::test]
 async fn ask_permission_deny_synthesizes_error_result_without_running_tool() {
     let provider = mock_provider_one_tool_call("gated", json!({"x": 1}));

@@ -69,6 +69,13 @@ pub fn handle_create_session(
     if let Some(autonomy) = params.autonomy {
         capability.autonomy = autonomy;
     }
+    // mu-n25a: side-effects ceiling, same plumbing as the autonomy grant.
+    // None → root stays unrestricted (back-compat); Some(x) caps the
+    // session so any tool declaring side-effects above `x` is refused at
+    // the dispatch choke point regardless of its permission level.
+    if let Some(max_side_effects) = params.max_side_effects {
+        capability.max_side_effects = Some(max_side_effects);
+    }
 
     match build_and_register_session(BuildSessionRequest {
         selector: &params.provider,

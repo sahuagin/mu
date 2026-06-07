@@ -57,6 +57,23 @@ NON_BEADS=$(jj diff --summary 2>/dev/null | awk '$2 !~ /^\.beads\// {print $2}')
 [ -z "$NON_BEADS" ] || fail "working copy has non-.beads changes; commit or stash them first:
 $NON_BEADS"
 
+# ── guard: one sync in flight at a time ──────────────────────────────────────
+# The no-op detection below compares the fresh export against MAIN — but a
+# just-opened sync PR hasn't merged yet, so an immediate rerun would diff
+# against the pre-sync JSONL and open a duplicate PR (live-tested: PR #225
+# duplicated #224 within a minute). Bail while a prior sync is still open;
+# its merge brings main current, and bead churn since then rides the next run.
+# Known TOCTOU: two runs starting in the same instant could both pass this
+# check. Accepted — this is single-operator session-end tooling, and truly
+# concurrent runs would also collide in the backing repo's jj working copy;
+# the cost of a lost race is one duplicate beads-only PR to close by hand.
+IN_FLIGHT=$(gh pr list -R "$REPO" --state open --json number,headRefName \
+  --jq '.[] | select(.headRefName | startswith("agent/beads-sync-")) | .number' 2>/dev/null | head -1)
+if [ -n "$IN_FLIGHT" ]; then
+  say "${C_YEL}sync already in flight: PR #$IN_FLIGHT — nothing to do until it merges${C_OFF}"
+  exit 0
+fi
+
 # ── fetch + fresh commit on main ─────────────────────────────────────────────
 # Remember the current @: if it held .beads-only auto-export changes (the
 # usual disease), it would dangle after `jj new main` — exactly the orphan

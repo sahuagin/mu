@@ -1553,15 +1553,24 @@ async fn create_and_ask_to_done(
         "jsonrpc": "2.0", "id": id_base, "method": "create_session",
         "params": { "provider": { "kind": "anthropic_api", "model": "x" } }
     });
-    client.write_all(format!("{req}\n").as_bytes()).await.expect("write create");
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write create");
     let resp = read_line(client).await;
-    let session_id = resp["result"]["session_id"].as_str().expect("session_id").to_string();
+    let session_id = resp["result"]["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
 
     let req = json!({
         "jsonrpc": "2.0", "id": id_base + 1, "method": "ask_session",
         "params": { "session_id": session_id, "user_message": prompt }
     });
-    client.write_all(format!("{req}\n").as_bytes()).await.expect("write ask");
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write ask");
 
     let mut saw_done = false;
     while !saw_done {
@@ -1592,7 +1601,10 @@ async fn mh4_resume_forks_clean_session_at_tail() {
             "provider": { "kind": "anthropic_api", "model": "x" }
         }
     });
-    client.write_all(format!("{req}\n").as_bytes()).await.expect("write resume");
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write resume");
 
     // Drain to the resume response.
     let resp = loop {
@@ -1605,7 +1617,9 @@ async fn mh4_resume_forks_clean_session_at_tail() {
         resp.get("error").is_none(),
         "resume should succeed on a clean log; got {resp}"
     );
-    let new_session = resp["result"]["session_id"].as_str().expect("new session id");
+    let new_session = resp["result"]["session_id"]
+        .as_str()
+        .expect("new session id");
     assert_ne!(new_session, predecessor, "resume births a NEW session");
     assert_eq!(
         resp["result"]["predecessor_session_id"], predecessor,
@@ -1639,7 +1653,10 @@ async fn mh4_resume_unknown_session_refused() {
             "provider": { "kind": "anthropic_api", "model": "x" }
         }
     });
-    client.write_all(format!("{req}\n").as_bytes()).await.expect("write");
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write");
     let resp = read_line(&mut client).await;
     assert_eq!(resp["id"], 1);
     let msg = resp["error"]["message"].as_str().expect("error message");
@@ -1666,7 +1683,10 @@ async fn mh4_resume_bad_ref_rejected() {
             "provider": { "kind": "anthropic_api", "model": "x" }
         }
     });
-    client.write_all(format!("{req}\n").as_bytes()).await.expect("write");
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write");
     let resp = read_line(&mut client).await;
     let msg = resp["error"]["message"].as_str().expect("error message");
     assert!(

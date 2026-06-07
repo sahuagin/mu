@@ -83,7 +83,7 @@ pub fn handle_create_session(
         cwd: params.cwd,                     // mu-phl v0 / mu-045
         parent_session_id: None,             // no parent — this is a root session
         branched_at_parent_event_id: None,
-        capability, // root: unrestricted, autonomy per mu-7e21 grant above
+        capability,                // root: unrestricted, autonomy per mu-7e21 grant above
         seed_messages: Vec::new(), // mu-mh4: fresh session starts empty
         cache_ttl: params.cache_ttl.unwrap_or_default(), // mu-f1a0
         notif,
@@ -228,7 +228,13 @@ pub fn handle_resume_session(
     // Parse the session ref (daemon:session or mu:<daemon>/<session>).
     let parsed = match SessionRef::parse(&params.session_ref) {
         Ok(r) => r,
-        Err(e) => return err_response(request.id, codes::INVALID_PARAMS, format!("session.resume: {e}")),
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("session.resume: {e}"),
+            )
+        }
     };
 
     // Resolve the predecessor's event log from the Sessions map (the
@@ -282,7 +288,10 @@ pub fn handle_resume_session(
     };
 
     let seeded_message_count = continuation.messages.len();
-    let actor = params.actor.clone().unwrap_or_else(|| "operator".to_string());
+    let actor = params
+        .actor
+        .clone()
+        .unwrap_or_else(|| "operator".to_string());
 
     let new_session_id = match build_and_register_session(BuildSessionRequest {
         selector: &params.provider,
@@ -303,7 +312,11 @@ pub fn handle_resume_session(
     }) {
         Ok(id) => id,
         Err(e) => {
-            return err_response(request.id, codes::INVALID_PARAMS, format!("session.resume: {e}"))
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("session.resume: {e}"),
+            )
         }
     };
 

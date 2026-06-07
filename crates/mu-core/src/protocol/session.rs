@@ -418,9 +418,7 @@ impl SessionRef {
         // Canonical form: mu:<daemon>/<session>
         if let Some(rest) = s.strip_prefix("mu:") {
             let (daemon, session) = rest.split_once('/').ok_or_else(|| {
-                format!(
-                    "invalid session ref `{s}`: canonical form is `mu:<daemon>/<session>`"
-                )
+                format!("invalid session ref `{s}`: canonical form is `mu:<daemon>/<session>`")
             })?;
             if daemon.is_empty() || session.is_empty() {
                 return Err(format!(

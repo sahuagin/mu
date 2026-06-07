@@ -1203,6 +1203,8 @@ mod tests {
                 EventPayload::WorkerFailed { .. } => "worker_failed",
                 EventPayload::WorkerTimeout { .. } => "worker_timeout",
                 EventPayload::OperatorMark { .. } => "operator_mark",
+                EventPayload::Tombstone { .. } => "tombstone",
+                EventPayload::HeadAttached { .. } => "head_attached",
             })
             .collect();
         assert_eq!(kinds, vec!["assistant_message", "done"]);

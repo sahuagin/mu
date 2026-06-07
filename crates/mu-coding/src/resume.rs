@@ -95,8 +95,14 @@ pub async fn run(opts: ResumeOptions) -> Result<()> {
     );
 
     let stop_reason = if let Some(prompt) = opts.prompt.as_deref() {
-        let (text, stop_reason) =
-            ask_and_drain(&mut stdin, &mut stdout, &resp.session_id, prompt, &mut next_id).await?;
+        let (text, stop_reason) = ask_and_drain(
+            &mut stdin,
+            &mut stdout,
+            &resp.session_id,
+            prompt,
+            &mut next_id,
+        )
+        .await?;
         println!("{text}");
         stop_reason
     } else {
@@ -118,12 +124,12 @@ pub async fn run(opts: ResumeOptions) -> Result<()> {
     }
 
     match stop_reason.as_deref() {
-        Some("max_tokens") => bail!(
-            "response truncated (stop_reason=max_tokens). Output above may be a fragment."
-        ),
-        Some("degraded_eof") => bail!(
-            "response degraded (stop_reason=degraded_eof). Output above may be a fragment."
-        ),
+        Some("max_tokens") => {
+            bail!("response truncated (stop_reason=max_tokens). Output above may be a fragment.")
+        }
+        Some("degraded_eof") => {
+            bail!("response degraded (stop_reason=degraded_eof). Output above may be a fragment.")
+        }
         _ => Ok(()),
     }
 }

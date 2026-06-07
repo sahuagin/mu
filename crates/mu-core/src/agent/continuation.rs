@@ -246,11 +246,11 @@ fn project_internal(events: &[SessionEvent]) -> Result<Continuation, Continuatio
             }
             EventPayload::ErrorInvalidMessage {
                 validation_error, ..
-            } => {
-                if first_ragged.is_none() {
-                    first_ragged =
-                        Some((ev.id, format!("invalid provider message: {validation_error}")));
-                }
+            } if first_ragged.is_none() => {
+                first_ragged = Some((
+                    ev.id,
+                    format!("invalid provider message: {validation_error}"),
+                ));
             }
             // All other event kinds (ContextAssembly, CompactionAssembly,
             // ProviderStatusUpdate, telemetry, mailbox, autonomy
@@ -351,7 +351,10 @@ fn ragged_detail(events: &[SessionEvent], first_ragged_event_id: Option<u64>) ->
     // failure mode (the 402-incident shape).
     let mut pending: Vec<(String, String)> = Vec::new(); // (call_id, tool name)
     let mut terminal_err: Option<String> = None;
-    for ev in events.iter().filter(|e| e.id >= start && !dead.contains(&e.id)) {
+    for ev in events
+        .iter()
+        .filter(|e| e.id >= start && !dead.contains(&e.id))
+    {
         match &ev.payload {
             EventPayload::AssistantMessageEvent { message } => {
                 for block in &message.content {
@@ -554,7 +557,10 @@ mod tests {
                 first_ragged_event_id,
                 detail,
             } => {
-                assert_eq!(clean_boundary_event_id, 2, "last clean boundary is the user msg");
+                assert_eq!(
+                    clean_boundary_event_id, 2,
+                    "last clean boundary is the user msg"
+                );
                 assert_eq!(first_ragged_event_id, 3, "the dangling tool call event");
                 assert!(
                     detail.contains("c1") || detail.contains("result"),
@@ -587,7 +593,9 @@ mod tests {
             } => {
                 // The first coherence break is the dangling tool call at 3.
                 assert_eq!(first_ragged_event_id, 3);
-                assert!(detail.contains("result") || detail.contains("402") || detail.contains("c1"));
+                assert!(
+                    detail.contains("result") || detail.contains("402") || detail.contains("c1")
+                );
             }
             other => panic!("expected RaggedTail, got {other:?}"),
         }

@@ -13,6 +13,12 @@
 .env
 .env.local
 
+# Python bytecode cache (scripts/ has a few .py tools, e.g. the
+# compaction probe harness). A stale scripts/__pycache__/*.pyc predates
+# this rule and stays tracked; this just stops NEW ones being added.
+__pycache__/
+*.pyc
+
 # code_index per-project DB (we use mu's own caches if wired in)
 /.code_index/
 

@@ -1,0 +1,50 @@
+{
+  "session_id": "session-2",
+  "source_jsonl": "~/.local/share/mu/events/8c78230c467e1de7/session-2.jsonl",
+  "target_tokens": 3000,
+  "note": "Hand-authored probes (mu-0fla Layer 2). The session is an agent exploring the mu workspace; each probe targets a concrete factual tool-result span. At target_tokens=3000 every target below is DROPPED by span-family-drop and (mostly) summarized by the mock judge, but KEPT under no-compaction (the control). So a probe answered correctly under no-compaction but wrong under a policy = that policy lost a load-bearing fact. Gold answers transcribed from the no-compaction fixture span content.",
+  "probes": [
+    {
+      "id": "workspace-members",
+      "question": "What crates are members of the mu Cargo workspace?",
+      "gold_answer": "crates/mu-core, crates/mu-ai, crates/mu-coding, and crates/mu-tui",
+      "target_span_id": "msg-8-tool-result:toolu_013XnMxiGaTjrTh3KKFctg1S",
+      "note": "from Cargo.toml [workspace] members"
+    },
+    {
+      "id": "what-is-mu",
+      "question": "What is mu, in one sentence?",
+      "gold_answer": "A local-first coding-agent runtime written in Rust (a single binary with multiple frontends).",
+      "target_span_id": "msg-10-tool-result:toolu_01TaFhRoxmT4sv6bi7FGxnty",
+      "note": "from README.md opening line"
+    },
+    {
+      "id": "serve-subcommand",
+      "question": "What does the `mu serve` subcommand run?",
+      "gold_answer": "The JSON-RPC daemon.",
+      "target_span_id": "msg-10-tool-result:toolu_01TaFhRoxmT4sv6bi7FGxnty",
+      "note": "from README.md frontends description"
+    },
+    {
+      "id": "mu-core-role",
+      "question": "What is the mu-core crate responsible for?",
+      "gold_answer": "The agent loop / state machine, the JSON-RPC protocol, transport, and state; it is provider-agnostic and frontend-agnostic.",
+      "target_span_id": "msg-16-tool-result:toolu_01CpjwJusd5qJGgv4ck3mF64",
+      "note": "from crates/mu-core/src/lib.rs doc comment"
+    },
+    {
+      "id": "mu-ai-role",
+      "question": "What does the mu-ai crate provide, and is its provider trait synchronous or asynchronous?",
+      "gold_answer": "The LLM provider abstraction (the Provider trait); the trait is asynchronous (async).",
+      "target_span_id": "msg-18-tool-result:toolu_01JbSeQ7zmFfGBupF8TsEeky",
+      "note": "from crates/mu-ai/src/lib.rs doc comment"
+    },
+    {
+      "id": "protocol-version",
+      "question": "What JSON-RPC version does mu's protocol envelope use?",
+      "gold_answer": "JSON-RPC version 2.0 (the JSONRPC_VERSION constant is \"2.0\").",
+      "target_span_id": "msg-20-tool-result:toolu_01PaKJ6x2W5wiMHyAUPpsfxp",
+      "note": "from crates/mu-core/src/protocol.rs"
+    }
+  ]
+}

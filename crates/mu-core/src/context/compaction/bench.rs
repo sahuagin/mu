@@ -31,6 +31,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
+use super::fidelity::{fidelity_report, FidelityReport, DEFAULT_RECENCY_WINDOWS};
 use super::hash_summary::{Judge, JudgeError};
 use super::CompactionPolicy;
 use crate::agent::types::AgentMessage;
@@ -74,6 +75,13 @@ pub struct BenchRow {
     pub spans_before: usize,
     /// Total spans in the rope AFTER compaction.
     pub spans_after: usize,
+    /// Structural-fidelity rollup (mu-0fla): which pre-compaction spans
+    /// survived (kept verbatim / absorbed into a summary / dropped), the
+    /// goal's fate, per-kind retention, and the recency curve. The cost
+    /// columns above say *how much* shrank; this says *what* was kept.
+    /// Serialized in full under JSON; the CSV writer projects scalar
+    /// columns out of it (see [`csv_header`] / [`csv_row`]).
+    pub fidelity: FidelityReport,
 }
 
 /// Load a session JSONL into a [`RetainedRope`].
@@ -174,6 +182,9 @@ pub fn benchmark_session(
         let start = Instant::now();
         let result = lp.policy.compact(rope, target_tokens);
         let wall_clock_us = start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        // Structural fidelity over the SAME (rope, result) pair — no
+        // extra model calls, just classifies what survived.
+        let fidelity = fidelity_report(rope, &result, DEFAULT_RECENCY_WINDOWS);
         rows.push(BenchRow {
             session_id: session_id.to_string(),
             policy_label: lp.label.clone(),
@@ -184,6 +195,7 @@ pub fn benchmark_session(
             wall_clock_us,
             spans_before,
             spans_after: result.rope.len(),
+            fidelity,
         });
     }
     rows
@@ -250,9 +262,13 @@ impl Judge for KeepHalfJudge {
     }
 }
 
-/// Write a CSV header line matching [`BenchRow`]'s field order.
+/// Write a CSV header line matching [`csv_row`]'s column order.
+///
+/// The trailing `goal_fate..recency_kept_last50` columns are the
+/// structural-fidelity projection (mu-0fla); the full per-kind +
+/// recency-curve breakdown is JSON-only (it doesn't flatten to CSV).
 pub fn csv_header() -> &'static str {
-    "session_id,policy_label,tokens_before,tokens_after,decisions_count,model_calls,wall_clock_us,spans_before,spans_after"
+    "session_id,policy_label,tokens_before,tokens_after,decisions_count,model_calls,wall_clock_us,spans_before,spans_after,goal_fate,kept_spans,summarized_spans,dropped_spans,kept_tokens,recency_kept_last50"
 }
 
 /// Render one [`BenchRow`] as a CSV line. Strings are quoted only
@@ -267,8 +283,18 @@ pub fn csv_row(r: &BenchRow) -> String {
             s.to_string()
         }
     }
+    let goal_fate = r.fidelity.goal_fate.map(|f| f.label()).unwrap_or("none");
+    // Verbatim retention of the most-recent 50 spans — the heuristic's
+    // claimed "raw recent depth" edge as a single scalar. `window == 50`
+    // is in DEFAULT_RECENCY_WINDOWS, so it's present for rows produced by
+    // benchmark_session; an empty cell (not 0.0) flags a row built with a
+    // different window set — "no window-50 datum", not "kept nothing".
+    let recency_kept_last50 = match r.fidelity.recency_kept_fraction(50) {
+        Some(f) => format!("{f:.4}"),
+        None => String::new(),
+    };
     format!(
-        "{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         esc(&r.session_id),
         esc(&r.policy_label),
         r.tokens_before,
@@ -278,6 +304,12 @@ pub fn csv_row(r: &BenchRow) -> String {
         r.wall_clock_us,
         r.spans_before,
         r.spans_after,
+        goal_fate,
+        r.fidelity.kept_spans,
+        r.fidelity.summarized_spans,
+        r.fidelity.dropped_spans,
+        r.fidelity.kept_tokens,
+        recency_kept_last50,
     )
 }
 
@@ -610,6 +642,7 @@ mod tests {
             wall_clock_us: 1,
             spans_before: 3,
             spans_after: 1,
+            fidelity: FidelityReport::default(),
         };
         let header = csv_header();
         let line = csv_row(&row);

@@ -38,6 +38,7 @@
 //! API matches the call site.
 
 pub mod bench;
+pub mod fidelity;
 pub mod hash_summary;
 pub mod heuristic;
 pub mod provider_judge;

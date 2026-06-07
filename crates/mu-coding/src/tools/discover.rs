@@ -86,6 +86,9 @@ impl Tool for DiscoverTool {
                 "required": ["intent"]
             }),
         )
+        // mu-cvm5: explicit read-only opt-in (default now fails closed).
+        // discover ranks the session's own tools; read-only projection.
+        .read_only()
     }
 
     async fn execute(&self, arguments: Value, _cancel_rx: oneshot::Receiver<()>) -> ToolResult {

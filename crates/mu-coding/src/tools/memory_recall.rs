@@ -65,7 +65,9 @@ impl Default for MemoryRecallTool {
 
 impl Tool for MemoryRecallTool {
     fn spec(&self) -> ToolSpec {
-        // ReadOnly + Allow + ModelDecides is the default policy.
+        // mu-cvm5: explicit read-only opt-in (default now fails closed).
+        // memory_recall execs a FIXED read-oriented binary with structured
+        // args — the model cannot make it run arbitrary work.
         ToolSpec::new(
             "memory_recall",
             "Semantic recall over the operator's long-term memory store. Session-start context \
@@ -95,6 +97,7 @@ impl Tool for MemoryRecallTool {
                 "required": ["query"]
             }),
         )
+        .read_only()
     }
 
     fn validate(&self, arguments: &Value) -> Result<(), String> {

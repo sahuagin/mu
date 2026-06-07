@@ -95,6 +95,19 @@ impl ToolSpec {
         self.policy = policy;
         self
     }
+
+    /// Builder: declare this tool genuinely read-only (`ReadOnly` +
+    /// `Allow`). The EXPLICIT opt-in to the benign posture.
+    ///
+    /// mu-cvm5 (mu-n25a Phase 5): since `ToolPolicy::default()` now fails
+    /// CLOSED (`Mutating` + `Ask`), a tool that forgets `.with_policy()`
+    /// ships restricted, not benign. A genuinely read-only tool must SAY
+    /// SO with this call — making "this tool is benign" a deliberate,
+    /// auditable declaration rather than the silent fallthrough that let
+    /// the mu-usfj SELF-CLASSIFIED-AUTHORITY bug class exist.
+    pub fn read_only(self) -> Self {
+        self.with_policy(ToolPolicy::read_only())
+    }
 }
 
 /// Runtime-enforced metadata about a tool. Not sent to the model
@@ -120,7 +133,41 @@ pub struct ToolPolicy {
 }
 
 impl Default for ToolPolicy {
+    /// mu-cvm5 (mu-n25a Phase 5): the default FAILS CLOSED. A tool that
+    /// forgets to call `.with_policy()` / `.read_only()` ships RESTRICTED
+    /// (`Mutating` side-effects + `Ask` permission), not benign-and-allowed.
+    ///
+    /// Before this flip the default was `ReadOnly` + `Allow` — the silent
+    /// fallthrough that let the mu-usfj SELF-CLASSIFIED-AUTHORITY bug class
+    /// exist: a tool that could affect the world but omitted its policy was
+    /// treated as benign. Now omission is the conservative posture, so the
+    /// failure mode of forgetting is "too restrictive" (a visible Ask
+    /// prompt / a refused dispatch under a tight ceiling) rather than
+    /// "silently dangerous". Genuinely read-only tools must OPT IN with
+    /// `ToolPolicy::read_only()` / `ToolSpec::read_only()`.
+    ///
+    /// `Mutating` (not `Execute`) is the floor: a forgotten policy is most
+    /// likely a write-class tool, and `Mutating` + `Ask` already blocks the
+    /// free-ride past a restrictive `max_side_effects` posture. Tools that
+    /// are actually exec/destructive still declare so explicitly (bash,
+    /// watch, spawn_worker), and the `policy_invariants` test keeps those
+    /// declarations honest.
     fn default() -> Self {
+        Self {
+            side_effects: SideEffects::Mutating,
+            permission: PermissionLevel::Ask,
+            retry: RetryPolicy::ModelDecides,
+            required_aws_capability: None,
+            idempotent: false,
+        }
+    }
+}
+
+impl ToolPolicy {
+    /// The benign posture: `ReadOnly` + `Allow` + `ModelDecides`,
+    /// idempotent. The EXPLICIT opt-in a genuinely read-only tool uses
+    /// now that `default()` fails closed (mu-cvm5 / mu-n25a Phase 5).
+    pub fn read_only() -> Self {
         Self {
             side_effects: SideEffects::ReadOnly,
             permission: PermissionLevel::Allow,
@@ -336,13 +383,31 @@ mod tests {
     }
 
     #[test]
-    fn tool_policy_default_is_safe() {
+    fn tool_policy_default_fails_closed() {
+        // mu-cvm5 (mu-n25a Phase 5): the default is now RESTRICTED, not
+        // benign. A forgotten `.with_policy()` ships Mutating + Ask, so the
+        // failure mode of omission is "too restrictive", never "silently
+        // dangerous" (the mu-usfj class).
         let p = ToolPolicy::default();
+        assert_eq!(p.side_effects, SideEffects::Mutating);
+        assert_eq!(p.permission, PermissionLevel::Ask);
+        assert!(matches!(p.retry, RetryPolicy::ModelDecides));
+        assert_eq!(p.required_aws_capability, None);
+        assert!(!p.idempotent);
+    }
+
+    #[test]
+    fn tool_policy_read_only_is_the_benign_opt_in() {
+        // The explicit benign posture lives in read_only(), not default().
+        let p = ToolPolicy::read_only();
         assert_eq!(p.side_effects, SideEffects::ReadOnly);
         assert_eq!(p.permission, PermissionLevel::Allow);
         assert!(matches!(p.retry, RetryPolicy::ModelDecides));
         assert_eq!(p.required_aws_capability, None);
         assert!(p.idempotent);
+        // ToolSpec::read_only() applies the same posture.
+        let spec = ToolSpec::new("x", "d", Value::Object(Default::default())).read_only();
+        assert_eq!(spec.policy, ToolPolicy::read_only());
     }
 
     #[test]

@@ -22,7 +22,7 @@ impl Default for LsTool {
 
 impl Tool for LsTool {
     fn spec(&self) -> ToolSpec {
-        // ReadOnly default policy.
+        // mu-cvm5: explicit read-only opt-in (default now fails closed).
         ToolSpec::new(
             "ls",
             "List the contents of a directory (one level only). Directories are suffixed with '/'. Returns names one per line. Defaults to the current directory if no path is given.",
@@ -37,6 +37,7 @@ impl Tool for LsTool {
                 "required": []
             }),
         )
+        .read_only()
     }
 
     fn execute<'life0, 'async_trait>(

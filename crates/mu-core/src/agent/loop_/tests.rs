@@ -266,7 +266,15 @@ impl Tool for MockTool {
             name: self.name.clone(),
             description: format!("Mock tool: {}", self.name),
             input_schema: json!({"type": "object"}),
-            policy: self.policy_override.clone().unwrap_or_default(),
+            // mu-cvm5: the production default now FAILS CLOSED (Mutating +
+            // Ask). These mocks model "a benign tool that just runs" unless
+            // a test explicitly sets a stricter policy via with_policy(),
+            // so they default to the read_only() opt-in — preserving the
+            // pre-flip test intent (no spurious Ask gate / refusal).
+            policy: self
+                .policy_override
+                .clone()
+                .unwrap_or_else(crate::agent::tool::ToolPolicy::read_only),
             verbatim_result: self.verbatim_result,
             ..Default::default()
         }

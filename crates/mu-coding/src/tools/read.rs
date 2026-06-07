@@ -22,7 +22,8 @@ impl Default for ReadTool {
 
 impl Tool for ReadTool {
     fn spec(&self) -> ToolSpec {
-        // ReadOnly + Allow + ModelDecides is the default policy.
+        // mu-cvm5: ReadOnly + Allow is now an EXPLICIT opt-in via
+        // `.read_only()` — the default fails closed (Mutating + Ask).
         // verbatim_result: read output is the model's belief about
         // disk truth — exact-match `edit` builds on it, so the tier-1
         // ingestion filter (mu-2e0h) must never collapse/cap/truncate
@@ -41,6 +42,7 @@ impl Tool for ReadTool {
                 "required": ["path"]
             }),
         )
+        .read_only()
         .with_verbatim_result()
     }
 

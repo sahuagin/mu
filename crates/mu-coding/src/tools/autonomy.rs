@@ -124,6 +124,11 @@ impl Tool for StartAutonomousTool {
                 "required": ["goal"]
             }),
         )
+        // mu-cvm5: explicit read-only opt-in (default now fails closed).
+        // Affects only this session's own control flow, not world state;
+        // gated by AutonomyCapability at tool-presence + the loop input
+        // handler, not the tool-policy gate (mu-036).
+        .read_only()
     }
 
     async fn execute(&self, arguments: Value, _cancel_rx: oneshot::Receiver<()>) -> ToolResult {
@@ -208,6 +213,10 @@ impl Tool for ScheduleWakeupTool {
                 }
             }),
         )
+        // mu-cvm5: explicit read-only opt-in (default now fails closed).
+        // Affects only this session's own control flow (mu-036), gated by
+        // AutonomyCapability, not the tool-policy gate.
+        .read_only()
     }
 
     async fn execute(&self, arguments: Value, _cancel_rx: oneshot::Receiver<()>) -> ToolResult {

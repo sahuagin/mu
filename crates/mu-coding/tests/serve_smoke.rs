@@ -1325,6 +1325,11 @@ async fn mcp_tools_imported_from_config_mu_yc6() {
                 url,
                 tools: Some(vec!["code_recall".into()]),
                 prefix: None,
+                // mu-cvm5: operator classifies this trusted code-search
+                // server as read-only so imported tools aren't fail-safed
+                // to Execute (which a restrictive session would refuse).
+                side_effects: Some(mu_core::agent::SideEffects::ReadOnly),
+                tool_side_effects: Default::default(),
             }],
         },
         ..Default::default()
@@ -1425,6 +1430,8 @@ async fn mcp_unreachable_server_degrades_gracefully_mu_yc6() {
                 url: "http://127.0.0.1:1/mcp".into(),
                 tools: None,
                 prefix: None,
+                side_effects: None,
+                tool_side_effects: Default::default(),
             }],
         },
         ..Default::default()

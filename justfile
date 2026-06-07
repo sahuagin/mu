@@ -39,6 +39,12 @@ ci: fmt-check clippy test
 ci-aipr: ci
     scripts/ai-review.sh
 
+# Trailing-PR sync of the canonical beads DB to .beads/issues.jsonl on main
+# (mu-4sf8). Run at session end / after a merge wave, from the BACKING repo.
+# Idempotent: no-op exit 0 when main's JSONL already matches the DB.
+beads-sync:
+    scripts/beads-sync.sh
+
 # ── individual cargo steps ────────────────────────────────────────────────
 
 # Format every crate in place.

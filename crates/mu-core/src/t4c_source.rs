@@ -371,6 +371,15 @@ fn effects_from_policy(policy: &ToolPolicy) -> Effects {
         SideEffects::Mutating | SideEffects::Destructive => e.filesystem = FsEffect::Write,
         // External = reaches the network (mu's reserved network class).
         SideEffects::External => e.network = true,
+        // Execute = runs arbitrary code / spawns a process (shell, worker,
+        // exec). It subsumes the others — a shell can read, write, and
+        // network — so the honest projection flags every reachable axis
+        // plus `process`. This is the surface OS sandboxing keys on (mu-627).
+        SideEffects::Execute => {
+            e.filesystem = FsEffect::Write;
+            e.network = true;
+            e.process = true;
+        }
     }
     if policy.required_aws_capability.is_some() {
         e.network = true;

@@ -232,6 +232,21 @@ impl Tool for WatchTool {
                 "required": ["command", "note"]
             }),
         )
+        // mu-usfj: watch runs arbitrary `sh -c` — it is Execute, NOT the
+        // defaulted ReadOnly. The previous default policy let a watch
+        // bypass the gate `bash` faces (a `watch("rm -rf x")` sailed
+        // through). Honest declaration now; the side-effects-aware gate
+        // that ACTS on Execute is mu-n25a Phase 2. `idempotent: false`
+        // (the world changes between runs), permission left Allow until
+        // the gate + session posture exist to narrow it correctly
+        // without breaking the autonomous watch flow.
+        .with_policy(mu_core::agent::ToolPolicy {
+            side_effects: mu_core::agent::SideEffects::Execute,
+            permission: mu_core::agent::PermissionLevel::Allow,
+            retry: mu_core::agent::RetryPolicy::ModelDecides,
+            required_aws_capability: None,
+            idempotent: false,
+        })
     }
 
     fn execute<'life0, 'async_trait>(

@@ -128,13 +128,34 @@ pub(crate) fn fmt_unix_ms(v: Option<u64>) -> String {
 }
 
 pub(crate) fn time_tag(ms: u64) -> String {
+    // mu-console-human-time-f6b0: the visible cell text is a human-readable
+    // UTC stamp ("YYYY-MM-DD HH:MM"), not a raw epoch — the operator reads
+    // this column at a glance. The precise instant (millisecond resolution,
+    // ISO `…Z`) stays in `datetime`; `data-epoch-ms` carries the raw ms for
+    // the `localizeTimes()` client-side localizer. So the no-JS fallback is
+    // already readable, and JS upgrades it to local time + elapsed in place.
     format!(
-        "<time datetime=\"{}\" data-epoch-ms=\"{}\">{}.{:03}s</time>",
+        "<time datetime=\"{}\" data-epoch-ms=\"{}\">{}</time>",
         esc_attr(&epoch_ms_to_iso_utc(ms)),
         ms,
-        ms / 1000,
-        ms % 1000
+        epoch_ms_to_human_utc(ms),
     )
+}
+
+/// Human-readable `YYYY-MM-DD HH:MM` UTC stamp for the visible `<time>` cell
+/// text. Minute resolution is deliberate: this is the "last activity" column,
+/// read at a glance — the millisecond-precise instant lives in the `datetime`
+/// / `data-epoch-ms` attributes alongside it. UTC matches the rest of this
+/// module (see [`epoch_ms_to_iso_utc`]); the browser localizes via
+/// `localizeTimes()` when JS is available. mu-console-human-time-f6b0.
+fn epoch_ms_to_human_utc(ms: u64) -> String {
+    let secs = (ms / 1000) as i64;
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = sod / 3600;
+    let minute = (sod % 3600) / 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
 }
 
 fn epoch_ms_to_iso_utc(ms: u64) -> String {
@@ -276,3 +297,43 @@ summary { cursor:pointer; color:var(--link); }
 .kv { display:grid; grid-template-columns:max-content 1fr; gap:6px 14px; }
 .kv dt { color:var(--muted); } .kv dd { margin:0; }
 </style>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 1749195079771 ms == 2025-06-06T07:31:19.771Z.
+    const SAMPLE_MS: u64 = 1_749_195_079_771;
+
+    #[test]
+    fn time_tag_visible_text_is_human_readable_not_raw_epoch() {
+        let html = time_tag(SAMPLE_MS);
+        // mu-console-human-time-f6b0: the regression. The visible cell text
+        // must be the human stamp, never the old "{epoch_s}.{ms}s" form.
+        assert!(
+            html.contains(">2025-06-06 07:31</time>"),
+            "visible text should be human-readable UTC, got: {html}"
+        );
+        assert!(
+            !html.contains("1749195079.771s"),
+            "raw epoch must not leak into the visible text: {html}"
+        );
+    }
+
+    #[test]
+    fn time_tag_keeps_machine_attributes() {
+        let html = time_tag(SAMPLE_MS);
+        // Precise instant stays in datetime; raw ms stays for the JS localizer.
+        assert!(
+            html.contains("datetime=\"2025-06-06T07:31:19.771Z\""),
+            "{html}"
+        );
+        assert!(html.contains("data-epoch-ms=\"1749195079771\""), "{html}");
+    }
+
+    #[test]
+    fn epoch_ms_to_human_utc_minute_resolution() {
+        assert_eq!(epoch_ms_to_human_utc(0), "1970-01-01 00:00");
+        assert_eq!(epoch_ms_to_human_utc(SAMPLE_MS), "2025-06-06 07:31");
+    }
+}

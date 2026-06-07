@@ -1,0 +1,153 @@
+# t4c built-in curated catalog — the durable asset.
+#
+# This file is baked into the t4c binary via `include_str!` (see
+# catalog.rs::DEFAULT_CATALOG_TOML), exactly mirroring how mu-core ships
+# `models.default.toml`. Adding a tool or changing a calling convention is an
+# EDIT TO THIS FILE, not a code change + recompile (goal mu-2332).
+#
+# Layering (lowest → highest authority; later wins on path collision):
+#   1. this baked-in default
+#   2. ${MU_CONFIG_DIR}/defaults/t4c.curated.toml  (install-shipped, same
+#      mechanism as models.default.toml — mu-hqto)
+#   3. operator/local override TOML ($T4C_CONFIG or ~/.config/t4c/registry.toml)
+#
+# Two grammars share this file (chain.rs comment: unknown sections are ignored
+# by each parser, so they coexist):
+#   [[capability]] — a distinct tool/subcommand node (neighborhood members).
+#   [[chain]]      — an ordered, best-first list of INTERCHANGEABLE impls of one
+#                    slot; `discover` resolves to the first installed impl and
+#                    tombstones the rest. Per-impl mandatory_flags bake in
+#                    safe-default flags (mu-kex4.6.7).
+#
+# The catalog is curated once and applied everywhere t4c lands; on a given host
+# the live registry is catalog ∩ what's-installed (discovery tracks permission).
+
+# ─────────────────────────────── capabilities ───────────────────────────────
+
+[[capability]]
+path = "mcp.code-index.recall"
+summary = "semantic + lexical code search over an indexed repo (best first pass for 'where is X')"
+keywords = [
+    "code", "search", "semantic", "symbol", "recall", "function", "struct", "where",
+]
+invoke = ["code-index", "recall"]
+requires = []
+[capability.help]
+argv = ["code-index", "--help-ai"]
+ai = true
+
+[[capability]]
+path = "bash.agent.memory"
+summary = "search persistent agent memory (decisions, feedback, project state, references)"
+keywords = [
+    "memory", "remember", "know", "decision", "feedback", "why", "prior", "history", "context",
+]
+invoke = ["agent", "memory", "search"]
+requires = []
+[capability.help]
+argv = ["agent", "memory", "--help-ai"]
+ai = true
+
+[[capability]]
+path = "bash.jj.status"
+summary = "jujutsu — working-copy and parent status"
+keywords = ["vcs", "version", "diff", "working", "copy", "commit", "jujutsu"]
+invoke = ["jj", "status"]
+requires = []
+[capability.help]
+argv = ["jj", "status", "--help"]
+ai = false
+
+[[capability]]
+path = "bash.git.status"
+summary = "git — working-tree status"
+keywords = ["vcs", "version", "diff", "staged", "commit"]
+invoke = ["git", "status"]
+requires = []
+[capability.help]
+argv = ["git", "status", "--help"]
+ai = false
+
+[[capability]]
+path = "bash.gh.pr"
+summary = "GitHub CLI for PRs/issues. In jj sibling workspaces there is no .git: always pass `-R owner/repo` (e.g. `gh pr create -R sahuagin/mu ...`). Avoid `gh pr merge -d`; merge, then `jj git fetch`."
+keywords = [
+    "github", "gh", "pr", "pull-request", "review", "merge", "issue", "jj",
+    "workspace", "not-a-git-repository", "repository",
+]
+invoke = ["gh", "pr", "create", "-R", "OWNER/REPO", "--base", "main", "--head", "BRANCH"]
+requires = []
+[capability.help]
+argv = ["gh", "pr", "--help"]
+ai = false
+
+[[capability]]
+path = "bash.jq"
+summary = "jq — query and transform JSON"
+keywords = ["json", "query", "filter", "transform", "parse"]
+invoke = ["jq"]
+requires = []
+[capability.help]
+argv = ["jq", "--help"]
+ai = false
+
+[[capability]]
+path = "bash.t4c"
+summary = "tools4claude — discover, learn, and invoke tools by intent (this tool, self-registered)"
+keywords = ["discover", "tool", "find", "capability", "help", "registry", "meta"]
+invoke = ["t4c"]
+requires = []
+[capability.help]
+argv = ["t4c", "--help-ai"]
+ai = true
+
+[[capability]]
+path = "bash.antagonist-log"
+summary = "verdict journal for review antagonists (verifier/judge/gate) — record runs, adjudicate findings, catch/false-alarm stats"
+keywords = [
+    "verdict", "verifier", "judge", "review", "gate", "false-alarm", "catch",
+    "stats", "adjudicate", "antagonist", "finding",
+]
+invoke = ["antagonist_log", "recent"]
+requires = []
+[capability.help]
+argv = ["antagonist_log", "--help"]
+ai = false
+
+# ─────────────────────────────────── chains ─────────────────────────────────
+
+[[chain]]
+slot = "bash.search"
+summary = "search file contents for a pattern or regex"
+keywords = ["search", "grep", "regex", "pattern", "string", "text"]
+# rg/grep both auto-disable color when stdout isn't a tty, so no mandatory flag.
+impls = ["rg", "grep"]
+
+[[chain]]
+slot = "bash.find-files"
+summary = "find files and directories by name or glob"
+keywords = ["find", "file", "filename", "path", "glob", "locate", "directory"]
+# Confine to one filesystem so a search never crawls the ~12TB NFS mount.
+# fd spells it `--one-file-system`; BSD find spells it `-x`. (mu-kex4.6.7)
+impls = [
+    { cmd = "fd", flags = ["--one-file-system"] },
+    { cmd = "find", flags = ["-x"] },
+]
+
+[[chain]]
+slot = "bash.ls"
+summary = "list directory contents"
+keywords = ["list", "ls", "directory", "files", "tree"]
+# eza/exa emit ANSI under a color-forcing alias; `--color=never` keeps agent
+# path-captures clean. BSD ls has no --color flag (would error), carries none.
+impls = [
+    { cmd = "eza", flags = ["--color=never"] },
+    { cmd = "exa", flags = ["--color=never"] },
+    "ls",
+]
+
+[[chain]]
+slot = "bash.compress"
+summary = "compress or archive data"
+keywords = ["compress", "archive", "zip", "gzip", "tar"]
+impls = ["zstd", "pixz", "xz", "gzip"]

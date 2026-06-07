@@ -46,6 +46,14 @@ figment = { version = "0.10", features = ["toml", "env"] }
 
 # storage
 rusqlite = { version = "0.31", features = ["bundled"] }
+# mu-2332: t4c's warm-start snapshot. rkyv archives the post-discovery registry
+# (capabilities + present/absent + help text + embedding vectors) so a `find`
+# loads it zero-copy via mmap and does NO env probing. f32 vectors are rkyv's
+# best case. The snapshot is CACHE, never source of truth — schema-version /
+# catalog-hash / PATH-hash mismatch self-heals via rediscovery, so rkyv's
+# schema-evolution brittleness is acceptable by design.
+rkyv = { version = "0.8" }
+memmap2 = { version = "0.9" }
 
 # CLI + errors + logging
 clap = { version = "4", features = ["derive"] }

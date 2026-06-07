@@ -1,0 +1,35 @@
+{
+  "note": "Settings A/B as PROFILES on ONE base model — no Modelfile variants needed; ollama accepts every sampling parameter per-request. Values are Unsloth's authoritative Qwen3.6 recommendations (memory 41771769): thinking-mode GENERAL = temp 1.0, PRECISE CODING = temp 0.6, both with top_p 0.95 / top_k 20 / min_p 0 / presence_penalty 0 / repeat_penalty 1. The two profiles differ ONLY in temperature, isolating 'does the coding-vs-general temperature change the fidelity reading?'. NOTE: temperature 0 is OFF-DISTRIBUTION for this model (appears nowhere in Unsloth's recipe) and was verified to break it — at temp 0 the model degenerated into thinking-loops AND failed the no-compaction control. So neither profile uses temp 0; reproducibility comes from the fixed seed at the recommended temperature. num_ctx held constant (ample for these small probe contexts); num_predict caps a runaway generation cheaply. Set the base model to your loaded Qwen3.6 tag (e.g. qwen3.6:27b or qwen3.6:35b-a3b).",
+  "runs": [
+    {
+      "label": "coding@temp0.6",
+      "model": "qwen3.6:27b",
+      "options": {
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "seed": 42,
+        "num_ctx": 16384,
+        "num_predict": 1024
+      }
+    },
+    {
+      "label": "general@temp1.0",
+      "model": "qwen3.6:27b",
+      "options": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "seed": 42,
+        "num_ctx": 16384,
+        "num_predict": 1024
+      }
+    }
+  ]
+}

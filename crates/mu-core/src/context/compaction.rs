@@ -39,6 +39,7 @@
 
 pub mod bench;
 pub mod fidelity;
+pub mod fixture;
 pub mod hash_summary;
 pub mod heuristic;
 pub mod provider_judge;

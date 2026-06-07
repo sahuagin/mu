@@ -34,12 +34,25 @@ use rmcp::ServiceExt;
 /// and is refused by any session with a `max_side_effects` ceiling below
 /// `Execute` (e.g. a read-only operator posture). Classifying a server is a
 /// deliberate, auditable operator act — never something the remote asserts.
-fn resolve_side_effects(cfg: &McpServerConfig, remote_name: &str) -> SideEffects {
-    cfg.tool_side_effects
+///
+/// The second tuple element is `classified`: whether an operator
+/// classification existed (per-tool or server floor) or the fail-safe fired.
+/// The importer uses it to pick the permission level — a classified tool is
+/// the operator's trust statement and runs `Allow`; an unclassified one
+/// keeps `Ask` as a second gate behind the side-effects ceiling. Without
+/// this, the Phase-5 fail-closed `ToolPolicy::default()` (`Ask`) would make
+/// every MCP call prompt — and wedge headless serve sessions, which have no
+/// approver (observed live: serve_smoke's MCP import test hung forever).
+fn resolve_side_effects(cfg: &McpServerConfig, remote_name: &str) -> (SideEffects, bool) {
+    match cfg
+        .tool_side_effects
         .get(remote_name)
         .copied()
         .or(cfg.side_effects)
-        .unwrap_or(SideEffects::Execute)
+    {
+        Some(se) => (se, true),
+        None => (SideEffects::Execute, false),
+    }
 }
 
 /// The long-lived client handle for one remote server. `()` is the trivial
@@ -97,12 +110,13 @@ async fn import_from_server(cfg: &McpServerConfig) -> anyhow::Result<Vec<Arc<dyn
                 continue;
             }
         }
-        let side_effects = resolve_side_effects(cfg, def.name.as_ref());
+        let (side_effects, classified) = resolve_side_effects(cfg, def.name.as_ref());
         tools.push(Arc::new(RemoteMcpTool::new(
             &cfg.name,
             cfg.prefix.as_deref(),
             &def,
             side_effects,
+            classified,
             peer.clone(),
         )));
     }
@@ -133,10 +147,13 @@ mod tests {
         // mu-cvm5 ACCEPTANCE: adding an MCP server with no classification
         // fails safe — every imported tool is the most restrictive class.
         let c = cfg(None, &[]);
-        assert_eq!(resolve_side_effects(&c, "anything"), SideEffects::Execute);
+        assert_eq!(
+            resolve_side_effects(&c, "anything"),
+            (SideEffects::Execute, false)
+        );
         assert_eq!(
             resolve_side_effects(&c, "delete_everything"),
-            SideEffects::Execute
+            (SideEffects::Execute, false)
         );
     }
 
@@ -145,11 +162,11 @@ mod tests {
         let c = cfg(Some(SideEffects::ReadOnly), &[]);
         assert_eq!(
             resolve_side_effects(&c, "code_recall"),
-            SideEffects::ReadOnly
+            (SideEffects::ReadOnly, true)
         );
         assert_eq!(
             resolve_side_effects(&c, "code_status"),
-            SideEffects::ReadOnly
+            (SideEffects::ReadOnly, true)
         );
     }
 
@@ -162,9 +179,12 @@ mod tests {
         );
         assert_eq!(
             resolve_side_effects(&c, "code_recall"),
-            SideEffects::ReadOnly
+            (SideEffects::ReadOnly, true)
         );
-        assert_eq!(resolve_side_effects(&c, "run_query"), SideEffects::External);
+        assert_eq!(
+            resolve_side_effects(&c, "run_query"),
+            (SideEffects::External, true)
+        );
     }
 
     #[test]
@@ -174,8 +194,11 @@ mod tests {
         let c = cfg(None, &[("code_recall", SideEffects::ReadOnly)]);
         assert_eq!(
             resolve_side_effects(&c, "code_recall"),
-            SideEffects::ReadOnly
+            (SideEffects::ReadOnly, true)
         );
-        assert_eq!(resolve_side_effects(&c, "other"), SideEffects::Execute);
+        assert_eq!(
+            resolve_side_effects(&c, "other"),
+            (SideEffects::Execute, false)
+        );
     }
 }

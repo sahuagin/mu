@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use mu_core::agent::{SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec};
+use mu_core::agent::{PermissionLevel, SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec};
 use rmcp::model::CallToolRequestParams;
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -31,17 +31,21 @@ impl RemoteMcpTool {
     /// floor → fail-safe `Execute`). MCP carries no side-effects metadata,
     /// so this is the only honest source — it MUST be supplied by the caller,
     /// never inferred from the remote `def`. (mu-cvm5 / mu-n25a Phase 4)
+    /// `classified` is whether that classification was operator-supplied
+    /// (true) or the fail-safe `Execute` default (false) — it selects the
+    /// permission level (see `translate_spec`).
     pub fn new(
         server: &str,
         prefix: Option<&str>,
         def: &rmcp::model::Tool,
         side_effects: SideEffects,
+        classified: bool,
         peer: Arc<McpPeer>,
     ) -> Self {
         Self {
             server: server.to_owned(),
             remote_name: def.name.to_string(),
-            spec: translate_spec(prefix, def, side_effects),
+            spec: translate_spec(prefix, def, side_effects, classified),
             peer,
         }
     }
@@ -52,15 +56,27 @@ impl RemoteMcpTool {
 /// `ToolSpec` carries — no shape conversion, just an optional name prefix.
 ///
 /// The `policy.side_effects` is set to `side_effects` (the operator's
-/// classification, defaulting to the fail-safe `Execute` upstream). The rest
-/// of the policy stays at its safe baseline: the runtime cannot vouch for an
-/// imported tool's idempotency or retry-safety either, so it carries the
-/// conservative defaults and lets the dispatch-boundary side-effects gate
-/// (`Capability::check_side_effects`) do the gating. (mu-cvm5)
+/// classification, defaulting to the fail-safe `Execute` upstream).
+///
+/// `permission` follows `classified`: an operator classification is a
+/// deliberate, auditable trust statement, so a classified tool runs `Allow`
+/// (matching the pre-Phase-5 behavior for vouched servers); an unclassified
+/// tool keeps the fail-closed default `Ask` as a second gate behind the
+/// side-effects ceiling. Without this split, the Phase-5 `ToolPolicy::default()`
+/// flip (`Ask`) made EVERY imported MCP tool prompt on call — wedging
+/// headless serve sessions, which have no approver (observed live in
+/// serve_smoke::mcp_tools_imported_from_config_mu_yc6, hung forever).
+///
+/// The rest of the policy stays at its safe baseline: the runtime cannot
+/// vouch for an imported tool's idempotency or retry-safety either, so it
+/// carries the conservative defaults and lets the dispatch-boundary
+/// side-effects gate (`Capability::check_side_effects`) do the gating.
+/// (mu-cvm5)
 fn translate_spec(
     prefix: Option<&str>,
     def: &rmcp::model::Tool,
     side_effects: SideEffects,
+    classified: bool,
 ) -> ToolSpec {
     let local_name = match prefix {
         Some(p) if !p.is_empty() => format!("{p}{}", def.name),
@@ -68,8 +84,14 @@ fn translate_spec(
     };
     let description = def.description.as_deref().unwrap_or_default().to_owned();
     let schema = Value::Object((*def.input_schema).clone());
+    let permission = if classified {
+        PermissionLevel::Allow
+    } else {
+        PermissionLevel::Ask
+    };
     ToolSpec::new(local_name, description, schema).with_policy(ToolPolicy {
         side_effects,
+        permission,
         ..ToolPolicy::default()
     })
 }
@@ -155,6 +177,7 @@ mod tests {
             None,
             &def("code_recall", "hybrid retrieval"),
             SideEffects::ReadOnly,
+            true,
         );
         assert_eq!(spec.name, "code_recall");
         assert_eq!(spec.description, "hybrid retrieval");
@@ -170,10 +193,16 @@ mod tests {
             Some("code_index."),
             &def("code_status", ""),
             SideEffects::ReadOnly,
+            true,
         );
         assert_eq!(spec.name, "code_index.code_status");
         // Empty prefix behaves like no prefix.
-        let spec = translate_spec(Some(""), &def("code_status", ""), SideEffects::ReadOnly);
+        let spec = translate_spec(
+            Some(""),
+            &def("code_status", ""),
+            SideEffects::ReadOnly,
+            true,
+        );
         assert_eq!(spec.name, "code_status");
     }
 
@@ -181,11 +210,36 @@ mod tests {
     fn translate_spec_stamps_classified_side_effects() {
         // mu-cvm5: the operator's classification rides into the ToolSpec's
         // policy so the dispatch-boundary gate can act on it.
-        let benign = translate_spec(None, &def("code_recall", ""), SideEffects::ReadOnly);
+        let benign = translate_spec(None, &def("code_recall", ""), SideEffects::ReadOnly, true);
         assert_eq!(benign.policy.side_effects, SideEffects::ReadOnly);
         // Fail-safe default: an unclassified tool is stamped Execute upstream.
-        let danger = translate_spec(None, &def("delete_everything", ""), SideEffects::Execute);
+        let danger = translate_spec(
+            None,
+            &def("delete_everything", ""),
+            SideEffects::Execute,
+            false,
+        );
         assert_eq!(danger.policy.side_effects, SideEffects::Execute);
+    }
+
+    #[test]
+    fn classification_selects_permission_level() {
+        // mu-cvm5: an operator classification is the trust statement — a
+        // classified tool runs Allow (pre-Phase-5 behavior for vouched
+        // servers); an unclassified one keeps the fail-closed Ask as a
+        // second gate. Regression lock for the headless-serve wedge: with
+        // Ask on classified tools, every MCP call in a serve session blocks
+        // on a permission prompt that has no approver (serve_smoke's MCP
+        // import test hung forever).
+        let vouched = translate_spec(None, &def("code_recall", ""), SideEffects::ReadOnly, true);
+        assert_eq!(vouched.policy.permission, PermissionLevel::Allow);
+        let unknown = translate_spec(
+            None,
+            &def("delete_everything", ""),
+            SideEffects::Execute,
+            false,
+        );
+        assert_eq!(unknown.policy.permission, PermissionLevel::Ask);
     }
 
     #[test]
@@ -204,6 +258,7 @@ mod tests {
             None,
             &def("delete_everything", "deletes the world"),
             SideEffects::Execute,
+            false,
         );
         assert_eq!(spec.policy.side_effects, SideEffects::Execute);
 
@@ -223,7 +278,7 @@ mod tests {
 
         // Contrast: an operator-classified read-only MCP tool passes the
         // same ceiling — classification is the deliberate opt-in.
-        let classified = translate_spec(None, &def("code_recall", ""), SideEffects::ReadOnly);
+        let classified = translate_spec(None, &def("code_recall", ""), SideEffects::ReadOnly, true);
         assert!(read_only_session
             .check_side_effects(classified.policy.side_effects)
             .is_allowed());

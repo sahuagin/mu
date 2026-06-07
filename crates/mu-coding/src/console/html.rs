@@ -112,6 +112,11 @@ pub(crate) fn payload_kind(payload: &EventPayload) -> &'static str {
         EventPayload::WorkerFailed { .. } => "worker_failed",
         EventPayload::WorkerTimeout { .. } => "worker_timeout",
         EventPayload::OperatorMark { .. } => "operator_mark",
+        // mu-mh4: a compensating tombstone over a poisoned record. The
+        // console's CSS can target `.role-tombstone` to render it as
+        // scar tissue (visual styling is follow-up; the kind tag is the
+        // hook).
+        EventPayload::Tombstone { .. } => "tombstone",
     }
 }
 

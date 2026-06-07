@@ -84,6 +84,7 @@ pub fn handle_create_session(
         parent_session_id: None,             // no parent — this is a root session
         branched_at_parent_event_id: None,
         capability, // root: unrestricted, autonomy per mu-7e21 grant above
+        seed_messages: Vec::new(), // mu-mh4: fresh session starts empty
         cache_ttl: params.cache_ttl.unwrap_or_default(), // mu-f1a0
         notif,
         sessions,
@@ -159,6 +160,10 @@ pub fn handle_delegate_session(
         parent_session_id: Some(params.parent_session_id.clone()),
         branched_at_parent_event_id: params.branched_at_parent_event_id,
         capability: child_capability,
+        // mu-mh4: delegate sessions still start empty (the branch id is
+        // recorded for audit). session.resume is the path that seeds a
+        // continuation history; delegate-with-seed is future work.
+        seed_messages: Vec::new(),
         // mu-f1a0: delegated workers are PINNED to the 5m tier
         // regardless of the parent's — they run gap-free tool loops,
         // so the 1h tier's 2x write premium is pure cost (operator
@@ -199,6 +204,10 @@ struct BuildSessionRequest<'a> {
     parent_session_id: Option<String>,
     branched_at_parent_event_id: Option<u64>,
     capability: Capability,
+    /// mu-mh4: pre-seeded conversation history for a resumed/forked
+    /// session (continuation projection of the predecessor's log).
+    /// Empty for fresh and (current) delegate sessions.
+    seed_messages: Vec<AgentMessage>,
     /// mu-f1a0: prompt-cache TTL tier for this session's provider.
     cache_ttl: CacheTtl,
     // runtime deps (daemon-global)
@@ -279,6 +288,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         parent_session_id,
         branched_at_parent_event_id,
         capability,
+        seed_messages,
         notif,
         sessions,
         factory,
@@ -401,6 +411,9 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             project_context,
             compaction_threshold: Some(compaction_cfg.trigger_threshold_tokens),
             compaction_policy_override,
+            // mu-mh4: seed the loop with the continuation history when
+            // this session is a resume/fork-at-tail; empty otherwise.
+            seed_messages,
         },
         events: events_tx,
         pending_approvals: pending_approvals.clone(),
@@ -1155,6 +1168,7 @@ fn payload_kind_str(p: &EventPayload) -> &'static str {
         EventPayload::WorkerFailed { .. } => "worker_failed",
         EventPayload::WorkerTimeout { .. } => "worker_timeout",
         EventPayload::OperatorMark { .. } => "operator_mark",
+        EventPayload::Tombstone { .. } => "tombstone",
     }
 }
 

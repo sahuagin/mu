@@ -112,14 +112,28 @@ pub async fn run(opts: ResumeOptions) -> Result<()> {
         None
     };
 
+    // Dropping stdin signals EOF; the daemon's serve loop sees it and
+    // begins a CLEAN shutdown (flushing each session's JSONL writer).
+    // mu-mh4 (panel finding 5): give that clean shutdown a GENEROUS grace
+    // window before resorting to SIGKILL. SIGKILL cannot be caught, so it
+    // can truncate a session log mid-write — the ragged tail this very
+    // feature exists to manage. A long patience window means we
+    // effectively never SIGKILL a healthy-but-slow daemon; the kill stays
+    // a true last resort for a genuinely wedged process. (A SIGTERM-then-
+    // grace-then-SIGKILL escalation would be strictly nicer but needs a
+    // signal dep — nix/libc — which this crate does not carry; deferred to
+    // mu-nqn5's cleanup pass rather than pulling in a dep for a last-
+    // resort path.)
     drop(stdin);
-    match timeout(Duration::from_secs(5), child.wait()).await {
+    match timeout(Duration::from_secs(30), child.wait()).await {
         Ok(Ok(status)) if status.success() => {}
         Ok(Ok(status)) => bail!("mu serve exited with status {status}"),
         Ok(Err(e)) => return Err(e).context("waiting for child"),
         Err(_) => {
             let _ = child.kill().await;
-            bail!("mu serve did not exit within 5 seconds; killed")
+            bail!(
+                "mu serve did not exit within 30 seconds; killed (SIGKILL — log may be truncated)"
+            )
         }
     }
 
@@ -159,24 +173,40 @@ async fn resume_session(
     });
     write_line(stdin, &req).await?;
 
-    loop {
-        let line = read_line(stdout).await?;
-        if line.get("id") == Some(&Value::from(id)) {
-            if let Some(error) = line.get("error") {
-                // The daemon's refusal message already carries the
-                // precise diagnosis + the `mu --recover` hint.
-                let msg = error
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("(no message)");
-                bail!("{msg}");
+    // mu-mh4 (panel finding 2): bound the read loop. Without this, an
+    // unresponsive daemon (hung mid-rehydration, deadlocked, etc.) hangs
+    // the CLI forever — no terminal frame ever arrives, so a bare `loop`
+    // blocks indefinitely. Mirror ask.rs's `timeout()` discipline; the
+    // window is generous (the project prefers long timeouts over
+    // premature failure, and resume waits on a fresh `mu serve`
+    // rehydrating every on-disk log at startup).
+    let read_loop = async {
+        loop {
+            let line = read_line(stdout).await?;
+            if line.get("id") == Some(&Value::from(id)) {
+                if let Some(error) = line.get("error") {
+                    // The daemon's refusal message already carries the
+                    // precise diagnosis + the `mu --recover` hint.
+                    let msg = error
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("(no message)");
+                    bail!("{msg}");
+                }
+                let result = line
+                    .get("result")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("session.resume response missing `result`"))?;
+                return serde_json::from_value(result).context("parse ResumeSessionResponse");
             }
-            let result = line
-                .get("result")
-                .cloned()
-                .ok_or_else(|| anyhow!("session.resume response missing `result`"))?;
-            return serde_json::from_value(result).context("parse ResumeSessionResponse");
+            // Skip unrelated notifications.
         }
-        // Skip unrelated notifications.
+    };
+    match timeout(Duration::from_secs(120), read_loop).await {
+        Ok(res) => res,
+        Err(_) => bail!(
+            "session.resume timed out after 120s waiting for the daemon \
+             to respond (the daemon may be hung or still rehydrating)"
+        ),
     }
 }

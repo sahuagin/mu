@@ -455,8 +455,16 @@ pub enum EventPayload {
     HeadAttached {
         /// The daemon that attached the live head (the resuming daemon).
         daemon_id: String,
-        /// Who requested the attach (operator / agent actor).
-        actor: String,
+        /// Who CLAIMED to request the attach (operator / agent actor).
+        /// mu-mh4 (panel finding 3): this is caller-supplied and
+        /// UNVERIFIED — `session.resume` has no connection-derived
+        /// identity to cross-check it against (the serve layer
+        /// authenticates the connection with a trust-on-spawn bearer
+        /// token, not a per-actor identity). Named `claimed_actor` so
+        /// every projection of this event treats the attribution as a
+        /// claim, not a verified fact. A future identity layer (mu-nqn5
+        /// follow-up) can stamp a verified actor alongside.
+        claimed_actor: String,
         /// The predecessor session this forked from.
         predecessor_session_id: String,
         /// The event id in the predecessor's log this forked at (the

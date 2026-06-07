@@ -38,7 +38,7 @@ use mu_core::context::compaction::bench::{
     benchmark_session, csv_header, csv_row, load_session_rope, BenchRow, KeepHalfJudge,
     LabeledPolicy,
 };
-use mu_core::context::compaction::hash_summary::HashAndSummaryPolicy;
+use mu_core::context::compaction::hash_summary::{HashAndSummaryPolicy, KeepListMode};
 use mu_core::context::compaction::heuristic::SpanFamilyDropPolicy;
 use mu_core::context::compaction::provider_judge::ProviderJudge;
 use mu_core::context::compaction::NoCompactionPolicy;
@@ -251,12 +251,21 @@ fn build_policies(
                 }
             };
             let judge_impl = ProviderJudge::new(provider);
+            // MU_BENCH_OUTPUT_MODE=index_keep tests the index keep-list
+            // (what example-config ships) instead of the type-default
+            // HashKeep — closes the bench-fidelity gap (mu-0fla bug A).
+            let (mode, mode_label) = match std::env::var("MU_BENCH_OUTPUT_MODE").as_deref() {
+                Ok("index_keep") | Ok("index") => (KeepListMode::IndexKeep, "index"),
+                _ => (KeepListMode::HashKeep, "hash"),
+            };
             policies.push(LabeledPolicy {
                 label: format!(
-                    "hash-and-summary-v1[live:{}:{model}]",
+                    "hash-and-summary-v1[live:{}:{model}:{mode_label}]",
                     judge_provider.label()
                 ),
-                policy: Arc::new(HashAndSummaryPolicy::new(Arc::new(judge_impl))),
+                policy: Arc::new(
+                    HashAndSummaryPolicy::new(Arc::new(judge_impl)).with_output_mode(mode),
+                ),
                 model_calls: 1,
             });
         }

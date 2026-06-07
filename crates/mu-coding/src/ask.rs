@@ -143,7 +143,7 @@ pub async fn run(opts: AskOptions) -> Result<()> {
 /// handshake. The strength bar is "unguessable across this process
 /// lifetime"; SHA-256 + constant-time comparison on the daemon side
 /// already absorb timing concerns. 32 hex chars / 128 bits is plenty.
-fn generate_bearer_token() -> String {
+pub(crate) fn generate_bearer_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -152,7 +152,7 @@ fn generate_bearer_token() -> String {
 
 /// Run the `peer.auth_initiate` BEARER handshake. Returns Ok on
 /// `Accepted`; surfaces a clear error on `Denied` or any non-success.
-async fn authenticate(
+pub(crate) async fn authenticate(
     stdin: &mut ChildStdin,
     stdout: &mut BufReader<ChildStdout>,
     next_id: &mut u64,
@@ -187,7 +187,7 @@ async fn authenticate(
 }
 
 #[allow(clippy::too_many_arguments)] // mirrors the CLI flag bundle 1:1
-fn spawn_serve(
+pub(crate) fn spawn_serve(
     tools: &str,
     ephemeral: bool,
     thinking: Option<&str>,
@@ -312,7 +312,7 @@ async fn create_session(
 /// the daemon omits it — older daemons or malformed events), so the
 /// caller can distinguish a complete answer from a truncated one
 /// (mu-1mvq).
-async fn ask_and_drain(
+pub(crate) async fn ask_and_drain(
     stdin: &mut ChildStdin,
     stdout: &mut BufReader<ChildStdout>,
     session_id: &str,
@@ -395,7 +395,7 @@ async fn ask_and_drain(
     }
 }
 
-async fn write_line(stdin: &mut ChildStdin, value: &Value) -> Result<()> {
+pub(crate) async fn write_line(stdin: &mut ChildStdin, value: &Value) -> Result<()> {
     let mut s = serde_json::to_string(value)?;
     s.push('\n');
     stdin.write_all(s.as_bytes()).await?;
@@ -403,7 +403,7 @@ async fn write_line(stdin: &mut ChildStdin, value: &Value) -> Result<()> {
     Ok(())
 }
 
-async fn read_line(stdout: &mut BufReader<ChildStdout>) -> Result<Value> {
+pub(crate) async fn read_line(stdout: &mut BufReader<ChildStdout>) -> Result<Value> {
     let mut line = String::new();
     let n = stdout.read_line(&mut line).await?;
     if n == 0 {

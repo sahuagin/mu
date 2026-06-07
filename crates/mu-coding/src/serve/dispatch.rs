@@ -15,9 +15,9 @@ use mu_core::protocol::{
     DaemonListRoutesRequest, DaemonOutstandingCallsRequest, DaemonStatsRequest,
     DaemonUsageHistoryRequest, DelegateSessionRequest, MailboxConsumeRequest, MailboxListRequest,
     MailboxPostRequest, MailboxReadRequest, PeerHelloRequest, PingRequest, Request,
-    RespondToInputRequiredRequest, Response, ScheduleWakeupRequest, SessionEventsRequest,
-    SessionListRequest, SessionStatsRequest, SetRouteRequest, SpawnWorkerRequest,
-    StartAutonomousRequest,
+    RespondToInputRequiredRequest, Response, ResumeSessionRequest, ScheduleWakeupRequest,
+    SessionEventsRequest, SessionListRequest, SessionStatsRequest, SetRouteRequest,
+    SpawnWorkerRequest, StartAutonomousRequest,
 };
 use mu_core::skill::loader::LoadedSkill;
 use mu_core::transport::{codes, err_response, NotificationWriter};
@@ -149,6 +149,15 @@ pub async fn dispatch(
             daemon_info.clone(),
         ),
         DelegateSessionRequest::METHOD => handle_delegate_session(
+            request,
+            notif,
+            sessions,
+            factory,
+            tools,
+            daemon_info.clone(),
+        ),
+        // mu-mh4: strict fork-at-tail resume.
+        ResumeSessionRequest::METHOD => handle_resume_session(
             request,
             notif,
             sessions,

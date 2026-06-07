@@ -117,6 +117,8 @@ pub(crate) fn payload_kind(payload: &EventPayload) -> &'static str {
         // scar tissue (visual styling is follow-up; the kind tag is the
         // hook).
         EventPayload::Tombstone { .. } => "tombstone",
+        // mu-mh4: a live head attached to a resumed session.
+        EventPayload::HeadAttached { .. } => "head_attached",
     }
 }
 

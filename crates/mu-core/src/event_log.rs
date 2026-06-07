@@ -443,6 +443,27 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
+    /// mu-mh4: a live head was attached to this session's log — the
+    /// "attach head" half of resume. A session that died on daemon A is
+    /// resumed by daemon B forking a fresh live session at the dead
+    /// one's last clean boundary; this event records the attach so the
+    /// session's identity is continuous across serving daemons. Lands
+    /// on the NEW (live) session's log, naming the daemon that attached
+    /// and the actor who requested it; the new `SessionCreated`'s
+    /// `parent_session_id` / `branched_at_parent_event_id` point back to
+    /// the predecessor.
+    HeadAttached {
+        /// The daemon that attached the live head (the resuming daemon).
+        daemon_id: String,
+        /// Who requested the attach (operator / agent actor).
+        actor: String,
+        /// The predecessor session this forked from.
+        predecessor_session_id: String,
+        /// The event id in the predecessor's log this forked at (the
+        /// clean boundary).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branched_at_event_id: Option<u64>,
+    },
     /// mu-mh4: an append-only compensating event that marks an earlier
     /// record as poisoned (broken / incomplete / malformed). The log
     /// is NEVER edited; a Tombstone is laid OVER the bad record so

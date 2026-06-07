@@ -1540,3 +1540,140 @@ async fn serve_exits_on_eof_with_spawn_worker_session_mu_qc08() {
         .expect("server task panicked")
         .expect("serve_with_io_with_config returned an error");
 }
+
+/// Helpers for the mu-mh4 resume tests. Create a session, run one ask to
+/// completion (so the predecessor log reaches a clean boundary), and
+/// return its session id.
+async fn create_and_ask_to_done(
+    client: &mut tokio::io::DuplexStream,
+    id_base: u64,
+    prompt: &str,
+) -> String {
+    let req = json!({
+        "jsonrpc": "2.0", "id": id_base, "method": "create_session",
+        "params": { "provider": { "kind": "anthropic_api", "model": "x" } }
+    });
+    client.write_all(format!("{req}\n").as_bytes()).await.expect("write create");
+    let resp = read_line(client).await;
+    let session_id = resp["result"]["session_id"].as_str().expect("session_id").to_string();
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": id_base + 1, "method": "ask_session",
+        "params": { "session_id": session_id, "user_message": prompt }
+    });
+    client.write_all(format!("{req}\n").as_bytes()).await.expect("write ask");
+
+    let mut saw_done = false;
+    while !saw_done {
+        let line = read_line(client).await;
+        if line["method"] == "session.done" && line["params"]["session_id"] == session_id {
+            saw_done = true;
+        }
+    }
+    session_id
+}
+
+/// mu-mh4: session.resume forks a fresh live session at a clean
+/// predecessor's tail, seeding it with the continuation history.
+#[tokio::test]
+async fn mh4_resume_forks_clean_session_at_tail() {
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) = spawn_server(provider).await;
+
+    // Predecessor: one completed exchange → clean boundary.
+    let predecessor = create_and_ask_to_done(&mut client, 1, "first question").await;
+
+    // Resume it. daemon_id is unknown to the test, but the handler
+    // resolves by session id, so any daemon part parses fine.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 100, "method": "session.resume",
+        "params": {
+            "session_ref": format!("anydaemon:{predecessor}"),
+            "provider": { "kind": "anthropic_api", "model": "x" }
+        }
+    });
+    client.write_all(format!("{req}\n").as_bytes()).await.expect("write resume");
+
+    // Drain to the resume response.
+    let resp = loop {
+        let line = read_line(&mut client).await;
+        if line["id"] == 100 {
+            break line;
+        }
+    };
+    assert!(
+        resp.get("error").is_none(),
+        "resume should succeed on a clean log; got {resp}"
+    );
+    let new_session = resp["result"]["session_id"].as_str().expect("new session id");
+    assert_ne!(new_session, predecessor, "resume births a NEW session");
+    assert_eq!(
+        resp["result"]["predecessor_session_id"], predecessor,
+        "response names the predecessor"
+    );
+    // The clean exchange seeded 2 messages (user + assistant).
+    assert_eq!(
+        resp["result"]["seeded_message_count"], 2,
+        "continuation seeded the prior exchange: {resp}"
+    );
+    assert!(
+        resp["result"]["branched_at_event_id"].is_u64(),
+        "forked at a concrete boundary event: {resp}"
+    );
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}
+
+/// mu-mh4: session.resume REFUSES an unknown predecessor with a clear
+/// not-found error (does not panic or silently create an empty session).
+#[tokio::test]
+async fn mh4_resume_unknown_session_refused() {
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) = spawn_server(provider).await;
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "session.resume",
+        "params": {
+            "session_ref": "d:session-does-not-exist",
+            "provider": { "kind": "anthropic_api", "model": "x" }
+        }
+    });
+    client.write_all(format!("{req}\n").as_bytes()).await.expect("write");
+    let resp = read_line(&mut client).await;
+    assert_eq!(resp["id"], 1);
+    let msg = resp["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("not found"),
+        "unknown predecessor must be refused with not-found: {msg}"
+    );
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}
+
+/// mu-mh4: a malformed session ref is rejected with a message naming the
+/// accepted forms.
+#[tokio::test]
+async fn mh4_resume_bad_ref_rejected() {
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) = spawn_server(provider).await;
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "session.resume",
+        "params": {
+            "session_ref": "no-separator-here",
+            "provider": { "kind": "anthropic_api", "model": "x" }
+        }
+    });
+    client.write_all(format!("{req}\n").as_bytes()).await.expect("write");
+    let resp = read_line(&mut client).await;
+    let msg = resp["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("daemon:session") || msg.contains("mu:<daemon>"),
+        "bad ref error must name the accepted forms: {msg}"
+    );
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}

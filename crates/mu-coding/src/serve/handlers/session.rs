@@ -187,6 +187,149 @@ pub fn handle_delegate_session(
     }
 }
 
+/// mu-mh4: `session.resume` — STRICT fork-at-tail resume.
+///
+/// Resolves the predecessor session's event log (the rehydration pass
+/// at daemon startup loaded every daemon's on-disk logs into the
+/// Sessions map, so a cross-daemon predecessor is addressable here),
+/// projects it to its last clean boundary via
+/// [`mu_core::agent::continuation::project_strict`], and — only if the
+/// log is CLEAN — births a fresh live session parented on the dead one,
+/// seeded with the continuation history. A ragged log is REFUSED with a
+/// precise diagnosis and a `mu --recover` hint (git-style); it is never
+/// silently truncated.
+///
+/// The resumed session's capability is the predecessor's ∩ any requested
+/// attenuations (intersection-only — resume can only narrow). When the
+/// predecessor's live capability is gone (a cold rehydrated session has
+/// no capability handle), it falls back to a fresh root capability, then
+/// applies the attenuations — so voluntary-least-privilege still holds.
+pub fn handle_resume_session(
+    request: Request<Value>,
+    notif: NotificationWriter,
+    sessions: Sessions,
+    factory: ProviderFactory,
+    tools: Arc<Vec<Arc<dyn Tool>>>,
+    daemon_info: DaemonInfo,
+) -> Response<Value> {
+    use mu_core::protocol::{ResumeSessionRequest, ResumeSessionResponse, SessionRef};
+
+    let params: ResumeSessionRequest = match serde_json::from_value(request.params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("session.resume: invalid params: {e}"),
+            );
+        }
+    };
+
+    // Parse the session ref (daemon:session or mu:<daemon>/<session>).
+    let parsed = match SessionRef::parse(&params.session_ref) {
+        Ok(r) => r,
+        Err(e) => return err_response(request.id, codes::INVALID_PARAMS, format!("session.resume: {e}")),
+    };
+
+    // Resolve the predecessor's event log from the Sessions map (the
+    // session id is the addressable key; rehydration loaded all daemons'
+    // logs at startup).
+    let predecessor_log = match sessions.event_log(&parsed.session) {
+        Some(log) => log,
+        None => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!(
+                    "session.resume: predecessor session not found: {} \
+                     (looked up `{}`; is the daemon's events dir the one that holds it?)",
+                    parsed.to_canonical(),
+                    parsed.session
+                ),
+            );
+        }
+    };
+
+    // STRICT continuation projection. A ragged log is refused with a
+    // diagnosis naming the damage + a --recover hint.
+    let events = predecessor_log.snapshot();
+    let continuation = match mu_core::agent::continuation::project_strict(&events) {
+        Ok(c) => c,
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!(
+                    "session.resume refused: {e}. \
+                     The log is not cleanly resumable; run `mu --recover {}` to \
+                     tombstone the broken record(s) and resume from the last prompt.",
+                    params.session_ref
+                ),
+            );
+        }
+    };
+
+    // Capability: predecessor's (if still live) ∩ attenuations, else a
+    // fresh root ∩ attenuations. Intersection-only — resume can only
+    // narrow (the voluntary-least-privilege hook).
+    let base_cap = sessions
+        .capability(&parsed.session)
+        .and_then(|h| h.lock().ok().map(|c| c.clone()))
+        .unwrap_or_else(Capability::root);
+    let resumed_capability = match &params.attenuations {
+        Some(attn) => base_cap.attenuate(attn),
+        None => base_cap,
+    };
+
+    let seeded_message_count = continuation.messages.len();
+    let actor = params.actor.clone().unwrap_or_else(|| "operator".to_string());
+
+    let new_session_id = match build_and_register_session(BuildSessionRequest {
+        selector: &params.provider,
+        system_prompt: None,
+        cwd: params.cwd,
+        // The fork-at-tail lineage: the new live session is parented on
+        // the dead one, branched at its last clean boundary.
+        parent_session_id: Some(parsed.session.clone()),
+        branched_at_parent_event_id: continuation.fork_event_id,
+        capability: resumed_capability,
+        seed_messages: continuation.messages,
+        cache_ttl: CacheTtl::default(),
+        notif,
+        sessions: sessions.clone(),
+        factory,
+        tools,
+        daemon_info: &daemon_info,
+    }) {
+        Ok(id) => id,
+        Err(e) => {
+            return err_response(request.id, codes::INVALID_PARAMS, format!("session.resume: {e}"))
+        }
+    };
+
+    // The attach itself is an event on the new (live) session's log —
+    // session identity continuous across serving daemons (mu-mh4 design).
+    if let Some(new_log) = sessions.event_log(&new_session_id) {
+        new_log.append(
+            EventActor::System,
+            EventPayload::HeadAttached {
+                daemon_id: daemon_info.daemon_id().to_string(),
+                actor,
+                predecessor_session_id: parsed.session.clone(),
+                branched_at_event_id: continuation.fork_event_id,
+            },
+        );
+    }
+
+    let resp = ResumeSessionResponse {
+        session_id: new_session_id,
+        predecessor_session_id: parsed.session,
+        branched_at_event_id: continuation.fork_event_id,
+        seeded_message_count,
+    };
+    ok_response(request.id, to_value_or_null(resp))
+}
+
 /// Input bundle for [`build_and_register_session`]. Groups the
 /// request shape (selector / system prompt / parent linkage /
 /// capability) and the daemon's runtime dependencies (notification
@@ -1169,6 +1312,7 @@ fn payload_kind_str(p: &EventPayload) -> &'static str {
         EventPayload::WorkerTimeout { .. } => "worker_timeout",
         EventPayload::OperatorMark { .. } => "operator_mark",
         EventPayload::Tombstone { .. } => "tombstone",
+        EventPayload::HeadAttached { .. } => "head_attached",
     }
 }
 

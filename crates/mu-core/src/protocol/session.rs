@@ -393,6 +393,129 @@ pub struct DelegateSessionResponse {
     pub child_session_id: String,
 }
 
+// ── mu-mh4: session resume (fork-at-tail) ────────────────────────────
+
+/// A parsed reference to a session, addressing it by daemon + session.
+///
+/// Two textual forms are accepted (PR #206 contract):
+///   - `daemon:session`               — the operator-friendly short form
+///   - `mu:<daemon>/<session>`        — the canonical fleet-wide form
+///
+/// Either part MAY be a prefix; resolution against the events directory
+/// disambiguates (and refuses ambiguity rather than guessing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRef {
+    pub daemon: String,
+    pub session: String,
+}
+
+impl SessionRef {
+    /// Parse a `daemon:session` or `mu:<daemon>/<session>` reference.
+    /// Returns a human-readable error naming the accepted forms when
+    /// the input matches neither.
+    pub fn parse(s: &str) -> Result<SessionRef, String> {
+        let s = s.trim();
+        // Canonical form: mu:<daemon>/<session>
+        if let Some(rest) = s.strip_prefix("mu:") {
+            let (daemon, session) = rest.split_once('/').ok_or_else(|| {
+                format!(
+                    "invalid session ref `{s}`: canonical form is `mu:<daemon>/<session>`"
+                )
+            })?;
+            if daemon.is_empty() || session.is_empty() {
+                return Err(format!(
+                    "invalid session ref `{s}`: both daemon and session are required"
+                ));
+            }
+            return Ok(SessionRef {
+                daemon: daemon.to_string(),
+                session: session.to_string(),
+            });
+        }
+        // Short form: daemon:session
+        let (daemon, session) = s.split_once(':').ok_or_else(|| {
+            format!(
+                "invalid session ref `{s}`: expected `daemon:session` \
+                 or canonical `mu:<daemon>/<session>`"
+            )
+        })?;
+        if daemon.is_empty() || session.is_empty() {
+            return Err(format!(
+                "invalid session ref `{s}`: both daemon and session are required"
+            ));
+        }
+        Ok(SessionRef {
+            daemon: daemon.to_string(),
+            session: session.to_string(),
+        })
+    }
+
+    /// Render in canonical `mu:<daemon>/<session>` form.
+    pub fn to_canonical(&self) -> String {
+        format!("mu:{}/{}", self.daemon, self.session)
+    }
+}
+
+impl std::fmt::Display for SessionRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_canonical())
+    }
+}
+
+/// `session.resume` — STRICT fork-at-tail. The daemon resolves the
+/// predecessor session, projects its log to the last clean boundary
+/// ([`crate::agent::continuation::project_strict`]), and — only if the
+/// log is clean — births a fresh live session parented on the dead one,
+/// seeded with the continuation history. A ragged log is REFUSED with a
+/// precise diagnosis (which record, what's missing) and a `mu --recover`
+/// hint; it does NOT silently truncate (that's `session.recover`'s job).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResumeSessionRequest {
+    /// The predecessor session, as `daemon:session` or
+    /// `mu:<daemon>/<session>` (both parsed by [`SessionRef::parse`]).
+    pub session_ref: String,
+    /// Provider for the resumed (live) session. Independent of the
+    /// predecessor's — resume can switch providers (e.g. away from the
+    /// one that died).
+    pub provider: ProviderSelector,
+    /// Optional capability attenuations for the resumed session
+    /// (mu-033 intersection-only semantics). When present, the resumed
+    /// session's capability is the predecessor's ∩ these — so a resume
+    /// can ONLY narrow, never widen. This is the hook that lets resume
+    /// double as voluntary-least-privilege (fork your own memory into a
+    /// read-only child); the RPC does not preclude it. None → the
+    /// resumed session gets a fresh root capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attenuations: Option<crate::capability::CapabilityAttenuations>,
+    /// Working directory for the resumed session (same semantics as
+    /// [`CreateSessionRequest::cwd`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<std::path::PathBuf>,
+    /// Actor requesting the resume (operator / agent id). Recorded on
+    /// the `HeadAttached` event for attribution. None → "operator".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+}
+
+impl ResumeSessionRequest {
+    pub const METHOD: &'static str = "session.resume";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResumeSessionResponse {
+    /// The new live session's id.
+    pub session_id: String,
+    /// The predecessor session id that was forked from.
+    pub predecessor_session_id: String,
+    /// The event id in the predecessor's log this forked at (the clean
+    /// boundary). None when forked at the empty conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branched_at_event_id: Option<u64>,
+    /// Number of messages seeded into the resumed session from the
+    /// continuation projection.
+    pub seeded_message_count: usize,
+}
+
 /// Respond to an outstanding `session.input_required` notification
 /// (mu-029). The daemon blocks the corresponding tool call until
 /// the client sends this back. `request_id` identifies which prompt
@@ -469,4 +592,54 @@ pub enum WorkerStatus {
     Running,
     Done { exit_code: i32, elapsed_ms: u64 },
     Failed { reason: String },
+}
+
+#[cfg(test)]
+mod session_ref_tests {
+    use super::SessionRef;
+
+    #[test]
+    fn parses_short_form() {
+        let r = SessionRef::parse("daemonABC:session-1").expect("short form");
+        assert_eq!(r.daemon, "daemonABC");
+        assert_eq!(r.session, "session-1");
+        assert_eq!(r.to_canonical(), "mu:daemonABC/session-1");
+    }
+
+    #[test]
+    fn parses_canonical_form() {
+        let r = SessionRef::parse("mu:b533a22e600b31e0/session-1").expect("canonical");
+        assert_eq!(r.daemon, "b533a22e600b31e0");
+        assert_eq!(r.session, "session-1");
+    }
+
+    #[test]
+    fn canonical_round_trips() {
+        let r = SessionRef::parse("mu:d/s").unwrap();
+        assert_eq!(SessionRef::parse(&r.to_canonical()).unwrap(), r);
+    }
+
+    #[test]
+    fn rejects_missing_separator() {
+        let err = SessionRef::parse("justonepart").unwrap_err();
+        assert!(err.contains("daemon:session"), "{err}");
+        assert!(err.contains("mu:<daemon>/<session>"), "{err}");
+    }
+
+    #[test]
+    fn rejects_empty_parts() {
+        assert!(SessionRef::parse("daemon:").is_err());
+        assert!(SessionRef::parse(":session").is_err());
+        assert!(SessionRef::parse("mu:/session").is_err());
+        assert!(SessionRef::parse("mu:daemon/").is_err());
+    }
+
+    #[test]
+    fn canonical_takes_precedence_over_colon_split() {
+        // "mu:" prefix routes to canonical parsing, so the FIRST slash
+        // splits daemon/session — a colon inside is not a separator.
+        let r = SessionRef::parse("mu:dae/sess").unwrap();
+        assert_eq!(r.daemon, "dae");
+        assert_eq!(r.session, "sess");
+    }
 }

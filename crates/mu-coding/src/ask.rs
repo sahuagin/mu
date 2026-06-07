@@ -276,6 +276,10 @@ async fn create_session(
         // `--autonomy` flag fills this (operator-deferred; solo.toml
         // is the first frontend knob).
         autonomy: None,
+        // mu-n25a: `mu ask` does not restrict side-effects (root default,
+        // unrestricted ceiling). solo.toml's `[session] max_side_effects`
+        // is the first operator knob.
+        max_side_effects: None,
     };
     let req = json!({
         "jsonrpc": "2.0",

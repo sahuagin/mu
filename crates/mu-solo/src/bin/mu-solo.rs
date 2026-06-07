@@ -106,6 +106,14 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
 
+    // mu-n25a: parse the side-effects ceiling before building the app so
+    // a typo in `[session] max_side_effects` is a clean startup error
+    // rather than a silent fall-through to unrestricted.
+    let max_side_effects = cfg
+        .session
+        .max_side_effects_capability()
+        .context("invalid [session] max_side_effects in solo config")?;
+
     // Build the app FIRST (spawns daemon, creates session). Errors
     // here shouldn't leave the terminal in a weird state.
     let mut app = App::new(AppOptions {
@@ -123,6 +131,8 @@ async fn main() -> Result<()> {
         notifications: cfg.tui.notifications,
         // mu-7e21: [autonomy] in solo.toml → create_session grant.
         autonomy: cfg.autonomy.to_capability(),
+        // mu-n25a: [session] max_side_effects → create_session ceiling.
+        max_side_effects,
     })
     .context("App::new failed (is the mu binary path correct?)")?;
 

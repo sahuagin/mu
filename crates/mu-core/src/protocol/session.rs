@@ -46,6 +46,17 @@ pub struct CreateSessionRequest {
     /// the surface doesn't see it; one that can, does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autonomy: Option<crate::capability::AutonomyCapability>,
+    /// mu-n25a: the side-effects CEILING for this root session — the
+    /// posture an operator's "read only" binds to. `None` → root default
+    /// (unrestricted, Execute-equivalent ceiling; back-compat: nobody is
+    /// restricted unless they opt in). `Some(SideEffects::ReadOnly)` =>
+    /// every tool whose declared side-effects exceed ReadOnly is refused
+    /// at dispatch, with NO per-tool opt-in (write/edit/watch/spawn_worker
+    /// all gated). Like `autonomy`, the grant flows operator → client →
+    /// daemon at creation time only; the model can never widen it
+    /// (attenuation is intersect-only, narrower-wins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_side_effects: Option<crate::agent::tool::SideEffects>,
 }
 
 impl CreateSessionRequest {

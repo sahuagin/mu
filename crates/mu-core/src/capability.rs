@@ -22,6 +22,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::agent::tool::SideEffects;
+
 /// What a session is allowed to do. `None` on any field means
 /// "unrestricted on this axis." All `Some` values are upper-bound
 /// constraints — narrower than `None`, never broader.
@@ -60,6 +62,24 @@ pub struct Capability {
         deserialize_with = "deserialize_aws_capability_set"
     )]
     pub aws: HashSet<AwsCapability>,
+    /// mu-n25a: the session's side-effects CEILING — the most dangerous
+    /// `SideEffects` class any tool this session dispatches may declare.
+    /// A tool whose `policy.side_effects` ranks ABOVE this ceiling is
+    /// refused at the dispatch choke point (`check_side_effects`), BEFORE
+    /// the permission gate — so a `permission: Allow` tool cannot
+    /// free-ride past a restrictive posture (the mu-usfj bug class).
+    ///
+    /// `None` = unrestricted (Execute-equivalent ceiling): every class is
+    /// permitted. This is the BACK-COMPAT default — `Capability::root()`
+    /// leaves it `None`, so no existing session is restricted unless it
+    /// opts in. A read-only operator posture is `Some(SideEffects::ReadOnly)`.
+    ///
+    /// Narrowing-only on `attenuate`/`intersect`: a child can only LOWER
+    /// the ceiling (toward ReadOnly), never raise it (INV: attenuation
+    /// never widens). Wire-format is flat/snake_case to match the rest of
+    /// the capability serde (`"max_side_effects": "read_only"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_side_effects: Option<SideEffects>,
 }
 
 /// mu-036: whether a session may run autonomously (without an
@@ -228,6 +248,19 @@ where
     AwsCapability::try_from_iter(caps).map_err(serde::de::Error::custom)
 }
 
+/// Intersect two side-effects ceilings. `None` = unrestricted (Execute-
+/// equivalent), so it is the identity element: `None ∩ X = X`. Two `Some`
+/// ceilings collapse to the NARROWER (lower-rank) one — the more
+/// restrictive posture always wins, which is the narrowing-only invariant
+/// (a child can lower the ceiling but never raise it). (mu-n25a)
+fn intersect_side_effects(a: Option<SideEffects>, b: Option<SideEffects>) -> Option<SideEffects> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (Some(x), Some(y)) => Some(if x.rank() <= y.rank() { x } else { y }),
+    }
+}
+
 fn intersect_aws_sets(
     a: &HashSet<AwsCapability>,
     b: &HashSet<AwsCapability>,
@@ -358,12 +391,21 @@ impl Capability {
             }
         };
 
+        // mu-n25a: side-effects ceiling. Narrower (lower-rank) wins; a
+        // child can only LOWER the ceiling, never raise it. None on the
+        // request = no narrowing requested → child inherits parent's
+        // ceiling. None on the parent = unrestricted parent → child gets
+        // whatever it requested. Either way result ⊆ parent (INV).
+        let max_side_effects =
+            intersect_side_effects(self.max_side_effects, attenuations.max_side_effects);
+
         Capability {
             allowed_tools,
             expires_at_unix_ms,
             max_tool_calls_remaining,
             autonomy,
             aws,
+            max_side_effects,
         }
     }
 
@@ -407,6 +449,8 @@ impl Capability {
 
         let autonomy = self.autonomy.intersect(&other.autonomy);
         let aws = intersect_aws_sets(&self.aws, &other.aws);
+        let max_side_effects =
+            intersect_side_effects(self.max_side_effects, other.max_side_effects);
 
         Capability {
             allowed_tools,
@@ -414,6 +458,7 @@ impl Capability {
             max_tool_calls_remaining,
             autonomy,
             aws,
+            max_side_effects,
         }
     }
 
@@ -437,6 +482,24 @@ impl Capability {
             }
         }
         CapabilityCheck::Allowed
+    }
+
+    /// mu-n25a: does a tool declaring `declared` side-effects fit under
+    /// this session's `max_side_effects` ceiling? Checked at the dispatch
+    /// choke point alongside `check_allow`. `None` ceiling = unrestricted
+    /// → always `Allowed` (back-compat default). Otherwise the tool is
+    /// refused iff its declared class ranks ABOVE the ceiling.
+    ///
+    /// This is the structural close of the SELF-CLASSIFIED-AUTHORITY
+    /// class: a tool's `permission: Allow` no longer lets it free-ride
+    /// past a restrictive session posture — its declared danger is
+    /// checked against the posture FIRST.
+    pub fn check_side_effects(&self, declared: SideEffects) -> CapabilityCheck {
+        match self.max_side_effects {
+            None => CapabilityCheck::Allowed,
+            Some(ceiling) if declared.within(ceiling) => CapabilityCheck::Allowed,
+            Some(ceiling) => CapabilityCheck::DeniedSideEffectsExceeded { declared, ceiling },
+        }
     }
 
     /// Decrement the tool-call budget (if any). Call this AFTER a
@@ -477,6 +540,12 @@ pub struct CapabilityAttenuations {
     /// JSON ordering; converted to a set internally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aws: Option<Vec<AwsCapability>>,
+    /// mu-n25a: requested side-effects ceiling for the delegate. `None`
+    /// = no narrowing requested → child inherits parent's ceiling.
+    /// `Some(x)` = child ceiling is `min(parent, x)` by danger rank (a
+    /// child can only LOWER the ceiling, never raise it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_side_effects: Option<SideEffects>,
 }
 
 /// Result of `Capability::check_allow`. Distinguishes the three
@@ -492,6 +561,14 @@ pub enum CapabilityCheck {
     /// capability has `autonomy: Disallowed`. The default for
     /// `Capability::root()` (INV-1).
     DeniedAutonomyDisallowed,
+    /// mu-n25a: a tool's declared `side_effects` exceed the session's
+    /// `max_side_effects` ceiling. `declared` is the tool's class;
+    /// `ceiling` is the posture it overran. Surfaced so the refusal is
+    /// legible ("tool X is Execute; this session is capped at ReadOnly").
+    DeniedSideEffectsExceeded {
+        declared: SideEffects,
+        ceiling: SideEffects,
+    },
 }
 
 impl CapabilityCheck {
@@ -506,6 +583,9 @@ impl CapabilityCheck {
             CapabilityCheck::DeniedBudgetExhausted => "tool-call budget exhausted",
             CapabilityCheck::DeniedAutonomyDisallowed => {
                 "capability has autonomy: Disallowed; cannot enter autonomous mode"
+            }
+            CapabilityCheck::DeniedSideEffectsExceeded { .. } => {
+                "tool's declared side-effects exceed the session's max_side_effects ceiling"
             }
         }
     }
@@ -656,6 +736,7 @@ mod tests {
             max_tool_calls_remaining: Some(50),
             autonomy: AutonomyCapability::default(),
             aws: HashSet::new(),
+            max_side_effects: None,
         };
         let v = serde_json::to_value(&cap)?;
         let decoded: Capability = serde_json::from_value(v)?;
@@ -1132,6 +1213,7 @@ mod tests {
             max_tool_calls_remaining: Some(20),
             autonomy: AutonomyCapability::Disallowed,
             aws: aws_set(&[aws("aws.scout.readonly"), aws("aws.sandbox.build")]),
+            max_side_effects: None,
         };
         let b = Capability {
             allowed_tools: Some(set(&["read", "edit", "bash"])),
@@ -1139,6 +1221,7 @@ mod tests {
             max_tool_calls_remaining: Some(10),
             autonomy: AutonomyCapability::Disallowed,
             aws: aws_set(&[aws("aws.scout.readonly"), aws("aws.auditor.read")]),
+            max_side_effects: None,
         };
         let r = a.intersect(&b);
 
@@ -1184,6 +1267,7 @@ mod tests {
             max_tool_calls_remaining: Some(5),
             autonomy: AutonomyCapability::Disallowed,
             aws: aws_set(&[aws("aws.scout.readonly")]),
+            max_side_effects: None,
         };
         let r = unconstrained.intersect(&constrained);
         // Every axis takes constrained's value (it's the narrower side).
@@ -1215,6 +1299,157 @@ mod tests {
         assert!(r.aws.is_empty());
     }
 
+    // ── mu-n25a: max_side_effects ceiling ────────────────────────
+
+    #[test]
+    fn side_effects_rank_is_total_and_ordered() {
+        // Endpoints are load-bearing: ReadOnly is the minimum, Execute
+        // the maximum (it subsumes every class).
+        assert!(SideEffects::ReadOnly.rank() < SideEffects::Mutating.rank());
+        assert!(SideEffects::Mutating.rank() < SideEffects::External.rank());
+        assert!(SideEffects::External.rank() < SideEffects::Destructive.rank());
+        assert!(SideEffects::Destructive.rank() < SideEffects::Execute.rank());
+        // Ord agrees with rank.
+        assert!(SideEffects::ReadOnly < SideEffects::Execute);
+        // `within`: a class fits under itself and under anything higher.
+        assert!(SideEffects::ReadOnly.within(SideEffects::ReadOnly));
+        assert!(SideEffects::Mutating.within(SideEffects::Execute));
+        assert!(!SideEffects::Execute.within(SideEffects::ReadOnly));
+        assert!(!SideEffects::Destructive.within(SideEffects::Mutating));
+    }
+
+    #[test]
+    fn root_capability_has_no_side_effects_ceiling() {
+        // Back-compat: root is unrestricted on this axis, so existing
+        // sessions are never refused by the side-effects gate.
+        let cap = Capability::root();
+        assert_eq!(cap.max_side_effects, None);
+        assert!(cap.check_side_effects(SideEffects::Execute).is_allowed());
+        assert!(cap
+            .check_side_effects(SideEffects::Destructive)
+            .is_allowed());
+    }
+
+    #[test]
+    fn check_side_effects_refuses_above_ceiling() {
+        let cap = Capability {
+            max_side_effects: Some(SideEffects::ReadOnly),
+            ..Default::default()
+        };
+        // At/below ceiling allowed.
+        assert!(cap.check_side_effects(SideEffects::ReadOnly).is_allowed());
+        // Above ceiling refused, with both classes legible.
+        match cap.check_side_effects(SideEffects::Execute) {
+            CapabilityCheck::DeniedSideEffectsExceeded { declared, ceiling } => {
+                assert_eq!(declared, SideEffects::Execute);
+                assert_eq!(ceiling, SideEffects::ReadOnly);
+            }
+            other => panic!("expected DeniedSideEffectsExceeded, got {other:?}"),
+        }
+        assert!(!cap.check_side_effects(SideEffects::Mutating).is_allowed());
+    }
+
+    #[test]
+    fn attenuate_intersects_side_effects_narrower_wins() {
+        // Parent caps at Destructive; child requests ReadOnly → child
+        // gets the narrower (ReadOnly).
+        let parent = Capability {
+            max_side_effects: Some(SideEffects::Destructive),
+            ..Default::default()
+        };
+        let attn = CapabilityAttenuations {
+            max_side_effects: Some(SideEffects::ReadOnly),
+            ..Default::default()
+        };
+        let child = parent.attenuate(&attn);
+        assert_eq!(child.max_side_effects, Some(SideEffects::ReadOnly));
+    }
+
+    #[test]
+    fn attenuate_cannot_widen_side_effects() {
+        // INV: attenuation never widens. Parent caps at ReadOnly; child
+        // requests Execute → child stays at ReadOnly (the narrower).
+        let parent = Capability {
+            max_side_effects: Some(SideEffects::ReadOnly),
+            ..Default::default()
+        };
+        let attn = CapabilityAttenuations {
+            max_side_effects: Some(SideEffects::Execute),
+            ..Default::default()
+        };
+        let child = parent.attenuate(&attn);
+        assert_eq!(
+            child.max_side_effects,
+            Some(SideEffects::ReadOnly),
+            "child cannot raise the ceiling above the parent's"
+        );
+    }
+
+    #[test]
+    fn attenuate_unrestricted_parent_takes_child_ceiling() {
+        // None (unrestricted) parent + Some child request → child gets
+        // its requested ceiling (None is the identity).
+        let parent = Capability::root();
+        let attn = CapabilityAttenuations {
+            max_side_effects: Some(SideEffects::Mutating),
+            ..Default::default()
+        };
+        let child = parent.attenuate(&attn);
+        assert_eq!(child.max_side_effects, Some(SideEffects::Mutating));
+    }
+
+    #[test]
+    fn attenuate_no_request_inherits_parent_ceiling() {
+        let parent = Capability {
+            max_side_effects: Some(SideEffects::Mutating),
+            ..Default::default()
+        };
+        let attn = CapabilityAttenuations::default();
+        let child = parent.attenuate(&attn);
+        assert_eq!(child.max_side_effects, Some(SideEffects::Mutating));
+    }
+
+    #[test]
+    fn intersect_side_effects_narrower_wins() {
+        let a = Capability {
+            max_side_effects: Some(SideEffects::External),
+            ..Default::default()
+        };
+        let b = Capability {
+            max_side_effects: Some(SideEffects::Mutating),
+            ..Default::default()
+        };
+        assert_eq!(
+            a.intersect(&b).max_side_effects,
+            Some(SideEffects::Mutating)
+        );
+        // None side is the identity.
+        let r = a.intersect(&Capability::root());
+        assert_eq!(r.max_side_effects, Some(SideEffects::External));
+    }
+
+    #[test]
+    fn max_side_effects_round_trips_via_serde() -> Result<(), serde_json::Error> {
+        let cap = Capability {
+            max_side_effects: Some(SideEffects::ReadOnly),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&cap)?;
+        // Flat, snake_case wire form.
+        assert_eq!(v["max_side_effects"], "read_only");
+        let decoded: Capability = serde_json::from_value(v)?;
+        assert_eq!(decoded, cap);
+
+        // None is omitted from the wire entirely (back-compat).
+        let unrestricted = Capability::root();
+        let v = serde_json::to_value(&unrestricted)?;
+        assert!(
+            v.get("max_side_effects").is_none(),
+            "None ceiling must be skipped on the wire"
+        );
+        Ok(())
+    }
+
     #[test]
     fn capability_round_trips_with_aws_via_serde() -> Result<(), serde_json::Error> {
         let cap = Capability {
@@ -1229,6 +1464,7 @@ mod tests {
                     serde_json::json!({"Statement": [{"Effect": "Allow"}]}),
                 ),
             ]),
+            max_side_effects: None,
         };
         let v = serde_json::to_value(&cap)?;
         // aws field serializes as a JSON array of {name, session_policy?}.

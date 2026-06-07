@@ -149,8 +149,20 @@ async fn index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Redirect::temporary(&state.href("/sessions"))
 }
 
-async fn sessions_index(State(state): State<Arc<AppState>>) -> Html<String> {
-    render_sessions_index(state)
+/// mu-console-faux-toggle-putu: `?faux=1` reveals provider=faux (smoke/test)
+/// sessions that are hidden from the index by default. Any other value (or an
+/// absent param) keeps the default-hide behavior.
+#[derive(Debug, Deserialize)]
+struct SessionsQuery {
+    faux: Option<String>,
+}
+
+async fn sessions_index(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SessionsQuery>,
+) -> Html<String> {
+    let show_faux = q.faux.as_deref() == Some("1");
+    render_sessions_index(state, show_faux)
 }
 
 /// mu-console-hosts-dashboard-zy26: serve the latest cron-generated stats

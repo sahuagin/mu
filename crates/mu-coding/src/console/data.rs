@@ -18,6 +18,9 @@ pub(crate) struct AppState {
     /// receives the console mark POST's cc storage path. `None` keeps cc
     /// marks unread/unwritten.
     pub(crate) cc_marks_db: Option<PathBuf>,
+    /// mu-console-hosts-dashboard-zy26: path to the cron-generated stats
+    /// HTML served at GET /dashboard, read fresh per request.
+    pub(crate) dashboard_path: PathBuf,
     pub(crate) base_path: String,
 }
 

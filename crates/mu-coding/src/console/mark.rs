@@ -9,13 +9,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use rand::Rng;
 use rusqlite::{params, Connection};
 
 use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
+
+use super::time::now_rfc3339_utc;
 
 /// What a successful mark did, for caller-side reporting.
 #[derive(Debug)]
@@ -376,43 +377,6 @@ fn new_row_id() -> String {
     format!("{:08x}", rand::thread_rng().gen::<u32>())
 }
 
-/// Format "now" as `YYYY-MM-DDTHH:MM:SS+00:00` — the RFC3339 UTC shape the
-/// existing task_log rows use. Dependency-free (no chrono in this crate);
-/// the civil-date math is the inverse of `cc_data::days_from_civil`.
-fn now_rfc3339_utc() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    format_rfc3339_utc(secs)
-}
-
-/// Format epoch seconds as `YYYY-MM-DDTHH:MM:SS+00:00`.
-fn format_rfc3339_utc(epoch_secs: i64) -> String {
-    let days = epoch_secs.div_euclid(86_400);
-    let secs_of_day = epoch_secs.rem_euclid(86_400);
-    let (y, m, d) = civil_from_days(days);
-    let hour = secs_of_day / 3600;
-    let minute = (secs_of_day % 3600) / 60;
-    let second = secs_of_day % 60;
-    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}+00:00")
-}
-
-/// Civil date `(year, month, day)` from days since the Unix epoch — Howard
-/// Hinnant's `civil_from_days`, the inverse of `days_from_civil`.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,24 +547,5 @@ mod tests {
         let got = cc_session_mark(&db, "zzz").expect("read").expect("some");
         assert_eq!(got.rating, 3);
         assert_eq!(got.note.as_deref(), Some("degraded"));
-    }
-
-    #[test]
-    fn rfc3339_formats_known_epochs() {
-        assert_eq!(format_rfc3339_utc(0), "1970-01-01T00:00:00+00:00");
-        // 1700000000 == 2023-11-14T22:13:20Z (a well-known round number).
-        assert_eq!(
-            format_rfc3339_utc(1_700_000_000),
-            "2023-11-14T22:13:20+00:00"
-        );
-        // Leap-day boundary: 2024-02-29 exists; 2024-03-01 is the next day.
-        assert_eq!(
-            format_rfc3339_utc(1_709_164_800),
-            "2024-02-29T00:00:00+00:00"
-        );
-        assert_eq!(
-            format_rfc3339_utc(1_709_251_200),
-            "2024-03-01T00:00:00+00:00"
-        );
     }
 }

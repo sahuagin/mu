@@ -12,6 +12,7 @@ mod cc_data;
 mod data;
 mod html;
 pub mod mark;
+mod time;
 mod views;
 
 pub use cc_data::default_cc_projects_dir;

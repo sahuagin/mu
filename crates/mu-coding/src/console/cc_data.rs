@@ -54,6 +54,7 @@ use std::path::{Path, PathBuf};
 use mu_core::agent::Usage;
 
 use super::data::{ScanResult, SessionSummary};
+use super::time::parse_rfc3339_ms;
 
 /// The default claude-code projects root. `None` if the home dir can't
 /// be resolved (mirrors [`crate::serve::default_events_dir`]). Opt-in:
@@ -313,74 +314,6 @@ fn parse_usage(u: &serde_json::Value) -> Usage {
         cache_creation_1h_input_tokens: tier("ephemeral_1h_input_tokens"),
         reasoning_tokens: u64_of("reasoning_tokens"),
     }
-}
-
-/// Parse an RFC 3339 / ISO 8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SS`,
-/// optional `.fff` fraction, optional `Z`) into epoch milliseconds.
-/// Returns `None` on any malformation — cc always emits `…Z` UTC, so we
-/// only handle the `Z`/no-offset case and ignore non-UTC offsets rather
-/// than mis-parse them. Dependency-free (no chrono in this crate).
-fn parse_rfc3339_ms(s: &str) -> Option<u64> {
-    let s = s.trim();
-    let (date, rest) = s.split_once('T')?;
-    let mut d = date.split('-');
-    let year: i64 = d.next()?.parse().ok()?;
-    let month: i64 = d.next()?.parse().ok()?;
-    let day: i64 = d.next()?.parse().ok()?;
-    if d.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-
-    // Strip a trailing 'Z'; reject explicit non-UTC offsets to avoid
-    // silently dropping them.
-    let time = rest.strip_suffix('Z').unwrap_or(rest);
-    if time.contains('+') || time.contains('-') {
-        return None;
-    }
-
-    let (hms, frac) = match time.split_once('.') {
-        Some((hms, frac)) => (hms, Some(frac)),
-        None => (time, None),
-    };
-    let mut t = hms.split(':');
-    let hour: i64 = t.next()?.parse().ok()?;
-    let minute: i64 = t.next()?.parse().ok()?;
-    let second: i64 = t.next()?.parse().ok()?;
-    if t.next().is_some() || hour > 23 || minute > 59 || second > 60 {
-        return None;
-    }
-    // Fraction → milliseconds (first 3 digits, zero-padded).
-    let millis: i64 = match frac {
-        Some(f) => {
-            let digits: String = f.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if digits.is_empty() {
-                return None;
-            }
-            let mut ms = digits;
-            ms.truncate(3);
-            while ms.len() < 3 {
-                ms.push('0');
-            }
-            ms.parse().ok()?
-        }
-        None => 0,
-    };
-
-    let days = days_from_civil(year, month, day);
-    let total_ms = (((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis;
-    u64::try_from(total_ms).ok()
-}
-
-/// Days since the Unix epoch (1970-01-01) for a civil date, via Howard
-/// Hinnant's `days_from_civil`. Valid for the proleptic Gregorian
-/// calendar; cc timestamps are always well past 1970.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146097 + doe - 719468
 }
 
 // ── mu-cc-sessions-console-lqqt.2: full-transcript reader ──────────────
@@ -688,35 +621,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
-    }
-
-    #[test]
-    fn parses_rfc3339_to_epoch_ms() {
-        // 1970-01-01T00:00:00Z == 0.
-        assert_eq!(parse_rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
-        // Known epoch: 2026-06-06T07:31:19.771Z.
-        // days_from_civil(2026,6,6) computed by the same algorithm.
-        let days = days_from_civil(2026, 6, 6);
-        let expect = (((days * 24 + 7) * 60 + 31) * 60 + 19) * 1000 + 771;
-        assert_eq!(
-            parse_rfc3339_ms("2026-06-06T07:31:19.771Z"),
-            Some(expect as u64)
-        );
-        // Without fractional seconds, without Z.
-        assert_eq!(
-            parse_rfc3339_ms("2026-06-06T07:31:19"),
-            Some(((days_from_civil(2026, 6, 6) * 24 + 7) * 60 + 31) as u64 * 60_000 + 19_000)
-        );
-    }
-
-    #[test]
-    fn rejects_malformed_timestamps() {
-        assert_eq!(parse_rfc3339_ms("not-a-date"), None);
-        assert_eq!(parse_rfc3339_ms("2026-13-01T00:00:00Z"), None); // bad month
-        assert_eq!(parse_rfc3339_ms("2026-06-06T25:00:00Z"), None); // bad hour
-        assert_eq!(parse_rfc3339_ms(""), None);
-        // Non-UTC offset: refused rather than mis-parsed.
-        assert_eq!(parse_rfc3339_ms("2026-06-06T07:31:19+02:00"), None);
     }
 
     #[test]

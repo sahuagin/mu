@@ -591,6 +591,7 @@ fn test_events_stream(
     let state = StreamState {
         sse: Box::pin(sse),
         accumulated_text: String::new(),
+        accumulated_thinking: String::new(),
         tool_calls: HashMap::new(),
         tool_call_order: Vec::new(),
         finish_reason: None,
@@ -600,6 +601,70 @@ fn test_events_stream(
         emitted_done: false,
     };
     Box::pin(futures::stream::unfold(state, next_event))
+}
+
+#[tokio::test]
+async fn sse_reasoning_then_text_captures_thinking_mu_mdds() {
+    // mu-mdds: a thinking model (ollama OpenAI-compat) streams its
+    // reasoning on the `reasoning` delta field, then the answer on
+    // `content`. Before the fix, serde dropped `reasoning` → empty
+    // visible response. Now reasoning surfaces as ThinkingDelta and
+    // rides into the final message as a Thinking block (before Text).
+    let raw = concat!(
+        r#"data: {"choices":[{"delta":{"reasoning":"let me think"}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"delta":{"reasoning":" about it"}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"delta":{"content":"the answer"}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        "\n\n",
+        r#"data: [DONE]"#,
+        "\n\n",
+    );
+    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+        raw.as_bytes(),
+    ))]);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let mut stream = test_events_stream(bytes, rx);
+
+    let mut events = Vec::new();
+    while let Some(e) = stream.next().await {
+        events.push(e);
+    }
+
+    // 2 ThinkingDelta + 1 TextDelta + 1 Done.
+    assert_eq!(events.len(), 4, "got {events:?}");
+    match &events[0] {
+        ProviderEvent::ThinkingDelta(t) => assert_eq!(t, "let me think"),
+        other => panic!("expected ThinkingDelta, got {other:?}"),
+    }
+    match &events[1] {
+        ProviderEvent::ThinkingDelta(t) => assert_eq!(t, " about it"),
+        other => panic!("expected ThinkingDelta, got {other:?}"),
+    }
+    match &events[2] {
+        ProviderEvent::TextDelta(t) => assert_eq!(t, "the answer"),
+        other => panic!("expected TextDelta, got {other:?}"),
+    }
+    match &events[3] {
+        ProviderEvent::Done(msg) => {
+            assert_eq!(msg.stop_reason, StopReason::EndTurn);
+            // Thinking block first, then Text.
+            assert_eq!(msg.content.len(), 2, "got {:?}", msg.content);
+            match &msg.content[0] {
+                ContentBlock::Thinking { text } => {
+                    assert_eq!(text.as_ref(), "let me think about it")
+                }
+                other => panic!("expected Thinking first, got {other:?}"),
+            }
+            match &msg.content[1] {
+                ContentBlock::Text { text } => assert_eq!(text.as_ref(), "the answer"),
+                other => panic!("expected Text second, got {other:?}"),
+            }
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
 }
 
 #[tokio::test]

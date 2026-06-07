@@ -586,6 +586,12 @@ struct OpenAiChoice {
 struct OpenAiDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Thinking-model reasoning channel. ollama's OpenAI-compat endpoint
+    /// streams reasoning here (some servers spell it `reasoning_content`).
+    /// Without this field serde silently drops it — turns end text_len=0
+    /// while output_tokens shows the model reasoned (mu-mdds).
+    #[serde(default, alias = "reasoning_content")]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAiToolCallDelta>>,
 }
@@ -632,6 +638,7 @@ struct ToolCallBuilder {
 struct StreamState {
     sse: Pin<Box<dyn Stream<Item = SseEvent> + Send>>,
     accumulated_text: String,
+    accumulated_thinking: String,
     tool_calls: HashMap<u32, ToolCallBuilder>,
     tool_call_order: Vec<u32>,
     finish_reason: Option<String>,
@@ -652,6 +659,7 @@ fn events_stream(
     let state = StreamState {
         sse: Box::pin(sse),
         accumulated_text: String::new(),
+        accumulated_thinking: String::new(),
         tool_calls: HashMap::new(),
         tool_call_order: Vec::new(),
         finish_reason: None,
@@ -755,6 +763,19 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                     }
                 }
             }
+            // Reasoning delta? (thinking models via ollama OpenAI-compat —
+            // mu-mdds). Accumulate always so the final message carries it;
+            // stream a ThinkingDelta when the single per-chunk event slot is
+            // free. Reasoning and content almost always arrive in separate
+            // chunks, so first-come on the slot is fine in practice.
+            if let Some(reasoning) = choice.delta.reasoning {
+                if !reasoning.is_empty() {
+                    state.accumulated_thinking.push_str(&reasoning);
+                    if emitted_event.is_none() {
+                        emitted_event = Some(ProviderEvent::ThinkingDelta(reasoning));
+                    }
+                }
+            }
             // Tool call delta(s)?
             if let Some(deltas) = choice.delta.tool_calls {
                 for tc_delta in deltas {
@@ -796,6 +817,13 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
 
 fn assemble_content(state: &StreamState) -> Vec<ContentBlock> {
     let mut out: Vec<ContentBlock> = Vec::new();
+    // Reasoning precedes the answer; emit the Thinking block first so the
+    // persisted message preserves order (mu-mdds).
+    if !state.accumulated_thinking.is_empty() {
+        out.push(ContentBlock::Thinking {
+            text: state.accumulated_thinking.as_str().into(),
+        });
+    }
     if !state.accumulated_text.is_empty() {
         out.push(ContentBlock::Text {
             text: state.accumulated_text.as_str().into(),

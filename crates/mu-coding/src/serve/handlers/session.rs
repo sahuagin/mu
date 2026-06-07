@@ -1533,8 +1533,14 @@ fn resolve_hash_and_summary_policy(
         });
 
     let output_mode = match cfg.judge.output_mode.as_str() {
-        "index_keep" => KeepListMode::IndexKeep,
-        _ => KeepListMode::HashKeep,
+        "hash_keep" | "hash" => KeepListMode::HashKeep,
+        // Unset/unknown defaults to IndexKeep (mu-0fla): HashKeep makes
+        // the judge transcribe N opaque hashes verbatim, which fails
+        // fail-closed on large ropes (observed live on a 658-span log).
+        // Reaching the transcription-prone mode now requires an explicit
+        // "hash_keep". (The type-level KeepListMode::default() stays
+        // HashKeep for back-compat; this production fallback overrides it.)
+        _ => KeepListMode::IndexKeep,
     };
 
     let policy = match judge_provider {

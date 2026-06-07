@@ -188,7 +188,12 @@ pub fn derive_status_from_events(
             | EventPayload::WorkerTimeout { .. }
             // mu-operator-mark-5mwr: operator judgment, not
             // session-status-driving.
-            | EventPayload::OperatorMark { .. } => {}
+            | EventPayload::OperatorMark { .. }
+            // mu-mh4: a compensating tombstone over a poisoned record,
+            // or a live-head attach (resume) — neither is
+            // session-status-driving.
+            | EventPayload::Tombstone { .. }
+            | EventPayload::HeadAttached { .. } => {}
         }
         last_kind = Some(&ev.payload);
     }

@@ -443,6 +443,52 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
+    /// mu-mh4: a live head was attached to this session's log — the
+    /// "attach head" half of resume. A session that died on daemon A is
+    /// resumed by daemon B forking a fresh live session at the dead
+    /// one's last clean boundary; this event records the attach so the
+    /// session's identity is continuous across serving daemons. Lands
+    /// on the NEW (live) session's log, naming the daemon that attached
+    /// and the actor who requested it; the new `SessionCreated`'s
+    /// `parent_session_id` / `branched_at_parent_event_id` point back to
+    /// the predecessor.
+    HeadAttached {
+        /// The daemon that attached the live head (the resuming daemon).
+        daemon_id: String,
+        /// Who CLAIMED to request the attach (operator / agent actor).
+        /// mu-mh4 (panel finding 3): this is caller-supplied and
+        /// UNVERIFIED — `session.resume` has no connection-derived
+        /// identity to cross-check it against (the serve layer
+        /// authenticates the connection with a trust-on-spawn bearer
+        /// token, not a per-actor identity). Named `claimed_actor` so
+        /// every projection of this event treats the attribution as a
+        /// claim, not a verified fact. A future identity layer (mu-nqn5
+        /// follow-up) can stamp a verified actor alongside.
+        claimed_actor: String,
+        /// The predecessor session this forked from.
+        predecessor_session_id: String,
+        /// The event id in the predecessor's log this forked at (the
+        /// clean boundary).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branched_at_event_id: Option<u64>,
+    },
+    /// mu-mh4: an append-only compensating event that marks an earlier
+    /// record as poisoned (broken / incomplete / malformed). The log
+    /// is NEVER edited; a Tombstone is laid OVER the bad record so
+    /// every projection can skip it via one rule (skip tombstoned
+    /// event ids). Born for `mu --recover` (lay tombstones over the
+    /// ragged tail of a session that died mid-iteration, then resume
+    /// from the last clean prompt), but the kind generalizes to ANY
+    /// poisoned record: degraded_eof partials, malformed tool results,
+    /// etc. Attributed and reasoned so the scar is legible in every
+    /// consumer (the console renders tombstoned spans as scar tissue).
+    Tombstone {
+        /// The `id` of the event this tombstone invalidates.
+        target_event_id: u64,
+        /// Human-readable reason, e.g. "incomplete record: tool call
+        /// `c1` has no matching ToolResult".
+        reason: String,
+    },
 }
 
 /// Categorical exit reason for a task — what brought the task to its
@@ -844,6 +890,16 @@ impl SessionEventLog {
             .and_then(|events| events.last().map(|e| e.timestamp_unix_ms))
     }
 
+    /// mu-mh4: the set of event ids invalidated by `Tombstone` events
+    /// in this log. Projections skip these ids (one rule, every
+    /// consumer). Empty when no tombstones have been laid.
+    pub fn tombstoned_ids(&self) -> std::collections::BTreeSet<u64> {
+        self.events
+            .lock()
+            .map(|events| tombstoned_ids(&events))
+            .unwrap_or_default()
+    }
+
     /// Pull (provider_kind, model) out of the first SessionCreated
     /// event. None if no such event has been recorded (e.g. log was
     /// constructed manually without going through dispatch).
@@ -866,6 +922,21 @@ impl SessionEventLog {
         }
         None
     }
+}
+
+/// mu-mh4: collect the set of event ids invalidated by `Tombstone`
+/// events. Free function so both the live log and offline projections
+/// (over a borrowed `&[SessionEvent]`) share one rule.
+pub fn tombstoned_ids(events: &[SessionEvent]) -> std::collections::BTreeSet<u64> {
+    events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::Tombstone {
+                target_event_id, ..
+            } => Some(*target_event_id),
+            _ => None,
+        })
+        .collect()
 }
 
 fn now_unix_ms() -> u64 {

@@ -694,6 +694,7 @@ async fn b3_iteration_cap() {
         compaction_threshold: None,
         project_context: None,
         compaction_policy_override: None,
+        seed_messages: Vec::new(),
     };
     let (loop_, events_rx) = spawn_loop(provider, tools, config);
 
@@ -746,6 +747,7 @@ async fn mu_779s_iteration_cap_done_event_uses_iteration_cap_stop_reason() {
         compaction_threshold: None,
         project_context: None,
         compaction_policy_override: None,
+        seed_messages: Vec::new(),
     };
     let (loop_, events_rx) = spawn_loop(provider, tools, config);
 
@@ -3231,4 +3233,84 @@ async fn w1_watch_completed_wakes_idle_session_with_inline_result() {
     } else {
         panic!("last event must be Done");
     }
+}
+
+// ============================================================================
+// mu-mh4: seed_messages (fork-at-tail continuation) — the resumed loop
+// starts mid-conversation rather than empty. Reuses the existing
+// RecordingProvider (captures per-call message_count via `records`).
+// ============================================================================
+
+/// First-provider-call message count for a loop driven by ONE user
+/// message, under the given config. The projection adds a fixed
+/// structural baseline, so tests compare counts across configs rather
+/// than asserting an absolute (the baseline is an implementation
+/// detail of the rope renderer).
+async fn first_call_message_count(config: AgentConfig) -> usize {
+    let (provider, records) = RecordingProvider::new(vec![vec![
+        ProviderEvent::TextDelta("ok".into()),
+        ProviderEvent::Done(assistant_text("ok")),
+    ]]);
+    let (loop_, events_rx) = spawn_loop_with_provider(provider, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("the new message")))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let _ = events_handle.await.expect("drain");
+    let first = records
+        .lock()
+        .expect("records")
+        .first()
+        .cloned()
+        .expect("provider was called at least once");
+    first.message_count
+}
+
+/// A session born with `seed_messages` (the continuation projection of a
+/// dead predecessor) starts mid-conversation: the very first provider
+/// call sees the seeded history in ADDITION to the new user message.
+/// This is the runtime half of fork-at-tail resume. The seeded count
+/// exceeds the unseeded count by exactly the number of seeded messages.
+#[tokio::test]
+async fn mh4_seed_messages_prime_the_loop_history() {
+    // Predecessor history: one completed exchange (user + assistant).
+    let seed = vec![
+        AgentMessage::User {
+            content: "what is 2+2?".into(),
+        },
+        AgentMessage::Assistant(assistant_text("4")),
+    ];
+    let seeded = first_call_message_count(AgentConfig {
+        seed_messages: seed.clone(),
+        ..AgentConfig::default()
+    })
+    .await;
+    let unseeded = first_call_message_count(AgentConfig::default()).await;
+
+    assert_eq!(
+        seeded - unseeded,
+        seed.len(),
+        "the seeded history must reach the provider verbatim ({} extra messages)",
+        seed.len()
+    );
+    assert!(
+        seeded > unseeded,
+        "a seeded resume must start with more context than a fresh session"
+    );
+}
+
+/// Control: with no seed (the default), the loop is back-compatible —
+/// the seeding is purely additive and opt-in.
+#[tokio::test]
+async fn mh4_no_seed_is_back_compatible() {
+    let unseeded = first_call_message_count(AgentConfig::default()).await;
+    // Empty seed must behave identically to no seed.
+    let empty_seed = first_call_message_count(AgentConfig {
+        seed_messages: Vec::new(),
+        ..AgentConfig::default()
+    })
+    .await;
+    assert_eq!(unseeded, empty_seed, "empty seed == no seed");
 }

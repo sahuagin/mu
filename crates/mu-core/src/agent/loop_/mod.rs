@@ -558,6 +558,18 @@ pub struct AgentConfig {
     /// `provider.compaction_policy()`. Wired from daemon config's
     /// `compaction.default_policy` at session creation.
     pub compaction_policy_override: Option<Arc<dyn crate::context::compaction::CompactionPolicy>>,
+    /// mu-mh4: pre-seeded conversation history for a RESUMED (forked)
+    /// session. Empty for a fresh session (the default). When a session
+    /// is born as a fork-at-tail of a dead predecessor (`mu --resume` /
+    /// `session.resume`), the daemon projects the predecessor's event
+    /// log to its last clean boundary
+    /// ([`crate::agent::continuation::project_strict`]) and hands the
+    /// resulting [`AgentMessage`] history here, so the resumed loop
+    /// starts mid-conversation rather than empty. These messages are NOT
+    /// re-logged as events in the new session's log — they live in the
+    /// predecessor's log, which the new `SessionCreated` event points
+    /// back to via `branched_at_parent_event_id`.
+    pub seed_messages: Vec<AgentMessage>,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -583,6 +595,7 @@ impl Default for AgentConfig {
             compaction_threshold: None,
             project_context: None,
             compaction_policy_override: None,
+            seed_messages: Vec::new(),
         }
     }
 }
@@ -829,7 +842,10 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
     let mut provider = provider;
     let mut current_provider_kind = provider_kind;
     let mut current_model = model;
-    let mut messages: Vec<AgentMessage> = Vec::new();
+    // mu-mh4: a resumed (forked) session starts mid-conversation, seeded
+    // with the continuation projection of its predecessor's log; a fresh
+    // session starts empty (the default — seed_messages is `Vec::new()`).
+    let mut messages: Vec<AgentMessage> = config.seed_messages.clone();
     let mut queue: VecDeque<Action> = VecDeque::new();
     let mut turn_count: u32 = 0;
     let mut mode: RunMode = RunMode::Idle;

@@ -328,6 +328,33 @@ impl Capability {
         Self::default()
     }
 
+    /// The most-restrictive reasonable capability — the FAIL-CLOSED
+    /// baseline. No tools may be invoked (`allowed_tools = Some(empty)`),
+    /// the side-effects ceiling is pinned to `ReadOnly`, autonomy is
+    /// `Disallowed`, and the session holds no AWS grants. Every axis is
+    /// at its narrowest.
+    ///
+    /// mu-mh4 / mu-nqn5: `session.resume` uses this as the resumed
+    /// session's baseline when the predecessor's live capability handle
+    /// is gone (the NORMAL cold/rehydrated case — a dead session has no
+    /// in-memory capability). Falling back to `root()` there would let a
+    /// resume WIDEN privileges (attenuation-only-narrows violation, since
+    /// attenuate(root, ...) ⊇ attenuate(restricted_predecessor, ...)).
+    /// Failing closed preserves the invariant until capability
+    /// persistence (mu-nqn5) lets us recover the predecessor's actual
+    /// capability from its log. The operator can pass explicit
+    /// `attenuations` to NARROW further, never to widen past this floor.
+    pub fn read_only() -> Self {
+        Self {
+            allowed_tools: Some(HashSet::new()),
+            expires_at_unix_ms: None,
+            max_tool_calls_remaining: None,
+            autonomy: AutonomyCapability::Disallowed,
+            aws: HashSet::new(),
+            max_side_effects: Some(SideEffects::ReadOnly),
+        }
+    }
+
     /// Construct a capability by intersecting `self` with
     /// `attenuations`. The result is always ⊆ self on every axis.
     ///

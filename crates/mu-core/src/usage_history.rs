@@ -252,7 +252,12 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
             | EventPayload::WorkerTimeout { .. }
             // mu-operator-mark-5mwr: operator quality judgment, not a
             // usage/timing signal.
-            | EventPayload::OperatorMark { .. } => {}
+            | EventPayload::OperatorMark { .. }
+            // mu-mh4: a compensating tombstone over a poisoned record,
+            // or a live-head attach (resume) — neither is a usage/timing
+            // signal.
+            | EventPayload::Tombstone { .. }
+            | EventPayload::HeadAttached { .. } => {}
         }
     }
 

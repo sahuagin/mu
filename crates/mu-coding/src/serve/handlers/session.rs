@@ -83,7 +83,9 @@ pub fn handle_create_session(
         cwd: params.cwd,                     // mu-phl v0 / mu-045
         parent_session_id: None,             // no parent — this is a root session
         branched_at_parent_event_id: None,
-        capability, // root: unrestricted, autonomy per mu-7e21 grant above
+        capability,                // root: unrestricted, autonomy per mu-7e21 grant above
+        seed_messages: Vec::new(), // mu-mh4: fresh session starts empty
+        seed_events: Vec::new(),   // mu-mh4: fresh session has no seed events
         cache_ttl: params.cache_ttl.unwrap_or_default(), // mu-f1a0
         notif,
         sessions,
@@ -159,6 +161,11 @@ pub fn handle_delegate_session(
         parent_session_id: Some(params.parent_session_id.clone()),
         branched_at_parent_event_id: params.branched_at_parent_event_id,
         capability: child_capability,
+        // mu-mh4: delegate sessions still start empty (the branch id is
+        // recorded for audit). session.resume is the path that seeds a
+        // continuation history; delegate-with-seed is future work.
+        seed_messages: Vec::new(),
+        seed_events: Vec::new(), // mu-mh4: delegate sessions have no seed events
         // mu-f1a0: delegated workers are PINNED to the 5m tier
         // regardless of the parent's — they run gap-free tool loops,
         // so the 1h tier's 2x write premium is pure cost (operator
@@ -182,6 +189,195 @@ pub fn handle_delegate_session(
     }
 }
 
+/// mu-mh4: `session.resume` — STRICT fork-at-tail resume.
+///
+/// Resolves the predecessor session's event log (the rehydration pass
+/// at daemon startup loaded every daemon's on-disk logs into the
+/// Sessions map, so a cross-daemon predecessor is addressable here),
+/// projects it to its last clean boundary via
+/// [`mu_core::agent::continuation::project_strict`], and — only if the
+/// log is CLEAN — births a fresh live session parented on the dead one,
+/// seeded with the continuation history. A ragged log is REFUSED with a
+/// precise diagnosis and a `mu --recover` hint (git-style); it is never
+/// silently truncated.
+///
+/// The resumed session's capability is the predecessor's ∩ any requested
+/// attenuations (intersection-only — resume can only narrow). When the
+/// predecessor's live capability is gone (a cold rehydrated session has
+/// no capability handle — the NORMAL resume case), it FAILS CLOSED to the
+/// most-restrictive baseline ([`Capability::read_only`]) and then applies
+/// the attenuations — so a resume can never WIDEN privileges past a
+/// read-only floor (mu-mh4; capability persistence is the real fix —
+/// mu-nqn5).
+pub fn handle_resume_session(
+    request: Request<Value>,
+    notif: NotificationWriter,
+    sessions: Sessions,
+    factory: ProviderFactory,
+    tools: Arc<Vec<Arc<dyn Tool>>>,
+    daemon_info: DaemonInfo,
+) -> Response<Value> {
+    use mu_core::protocol::{ResumeSessionRequest, ResumeSessionResponse, SessionRef};
+
+    let params: ResumeSessionRequest = match serde_json::from_value(request.params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("session.resume: invalid params: {e}"),
+            );
+        }
+    };
+
+    // Parse the session ref (daemon:session or mu:<daemon>/<session>).
+    let parsed = match SessionRef::parse(&params.session_ref) {
+        Ok(r) => r,
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("session.resume: {e}"),
+            )
+        }
+    };
+
+    // Resolve the predecessor's event log from the Sessions map (the
+    // session id is the addressable key; rehydration loaded all daemons'
+    // logs at startup).
+    let predecessor_log = match sessions.event_log(&parsed.session) {
+        Some(log) => log,
+        None => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!(
+                    "session.resume: predecessor session not found: {} \
+                     (looked up `{}`; is the daemon's events dir the one that holds it?)",
+                    parsed.to_canonical(),
+                    parsed.session
+                ),
+            );
+        }
+    };
+
+    // STRICT continuation projection. A ragged log is refused with a
+    // diagnosis naming the damage + a --recover hint.
+    let events = predecessor_log.snapshot();
+    let continuation = match mu_core::agent::continuation::project_strict(&events) {
+        Ok(c) => c,
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!(
+                    "session.resume refused: {e}. \
+                     The log is not cleanly resumable; run `mu --recover {}` to \
+                     tombstone the broken record(s) and resume from the last prompt.",
+                    params.session_ref
+                ),
+            );
+        }
+    };
+
+    // Capability baseline (mu-mh4 fail-closed; mu-nqn5 is the real fix).
+    //
+    // When the predecessor's live capability handle is still present
+    // (warm same-daemon resume) we start from it — the resume can only
+    // intersect it down with the requested attenuations.
+    //
+    // When it is GONE — the NORMAL cold/rehydrated case, because a dead
+    // session has no in-memory capability and we do not yet persist it
+    // (mu-nqn5) — we FAIL CLOSED to the most-restrictive reasonable
+    // baseline (`Capability::read_only`): no tools, ReadOnly side-effects
+    // ceiling, autonomy disallowed. Falling back to `root()` here was the
+    // panel-flagged attenuation-only-narrows violation: resume of a
+    // restricted session would have WIDENED privileges, since
+    // attenuate(root, attn) ⊇ attenuate(restricted_predecessor, attn).
+    // The operator's `attenuations` can only narrow further from this
+    // floor, never widen past it; explicit re-grants are out of scope
+    // until capability persistence (mu-nqn5) lands.
+    let base_cap = sessions
+        .capability(&parsed.session)
+        .and_then(|h| h.lock().ok().map(|c| c.clone()))
+        .unwrap_or_else(Capability::read_only);
+    let resumed_capability = match &params.attenuations {
+        Some(attn) => base_cap.attenuate(attn),
+        None => base_cap,
+    };
+
+    let seeded_message_count = continuation.messages.len();
+    // mu-mh4 (panel finding 3): the actor is CALLER-SUPPLIED and
+    // UNVERIFIED — there is no connection-derived identity threaded into
+    // this handler (the serve layer authenticates the connection with a
+    // trust-on-spawn bearer token, not a per-actor identity). Record it
+    // as a CLAIMED identity so every projection of the HeadAttached event
+    // knows the attribution is unverified and a model calling
+    // session.resume cannot be mistaken for the operator. mu-nqn5 (and a
+    // future identity layer) can stamp a verified identity alongside.
+    let claimed_actor = params
+        .actor
+        .clone()
+        .unwrap_or_else(|| "operator".to_string());
+
+    // mu-mh4 (panel finding 4): NO authz check on who may resume the
+    // predecessor. This handler has no requester-identity primitive to
+    // check against — the serve layer authenticates the *connection*
+    // with a trust-on-spawn bearer token (every authenticated connection
+    // is daemon-local and equally trusted), and `create_session` itself
+    // applies no per-actor capability gate either, so there is nothing to
+    // mirror at this layer. Resume is therefore guarded by daemon-local
+    // trust only; a real "may this actor resume this session" check waits
+    // on the identity layer (mu-nqn5 follow-up).
+
+    // The attach itself is a HeadAttached event on the new (live)
+    // session's log — session identity continuous across serving daemons
+    // (mu-mh4 design). Passed as a SEED EVENT so it is appended before the
+    // session is registered (no audit-continuity gap — panel finding 4).
+    let head_attached = EventPayload::HeadAttached {
+        daemon_id: daemon_info.daemon_id().to_string(),
+        claimed_actor,
+        predecessor_session_id: parsed.session.clone(),
+        branched_at_event_id: continuation.fork_event_id,
+    };
+
+    let new_session_id = match build_and_register_session(BuildSessionRequest {
+        selector: &params.provider,
+        system_prompt: None,
+        cwd: params.cwd,
+        // The fork-at-tail lineage: the new live session is parented on
+        // the dead one, branched at its last clean boundary.
+        parent_session_id: Some(parsed.session.clone()),
+        branched_at_parent_event_id: continuation.fork_event_id,
+        capability: resumed_capability,
+        seed_messages: continuation.messages,
+        seed_events: vec![head_attached],
+        cache_ttl: CacheTtl::default(),
+        notif,
+        sessions: sessions.clone(),
+        factory,
+        tools,
+        daemon_info: &daemon_info,
+    }) {
+        Ok(id) => id,
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("session.resume: {e}"),
+            )
+        }
+    };
+
+    let resp = ResumeSessionResponse {
+        session_id: new_session_id,
+        predecessor_session_id: parsed.session,
+        branched_at_event_id: continuation.fork_event_id,
+        seeded_message_count,
+    };
+    ok_response(request.id, to_value_or_null(resp))
+}
+
 /// Input bundle for [`build_and_register_session`]. Groups the
 /// request shape (selector / system prompt / parent linkage /
 /// capability) and the daemon's runtime dependencies (notification
@@ -199,6 +395,19 @@ struct BuildSessionRequest<'a> {
     parent_session_id: Option<String>,
     branched_at_parent_event_id: Option<u64>,
     capability: Capability,
+    /// mu-mh4: pre-seeded conversation history for a resumed/forked
+    /// session (continuation projection of the predecessor's log).
+    /// Empty for fresh and (current) delegate sessions.
+    seed_messages: Vec<AgentMessage>,
+    /// mu-mh4 (panel finding 4): system events to append to the new
+    /// session's log immediately after `SessionCreated` and BEFORE the
+    /// session is registered in the Sessions map. Appending here (rather
+    /// than after registration) closes the audit-continuity race: a
+    /// reader that observes the session in the registry is guaranteed to
+    /// also see these seed events, because they are already durable on
+    /// the log before the session becomes observable. Used by
+    /// `session.resume` to seed `HeadAttached`. Empty otherwise.
+    seed_events: Vec<EventPayload>,
     /// mu-f1a0: prompt-cache TTL tier for this session's provider.
     cache_ttl: CacheTtl,
     // runtime deps (daemon-global)
@@ -279,6 +488,8 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         parent_session_id,
         branched_at_parent_event_id,
         capability,
+        seed_messages,
+        seed_events,
         notif,
         sessions,
         factory,
@@ -333,6 +544,16 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             usage_semantics: Some(provider.capabilities().usage_semantics),
         },
     );
+
+    // mu-mh4 (panel finding 4): append any seed events (e.g. resume's
+    // HeadAttached) AFTER SessionCreated but BEFORE the session is
+    // registered below. This closes the audit-continuity race: the
+    // session only becomes observable in the Sessions map once these
+    // events are already durable on the log, so no reader can see the
+    // session without also seeing them.
+    for payload in seed_events {
+        event_log.append(EventActor::System, payload);
+    }
 
     let pending_approvals = Arc::new(Mutex::new(HashMap::new()));
     // mu-phl v0 / mu-0bxv: build the new session's project context by
@@ -401,6 +622,9 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             project_context,
             compaction_threshold: Some(compaction_cfg.trigger_threshold_tokens),
             compaction_policy_override,
+            // mu-mh4: seed the loop with the continuation history when
+            // this session is a resume/fork-at-tail; empty otherwise.
+            seed_messages,
         },
         events: events_tx,
         pending_approvals: pending_approvals.clone(),
@@ -1155,6 +1379,8 @@ fn payload_kind_str(p: &EventPayload) -> &'static str {
         EventPayload::WorkerFailed { .. } => "worker_failed",
         EventPayload::WorkerTimeout { .. } => "worker_timeout",
         EventPayload::OperatorMark { .. } => "operator_mark",
+        EventPayload::Tombstone { .. } => "tombstone",
+        EventPayload::HeadAttached { .. } => "head_attached",
     }
 }
 
@@ -1783,6 +2009,93 @@ mod tests {
         assert_eq!(events[0]["payload"]["kind"], "session_created");
         assert_eq!(events[2]["payload"]["kind"], "done");
         assert_eq!(result["end_of_log"], true);
+    }
+
+    /// mu-mh4 (panel finding 1): resuming a COLD/rehydrated predecessor
+    /// (no live capability handle — the normal resume case) must FAIL
+    /// CLOSED. The resumed session's capability must be the
+    /// most-restrictive `read_only()` baseline, NOT `root()`. Falling back
+    /// to root would let resume WIDEN privileges (attenuation-only-narrows
+    /// violation). This pins the fix until capability persistence
+    /// (mu-nqn5) lets us recover the predecessor's actual capability.
+    #[tokio::test]
+    async fn resume_of_cold_session_does_not_yield_root_authority() {
+        use mu_core::capability::Capability;
+
+        let predecessor_id = "cold-predecessor";
+        // rehydrated_session_with_events uses `insert_rehydrated`, which
+        // registers the log WITHOUT a live capability handle — exactly the
+        // cold case that previously fell back to root().
+        let sessions = rehydrated_session_with_events(predecessor_id);
+        assert!(
+            sessions.capability(predecessor_id).is_none(),
+            "precondition: rehydrated predecessor has no live capability handle",
+        );
+
+        let factory = crate::serve::factory::make_provider_factory(false, None);
+        let tools: Arc<Vec<Arc<dyn Tool>>> = Arc::new(Vec::new());
+        let di = DaemonInfo::new("test-daemon"); // no events_dir — in-memory only
+
+        let req = Request {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id: json!(1),
+            method: "session.resume".into(),
+            params: json!({
+                "session_ref": format!("test-daemon:{predecessor_id}"),
+                "provider": { "kind": "anthropic_api", "model": "faux" },
+            }),
+        };
+
+        let resp = handle_resume_session(
+            req,
+            mu_core::transport::NotificationWriter::sink(),
+            sessions.clone(),
+            factory,
+            tools,
+            di,
+        );
+        let value = serde_json::to_value(&resp).expect("serialize response");
+        let result = value
+            .get("result")
+            .unwrap_or_else(|| panic!("resume must succeed, got {value}"));
+        let new_id = result["session_id"]
+            .as_str()
+            .expect("session_id in result")
+            .to_string();
+
+        let cap_handle = sessions
+            .capability(&new_id)
+            .expect("resumed session has a live capability handle");
+        let cap = cap_handle.lock().expect("lock capability").clone();
+
+        assert_ne!(
+            cap,
+            Capability::root(),
+            "FAIL-CLOSED: resuming a cold session must NOT yield root authority",
+        );
+        assert_eq!(
+            cap,
+            Capability::read_only(),
+            "resumed cold session must get the read_only fail-closed baseline",
+        );
+        // Spell out the load-bearing axes so a regression is legible.
+        assert_eq!(
+            cap.allowed_tools,
+            Some(std::collections::HashSet::new()),
+            "fail-closed baseline allows no tools",
+        );
+        assert!(
+            matches!(
+                cap.autonomy,
+                mu_core::capability::AutonomyCapability::Disallowed
+            ),
+            "fail-closed baseline disallows autonomy",
+        );
+        assert_eq!(
+            cap.max_side_effects,
+            Some(mu_core::agent::tool::SideEffects::ReadOnly),
+            "fail-closed baseline pins the side-effects ceiling to ReadOnly",
+        );
     }
 
     #[test]

@@ -110,6 +110,47 @@ enum Command {
         #[arg(long)]
         bare: bool,
     },
+    /// Resume a dead session by forking a fresh live head at its last
+    /// clean boundary (mu-mh4). STRICT: refuses a ragged log (incomplete
+    /// records / unanswered tool calls) with a precise diagnosis and a
+    /// `mu recover` hint — it never silently truncates. Accepts the
+    /// alias `--resume` too: `mu --resume daemon:session`.
+    #[command(alias = "--resume")]
+    Resume {
+        /// Predecessor session: `daemon:session` or the canonical
+        /// `mu:<daemon>/<session>`.
+        session_ref: String,
+        /// Optional prompt to ask the resumed session immediately.
+        /// Omit to just attach the head and print the new session id.
+        prompt: Option<String>,
+        /// Provider backend for the resumed (live) session.
+        #[arg(long, default_value = "faux")]
+        provider: String,
+        /// Model id for the resumed session.
+        #[arg(long)]
+        model: Option<String>,
+        /// Comma-separated list of tools (forwarded to `mu serve`).
+        #[arg(long, default_value = "")]
+        tools: String,
+        /// Forwarded as `--ephemeral` to `mu serve`.
+        #[arg(long)]
+        ephemeral: bool,
+        /// Forwarded as `--thinking` to `mu serve`.
+        #[arg(long)]
+        thinking: Option<String>,
+        /// Forwarded as `--bash-yolo` to `mu serve`.
+        #[arg(long)]
+        bash_yolo: bool,
+        /// Forwarded as `--bash-allow` to `mu serve` (repeatable).
+        #[arg(long = "bash-allow", value_name = "CMD")]
+        bash_allow: Vec<String>,
+        /// Forwarded as `--bash-prompt` to `mu serve`.
+        #[arg(long)]
+        bash_prompt: bool,
+        /// Forwarded as `--bare` to `mu serve`.
+        #[arg(long)]
+        bare: bool,
+    },
     /// Interactive terminal UI. Delegates to the `mu-tui` binary
     /// (resolved next to the `mu` binary, falling back to `$PATH`).
     /// Any arguments after `tui` are forwarded to `mu-tui` unchanged,
@@ -351,6 +392,34 @@ async fn main() -> Result<()> {
                 bash_allow,
                 bash_prompt,
                 system_prompt,
+                bare,
+            })
+            .await
+        }
+        Command::Resume {
+            session_ref,
+            prompt,
+            provider,
+            model,
+            tools,
+            ephemeral,
+            thinking,
+            bash_yolo,
+            bash_allow,
+            bash_prompt,
+            bare,
+        } => {
+            mu_coding::resume::run(mu_coding::resume::ResumeOptions {
+                session_ref,
+                prompt,
+                provider,
+                model,
+                tools,
+                ephemeral,
+                thinking,
+                bash_yolo,
+                bash_allow,
+                bash_prompt,
                 bare,
             })
             .await

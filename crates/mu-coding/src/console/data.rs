@@ -127,6 +127,16 @@ pub(crate) fn scan_sessions(events_dir: &Path) -> ScanResult {
             if file.path().extension().and_then(|s| s.to_str()) != Some("jsonl") {
                 continue;
             }
+            // mu-console-skip-supervisor-ankc: each daemon dir holds the
+            // agent session log(s) alongside a `supervisor.jsonl` of
+            // daemon-lifecycle records. That file carries no SessionEvent
+            // ask/usage content, so ingesting it produced a metricless
+            // "supervisor" ghost row in the sessions index. Skip it by
+            // name — daemon-lifecycle logs may earn their own surface
+            // later, but never as a fake session row.
+            if file.file_name().to_str() == Some("supervisor.jsonl") {
+                continue;
+            }
             match SessionEventLog::from_jsonl(&file.path()) {
                 Ok((log, malformed)) => {
                     if malformed > 0 {
@@ -186,4 +196,58 @@ pub(crate) fn normalize_base_path(path: &str) -> String {
     }
     let no_edges = trimmed.trim_matches('/');
     format!("/{no_edges}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
+
+    fn tmp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("mu-scan-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Write a one-event session log at `<dir>/<file>` via the real
+    /// serializer, so the fixture matches on-disk reality rather than a
+    /// hand-rolled JSON literal that could drift from the event format.
+    fn write_session_log(dir: &Path, file: &str, session_id: &str) {
+        let log = SessionEventLog::new(session_id);
+        log.attach_disk_writer(&dir.join(file)).unwrap();
+        log.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "anthropic".into(),
+                model: "claude-opus-4-8".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+    }
+
+    /// mu-console-skip-supervisor-ankc: a daemon dir holds the agent
+    /// session log alongside a `supervisor.jsonl` of daemon-lifecycle
+    /// records. Both are valid JSONL, so this guards the *filename* skip:
+    /// only the real session may surface as an index row.
+    #[test]
+    fn scan_skips_supervisor_jsonl() {
+        let root = tmp("supervisor-skip");
+        let daemon = root.join("daemon-1");
+        std::fs::create_dir_all(&daemon).unwrap();
+        write_session_log(&daemon, "session-1.jsonl", "session-1");
+        write_session_log(&daemon, "supervisor.jsonl", "supervisor");
+
+        let scan = scan_sessions(&root);
+        assert_eq!(
+            scan.sessions.len(),
+            1,
+            "supervisor.jsonl must not appear as a session row"
+        );
+        assert_eq!(scan.sessions[0].session_id, "session-1");
+        assert_eq!(scan.malformed_files, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

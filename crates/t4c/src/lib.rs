@@ -35,6 +35,7 @@ pub mod path;
 pub mod rank;
 pub mod registry;
 pub mod semantic;
+pub mod snapshot;
 pub mod source;
 
 pub use capability::{Capability, Effects, FsEffect, HelpAiDoc, HelpSpec, SessionConstraints};

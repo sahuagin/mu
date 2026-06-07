@@ -116,6 +116,13 @@ impl ConfigEmbedder {
         })
     }
 
+    /// The embedder model id (e.g. `qwen/qwen3-embedding-8b`). Used to guard
+    /// against cosine-comparing query embeddings against archived vectors from a
+    /// DIFFERENT model — a different embedding space yields meaningless scores.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     /// Extract `[<provider>].api_key` from the agent config TOML. Split out so the
     /// key-resolution is testable without I/O.
     pub fn api_key_from(text: &str, provider: &str) -> Result<String> {

@@ -7,214 +7,41 @@
 //! "discovery tracks permission." `discover` scans the environment, reports
 //! present/absent, and persists the intersection as a self-configured registry.
 
-use crate::capability::{Capability, HelpSpec};
-use crate::chain::{Chain, Impl};
-use crate::path::CapPath;
+use crate::capability::Capability;
+use crate::chain::Chain;
 use crate::source::RegistrySource;
 use anyhow::Result;
 use std::path::Path;
 
-fn cap(
-    path: &str,
-    summary: &str,
-    kw: &[&str],
-    invoke: &[&str],
-    help: &[&str],
-    ai: bool,
-) -> Capability {
-    Capability {
-        path: CapPath::parse(path).expect("curated catalog path is valid"),
-        summary: summary.to_string(),
-        keywords: kw.iter().map(|s| s.to_string()).collect(),
-        invoke: invoke.iter().map(|s| s.to_string()).collect(),
-        help: if help.is_empty() {
-            None
-        } else {
-            Some(HelpSpec {
-                argv: help.iter().map(|s| s.to_string()).collect(),
-                ai,
-            })
-        },
-        requires: vec![],
-        effects: None,
-    }
-}
+/// The built-in curated catalog, baked into the binary at compile time.
+///
+/// This is the **durable asset as config** (goal mu-2332): adding a tool or
+/// changing a calling convention is an edit to this TOML, not a code change.
+/// It mirrors the `models.default.toml` precedent in mu-core exactly — the
+/// engine (probing, ranking, help-ai execution) stays in Rust; the catalog
+/// data lives in config and is layered over by install-shipped and
+/// operator-local override TOMLs.
+pub const DEFAULT_CATALOG_TOML: &str = include_str!("config/curated.default.toml");
 
 /// The curated catalog — metadata for common tools regardless of what's
-/// installed here. `discover` intersects this with the environment.
+/// installed here, parsed from the embedded [`DEFAULT_CATALOG_TOML`].
+/// `discover` intersects this with the environment.
+///
+/// Parse failure is a programmer error (the embedded file shipped with the
+/// binary), so this panics — the same posture as `models.default.toml`'s
+/// `expect("built-in models.default.toml must parse")`.
 pub fn curated() -> Vec<Capability> {
-    vec![
-        cap(
-            "mcp.code-index.recall",
-            "semantic + lexical code search over an indexed repo (best first pass for 'where is X')",
-            &["code", "search", "semantic", "symbol", "recall", "function", "struct", "where"],
-            &["code-index", "recall"],
-            &["code-index", "--help-ai"],
-            true,
-        ),
-        cap(
-            "bash.agent.memory",
-            "search persistent agent memory (decisions, feedback, project state, references)",
-            &["memory", "remember", "know", "decision", "feedback", "why", "prior", "history", "context"],
-            &["agent", "memory", "search"],
-            &["agent", "memory", "--help-ai"],
-            true,
-        ),
-        cap(
-            "bash.jj.status",
-            "jujutsu — working-copy and parent status",
-            &["vcs", "version", "diff", "working", "copy", "commit", "jujutsu"],
-            &["jj", "status"],
-            &["jj", "status", "--help"],
-            false,
-        ),
-        cap(
-            "bash.git.status",
-            "git — working-tree status",
-            &["vcs", "version", "diff", "staged", "commit"],
-            &["git", "status"],
-            &["git", "status", "--help"],
-            false,
-        ),
-        cap(
-            "bash.gh.pr",
-            "GitHub CLI for PRs/issues. In jj sibling workspaces there is no .git: always pass `-R owner/repo` (e.g. `gh pr create -R sahuagin/mu ...`). Avoid `gh pr merge -d`; merge, then `jj git fetch`.",
-            &[
-                "github",
-                "gh",
-                "pr",
-                "pull-request",
-                "review",
-                "merge",
-                "issue",
-                "jj",
-                "workspace",
-                "not-a-git-repository",
-                "repository",
-            ],
-            &[
-                "gh",
-                "pr",
-                "create",
-                "-R",
-                "OWNER/REPO",
-                "--base",
-                "main",
-                "--head",
-                "BRANCH",
-            ],
-            &["gh", "pr", "--help"],
-            false,
-        ),
-        cap(
-            "bash.jq",
-            "jq — query and transform JSON",
-            &["json", "query", "filter", "transform", "parse"],
-            &["jq"],
-            &["jq", "--help"],
-            false,
-        ),
-        cap(
-            "bash.t4c",
-            "tools4claude — discover, learn, and invoke tools by intent (this tool, self-registered)",
-            &["discover", "tool", "find", "capability", "help", "registry", "meta"],
-            &["t4c"],
-            &["t4c", "--help-ai"],
-            true,
-        ),
-        // Personal agent-infra, same precedent as bash.agent.memory:
-        // curated here, present/absent resolved per-host by `discover`.
-        cap(
-            "bash.antagonist-log",
-            "verdict journal for review antagonists (verifier/judge/gate) — record runs, adjudicate findings, catch/false-alarm stats",
-            &[
-                "verdict",
-                "verifier",
-                "judge",
-                "review",
-                "gate",
-                "false-alarm",
-                "catch",
-                "stats",
-                "adjudicate",
-                "antagonist",
-                "finding",
-            ],
-            &["antagonist_log", "recent"],
-            &["antagonist_log", "--help"],
-            false,
-        ),
-    ]
+    crate::source::TomlConfigSource::parse_str(DEFAULT_CATALOG_TOML)
+        .expect("built-in curated.default.toml must parse")
 }
 
 /// Curated preference chains — interchangeable-impl slots resolved against the
-/// host at `discover` time (mu-d2iy.2). These supersede the flat per-tool entries
-/// (rg/fd/grep) that used to live in `curated()`.
+/// host at `discover` time (mu-d2iy.2), parsed from the embedded
+/// [`DEFAULT_CATALOG_TOML`]. These supersede the flat per-tool entries
+/// (rg/fd/grep) that the chain slots cover.
 pub fn default_chains() -> Vec<Chain> {
-    fn ch(slot: &str, summary: &str, kw: &[&str], impls: Vec<Impl>) -> Chain {
-        Chain {
-            slot: slot.to_string(),
-            summary: summary.to_string(),
-            keywords: kw.iter().map(|s| s.to_string()).collect(),
-            impls,
-        }
-    }
-    vec![
-        ch(
-            "bash.search",
-            "search file contents for a pattern or regex",
-            &["search", "grep", "regex", "pattern", "string", "text"],
-            // rg/grep both auto-disable color when stdout isn't a tty (the agent
-            // case), so no mandatory flag is needed to keep output clean.
-            vec![Impl::bare("rg"), Impl::bare("grep")],
-        ),
-        ch(
-            "bash.find-files",
-            "find files and directories by name or glob",
-            &[
-                "find",
-                "file",
-                "filename",
-                "path",
-                "glob",
-                "locate",
-                "directory",
-            ],
-            // Confine to one filesystem so a search never crawls the ~12TB NFS
-            // mount on this host. fd spells it `--one-file-system`; BSD find
-            // spells it `-x` (a global option before the path). t4c-notes data
-            // point 2 / mu-kex4.6.7.
-            vec![
-                Impl::with_flags("fd", &["--one-file-system"]),
-                Impl::with_flags("find", &["-x"]),
-            ],
-        ),
-        ch(
-            "bash.ls",
-            "list directory contents",
-            &["list", "ls", "directory", "files", "tree"],
-            // eza/exa emit ANSI under a color-forcing alias/env; `--color=never`
-            // overrides it so a path capture isn't mangled. BSD `ls` has no
-            // `--color` flag (it would error) and defaults to no color, so it
-            // carries none — the per-impl divergence this field exists for.
-            vec![
-                Impl::with_flags("eza", &["--color=never"]),
-                Impl::with_flags("exa", &["--color=never"]),
-                Impl::bare("ls"),
-            ],
-        ),
-        ch(
-            "bash.compress",
-            "compress or archive data",
-            &["compress", "archive", "zip", "gzip", "tar"],
-            vec![
-                Impl::bare("zstd"),
-                Impl::bare("pixz"),
-                Impl::bare("xz"),
-                Impl::bare("gzip"),
-            ],
-        ),
-    ]
+    crate::chain::parse_chains(DEFAULT_CATALOG_TOML)
+        .expect("built-in curated.default.toml chains must parse")
 }
 
 /// Is this capability's underlying command present on `$PATH`?
@@ -264,6 +91,24 @@ mod tests {
     #[test]
     fn curated_is_nonempty() {
         assert!(!curated().is_empty());
+    }
+
+    #[test]
+    fn embedded_default_toml_parses_caps_and_chains() {
+        // The single-source-of-truth invariant (mu-2332): the baked-in TOML is
+        // the catalog, parsed at runtime — not a hardcoded Vec. Both grammars
+        // coexist in one file.
+        let caps = curated();
+        let chains = default_chains();
+        assert_eq!(caps.len(), 8, "expected 8 [[capability]] entries");
+        assert_eq!(chains.len(), 4, "expected 4 [[chain]] entries");
+        // chains carry their per-impl mandatory flags through the TOML round-trip
+        let find = chains
+            .iter()
+            .find(|c| c.slot == "bash.find-files")
+            .expect("find-files chain missing");
+        assert_eq!(find.impls[0].cmd, "fd");
+        assert_eq!(find.impls[0].mandatory_flags, vec!["--one-file-system"]);
     }
 
     #[test]

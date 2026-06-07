@@ -126,9 +126,36 @@ impl RegistrySource for TomlConfigSource {
         "toml-config"
     }
     fn capabilities(&self) -> Result<Vec<Capability>> {
-        let text = std::fs::read_to_string(&self.path)
-            .with_context(|| format!("reading t4c config {}", self.path.display()))?;
-        Self::parse_str(&text)
+        // The override layer is BEST-EFFORT: a user's malformed override TOML
+        // (a typo) must not brick the whole registry build and take down `find`.
+        // We warn loudly to stderr (so the loss isn't silent — the user sees it
+        // every invocation until fixed) and contribute no capabilities, letting
+        // catalog + chains still resolve. This mirrors the fail-soft-but-visible
+        // posture of `verify` (always returns a verdict) and the embed-model
+        // fallback (ranks lexically rather than failing). A genuinely missing
+        // file is not an error (the source just contributes nothing).
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                eprintln!(
+                    "t4c: cannot read override {} ({e}) — ignoring overrides",
+                    self.path.display()
+                );
+                return Ok(Vec::new());
+            }
+        };
+        match Self::parse_str(&text) {
+            Ok(caps) => Ok(caps),
+            Err(e) => {
+                eprintln!(
+                    "t4c: malformed override {} ({e}) — ignoring overrides; \
+                     fix the TOML to restore them",
+                    self.path.display()
+                );
+                Ok(Vec::new())
+            }
+        }
     }
 }
 

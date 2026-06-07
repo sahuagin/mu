@@ -60,6 +60,16 @@ pub enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Terrain-check the persisted warm-start snapshot against the live world
+    /// WITHOUT writing anything: is the snapshot still fresh, and if not, how
+    /// badly? Exit 0 = fresh, 1 = stale-equivalent (lossless rediscover),
+    /// 2 = stale-degraded (a capability category has no live tool), 3 = missing.
+    /// `--diff` expands to the per-capability delta (present only in snapshot vs
+    /// only live), tagged with each capability's resolved source.
+    Verify {
+        #[arg(long)]
+        diff: bool,
+    },
     /// Run the find-quality benchmark (known-answer intent-sets). `--fake` =
     /// deterministic baseline; default = the live embedder (the mu-d2iy.6 gate).
     Bench {
@@ -135,14 +145,20 @@ pub fn route_bare(tree: &Tree, tokens: &[String]) -> BareAction {
 }
 
 /// Build the default registry: the curated catalog ∩ installed env, optionally
-/// overridden by a TOML config at `$T4C_CONFIG` or `~/.config/t4c/registry.toml`.
+/// overridden by a user-authored TOML at `$T4C_CONFIG` or
+/// `~/.config/t4c/overrides.toml`.
+///
+/// This is the COLD path — [`catalog::EnvCatalogSource`] probes the PATH
+/// (`which` per catalogued tool) every time it's built. Read commands should
+/// prefer [`warm_registry`], which mmaps the snapshot and skips that probing
+/// entirely, falling back here only when the snapshot is stale or missing.
 pub fn build_registry() -> Registry {
     let mut reg = Registry::new();
     reg.add_source(Box::new(catalog::EnvCatalogSource));
     reg.add_source(Box::new(crate::chain::ChainSource::new(
         catalog::default_chains(),
     )));
-    if let Some(cfg) = config_path() {
+    if let Some(cfg) = overrides_path() {
         if cfg.exists() {
             reg.add_source(Box::new(TomlConfigSource::new(cfg)));
         }
@@ -150,13 +166,92 @@ pub fn build_registry() -> Registry {
     reg
 }
 
-fn config_path() -> Option<PathBuf> {
+/// Build a registry WITHOUT probing the environment, by loading the rkyv
+/// warm-start snapshot (mu-2332). On a fresh snapshot the present-set comes from
+/// the archive — zero `which` calls — and chains + TOML overrides are re-layered
+/// on top (cheap, and authoritative-last as before). On a stale/missing snapshot
+/// this returns `None` and the caller falls back to the cold [`build_registry`].
+///
+/// Returns the registry AND the snapshot's archived embedding vectors (as a
+/// [`VectorCache`]) when present, so warm `find` ranks semantically straight
+/// from the archive — fulfilling the contract that a warm start needs neither
+/// the JSON vector cache nor a re-embed. An empty vector set yields `None` for
+/// the cache (no embedder ran at discover) and find degrades to lexical.
+///
+/// The snapshot is CACHE: a hash/schema mismatch is silently treated as a miss,
+/// never an error, so a changed catalog or PATH self-heals on the next
+/// `discover` without ever surfacing a failure to the user.
+fn warm_registry() -> Option<(Registry, Option<crate::semantic::VectorCache>)> {
+    let path = crate::snapshot::Snapshot::default_path()?;
+    let catalog_hash = crate::snapshot::catalog_content_hash(&catalog_files());
+    let path_hash = crate::snapshot::path_set_hash();
+    match crate::snapshot::load_valid(&path, &catalog_hash, &path_hash) {
+        crate::snapshot::LoadOutcome::Fresh {
+            caps,
+            vectors,
+            model,
+        } => {
+            let mut reg = Registry::new();
+            // Archived present-set stands in for EnvCatalogSource AND the
+            // resolved ChainSource (both folded into the snapshot at discover) —
+            // so the warm path probes ZERO commands. Only TOML overrides, which
+            // are read-from-disk not probed, re-layer on top.
+            reg.add_source(Box::new(crate::source::StaticSource::new("snapshot", caps)));
+            if let Some(cfg) = overrides_path() {
+                if cfg.exists() {
+                    reg.add_source(Box::new(TomlConfigSource::new(cfg)));
+                }
+            }
+            // Surface the archived vectors so the warm ranker uses them directly
+            // instead of re-reading vectors.json. Empty => no embedder at
+            // discover => no cache => lexical fallback (same as cold).
+            let cache = if vectors.is_empty() {
+                None
+            } else {
+                Some(crate::semantic::VectorCache {
+                    model,
+                    by_path: vectors,
+                })
+            };
+            Some((reg, cache))
+        }
+        _ => None, // stale or missing -> caller does a cold build (self-heal on next discover)
+    }
+}
+
+/// The registry for read commands, plus an optional in-memory vector cache from
+/// the snapshot. Warm (snapshot, no probing, vectors-from-archive) when
+/// available, else cold (probes, vectors-from-`vectors.json`-if-present). This
+/// is the function `find`/`walk`/banner go through so the common path is
+/// zero-probe and serves its own semantic vectors.
+fn read_registry() -> (Registry, Option<crate::semantic::VectorCache>) {
+    warm_registry().unwrap_or_else(|| (build_registry(), None))
+}
+
+fn overrides_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("T4C_CONFIG") {
         return Some(PathBuf::from(p));
     }
     std::env::var("HOME")
         .ok()
-        .map(|h| PathBuf::from(h).join(".config/t4c/registry.toml"))
+        .map(|h| PathBuf::from(h).join(".config/t4c/overrides.toml"))
+}
+
+/// Where `discover` writes its self-configured registry (machine output, NOT
+/// hand-edited). `$T4C_SELF_CONFIG` or `~/.cache/t4c/registry.toml`.
+///
+/// This is deliberately DISTINCT from [`overrides_path`]: discover overwrites
+/// this file wholesale on every run, so it must never be the same file a user
+/// hand-authors their additions into. Conflating the two (the pre-mu-2332 bug)
+/// meant `discover` silently clobbered user overrides. Output lives in the cache
+/// dir (regenerable); input lives in the config dir (durable, user-owned).
+fn self_config_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("T4C_SELF_CONFIG") {
+        return Some(PathBuf::from(p));
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".cache/t4c/registry.toml"))
 }
 
 /// Where the catalog vector cache lives (`$T4C_VECTORS` or `~/.cache/t4c/vectors.json`).
@@ -169,23 +264,56 @@ fn vectors_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("vectors.json"))
 }
 
-/// Rank with semantic embeddings when a vector cache AND a live embedder are both
-/// available; otherwise lexical. `find` never re-embeds the catalog — the cache
-/// was built at `discover`; only the intent is embedded here (one call).
-fn rank_caps<'a>(intent: &str, caps: &[&'a Capability]) -> Vec<Ranked<'a>> {
-    if let Ok(cache) = crate::semantic::VectorCache::load(&vectors_path()) {
+/// Rank with semantic embeddings when vectors AND a live embedder are both
+/// available AND their embedding spaces match; otherwise lexical. `find` never
+/// re-embeds the catalog — vectors were built at `discover`. The preferred
+/// vector source is `snapshot_cache` (the archive loaded by the warm path); it
+/// falls back to the on-disk `vectors.json` only when the warm path didn't
+/// supply one (cold start). Only the intent is embedded here (one call).
+///
+/// CRITICAL: the archived vectors carry the model that produced them, and we
+/// only cosine-compare against the live query embedder when the two models
+/// MATCH. If `$T4C_EMBED_MODEL` changed since discover (while catalog/PATH
+/// hashes stayed the same, so the snapshot is still "fresh"), the archived
+/// vectors live in a different embedding space — comparing them to fresh query
+/// embeddings yields meaningless scores. On mismatch we drop to lexical, which
+/// is correct-but-degraded rather than confidently-wrong (reviewer finding).
+fn rank_caps<'a>(
+    intent: &str,
+    caps: &[&'a Capability],
+    snapshot_cache: Option<&crate::semantic::VectorCache>,
+) -> Vec<Ranked<'a>> {
+    // Prefer the snapshot's in-memory cache; else the JSON cache on disk. Carry
+    // the model alongside the vectors so we can verify the embedding space.
+    let cache: Option<crate::semantic::VectorCache> = match snapshot_cache {
+        Some(c) => Some(c.clone()),
+        None => crate::semantic::VectorCache::load(&vectors_path()).ok(),
+    };
+    if let Some(cache) = cache {
         if let Ok(emb) = crate::embedder::ConfigEmbedder::from_config() {
-            return crate::semantic::SemanticRanker::new(emb, cache.by_path).rank(intent, caps);
+            if emb.model() == cache.model {
+                return crate::semantic::SemanticRanker::new(emb, cache.by_path).rank(intent, caps);
+            }
+            // Model drift: archived vectors are a different embedding space.
+            // Lexical is honest; a rediscover (re-embed) will heal the cache.
+            eprintln!(
+                "t4c: embed model changed ({} archived vs {} live) — \
+                 ranking lexically; run `t4c discover` to re-embed",
+                cache.model,
+                emb.model()
+            );
         }
     }
     LexicalRanker.rank(intent, caps)
 }
 
 /// Embed the active catalog and persist the vector cache (the compile step for
-/// semantic `find`). Returns the cache path if written; `None` if no embedder is
-/// configured or the endpoint is unreachable (find then stays lexical — the live
-/// endpoint is the mu-d2iy.6 gate).
-fn build_vector_cache() -> Result<Option<PathBuf>> {
+/// semantic `find`). Returns the built [`VectorCache`] (path + vectors) when an
+/// embedder is configured and reachable; `None` if not (find then stays lexical
+/// — the live endpoint is the mu-d2iy.6 gate). The caller folds the returned
+/// vectors into the rkyv snapshot so a warm `find` needs neither this JSON cache
+/// nor a re-embed.
+fn build_vector_cache() -> Result<Option<(PathBuf, crate::semantic::VectorCache)>> {
     let emb = match crate::embedder::ConfigEmbedder::from_config() {
         Ok(e) => e,
         Err(_) => return Ok(None),
@@ -198,7 +326,7 @@ fn build_vector_cache() -> Result<Option<PathBuf>> {
         Ok(cache) => {
             let path = vectors_path();
             cache.save(&path)?;
-            Ok(Some(path))
+            Ok(Some((path, cache)))
         }
         Err(_) => Ok(None), // endpoint down/wrong — the gate fixes the endpoint
     }
@@ -311,18 +439,51 @@ fn do_discover(json: bool, dry_run: bool) -> Result<i32> {
         build_vector_cache().unwrap_or(None)
     };
 
+    // mu-2332 part 2/3: persist the rkyv warm-start snapshot. This is the ONLY
+    // place probing + embedding happen; every later `find` mmaps this instead.
+    // The snapshot folds in whatever vectors build_vector_cache produced (empty
+    // if no live embedder — find then degrades to lexical, same as today).
+    //
+    // The snapshot's present-set = env-installed catalog ∩ PLUS the resolved
+    // chain winners (chains layered last so they win on path collision, exactly
+    // as the cold registry orders them). Folding the resolved chains in here is
+    // what lets warm_registry drop the live ChainSource and probe ZERO commands.
+    let snapshot_wrote = if dry_run {
+        None
+    } else {
+        let mut present_for_snapshot = present.clone();
+        if let Ok((chain_caps, _)) =
+            crate::chain::resolve_chains(&catalog::default_chains(), catalog::which)
+        {
+            present_for_snapshot.extend(chain_caps);
+        }
+        let vectors = cache_wrote
+            .as_ref()
+            .map(|(_, c)| c.by_path.clone())
+            .unwrap_or_default();
+        let model = cache_wrote
+            .as_ref()
+            .map(|(_, c)| c.model.clone())
+            .unwrap_or_default();
+        write_snapshot(&present_for_snapshot, &vectors, &model)
+            .ok()
+            .flatten()
+    };
+
     if json {
         #[derive(Serialize)]
         struct Disc {
             present: Vec<String>,
             absent: Vec<String>,
             wrote: Option<String>,
+            snapshot: Option<String>,
             dry_run: bool,
         }
         let d = Disc {
             present: present.iter().map(|c| c.path.to_string()).collect(),
             absent: absent.iter().map(|c| c.path.to_string()).collect(),
             wrote: wrote.as_ref().map(|p| p.display().to_string()),
+            snapshot: snapshot_wrote.as_ref().map(|p| p.display().to_string()),
             dry_run,
         };
         println!("{}", serde_json::to_string_pretty(&d)?);
@@ -351,12 +512,225 @@ fn do_discover(json: bool, dry_run: bool) -> Result<i32> {
     }
     if dry_run {
         println!("(dry-run — vector cache not built)");
-    } else if let Some(p) = &cache_wrote {
+    } else if let Some((p, _)) = &cache_wrote {
         println!("embedded + cached catalog vectors: {}", p.display());
     } else {
         println!("(no live embedder/endpoint — semantic find disabled; lexical fallback)");
     }
+    match &snapshot_wrote {
+        Some(p) => println!("wrote warm-start snapshot: {}", p.display()),
+        None if dry_run => println!("(dry-run — snapshot not written)"),
+        None => println!("(snapshot not written — no HOME/$T4C_SNAPSHOT)"),
+    }
     Ok(0)
+}
+
+/// The live PROBED present-set t4c would archive right now, by capability path,
+/// each tagged with the source it resolved from. Recomputed exactly as
+/// `discover` builds the *snapshot* present-set: curated catalog ∩ installed
+/// (`catalog`) plus resolved chain winners (`chain`). Pure read — probes PATH
+/// via `which` but writes nothing. The `BTreeMap` gives a stable, sorted path
+/// set for diffing against the snapshot.
+///
+/// Deliberately EXCLUDES the user override layer. Overrides re-layer at read
+/// time and are intentionally not baked into the snapshot body — they're
+/// fingerprinted into `catalog_hash` instead, so editing one flips `verify` to
+/// stale via the hash verdict (the correct signal). Including them here would
+/// make every override show as a phantom "rediscover would gain" delta even
+/// immediately after a clean discover, because the snapshot never archived them.
+/// So `verify` diffs like-for-like (probed-vs-archived) and lets the hash
+/// verdict carry override drift.
+fn live_present_sources() -> std::collections::BTreeMap<String, String> {
+    use std::collections::BTreeMap;
+    let mut by_path: BTreeMap<String, String> = BTreeMap::new();
+
+    // catalog ∩ installed
+    for c in catalog::curated().into_iter().filter(catalog::is_installed) {
+        by_path.insert(c.path.to_string(), "catalog".to_string());
+    }
+    // resolved chain winners (chains layer last, so they win on path collision)
+    if let Ok((chain_caps, _)) =
+        crate::chain::resolve_chains(&catalog::default_chains(), catalog::which)
+    {
+        for c in chain_caps {
+            by_path.insert(c.path.to_string(), "chain".to_string());
+        }
+    }
+    by_path
+}
+
+/// `verify` — terrain-check the persisted snapshot against the live world,
+/// WRITING NOTHING. Answers "is the warm-start snapshot still fresh, and if not,
+/// how badly?" without overwriting the snapshot or config (unlike `discover`).
+///
+/// Exit code is the cheap machine gate — a caller checks `$?` and only parses
+/// output (or runs `--diff`) when it's nonzero:
+///
+/// | verdict           | exit | meaning                                            |
+/// |-------------------|------|----------------------------------------------------|
+/// | `fresh`           | 0    | hashes match AND no new tools — no work            |
+/// | `stale-equivalent`| 1    | world moved, but every snapshot capability still   |
+/// |                   |      | resolves to *something* — rediscover is LOSSLESS   |
+/// | `stale-augmentable`| 1   | hashes match, but a tool was installed since        |
+/// |                   |      | discover — rediscover only GAINS (nothing lost)    |
+/// | `stale-degraded`  | 2    | world moved AND ≥1 capability path has no live      |
+/// |                   |      | implementation — rediscover LOSES it               |
+/// | `missing`         | 3    | no snapshot — cold start needed                     |
+///
+/// `stale-augmentable` is the case the hash checks structurally can't catch: a
+/// catalogued tool absent at discover, later installed into an EXISTING PATH
+/// directory (path-set hash unchanged, and it wasn't in the present-set to be
+/// tool-fingerprinted). `verify` catches it because it recomputes the live
+/// present-set — which is exactly why this lives in `verify` (an explicit
+/// opt-in check) and NOT on the warm `find` load path (which must stay
+/// zero-probe). A reviewer flagged the gap; the answer is "verify detects it,
+/// find doesn't pay for it."
+///
+/// Severity is monotonic (`$? -ge 2` = "a capability is gone"; `-eq 0` = skip).
+/// Crucially, the equivalent/degraded split is judged on capability PATHS, not
+/// tool identity: `bash.search` filled by `rg` here and `grep` in CI is still
+/// `stale-equivalent` because the path survives — which is what makes a verify
+/// assertion portable across hosts (FreeBSD dev box ↔ Ubuntu Actions runner).
+/// `--diff` expands the per-capability delta, each tagged with its source.
+fn do_verify(json: bool, diff: bool) -> Result<i32> {
+    let Some(path) = crate::snapshot::Snapshot::default_path() else {
+        if json {
+            println!(
+                r#"{{"verdict":"missing","reason":"no snapshot path (no HOME/$T4C_SNAPSHOT)"}}"#
+            );
+        } else {
+            println!("verify: missing — no snapshot path (set HOME or $T4C_SNAPSHOT)");
+        }
+        return Ok(3);
+    };
+
+    let catalog_hash = crate::snapshot::catalog_content_hash(&catalog_files());
+    let path_hash = crate::snapshot::path_set_hash();
+    let outcome = crate::snapshot::load_valid(&path, &catalog_hash, &path_hash);
+
+    let live = live_present_sources();
+
+    // The snapshot's archived present-set (paths), read REGARDLESS of freshness
+    // via archived_paths — so a stale snapshot (hash mismatch) still yields its
+    // categories, which is exactly what we need to judge equivalent-vs-degraded.
+    // (load_valid's Fresh.caps would be empty on any stale load, defeating the
+    // degraded check.) None => unreadable/corrupt archive => no categories to
+    // compare; the load outcome below still classifies it.
+    let snapshot_paths: Vec<String> = crate::snapshot::archived_paths(&path).unwrap_or_default();
+
+    // Capability paths in the snapshot that NO live tool fills now = lost
+    // categories. (Path-based, so a swapped implementation isn't counted.)
+    let only_snapshot: Vec<String> = snapshot_paths
+        .iter()
+        .filter(|p| !live.contains_key(*p))
+        .cloned()
+        .collect();
+
+    // Live paths absent from the snapshot (a rediscover would GAIN these — e.g.
+    // a catalogued tool that was absent at discover and has since been installed
+    // into an existing PATH dir, which the hash checks can't see). Computed
+    // before the verdict so it can upgrade an otherwise-Fresh load.
+    let snap_set: std::collections::BTreeSet<&String> = snapshot_paths.iter().collect();
+    let only_live: Vec<(&String, &String)> =
+        live.iter().filter(|(p, _)| !snap_set.contains(p)).collect();
+
+    let (verdict, reason, exit): (&str, Option<String>, i32) = match &outcome {
+        crate::snapshot::LoadOutcome::Fresh { .. } => {
+            // Hashes match — but the live present-set may have tools the snapshot
+            // lacks (newly installed since discover). That's not degraded (we
+            // lost nothing) and not a hard "moved" — it's augmentable: rediscover
+            // would GAIN capabilities, losslessly. Exit 1 (rediscover-worthwhile),
+            // distinguished from stale-equivalent by verdict string + only_live.
+            if only_live.is_empty() {
+                ("fresh", None, 0)
+            } else {
+                (
+                    "stale-augmentable",
+                    Some(format!(
+                        "{} tool(s) installed since discover — rediscover would gain them",
+                        only_live.len()
+                    )),
+                    1,
+                )
+            }
+        }
+        crate::snapshot::LoadOutcome::Stale(why) => {
+            if only_snapshot.is_empty() {
+                ("stale-equivalent", Some(why.clone()), 1)
+            } else {
+                ("stale-degraded", Some(why.clone()), 2)
+            }
+        }
+        crate::snapshot::LoadOutcome::Missing => ("missing", None, 3),
+    };
+
+    if json {
+        #[derive(Serialize)]
+        struct DeltaEntry {
+            path: String,
+            source: String,
+        }
+        #[derive(Serialize)]
+        struct VerifyOut {
+            verdict: String,
+            reason: Option<String>,
+            snapshot_path: String,
+            /// snapshot paths NO live tool fills now — the lost categories that
+            /// make a verdict `stale-degraded`.
+            dropped: Vec<String>,
+            /// in live recompute but NOT in snapshot (rediscover would gain).
+            only_live: Vec<DeltaEntry>,
+        }
+        let out = VerifyOut {
+            verdict: verdict.to_string(),
+            reason,
+            snapshot_path: path.display().to_string(),
+            dropped: only_snapshot.clone(),
+            only_live: only_live
+                .iter()
+                .map(|(p, s)| DeltaEntry {
+                    path: (*p).clone(),
+                    source: (*s).clone(),
+                })
+                .collect(),
+        };
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(exit);
+    }
+
+    // Human form.
+    match (verdict, &reason) {
+        ("fresh", _) => println!(
+            "verify: fresh — snapshot matches the live world ({})",
+            path.display()
+        ),
+        ("stale-equivalent", Some(why)) => println!(
+            "verify: STALE (equivalent) — {why}; every capability still resolves, rediscover is lossless"
+        ),
+        ("stale-augmentable", Some(why)) => println!(
+            "verify: STALE (augmentable) — {why}; nothing lost, rediscover only adds"
+        ),
+        ("stale-degraded", Some(why)) => println!(
+            "verify: STALE (degraded) — {why}; {} capability path(s) have no live tool",
+            only_snapshot.len()
+        ),
+        ("missing", _) => println!("verify: missing — no snapshot at {}", path.display()),
+        _ => {}
+    }
+
+    if diff {
+        if only_live.is_empty() && only_snapshot.is_empty() {
+            println!("  diff: none — snapshot and live present-set are identical");
+        } else {
+            for p in &only_snapshot {
+                println!("  - {p:<28} (snapshot only, NO live tool) — capability lost");
+            }
+            for (p, src) in &only_live {
+                println!("  + {p:<28} (live only, source: {src}) — rediscover would gain");
+            }
+        }
+    }
+    Ok(exit)
 }
 
 /// `bench` — run the find-quality benchmark. `--fake` uses the deterministic
@@ -403,17 +777,51 @@ fn do_bench(json: bool, fake: bool) -> Result<i32> {
     Ok(if report.passed == report.total { 0 } else { 1 })
 }
 
-/// Persist a capability set to the config path as TOML (the self-configuring
-/// half of `discover`).
+/// Persist a capability set to the self-config path as TOML (the
+/// self-configuring half of `discover`). Writes to [`self_config_path`] — the
+/// cache-dir output file — NOT the user's override layer, so a discover run
+/// never clobbers hand-authored additions.
 fn write_registry(caps: &[Capability]) -> Result<PathBuf> {
-    let path = config_path().context("no config path (set HOME or T4C_CONFIG)")?;
+    let path = self_config_path().context("no self-config path (set HOME or T4C_SELF_CONFIG)")?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating config dir {}", parent.display()))?;
+            .with_context(|| format!("creating self-config dir {}", parent.display()))?;
     }
     let text = TomlConfigSource::to_toml(caps)?;
     std::fs::write(&path, text).with_context(|| format!("writing registry {}", path.display()))?;
     Ok(path)
+}
+
+/// The catalog files whose content fingerprints the snapshot: the user-authored
+/// override TOML if it exists (the baked-in default is hashed unconditionally
+/// inside [`crate::snapshot::catalog_content_hash`]). We hash the OVERRIDE
+/// (input) layer, not the self-config output — editing the input is what should
+/// invalidate the snapshot; the output is derived and would create a
+/// hash-of-its-own-result feedback loop.
+fn catalog_files() -> Vec<PathBuf> {
+    overrides_path()
+        .filter(|p| p.exists())
+        .into_iter()
+        .collect()
+}
+
+/// Persist the rkyv warm-start snapshot (mu-2332 part 2/3). Returns the path
+/// written, or `None` if there's nowhere to write it (no HOME / $T4C_SNAPSHOT).
+/// Fingerprints the current world (catalog content + PATH set) so a later load
+/// can tell fresh from stale.
+fn write_snapshot(
+    present: &[Capability],
+    vectors: &std::collections::HashMap<String, Vec<f32>>,
+    model: &str,
+) -> Result<Option<PathBuf>> {
+    let Some(path) = crate::snapshot::Snapshot::default_path() else {
+        return Ok(None);
+    };
+    let catalog_hash = crate::snapshot::catalog_content_hash(&catalog_files());
+    let path_hash = crate::snapshot::path_set_hash();
+    let snap = crate::snapshot::Snapshot::build(present, vectors, model, catalog_hash, path_hash);
+    snap.save(&path)?;
+    Ok(Some(path))
 }
 
 /// Dispatch a parsed [`Cli`] to its handler. Returns the process exit code.
@@ -424,17 +832,29 @@ pub fn run(cli: Cli) -> Result<i32> {
         println!("{}", crate::helpai::to_json(&doc)?);
         return Ok(0);
     }
-    let tree = build_registry().build()?;
+    // Commands that DON'T need the resolved registry tree dispatch first, before
+    // any registry construction — so a malformed override TOML (which would make
+    // tree.build() fail) can't break them. `verify` especially must always
+    // return its freshness exit code, never error on registry construction
+    // (reviewer finding). `discover`/`list`/`bench` recompute their own view.
+    match &cli.cmd {
+        Some(Cmd::Verify { diff }) => return do_verify(cli.json, *diff),
+        Some(Cmd::Discover { dry_run }) => return do_discover(cli.json, *dry_run),
+        Some(Cmd::List) => return do_list(cli.json),
+        Some(Cmd::Bench { fake }) => return do_bench(cli.json, *fake),
+        _ => {}
+    }
+
+    let (tree, snap_cache) = read_registry();
+    let tree = tree.build()?;
+    let cache_ref = snap_cache.as_ref();
     match cli.cmd {
         None => {
             print_banner(&tree);
             Ok(0)
         }
-        Some(Cmd::Find { intent }) => do_find(&tree, &intent.join(" "), cli.json),
+        Some(Cmd::Find { intent }) => do_find(&tree, &intent.join(" "), cli.json, cache_ref),
         Some(Cmd::Walk { prefix }) => do_walk(&tree, prefix.as_deref(), cli.json),
-        Some(Cmd::List) => do_list(cli.json),
-        Some(Cmd::Discover { dry_run }) => do_discover(cli.json, dry_run),
-        Some(Cmd::Bench { fake }) => do_bench(cli.json, fake),
         Some(Cmd::Help { path, full, schema }) => do_help(&tree, &path, full, schema, cli.json),
         Some(Cmd::Run { path, args }) => do_run(&tree, &path, &args),
         Some(Cmd::Bare(tokens)) => match route_bare(&tree, &tokens) {
@@ -443,8 +863,12 @@ pub fn run(cli: Cli) -> Result<i32> {
             BareAction::Help { path, schema } => {
                 do_help(&tree, &path.to_string(), false, schema, cli.json)
             }
-            BareAction::Find { intent } => do_find(&tree, &intent, cli.json),
+            BareAction::Find { intent } => do_find(&tree, &intent, cli.json, cache_ref),
         },
+        // Handled above (registry-free dispatch); unreachable here.
+        Some(Cmd::Verify { .. } | Cmd::Discover { .. } | Cmd::List | Cmd::Bench { .. }) => {
+            unreachable!("registry-free commands dispatched before tree build")
+        }
     }
 }
 
@@ -482,9 +906,14 @@ struct HelpPtr {
     ai: bool,
 }
 
-fn do_find(tree: &Tree, intent: &str, json: bool) -> Result<i32> {
+fn do_find(
+    tree: &Tree,
+    intent: &str,
+    json: bool,
+    snapshot_cache: Option<&crate::semantic::VectorCache>,
+) -> Result<i32> {
     let caps: Vec<&Capability> = tree.all().collect();
-    let ranked = rank_caps(intent, &caps);
+    let ranked = rank_caps(intent, &caps, snapshot_cache);
     let hits: Vec<Hit> = ranked
         .iter()
         .take(8)
@@ -788,5 +1217,74 @@ mod tests {
             .is_some());
         assert!(t.walk(&CapPath::parse("bash").unwrap()).len() >= 4);
         assert!(t.get(&CapPath::parse("bash.jq").unwrap()).is_some());
+    }
+
+    // --- mu-2332: warm-path vector wiring (the gpt-5.5 review finding) --------
+    // The bug the reviewer caught: warm_registry destructured `Fresh { caps, .. }`
+    // and threw away the archived vectors, so semantic find silently fell back to
+    // the JSON cache (or lexical). These tests lock the contract that the warm
+    // path SURFACES the snapshot's vectors and rank_caps PREFERS them.
+
+    /// A round-tripped snapshot carrying vectors yields a non-empty
+    /// `VectorCache` via the same conversion `warm_registry` performs — i.e. the
+    /// archived vectors are not dropped on the warm read.
+    #[test]
+    fn warm_path_surfaces_snapshot_vectors() {
+        use crate::semantic::VectorCache;
+        use std::collections::HashMap;
+
+        let caps = crate::catalog::curated();
+        let mut vectors = HashMap::new();
+        vectors.insert("bash.jq".to_string(), vec![0.1f32, 0.2, 0.3]);
+        let snap =
+            crate::snapshot::Snapshot::build(&caps, &vectors, "mdl", "CAT".into(), "PATH".into());
+
+        let dir = std::env::temp_dir().join(format!("t4c-warmvec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snap.rkyv");
+        snap.save(&path).unwrap();
+
+        // Load + apply warm_registry's exact vectors->cache conversion.
+        let outcome = crate::snapshot::load_valid(&path, "CAT", "PATH");
+        let cache = match outcome {
+            crate::snapshot::LoadOutcome::Fresh { vectors, model, .. } => {
+                if vectors.is_empty() {
+                    None
+                } else {
+                    Some(VectorCache {
+                        model,
+                        by_path: vectors,
+                    })
+                }
+            }
+            other => panic!("expected Fresh, got {other:?}"),
+        };
+        let cache = cache.expect("warm path must surface a cache when vectors archived");
+        assert_eq!(cache.model, "mdl");
+        assert_eq!(cache.by_path.get("bash.jq").unwrap(), &vec![0.1, 0.2, 0.3]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// rank_caps PREFERS the passed snapshot cache over the on-disk JSON path:
+    /// with no embedder configured both branches fall through to lexical, so we
+    /// assert the call is well-formed and total (no panic, returns a ranking)
+    /// when handed an explicit cache — the wiring `do_find` now relies on.
+    #[test]
+    fn rank_caps_accepts_snapshot_cache() {
+        use crate::semantic::VectorCache;
+        use std::collections::HashMap;
+
+        let t = tree();
+        let caps: Vec<&Capability> = t.all().collect();
+        let mut by_path = HashMap::new();
+        by_path.insert("bash.jq".to_string(), vec![0.0f32; 4]);
+        let cache = VectorCache {
+            model: "m".into(),
+            by_path,
+        };
+        // Passing the cache must not panic and must produce a full ranking.
+        let ranked = rank_caps("query text", &caps, Some(&cache));
+        assert_eq!(ranked.len(), caps.len());
     }
 }

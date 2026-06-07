@@ -33,3 +33,10 @@ toml = { workspace = true }
 # `blocking` added on top of the workspace features (t4c's CLI path is one-shot).
 # Third-party only — leaf invariant intact.
 reqwest = { workspace = true, features = ["blocking"] }
+# mu-2332: warm-start snapshot. rkyv archives post-discovery state for zero-copy
+# mmap load (no env probing on `find`); memmap2 maps the file. blake3 (already a
+# workspace dep) hashes the catalog + PATH set for snapshot invalidation.
+# Third-party only — leaf invariant intact.
+rkyv = { workspace = true }
+memmap2 = { workspace = true }
+blake3 = { workspace = true }

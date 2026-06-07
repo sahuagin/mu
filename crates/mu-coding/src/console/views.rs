@@ -81,8 +81,29 @@ pub(crate) fn render_sessions_index(state: Arc<AppState>) -> Html<String> {
             "<p class=muted>Excluded {sidechain_total} subagent (sidechain) turn(s) from session rollups.</p>"
         ));
     }
+    // mu-console-faux-filter-ja30: provider=faux are smoke/test sessions that
+    // pollute the index. Hide them at the render layer (scan layer untouched)
+    // and surface a muted count so the filter is visible, not silent. The
+    // `?faux=1` reveal toggle is deferred: it needs a Query extractor on the
+    // sessions_index handler (console/mod.rs), owned this cycle by a sibling
+    // bead — see this bead's notes for the follow-up plumbing.
+    let faux_hidden = scan
+        .sessions
+        .iter()
+        .filter(|s| s.provider.as_deref() == Some("faux"))
+        .count();
+    if faux_hidden > 0 {
+        body.push_str(&format!(
+            "<p class=muted>Hiding {faux_hidden} faux (smoke/test) session(s).</p>"
+        ));
+    }
     body.push_str("<table><thead><tr><th>last</th><th>daemon</th><th>session</th><th>mark</th><th>provider</th><th>model</th><th>asks</th><th>calls</th><th>tools</th><th>input</th><th>output</th><th>cache read</th><th>cache write</th></tr></thead><tbody>");
     for s in scan.sessions {
+        // mu-console-faux-filter-ja30: default-filter faux sessions out of the
+        // index (counted above). Reveal toggle (?faux=1) pending mod.rs plumbing.
+        if s.provider.as_deref() == Some("faux") {
+            continue;
+        }
         // mu-cc-sessions-console-lqqt.2: claude-code rows open the cc
         // detail route (a separate reader over the cc projects dir);
         // native mu rows keep the event-log detail route.

@@ -145,6 +145,18 @@ pub enum SideEffects {
     /// Reaches the network. Fetches, posts, calls APIs. (Not yet
     /// used by any tool but reserved for clarity.)
     External,
+    /// Runs arbitrary code or spawns a process whose effects are not
+    /// statically known — a shell command, a spawned worker, an exec.
+    /// The MOST dangerous class: it subsumes every other (a shell can
+    /// read, mutate, destroy, AND network), so it can never be treated
+    /// as benign. Tools in this class must not ride on
+    /// `permission: Allow` once the side-effects gate lands (mu-n25a
+    /// Phase 2), and it is the natural seam for OS-enforced
+    /// least-privilege — at the exec boundary, grant only the rights it
+    /// implies via `cap_enter()` then fork-exec (mu-627). It is also
+    /// what a session forks-and-attenuates AWAY from when it
+    /// voluntarily drops to read-only (mu-mh4). (mu-usfj)
+    Execute,
 }
 
 /// Permission posture. v1 only honors `Allow` and `Deny` at the

@@ -94,6 +94,17 @@ impl Tool for SpawnWorkerTool {
                 "required": ["prompt"]
             }),
         )
+        // mu-usfj: spawning a worker with "full tool access" is the
+        // Execute class, not the defaulted ReadOnly — under-declaring it
+        // let spawn_worker bypass the gate bash faces. Honest now; the
+        // gate that acts on Execute is mu-n25a Phase 2.
+        .with_policy(mu_core::agent::ToolPolicy {
+            side_effects: mu_core::agent::SideEffects::Execute,
+            permission: mu_core::agent::PermissionLevel::Allow,
+            retry: mu_core::agent::RetryPolicy::ModelDecides,
+            required_aws_capability: None,
+            idempotent: false,
+        })
     }
 
     fn execute<'life0, 'async_trait>(

@@ -422,6 +422,9 @@ pub struct AppOptions<'a> {
     /// mu-solo-osc-notify-mbmn: desktop notifications via OSC 99 on
     /// main-session turn done/error while the terminal is unfocused.
     pub notifications: bool,
+    /// mu-7e21: autonomy grant forwarded in create_session. None ⇒
+    /// field omitted (INV-1 default: disallowed; no autonomy tools).
+    pub autonomy: Option<mu_core::capability::AutonomyCapability>,
 }
 
 impl App {
@@ -445,6 +448,7 @@ impl App {
             cache_ttl,
             renderer_journal,
             notifications,
+            autonomy,
         } = opts;
         let effort = EffortLevel::parse(effort).ok_or_else(|| {
             anyhow!("invalid effort {effort:?} (valid: low|medium|high|xhigh|max)")
@@ -470,6 +474,19 @@ impl App {
         });
         if matches!(cache_ttl, "5m" | "1h") {
             create_params["cache_ttl"] = serde_json::json!(cache_ttl);
+        }
+        // mu-7e21: forward the autonomy grant when configured. The
+        // type serializes to the capability wire shape directly, so
+        // the daemon-side deserialization can't drift from this.
+        if let Some(autonomy) = &autonomy {
+            match serde_json::to_value(autonomy) {
+                Ok(v) => {
+                    create_params["autonomy"] = v;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not serialize autonomy grant; omitting");
+                }
+            }
         }
         let resp = client
             .request("create_session", create_params)

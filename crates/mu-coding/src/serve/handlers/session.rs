@@ -60,13 +60,23 @@ pub fn handle_create_session(
         }
     };
 
+    // mu-7e21: root capability, with autonomy granted IFF the client
+    // asked at creation. INV-1 holds: `Capability::root()` itself stays
+    // autonomy-Disallowed; the grant rides the operator's create call,
+    // never anything the model can reach (attenuation is intersect-only
+    // and no agent-facing surface writes capability).
+    let mut capability = Capability::root();
+    if let Some(autonomy) = params.autonomy {
+        capability.autonomy = autonomy;
+    }
+
     match build_and_register_session(BuildSessionRequest {
         selector: &params.provider,
         system_prompt: params.system_prompt, // mu-n48
         cwd: params.cwd,                     // mu-phl v0 / mu-045
         parent_session_id: None,             // no parent — this is a root session
         branched_at_parent_event_id: None,
-        capability: Capability::root(), // root session: unrestricted
+        capability, // root: unrestricted, autonomy per mu-7e21 grant above
         cache_ttl: params.cache_ttl.unwrap_or_default(), // mu-f1a0
         notif,
         sessions,
@@ -197,12 +207,23 @@ struct BuildSessionRequest<'a> {
 /// session's mailbox (waking it) rather than the dead "supervisor" ghost.
 /// The spawn_worker tool is only added in production (events_dir set) —
 /// tests have no pot infrastructure. (mu-slat)
+///
+/// mu-7e21: autonomy tools are injected IFF the session's capability
+/// grants them — gated on capability, NOT events_dir (they need no pot
+/// infrastructure, only the session's own input channel). The tool
+/// list is therefore capability-honest: a session that can't enter
+/// autonomous mode never sees `start_autonomous`; one whose grant has
+/// `allow_schedule_wakeup: false` sees `start_autonomous` but not
+/// `schedule_wakeup`.
 fn session_spawn_tools(
     base: &[Arc<dyn Tool>],
     sessions: &Sessions,
     daemon_info: &DaemonInfo,
     session_id: &str,
+    autonomy: &mu_core::capability::AutonomyCapability,
 ) -> Vec<Arc<dyn Tool>> {
+    use mu_core::capability::AutonomyCapability;
+
     let mut tools = base.to_vec();
     if daemon_info.events_dir().is_some() {
         tools.push(Arc::new(crate::tools::SpawnWorkerTool::new(
@@ -220,6 +241,22 @@ fn session_spawn_tools(
             sessions.downgrade(),
             session_id.to_string(),
         )));
+    }
+    if let AutonomyCapability::Allowed {
+        allow_schedule_wakeup,
+        ..
+    } = autonomy
+    {
+        tools.push(Arc::new(crate::tools::StartAutonomousTool::new(
+            sessions.downgrade(),
+            session_id.to_string(),
+        )));
+        if *allow_schedule_wakeup {
+            tools.push(Arc::new(crate::tools::ScheduleWakeupTool::new(
+                sessions.downgrade(),
+                session_id.to_string(),
+            )));
+        }
     }
     tools
 }
@@ -297,14 +334,23 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     // and the session's capability. Computed BEFORE capability is moved
     // into capability_handle so we can borrow it.
     let project_context = build_project_context(daemon_info, cwd.as_deref(), &capability);
+    // mu-7e21: snapshot the autonomy grant before `capability` moves
+    // into its handle — the tool list is built from it (injection is
+    // capability-gated; see session_spawn_tools).
+    let autonomy = capability.autonomy.clone();
     let capability_handle = Arc::new(Mutex::new(capability));
     let provider_status = Arc::new(Mutex::new(
         super::super::provider_status::ProviderStatusTracker::new(),
     ));
     let mailbox = Arc::new(super::super::mailbox::MailboxState::new());
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
-    let mut session_tools =
-        session_spawn_tools(tools.as_slice(), &sessions, daemon_info, &session_id);
+    let mut session_tools = session_spawn_tools(
+        tools.as_slice(),
+        &sessions,
+        daemon_info,
+        &session_id,
+        &autonomy,
+    );
     // mu-onq8: always-on in-loop capability discovery. Ranks the session's
     // sibling tools (attenuated by this session's capability) against a
     // free-text intent, so the agent can find the right tool in-loop instead
@@ -1510,7 +1556,13 @@ mod tests {
         let sessions = Sessions::new();
         let di = DaemonInfo::new("test")
             .with_events_dir(Some(std::path::PathBuf::from("/tmp/mu-test-events")));
-        let tools = session_spawn_tools(&base, &sessions, &di, "session-42");
+        let tools = session_spawn_tools(
+            &base,
+            &sessions,
+            &di,
+            "session-42",
+            &mu_core::capability::AutonomyCapability::Disallowed,
+        );
         assert!(
             tools.iter().any(|t| t.spec().name == "spawn_worker"),
             "production session should get a spawn_worker tool",
@@ -1526,7 +1578,13 @@ mod tests {
         let sessions = Sessions::new();
         let di = DaemonInfo::new("test")
             .with_events_dir(Some(std::path::PathBuf::from("/tmp/mu-test-events")));
-        let tools = session_spawn_tools(&base, &sessions, &di, "session-42");
+        let tools = session_spawn_tools(
+            &base,
+            &sessions,
+            &di,
+            "session-42",
+            &mu_core::capability::AutonomyCapability::Disallowed,
+        );
         assert!(
             tools.iter().any(|t| t.spec().name == "watch"),
             "production session should get a watch tool",
@@ -1538,7 +1596,13 @@ mod tests {
         let base: Vec<Arc<dyn Tool>> = vec![];
         let sessions = Sessions::new();
         let di = DaemonInfo::new("test"); // no events_dir (tests / ephemeral)
-        let tools = session_spawn_tools(&base, &sessions, &di, "session-42");
+        let tools = session_spawn_tools(
+            &base,
+            &sessions,
+            &di,
+            "session-42",
+            &mu_core::capability::AutonomyCapability::Disallowed,
+        );
         assert!(
             !tools.iter().any(|t| t.spec().name == "watch"),
             "no events_dir => no watch tool",
@@ -1550,10 +1614,88 @@ mod tests {
         let base: Vec<Arc<dyn Tool>> = vec![];
         let sessions = Sessions::new();
         let di = DaemonInfo::new("test"); // no events_dir (tests / ephemeral)
-        let tools = session_spawn_tools(&base, &sessions, &di, "session-42");
+        let tools = session_spawn_tools(
+            &base,
+            &sessions,
+            &di,
+            "session-42",
+            &mu_core::capability::AutonomyCapability::Disallowed,
+        );
         assert!(
             !tools.iter().any(|t| t.spec().name == "spawn_worker"),
             "no events_dir => no spawn_worker tool",
+        );
+    }
+
+    // mu-7e21: autonomy tools are capability-gated, independent of
+    // events_dir — the tool list must be honest in both directions.
+    #[test]
+    fn session_spawn_tools_injects_autonomy_tools_when_granted() {
+        use mu_core::capability::AutonomyCapability;
+        let base: Vec<Arc<dyn Tool>> = vec![];
+        let sessions = Sessions::new();
+        let di = DaemonInfo::new("test"); // no events_dir — gate is capability, not pots
+        let granted = AutonomyCapability::Allowed {
+            max_iterations: 10,
+            max_wall_clock_ms: 60_000,
+            max_total_tool_calls_in_autonomy: 100,
+            allow_schedule_wakeup: true,
+            allow_delegate_grader: false,
+        };
+        let tools = session_spawn_tools(&base, &sessions, &di, "session-42", &granted);
+        assert!(
+            tools.iter().any(|t| t.spec().name == "start_autonomous"),
+            "autonomy grant => start_autonomous tool present",
+        );
+        assert!(
+            tools.iter().any(|t| t.spec().name == "schedule_wakeup"),
+            "allow_schedule_wakeup => schedule_wakeup tool present",
+        );
+    }
+
+    #[test]
+    fn session_spawn_tools_omits_schedule_wakeup_when_not_allowed() {
+        use mu_core::capability::AutonomyCapability;
+        let base: Vec<Arc<dyn Tool>> = vec![];
+        let sessions = Sessions::new();
+        let di = DaemonInfo::new("test");
+        let granted = AutonomyCapability::Allowed {
+            max_iterations: 10,
+            max_wall_clock_ms: 60_000,
+            max_total_tool_calls_in_autonomy: 100,
+            allow_schedule_wakeup: false,
+            allow_delegate_grader: false,
+        };
+        let tools = session_spawn_tools(&base, &sessions, &di, "session-42", &granted);
+        assert!(
+            tools.iter().any(|t| t.spec().name == "start_autonomous"),
+            "autonomy grant => start_autonomous tool present",
+        );
+        assert!(
+            !tools.iter().any(|t| t.spec().name == "schedule_wakeup"),
+            "allow_schedule_wakeup: false => no schedule_wakeup tool",
+        );
+    }
+
+    #[test]
+    fn session_spawn_tools_omits_autonomy_tools_when_disallowed() {
+        use mu_core::capability::AutonomyCapability;
+        let base: Vec<Arc<dyn Tool>> = vec![];
+        let sessions = Sessions::new();
+        let di = DaemonInfo::new("test")
+            .with_events_dir(Some(std::path::PathBuf::from("/tmp/mu-test-events")));
+        let tools = session_spawn_tools(
+            &base,
+            &sessions,
+            &di,
+            "session-42",
+            &AutonomyCapability::Disallowed,
+        );
+        assert!(
+            !tools
+                .iter()
+                .any(|t| t.spec().name == "start_autonomous" || t.spec().name == "schedule_wakeup"),
+            "INV-1: no autonomy grant => no autonomy tools, even in production",
         );
     }
 

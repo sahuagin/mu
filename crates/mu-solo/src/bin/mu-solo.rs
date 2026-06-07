@@ -121,6 +121,8 @@ async fn main() -> Result<()> {
         clipboard_command: cfg.tui.clipboard_command.as_deref(),
         renderer_journal: cfg.tui.renderer_journal,
         notifications: cfg.tui.notifications,
+        // mu-7e21: [autonomy] in solo.toml → create_session grant.
+        autonomy: cfg.autonomy.to_capability(),
     })
     .context("App::new failed (is the mu binary path correct?)")?;
 

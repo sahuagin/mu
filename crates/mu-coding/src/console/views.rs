@@ -36,7 +36,7 @@ pub(crate) enum CcDetailTab {
     Cost,
 }
 
-pub(crate) fn render_sessions_index(state: Arc<AppState>) -> Html<String> {
+pub(crate) fn render_sessions_index(state: Arc<AppState>, show_faux: bool) -> Html<String> {
     let scan = scan_all(
         &state.events_dir,
         state.cc_projects_dir.as_deref(),
@@ -87,25 +87,35 @@ pub(crate) fn render_sessions_index(state: Arc<AppState>) -> Html<String> {
     }
     // mu-console-faux-filter-ja30: provider=faux are smoke/test sessions that
     // pollute the index. Hide them at the render layer (scan layer untouched)
-    // and surface a muted count so the filter is visible, not silent. The
-    // `?faux=1` reveal toggle is deferred: it needs a Query extractor on the
-    // sessions_index handler (console/mod.rs), owned this cycle by a sibling
-    // bead — see this bead's notes for the follow-up plumbing.
-    let faux_hidden = scan
+    // and surface a muted count so the filter is visible, not silent.
+    // mu-console-faux-toggle-putu: the `?faux=1` reveal toggle is now wired
+    // (Query extractor on the sessions_index handler threads `show_faux`).
+    // The count is computed over the full scan so it stays accurate in both
+    // states; only the link direction and the row filter below change.
+    let faux_count = scan
         .sessions
         .iter()
         .filter(|s| s.provider.as_deref() == Some("faux"))
         .count();
-    if faux_hidden > 0 {
-        body.push_str(&format!(
-            "<p class=muted>Hiding {faux_hidden} faux (smoke/test) session(s).</p>"
-        ));
+    if faux_count > 0 {
+        if show_faux {
+            body.push_str(&format!(
+                "<p class=muted>Showing {faux_count} faux (smoke/test) session(s). <a href=\"{}\">(hide)</a></p>",
+                esc_attr(&state.href("/sessions"))
+            ));
+        } else {
+            body.push_str(&format!(
+                "<p class=muted>Hiding {faux_count} faux (smoke/test) session(s). <a href=\"{}\">(show)</a></p>",
+                esc_attr(&state.href("/sessions?faux=1"))
+            ));
+        }
     }
     body.push_str("<table><thead><tr><th>last</th><th>daemon</th><th>session</th><th>mark</th><th>provider</th><th>model</th><th>asks</th><th>calls</th><th>tools</th><th>input</th><th>output</th><th>cache read</th><th>cache write</th></tr></thead><tbody>");
     for s in scan.sessions {
         // mu-console-faux-filter-ja30: default-filter faux sessions out of the
-        // index (counted above). Reveal toggle (?faux=1) pending mod.rs plumbing.
-        if s.provider.as_deref() == Some("faux") {
+        // index (counted above). mu-console-faux-toggle-putu: `?faux=1` keeps
+        // them in via show_faux.
+        if !show_faux && s.provider.as_deref() == Some("faux") {
             continue;
         }
         // mu-cc-sessions-console-lqqt.2: claude-code rows open the cc

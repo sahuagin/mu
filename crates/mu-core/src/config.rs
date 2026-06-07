@@ -111,6 +111,8 @@ pub struct IndexConfig {
 /// name  = "code-index"
 /// url   = "http://10.1.1.172:7622/mcp"
 /// tools = ["code_recall", "code_status"]  # optional allowlist; omit = all
+/// side_effects = "read_only"              # operator trust floor for this server
+/// tool_side_effects = { code_recall = "read_only" }  # per-tool override
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -136,6 +138,32 @@ pub struct McpServerConfig {
     /// `None`/empty imports unprefixed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
+    /// mu-cvm5 (mu-n25a Phase 4): operator-supplied side-effects
+    /// classification for tools imported from this server. MCP carries no
+    /// side-effects metadata, so there is NO honest source the runtime can
+    /// trust — a remote `delete_everything` tool would otherwise import as
+    /// benign `ReadOnly` and free-ride past a restrictive session posture.
+    ///
+    /// `None` (the default) means UNCLASSIFIED: imported tools fail SAFE and
+    /// are treated as the most dangerous class (`Execute`), so a read-only
+    /// session refuses them at the dispatch gate. An operator who has
+    /// vetted a server declares its trust floor here (e.g. `"read_only"` for
+    /// a code-search server) — a deliberate, auditable act, never something
+    /// a remote server gets to assert about itself.
+    ///
+    /// Wire form is flat snake_case (`side_effects = "read_only"`), matching
+    /// the `SideEffects` serde elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_effects: Option<crate::agent::tool::SideEffects>,
+    /// mu-cvm5: per-tool side-effects override, keyed by the tool's
+    /// REMOTE name (pre-prefix, as the server lists it). Takes precedence
+    /// over the server-wide `side_effects` for the named tool. Lets an
+    /// operator trust most of a server at one floor while pinning a few
+    /// tools higher/lower (e.g. server `read_only`, but `run_query =
+    /// "external"`). Unlisted tools fall back to `side_effects`, then to
+    /// the fail-safe `Execute` default.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub tool_side_effects: std::collections::HashMap<String, crate::agent::tool::SideEffects>,
 }
 
 /// `[recall]` section. Controls session-start context injection — the
@@ -647,6 +675,30 @@ mod tests {
         assert_eq!(s.url, "http://10.1.1.172:7622/mcp");
         assert_eq!(s.tools.as_deref(), Some(&["code_recall".to_owned()][..]));
         assert_eq!(s.prefix, None);
+        // mu-cvm5: classification fields default to unset (fail-safe upstream).
+        assert_eq!(s.side_effects, None);
+        assert!(s.tool_side_effects.is_empty());
+    }
+
+    #[test]
+    fn mcp_server_side_effects_classification_parses() {
+        // mu-cvm5 (mu-n25a Phase 4): operator can declare a server-wide
+        // side-effects floor and per-tool overrides via TOML.
+        use crate::agent::tool::SideEffects;
+        let c: Config = toml::from_str(
+            "[[mcp.servers]]\n\
+             name = \"code-index\"\n\
+             url = \"http://10.1.1.172:7622/mcp\"\n\
+             side_effects = \"read_only\"\n\
+             tool_side_effects = { run_query = \"external\" }\n",
+        )
+        .expect("parse");
+        let s = &c.mcp.servers[0];
+        assert_eq!(s.side_effects, Some(SideEffects::ReadOnly));
+        assert_eq!(
+            s.tool_side_effects.get("run_query").copied(),
+            Some(SideEffects::External)
+        );
     }
 
     #[test]

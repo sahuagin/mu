@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use mu_core::agent::{Tool, ToolResult, ToolSpec};
+use mu_core::agent::{SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec};
 use rmcp::model::CallToolRequestParams;
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -26,16 +26,22 @@ pub struct RemoteMcpTool {
 }
 
 impl RemoteMcpTool {
+    /// `side_effects` is the operator-supplied classification for THIS tool
+    /// (already resolved by the importer: per-tool override → server-wide
+    /// floor → fail-safe `Execute`). MCP carries no side-effects metadata,
+    /// so this is the only honest source — it MUST be supplied by the caller,
+    /// never inferred from the remote `def`. (mu-cvm5 / mu-n25a Phase 4)
     pub fn new(
         server: &str,
         prefix: Option<&str>,
         def: &rmcp::model::Tool,
+        side_effects: SideEffects,
         peer: Arc<McpPeer>,
     ) -> Self {
         Self {
             server: server.to_owned(),
             remote_name: def.name.to_string(),
-            spec: translate_spec(prefix, def),
+            spec: translate_spec(prefix, def, side_effects),
             peer,
         }
     }
@@ -44,14 +50,28 @@ impl RemoteMcpTool {
 /// Translate a remote `tools/list` entry into a mu `ToolSpec`. The MCP
 /// `inputSchema` is already a JSON Schema object, which is exactly what
 /// `ToolSpec` carries — no shape conversion, just an optional name prefix.
-fn translate_spec(prefix: Option<&str>, def: &rmcp::model::Tool) -> ToolSpec {
+///
+/// The `policy.side_effects` is set to `side_effects` (the operator's
+/// classification, defaulting to the fail-safe `Execute` upstream). The rest
+/// of the policy stays at its safe baseline: the runtime cannot vouch for an
+/// imported tool's idempotency or retry-safety either, so it carries the
+/// conservative defaults and lets the dispatch-boundary side-effects gate
+/// (`Capability::check_side_effects`) do the gating. (mu-cvm5)
+fn translate_spec(
+    prefix: Option<&str>,
+    def: &rmcp::model::Tool,
+    side_effects: SideEffects,
+) -> ToolSpec {
     let local_name = match prefix {
         Some(p) if !p.is_empty() => format!("{p}{}", def.name),
         _ => def.name.to_string(),
     };
     let description = def.description.as_deref().unwrap_or_default().to_owned();
     let schema = Value::Object((*def.input_schema).clone());
-    ToolSpec::new(local_name, description, schema)
+    ToolSpec::new(local_name, description, schema).with_policy(ToolPolicy {
+        side_effects,
+        ..ToolPolicy::default()
+    })
 }
 
 /// Normalize an MCP `CallToolResult` into mu's `ToolResult`: text content
@@ -131,7 +151,11 @@ mod tests {
 
     #[test]
     fn translate_spec_carries_name_description_schema() {
-        let spec = translate_spec(None, &def("code_recall", "hybrid retrieval"));
+        let spec = translate_spec(
+            None,
+            &def("code_recall", "hybrid retrieval"),
+            SideEffects::ReadOnly,
+        );
         assert_eq!(spec.name, "code_recall");
         assert_eq!(spec.description, "hybrid retrieval");
         assert_eq!(
@@ -142,11 +166,67 @@ mod tests {
 
     #[test]
     fn translate_spec_applies_prefix_when_nonempty() {
-        let spec = translate_spec(Some("code_index."), &def("code_status", ""));
+        let spec = translate_spec(
+            Some("code_index."),
+            &def("code_status", ""),
+            SideEffects::ReadOnly,
+        );
         assert_eq!(spec.name, "code_index.code_status");
         // Empty prefix behaves like no prefix.
-        let spec = translate_spec(Some(""), &def("code_status", ""));
+        let spec = translate_spec(Some(""), &def("code_status", ""), SideEffects::ReadOnly);
         assert_eq!(spec.name, "code_status");
+    }
+
+    #[test]
+    fn translate_spec_stamps_classified_side_effects() {
+        // mu-cvm5: the operator's classification rides into the ToolSpec's
+        // policy so the dispatch-boundary gate can act on it.
+        let benign = translate_spec(None, &def("code_recall", ""), SideEffects::ReadOnly);
+        assert_eq!(benign.policy.side_effects, SideEffects::ReadOnly);
+        // Fail-safe default: an unclassified tool is stamped Execute upstream.
+        let danger = translate_spec(None, &def("delete_everything", ""), SideEffects::Execute);
+        assert_eq!(danger.policy.side_effects, SideEffects::Execute);
+    }
+
+    #[test]
+    fn read_only_ceiling_refuses_unclassified_mcp_tool() {
+        // mu-cvm5 / mu-n25a Phase 4 ACCEPTANCE: a session capped at a
+        // ReadOnly side-effects ceiling REFUSES an imported MCP tool of
+        // unknown danger. Unclassified MCP tools import as Execute (the
+        // fail-safe), so the dispatch-boundary side-effects gate
+        // (Capability::check_side_effects) denies them. Without the
+        // fail-safe (old behavior: ReadOnly default) this session would
+        // have ALLOWED a remote `delete_everything`.
+        use mu_core::capability::{Capability, CapabilityCheck};
+
+        // An unclassified import is stamped Execute upstream.
+        let spec = translate_spec(
+            None,
+            &def("delete_everything", "deletes the world"),
+            SideEffects::Execute,
+        );
+        assert_eq!(spec.policy.side_effects, SideEffects::Execute);
+
+        let read_only_session = Capability {
+            max_side_effects: Some(SideEffects::ReadOnly),
+            ..Default::default()
+        };
+        match read_only_session.check_side_effects(spec.policy.side_effects) {
+            CapabilityCheck::DeniedSideEffectsExceeded { declared, ceiling } => {
+                assert_eq!(declared, SideEffects::Execute);
+                assert_eq!(ceiling, SideEffects::ReadOnly);
+            }
+            other => {
+                panic!("read-only session must refuse an unclassified MCP tool, got {other:?}")
+            }
+        }
+
+        // Contrast: an operator-classified read-only MCP tool passes the
+        // same ceiling — classification is the deliberate opt-in.
+        let classified = translate_spec(None, &def("code_recall", ""), SideEffects::ReadOnly);
+        assert!(read_only_session
+            .check_side_effects(classified.policy.side_effects)
+            .is_allowed());
     }
 
     #[test]

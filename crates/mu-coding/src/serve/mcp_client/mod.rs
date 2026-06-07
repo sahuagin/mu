@@ -18,10 +18,29 @@ pub use remote_tool::RemoteMcpTool;
 
 use std::sync::Arc;
 
-use mu_core::agent::Tool;
+use mu_core::agent::{SideEffects, Tool};
 use mu_core::config::McpServerConfig;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::ServiceExt;
+
+/// mu-cvm5 (mu-n25a Phase 4): resolve the side-effects class for one imported
+/// MCP tool, fail-safe. MCP carries no side-effects metadata, so there is no
+/// honest source the runtime can trust. Precedence:
+///   1. per-tool override (`tool_side_effects[remote_name]`),
+///   2. server-wide operator floor (`side_effects`),
+///   3. the fail-safe default `Execute` — the MOST restrictive class.
+///
+/// An UNCLASSIFIED tool (no operator config) therefore imports as `Execute`
+/// and is refused by any session with a `max_side_effects` ceiling below
+/// `Execute` (e.g. a read-only operator posture). Classifying a server is a
+/// deliberate, auditable operator act — never something the remote asserts.
+fn resolve_side_effects(cfg: &McpServerConfig, remote_name: &str) -> SideEffects {
+    cfg.tool_side_effects
+        .get(remote_name)
+        .copied()
+        .or(cfg.side_effects)
+        .unwrap_or(SideEffects::Execute)
+}
 
 /// The long-lived client handle for one remote server. `()` is the trivial
 /// rmcp `ClientHandler` — we consume server-offered tools and need none of
@@ -78,12 +97,85 @@ async fn import_from_server(cfg: &McpServerConfig) -> anyhow::Result<Vec<Arc<dyn
                 continue;
             }
         }
+        let side_effects = resolve_side_effects(cfg, def.name.as_ref());
         tools.push(Arc::new(RemoteMcpTool::new(
             &cfg.name,
             cfg.prefix.as_deref(),
             &def,
+            side_effects,
             peer.clone(),
         )));
     }
     Ok(tools)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn cfg(side_effects: Option<SideEffects>, per_tool: &[(&str, SideEffects)]) -> McpServerConfig {
+        McpServerConfig {
+            name: "srv".to_owned(),
+            url: "http://localhost/mcp".to_owned(),
+            tools: None,
+            prefix: None,
+            side_effects,
+            tool_side_effects: per_tool
+                .iter()
+                .map(|(n, se)| (n.to_string(), *se))
+                .collect::<HashMap<_, _>>(),
+        }
+    }
+
+    #[test]
+    fn unclassified_server_fails_safe_to_execute() {
+        // mu-cvm5 ACCEPTANCE: adding an MCP server with no classification
+        // fails safe — every imported tool is the most restrictive class.
+        let c = cfg(None, &[]);
+        assert_eq!(resolve_side_effects(&c, "anything"), SideEffects::Execute);
+        assert_eq!(
+            resolve_side_effects(&c, "delete_everything"),
+            SideEffects::Execute
+        );
+    }
+
+    #[test]
+    fn server_wide_floor_applies_to_all_tools() {
+        let c = cfg(Some(SideEffects::ReadOnly), &[]);
+        assert_eq!(
+            resolve_side_effects(&c, "code_recall"),
+            SideEffects::ReadOnly
+        );
+        assert_eq!(
+            resolve_side_effects(&c, "code_status"),
+            SideEffects::ReadOnly
+        );
+    }
+
+    #[test]
+    fn per_tool_override_beats_server_floor() {
+        // Server trusted as read_only, but one tool pinned higher.
+        let c = cfg(
+            Some(SideEffects::ReadOnly),
+            &[("run_query", SideEffects::External)],
+        );
+        assert_eq!(
+            resolve_side_effects(&c, "code_recall"),
+            SideEffects::ReadOnly
+        );
+        assert_eq!(resolve_side_effects(&c, "run_query"), SideEffects::External);
+    }
+
+    #[test]
+    fn per_tool_override_applies_even_without_server_floor() {
+        // No server-wide floor: unlisted tools fail safe to Execute, but a
+        // per-tool classification still takes effect for the named tool.
+        let c = cfg(None, &[("code_recall", SideEffects::ReadOnly)]);
+        assert_eq!(
+            resolve_side_effects(&c, "code_recall"),
+            SideEffects::ReadOnly
+        );
+        assert_eq!(resolve_side_effects(&c, "other"), SideEffects::Execute);
+    }
 }

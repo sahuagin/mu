@@ -49,6 +49,17 @@ pub struct ConsoleOptions {
     /// mu-cc-sessions-console-lqqt.3: task_log sidecar DB for cc session
     /// marks (index column + mark POST). `None` keeps cc marks off.
     pub cc_marks_db: Option<PathBuf>,
+    /// mu-console-hosts-dashboard-zy26: path to the cron-generated stats
+    /// HTML served at GET /dashboard. The file is read fresh per request
+    /// (it regenerates hourly out-of-band); a missing file renders a
+    /// friendly note instead of an error. Default: ~/mu-stats/dashboard.html.
+    pub dashboard_path: PathBuf,
+}
+
+/// mu-console-hosts-dashboard-zy26: default location of the cron-generated
+/// dashboard artifact. `None` only when the home dir can't be resolved.
+pub fn default_dashboard_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join("mu-stats/dashboard.html"))
 }
 
 pub async fn run(opts: ConsoleOptions) -> Result<()> {
@@ -58,12 +69,14 @@ pub async fn run(opts: ConsoleOptions) -> Result<()> {
         analytics_db: opts.analytics_db,
         cc_projects_dir: opts.cc_projects_dir,
         cc_marks_db: opts.cc_marks_db,
+        dashboard_path: opts.dashboard_path,
         base_path: base_path.clone(),
     });
 
     let inner = Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
+        .route("/dashboard", get(dashboard))
         .route("/sessions", get(sessions_index))
         .route("/sessions/{daemon_id}/{session_id}", get(session_detail))
         .route(
@@ -137,6 +150,30 @@ async fn index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 async fn sessions_index(State(state): State<Arc<AppState>>) -> Html<String> {
     render_sessions_index(state)
+}
+
+/// mu-console-hosts-dashboard-zy26: serve the latest cron-generated stats
+/// HTML. The artifact is a complete standalone document, so on success it
+/// is returned verbatim (wrapping it in the console chrome would nest two
+/// documents). It is read fresh every request — the cron pipeline rewrites
+/// it hourly and the console deliberately does no caching. A missing or
+/// unreadable file renders a friendly note inside the console chrome
+/// instead of a bare error, so a not-yet-generated dashboard is explained
+/// rather than surfaced as a 500.
+async fn dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
+    match std::fs::read_to_string(&state.dashboard_path) {
+        Ok(contents) => Html(contents),
+        Err(e) => {
+            let body = format!(
+                "<h1>dashboard</h1><p class=warn>No dashboard artifact yet.</p>\
+                 <p class=muted>Expected at <code>{}</code> ({}). It is generated \
+                 hourly by the stats cron pipeline; check back once that has run.</p>",
+                html::esc(&state.dashboard_path.display().to_string()),
+                html::esc(&e.to_string())
+            );
+            html::page(&state, "dashboard", &body)
+        }
+    }
 }
 
 async fn session_detail(

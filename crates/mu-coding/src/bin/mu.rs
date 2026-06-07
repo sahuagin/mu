@@ -164,6 +164,10 @@ enum Command {
         /// ~/.local/share/task_log.sqlite.
         #[arg(long, value_name = "PATH")]
         cc_marks_db: Option<std::path::PathBuf>,
+        /// mu-console-hosts-dashboard-zy26: path to the cron-generated
+        /// stats HTML served at /dashboard. Default: ~/mu-stats/dashboard.html.
+        #[arg(long, value_name = "PATH")]
+        dashboard_path: Option<std::path::PathBuf>,
     },
     /// Append an operator quality mark (1-5) to a session's event log.
     /// Quit-time capture for degraded (or excellent) sessions — the
@@ -369,6 +373,7 @@ async fn main() -> Result<()> {
             cc_sessions,
             cc_projects_dir,
             cc_marks_db,
+            dashboard_path,
         } => {
             let events_dir = match events_dir {
                 Some(p) => p,
@@ -400,6 +405,16 @@ async fn main() -> Result<()> {
                 None if cc_projects_dir.is_some() => mu_coding::console::default_cc_marks_db(),
                 None => None,
             };
+            // mu-console-hosts-dashboard-zy26: resolve the dashboard
+            // artifact path; the default is ~/mu-stats/dashboard.html. A
+            // missing file is handled at request time (friendly note), so
+            // we only error here if the home dir itself can't be resolved.
+            let dashboard_path = match dashboard_path {
+                Some(p) => p,
+                None => mu_coding::console::default_dashboard_path().context(
+                    "could not resolve default dashboard path; pass --dashboard-path PATH",
+                )?,
+            };
             mu_coding::console::run(mu_coding::console::ConsoleOptions {
                 bind,
                 base_path,
@@ -407,6 +422,7 @@ async fn main() -> Result<()> {
                 analytics_db,
                 cc_projects_dir,
                 cc_marks_db,
+                dashboard_path,
             })
             .await
         }

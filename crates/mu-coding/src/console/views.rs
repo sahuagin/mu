@@ -45,6 +45,10 @@ pub(crate) fn render_sessions_index(state: Arc<AppState>) -> Html<String> {
     let mut body = String::new();
     body.push_str("<h1>mu sessions</h1>");
     body.push_str(&format!(
+        "<nav class=tabs><a href=\"{}\">dashboard</a></nav>",
+        esc_attr(&state.href("/dashboard"))
+    )); // mu-console-hosts-dashboard-zy26
+    body.push_str(&format!(
         "<p class=muted>events: <code>{}</code></p>",
         esc(&state.events_dir.display().to_string())
     ));

@@ -1,9 +1,11 @@
 //! `mu resume` (a.k.a. `mu --resume`) — STRICT fork-at-tail resume of a
 //! dead session (mu-mh4).
 //!
-//! Spawns `mu serve` (which rehydrates every on-disk session log at
-//! startup), authenticates, then calls `session.resume` with the
+//! Spawns `mu serve`, authenticates, then calls `session.resume` with the
 //! predecessor's `daemon:session` / `mu:<daemon>/<session>` ref. The
+//! daemon no longer rehydrates every log at startup
+//! (mu-lazy-session-rehydration-bh4f); it lazily find-by-ids and parses
+//! the predecessor's one log on demand when `session.resume` resolves it. The
 //! daemon projects the predecessor's log to its last clean boundary and
 //! births a fresh live session seeded with that history — or REFUSES
 //! with a precise diagnosis if the log is ragged (and the CLI prints the
@@ -174,12 +176,12 @@ async fn resume_session(
     write_line(stdin, &req).await?;
 
     // mu-mh4 (panel finding 2): bound the read loop. Without this, an
-    // unresponsive daemon (hung mid-rehydration, deadlocked, etc.) hangs
-    // the CLI forever — no terminal frame ever arrives, so a bare `loop`
-    // blocks indefinitely. Mirror ask.rs's `timeout()` discipline; the
-    // window is generous (the project prefers long timeouts over
-    // premature failure, and resume waits on a fresh `mu serve`
-    // rehydrating every on-disk log at startup).
+    // unresponsive daemon (hung, deadlocked, etc.) hangs the CLI forever
+    // — no terminal frame ever arrives, so a bare `loop` blocks
+    // indefinitely. Mirror ask.rs's `timeout()` discipline; the window is
+    // generous (the project prefers long timeouts over premature failure,
+    // and resume waits on a fresh `mu serve` plus the lazy parse of the
+    // predecessor's one log — mu-lazy-session-rehydration-bh4f).
     let read_loop = async {
         loop {
             let line = read_line(stdout).await?;
@@ -205,8 +207,8 @@ async fn resume_session(
     match timeout(Duration::from_secs(120), read_loop).await {
         Ok(res) => res,
         Err(_) => bail!(
-            "session.resume timed out after 120s waiting for the daemon \
-             to respond (the daemon may be hung or still rehydrating)"
+            "session.resume timed out after 120s waiting for the daemon to respond \
+             (the daemon may be hung, or the predecessor log is very large to parse)"
         ),
     }
 }

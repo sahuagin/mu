@@ -191,9 +191,10 @@ pub fn handle_delegate_session(
 
 /// mu-mh4: `session.resume` — STRICT fork-at-tail resume.
 ///
-/// Resolves the predecessor session's event log (the rehydration pass
-/// at daemon startup loaded every daemon's on-disk logs into the
-/// Sessions map, so a cross-daemon predecessor is addressable here),
+/// Resolves the predecessor session's event log (`Sessions::event_log`
+/// lazily find-by-ids and parses the one matching on-disk log on demand —
+/// across daemon dirs — so a cross-daemon predecessor is addressable here
+/// without the old startup bulk-rehydration; mu-lazy-session-rehydration-bh4f),
 /// projects it to its last clean boundary via
 /// [`mu_core::agent::continuation::project_strict`], and — only if the
 /// log is CLEAN — births a fresh live session parented on the dead one,
@@ -934,7 +935,11 @@ pub fn handle_close_session(request: Request<Value>, sessions: Sessions) -> Resp
 
     // Emit SessionClosed into the log BEFORE removing the session
     // from the registry — once removed, the log handle is dropped.
-    if let Some(log) = sessions.event_log(&params.session_id) {
+    // In-memory ONLY (mu-lazy-session-rehydration-bh4f, gpt-5.5 review):
+    // close must not lazily resurrect a read-only ghost from disk just to
+    // append a no-op SessionClosed to it. An unloaded past session has
+    // nothing to close — `remove` below returns false, which is correct.
+    if let Some(log) = sessions.event_log_in_memory(&params.session_id) {
         log.append(EventActor::System, EventPayload::SessionClosed);
     }
 

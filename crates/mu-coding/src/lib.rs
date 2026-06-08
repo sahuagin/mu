@@ -29,6 +29,7 @@ pub mod ask;
 pub mod console;
 pub mod resume;
 pub mod serve;
+pub mod sessions_index;
 pub mod skills;
 pub mod tools;
 

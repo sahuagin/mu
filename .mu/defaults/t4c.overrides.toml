@@ -1,0 +1,46 @@
+# t4c operator-local overrides — TEMPLATE / copy-me.
+#
+# Documentation-by-example. To use it, copy to your t4c override path and edit:
+#
+#     cp .mu/defaults/t4c.overrides.toml ~/.config/t4c/overrides.toml
+#
+# t4c reads ~/.config/t4c/overrides.toml (NOT this in-repo path) and layers it
+# OVER the shipped catalog (crates/t4c/src/config/curated.default.toml), with the
+# later source winning on collision. It is NEVER clobbered by `t4c discover` —
+# that writes the generated registry to ~/.cache/t4c/registry.toml instead.
+#
+# Full model + the "how to add a tool" recipe live in crates/t4c/AGENTS.md.
+# Inspect the live result with `t4c find <intent>`, `t4c list`, or `t4c verify`
+# (don't read the generated registry by hand).
+#
+# ── Anatomy of a capability ──────────────────────────────────────────────
+# Each tool is one [[capability]] table. The worked example below is `webshot`,
+# the aiteam-jail screenshot wrapper — a real entry (see agent memory 4c8088de).
+
+[[capability]]
+# Dotted id, namespaced by launcher: bash.<name>, mcp.<server>.<tool>, ...
+path = "bash.webshot"
+
+# One line shown by `t4c find`. PUT THE CALLING-CONVENTION GOTCHA HERE — this is
+# where context-specific rules surface at discovery time (cf. bash.gh.pr's
+# "in jj workspaces pass -R owner/repo").
+summary = "Headless full-page screenshot of a URL via playwright+firefox. Usage: `webshot <url> [out.png]` (out defaults to /tmp/webshot.png). aiteam-jail only — firefox lives in that jail's /usr/local/share/ms-playwright (see agent memory 4c8088de)."
+
+# Words someone would search by — these drive `t4c find <intent>`.
+keywords = ["screenshot", "render", "browser", "playwright", "firefox", "headless", "visual", "url", "png"]
+
+# The suggested call AND the present/absent probe: t4c marks a capability
+# "present" iff `which(invoke[0])` resolves on the host it runs on. So an entry
+# is automatically absent where its binary isn't installed and present where it
+# is — including jail vs. host — with no environment logic in this file. Use
+# UPPERCASE placeholders for the args the caller fills in.
+invoke = ["webshot", "URL", "OUT.png"]
+
+# Reserved for explicit extra prerequisites; usually empty (invoke[0] is the
+# real availability probe).
+requires = []
+
+# What `t4c help bash.webshot` runs to show usage.
+[capability.help]
+argv = ["webshot", "--help"]
+ai = false   # set true iff the tool emits a `--help-ai --json` document

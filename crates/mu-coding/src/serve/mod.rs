@@ -468,11 +468,21 @@ fn build_recall_providers(
             config.bootloader_text().to_string(),
         )));
     }
-    // mu-zk2i: tier from `[recall].tier` — "identity" (default) injects the
-    // small kernel; "full" restores the four-section wall.
-    providers.push(Arc::new(
-        SubprocessRecallProvider::default().with_tier(&config.recall.tier),
-    ));
+    // mu-recall-operator-controls-5y6a: the agent-memory provider is now
+    // independently toggleable (`[recall].memory`, default true) and its
+    // binary is configurable (`[recall].memory_command`, default
+    // ~/.local/bin/agent). Skipping it leaves the project-file provider
+    // (MU.md/AGENTS.md) below intact — file-only context with no
+    // agent.sqlite injection — without disabling all recall.
+    if config.recall.memory {
+        // mu-zk2i: tier from `[recall].tier` — "identity" (default) injects
+        // the small kernel; "full" restores the four-section wall.
+        let memory_provider = match &config.recall.memory_command {
+            Some(path) => SubprocessRecallProvider::with_binary(path.clone()),
+            None => SubprocessRecallProvider::default(),
+        };
+        providers.push(Arc::new(memory_provider.with_tier(&config.recall.tier)));
+    }
     providers.push(Arc::new(ProjectFileRecallProvider::default()));
     providers
 }
@@ -699,6 +709,52 @@ mod tests {
                 "default chain is subprocess + project-file"
             );
             assert!(!first_is_bootloader(&providers));
+        });
+    }
+
+    #[test]
+    fn build_recall_providers_memory_false_omits_memory_keeps_project_file() {
+        // mu-recall-operator-controls-5y6a: [recall].memory=false drops the
+        // agent-memory provider but KEEPS the project-file provider — file-only
+        // context (MU.md/AGENTS.md) with no agent.sqlite injection, without
+        // disabling all recall.
+        with_bootloader_env_clear(|| {
+            let mut config = Config::default();
+            config.recall.memory = false;
+            let providers = build_recall_providers(&config);
+            assert_eq!(providers.len(), 1, "only the project-file provider remains");
+            let debug = format!("{:?}", providers[0]);
+            assert!(
+                debug.starts_with("ProjectFileRecallProvider"),
+                "sole provider should be project-file, got: {debug}"
+            );
+            assert!(
+                !providers
+                    .iter()
+                    .any(|p| format!("{p:?}").starts_with("SubprocessRecallProvider")),
+                "memory provider must be absent when [recall].memory=false"
+            );
+        });
+    }
+
+    #[test]
+    fn build_recall_providers_memory_command_reaches_provider() {
+        // mu-recall-operator-controls-5y6a: [recall].memory_command points the
+        // agent-memory provider at a custom binary instead of the hardcoded
+        // ~/.local/bin/agent default.
+        with_bootloader_env_clear(|| {
+            let mut config = Config::default();
+            config.recall.memory_command = Some(std::path::PathBuf::from("/custom/agent-bin"));
+            let providers = build_recall_providers(&config);
+            let memory_debug = providers
+                .iter()
+                .map(|p| format!("{p:?}"))
+                .find(|d| d.starts_with("SubprocessRecallProvider"))
+                .expect("memory provider present by default");
+            assert!(
+                memory_debug.contains("/custom/agent-bin"),
+                "custom memory_command should reach the provider, got: {memory_debug}"
+            );
         });
     }
 

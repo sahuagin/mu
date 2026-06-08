@@ -3,7 +3,8 @@
 //! The mu console's native index reads mu's own event-log JSONL
 //! (`console::data::scan_sessions`). This module is its sibling for the
 //! *other* fleet: claude-code's session transcripts under
-//! `~/.claude-personal/projects/<project-dir>/<session-uuid>.jsonl`. It
+//! `<claude-config-dir>/projects/<project-dir>/<session-uuid>.jsonl`
+//! (the dir resolved by [`default_cc_projects_dir`]). It
 //! projects those wrapper-shaped logs into the same [`SessionSummary`]
 //! rows so both corpora render in one table — "one pane of glass."
 //!
@@ -16,7 +17,7 @@
 //! envelopes. We process only the two message types and skip the rest.
 //!
 //! INVARIANT (cc transcript ownership): this module is strictly
-//! READ-ONLY over `~/.claude-personal`. It opens files for reading and
+//! READ-ONLY over the claude-code config dir. It opens files for reading and
 //! never creates, writes, or appends. Marks for cc sessions live in a
 //! task_log sidecar (sibling bead .3), never in the transcript itself.
 //!
@@ -56,11 +57,24 @@ use mu_core::agent::Usage;
 use super::data::{ScanResult, SessionSummary};
 use super::time::parse_rfc3339_ms;
 
-/// The default claude-code projects root. `None` if the home dir can't
-/// be resolved (mirrors [`crate::serve::default_events_dir`]). Opt-in:
-/// the console only scans cc sessions when explicitly asked.
+/// The default claude-code projects root. Resolves the way claude-code
+/// itself does: honor `$CLAUDE_CONFIG_DIR` if set, otherwise fall back
+/// to its standard `~/.claude`. `None` if neither is resolvable (mirrors
+/// [`crate::serve::default_events_dir`]). Opt-in: the console only scans
+/// cc sessions when explicitly asked, and `--cc-projects-dir` overrides
+/// this for any non-standard install.
+///
+/// mu-native (bead `mu-mu-native-config-sources-98j7`): previously this
+/// hardcoded `~/.claude-personal/projects` — an operator-specific
+/// `CLAUDE_CONFIG_DIR` value, a bad default for anyone else. We now
+/// derive it from the environment with claude-code's real default.
 pub fn default_cc_projects_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude-personal/projects"))
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir).join("projects"));
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".claude/projects"))
 }
 
 /// Scan `projects_dir` for claude-code session transcripts and project
@@ -323,8 +337,8 @@ fn parse_usage(u: &serde_json::Value) -> Usage {
 // stays defensive to the same standard as the scanner: a line that fails
 // to parse is counted, never fatal; an envelope shape we don't recognize
 // degrades to a `Meta` entry whose raw JSON is preserved for drilldown.
-// It is strictly READ-ONLY over `~/.claude-personal` — it opens the file
-// for reading and never writes.
+// It is strictly READ-ONLY over the claude-code config dir — it opens the
+// file for reading and never writes.
 
 /// Which transcript lane a cc envelope renders into. Maps onto the same
 /// `role-{user,assistant,tool}` CSS the native transcript uses; `Meta`

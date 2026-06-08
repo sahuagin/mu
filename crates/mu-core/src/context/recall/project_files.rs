@@ -2,19 +2,22 @@
 //! AGENTS.md hierarchy at session start and wraps each present file as
 //! one [`RecalledItem`] with [`RecallSource::ProjectFile`].
 //!
-//! mu-phl v0 / bead `mu-zj4e`. The file set mirrors what claude-code
-//! sessions load via their memory hierarchy: project-local files first
-//! (so they can override globals), then the operator's personal global,
-//! then the shared global, then pi-rust's agent rules.
+//! mu-phl v0 / bead `mu-zj4e`. The file set is mu-native: project-local
+//! files first (so they can override globals), then the operator's
+//! mu global under `~/.config/mu/`.
 //!
-//! When the `~/.config/mu/` migration lands (separate bead, not yet
-//! filed), `~/.pi/agent/AGENTS.md` becomes `~/.config/mu/AGENTS.md` —
-//! one line of [`DEFAULT_FILES_IN_ORDER`] changes.
+//! mu-native migration (bead `mu-mu-native-config-sources-98j7`): the
+//! defaults no longer borrow the operator's claude-code / pi-rust config
+//! (`~/.claude-personal/CLAUDE.md`, `~/CLAUDE.md`, `~/.pi/agent/AGENTS.md`).
+//! mu reads its OWN files under `~/.config/mu/` — the same root the
+//! layered [`crate::config::Config`] loads `config.toml` from. A
+//! deployment that still wants those files can pass them explicitly via
+//! [`ProjectFileRecallProvider::with_files`].
 //!
 //! Behavior:
 //!
 //! - Missing files: skipped silently (no warn, no panic). Most installs
-//!   won't have all five.
+//!   won't have all of them.
 //! - Non-readable files: logged at `warn`, skipped.
 //! - Duplicate canonical paths (e.g., a symlink resolving to the same
 //!   target as an absolute entry): emitted ONCE, in the order of first
@@ -39,11 +42,10 @@ use super::{RecallProvider, RecallSource, RecalledItem};
 /// leading `~/` resolves against the operator's home directory
 /// (`$HOME` / `dirs::home_dir()`).
 pub const DEFAULT_FILES_IN_ORDER: &[&str] = &[
-    "./CLAUDE.md",                  // project root
-    "./AGENTS.md",                  // project root
-    "~/.claude-personal/CLAUDE.md", // operator's personal global
-    "~/CLAUDE.md",                  // shared global
-    "~/.pi/agent/AGENTS.md",        // pi-rust agent rules
+    "./CLAUDE.md",            // project root (overrides the global)
+    "./AGENTS.md",            // project root
+    "~/.config/mu/CLAUDE.md", // operator's mu-native global
+    "~/.config/mu/AGENTS.md", // operator's mu-native global
 ];
 
 /// Reads a fixed hierarchy of project-context files at session start.
@@ -272,8 +274,8 @@ mod tests {
             Some(PathBuf::from("/home/user/project/CLAUDE.md")),
         );
         assert_eq!(
-            resolve_template("~/.claude-personal/CLAUDE.md", &cwd, Some(&home)),
-            Some(PathBuf::from("/home/user/.claude-personal/CLAUDE.md")),
+            resolve_template("~/.config/mu/CLAUDE.md", &cwd, Some(&home)),
+            Some(PathBuf::from("/home/user/.config/mu/CLAUDE.md")),
         );
         assert_eq!(
             resolve_template("/etc/global.md", &cwd, Some(&home)),

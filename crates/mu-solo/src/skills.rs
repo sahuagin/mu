@@ -274,16 +274,18 @@ fn load_skill_dir(dir: &Path) -> Option<DiscoveredSkill> {
 // ── discovery ──────────────────────────────────────────────────────
 
 /// Default search directories in priority order.
+///
+/// mu-native (bead `mu-mu-native-config-sources-98j7`): `.mu/skills`
+/// (project) then `~/.config/mu/skills` (operator). The former
+/// `~/.claude-personal/skills` compat-read was dropped — mu no longer
+/// borrows the operator's claude-code skills.
 pub fn default_search_dirs(project_root: Option<&Path>) -> Vec<PathBuf> {
-    let mut dirs = Vec::with_capacity(3);
+    let mut dirs = Vec::with_capacity(2);
     if let Some(root) = project_root {
         dirs.push(root.join(".mu/skills"));
     }
     if let Some(config) = dirs::config_dir() {
         dirs.push(config.join("mu/skills"));
-    }
-    if let Some(home) = dirs::home_dir() {
-        dirs.push(home.join(".claude-personal/skills"));
     }
     dirs
 }

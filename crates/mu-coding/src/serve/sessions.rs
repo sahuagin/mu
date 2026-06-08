@@ -136,12 +136,15 @@ pub struct Sessions {
     inner: Arc<Mutex<HashMap<String, SessionState>>>,
     workers: Arc<Mutex<HashMap<String, SubprocessSession>>>,
     rehydrated: Arc<Mutex<HashMap<String, RehydratedSession>>>,
-    /// On-disk events root (`~/.local/share/mu/events`), when persistence
-    /// is enabled. Enables [`event_log`](Self::event_log)'s lazy
-    /// find-by-id fallback: a past session is loaded from disk (and
+    /// On-disk events root. Not hardcoded here — it's resolved elsewhere
+    /// and handed in at construction: `serve::resolve_events_dir(config)`
+    /// derives it from `[session].state_dir` (overridable) and
+    /// `[session].persist_events_to_disk`, falling back to
+    /// `serve::default_events_dir()`. Enables [`event_log`](Self::event_log)'s
+    /// lazy find-by-id fallback: a past session is loaded from disk (and
     /// cached) the first time it's addressed, rather than the daemon
     /// bulk-rehydrating every log at startup (mu-lazy-session-rehydration-bh4f).
-    /// `None` in tests / ephemeral daemons → no disk fallback.
+    /// `None` when persistence is off (tests / ephemeral) → no disk fallback.
     events_dir: Option<PathBuf>,
 }
 

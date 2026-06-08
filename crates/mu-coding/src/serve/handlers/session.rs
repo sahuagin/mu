@@ -948,6 +948,16 @@ pub fn handle_close_session(request: Request<Value>, sessions: Sessions) -> Resp
     ok_response(request.id, to_value_or_null(resp))
 }
 
+/// Lists sessions known to the live daemon: in-memory live/worker sessions,
+/// any past session already lazily cached (via `event_log`), plus peers when
+/// `include_remote` is set. By design (mu-lazy-session-rehydration-bh4f) this
+/// does NOT bulk-scan disk — the daemon no longer rehydrates every log at
+/// startup, so a past session won't appear here until it's been addressed.
+/// Cheap offline enumeration of ALL on-disk sessions (after a restart, to find
+/// an id to `resume`/`recover`) is the standalone `mu list-sessions` command
+/// (`crate::sessions_index::scan_session_index`), not this RPC. If a future
+/// consumer needs past sessions surfaced through this RPC, wire that scan in
+/// here behind a filter flag rather than reviving the startup bulk-load.
 pub async fn handle_session_list(
     request: Request<Value>,
     discovery: Arc<dyn SessionDiscovery>,

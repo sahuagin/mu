@@ -212,6 +212,30 @@ pub struct RecallConfig {
     /// consulted when `bootloader` (or the env override) is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootloader_text: Option<String>,
+    /// mu-recall-operator-controls-5y6a: toggle for the agent-memory
+    /// provider (`SubprocessRecallProvider`) INDEPENDENTLY of the
+    /// project-file provider. `true` (default) preserves today's behavior
+    /// (inject the `agent memory context` kernel). Set `false` to run with
+    /// ONLY the file-based project context (MU.md / AGENTS.md) and no
+    /// agent.sqlite-backed injection — without disabling all recall
+    /// (`enabled = false`), which would also drop the project files.
+    #[serde(default = "default_true")]
+    pub memory: bool,
+    /// mu-recall-operator-controls-5y6a: path to the memory CLI the
+    /// agent-memory provider invokes (`<this> memory context --tier <tier>`).
+    /// `None` (default) => the built-in default `~/.local/bin/agent`
+    /// (`SubprocessRecallProvider::default`). Set this to point mu at a
+    /// different binary rather than relying on the hardcoded operator path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_binary: Option<PathBuf>,
+}
+
+/// serde default helper: `true`. A bare `#[serde(default)]` on a `bool`
+/// yields `false`, which would silently flip the memory provider OFF for
+/// any config that omits the key — so `memory` needs an explicit `true`
+/// default.
+fn default_true() -> bool {
+    true
 }
 
 impl Default for RecallConfig {
@@ -222,6 +246,8 @@ impl Default for RecallConfig {
             tier: "identity".to_string(),
             bootloader: false,
             bootloader_text: None,
+            memory: true,
+            memory_binary: None,
         }
     }
 }
@@ -639,6 +665,48 @@ mod tests {
         // operators opt into discover-on-demand via TOML
         let c: Config = toml::from_str("[recall]\nenabled = false\n").expect("parse");
         assert!(!c.recall.enabled);
+    }
+
+    #[test]
+    fn recall_memory_defaults_on_and_toml_can_disable() {
+        // mu-recall-operator-controls-5y6a: the agent-memory provider is on by
+        // default (preserves today's injection); operators opt out via TOML
+        // while keeping project-file recall.
+        assert!(Config::default().recall.memory);
+        assert_eq!(Config::default().recall.memory_binary, None);
+        let c: Config = toml::from_str("[recall]\nmemory = false\n").expect("parse memory toggle");
+        assert!(!c.recall.memory);
+        // composes with the other axes untouched
+        assert!(c.recall.enabled);
+    }
+
+    #[test]
+    fn recall_memory_stays_on_when_section_present_but_key_omitted() {
+        // The `default_true` guard, pinned: a [recall] section that sets some
+        // OTHER key but omits `memory` must still default it ON. Without the
+        // explicit #[serde(default = "default_true")], a partial section would
+        // silently flip memory OFF (a bare bool serde-default is `false`) and
+        // disable the agent-memory injection for that operator — green CI, wrong
+        // behavior. This test is what a future "simplify to #[serde(default)]"
+        // would have to break.
+        let c: Config =
+            toml::from_str("[recall]\nbootloader = true\n").expect("parse partial recall");
+        assert!(
+            c.recall.memory,
+            "memory must default ON for a [recall] section that omits the key"
+        );
+    }
+
+    #[test]
+    fn recall_memory_binary_toml_sets_path() {
+        let c: Config = toml::from_str("[recall]\nmemory_binary = \"/opt/agent\"\n")
+            .expect("parse memory_binary");
+        assert_eq!(
+            c.recall.memory_binary,
+            Some(std::path::PathBuf::from("/opt/agent"))
+        );
+        // default still on so the path is actually used
+        assert!(c.recall.memory);
     }
 
     #[test]

@@ -90,6 +90,12 @@ impl Transcript {
     pub fn render_all_plain(&self) -> String {
         render_blocks_plain(&self.blocks)
     }
+
+    /// All blocks as a slice — for styled rendering (the fullscreen
+    /// owned-buffer render windows over this; mu-5h9m).
+    pub fn blocks(&self) -> &[TranscriptBlock] {
+        &self.blocks
+    }
 }
 
 pub fn render_blocks_plain(blocks: &[TranscriptBlock]) -> String {

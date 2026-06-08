@@ -248,6 +248,15 @@ pub struct App {
     prompt: InputBuffer,
     /// Session-wide paste counter for collapse display.
     paste_count: usize,
+    /// Fullscreen owned-buffer render mode (mu-5h9m). When true, the whole
+    /// transcript is rendered from the in-memory model into an alt-screen
+    /// buffer each frame, windowed by `transcript_scroll` — no `insert_before`,
+    /// no native scrollback. Opt-in via `MU_SOLO_FULLSCREEN` while it's built
+    /// as a parallel mode alongside the inline path.
+    fullscreen: bool,
+    /// Lines scrolled UP from the bottom of the transcript in fullscreen mode
+    /// (0 = stuck to the latest). Ignored in inline mode.
+    transcript_scroll: usize,
     /// Daemon ID (per daemon.stats at startup). Surfaced via /status.
     daemon_id: String,
     /// Daemon version string. Surfaced via /status.
@@ -561,6 +570,8 @@ impl App {
             pending_ask_ids: std::collections::HashSet::new(),
             live_turn: None,
             transcript: Transcript::new(),
+            fullscreen: std::env::var_os("MU_SOLO_FULLSCREEN").is_some(),
+            transcript_scroll: 0,
             selected_block: None,
             maximized_block: None,
             events_file,
@@ -642,7 +653,11 @@ impl App {
         let mut mcp_rx = self.mcp_status_rx.take();
 
         loop {
-            self.render_viewport(&mut vp)?;
+            if self.fullscreen {
+                self.render_fullscreen(&mut vp)?;
+            } else {
+                self.render_viewport(&mut vp)?;
+            }
 
             tokio::select! {
                 biased;
@@ -719,6 +734,65 @@ impl App {
     }
 
     /// Render the viewport (separator + menu + prompt + status line).
+    /// Fullscreen owned-buffer render (mu-5h9m): paint the whole transcript
+    /// from the in-memory model into a maximized viewport each frame, windowed
+    /// by `transcript_scroll`, with the input chrome pinned at the bottom. No
+    /// `insert_before`, so the inline scrollback gap/dup class can't occur.
+    /// First cut renders the transcript plainly; styled per-block render is a
+    /// follow-up. Built as a parallel mode (opt-in via `MU_SOLO_FULLSCREEN`).
+    fn render_fullscreen(&mut self, vp: &mut DynamicViewport) -> Result<()> {
+        vp.maximize_height()?;
+        let area = vp.area();
+        let total = area.height as usize;
+        let width = area.width as usize;
+        let wrap = width.saturating_sub(1);
+
+        // Bottom chrome: a separator rule + the prompt's visual lines.
+        let layout = self.prompt.visual_layout(wrap);
+        let mut chrome: Vec<Line<'static>> = Vec::new();
+        chrome.push(Line::from("─".repeat(width)));
+        if layout.lines.is_empty() {
+            chrome.push(Line::from("> ".to_string()));
+        } else {
+            for vline in &layout.lines {
+                chrome.push(Line::from(format!("> {}", vline.text)));
+            }
+        }
+        let transcript_rows = total.saturating_sub(chrome.len());
+
+        // Transcript body (plain for the first cut) + the in-flight turn.
+        let body = self.transcript.render_all_plain();
+        let mut tlines: Vec<Line<'static>> =
+            body.lines().map(|l| Line::from(l.to_string())).collect();
+        if let Some(turn) = self.live_turn.as_ref() {
+            let tool_preview = if self.bash_yolo { 15 } else { 4 };
+            tlines.extend(render::render_turn(
+                turn.route.header_label(),
+                turn.route.color(),
+                &turn.items,
+                wrap,
+                tool_preview,
+            ));
+        }
+
+        // Window: bottom-anchored, minus the scroll-up offset.
+        let len = tlines.len();
+        let max_off = len.saturating_sub(transcript_rows);
+        let off = self.transcript_scroll.min(max_off);
+        self.transcript_scroll = off;
+        let end = len.saturating_sub(off);
+        let start = end.saturating_sub(transcript_rows);
+        let mut lines: Vec<Line<'static>> = tlines[start..end].to_vec();
+        while lines.len() < transcript_rows {
+            lines.push(Line::from(""));
+        }
+        lines.extend(chrome);
+
+        vp.render(Paragraph::new(lines));
+        vp.flush()?;
+        Ok(())
+    }
+
     fn render_viewport(&mut self, vp: &mut DynamicViewport) -> Result<()> {
         if self.maximized_block.is_some() {
             return self.render_maximized_block(vp);
@@ -1026,10 +1100,24 @@ impl App {
 
         match (key.modifiers, key.code) {
             (KeyModifiers::ALT, KeyCode::Up) | (KeyModifiers::ALT, KeyCode::Char('k')) => {
-                self.move_selected_block(-1)
+                if self.fullscreen {
+                    self.transcript_scroll = self.transcript_scroll.saturating_add(1);
+                } else {
+                    self.move_selected_block(-1);
+                }
             }
             (KeyModifiers::ALT, KeyCode::Down) | (KeyModifiers::ALT, KeyCode::Char('j')) => {
-                self.move_selected_block(1)
+                if self.fullscreen {
+                    self.transcript_scroll = self.transcript_scroll.saturating_sub(1);
+                } else {
+                    self.move_selected_block(1);
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::PageUp) if self.fullscreen => {
+                self.transcript_scroll = self.transcript_scroll.saturating_add(10);
+            }
+            (KeyModifiers::NONE, KeyCode::PageDown) if self.fullscreen => {
+                self.transcript_scroll = self.transcript_scroll.saturating_sub(10);
             }
             (_, KeyCode::Char('c')) if self.prompt.is_empty() && self.selected_block.is_some() => {
                 self.apply_block_action(vp, BlockAction::Copy)?;

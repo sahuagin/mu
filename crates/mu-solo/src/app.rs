@@ -760,18 +760,47 @@ impl App {
         }
         let transcript_rows = total.saturating_sub(chrome.len());
 
-        // Transcript body (plain for the first cut) + the in-flight turn.
-        let body = self.transcript.render_all_plain();
-        let mut tlines: Vec<Line<'static>> =
-            body.lines().map(|l| Line::from(l.to_string())).collect();
+        // One styled renderer for the whole transcript: committed blocks and
+        // the live turn go through the same block/turn renderers (no plain
+        // downgrade), one blank line between blocks (mu-5h9m). Assistant turns
+        // keep their structured `items`, so committed turns look identical to
+        // the live one.
+        let bwrap = (area.width as usize).saturating_sub(2);
+        let preview = if self.bash_yolo { 15 } else { 4 };
+        let mut tlines: Vec<Line<'static>> = Vec::new();
+        for block in self.transcript.blocks() {
+            if !tlines.is_empty() {
+                tlines.push(Line::from(""));
+            }
+            match (block.kind, block.items.as_ref()) {
+                (TranscriptKind::User, _) => {
+                    tlines.extend(render::you_block(&block.body, bwrap))
+                }
+                (TranscriptKind::Assistant, Some(items)) => tlines.extend(render::render_turn(
+                    &block.label,
+                    ratatui::style::Color::White,
+                    items,
+                    bwrap,
+                    preview,
+                )),
+                (TranscriptKind::Assistant, None) | (TranscriptKind::Notice, _) => {
+                    tlines.extend(render::assistant_block(&block.body, bwrap))
+                }
+                (TranscriptKind::Error, _) => {
+                    tlines.extend(render::error_block(&block.body, bwrap))
+                }
+            }
+        }
         if let Some(turn) = self.live_turn.as_ref() {
-            let tool_preview = if self.bash_yolo { 15 } else { 4 };
+            if !tlines.is_empty() {
+                tlines.push(Line::from(""));
+            }
             tlines.extend(render::render_turn(
                 turn.route.header_label(),
                 turn.route.color(),
                 &turn.items,
-                wrap,
-                tool_preview,
+                bwrap,
+                preview,
             ));
         }
 

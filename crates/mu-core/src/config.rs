@@ -227,7 +227,7 @@ pub struct RecallConfig {
     /// (`SubprocessRecallProvider::default`). Set this to point mu at a
     /// different binary rather than relying on the hardcoded operator path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_command: Option<PathBuf>,
+    pub memory_binary: Option<PathBuf>,
 }
 
 /// serde default helper: `true`. A bare `#[serde(default)]` on a `bool`
@@ -247,7 +247,7 @@ impl Default for RecallConfig {
             bootloader: false,
             bootloader_text: None,
             memory: true,
-            memory_command: None,
+            memory_binary: None,
         }
     }
 }
@@ -673,7 +673,7 @@ mod tests {
         // default (preserves today's injection); operators opt out via TOML
         // while keeping project-file recall.
         assert!(Config::default().recall.memory);
-        assert_eq!(Config::default().recall.memory_command, None);
+        assert_eq!(Config::default().recall.memory_binary, None);
         let c: Config = toml::from_str("[recall]\nmemory = false\n").expect("parse memory toggle");
         assert!(!c.recall.memory);
         // composes with the other axes untouched
@@ -681,11 +681,28 @@ mod tests {
     }
 
     #[test]
-    fn recall_memory_command_toml_sets_path() {
-        let c: Config = toml::from_str("[recall]\nmemory_command = \"/opt/agent\"\n")
-            .expect("parse memory_command");
+    fn recall_memory_stays_on_when_section_present_but_key_omitted() {
+        // The `default_true` guard, pinned: a [recall] section that sets some
+        // OTHER key but omits `memory` must still default it ON. Without the
+        // explicit #[serde(default = "default_true")], a partial section would
+        // silently flip memory OFF (a bare bool serde-default is `false`) and
+        // disable the agent-memory injection for that operator — green CI, wrong
+        // behavior. This test is what a future "simplify to #[serde(default)]"
+        // would have to break.
+        let c: Config =
+            toml::from_str("[recall]\nbootloader = true\n").expect("parse partial recall");
+        assert!(
+            c.recall.memory,
+            "memory must default ON for a [recall] section that omits the key"
+        );
+    }
+
+    #[test]
+    fn recall_memory_binary_toml_sets_path() {
+        let c: Config = toml::from_str("[recall]\nmemory_binary = \"/opt/agent\"\n")
+            .expect("parse memory_binary");
         assert_eq!(
-            c.recall.memory_command,
+            c.recall.memory_binary,
             Some(std::path::PathBuf::from("/opt/agent"))
         );
         // default still on so the path is actually used

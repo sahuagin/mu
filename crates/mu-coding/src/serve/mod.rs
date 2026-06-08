@@ -470,14 +470,14 @@ fn build_recall_providers(
     }
     // mu-recall-operator-controls-5y6a: the agent-memory provider is now
     // independently toggleable (`[recall].memory`, default true) and its
-    // binary is configurable (`[recall].memory_command`, default
+    // binary is configurable (`[recall].memory_binary`, default
     // ~/.local/bin/agent). Skipping it leaves the project-file provider
     // (MU.md/AGENTS.md) below intact — file-only context with no
     // agent.sqlite injection — without disabling all recall.
     if config.recall.memory {
         // mu-zk2i: tier from `[recall].tier` — "identity" (default) injects
         // the small kernel; "full" restores the four-section wall.
-        let memory_provider = match &config.recall.memory_command {
+        let memory_provider = match &config.recall.memory_binary {
             Some(path) => SubprocessRecallProvider::with_binary(path.clone()),
             None => SubprocessRecallProvider::default(),
         };
@@ -738,13 +738,13 @@ mod tests {
     }
 
     #[test]
-    fn build_recall_providers_memory_command_reaches_provider() {
-        // mu-recall-operator-controls-5y6a: [recall].memory_command points the
+    fn build_recall_providers_memory_binary_reaches_provider() {
+        // mu-recall-operator-controls-5y6a: [recall].memory_binary points the
         // agent-memory provider at a custom binary instead of the hardcoded
         // ~/.local/bin/agent default.
         with_bootloader_env_clear(|| {
             let mut config = Config::default();
-            config.recall.memory_command = Some(std::path::PathBuf::from("/custom/agent-bin"));
+            config.recall.memory_binary = Some(std::path::PathBuf::from("/custom/agent-bin"));
             let providers = build_recall_providers(&config);
             let memory_debug = providers
                 .iter()
@@ -753,7 +753,7 @@ mod tests {
                 .expect("memory provider present by default");
             assert!(
                 memory_debug.contains("/custom/agent-bin"),
-                "custom memory_command should reach the provider, got: {memory_debug}"
+                "custom memory_binary should reach the provider, got: {memory_debug}"
             );
         });
     }

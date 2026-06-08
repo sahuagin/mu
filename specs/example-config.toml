@@ -138,7 +138,7 @@ memory = true
 # Path to the memory CLI the agent-memory provider invokes. Unset (default)
 # uses ~/.local/bin/agent. Set this to point mu at a different binary
 # instead of relying on that hardcoded path.
-# memory_command = "/usr/local/bin/agent"
+# memory_binary = "/usr/local/bin/agent"
 
 # First-position "this is startup orientation, not the task" preamble.
 # false (default) = no preamble. The MU_RECALL_BOOTLOADER=0/1 env var

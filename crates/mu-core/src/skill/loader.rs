@@ -181,16 +181,10 @@ pub fn load_skill_dir(dir: &Path) -> Result<LoadedSkill, LoadError> {
     })
 }
 
-/// Default discovery directories in priority order.
-///
-/// Higher priority directories shadow lower ones on name collision.
-/// `project_root` is optional — when `None`, only the user dir
-/// (`~/.config/mu/skills`) is searched.
-///
-/// mu-native (bead `mu-mu-native-config-sources-98j7`): mu reads its
-/// OWN skills under `.mu/skills` (project) and `~/.config/mu/skills`
-/// (operator). The former `~/.claude-personal/skills` compat-read was
-/// dropped — mu no longer borrows the operator's claude-code skills.
+/// Default discovery directories in priority order: `.mu/skills`
+/// (project) then `~/.config/mu/skills` (operator). Higher-priority
+/// directories shadow lower ones on name collision. `project_root` is
+/// optional — when `None`, only the operator dir is searched.
 pub fn default_search_dirs(project_root: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = Vec::with_capacity(2);
     if let Some(root) = project_root {

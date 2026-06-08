@@ -1,0 +1,70 @@
+#!/bin/sh
+# emu — "execute mu": a multi-call auto-build launcher.
+#
+# Symlink this script (from the checkout it lives in) into ~/.local/bin under a
+# tool's name; invoking that name rebuilds the tool from THIS workspace and
+# execs it. Everything is derived from $0 — no hardcoded paths, no per-tool
+# wrapper scripts:
+#
+#   basename "$0"      -> WHICH tool   (the invoked symlink name)
+#   readlink -f "$0"   -> WHERE I live -> the workspace I was installed from
+#
+# So a symlink made from a dev checkout tracks that dev tree; one made from a
+# main checkout tracks main. The operator picks the update source by choosing
+# which checkout they `emu install` from.
+#
+#   emu install t4c mu-solo    # run from a checkout: create the ~/.local/bin links
+#   t4c <args>                 # (via the symlink) build t4c from this workspace, exec it
+#
+# cargo build writes to stderr, so stdout stays clean for the tool's own output.
+# A build failure aborts (set -e) instead of exec'ing a stale binary.
+set -eu
+
+self=$(readlink -f "$0")
+root=$(CDPATH= cd "$(dirname "$self")/.." && pwd)   # <root>/.mu/emu -> <root>
+name=$(basename "$0")
+target="$root/target/release"
+
+# Manager mode: invoked by its own name, not through a tool symlink.
+if [ "$name" = "emu" ]; then
+    case "${1:-}" in
+        install)
+            shift
+            [ "$#" -ge 1 ] || { echo "usage: emu install <tool>..." >&2; exit 2; }
+            bindir="$HOME/.local/bin"
+            mkdir -p "$bindir"
+            for t in "$@"; do
+                ln -sf "$self" "$bindir/$t"
+                echo "linked $bindir/$t -> $self"
+            done
+            exit 0 ;;
+        *)
+            echo "emu — multi-call auto-build launcher (workspace: $root)" >&2
+            echo "usage: emu install <tool>...   then invoke each tool by name" >&2
+            exit 0 ;;
+    esac
+fi
+
+# Per-tool launch profile. Tools not matched fall through to the default:
+# build the tool's own --bin and exec it, forwarding args verbatim.
+case "$name" in
+    mu-solo)
+        # Standalone TUI: needs `mu` built alongside, default flags
+        # (provider/model overridable via MU_SOLO_*), the claude-proxy
+        # ANTHROPIC_BASE_URL cleared, and API keys pulled from the agent config
+        # via tq.
+        ( cd "$root" && cargo build --release --bin mu --bin mu-solo )
+        TQ="${TQ:-$HOME/.cargo/bin/tq}"
+        unset ANTHROPIC_BASE_URL
+        ANTHROPIC_API_KEY=$("$TQ" -f "$HOME/.config/agent/config.toml" -r anthropic.api_key 2>/dev/null || true) \
+        OPENROUTER_API_KEY=$("$TQ" -f "$HOME/.config/agent/config.toml" -r openrouter.api_key 2>/dev/null || true) \
+        exec "$target/mu-solo" \
+            --provider "${MU_SOLO_PROVIDER:-openai-codex}" \
+            --model "${MU_SOLO_MODEL:-gpt-5.5}" \
+            --bash-yolo \
+            --mu-binary "$target/mu" \
+            "$@" ;;
+    *)
+        ( cd "$root" && cargo build --release --bin "$name" )
+        exec "$target/$name" "$@" ;;
+esac

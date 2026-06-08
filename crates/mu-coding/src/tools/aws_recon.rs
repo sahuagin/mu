@@ -767,7 +767,15 @@ mod tests {
         );
     }
 
+    // mu-2uc8 STOPGAP: the three runner tests below write an executable
+    // and immediately spawn it. Under the full parallel `just ci`, a
+    // concurrent Command::spawn elsewhere can hold a writable fd to the
+    // freshly-written script across fork(), so exec intermittently fails
+    // with ETXTBSY (fine in isolation, flaky under load). Ignored to keep
+    // green ci a reliable gate until aws_recon is extracted/removed
+    // (existing removal beads), which deletes these tests outright.
     #[tokio::test]
+    #[ignore = "mu-2uc8: flaky under parallel ci (fork/exec ETXTBSY); aws_recon slated for removal"]
     async fn runner_mode_invokes_capability_runner_and_returns_report_shape() {
         let dir = temp_test_dir("aws-recon-runner-ok");
         let runner = dir.join("runner.sh");
@@ -824,6 +832,7 @@ printf '{"account":"123456789012","aws_profile":"mu-readonly-scout","capability_
     }
 
     #[tokio::test]
+    #[ignore = "mu-2uc8: flaky under parallel ci (fork/exec ETXTBSY); aws_recon slated for removal"]
     async fn runner_timeout_kills_hung_runner() {
         let dir = temp_test_dir("aws-recon-runner-timeout");
         let runner = dir.join("runner.sh");
@@ -888,6 +897,7 @@ sleep 20
     }
 
     #[tokio::test]
+    #[ignore = "mu-2uc8: flaky under parallel ci (fork/exec ETXTBSY); aws_recon slated for removal"]
     async fn runner_failure_is_structured_error() {
         let dir = temp_test_dir("aws-recon-runner-fail");
         let runner = dir.join("runner.sh");

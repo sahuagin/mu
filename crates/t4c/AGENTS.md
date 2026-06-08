@@ -71,9 +71,9 @@ Keep portable, version-with-the-code facts (calling conventions, design) in the
 catalog / these docs. Keep machine-specific facts (where a binary physically
 lives, jail caveats) in **agent memory**, so the catalog stays portable.
 
-Worked example — `pw-render` (headless screenshot via playwright+firefox):
+Worked example — `webshot` (headless screenshot via playwright+firefox):
 - Registered via `overrides.toml` (operator-local: the binary exists only in
-  the aiteam jail, so `which("pw-render")` is true there and false on the host —
+  the aiteam jail, so `which("webshot")` is true there and false on the host —
   the entry is correct in both places with no jail-awareness in t4c).
 - The deep caveats (shared browser dir, jail-scoping, `bash -c` reads no rc)
   live in agent memory `4c8088de`, not here.

@@ -1,0 +1,19 @@
+# qwen-orch — ORCHESTRATOR model for the review-gate v2 (bead mu-u1it).
+#
+# Role: the agentic lead. It fans the per-file reviewer (gpt-oss-rev) over a
+# diff, then reasons across the collected findings with cross-file context and
+# emits the verdict. qwen3.6:27b is the agentic-bench champion (tool-loop).
+#
+# WHY num_ctx IS BAKED HERE (not passed per request):
+# mu talks to ollama over the Anthropic Messages wire (/v1/messages, bead
+# mu-fmas), which carries NO num_ctx field. Without baking, ollama loads this
+# model at the server default OLLAMA_CONTEXT_LENGTH (262144 -> ~32GB), which
+# EVICTS the co-resident worker on the 2x24GB box. Baking pins the context to
+# the artifact so the context-less wire still gets the right size.
+# See memory: ollama-anthropic-wire-numctx-modelfile-fix-2026-06-08 (a721c14d).
+#
+# 131072 = orchestrator headroom for findings synthesis; co-resides with
+# gpt-oss-rev@49152 (~43GB total, both 100% GPU on 2x24GB). Do NOT raise toward
+# 262144 — qwen alone at max is 32GB and stops co-residing.
+FROM qwen3.6:27b
+PARAMETER num_ctx 131072

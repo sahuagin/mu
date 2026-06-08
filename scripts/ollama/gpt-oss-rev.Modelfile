@@ -1,0 +1,16 @@
+# gpt-oss-rev — per-FILE REVIEWER (worker) for the review-gate v2 (bead mu-u1it).
+#
+# Role: single-shot bug finder, invoked once per changed file by qwen-orch.
+# gpt-oss:20b leads the code-review-bench on recall (catches every planted
+# defect) but over-flags (lower precision) — fine here, because qwen-orch
+# applies precision downstream in synthesis. The worker only ever sees one
+# file, so a modest context is ample.
+#
+# num_ctx is baked for the same reason as qwen-orch (the Anthropic wire carries
+# no num_ctx; baking pins per-model context so the worker stays small and both
+# models co-reside). See memory a721c14d.
+#
+# 49152 comfortably holds any single source file; keeps the worker ~14GB so
+# qwen-orch@131072 co-resides. (gpt-oss:20b's trained context ceiling is 131072.)
+FROM gpt-oss:20b
+PARAMETER num_ctx 49152

@@ -59,6 +59,25 @@ not replacements. Read that file first; this file extends it.
 - `~/src/agent_tools/agent` — the memory CLI, also the eventual
   built-in MCP memory server.
 
+## Testing a TUI / driving a terminal
+
+Don't build a new TUI test rig — the pieces exist (vt100 0.16 +
+portable-pty 0.9, workspace deps):
+
+- `crates/mu-coding/src/serve/pty_spawn.rs` — production Rust-owned pty +
+  headless vt100 emulator (the "terminal Jody set up"): maintains a
+  screen-cell grid, detects prompt-ready (the `❯` glyph) instead of sleeping
+  blind, delivers keystrokes with human-ish cadence through the TUI's
+  bracketed-paste/debounce input path. Replaced the `script(1)`+stdin-pipe
+  kickstart hack (mu-slat Phase 3).
+- `crates/mu-coding/examples/pty_probe.rs` — drive any TUI (e.g. claude-code)
+  *through the terminal* instead of `--json`: spawn in a pty, poll the grid
+  until `❯`, type a message char-by-char, scrape the screen for a sentinel.
+  Run: `cargo run -p mu-coding --example pty_probe -- <pot-name>`.
+
+`mu-solo` (`crates/mu-solo`) is the real interactive front-end (crossterm),
+distinct from this headless harness.
+
 ## Multi-agent build flow
 
 `mu`'s build itself uses the multi-agent dispatch tools at

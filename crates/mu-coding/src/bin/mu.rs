@@ -249,6 +249,25 @@ enum Command {
         #[arg(value_name = "LOG")]
         log: std::path::PathBuf,
     },
+    /// List past sessions, newest-first — the discovery surface for
+    /// `mu resume` / `mu --recover` (which take an id). Offline; no daemon.
+    ///
+    /// Cheap by design (mu-lazy-session-rehydration-bh4f): the recency
+    /// sort uses file mtime only, and just the most-recent `--last` logs
+    /// are opened (first record only), not the whole corpus. The daemon
+    /// no longer rehydrates every log at startup, so this is how you find
+    /// a session id to resume.
+    ListSessions {
+        /// Show at most this many of the most-recent sessions.
+        #[arg(long, default_value = "20")]
+        last: usize,
+        /// Show all sessions (overrides --last).
+        #[arg(long)]
+        all: bool,
+        /// Events directory. Default: ~/.local/share/mu/events/.
+        #[arg(long, value_name = "PATH")]
+        events_dir: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -342,6 +361,21 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Audit { log } => run_audit(&log),
+        Command::ListSessions {
+            last,
+            all,
+            events_dir,
+        } => {
+            // The side effect (writing to the real stdout) lives here at
+            // the call site; run_list_sessions itself just writes to the
+            // stream it's handed. (#249 review)
+            let stdout = std::io::stdout();
+            run_list_sessions(
+                &mut stdout.lock(),
+                if all { None } else { Some(last) },
+                events_dir,
+            )
+        }
         Command::Serve {
             tools,
             ephemeral,
@@ -708,6 +742,110 @@ fn run_audit(log: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// `mu list-sessions` — print past sessions newest-first. Offline; reads
+/// only each shown log's first record + dir mtimes
+/// (mu-lazy-session-rehydration-bh4f). `last == None` means all.
+/// Render the session listing to `out`. Display-style: no stdout side
+/// effects of its own — the caller owns the sink (so `main` writes to
+/// stdout, tests write to a buffer). `now_ms` is read here only to
+/// compute relative ages. (#249 review)
+fn run_list_sessions<W: std::io::Write>(
+    out: &mut W,
+    last: Option<usize>,
+    events_dir: Option<std::path::PathBuf>,
+) -> Result<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let events_dir = match events_dir {
+        Some(p) => p,
+        None => mu_coding::serve::default_events_dir()
+            .context("could not resolve default events dir; pass --events-dir PATH explicitly")?,
+    };
+
+    let index = mu_coding::sessions_index::scan_session_index(&events_dir, last);
+    if index.total == 0 {
+        writeln!(out, "no sessions found under {}", events_dir.display())?;
+        return Ok(());
+    }
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    writeln!(
+        out,
+        "{:<24}  {:<28}  {:>5}  DAEMON",
+        "SESSION", "PROVIDER/MODEL", "AGE"
+    )?;
+    for h in &index.headers {
+        let pm = match (&h.provider_kind, &h.model) {
+            (Some(p), Some(m)) => format!("{p}/{m}"),
+            (Some(p), None) => p.clone(),
+            _ => "-".to_string(),
+        };
+        // last_activity_unix_ms is 0 when the file's mtime couldn't be
+        // read; show a sentinel rather than a misleading ~2857w age.
+        let age = if h.last_activity_unix_ms == 0 {
+            "?".to_string()
+        } else {
+            humanize_age_ms(now_ms.saturating_sub(h.last_activity_unix_ms))
+        };
+        writeln!(
+            out,
+            "{:<24}  {:<28}  {:>5}  {}",
+            h.session_id,
+            truncate_chars(&pm, 28),
+            age,
+            h.daemon_id
+        )?;
+    }
+
+    // Only nudge about the cap when one is actually in effect. Under
+    // --all (last == None), shown < total just means some files couldn't
+    // be read, not that rows were withheld — don't imply otherwise.
+    let shown = index.headers.len();
+    if last.is_some() && shown < index.total {
+        writeln!(
+            out,
+            "\n(showing {shown} of {} — use --last N or --all)",
+            index.total
+        )?;
+    }
+    Ok(())
+}
+
+/// Compact, dependency-free relative age: "12s", "5m", "3h", "2d", "4w".
+fn humanize_age_ms(ms: u64) -> String {
+    let s = ms / 1000;
+    if s < 60 {
+        return format!("{s}s");
+    }
+    let m = s / 60;
+    if m < 60 {
+        return format!("{m}m");
+    }
+    let h = m / 60;
+    if h < 24 {
+        return format!("{h}h");
+    }
+    let d = h / 24;
+    if d < 7 {
+        return format!("{d}d");
+    }
+    format!("{}w", d / 7)
+}
+
+/// Char-safe truncation with an ellipsis (keeps multi-byte models intact).
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{t}…")
+    }
+}
+
 async fn run_login(provider: &str) -> Result<()> {
     use mu_ai::auth::{FileSystemTokenStore, TokenStore};
     match provider {
@@ -815,5 +953,54 @@ mod tests {
             msg.contains("hallucination"),
             "error must name the supported metric(s), got: {msg}"
         );
+    }
+
+    fn unique_tmp(tag: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("mu-{tag}-{pid}-{nonce}"));
+        std::fs::create_dir_all(&dir).expect("mkdir tmp");
+        dir
+    }
+
+    #[test]
+    fn list_sessions_writes_to_provided_stream() {
+        // run_list_sessions has no stdout side effects — it writes to the
+        // sink it's handed. Capture into a Vec<u8> and assert. (#249 review)
+        let dir = unique_tmp("listsessions");
+        let daemon = dir.join("daemon-a");
+        std::fs::create_dir_all(&daemon).expect("mkdir daemon");
+        std::fs::write(
+            daemon.join("session-1.jsonl"),
+            "{\"id\":1,\"session_id\":\"session-1\",\"timestamp_unix_ms\":1700000000000,\
+             \"actor\":{\"kind\":\"system\"},\"payload\":{\"kind\":\"session_created\",\
+             \"provider_kind\":\"ollama\",\"model\":\"qwen3-coder:30b\"}}\n",
+        )
+        .expect("write session");
+
+        let mut buf: Vec<u8> = Vec::new();
+        run_list_sessions(&mut buf, Some(10), Some(dir.clone())).expect("list");
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(out.contains("SESSION"), "header present, got: {out}");
+        assert!(out.contains("session-1"), "session id present, got: {out}");
+        assert!(
+            out.contains("ollama/qwen3-coder:30b"),
+            "provider/model present, got: {out}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_sessions_empty_dir_writes_notice_to_stream() {
+        let dir = unique_tmp("listsessions-empty");
+        let mut buf: Vec<u8> = Vec::new();
+        run_list_sessions(&mut buf, Some(10), Some(dir.clone())).expect("list");
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(out.contains("no sessions found"), "got: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -51,65 +51,13 @@ pub fn default_events_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".local/share/mu/events"))
 }
 
-/// mu-u1ld: scan `events_dir` for past-run session JSONLs and
-/// register them in `sessions` as read-only rehydrated entries.
-/// Called once at daemon startup. Returns the number of sessions
-/// rehydrated (zero on any I/O error — rehydration is best-effort,
-/// never aborts startup).
-///
-/// Scan structure: `events_dir/<daemon_id>/<session_id>.jsonl`. The
-/// new daemon's own `<daemon_id>` directory doesn't exist yet at this
-/// point (no sessions have been created), so every visible subdir
-/// represents some prior or concurrent daemon. We load every file we
-/// find. Concurrent peers' active sessions are also rehydrated as
-/// read-only — `FileBackend::list` continues to expose them as remote
-/// for `session.list --include-remote`, but local read-only queries
-/// (`session.events`, `session.stats`) work too.
-///
-/// Per the mu-u1ld P1 design (2026-05-18): MVP is read-only and
-/// no-cap. Garbage collection and writable rehydration are deferred to
-/// follow-up beads.
-pub fn rehydrate_sessions(events_dir: &std::path::Path, sessions: &Sessions) -> usize {
-    use mu_core::event_log::{EventPayload, SessionEventLog};
-    let outer = match std::fs::read_dir(events_dir) {
-        Ok(r) => r,
-        Err(_) => return 0,
-    };
-    let mut count = 0usize;
-    for daemon_entry in outer.flatten() {
-        let daemon_path = daemon_entry.path();
-        if !daemon_path.is_dir() {
-            continue;
-        }
-        let session_files = match std::fs::read_dir(&daemon_path) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        for f in session_files.flatten() {
-            let session_path = f.path();
-            if session_path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let (log, _malformed) = match SessionEventLog::from_jsonl(&session_path) {
-                Ok(loaded) => loaded,
-                Err(_) => continue,
-            };
-            // Pull parent_session_id from the SessionCreated event,
-            // matching FileBackend's discovery pattern (mu-031 tree
-            // queries traverse parents across the boundary).
-            let parent_session_id = log.snapshot().iter().find_map(|e| match &e.payload {
-                EventPayload::SessionCreated {
-                    parent_session_id, ..
-                } => parent_session_id.clone(),
-                _ => None,
-            });
-            let session_id = log.session_id().to_string();
-            sessions.insert_rehydrated(session_id, Arc::new(log), parent_session_id);
-            count += 1;
-        }
-    }
-    count
-}
+// mu-lazy-session-rehydration-bh4f: the startup bulk-rehydration pass
+// (mu-u1ld `rehydrate_sessions`) was removed. It parsed every on-disk
+// session log into the registry before `mu serve` was usable — O(thousands
+// of full JSONL parses) on a busy box. Rehydration is now request-driven:
+// `Sessions::event_log` lazily loads one log by id on first access, and
+// `sessions_index` enumerates cheaply (first record + mtime). See
+// `serve_with_io_with_config` and `crate::sessions_index`.
 
 /// mu-l1z: resolve the events directory from a loaded
 /// [`mu_core::config::Config`].
@@ -226,14 +174,17 @@ where
     R: AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let sessions = Sessions::new();
-    // mu-u1ld: rehydrate past sessions from on-disk event logs so
-    // `session.list`, `session.events`, and `session.stats` queries
-    // see them after a daemon restart. Read-only — no agent loop is
-    // spawned. No-op when events_dir is None.
-    if let Some(ref dir) = events_dir {
-        let _rehydrated = rehydrate_sessions(dir, &sessions);
-    }
+    // mu-lazy-session-rehydration-bh4f: the daemon no longer bulk-loads
+    // and parses every on-disk session log at startup (the old mu-u1ld
+    // `rehydrate_sessions` pass — O(thousands of full JSONL parses) before
+    // `mu serve` was usable). Rehydration is now request-driven:
+    //   - find-by-id (`resume` / `recover` / `session.events` /
+    //     `session.stats`) lazily loads the one matching log on first
+    //     access via `Sessions::event_log` — hence the events dir handed
+    //     to the registry here.
+    //   - enumeration (the standalone `mu list-sessions`) reads only each
+    //     log's first record + mtime (`sessions_index::scan_session_index`).
+    let sessions = Sessions::new_with_events_dir(events_dir.clone());
     // mu-7rk (mu-yox): build the connect-time auth registry from
     // `[auth]` config and allocate a fresh per-connection `AuthState`
     // handle. This `serve_with_io_with_config` call corresponds to one
@@ -549,79 +500,91 @@ mod tests {
     }
 
     #[test]
-    fn rehydrate_sessions_registers_jsonl_entries_as_read_only() {
-        // mu-u1ld: drop two daemon-dir JSONLs into a temp events_dir
-        // and verify rehydrate_sessions registers them both as
-        // read-only ghosts.
-        let events_dir = tempdir("rehydrate-two");
+    fn event_log_lazily_loads_past_session_from_disk() {
+        // mu-lazy-session-rehydration-bh4f: no startup rehydration. A
+        // past session is found-by-id and parsed on FIRST access, then
+        // cached as a read-only ghost — replacing the old bulk
+        // `rehydrate_sessions` pass.
+        let events_dir = tempdir("lazy-load");
         write_session_jsonl(
             &events_dir,
             "daemon-aaa",
             "session-prev-1",
             "anthropic_api",
             "haiku",
-            None,
-        );
-        write_session_jsonl(
-            &events_dir,
-            "daemon-bbb",
-            "session-prev-2",
-            "openai_codex",
-            "gpt-5",
-            Some("session-prev-1"),
+            Some("session-parent-0"),
         );
 
-        let sessions = Sessions::new();
-        let n = rehydrate_sessions(&events_dir, &sessions);
-        assert_eq!(n, 2, "both files should rehydrate");
+        let sessions = Sessions::new_with_events_dir(Some(events_dir.clone()));
+        // Nothing loaded up front — startup does no parsing.
+        assert!(sessions.snapshot_for_listing().is_empty());
 
+        // First access loads it from disk.
+        let log = sessions.event_log("session-prev-1").expect("lazy load");
+        assert_eq!(log.session_id(), "session-prev-1");
+
+        // Now cached: visible in the in-memory listing (with the parent
+        // ref carried from SessionCreated), and a second lookup returns
+        // the SAME Arc rather than re-reading the file.
         let listing = sessions.snapshot_for_listing();
-        assert_eq!(listing.len(), 2);
-        // Parent reference comes through from SessionCreated.
-        let by_id: std::collections::HashMap<_, _> = listing
-            .iter()
-            .map(|(id, _, p)| (id.clone(), p.clone()))
-            .collect();
-        assert_eq!(by_id["session-prev-1"], None);
-        assert_eq!(by_id["session-prev-2"], Some("session-prev-1".to_string()));
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing[0].2, Some("session-parent-0".to_string()));
+        let again = sessions.event_log("session-prev-1").expect("cached");
+        assert!(Arc::ptr_eq(&log, &again), "second lookup hits the cache");
 
-        // Live-state queries return None — rehydrated sessions are
-        // read-only.
+        // Live-state queries stay None — it's a read-only ghost.
         assert!(sessions.input_sender("session-prev-1").is_none());
 
         let _ = std::fs::remove_dir_all(&events_dir);
     }
 
     #[test]
-    fn rehydrate_sessions_returns_zero_when_events_dir_missing() {
-        let sessions = Sessions::new();
-        let n = rehydrate_sessions(std::path::Path::new("/nonexistent/path/mu-u1ld"), &sessions);
-        assert_eq!(n, 0);
-    }
-
-    #[test]
-    fn rehydrate_sessions_skips_non_jsonl_files_and_loose_files_in_events_root() {
-        // events_dir has an unrelated file at the top level (not a
-        // subdir) and a non-jsonl file inside a daemon dir. Both
-        // should be ignored without erroring.
-        let events_dir = tempdir("rehydrate-skip");
-        std::fs::write(events_dir.join("README.txt"), "not a daemon dir").unwrap();
-        let daemon_dir = events_dir.join("daemon-xxx");
-        std::fs::create_dir_all(&daemon_dir).unwrap();
-        std::fs::write(daemon_dir.join("note.txt"), "not a session log").unwrap();
+    fn event_log_unknown_id_returns_none_even_with_events_dir() {
+        let events_dir = tempdir("lazy-miss");
         write_session_jsonl(
             &events_dir,
-            "daemon-xxx",
-            "session-keepme",
+            "daemon-aaa",
+            "session-real",
             "anthropic_api",
             "haiku",
             None,
         );
+        let sessions = Sessions::new_with_events_dir(Some(events_dir.clone()));
+        assert!(sessions.event_log("session-does-not-exist").is_none());
+        let _ = std::fs::remove_dir_all(&events_dir);
+    }
 
+    #[test]
+    fn event_log_no_events_dir_means_no_disk_fallback() {
+        // Tests / ephemeral daemons construct Sessions without an events
+        // dir; the lazy fallback is a no-op (no disk touched).
         let sessions = Sessions::new();
-        let n = rehydrate_sessions(&events_dir, &sessions);
-        assert_eq!(n, 1);
-        assert!(sessions.event_log("session-keepme").is_some());
+        assert!(sessions.event_log("anything").is_none());
+    }
+
+    #[test]
+    fn event_log_in_memory_does_not_lazy_load() {
+        // gpt-5.5 review: mutating callers (session.close) use the
+        // in-memory lookup, which must NOT resurrect a past on-disk
+        // session — otherwise close would append a no-op SessionClosed to
+        // a ghost and report closed=true for something never live.
+        let events_dir = tempdir("in-memory-no-disk");
+        write_session_jsonl(
+            &events_dir,
+            "daemon-a",
+            "session-disk",
+            "anthropic_api",
+            "haiku",
+            None,
+        );
+        let sessions = Sessions::new_with_events_dir(Some(events_dir.clone()));
+
+        // In-memory lookup never touches disk → miss for an uncached log.
+        assert!(sessions.event_log_in_memory("session-disk").is_none());
+        // The lazy accessor does find + cache it.
+        assert!(sessions.event_log("session-disk").is_some());
+        // Now cached, the in-memory lookup sees it.
+        assert!(sessions.event_log_in_memory("session-disk").is_some());
 
         let _ = std::fs::remove_dir_all(&events_dir);
     }

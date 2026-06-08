@@ -111,3 +111,45 @@ default_model    = "claude-haiku-4-5-20251001"
 # CLI flags (e.g. --max-budget-usd). Unset = no warning.
 # api_key_daily_warn_usd  = 10
 # api_key_weekly_warn_usd = 30
+
+
+# ── Recall (session-start context) ────────────────────────────────
+# Controls what mu injects into a session's context at start. The
+# providers run in order: bootloader preamble (off by default), the
+# agent-memory kernel, then the project files (MU.md / AGENTS.md from
+# the cwd, then <config-dir>/mu/). Defaults below match shipped behavior.
+
+[recall]
+# Master switch for ALL session-start injection. false = discover-on-demand
+# (no front-loaded context at all, including project files).
+enabled = true
+
+# Memory-injection tier passed to the agent-memory CLI
+# (`agent memory context --tier <this>`): "identity" (default) = the small
+# user-identity kernel; "full" = the larger four-section memory wall.
+tier = "identity"
+
+# Toggle the agent-memory provider INDEPENDENTLY of the project files.
+# true (default) injects the agent.sqlite-backed kernel. Set false to run
+# with ONLY the file-based project context (MU.md / AGENTS.md) and no
+# memory injection — without turning off all recall (enabled = false).
+memory = true
+
+# Path to the memory CLI the agent-memory provider invokes. Unset (default)
+# uses ~/.local/bin/agent. Set this to point mu at a different binary
+# instead of relying on that hardcoded path.
+# memory_command = "/usr/local/bin/agent"
+
+# First-position "this is startup orientation, not the task" preamble.
+# false (default) = no preamble. The MU_RECALL_BOOTLOADER=0/1 env var
+# overrides this per-session.
+bootloader = false
+
+# Override text for the bootloader preamble. Unset = the built-in wording.
+# Only consulted when bootloader = true.
+# bootloader_text = "## Bootloader\n..."
+
+# Hermetic mode: recall off AND the discovery bootstrap suppressed, so a
+# session gets NO mu-injected system content. Set by `mu ask/serve --bare`;
+# here for completeness.
+bare = false

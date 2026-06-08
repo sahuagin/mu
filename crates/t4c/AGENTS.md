@@ -36,7 +36,9 @@ catalog entry is portable metadata; correctness is per-environment.
 ## Adding a tool
 
 1. **Pick scope:** everyone/everywhere → `curated.default.toml`; just me / this
-   host → `~/.config/t4c/overrides.toml`. Same grammar either way.
+   host → `~/.config/t4c/overrides.toml`. Same grammar either way. For the
+   override case there's a copy-me, field-annotated starter at
+   `.mu/defaults/t4c.overrides.toml` (`cp` it to `~/.config/t4c/overrides.toml`).
 2. **Write the entry:**
    ```toml
    [[capability]]

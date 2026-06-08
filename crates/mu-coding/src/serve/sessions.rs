@@ -5,6 +5,7 @@
 //! lock-then-clone-then-drop pattern.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -135,6 +136,16 @@ pub struct Sessions {
     inner: Arc<Mutex<HashMap<String, SessionState>>>,
     workers: Arc<Mutex<HashMap<String, SubprocessSession>>>,
     rehydrated: Arc<Mutex<HashMap<String, RehydratedSession>>>,
+    /// On-disk events root. Not hardcoded here — it's resolved elsewhere
+    /// and handed in at construction: `serve::resolve_events_dir(config)`
+    /// derives it from `[session].state_dir` (overridable) and
+    /// `[session].persist_events_to_disk`, falling back to
+    /// `serve::default_events_dir()`. Enables [`event_log`](Self::event_log)'s
+    /// lazy find-by-id fallback: a past session is loaded from disk (and
+    /// cached) the first time it's addressed, rather than the daemon
+    /// bulk-rehydrating every log at startup (mu-lazy-session-rehydration-bh4f).
+    /// `None` when persistence is off (tests / ephemeral) → no disk fallback.
+    events_dir: Option<PathBuf>,
 }
 
 /// A non-owning handle to the session registry (mu-qc08).
@@ -154,6 +165,7 @@ pub struct WeakSessions {
     inner: Weak<Mutex<HashMap<String, SessionState>>>,
     workers: Weak<Mutex<HashMap<String, SubprocessSession>>>,
     rehydrated: Weak<Mutex<HashMap<String, RehydratedSession>>>,
+    events_dir: Option<PathBuf>,
 }
 
 impl WeakSessions {
@@ -165,6 +177,7 @@ impl WeakSessions {
             inner: self.inner.upgrade()?,
             workers: self.workers.upgrade()?,
             rehydrated: self.rehydrated.upgrade()?,
+            events_dir: self.events_dir.clone(),
         })
     }
 }
@@ -191,10 +204,23 @@ pub struct NewSession {
 
 impl Sessions {
     pub fn new() -> Self {
+        Self::new_with_events_dir(None)
+    }
+
+    /// Construct a registry that knows its on-disk events root, enabling
+    /// [`event_log`](Self::event_log)'s lazy find-by-id fallback
+    /// (mu-lazy-session-rehydration-bh4f). Production (`mu serve`) passes
+    /// the resolved events dir; tests / ephemeral daemons pass `None`.
+    ///
+    /// NOTE: `events_dir` is a plain (immutable) field, not shared across
+    /// clones, so it must be set at construction — before the registry is
+    /// cloned into the discovery backends and handler tasks.
+    pub fn new_with_events_dir(events_dir: Option<PathBuf>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
             rehydrated: Arc::new(Mutex::new(HashMap::new())),
+            events_dir,
         }
     }
 
@@ -206,6 +232,7 @@ impl Sessions {
             inner: Arc::downgrade(&self.inner),
             workers: Arc::downgrade(&self.workers),
             rehydrated: Arc::downgrade(&self.rehydrated),
+            events_dir: self.events_dir.clone(),
         }
     }
 
@@ -342,28 +369,102 @@ impl Sessions {
             .collect()
     }
 
-    /// Look up a session's event log. Returns None if the session
-    /// doesn't exist in either the live or rehydrated map. Live wins
-    /// on ID collision. Same lock-then-clone-then-drop pattern as
-    /// `input_sender`.
+    /// Look up a session's event log in memory only — live wins on ID
+    /// collision, then workers, then already-cached rehydrated entries.
+    /// Does NOT touch disk. Mutating callers that must not resurrect a
+    /// read-only ghost from disk just to act on it (e.g. `session.close`,
+    /// which appends `SessionClosed` then removes) use THIS rather than
+    /// [`event_log`](Self::event_log). Same lock-then-clone-then-drop
+    /// pattern as `input_sender`. (mu-lazy-session-rehydration-bh4f)
+    pub fn event_log_in_memory(&self, id: &str) -> Option<Arc<SessionEventLog>> {
+        if let Ok(map) = self.inner.lock() {
+            if let Some(s) = map.get(id) {
+                return Some(s.event_log.clone());
+            }
+        }
+        if let Ok(map) = self.workers.lock() {
+            if let Some(s) = map.get(id) {
+                return Some(s.event_log.clone());
+            }
+        }
+        if let Ok(map) = self.rehydrated.lock() {
+            if let Some(s) = map.get(id) {
+                return Some(s.event_log.clone());
+            }
+        }
+        None
+    }
+
+    /// Look up a session's event log, with a lazy find-by-id load from
+    /// disk on a full in-memory miss (mu-lazy-session-rehydration-bh4f):
+    /// the daemon no longer bulk-rehydrates every log at startup, so a
+    /// past session is parsed (and cached for next time) the first time
+    /// it's actually addressed — by the READ-ONLY `resume` / `recover` /
+    /// `session.events` / `session.stats` paths, all of which already
+    /// have the id. Returns None if the session exists nowhere. The disk
+    /// read happens after all in-memory locks are dropped.
     pub fn event_log(&self, id: &str) -> Option<Arc<SessionEventLog>> {
-        if let Some(log) = self.inner.lock().ok()?.get(id).map(|s| s.event_log.clone()) {
-            return Some(log);
+        self.event_log_in_memory(id)
+            .or_else(|| self.lazy_load_from_disk(id))
+    }
+
+    /// Find a past session's `<daemon>/<id>.jsonl` on disk, parse it once,
+    /// cache it as a read-only rehydrated entry, and return it. `None`
+    /// when no events dir is configured (tests / ephemeral) or no log
+    /// with that id exists. The targeted find ([`find_session_path`])
+    /// touches only daemon-dir metadata — it never enumerates or parses
+    /// the other logs. (mu-lazy-session-rehydration-bh4f)
+    ///
+    /// [`find_session_path`]: crate::sessions_index::find_session_path
+    fn lazy_load_from_disk(&self, id: &str) -> Option<Arc<SessionEventLog>> {
+        let dir = self.events_dir.as_ref()?;
+        let path = crate::sessions_index::find_session_path(dir, id)?;
+        let (log, malformed) = match SessionEventLog::from_jsonl(&path) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                // Don't swallow I/O failures silently — a present-but-
+                // unreadable log surfacing as "session not found" hides a
+                // real defect (e.g. a ragged log the resume path should
+                // diagnose). mu-lazy-session-rehydration-bh4f.
+                tracing::warn!(
+                    session_id = id,
+                    path = %path.display(),
+                    error = %e,
+                    "lazy session load: failed to read on-disk event log",
+                );
+                return None;
+            }
+        };
+        if malformed > 0 {
+            tracing::warn!(
+                session_id = id,
+                path = %path.display(),
+                malformed,
+                "lazy session load: skipped malformed event-log line(s)",
+            );
         }
-        if let Some(log) = self
-            .workers
-            .lock()
-            .ok()?
-            .get(id)
-            .map(|s| s.event_log.clone())
-        {
-            return Some(log);
+        let log = Arc::new(log);
+        // A concurrent first-access may have parsed + cached the same id
+        // while we were reading. Prefer the already-cached Arc so repeat
+        // lookups stay pointer-stable and we don't double-insert (the two
+        // parses are equal for a dead session, so this is purely to avoid
+        // wasted work + an Arc-identity surprise). (qwen review #1)
+        if let Some(existing) = self.event_log_in_memory(id) {
+            return Some(existing);
         }
-        self.rehydrated
-            .lock()
-            .ok()?
-            .get(id)
-            .map(|s| s.event_log.clone())
+        // Pull parent_session_id from the SessionCreated record so cached
+        // tree-queries match the old bulk-rehydration behavior. Cached
+        // under the queried id (what every caller addresses it by), not
+        // the log's internal session_id — so repeat lookups by that id
+        // hit the cache even if a renamed file's content id drifted.
+        let parent_session_id = log.snapshot().iter().find_map(|e| match &e.payload {
+            mu_core::event_log::EventPayload::SessionCreated {
+                parent_session_id, ..
+            } => parent_session_id.clone(),
+            _ => None,
+        });
+        self.insert_rehydrated(id.to_string(), log.clone(), parent_session_id);
+        Some(log)
     }
 
     /// Take a pending-approval oneshot off the session's registry

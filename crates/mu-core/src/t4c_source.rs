@@ -18,8 +18,9 @@
 use std::sync::Arc;
 
 use t4c::{
-    CapPath, Capability, ConfigEmbedder, Effects, Embedder, FsEffect, LexicalRanker, Ranked,
-    Ranker, Registry, RegistrySource, SemanticRanker, SessionConstraints, Tree, VectorCache,
+    CapPath, Capability, ConfigEmbedder, Effects, Embedder, EnvCatalogSource, FsEffect,
+    LexicalRanker, Ranked, Ranker, Registry, RegistrySource, SemanticRanker, SessionConstraints,
+    Tree, VectorCache,
 };
 
 use crate::agent::tool::{SideEffects, Tool, ToolPolicy};
@@ -110,14 +111,25 @@ impl RegistrySource for MuRegistrySource {
 }
 
 /// Assemble mu's live capability manifest: registered tools + discovered skills
-/// projected into one t4c [`Registry`]. Pass an already-attenuated tool slice so
-/// discovery tracks permission. Build the returned registry into a [`Tree`] to
-/// query it — this is the in-process Layer-1 manifest, the same shape the CLI
-/// builds from a curated catalog but sourced from mu's runtime (mu-kex4.6.4).
+/// projected into one t4c [`Registry`], plus the curated host-CLI catalog
+/// ([`EnvCatalogSource`] = curated ∩ installed). Pass an already-attenuated tool
+/// slice so discovery tracks permission. Build the returned registry into a
+/// [`Tree`] to query it — this is the in-process Layer-1 manifest, the same shape
+/// the CLI builds from a curated catalog but sourced from mu's runtime
+/// (mu-kex4.6.4).
+///
+/// Three sources, three path prefixes the model can tell apart: `tool.*` (native
+/// tools, call directly), `skill.*` (skills), `bash.*` (host CLIs — run via the
+/// `bash` tool). Merging the host catalog (mu-ndo2) means `discover` is the single
+/// discovery affordance spanning session *and* host capabilities — the same engine
+/// the `t4c` CLI uses, just over both source sets. The host catalog is cheap
+/// (curated ∩ installed); it is *not* permission-attenuated here (host CLIs are
+/// gated by the `bash` tool's own allowlist, not mu's tool-capability axis).
 pub fn build_manifest(tools: &[Arc<dyn Tool>], skills: &[LoadedSkill]) -> Registry {
     let mut reg = Registry::new();
     reg.add_source(Box::new(MuRegistrySource::from_tools(tools)));
     reg.add_source(Box::new(MuRegistrySource::from_skills(skills)));
+    reg.add_source(Box::new(EnvCatalogSource));
     reg
 }
 
@@ -433,6 +445,26 @@ mod tests {
         // in-process => no shell invoke/help
         assert!(c.invoke.is_empty());
         assert!(c.help.is_none());
+    }
+
+    #[test]
+    fn build_manifest_merges_host_cli_catalog_under_bash_prefix() {
+        // mu-ndo2: discover spans session tools/skills AND host CLIs. The host
+        // catalog is `curated ∩ installed`, so self-gate on what's actually
+        // present here — assert the flow-through only when host tools exist
+        // (keeps the test non-flaky across CI/dev machines).
+        let host = EnvCatalogSource
+            .capabilities()
+            .expect("env catalog capabilities");
+        if host.is_empty() {
+            return; // no curated host CLI installed in this environment
+        }
+        let reg = build_manifest(&[], &[]);
+        let tree = reg.build().expect("build manifest");
+        assert!(
+            tree.all().any(|c| c.path.to_string().starts_with("bash.")),
+            "host catalog (bash.*) should flow through build_manifest when installed"
+        );
     }
 
     #[test]

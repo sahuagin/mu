@@ -30,17 +30,35 @@ INPUT
 USAGE
   cargo run --release --example compaction-fixtures -p mu-ai -- \
       ~/.local/share/mu/events/<daemon>/<session>.jsonl 3000 > fixtures.json
+
+  # A/B settings PROFILES on one base model (recommended — no Modelfile
+  # variants; every sampling param is a per-request option):
   python3 scripts/compaction_probe.py \
       --fixtures fixtures.json \
       --probes scripts/compaction_probes/<session>.json \
-      --models qwen3.6-det qwen3.6-code \
-      --judge-model qwen3.6-det
+      --runs scripts/compaction_probes/runs-qwen3.6-sampling-ab.json \
+      --judge-model qwen3.6-det:latest
 
-DETERMINISM (per memory 6679bf86): reproducibility for these qwen3.6
-variants comes from a FIXED SEED, not temperature, and `num_ctx` is a
-LOAD-TIME Modelfile setting — so by default we do NOT send `num_ctx`
-(sending it can force a reload). Run the ollama server with
-OLLAMA_NUM_PARALLEL=1 for serial, batch-deterministic decoding.
+  # ...or one run per named model, each using its OWN Modelfile defaults:
+  python3 scripts/compaction_probe.py --fixtures fixtures.json \
+      --probes ... --models qwen3.6-det:latest --judge-model qwen3.6-det:latest
+
+SETTINGS ARE PER-REQUEST. Anything a Modelfile bakes with PARAMETER
+(temperature, seed, top_p, top_k, min_p, presence_penalty, repeat_penalty,
+num_predict, num_ctx, ...) can be sent in the ollama `options` field — so a
+settings A/B needs NO model variants, just different `--runs` profiles
+against one base model. CAVEAT: a profile inherits the base model's other
+defaults, so set the full set you care about (base qwen3.6 ships
+presence_penalty 1.5 — a codegen footgun — so profiles set it explicitly).
+
+DETERMINISM (per memory 6679bf86): reproducibility comes from a FIXED SEED,
+not temperature; `--models` runs do NOT send temperature/seed/num_ctx
+unless you pass them (no silent temperature override — each model uses its
+Modelfile value), and `--runs` profiles send exactly what they declare. A
+different `num_ctx` than the loaded instance forces a reload, so hold it
+constant across profiles. `num_predict` caps a degenerate temp-0
+thinking-loop cheaply. Run the ollama server with OLLAMA_NUM_PARALLEL=1 for
+serial, batch-deterministic decoding.
 """
 
 from __future__ import annotations
@@ -101,16 +119,21 @@ def chat(
     system: str,
     user: str,
     *,
-    seed: int,
-    temperature: float,
-    num_ctx: int | None,
+    options: dict[str, Any],
     force_json: bool,
     timeout: int,
 ) -> tuple[str, dict[str, Any]]:
-    """One non-streaming /api/chat call. Returns (text, raw_response)."""
-    options: dict[str, Any] = {"temperature": temperature, "seed": seed}
-    if num_ctx is not None:
-        options["num_ctx"] = num_ctx
+    """One non-streaming /api/chat call. Returns (text, raw_response).
+
+    `options` is sent verbatim as the ollama per-request sampling profile
+    (temperature, seed, top_p, top_k, min_p, presence_penalty,
+    repeat_penalty, num_predict, num_ctx, ...). Anything a Modelfile can
+    bake with PARAMETER can be sent here — so a settings A/B needs no
+    model variants, just different `options` against the same base model.
+    An empty dict means "use the model's own (Modelfile) defaults". NOTE:
+    a partial profile inherits the base model's other defaults — e.g.
+    base qwen3.6 ships presence_penalty 1.5, so a profile that cares about
+    codegen must set presence_penalty explicitly to neutralize it."""
     payload: dict[str, Any] = {
         "model": model,
         "messages": [
@@ -163,20 +186,59 @@ def extract_verdict(raw: str) -> tuple[str, str]:
         return "unparsed", repr(exc)
 
 
+def build_runs(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """The list of `(label, model, options)` runs to probe with.
+
+    Two ways to specify the A/B axis:
+    - `--runs FILE`: explicit settings PROFILES — `{"runs":[{"label","model",
+      "options":{...}}]}`. This is the way to A/B *settings* on one base
+      model with no Modelfile variants (each profile sends its full ollama
+      options verbatim). `label` defaults to `model`; `options` to `{}`.
+    - `--models M [M ...]`: one run per model. Options are synthesized ONLY
+      from explicitly-passed `--temperature`/`--seed`/`--num-ctx`; when none
+      are passed, options stay empty so each model uses its own Modelfile
+      defaults (no silent temperature override)."""
+    if args.runs:
+        with open(args.runs) as fh:
+            doc = json.load(fh)
+        runs = doc["runs"]
+        for r in runs:
+            r.setdefault("label", r["model"])
+            r.setdefault("options", {})
+        return runs
+    opts: dict[str, Any] = {}
+    if args.temperature is not None:
+        opts["temperature"] = args.temperature
+    if args.seed is not None:
+        opts["seed"] = args.seed
+    if args.num_ctx is not None:
+        opts["num_ctx"] = args.num_ctx
+    return [{"label": m, "model": m, "options": dict(opts)} for m in args.models]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--fixtures", required=True, help="RopeFixture JSON (from compaction-fixtures)")
     ap.add_argument("--probes", required=True, help="probe-set JSON")
-    ap.add_argument("--models", nargs="+", required=True, help="downstream model(s) to A/B")
-    ap.add_argument("--judge-model", required=True, help="model that grades answers")
+    ap.add_argument("--models", nargs="+", help="downstream model(s); one run each, using each model's Modelfile defaults unless --temperature/--seed/--num-ctx are set")
+    ap.add_argument("--runs", help="JSON file of explicit settings profiles {runs:[{label,model,options}]} — the way to A/B settings on one base model")
+    ap.add_argument("--judge-model", required=True, help="model that grades answers (graded deterministically: temp 0, seed 42)")
     ap.add_argument("--ollama", default=DEFAULT_OLLAMA)
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="seed for --models runs (default: omit — use the model's Modelfile value)")
+    ap.add_argument("--temperature", type=float, default=None,
+                    help="temperature for --models runs (default: omit — use the model's Modelfile value; do NOT silently force 0)")
     ap.add_argument("--num-ctx", type=int, default=None,
-                    help="override num_ctx (default: omit — use the model's load-time Modelfile value)")
-    ap.add_argument("--timeout", type=int, default=900)
+                    help="num_ctx for --models runs (default: omit — use the load-time Modelfile value; a different value forces a reload)")
+    ap.add_argument("--timeout", type=int, default=300,
+                    help="per-call timeout in seconds (default 300; a degenerate generation caps here as an unparsed record instead of hanging)")
     ap.add_argument("--out", default=None, help="write full results JSON here (default: stdout only summary)")
     args = ap.parse_args()
+    if not args.models and not args.runs:
+        ap.error("provide --models and/or --runs")
+
+    runs = build_runs(args)
+    judge_options: dict[str, Any] = {"temperature": 0, "seed": 42}
 
     with open(args.fixtures) as fh:
         fixtures = json.load(fh)
@@ -200,7 +262,8 @@ def main() -> int:
               f"!= fixtures target_tokens={fx_target}", file=sys.stderr)
 
     results: list[dict[str, Any]] = []
-    for model in args.models:
+    for run in runs:
+        label, model, options = run["label"], run["model"], run["options"]
         for policy, fixture in by_policy.items():
             context = build_context(fixture)
             for probe in probes:
@@ -209,15 +272,15 @@ def main() -> int:
                 try:
                     answer, _ = chat(
                         args.ollama, model, ANSWER_SYSTEM, user,
-                        seed=args.seed, temperature=args.temperature,
-                        num_ctx=args.num_ctx, force_json=False, timeout=args.timeout,
+                        options=options, force_json=False, timeout=args.timeout,
                     )
                     ans_err = None
                 except CALL_ERRORS as exc:
                     answer, ans_err = "", repr(exc)
                 elapsed = time.time() - started
 
-                # Judge (skip if the answer call failed).
+                # Judge (skip if the answer call failed). Graded
+                # deterministically regardless of the run's own profile.
                 verdict, reason = "unparsed", ans_err or ""
                 if ans_err is None:
                     judge_user = (
@@ -228,8 +291,7 @@ def main() -> int:
                     try:
                         jraw, _ = chat(
                             args.ollama, args.judge_model, JUDGE_SYSTEM, judge_user,
-                            seed=args.seed, temperature=0.0,
-                            num_ctx=args.num_ctx, force_json=True, timeout=args.timeout,
+                            options=judge_options, force_json=True, timeout=args.timeout,
                         )
                         verdict, reason = extract_verdict(jraw)
                     except CALL_ERRORS as exc:
@@ -237,7 +299,9 @@ def main() -> int:
 
                 fate = target_fate(fixture, probe["target_span_id"])
                 rec = {
-                    "model": model,
+                    "model": label,
+                    "base_model": model,
+                    "options": options,
                     "policy": policy,
                     "probe_id": probe["id"],
                     "target_span_id": probe["target_span_id"],
@@ -248,7 +312,7 @@ def main() -> int:
                     "judge_reason": reason,
                 }
                 results.append(rec)
-                print(f"  {model:18} {policy:26} {probe['id']:12} "
+                print(f"  {label:18} {policy:26} {probe['id']:12} "
                       f"fate={fate:10} -> {verdict}", file=sys.stderr)
 
     # Aggregate: correctness per (model, policy) and per (model, policy, fate).
@@ -280,9 +344,8 @@ def main() -> int:
                 "run_at": datetime.now(timezone.utc).isoformat(),
                 "fixtures": args.fixtures,
                 "probes": args.probes,
-                "models": args.models,
+                "runs": runs,
                 "judge_model": args.judge_model,
-                "seed": args.seed,
                 "results": results,
                 "summary": summary,
             }, fh, indent=2)

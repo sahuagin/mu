@@ -652,6 +652,12 @@ impl App {
         let mut render_interval = tokio::time::interval(Duration::from_millis(100));
         let mut mcp_rx = self.mcp_status_rx.take();
 
+        if self.fullscreen {
+            // Capture the wheel so scrolling drives `transcript_scroll` (a clean
+            // full repaint) instead of kitty's alt-screen frame-history, which
+            // composites stale frames into "mergers" (mu-5h9m).
+            crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+        }
         loop {
             if self.fullscreen {
                 self.render_fullscreen(&mut vp)?;
@@ -719,6 +725,19 @@ impl App {
                         Some(Ok(Event::FocusLost)) => {
                             self.terminal_focused = false;
                         }
+                        Some(Ok(Event::Mouse(me))) if self.fullscreen => {
+                            match me.kind {
+                                crossterm::event::MouseEventKind::ScrollUp => {
+                                    self.transcript_scroll =
+                                        self.transcript_scroll.saturating_add(3);
+                                }
+                                crossterm::event::MouseEventKind::ScrollDown => {
+                                    self.transcript_scroll =
+                                        self.transcript_scroll.saturating_sub(3);
+                                }
+                                _ => {}
+                            }
+                        }
                         Some(Err(e)) => {
                             tracing::warn!("crossterm event error: {e}");
                         }
@@ -729,6 +748,9 @@ impl App {
                 // Periodic render tick — updates elapsed time display.
                 _ = render_interval.tick() => {}
             }
+        }
+        if self.fullscreen {
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
         }
         Ok(())
     }

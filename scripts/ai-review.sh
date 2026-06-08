@@ -37,12 +37,12 @@
 # Process-layer auditors / correlation: bead mu-pr6r.
 #
 # Env:
-#   Reviewer 1 (default ollama / qwen3-coder:30b):
+#   Reviewer 1 (default ollama / qwen-orch):
 #     MU_REVIEW_PROVIDER        provider (default: ollama; codex = openai-codex)
-#     MU_REVIEW_MODEL           model    (default: qwen3-coder:30b)
-#   Reviewer 2 (default ollama / gpt-oss:20b):
+#     MU_REVIEW_MODEL           model    (default: qwen-orch — baked qwen3.6:27b@131072)
+#   Reviewer 2 (default ollama / gpt-oss-rev):
 #     MU_REVIEW_PROVIDER_2      provider (default: ollama)
-#     MU_REVIEW_MODEL_2         model    (default: gpt-oss:20b)
+#     MU_REVIEW_MODEL_2         model    (default: gpt-oss-rev — baked gpt-oss:20b@49152)
 #   Shared:
 #     MU_REVIEW_TOOLS           reviewer tools, e.g. "read,grep" (default: none, single-shot)
 #     MU_REVIEW_BASE            base ref to diff against (default: main)
@@ -62,17 +62,23 @@ set -u
 set -o pipefail
 
 # Both reviewers default to local ollama: free, reliable, non-Claude second/third
-# opinions, both warm on the box (24h keep-alive, memory 3d973420) and co-resident
-# in 48GB. qwen3-coder:30b and gpt-oss:20b have inverted strengths (see header) —
-# the panel keeps both. codex/gpt-5.5 is a stronger reviewer when its OAuth is
+# opinions, warm on the box (24h keep-alive) and CO-RESIDENT in 48GB. They are the
+# BAKED, context-pinned models qwen-orch (qwen3.6:27b @ num_ctx 131072) and
+# gpt-oss-rev (gpt-oss:20b @ 49152), created from scripts/ollama/ — NOT the base
+# tags. WHY BAKED: mu talks to ollama over the Anthropic wire (mu-fmas) which sends
+# no num_ctx, so a base tag loads at the server default (262144), bloats and EVICTS
+# its co-resident partner — model thrash on every review (terrain-verified 2026-06-08,
+# memory a721c14d). Baking pins each model's context so both stay resident. gpt-oss
+# leads single-shot review recall; qwen3.6:27b is the agentic/precision counterweight
+# — the panel keeps both. codex/gpt-5.5 is a stronger reviewer when its OAuth is
 # healthy; point either slot at it with MU_REVIEW_PROVIDER[_2]=openai-codex
 # MU_REVIEW_MODEL[_2]=gpt-5.5. It is NOT a default because its OAuth refresh was
 # failing at build time (bead mu-cea). Bench provenance:
 # ~/src/public_github/code-review-bench/reports/NOTES.md.
 PROVIDER="${MU_REVIEW_PROVIDER:-ollama}"
-MODEL="${MU_REVIEW_MODEL:-qwen3-coder:30b}"
+MODEL="${MU_REVIEW_MODEL:-qwen-orch}"
 PROVIDER2="${MU_REVIEW_PROVIDER_2:-ollama}"
-MODEL2="${MU_REVIEW_MODEL_2:-gpt-oss:20b}"
+MODEL2="${MU_REVIEW_MODEL_2:-gpt-oss-rev}"
 TOOLS="${MU_REVIEW_TOOLS:-}"   # empty = single-shot (default); e.g. "read,grep" lets the reviewer inspect surrounding code (slower, multi-turn)
 BASE="${MU_REVIEW_BASE:-main}"
 LOG="${MU_REVIEW_LOG:-$HOME/.local/share/mu/review-events.jsonl}"

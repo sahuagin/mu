@@ -8,9 +8,14 @@ the source of truth — the in-memory `Vec<SessionEvent>` is a projection that
 can be rebuilt from the log. This is write-ahead, not write-back: no event
 exists in memory that isn't already durable on disk.
 
-Rehydration (rebuilding session state from persisted logs on daemon restart)
-is implemented. Live session resumption (re-attaching a frontend to a
-rehydrated session and continuing the agent loop) is not yet implemented.
+Rehydration (rebuilding session state from a persisted log) is request-driven,
+not a startup pass (mu-lazy-session-rehydration-bh4f): `mu serve` parses nothing
+on cold start. A past session is loaded lazily, by id, the first time it's
+addressed (`resume`/`recover`/`session.events`/`session.stats` via
+`Sessions::event_log`); enumeration is the offline `mu list-sessions` (reads
+each log's first record + mtime only — see `sessions_index`). Live session
+resumption (re-attaching a frontend to a rehydrated session and continuing the
+agent loop) is not yet implemented.
 
 ## Code search
 

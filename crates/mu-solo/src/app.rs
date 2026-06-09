@@ -751,6 +751,49 @@ impl App {
         let layout = self.prompt.visual_layout(wrap);
         let mut chrome: Vec<Line<'static>> = Vec::new();
         chrome.push(Line::from("─".repeat(width)));
+        // Slash-command dropdown above the prompt (mu-5h9m: was missing in
+        // fullscreen). Mirrors render_viewport.
+        if let Some(ref menu) = self.inline_menu {
+            let (visible, cursor_pos, has_above, has_below) = menu.visible_items();
+            if has_above {
+                chrome.push(Line::from(Span::styled(
+                    "  ↑ more".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            for (vi, (_orig_idx, item)) in visible.iter().enumerate() {
+                let is_selected = vi == cursor_pos;
+                let name_width = 24.min(width / 3);
+                let desc_width = width.saturating_sub(name_width + 4);
+                let name_padded = format!("{:<width$}", item.name, width = name_width);
+                let desc_trunc = if item.description.len() > desc_width {
+                    format!("{}…", &item.description[..desc_width.saturating_sub(1)])
+                } else {
+                    item.description.clone()
+                };
+                let (name_style, desc_style) = if is_selected {
+                    (
+                        Style::default().fg(Color::Black).bg(Color::Cyan),
+                        Style::default().fg(Color::DarkGray).bg(Color::Cyan),
+                    )
+                } else {
+                    (
+                        Style::default().fg(Color::White),
+                        Style::default().fg(Color::DarkGray),
+                    )
+                };
+                chrome.push(Line::from(vec![
+                    Span::styled(format!("  {name_padded}"), name_style),
+                    Span::styled(format!(" {desc_trunc}"), desc_style),
+                ]));
+            }
+            if has_below {
+                chrome.push(Line::from(Span::styled(
+                    "  ↓ more".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
         // Prompt with a visible (inverted-block) cursor at the caret, since
         // fullscreen hides the terminal cursor (mu-5h9m).
         let cursor_style = Style::default().fg(Color::Black).bg(Color::Cyan);

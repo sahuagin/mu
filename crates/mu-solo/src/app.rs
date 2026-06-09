@@ -776,13 +776,17 @@ impl App {
                 (TranscriptKind::User, _) => {
                     tlines.extend(render::you_block(&block.body, bwrap))
                 }
-                (TranscriptKind::Assistant, Some(items)) => tlines.extend(render::render_turn(
-                    &block.label,
-                    ratatui::style::Color::White,
-                    items,
-                    bwrap,
-                    preview,
-                )),
+                (TranscriptKind::Assistant, Some(items)) => {
+                    tlines.extend(render::render_turn(
+                        &block.label,
+                        ratatui::style::Color::White,
+                        items,
+                        bwrap,
+                        preview,
+                    ));
+                    // Committed turns get the closer (the live turn stays open).
+                    tlines.extend(render::turn_closer(ratatui::style::Color::White));
+                }
                 (TranscriptKind::Assistant, None) | (TranscriptKind::Notice, _) => {
                     tlines.extend(render::assistant_block(&block.body, bwrap))
                 }
@@ -1147,6 +1151,11 @@ impl App {
             }
             (KeyModifiers::NONE, KeyCode::PageDown) if self.fullscreen => {
                 self.transcript_scroll = self.transcript_scroll.saturating_sub(10);
+            }
+            // ctrl+s: dump the record into $EDITOR (hx) — keyboard copy-out
+            // that works in fullscreen (mu-5h9m), like the zellij `ctrl+s e`.
+            (KeyModifiers::CONTROL, KeyCode::Char('s')) => {
+                self.open_in_editor(vp)?;
             }
             (_, KeyCode::Char('c')) if self.prompt.is_empty() && self.selected_block.is_some() => {
                 self.apply_block_action(vp, BlockAction::Copy)?;
@@ -2121,6 +2130,32 @@ impl App {
     /// /transcript [PATH] — write the semantic transcript projection to a file.
     /// Bare command writes to a temp file and prints the path. This reads the
     /// in-memory semantic record, not rendered terminal cells.
+    /// Dump the record to a temp file and hand the terminal to `$EDITOR`/`hx`,
+    /// then take it back. Keyboard copy-out (`ctrl+s`) that survives fullscreen
+    /// (mu-5h9m): mirrors the `ctrl+s e` zellij→editor habit, but reads mu's own
+    /// record, so it works without a terminal scrollback buffer to dump.
+    fn open_in_editor(&mut self, _vp: &mut DynamicViewport) -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "mu-solo-transcript-{}-{}.md",
+            std::process::id(),
+            self.ask_count
+        ));
+        std::fs::write(&path, self.transcript.render_all_plain())
+            .with_context(|| format!("write transcript to {path:?}"))?;
+        let editor = std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .unwrap_or_else(|_| "hx".to_string());
+        crossterm::terminal::disable_raw_mode()?;
+        crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
+        let status = std::process::Command::new(&editor).arg(&path).status();
+        crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide)?;
+        if let Err(e) = status {
+            tracing::warn!("editor '{editor}' spawn failed: {e}");
+        }
+        Ok(())
+    }
+
     fn cmd_transcript(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
         let path = if arg.is_empty() {
             std::env::temp_dir().join(format!(

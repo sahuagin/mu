@@ -28,6 +28,7 @@ pub mod bench;
 pub mod capability;
 pub mod catalog;
 pub mod chain;
+pub mod classify;
 pub mod cli;
 pub mod embedder;
 pub mod helpai;

@@ -340,6 +340,11 @@ pub struct App {
     /// fullscreen actions otherwise succeed silently (insert_before is painted
     /// over), so there was no signal the command did anything.
     flash: Option<String>,
+    /// Fold completed tool call+result blocks to one-line summaries in the
+    /// fullscreen render (mu-5h9m, /collapse). Default on — the
+    /// readable-while-streaming firehose fix. Fullscreen-only; inline
+    /// scrollback keeps full results (terminal history can't be re-expanded).
+    collapse_tools: bool,
     bash_yolo: bool,
     /// Discovered skills from SKILL.md files on disk.
     skills: HashMap<String, DiscoveredSkill>,
@@ -597,6 +602,7 @@ impl App {
             maximized_block: None,
             overlay: None,
             flash: None,
+            collapse_tools: true,
             events_file,
             actual_renderer: None,
             actual_cache_strategy: None,
@@ -880,6 +886,7 @@ impl App {
                         items,
                         bwrap,
                         preview,
+                        self.collapse_tools,
                     ));
                     // Committed turns get the closer (the live turn stays open).
                     tlines.extend(render::turn_closer(ratatui::style::Color::White));
@@ -902,6 +909,7 @@ impl App {
                 &turn.items,
                 bwrap,
                 preview,
+                self.collapse_tools,
             ));
         }
 
@@ -949,6 +957,7 @@ impl App {
                     &turn.items,
                     w.saturating_sub(2),
                     tool_preview,
+                    false, // inline live preview keeps full results (mu-5h9m)
                 );
                 // Reserve chrome (2 separators + status + info = 4) + menu +
                 // up to 3 prompt rows; the preview gets the rest up to MAX,
@@ -1193,7 +1202,12 @@ impl App {
                                 let takes_arg =
                                     matches!(
                                         cmd.as_str(),
-                                        "/btw" | "/effort" | "/provider" | "/model" | "/focus"
+                                        "/btw"
+                                            | "/effort"
+                                            | "/provider"
+                                            | "/model"
+                                            | "/focus"
+                                            | "/collapse"
                                     ) || self.skills.contains_key(cmd.trim_start_matches('/'));
                                 self.prompt.clear();
                                 for c in cmd.chars() {
@@ -1386,6 +1400,10 @@ impl App {
                     }
                     "/focus" => {
                         self.cmd_focus(vp, tail)?;
+                        return Ok(false);
+                    }
+                    "/collapse" => {
+                        self.cmd_collapse(vp, tail)?;
                         return Ok(false);
                     }
                     "/btw" => {
@@ -2178,6 +2196,58 @@ impl App {
         Ok(())
     }
 
+    /// /collapse — fold completed tool call+result blocks to one-liners in the
+    /// fullscreen render (mu-5h9m). `/collapse` toggles; `/collapse on|off`
+    /// sets. Fullscreen-only effect; the flash ack is the visible signal.
+    fn cmd_collapse(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
+        let new_value = match arg.trim().to_lowercase().as_str() {
+            "" | "toggle" => !self.collapse_tools,
+            "on" | "true" | "1" | "yes" => true,
+            "off" | "false" | "0" | "no" => false,
+            other => {
+                let lines: Vec<Line<'static>> = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("unknown collapse arg: {other:?}"),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from("  usage:    /collapse [on|off|toggle]"),
+                    Line::from(""),
+                ];
+                let h = lines.len() as u16;
+                vp.insert_before(h, |buf| {
+                    let p = Paragraph::new(lines);
+                    ratatui::widgets::Widget::render(p, buf.area, buf);
+                })?;
+                return Ok(());
+            }
+        };
+        self.collapse_tools = new_value;
+        self.set_flash(format!(
+            "tools {}",
+            if new_value { "collapsed" } else { "expanded" }
+        ));
+        if !self.fullscreen {
+            let lines: Vec<Line<'static>> = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("tools {}", if new_value { "collapsed" } else { "expanded" }),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from("  (collapse only affects the fullscreen render)"),
+                Line::from(""),
+            ];
+            let h = lines.len() as u16;
+            vp.insert_before(h, |buf| {
+                let p = Paragraph::new(lines);
+                ratatui::widgets::Widget::render(p, buf.area, buf);
+            })?;
+        }
+        Ok(())
+    }
+
     /// /provider [name] — switch the session's provider. Bare
     /// `/provider` opens a modal picker; `/provider <name>` sets
     /// directly. Sends `session.set_route` to the daemon; the switch
@@ -2665,6 +2735,7 @@ impl App {
             MenuItem::new("/help", "Show help for commands"),
             MenuItem::new("/effort ›", "Select effort level"),
             MenuItem::new("/focus", "Toggle focus mode (suppress streaming preview)"),
+            MenuItem::new("/collapse", "Fold tool call+result blocks to one-liners"),
             MenuItem::new("/provider ›", "Select provider"),
             MenuItem::new("/model ›", "Select model"),
             MenuItem::new(
@@ -2701,6 +2772,9 @@ impl App {
             Line::from("  /help              show this list"),
             Line::from("  /effort [LEVEL]    show or set effort: low|medium|high|xhigh|max"),
             Line::from("  /focus [on|off]    toggle focus mode (suppress streaming preview)"),
+            Line::from(
+                "  /collapse [on|off] fold completed tool blocks to one-liners (fullscreen)",
+            ),
             Line::from("  /provider [name]   list-picker (bare) or set directly"),
             Line::from("  /model [name]      list-picker (bare) or set directly"),
             Line::from("  /btw <message>     side question via sidecar (main history unaffected)"),
@@ -3197,6 +3271,7 @@ impl App {
                             &t.items,
                             wrap_width,
                             preview_lines,
+                            false, // inline scrollback commit keeps full results (mu-5h9m)
                         );
                         lines.extend(render::turn_closer(t.route.color()));
                         let h = lines.len() as u16;

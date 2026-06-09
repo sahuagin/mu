@@ -91,6 +91,17 @@ pub enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Probe a command and PROPOSE an effect classification (+ passthrough flag +
+    /// confidence) for it and its subcommands — a heuristic candidate for review,
+    /// the floor under the Phase-2 classification grind. Default: emit to stdout
+    /// (`--json` for the agent); `--write` appends to the local candidates file.
+    Classify {
+        /// The command to probe and classify, e.g. `jj` or `curl`. A single token
+        /// (NOT a trailing vararg) so `--write` parses in any position.
+        cmd: String,
+        #[arg(long)]
+        write: bool,
+    },
     /// Fallback: a bare dotted path (invoke / walk) or a natural intent (find).
     #[command(external_subcommand)]
     Bare(Vec<String>),
@@ -797,6 +808,202 @@ const REGISTRY_BANNER: &str = "\
 
 ";
 
+const CLASSIFY_BANNER: &str = "\
+# t4c classify — PROPOSED effect classifications. UNVERIFIED: a deterministic
+# heuristic floor, NOT a verdict. Review (or let the grind agent refine with a
+# model) before trusting — low-confidence rows especially. PASSTHROUGH rows run
+# arbitrary commands; their effects are invocation-determined and the worst case
+# is emitted, so gate them at the shell boundary, not by this label.
+
+";
+
+/// One classified capability candidate: the proposed [`Capability`] (with
+/// `effects` set) plus the markers that don't live on `Capability`.
+struct Candidate {
+    cap: Capability,
+    passthrough: bool,
+    confidence: crate::classify::Confidence,
+}
+
+/// `T4C_CANDIDATES` or `~/.config/t4c/candidates.toml` — the `--write` sink.
+/// Deliberately NOT the shipped catalog or the override input: candidates are
+/// unverified proposals; promoting one is a reviewed step the agent/human takes.
+fn candidates_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("T4C_CANDIDATES") {
+        return Some(PathBuf::from(p));
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".config/t4c/candidates.toml"))
+}
+
+/// Try `<cmd> --help-ai --json`; `None` if absent/non-conforming.
+fn probe_help_ai(cmd: &str) -> Option<crate::capability::HelpAiDoc> {
+    let out = Command::new(cmd)
+        .arg("--help-ai")
+        .arg("--json")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+/// Capture plain `<cmd> --help` text (a heuristic signal source, not parsed
+/// structure). Some tools print help to stderr; fall back to it. Capped so a
+/// pathological help page can't bloat the signal.
+fn capture_help(cmd: &str) -> Option<String> {
+    let out = Command::new(cmd).arg("--help").output().ok()?;
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    if s.trim().is_empty() {
+        s = String::from_utf8_lossy(&out.stderr).into_owned();
+    }
+    if s.trim().is_empty() {
+        return None;
+    }
+    Some(s.chars().take(8000).collect())
+}
+
+/// Run the heuristic over one probed capability (token = its last path segment),
+/// stamping the proposed effects onto a clone.
+fn classify_cap(mut cap: Capability, token: &str, haystack: &str) -> Candidate {
+    let cls = crate::classify::classify(token, haystack);
+    cap.effects = Some(cls.effects);
+    Candidate {
+        cap,
+        passthrough: cls.passthrough,
+        confidence: cls.confidence,
+    }
+}
+
+/// Probe a command and classify it (+ subcommands, if it speaks `--help-ai`).
+fn probe_and_classify(cmd: &str) -> Result<Vec<Candidate>> {
+    if let Some(doc) = probe_help_ai(cmd) {
+        let caps = crate::source::HelpAiProbeSource::doc_to_caps("bash", cmd, doc)?;
+        return Ok(caps
+            .into_iter()
+            .map(|cap| {
+                let token = cap
+                    .path
+                    .to_string()
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let hay = format!("{token} {} {}", cap.summary, cap.keywords.join(" "));
+                classify_cap(cap, &token, &hay)
+            })
+            .collect());
+    }
+    // Non-conforming: classify the single tool node off its plain --help text.
+    let Some(help) = capture_help(cmd) else {
+        return Ok(Vec::new());
+    };
+    // Pick the first useful line as the summary, skipping the option-error noise
+    // BSD base tools emit when they don't grok `--help` (e.g. `cat: illegal
+    // option -- -`, then a `usage:` synopsis). Classification still comes from
+    // the name/keyword signal; this just keeps the candidate's summary honest.
+    let looks_like_opt_error = |l: &str| {
+        let l = l.to_lowercase();
+        l.contains("illegal option")
+            || l.contains("unknown option")
+            || l.contains("invalid option")
+            || l.contains("unrecognized option")
+    };
+    let summary = help
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !looks_like_opt_error(l))
+        .unwrap_or("")
+        .to_string();
+    let cap = Capability {
+        path: CapPath::parse(&format!("bash.{cmd}"))?,
+        summary,
+        keywords: vec![],
+        invoke: vec![cmd.to_string()],
+        help: Some(crate::capability::HelpSpec {
+            argv: vec![cmd.to_string(), "--help".to_string()],
+            ai: false,
+        }),
+        requires: vec![],
+        effects: None,
+    };
+    let hay = format!("{cmd} {help}");
+    Ok(vec![classify_cap(cap, cmd, &hay)])
+}
+
+/// `t4c classify <cmd>`: probe + PROPOSE effect classifications. Emits candidate
+/// `[[capability]]` entries (+ confidence/passthrough markers) for review; never
+/// writes the shipped catalog. Exit 0 = emitted, 1 = unprobeable.
+fn do_classify(cmd: &str, write: bool, json: bool) -> Result<i32> {
+    let candidates = probe_and_classify(cmd)?;
+    if candidates.is_empty() {
+        eprintln!("t4c classify: could not probe `{cmd}` (absent, or no --help/--help-ai)");
+        return Ok(1);
+    }
+
+    if json {
+        let arr: Vec<_> = candidates
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "path": c.cap.path.to_string(),
+                    "summary": c.cap.summary,
+                    "invoke": c.cap.invoke,
+                    "effects": c.cap.effects,
+                    "passthrough": c.passthrough,
+                    "confidence": c.confidence.as_str(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "candidates": arr }))?
+        );
+    } else {
+        print!("{CLASSIFY_BANNER}");
+        for c in &candidates {
+            let tag = if c.passthrough {
+                " PASSTHROUGH (effects worst-case; gate at shell boundary)"
+            } else {
+                ""
+            };
+            println!(
+                "# {}  [confidence={}]{tag}",
+                c.cap.path,
+                c.confidence.as_str()
+            );
+        }
+        println!();
+        let caps: Vec<Capability> = candidates.iter().map(|c| c.cap.clone()).collect();
+        print!("{}", TomlConfigSource::to_toml(&caps)?);
+    }
+
+    if write {
+        let caps: Vec<Capability> = candidates.iter().map(|c| c.cap.clone()).collect();
+        let path = candidates_path().context("no candidates path (set HOME or T4C_CANDIDATES)")?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating candidates dir {}", parent.display()))?;
+        }
+        let body = format!("{CLASSIFY_BANNER}{}", TomlConfigSource::to_toml(&caps)?);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening candidates {}", path.display()))?;
+        f.write_all(body.as_bytes())
+            .with_context(|| format!("appending candidates {}", path.display()))?;
+        eprintln!(
+            "t4c classify: appended {} candidate(s) to {}",
+            caps.len(),
+            path.display()
+        );
+    }
+    Ok(0)
+}
+
 /// The full registry document as persisted: the review-only [`REGISTRY_BANNER`]
 /// followed by the serialized capabilities. Kept distinct from
 /// [`TomlConfigSource::to_toml`] so the serializer stays pure (and its
@@ -873,6 +1080,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         Some(Cmd::Discover { dry_run }) => return do_discover(cli.json, *dry_run),
         Some(Cmd::List) => return do_list(cli.json),
         Some(Cmd::Bench { fake }) => return do_bench(cli.json, *fake),
+        Some(Cmd::Classify { cmd, write }) => return do_classify(cmd, *write, cli.json),
         _ => {}
     }
 
@@ -897,7 +1105,13 @@ pub fn run(cli: Cli) -> Result<i32> {
             BareAction::Find { intent } => do_find(&tree, &intent, cli.json, cache_ref),
         },
         // Handled above (registry-free dispatch); unreachable here.
-        Some(Cmd::Verify { .. } | Cmd::Discover { .. } | Cmd::List | Cmd::Bench { .. }) => {
+        Some(
+            Cmd::Verify { .. }
+            | Cmd::Discover { .. }
+            | Cmd::List
+            | Cmd::Bench { .. }
+            | Cmd::Classify { .. },
+        ) => {
             unreachable!("registry-free commands dispatched before tree build")
         }
     }

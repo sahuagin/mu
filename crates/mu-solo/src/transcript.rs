@@ -26,6 +26,12 @@ pub struct TranscriptBlock {
     /// (no plain downgrade). `None` for user/notice/error and legacy blocks;
     /// `body` is still kept for plain export/copy.
     pub items: Option<Vec<TurnItem>>,
+    /// The turn's route (Main/Btw), preserved so the fullscreen renderer can
+    /// color committed turns by route — a committed `/btw` turn keeps its
+    /// sidecar color instead of falling back to white (ci-aipr finding).
+    /// `None` for notice/error/legacy blocks. Kept as `TurnRoute` (not a
+    /// ratatui color) so this model stays render-independent.
+    pub route: Option<TurnRoute>,
 }
 
 impl TranscriptBlock {
@@ -35,11 +41,14 @@ impl TranscriptBlock {
             label: label.into(),
             body: body.into(),
             items: None,
+            route: None,
         }
     }
 
     pub fn user(route: TurnRoute, body: impl Into<String>) -> Self {
-        Self::new(TranscriptKind::User, route.you_label(), body)
+        let mut b = Self::new(TranscriptKind::User, route.you_label(), body);
+        b.route = Some(route);
+        b
     }
 
     pub fn assistant(route: TurnRoute, items: &[TurnItem]) -> Self {
@@ -49,6 +58,7 @@ impl TranscriptBlock {
             render_turn_items_plain(items),
         );
         b.items = Some(items.to_vec());
+        b.route = Some(route);
         b
     }
 

@@ -878,18 +878,32 @@ impl App {
                 tlines.push(Line::from(""));
             }
             match (block.kind, block.items.as_ref()) {
-                (TranscriptKind::User, _) => tlines.extend(render::you_block(&block.body, bwrap)),
+                (TranscriptKind::User, _) => {
+                    // Color committed user turns by route — a /btw turn keeps
+                    // its sidecar color (ci-aipr finding).
+                    let color = block
+                        .route
+                        .map(|r| r.you_color())
+                        .unwrap_or(ratatui::style::Color::Cyan);
+                    tlines.extend(render::block_lines(&block.label, color, &block.body, bwrap));
+                }
                 (TranscriptKind::Assistant, Some(items)) => {
+                    // Route color, not hardcoded white — committed /btw turns
+                    // stay magenta in fullscreen (ci-aipr finding).
+                    let color = block
+                        .route
+                        .map(|r| r.color())
+                        .unwrap_or(ratatui::style::Color::White);
                     tlines.extend(render::render_turn(
                         &block.label,
-                        ratatui::style::Color::White,
+                        color,
                         items,
                         bwrap,
                         preview,
                         self.collapse_tools,
                     ));
                     // Committed turns get the closer (the live turn stays open).
-                    tlines.extend(render::turn_closer(ratatui::style::Color::White));
+                    tlines.extend(render::turn_closer(color));
                 }
                 (TranscriptKind::Assistant, None) | (TranscriptKind::Notice, _) => {
                     tlines.extend(render::assistant_block(&block.body, bwrap))
@@ -1775,9 +1789,16 @@ impl App {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                let outcome =
-                    copy_to_clipboard_or_file(text.trim(), self.clipboard_command.as_deref())?;
-                self.set_flash(format!("✓ copied {} · {outcome}", overlay.title));
+                // Don't `?` here: the overlay was taken out at the top of this
+                // fn and is only restored at the bottom — propagating would leak
+                // it (modal silently dies). Report the outcome via flash either
+                // way and fall through to the restore (ci-aipr finding).
+                match copy_to_clipboard_or_file(text.trim(), self.clipboard_command.as_deref()) {
+                    Ok(outcome) => {
+                        self.set_flash(format!("✓ copied {} · {outcome}", overlay.title))
+                    }
+                    Err(e) => self.set_flash(format!("copy failed: {e}")),
+                }
             }
             (_, KeyCode::Up) | (KeyModifiers::ALT, KeyCode::Char('k')) => {
                 overlay.scroll = overlay.scroll.saturating_sub(1);
@@ -2159,6 +2180,10 @@ impl App {
             "on" | "true" | "1" | "yes" => true,
             "off" | "false" | "0" | "no" => false,
             other => {
+                // Flash so the error is visible in fullscreen (insert_before is
+                // painted over there); inline keeps the scrollback notice
+                // (ci-aipr finding).
+                self.set_flash(format!("unknown focus arg {other:?} — use on|off|toggle"));
                 let lines: Vec<Line<'static>> = vec![
                     Line::from(""),
                     Line::from(Span::styled(
@@ -2205,20 +2230,28 @@ impl App {
             "on" | "true" | "1" | "yes" => true,
             "off" | "false" | "0" | "no" => false,
             other => {
-                let lines: Vec<Line<'static>> = vec![
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        format!("unknown collapse arg: {other:?}"),
-                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from("  usage:    /collapse [on|off|toggle]"),
-                    Line::from(""),
-                ];
-                let h = lines.len() as u16;
-                vp.insert_before(h, |buf| {
-                    let p = Paragraph::new(lines);
-                    ratatui::widgets::Widget::render(p, buf.area, buf);
-                })?;
+                // Fullscreen paints over insert_before, so the error needs the
+                // flash to be visible there; inline keeps the scrollback notice
+                // (ci-aipr finding).
+                self.set_flash(format!(
+                    "unknown collapse arg {other:?} — use on|off|toggle"
+                ));
+                if !self.fullscreen {
+                    let lines: Vec<Line<'static>> = vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            format!("unknown collapse arg: {other:?}"),
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from("  usage:    /collapse [on|off|toggle]"),
+                        Line::from(""),
+                    ];
+                    let h = lines.len() as u16;
+                    vp.insert_before(h, |buf| {
+                        let p = Paragraph::new(lines);
+                        ratatui::widgets::Widget::render(p, buf.area, buf);
+                    })?;
+                }
                 return Ok(());
             }
         };
@@ -2278,6 +2311,7 @@ impl App {
                 self.set_flash(format!("provider → {} · {}", self.provider, self.model));
             }
             Err(e) => {
+                self.set_flash(format!("provider switch failed: {e}"));
                 let lines = vec![
                     Line::from(""),
                     Line::from(Span::styled(
@@ -2343,6 +2377,7 @@ impl App {
                 self.set_flash(format!("model → {}", self.model));
             }
             Err(e) => {
+                self.set_flash(format!("model switch failed: {e}"));
                 let lines = vec![
                     Line::from(""),
                     Line::from(Span::styled(
@@ -3229,6 +3264,9 @@ impl App {
                     self.try_load_actual_renderer();
                     if self.is_renderer_mismatch() && !self.renderer_mismatch_warned {
                         self.emit_renderer_mismatch_warning(vp)?;
+                        // Flash too — the inline warning is painted over in
+                        // fullscreen (ci-aipr finding); full detail in /status.
+                        self.set_flash("⚠ renderer mismatch — see /status".to_string());
                         self.renderer_mismatch_warned = true;
                     }
                 }

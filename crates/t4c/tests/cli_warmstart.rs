@@ -430,7 +430,24 @@ fn classify_conforming_tool_emits_candidate_toml() {
         out.contains("[[capability]]"),
         "missing capability block:\n{out}"
     );
-    assert!(out.contains("bash.t4c"), "missing tool path:\n{out}");
+    // Prove the CONFORMING (`--help-ai --json`) path actually fired, not the
+    // plain-`--help` fallback. Both paths emit "PROPOSED", "[[capability]]", and
+    // a `bash.t4c` node, so those assertions alone validate nothing about which
+    // branch ran (the gap qwen flagged on the review panel). Only the conforming
+    // path enumerates subcommands via `doc_to_caps`, so it alone emits dotted
+    // subcommand paths (`bash.t4c.find`) and MORE THAN ONE capability block; the
+    // fallback emits exactly one node with no subcommand segment.
+    assert!(
+        out.contains("bash.t4c.find"),
+        "expected a dotted subcommand path (only the --help-ai path emits these); \
+         the plain --help fallback would emit a single `bash.t4c` node:\n{out}"
+    );
+    assert!(
+        out.matches("[[capability]]").count() > 1,
+        "conforming probe must enumerate subcommands into multiple capability \
+         blocks; got {} (the fallback emits exactly one):\n{out}",
+        out.matches("[[capability]]").count()
+    );
     assert!(
         out.contains("[capability.effects]"),
         "every candidate must carry a proposed effects block:\n{out}"

@@ -50,6 +50,12 @@
 #                               prompt so reviewers see definitions outside the diff
 #                               window (default: 1; set 0 for diff-only)
 #     MU_REVIEW_CONTEXT_MAX_BYTES  cap on appended full-file context (default: 200000)
+#     MU_REVIEW_TIMEOUT         per-reviewer wall-clock cap, seconds (default: 600). Bounds a
+#                               hung/slow model; the two reviewers run SEQUENTIALLY, so the
+#                               panel's total wall-clock can reach ~2x this. 300 was too tight —
+#                               a typical Claude/reasoning response (>5min) plus a possible
+#                               ollama model reload (~2min) overran it, SIGTERMing the reviewer
+#                               mid-stream before its final VERDICT line (spurious UNCLEAR).
 #     MU_REVIEW_OVERRIDE=1      operator override: proceed despite BLOCK/ESCALATE (logged)
 #     MU_REVIEW_SYSTEM_PROMPT   reviewer system-prompt file (default: ai-review-system-prompt.txt)
 #     MU_REVIEW_LOG             event log (default: ~/.local/share/mu/review-events.jsonl)
@@ -81,6 +87,9 @@ PROVIDER2="${MU_REVIEW_PROVIDER_2:-ollama}"
 MODEL2="${MU_REVIEW_MODEL_2:-gpt-oss-rev}"
 TOOLS="${MU_REVIEW_TOOLS:-}"   # empty = single-shot (default); e.g. "read,grep" lets the reviewer inspect surrounding code (slower, multi-turn)
 BASE="${MU_REVIEW_BASE:-main}"
+# Per-reviewer timeout: 2x a typical Claude response, with room for one ollama
+# reload. The two reviewers run sequentially, so panel wall-clock is up to ~2x.
+TIMEOUT="${MU_REVIEW_TIMEOUT:-600}"
 LOG="${MU_REVIEW_LOG:-$HOME/.local/share/mu/review-events.jsonl}"
 # Minimal reviewer system prompt (mu-ai-review-minimal-sysprompt-9esh).
 # Without this, `mu ask` sessions get the daemon-default system prompt —
@@ -181,9 +190,9 @@ run_review() { # $1=provider $2=model — prints reviewer stdout; stderr -> $ERR
   SYS_FLAGS=""
   [ -r "$SYSPROMPT" ] && SYS_FLAGS="--append-system-prompt $SYSPROMPT"
   if [ -n "$TOOLS" ]; then
-    timeout 300 "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS --tools "$TOOLS" "$PROMPT" 2>>"$ERRLOG"
+    timeout "$TIMEOUT" "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS --tools "$TOOLS" "$PROMPT" 2>>"$ERRLOG"
   else
-    timeout 300 "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS "$PROMPT" 2>>"$ERRLOG"
+    timeout "$TIMEOUT" "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS "$PROMPT" 2>>"$ERRLOG"
   fi
 }
 verdict_of() { # stdin -> APPROVE | REJECT | UNCLEAR

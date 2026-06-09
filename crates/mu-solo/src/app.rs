@@ -2384,7 +2384,8 @@ impl App {
             MenuItem::new("/clear", "Clear the visible scrollback"),
             MenuItem::new("/transcript", "Write semantic transcript to a file"),
             MenuItem::new("/copy", "Copy last/assistant/user/all semantic content"),
-            MenuItem::new("/q", "Leave the session"),
+            MenuItem::new("/quit", "Leave the session (/q, /exit)"),
+            MenuItem::new("/exit", "Leave the session"),
         ];
         let mut skill_names: Vec<&str> = self.skills.keys().map(|s| s.as_str()).collect();
         skill_names.sort();

@@ -142,23 +142,34 @@ pub(crate) async fn handle_execute_tools(
             let cap = capability.lock().ok();
             cap.as_ref().and_then(|c| match c.check_allow(&call.name) {
                 CapabilityCheck::Allowed => {
-                    // mu-n25a: the side-effects gate. Consult the tool's
-                    // DECLARED side_effects against the session's
-                    // max_side_effects ceiling BEFORE the AWS gate and
-                    // BEFORE the permission gate, so a `permission: Allow`
-                    // tool cannot free-ride past a restrictive posture
-                    // (the SELF-CLASSIFIED-AUTHORITY bug class, mu-usfj).
-                    // None ceiling (root default) ⇒ Allowed, so existing
-                    // sessions are unaffected (back-compat).
-                    let declared = tool.as_ref().map(|t| t.spec().policy.side_effects);
-                    if let Some(declared) = declared {
-                        if let CapabilityCheck::DeniedSideEffectsExceeded { declared, ceiling } =
-                            c.check_side_effects(declared)
+                    // mu-8stm.2 (1b): the STRUCTURED appropriateness gate
+                    // (canonical successor to mu-n25a's linear ceiling). Check
+                    // the tool's canonical Effects against the session's
+                    // per-axis constraints via the SAME `disallowed_by`
+                    // predicate the discovery surface uses (single source of
+                    // truth), BEFORE the AWS + permission gates so a
+                    // `permission: Allow` tool cannot free-ride a restrictive
+                    // posture (the SELF-CLASSIFIED-AUTHORITY bug class, mu-usfj).
+                    // Unconstrained sessions (no ceiling) allow everything
+                    // (back-compat). A missing tool falls through to the
+                    // not-found path below. Unannotated effects fail closed —
+                    // dormant today (`derived_effects()` is total over every
+                    // dispatchable tool), it bites only a future unclassified
+                    // dispatchable source.
+                    //
+                    // Use `derived_effects()` — the SAME projection discovery
+                    // uses (including the aws->network/spend reach) — so the gate
+                    // and `allowed_by_session` agree exactly, and an AWS-gated
+                    // tool can't slip its network/spend reach past a
+                    // no-network/no-spend posture just because the grant is held.
+                    // The AWS-grant gate below is an ADDITIONAL check, not a
+                    // substitute for the posture (review: gpt-5.5).
+                    if let Some(t) = tool.as_ref() {
+                        let effects = t.spec().policy.derived_effects();
+                        if let CapabilityCheck::DeniedInappropriate { reason } =
+                            c.check_effects(Some(&effects))
                         {
-                            return Some(format!(
-                                "tool declares `{declared:?}` side-effects but this session is \
-                                 capped at `{ceiling:?}` (max_side_effects)"
-                            ));
+                            return Some(reason);
                         }
                     }
                     let required_aws = tool
@@ -179,7 +190,8 @@ pub(crate) async fn handle_execute_tools(
                     Some("session capability's tool-call budget exhausted".to_owned())
                 }
                 CapabilityCheck::DeniedAutonomyDisallowed
-                | CapabilityCheck::DeniedSideEffectsExceeded { .. } => None,
+                | CapabilityCheck::DeniedSideEffectsExceeded { .. }
+                | CapabilityCheck::DeniedInappropriate { .. } => None,
             })
         };
 

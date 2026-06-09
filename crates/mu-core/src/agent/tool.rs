@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use t4c::{Effects, FsEffect};
 use tokio::sync::oneshot;
 
 /// Public description of a tool, sent to the provider so the model
@@ -176,6 +177,23 @@ impl ToolPolicy {
             idempotent: true,
         }
     }
+
+    /// The tool's canonical structured [`Effects`]: the side-effects projection
+    /// ([`SideEffects::effects`]) plus the one inference mu can make — a tool
+    /// gated on an AWS capability reaches the network and spends. BOTH the
+    /// dispatch gate and the discovery surface consult this (single source of
+    /// truth), so a tool's `allowed_by_session` and its gate refusal agree. The
+    /// aws->network/spend reach is REAL reach the appropriateness gate must
+    /// honor; the `required_aws_capability` grant gate is an ADDITIONAL check,
+    /// not a substitute for the session's network/spend posture. (mu-8stm.2)
+    pub fn derived_effects(&self) -> Effects {
+        let mut e = self.side_effects.effects();
+        if self.required_aws_capability.is_some() {
+            e.network = true;
+            e.spend = true;
+        }
+        e
+    }
 }
 
 /// Side-effect class. UI/audit/orchestration use this to categorize
@@ -247,6 +265,33 @@ impl SideEffects {
     /// `self.rank() <= ceiling.rank()`.
     pub fn within(self, ceiling: SideEffects) -> bool {
         self.rank() <= ceiling.rank()
+    }
+
+    /// Project this coarse class onto t4c's structured [`Effects`] — the
+    /// canonical, multi-axis representation the dispatch gate and discovery
+    /// surface both reason over (mu-8stm.2 phase 1). The coarse class stays
+    /// the ergonomic DECLARATION vocabulary; `Effects` is what gets enforced.
+    ///
+    /// CAVEAT: the linear ladder is a TOTAL order; `Effects` is a product of
+    /// INDEPENDENT axes. They are isomorphic only at the endpoints and for the
+    /// classes tools actually declare (ReadOnly/Mutating/Execute). `Effects`
+    /// has no irreversibility axis, so `Destructive` collapses to a write; no
+    /// tool declares it today. When a tool genuinely needs `External`/
+    /// `Destructive` semantics, express them as per-axis session constraints
+    /// directly rather than through the coarse ceiling.
+    pub fn effects(self) -> Effects {
+        let mut e = Effects::default();
+        match self {
+            SideEffects::ReadOnly => e.filesystem = FsEffect::Read,
+            SideEffects::Mutating | SideEffects::Destructive => e.filesystem = FsEffect::Write,
+            SideEffects::External => e.network = true,
+            SideEffects::Execute => {
+                e.filesystem = FsEffect::Write;
+                e.network = true;
+                e.process = true;
+            }
+        }
+        e
     }
 }
 

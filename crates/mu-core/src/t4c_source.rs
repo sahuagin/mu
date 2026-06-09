@@ -18,12 +18,12 @@
 use std::sync::Arc;
 
 use t4c::{
-    CapPath, Capability, ConfigEmbedder, Effects, Embedder, EnvCatalogSource, FsEffect,
-    LexicalRanker, Ranked, Ranker, Registry, RegistrySource, SemanticRanker, SessionConstraints,
-    Tree, VectorCache,
+    CapPath, Capability, ConfigEmbedder, Effects, Embedder, EnvCatalogSource, LexicalRanker,
+    Ranked, Ranker, Registry, RegistrySource, SemanticRanker, SessionConstraints, Tree,
+    VectorCache,
 };
 
-use crate::agent::tool::{SideEffects, Tool, ToolPolicy};
+use crate::agent::tool::{Tool, ToolPolicy};
 use crate::capability::Capability as MuCapability;
 use crate::skill::loader::LoadedSkill;
 use crate::tool_registry::ToolRegistry;
@@ -365,39 +365,12 @@ fn capability_for(
     })
 }
 
-/// Project mu's runtime [`ToolPolicy`] into t4c [`Effects`] — the lossy but
-/// honest bridge from mu's single `SideEffects` axis to t4c's multi-axis safety
-/// surface. mu collapses effects into one enum, so this maps what mu actually
-/// knows (filesystem reach; network for `External`) and leaves the axes mu
-/// can't speak to at their conservative default. The one inference: a tool
-/// gated on an AWS capability hits the network and spends, so flag both.
+/// Project mu's runtime [`ToolPolicy`] into t4c [`Effects`] for the discovery
+/// surface. The canonical mapping now lives on the policy itself
+/// ([`ToolPolicy::derived_effects`], mu-8stm.2) so the dispatch gate and
+/// discovery cannot diverge; this stays as the call site's thin delegate.
 fn effects_from_policy(policy: &ToolPolicy) -> Effects {
-    let mut e = Effects::default();
-    match policy.side_effects {
-        // ReadOnly = "no observable change" — the common case is a filesystem
-        // read; mu has no finer signal, so claim read, nothing more.
-        SideEffects::ReadOnly => e.filesystem = FsEffect::Read,
-        // Mutating / Destructive both write; mu's enum doesn't distinguish
-        // reversibility, and t4c's `Effects` doesn't model it, so both land as
-        // a write claim.
-        SideEffects::Mutating | SideEffects::Destructive => e.filesystem = FsEffect::Write,
-        // External = reaches the network (mu's reserved network class).
-        SideEffects::External => e.network = true,
-        // Execute = runs arbitrary code / spawns a process (shell, worker,
-        // exec). It subsumes the others — a shell can read, write, and
-        // network — so the honest projection flags every reachable axis
-        // plus `process`. This is the surface OS sandboxing keys on (mu-627).
-        SideEffects::Execute => {
-            e.filesystem = FsEffect::Write;
-            e.network = true;
-            e.process = true;
-        }
-    }
-    if policy.required_aws_capability.is_some() {
-        e.network = true;
-        e.spend = true;
-    }
-    e
+    policy.derived_effects()
 }
 
 /// Lowercase alphanumeric word-split — splits on any non-alphanumeric so
@@ -414,6 +387,8 @@ mod tests {
     use super::*;
     use crate::agent::tool::PermissionLevel;
     use crate::agent::tool::RetryPolicy;
+    use crate::agent::tool::SideEffects;
+    use t4c::FsEffect;
 
     /// Test shorthand: project a `tool.<name>` capability with no effect
     /// annotation (the effect axis is exercised separately).

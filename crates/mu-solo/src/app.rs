@@ -335,6 +335,11 @@ pub struct App {
     /// Active modal overlay (slash-command output panel: /help, /status).
     /// None when closed. Takes over the screen until dismissed (Esc/q).
     overlay: Option<Overlay>,
+    /// Ephemeral action acknowledgment shown in the info line (e.g. "✓ copied"),
+    /// like vim's "N lines yanked". Cleared on the next keystroke (mu-5h9m):
+    /// fullscreen actions otherwise succeed silently (insert_before is painted
+    /// over), so there was no signal the command did anything.
+    flash: Option<String>,
     bash_yolo: bool,
     /// Discovered skills from SKILL.md files on disk.
     skills: HashMap<String, DiscoveredSkill>,
@@ -591,6 +596,7 @@ impl App {
             selected_block: None,
             maximized_block: None,
             overlay: None,
+            flash: None,
             events_file,
             actual_renderer: None,
             actual_cache_strategy: None,
@@ -1156,6 +1162,10 @@ impl App {
 
     /// Handle one keypress. Returns Ok(true) to exit the loop.
     fn handle_key(&mut self, vp: &mut DynamicViewport, key: KeyEvent) -> Result<bool> {
+        // Clear any prior flash on the next keystroke. A command that sets a
+        // flash does so later in this same call, so the new flash survives
+        // until the *following* key (vim-style transient ack, mu-5h9m).
+        self.flash = None;
         if self.maximized_block.is_some() {
             return self.handle_maximized_key(vp, key);
         }
@@ -1200,6 +1210,7 @@ impl App {
                         MenuContext::Effort => {
                             if let Some(level) = EffortLevel::ALL.get(idx) {
                                 self.effort = *level;
+                                self.set_flash(format!("effort → {}", level.as_str()));
                             }
                         }
                     }
@@ -1624,6 +1635,11 @@ impl App {
         });
     }
 
+    /// Set the ephemeral info-line acknowledgment (cleared on the next key).
+    fn set_flash(&mut self, msg: impl Into<String>) {
+        self.flash = Some(msg.into());
+    }
+
     /// Render the active modal overlay: a full-viewport bordered box of the
     /// overlay's pre-built lines, scrollable, painted via the owned buffer (no
     /// `insert_before`). Mirrors `render_maximized_block`; cyan border to
@@ -1672,20 +1688,33 @@ impl App {
                 Style::default().fg(Color::Cyan),
             )));
         }
-        let footer = if max_scroll > 0 {
-            format!(
-                " ↑/↓ PgUp/PgDn scroll · Esc close · {}/{} ",
-                scroll + 1,
-                max_scroll + 1
+        let (footer, footer_style) = if let Some(flash) = self.flash.clone() {
+            (
+                format!(" {flash} "),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else if max_scroll > 0 {
+            (
+                format!(
+                    " ↑/↓ PgUp/PgDn scroll · c copy · Esc close · {}/{} ",
+                    scroll + 1,
+                    max_scroll + 1
+                ),
+                Style::default().fg(Color::DarkGray),
             )
         } else {
-            " Esc close ".to_string()
+            (
+                " c copy · Esc close ".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )
         };
         lines.push(Line::from(vec![
             Span::styled("╰".to_string(), Style::default().fg(Color::Cyan)),
             Span::styled(
                 truncate_at_word(&footer, width.saturating_sub(2)),
-                Style::default().fg(Color::DarkGray),
+                footer_style,
             ),
         ]));
 
@@ -1711,6 +1740,26 @@ impl App {
                     vp.set_height(VIEWPORT_HEIGHT)?;
                 }
                 return Ok(false);
+            }
+            (_, KeyCode::Char('c')) => {
+                // Copy the panel's text out (e.g. /status session/daemon ids) —
+                // ctrl+s and terminal selection don't reach the owned buffer, so
+                // the overlay needs its own copy-out (mu-5h9m). Flatten each
+                // styled line back to plain text.
+                let text = overlay
+                    .lines
+                    .iter()
+                    .map(|l| {
+                        l.spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let outcome =
+                    copy_to_clipboard_or_file(text.trim(), self.clipboard_command.as_deref())?;
+                self.set_flash(format!("✓ copied {} · {outcome}", overlay.title));
             }
             (_, KeyCode::Up) | (KeyModifiers::ALT, KeyCode::Char('k')) => {
                 overlay.scroll = overlay.scroll.saturating_sub(1);
@@ -2047,6 +2096,7 @@ impl App {
             return Ok(());
         } else if let Some(level) = EffortLevel::parse(arg) {
             self.effort = level;
+            self.set_flash(format!("effort → {}", level.as_str()));
             vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -2109,6 +2159,7 @@ impl App {
             }
         };
         self.focus_mode = new_value;
+        self.set_flash(format!("focus → {}", if new_value { "on" } else { "off" }));
         let lines: Vec<Line<'static>> = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -2154,6 +2205,7 @@ impl App {
             Ok(()) => {
                 self.provider = new_provider;
                 self.model = default_model;
+                self.set_flash(format!("provider → {} · {}", self.provider, self.model));
             }
             Err(e) => {
                 let lines = vec![
@@ -2218,6 +2270,7 @@ impl App {
         match self.send_set_route(vp, &kind, &new_model) {
             Ok(()) => {
                 self.model = new_model;
+                self.set_flash(format!("model → {}", self.model));
             }
             Err(e) => {
                 let lines = vec![
@@ -2408,6 +2461,7 @@ impl App {
         };
         let text = self.transcript.render_all_plain();
         std::fs::write(&path, text).with_context(|| format!("write transcript to {path:?}"))?;
+        self.set_flash(format!("✓ transcript → {}", path.display()));
         let lines: Vec<Line<'static>> = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -2444,6 +2498,7 @@ impl App {
             _ => None,
         };
         let Some(text) = text else {
+            self.set_flash(format!("nothing to copy ({selector})"));
             let lines: Vec<Line<'static>> = vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -2464,6 +2519,7 @@ impl App {
         };
 
         let outcome = copy_to_clipboard_or_file(&text, self.clipboard_command.as_deref())?;
+        self.set_flash(format!("✓ copied {selector} · {outcome}"));
         let lines: Vec<Line<'static>> = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -2807,7 +2863,21 @@ impl App {
             .and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
             .unwrap_or_else(|| "?".into());
 
-        let left = format!("  {user}@{host}:{cwd}");
+        // An active flash takes over the left of the info line (green), so a
+        // command's "✓ did the thing" is visible even in fullscreen where the
+        // insert_before confirmation is painted over (mu-5h9m).
+        let (left, left_style) = match self.flash {
+            Some(ref flash) => (
+                format!("  {flash}"),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            None => (
+                format!("  {user}@{host}:{cwd}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        };
 
         let (right, right_style) = if let Some(ref status) = self.mcp_status {
             if let Some(pct) = status.context_pressure_pct {
@@ -2830,7 +2900,7 @@ impl App {
         let padding = " ".repeat(gap.max(1));
 
         Line::from(vec![
-            Span::styled(left, Style::default().fg(Color::DarkGray)),
+            Span::styled(left, left_style),
             Span::styled(padding, Style::default()),
             Span::styled(right, right_style),
         ])

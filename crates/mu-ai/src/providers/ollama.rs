@@ -47,7 +47,7 @@ use serde::Deserialize;
 use tokio::sync::oneshot;
 
 use mu_core::agent::capabilities::ProviderCapabilities;
-use mu_core::agent::{MessageInput, Provider, ProviderError, ProviderEvent, ToolSpec};
+use mu_core::agent::{MessageInput, ProbedModel, Provider, ProviderError, ProviderEvent, ToolSpec};
 use mu_core::context::{CacheStrategy, NoCacheStrategy, ProviderRenderer};
 
 use super::anthropic::AnthropicProvider;
@@ -56,6 +56,11 @@ use super::anthropic::AnthropicProvider;
 /// `--provider ollama` and `AGENT_SPAWN_PROVIDER=ollama` work with no
 /// extra configuration — overridable via `OLLAMA_API_BASE`.
 pub const OLLAMA_API_BASE: &str = "http://10.1.1.143:11434";
+
+/// Timeout for the capability probe (mu-1gx5). Bounds a slow / half-open ollama
+/// so `mu models refresh` skips it best-effort instead of hanging — parity with
+/// `discover_models`'s timeout (review-gate finding).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resolve the ollama base URL: `OLLAMA_API_BASE` if set and non-empty,
 /// else the baked-in [`OLLAMA_API_BASE`] default.
@@ -68,6 +73,10 @@ pub fn base_from_env() -> String {
 
 pub struct OllamaProvider {
     inner: AnthropicProvider,
+    /// The ollama base URL (e.g. `http://10.1.1.143:11434`), kept so the
+    /// capability probe can reach the NATIVE `/api/tags` endpoint — distinct
+    /// from the `/v1/messages` wire the inner Anthropic provider uses for chat.
+    base: String,
 }
 
 impl OllamaProvider {
@@ -85,8 +94,8 @@ impl OllamaProvider {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_default();
-        let inner = AnthropicProvider::new(key, model).with_api_base(base);
-        Ok(Self { inner })
+        let inner = AnthropicProvider::new(key, model).with_api_base(base.clone());
+        Ok(Self { inner, base })
     }
 
     /// Query the ollama server for its locally-available models via the
@@ -200,9 +209,55 @@ impl Provider for OllamaProvider {
     fn cache_strategy(&self) -> Arc<dyn CacheStrategy> {
         Arc::new(NoCacheStrategy::new())
     }
+
+    /// mu-1gx5: probe via the NATIVE `/api/tags` (ollama's `/v1/*` surface is
+    /// OpenAI-thin and carries no metadata). Each entry's `details.context_length`
+    /// is the model's architectural context ceiling. `max_output_tokens` is left
+    /// `None` ON PURPOSE: ollama has no hard per-model output cap — output is
+    /// bounded by `num_ctx - input`, not a reported ceiling — so the probe
+    /// informs context, not output (capability flags live in `/api/show`, a
+    /// per-model N+1 call deferred to a follow-up).
+    async fn probe_model_capabilities(&self) -> Result<Vec<ProbedModel>, ProviderError> {
+        let url = format!("{}/api/tags", self.base.trim_end_matches('/'));
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .timeout(PROBE_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Other(format!("ollama /api/tags GET {url}: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ProviderError::Other(format!(
+                "ollama /api/tags GET {url}: HTTP {status}"
+            )));
+        }
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| ProviderError::Other(format!("ollama /api/tags read: {e}")))?;
+        parse_ollama_tags(&text)
+    }
 }
 
-/// `/api/tags` response shape — only the model names are needed.
+/// Parse an ollama `/api/tags` body into [`ProbedModel`]s. Pure (no I/O) so it
+/// is unit-testable against a captured sample. mu-1gx5.
+pub(crate) fn parse_ollama_tags(json: &str) -> Result<Vec<ProbedModel>, ProviderError> {
+    let parsed: TagsResponse = serde_json::from_str(json)
+        .map_err(|e| ProviderError::Other(format!("ollama /api/tags parse: {e}")))?;
+    Ok(parsed
+        .models
+        .into_iter()
+        .map(|m| ProbedModel {
+            id: m.name,
+            // ollama has no hard output cap — see probe_model_capabilities.
+            max_output_tokens: None,
+            context_length: m.details.and_then(|d| d.context_length),
+            capabilities: Vec::new(),
+        })
+        .collect())
+}
+
+/// `/api/tags` response shape — model name + architectural context length.
 #[derive(Debug, Deserialize)]
 struct TagsResponse {
     #[serde(default)]
@@ -212,6 +267,19 @@ struct TagsResponse {
 #[derive(Debug, Deserialize)]
 struct TagModel {
     name: String,
+    // Option (not bare `#[serde(default)]`) so an explicit `"details": null` —
+    // not just an ABSENT field — degrades to None instead of failing the whole
+    // probe with "invalid type: null, expected struct" (review-gate finding).
+    #[serde(default)]
+    details: Option<TagDetails>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TagDetails {
+    /// The model's architectural context ceiling (GGUF metadata). May be
+    /// absent (`null`) for some tags.
+    #[serde(default)]
+    context_length: Option<u64>,
 }
 
 #[cfg(test)]
@@ -266,5 +334,40 @@ mod tests {
         let parsed: TagsResponse = serde_json::from_str(json).unwrap();
         let names: Vec<String> = parsed.models.into_iter().map(|m| m.name).collect();
         assert_eq!(names, vec!["qwen3-coder:30b", "deepseek-r1:32b"]);
+    }
+
+    // mu-1gx5: capability probe — parse /api/tags into ProbedModel, reading the
+    // architectural context ceiling and (deliberately) NO output cap.
+    #[test]
+    fn probe_parses_ollama_tags() {
+        // Captured shape: details.context_length present on one, absent on
+        // another (some tags report null).
+        let json = r#"{"models":[
+          {"name":"qwen3.6:35b-a3b-q8_0","details":{"context_length":262144,"quantization_level":"Q8_0"}},
+          {"name":"gpt-oss:20b","details":{"family":"gptoss"}}
+        ]}"#;
+        let models = parse_ollama_tags(json).expect("parse");
+        assert_eq!(models.len(), 2);
+
+        let q = &models[0];
+        assert_eq!(q.id, "qwen3.6:35b-a3b-q8_0");
+        assert_eq!(q.context_length, Some(262_144));
+        // ollama has no hard output cap — the probe reports None, never a guess.
+        assert_eq!(q.max_output_tokens, None);
+
+        // Missing details.context_length → None, not an error.
+        assert_eq!(models[1].context_length, None);
+    }
+
+    // mu-1gx5 (review-gate finding, gpt-5.5): an explicit `"details": null` must
+    // degrade to context_length=None, NOT fail the whole probe. #[serde(default)]
+    // only covers an ABSENT field; a present null needs Option<TagDetails>.
+    #[test]
+    fn probe_handles_null_details() {
+        let json = r#"{"models":[{"name":"weird:tag","details":null}]}"#;
+        let models = parse_ollama_tags(json).expect("null details must not fail the probe");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "weird:tag");
+        assert_eq!(models[0].context_length, None);
     }
 }

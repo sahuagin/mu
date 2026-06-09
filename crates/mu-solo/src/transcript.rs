@@ -16,11 +16,16 @@ pub enum TranscriptKind {
     Error,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptBlock {
     pub kind: TranscriptKind,
     pub label: String,
     pub body: String,
+    /// Structured items for assistant turns (mu-5h9m) — preserved so the
+    /// fullscreen renderer styles committed turns identically to the live one
+    /// (no plain downgrade). `None` for user/notice/error and legacy blocks;
+    /// `body` is still kept for plain export/copy.
+    pub items: Option<Vec<TurnItem>>,
 }
 
 impl TranscriptBlock {
@@ -29,6 +34,7 @@ impl TranscriptBlock {
             kind,
             label: label.into(),
             body: body.into(),
+            items: None,
         }
     }
 
@@ -37,11 +43,13 @@ impl TranscriptBlock {
     }
 
     pub fn assistant(route: TurnRoute, items: &[TurnItem]) -> Self {
-        Self::new(
+        let mut b = Self::new(
             TranscriptKind::Assistant,
             route.header_label(),
             render_turn_items_plain(items),
-        )
+        );
+        b.items = Some(items.to_vec());
+        b
     }
 
     pub fn notice(label: impl Into<String>, body: impl Into<String>) -> Self {
@@ -67,6 +75,10 @@ impl Transcript {
         self.blocks.push(block);
     }
 
+    pub fn clear(&mut self) {
+        self.blocks.clear();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
@@ -89,6 +101,12 @@ impl Transcript {
 
     pub fn render_all_plain(&self) -> String {
         render_blocks_plain(&self.blocks)
+    }
+
+    /// All blocks as a slice — for styled rendering (the fullscreen
+    /// owned-buffer render windows over this; mu-5h9m).
+    pub fn blocks(&self) -> &[TranscriptBlock] {
+        &self.blocks
     }
 }
 

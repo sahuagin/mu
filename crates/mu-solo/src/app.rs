@@ -45,6 +45,19 @@ struct MaximizedBlock {
     scroll: usize,
 }
 
+/// A modal overlay panel (mu-5h9m): a full-viewport bordered box that takes
+/// over the screen to show command output — `/help`, `/status` — which would
+/// otherwise emit via `insert_before` and be painted over by the fullscreen
+/// owned-buffer render the next frame. Painted through the owned buffer like
+/// `MaximizedBlock`, so it survives fullscreen. Holds pre-built styled lines
+/// (so `/status`'s colors carry through); dismiss with Esc/q.
+#[derive(Debug, Clone)]
+struct Overlay {
+    title: String,
+    lines: Vec<Line<'static>>,
+    scroll: usize,
+}
+
 /// Known providers offered by the `/provider` picker. Free-form
 /// `/provider <name>` also works for anything not on this list.
 const KNOWN_PROVIDERS: &[&str] = &[
@@ -248,6 +261,15 @@ pub struct App {
     prompt: InputBuffer,
     /// Session-wide paste counter for collapse display.
     paste_count: usize,
+    /// Fullscreen owned-buffer render mode (mu-5h9m). When true, the whole
+    /// transcript is rendered from the in-memory model into an alt-screen
+    /// buffer each frame, windowed by `transcript_scroll` — no `insert_before`,
+    /// no native scrollback. Opt-in via `MU_SOLO_FULLSCREEN` while it's built
+    /// as a parallel mode alongside the inline path.
+    fullscreen: bool,
+    /// Lines scrolled UP from the bottom of the transcript in fullscreen mode
+    /// (0 = stuck to the latest). Ignored in inline mode.
+    transcript_scroll: usize,
     /// Daemon ID (per daemon.stats at startup). Surfaced via /status.
     daemon_id: String,
     /// Daemon version string. Surfaced via /status.
@@ -310,6 +332,19 @@ pub struct App {
     /// Focused single-block pager. This is another semantic transcript
     /// projection, not a dump into terminal scrollback.
     maximized_block: Option<MaximizedBlock>,
+    /// Active modal overlay (slash-command output panel: /help, /status).
+    /// None when closed. Takes over the screen until dismissed (Esc/q).
+    overlay: Option<Overlay>,
+    /// Ephemeral action acknowledgment shown in the info line (e.g. "✓ copied"),
+    /// like vim's "N lines yanked". Cleared on the next keystroke (mu-5h9m):
+    /// fullscreen actions otherwise succeed silently (insert_before is painted
+    /// over), so there was no signal the command did anything.
+    flash: Option<String>,
+    /// Fold completed tool call+result blocks to one-line summaries in the
+    /// fullscreen render (mu-5h9m, /collapse). Default on — the
+    /// readable-while-streaming firehose fix. Fullscreen-only; inline
+    /// scrollback keeps full results (terminal history can't be re-expanded).
+    collapse_tools: bool,
     bash_yolo: bool,
     /// Discovered skills from SKILL.md files on disk.
     skills: HashMap<String, DiscoveredSkill>,
@@ -561,8 +596,13 @@ impl App {
             pending_ask_ids: std::collections::HashSet::new(),
             live_turn: None,
             transcript: Transcript::new(),
+            fullscreen: std::env::var_os("MU_SOLO_FULLSCREEN").is_some(),
+            transcript_scroll: 0,
             selected_block: None,
             maximized_block: None,
+            overlay: None,
+            flash: None,
+            collapse_tools: true,
             events_file,
             actual_renderer: None,
             actual_cache_strategy: None,
@@ -642,7 +682,13 @@ impl App {
         let mut mcp_rx = self.mcp_status_rx.take();
 
         loop {
-            self.render_viewport(&mut vp)?;
+            if self.overlay.is_some() {
+                self.render_overlay(&mut vp)?;
+            } else if self.fullscreen {
+                self.render_fullscreen(&mut vp)?;
+            } else {
+                self.render_viewport(&mut vp)?;
+            }
 
             tokio::select! {
                 biased;
@@ -719,6 +765,172 @@ impl App {
     }
 
     /// Render the viewport (separator + menu + prompt + status line).
+    /// Fullscreen owned-buffer render (mu-5h9m): paint the whole transcript
+    /// from the in-memory model into a maximized viewport each frame, windowed
+    /// by `transcript_scroll`, with the input chrome pinned at the bottom. No
+    /// `insert_before`, so the inline scrollback gap/dup class can't occur.
+    /// First cut renders the transcript plainly; styled per-block render is a
+    /// follow-up. Built as a parallel mode (opt-in via `MU_SOLO_FULLSCREEN`).
+    fn render_fullscreen(&mut self, vp: &mut DynamicViewport) -> Result<()> {
+        vp.maximize_height()?;
+        let area = vp.area();
+        let total = area.height as usize;
+        let width = area.width as usize;
+        // Reserve the 3-col " > " / "   " prompt prefix plus 1 col for the
+        // trailing block cursor, matching render_viewport's `w - 4` (mu-5h9m).
+        // Wrapping at `width - 1` overflowed the prefix and hard-wrapped the
+        // tail of long prompt lines.
+        let wrap = width.saturating_sub(4);
+
+        // Bottom chrome: a separator rule + the prompt's visual lines.
+        let layout = self.prompt.visual_layout(wrap);
+        let mut chrome: Vec<Line<'static>> = Vec::new();
+        chrome.push(Line::from("─".repeat(width)));
+        // Slash-command dropdown above the prompt (mu-5h9m: was missing in
+        // fullscreen). Mirrors render_viewport.
+        if let Some(ref menu) = self.inline_menu {
+            let (visible, cursor_pos, has_above, has_below) = menu.visible_items();
+            if has_above {
+                chrome.push(Line::from(Span::styled(
+                    "  ↑ more".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            for (vi, (_orig_idx, item)) in visible.iter().enumerate() {
+                let is_selected = vi == cursor_pos;
+                let name_width = 24.min(width / 3);
+                let desc_width = width.saturating_sub(name_width + 4);
+                let name_padded = format!("{:<width$}", item.name, width = name_width);
+                let desc_trunc = if item.description.len() > desc_width {
+                    format!("{}…", &item.description[..desc_width.saturating_sub(1)])
+                } else {
+                    item.description.clone()
+                };
+                let (name_style, desc_style) = if is_selected {
+                    (
+                        Style::default().fg(Color::Black).bg(Color::Cyan),
+                        Style::default().fg(Color::DarkGray).bg(Color::Cyan),
+                    )
+                } else {
+                    (
+                        Style::default().fg(Color::White),
+                        Style::default().fg(Color::DarkGray),
+                    )
+                };
+                chrome.push(Line::from(vec![
+                    Span::styled(format!("  {name_padded}"), name_style),
+                    Span::styled(format!(" {desc_trunc}"), desc_style),
+                ]));
+            }
+            if has_below {
+                chrome.push(Line::from(Span::styled(
+                    "  ↓ more".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+        // Prompt with a visible (inverted-block) cursor at the caret, since
+        // fullscreen hides the terminal cursor (mu-5h9m).
+        let cursor_style = Style::default().fg(Color::Black).bg(Color::Cyan);
+        if layout.lines.is_empty() {
+            chrome.push(Line::from(vec![
+                Span::styled(" > ".to_string(), Style::default().fg(Color::Cyan)),
+                Span::styled(" ".to_string(), cursor_style),
+            ]));
+        } else {
+            for (row_idx, vline) in layout.lines.iter().enumerate() {
+                let prefix = if row_idx == 0 { " > " } else { "   " };
+                if row_idx == layout.cursor_row {
+                    let before: String = vline.text.chars().take(layout.cursor_col).collect();
+                    let after: String = vline.text.chars().skip(layout.cursor_col).collect();
+                    let cursor_char = after.chars().next().unwrap_or(' ').to_string();
+                    let rest: String = after.chars().skip(1).collect();
+                    chrome.push(Line::from(vec![
+                        Span::styled(prefix.to_string(), Style::default().fg(Color::Cyan)),
+                        Span::raw(before),
+                        Span::styled(cursor_char, cursor_style),
+                        Span::raw(rest),
+                    ]));
+                } else {
+                    chrome.push(Line::from(vec![
+                        Span::styled(prefix.to_string(), Style::default().fg(Color::Cyan)),
+                        Span::raw(vline.text.clone()),
+                    ]));
+                }
+            }
+        }
+        // Status + info lines so streaming/idle is visible (mu-5h9m): without
+        // these you can't tell "processing" from "hung".
+        chrome.push(self.format_status_line(width));
+        chrome.push(self.format_info_line(width));
+        let transcript_rows = total.saturating_sub(chrome.len());
+
+        // One styled renderer for the whole transcript: committed blocks and
+        // the live turn go through the same block/turn renderers (no plain
+        // downgrade), one blank line between blocks (mu-5h9m). Assistant turns
+        // keep their structured `items`, so committed turns look identical to
+        // the live one.
+        let bwrap = (area.width as usize).saturating_sub(2);
+        let preview = if self.bash_yolo { 15 } else { 4 };
+        let mut tlines: Vec<Line<'static>> = Vec::new();
+        for block in self.transcript.blocks() {
+            if !tlines.is_empty() {
+                tlines.push(Line::from(""));
+            }
+            match (block.kind, block.items.as_ref()) {
+                (TranscriptKind::User, _) => tlines.extend(render::you_block(&block.body, bwrap)),
+                (TranscriptKind::Assistant, Some(items)) => {
+                    tlines.extend(render::render_turn(
+                        &block.label,
+                        ratatui::style::Color::White,
+                        items,
+                        bwrap,
+                        preview,
+                        self.collapse_tools,
+                    ));
+                    // Committed turns get the closer (the live turn stays open).
+                    tlines.extend(render::turn_closer(ratatui::style::Color::White));
+                }
+                (TranscriptKind::Assistant, None) | (TranscriptKind::Notice, _) => {
+                    tlines.extend(render::assistant_block(&block.body, bwrap))
+                }
+                (TranscriptKind::Error, _) => {
+                    tlines.extend(render::error_block(&block.body, bwrap))
+                }
+            }
+        }
+        if let Some(turn) = self.live_turn.as_ref() {
+            if !tlines.is_empty() {
+                tlines.push(Line::from(""));
+            }
+            tlines.extend(render::render_turn(
+                turn.route.header_label(),
+                turn.route.color(),
+                &turn.items,
+                bwrap,
+                preview,
+                self.collapse_tools,
+            ));
+        }
+
+        // Window: bottom-anchored, minus the scroll-up offset.
+        let len = tlines.len();
+        let max_off = len.saturating_sub(transcript_rows);
+        let off = self.transcript_scroll.min(max_off);
+        self.transcript_scroll = off;
+        let end = len.saturating_sub(off);
+        let start = end.saturating_sub(transcript_rows);
+        let mut lines: Vec<Line<'static>> = tlines[start..end].to_vec();
+        while lines.len() < transcript_rows {
+            lines.push(Line::from(""));
+        }
+        lines.extend(chrome);
+
+        vp.render(Paragraph::new(lines));
+        vp.flush()?;
+        Ok(())
+    }
+
     fn render_viewport(&mut self, vp: &mut DynamicViewport) -> Result<()> {
         if self.maximized_block.is_some() {
             return self.render_maximized_block(vp);
@@ -745,6 +957,7 @@ impl App {
                     &turn.items,
                     w.saturating_sub(2),
                     tool_preview,
+                    false, // inline live preview keeps full results (mu-5h9m)
                 );
                 // Reserve chrome (2 separators + status + info = 4) + menu +
                 // up to 3 prompt rows; the preview gets the rest up to MAX,
@@ -958,8 +1171,15 @@ impl App {
 
     /// Handle one keypress. Returns Ok(true) to exit the loop.
     fn handle_key(&mut self, vp: &mut DynamicViewport, key: KeyEvent) -> Result<bool> {
+        // Clear any prior flash on the next keystroke. A command that sets a
+        // flash does so later in this same call, so the new flash survives
+        // until the *following* key (vim-style transient ack, mu-5h9m).
+        self.flash = None;
         if self.maximized_block.is_some() {
             return self.handle_maximized_key(vp, key);
+        }
+        if self.overlay.is_some() {
+            return self.handle_overlay_key(vp, key);
         }
 
         // If an inline menu is open, route keys there first.
@@ -982,7 +1202,12 @@ impl App {
                                 let takes_arg =
                                     matches!(
                                         cmd.as_str(),
-                                        "/btw" | "/effort" | "/provider" | "/model" | "/focus"
+                                        "/btw"
+                                            | "/effort"
+                                            | "/provider"
+                                            | "/model"
+                                            | "/focus"
+                                            | "/collapse"
                                     ) || self.skills.contains_key(cmd.trim_start_matches('/'));
                                 self.prompt.clear();
                                 for c in cmd.chars() {
@@ -999,6 +1224,7 @@ impl App {
                         MenuContext::Effort => {
                             if let Some(level) = EffortLevel::ALL.get(idx) {
                                 self.effort = *level;
+                                self.set_flash(format!("effort → {}", level.as_str()));
                             }
                         }
                     }
@@ -1026,10 +1252,29 @@ impl App {
 
         match (key.modifiers, key.code) {
             (KeyModifiers::ALT, KeyCode::Up) | (KeyModifiers::ALT, KeyCode::Char('k')) => {
-                self.move_selected_block(-1)
+                if self.fullscreen {
+                    self.transcript_scroll = self.transcript_scroll.saturating_add(1);
+                } else {
+                    self.move_selected_block(-1);
+                }
             }
             (KeyModifiers::ALT, KeyCode::Down) | (KeyModifiers::ALT, KeyCode::Char('j')) => {
-                self.move_selected_block(1)
+                if self.fullscreen {
+                    self.transcript_scroll = self.transcript_scroll.saturating_sub(1);
+                } else {
+                    self.move_selected_block(1);
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::PageUp) if self.fullscreen => {
+                self.transcript_scroll = self.transcript_scroll.saturating_add(10);
+            }
+            (KeyModifiers::NONE, KeyCode::PageDown) if self.fullscreen => {
+                self.transcript_scroll = self.transcript_scroll.saturating_sub(10);
+            }
+            // ctrl+s: dump the record into $EDITOR (hx) — keyboard copy-out
+            // that works in fullscreen (mu-5h9m), like the zellij `ctrl+s e`.
+            (KeyModifiers::CONTROL, KeyCode::Char('s')) => {
+                self.open_in_editor(vp)?;
             }
             (_, KeyCode::Char('c')) if self.prompt.is_empty() && self.selected_block.is_some() => {
                 self.apply_block_action(vp, BlockAction::Copy)?;
@@ -1129,11 +1374,24 @@ impl App {
                 match head {
                     "/q" | "/quit" | "/exit" if tail.is_empty() => return Ok(true),
                     "/status" if tail.is_empty() => {
-                        self.emit_status_lines(vp)?;
+                        // Fullscreen paints over insert_before'd output, so
+                        // route the panel through the owned-buffer overlay
+                        // (mu-5h9m); inline mode keeps the scrollback emit.
+                        if self.fullscreen {
+                            let lines = self.build_status_lines();
+                            self.open_overlay("/status", lines);
+                        } else {
+                            self.emit_status_lines(vp)?;
+                        }
                         return Ok(false);
                     }
                     "/help" => {
-                        self.emit_help_lines(vp)?;
+                        if self.fullscreen {
+                            let lines = self.build_help_lines();
+                            self.open_overlay("/help", lines);
+                        } else {
+                            self.emit_help_lines(vp)?;
+                        }
                         return Ok(false);
                     }
                     "/effort" => {
@@ -1142,6 +1400,10 @@ impl App {
                     }
                     "/focus" => {
                         self.cmd_focus(vp, tail)?;
+                        return Ok(false);
+                    }
+                    "/collapse" => {
+                        self.cmd_collapse(vp, tail)?;
                         return Ok(false);
                     }
                     "/btw" => {
@@ -1380,6 +1642,163 @@ impl App {
         Ok(false)
     }
 
+    /// Open a modal overlay with pre-built styled lines. Used for slash-command
+    /// output (/help, /status) that must be visible in fullscreen, where the
+    /// owned-buffer render paints over anything `insert_before`'d (mu-5h9m).
+    fn open_overlay(&mut self, title: impl Into<String>, lines: Vec<Line<'static>>) {
+        self.overlay = Some(Overlay {
+            title: title.into(),
+            lines,
+            scroll: 0,
+        });
+    }
+
+    /// Set the ephemeral info-line acknowledgment (cleared on the next key).
+    fn set_flash(&mut self, msg: impl Into<String>) {
+        self.flash = Some(msg.into());
+    }
+
+    /// Render the active modal overlay: a full-viewport bordered box of the
+    /// overlay's pre-built lines, scrollable, painted via the owned buffer (no
+    /// `insert_before`). Mirrors `render_maximized_block`; cyan border to
+    /// distinguish it from the yellow maximized-block box (mu-5h9m).
+    fn render_overlay(&mut self, vp: &mut DynamicViewport) -> Result<()> {
+        vp.maximize_height()?;
+        let width = vp.area().width as usize;
+        let height = vp.area().height as usize;
+        if self.overlay.is_none() {
+            return Ok(());
+        }
+
+        // Clamp scroll to content (body = viewport minus the top/bottom border).
+        let body_height = height.saturating_sub(2).max(1);
+        let total = self.overlay.as_ref().unwrap().lines.len();
+        let max_scroll = total.saturating_sub(body_height);
+        let scroll = self.overlay.as_ref().unwrap().scroll.min(max_scroll);
+        self.overlay.as_mut().unwrap().scroll = scroll;
+        let overlay = self.overlay.as_ref().unwrap();
+
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
+        let title = format!(" {} ", overlay.title);
+        lines.push(Line::from(vec![
+            Span::styled("╭".to_string(), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                truncate_at_word(&title, width.saturating_sub(2)),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        // Body rows: prefix each stored line with the box edge, preserving its
+        // own styled spans (so /status keeps its colors). Lines wider than the
+        // box are clipped by the Paragraph render — status/help rows are short.
+        for line in overlay.lines.iter().skip(scroll).take(body_height) {
+            let mut spans = vec![Span::styled(
+                "│ ".to_string(),
+                Style::default().fg(Color::Cyan),
+            )];
+            spans.extend(line.spans.iter().cloned());
+            lines.push(Line::from(spans));
+        }
+        while lines.len() < height.saturating_sub(1) {
+            lines.push(Line::from(Span::styled(
+                "│".to_string(),
+                Style::default().fg(Color::Cyan),
+            )));
+        }
+        let (footer, footer_style) = if let Some(flash) = self.flash.clone() {
+            (
+                format!(" {flash} "),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else if max_scroll > 0 {
+            (
+                format!(
+                    " ↑/↓ PgUp/PgDn scroll · c copy · Esc close · {}/{} ",
+                    scroll + 1,
+                    max_scroll + 1
+                ),
+                Style::default().fg(Color::DarkGray),
+            )
+        } else {
+            (
+                " c copy · Esc close ".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )
+        };
+        lines.push(Line::from(vec![
+            Span::styled("╰".to_string(), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                truncate_at_word(&footer, width.saturating_sub(2)),
+                footer_style,
+            ),
+        ]));
+
+        vp.render(Paragraph::new(lines));
+        vp.flush()?;
+        Ok(())
+    }
+
+    /// Key handling while a modal overlay is open: scroll or dismiss. Mirrors
+    /// `handle_maximized_key`. Esc/q closes; in inline mode the viewport is
+    /// shrunk back to its normal height (fullscreen re-maximizes on the next
+    /// frame, so no shrink there).
+    fn handle_overlay_key(&mut self, vp: &mut DynamicViewport, key: KeyEvent) -> Result<bool> {
+        let Some(mut overlay) = self.overlay.take() else {
+            return Ok(false);
+        };
+        let page = vp.area().height.saturating_sub(3).max(1) as usize;
+        match (key.modifiers, key.code) {
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) => return Ok(true),
+            (_, KeyCode::Esc) | (_, KeyCode::Char('q')) => {
+                // Overlay already taken (stays closed).
+                if !self.fullscreen {
+                    vp.set_height(VIEWPORT_HEIGHT)?;
+                }
+                return Ok(false);
+            }
+            (_, KeyCode::Char('c')) => {
+                // Copy the panel's text out (e.g. /status session/daemon ids) —
+                // ctrl+s and terminal selection don't reach the owned buffer, so
+                // the overlay needs its own copy-out (mu-5h9m). Flatten each
+                // styled line back to plain text.
+                let text = overlay
+                    .lines
+                    .iter()
+                    .map(|l| {
+                        l.spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let outcome =
+                    copy_to_clipboard_or_file(text.trim(), self.clipboard_command.as_deref())?;
+                self.set_flash(format!("✓ copied {} · {outcome}", overlay.title));
+            }
+            (_, KeyCode::Up) | (KeyModifiers::ALT, KeyCode::Char('k')) => {
+                overlay.scroll = overlay.scroll.saturating_sub(1);
+            }
+            (_, KeyCode::Down) | (KeyModifiers::ALT, KeyCode::Char('j')) => {
+                overlay.scroll = overlay.scroll.saturating_add(1);
+            }
+            (_, KeyCode::PageUp) => {
+                overlay.scroll = overlay.scroll.saturating_sub(page);
+            }
+            (_, KeyCode::PageDown) | (_, KeyCode::Char(' ')) => {
+                overlay.scroll = overlay.scroll.saturating_add(page);
+            }
+            (_, KeyCode::Home) => overlay.scroll = 0,
+            (_, KeyCode::End) => overlay.scroll = usize::MAX,
+            _ => {}
+        }
+        self.overlay = Some(overlay);
+        Ok(false)
+    }
+
     fn emit_block_action_menu(&self, vp: &mut DynamicViewport) -> Result<()> {
         let Some(block) = self.selected_block() else {
             return Ok(());
@@ -1589,8 +2008,8 @@ impl App {
     /// /status — print provider, model, session_id, daemon_id, version
     /// to scrollback. Lets the operator find the daemon's events
     /// directory: ~/.local/share/mu/events/{daemon_id}/session-N.jsonl
-    fn emit_status_lines(&self, vp: &mut DynamicViewport) -> Result<()> {
-        let lines: Vec<Line<'static>> = vec![
+    fn build_status_lines(&self) -> Vec<Line<'static>> {
+        vec![
             Line::from(""),
             Line::from(Span::styled(
                 "── /status ─────────────────────────".to_string(),
@@ -1650,7 +2069,11 @@ impl App {
                 self.daemon_id
             )),
             Line::from(""),
-        ];
+        ]
+    }
+
+    fn emit_status_lines(&self, vp: &mut DynamicViewport) -> Result<()> {
+        let lines = self.build_status_lines();
         let h = lines.len() as u16;
         vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);
@@ -1691,6 +2114,7 @@ impl App {
             return Ok(());
         } else if let Some(level) = EffortLevel::parse(arg) {
             self.effort = level;
+            self.set_flash(format!("effort → {}", level.as_str()));
             vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -1753,6 +2177,7 @@ impl App {
             }
         };
         self.focus_mode = new_value;
+        self.set_flash(format!("focus → {}", if new_value { "on" } else { "off" }));
         let lines: Vec<Line<'static>> = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -1768,6 +2193,58 @@ impl App {
             let p = Paragraph::new(lines);
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
+        Ok(())
+    }
+
+    /// /collapse — fold completed tool call+result blocks to one-liners in the
+    /// fullscreen render (mu-5h9m). `/collapse` toggles; `/collapse on|off`
+    /// sets. Fullscreen-only effect; the flash ack is the visible signal.
+    fn cmd_collapse(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
+        let new_value = match arg.trim().to_lowercase().as_str() {
+            "" | "toggle" => !self.collapse_tools,
+            "on" | "true" | "1" | "yes" => true,
+            "off" | "false" | "0" | "no" => false,
+            other => {
+                let lines: Vec<Line<'static>> = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("unknown collapse arg: {other:?}"),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from("  usage:    /collapse [on|off|toggle]"),
+                    Line::from(""),
+                ];
+                let h = lines.len() as u16;
+                vp.insert_before(h, |buf| {
+                    let p = Paragraph::new(lines);
+                    ratatui::widgets::Widget::render(p, buf.area, buf);
+                })?;
+                return Ok(());
+            }
+        };
+        self.collapse_tools = new_value;
+        self.set_flash(format!(
+            "tools {}",
+            if new_value { "collapsed" } else { "expanded" }
+        ));
+        if !self.fullscreen {
+            let lines: Vec<Line<'static>> = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("tools {}", if new_value { "collapsed" } else { "expanded" }),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from("  (collapse only affects the fullscreen render)"),
+                Line::from(""),
+            ];
+            let h = lines.len() as u16;
+            vp.insert_before(h, |buf| {
+                let p = Paragraph::new(lines);
+                ratatui::widgets::Widget::render(p, buf.area, buf);
+            })?;
+        }
         Ok(())
     }
 
@@ -1798,6 +2275,7 @@ impl App {
             Ok(()) => {
                 self.provider = new_provider;
                 self.model = default_model;
+                self.set_flash(format!("provider → {} · {}", self.provider, self.model));
             }
             Err(e) => {
                 let lines = vec![
@@ -1862,6 +2340,7 @@ impl App {
         match self.send_set_route(vp, &kind, &new_model) {
             Ok(()) => {
                 self.model = new_model;
+                self.set_flash(format!("model → {}", self.model));
             }
             Err(e) => {
                 let lines = vec![
@@ -1996,14 +2475,72 @@ impl App {
     /// /clear — clear the visible scrollback. Doesn't touch the
     /// daemon's event log; this is a display-only reset. The inline
     /// viewport redraws on the next tick.
-    fn cmd_clear(&mut self, _vp: &mut DynamicViewport) -> Result<()> {
-        // TODO: implement viewport clear
+    fn cmd_clear(&mut self, vp: &mut DynamicViewport) -> Result<()> {
+        // Drop the in-memory transcript. In fullscreen the owned-buffer render
+        // windows `self.transcript`, so this visibly empties the screen the next
+        // frame (mu-5h9m). Inline mode also clears the live viewport region;
+        // terminal scrollback above it belongs to the multiplexer and is left
+        // alone (it's the user's scroll history, not ours to wipe).
+        self.transcript.clear();
+        self.transcript_scroll = 0;
+        self.selected_block = None;
+        if !self.fullscreen {
+            vp.clear_viewport()?;
+        }
         Ok(())
     }
 
     /// /transcript [PATH] — write the semantic transcript projection to a file.
     /// Bare command writes to a temp file and prints the path. This reads the
     /// in-memory semantic record, not rendered terminal cells.
+    /// Dump the record to a temp file and hand the terminal to `$EDITOR`/`hx`,
+    /// then take it back. Keyboard copy-out (`ctrl+s`) that survives fullscreen
+    /// (mu-5h9m): mirrors the `ctrl+s e` zellij→editor habit, but reads mu's own
+    /// record, so it works without a terminal scrollback buffer to dump.
+    fn open_in_editor(&mut self, _vp: &mut DynamicViewport) -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "mu-solo-transcript-{}-{}.md",
+            std::process::id(),
+            self.ask_count
+        ));
+        std::fs::write(&path, self.transcript.render_all_plain())
+            .with_context(|| format!("write transcript to {path:?}"))?;
+        let editor = std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .unwrap_or_else(|_| "hx".to_string());
+        // Hand the terminal to the editor cleanly, then restore EVERY mode set
+        // at startup — not just raw mode. Helix (and most modern editors) speak
+        // the kitty keyboard protocol and reset terminal keyboard state on exit,
+        // which silently drops our DISAMBIGUATE_ESCAPE_CODES push; without
+        // re-arming it, modified Enter (Shift-Enter → newline) collapses back to
+        // plain CR until restart (mu-5h9m, mu-solo-shift-enter-62tx). Mirror the
+        // startup/shutdown sequence in bin/mu-solo.rs: pop our flags before the
+        // editor (clean slate, keeps the kitty stack balanced) and re-push after.
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableFocusChange,
+            crossterm::event::PopKeyboardEnhancementFlags,
+            crossterm::event::DisableBracketedPaste,
+        );
+        crossterm::terminal::disable_raw_mode()?;
+        crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
+        let status = std::process::Command::new(&editor).arg(&path).status();
+        crossterm::terminal::enable_raw_mode()?;
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            ),
+            crossterm::event::EnableFocusChange,
+        );
+        crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide)?;
+        if let Err(e) = status {
+            tracing::warn!("editor '{editor}' spawn failed: {e}");
+        }
+        Ok(())
+    }
+
     fn cmd_transcript(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
         let path = if arg.is_empty() {
             std::env::temp_dir().join(format!(
@@ -2016,6 +2553,7 @@ impl App {
         };
         let text = self.transcript.render_all_plain();
         std::fs::write(&path, text).with_context(|| format!("write transcript to {path:?}"))?;
+        self.set_flash(format!("✓ transcript → {}", path.display()));
         let lines: Vec<Line<'static>> = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -2052,6 +2590,7 @@ impl App {
             _ => None,
         };
         let Some(text) = text else {
+            self.set_flash(format!("nothing to copy ({selector})"));
             let lines: Vec<Line<'static>> = vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -2072,6 +2611,7 @@ impl App {
         };
 
         let outcome = copy_to_clipboard_or_file(&text, self.clipboard_command.as_deref())?;
+        self.set_flash(format!("✓ copied {selector} · {outcome}"));
         let lines: Vec<Line<'static>> = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -2195,6 +2735,7 @@ impl App {
             MenuItem::new("/help", "Show help for commands"),
             MenuItem::new("/effort ›", "Select effort level"),
             MenuItem::new("/focus", "Toggle focus mode (suppress streaming preview)"),
+            MenuItem::new("/collapse", "Fold tool call+result blocks to one-liners"),
             MenuItem::new("/provider ›", "Select provider"),
             MenuItem::new("/model ›", "Select model"),
             MenuItem::new(
@@ -2205,7 +2746,8 @@ impl App {
             MenuItem::new("/clear", "Clear the visible scrollback"),
             MenuItem::new("/transcript", "Write semantic transcript to a file"),
             MenuItem::new("/copy", "Copy last/assistant/user/all semantic content"),
-            MenuItem::new("/q", "Leave the session"),
+            MenuItem::new("/quit", "Leave the session (/q, /exit)"),
+            MenuItem::new("/exit", "Leave the session"),
         ];
         let mut skill_names: Vec<&str> = self.skills.keys().map(|s| s.as_str()).collect();
         skill_names.sort();
@@ -2217,7 +2759,7 @@ impl App {
         items
     }
 
-    fn emit_help_lines(&self, vp: &mut DynamicViewport) -> Result<()> {
+    fn build_help_lines(&self) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -2230,6 +2772,9 @@ impl App {
             Line::from("  /help              show this list"),
             Line::from("  /effort [LEVEL]    show or set effort: low|medium|high|xhigh|max"),
             Line::from("  /focus [on|off]    toggle focus mode (suppress streaming preview)"),
+            Line::from(
+                "  /collapse [on|off] fold completed tool blocks to one-liners (fullscreen)",
+            ),
             Line::from("  /provider [name]   list-picker (bare) or set directly"),
             Line::from("  /model [name]      list-picker (bare) or set directly"),
             Line::from("  /btw <message>     side question via sidecar (main history unaffected)"),
@@ -2269,7 +2814,11 @@ impl App {
             "  Anything else is sent to the model as a prompt.",
         ));
         lines.push(Line::from(""));
+        lines
+    }
 
+    fn emit_help_lines(&self, vp: &mut DynamicViewport) -> Result<()> {
+        let lines = self.build_help_lines();
         let h = lines.len() as u16;
         vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);
@@ -2410,7 +2959,21 @@ impl App {
             .and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
             .unwrap_or_else(|| "?".into());
 
-        let left = format!("  {user}@{host}:{cwd}");
+        // An active flash takes over the left of the info line (green), so a
+        // command's "✓ did the thing" is visible even in fullscreen where the
+        // insert_before confirmation is painted over (mu-5h9m).
+        let (left, left_style) = match self.flash {
+            Some(ref flash) => (
+                format!("  {flash}"),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            None => (
+                format!("  {user}@{host}:{cwd}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        };
 
         let (right, right_style) = if let Some(ref status) = self.mcp_status {
             if let Some(pct) = status.context_pressure_pct {
@@ -2433,7 +2996,7 @@ impl App {
         let padding = " ".repeat(gap.max(1));
 
         Line::from(vec![
-            Span::styled(left, Style::default().fg(Color::DarkGray)),
+            Span::styled(left, left_style),
             Span::styled(padding, Style::default()),
             Span::styled(right, right_style),
         ])
@@ -2708,6 +3271,7 @@ impl App {
                             &t.items,
                             wrap_width,
                             preview_lines,
+                            false, // inline scrollback commit keeps full results (mu-5h9m)
                         );
                         lines.extend(render::turn_closer(t.route.color()));
                         let h = lines.len() as u16;

@@ -20,7 +20,7 @@ use std::io::{stdout, Stdout, Write};
 use anyhow::Result;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute, queue,
     style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
@@ -45,36 +45,77 @@ pub fn run_picker(title: &str, items: &[String], initial: usize) -> Result<Optio
     result
 }
 
+/// Recompute the matched indices for `filter` (case-insensitive substring).
+/// Empty filter matches everything. Pure so it's unit-testable.
+fn refilter(items: &[String], filter: &str, matches: &mut Vec<usize>) {
+    matches.clear();
+    if filter.is_empty() {
+        matches.extend(0..items.len());
+        return;
+    }
+    let needle = filter.to_lowercase();
+    for (i, item) in items.iter().enumerate() {
+        if item.to_lowercase().contains(&needle) {
+            matches.push(i);
+        }
+    }
+}
+
 fn picker_loop(
     out: &mut Stdout,
     title: &str,
     items: &[String],
     initial: usize,
 ) -> Result<Option<usize>> {
+    // Type-to-filter: printable chars narrow the list, arrows move the cursor
+    // within the matches, Enter commits the highlighted ORIGINAL index. This
+    // is the "works like other pickers" model — no vim nav / digit shortcuts,
+    // because those characters now feed the filter.
+    let mut filter = String::new();
+    let mut matches: Vec<usize> = (0..items.len()).collect();
+    // Cursor within `matches`; start on the initial selection (empty filter,
+    // so match index == original index).
     let mut idx = initial.min(items.len().saturating_sub(1));
     loop {
-        draw(out, title, items, idx)?;
+        draw(out, title, items, &matches, idx, &filter)?;
         if let Event::Key(KeyEvent {
-            code, modifiers, ..
+            code,
+            modifiers,
+            kind,
+            ..
         }) = event::read()?
         {
+            // Under the keyboard-enhancement flags the app pushes, a keypress
+            // also emits a Release; ignore it so typing isn't doubled.
+            if kind == KeyEventKind::Release {
+                continue;
+            }
             match (modifiers, code) {
                 (KeyModifiers::CONTROL, KeyCode::Char('c')) => return Ok(None),
                 (_, KeyCode::Esc) => return Ok(None),
-                (_, KeyCode::Enter) => return Ok(Some(idx)),
-                (_, KeyCode::Up) | (_, KeyCode::Char('k')) => {
-                    idx = idx.saturating_sub(1);
-                }
-                (_, KeyCode::Down) | (_, KeyCode::Char('j')) => {
-                    idx = (idx + 1).min(items.len() - 1);
-                }
-                (_, KeyCode::Home) | (_, KeyCode::Char('g')) => idx = 0,
-                (_, KeyCode::End) | (_, KeyCode::Char('G')) => idx = items.len() - 1,
-                (_, KeyCode::Char(c @ '1'..='9')) => {
-                    let pick = c.to_digit(10).unwrap() as usize - 1;
-                    if pick < items.len() {
-                        idx = pick;
+                (_, KeyCode::Enter) => {
+                    if let Some(&orig) = matches.get(idx) {
+                        return Ok(Some(orig));
                     }
+                }
+                (_, KeyCode::Up) => idx = idx.saturating_sub(1),
+                (_, KeyCode::Down) => {
+                    if !matches.is_empty() {
+                        idx = (idx + 1).min(matches.len() - 1);
+                    }
+                }
+                (_, KeyCode::Backspace) => {
+                    if filter.pop().is_some() {
+                        refilter(items, &filter, &mut matches);
+                        idx = 0;
+                    }
+                }
+                (m, KeyCode::Char(c))
+                    if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+                {
+                    filter.push(c);
+                    refilter(items, &filter, &mut matches);
+                    idx = 0;
                 }
                 _ => {}
             }
@@ -82,7 +123,14 @@ fn picker_loop(
     }
 }
 
-fn draw(out: &mut Stdout, title: &str, items: &[String], idx: usize) -> Result<()> {
+fn draw(
+    out: &mut Stdout,
+    title: &str,
+    items: &[String],
+    matches: &[usize],
+    idx: usize,
+    filter: &str,
+) -> Result<()> {
     queue!(
         out,
         Clear(ClearType::All),
@@ -91,30 +139,84 @@ fn draw(out: &mut Stdout, title: &str, items: &[String], idx: usize) -> Result<(
         Print(format!("── {title} ──")),
         ResetColor,
     )?;
+    // Filter line: what's been typed so far.
+    queue!(
+        out,
+        cursor::MoveToNextLine(1),
+        cursor::MoveToColumn(2),
+        SetForegroundColor(Color::DarkGrey),
+        Print("filter: "),
+        ResetColor,
+        Print(filter),
+    )?;
     queue!(out, cursor::MoveToNextLine(2))?;
-    for (i, item) in items.iter().enumerate() {
-        queue!(out, cursor::MoveToColumn(2))?;
-        if i == idx {
-            queue!(
-                out,
-                SetForegroundColor(Color::Black),
-                SetBackgroundColor(Color::Cyan),
-                Print(format!(" ▶ {item} ")),
-                ResetColor,
-            )?;
-        } else {
-            queue!(out, Print(format!("   {item}")))?;
+    if matches.is_empty() {
+        queue!(
+            out,
+            cursor::MoveToColumn(2),
+            SetForegroundColor(Color::DarkGrey),
+            Print("(no matches)"),
+            ResetColor,
+            cursor::MoveToNextLine(1),
+        )?;
+    } else {
+        for (row, &orig) in matches.iter().enumerate() {
+            let item = &items[orig];
+            queue!(out, cursor::MoveToColumn(2))?;
+            if row == idx {
+                queue!(
+                    out,
+                    SetForegroundColor(Color::Black),
+                    SetBackgroundColor(Color::Cyan),
+                    Print(format!(" ▶ {item} ")),
+                    ResetColor,
+                )?;
+            } else {
+                queue!(out, Print(format!("   {item}")))?;
+            }
+            queue!(out, cursor::MoveToNextLine(1))?;
         }
-        queue!(out, cursor::MoveToNextLine(1))?;
     }
     queue!(
         out,
         cursor::MoveToNextLine(1),
         cursor::MoveToColumn(2),
         SetForegroundColor(Color::DarkGrey),
-        Print("↑/↓ or j/k navigate · 1-9 jump · Enter commit · Esc cancel"),
+        Print("type to filter · ↑/↓ select · Enter commit · Esc cancel"),
         ResetColor,
     )?;
     out.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refilter;
+
+    fn items() -> Vec<String> {
+        ["gpt-5.5", "gpt-oss:20b", "claude-opus-4-8", "qwen3-coder"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn empty_filter_matches_all() {
+        let items = items();
+        let mut m = Vec::new();
+        refilter(&items, "", &mut m);
+        assert_eq!(m, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn substring_filter_is_case_insensitive() {
+        let items = items();
+        let mut m = Vec::new();
+        refilter(&items, "GPT", &mut m);
+        assert_eq!(m, vec![0, 1]);
+        refilter(&items, "opus", &mut m);
+        assert_eq!(m, vec![2]);
+        refilter(&items, "zzz", &mut m);
+        assert!(m.is_empty());
+    }
 }

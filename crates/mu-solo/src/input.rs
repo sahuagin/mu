@@ -128,17 +128,27 @@ impl InputBuffer {
         self.adjust_paste_regions_for_delete(self.cursor, deleted);
     }
 
-    /// Move cursor one char left.
+    /// Move cursor one char left. A collapsed paste is an atomic stop: landing
+    /// inside one snaps to its start, so the caret skips the placeholder in one
+    /// step instead of crawling the hidden paste bytes (mu-5h9m).
     pub fn move_left(&mut self) {
         if self.cursor > 0 {
-            self.cursor = self.prev_char_boundary();
+            let prev = self.prev_char_boundary();
+            self.cursor = match self.collapsed_region_containing(prev) {
+                Some((start, _)) => start,
+                None => prev,
+            };
         }
     }
 
-    /// Move cursor one char right.
+    /// Move cursor one char right. Atomic over collapsed pastes (see `move_left`).
     pub fn move_right(&mut self) {
         if self.cursor < self.content.len() {
-            self.cursor = self.next_char_boundary();
+            let next = self.next_char_boundary();
+            self.cursor = match self.collapsed_region_containing(next) {
+                Some((_, end)) => end,
+                None => next,
+            };
         }
     }
 
@@ -167,7 +177,11 @@ impl InputBuffer {
         while pos > 0 && !bytes[pos - 1].is_ascii_whitespace() {
             pos = prev_boundary(&self.content, pos);
         }
-        self.cursor = pos;
+        // Don't land inside a collapsed paste — snap to its start.
+        self.cursor = match self.collapsed_region_containing(pos) {
+            Some((start, _)) => start,
+            None => pos,
+        };
     }
 
     /// Move cursor one word right (to end of next word).
@@ -186,7 +200,11 @@ impl InputBuffer {
         while pos < len && bytes[pos].is_ascii_whitespace() {
             pos = next_boundary(&self.content, pos);
         }
-        self.cursor = pos;
+        // Don't land inside a collapsed paste — snap to its end.
+        self.cursor = match self.collapsed_region_containing(pos) {
+            Some((_, end)) => end,
+            None => pos,
+        };
     }
 
     /// Shift paste regions that start at or after `pos` by `delta` bytes.
@@ -237,6 +255,19 @@ impl InputBuffer {
         self.pastes.iter().find(|p| pos >= p.start && pos < p.end)
     }
 
+    /// If a COLLAPSED paste (≥ threshold lines, shown as a one-line placeholder)
+    /// *strictly* contains byte offset `pos`, return its `(start, end)`. Lets
+    /// cursor movement treat the placeholder as a single atomic stop instead of
+    /// crawling the hidden raw paste bytes (mu-5h9m). Positions exactly at a
+    /// region boundary are not "inside".
+    fn collapsed_region_containing(&self, pos: usize) -> Option<(usize, usize)> {
+        self.pastes
+            .iter()
+            .filter(|p| p.line_count >= PASTE_COLLAPSE_THRESHOLD)
+            .find(|p| pos > p.start && pos < p.end)
+            .map(|p| (p.start, p.end))
+    }
+
     /// Compute visual lines given a wrap width. Returns (lines, cursor_row, cursor_col).
     /// Paste regions above PASTE_COLLAPSE_THRESHOLD lines are rendered as a
     /// single placeholder line `[Pasted text #N +X lines]`.
@@ -262,17 +293,21 @@ impl InputBuffer {
                     line_count,
                 } => {
                     let placeholder = format!("[Pasted text #{} +{} lines]", number, line_count);
+                    let ph_cols = placeholder.chars().count();
                     let row_idx = lines.len();
                     lines.push(VisualLine {
                         text: placeholder,
                         byte_start: *start,
                         byte_end: *end,
                     });
-                    // If cursor is inside the collapsed paste, place it
-                    // at the end of the placeholder line.
+                    // Caret renders *before* the placeholder at the region start
+                    // and *after* it once the cursor has moved past start —
+                    // movement is atomic, so the cursor only ever rests at start
+                    // or end, never mid-placeholder (mu-5h9m). The old code
+                    // pinned col 0 for the whole range, trapping the caret.
                     if !cursor.found && self.cursor >= *start && self.cursor <= *end {
                         cursor.row = row_idx;
-                        cursor.col = 0; // beginning of placeholder
+                        cursor.col = if self.cursor > *start { ph_cols } else { 0 };
                         cursor.found = true;
                     }
                 }
@@ -613,6 +648,37 @@ mod tests {
         assert_eq!(layout.lines.len(), 2);
         assert_eq!(layout.lines[0].text, "ab");
         assert_eq!(layout.lines[1].text, "cd");
+    }
+
+    #[test]
+    fn collapsed_paste_is_atomic_cursor_stop() {
+        // mu-5h9m: after a collapsed paste the caret renders AFTER the
+        // placeholder (not pinned at col 0), and left/right skip the whole
+        // placeholder in one step instead of crawling the hidden paste bytes.
+        let mut buf = InputBuffer::new();
+        buf.insert_paste("a\nb\nc\nd\n", 1); // 4 lines ≥ threshold → collapsed
+        let lay = buf.visual_layout(80);
+        assert_eq!(lay.lines.len(), 1);
+        let ph_cols = lay.lines[0].text.chars().count();
+        assert!(lay.lines[0].text.contains("[Pasted text #1"));
+        // caret sits AFTER the placeholder, not before it
+        assert_eq!(lay.cursor_col, ph_cols, "caret should be after ]");
+
+        // one Left jumps atomically to before the placeholder
+        buf.move_left();
+        assert_eq!(
+            buf.visual_layout(80).cursor_col,
+            0,
+            "caret should be before ["
+        );
+
+        // one Right jumps atomically back past the whole placeholder
+        buf.move_right();
+        assert_eq!(
+            buf.visual_layout(80).cursor_col,
+            ph_cols,
+            "Right should skip the whole placeholder in one step"
+        );
     }
 
     #[test]

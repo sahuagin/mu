@@ -412,3 +412,38 @@ fn verify_augmentable_when_tool_installed_into_unchanged_path_dir() {
         "only_live should name the newly-installed tool; got:\n{out}"
     );
 }
+
+// mu-8stm.3: `classify` probes a command and emits PROPOSED, unverified effect
+// candidates — the floor under the Phase-2 grind. We classify the t4c binary
+// itself (it speaks `--help-ai --json`) via its absolute path, so the test is
+// host-independent (no reliance on a tool being on PATH).
+#[test]
+fn classify_conforming_tool_emits_candidate_toml() {
+    let sb = Sandbox::new("classify-conf");
+    let (out, ok) = sb.run(&["classify", env!("CARGO_BIN_EXE_t4c")]);
+    assert!(ok, "classify failed: {out}");
+    assert!(
+        out.contains("PROPOSED"),
+        "missing UNVERIFIED banner:\n{out}"
+    );
+    assert!(
+        out.contains("[[capability]]"),
+        "missing capability block:\n{out}"
+    );
+    assert!(out.contains("bash.t4c"), "missing tool path:\n{out}");
+    assert!(
+        out.contains("[capability.effects]"),
+        "every candidate must carry a proposed effects block:\n{out}"
+    );
+}
+
+// Absent / unprobeable command: exit 1 (not a panic, not exit 0).
+#[test]
+fn classify_absent_command_degrades_gracefully() {
+    let sb = Sandbox::new("classify-absent");
+    let (out, code) = sb.run_code(&["classify", "t4c-no-such-cmd-xyzzy"], None);
+    assert_eq!(
+        code, 1,
+        "absent cmd must exit 1 (unprobeable), not panic; got:\n{out}"
+    );
+}

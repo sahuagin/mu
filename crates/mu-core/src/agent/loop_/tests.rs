@@ -1819,9 +1819,13 @@ async fn read_only_ceiling_refuses_execute_tool() {
     assert!(callout, "expected a capability-refused callout");
     let content = content.expect("ToolCallCompleted should fire");
     assert!(is_error, "side-effects refusal => is_error");
+    // mu-8stm.2 (1b): the refusal now carries the structured `disallowed_by`
+    // reason (the SAME string discovery shows) instead of the old linear
+    // "max_side_effects" wording — an Execute tool writes, which a read-only
+    // posture forbids.
     assert!(
-        content.contains("side-effects") && content.contains("max_side_effects"),
-        "refusal should name the side-effects ceiling; got: {content}"
+        content.contains("read-only") || content.contains("no filesystem writes"),
+        "refusal should name the read-only posture; got: {content}"
     );
     assert!(
         !content.contains("DANGER"),

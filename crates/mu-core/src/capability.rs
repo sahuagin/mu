@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::agent::tool::SideEffects;
-use t4c::SessionConstraints;
+use t4c::{Effects, SessionConstraints};
 
 /// What a session is allowed to do. `None` on any field means
 /// "unrestricted on this axis." All `Some` values are upper-bound
@@ -576,6 +576,32 @@ impl Capability {
         }
     }
 
+    /// mu-8stm.2 (phase 1b): the STRUCTURED appropriateness check — the
+    /// canonical replacement for `check_side_effects` at the dispatch gate.
+    /// Tests the tool's canonical [`Effects`] against the session's per-axis
+    /// [`SessionConstraints`] via t4c's `disallowed_by` — the SAME predicate
+    /// the discovery surface uses, so a tool's gate refusal and its
+    /// `allowed_by_session=false` reason are identical (single source of
+    /// truth). `None` effects (unannotated) FAIL CLOSED under any active
+    /// posture; an unconstrained session (no ceiling) allows everything
+    /// (back-compat root default).
+    pub fn check_effects(&self, effects: Option<&Effects>) -> CapabilityCheck {
+        match self.effective_constraints() {
+            None => CapabilityCheck::Allowed,
+            Some(constraints) => match effects {
+                Some(e) => match e.disallowed_by(&constraints) {
+                    Some(reason) => CapabilityCheck::DeniedInappropriate { reason },
+                    None => CapabilityCheck::Allowed,
+                },
+                None => CapabilityCheck::DeniedInappropriate {
+                    reason: "tool has unclassified (unannotated) effects; refused under this \
+                             session's posture — classify it before use"
+                        .to_string(),
+                },
+            },
+        }
+    }
+
     /// Decrement the tool-call budget (if any). Call this AFTER a
     /// successful `check_allow`, immediately before dispatching the
     /// tool. Returns the new remaining count (or None for unlimited).
@@ -643,6 +669,14 @@ pub enum CapabilityCheck {
         declared: SideEffects,
         ceiling: SideEffects,
     },
+    /// mu-8stm.2 (phase 1b): the tool's structured [`t4c::Effects`] are
+    /// inappropriate for the session's per-axis posture — or are unannotated
+    /// and refused fail-closed. `reason` is the legible, axis-named
+    /// explanation (from `Effects::disallowed_by`, the SAME predicate the
+    /// discovery surface uses, or the unclassified-fail-closed message).
+    DeniedInappropriate {
+        reason: String,
+    },
 }
 
 impl CapabilityCheck {
@@ -660,6 +694,9 @@ impl CapabilityCheck {
             }
             CapabilityCheck::DeniedSideEffectsExceeded { .. } => {
                 "tool's declared side-effects exceed the session's max_side_effects ceiling"
+            }
+            CapabilityCheck::DeniedInappropriate { .. } => {
+                "tool's effects are inappropriate for the session's posture (or unannotated)"
             }
         }
     }
@@ -1607,5 +1644,60 @@ mod tests {
         ro.max_side_effects = Some(SideEffects::ReadOnly);
         let c = ro.effective_constraints().expect("constrained");
         assert!(c.no_writes && c.no_vcs && c.no_network && c.no_spend && c.no_process);
+    }
+
+    // mu-8stm.2 phase 1b: the structured gate predicate. Unconstrained sessions
+    // allow everything (back-compat); a constrained posture refuses tools whose
+    // effects exceed it AND fails closed on unannotated (None) effects.
+    #[test]
+    fn check_effects_enforces_constraints_and_fails_closed_on_none() {
+        use SideEffects::*;
+        // Unconstrained (root) — allows everything, even unannotated effects.
+        let root = Capability::root();
+        assert!(root.check_effects(Some(&Execute.effects())).is_allowed());
+        assert!(root.check_effects(None).is_allowed());
+
+        // Read-only posture.
+        let mut ro = Capability::root();
+        ro.max_side_effects = Some(ReadOnly);
+        assert!(ro.check_effects(Some(&ReadOnly.effects())).is_allowed());
+        assert!(matches!(
+            ro.check_effects(Some(&Execute.effects())),
+            CapabilityCheck::DeniedInappropriate { .. }
+        ));
+        // None-closed: unannotated effects refused under an active posture.
+        assert!(matches!(
+            ro.check_effects(None),
+            CapabilityCheck::DeniedInappropriate { .. }
+        ));
+    }
+
+    // mu-8stm.2 (1b, review: gpt-5.5): the gate consults derived_effects(), so an
+    // AWS-gated tool's network/spend reach is honored — a read-only posture
+    // refuses it even though its declared class is ReadOnly, and even if the AWS
+    // grant is held. Pins gate<->discovery agreement (both use derived_effects)
+    // and closes the fail-open where a grant let a network/spend tool slip a
+    // no-network/no-spend posture.
+    #[test]
+    fn aws_gated_tool_refused_under_no_network_posture() {
+        use crate::agent::tool::{PermissionLevel, RetryPolicy, ToolPolicy};
+        let policy = ToolPolicy {
+            side_effects: SideEffects::ReadOnly,
+            permission: PermissionLevel::Allow,
+            retry: RetryPolicy::ModelDecides,
+            required_aws_capability: Some("aws.scout.readonly".to_string()),
+            idempotent: true,
+        };
+        // derived_effects() adds network+spend for the AWS grant.
+        let eff = policy.derived_effects();
+        assert!(eff.network && eff.spend);
+        // A read-only posture (no_network/no_spend) refuses it via the gate
+        // predicate — not allowed just because its declared class is ReadOnly.
+        let mut ro = Capability::root();
+        ro.max_side_effects = Some(SideEffects::ReadOnly);
+        assert!(matches!(
+            ro.check_effects(Some(&eff)),
+            CapabilityCheck::DeniedInappropriate { .. }
+        ));
     }
 }

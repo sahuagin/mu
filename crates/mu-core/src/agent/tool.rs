@@ -178,12 +178,14 @@ impl ToolPolicy {
         }
     }
 
-    /// The tool's structured [`Effects`] for the DISCOVERY surface: the
-    /// side-effects projection ([`SideEffects::effects`]) plus the one
-    /// inference mu can make — a tool gated on an AWS capability reaches the
-    /// network and spends. The dispatch gate uses `side_effects.effects()`
-    /// directly (the AWS axis has its own gate via `required_aws_capability`),
-    /// so this `aws` inference is a discovery-display hint only. (mu-8stm.2)
+    /// The tool's canonical structured [`Effects`]: the side-effects projection
+    /// ([`SideEffects::effects`]) plus the one inference mu can make — a tool
+    /// gated on an AWS capability reaches the network and spends. BOTH the
+    /// dispatch gate and the discovery surface consult this (single source of
+    /// truth), so a tool's `allowed_by_session` and its gate refusal agree. The
+    /// aws->network/spend reach is REAL reach the appropriateness gate must
+    /// honor; the `required_aws_capability` grant gate is an ADDITIONAL check,
+    /// not a substitute for the session's network/spend posture. (mu-8stm.2)
     pub fn derived_effects(&self) -> Effects {
         let mut e = self.side_effects.effects();
         if self.required_aws_capability.is_some() {

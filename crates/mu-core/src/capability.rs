@@ -23,6 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::agent::tool::SideEffects;
+use t4c::SessionConstraints;
 
 /// What a session is allowed to do. `None` on any field means
 /// "unrestricted on this axis." All `Some` values are upper-bound
@@ -321,6 +322,44 @@ impl AutonomyCapability {
     }
 }
 
+/// Map the coarse linear `max_side_effects` ceiling onto t4c's per-axis
+/// [`SessionConstraints`] (mu-8stm.2 phase 1). The coarse ceiling is a TOTAL
+/// order while constraints are INDEPENDENT axes; this mapping is exact for the
+/// tool classes mu actually declares (ReadOnly/Mutating/Execute) across every
+/// ceiling — proven by `structured_constraints_match_linear_ceiling_*` — and is
+/// the conservative reading for the unused middle classes. `ReadOnly` forbids
+/// everything above a read; `Execute` forbids nothing.
+pub fn constraints_from_max_side_effects(ceiling: SideEffects) -> SessionConstraints {
+    match ceiling {
+        SideEffects::ReadOnly => SessionConstraints {
+            no_writes: true,
+            no_vcs: true,
+            no_network: true,
+            no_spend: true,
+            no_process: true,
+        },
+        // Local writes/vcs allowed; anything reaching out (network/spend/
+        // process) is not.
+        SideEffects::Mutating | SideEffects::Destructive => SessionConstraints {
+            no_writes: false,
+            no_vcs: false,
+            no_network: true,
+            no_spend: true,
+            no_process: true,
+        },
+        // Network allowed; spawning processes / spend is not.
+        SideEffects::External => SessionConstraints {
+            no_writes: false,
+            no_vcs: false,
+            no_network: false,
+            no_spend: true,
+            no_process: true,
+        },
+        // Execute ceiling = unconstrained.
+        SideEffects::Execute => SessionConstraints::default(),
+    }
+}
+
 impl Capability {
     /// The root capability — unrestricted on every axis. Used for
     /// sessions created via `create_session` (no delegation chain).
@@ -353,6 +392,14 @@ impl Capability {
             aws: HashSet::new(),
             max_side_effects: Some(SideEffects::ReadOnly),
         }
+    }
+
+    /// The session's effective per-axis [`SessionConstraints`], or `None`
+    /// (unconstrained) — the single posture the dispatch gate consults in
+    /// phase 1b (mu-8stm.2). Derived from the coarse `max_side_effects`
+    /// ceiling; a future additive per-axis field would take precedence here.
+    pub fn effective_constraints(&self) -> Option<SessionConstraints> {
+        self.max_side_effects.map(constraints_from_max_side_effects)
     }
 
     /// Construct a capability by intersecting `self` with
@@ -1499,5 +1546,66 @@ mod tests {
         let decoded: Capability = serde_json::from_value(v)?;
         assert_eq!(decoded, cap);
         Ok(())
+    }
+
+    // mu-8stm.2 phase 1a: the structured per-axis check must reproduce the
+    // legacy linear ceiling for the tool classes mu actually declares, across
+    // every ceiling. This is the equivalence proof that licenses swapping the
+    // dispatch gate (1b) from `check_side_effects` to `disallowed_by` with no
+    // behavior change.
+    #[test]
+    fn structured_constraints_match_linear_ceiling_for_declared_tool_classes() {
+        use SideEffects::*;
+        // The classes tools actually declare today (read/ls/glob/grep/... are
+        // ReadOnly; write/edit are Mutating; bash/watch/spawn_worker are
+        // Execute). No tool declares External or Destructive.
+        let tool_classes = [ReadOnly, Mutating, Execute];
+        let ceilings = [ReadOnly, Mutating, External, Destructive, Execute];
+        for &tool in &tool_classes {
+            for &ceiling in &ceilings {
+                let c = constraints_from_max_side_effects(ceiling);
+                let structured_ok = tool.effects().disallowed_by(&c).is_none();
+                assert_eq!(
+                    structured_ok,
+                    tool.within(ceiling),
+                    "tool {tool:?} under ceiling {ceiling:?}: structured allowed={structured_ok}, \
+                     linear within={}",
+                    tool.within(ceiling)
+                );
+            }
+        }
+    }
+
+    // mu-8stm.2: KNOWN, ACCEPTED divergence. A total order (the linear ladder)
+    // cannot be reproduced by independent per-axis constraints in the middle,
+    // and `Effects` has no irreversibility axis — so a `Destructive` *tool*
+    // (none exist today) reads as a plain write and is allowed under a
+    // `Mutating` ceiling where the linear ladder refused it. Pinned here so the
+    // gap is visible, not silent. Resolution for the capability circle-back:
+    // add a `destructive` axis to t4c `Effects`, or specify per-axis session
+    // constraints directly, when a Destructive tool is introduced.
+    #[test]
+    fn structured_model_diverges_from_linear_for_unused_middle_classes() {
+        use SideEffects::*;
+        let c = constraints_from_max_side_effects(Mutating);
+        assert!(
+            Destructive.effects().disallowed_by(&c).is_none(),
+            "structured: Destructive collapses to a write, allowed under Mutating"
+        );
+        assert!(
+            !Destructive.within(Mutating),
+            "linear: Destructive ranks above Mutating, refused"
+        );
+    }
+
+    #[test]
+    fn effective_constraints_precedence() {
+        // No ceiling -> unconstrained (back-compat root default).
+        assert!(Capability::root().effective_constraints().is_none());
+        // ReadOnly ceiling -> all axes constrained.
+        let mut ro = Capability::root();
+        ro.max_side_effects = Some(SideEffects::ReadOnly);
+        let c = ro.effective_constraints().expect("constrained");
+        assert!(c.no_writes && c.no_vcs && c.no_network && c.no_spend && c.no_process);
     }
 }

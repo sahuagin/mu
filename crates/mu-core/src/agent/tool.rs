@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use t4c::{Effects, FsEffect};
 use tokio::sync::oneshot;
 
 /// Public description of a tool, sent to the provider so the model
@@ -176,6 +177,21 @@ impl ToolPolicy {
             idempotent: true,
         }
     }
+
+    /// The tool's structured [`Effects`] for the DISCOVERY surface: the
+    /// side-effects projection ([`SideEffects::effects`]) plus the one
+    /// inference mu can make — a tool gated on an AWS capability reaches the
+    /// network and spends. The dispatch gate uses `side_effects.effects()`
+    /// directly (the AWS axis has its own gate via `required_aws_capability`),
+    /// so this `aws` inference is a discovery-display hint only. (mu-8stm.2)
+    pub fn derived_effects(&self) -> Effects {
+        let mut e = self.side_effects.effects();
+        if self.required_aws_capability.is_some() {
+            e.network = true;
+            e.spend = true;
+        }
+        e
+    }
 }
 
 /// Side-effect class. UI/audit/orchestration use this to categorize
@@ -247,6 +263,33 @@ impl SideEffects {
     /// `self.rank() <= ceiling.rank()`.
     pub fn within(self, ceiling: SideEffects) -> bool {
         self.rank() <= ceiling.rank()
+    }
+
+    /// Project this coarse class onto t4c's structured [`Effects`] — the
+    /// canonical, multi-axis representation the dispatch gate and discovery
+    /// surface both reason over (mu-8stm.2 phase 1). The coarse class stays
+    /// the ergonomic DECLARATION vocabulary; `Effects` is what gets enforced.
+    ///
+    /// CAVEAT: the linear ladder is a TOTAL order; `Effects` is a product of
+    /// INDEPENDENT axes. They are isomorphic only at the endpoints and for the
+    /// classes tools actually declare (ReadOnly/Mutating/Execute). `Effects`
+    /// has no irreversibility axis, so `Destructive` collapses to a write; no
+    /// tool declares it today. When a tool genuinely needs `External`/
+    /// `Destructive` semantics, express them as per-axis session constraints
+    /// directly rather than through the coarse ceiling.
+    pub fn effects(self) -> Effects {
+        let mut e = Effects::default();
+        match self {
+            SideEffects::ReadOnly => e.filesystem = FsEffect::Read,
+            SideEffects::Mutating | SideEffects::Destructive => e.filesystem = FsEffect::Write,
+            SideEffects::External => e.network = true,
+            SideEffects::Execute => {
+                e.filesystem = FsEffect::Write;
+                e.network = true;
+                e.process = true;
+            }
+        }
+        e
     }
 }
 

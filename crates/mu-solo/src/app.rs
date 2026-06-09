@@ -758,6 +758,10 @@ impl App {
                 chrome.push(Line::from(format!("> {}", vline.text)));
             }
         }
+        // Status + info lines so streaming/idle is visible (mu-5h9m): without
+        // these you can't tell "processing" from "hung".
+        chrome.push(self.format_status_line(width));
+        chrome.push(self.format_info_line(width));
         let transcript_rows = total.saturating_sub(chrome.len());
 
         // One styled renderer for the whole transcript: committed blocks and

@@ -1760,6 +1760,7 @@ dependencies = [
  "dirs",
  "figment",
  "futures",
+ "gethostname",
  "mu-core",
  "rand 0.8.6",
  "ratatui",

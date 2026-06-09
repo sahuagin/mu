@@ -31,6 +31,17 @@ const RETRY_STREAK_LIMIT: usize = 3;
 /// readability + uniqueness even across sessions.
 static ASK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// mu-8stm.1: upper bound on how long the dispatch gate will wait for an
+/// approval decision before failing closed. The approver lives across an
+/// unsecured process boundary (remote frontend ↔ daemon), so "no response"
+/// can be a silent human OR a dropped channel — both resolve the same way:
+/// deny. A turn must NEVER park forever on an approver that may not exist
+/// (that was the MCP `code_index` wedge: unclassified → Ask → no solo
+/// approver → permanent hang). A session-declared "approver present" flag
+/// (deny immediately when known-headless instead of waiting this out) is the
+/// planned refinement; until then this bound is the floor.
+const APPROVAL_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 #[derive(Debug, Default)]
 pub(crate) struct ToolHistory {
     pub(crate) entries: VecDeque<ToolHistoryEntry>,
@@ -205,75 +216,98 @@ pub(crate) async fn handle_execute_tools(
                 None
             };
 
-        let permission_decision =
-            if retry_refusal_reason.is_none() && validate_refusal_reason.is_none() {
-                match tool.as_ref().map(|t| t.spec().policy.permission) {
-                    Some(PermissionLevel::Ask) | Some(PermissionLevel::AskOnce) => {
-                        let request_id = format!(
-                            "ask-{}-{}",
-                            call.id,
-                            ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        );
-                        let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
-                        if let Ok(mut pending) = pending_approvals.lock() {
-                            pending.insert(request_id.clone(), decision_tx);
-                        }
-                        let _ = events
-                            .send(AgentEvent::InputRequired {
-                                request_id: request_id.clone(),
-                                tool_call_id: call.id.clone(),
-                                tool_name: call.name.clone(),
-                                arguments: call.arguments.clone().into(),
-                                summary: format!(
-                                    "{}({})",
-                                    call.name,
-                                    serde_json::to_string(&call.arguments)
-                                        .unwrap_or_else(|_| "?".into())
-                                ),
-                            })
-                            .await;
-                        let decision = tokio::select! {
-                            d = decision_rx => d.ok(),
-                            input_opt = input_rx.recv() => match input_opt {
-                                Some(AgentInput::Cancel) => {
-                                    if let Ok(mut pending) = pending_approvals.lock() {
-                                        pending.remove(&request_id);
-                                    }
-                                    return Err(Outcome::Cancelled);
-                                }
-                                Some(AgentInput::CancelOutstanding { reason }) => {
-                                    if let Ok(mut pending) = pending_approvals.lock() {
-                                        pending.remove(&request_id);
-                                    }
-                                    return Err(Outcome::OutstandingCancelled { reason });
-                                }
-                                Some(AgentInput::UserMessage(_))
-                                | Some(AgentInput::StartAutonomous { .. })
-                                | Some(AgentInput::ScheduleWakeup { .. })
-                                | Some(AgentInput::SwitchProvider { .. })
-                                | Some(AgentInput::WatchCompleted { .. })
-                                | Some(AgentInput::MailboxMessage { .. }) => {
-                                    if let Ok(mut pending) = pending_approvals.lock() {
-                                        pending.remove(&request_id);
-                                    }
-                                    return Err(Outcome::Cancelled);
-                                }
-                                None => {
-                                    if let Ok(mut pending) = pending_approvals.lock() {
-                                        pending.remove(&request_id);
-                                    }
-                                    return Err(Outcome::Cancelled);
-                                }
-                            },
-                        };
-                        Some(decision.unwrap_or(ApprovalDecision::Deny))
+        // mu-8stm.1: a no-approver / dropped-channel timeout produces a
+        // refusal distinct from a human denial, so the model doesn't read
+        // "fail-closed, no approver" as "the user said no".
+        let mut permission_refusal_reason: Option<String> = None;
+        let permission_decision = if retry_refusal_reason.is_none()
+            && validate_refusal_reason.is_none()
+        {
+            match tool.as_ref().map(|t| t.spec().policy.permission) {
+                Some(PermissionLevel::Ask) | Some(PermissionLevel::AskOnce) => {
+                    let request_id = format!(
+                        "ask-{}-{}",
+                        call.id,
+                        ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    );
+                    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+                    if let Ok(mut pending) = pending_approvals.lock() {
+                        pending.insert(request_id.clone(), decision_tx);
                     }
-                    Some(PermissionLevel::Deny) => Some(ApprovalDecision::Deny),
-                    _ => None,
+                    let _ = events
+                        .send(AgentEvent::InputRequired {
+                            request_id: request_id.clone(),
+                            tool_call_id: call.id.clone(),
+                            tool_name: call.name.clone(),
+                            arguments: call.arguments.clone().into(),
+                            summary: format!(
+                                "{}({})",
+                                call.name,
+                                serde_json::to_string(&call.arguments)
+                                    .unwrap_or_else(|_| "?".into())
+                            ),
+                        })
+                        .await;
+                    let decision = tokio::select! {
+                        d = decision_rx => d.ok(),
+                        _ = tokio::time::sleep(APPROVAL_GATE_TIMEOUT) => {
+                            // No approver responded in time — fail closed.
+                            // Drop the pending entry so a late responder
+                            // can't fire a stale oneshot.
+                            if let Ok(mut pending) = pending_approvals.lock() {
+                                pending.remove(&request_id);
+                            }
+                            permission_refusal_reason = Some(format!(
+                                "tool `{}` required approval but no approver responded within \
+                                 {}s — denied (fail-closed). This session has no interactive \
+                                 approver, or the approval channel dropped; this is NOT a human \
+                                 denial. Classify the tool/server (side_effects) or attach an \
+                                 approver.",
+                                call.name,
+                                APPROVAL_GATE_TIMEOUT.as_secs()
+                            ));
+                            Some(ApprovalDecision::Deny)
+                        }
+                        input_opt = input_rx.recv() => match input_opt {
+                            Some(AgentInput::Cancel) => {
+                                if let Ok(mut pending) = pending_approvals.lock() {
+                                    pending.remove(&request_id);
+                                }
+                                return Err(Outcome::Cancelled);
+                            }
+                            Some(AgentInput::CancelOutstanding { reason }) => {
+                                if let Ok(mut pending) = pending_approvals.lock() {
+                                    pending.remove(&request_id);
+                                }
+                                return Err(Outcome::OutstandingCancelled { reason });
+                            }
+                            Some(AgentInput::UserMessage(_))
+                            | Some(AgentInput::StartAutonomous { .. })
+                            | Some(AgentInput::ScheduleWakeup { .. })
+                            | Some(AgentInput::SwitchProvider { .. })
+                            | Some(AgentInput::WatchCompleted { .. })
+                            | Some(AgentInput::MailboxMessage { .. }) => {
+                                if let Ok(mut pending) = pending_approvals.lock() {
+                                    pending.remove(&request_id);
+                                }
+                                return Err(Outcome::Cancelled);
+                            }
+                            None => {
+                                if let Ok(mut pending) = pending_approvals.lock() {
+                                    pending.remove(&request_id);
+                                }
+                                return Err(Outcome::Cancelled);
+                            }
+                        },
+                    };
+                    Some(decision.unwrap_or(ApprovalDecision::Deny))
                 }
-            } else {
-                None
-            };
+                Some(PermissionLevel::Deny) => Some(ApprovalDecision::Deny),
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         let permission_denied = matches!(permission_decision, Some(ApprovalDecision::Deny));
 
@@ -330,6 +364,15 @@ pub(crate) async fn handle_execute_tools(
             // No InputRequired was dispatched — the user was never asked
             // to approve a call that would fail. The reason string is
             // already user-facing (e.g. bash's allowlist message).
+            ToolResult {
+                content: reason,
+                is_error: true,
+            }
+        } else if let Some(reason) = permission_refusal_reason {
+            // mu-8stm.1: bounded approval gate timed out (no approver /
+            // dropped channel) — fail closed, loudly, distinct from a human
+            // denial so the model treats it as an obstacle to route around,
+            // not a "the user said no".
             ToolResult {
                 content: reason,
                 is_error: true,

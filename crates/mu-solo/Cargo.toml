@@ -39,6 +39,9 @@ figment = { version = "0.10", features = ["toml", "env"] }
 # `dirs` resolves XDG config / home paths cross-platform (rather than
 # hand-rolling $HOME / $XDG_CONFIG_HOME). Tiny crate, transitive-light.
 dirs = "5"
+# mu-8stm.1: hostname via gethostname(3) (backed by the kern.hostname sysctl on
+# BSD) — one syscall, cached once, instead of fork+exec'ing `hostname` per frame.
+gethostname = "1"
 rmcp = { workspace = true, features = ["client", "transport-async-rw"] }
 ansi-to-tui = "8"
 serde_yaml = { workspace = true }

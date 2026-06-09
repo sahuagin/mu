@@ -27,3 +27,6 @@ anyhow = { workspace = true }  # impl t4c::RegistrySource — its capabilities()
 
 [dev-dependencies]
 tempfile = "3"
+# mu-8stm.1: start_paused tests for the approval-gate timeout — auto-advance
+# past APPROVAL_GATE_TIMEOUT instead of waiting it out in real time.
+tokio = { workspace = true, features = ["test-util"] }

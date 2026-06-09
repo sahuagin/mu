@@ -6,6 +6,7 @@
 //! normalizing the MCP result shape into mu's `ToolResult`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use mu_core::agent::{PermissionLevel, SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec};
@@ -14,6 +15,18 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 
 use super::McpPeer;
+
+/// mu-8stm.1: per-attempt ceiling on a remote `tools/call`. A slow or
+/// unresponsive server must degrade to a loud error, never hang the turn —
+/// `peer.call_tool` has no timeout of its own (contrast the 5 s import
+/// timeout in [`super::import_remote_tools`]).
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Max attempts for a *retry-safe* (ReadOnly) tool. Non-idempotent tools get
+/// exactly one attempt — retrying a timed-out mutation could double-apply it
+/// (the request may have reached the server before the response was lost).
+const MAX_ATTEMPTS: u32 = 3;
+/// Base for exponential backoff between retries (×2 per attempt).
+const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(500);
 
 pub struct RemoteMcpTool {
     /// Config-level server label, for error messages.
@@ -127,28 +140,63 @@ impl Tool for RemoteMcpTool {
         self.spec.clone()
     }
 
-    async fn execute(&self, arguments: Value, cancel_rx: oneshot::Receiver<()>) -> ToolResult {
-        let mut params = CallToolRequestParams::new(self.remote_name.clone());
-        if let Value::Object(map) = arguments {
-            params = params.with_arguments(map);
-        }
-        let call = self.peer.call_tool(params);
-        tokio::select! {
-            biased;
-            _ = cancel_rx => ToolResult {
-                content: format!("{} cancelled", self.spec.name),
-                is_error: true,
-            },
-            res = call => match res {
-                Ok(r) => normalize_result(&r),
-                Err(e) => ToolResult {
-                    content: format!(
-                        "MCP call {}::{} failed: {e}",
-                        self.server, self.remote_name
-                    ),
-                    is_error: true,
+    async fn execute(&self, arguments: Value, mut cancel_rx: oneshot::Receiver<()>) -> ToolResult {
+        // mu-8stm.1: bound + (conditionally) retry the remote call so a
+        // slow/unreachable server fails loudly instead of hanging the turn —
+        // the transport-layer half of the never-hang invariant (the approval
+        // gate is the other half). Only ReadOnly tools are retried; retrying a
+        // timed-out mutation could double-apply it. Cancellation aborts across
+        // the whole loop.
+        let base_map = match arguments {
+            Value::Object(map) => Some(map),
+            _ => None,
+        };
+        let retry_safe = self.spec.policy.side_effects == SideEffects::ReadOnly;
+        let max_attempts = if retry_safe { MAX_ATTEMPTS } else { 1 };
+
+        let cancelled = || ToolResult {
+            content: format!("{} cancelled", self.spec.name),
+            is_error: true,
+        };
+
+        let mut last_err = String::new();
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
+                let backoff = RETRY_BACKOFF_BASE * 2u32.pow(attempt - 1);
+                tokio::select! {
+                    biased;
+                    _ = &mut cancel_rx => return cancelled(),
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+            }
+            let mut params = CallToolRequestParams::new(self.remote_name.clone());
+            if let Some(map) = base_map.clone() {
+                params = params.with_arguments(map);
+            }
+            let call = self.peer.call_tool(params);
+            tokio::select! {
+                biased;
+                _ = &mut cancel_rx => return cancelled(),
+                res = tokio::time::timeout(CALL_TIMEOUT, call) => match res {
+                    Ok(Ok(r)) => return normalize_result(&r),
+                    Ok(Err(e)) => {
+                        last_err =
+                            format!("MCP call {}::{} failed: {e}", self.server, self.remote_name);
+                    }
+                    Err(_elapsed) => {
+                        last_err = format!(
+                            "MCP call {}::{} timed out after {}s",
+                            self.server,
+                            self.remote_name,
+                            CALL_TIMEOUT.as_secs()
+                        );
+                    }
                 },
-            },
+            }
+        }
+        ToolResult {
+            content: format!("{last_err} (gave up after {max_attempts} attempt(s))"),
+            is_error: true,
         }
     }
 }

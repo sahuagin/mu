@@ -75,6 +75,10 @@ impl Transcript {
         self.blocks.push(block);
     }
 
+    pub fn clear(&mut self) {
+        self.blocks.clear();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }

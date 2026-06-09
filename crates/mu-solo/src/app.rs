@@ -45,6 +45,19 @@ struct MaximizedBlock {
     scroll: usize,
 }
 
+/// A modal overlay panel (mu-5h9m): a full-viewport bordered box that takes
+/// over the screen to show command output — `/help`, `/status` — which would
+/// otherwise emit via `insert_before` and be painted over by the fullscreen
+/// owned-buffer render the next frame. Painted through the owned buffer like
+/// `MaximizedBlock`, so it survives fullscreen. Holds pre-built styled lines
+/// (so `/status`'s colors carry through); dismiss with Esc/q.
+#[derive(Debug, Clone)]
+struct Overlay {
+    title: String,
+    lines: Vec<Line<'static>>,
+    scroll: usize,
+}
+
 /// Known providers offered by the `/provider` picker. Free-form
 /// `/provider <name>` also works for anything not on this list.
 const KNOWN_PROVIDERS: &[&str] = &[
@@ -319,6 +332,9 @@ pub struct App {
     /// Focused single-block pager. This is another semantic transcript
     /// projection, not a dump into terminal scrollback.
     maximized_block: Option<MaximizedBlock>,
+    /// Active modal overlay (slash-command output panel: /help, /status).
+    /// None when closed. Takes over the screen until dismissed (Esc/q).
+    overlay: Option<Overlay>,
     bash_yolo: bool,
     /// Discovered skills from SKILL.md files on disk.
     skills: HashMap<String, DiscoveredSkill>,
@@ -574,6 +590,7 @@ impl App {
             transcript_scroll: 0,
             selected_block: None,
             maximized_block: None,
+            overlay: None,
             events_file,
             actual_renderer: None,
             actual_cache_strategy: None,
@@ -653,7 +670,9 @@ impl App {
         let mut mcp_rx = self.mcp_status_rx.take();
 
         loop {
-            if self.fullscreen {
+            if self.overlay.is_some() {
+                self.render_overlay(&mut vp)?;
+            } else if self.fullscreen {
                 self.render_fullscreen(&mut vp)?;
             } else {
                 self.render_viewport(&mut vp)?;
@@ -843,9 +862,7 @@ impl App {
                 tlines.push(Line::from(""));
             }
             match (block.kind, block.items.as_ref()) {
-                (TranscriptKind::User, _) => {
-                    tlines.extend(render::you_block(&block.body, bwrap))
-                }
+                (TranscriptKind::User, _) => tlines.extend(render::you_block(&block.body, bwrap)),
                 (TranscriptKind::Assistant, Some(items)) => {
                     tlines.extend(render::render_turn(
                         &block.label,
@@ -1138,6 +1155,9 @@ impl App {
         if self.maximized_block.is_some() {
             return self.handle_maximized_key(vp, key);
         }
+        if self.overlay.is_some() {
+            return self.handle_overlay_key(vp, key);
+        }
 
         // If an inline menu is open, route keys there first.
         if let Some(ref mut menu) = self.inline_menu {
@@ -1325,11 +1345,24 @@ impl App {
                 match head {
                     "/q" | "/quit" | "/exit" if tail.is_empty() => return Ok(true),
                     "/status" if tail.is_empty() => {
-                        self.emit_status_lines(vp)?;
+                        // Fullscreen paints over insert_before'd output, so
+                        // route the panel through the owned-buffer overlay
+                        // (mu-5h9m); inline mode keeps the scrollback emit.
+                        if self.fullscreen {
+                            let lines = self.build_status_lines();
+                            self.open_overlay("/status", lines);
+                        } else {
+                            self.emit_status_lines(vp)?;
+                        }
                         return Ok(false);
                     }
                     "/help" => {
-                        self.emit_help_lines(vp)?;
+                        if self.fullscreen {
+                            let lines = self.build_help_lines();
+                            self.open_overlay("/help", lines);
+                        } else {
+                            self.emit_help_lines(vp)?;
+                        }
                         return Ok(false);
                     }
                     "/effort" => {
@@ -1576,6 +1609,125 @@ impl App {
         Ok(false)
     }
 
+    /// Open a modal overlay with pre-built styled lines. Used for slash-command
+    /// output (/help, /status) that must be visible in fullscreen, where the
+    /// owned-buffer render paints over anything `insert_before`'d (mu-5h9m).
+    fn open_overlay(&mut self, title: impl Into<String>, lines: Vec<Line<'static>>) {
+        self.overlay = Some(Overlay {
+            title: title.into(),
+            lines,
+            scroll: 0,
+        });
+    }
+
+    /// Render the active modal overlay: a full-viewport bordered box of the
+    /// overlay's pre-built lines, scrollable, painted via the owned buffer (no
+    /// `insert_before`). Mirrors `render_maximized_block`; cyan border to
+    /// distinguish it from the yellow maximized-block box (mu-5h9m).
+    fn render_overlay(&mut self, vp: &mut DynamicViewport) -> Result<()> {
+        vp.maximize_height()?;
+        let width = vp.area().width as usize;
+        let height = vp.area().height as usize;
+        if self.overlay.is_none() {
+            return Ok(());
+        }
+
+        // Clamp scroll to content (body = viewport minus the top/bottom border).
+        let body_height = height.saturating_sub(2).max(1);
+        let total = self.overlay.as_ref().unwrap().lines.len();
+        let max_scroll = total.saturating_sub(body_height);
+        let scroll = self.overlay.as_ref().unwrap().scroll.min(max_scroll);
+        self.overlay.as_mut().unwrap().scroll = scroll;
+        let overlay = self.overlay.as_ref().unwrap();
+
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
+        let title = format!(" {} ", overlay.title);
+        lines.push(Line::from(vec![
+            Span::styled("╭".to_string(), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                truncate_at_word(&title, width.saturating_sub(2)),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        // Body rows: prefix each stored line with the box edge, preserving its
+        // own styled spans (so /status keeps its colors). Lines wider than the
+        // box are clipped by the Paragraph render — status/help rows are short.
+        for line in overlay.lines.iter().skip(scroll).take(body_height) {
+            let mut spans = vec![Span::styled(
+                "│ ".to_string(),
+                Style::default().fg(Color::Cyan),
+            )];
+            spans.extend(line.spans.iter().cloned());
+            lines.push(Line::from(spans));
+        }
+        while lines.len() < height.saturating_sub(1) {
+            lines.push(Line::from(Span::styled(
+                "│".to_string(),
+                Style::default().fg(Color::Cyan),
+            )));
+        }
+        let footer = if max_scroll > 0 {
+            format!(
+                " ↑/↓ PgUp/PgDn scroll · Esc close · {}/{} ",
+                scroll + 1,
+                max_scroll + 1
+            )
+        } else {
+            " Esc close ".to_string()
+        };
+        lines.push(Line::from(vec![
+            Span::styled("╰".to_string(), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                truncate_at_word(&footer, width.saturating_sub(2)),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+
+        vp.render(Paragraph::new(lines));
+        vp.flush()?;
+        Ok(())
+    }
+
+    /// Key handling while a modal overlay is open: scroll or dismiss. Mirrors
+    /// `handle_maximized_key`. Esc/q closes; in inline mode the viewport is
+    /// shrunk back to its normal height (fullscreen re-maximizes on the next
+    /// frame, so no shrink there).
+    fn handle_overlay_key(&mut self, vp: &mut DynamicViewport, key: KeyEvent) -> Result<bool> {
+        let Some(mut overlay) = self.overlay.take() else {
+            return Ok(false);
+        };
+        let page = vp.area().height.saturating_sub(3).max(1) as usize;
+        match (key.modifiers, key.code) {
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) => return Ok(true),
+            (_, KeyCode::Esc) | (_, KeyCode::Char('q')) => {
+                // Overlay already taken (stays closed).
+                if !self.fullscreen {
+                    vp.set_height(VIEWPORT_HEIGHT)?;
+                }
+                return Ok(false);
+            }
+            (_, KeyCode::Up) | (KeyModifiers::ALT, KeyCode::Char('k')) => {
+                overlay.scroll = overlay.scroll.saturating_sub(1);
+            }
+            (_, KeyCode::Down) | (KeyModifiers::ALT, KeyCode::Char('j')) => {
+                overlay.scroll = overlay.scroll.saturating_add(1);
+            }
+            (_, KeyCode::PageUp) => {
+                overlay.scroll = overlay.scroll.saturating_sub(page);
+            }
+            (_, KeyCode::PageDown) | (_, KeyCode::Char(' ')) => {
+                overlay.scroll = overlay.scroll.saturating_add(page);
+            }
+            (_, KeyCode::Home) => overlay.scroll = 0,
+            (_, KeyCode::End) => overlay.scroll = usize::MAX,
+            _ => {}
+        }
+        self.overlay = Some(overlay);
+        Ok(false)
+    }
+
     fn emit_block_action_menu(&self, vp: &mut DynamicViewport) -> Result<()> {
         let Some(block) = self.selected_block() else {
             return Ok(());
@@ -1785,8 +1937,8 @@ impl App {
     /// /status — print provider, model, session_id, daemon_id, version
     /// to scrollback. Lets the operator find the daemon's events
     /// directory: ~/.local/share/mu/events/{daemon_id}/session-N.jsonl
-    fn emit_status_lines(&self, vp: &mut DynamicViewport) -> Result<()> {
-        let lines: Vec<Line<'static>> = vec![
+    fn build_status_lines(&self) -> Vec<Line<'static>> {
+        vec![
             Line::from(""),
             Line::from(Span::styled(
                 "── /status ─────────────────────────".to_string(),
@@ -1846,7 +1998,11 @@ impl App {
                 self.daemon_id
             )),
             Line::from(""),
-        ];
+        ]
+    }
+
+    fn emit_status_lines(&self, vp: &mut DynamicViewport) -> Result<()> {
+        let lines = self.build_status_lines();
         let h = lines.len() as u16;
         vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);
@@ -2192,8 +2348,18 @@ impl App {
     /// /clear — clear the visible scrollback. Doesn't touch the
     /// daemon's event log; this is a display-only reset. The inline
     /// viewport redraws on the next tick.
-    fn cmd_clear(&mut self, _vp: &mut DynamicViewport) -> Result<()> {
-        // TODO: implement viewport clear
+    fn cmd_clear(&mut self, vp: &mut DynamicViewport) -> Result<()> {
+        // Drop the in-memory transcript. In fullscreen the owned-buffer render
+        // windows `self.transcript`, so this visibly empties the screen the next
+        // frame (mu-5h9m). Inline mode also clears the live viewport region;
+        // terminal scrollback above it belongs to the multiplexer and is left
+        // alone (it's the user's scroll history, not ours to wipe).
+        self.transcript.clear();
+        self.transcript_scroll = 0;
+        self.selected_block = None;
+        if !self.fullscreen {
+            vp.clear_viewport()?;
+        }
         Ok(())
     }
 
@@ -2440,7 +2606,7 @@ impl App {
         items
     }
 
-    fn emit_help_lines(&self, vp: &mut DynamicViewport) -> Result<()> {
+    fn build_help_lines(&self) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -2492,7 +2658,11 @@ impl App {
             "  Anything else is sent to the model as a prompt.",
         ));
         lines.push(Line::from(""));
+        lines
+    }
 
+    fn emit_help_lines(&self, vp: &mut DynamicViewport) -> Result<()> {
+        let lines = self.build_help_lines();
         let h = lines.len() as u16;
         vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);

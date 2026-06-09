@@ -751,11 +751,34 @@ impl App {
         let layout = self.prompt.visual_layout(wrap);
         let mut chrome: Vec<Line<'static>> = Vec::new();
         chrome.push(Line::from("─".repeat(width)));
+        // Prompt with a visible (inverted-block) cursor at the caret, since
+        // fullscreen hides the terminal cursor (mu-5h9m).
+        let cursor_style = Style::default().fg(Color::Black).bg(Color::Cyan);
         if layout.lines.is_empty() {
-            chrome.push(Line::from("> ".to_string()));
+            chrome.push(Line::from(vec![
+                Span::styled(" > ".to_string(), Style::default().fg(Color::Cyan)),
+                Span::styled(" ".to_string(), cursor_style),
+            ]));
         } else {
-            for vline in &layout.lines {
-                chrome.push(Line::from(format!("> {}", vline.text)));
+            for (row_idx, vline) in layout.lines.iter().enumerate() {
+                let prefix = if row_idx == 0 { " > " } else { "   " };
+                if row_idx == layout.cursor_row {
+                    let before: String = vline.text.chars().take(layout.cursor_col).collect();
+                    let after: String = vline.text.chars().skip(layout.cursor_col).collect();
+                    let cursor_char = after.chars().next().unwrap_or(' ').to_string();
+                    let rest: String = after.chars().skip(1).collect();
+                    chrome.push(Line::from(vec![
+                        Span::styled(prefix.to_string(), Style::default().fg(Color::Cyan)),
+                        Span::raw(before),
+                        Span::styled(cursor_char, cursor_style),
+                        Span::raw(rest),
+                    ]));
+                } else {
+                    chrome.push(Line::from(vec![
+                        Span::styled(prefix.to_string(), Style::default().fg(Color::Cyan)),
+                        Span::raw(vline.text.clone()),
+                    ]));
+                }
             }
         }
         // Status + info lines so streaming/idle is visible (mu-5h9m): without

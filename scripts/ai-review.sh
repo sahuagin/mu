@@ -1,48 +1,63 @@
 #!/usr/bin/env bash
-# ai-review.sh — pre-PR two-reviewer PANEL gate (beads mu-6qst, mu-ai-review-panel-lrwq).
+# ai-review.sh — pre-PR review PANEL gate (beads mu-6qst, mu-ai-review-panel-lrwq, mu-f0ls).
 #
-# Two LOCAL reviewer models form a panel that reviews the working diff before a
-# PR — a third check on top of CI and the human/agent. Run it via `just ci-aipr`,
-# which runs `just ci` first and only reviews green code.
+# A reviewer panel checks the working diff before a PR — a check on top of CI and
+# the human/agent. Run it via `just ci-aipr`, which runs `just ci` first and only
+# reviews green code.
 #
-# WHY A PANEL (not a single champion): the two reviewers have complementary,
-# inverted strengths — gpt-oss:20b leads single-shot review but trails
-# agentically; qwen3-coder:30b is the reverse (code-review-bench + agentic-bench,
-# 2026-06-04..06). A single-reviewer gate inherits one model's blind spots. On
-# 2026-06-06 gpt-oss:20b APPROVEd a correct PR (#200) and REJECTed an equally
-# correct one (#201) on a false premise (a hypothetical non-Copy compile error on
-# the very line that fixes it), contradicted by the green `just ci` in the same
-# recipe run. The panel exists to absorb exactly that single-reviewer miss: keep
-# BOTH on the gate, treat them like a team, never optimize to one winner.
-# (Operator-ratified: memory d88e133e / reviewer-models-as-team, 2026-06-06.)
+# PANEL SHAPE (mu-f0ls): TWO primaries + a conditional TIEBREAKER.
+#   Primary 1 (local):  qwen-rev (qwen3.6:35b-a3b-q8_0 @ num_ctx 262144, temp 0.6)
+#                       over ollama — free, warm on the box, returns COMPLETE reviews.
+#   Primary 2:          gpt-5.5 over openai-codex — the strong generalist.
+#   Tiebreaker:         deepseek-v4-pro over openrouter — invoked ONLY when the
+#                       two primaries disagree (consensus short-circuits it).
 #
-# PANEL SEMANTICS (the verdict of each reviewer is read from its STDOUT, NOT its
-# process exit code — `mu ask` historically exits non-zero on a shutdown wart
-# (mu-qc08) even on success, so the exit code is not load-bearing here):
+# WHY THIS SHAPE: the previous panel ran two LOCAL models co-resident (qwen +
+# gpt-oss:20b) and dead-ended a split at the operator. gpt-oss@49152 truncated its
+# review on larger diffs before the VERDICT line — a model that can't return a
+# complete verdict adds no signal — and it over-flags (high recall, low precision),
+# the wrong failure mode for a primary, where every noisy REJECT would drag a good
+# PR to a tiebreak. So we drop the co-residency compromise: one PRECISE local
+# primary that always answers, paired with gpt-5.5, and an INDEPENDENT third model
+# (deepseek) to BREAK a genuine tie rather than bouncing every disagreement to the
+# operator. gpt-oss keeps its Modelfile for the future review-gate v2 per-file
+# worker role; it is just not a flat-panel primary. (co-residency bench: memory
+# a721c14d; reviewers-as-team: d88e133e.)
 #
-#   both APPROVE            → PASS     (exit 0)
-#   both REJECT             → BLOCK    (exit 1)  — a real design/correctness call
-#   split / any UNCLEAR     → ESCALATE (exit 3)  — operator decides; NOT self-overridden
+# PANEL SEMANTICS (each verdict is read from reviewer STDOUT, NOT its process exit
+# code — `mu ask` historically exits non-zero on a shutdown wart (mu-qc08) even on
+# success, so the exit code is not load-bearing here):
 #
-# The two non-pass outcomes have DISTINCT exit codes (1 vs 3) and distinct,
-# verdict-naming messages so a split is never confused with a unanimous block.
-# MU_REVIEW_OVERRIDE=1 is the operator's override on BLOCK *or* ESCALATE: it
-# proceeds (exit 0) and is logged as a calibration signal.
+#   both primaries APPROVE   → PASS     (exit 0)
+#   both primaries REJECT    → BLOCK    (exit 1)  — a real design/correctness call
+#   primaries disagree       → TIEBREAK: run deepseek; its verdict decides —
+#         tiebreaker APPROVE → PASS     (exit 0)  — tiebroken
+#         tiebreaker REJECT  → BLOCK    (exit 1)  — tiebroken
+#         tiebreaker UNCLEAR → ESCALATE (exit 3)  — tie unbroken; operator decides
+#   both primaries UNCLEAR   → ESCALATE (exit 3)  — no verdict to tiebreak (infra?)
 #
-# This panel REPLACES the old single-reviewer + opt-in escalation-ladder shape
-# (MU_REVIEW_ESCALATE_PROVIDER/_MODEL): the second reviewer IS the differential,
-# always-on rather than only-on-reject.
+# "disagree" INCLUDES the case where exactly one primary is UNCLEAR (no VERDICT
+# line parsed): one real opinion + one missing is still a tie for deepseek to
+# resolve. "both UNCLEAR" is held out — a tiebreaker breaks a tie between OPINIONS;
+# with zero usable opinions there is nothing to break (likely a provider/infra
+# fault), and a lone third model must not stand in for a dead panel. The non-pass
+# paths have DISTINCT exit codes (BLOCK 1 vs ESCALATE 3) and verdict-naming
+# messages. MU_REVIEW_OVERRIDE=1 is the operator's override on BLOCK *or* ESCALATE:
+# it proceeds (exit 0) and is logged as a calibration signal.
 #
 # Design: ~/.claude-personal/notes/design-prepr-review-and-degradation-gate.md
 # Process-layer auditors / correlation: bead mu-pr6r.
 #
 # Env:
-#   Reviewer 1 (default ollama / qwen-orch):
-#     MU_REVIEW_PROVIDER        provider (default: ollama; codex = openai-codex)
-#     MU_REVIEW_MODEL           model    (default: qwen-orch — baked qwen3.6:27b@131072)
-#   Reviewer 2 (default ollama / gpt-oss-rev):
-#     MU_REVIEW_PROVIDER_2      provider (default: ollama)
-#     MU_REVIEW_MODEL_2         model    (default: gpt-oss-rev — baked gpt-oss:20b@49152)
+#   Primary 1 (default ollama / qwen-rev):
+#     MU_REVIEW_PROVIDER        provider (default: ollama)
+#     MU_REVIEW_MODEL           model    (default: qwen-rev — baked qwen3.6:35b-a3b-q8_0@262144, temp 0.6)
+#   Primary 2 (default openai-codex / gpt-5.5):
+#     MU_REVIEW_PROVIDER_2      provider (default: openai-codex)
+#     MU_REVIEW_MODEL_2         model    (default: gpt-5.5)
+#   Tiebreaker (default openrouter / deepseek-v4-pro; runs ONLY on a split):
+#     MU_REVIEW_PROVIDER_3      provider (default: openrouter)
+#     MU_REVIEW_MODEL_3         model    (default: deepseek/deepseek-v4-pro)
 #   Shared:
 #     MU_REVIEW_TOOLS           reviewer tools, e.g. "read,grep" (default: none, single-shot)
 #     MU_REVIEW_BASE            base ref to diff against (default: main)
@@ -51,40 +66,61 @@
 #                               window (default: 1; set 0 for diff-only)
 #     MU_REVIEW_CONTEXT_MAX_BYTES  cap on appended full-file context (default: 200000)
 #     MU_REVIEW_TIMEOUT         per-reviewer wall-clock cap, seconds (default: 600). Bounds a
-#                               hung/slow model; the two reviewers run SEQUENTIALLY, so the
-#                               panel's total wall-clock can reach ~2x this. 300 was too tight —
-#                               a typical Claude/reasoning response (>5min) plus a possible
-#                               ollama model reload (~2min) overran it, SIGTERMing the reviewer
-#                               mid-stream before its final VERDICT line (spurious UNCLEAR).
+#                               hung/slow model; reviewers run SEQUENTIALLY, so panel wall-clock
+#                               is up to ~2x this (and up to ~3x when a split triggers the
+#                               tiebreaker). 300 was too tight — a typical Claude/reasoning
+#                               response (>5min) plus a possible ollama model reload (~2min)
+#                               overran it, SIGTERMing the reviewer mid-stream before its final
+#                               VERDICT line (spurious UNCLEAR).
 #     MU_REVIEW_OVERRIDE=1      operator override: proceed despite BLOCK/ESCALATE (logged)
 #     MU_REVIEW_SYSTEM_PROMPT   reviewer system-prompt file (default: ai-review-system-prompt.txt)
 #     MU_REVIEW_LOG             event log (default: ~/.local/share/mu/review-events.jsonl)
 #     MU_REVIEW_NO_COLOR        disable color
 #
-# The log carries BOTH reviewers' verdicts: one {"event":"reviewer",...} line per
-# reviewer plus one {"event":"panel",...} summary line with the panel outcome.
+# The log carries every reviewer's verdict: one {"event":"reviewer",...} line per
+# reviewer that RAN plus one {"event":"panel",...} summary with the outcome and all
+# three slots (r3_verdict is "" when the tiebreaker did not run).
 
 set -u
 set -o pipefail
 
-# Both reviewers default to local ollama: free, reliable, non-Claude second/third
-# opinions, warm on the box (24h keep-alive) and CO-RESIDENT in 48GB. They are the
-# BAKED, context-pinned models qwen-orch (qwen3.6:27b @ num_ctx 131072) and
-# gpt-oss-rev (gpt-oss:20b @ 49152), created from scripts/ollama/ — NOT the base
-# tags. WHY BAKED: mu talks to ollama over the Anthropic wire (mu-fmas) which sends
-# no num_ctx, so a base tag loads at the server default (262144), bloats and EVICTS
-# its co-resident partner — model thrash on every review (terrain-verified 2026-06-08,
-# memory a721c14d). Baking pins each model's context so both stay resident. gpt-oss
-# leads single-shot review recall; qwen3.6:27b is the agentic/precision counterweight
-# — the panel keeps both. codex/gpt-5.5 is a stronger reviewer when its OAuth is
-# healthy; point either slot at it with MU_REVIEW_PROVIDER[_2]=openai-codex
-# MU_REVIEW_MODEL[_2]=gpt-5.5. It is NOT a default because its OAuth refresh was
-# failing at build time (bead mu-cea). Bench provenance:
-# ~/src/public_github/code-review-bench/reports/NOTES.md.
+# Primary 1 is local ollama: free, reliable, a non-Claude opinion, warm on the box
+# (24h keep-alive). It is the BAKED model qwen-rev (qwen3.6:35b-a3b-q8_0 @ num_ctx
+# 262144, temp 0.6) from scripts/ollama/, NOT a base tag. WHY BAKED: mu talks to
+# ollama over the Anthropic wire (mu-fmas) which sends NO num_ctx and NO sampling
+# params (verified 2026-06-09: build_request_body is model/system/messages/tools/
+# max_tokens only), so the model falls back to its baked defaults — baking is the
+# only lever for both the window AND the sampling (memory a721c14d, 41771769).
+#
+# WHY THE FULL 35b (not the shrunk 27b): with a SINGLE local primary the old
+# co-residency squeeze is gone — qwen-rev gets the 48GB card to itself, so we run
+# the full q8 35b (best local quality) at its full 262144 window. It fits: an
+# SSM/attention HYBRID (full_attention_interval=4) keeps the KV cache ~1GB/64k, so
+# 262144 costs only ~5GB over the 38GB weights → 43GB/100% GPU (terrain-verified
+# 2026-06-09). temp 0.6 = Unsloth's precise-coding setting (NOT temp 0, which is
+# off-distribution and degenerates — memory 41771769); a fixed seed gives the gate
+# run-to-run reproducibility.
+#
+# WHY QWEN (not gpt-oss) FOR THE LOCAL SLOT: in our synthetic benchmarks gpt-oss:20b
+# leads single-shot CODE review and qwen leads AGENTIC — so gpt-oss is the stronger
+# pure code reviewer. BUT gpt-oss@49152 truncates its review before the VERDICT line
+# on larger diffs, and a model that can't return a complete verdict contributes no
+# signal regardless of its coding skill. Between "stronger coder that truncates" and
+# "complete reviewer," the complete one takes the always-on local slot; gpt-5.5 and
+# deepseek already supply aggressive code-level finding. gpt-oss keeps its Modelfile
+# for the review-gate v2 per-file worker (one file fits in 49152), just not here.
+# (gpt-oss:120b @ 65GB is a future single-local option once the box hits 72GB.)
+#
+# Primary 2 defaults to gpt-5.5 over openai-codex — the strong generalist. If its
+# OAuth is unhealthy it returns no verdict (UNCLEAR) and the tiebreaker covers it.
+# Tiebreaker is deepseek-v4-pro over openrouter, invoked only on a primary split.
+# Bench provenance: ~/src/public_github/code-review-bench/reports/NOTES.md.
 PROVIDER="${MU_REVIEW_PROVIDER:-ollama}"
-MODEL="${MU_REVIEW_MODEL:-qwen-orch}"
-PROVIDER2="${MU_REVIEW_PROVIDER_2:-ollama}"
-MODEL2="${MU_REVIEW_MODEL_2:-gpt-oss-rev}"
+MODEL="${MU_REVIEW_MODEL:-qwen-rev}"
+PROVIDER2="${MU_REVIEW_PROVIDER_2:-openai-codex}"
+MODEL2="${MU_REVIEW_MODEL_2:-gpt-5.5}"
+PROVIDER3="${MU_REVIEW_PROVIDER_3:-openrouter}"
+MODEL3="${MU_REVIEW_MODEL_3:-deepseek/deepseek-v4-pro}"
 TOOLS="${MU_REVIEW_TOOLS:-}"   # empty = single-shot (default); e.g. "read,grep" lets the reviewer inspect surrounding code (slower, multi-turn)
 BASE="${MU_REVIEW_BASE:-main}"
 # Per-reviewer timeout: 2x a typical Claude response, with room for one ollama
@@ -237,62 +273,104 @@ log_reviewer() { # $1=role $2=provider $3=model $4=verdict
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$(json_escape "$2")" "$(json_escape "$3")" "$(json_escape "$4")" "$(json_escape "$BASE")" "$FILES" >> "$LOG"
 }
 log_panel() { # $1=outcome(PASS|BLOCK|ESCALATE) $2=override(true|false)
+  # Carries all three slots. r3_verdict is "" when the tiebreaker did not run
+  # (the primaries agreed) — dashboards detect a tiebreak by r3_verdict != "".
   mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
-  printf '{"ts":"%s","event":"panel","outcome":"%s","r1_provider":"%s","r1_model":"%s","r1_verdict":"%s","r2_provider":"%s","r2_model":"%s","r2_verdict":"%s","base":"%s","files_changed":%s,"override":%s}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$(json_escape "$PROVIDER")" "$(json_escape "$MODEL")" "$(json_escape "$V1")" "$(json_escape "$PROVIDER2")" "$(json_escape "$MODEL2")" "$(json_escape "$V2")" "$(json_escape "$BASE")" "$FILES" "$2" >> "$LOG"
+  printf '{"ts":"%s","event":"panel","outcome":"%s","r1_provider":"%s","r1_model":"%s","r1_verdict":"%s","r2_provider":"%s","r2_model":"%s","r2_verdict":"%s","r3_provider":"%s","r3_model":"%s","r3_verdict":"%s","base":"%s","files_changed":%s,"override":%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" \
+    "$(json_escape "$PROVIDER")"  "$(json_escape "$MODEL")"  "$(json_escape "$V1")" \
+    "$(json_escape "$PROVIDER2")" "$(json_escape "$MODEL2")" "$(json_escape "$V2")" \
+    "$(json_escape "$PROVIDER3")" "$(json_escape "$MODEL3")" "$(json_escape "$V3")" \
+    "$(json_escape "$BASE")" "$FILES" "$2" >> "$LOG"
 }
 
-# --- run the panel: both reviewers, same diff, sequentially ----------------
-echo "${C_DIM}ai-review: PANEL reviewing $FILES file(s) vs $BASE — reviewers: $PROVIDER/$MODEL + $PROVIDER2/$MODEL2${C_OFF}"
+# --- run the panel: two primaries, same diff, sequentially -----------------
+echo "${C_DIM}ai-review: PANEL reviewing $FILES file(s) vs $BASE — primaries: $PROVIDER/$MODEL + $PROVIDER2/$MODEL2 (tiebreaker $PROVIDER3/$MODEL3 on split)${C_OFF}"
 
-echo "${C_DIM}── reviewer 1: $PROVIDER/$MODEL ─────────────────────────────${C_OFF}"
+echo "${C_DIM}── primary 1: $PROVIDER/$MODEL ─────────────────────────────${C_OFF}"
 REVIEW1="$(run_review "$PROVIDER" "$MODEL")"
 printf '%s\n' "$REVIEW1"
 V1="$(printf '%s' "$REVIEW1" | verdict_of)"
 log_reviewer r1 "$PROVIDER" "$MODEL" "$V1"
-echo "${C_DIM}  → reviewer 1 ($MODEL): $V1${C_OFF}"
+echo "${C_DIM}  → primary 1 ($MODEL): $V1${C_OFF}"
 
-echo "${C_DIM}── reviewer 2: $PROVIDER2/$MODEL2 ─────────────────────────────${C_OFF}"
+echo "${C_DIM}── primary 2: $PROVIDER2/$MODEL2 ─────────────────────────────${C_OFF}"
 REVIEW2="$(run_review "$PROVIDER2" "$MODEL2")"
 printf '%s\n' "$REVIEW2"
 V2="$(printf '%s' "$REVIEW2" | verdict_of)"
 log_reviewer r2 "$PROVIDER2" "$MODEL2" "$V2"
-echo "${C_DIM}  → reviewer 2 ($MODEL2): $V2${C_OFF}"
+echo "${C_DIM}  → primary 2 ($MODEL2): $V2${C_OFF}"
 
-if [ "$V1" = UNCLEAR ] || [ "$V2" = UNCLEAR ]; then
-  echo "${C_DIM}  (an UNCLEAR verdict means no VERDICT line parsed — reviewer may have erred; stderr: $ERRLOG)${C_OFF}"
-fi
-
-# --- panel verdict ---------------------------------------------------------
+V3=""   # set only if the tiebreaker runs; kept in the panel log either way
 OVERRIDE_BOOL=false; [ "${MU_REVIEW_OVERRIDE:-}" = "1" ] && OVERRIDE_BOOL=true
 
+# --- primaries agree: short-circuit (no tiebreaker / openrouter call) ------
 if [ "$V1" = APPROVE ] && [ "$V2" = APPROVE ]; then
   log_panel PASS false
-  echo "${C_GREEN}ai-review: PANEL PASS — both reviewers APPROVE ($MODEL + $MODEL2).${C_OFF}"
+  echo "${C_GREEN}ai-review: PANEL PASS — both primaries APPROVE ($MODEL + $MODEL2).${C_OFF}"
   exit 0
 fi
-
 if [ "$V1" = REJECT ] && [ "$V2" = REJECT ]; then
-  # Unanimous block: a real design/correctness call.
   if [ "$OVERRIDE_BOOL" = true ]; then
     log_panel BLOCK true
     echo "${C_YEL}ai-review: PANEL BLOCK ($MODEL=REJECT, $MODEL2=REJECT) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
     exit 0
   fi
   log_panel BLOCK false
-  echo "${C_RED}ai-review: PANEL BLOCK — both reviewers REJECT ($MODEL=REJECT, $MODEL2=REJECT). Set MU_REVIEW_OVERRIDE=1 to proceed if you disagree.${C_OFF}" >&2
+  echo "${C_RED}ai-review: PANEL BLOCK — both primaries REJECT ($MODEL=REJECT, $MODEL2=REJECT). Set MU_REVIEW_OVERRIDE=1 to proceed if you disagree.${C_OFF}" >&2
   exit 1
 fi
 
-# Split (one APPROVE one REJECT) or any UNCLEAR: escalate to the operator.
-# The panel does NOT self-override a split — that is the operator's call.
+# --- both primaries UNCLEAR: no verdict to tiebreak — escalate -------------
+# A tiebreaker breaks a tie between OPINIONS. If NEITHER primary produced a
+# verdict (likely infra: provider auth, model-reload overrun, truncation), there
+# is nothing to break; surfacing ESCALATE is more honest than letting a lone
+# third model stand in for a dead panel.
+if [ "$V1" = UNCLEAR ] && [ "$V2" = UNCLEAR ]; then
+  echo "${C_DIM}  (both primaries UNCLEAR — no VERDICT line parsed; likely a provider/infra fault. stderr: $ERRLOG)${C_OFF}"
+  if [ "$OVERRIDE_BOOL" = true ]; then
+    log_panel ESCALATE true
+    echo "${C_YEL}ai-review: PANEL ESCALATE (both primaries UNCLEAR) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
+    exit 0
+  fi
+  log_panel ESCALATE false
+  echo "${C_YEL}ai-review: PANEL ESCALATE — both primaries returned no verdict ($MODEL=$V1, $MODEL2=$V2); not a tie to break. Check $ERRLOG.${C_OFF}" >&2
+  echo "${C_DIM}  Set MU_REVIEW_OVERRIDE=1 to proceed once you've adjudicated.${C_OFF}" >&2
+  exit 3
+fi
+
+# --- primaries disagree (split, or exactly one UNCLEAR): run the tiebreaker -
+echo "${C_YEL}ai-review: primaries SPLIT ($MODEL=$V1, $MODEL2=$V2) → tiebreaker $PROVIDER3/$MODEL3${C_OFF}"
+echo "${C_DIM}── tiebreaker: $PROVIDER3/$MODEL3 ─────────────────────────────${C_OFF}"
+REVIEW3="$(run_review "$PROVIDER3" "$MODEL3")"
+printf '%s\n' "$REVIEW3"
+V3="$(printf '%s' "$REVIEW3" | verdict_of)"
+log_reviewer r3 "$PROVIDER3" "$MODEL3" "$V3"
+echo "${C_DIM}  → tiebreaker ($MODEL3): $V3${C_OFF}"
+
+if [ "$V3" = APPROVE ]; then
+  log_panel PASS false
+  echo "${C_GREEN}ai-review: PANEL PASS (tiebroken) — primaries split $MODEL=$V1/$MODEL2=$V2, tiebreaker $MODEL3=APPROVE.${C_OFF}"
+  exit 0
+fi
+if [ "$V3" = REJECT ]; then
+  if [ "$OVERRIDE_BOOL" = true ]; then
+    log_panel BLOCK true
+    echo "${C_YEL}ai-review: PANEL BLOCK (tiebroken: $MODEL3=REJECT) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
+    exit 0
+  fi
+  log_panel BLOCK false
+  echo "${C_RED}ai-review: PANEL BLOCK (tiebroken) — primaries split $MODEL=$V1/$MODEL2=$V2, tiebreaker $MODEL3=REJECT. Set MU_REVIEW_OVERRIDE=1 to proceed if you disagree.${C_OFF}" >&2
+  exit 1
+fi
+
+# Tiebreaker itself returned no verdict: the tie is UNBROKEN — operator decides.
 if [ "$OVERRIDE_BOOL" = true ]; then
   log_panel ESCALATE true
-  echo "${C_YEL}ai-review: PANEL SPLIT → ESCALATE ($MODEL=$V1, $MODEL2=$V2) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
+  echo "${C_YEL}ai-review: PANEL ESCALATE (tiebreaker UNCLEAR) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
   exit 0
 fi
 log_panel ESCALATE false
-echo "${C_YEL}ai-review: PANEL SPLIT → ESCALATE — reviewers disagree: $MODEL=$V1, $MODEL2=$V2.${C_OFF}" >&2
-echo "${C_YEL}  → operator decision required. This is NOT a unanimous block; do not self-override.${C_OFF}" >&2
-echo "${C_DIM}  Set MU_REVIEW_OVERRIDE=1 to proceed once you've adjudicated.${C_OFF}" >&2
+echo "${C_YEL}ai-review: PANEL ESCALATE — primaries split ($MODEL=$V1, $MODEL2=$V2) and tiebreaker $MODEL3 returned no verdict.${C_OFF}" >&2
+echo "${C_YEL}  → operator decision required. Set MU_REVIEW_OVERRIDE=1 to proceed once you've adjudicated.${C_OFF}" >&2
 exit 3

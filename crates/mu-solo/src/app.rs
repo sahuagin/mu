@@ -764,7 +764,11 @@ impl App {
         let area = vp.area();
         let total = area.height as usize;
         let width = area.width as usize;
-        let wrap = width.saturating_sub(1);
+        // Reserve the 3-col " > " / "   " prompt prefix plus 1 col for the
+        // trailing block cursor, matching render_viewport's `w - 4` (mu-5h9m).
+        // Wrapping at `width - 1` overflowed the prefix and hard-wrapped the
+        // tail of long prompt lines.
+        let wrap = width.saturating_sub(4);
 
         // Bottom chrome: a separator rule + the prompt's visual lines.
         let layout = self.prompt.visual_layout(wrap);

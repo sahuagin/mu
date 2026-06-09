@@ -2438,10 +2438,32 @@ impl App {
         let editor = std::env::var("VISUAL")
             .or_else(|_| std::env::var("EDITOR"))
             .unwrap_or_else(|_| "hx".to_string());
+        // Hand the terminal to the editor cleanly, then restore EVERY mode set
+        // at startup — not just raw mode. Helix (and most modern editors) speak
+        // the kitty keyboard protocol and reset terminal keyboard state on exit,
+        // which silently drops our DISAMBIGUATE_ESCAPE_CODES push; without
+        // re-arming it, modified Enter (Shift-Enter → newline) collapses back to
+        // plain CR until restart (mu-5h9m, mu-solo-shift-enter-62tx). Mirror the
+        // startup/shutdown sequence in bin/mu-solo.rs: pop our flags before the
+        // editor (clean slate, keeps the kitty stack balanced) and re-push after.
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableFocusChange,
+            crossterm::event::PopKeyboardEnhancementFlags,
+            crossterm::event::DisableBracketedPaste,
+        );
         crossterm::terminal::disable_raw_mode()?;
         crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
         let status = std::process::Command::new(&editor).arg(&path).status();
         crossterm::terminal::enable_raw_mode()?;
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            ),
+            crossterm::event::EnableFocusChange,
+        );
         crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide)?;
         if let Err(e) = status {
             tracing::warn!("editor '{editor}' spawn failed: {e}");

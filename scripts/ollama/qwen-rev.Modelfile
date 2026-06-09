@@ -1,0 +1,41 @@
+# qwen-rev — local code-review reviewer for the ai-review panel (bead mu-f0ls).
+#
+# The single LOCAL primary in the flat ai-review panel (scripts/ai-review.sh).
+# With the panel down to one local model (mu-f0ls), it gets the 48GB card to
+# itself — so we run the FULL qwen3.6:35b-a3b-q8_0 (best local quality) instead of
+# the shrunk 27b that had to co-reside with gpt-oss-rev.
+#
+# FITS THE CARD AT FULL CONTEXT (terrain-verified 2026-06-09, OLLAMA_HOST
+# 10.1.1.143): loaded at num_ctx 262144 it sits at 43GB VRAM / 100% GPU on the
+# 48GB card. The arch is an SSM/attention HYBRID (model_info full_attention_interval=4
+# + ssm.* keys): only ~1 in 4 layers carries a KV cache, so KV is ~1GB/64k and the
+# full 262144 window costs only ~5GB on top of the 38GB weights. No compromise.
+#
+# WHY num_ctx IS BAKED: mu talks to ollama over the Anthropic Messages wire
+# (/v1/messages, bead mu-fmas) which carries NO num_ctx; baking pins the window to
+# the artifact. (memory a721c14d.)
+#
+# WHY SAMPLING IS BAKED: verified 2026-06-09 — mu's anthropic-wire provider sends
+# NO temperature/top_p/top_k/min_p/seed (build_request_body is model/system/
+# messages/tools/max_tokens only), so the model uses its baked defaults. Baking is
+# therefore the only sampling lever for this path, same as num_ctx.
+#
+# SAMPLING = Unsloth Qwen3.6 recipe, THINKING mode + PRECISE CODING (memory
+# 41771769):
+#   - temperature 0.6  — the precise-coding temp. NOT 0: temp 0 is off-distribution
+#     for Qwen3.6 and degenerates into multi-minute thinking-loops AND fails the
+#     no-compaction control (verified 2026-06-07). 0.6 < the general-task 1.0, so
+#     a review gate gets lower run-to-run variance without leaving the distribution.
+#   - top_p 0.95, top_k 20, min_p 0  — the recipe's thinking-mode values.
+#   - presence_penalty 0  — OVERRIDES the base tag's inherited 1.5, which is the
+#     NON-thinking-mode setting and wrong for a thinking reviewer (memory 41771769).
+#   - seed 42  — fixed seed = run-to-run reproducibility at temp 0.6. This is the
+#     correct determinism lever for a gate; temp 0 is not (see above).
+FROM qwen3.6:35b-a3b-q8_0
+PARAMETER num_ctx 262144
+PARAMETER temperature 0.6
+PARAMETER top_p 0.95
+PARAMETER top_k 20
+PARAMETER min_p 0
+PARAMETER presence_penalty 0
+PARAMETER seed 42

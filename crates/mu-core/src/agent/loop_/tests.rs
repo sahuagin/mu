@@ -1405,6 +1405,76 @@ async fn ask_permission_emits_input_required_and_dispatches_on_approve() {
     assert!(got_done, "expected Done event at end");
 }
 
+/// mu-8stm.1: the approval gate must NEVER park forever. With no approver
+/// responding, the bounded timeout fires and the call is denied (fail-closed)
+/// with a refusal distinct from a human denial. Regression lock for the MCP
+/// `code_index` wedge: unclassified -> Ask -> no solo approver -> (previously)
+/// permanent hang. `start_paused` lets the runtime auto-advance past the gate
+/// timeout instead of waiting it out in real time.
+#[tokio::test(start_paused = true)]
+async fn ask_permission_times_out_and_denies_when_no_approver() {
+    let provider = mock_provider_one_tool_call("gated", json!({"x": 1}));
+    let tool = MockTool::ok("gated", "tool ran").with_policy(crate::agent::tool::ToolPolicy {
+        permission: crate::agent::tool::PermissionLevel::Ask,
+        ..Default::default()
+    });
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let cap: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let loop_ = loop_with(
+        Arc::new(provider),
+        Arc::from("faux"),
+        Arc::from("faux"),
+        vec![Arc::new(tool) as Arc<dyn Tool>],
+        AgentConfig::default(),
+        events_tx,
+        approvals.clone(),
+        cap,
+    );
+    loop_
+        .send(AgentInput::UserMessage(user_msg("please use gated")))
+        .await
+        .expect("send");
+
+    // Never respond to InputRequired. Paused-time auto-advance fires the gate
+    // timeout, which must produce an ERROR ToolCallCompleted naming the
+    // no-approver fail-closed deny (NOT a human denial), then Done.
+    let mut input_required_seen = false;
+    let mut denied_no_approver = false;
+    let mut got_done = false;
+    while let Some(ev) = events_rx.recv().await {
+        match ev {
+            AgentEvent::InputRequired { .. } => input_required_seen = true,
+            AgentEvent::ToolCallCompleted {
+                is_error, content, ..
+            } => {
+                denied_no_approver = is_error && content.contains("no approver responded");
+            }
+            AgentEvent::Done { .. } => {
+                got_done = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        input_required_seen,
+        "Ask policy should still emit InputRequired"
+    );
+    assert!(
+        denied_no_approver,
+        "no-approver timeout must deny fail-closed with a distinct message"
+    );
+    assert!(
+        got_done,
+        "turn must complete (not hang) after the timeout deny"
+    );
+    assert!(
+        approvals.lock().unwrap().is_empty(),
+        "pending approval entry must be removed on timeout"
+    );
+}
+
 /// mu-bkjr: the dispatcher's argument-aware pre-flight (`Tool::validate`)
 /// must short-circuit a call BEFORE firing `InputRequired`. This pins the
 /// fix for mu-20l: previously, a tool with `PermissionLevel::Ask` whose

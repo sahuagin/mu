@@ -2389,19 +2389,22 @@ impl App {
     /// Bottom info line: user@host:project | model | ctx:%
     fn format_info_line(&self, width: usize) -> Line<'static> {
         let user = std::env::var("USER").unwrap_or_else(|_| "?".into());
-        let host = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("HOST"))
-            .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
-            .unwrap_or_else(|_| {
-                // Last resort: short hostname from sysctl on FreeBSD
-                std::process::Command::new("hostname")
-                    .arg("-s")
-                    .output()
-                    .ok()
-                    .and_then(|o| String::from_utf8(o.stdout).ok())
-                    .map(|s| s.trim().to_string())
-                    .unwrap_or_else(|| "?".into())
-            });
+        // mu-8stm.1: the hostname is constant for the life of the process —
+        // resolve it ONCE via gethostname(3) (the kern.hostname sysctl on BSD,
+        // i.e. what `hostname` itself reads) and cache it. The previous
+        // $HOSTNAME→$HOST→/etc/hostname→`hostname -s` ladder ran every render
+        // frame, and on FreeBSD (no /etc/hostname, $HOSTNAME unset) fell all
+        // the way through to fork+exec'ing `hostname` per frame — a syscall
+        // storm during any in-flight turn.
+        static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let host = HOST.get_or_init(|| {
+            gethostname::gethostname()
+                .to_string_lossy()
+                .split('.')
+                .next()
+                .unwrap_or("?")
+                .to_string()
+        });
         let cwd = std::env::current_dir()
             .ok()
             .and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))

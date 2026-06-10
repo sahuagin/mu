@@ -95,11 +95,30 @@ fn path_argument(arguments: &Value) -> Result<PathBuf, ToolResult> {
     arguments
         .get("path")
         .and_then(Value::as_str)
-        .map(PathBuf::from)
+        .map(expand_leading_tilde)
         .ok_or_else(|| ToolResult {
             content: "missing required `path` argument".to_owned(),
             is_error: true,
         })
+}
+
+/// Expand the human-path shorthand accepted by shell users without
+/// turning the file tool into a shell. Only leading `~` and `~/...` are
+/// expanded; `$VARS`, globs, command substitution, and `~user` are not.
+fn expand_leading_tilde(path: &str) -> PathBuf {
+    match path {
+        "~" => home_dir().unwrap_or_else(|| PathBuf::from(path)),
+        _ if path.starts_with("~/") => home_dir()
+            .map(|home| home.join(&path[2..]))
+            .unwrap_or_else(|| PathBuf::from(path)),
+        _ => PathBuf::from(path),
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
 }
 
 #[cfg(test)]
@@ -195,18 +214,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn b6_cancel_before_read_does_not_hang() -> Result<(), Box<dyn Error>> {
-        let path = temp_path("cancel")?;
-        fs::write(&path, "content")?;
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        let _ = cancel_tx.send(());
+    async fn b7_expands_home_shorthand() -> Result<(), Box<dyn Error>> {
+        let home = temp_path("home")?;
+        fs::create_dir(&home)?;
+        let path = home.join("tilde-file.txt");
+        fs::write(&path, "from home")?;
 
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
         let result = ReadTool::new()
-            .execute(json!({ "path": path.to_string_lossy() }), cancel_rx)
+            .execute(json!({ "path": "~/tilde-file.txt" }), cancel_rx)
             .await;
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&home);
 
-        assert!(result.is_error || result.content == "content");
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.content, "from home");
         Ok(())
     }
 }

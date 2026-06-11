@@ -138,6 +138,14 @@ async fn main() -> Result<()> {
 
     // Enter raw mode + bracketed paste for inline rendering.
     enable_raw_mode().context("enable_raw_mode")?;
+    // mu-mu-solo-loop-terminate-5ek5: restore the terminal on EVERY
+    // exit path — including a panic unwinding out of `app.run()`,
+    // which previously skipped the restore lines below and left the
+    // terminal raw (the worst part of a hung/dying session). Drop
+    // runs on unwind; the explicit restore below stays as the normal
+    // path and double-restoring is harmless (all calls are no-op
+    // idempotent).
+    let _restore_guard = TerminalRestoreGuard;
     execute!(std::io::stdout(), EnableBracketedPaste)?;
     // mu-solo-shift-enter-62tx: opt into the Kitty Keyboard Protocol so
     // modified Enter (Shift-Enter etc.) reaches the app as a distinct
@@ -166,5 +174,26 @@ async fn main() -> Result<()> {
     let _ = disable_raw_mode();
     let _ = execute!(std::io::stdout(), crossterm::cursor::Show);
 
+    // mu-mu-solo-loop-terminate-5ek5: tear the daemon down AFTER the
+    // terminal is restored (restore is the priority on a bad day) —
+    // bounded by construction (stdin-EOF grace then SIGKILL), so quit
+    // can never hang here even when the daemon is wedged.
+    app.shutdown_daemon();
+
     run_result
+}
+
+/// Restores the terminal when dropped — including on panic unwind.
+/// Mirrors the explicit restore sequence in `main`; every operation
+/// is idempotent so running both is fine.
+struct TerminalRestoreGuard;
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        let _ = execute!(std::io::stdout(), DisableFocusChange);
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), crossterm::cursor::Show);
+    }
 }

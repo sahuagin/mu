@@ -44,9 +44,9 @@ pub enum Message {
 }
 
 pub struct Client {
-    #[allow(dead_code)]
     child: Child,
-    stdin: ChildStdin,
+    /// `None` after [`Client::shutdown`] closed it to signal EOF.
+    stdin: Option<ChildStdin>,
     /// Synchronous receiver for request/response pairing. mu-9x4j:
     /// the reader thread routes ONLY responses (plus Eof/ReaderError)
     /// here — notifications never touch this channel, so `request()`
@@ -238,7 +238,7 @@ impl Client {
             .context("spawning stdout reader thread")?;
         let mut client = Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             rx,
             next_id: AtomicI64::new(1),
             default_read_timeout: Duration::from_secs(120),
@@ -279,10 +279,14 @@ impl Client {
             "params": params,
         });
         let line = serde_json::to_string(&req).context("serialize request")? + "\n";
-        self.stdin
+        let stdin = self
+            .stdin
+            .as_mut()
+            .context("daemon stdin already closed (client shut down)")?;
+        stdin
             .write_all(line.as_bytes())
             .context("write request to daemon")?;
-        self.stdin.flush().context("flush request")?;
+        stdin.flush().context("flush request")?;
 
         let deadline = Instant::now() + self.default_read_timeout;
         loop {
@@ -348,10 +352,14 @@ impl Client {
             "params": params,
         });
         let line = serde_json::to_string(&req).context("serialize request")? + "\n";
-        let written = self
-            .stdin
-            .write_all(line.as_bytes())
-            .and_then(|()| self.stdin.flush());
+        let written = match self.stdin.as_mut() {
+            Some(stdin) => stdin
+                .write_all(line.as_bytes())
+                .and_then(|()| stdin.flush()),
+            None => Err(std::io::Error::other(
+                "daemon stdin already closed (client shut down)",
+            )),
+        };
         if let Err(e) = written {
             // Nothing was (reliably) sent — unregister so a future id
             // collision can't misroute.
@@ -372,6 +380,45 @@ impl Client {
     pub fn take_notification_rx(&mut self) -> Option<tokio_mpsc::UnboundedReceiver<Message>> {
         self.notif_rx.take()
     }
+
+    /// Shut the daemon down, bounded by construction
+    /// (mu-mu-solo-loop-terminate-5ek5). Pre-fix, quit never touched
+    /// the child at all: the daemon was left to notice stdin EOF at
+    /// process exit, so a wedged daemon (the 1.88 GB-read incident)
+    /// survived as an orphan grinding CPU/memory. There is no
+    /// graceful-shutdown RPC to wait on (none exists in the protocol,
+    /// and a wedged daemon wouldn't answer one) — the graceful signal
+    /// IS the stdin close. Sequence: close stdin (EOF → daemon's
+    /// command loop exits), poll up to `grace`, then SIGKILL + reap.
+    /// Every step is non-blocking or bounded; this can never hang the
+    /// quit path.
+    pub fn shutdown(&mut self, grace: Duration) {
+        let stdin = self.stdin.take();
+        shutdown_child(&mut self.child, stdin, grace);
+    }
+}
+
+/// Bounded child shutdown (free function so it's testable without a
+/// real daemon handshake): drop `stdin` to signal EOF, give the child
+/// `grace` to exit on its own, then SIGKILL and reap. `kill` on an
+/// already-dead child is a no-op error; `wait` after SIGKILL returns
+/// promptly (the OS guarantees delivery).
+fn shutdown_child(child: &mut Child, stdin: Option<ChildStdin>, grace: Duration) {
+    drop(stdin);
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return, // exited gracefully and reaped
+            Ok(None) => {}
+            Err(_) => break, // can't observe it — go straight to kill
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn parse_message(line: &str) -> Result<Message> {
@@ -565,5 +612,56 @@ mod tests {
         drop(rx);
         // Now every destination is gone.
         assert!(route_message(Message::Eof, &tx, &ntx, &no_pending()).is_err());
+    }
+
+    // ── bounded daemon shutdown (mu-mu-solo-loop-terminate-5ek5) ────────
+
+    /// A child that honors stdin EOF (like a healthy daemon) exits
+    /// within the grace window — no SIGKILL needed.
+    #[test]
+    fn shutdown_child_graceful_on_stdin_eof() {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn cat");
+        let stdin = child.stdin.take();
+
+        let started = Instant::now();
+        shutdown_child(&mut child, stdin, Duration::from_secs(5));
+
+        // cat exits 0 on EOF, well inside the grace window.
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // Child is reaped: try_wait reports the recorded exit.
+        let status = child.try_wait().expect("try_wait").expect("exited");
+        assert!(status.success(), "cat should exit 0 on EOF: {status:?}");
+    }
+
+    /// A wedged child that ignores stdin EOF (the incident shape:
+    /// daemon grinding in a compute loop) is force-killed after the
+    /// grace window. The whole call is bounded — this is the property
+    /// the /q hang fix rests on.
+    #[test]
+    fn shutdown_child_kills_wedged_child_within_bound() {
+        // `sleep` never reads stdin, so EOF does nothing — a stand-in
+        // for a wedged daemon.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+        let stdin = child.stdin.take();
+
+        let grace = Duration::from_millis(200);
+        let started = Instant::now();
+        shutdown_child(&mut child, stdin, grace);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown must be bounded; took {elapsed:?}"
+        );
+        let status = child.try_wait().expect("try_wait").expect("reaped");
+        assert!(!status.success(), "sleep must have been killed: {status:?}");
     }
 }

@@ -73,12 +73,28 @@ pub fn estimate_tokens(spans: &[Span]) -> usize {
     // the agent loop's hot path.
     let bpe = BPE.get_or_init(|| tiktoken_rs::cl100k_base().ok());
     match bpe {
-        Some(b) => spans
-            .iter()
-            .map(|s| b.encode_with_special_tokens(&s.content).len())
-            .sum(),
+        Some(b) => spans.iter().map(|s| bpe_span_tokens(b, s)).sum(),
         None => spans.iter().map(|s| s.content.chars().count()).sum(),
     }
+}
+
+/// Per-span BPE estimate with a size guard
+/// (mu-mu-solo-loop-terminate-5ek5): tiktoken's cl100k regex is
+/// measured QUADRATIC on long uniform runs (400K spaces took 150s on
+/// the dev host; the 2026-06-07 incident's 1.88 GB span would never
+/// return), and the rank vector for a multi-GB span is itself
+/// GB-scale. Since this can run INLINE in the agent loop task
+/// (sync compaction policies), spans over the guard get the chars/4
+/// approximation instead — compaction thresholds are coarse; a
+/// megabyte-plus span is over any sane per-span budget on either
+/// ruler.
+const BPE_SPAN_GUARD_BYTES: usize = 1024 * 1024;
+
+fn bpe_span_tokens(bpe: &tiktoken_rs::CoreBPE, span: &Span) -> usize {
+    if span.content.len() > BPE_SPAN_GUARD_BYTES {
+        return span.content.chars().count() / 4;
+    }
+    bpe.encode_with_special_tokens(&span.content).len()
 }
 
 /// Pluggable strategy for compacting a [`RetainedRope`] toward a token

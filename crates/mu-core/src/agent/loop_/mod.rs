@@ -1485,22 +1485,56 @@ async fn run_inner(
                         );
                         rope
                     } else {
-                        let result = policy.compact(&rope, target_tokens);
-                        let _ = events
-                            .send(AgentEvent::CompactionAssembly {
-                                model_call_id: model_call_id + 1,
-                                policy_id: policy.policy_label().to_owned(),
-                                tokens_before: pre_compaction_tokens,
-                                tokens_after: renderer.estimate_tokens(&result.rope),
-                                decisions: result.decisions.clone(),
-                                wall_clock_us: result.wall_clock_us,
-                            })
-                            .await;
-                        compaction_baseline = Some(CompactionBaseline {
-                            rope: result.rope.clone(),
-                            messages_at_spawn: messages.len(),
-                        });
-                        result.rope
+                        // mu-mu-solo-loop-terminate-5ek5: the sync
+                        // compact runs INLINE in the loop task, so a
+                        // panicking policy (e.g. tiktoken over a
+                        // pathological span in the 2026-06-07 incident)
+                        // would unwind the whole loop — input channel
+                        // closed, every later ask -32603. The async
+                        // path already tolerates panics (JoinError →
+                        // "no compaction this round"); give the inline
+                        // path the same contract: panic → continue
+                        // with the un-compacted rope, loudly.
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            policy.compact(&rope, target_tokens)
+                        })) {
+                            Ok(result) => {
+                                let _ = events
+                                    .send(AgentEvent::CompactionAssembly {
+                                        model_call_id: model_call_id + 1,
+                                        policy_id: policy.policy_label().to_owned(),
+                                        tokens_before: pre_compaction_tokens,
+                                        tokens_after: renderer.estimate_tokens(&result.rope),
+                                        decisions: result.decisions.clone(),
+                                        wall_clock_us: result.wall_clock_us,
+                                    })
+                                    .await;
+                                compaction_baseline = Some(CompactionBaseline {
+                                    rope: result.rope.clone(),
+                                    messages_at_spawn: messages.len(),
+                                });
+                                result.rope
+                            }
+                            Err(panic) => {
+                                let _ = events
+                                    .send(AgentEvent::Callout {
+                                        category: "warning".to_owned(),
+                                        title: "compaction policy panicked".to_owned(),
+                                        body: serde_json::json!({
+                                            "policy": policy.policy_label(),
+                                            "panic": execute_tools::panic_message(
+                                                panic.as_ref()
+                                            ),
+                                        }),
+                                        theme: Some("warning".to_owned()),
+                                        context_refs: vec![
+                                            "bead:mu-mu-solo-loop-terminate-5ek5".to_owned()
+                                        ],
+                                    })
+                                    .await;
+                                rope
+                            }
+                        }
                     }
                 } else {
                     rope

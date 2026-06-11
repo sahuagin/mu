@@ -717,6 +717,14 @@ impl App {
         })
     }
 
+    /// Shut the spawned daemon down, bounded
+    /// (mu-mu-solo-loop-terminate-5ek5): stdin-EOF grace, then
+    /// SIGKILL + reap. Called by the binary after `run` returns so
+    /// quit never orphans a wedged daemon and never waits on one.
+    pub fn shutdown_daemon(&mut self) {
+        self.client.shutdown(std::time::Duration::from_millis(1500));
+    }
+
     /// Run the async event loop. Returns Ok(()) on clean exit.
     ///
     /// Uses `tokio::select!` to multiplex four event sources:

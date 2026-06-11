@@ -98,6 +98,18 @@ impl ToolHistory {
     }
 }
 
+/// Best-effort extraction of a panic payload's message. Panics carry
+/// `&str` or `String` in practice; anything else gets a placeholder.
+pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_owned()
+    }
+}
+
 fn now_unix_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -404,8 +416,33 @@ pub(crate) async fn handle_execute_tools(
             match tool {
                 Some(t) => {
                     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-                    let mut execute_fut =
-                        Box::pin(t.execute(call.arguments.clone().into(), cancel_rx));
+                    // mu-mu-solo-loop-terminate-5ek5: tool futures are
+                    // awaited IN the loop task, so before this wrap a
+                    // panicking tool unwound the whole agent loop —
+                    // the input channel closed and every later ask
+                    // got "session loop has terminated" (the 2026-06-07
+                    // incident class). spawn_blocking-based tools were
+                    // already isolated (panic → JoinError → error
+                    // result); this extends the same contract to the
+                    // async path: a panic is an is_error ToolResult,
+                    // never a loop-killing condition.
+                    use futures::FutureExt as _;
+                    let tool_name_for_panic = call.name.clone();
+                    let mut execute_fut = Box::pin(
+                        std::panic::AssertUnwindSafe(
+                            t.execute(call.arguments.clone().into(), cancel_rx),
+                        )
+                        .catch_unwind()
+                        .map(move |res| {
+                            res.unwrap_or_else(|panic| ToolResult {
+                                content: format!(
+                                    "tool `{tool_name_for_panic}` panicked: {}",
+                                    panic_message(panic.as_ref())
+                                ),
+                                is_error: true,
+                            })
+                        }),
+                    );
 
                     let tool_call_started_at = Instant::now();
                     let tool_state_started_unix_ms = now_unix_ms();

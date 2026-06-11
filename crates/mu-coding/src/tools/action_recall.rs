@@ -149,6 +149,12 @@ pub struct ActionRecall {
     /// construction-time read keeps per-call behavior deterministic
     /// and tests free of process-env mutation.
     enabled: bool,
+    /// Subprocess budget for the memory search. Production uses
+    /// [`SEARCH_TIMEOUT`] (fail-open — an advisory must never stall a
+    /// turn); tests inject a generous budget because a loaded CI
+    /// runner can take >1s just to fork the stub shell, and the tests'
+    /// subject is the advise-once logic, not the timeout.
+    search_timeout: Duration,
     /// Command-hashes already advised this session. A hash hit means
     /// the model saw the rule and re-issued: execute.
     advised: Mutex<HashSet<u64>>,
@@ -167,6 +173,7 @@ impl ActionRecall {
         Self {
             binary_path: path,
             enabled: !disabled,
+            search_timeout: SEARCH_TIMEOUT,
             advised: Mutex::new(HashSet::new()),
         }
     }
@@ -176,6 +183,20 @@ impl ActionRecall {
         Self {
             binary_path: binary_path.into(),
             enabled: true,
+            search_timeout: SEARCH_TIMEOUT,
+            advised: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Test hook: stub binary path + explicit subprocess budget (see
+    /// `search_timeout` — loaded CI runners need more than the 1s
+    /// production fail-open budget just to fork a shell).
+    #[cfg(test)]
+    fn with_binary_and_timeout(binary_path: impl Into<PathBuf>, search_timeout: Duration) -> Self {
+        Self {
+            binary_path: binary_path.into(),
+            enabled: true,
+            search_timeout,
             advised: Mutex::new(HashSet::new()),
         }
     }
@@ -185,6 +206,7 @@ impl ActionRecall {
         Self {
             binary_path: PathBuf::from("agent"),
             enabled: false,
+            search_timeout: SEARCH_TIMEOUT,
             advised: Mutex::new(HashSet::new()),
         }
     }
@@ -223,7 +245,7 @@ impl ActionRecall {
                 .args(["memory", "search", &q, "--type", "feedback", "--limit", "2"])
                 .output()
         });
-        let output = match tokio::time::timeout(SEARCH_TIMEOUT, task).await {
+        let output = match tokio::time::timeout(self.search_timeout, task).await {
             Ok(Ok(Ok(out))) if out.status.success() => out,
             // Absent binary / non-zero exit / join error / timeout:
             // fail open.
@@ -299,7 +321,10 @@ mod tests {
             r#"echo '[838c3bf4] (feedback) never-batch-destructive — rule  [2026-06-04]'
 echo '  recorded 2026-06-04 · never verified'"#,
         );
-        let ar = ActionRecall::with_binary(&script);
+        // Generous budget: a loaded CI runner can take >1s to fork the
+        // stub shell, and a timeout fails open to None — which this
+        // test would misread as "did not advise".
+        let ar = ActionRecall::with_binary_and_timeout(&script, Duration::from_secs(30));
 
         let first = ar.advisory_for("jj abandon xyz").await;
         let text = first.expect("first matching call must advise");
@@ -340,7 +365,9 @@ echo '  recorded 2026-06-04 · never verified'"#,
     #[tokio::test]
     async fn advisory_excerpt_is_capped() {
         let script = stub("long", r#"yes 'rule line padding' | head -200"#);
-        let ar = ActionRecall::with_binary(&script);
+        // Generous budget — same CI-load rationale as
+        // advisory_fires_once_then_allows_reissue.
+        let ar = ActionRecall::with_binary_and_timeout(&script, Duration::from_secs(30));
         let text = ar.advisory_for("cargo publish").await.expect("advises");
         assert!(
             text.len() < ADVISORY_EXCERPT_CHARS + 400,

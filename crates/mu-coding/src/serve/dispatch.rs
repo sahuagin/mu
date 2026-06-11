@@ -128,10 +128,19 @@ pub(crate) fn auth_gate(auth_state: &AuthStateHandle, method: &str) -> Result<()
 /// caller (the pipeline consumer) has already run [`auth_gate`]. The
 /// arms are the pre-mu-046 `dispatch()` arms, byte-identical; only the
 /// entry path around them changed.
+///
+/// `ask_ticket` (spec mu-046 WP4) is the receipt ticket the pipeline
+/// minted when this command's `CommandReceived` landed in the
+/// session's own event log. Only the `ask_session` arm consumes it —
+/// the handler threads it into `AgentInput::UserMessage` so the
+/// turn's terminal receipt pairs with the right `CommandReceived`.
+/// `Some` only when the pipeline routed the command to a session log
+/// AND the method is accept-async (`ask_session`); `None` otherwise.
 pub(crate) async fn dispatch_inner(
     request: Request<Value>,
     notif: NotificationWriter,
     ctx: DispatchCtx,
+    ask_ticket: Option<mu_core::command_journal::CommandTicket>,
 ) -> Response<Value> {
     let DispatchCtx {
         sessions,
@@ -182,7 +191,7 @@ pub(crate) async fn dispatch_inner(
             skills,
             daemon_info.clone(),
         ),
-        AskSessionRequest::METHOD => handle_ask_session(request, sessions).await,
+        AskSessionRequest::METHOD => handle_ask_session(request, sessions, ask_ticket).await,
         CancelSessionRequest::METHOD => handle_cancel_session(request, sessions).await,
         CancelOutstandingRequest::METHOD => handle_cancel_outstanding(request, sessions).await,
         CloseSessionRequest::METHOD => handle_close_session(request, sessions),

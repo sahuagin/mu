@@ -116,6 +116,26 @@ pub struct CommandEcho {
     pub params: Value,
 }
 
+/// spec mu-046 WP4: explicit receipt correlation for accept-async
+/// session commands (`ask_session`). Minted by the ingest pipeline
+/// when the command's `CommandReceived` lands in the session's own
+/// event log, then threaded through `AgentInput::UserMessage` into the
+/// agent loop, and carried back out on the terminal
+/// `AgentEvent::Done` — so the forwarder can write the
+/// `CommandSucceeded`/`CommandFailed` receipt with the correct pairing
+/// even when several asks are queued (no inference via side tables).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommandTicket {
+    /// Session-log event id of the `CommandReceived` this ticket
+    /// answers (the session pipeline's command id).
+    pub command_event_id: u64,
+    /// The original command (INV-5: receipts wrap the original).
+    pub echo: CommandEcho,
+    /// Unix ms the command crossed the border — receipts compute
+    /// their `elapsed_ms` from this.
+    pub received_at_unix_ms: u64,
+}
+
 /// Which gate rejected a command before processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

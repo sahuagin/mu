@@ -32,6 +32,7 @@ use mu_core::command_journal::{
     orphaned_command_seqs, CommandJournal, JournalPayload, JournalRecord, RejectStage,
 };
 use mu_core::config::{AuthConfig, Config, JournalConfig};
+use mu_core::event_log::{EventPayload, SessionEvent, SessionEventLog};
 
 /// Shared bearer token used by the harness — also the secret the
 /// INV-6 test greps the raw journal bytes for.
@@ -54,9 +55,30 @@ fn unique_journal_dir() -> PathBuf {
 /// at a fresh tempdir. Does NOT authenticate — callers that need an
 /// authed client call [`authenticate`] themselves (the INV-6 test
 /// needs the unauthenticated phase).
+///
+/// `events_dir = None`: sessions get in-memory-only logs, so
+/// session-scoped commands take the WP4 documented FALLBACK into the
+/// daemon journal — which is exactly what the WP3-era tests below
+/// assert against. The WP4 session-log tests use
+/// [`spawn_server_with_events`] instead.
 fn spawn_server_raw(
     provider: Arc<dyn Provider>,
     journal_dir: PathBuf,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    spawn_server_with_events(provider, journal_dir, None)
+}
+
+/// [`spawn_server_raw`] with an optional events dir: `Some(dir)` gives
+/// every created session a DISK-BACKED event log, activating the WP4
+/// session-pipeline path (session-scoped commands journal into the
+/// session's own log).
+fn spawn_server_with_events(
+    provider: Arc<dyn Provider>,
+    journal_dir: PathBuf,
+    events_dir: Option<PathBuf>,
 ) -> (
     tokio::io::DuplexStream,
     tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -81,7 +103,7 @@ fn spawn_server_raw(
         server_write,
         factory,
         Vec::new(),
-        None,
+        events_dir,
         config,
     ));
     (client, handle)
@@ -141,6 +163,48 @@ async fn await_response<R: tokio::io::AsyncRead + Unpin>(reader: &mut R, id: i64
     .expect("response did not arrive within 2s")
 }
 
+/// Skim lines until the first NOTIFICATION with `method` arrives
+/// (responses and other notifications are dropped). Times out at 5s —
+/// generous because servers with an events dir run the (bounded)
+/// ollama route-discovery probe at startup.
+async fn await_notification<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    method: &str,
+) -> Value {
+    timeout(Duration::from_millis(5000), async {
+        loop {
+            let line = read_line(reader).await;
+            if line.get("method").and_then(|v| v.as_str()) == Some(method) {
+                return line;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("notification {method} did not arrive within 5s"))
+}
+
+/// Locate and parse `<events_dir>/<daemon_id>/<session_id>.jsonl`
+/// (the daemon id is generated, so scan one level). Returns the
+/// parsed events; panics on a missing or malformed log.
+fn session_log_events(events_dir: &Path, session_id: &str) -> Vec<SessionEvent> {
+    let path = std::fs::read_dir(events_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .map(|d| d.join(format!("{session_id}.jsonl")))
+        .find(|p| p.exists())
+        .unwrap_or_else(|| {
+            panic!(
+                "session log for {session_id} not found under {}",
+                events_dir.display()
+            )
+        });
+    let (log, malformed) = SessionEventLog::from_jsonl(&path).expect("parse session log");
+    assert_eq!(malformed, 0, "session log has malformed lines");
+    log.snapshot()
+}
+
 /// Replay the single `<daemon_id>.jsonl` journal in `dir`. Receipts
 /// are appended BEFORE responses are emitted, so once a command's
 /// response has been observed on the wire its records are durable.
@@ -172,6 +236,11 @@ fn received_seq(records: &[JournalRecord], wanted_method: &str) -> Vec<u64> {
 /// and NO receipt; replay surfaces it as an orphan. The control plane
 /// survives (the panic is in a spawned session-scope task) — a
 /// follow-up ping completes WITH a receipt.
+///
+/// WP4 note: `mu.test.panic` is session-scoped but addresses a session
+/// that does not exist (`s-doomed`), so it takes the documented
+/// unresolvable-session fallback and still journals into the DAEMON
+/// journal — these assertions stay against the right journal.
 #[cfg(debug_assertions)] // the crash seam exists in debug builds only
 #[tokio::test]
 async fn crash_after_ingest_leaves_orphaned_command_received_inv1_inv4() {
@@ -395,6 +464,13 @@ async fn daemon_commands_process_in_seq_order_inv3() {
 /// full create→ask round trip through the new path leaves
 /// `CommandSucceeded` receipts whose echoes carry the original method
 /// + params.
+///
+/// WP4 note: this server runs with `events_dir = None`, so the
+/// session's log is in-memory-only and the ask takes the DOCUMENTED
+/// fallback into the daemon journal with the WP3 receipt shape
+/// (immediate `accepted: true` receipt) — this test now pins that
+/// fallback. The session-log path is covered by
+/// `ask_receipt_lands_in_session_log_at_done_wp4` below.
 #[tokio::test]
 async fn receipts_wrap_the_original_command_inv5() {
     let journal_dir = unique_journal_dir();
@@ -451,4 +527,338 @@ async fn receipts_wrap_the_original_command_inv5() {
     drop(client);
     let _ = timeout(Duration::from_millis(500), server_handle).await;
     let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// spec mu-046 WP4: session-scoped commands journal into THEIR
+// SESSION's event log; completion receipts pair by command_event_id.
+// ───────────────────────────────────────────────────────────────────
+
+/// A unique throwaway events dir (gives sessions disk-backed logs).
+fn unique_events_dir() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "mu-pipeline-smoke-events-{}-{}",
+        std::process::id(),
+        n
+    ))
+}
+
+/// create_session and return the new session id.
+async fn create_session(client: &mut tokio::io::DuplexStream, id: i64) -> String {
+    let req = json!({
+        "jsonrpc": "2.0", "id": id, "method": "create_session",
+        "params": { "provider": { "kind": "anthropic_api", "model": "x" } }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write create");
+    let resp = await_response(client, id).await;
+    resp["result"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("create_session failed: {resp}"))
+        .to_string()
+}
+
+/// Receipt-at-Done (spec mu-046 WP4, receipt semantics): with a
+/// disk-backed session log, `ask_session` journals `CommandReceived`
+/// into the SESSION's log BEFORE the loop processes the message, the
+/// wire `accepted: true` stays immediate, and after the turn's `Done`
+/// exactly one `CommandSucceeded` wraps the original ask with the
+/// matching `command_event_id`. The daemon journal carries NO
+/// session-scoped command — but the unresolvable-session fallback
+/// still lands there (border record always exists).
+#[tokio::test]
+async fn ask_receipt_lands_in_session_log_at_done_wp4() {
+    let journal_dir = unique_journal_dir();
+    let events_dir = unique_events_dir();
+    std::fs::create_dir_all(&events_dir).expect("create events dir");
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) =
+        spawn_server_with_events(provider, journal_dir.clone(), Some(events_dir.clone()));
+    authenticate(&mut client).await;
+
+    let session_id = create_session(&mut client, 1).await;
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "ask_session",
+        "params": { "session_id": session_id, "user_message": "hello" }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write ask");
+    let resp = await_response(&mut client, 2).await;
+    assert_eq!(
+        resp["result"]["accepted"], true,
+        "wire response stays immediate: {resp}"
+    );
+    // The receipt is appended BEFORE the wire `session.done` leaves,
+    // so observing the notification means the receipt is durable.
+    let done = await_notification(&mut client, "session.done").await;
+    assert_eq!(done["params"]["session_id"], session_id.as_str());
+
+    let events = session_log_events(&events_dir, &session_id);
+    // CommandReceived for the ask is in the session log, BEFORE the
+    // UserMessage the loop projected for it (durable before
+    // processed, INV-1).
+    let received_id = events
+        .iter()
+        .find_map(|e| match &e.payload {
+            EventPayload::CommandReceived { method, params, .. }
+                if method == "ask_session" && params["user_message"] == "hello" =>
+            {
+                Some(e.id)
+            }
+            _ => None,
+        })
+        .expect("CommandReceived in session log");
+    let user_msg_id = events
+        .iter()
+        .find_map(|e| match &e.payload {
+            EventPayload::UserMessage { content } if content == "hello" => Some(e.id),
+            _ => None,
+        })
+        .expect("UserMessage in session log");
+    assert!(
+        received_id < user_msg_id,
+        "CommandReceived (id {received_id}) must precede processing (UserMessage id {user_msg_id})"
+    );
+    // Exactly one CommandSucceeded, wrapping the original ask,
+    // pairing by command_event_id.
+    let receipts: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::CommandSucceeded {
+                command_event_id,
+                command,
+                ..
+            } => Some((*command_event_id, command.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(receipts.len(), 1, "exactly one success receipt: {events:?}");
+    let (command_event_id, echo) = &receipts[0];
+    assert_eq!(*command_event_id, received_id, "receipt pairs the ask");
+    assert_eq!(echo.method, "ask_session");
+    assert_eq!(echo.params["user_message"], "hello");
+    // No failure/rejection receipts for the ask.
+    assert!(
+        !events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::CommandFailed { .. } | EventPayload::CommandRejected { .. }
+        )),
+        "no failure receipts expected: {events:?}"
+    );
+
+    // The DAEMON journal no longer carries the session-scoped ask...
+    let (_path, records) = read_journal(&journal_dir);
+    assert!(
+        received_seq(&records, "ask_session").is_empty(),
+        "daemon journal must not carry session-scoped commands: {records:?}"
+    );
+
+    // ...but an UNRESOLVABLE session still falls back there (the
+    // border record always exists).
+    let req = json!({
+        "jsonrpc": "2.0", "id": 3, "method": "ask_session",
+        "params": { "session_id": "no-such-session", "user_message": "hi" }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write bogus ask");
+    let resp = await_response(&mut client, 3).await;
+    assert!(resp.get("error").is_some(), "expected an error: {resp}");
+    let (_path, records) = read_journal(&journal_dir);
+    let bogus_seqs = received_seq(&records, "ask_session");
+    assert_eq!(
+        bogus_seqs.len(),
+        1,
+        "unresolvable-session ask lands in the daemon journal: {records:?}"
+    );
+    let rejected = records.iter().any(|r| {
+        matches!(&r.payload, JournalPayload::CommandRejected { command_seq, .. }
+            if *command_seq == bogus_seqs[0])
+    });
+    assert!(rejected, "and gains its rejection receipt: {records:?}");
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+    let _ = std::fs::remove_dir_all(&journal_dir);
+    let _ = std::fs::remove_dir_all(&events_dir);
+}
+
+/// A provider whose stream never yields: the ask wedges in-flight so
+/// the test can cancel it mid-turn. The agent loop's cancel path does
+/// not need provider cooperation — it selects on its input channel.
+struct StallProvider;
+
+#[async_trait::async_trait]
+impl Provider for StallProvider {
+    async fn stream(
+        &self,
+        _system_prompt: Option<&str>,
+        _input: mu_core::agent::MessageInput<'_>,
+        _tools: &[mu_core::agent::ToolSpec],
+        _cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<
+        futures::stream::BoxStream<'static, mu_core::agent::ProviderEvent>,
+        mu_core::agent::ProviderError,
+    > {
+        Ok(Box::pin(futures::stream::pending()))
+    }
+}
+
+/// Cancel pairing (spec mu-046 WP4): `cancel_session` journals its own
+/// `CommandReceived` + `CommandSucceeded` receipt in the session log,
+/// and the in-flight ask's terminal `Done(Aborted)` produces THAT
+/// ask's receipt — a `CommandFailed` (documented choice: the ask was
+/// accepted and entered processing; abort is a processing outcome)
+/// pairing the ask's `command_event_id`.
+#[tokio::test]
+async fn cancel_session_pairs_aborted_ask_receipt_wp4() {
+    let journal_dir = unique_journal_dir();
+    let events_dir = unique_events_dir();
+    std::fs::create_dir_all(&events_dir).expect("create events dir");
+    let provider: Arc<dyn Provider> = Arc::new(StallProvider);
+    let (mut client, server_handle) =
+        spawn_server_with_events(provider, journal_dir.clone(), Some(events_dir.clone()));
+    authenticate(&mut client).await;
+
+    let session_id = create_session(&mut client, 1).await;
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "ask_session",
+        "params": { "session_id": session_id, "user_message": "spin forever" }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write ask");
+    let resp = await_response(&mut client, 2).await;
+    assert_eq!(resp["result"]["accepted"], true);
+
+    // Wait until the loop has actually STARTED the ask (its
+    // UserMessage is in the log) so the receipt ticket is pending
+    // inside the loop before we cancel.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let events = session_log_events(&events_dir, &session_id);
+            if events
+                .iter()
+                .any(|e| matches!(&e.payload, EventPayload::UserMessage { content } if content == "spin forever"))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("ask never reached the loop");
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 3, "method": "cancel_session",
+        "params": { "session_id": session_id }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write cancel");
+    let resp = await_response(&mut client, 3).await;
+    assert_eq!(resp["result"]["cancelled"], true);
+
+    // The dying loop flushes Done(Aborted) carrying the ask's ticket;
+    // the forwarder writes the CommandFailed receipt. Poll the log.
+    let events = timeout(Duration::from_secs(5), async {
+        loop {
+            let events = session_log_events(&events_dir, &session_id);
+            if events
+                .iter()
+                .any(|e| matches!(&e.payload, EventPayload::CommandFailed { .. }))
+            {
+                return events;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("aborted ask never gained its CommandFailed receipt");
+
+    let ask_received_id = events
+        .iter()
+        .find_map(|e| match &e.payload {
+            EventPayload::CommandReceived { method, params, .. }
+                if method == "ask_session" && params["user_message"] == "spin forever" =>
+            {
+                Some(e.id)
+            }
+            _ => None,
+        })
+        .expect("ask CommandReceived in session log");
+    let cancel_received_id = events
+        .iter()
+        .find_map(|e| match &e.payload {
+            EventPayload::CommandReceived { method, .. } if method == "cancel_session" => {
+                Some(e.id)
+            }
+            _ => None,
+        })
+        .expect("cancel CommandReceived in session log");
+    // cancel_session: immediate-completion receipt, paired.
+    let cancel_receipted = events.iter().any(|e| {
+        matches!(&e.payload, EventPayload::CommandSucceeded { command_event_id, command, .. }
+            if *command_event_id == cancel_received_id && command.method == "cancel_session")
+    });
+    assert!(
+        cancel_receipted,
+        "cancel_session gains its own paired receipt: {events:?}"
+    );
+    // The aborted ask: CommandFailed pairing the ASK's id, wrapping
+    // the original ask.
+    let ask_failed = events
+        .iter()
+        .find_map(|e| match &e.payload {
+            EventPayload::CommandFailed {
+                command_event_id,
+                command,
+                message,
+                ..
+            } => Some((*command_event_id, command.clone(), message.clone())),
+            _ => None,
+        })
+        .expect("CommandFailed receipt present");
+    assert_eq!(
+        ask_failed.0, ask_received_id,
+        "Done(Aborted) receipt pairs the in-flight ask"
+    );
+    assert_eq!(ask_failed.1.method, "ask_session");
+    assert_eq!(ask_failed.1.params["user_message"], "spin forever");
+    assert!(
+        ask_failed.2.contains("abort"),
+        "failure message names the abort: {}",
+        ask_failed.2
+    );
+    // Exactly one receipt per command (INV-4): one success (cancel),
+    // one failure (ask), nothing else.
+    let receipt_count = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.payload,
+                EventPayload::CommandSucceeded { .. }
+                    | EventPayload::CommandFailed { .. }
+                    | EventPayload::CommandRejected { .. }
+            )
+        })
+        .count();
+    assert_eq!(receipt_count, 2, "one receipt per command: {events:?}");
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+    let _ = std::fs::remove_dir_all(&journal_dir);
+    let _ = std::fs::remove_dir_all(&events_dir);
 }

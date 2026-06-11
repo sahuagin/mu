@@ -1,6 +1,26 @@
 //! Translate `AgentEvent`s from the loop into `session.*` JSON-RPC
 //! notifications.
 //!
+//! ## Gateway re-entry seam (spec mu-046 INV-10)
+//!
+//! This module is the daemon-side terminus of the gateway re-entry
+//! rule: slow external work (provider streams, tool execution) runs in
+//! async gateways inside the agent loop, and its results re-enter the
+//! session pipeline as SEQUENCED `AgentEvent`s on the loop's event
+//! channel — never by mutating pipeline state from the side. The
+//! forwarder consumes that one ordered stream and projects it into the
+//! session's event log and the wire notification surface. Nothing
+//! else writes gateway results into either projection, so within a
+//! session the log order IS the processing order the loop observed.
+//!
+//! The same channel carries command receipts (spec mu-046 WP4): an
+//! `ask_session` journaled into the session's log rides a
+//! [`CommandTicket`] through the agent loop, and the terminal
+//! `AgentEvent::Done` returns it here, where
+//! [`forward_events`] writes the `CommandSucceeded`/`CommandFailed`
+//! receipt — strict `append_command`, pairing by `command_event_id` —
+//! into the same session log that holds the `CommandReceived`.
+//!
 //! ## Why this is split
 //!
 //! `translate_event` is a pure function: given a session id and an
@@ -22,7 +42,8 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use mu_core::agent::{AgentEvent, AgentMessage};
+use mu_core::agent::{AgentEvent, AgentMessage, StopReason, Usage};
+use mu_core::command_journal::CommandTicket;
 use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
     AssistantTextFinalizedEvent, AutonomousIterationCompletedEvent,
@@ -31,6 +52,7 @@ use mu_core::protocol::{
     ToolCallCompletedEvent, ToolCallStartedEvent, ToolOutcome,
 };
 use mu_core::session_status::SessionStatus;
+use mu_core::transport::codes;
 use mu_core::transport::NotificationWriter;
 
 use super::provider_status::{ProviderCallState, ProviderStatusTracker};
@@ -282,6 +304,13 @@ pub async fn forward_events(
     daemon_id: String,
     status_watch_tx: Option<tokio::sync::watch::Sender<Option<SessionStatus>>>,
 ) {
+    // spec mu-046 WP4: the most recent AgentEvent::Error message. The
+    // loop emits Error then its terminal Done(Error) on the same
+    // ordered channel, so consuming this at the Done gives the
+    // CommandFailed receipt the real failure text instead of a
+    // generic one. Local to this one ordered stream — not a side
+    // table; correlation still comes from the ticket.
+    let mut last_error_message: Option<String> = None;
     while let Some(event) = events_rx.recv().await {
         // mu-035 Phase D: mirror provider-call lifecycle into the
         // shared tracker so dispatch handlers (cancel_outstanding,
@@ -289,6 +318,10 @@ pub async fn forward_events(
         // The lock is held only for the sync mutate; no `.await`
         // runs while it's held.
         update_provider_status(&event, &provider_status);
+
+        if let AgentEvent::Error { message } = &event {
+            last_error_message = Some(message.clone());
+        }
 
         let recompute_status = should_recompute_status(&event);
 
@@ -312,6 +345,44 @@ pub async fn forward_events(
                 }
             }
             event_log.append(actor, payload);
+        }
+        // spec mu-046 WP4: completion receipts for journaled asks.
+        // Each ticket the terminal Done carries becomes one receipt
+        // row in the SAME session log that holds its CommandReceived
+        // — CommandSucceeded on a normal stop, CommandFailed on
+        // Aborted/Error. Written via the strict append_command
+        // (receipts are outcomes, but a fsync'd receipt before the
+        // wire notification keeps the log self-consistent); an append
+        // failure is logged and the CommandReceived stays an orphan —
+        // the legible marker (INV-4).
+        if let AgentEvent::Done {
+            stop_reason,
+            turn_count,
+            usage,
+            elapsed_ms,
+            command_receipts,
+        } = &event
+        {
+            for ticket in command_receipts {
+                let payload = ask_receipt_for(
+                    ticket,
+                    *stop_reason,
+                    *turn_count,
+                    *usage,
+                    *elapsed_ms,
+                    last_error_message.as_deref(),
+                    now_unix_ms(),
+                );
+                if let Err(err) = event_log.append_command(EventActor::System, payload) {
+                    tracing::error!(
+                        %err,
+                        session_id = %session_id,
+                        command_event_id = ticket.command_event_id,
+                        "ask receipt append failed; command stays an orphan in the session log"
+                    );
+                }
+            }
+            last_error_message = None;
         }
         // mu-5g7i / spec mu-040: at every task termination (Done or
         // Error AgentEvent), emit one TaskTelemetry envelope. This is
@@ -498,6 +569,71 @@ pub(crate) fn task_telemetry_for(
     })
 }
 
+/// spec mu-046 WP4: project one [`CommandTicket`] + the terminal
+/// Done's outcome into the session-log receipt for that ask. Pure for
+/// testability; `forward_events` appends the result via the strict
+/// `append_command` path.
+///
+/// Mapping (spec "Receipt semantics", documented decisions):
+/// - normal stops (`EndTurn`, `IterationCap`, …) → `CommandSucceeded`
+///   wrapping the original ask; `result` summarizes the turn the same
+///   way the wire `session.done` does.
+/// - `StopReason::Error` → `CommandFailed`, carrying the loop's last
+///   `AgentEvent::Error` message when available.
+/// - `StopReason::Aborted` (cancel_session / cancel_outstanding) →
+///   `CommandFailed`, NOT `CommandRejected`: the ask was accepted and
+///   entered processing — abort is a processing outcome, and Rejected
+///   is reserved for pre-handler refusals (auth/validation/routing).
+pub(crate) fn ask_receipt_for(
+    ticket: &CommandTicket,
+    stop_reason: StopReason,
+    turn_count: u32,
+    usage: Option<Usage>,
+    elapsed_ms: Option<u64>,
+    error_message: Option<&str>,
+    now_unix_ms: u64,
+) -> EventPayload {
+    // Receipt elapsed = border crossing → completion (not just the
+    // turn's wall time — a queued ask waited first).
+    let receipt_elapsed_ms = now_unix_ms.saturating_sub(ticket.received_at_unix_ms);
+    match stop_reason {
+        StopReason::Aborted => EventPayload::CommandFailed {
+            command_event_id: ticket.command_event_id,
+            command: ticket.echo.clone(),
+            code: codes::INTERNAL_ERROR,
+            message: "ask aborted before completion (cancelled)".to_string(),
+            elapsed_ms: receipt_elapsed_ms,
+        },
+        StopReason::Error => EventPayload::CommandFailed {
+            command_event_id: ticket.command_event_id,
+            command: ticket.echo.clone(),
+            code: codes::INTERNAL_ERROR,
+            message: error_message
+                .unwrap_or("ask terminated with an error")
+                .to_string(),
+            elapsed_ms: receipt_elapsed_ms,
+        },
+        _ => EventPayload::CommandSucceeded {
+            command_event_id: ticket.command_event_id,
+            command: ticket.echo.clone(),
+            result: serde_json::json!({
+                "stop_reason": stop_reason,
+                "turn_count": turn_count,
+                "usage": usage,
+                "elapsed_ms": elapsed_ms,
+            }),
+            elapsed_ms: receipt_elapsed_ms,
+        },
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Translate an `AgentEvent` into a durable-log entry, or None if the
 /// event isn't worth recording (text deltas, lifecycle ticks). Kept
 /// pure for testability.
@@ -553,6 +689,10 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
             turn_count,
             usage,
             elapsed_ms,
+            // command_receipts are NOT part of the durable Done row —
+            // each ticket becomes its own receipt row (see
+            // forward_events), which carries the correlation.
+            ..
         } => Some((
             EventActor::Agent,
             EventPayload::Done {
@@ -1101,6 +1241,7 @@ mod tests {
                 reasoning_tokens: None,
             }),
             elapsed_ms: Some(1234),
+            command_receipts: Vec::new(),
         };
         let (actor, payload) = to_log_event(&ev).expect("Done → log");
         assert!(matches!(actor, EventActor::Agent));
@@ -1162,6 +1303,7 @@ mod tests {
                     reasoning_tokens: None,
                 }),
                 elapsed_ms: Some(123),
+                command_receipts: Vec::new(),
             },
         ];
         for ev in sequence {
@@ -1241,6 +1383,7 @@ mod tests {
                     reasoning_tokens: None,
                 }),
                 elapsed_ms: Some(elapsed),
+                command_receipts: Vec::new(),
             };
             let (actor, payload) = to_log_event(&ev).unwrap();
             log.append(actor, payload);
@@ -1274,6 +1417,7 @@ mod tests {
                 reasoning_tokens: None,
             }),
             elapsed_ms: Some(1234),
+            command_receipts: Vec::new(),
         };
         let payload = task_telemetry_for(
             "session-abc",
@@ -1354,6 +1498,7 @@ mod tests {
             turn_count: 0,
             usage: None,
             elapsed_ms: None,
+            command_receipts: Vec::new(),
         };
         let payload = task_telemetry_for(
             "session-xyz",
@@ -1438,6 +1583,7 @@ mod tests {
                 reasoning_tokens: None,
             }),
             elapsed_ms: Some(500),
+            command_receipts: Vec::new(),
         };
         let payload = task_telemetry_for(
             "session-tier",
@@ -1494,6 +1640,7 @@ mod tests {
             turn_count: 1,
             usage: None,
             elapsed_ms: None,
+            command_receipts: Vec::new(),
         };
         let payload = task_telemetry_for("session-no-info", &event, None).expect("must still emit");
         match payload {

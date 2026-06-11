@@ -140,7 +140,7 @@ pub(crate) async fn handle_invoke_llm(
                     let _ = cancel_tx.send(());
                     return Err(Outcome::OutstandingCancelled { reason });
                 }
-                Some(input @ AgentInput::UserMessage(_))
+                Some(input @ AgentInput::UserMessage(..))
                 | Some(input @ AgentInput::StartAutonomous { .. })
                 | Some(input @ AgentInput::ScheduleWakeup { .. })
                 | Some(input @ AgentInput::SwitchProvider { .. })

@@ -758,6 +758,21 @@ impl SessionEventLog {
         Ok(id)
     }
 
+    /// spec mu-046 WP4: does this log have an on-disk JSONL writer
+    /// attached? The ingest pipeline consults this to decide where a
+    /// session-scoped command journals: a disk-backed session log can
+    /// take the strict [`append_command`](Self::append_command) path;
+    /// an in-memory-only log cannot make a command durable, so the
+    /// pipeline explicitly falls back to the daemon control-plane
+    /// journal instead (border compliance preserved; session-log
+    /// strictness needs disk).
+    pub fn has_disk_writer(&self) -> bool {
+        self.disk_writer
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+    }
+
     fn write_to_disk(&self, event: &SessionEvent) {
         let Ok(mut guard) = self.disk_writer.lock() else {
             return;

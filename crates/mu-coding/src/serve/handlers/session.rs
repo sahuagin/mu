@@ -727,7 +727,20 @@ fn describe_selector(selector: &ProviderSelector) -> (String, String) {
     }
 }
 
-pub async fn handle_ask_session(request: Request<Value>, sessions: Sessions) -> Response<Value> {
+/// `ticket` (spec mu-046 WP4): when the ingest pipeline journaled this
+/// ask's `CommandReceived` into the session's own event log, the
+/// ticket rides into `AgentInput::UserMessage` here so the agent loop
+/// can carry it back out on the turn's terminal `Done` — the forwarder
+/// then writes the `CommandSucceeded`/`CommandFailed` receipt with the
+/// correct pairing. If the send below FAILS, the ticket dies with the
+/// input; the pipeline (which kept its own echo) writes the failure
+/// receipt at handler completion instead — delivery failure is an
+/// outcome.
+pub async fn handle_ask_session(
+    request: Request<Value>,
+    sessions: Sessions,
+    ticket: Option<mu_core::command_journal::CommandTicket>,
+) -> Response<Value> {
     let params: AskSessionRequest = match serde_json::from_value(request.params.clone()) {
         Ok(p) => p,
         Err(e) => {
@@ -753,7 +766,12 @@ pub async fn handle_ask_session(request: Request<Value>, sessions: Sessions) -> 
             let msg = AgentMessage::User {
                 content: params.user_message,
             };
-            match tx.send(AgentInput::UserMessage(msg)).await {
+            // Boxed to keep AgentInput's variant size small (clippy
+            // large_enum_variant) — tickets ride rarely-hot paths.
+            match tx
+                .send(AgentInput::UserMessage(msg, ticket.map(Box::new)))
+                .await
+            {
                 Ok(_) => {
                     let resp = AskSessionResponse { accepted: true };
                     ok_response(request.id, to_value_or_null(resp))

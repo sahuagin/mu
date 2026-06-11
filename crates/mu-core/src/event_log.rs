@@ -658,6 +658,20 @@ impl SessionEventLog {
             std::fs::create_dir_all(parent)?;
         }
         let file = OpenOptions::new().create(true).append(true).open(path)?;
+        // Fsync the parent directory so the just-created file's dirent
+        // survives a crash (the file's own writes don't persist it).
+        // BEST-EFFORT, matching this log's posture (append() swallows
+        // IO errors; persistence here is not load-bearing) — contrast
+        // `CommandJournal::open`, where the same sync propagates.
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Err(e) = std::fs::File::open(parent).and_then(|d| d.sync_all()) {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    error = %e,
+                    "parent-directory fsync failed after attaching disk writer; continuing"
+                );
+            }
+        }
         let mut guard = self
             .disk_writer
             .lock()

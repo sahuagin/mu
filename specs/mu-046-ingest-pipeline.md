@@ -228,6 +228,12 @@ the owning pipeline at completion:
 - Rejections (auth gate, validation, unknown method, session-not-found) are
   receipts too — `CommandRejected{stage}` — and are journaled even though no
   handler ran. The journal append happens *before* the auth gate.
+- Query-class receipts elide their result (WP8): for methods on the
+  `QUERY_METHODS` allowlist a success receipt's `result` is replaced by the
+  compact marker `{"elided": true, "result_bytes": <serialized length>}` —
+  the `CommandEcho` still wraps the full command — because embedding a
+  `session.events` result into the very log it just read would compound log
+  growth under polling. Non-query receipts and wire responses are unchanged.
 
 ## Work packages (beads mu-ingest-pipeline-umbrella-n3yy.1–.7)
 
@@ -311,6 +317,41 @@ Order: WP1 → WP2 → WP3 → {WP4 ∥ WP5} → WP6 → WP7.
   journal with the immediate accepted-receipt shape (pinned by
   `receipts_wrap_the_original_command_inv5`); the session-log Done-time
   receipt path is `ask_receipt_lands_in_session_log_at_done_wp4`.
+
+### WP8 amendments (adversarial review, 2026-06-11)
+
+- **Per-session FIFO dispatch** — the control-plane consumer originally
+  spawned one independent task per session-scoped command, so two commands
+  pipelined to the SAME session could reach its input channel out of journal
+  order (an INV-3 violation within the session pipeline). The consumer now
+  routes session-scoped commands (post-journal, in seq order) into a
+  per-session dispatcher: one task per addressed session id, strict FIFO
+  within a session, concurrency only across sessions. Dispatchers are
+  created lazily on first command and torn down when the session is no
+  longer live and the lane is drained; a wedged session wedges only its own
+  dispatcher. See the `serve/pipeline.rs` module doc ("Per-session FIFO
+  dispatch") for the lifecycle, including the sweep-on-send-failure path.
+- **Outbound is lossy under lag — responses included.** The daemon-wide
+  outbound stream is a bounded `tokio::sync::broadcast`; a subscriber that
+  falls more than the capacity behind drops envelopes (`Lagged`), and
+  RESPONSES are dropped along with notifications. Receipts are written
+  before emission, so under lag the wire and the journal can diverge — the
+  journal remains the source of truth, and the MCP per-call lag error now
+  says so explicitly (check state before retrying non-idempotent calls;
+  blind retry of a lost-result mutation can double its effect). Accepted
+  tradeoff for this spec; the named follow-up is lossless per-connection
+  buffering at the transport writer. No transport behavior change in WP8.
+- **INV-8 scope cut** — MCP resource reads (`mu://...` status reads) and
+  `mu/session_status` subscription pushes bypass the tagged outbound
+  stream; INV-8 currently holds for the tool/command surface only. Porting
+  the MCP resource/subscription surface onto the outbound stream is the
+  named follow-up.
+- **Redaction is schema-keyed** — INV-6's mechanism redacts params of
+  methods on the redaction map (`SECRET_PARAM_FIELDS`,
+  `SECRET_KEY_DENYLIST`). Value-shaped secrets — e.g. a human pasting a
+  credential into `session.respond_to_input_required` or a user message —
+  are not detected; they are the same exposure class as user messages
+  generally. Future work alongside capability gating.
 
 ## Out of scope (deferred)
 

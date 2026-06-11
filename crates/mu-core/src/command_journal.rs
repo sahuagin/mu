@@ -220,6 +220,17 @@ impl CommandJournal {
             Err(e) => return Err(e),
         };
         let file = OpenOptions::new().create(true).append(true).open(path)?;
+        // Durability of the file's EXISTENCE, not just its bytes: a
+        // newly created journal file (and journal dir) lives in its
+        // parent directory's entries, and `sync_data` on the file does
+        // not persist those. Fsync the parent once per open so a crash
+        // right after boot cannot lose the whole journal file. Errors
+        // propagate — this journal is load-bearing (INV-2), unlike the
+        // session log's best-effort posture. `File::open` on a
+        // directory + `sync_all` works on FreeBSD and Linux.
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            File::open(parent)?.sync_all()?;
+        }
         let journal = Self {
             daemon_id: daemon_id.to_string(),
             file: Mutex::new(file),

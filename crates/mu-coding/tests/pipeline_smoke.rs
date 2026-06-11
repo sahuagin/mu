@@ -862,3 +862,119 @@ async fn cancel_session_pairs_aborted_ask_receipt_wp4() {
     let _ = std::fs::remove_dir_all(&journal_dir);
     let _ = std::fs::remove_dir_all(&events_dir);
 }
+
+/// Per-session FIFO ordering end-to-end (spec mu-046 WP8, the INV-3
+/// blocker's regression test at the serve level): an `ask_session` and
+/// a `cancel_session` PIPELINED in one write — no waiting for the ask
+/// to start, unlike the WP4 test above — must reach the session in
+/// journal order. Deterministic outcome via receipts: the ask is
+/// always delivered first, enters the (stalling) turn, and is aborted
+/// by the cancel — `CommandFailed` from `Done(Aborted)` pairing the
+/// ask, `CommandSucceeded` pairing the cancel. Pre-WP8 the cancel
+/// could overtake the ask (hitting an idle loop, leaving the ask
+/// spinning forever with no abort and no receipt). Repeated across
+/// sessions for scheduling-noise margin; each repetition is an
+/// independent shot at the race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pipelined_ask_then_cancel_keep_journal_order_wp8() {
+    let journal_dir = unique_journal_dir();
+    let events_dir = unique_events_dir();
+    std::fs::create_dir_all(&events_dir).expect("create events dir");
+    let provider: Arc<dyn Provider> = Arc::new(StallProvider);
+    let (mut client, server_handle) =
+        spawn_server_with_events(provider, journal_dir.clone(), Some(events_dir.clone()));
+    authenticate(&mut client).await;
+
+    for round in 0..3 {
+        let session_id = create_session(&mut client, 100 + round).await;
+        let ask_id = 200 + round * 2;
+        let cancel_id = ask_id + 1;
+
+        // ONE batched write: ask + cancel hit the read loop
+        // back-to-back, journaling in that order.
+        let ask = json!({
+            "jsonrpc": "2.0", "id": ask_id, "method": "ask_session",
+            "params": { "session_id": session_id, "user_message": "spin forever" }
+        });
+        let cancel = json!({
+            "jsonrpc": "2.0", "id": cancel_id, "method": "cancel_session",
+            "params": { "session_id": session_id }
+        });
+        client
+            .write_all(format!("{ask}\n{cancel}\n").as_bytes())
+            .await
+            .expect("write pipelined ask+cancel");
+        let resp = await_response(&mut client, ask_id).await;
+        assert_eq!(resp["result"]["accepted"], true, "round {round}: {resp}");
+        let resp = await_response(&mut client, cancel_id).await;
+        assert_eq!(resp["result"]["cancelled"], true, "round {round}: {resp}");
+
+        // FIFO guarantees the ask entered the loop BEFORE the cancel,
+        // so the cancel always aborts it: CommandFailed (abort) for
+        // the ask, CommandSucceeded for the cancel. Pre-WP8 the
+        // inverted interleaving leaves the ask receiptless forever —
+        // this poll times out.
+        let events = timeout(Duration::from_secs(5), async {
+            loop {
+                let events = session_log_events(&events_dir, &session_id);
+                if events
+                    .iter()
+                    .any(|e| matches!(&e.payload, EventPayload::CommandFailed { .. }))
+                {
+                    return events;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("round {round}: pipelined ask was never aborted — cancel overtook it (INV-3)")
+        });
+
+        let ask_received_id = events
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::CommandReceived { method, .. } if method == "ask_session" => {
+                    Some(e.id)
+                }
+                _ => None,
+            })
+            .expect("ask CommandReceived in session log");
+        let cancel_received_id = events
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::CommandReceived { method, .. } if method == "cancel_session" => {
+                    Some(e.id)
+                }
+                _ => None,
+            })
+            .expect("cancel CommandReceived in session log");
+        assert!(
+            ask_received_id < cancel_received_id,
+            "round {round}: journal order is ask then cancel"
+        );
+        let ask_failed = events.iter().any(|e| {
+            matches!(&e.payload, EventPayload::CommandFailed { command_event_id, command, message, .. }
+                if *command_event_id == ask_received_id
+                    && command.method == "ask_session"
+                    && message.contains("abort"))
+        });
+        assert!(
+            ask_failed,
+            "round {round}: ask gains CommandFailed from Done(Aborted): {events:?}"
+        );
+        let cancel_succeeded = events.iter().any(|e| {
+            matches!(&e.payload, EventPayload::CommandSucceeded { command_event_id, command, .. }
+                if *command_event_id == cancel_received_id && command.method == "cancel_session")
+        });
+        assert!(
+            cancel_succeeded,
+            "round {round}: cancel gains CommandSucceeded: {events:?}"
+        );
+    }
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+    let _ = std::fs::remove_dir_all(&journal_dir);
+    let _ = std::fs::remove_dir_all(&events_dir);
+}

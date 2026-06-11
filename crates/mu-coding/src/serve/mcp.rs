@@ -629,11 +629,18 @@ impl MuMcpHandler {
                 // transport::write_loop: skipped envelopes are gone. If
                 // this command's response was among them the await would
                 // never resolve, so surface the lag as an error instead
-                // of risking a wedged MCP connection.
+                // of risking a wedged MCP connection. Do NOT advise a
+                // blind retry: the command was journaled and may have
+                // EXECUTED — only its result envelope was lost — so a
+                // retry of a non-idempotent tool (e.g. mailbox post)
+                // would double its effect.
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     return Err(format!(
                         "outbound stream lagged ({skipped} envelopes dropped); \
-                         tool result lost — retry the call"
+                         the tool RESULT was lost, but the call itself may have \
+                         executed — check daemon state (the command journal and \
+                         its receipts are the source of truth) before retrying \
+                         anything non-idempotent"
                     ));
                 }
                 // Every sender dropped — daemon shutting down.

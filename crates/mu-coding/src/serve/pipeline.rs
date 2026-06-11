@@ -34,8 +34,11 @@
 //!    into the same journal slot, a receipt too), then routes through
 //!    [`super::dispatch::dispatch_inner`]. Daemon-scoped commands run
 //!    inline, preserving control-plane ordering; session-scoped
-//!    commands are spawned so a slow session cannot stall the control
-//!    plane (concurrency exists only across pipelines).
+//!    commands are handed — still in consumer/seq order — to their
+//!    session's FIFO dispatcher (next section) so a slow session
+//!    cannot stall the control plane and commands to the SAME session
+//!    cannot reorder. Concurrency exists only across pipelines, never
+//!    within one.
 //! 3. On completion a receipt wrapping the original command (INV-5,
 //!    [`CommandEcho`]) is journaled into the command's slot —
 //!    `CommandSucceeded` / `CommandFailed` / `CommandRejected` — and
@@ -43,6 +46,38 @@
 //!    A receipt-append failure is logged and the response still goes
 //!    out: the command is already durable, and the orphaned
 //!    `CommandReceived` IS the legible marker (INV-4).
+//!
+//! ## Per-session FIFO dispatch (WP8 — the session pipeline's intake)
+//!
+//! The consumer routes session-scoped commands (post-journal, in seq
+//! order) into a per-session dispatcher: one task per addressed
+//! session id, processing that session's commands strictly in arrival
+//! order — execute handler → receipt → emit, exactly one command at a
+//! time. This is what makes INV-3 true for session pipelines: journal
+//! order == queue order == processing order WITHIN a session (a
+//! pipelined `ask_session` then `cancel_session` reach the session's
+//! input channel in journal order); concurrency exists only ACROSS
+//! sessions and the control plane. A dispatcher wedged on a full
+//! input channel wedges only its own session's lane — never the
+//! control plane, never another session.
+//!
+//! Lifecycle: a dispatcher is created lazily on the first command
+//! addressed to a session id, and torn down after processing a
+//! command once the session is no longer live (closed — or never
+//! existed: the unresolvable fallback) AND its queue is empty.
+//! Emptiness is checked under the same lock the consumer enqueues
+//! under, so teardown cannot race an incoming command. If a
+//! dispatcher task dies without removing its entry (a handler
+//! panic), the next command for that session sweeps the dead entry
+//! and spawns a fresh dispatcher; commands queued in the dead lane
+//! are lost to processing and stay journaled-but-receiptless — the
+//! INV-4 orphan marker, the same blast shape a panicked pre-WP8
+//! spawn had. Ordering is keyed by the ADDRESSED session id, not the
+//! journal slot: session-scoped commands that fell back to the
+//! daemon journal (below) still ride their session's dispatcher.
+//! Only a session-scoped command carrying no session id at all is
+//! spawned free (defensive — validation rejects those; there is no
+//! lane to order it against).
 //!
 //! ## Session-log routing fallbacks (WP4, documented rule)
 //!
@@ -83,10 +118,11 @@
 //! channel closed — delivery failure is an outcome), the pipeline
 //! writes the failure receipt itself at handler completion.
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use mu_core::agent::Tool;
@@ -129,9 +165,10 @@ enum Scope {
     /// Control-plane: processed inline by the single-writer consumer.
     Daemon,
     /// Session-addressed: journals into the session's own event log
-    /// (WP4; daemon-journal fallback per the module doc) and is
-    /// spawned so a session's input channel can never block the
-    /// control plane.
+    /// (WP4; daemon-journal fallback per the module doc) and rides
+    /// the session's FIFO dispatcher (WP8, module doc) so a session's
+    /// input channel can never block the control plane — and commands
+    /// to the same session can never reorder.
     Session,
 }
 
@@ -300,6 +337,12 @@ pub(crate) struct Command {
     slot: JournalSlot,
     request: Request<Value>,
     origin: Origin,
+    /// The session this command addresses
+    /// ([`addressed_session_id`]) — the per-session dispatcher's
+    /// routing key (WP8). Kept on the command (independent of the
+    /// journal slot) so fallback-journaled commands still order
+    /// against their session.
+    session_id: Option<String>,
     /// Secret-redacted params (INV-6) — what receipts echo (INV-5).
     redacted_params: Value,
     scope: Scope,
@@ -453,10 +496,16 @@ pub(crate) fn spawn_control_plane(
     let journal_queries = ctx.daemon_info.config().journal.journal_queries;
     let consumer_journal = journal.clone();
     tokio::spawn(async move {
+        // Per-session FIFO dispatchers (WP8, module doc). The consumer
+        // holds the only strong Arc: when it exits, the map drops, the
+        // dispatcher channels close, and each dispatcher drains its
+        // queue and exits — the same shutdown cascade order as the
+        // consumer itself.
+        let dispatchers = Arc::new(SessionDispatchers::default());
         while let Some(input) = rx.recv().await {
             match input {
                 PipelineInput::Command(cmd) => {
-                    process_command(*cmd, &ctx, &consumer_journal, &stream).await;
+                    process_command(cmd, &ctx, &consumer_journal, &stream, &dispatchers).await;
                 }
                 PipelineInput::ConfigLoaded { seq } => process_config_loaded(seq),
             }
@@ -583,7 +632,7 @@ pub(crate) fn ingest(
                     request_id: request.id.clone(),
                     method: request.method.clone(),
                     params: redacted_params.clone(),
-                    session_id,
+                    session_id: session_id.clone(),
                     auth,
                     origin: origin.clone(),
                 });
@@ -611,6 +660,7 @@ pub(crate) fn ingest(
         slot,
         request,
         origin,
+        session_id,
         redacted_params,
         scope,
         received_at_unix_ms,
@@ -632,12 +682,133 @@ pub(crate) fn ingest(
     None
 }
 
+/// One session-scoped command, prepared by the consumer (gate already
+/// passed, per-command context built) and queued on its session's
+/// dispatcher — the arguments of one [`execute_and_receipt`] call.
+struct SessionWork {
+    cmd: Box<Command>,
+    notif: NotificationWriter,
+    dctx: DispatchCtx,
+}
+
+/// Per-session FIFO intake (spec mu-046 WP8, module doc): one
+/// dispatcher task per addressed session id, each processing its
+/// session's commands strictly in arrival order. The consumer enqueues
+/// under the map lock; teardown checks queue emptiness under the same
+/// lock — so a command can never land in a lane that has decided to
+/// exit.
+#[derive(Default)]
+struct SessionDispatchers {
+    map: Mutex<HashMap<String, mpsc::UnboundedSender<SessionWork>>>,
+}
+
+impl SessionDispatchers {
+    /// Lock the map, recovering from poisoning: the guarded sections
+    /// are straight-line map operations (no panics mid-mutation can
+    /// leave the map incoherent), and wedging EVERY session over one
+    /// poisoned lane would invert the isolation this type exists for.
+    fn lock_map(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, mpsc::UnboundedSender<SessionWork>>> {
+        match self.map.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Route one session-scoped command — already journaled, arriving
+    /// in consumer/seq order — onto its session's dispatcher, created
+    /// lazily on first use. A dead entry (the dispatcher task panicked
+    /// without removing itself) is swept here: replace it and re-send
+    /// this command; whatever was queued in the dead lane stays
+    /// journaled-but-receiptless (the INV-4 orphan marker).
+    fn dispatch(
+        self: &Arc<Self>,
+        session_id: String,
+        work: SessionWork,
+        sessions: &Sessions,
+        journal: &Arc<CommandJournal>,
+        stream: &OutboundStream,
+    ) {
+        let mut map = self.lock_map();
+        let tx = map.entry(session_id.clone()).or_insert_with(|| {
+            spawn_session_dispatcher(
+                session_id.clone(),
+                Arc::downgrade(self),
+                sessions.clone(),
+                journal.clone(),
+                stream.clone(),
+            )
+        });
+        if let Err(dead) = tx.send(work) {
+            tracing::warn!(
+                session_id = %session_id,
+                "session dispatcher died (handler panic?); sweeping and respawning"
+            );
+            let fresh = spawn_session_dispatcher(
+                session_id.clone(),
+                Arc::downgrade(self),
+                sessions.clone(),
+                journal.clone(),
+                stream.clone(),
+            );
+            let _ = fresh.send(dead.0);
+            map.insert(session_id, fresh);
+        }
+    }
+}
+
+/// Spawn one session's dispatcher: drain the lane strictly in order —
+/// each command fully executes (handler → receipt → emit) before the
+/// next starts. A send into a full session input channel therefore
+/// blocks ONLY this lane (the wedged-loop posture, WP8).
+///
+/// Teardown (module doc): after each command, if the session is no
+/// longer live in the registry — closed, or it never was (the
+/// unresolvable/daemon-fallback cases) — and the queue is empty under
+/// the map lock, remove our entry and exit. `registry` is Weak so a
+/// lingering dispatcher cannot keep the map (and thus itself) alive
+/// past the consumer.
+fn spawn_session_dispatcher(
+    session_id: String,
+    registry: Weak<SessionDispatchers>,
+    sessions: Sessions,
+    journal: Arc<CommandJournal>,
+    stream: OutboundStream,
+) -> mpsc::UnboundedSender<SessionWork> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<SessionWork>();
+    tokio::spawn(async move {
+        while let Some(SessionWork { cmd, notif, dctx }) = rx.recv().await {
+            execute_and_receipt(*cmd, notif, dctx, journal.clone(), stream.clone()).await;
+            if sessions.input_sender(&session_id).is_some() {
+                continue; // live session: the lane persists.
+            }
+            let Some(registry) = registry.upgrade() else {
+                // Consumer gone (shutdown): no map to clean; keep
+                // draining until the channel closes.
+                continue;
+            };
+            let map = &mut *registry.lock_map();
+            // Emptiness under the SAME lock the consumer sends under:
+            // nothing can be enqueued between this check and the
+            // removal, and a fresh dispatcher (spawned by the next
+            // command, if any) only starts after we are gone.
+            if rx.is_empty() {
+                map.remove(&session_id);
+                return;
+            }
+        }
+    });
+    tx
+}
+
 /// One consumer tick: gate, route, receipt, respond.
 async fn process_command(
-    cmd: Command,
+    cmd: Box<Command>,
     ctx: &PipelineCtx,
     journal: &Arc<CommandJournal>,
     stream: &OutboundStream,
+    dispatchers: &Arc<SessionDispatchers>,
 ) {
     // Gate first, route second (mu-fnn) — an unauthenticated
     // METHOD_NOT_FOUND would reveal routing surface. The rejection is
@@ -669,20 +840,34 @@ async fn process_command(
         // Daemon-scoped: inline, preserving control-plane ordering
         // (INV-3: seq order == processing order).
         Scope::Daemon => {
-            execute_and_receipt(cmd, notif, dctx, journal.clone(), stream.clone()).await
+            execute_and_receipt(*cmd, notif, dctx, journal.clone(), stream.clone()).await
         }
-        // Session-scoped: spawned — the control plane must never block
-        // on a session's input channel. Ordering holds within the
-        // control plane; concurrency exists only across pipelines.
-        Scope::Session => {
-            tokio::spawn(execute_and_receipt(
-                cmd,
-                notif,
-                dctx,
-                journal.clone(),
-                stream.clone(),
-            ));
-        }
+        // Session-scoped: onto the session's FIFO dispatcher (WP8,
+        // module doc) — the control plane never blocks on a session's
+        // input channel, and commands to the same session process in
+        // journal order. Concurrency exists only across pipelines.
+        Scope::Session => match cmd.session_id.clone() {
+            Some(session_id) => dispatchers.dispatch(
+                session_id,
+                SessionWork { cmd, notif, dctx },
+                &ctx.sessions,
+                journal,
+                stream,
+            ),
+            // Defensive: a session-scoped method carrying no session
+            // id at all (validation rejects it). There is no lane to
+            // order it against, so the pre-WP8 spawn keeps the control
+            // plane unblocked.
+            None => {
+                tokio::spawn(execute_and_receipt(
+                    *cmd,
+                    notif,
+                    dctx,
+                    journal.clone(),
+                    stream.clone(),
+                ));
+            }
+        },
     }
 }
 
@@ -736,12 +921,10 @@ async fn execute_and_receipt(
         (Response::Ok { .. }, true) => {}
         // Everything else — including a REJECTED/FAILED ask (the
         // ticket died with the undelivered input) — receipts here.
-        _ => append_receipt(
-            &journal,
-            &slot,
-            echo,
-            receipt_body_for(&response, elapsed_ms),
-        ),
+        _ => {
+            let body = receipt_body_for(&echo.method, &response, elapsed_ms);
+            append_receipt(&journal, &slot, echo, body);
+        }
     }
     emit_response(&stream, &origin, slot.command_id(), response);
 }
@@ -777,11 +960,12 @@ enum ReceiptBody {
 /// Classify a handler outcome into its receipt. `INVALID_PARAMS` /
 /// `METHOD_NOT_FOUND` are pre-handler-effect refusals —
 /// `CommandRejected { Validation | Routing }`; other errors are
-/// processing failures (`CommandFailed`).
-fn receipt_body_for(response: &Response<Value>, elapsed_ms: u64) -> ReceiptBody {
+/// processing failures (`CommandFailed`). Success results for
+/// query-class methods are elided — see [`receipt_result`].
+fn receipt_body_for(method: &str, response: &Response<Value>, elapsed_ms: u64) -> ReceiptBody {
     match response {
         Response::Ok { result, .. } => ReceiptBody::Succeeded {
-            result: result.clone(),
+            result: receipt_result(method, result),
             elapsed_ms,
         },
         Response::Err { error, .. } => match error.code {
@@ -801,6 +985,23 @@ fn receipt_body_for(response: &Response<Value>, elapsed_ms: u64) -> ReceiptBody 
                 elapsed_ms,
             },
         },
+    }
+}
+
+/// The `result` a success receipt embeds (spec mu-046 WP8).
+/// Query-class methods ([`is_query`]) get a compact elision marker —
+/// `{"elided": true, "result_bytes": N}` — instead of the full
+/// result: a `session.events` receipt embedding the very events it
+/// just read back into the same log would compound log growth under
+/// polling. The `CommandEcho` still wraps the full command; only the
+/// RESULT is elided. Non-query receipts carry their real result, and
+/// the wire response is untouched either way.
+fn receipt_result(method: &str, result: &Value) -> Value {
+    if is_query(method) {
+        let result_bytes = serde_json::to_string(result).map(|s| s.len()).unwrap_or(0);
+        json!({ "elided": true, "result_bytes": result_bytes })
+    } else {
+        result.clone()
     }
 }
 
@@ -1153,9 +1354,9 @@ mod tests {
     /// Wedged-loop, channel-FULL case (spec mu-046 WP4, INV-1): an
     /// ask to a session whose input channel is saturated is still
     /// durable in the SESSION's log before any delivery attempt — the
-    /// spawned handler blocks on the send, no receipt yet, and the
-    /// daemon journal carries nothing for the ask (it lives in the
-    /// session pipeline).
+    /// session's dispatcher blocks on the send (WP8: wedging only that
+    /// session's lane), no receipt yet, and the daemon journal carries
+    /// nothing for the ask (it lives in the session pipeline).
     #[tokio::test]
     async fn wedged_full_channel_ask_is_durable_in_session_log_inv1() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1608,5 +1809,241 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("mutating command must still journal with journal_queries=false");
+    }
+
+    // ─── spec mu-046 WP8 ────────────────────────────────────────────
+
+    /// INV-3 within a session pipeline (the WP8 blocker's regression
+    /// test): pipelined `ask_session` + `cancel_session` to ONE
+    /// session reach that session's input channel strictly in journal
+    /// order. The asks carry a ~1 MiB message, so each ask's handler
+    /// does megabytes of params clone+parse before its send while the
+    /// cancel's handler parses a few bytes — under the pre-WP8
+    /// spawn-per-command shape (independent tasks racing to the input
+    /// channel) the cancel reliably overtakes its ask on a
+    /// multi-thread runtime; the per-session FIFO dispatcher makes the
+    /// order deterministic regardless of handler latency.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_commands_reach_input_channel_in_journal_order_inv3() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Arc::new(
+            CommandJournal::open(&dir.path().join("d.jsonl"), "d", FsyncPolicy::Never)
+                .expect("open journal"),
+        );
+        let ctx = test_ctx();
+        let sessions = ctx.sessions.clone();
+        let stream = OutboundStream::new();
+        let control = spawn_control_plane(journal, ctx, stream);
+
+        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(1);
+        insert_session(&sessions, "s-fifo", input_tx, Some(dir.path()));
+
+        let auth = authed_state();
+        let padding = "x".repeat(1 << 20);
+        for i in 0..4 {
+            let ask = request(
+                AskSessionRequest::METHOD,
+                json!({
+                    "session_id": "s-fifo",
+                    "user_message": format!("m{i}:{padding}"),
+                }),
+            );
+            assert!(ingest(&control, ask, test_origin(), &auth).is_none());
+            let cancel = request(
+                CancelSessionRequest::METHOD,
+                json!({ "session_id": "s-fifo" }),
+            );
+            assert!(ingest(&control, cancel, test_origin(), &auth).is_none());
+        }
+
+        // Drain: journal order was ask(m0), cancel, ask(m1), cancel, …
+        // — the input channel must replay exactly that.
+        for i in 0..4 {
+            let delivered = tokio::time::timeout(Duration::from_secs(10), input_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("input {i} (ask) not delivered"))
+                .expect("channel open");
+            match delivered {
+                AgentInput::UserMessage(mu_core::agent::AgentMessage::User { content }, _) => {
+                    assert!(
+                        content.starts_with(&format!("m{i}:")),
+                        "asks must arrive in journal order: expected m{i}, got {}…",
+                        &content[..8.min(content.len())]
+                    );
+                }
+                other => panic!("expected UserMessage m{i}, got {other:?}"),
+            }
+            let delivered = tokio::time::timeout(Duration::from_secs(10), input_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("input {i} (cancel) not delivered"))
+                .expect("channel open");
+            assert!(
+                matches!(delivered, AgentInput::Cancel),
+                "cancel {i} must follow its ask: got {delivered:?}"
+            );
+        }
+    }
+
+    /// Cross-session concurrency survives WP8: a session whose
+    /// dispatcher is wedged on a full input channel delays neither
+    /// another session's commands nor the control plane.
+    #[tokio::test]
+    async fn wedged_session_does_not_delay_other_sessions_or_control_plane() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Arc::new(
+            CommandJournal::open(&dir.path().join("d.jsonl"), "d", FsyncPolicy::Never)
+                .expect("open journal"),
+        );
+        let ctx = test_ctx();
+        let sessions = ctx.sessions.clone();
+        let stream = OutboundStream::new();
+        let mut outbound_rx = stream.subscribe();
+        let control = spawn_control_plane(journal, ctx, stream);
+
+        // Session A: saturated channel, receiver alive but never
+        // draining — its dispatcher wedges on the first ask.
+        let (a_tx, _a_rx) = mpsc::channel::<AgentInput>(1);
+        a_tx.try_send(AgentInput::Cancel).expect("pre-fill");
+        insert_session(&sessions, "s-wedged", a_tx, Some(dir.path()));
+        // Session B: healthy.
+        let (b_tx, mut b_rx) = mpsc::channel::<AgentInput>(4);
+        insert_session(&sessions, "s-healthy", b_tx, Some(dir.path()));
+
+        let auth = authed_state();
+        let ask_a = request(
+            AskSessionRequest::METHOD,
+            json!({ "session_id": "s-wedged", "user_message": "stuck" }),
+        );
+        assert!(ingest(&control, ask_a, test_origin(), &auth).is_none());
+        let ask_b = request(
+            AskSessionRequest::METHOD,
+            json!({ "session_id": "s-healthy", "user_message": "moving" }),
+        );
+        assert!(ingest(&control, ask_b, test_origin(), &auth).is_none());
+
+        // B's command lands despite A's wedged dispatcher…
+        let delivered = tokio::time::timeout(Duration::from_secs(2), b_rx.recv())
+            .await
+            .expect("session B must not be delayed by session A's wedge")
+            .expect("channel open");
+        assert!(matches!(delivered, AgentInput::UserMessage(_, _)));
+
+        // …and the control plane still answers daemon-scoped commands.
+        assert!(ingest(&control, request("ping", json!(null)), test_origin(), &auth).is_none());
+        let pong = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let envelope = outbound_rx.recv().await.expect("stream open");
+                if envelope.item.0["result"]["pong"] == true {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            pong.is_ok(),
+            "control plane must not block on a wedged session"
+        );
+    }
+
+    /// Receipt-result elision (WP8): a query-class command's success
+    /// receipt carries the compact elision marker — NOT the (possibly
+    /// huge) result it would otherwise re-embed into the very session
+    /// log it read — while a mutating command's receipt keeps its real
+    /// result. CommandEcho is untouched either way.
+    #[tokio::test]
+    async fn query_receipt_elides_result_mutation_receipt_keeps_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Arc::new(
+            CommandJournal::open(&dir.path().join("d.jsonl"), "d", FsyncPolicy::Never)
+                .expect("open journal"),
+        );
+        let ctx = test_ctx();
+        let sessions = ctx.sessions.clone();
+        let stream = OutboundStream::new();
+        let control = spawn_control_plane(journal, ctx, stream);
+
+        let (input_tx, mut _input_rx) = mpsc::channel::<AgentInput>(4);
+        let log = insert_session(&sessions, "s-q", input_tx, Some(dir.path()));
+        // Seed content a non-elided session.events receipt would echo
+        // back into the log.
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "seed-event-content".to_string(),
+            },
+        );
+
+        // Query: session.events (journal_queries defaults to true).
+        let auth = authed_state();
+        let req = request(SessionEventsRequest::METHOD, json!({ "session_id": "s-q" }));
+        assert!(ingest(&control, req, test_origin(), &auth).is_none());
+        wait_for_log(&log, |events| {
+            events.iter().any(|e| {
+                matches!(&e.payload, EventPayload::CommandSucceeded { command, .. }
+                    if command.method == SessionEventsRequest::METHOD)
+            })
+        })
+        .await;
+        let (echo_method, result) = log
+            .snapshot()
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::CommandSucceeded {
+                    command, result, ..
+                } if command.method == SessionEventsRequest::METHOD => {
+                    Some((command.method.clone(), result.clone()))
+                }
+                _ => None,
+            })
+            .expect("session.events receipt");
+        assert_eq!(
+            echo_method,
+            SessionEventsRequest::METHOD,
+            "echo keeps the command"
+        );
+        assert_eq!(
+            result["elided"], true,
+            "query result must be elided: {result}"
+        );
+        assert!(
+            result["result_bytes"].as_u64().unwrap_or(0) > 0,
+            "marker records the elided size: {result}"
+        );
+        assert!(
+            !serde_json::to_string(&result)
+                .expect("serialize")
+                .contains("seed-event-content"),
+            "elided receipt must not embed event content: {result}"
+        );
+
+        // Mutation: cancel_session on the same session keeps its real
+        // result.
+        let req = request(CancelSessionRequest::METHOD, json!({ "session_id": "s-q" }));
+        assert!(ingest(&control, req, test_origin(), &auth).is_none());
+        wait_for_log(&log, |events| {
+            events.iter().any(|e| {
+                matches!(&e.payload, EventPayload::CommandSucceeded { command, .. }
+                    if command.method == CancelSessionRequest::METHOD)
+            })
+        })
+        .await;
+        let cancel_result = log
+            .snapshot()
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::CommandSucceeded {
+                    command, result, ..
+                } if command.method == CancelSessionRequest::METHOD => Some(result.clone()),
+                _ => None,
+            })
+            .expect("cancel_session receipt");
+        assert_eq!(
+            cancel_result["cancelled"], true,
+            "mutation receipts keep their real result: {cancel_result}"
+        );
+        assert!(
+            cancel_result.get("elided").is_none(),
+            "mutation receipts are never elided: {cancel_result}"
+        );
     }
 }

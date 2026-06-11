@@ -257,7 +257,14 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
             // or a live-head attach (resume) — neither is a usage/timing
             // signal.
             | EventPayload::Tombstone { .. }
-            | EventPayload::HeadAttached { .. } => {}
+            | EventPayload::HeadAttached { .. }
+            // spec mu-046: command/receipt journal records are border
+            // bookkeeping; their token/timing signal already arrives
+            // via the Done/AssistantMessage events they wrap.
+            | EventPayload::CommandReceived { .. }
+            | EventPayload::CommandSucceeded { .. }
+            | EventPayload::CommandFailed { .. }
+            | EventPayload::CommandRejected { .. } => {}
         }
     }
 

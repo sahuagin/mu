@@ -21,6 +21,7 @@ pub mod agent;
 pub mod auditor;
 pub mod aws;
 pub mod capability;
+pub mod command_journal; // spec mu-046: daemon control-plane command journal
 pub mod config;
 pub mod context;
 pub mod context_attribution;
@@ -37,6 +38,11 @@ pub mod t4c_source; // mu-kex4.6 phase 3: project tools+skills into t4c's Regist
 pub mod tool_registry;
 pub mod transport;
 pub mod usage_history;
+
+// spec mu-046: border-identity types shared by the daemon journal and
+// the session log's command/receipt variants. Re-exported at the root
+// so consumers don't have to know which module owns them.
+pub use command_journal::{AuthSnapshot, CommandEcho, Origin, RejectStage};
 
 /// Returns the crate version. Wired up so the workspace `cargo build`
 /// produces something callable from day one.

@@ -81,6 +81,31 @@ pub struct Config {
     /// `[mcp]` — outbound MCP client: servers whose tools the daemon
     /// imports at startup (mu-yc6).
     pub mcp: McpConfig,
+    /// `[journal]` — command-journal durability + location (spec mu-046).
+    pub journal: JournalConfig,
+    /// `[routes]` — provider route-catalog discovery knobs.
+    pub routes: RoutesConfig,
+}
+
+/// `[routes]` section. Startup route-catalog discovery (mu-818c).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoutesConfig {
+    /// Probe the ollama box at daemon startup to populate the route
+    /// catalog. Default `true` (production daemons with an events dir).
+    /// Hermetic tests MUST set `false`: the baked-in ollama base is a
+    /// private LAN address, unroutable on CI runners, so the probe's
+    /// bounded connect timeout stalls boot for its full duration there
+    /// (observed as pipeline_smoke response timeouts on GitHub CI).
+    pub ollama_discover: bool,
+}
+
+impl Default for RoutesConfig {
+    fn default() -> Self {
+        Self {
+            ollama_discover: true,
+        }
+    }
 }
 
 /// `[index]` section. Knobs for the in-loop discovery surface. (Code-index
@@ -98,6 +123,70 @@ pub struct IndexConfig {
     /// floor, so enabling this never breaks discovery. Default `false` keeps
     /// prior behavior and keeps tests offline.
     pub semantic_discover: bool,
+}
+
+/// `[journal]` section (spec mu-046). Controls the daemon
+/// control-plane command journal
+/// ([`crate::command_journal::CommandJournal`]) and the session logs'
+/// strict command appends.
+///
+/// ```toml
+/// [journal]
+/// fsync = "always"          # "always" | "never" — default always
+/// journal_queries = true    # read-only queries are journaled too
+/// # dir = "..."             # override location (tests/ephemeral daemons)
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JournalConfig {
+    /// `"always"` (default) — `sync_data()` after every command
+    /// append, before the command is processed (spec mu-046 INV-1).
+    /// `"never"` skips the fsync (tests / ephemeral daemons).
+    /// Unrecognized values resolve to `Always` — fail durable, not
+    /// fast (see [`JournalConfig::fsync_policy`]).
+    pub fsync: String,
+    /// Journal read-only queries (`session.list`, `daemon.stats`, …)
+    /// too, not just mutating commands. Default `true` — the locked
+    /// decision: the audit trail records what was ASKED, not only what
+    /// changed. `false` (test/ephemeral daemons) makes the pipeline's
+    /// recognized read-only query methods skip the journal entirely —
+    /// no `CommandReceived`, no receipt, no fsync on the hot read path
+    /// — while still flowing through the same ingest seam, auth gate,
+    /// and single-writer consumer (the border doesn't open; it just
+    /// stops writing for reads). Mutating commands always journal
+    /// regardless of this knob. The query set is the per-method
+    /// predicate in `serve/pipeline.rs` (`is_query`).
+    #[serde(default = "default_true")]
+    pub journal_queries: bool,
+    /// Override the journal directory. `None` resolves to the
+    /// platform default at runtime (`<state_dir>/journal/`, a sibling
+    /// of `events/` so the session-log scanners never see it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<PathBuf>,
+}
+
+impl Default for JournalConfig {
+    fn default() -> Self {
+        Self {
+            fsync: "always".to_string(),
+            journal_queries: true,
+            dir: None,
+        }
+    }
+}
+
+impl JournalConfig {
+    /// Resolve the `fsync` string to a typed policy. Only an explicit
+    /// `"never"` opts out of durability; anything else — including a
+    /// typo — is `Always`, because the failure mode of a misread knob
+    /// must be "slower" rather than "commands lost on crash".
+    pub fn fsync_policy(&self) -> crate::command_journal::FsyncPolicy {
+        if self.fsync.trim().eq_ignore_ascii_case("never") {
+            crate::command_journal::FsyncPolicy::Never
+        } else {
+            crate::command_journal::FsyncPolicy::Always
+        }
+    }
 }
 
 /// `[mcp]` section (mu-yc6). Outbound MCP client: at startup the daemon
@@ -482,6 +571,47 @@ impl fmt::Debug for RedactedTokenList {
     }
 }
 
+/// Keys whose values are secret-shaped, matched case-insensitively at
+/// every depth of the config tree by [`redact_config`]. `auth.tokens`
+/// is the canonical entry. This denylist MUST grow with every new
+/// secret-shaped config field — a field added without an entry here
+/// would land in the journal in plaintext (spec mu-046 INV-6), so
+/// review it whenever a struct in this file gains a credential.
+const SECRET_KEY_DENYLIST: &[&str] = &[
+    "token", "tokens", "secret", "secrets", "api_key", "api_keys", "password",
+];
+
+/// spec mu-046 INV-6: secrets never hit a journal. Strips
+/// secret-shaped fields — any key on [`SECRET_KEY_DENYLIST`], at any
+/// depth — from a JSON projection of the config, replacing values
+/// with `"[REDACTED]"` so the shape stays legible while the bytes are
+/// gone. In-place because the caller has already paid for the
+/// serialization (`ConfigLoaded` builds the `serde_json::Value`
+/// anyway) and a mutate-then-append flow can't accidentally journal
+/// the unredacted original.
+pub fn redact_config(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, v) in map.iter_mut() {
+                if SECRET_KEY_DENYLIST
+                    .iter()
+                    .any(|d| key.eq_ignore_ascii_case(d))
+                {
+                    *v = serde_json::Value::String("[REDACTED]".to_string());
+                } else {
+                    redact_config(v);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items.iter_mut() {
+                redact_config(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl Config {
     /// Layered TOML load. Each path is loaded if present; entries
     /// from later paths overlay earlier ones via deep-merge on the
@@ -494,12 +624,33 @@ impl Config {
     /// panics; never returns Err. Worst case is "all files failed to
     /// parse" → equivalent to [`Config::default`].
     pub fn load<P: AsRef<Path>>(paths: &[P]) -> Self {
+        Self::load_with_sources(paths).0
+    }
+
+    /// [`Config::load`] plus source provenance (spec mu-046 WP6): the
+    /// second element lists the layers that actually CONTRIBUTED to the
+    /// resolved config — `"defaults"` first (always present), then the
+    /// path of each file that was present AND parsed. Missing or
+    /// malformed files are not listed: provenance records what was
+    /// applied, not what was probed. Consumer-side overrides (env, CLI
+    /// flags — resolution steps 4–5 in the module doc) append their own
+    /// entries at their call sites (e.g. `"env:MU_BEARER_TOKEN"`,
+    /// `"cli:--bare"` in `mu serve`'s boot path).
+    ///
+    /// The sources vec rides into the journal as
+    /// `JournalPayload::ConfigLoaded { sources, .. }` (INV-9) — the
+    /// durable answer to "where did this daemon's config come from".
+    pub fn load_with_sources<P: AsRef<Path>>(paths: &[P]) -> (Self, Vec<String>) {
+        let mut sources: Vec<String> = vec!["defaults".to_string()];
         let mut merged: toml::Value = toml::Value::Table(Default::default());
         for p in paths {
             let path = p.as_ref();
             match std::fs::read_to_string(path) {
                 Ok(content) => match content.parse::<toml::Value>() {
-                    Ok(v) => deep_merge(&mut merged, v),
+                    Ok(v) => {
+                        deep_merge(&mut merged, v);
+                        sources.push(path.display().to_string());
+                    }
                     Err(e) => {
                         tracing::warn!(
                             path = %path.display(),
@@ -523,13 +674,15 @@ impl Config {
             }
         }
         match merged.try_into::<Config>() {
-            Ok(c) => c,
+            Ok(c) => (c, sources),
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     "merged mu config failed deserialization; falling back to all-defaults",
                 );
-                Config::default()
+                // The files did NOT contribute to the effective config
+                // — provenance must say so.
+                (Config::default(), vec!["defaults".to_string()])
             }
         }
     }
@@ -543,11 +696,17 @@ impl Config {
     /// Tests should call [`Config::load`] with explicit paths to
     /// avoid pollution from the developer's real config.
     pub fn load_default() -> Self {
+        Self::load_default_with_sources().0
+    }
+
+    /// [`Config::load_default`] plus source provenance — see
+    /// [`Config::load_with_sources`].
+    pub fn load_default_with_sources() -> (Self, Vec<String>) {
         let mut paths: Vec<PathBuf> = vec![PathBuf::from("/etc/mu/config.toml")];
         if let Some(dir) = dirs::config_dir() {
             paths.push(dir.join("mu").join("config.toml"));
         }
-        Self::load(&paths)
+        Self::load_with_sources(&paths)
     }
 
     /// Whether session-start recall injection should run: the `[recall].enabled`
@@ -984,6 +1143,127 @@ default_model = "operator/model"
         );
         assert!(c.session.persist_events_to_disk);
         assert_eq!(c.ui.tui.default_provider, "anthropic_api");
+    }
+
+    #[test]
+    fn journal_defaults_fsync_always_queries_on() {
+        // spec mu-046: absent [journal] section → fsync always,
+        // journal_queries true — the durable-by-default posture.
+        let c: Config = toml::from_str("").expect("empty TOML must parse");
+        assert_eq!(c.journal.fsync, "always");
+        assert!(c.journal.journal_queries);
+        assert_eq!(c.journal.dir, None);
+        assert_eq!(
+            c.journal.fsync_policy(),
+            crate::command_journal::FsyncPolicy::Always
+        );
+    }
+
+    #[test]
+    fn journal_toml_can_opt_out_of_fsync_and_set_dir() {
+        let c: Config = toml::from_str(
+            "[journal]\nfsync = \"never\"\njournal_queries = false\ndir = \"/tmp/mu-j\"\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            c.journal.fsync_policy(),
+            crate::command_journal::FsyncPolicy::Never
+        );
+        assert!(!c.journal.journal_queries);
+        assert_eq!(c.journal.dir, Some(PathBuf::from("/tmp/mu-j")));
+    }
+
+    #[test]
+    fn journal_fsync_typo_fails_durable_not_fast() {
+        // An unrecognized fsync value must resolve to Always — the
+        // misread-knob failure mode is "slower", never "commands lost".
+        let c: Config = toml::from_str("[journal]\nfsync = \"nevr\"\n").expect("parse");
+        assert_eq!(
+            c.journal.fsync_policy(),
+            crate::command_journal::FsyncPolicy::Always
+        );
+    }
+
+    #[test]
+    fn journal_queries_stays_on_when_section_present_but_key_omitted() {
+        // The default_true guard, same trap as [recall].memory: a
+        // [journal] section that sets another key but omits
+        // journal_queries must not silently flip it off.
+        let c: Config = toml::from_str("[journal]\nfsync = \"never\"\n").expect("parse");
+        assert!(c.journal.journal_queries);
+    }
+
+    #[test]
+    fn load_with_sources_lists_only_contributing_layers() {
+        // spec mu-046 WP6: provenance records what was APPLIED —
+        // "defaults" always first, then each file that was present and
+        // parsed; missing and malformed files are absent.
+        let dir = std::env::temp_dir().join(format!("mu-046-sources-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let present = dir.join("present.toml");
+        std::fs::write(&present, "[recall]\nenabled = false\n").unwrap();
+        let missing = dir.join("never-written.toml");
+        let malformed = dir.join("malformed.toml");
+        std::fs::write(&malformed, "not toml ][[[").unwrap();
+
+        let (c, sources) = Config::load_with_sources(&[&present, &missing, &malformed]);
+        assert!(!c.recall.enabled, "the present layer applied");
+        assert_eq!(
+            sources,
+            vec!["defaults".to_string(), present.display().to_string()],
+            "only defaults + the contributing file are listed"
+        );
+
+        // No paths at all: pure defaults.
+        let (_, sources) = Config::load_with_sources::<&Path>(&[]);
+        assert_eq!(sources, vec!["defaults".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn redact_config_strips_auth_tokens() {
+        // spec mu-046 INV-6: serialize a config carrying a live token,
+        // redact, and assert the token bytes are absent from the
+        // serialized output — the same check the boot test (WP6) runs
+        // against raw journal bytes.
+        let c = Config {
+            auth: AuthConfig::Bearer {
+                tokens: vec!["super-secret-bearer-token".to_string()],
+            },
+            ..Default::default()
+        };
+        let mut v = serde_json::to_value(&c).expect("config serializes");
+        redact_config(&mut v);
+        let bytes = serde_json::to_string(&v).expect("redacted value serializes");
+        assert!(
+            !bytes.contains("super-secret-bearer-token"),
+            "token leaked through redaction: {bytes}"
+        );
+        assert!(bytes.contains("[REDACTED]"), "expected marker: {bytes}");
+        // Non-secret fields survive: the shape stays legible.
+        assert!(bytes.contains("compaction"), "shape lost: {bytes}");
+    }
+
+    #[test]
+    fn redact_config_strips_denylisted_keys_at_any_depth() {
+        let mut v = serde_json::json!({
+            "providers": {
+                "nested": { "api_key": "sk-live-123", "API_KEY": "sk-live-456" },
+                "list": [ { "secret": "hush" }, { "model": "ok" } ],
+            },
+            "model": "claude-haiku-4-5",
+        });
+        redact_config(&mut v);
+        let bytes = serde_json::to_string(&v).expect("serializes");
+        assert!(!bytes.contains("sk-live-123"), "{bytes}");
+        assert!(!bytes.contains("sk-live-456"), "case-insensitive: {bytes}");
+        assert!(!bytes.contains("hush"), "arrays recursed: {bytes}");
+        assert!(
+            bytes.contains("claude-haiku-4-5"),
+            "non-secret kept: {bytes}"
+        );
     }
 
     #[test]

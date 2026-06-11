@@ -33,6 +33,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::capability::{AutonomyCapability, Capability};
+use crate::command_journal::CommandTicket;
 use crate::context::rope::SpanText;
 use crate::context::{ProjectContext, ProjectionTarget, ProviderMessages, RetainedRope};
 
@@ -124,7 +125,17 @@ pub type SessionCapability = Arc<Mutex<Capability>>;
 #[derive(Clone)]
 pub enum AgentInput {
     /// Add a message to the conversation. Loop runs the LLM after.
-    UserMessage(AgentMessage),
+    ///
+    /// spec mu-046 WP4: the second field is the optional receipt
+    /// ticket minted by the ingest pipeline when this message arrived
+    /// as a journaled `ask_session` command. The loop collects tickets
+    /// per ask and carries them out on the terminal
+    /// [`AgentEvent::Done`], where the forwarder writes the
+    /// `CommandSucceeded`/`CommandFailed` receipt into the session's
+    /// event log with explicit pairing (no side tables). `None` for
+    /// internal/synthetic messages (tools, tests, autonomy
+    /// continuations).
+    UserMessage(AgentMessage, Option<Box<CommandTicket>>),
     /// Stop. In-flight provider stream and tool execution are
     /// cancelled; loop returns `Outcome::Cancelled`.
     Cancel,
@@ -198,7 +209,11 @@ pub enum AgentInput {
 impl std::fmt::Debug for AgentInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UserMessage(m) => f.debug_tuple("UserMessage").field(m).finish(),
+            Self::UserMessage(m, ticket) => f
+                .debug_tuple("UserMessage")
+                .field(m)
+                .field(&ticket.as_ref().map(|t| t.command_event_id))
+                .finish(),
             Self::Cancel => write!(f, "Cancel"),
             Self::CancelOutstanding { reason } => f
                 .debug_struct("CancelOutstanding")
@@ -285,6 +300,16 @@ pub enum AgentEvent {
         /// Captures multi-turn tool-use loops; resets per ask_session.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         elapsed_ms: Option<u64>,
+        /// spec mu-046 WP4: tickets of the journaled `ask_session`
+        /// commands this Done terminates. The forwarder writes one
+        /// session-log receipt per ticket (`CommandSucceeded` on a
+        /// normal stop, `CommandFailed` on `Aborted`/`Error`). Empty
+        /// for non-command asks; never serialized to the wire (the
+        /// wire `session.done` is the separate `DoneEvent`, and the
+        /// durable `EventPayload::Done` drops this field too — the
+        /// receipt rows carry the correlation instead).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        command_receipts: Vec<CommandTicket>,
     },
     Error {
         message: String,
@@ -828,7 +853,45 @@ impl AgentLoop {
     }
 }
 
-async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outcome {
+/// Outer loop entry: delegates to [`run_inner`] and then closes out
+/// any receipt tickets still pending when the loop terminates without
+/// a Done (spec mu-046 WP4, INV-4: every `CommandReceived` should gain
+/// exactly one receipt). The main case is `cancel_session` /
+/// channel-close mid-ask: `run_inner` returns `Outcome::Cancelled`
+/// without emitting a Done, so we emit a synthetic terminal
+/// `Done(Aborted)` (or `Done(Error)` for error outcomes) carrying the
+/// pending tickets — the forwarder turns each into a `CommandFailed`
+/// receipt. Loops with no pending tickets (every pre-mu-046 flow and
+/// all direct loop tests) see no behavior change. Asks still queued
+/// but never started when the loop dies remain orphans — the legible
+/// crash marker INV-4 allows.
+async fn run(args: SpawnArgs, input_rx: mpsc::Receiver<AgentInput>) -> Outcome {
+    let events = args.events.clone();
+    let mut pending_tickets: Vec<CommandTicket> = Vec::new();
+    let outcome = run_inner(args, input_rx, &mut pending_tickets).await;
+    if !pending_tickets.is_empty() {
+        let stop_reason = match &outcome {
+            Outcome::Error(_) => StopReason::Error,
+            _ => StopReason::Aborted,
+        };
+        let _ = events
+            .send(AgentEvent::Done {
+                stop_reason,
+                turn_count: 0,
+                usage: None,
+                elapsed_ms: None,
+                command_receipts: std::mem::take(&mut pending_tickets),
+            })
+            .await;
+    }
+    outcome
+}
+
+async fn run_inner(
+    args: SpawnArgs,
+    mut input_rx: mpsc::Receiver<AgentInput>,
+    pending_tickets: &mut Vec<CommandTicket>,
+) -> Outcome {
     let SpawnArgs {
         provider,
         provider_kind,
@@ -897,7 +960,7 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                         })
                         .await;
                 }
-                AgentInput::UserMessage(_)
+                AgentInput::UserMessage(..)
                 | AgentInput::StartAutonomous { .. }
                 | AgentInput::ScheduleWakeup { .. }
                 | AgentInput::WatchCompleted { .. }
@@ -947,7 +1010,15 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
         };
 
         match action {
-            Action::External(AgentInput::UserMessage(msg)) => {
+            Action::External(AgentInput::UserMessage(msg, ticket)) => {
+                // spec mu-046 WP4: a journaled ask's ticket joins the
+                // current ask's pending set; it is drained into the
+                // terminal Done below (back-to-back asks that share
+                // one LLM call share one Done — each ticket still
+                // gets its own receipt, paired to that Done).
+                if let Some(t) = ticket {
+                    pending_tickets.push(*t);
+                }
                 let _ = events
                     .send(AgentEvent::MessageStart {
                         message: msg.clone(),
@@ -1279,6 +1350,7 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                             turn_count,
                             usage: aggregated_usage.take(),
                             elapsed_ms,
+                            command_receipts: std::mem::take(pending_tickets),
                         })
                         .await;
                     started_at = None;
@@ -1328,6 +1400,7 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                             turn_count,
                             usage: aggregated_usage.take(),
                             elapsed_ms,
+                            command_receipts: std::mem::take(pending_tickets),
                         })
                         .await;
                     started_at = None;
@@ -1555,6 +1628,7 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                                 turn_count,
                                 usage: aggregated_usage.take(),
                                 elapsed_ms,
+                                command_receipts: std::mem::take(pending_tickets),
                             })
                             .await;
                         started_at = None;
@@ -1573,6 +1647,7 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                                 turn_count,
                                 usage: aggregated_usage.take(),
                                 elapsed_ms,
+                                command_receipts: std::mem::take(pending_tickets),
                             })
                             .await;
                         started_at = None;
@@ -1633,6 +1708,7 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                                 turn_count,
                                 usage: aggregated_usage.take(),
                                 elapsed_ms,
+                                command_receipts: std::mem::take(pending_tickets),
                             })
                             .await;
                         started_at = None;
@@ -1677,7 +1753,7 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                                 })
                                 .await;
                         }
-                        AgentInput::UserMessage(_)
+                        AgentInput::UserMessage(..)
                         | AgentInput::StartAutonomous { .. }
                         | AgentInput::ScheduleWakeup { .. }
                         | AgentInput::WatchCompleted { .. }
@@ -1817,6 +1893,7 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                                 turn_count,
                                 usage: aggregated_usage.take(),
                                 elapsed_ms,
+                                command_receipts: std::mem::take(pending_tickets),
                             })
                             .await;
                         started_at = None;
@@ -1870,6 +1947,7 @@ async fn run(args: SpawnArgs, mut input_rx: mpsc::Receiver<AgentInput>) -> Outco
                         turn_count,
                         usage: aggregated_usage.take(),
                         elapsed_ms,
+                        command_receipts: std::mem::take(pending_tickets),
                     })
                     .await;
                 started_at = None;

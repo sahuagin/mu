@@ -20,6 +20,7 @@ mod handlers;
 mod mailbox;
 pub mod mcp;
 pub mod mcp_client;
+mod pipeline;
 mod provider_status;
 pub(crate) mod pty_spawn;
 mod sessions;
@@ -80,6 +81,31 @@ pub fn resolve_events_dir(config: &mu_core::config::Config) -> Option<PathBuf> {
         .or_else(default_events_dir)
 }
 
+/// spec mu-046 (WP3): resolve the daemon control-plane journal path.
+///
+/// `[journal].dir` overrides; otherwise the resolution mirrors
+/// [`resolve_events_dir`] — `[session].state_dir` if set, else the
+/// platform default — landing at `journal/`, a sibling of `events/`,
+/// so the session-log scanners (`sessions_index`,
+/// `discovery/file_backend`) never see it.
+///
+/// Unlike events, the journal has NO opt-out: a daemon that cannot
+/// make commands durable does not serve (INV-2). Hermetic tests point
+/// `[journal].dir` at a tempdir.
+pub fn resolve_journal_path(config: &mu_core::config::Config, daemon_id: &str) -> PathBuf {
+    let dir = config
+        .journal
+        .dir
+        .clone()
+        .or_else(|| config.session.state_dir.as_ref().map(|s| s.join("journal")))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/share/mu/journal")))
+        // No home dir at all (stripped-down container): fall back to a
+        // per-user-less location rather than refusing to resolve — the
+        // open itself still fails closed if the path is unusable.
+        .unwrap_or_else(|| std::env::temp_dir().join("mu-journal"));
+    dir.join(format!("{daemon_id}.jsonl"))
+}
+
 /// Production entry point — serve over the process's stdin/stdout.
 ///
 /// `factory` is called once per session, given the client's
@@ -108,22 +134,37 @@ pub async fn run(
     tools: Vec<Arc<dyn Tool>>,
     bare: bool,
 ) -> anyhow::Result<()> {
-    let mut config = mu_core::config::Config::load_default();
+    // spec mu-046 WP6: track config provenance — the file layers that
+    // contributed, plus the consumer-side overrides applied right
+    // here — so the journaled `ConfigLoaded` records where the
+    // effective config came from (INV-9).
+    let (mut config, mut config_sources) = mu_core::config::Config::load_default_with_sources();
     if let Ok(token) = std::env::var("MU_BEARER_TOKEN") {
         if !token.is_empty() {
             config.auth = mu_core::config::AuthConfig::Bearer {
                 tokens: vec![token],
             };
+            config_sources.push("env:MU_BEARER_TOKEN".to_string());
         }
     }
     if bare {
         config.recall.enabled = false;
         config.recall.bare = true;
+        config_sources.push("cli:--bare".to_string());
     }
     let events_dir = resolve_events_dir(&config);
     let stdin = BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();
-    serve_with_io_with_config(stdin, stdout, factory, tools, events_dir, config).await
+    serve_with_io_with_config_sources(
+        stdin,
+        stdout,
+        factory,
+        tools,
+        events_dir,
+        config,
+        config_sources,
+    )
+    .await
 }
 
 /// Test/integration hook — serve over generic reader/writer.
@@ -159,9 +200,12 @@ where
 }
 
 /// mu-l1z: test/integration hook with explicit `Config`. Production
-/// [`run`] loads `Config::load_default()` and calls this. Tests pass
+/// [`run`] loads `Config::load_default()` and calls
+/// [`serve_with_io_with_config_sources`]. Tests pass
 /// `Config::default()` (or a custom one if they're testing
-/// config-driven behavior).
+/// config-driven behavior); the journaled `ConfigLoaded` provenance is
+/// then the bare `["defaults"]` — an explicitly-passed config has no
+/// file/env/CLI layers to attribute.
 pub async fn serve_with_io_with_config<R, W>(
     reader: R,
     writer: W,
@@ -169,6 +213,35 @@ pub async fn serve_with_io_with_config<R, W>(
     tools: Vec<Arc<dyn Tool>>,
     events_dir: Option<PathBuf>,
     config: mu_core::config::Config,
+) -> anyhow::Result<()>
+where
+    R: AsyncBufRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    serve_with_io_with_config_sources(
+        reader,
+        writer,
+        factory,
+        tools,
+        events_dir,
+        config,
+        vec!["defaults".to_string()],
+    )
+    .await
+}
+
+/// [`serve_with_io_with_config`] plus config source provenance (spec
+/// mu-046 WP6): `config_sources` lists the layers that produced
+/// `config` (see [`mu_core::config::Config::load_with_sources`]) and
+/// is journaled verbatim in the boot-time `ConfigLoaded` record.
+pub async fn serve_with_io_with_config_sources<R, W>(
+    reader: R,
+    writer: W,
+    factory: ProviderFactory,
+    tools: Vec<Arc<dyn Tool>>,
+    events_dir: Option<PathBuf>,
+    config: mu_core::config::Config,
+    config_sources: Vec<String>,
 ) -> anyhow::Result<()>
 where
     R: AsyncBufRead + Unpin + Send + 'static,
@@ -192,34 +265,32 @@ where
     // handle is freshly allocated here so cross-connection auth state
     // never leaks.
     let auth_registry = Arc::new(auth::registry_from_config(&config.auth));
-    // mu-ddua: auth is opt-in. When no configured mechanism actually
-    // enforces (the default config registers BEARER with an empty
-    // allowlist, which can never authenticate anyone), gating
-    // `create_session` would lock out every client with no way back in.
-    // Start such connections pre-authenticated under root — mirroring a
-    // successful BEARER handshake — so a default `mu serve` is usable
-    // out-of-box. The gate enforces only once `[auth]` tokens are set.
-    let initial_auth_state = if auth_registry.is_auth_required() {
-        auth::AuthState::Unauthenticated
-    } else {
-        auth::AuthState::Authenticated {
-            capability: mu_core::capability::Capability::root(),
-        }
-    };
-    let auth_state: auth::AuthStateHandle = Arc::new(std::sync::Mutex::new(initial_auth_state));
+    // mu-ddua: auth is opt-in — when no configured mechanism actually
+    // enforces, connections start pre-authenticated under root so a
+    // default `mu serve` is usable out-of-box. The shared posture lives
+    // in `auth::initial_connection_state` (the MCP adapter applies the
+    // same rule per accepted connection, spec mu-046 WP5).
+    let auth_state: auth::AuthStateHandle = Arc::new(std::sync::Mutex::new(
+        auth::initial_connection_state(&auth_registry),
+    ));
     // mu-phl v0 (mu-0bxv): wire up the canonical session-start recall
     // provider chain. Tests construct DaemonInfo without these (empty
     // vec) to skip recall; production runs the full chain.
     let recall_providers = build_recall_providers(&config);
     // mu-818c: best-effort ollama discovery → route catalog. Only in
-    // production (events_dir set) so tests stay hermetic and fast. A
-    // short timeout bounds startup, so a down/absent ollama box can't
-    // stall the daemon; any failure means "no ollama routes", logged at
-    // debug. `mu ask` (ephemeral, no events_dir) skips the probe — it
-    // resolves ollama via the selector, not the catalog.
+    // production (events_dir set AND `[routes].ollama_discover`, default
+    // true). The events_dir heuristic alone did NOT keep tests hermetic:
+    // disk-backed test daemons tripped it, and on CI runners the
+    // baked-in ollama base is an unroutable LAN address, so the probe's
+    // bounded connect timeout stalled boot for its full duration —
+    // hermetic tests set the knob false. A short timeout bounds
+    // startup, so a down/absent ollama box can't stall the daemon; any
+    // failure means "no ollama routes", logged at debug. `mu ask`
+    // (ephemeral, no events_dir) skips the probe — it resolves ollama
+    // via the selector, not the catalog.
     let route_catalog = {
         let mut catalog = mu_core::route_catalog::RouteCatalog::from_env();
-        if events_dir.is_some() {
+        if events_dir.is_some() && config.routes.ollama_discover {
             let base = mu_ai::providers::ollama::base_from_env();
             match mu_ai::OllamaProvider::discover_models(&base, std::time::Duration::from_secs(2))
                 .await
@@ -275,39 +346,6 @@ where
         )),
         None => local,
     };
-    // mu-mb02: start MCP server on a unix socket if MU_MCP_SOCKET is
-    // set or if the default socket path's parent exists. The MCP surface
-    // shares Sessions + DaemonInfo with the primary JSON-RPC loop so
-    // mailbox operations are consistent across both surfaces.
-    //
-    // The MCP task holds a Sessions clone. transport::serve's shutdown
-    // cascade (drop handler → drop sessions → agent loops exit →
-    // NotificationWriters drop → writer_task completes) deadlocks if
-    // any external clone keeps sessions alive. AbortOnDrop is captured
-    // by the handler closure so that dropping the handler aborts the
-    // MCP task first, releasing its sessions clone.
-    let mcp_socket_path = std::env::var("MU_MCP_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| mcp::default_mcp_socket_path());
-    let mcp_guard = if mcp_socket_path
-        .parent()
-        .map(|p| p.exists())
-        .unwrap_or(false)
-    {
-        let mcp_sessions = sessions.clone();
-        let mcp_daemon_info = daemon_info.clone();
-        let handle = tokio::spawn(async move {
-            if let Err(e) =
-                mcp::serve_mcp_socket(mcp_socket_path, mcp_sessions, mcp_daemon_info).await
-            {
-                tracing::error!("MCP server exited: {e:#}");
-            }
-        });
-        Some(AbortOnDrop(std::sync::Mutex::new(Some(handle))))
-    } else {
-        None
-    };
-
     // mu-slat: the spawn_worker tool is injected per-session in
     // build_and_register_session (handlers/session.rs), not here — it
     // needs the calling session's id so worker results route back to
@@ -350,33 +388,135 @@ where
         }
         Arc::new(mu_core::skill::loader::discover_skills(&dirs))
     };
-    mu_core::transport::serve(reader, writer, move |req, notif| {
-        let _ = &mcp_guard;
-        let sessions = sessions.clone();
-        let factory = factory.clone();
-        let tools = tools.clone();
-        let skills = skills.clone();
-        let daemon_info = daemon_info.clone();
-        let discovery = discovery.clone();
-        let auth_registry = auth_registry.clone();
-        let auth_state = auth_state.clone();
-        async move {
-            dispatch::dispatch(
-                req,
-                notif,
-                dispatch::DispatchCtx {
-                    sessions,
-                    factory,
-                    tools,
-                    skills,
-                    daemon_info,
-                    discovery,
-                    auth_registry,
-                    auth_state,
-                },
+    // spec mu-046 INV-1/INV-2 (WP3): open the control-plane command
+    // journal BEFORE accepting any traffic. Open failure ABORTS serve —
+    // a daemon that cannot make commands durable does not serve.
+    let journal_path = resolve_journal_path(daemon_info.config(), daemon_info.daemon_id());
+    let journal = Arc::new(
+        mu_core::command_journal::CommandJournal::open(
+            &journal_path,
+            daemon_info.daemon_id(),
+            daemon_info.config().journal.fsync_policy(),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot open command journal at {}: {e} (refusing to serve, spec mu-046 INV-2)",
+                journal_path.display()
+            )
+        })?,
+    );
+    // spec mu-046 INV-8 (WP2) + INV-11 (WP9): the daemon-wide outbound
+    // Router — the one way bytes leave the daemon. Each connection
+    // registers its own ordered egress lane (the stdio connection's
+    // inside serve_with_ingest; MCP connections at accept); tagged
+    // envelopes route to their origin's lane, broadcasts to all. The
+    // pipeline consumer holds a producer clone and drops it on
+    // shutdown, closing the lanes.
+    let outbound = mu_core::transport::Router::new();
+    // spec mu-046 INV-3/INV-7 (WP3): the single-writer control-plane
+    // consumer. It owns the daemon's session map et al. and exits —
+    // releasing them, continuing the shutdown cascade — when the last
+    // producer handle (held by the closure below) drops.
+    let control = Arc::new(pipeline::spawn_control_plane(
+        journal,
+        pipeline::PipelineCtx {
+            sessions: sessions.clone(),
+            factory,
+            tools,
+            skills,
+            daemon_info: daemon_info.clone(),
+            discovery,
+            auth_registry: auth_registry.clone(),
+        },
+        outbound.clone(),
+    ));
+    // spec mu-046 INV-9 (WP6): config is a message. The resolved
+    // effective config — redacted (INV-6) — enters the control plane
+    // as a journaled, sequenced `ConfigLoaded` HERE, after the journal
+    // opened (so it is record 2, behind open()'s `JournalOpened`) and
+    // strictly BEFORE any adapter exists (the MCP listener below, the
+    // stdio read loop at the bottom): every adapter command's seq is
+    // therefore greater than the config's. Append failure aborts
+    // serve — boot-time fail-closed, same posture as journal open
+    // failure (INV-2).
+    {
+        let mut effective = serde_json::to_value(daemon_info.config())
+            .map_err(|e| anyhow::anyhow!("cannot serialize effective config: {e}"))?;
+        mu_core::config::redact_config(&mut effective);
+        control
+            .inject_config_loaded(config_sources, effective)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot journal ConfigLoaded: {e} (refusing to serve, spec mu-046 INV-2/INV-9)"
+                )
+            })?;
+    }
+    // mu-mb02: start MCP server on a unix socket if MU_MCP_SOCKET is
+    // set or if the default socket path's parent exists. The MCP surface
+    // shares Sessions + DaemonInfo with the primary JSON-RPC loop so
+    // mailbox operations are consistent across both surfaces — and
+    // since spec mu-046 WP5 it is adapter #2 (INV-7): it holds a
+    // ControlPlane producer handle and the outbound stream, so it must
+    // be spawned AFTER the control plane exists (hence this block sits
+    // below `spawn_control_plane`, later in startup than pre-WP5).
+    //
+    // The MCP task holds Sessions + ControlPlane clones (the latter is
+    // a pipeline producer handle). transport::serve's shutdown cascade
+    // (drop handler → drop the control-plane sender → consumer exits →
+    // sessions release → agent loops exit → NotificationWriters drop →
+    // writer_task completes) deadlocks if any external clone keeps
+    // those alive. AbortOnDrop is captured by the handler closure so
+    // that dropping the handler aborts the MCP listener task first,
+    // releasing its clones. (Per-connection MCP tasks keep their own
+    // clones until the peer disconnects — pre-existing posture, now
+    // also covering the ControlPlane handle.)
+    let mcp_socket_path = std::env::var("MU_MCP_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| mcp::default_mcp_socket_path());
+    let mcp_guard = if mcp_socket_path
+        .parent()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+    {
+        let mcp_sessions = sessions.clone();
+        let mcp_daemon_info = daemon_info.clone();
+        let mcp_control = control.clone();
+        let mcp_outbound = outbound.clone();
+        let mcp_auth_registry = auth_registry.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = mcp::serve_mcp_socket(
+                mcp_socket_path,
+                mcp_sessions,
+                mcp_daemon_info,
+                mcp_control,
+                mcp_outbound,
+                mcp_auth_registry,
             )
             .await
-        }
+            {
+                tracing::error!("MCP server exited: {e:#}");
+            }
+        });
+        Some(AbortOnDrop(std::sync::Mutex::new(Some(handle))))
+    } else {
+        None
+    };
+    // The local Sessions handle must not outlive the transport closure:
+    // a clone held across the final await below would keep every
+    // SessionState alive and wedge the shutdown cascade documented in
+    // transport::serve_with_ingest (writer_task would never observe
+    // Closed). The pipeline consumer and the MCP guard own their own
+    // clones with their own release paths.
+    drop(sessions);
+    // The stdio transport is adapter #1 (INV-7, no side doors): every
+    // parsed request crosses pipeline::ingest — journaled before
+    // anything processes it. `Some` = immediate reject the transport
+    // sends; `None` = the pipeline owns the response.
+    mu_core::transport::serve_with_ingest(reader, writer, outbound, move |req, _notif, origin| {
+        let _ = &mcp_guard;
+        let control = control.clone();
+        let auth_state = auth_state.clone();
+        async move { pipeline::ingest(&control, req, origin, &auth_state) }
     })
     .await
     .map_err(Into::into)
@@ -469,6 +609,61 @@ mod tests {
         assert_eq!(
             resolve_events_dir(&config),
             Some(PathBuf::from("/var/lib/mu/events"))
+        );
+    }
+
+    #[test]
+    fn resolve_journal_path_prefers_journal_dir_override() {
+        let config = Config {
+            journal: mu_core::config::JournalConfig {
+                dir: Some(PathBuf::from("/tmp/mu-j")),
+                ..Default::default()
+            },
+            session: SessionConfig {
+                state_dir: Some(PathBuf::from("/var/lib/mu")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_journal_path(&config, "d1"),
+            PathBuf::from("/tmp/mu-j/d1.jsonl")
+        );
+    }
+
+    #[test]
+    fn resolve_journal_path_uses_state_dir_journal_sibling() {
+        let config = Config {
+            session: SessionConfig {
+                state_dir: Some(PathBuf::from("/var/lib/mu")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_journal_path(&config, "d1"),
+            PathBuf::from("/var/lib/mu/journal/d1.jsonl")
+        );
+    }
+
+    #[test]
+    fn resolve_journal_path_defaults_next_to_events() {
+        // No override, no state_dir: the platform default — a sibling
+        // of events/ so the session-log scanners never see it. Unlike
+        // events there is no opt-out: persist_events_to_disk=false
+        // does NOT turn the journal off (spec mu-046 INV-2).
+        let config = Config {
+            session: SessionConfig {
+                persist_events_to_disk: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let path = resolve_journal_path(&config, "d1");
+        assert!(
+            path.ends_with(".local/share/mu/journal/d1.jsonl")
+                || path.ends_with("mu-journal/d1.jsonl"),
+            "expected default journal path, got {path:?}",
         );
     }
 

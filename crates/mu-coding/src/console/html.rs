@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
 use axum::response::Html;
-use mu_core::event_log::EventPayload;
 
 use crate::console::data::AppState;
 use crate::console::time::civil_from_days;
@@ -82,44 +81,6 @@ pub(crate) fn td_code(s: &str) -> String {
 
 pub(crate) fn td_num(n: impl std::fmt::Display) -> String {
     format!("<td class=num>{n}</td>")
-}
-
-pub(crate) fn payload_kind(payload: &EventPayload) -> &'static str {
-    match payload {
-        EventPayload::SessionCreated { .. } => "session_created",
-        EventPayload::UserMessage { .. } => "user_message",
-        EventPayload::AssistantMessageEvent { .. } => "assistant_message_event",
-        EventPayload::ToolCall { .. } => "tool_call",
-        EventPayload::ToolResult { .. } => "tool_result",
-        EventPayload::Done { .. } => "done",
-        EventPayload::Error { .. } => "error",
-        EventPayload::Callout { .. } => "callout",
-        EventPayload::ErrorInvalidMessage { .. } => "error_invalid_message",
-        EventPayload::ProviderSwitched { .. } => "provider_switched",
-        EventPayload::SessionClosed => "session_closed",
-        EventPayload::ContextAssembly { .. } => "context_assembly",
-        EventPayload::CompactionAssembly { .. } => "compaction_assembly",
-        EventPayload::AutonomousIterationStarted { .. } => "autonomous_iteration_started",
-        EventPayload::AutonomousIterationCompleted { .. } => "autonomous_iteration_completed",
-        EventPayload::AutonomousScheduledWakeup { .. } => "autonomous_scheduled_wakeup",
-        EventPayload::AutonomousTerminated { .. } => "autonomous_terminated",
-        EventPayload::ProviderStatusUpdate { .. } => "provider_status_update",
-        EventPayload::MailboxMessagePosted { .. } => "mailbox_message_posted",
-        EventPayload::MailboxMessageConsumed { .. } => "mailbox_message_consumed",
-        EventPayload::TaskTelemetry { .. } => "task_telemetry",
-        EventPayload::WorkerSpawned { .. } => "worker_spawned",
-        EventPayload::WorkerExited { .. } => "worker_exited",
-        EventPayload::WorkerFailed { .. } => "worker_failed",
-        EventPayload::WorkerTimeout { .. } => "worker_timeout",
-        EventPayload::OperatorMark { .. } => "operator_mark",
-        // mu-mh4: a compensating tombstone over a poisoned record. The
-        // console's CSS can target `.role-tombstone` to render it as
-        // scar tissue (visual styling is follow-up; the kind tag is the
-        // hook).
-        EventPayload::Tombstone { .. } => "tombstone",
-        // mu-mh4: a live head attached to a resumed session.
-        EventPayload::HeadAttached { .. } => "head_attached",
-    }
 }
 
 pub(crate) fn fmt_opt_u64(v: Option<u64>) -> String {

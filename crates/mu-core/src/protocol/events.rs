@@ -71,6 +71,10 @@ pub struct ProviderStatusEvent {
     pub tool_call_id: Option<String>,
 }
 
+impl ProviderStatusEvent {
+    pub const METHOD: &'static str = "session.provider_status";
+}
+
 // ===== Event notifications (daemon → frontend) =====
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

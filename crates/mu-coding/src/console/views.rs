@@ -10,9 +10,8 @@ use crate::console::{
     cc_data::{read_cc_transcript, CcRole, CcTranscript},
     data::{load_events, scan_all, AppState},
     html::{
-        breakdown_table, esc, esc_attr, event_anchor, fmt_opt_u32, fmt_opt_u64, kv, page,
-        payload_kind, td, td_code, td_num, td_time, transcript_block, truncate, truncated_details,
-        urlish,
+        breakdown_table, esc, esc_attr, event_anchor, fmt_opt_u32, fmt_opt_u64, kv, page, td,
+        td_code, td_num, td_time, transcript_block, truncate, truncated_details, urlish,
     },
 };
 
@@ -575,7 +574,7 @@ fn render_events(events: &[SessionEvent]) -> String {
         out.push_str(&format!("<td>{}</td>", event_anchor(ev.id)));
         out.push_str(&td_time(Some(ev.timestamp_unix_ms)));
         out.push_str(&td_code(&format!("{:?}", ev.actor)));
-        out.push_str(&td_code(payload_kind(&ev.payload)));
+        out.push_str(&td_code(ev.payload.kind_str()));
         let json = serde_json::to_string_pretty(ev).unwrap_or_else(|_| format!("{ev:#?}"));
         out.push_str(&format!(
             "<td>{}</td>",
@@ -603,7 +602,7 @@ fn render_cost(events: &[SessionEvent]) -> String {
             total = total + u;
             out.push_str("<tr>");
             out.push_str(&td_num(ev.id));
-            out.push_str(&td_code(payload_kind(&ev.payload)));
+            out.push_str(&td_code(ev.payload.kind_str()));
             out.push_str(&td_num(u.input_tokens));
             out.push_str(&td_num(u.output_tokens));
             out.push_str(&td(&fmt_opt_u64(u.cache_read_input_tokens)));

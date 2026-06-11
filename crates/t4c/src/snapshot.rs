@@ -154,15 +154,18 @@ impl Snapshot {
         }
         let bytes =
             rkyv::to_bytes::<rkyv::rancor::Error>(self).context("rkyv-serializing snapshot")?;
-        // Unique temp name per writer (pid + nanos) so two concurrent `discover`
-        // processes targeting the same snapshot don't clobber a shared temp file
-        // — each writes its own temp, then atomically renames into place. The
-        // rename is the commit point; last writer wins cleanly, no torn file
-        // (reviewer finding: a fixed `.rkyv.tmp` raced under concurrency).
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+        // Unique temp name per writer so concurrent savers targeting the same
+        // snapshot don't clobber a shared temp file — each writes its own temp,
+        // then atomically renames into place. The rename is the commit point;
+        // last writer wins cleanly, no torn file (reviewer finding: a fixed
+        // `.rkyv.tmp` raced under concurrency). Uniqueness is STRUCTURAL, not
+        // probabilistic: pid separates processes, the atomic counter separates
+        // threads. The previous pid+SystemTime-nanos nonce collided for
+        // same-process threads on coarse CI clocks — two writers shared a temp,
+        // the first rename took it, the second failed ENOENT (flaked
+        // concurrent_saves_produce_a_valid_archive three times on 2026-06-11).
+        static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = path.with_extension(format!("rkyv.tmp.{}.{nonce}", std::process::id()));
         std::fs::write(&tmp, &bytes)
             .with_context(|| format!("writing snapshot tmp {}", tmp.display()))?;

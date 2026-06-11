@@ -743,6 +743,21 @@ impl SessionEventLog {
         payload: EventPayload,
         parent_event_ids: Vec<u64>,
     ) -> u64 {
+        // mu-kgpg: this mutex is also the append-order mutex.  Both
+        // best-effort appends and strict command appends hold it from
+        // id assignment through disk projection and in-memory push, so
+        // file order, event id order, and snapshot order cannot drift
+        // across the two append paths.
+        let mut disk_guard = match self.disk_writer.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    "disk writer mutex poisoned; recovering for best-effort append"
+                );
+                poisoned.into_inner()
+            }
+        };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let event = SessionEvent {
             id,
@@ -756,7 +771,26 @@ impl SessionEventLog {
         // so the disk record is at least as complete as memory. IO
         // failures are logged and ignored — disk persistence is not
         // load-bearing for the running daemon.
-        self.write_to_disk(&event);
+        if let Some(file) = disk_guard.as_mut() {
+            match serde_json::to_string(&event) {
+                Ok(line) => {
+                    if let Err(e) = writeln!(file, "{line}") {
+                        tracing::warn!(
+                            session_id = %self.session_id,
+                            error = %e,
+                            "disk write failed; continuing in-memory only"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        error = %e,
+                        "event serialization failed for disk write"
+                    );
+                }
+            }
+        }
         if let Ok(mut events) = self.events.lock() {
             events.push(event);
         } else {
@@ -780,8 +814,10 @@ impl SessionEventLog {
     /// in-memory-only session cannot make a command durable, and
     /// silently succeeding would forge the write-ahead guarantee.
     pub fn append_command(&self, actor: EventActor, payload: EventPayload) -> std::io::Result<u64> {
-        // Hold the writer lock across assign-id → write → fsync so
-        // disk order matches id order for concurrent command appends.
+        // Hold the append-order lock across assign-id → write → fsync
+        // → memory push so disk order, event id order, and snapshot
+        // order stay aligned against both command and non-command
+        // appends.
         let mut guard = self
             .disk_writer
             .lock()
@@ -804,12 +840,13 @@ impl SessionEventLog {
         let line = serde_json::to_string(&event).map_err(std::io::Error::other)?;
         writeln!(file, "{line}")?;
         file.sync_data()?;
-        drop(guard);
         // Disk first, memory second: by the time the event is visible
         // in any projection it is already durable. A poisoned events
         // mutex after a durable write surfaces as an error — the
         // on-disk record then reads as an orphan, which is the legible
-        // outcome (INV-4).
+        // outcome (INV-4). Keep the append-order lock held until the
+        // memory push completes so a best-effort append cannot overtake
+        // a strict command append in snapshots.
         let mut events = self
             .events
             .lock()
@@ -831,33 +868,6 @@ impl SessionEventLog {
             .lock()
             .map(|g| g.is_some())
             .unwrap_or(false)
-    }
-
-    fn write_to_disk(&self, event: &SessionEvent) {
-        let Ok(mut guard) = self.disk_writer.lock() else {
-            return;
-        };
-        let Some(file) = guard.as_mut() else {
-            return;
-        };
-        match serde_json::to_string(event) {
-            Ok(line) => {
-                if let Err(e) = writeln!(file, "{line}") {
-                    tracing::warn!(
-                        session_id = %self.session_id,
-                        error = %e,
-                        "disk write failed; continuing in-memory only"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    session_id = %self.session_id,
-                    error = %e,
-                    "event serialization failed for disk write"
-                );
-            }
-        }
     }
 
     /// Snapshot the log. Clones the inner vec — safe to read without
@@ -1836,6 +1846,56 @@ mod tests {
         assert_eq!(recovered.snapshot(), log.snapshot());
         // … and the recovered payloads are the command variants.
         assert_eq!(recovered.snapshot()[0].payload, sample_command_received());
+    }
+
+    /// mu-kgpg: strict command appends and normal best-effort appends
+    /// share one append-order lock, so snapshots and JSONL replay stay
+    /// sorted by event id even when both paths race.
+    #[test]
+    fn mixed_append_paths_keep_id_snapshot_and_disk_order_aligned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s-mixed.jsonl");
+        let log = std::sync::Arc::new(SessionEventLog::new("s-mixed"));
+        log.attach_disk_writer(&path).expect("attach");
+
+        let mut threads = Vec::new();
+        for worker in 0..8 {
+            let log = std::sync::Arc::clone(&log);
+            threads.push(std::thread::spawn(move || {
+                for n in 0..100 {
+                    if (worker + n) % 2 == 0 {
+                        let _ = log
+                            .append_command(EventActor::User, sample_command_received())
+                            .expect("strict command append");
+                    } else {
+                        log.append(
+                            EventActor::System,
+                            EventPayload::OperatorMark {
+                                rating: ((worker % 5) + 1) as u8,
+                                note: Some(format!("worker {worker} event {n}")),
+                            },
+                        );
+                    }
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("append worker");
+        }
+
+        let snapshot = log.snapshot();
+        assert_eq!(snapshot.len(), 800);
+        for (idx, event) in snapshot.iter().enumerate() {
+            assert_eq!(event.id, (idx + 1) as u64, "snapshot order drifted");
+        }
+
+        let (recovered, malformed) = SessionEventLog::from_jsonl(&path).expect("from_jsonl");
+        assert_eq!(malformed, 0);
+        let recovered = recovered.snapshot();
+        assert_eq!(recovered.len(), snapshot.len());
+        for (idx, event) in recovered.iter().enumerate() {
+            assert_eq!(event.id, (idx + 1) as u64, "disk order drifted");
+        }
     }
 
     /// The four mu-046 variants' wire shape, pinned: internally tagged

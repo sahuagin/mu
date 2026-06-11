@@ -98,6 +98,34 @@ pub fn error_block(content: &str, wrap_width: usize) -> Vec<Line<'static>> {
     block_lines("ERROR", Color::Red, content, wrap_width)
 }
 
+/// Stand-alone error notice (an error with no turn to attach to): a bold
+/// `× <header>` line followed by the FULL message, word-wrapped to the
+/// viewport width with unbroken runs (e.g. a provider's JSON error body)
+/// hard-broken mid-run. Never truncates — errors are exactly the content
+/// the operator must be able to read in full (mu-ka3c: a ~400-char 402
+/// provider error rendered truncated and unreadable). Every line carries
+/// the error styling.
+pub fn error_notice(header: &str, msg: &str, wrap_width: usize) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = vec![Line::from("")];
+    out.push(Line::from(Span::styled(
+        format!("× {header}"),
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    )));
+    // Reserve 2 cols for the "  " indent + 2 cols safety gutter (same
+    // budget discipline as block_lines, so ratatui can't re-wrap).
+    let inner = wrap_width.saturating_sub(4).max(1);
+    for raw in msg.lines() {
+        for row in wrap_line(raw, inner) {
+            out.push(Line::from(Span::styled(
+                format!("  {row}"),
+                Style::default().fg(Color::Red),
+            )));
+        }
+    }
+    out.push(Line::from(""));
+    out
+}
+
 /// Build a wrapped paragraph for ratatui to render. Wrapping is
 /// handled by ratatui's `Wrap { trim: false }`; we just pass the
 /// lines through.
@@ -346,15 +374,34 @@ pub fn render_turn_item(
             render_tool_result(kind, text, color, wrap_width, tool_preview_lines)
         }
         TurnItem::Error(msg) => {
-            let short: String = msg.chars().take(400).collect();
-            vec![Line::from(vec![
-                Span::styled("│ ", Style::default().fg(color)),
-                Span::styled(
-                    "× ",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(short, Style::default().fg(Color::Red)),
-            ])]
+            // mu-ka3c: errors must be FULLY readable. Wrap the whole
+            // message (hard-breaking unbroken JSON runs) instead of the
+            // old truncate-to-one-line, and keep the error styling on
+            // every wrapped row. Continuation rows indent under the `×`.
+            let body = if msg.is_empty() {
+                "(unknown error)"
+            } else {
+                msg.as_str()
+            };
+            // "│ " (2) + "× " (2) prefixes + 2 cols safety gutter.
+            let inner = wrap_width.saturating_sub(6).max(1);
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            let mut first = true;
+            for raw in body.lines() {
+                for row in wrap_line(raw, inner) {
+                    let marker = if first { "× " } else { "  " };
+                    first = false;
+                    lines.push(Line::from(vec![
+                        Span::styled("│ ", Style::default().fg(color)),
+                        Span::styled(
+                            marker.to_string(),
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(row, Style::default().fg(Color::Red)),
+                    ]));
+                }
+            }
+            lines
         }
     }
 }
@@ -423,19 +470,27 @@ fn render_tool_result(
             let all: Vec<&str> = msg.lines().collect();
             let total = all.len();
             let show = total.min(preview_lines);
-            let max_w = wrap_width.saturating_sub(8);
+            let max_w = wrap_width.saturating_sub(8).max(1);
             let mut out: Vec<Line<'static>> = Vec::new();
-            for (i, &tl) in all.iter().take(show).enumerate() {
-                let truncated: String = tl.chars().take(max_w).collect();
-                let prefix = if i == 0 {
-                    format!("{indent}⎿  ")
-                } else {
-                    format!("{indent}   ")
-                };
-                out.push(Line::from(vec![
-                    Span::styled(prefix, bar_style),
-                    Span::styled(truncated, Style::default().fg(Color::Red)),
-                ]));
+            // mu-ka3c: error lines WRAP (hard-breaking unbroken runs)
+            // instead of the ok-arm's char-truncation — a long provider
+            // error in a tool result must stay readable. The preview
+            // bound still applies to source lines; each shown line may
+            // occupy several wrapped rows, all red.
+            let mut emitted = 0usize;
+            for &tl in all.iter().take(show) {
+                for row in wrap_line(tl, max_w) {
+                    let prefix = if emitted == 0 {
+                        format!("{indent}⎿  ")
+                    } else {
+                        format!("{indent}   ")
+                    };
+                    emitted += 1;
+                    out.push(Line::from(vec![
+                        Span::styled(prefix, bar_style),
+                        Span::styled(row, Style::default().fg(Color::Red)),
+                    ]));
+                }
             }
             if total > show {
                 out.push(Line::from(vec![
@@ -500,6 +555,25 @@ mod tests {
     #[test]
     fn wrap_zero_width_passthrough() {
         assert_eq!(wrap_line("abc", 0), vec!["abc".to_string()]);
+    }
+
+    /// A 400-char unbroken run (a provider's JSON error body has no
+    /// spaces) hard-wraps to width-bounded rows with NO truncation —
+    /// the mu-ka3c incident shape.
+    #[test]
+    fn wrap_hard_breaks_unbroken_json_without_loss() {
+        let json: String = r#"{"error":{"type":"payment_required","message":"x"},"#
+            .chars()
+            .cycle()
+            .take(400)
+            .collect();
+        let width = 60;
+        let rows = wrap_line(&json, width);
+        assert!(rows.len() >= 400 / width, "expected multiple rows");
+        for row in &rows {
+            assert!(row.chars().count() <= width, "row exceeded width: {row:?}");
+        }
+        assert_eq!(rows.concat(), json, "wrap must not drop characters");
     }
 
     #[test]
@@ -652,6 +726,113 @@ mod tests {
             4,
         );
         assert!(plain(&lines)[0].contains("(no output)"));
+    }
+
+    // ---- error wrapping (mu-ka3c) ----
+
+    /// Recover the body text of an error row: everything after the
+    /// "│ " bar and the 2-col marker column.
+    fn error_row_body(line: &Line<'static>) -> String {
+        let full = line
+            .spans
+            .iter()
+            .map(|s| s.content.clone())
+            .collect::<String>();
+        full.chars().skip(4).collect()
+    }
+
+    #[test]
+    fn turn_item_error_wraps_400_char_json_no_truncation() {
+        let json: String = r#"{"type":"error","error":{"type":"payment_required""#
+            .chars()
+            .cycle()
+            .take(400)
+            .collect();
+        let wrap_width = 80;
+        let lines = render_turn_item(&TurnItem::Error(json.clone()), Color::White, wrap_width, 4);
+        assert!(
+            lines.len() > 1,
+            "400 chars at width 80 must wrap to multiple rows"
+        );
+        let mut reassembled = String::new();
+        for line in &lines {
+            let row = error_row_body(line);
+            assert!(
+                4 + row.chars().count() <= wrap_width,
+                "row exceeded viewport width: {row:?}"
+            );
+            reassembled.push_str(&row);
+        }
+        assert_eq!(reassembled, json, "error body must not be truncated");
+    }
+
+    #[test]
+    fn turn_item_error_styles_every_wrapped_line_red() {
+        let msg = "x".repeat(300);
+        let lines = render_turn_item(&TurnItem::Error(msg), Color::White, 60, 4);
+        assert!(lines.len() > 1);
+        for line in &lines {
+            // spans: [bar, marker, body] — marker and body must both be red.
+            assert_eq!(line.spans.len(), 3, "expected bar+marker+body spans");
+            assert_eq!(line.spans[1].style.fg, Some(Color::Red));
+            assert_eq!(line.spans[2].style.fg, Some(Color::Red));
+        }
+        // First row carries the `× ` marker; continuations indent under it.
+        assert_eq!(lines[0].spans[1].content.as_ref(), "× ");
+        assert_eq!(lines[1].spans[1].content.as_ref(), "  ");
+    }
+
+    #[test]
+    fn error_notice_wraps_full_message_and_styles_every_line() {
+        let msg: String = "abcdefgh".chars().cycle().take(400).collect();
+        let wrap_width = 78;
+        let lines = error_notice("turn ended with error", &msg, wrap_width);
+        let p = plain(&lines);
+        assert_eq!(p[0], "");
+        assert_eq!(p[1], "× turn ended with error");
+        assert_eq!(p.last().unwrap(), "");
+        // Body rows: indented, width-bounded, nothing lost.
+        let body: String = p[2..p.len() - 1]
+            .iter()
+            .map(|l| l.trim_start().to_string())
+            .collect();
+        assert_eq!(body, msg, "error_notice must not truncate the message");
+        for l in &p[2..p.len() - 1] {
+            assert!(l.chars().count() <= wrap_width, "row exceeded width: {l:?}");
+        }
+        // Every non-blank line is styled red.
+        for line in lines
+            .iter()
+            .filter(|l| !plain(&[(*l).clone()])[0].is_empty())
+        {
+            for span in &line.spans {
+                assert_eq!(span.style.fg, Some(Color::Red), "non-red span: {span:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn tool_result_err_wraps_long_line_instead_of_truncating() {
+        let long = "e".repeat(200);
+        let wrap_width = 80;
+        let lines = render_turn_item(
+            &TurnItem::ToolResult {
+                kind: "err".into(),
+                text: long.clone(),
+            },
+            Color::White,
+            wrap_width,
+            4,
+        );
+        assert!(lines.len() > 1, "200-char err line must wrap, not truncate");
+        let reassembled: String = lines
+            .iter()
+            .map(|l| l.spans.last().unwrap().content.to_string())
+            .collect();
+        assert_eq!(reassembled, long, "err preview must keep the whole line");
+        for line in &lines {
+            assert_eq!(line.spans.last().unwrap().style.fg, Some(Color::Red));
+        }
     }
 
     #[test]

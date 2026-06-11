@@ -8,7 +8,7 @@
 | updated    | 2026-06-10                                                     |
 | authors    | tcovert + claude                                               |
 | supersedes | amends the dispatch model of mu-004 (handlers stay; entry changes) |
-| beads      | mu-ingest-pipeline-umbrella-n3yy (.1–.7)                       |
+| beads      | mu-ingest-pipeline-umbrella-n3yy (.1–.9)                       |
 
 ## Why
 
@@ -66,8 +66,10 @@ each pipeline: journal CommandReceived (fsync) → enqueue   [single writer; seq
                sequenced inputs; on completion journal CommandSucceeded/Failed
                wrapping the original command → emit to outbound
 
-outbound: one daemon-wide stream, tagged envelopes (origin connection id, request
-id, command seq), spmc — transport writers filter; notifications fan out
+outbound: Router — tagged envelopes (origin connection id, request id, command
+seq) route to per-connection ordered lanes (one egress queue per connection;
+durable never dropped, ephemeral evicted under pressure, slow consumers
+disconnected — INV-11); origin-less envelopes broadcast to every lane
 ```
 
 **One pipeline per session.** The daemon hosts many sessions; each has its own
@@ -160,10 +162,12 @@ pub struct OutboundEnvelope {
 }
 ```
 
-One daemon-wide stream (`tokio::sync::broadcast`), spmc: each transport writer
-subscribes and forwards envelopes whose `origin` matches its connection (or
-broadcasts). `NotificationWriter` and `write_loop` port onto this; there is no
-other way to emit bytes outward.
+One daemon-wide `Router` (WP9; originally a `tokio::sync::broadcast` — see the
+WP9 amendments for why that was replaced): each connection registers one
+ordered egress lane at accept; producers route envelopes to the addressed
+origin's lane (or every lane for `origin: None`), non-blocking always.
+`NotificationWriter` and `write_loop` ride this; there is no other way to emit
+bytes outward.
 
 ### Wire surface
 
@@ -213,6 +217,13 @@ journal_queries = true    # default true: read-only queries are journaled too
   (provider streams, tool execution) happens in async gateways; their results
   come back into the pipeline as sequenced inputs. No gateway mutates pipeline
   state from the side.
+- **INV-11 (two-tier outbound — WP9).** Durable outbound (responses, receipts,
+  lifecycle notifications) is never dropped while its connection lives;
+  ephemeral outbound (live-feed ticks: text deltas, provider-status updates)
+  may be evicted under pressure — announced by a one-shot
+  `connection.lagged { dropped }` notice when pressure clears; a connection
+  that cannot keep up with its own durable stream is disconnected — the
+  journals remain the recovery path.
 
 ## Receipt semantics
 
@@ -318,7 +329,7 @@ Order: WP1 → WP2 → WP3 → {WP4 ∥ WP5} → WP6 → WP7.
   `receipts_wrap_the_original_command_inv5`); the session-log Done-time
   receipt path is `ask_receipt_lands_in_session_log_at_done_wp4`.
 
-### WP8 amendments (adversarial review, 2026-06-11)
+### WP8–WP9 amendments (adversarial review, 2026-06-11)
 
 - **Per-session FIFO dispatch** — the control-plane consumer originally
   spawned one independent task per session-scoped command, so two commands
@@ -331,16 +342,34 @@ Order: WP1 → WP2 → WP3 → {WP4 ∥ WP5} → WP6 → WP7.
   longer live and the lane is drained; a wedged session wedges only its own
   dispatcher. See the `serve/pipeline.rs` module doc ("Per-session FIFO
   dispatch") for the lifecycle, including the sweep-on-send-failure path.
-- **Outbound is lossy under lag — responses included.** The daemon-wide
-  outbound stream is a bounded `tokio::sync::broadcast`; a subscriber that
-  falls more than the capacity behind drops envelopes (`Lagged`), and
-  RESPONSES are dropped along with notifications. Receipts are written
-  before emission, so under lag the wire and the journal can diverge — the
-  journal remains the source of truth, and the MCP per-call lag error now
-  says so explicitly (check state before retrying non-idempotent calls;
-  blind retry of a lost-result mutation can double its effect). Accepted
-  tradeoff for this spec; the named follow-up is lossless per-connection
-  buffering at the transport writer. No transport behavior change in WP8.
+- **Two-tier outbound (WP9, superseding the WP8 lossy-outbound note).** WP8
+  had documented the daemon-wide `tokio::sync::broadcast` as lossy under lag
+  — responses included, with one connection stalled on its own socket having
+  its RESPONSES evicted by OTHER sessions' token deltas advancing the shared
+  ring. Wrong semantics; replaced (bead n3yy.9) by the exchange answer:
+  `transport::Router`, per-consumer egress queues with an explicit
+  slow-consumer policy. Each connection registers ONE ordered lane (a single
+  queue, so per-connection wire ordering is exactly emission ordering);
+  envelopes are tier-classified at push — responses and every notification
+  not on the ephemeral allowlist (`session.text_delta`,
+  `session.provider_status`; unknown methods fail safe to durable) are
+  DURABLE and never evicted while the connection lives. Past
+  `EPHEMERAL_PRESSURE_CAP` (1024) a push evicts the oldest queued ephemeral
+  envelope; when pressure clears, a one-shot durable
+  `connection.lagged { dropped: n }` notification (new wire method,
+  additive) tells the client how many ticks it missed. A lane past
+  `LANE_HARD_CAP` (65536) with nothing ephemeral left to shed is poisoned:
+  the writer logs the drop counters and terminates — the slow consumer is
+  DISCONNECTED. Nothing is lost from the system of record: every durable
+  item is derivable from the command journal / session logs (the recovery
+  path on reconnect), and durable growth is otherwise self-limiting because
+  responses are 1:1 with commands the client itself sent. MCP connections
+  register their lane at accept; a per-connection demux task routes response
+  envelopes to per-invocation waiters by synthetic request id and drops
+  notifications at trace (the MCP tool surface has no notification channel);
+  the old per-call `Lagged` error is gone — the failure modes are now lane
+  closed (shutdown) and lane poisoned (slow-consumer disconnect; journal =
+  source of truth).
 - **INV-8 scope cut** — MCP resource reads (`mu://...` status reads) and
   `mu/session_status` subscription pushes bypass the tagged outbound
   stream; INV-8 currently holds for the tool/command surface only. Porting

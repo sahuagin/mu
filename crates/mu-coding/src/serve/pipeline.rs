@@ -141,7 +141,7 @@ use mu_core::protocol::{
 };
 use mu_core::skill::loader::LoadedSkill;
 use mu_core::transport::{
-    codes, err_response, NotificationWriter, Outbound, OutboundEnvelope, OutboundStream,
+    codes, err_response, NotificationWriter, Outbound, OutboundEnvelope, Router,
 };
 
 use super::auth::{AuthRegistry, AuthState, AuthStateHandle};
@@ -489,7 +489,7 @@ impl PipelineCtx {
 pub(crate) fn spawn_control_plane(
     journal: Arc<CommandJournal>,
     ctx: PipelineCtx,
-    stream: OutboundStream,
+    stream: Router,
 ) -> ControlPlane {
     let (tx, mut rx) = mpsc::unbounded_channel::<PipelineInput>();
     let sessions = ctx.sessions.clone();
@@ -728,7 +728,7 @@ impl SessionDispatchers {
         work: SessionWork,
         sessions: &Sessions,
         journal: &Arc<CommandJournal>,
-        stream: &OutboundStream,
+        stream: &Router,
     ) {
         let mut map = self.lock_map();
         let tx = map.entry(session_id.clone()).or_insert_with(|| {
@@ -774,7 +774,7 @@ fn spawn_session_dispatcher(
     registry: Weak<SessionDispatchers>,
     sessions: Sessions,
     journal: Arc<CommandJournal>,
-    stream: OutboundStream,
+    stream: Router,
 ) -> mpsc::UnboundedSender<SessionWork> {
     let (tx, mut rx) = mpsc::unbounded_channel::<SessionWork>();
     tokio::spawn(async move {
@@ -807,7 +807,7 @@ async fn process_command(
     cmd: Box<Command>,
     ctx: &PipelineCtx,
     journal: &Arc<CommandJournal>,
-    stream: &OutboundStream,
+    stream: &Router,
     dispatchers: &Arc<SessionDispatchers>,
 ) {
     // Gate first, route second (mu-fnn) — an unauthenticated
@@ -883,7 +883,7 @@ async fn execute_and_receipt(
     notif: NotificationWriter,
     dctx: DispatchCtx,
     journal: Arc<CommandJournal>,
-    stream: OutboundStream,
+    stream: Router,
 ) {
     let echo = command_echo(&cmd);
     let Command {
@@ -1111,7 +1111,7 @@ fn append_receipt(
 /// `None` for unjournaled queries (WP6) — there is no journal record
 /// to correlate to.
 fn emit_response(
-    stream: &OutboundStream,
+    stream: &Router,
     origin: &Origin,
     command_seq: Option<u64>,
     response: Response<Value>,
@@ -1271,7 +1271,7 @@ mod tests {
         );
         let ctx = test_ctx();
         let sessions = ctx.sessions.clone();
-        let stream = OutboundStream::new();
+        let stream = Router::new();
         let control = Arc::new(spawn_control_plane(journal.clone(), ctx, stream));
 
         // Poison the ingest seam: a thread panics while holding it.
@@ -1366,7 +1366,7 @@ mod tests {
         );
         let ctx = test_ctx();
         let sessions = ctx.sessions.clone();
-        let stream = OutboundStream::new();
+        let stream = Router::new();
         let control = spawn_control_plane(journal, ctx, stream);
 
         // Capacity-1 channel, pre-filled, receiver alive but never
@@ -1434,7 +1434,7 @@ mod tests {
         );
         let ctx = test_ctx();
         let sessions = ctx.sessions.clone();
-        let stream = OutboundStream::new();
+        let stream = Router::new();
         let control = spawn_control_plane(journal, ctx, stream);
 
         // Channel whose receiver is already gone: the dead loop.
@@ -1499,7 +1499,7 @@ mod tests {
         );
         let ctx = test_ctx();
         let sessions = ctx.sessions.clone();
-        let stream = OutboundStream::new();
+        let stream = Router::new();
         let control = spawn_control_plane(journal, ctx, stream);
 
         // Live session, but its log has NO disk writer
@@ -1563,7 +1563,7 @@ mod tests {
             CommandJournal::open(&journal_path, "d", FsyncPolicy::Never).expect("open journal"),
         );
         let ctx = test_ctx();
-        let stream = OutboundStream::new();
+        let stream = Router::new();
         let control = spawn_control_plane(journal, ctx, stream);
 
         let req = request(
@@ -1606,7 +1606,7 @@ mod tests {
         );
         let ctx = test_ctx();
         let sessions = ctx.sessions.clone();
-        let stream = OutboundStream::new();
+        let stream = Router::new();
         let control = spawn_control_plane(journal, ctx, stream);
 
         let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(4);
@@ -1703,7 +1703,7 @@ mod tests {
         let journal = Arc::new(
             CommandJournal::open(&journal_path, "d", FsyncPolicy::Never).expect("open journal"),
         );
-        let stream = OutboundStream::new();
+        let stream = Router::new();
         let control = spawn_control_plane(journal, test_ctx(), stream);
 
         let config_seq = control
@@ -1766,8 +1766,8 @@ mod tests {
         config.journal.journal_queries = false;
         let mut ctx = test_ctx();
         ctx.daemon_info = ctx.daemon_info.clone().with_config(config);
-        let stream = OutboundStream::new();
-        let mut outbound_rx = stream.subscribe();
+        let stream = Router::new();
+        let outbound_lane = stream.register(test_origin());
         let control = spawn_control_plane(journal, ctx, stream);
 
         let auth = authed_state();
@@ -1775,10 +1775,10 @@ mod tests {
             ingest(&control, request("ping", json!(null)), test_origin(), &auth).is_none(),
             "queries still cross the pipeline; response rides outbound"
         );
-        let envelope = tokio::time::timeout(Duration::from_secs(2), outbound_rx.recv())
+        let envelope = tokio::time::timeout(Duration::from_secs(2), outbound_lane.recv())
             .await
             .expect("ping response within 2s")
-            .expect("stream open");
+            .expect("lane open");
         assert_eq!(
             envelope.command_seq, None,
             "unjournaled query has no journal correlation"
@@ -1832,7 +1832,7 @@ mod tests {
         );
         let ctx = test_ctx();
         let sessions = ctx.sessions.clone();
-        let stream = OutboundStream::new();
+        let stream = Router::new();
         let control = spawn_control_plane(journal, ctx, stream);
 
         let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(1);
@@ -1896,8 +1896,8 @@ mod tests {
         );
         let ctx = test_ctx();
         let sessions = ctx.sessions.clone();
-        let stream = OutboundStream::new();
-        let mut outbound_rx = stream.subscribe();
+        let stream = Router::new();
+        let outbound_lane = stream.register(test_origin());
         let control = spawn_control_plane(journal, ctx, stream);
 
         // Session A: saturated channel, receiver alive but never
@@ -1932,7 +1932,7 @@ mod tests {
         assert!(ingest(&control, request("ping", json!(null)), test_origin(), &auth).is_none());
         let pong = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let envelope = outbound_rx.recv().await.expect("stream open");
+                let envelope = outbound_lane.recv().await.expect("lane open");
                 if envelope.item.0["result"]["pong"] == true {
                     return;
                 }
@@ -1959,7 +1959,7 @@ mod tests {
         );
         let ctx = test_ctx();
         let sessions = ctx.sessions.clone();
-        let stream = OutboundStream::new();
+        let stream = Router::new();
         let control = spawn_control_plane(journal, ctx, stream);
 
         let (input_tx, mut _input_rx) = mpsc::channel::<AgentInput>(4);

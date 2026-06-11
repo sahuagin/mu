@@ -27,7 +27,7 @@
 //! `dispatch_inner`'s mcp.* tool table (which invokes the unchanged
 //! pre-WP5 handler bodies), exactly one receipt wrapping the original
 //! command, and the response returning through the tagged outbound
-//! stream (INV-8) filtered by this connection's
+//! router (INV-8) on the lane registered for this connection's
 //! `Origin { transport: "mcp", connection_id }`.
 //!
 //! **Naming rule:** every tool journals as method `mcp.<tool_name>` —
@@ -51,12 +51,21 @@
 //! | `mcp.mu_mailbox_read`    | daemon  | `mailbox.read` |
 //! | `mcp.mu_mailbox_consume` | daemon  | `mailbox.consume` |
 //!
-//! **Response correlation:** rmcp may interleave tool calls on one
-//! connection, so each invocation mints a daemon-unique synthetic
-//! request id, subscribes its own outbound receiver BEFORE ingesting,
-//! and awaits the envelope matching (origin, request_id). Like
-//! `transport::write_loop`, a subscriber lagged more than the stream
-//! capacity is lossy — a documented MVP tradeoff.
+//! **Response correlation (WP9):** rmcp may interleave tool calls on
+//! one connection, so each invocation mints a daemon-unique synthetic
+//! request id. The connection registers ONE outbound lane at accept
+//! (spec mu-046 INV-11 — per-connection egress queues; no shared
+//! broadcast ring, so other sessions' traffic can never evict this
+//! connection's responses); a connection-level demux task
+//! ([`demux_loop`]) drains the lane and routes Response envelopes by
+//! request id to per-invocation oneshot waiters, registered BEFORE
+//! ingest and removed at delivery. Notifications arriving on an MCP
+//! lane — including broadcast (origin-less) envelopes, which reach
+//! every lane — are dropped at the demux with a trace: the MCP tool
+//! surface has no notification channel today. Failure modes: lane
+//! closed (daemon shutting down) and lane poisoned (this connection
+//! was disconnected as a slow consumer; the command journal and its
+//! receipts are the source of truth).
 //!
 //! **Auth:** pre-WP5 the MCP surface had no auth at all. Each accepted
 //! connection now gets a fresh per-connection `AuthState` with the
@@ -85,13 +94,13 @@ use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
 use serde_json::{json, Map as JsonMap, Value};
 use tokio::net::UnixListener;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, info};
 
 use mu_core::command_journal::Origin;
 use mu_core::protocol::{Request, Response, JSONRPC_VERSION};
 use mu_core::session_status::{ProviderSnapshot, SessionStatus, StatusInputs};
-use mu_core::transport::OutboundStream;
+use mu_core::transport::{ConnectionLane, LaneTerminated, Router};
 
 use super::auth::{self, AuthRegistry, AuthStateHandle};
 use super::daemon_info::DaemonInfo;
@@ -137,7 +146,7 @@ pub(crate) async fn serve_mcp_socket(
     sessions: Sessions,
     daemon_info: DaemonInfo,
     control: Arc<ControlPlane>,
-    outbound: OutboundStream,
+    outbound: Router,
     auth_registry: Arc<AuthRegistry>,
 ) -> anyhow::Result<()> {
     if socket_path.exists() {
@@ -160,14 +169,17 @@ pub(crate) async fn serve_mcp_socket(
             auth::initial_connection_state(&auth_registry),
         ));
         tokio::spawn(async move {
-            let handler = MuMcpHandler::new(
-                sessions,
-                daemon_info,
-                control,
-                outbound,
-                next_mcp_origin(),
-                auth_state,
-            );
+            let origin = next_mcp_origin();
+            // spec mu-046 WP9: ONE outbound lane per MCP connection,
+            // registered at accept; the demux task drains it for the
+            // connection's whole life, routing responses to their
+            // invocation's waiter (module doc, "Response correlation").
+            let lane = outbound.register(origin.clone());
+            let demux = Arc::new(McpDemux::default());
+            let demux_task = tokio::spawn(demux_loop(lane, Arc::clone(&demux)));
+            let demux_for_cleanup = Arc::clone(&demux);
+            let handler =
+                MuMcpHandler::new(sessions, daemon_info, control, origin, auth_state, demux);
             let (reader, writer) = stream.into_split();
             match handler.serve((reader, writer)).await {
                 Ok(running) => {
@@ -179,6 +191,17 @@ pub(crate) async fn serve_mcp_socket(
                     debug!("MCP connection failed: {e:#}");
                 }
             }
+            // Connection over: stop the demux; dropping its lane
+            // unregisters it from the router. abort() bypasses the
+            // loop's own terminal-set + waiter-clear, so repeat that
+            // cleanup here — any in-flight invocation future rmcp left
+            // alive would otherwise await a waiter nobody will resolve.
+            // Same order rule as demux_loop: reason first, then drop
+            // the waiters.
+            demux_task.abort();
+            McpDemux::lock(&demux_for_cleanup.terminal)
+                .get_or_insert_with(|| "MCP connection closed".to_string());
+            McpDemux::lock(&demux_for_cleanup.waiters).clear();
         });
     }
 }
@@ -193,9 +216,11 @@ struct MuMcpHandler {
     /// every tool invocation becomes a journaled `mcp.<tool>` command
     /// through [`pipeline::ingest`] — adapter #2, no side doors.
     control: Arc<ControlPlane>,
-    /// The daemon-wide outbound stream (INV-8); tool responses come
-    /// back as envelopes tagged with this connection's origin.
-    outbound: OutboundStream,
+    /// This connection's response demultiplexer (spec mu-046 WP9):
+    /// the connection's single outbound lane is drained by
+    /// [`demux_loop`]; each invocation registers a waiter here and
+    /// receives its response by request id.
+    demux: Arc<McpDemux>,
     /// This connection's border identity (`transport: "mcp"`).
     origin: Origin,
     /// This connection's auth state — the pipeline's gate reads it at
@@ -212,15 +237,15 @@ impl MuMcpHandler {
         sessions: Sessions,
         daemon_info: DaemonInfo,
         control: Arc<ControlPlane>,
-        outbound: OutboundStream,
         origin: Origin,
         auth_state: AuthStateHandle,
+        demux: Arc<McpDemux>,
     ) -> Self {
         Self {
             sessions,
             daemon_info,
             control,
-            outbound,
+            demux,
             origin,
             auth_state,
             watch_tasks: Arc::new(Mutex::new(HashMap::new())),
@@ -586,21 +611,36 @@ impl MuMcpHandler {
     /// `mcp.<tool_name>` command (params = the raw MCP arguments),
     /// cross [`pipeline::ingest`] — journaled before processing,
     /// fail-closed on journal error — then await this command's
-    /// response envelope on the outbound stream and translate it back
-    /// into the MCP tool-result shape (`Ok(result)` → success content,
-    /// `Err("code: message")` → error content, exactly the pre-WP5
-    /// strings for handler outcomes).
+    /// response from the connection's demux (spec mu-046 WP9) and
+    /// translate it back into the MCP tool-result shape
+    /// (`Ok(result)` → success content, `Err("code: message")` →
+    /// error content, exactly the pre-WP5 strings for handler
+    /// outcomes).
     async fn dispatch_tool(&self, name: &str, arguments: Value) -> Result<Value, String> {
         let request_id = next_mcp_request_id();
+        let id_key = request_id
+            .as_str()
+            .expect("minted MCP request ids are strings")
+            .to_string();
         let request = Request {
             jsonrpc: JSONRPC_VERSION.to_string(),
-            id: request_id.clone(),
+            id: request_id,
             method: format!("{MCP_METHOD_PREFIX}{name}"),
             params: arguments,
         };
-        // Subscribe BEFORE ingesting so the response envelope cannot
-        // slip past between enqueue and subscribe.
-        let mut rx = self.outbound.subscribe();
+        // Register the waiter BEFORE ingesting so the response cannot
+        // slip past between enqueue and registration (the same race
+        // the pre-WP9 subscribe-before-ingest closed).
+        let (tx, rx) = oneshot::channel();
+        self.demux.register_waiter(id_key.clone(), tx);
+        // If the demux has already terminated (lane closed or
+        // poisoned), nothing will ever deliver: bail with its reason.
+        // A termination AFTER this check drops our waiter, resolving
+        // `rx` below with the same reason.
+        if let Some(reason) = self.demux.terminal_reason() {
+            self.demux.remove_waiter(&id_key);
+            return Err(reason);
+        }
         if let Some(response) = pipeline::ingest(
             &self.control,
             request,
@@ -609,47 +649,143 @@ impl MuMcpHandler {
         ) {
             // Immediate reject (journal unavailable / daemon shutting
             // down): nothing was enqueued, nothing will arrive on the
-            // stream — fail closed to the MCP caller.
+            // lane — fail closed to the MCP caller.
+            self.demux.remove_waiter(&id_key);
             return extract_result(response);
         }
-        loop {
-            match rx.recv().await {
-                Ok(envelope) => {
-                    if envelope.origin.as_ref() != Some(&self.origin) {
-                        continue;
-                    }
-                    if envelope.request_id.as_ref() != Some(&request_id) {
-                        continue;
-                    }
-                    let response: Response<Value> = serde_json::from_value(envelope.item.0)
-                        .map_err(|e| format!("malformed response envelope: {e}"))?;
-                    return extract_result(response);
-                }
-                // Same documented lossy-under-extreme-lag tradeoff as
-                // transport::write_loop: skipped envelopes are gone. If
-                // this command's response was among them the await would
-                // never resolve, so surface the lag as an error instead
-                // of risking a wedged MCP connection. Do NOT advise a
-                // blind retry: the command was journaled and may have
-                // EXECUTED — only its result envelope was lost — so a
-                // retry of a non-idempotent tool (e.g. mailbox post)
-                // would double its effect.
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    return Err(format!(
-                        "outbound stream lagged ({skipped} envelopes dropped); \
-                         the tool RESULT was lost, but the call itself may have \
-                         executed — check daemon state (the command journal and \
-                         its receipts are the source of truth) before retrying \
-                         anything non-idempotent"
-                    ));
-                }
-                // Every sender dropped — daemon shutting down.
-                Err(broadcast::error::RecvError::Closed) => {
-                    return Err("daemon outbound stream closed (shutting down)".to_string());
-                }
-            }
+        match rx.await {
+            Ok(response) => extract_result(response),
+            // The demux exited — dropping every pending waiter —
+            // before this command's response arrived: the lane closed
+            // (daemon shutdown) or was poisoned (slow-consumer
+            // disconnect). Either way the reason explains it; the
+            // command was journaled and may have EXECUTED, so callers
+            // must check state before retrying non-idempotent tools.
+            Err(_) => Err(self.demux.terminal_reason().unwrap_or_else(|| {
+                "MCP outbound demux terminated before the response arrived".to_string()
+            })),
         }
     }
+}
+
+/// Per-connection response demultiplexer (spec mu-046 WP9): the
+/// invocation-side half of the connection's single outbound lane.
+/// [`demux_loop`] is the consumer half.
+#[derive(Default)]
+struct McpDemux {
+    /// Synthetic request id → the invocation's response waiter.
+    /// Registered before ingest; removed at delivery, or by the
+    /// invocation itself on an immediate ingest reject.
+    waiters: std::sync::Mutex<HashMap<String, oneshot::Sender<Response<Value>>>>,
+    /// Why [`demux_loop`] exited — set BEFORE the pending waiters are
+    /// dropped, so an invocation woken by its dropped waiter can read
+    /// the reason.
+    terminal: std::sync::Mutex<Option<String>>,
+}
+
+impl McpDemux {
+    /// Lock recovering from poisoning: the guarded sections are
+    /// straight-line map operations, and wedging the connection over
+    /// a poisoned lock helps no one.
+    fn lock<'a, T>(mutex: &'a std::sync::Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+        match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn register_waiter(&self, id: String, tx: oneshot::Sender<Response<Value>>) {
+        Self::lock(&self.waiters).insert(id, tx);
+    }
+
+    fn remove_waiter(&self, id: &str) -> Option<oneshot::Sender<Response<Value>>> {
+        Self::lock(&self.waiters).remove(id)
+    }
+
+    fn terminal_reason(&self) -> Option<String> {
+        Self::lock(&self.terminal).clone()
+    }
+}
+
+/// Drain one MCP connection's outbound lane for the connection's
+/// whole life (spec mu-046 WP9): deliver Response envelopes to their
+/// invocation's waiter by request id; DROP notifications at trace —
+/// the MCP tool surface has no notification channel today, and
+/// broadcast (origin-less) envelopes land on MCP lanes too (module
+/// doc, "Response correlation"). On lane termination, record why and
+/// drop every pending waiter so in-flight invocations resolve with
+/// the reason instead of hanging.
+async fn demux_loop(lane: ConnectionLane, demux: Arc<McpDemux>) {
+    let reason = loop {
+        match lane.recv().await {
+            Ok(envelope) => {
+                if envelope.item.0.get("method").is_some() {
+                    tracing::trace!(
+                        origin = ?lane.origin(),
+                        method = ?envelope.item.0.get("method"),
+                        "dropping notification at MCP demux (no notification channel \
+                         on the tool surface)"
+                    );
+                    continue;
+                }
+                let Some(id) = envelope.request_id.as_ref().and_then(Value::as_str) else {
+                    tracing::trace!(
+                        origin = ?lane.origin(),
+                        "response envelope without a string request id at MCP demux"
+                    );
+                    continue;
+                };
+                let Some(tx) = demux.remove_waiter(id) else {
+                    tracing::trace!(
+                        origin = ?lane.origin(),
+                        request_id = %id,
+                        "response with no registered waiter at MCP demux"
+                    );
+                    continue;
+                };
+                match serde_json::from_value::<Response<Value>>(envelope.item.0) {
+                    // A send failure means the invocation gave up
+                    // (rmcp connection torn down mid-call); fine.
+                    Ok(response) => {
+                        let _ = tx.send(response);
+                    }
+                    // Cannot happen — the pipeline serializes a real
+                    // Response into the envelope. Dropping `tx`
+                    // resolves the invocation with the generic
+                    // demux-terminated error.
+                    Err(err) => {
+                        tracing::warn!(%err, "malformed response envelope at MCP demux");
+                    }
+                }
+            }
+            // Every Router producer dropped — daemon shutting down.
+            Err(LaneTerminated::Closed) => {
+                break "daemon outbound closed (shutting down)".to_string();
+            }
+            // Slow-consumer disconnect (spec mu-046 INV-11). Do NOT
+            // advise a blind retry: pending commands were journaled
+            // and may have EXECUTED — only their result envelopes are
+            // gone.
+            Err(LaneTerminated::SlowConsumer { dropped_ephemeral }) => {
+                tracing::error!(
+                    origin = ?lane.origin(),
+                    dropped_ephemeral,
+                    "MCP connection disconnected as a slow consumer (outbound lane \
+                     overflowed; spec mu-046 INV-11)"
+                );
+                break "MCP connection disconnected as a slow consumer (outbound lane \
+                       overflowed); any in-flight tool RESULT was lost, but the calls \
+                       themselves may have executed — the command journal and its \
+                       receipts are the source of truth; check daemon state before \
+                       retrying anything non-idempotent"
+                    .to_string();
+            }
+        }
+    };
+    // Order matters: reason first, then drop the waiters, so an
+    // invocation woken by its dropped waiter reads Some(reason).
+    *McpDemux::lock(&demux.terminal) = Some(reason);
+    McpDemux::lock(&demux.waiters).clear();
 }
 
 fn extract_result(response: Response<Value>) -> Result<Value, String> {
@@ -696,6 +832,9 @@ mod tests {
         sessions: Sessions,
         daemon_info: DaemonInfo,
         control: Arc<ControlPlane>,
+        /// Producer handle on the daemon-wide outbound router (WP9) —
+        /// lets tests inject broadcast envelopes at MCP lanes.
+        outbound: Router,
         client: rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
         _server: tokio::task::JoinHandle<()>,
     }
@@ -736,7 +875,7 @@ mod tests {
             sessions.clone(),
             daemon_info.daemon_id().to_string(),
         ));
-        let outbound = OutboundStream::new();
+        let outbound = Router::new();
         let control = Arc::new(pipeline::spawn_control_plane(
             journal,
             pipeline::PipelineCtx {
@@ -756,6 +895,7 @@ mod tests {
             let sessions = sessions.clone();
             let daemon_info = daemon_info.clone();
             let control = control.clone();
+            let outbound = outbound.clone();
             tokio::spawn(async move {
                 let _ = serve_mcp_socket(
                     socket_path,
@@ -785,6 +925,7 @@ mod tests {
             sessions,
             daemon_info,
             control,
+            outbound,
             client,
             _server: server,
         }
@@ -1120,6 +1261,85 @@ mod tests {
                 JournalPayload::CommandRejected { command_seq, stage: RejectStage::Routing, .. }
                     if *command_seq == seq)),
             "routing rejection is a receipt: {records:?}"
+        );
+    }
+
+    // ─── spec mu-046 WP9: per-connection lane + demux ───────────────
+
+    /// Two interleaved invocations on ONE connection demux correctly:
+    /// each registers its own waiter keyed by its synthetic request
+    /// id, and each resolves with its own result.
+    #[tokio::test]
+    async fn interleaved_invocations_demux_by_request_id() {
+        let harness = spawn_harness(open_registry()).await;
+        let (first, second) = tokio::join!(
+            call_tool(&harness, "mu_daemon_info", json!({})),
+            call_tool(&harness, "mu_daemon_info", json!({})),
+        );
+        for result in [first, second] {
+            assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+            let v: Value = serde_json::from_str(&result_text(&result)).expect("result json");
+            assert_eq!(v["daemon_id"], harness.daemon_info.daemon_id());
+        }
+    }
+
+    /// Broadcast (origin-less) envelopes reach MCP lanes and are
+    /// dropped at the demux — the tool surface has no notification
+    /// channel — without confusing response correlation: a tool call
+    /// issued after the broadcast still round-trips.
+    #[tokio::test]
+    async fn broadcast_notifications_dropped_at_demux_without_breaking_calls() {
+        let harness = spawn_harness(open_registry()).await;
+        let broadcast = mu_core::transport::NotificationWriter::broadcast(harness.outbound.clone());
+        broadcast
+            .emit("daemon.announce", json!({"msg": "hello"}))
+            .await
+            .expect("broadcast emit");
+        let result = call_tool(&harness, "mu_daemon_info", json!({})).await;
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+    }
+
+    /// Slow-consumer disconnect at the demux (spec mu-046 INV-11): a
+    /// poisoned lane terminates the demux loop, which records the
+    /// reason and drops every pending waiter — in-flight invocations
+    /// resolve with the journal-is-source-of-truth error instead of
+    /// hanging.
+    #[tokio::test]
+    async fn poisoned_lane_fails_pending_invocations_with_slow_consumer_error() {
+        use mu_core::transport::{Outbound, OutboundEnvelope, LANE_HARD_CAP};
+
+        let router = Router::new();
+        let origin = next_mcp_origin();
+        let lane = router.register(origin.clone());
+        let demux = Arc::new(McpDemux::default());
+        let (tx, rx) = oneshot::channel();
+        demux.register_waiter("mcp-pending".to_string(), tx);
+
+        // Poison the (not-yet-consumed) lane with a durable-only
+        // flood, THEN run the demux: its first recv observes the
+        // poison and it exits through the slow-consumer arm.
+        for n in 0..=LANE_HARD_CAP {
+            router.send(OutboundEnvelope {
+                origin: Some(origin.clone()),
+                request_id: Some(json!(format!("other-{n}"))),
+                command_seq: None,
+                item: Outbound(json!({"jsonrpc": "2.0", "id": n, "result": {}})),
+            });
+        }
+        demux_loop(lane, Arc::clone(&demux)).await;
+
+        assert!(
+            rx.await.is_err(),
+            "pending waiter must be dropped when the demux exits"
+        );
+        let reason = demux.terminal_reason().expect("terminal reason recorded");
+        assert!(
+            reason.contains("slow consumer"),
+            "reason names the policy: {reason}"
+        );
+        assert!(
+            reason.contains("source of truth"),
+            "reason points at the journal: {reason}"
         );
     }
 }

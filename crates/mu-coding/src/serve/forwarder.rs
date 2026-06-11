@@ -192,7 +192,7 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
             bytes_received,
             tool_call_id,
         } => to_pair(
-            "session.provider_status",
+            ProviderStatusEvent::METHOD,
             ProviderStatusEvent {
                 session_id: session_id.to_string(),
                 kind: state,

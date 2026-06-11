@@ -400,11 +400,14 @@ where
             )
         })?,
     );
-    // spec mu-046 INV-8 (WP2): the daemon-wide tagged outbound stream —
-    // the one way bytes leave the daemon. The stdio connection's writer
-    // subscribes inside serve_with_ingest; the pipeline consumer holds
-    // the only other sender clone and drops it on shutdown.
-    let outbound = mu_core::transport::OutboundStream::new();
+    // spec mu-046 INV-8 (WP2) + INV-11 (WP9): the daemon-wide outbound
+    // Router — the one way bytes leave the daemon. Each connection
+    // registers its own ordered egress lane (the stdio connection's
+    // inside serve_with_ingest; MCP connections at accept); tagged
+    // envelopes route to their origin's lane, broadcasts to all. The
+    // pipeline consumer holds a producer clone and drops it on
+    // shutdown, closing the lanes.
+    let outbound = mu_core::transport::Router::new();
     // spec mu-046 INV-3/INV-7 (WP3): the single-writer control-plane
     // consumer. It owns the daemon's session map et al. and exits —
     // releasing them, continuing the shutdown cascade — when the last

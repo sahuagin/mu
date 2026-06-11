@@ -68,8 +68,19 @@ enum Command {
     },
     /// One-shot ask — spawn the daemon, single roundtrip, exit.
     Ask {
-        /// The prompt to send.
-        prompt: String,
+        /// The prompt to send. Omit when using --prompt-file.
+        #[arg(
+            required_unless_present = "prompt_file",
+            conflicts_with = "prompt_file"
+        )]
+        prompt: Option<String>,
+        /// Read the prompt from FILE instead of argv. Required for
+        /// large prompts: a megabyte-scale prompt as a positional
+        /// argument overflows the exec ARG_MAX limit before the
+        /// process can even start (mu-b6tl — observed live when
+        /// ai-review.sh handed a ~1MB review prompt to `mu ask`).
+        #[arg(long = "prompt-file", value_name = "FILE")]
+        prompt_file: Option<std::path::PathBuf>,
         /// Provider backend (forwarded to the spawned `mu serve`).
         #[arg(long, default_value = "faux")]
         provider: String,
@@ -398,6 +409,7 @@ async fn main() -> Result<()> {
         }
         Command::Ask {
             prompt,
+            prompt_file,
             provider,
             model,
             tools,
@@ -414,6 +426,12 @@ async fn main() -> Result<()> {
                     format!("--append-system-prompt: reading {}", path.display())
                 })?),
                 None => None,
+            };
+            // clap enforces exactly one of prompt / --prompt-file.
+            let prompt = match prompt_file {
+                Some(path) => std::fs::read_to_string(&path)
+                    .with_context(|| format!("--prompt-file: reading {}", path.display()))?,
+                None => prompt.expect("clap: prompt required unless --prompt-file"),
             };
             mu_coding::ask::run(mu_coding::ask::AskOptions {
                 prompt,

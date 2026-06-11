@@ -77,10 +77,28 @@
 #     MU_REVIEW_SYSTEM_PROMPT   reviewer system-prompt file (default: ai-review-system-prompt.txt)
 #     MU_REVIEW_LOG             event log (default: ~/.local/share/mu/review-events.jsonl)
 #     MU_REVIEW_NO_COLOR        disable color
+#   Chunked mode (review-gate v2 — beads mu-ja1x overflow detection, mu-u1it fan-out):
+#     MU_REVIEW_SINGLE_SHOT_MAX_BYTES  cap on the assembled single-shot prompt, bytes
+#                               (default 300000 ≈ 85k tokens at ~3.5 bytes/token —
+#                               fits every panel model with headroom). At or under
+#                               the cap the calibrated panel above runs untouched;
+#                               over it the review is CHUNKED: one findings-only
+#                               leaf per commit (primary 1's provider/model), then
+#                               one synthesis verdict over all findings.
+#     MU_REVIEW_HEAD            head rev of the review range (default: @ under jj,
+#                               HEAD under git). Pins BASE..HEAD so a branch other
+#                               than the checkout can be reviewed without moving
+#                               the working copy. When set, full-file context is
+#                               skipped (on-disk files belong to @, not HEAD).
+#     MU_REVIEW_SYNTH_PROVIDER  synthesis provider (default: primary 2's)
+#     MU_REVIEW_SYNTH_MODEL     synthesis model    (default: primary 2's)
 #
 # The log carries every reviewer's verdict: one {"event":"reviewer",...} line per
 # reviewer that RAN plus one {"event":"panel",...} summary with the outcome and all
-# three slots (r3_verdict is "" when the tiebreaker did not run).
+# three slots (r3_verdict is "" when the tiebreaker did not run). The panel line
+# carries "mode":"single_shot"|"chunked" so dashboards can tell the paths apart.
+# Chunked mode additionally writes one {"event":"leaf",...} line per leaf that
+# returned usable findings and one {"event":"leaf_error",...} per leaf that did not.
 
 set -u
 set -o pipefail
@@ -104,6 +122,11 @@ PROVIDER3="${MU_REVIEW_PROVIDER_3:-anthropic-api}"
 MODEL3="${MU_REVIEW_MODEL_3:-claude-sonnet-4-6}"
 TOOLS="${MU_REVIEW_TOOLS:-}"   # empty = single-shot (default); e.g. "read,grep" lets the reviewer inspect surrounding code (slower, multi-turn)
 BASE="${MU_REVIEW_BASE:-main}"
+# Chunked-mode knobs (v2). Synthesis defaults to primary 2: the strong/cheap
+# frontier lane is the right place for the one cross-commit judgement call.
+SS_MAX="${MU_REVIEW_SINGLE_SHOT_MAX_BYTES:-300000}"
+SYNTH_PROVIDER="${MU_REVIEW_SYNTH_PROVIDER:-$PROVIDER2}"
+SYNTH_MODEL="${MU_REVIEW_SYNTH_MODEL:-$MODEL2}"
 # Per-reviewer timeout: 2x a typical Claude response, with room for one ollama
 # reload. The two reviewers run sequentially, so panel wall-clock is up to ~2x.
 TIMEOUT="${MU_REVIEW_TIMEOUT:-600}"
@@ -132,12 +155,27 @@ fi
 cd "$ROOT" || exit 2
 
 # --- the diff to review (jj-aware) -----------------------------------------
+# HEADREV pins the far end of the range (MU_REVIEW_HEAD). The default — @ / HEAD
+# — is byte-equivalent to the old unpinned diff; a pinned head lets the gate
+# review another branch (e.g. a large historical branch, for chunked mode)
+# without touching the working copy.
 if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then
-  DIFF="$(jj diff --from "$BASE" --git 2>/dev/null)"
+  IS_JJ=1
+  HEADREV="${MU_REVIEW_HEAD:-@}"
+  DIFF="$(jj diff --from "$BASE" --to "$HEADREV" --git 2>/dev/null)"
 else
-  DIFF="$(git diff "$BASE"...HEAD 2>/dev/null)"
+  IS_JJ=""
+  HEADREV="${MU_REVIEW_HEAD:-HEAD}"
+  DIFF="$(git diff "$BASE...$HEADREV" 2>/dev/null)"
 fi
-if [ -z "${DIFF//[[:space:]]/}" ]; then
+# All-whitespace check via grep, NOT bash pattern substitution:
+# `${DIFF//[[:space:]]/}` is quadratic in the string length and burned
+# 10+ MINUTES of pure CPU on a ~1MB diff before the first reviewer ever
+# ran (mu-ai-review-quadratic-diff-emptycheck-4v89). Herestring, NOT a
+# `printf | grep -q` pipeline: under `set -o pipefail`, grep -q's
+# early exit SIGPIPEs the printf (status 141) and a NON-empty diff
+# reads as empty.
+if ! grep -q '[^[:space:]]' <<<"$DIFF"; then
   echo "${C_DIM}ai-review: no diff vs $BASE — nothing to review.${C_OFF}"
   exit 0
 fi
@@ -151,8 +189,11 @@ FILES=$(printf '%s\n' "$DIFF" | grep -c '^diff --git ')
 # undefined — it is defined (line 81), just not inside the diff window. Giving
 # them the full files lets them check before reporting. Disable with
 # MU_REVIEW_FULL_FILES=0; cap appended bytes with MU_REVIEW_CONTEXT_MAX_BYTES.
+# Skipped when MU_REVIEW_HEAD is set: the on-disk files belong to the working
+# copy, not the pinned head — appending them would hand reviewers the WRONG
+# definitions (worse than none).
 CONTEXT=""
-if [ "${MU_REVIEW_FULL_FILES:-1}" = "1" ]; then
+if [ "${MU_REVIEW_FULL_FILES:-1}" = "1" ] && [ -z "${MU_REVIEW_HEAD:-}" ]; then
   while IFS= read -r _f; do
     case "$_f" in ""|/dev/null) continue ;; esac   # skip blanks + pure deletions
     [ -f "$_f" ] || continue
@@ -180,9 +221,13 @@ EOF_CTX
 fi
 
 # --- reviewer client = freshly-built mu, never the (possibly stale) installed one
+# Prefer the DEBUG binary: it is the one the build line above just
+# refreshed. Preferring release here once handed the panel a weeks-old
+# release build that lacked a flag the script passed — every reviewer
+# died at clap with UNCLEAR (2026-06-11). Release is only a fallback.
 cargo build --bin mu -q 2>/dev/null || true
-if   [ -x ./target/release/mu ]; then MU=./target/release/mu
-elif [ -x ./target/debug/mu ];   then MU=./target/debug/mu
+if   [ -x ./target/debug/mu ];   then MU=./target/debug/mu
+elif [ -x ./target/release/mu ]; then MU=./target/release/mu
 else MU="$(command -v mu || true)"; fi
 [ -n "${MU:-}" ] || { echo "${C_RED}ai-review: no mu binary found${C_OFF}" >&2; exit 2; }
 
@@ -204,19 +249,28 @@ DIFF:
 $DIFF
 $CONTEXT"
 
-run_review() { # $1=provider $2=model — prints reviewer stdout; stderr -> $ERRLOG
+# The prompt goes to `mu ask` via --prompt-file, NEVER argv: a
+# megabyte-scale prompt as an exec argument overflows ARG_MAX and the
+# reviewer dies before it starts ("/bin/timeout: Argument list too
+# long" — mu-b6tl, observed live on a ~1MB review prompt 2026-06-11).
+PROMPT_FILE="$(mktemp "${TMPDIR:-/tmp}/ai-review-prompt.XXXXXX")"
+trap 'rm -f "$PROMPT_FILE"' EXIT
+printf '%s' "$PROMPT" > "$PROMPT_FILE"
+
+run_review() { # $1=provider $2=model [$3=prompt-file, default $PROMPT_FILE] — prints reviewer stdout; stderr -> $ERRLOG
   # The reviewer session must be hermetic: --bare (PR #187) guarantees
   # mu injects nothing — no session-start memory/project-file recall,
   # no discovery bootstrap — so the session's system prompt is exactly
   # the minimal reviewer prompt below (and nothing at all if the file
   # is missing). Replaces the MU_NO_RECALL=1 env spelling from #185.
   # shellcheck disable=SC2086 — $SYS_FLAGS intentionally word-splits
+  local PF="${3:-$PROMPT_FILE}"   # chunked mode passes leaf/synthesis prompt files
   SYS_FLAGS=""
   [ -r "$SYSPROMPT" ] && SYS_FLAGS="--append-system-prompt $SYSPROMPT"
   if [ -n "$TOOLS" ]; then
-    timeout "$TIMEOUT" "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS --tools "$TOOLS" "$PROMPT" 2>>"$ERRLOG"
+    timeout "$TIMEOUT" "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS --tools "$TOOLS" --prompt-file "$PF" 2>>"$ERRLOG"
   else
-    timeout "$TIMEOUT" "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS "$PROMPT" 2>>"$ERRLOG"
+    timeout "$TIMEOUT" "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS --prompt-file "$PF" 2>>"$ERRLOG"
   fi
 }
 verdict_of() { # stdin -> APPROVE | REJECT | UNCLEAR
@@ -264,13 +318,305 @@ log_panel() { # $1=outcome(PASS|BLOCK|ESCALATE) $2=override(true|false)
   # Carries all three slots. r3_verdict is "" when the tiebreaker did not run
   # (the primaries agreed) — dashboards detect a tiebreak by r3_verdict != "".
   mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
-  printf '{"ts":"%s","event":"panel","outcome":"%s","r1_provider":"%s","r1_model":"%s","r1_verdict":"%s","r2_provider":"%s","r2_model":"%s","r2_verdict":"%s","r3_provider":"%s","r3_model":"%s","r3_verdict":"%s","base":"%s","files_changed":%s,"override":%s}\n' \
+  printf '{"ts":"%s","event":"panel","mode":"single_shot","outcome":"%s","r1_provider":"%s","r1_model":"%s","r1_verdict":"%s","r2_provider":"%s","r2_model":"%s","r2_verdict":"%s","r3_provider":"%s","r3_model":"%s","r3_verdict":"%s","base":"%s","files_changed":%s,"override":%s}\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" \
     "$(json_escape "$PROVIDER")"  "$(json_escape "$MODEL")"  "$(json_escape "$V1")" \
     "$(json_escape "$PROVIDER2")" "$(json_escape "$MODEL2")" "$(json_escape "$V2")" \
     "$(json_escape "$PROVIDER3")" "$(json_escape "$MODEL3")" "$(json_escape "$V3")" \
     "$(json_escape "$BASE")" "$FILES" "$2" >> "$LOG"
 }
+
+# ── CHUNKED MODE (review-gate v2: beads mu-ja1x, mu-u1it) ───────────────────
+#
+# WHY: the single-shot panel dies on large branches — a ~1MB/12-commit branch
+# overflowed every reviewer's context (one emitted 2 characters), and
+# overflow-UNCLEAR is indistinguishable from substantive disagreement. So when
+# the assembled single-shot prompt exceeds $SS_MAX the review splits BY COMMIT,
+# never by file: a commit carries the author's stated intent, and review checks
+# change-against-claim — a bare file slice has no claim attached. Each LEAF
+# (primary 1: cheap, local) reports FINDINGS ONLY, no verdict; one SYNTHESIS
+# pass (primary 2's lane: strong, cross-cutting) judges which findings are real
+# and whether they interact across commits, and its verdict IS the gate verdict
+# — the leaves are its eyes; no second panel vote in v1. A commit whose lone
+# diff exceeds the cap is split per-file (same message, one file's diff per
+# leaf). Failure honesty: a leaf that errors/times out/breaks the contract is
+# logged as leaf_error and shown to synthesis as UNREVIEWED; if >1/3 of leaves
+# fail, synthesis is SKIPPED and the gate ESCALATEs — it must not approve a
+# mostly-unreviewed branch.
+
+leaf_findings() { # stdin = raw leaf output -> <=5 FINDING| lines, or NO_FINDINGS, or "" (unusable)
+  # Tolerate leading whitespace/markdown bullets around contract lines, but
+  # nothing looser: output with neither token is unusable and the caller
+  # records a leaf_error rather than guessing.
+  local out f
+  out="$(cat)"
+  f="$(printf '%s\n' "$out" | sed -n 's/^[^A-Za-z]*\(FINDING|.*\)$/\1/p' | head -n 5)"
+  if [ -n "$f" ]; then printf '%s\n' "$f"; return 0; fi
+  if printf '%s' "$out" | grep -q 'NO_FINDINGS'; then echo NO_FINDINGS; fi
+  return 0
+}
+
+log_leaf() { # $1=commit $2=unit-label $3=findings-count
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+  printf '{"ts":"%s","event":"leaf","commit":"%s","unit":"%s","provider":"%s","model":"%s","findings":%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(json_escape "$1")" "$(json_escape "$2")" \
+    "$(json_escape "$PROVIDER")" "$(json_escape "$MODEL")" "$3" >> "$LOG"
+}
+
+log_leaf_error() { # $1=commit $2=unit-label $3=reason
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+  printf '{"ts":"%s","event":"leaf_error","commit":"%s","unit":"%s","provider":"%s","model":"%s","reason":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(json_escape "$1")" "$(json_escape "$2")" \
+    "$(json_escape "$PROVIDER")" "$(json_escape "$MODEL")" "$(json_escape "$3")" >> "$LOG"
+}
+
+log_panel_chunked() { # $1=outcome $2=override $3=synth-verdict $4=leaves $5=leaf-errors
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+  printf '{"ts":"%s","event":"panel","mode":"chunked","outcome":"%s","leaf_provider":"%s","leaf_model":"%s","leaves":%s,"leaf_errors":%s,"synth_provider":"%s","synth_model":"%s","synth_verdict":"%s","base":"%s","head":"%s","files_changed":%s,"override":%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" \
+    "$(json_escape "$PROVIDER")" "$(json_escape "$MODEL")" "$4" "$5" \
+    "$(json_escape "$SYNTH_PROVIDER")" "$(json_escape "$SYNTH_MODEL")" "$(json_escape "$3")" \
+    "$(json_escape "$BASE")" "$(json_escape "$HEADREV")" "$FILES" "$2" >> "$LOG"
+}
+
+review_leaf() { # $1=commit $2=short-id $3=unit-label ("" = whole commit) $4=message $5=diff
+  # Runs ONE leaf and folds its result into the caller's (run_chunked's)
+  # accumulators — leaves/failed/findings_total/SYNTH_FINDINGS via bash
+  # dynamic scoping, same pattern as verify_claims_step in pre-pr-check.sh.
+  local c="$1" cshort="$2" unit="${3:-commit $2}" msg="$4" d="$5"
+  leaves=$((leaves + 1))
+  echo "${C_DIM}── leaf $leaves: $unit ($PROVIDER/$MODEL) ─────────────────${C_OFF}"
+  {
+    printf '%s\n' "You are one LEAF of a chunked pre-PR review: the branch is too large for a single review, so each commit is reviewed in isolation against its own stated intent, and a separate synthesis pass renders the verdict. Review ONLY the diff below for: correctness bugs; concurrency / lifecycle hazards; missing error handling; safeguards that nearby code in the diff applies but this change omits; and mismatches between the commit message's claims and the change. You see one unit — the branch context is orientation only; do NOT raise findings about code you cannot see, and do NOT call any tools."
+    printf '%s\n' ""
+    printf '%s\n' "Output contract (STRICT):"
+    printf '%s\n' "- One line per finding: FINDING|<blocker|should-fix|note>|<file>|<one-line claim>"
+    printf '%s\n' "- At most 5 findings, highest severity first; omit low-confidence concerns."
+    printf '%s\n' "- If there is nothing worth reporting, output the single line: NO_FINDINGS"
+    printf '%s\n' "- NO verdict line, NO narration, NOTHING else."
+    printf '%s\n' ""
+    printf '%s\n' "BRANCH COMMITS (orientation; you are reviewing $unit):"
+    printf '%s\n' "$COMMIT_LIST"
+    printf '%s\n' "TOTAL BRANCH DIFFSTAT:"
+    printf '%s\n' "$DIFFSTAT"
+    printf '%s\n' "UNIT UNDER REVIEW: $unit"
+    printf '%s\n' "COMMIT MESSAGE:"
+    printf '%s\n' "$msg"
+    printf '%s\n' ""
+    printf '%s\n' "DIFF:"
+    printf '%s\n' "$d"
+  } > "$LEAF_FILE"
+  local out rc f
+  out="$(run_review "$PROVIDER" "$MODEL" "$LEAF_FILE")"; rc=$?
+  f="$(printf '%s' "$out" | leaf_findings)"
+  if [ "$rc" -eq 124 ] || [ -z "$f" ]; then
+    # mu ask's exit code is not load-bearing (mu-qc08) — only timeout's 124 is
+    # trusted; otherwise "failed" means the output carried no contract lines.
+    local reason="no contract output"
+    [ "$rc" -eq 124 ] && reason="timeout after ${TIMEOUT}s"
+    failed=$((failed + 1))
+    log_leaf_error "$c" "$unit" "$reason"
+    echo "${C_YEL}  → leaf FAILED ($reason) — recorded as unreviewed. stderr: $ERRLOG${C_OFF}"
+    SYNTH_FINDINGS="$SYNTH_FINDINGS
+$unit: REVIEW FAILED — treat as unreviewed"
+    return 0
+  fi
+  local n=0
+  [ "$f" != "NO_FINDINGS" ] && n="$(printf '%s\n' "$f" | grep -c .)"
+  findings_total=$((findings_total + n))
+  log_leaf "$c" "$unit" "$n"
+  printf '%s\n' "$f"
+  echo "${C_DIM}  → leaf $leaves: $n finding(s)${C_OFF}"
+  SYNTH_FINDINGS="$SYNTH_FINDINGS
+$unit — $(printf '%s' "$msg" | head -n 1):
+$f"
+}
+
+run_chunked() { # never returns — exits with the gate verdict
+  local LEAF_FILE SYNTH_FILE
+  LEAF_FILE="$(mktemp "${TMPDIR:-/tmp}/ai-review-leaf.XXXXXX")"
+  SYNTH_FILE="$(mktemp "${TMPDIR:-/tmp}/ai-review-synth.XXXXXX")"
+  trap 'rm -f "$PROMPT_FILE" "$LEAF_FILE" "$SYNTH_FILE"' EXIT
+
+  local ov=false
+  [ "${MU_REVIEW_OVERRIDE:-}" = "1" ] && ov=true
+
+  # Commits oldest-first — later leaves' "orientation" list reads naturally and
+  # synthesis sees the branch as the author built it. Empty commits carry no
+  # reviewable change (jj filters in the revset; git path re-checks per diff).
+  local commits
+  if [ -n "$IS_JJ" ]; then
+    commits="$(jj log -r "$BASE..$HEADREV ~ empty()" --no-graph --reversed -T 'commit_id ++ "\n"' 2>/dev/null)"
+  else
+    commits="$(git rev-list --reverse "$BASE..$HEADREV" 2>/dev/null)"
+  fi
+  if ! grep -q '[^[:space:]]' <<<"$commits"; then
+    echo "${C_RED}ai-review: chunked mode found no commits in $BASE..$HEADREV — cannot review${C_OFF}" >&2
+    exit 2
+  fi
+
+  # Ambient context every leaf gets: the branch's whole shape, cheaply.
+  if [ -n "$IS_JJ" ]; then
+    COMMIT_LIST="$(jj log -r "$BASE..$HEADREV" --no-graph --reversed -T 'commit_id.short() ++ " " ++ description.first_line() ++ "\n"' 2>/dev/null)"
+    DIFFSTAT="$(jj diff --from "$BASE" --to "$HEADREV" --stat 2>/dev/null | tail -c 6000)"
+  else
+    COMMIT_LIST="$(git log --reverse --format='%h %s' "$BASE..$HEADREV" 2>/dev/null)"
+    DIFFSTAT="$(git diff --stat "$BASE...$HEADREV" 2>/dev/null | tail -c 6000)"
+  fi
+
+  local n_commits
+  n_commits="$(printf '%s\n' "$commits" | grep -c .)"
+  echo "${C_DIM}ai-review: CHUNKED mode — single-shot prompt ${PROMPT_BYTES}B > cap ${SS_MAX}B; $n_commits commit(s) in $BASE..$HEADREV. Leaves: $PROVIDER/$MODEL, synthesis: $SYNTH_PROVIDER/$SYNTH_MODEL.${C_OFF}"
+
+  local leaves=0 failed=0 findings_total=0
+  local SYNTH_FINDINGS="" ALL_MSGS=""
+  local c cshort msg cdiff
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    cshort="${c:0:12}"
+    if [ -n "$IS_JJ" ]; then
+      msg="$(jj log -r "$c" --no-graph -T description 2>/dev/null)"
+      cdiff="$(jj diff -r "$c" --git 2>/dev/null)"
+    else
+      msg="$(git log -1 --format=%B "$c" 2>/dev/null)"
+      cdiff="$(git show --format= "$c" 2>/dev/null)"
+    fi
+    ALL_MSGS="$ALL_MSGS
+$msg"
+    grep -q '[^[:space:]]' <<<"$cdiff" || continue
+    if [ "$(printf '%s' "$cdiff" | wc -c)" -le "$SS_MAX" ]; then
+      review_leaf "$c" "$cshort" "" "$msg" "$cdiff"
+    else
+      # One commit alone exceeds the cap: split per-file. The commit message
+      # (the claim) rides along on every slice so each leaf still reviews
+      # change-against-claim; the label tells it which slice it holds.
+      local files nf i f fdiff
+      files="$(printf '%s\n' "$cdiff" | sed -n 's#^diff --git a/.* b/##p')"
+      nf="$(printf '%s\n' "$files" | grep -c .)"
+      i=0
+      while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        i=$((i + 1))
+        if [ -n "$IS_JJ" ]; then
+          fdiff="$(jj diff -r "$c" --git -- "$f" 2>/dev/null)"
+        else
+          fdiff="$(git show --format= "$c" -- "$f" 2>/dev/null)"
+        fi
+        if [ "$(printf '%s' "$fdiff" | wc -c)" -gt "$SS_MAX" ]; then
+          fdiff="$(printf '%s' "$fdiff" | head -c "$SS_MAX")
+[diff truncated at ${SS_MAX} bytes]"
+        fi
+        review_leaf "$c" "$cshort" "file $i/$nf of commit $cshort: $f" "$msg" "$fdiff"
+      done <<<"$files"
+    fi
+  done <<<"$commits"
+
+  echo "${C_DIM}ai-review: $leaves leaf review(s) done — $findings_total finding(s), $failed failure(s)${C_OFF}"
+
+  # Failure honesty: with >1/3 of leaves unreviewed, a synthesis verdict would
+  # rest mostly on blind spots — name the infra failure and escalate instead.
+  if [ "$failed" -gt 0 ] && [ $((failed * 3)) -gt "$leaves" ]; then
+    if [ "$ov" = true ]; then
+      log_panel_chunked ESCALATE true "" "$leaves" "$failed"
+      echo "${C_YEL}ai-review: CHUNKED ESCALATE ($failed/$leaves leaf reviews failed) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
+      exit 0
+    fi
+    log_panel_chunked ESCALATE false "" "$leaves" "$failed"
+    echo "${C_YEL}ai-review: CHUNKED ESCALATE — $failed of $leaves leaf reviews FAILED (leaf provider/infra fault, not a review opinion; check $ERRLOG). Synthesis skipped: it must not approve a mostly-unreviewed branch.${C_OFF}" >&2
+    echo "${C_DIM}  Fix the leaf lane ($PROVIDER/$MODEL) and re-run, or set MU_REVIEW_OVERRIDE=1 once you've adjudicated.${C_OFF}" >&2
+    exit 3
+  fi
+
+  # Spec inclusion: a commit that references a spec is judged against it. Read
+  # from HEADREV, not the working copy — the spec usually lands IN the branch
+  # under review, and @'s tree may predate (or postdate) it.
+  local spec_ids spec_text="" id sf matches content
+  spec_ids="$(printf '%s\n' "$ALL_MSGS" | grep -oE 'mu-[0-9]{3}' | sort -u || true)"
+  for id in $spec_ids; do
+    if [ -n "$IS_JJ" ]; then
+      matches="$(jj file list -r "$HEADREV" -- specs/ 2>/dev/null | grep -E "^specs/${id}-[^/]*\.md$" || true)"
+    else
+      matches="$(git ls-tree -r --name-only "$HEADREV" -- specs/ 2>/dev/null | grep -E "^specs/${id}-[^/]*\.md$" || true)"
+    fi
+    for sf in $matches; do
+      if [ -n "$IS_JJ" ]; then
+        content="$(jj file show -r "$HEADREV" -- "$sf" 2>/dev/null)"
+      else
+        content="$(git show "$HEADREV:$sf" 2>/dev/null)"
+      fi
+      spec_text="$spec_text
+
+===== SPEC: $sf =====
+$content"
+    done
+  done
+  if [ -n "$spec_text" ] && [ "$(printf '%s' "$spec_text" | wc -c)" -gt 60000 ]; then
+    spec_text="$(printf '%s' "$spec_text" | head -c 60000)
+[spec context truncated at 60000 bytes]"
+  fi
+
+  echo "${C_DIM}── synthesis: $SYNTH_PROVIDER/$SYNTH_MODEL ─────────────────────${C_OFF}"
+  {
+    printf '%s\n' "You are the SYNTHESIS reviewer of a chunked pre-PR review. The branch was too large for one review, so each commit was reviewed in isolation by a leaf reviewer; their findings are below, verbatim, in the form FINDING|<severity>|<file>|<claim>. You hold the only branch-wide view: judge which findings are REAL (leaves can be wrong — each saw one commit, and a later commit may already fix what an earlier leaf flagged) and whether any findings INTERACT across commits into a larger hazard no single commit shows. Units marked 'REVIEW FAILED — treat as unreviewed' carry unknown risk; weigh that. If a SPEC section is included, also judge whether the branch delivers what the spec claims."
+    printf '%s\n' ""
+    printf '%s\n' "Output contract:"
+    printf '%s\n' "- Brief judgement on each finding you accept or reject (cite its unit); under 1200 words total."
+    printf '%s\n' "- Your reply's LAST line MUST be exactly 'VERDICT: APPROVE' or 'VERDICT: REJECT' (those literal words). Do not continue after the verdict line."
+    printf '%s\n' ""
+    printf '%s\n' "BRANCH COMMITS (oldest first):"
+    printf '%s\n' "$COMMIT_LIST"
+    printf '%s\n' "TOTAL BRANCH DIFFSTAT:"
+    printf '%s\n' "$DIFFSTAT"
+    printf '%s\n' "$spec_text"
+    printf '%s\n' ""
+    printf '%s\n' "LEAF FINDINGS ($leaves units, $failed unreviewed):"
+    printf '%s\n' "$SYNTH_FINDINGS"
+  } > "$SYNTH_FILE"
+
+  local SREV SV
+  SREV="$(run_review "$SYNTH_PROVIDER" "$SYNTH_MODEL" "$SYNTH_FILE")"
+  printf '%s\n' "$SREV"
+  SV="$(printf '%s' "$SREV" | verdict_of)"
+  log_reviewer synth "$SYNTH_PROVIDER" "$SYNTH_MODEL" "$SV"
+  echo "${C_DIM}  → synthesis ($SYNTH_MODEL): $SV${C_OFF}"
+
+  # Synthesis verdict IS the gate verdict (single reviewer; the leaves are its
+  # eyes). Outcome/override/exit semantics mirror the single-shot panel.
+  if [ "$SV" = APPROVE ]; then
+    log_panel_chunked PASS false "$SV" "$leaves" "$failed"
+    echo "${C_GREEN}ai-review: CHUNKED PASS — synthesis APPROVE over $leaves leaf review(s) ($findings_total finding(s), $failed unreviewed).${C_OFF}"
+    exit 0
+  fi
+  if [ "$SV" = REJECT ]; then
+    if [ "$ov" = true ]; then
+      log_panel_chunked BLOCK true "$SV" "$leaves" "$failed"
+      echo "${C_YEL}ai-review: CHUNKED BLOCK (synthesis $SYNTH_MODEL=REJECT) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
+      exit 0
+    fi
+    log_panel_chunked BLOCK false "$SV" "$leaves" "$failed"
+    echo "${C_RED}ai-review: CHUNKED BLOCK — synthesis $SYNTH_MODEL=REJECT over $leaves leaf review(s). Set MU_REVIEW_OVERRIDE=1 to proceed if you disagree.${C_OFF}" >&2
+    exit 1
+  fi
+  # Synthesis returned no verdict: nothing decided the gate — operator's call.
+  if [ "$ov" = true ]; then
+    log_panel_chunked ESCALATE true "$SV" "$leaves" "$failed"
+    echo "${C_YEL}ai-review: CHUNKED ESCALATE (synthesis UNCLEAR) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
+    exit 0
+  fi
+  log_panel_chunked ESCALATE false "$SV" "$leaves" "$failed"
+  echo "${C_YEL}ai-review: CHUNKED ESCALATE — synthesis $SYNTH_MODEL returned no verdict (check $ERRLOG). Set MU_REVIEW_OVERRIDE=1 to proceed once you've adjudicated.${C_OFF}" >&2
+  exit 3
+}
+
+# ── MODE GATE (mu-ja1x): chunk only when the single-shot prompt cannot fit ──
+# Bytes, not tokens: bytes/3.5 ≈ tokens, so the 300000B default ≈ 85k tokens —
+# inside every panel model's window with headroom. At or under the cap the
+# calibrated single-shot panel below runs EXACTLY as before (do not perturb
+# it); over the cap, run_chunked() takes over and exits with the gate verdict.
+PROMPT_BYTES=$(( $(printf '%s' "$PROMPT" | wc -c) ))
+if [ "$PROMPT_BYTES" -gt "$SS_MAX" ]; then
+  run_chunked
+fi
 
 # --- run the panel: two primaries, same diff, sequentially -----------------
 echo "${C_DIM}ai-review: PANEL reviewing $FILES file(s) vs $BASE — primaries: $PROVIDER/$MODEL + $PROVIDER2/$MODEL2 (tiebreaker $PROVIDER3/$MODEL3 on split)${C_OFF}"

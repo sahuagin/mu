@@ -13,7 +13,7 @@ use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
 use crate::serve::daemon_info::DaemonInfo;
 use crate::serve::sessions::Sessions;
 
-use super::to_value_or_null;
+use super::{ok_or_respond, some_or_respond, to_value_or_null};
 
 /// `peer.hello` — A asks B for a peer handle. v1 policy: accept any
 /// same-daemon peer whose `want.method` is `"mailbox.post"`. The
@@ -25,16 +25,12 @@ pub fn handle_peer_hello(
     sessions: Sessions,
     _daemon_info: DaemonInfo,
 ) -> Response<Value> {
-    let params: PeerHelloRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("peer.hello: invalid params: {e}"),
-            );
-        }
-    };
+    let params: PeerHelloRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "peer.hello: invalid params"
+    );
 
     // Target must exist.
     let mailbox = match sessions.mailbox(&params.to_session_id) {
@@ -86,27 +82,19 @@ pub async fn handle_mailbox_post(
     notif: NotificationWriter,
     daemon_info: DaemonInfo,
 ) -> Response<Value> {
-    let params: MailboxPostRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("mailbox.post: invalid params: {e}"),
-            );
-        }
-    };
+    let params: MailboxPostRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "mailbox.post: invalid params"
+    );
 
-    let target_mailbox = match sessions.mailbox(&params.to_session_id) {
-        Some(m) => m,
-        None => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("session not found: {}", params.to_session_id),
-            );
-        }
-    };
+    let target_mailbox = some_or_respond!(
+        sessions.mailbox(&params.to_session_id),
+        request.id,
+        codes::INVALID_PARAMS,
+        format!("session not found: {}", params.to_session_id)
+    );
 
     // Authorization: require a valid peer handle issued by target.
     // Note: same-daemon trust intentionally NOT applied here — even
@@ -141,18 +129,14 @@ pub async fn handle_mailbox_post(
         );
     }
 
-    let log = match sessions.event_log(&params.to_session_id) {
-        Some(l) => l,
-        None => {
-            // Race: session vanished between `mailbox()` and now.
-            // Treat as "session not found."
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                "mailbox.post: target session no longer exists".to_string(),
-            );
-        }
-    };
+    // On None: race — session vanished between `mailbox()` and now.
+    // Treat as "session not found."
+    let log = some_or_respond!(
+        sessions.event_log(&params.to_session_id),
+        request.id,
+        codes::INVALID_PARAMS,
+        "mailbox.post: target session no longer exists".to_string()
+    );
 
     let seq = target_mailbox.allocate_seq();
     // EventActor for a peer-originated post: the daemon mediated the
@@ -228,27 +212,19 @@ pub async fn handle_mailbox_post(
 /// log: posts minus consumed. Self-access (a session listing its own
 /// mailbox) doesn't require a handle; cross-session listing does.
 pub fn handle_mailbox_list(request: Request<Value>, sessions: Sessions) -> Response<Value> {
-    let params: MailboxListRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("mailbox.list: invalid params: {e}"),
-            );
-        }
-    };
+    let params: MailboxListRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "mailbox.list: invalid params"
+    );
 
-    let log = match sessions.event_log(&params.session_id) {
-        Some(l) => l,
-        None => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("session not found: {}", params.session_id),
-            );
-        }
-    };
+    let log = some_or_respond!(
+        sessions.event_log(&params.session_id),
+        request.id,
+        codes::INVALID_PARAMS,
+        format!("session not found: {}", params.session_id)
+    );
 
     let messages = project_mailbox(&log, params.since_seq, params.include_consumed);
     ok_response(
@@ -260,27 +236,19 @@ pub fn handle_mailbox_list(request: Request<Value>, sessions: Sessions) -> Respo
 /// `mailbox.read` — fetch a single message's full view by seq.
 /// Self-access doesn't require a handle; cross-session read does.
 pub fn handle_mailbox_read(request: Request<Value>, sessions: Sessions) -> Response<Value> {
-    let params: MailboxReadRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("mailbox.read: invalid params: {e}"),
-            );
-        }
-    };
+    let params: MailboxReadRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "mailbox.read: invalid params"
+    );
 
-    let log = match sessions.event_log(&params.session_id) {
-        Some(l) => l,
-        None => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("session not found: {}", params.session_id),
-            );
-        }
-    };
+    let log = some_or_respond!(
+        sessions.event_log(&params.session_id),
+        request.id,
+        codes::INVALID_PARAMS,
+        format!("session not found: {}", params.session_id)
+    );
 
     let message = project_mailbox(&log, None, true)
         .into_iter()
@@ -296,27 +264,19 @@ pub fn handle_mailbox_read(request: Request<Value>, sessions: Sessions) -> Respo
 /// already-consumed seq is silently skipped; the response reports
 /// how many transitioned.
 pub fn handle_mailbox_consume(request: Request<Value>, sessions: Sessions) -> Response<Value> {
-    let params: MailboxConsumeRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("mailbox.consume: invalid params: {e}"),
-            );
-        }
-    };
+    let params: MailboxConsumeRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "mailbox.consume: invalid params"
+    );
 
-    let log = match sessions.event_log(&params.session_id) {
-        Some(l) => l,
-        None => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("session not found: {}", params.session_id),
-            );
-        }
-    };
+    let log = some_or_respond!(
+        sessions.event_log(&params.session_id),
+        request.id,
+        codes::INVALID_PARAMS,
+        format!("session not found: {}", params.session_id)
+    );
 
     // Compute current consumed-set and posted-set from the log to
     // skip duplicates / unknowns.

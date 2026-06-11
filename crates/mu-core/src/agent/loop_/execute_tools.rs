@@ -293,7 +293,7 @@ pub(crate) async fn handle_execute_tools(
                                 }
                                 return Err(Outcome::OutstandingCancelled { reason });
                             }
-                            Some(AgentInput::UserMessage(_))
+                            Some(AgentInput::UserMessage(..))
                             | Some(AgentInput::StartAutonomous { .. })
                             | Some(AgentInput::ScheduleWakeup { .. })
                             | Some(AgentInput::SwitchProvider { .. })
@@ -432,7 +432,7 @@ pub(crate) async fn handle_execute_tools(
                                     let _ = cancel_tx.send(());
                                     return Err(Outcome::OutstandingCancelled { reason });
                                 }
-                                Some(input @ AgentInput::UserMessage(_))
+                                Some(input @ AgentInput::UserMessage(..))
                                 | Some(input @ AgentInput::StartAutonomous { .. })
                                 | Some(input @ AgentInput::ScheduleWakeup { .. })
                                 | Some(input @ AgentInput::SwitchProvider { .. })

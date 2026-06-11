@@ -193,7 +193,13 @@ pub fn derive_status_from_events(
             // or a live-head attach (resume) — neither is
             // session-status-driving.
             | EventPayload::Tombstone { .. }
-            | EventPayload::HeadAttached { .. } => {}
+            | EventPayload::HeadAttached { .. }
+            // spec mu-046: command/receipt records are border
+            // bookkeeping, not session-status-driving.
+            | EventPayload::CommandReceived { .. }
+            | EventPayload::CommandSucceeded { .. }
+            | EventPayload::CommandFailed { .. }
+            | EventPayload::CommandRejected { .. } => {}
         }
         last_kind = Some(&ev.payload);
     }

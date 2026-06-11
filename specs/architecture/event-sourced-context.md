@@ -5,7 +5,7 @@
 | doc_id     | architecture/event-sourced-context             |
 | status     | architecture breadcrumb (no immediate impl)    |
 | created    | 2026-05-10                                     |
-| updated    | 2026-05-10                                     |
+| updated    | 2026-06-10                                     |
 | authors    | tcovert + claude (cooperating sessions)        |
 | supersedes | none                                           |
 
@@ -860,6 +860,63 @@ historical — `messages` remains canonical session state, but what
 goes on the wire is the rendered, cache-annotated rope projection,
 per this spec's thesis.
 
+## The border: command journal and pipelines (mu-046)
+
+The sections above treat the log as the substrate *inside* a
+session. mu-046 extends the same discipline to the daemon's border:
+**mu controls its border, not the world.** External UIs bring
+themselves (JSON-RPC, MCP); every transport is an adapter producing
+into a single ingest/route seam, and nothing reaches a handler any
+other way. The named pattern: disruptor + event sourcing, with the
+core treated like a matching engine.
+
+```text
+stdio-jrpc adapter ─┐                      ┌→ daemon control-plane pipeline
+MCP adapter        ─┼→ parse → route by ───┤
+(ACP, …: later)    ─┘  session_id          └→ session pipeline (one per session)
+
+each pipeline: journal CommandReceived (fsync) → enqueue → consume
+               [single writer; journal seq IS the sequencer]
+```
+
+Matching-engine properties, per pipeline:
+
+- **Single writer.** Journal order == queue order == processing
+  order. Concurrency exists only *across* pipelines, never within
+  one.
+- **Deterministic per-session replay.** Re-feed a session's journal,
+  get the same state. The reproducible-trace goals above now hold at
+  the command level, not just inside a turn.
+- **Gateways re-enter, never mutate sideways.** Slow external work
+  (provider streams, tool execution) runs in async gateways; results
+  come back as sequenced inputs. The forwarder's appends are
+  downstream records of processing — the write-ahead path is the
+  journal, upstream.
+
+Two log families, one ownership rule:
+
+- **Daemon control-plane journal**
+  (`~/.local/share/mu/journal/<daemon_id>.jsonl`) — intent crossing
+  the border for daemon-scoped commands (`session.create`,
+  `daemon.*`, config, peer/mailbox routing). Fail-closed: an append
+  error rejects the command; it is never processed.
+- **Session event logs** — session-scoped command intake (strict
+  fsync'd `append_command`) AND the session's state evolution, in
+  one file. The command record and the events it caused share a log,
+  so the projection machinery above sees commands as just another
+  event kind.
+
+Receipts wrap the original command: `CommandSucceeded`/`Failed`/
+`Rejected` embed a `CommandEcho`, so each receipt is self-contained
+evidence of what was asked and what came of it. An orphaned
+`CommandReceived` — no receipt — is the legible crash marker, not a
+bug to erase. And config enters as a message: the resolved startup
+config rides the control-plane pipeline as `ConfigLoaded`, journaled
+and sequenced before adapters accept traffic, so future `config.set`
+is a new verb on an existing path, not a new mechanism.
+
+Spec: `specs/mu-046-ingest-pipeline.md` (invariants INV-1..INV-10).
+
 ## Changelog
 
 - 2026-05-10 — initial doc, promoted from cross-session handoff
@@ -884,3 +941,6 @@ per this spec's thesis.
   (session 013ff06b4b86046b): the doc still said threading
   `ProviderMessages` into `stream()` was future work two weeks after
   it shipped.
+- 2026-06-10 — amendment (mu-046 WP7): "The border" section — command
+  journal, adapter/ingest/route seam, single-writer pipelines,
+  two-log-family ownership, receipts, config-as-message.

@@ -290,6 +290,24 @@ pub enum AuthState {
 /// receives one of these per connection.
 pub type AuthStateHandle = Arc<Mutex<AuthState>>;
 
+/// The mu-ddua posture, shared by every adapter (the stdio serve loop,
+/// the MCP socket — spec mu-046 INV-7): auth is opt-in. When no
+/// configured mechanism actually enforces (the default config registers
+/// BEARER with an empty allowlist, which can never authenticate
+/// anyone), gating would lock every client out with no way back in, so
+/// fresh connections start pre-authenticated under root — mirroring a
+/// successful BEARER handshake. The gate enforces only once `[auth]`
+/// tokens are set.
+pub fn initial_connection_state(registry: &AuthRegistry) -> AuthState {
+    if registry.is_auth_required() {
+        AuthState::Unauthenticated
+    } else {
+        AuthState::Authenticated {
+            capability: Capability::root(),
+        }
+    }
+}
+
 /// Build the v1 [`AuthRegistry`] from the daemon's [`AuthConfig`].
 ///
 /// Currently registers exactly one [`BearerHandler`] whose allowlist

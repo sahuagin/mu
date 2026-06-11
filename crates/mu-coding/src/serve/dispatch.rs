@@ -1,8 +1,11 @@
 //! JSON-RPC method dispatch router for `mu serve`.
 //!
-//! The handler closure passed to `mu_core::transport::serve` calls
-//! `dispatch::dispatch` for every incoming request. The match statement
-//! routes based on method name to handler modules.
+//! spec mu-046 (WP3): requests no longer arrive here straight off the
+//! transport — they cross the ingest pipeline first
+//! ([`super::pipeline`]: journaled, sequenced, single-writer). The
+//! pipeline's control-plane consumer applies [`auth_gate`] and then
+//! routes via [`dispatch_inner`], whose match arms are the unchanged
+//! per-method handlers.
 
 use std::sync::Arc;
 
@@ -31,11 +34,10 @@ use super::handlers::capabilities::handle_capabilities_discover;
 use super::handlers::{daemon::*, mailbox::*, session::*};
 use super::sessions::Sessions;
 
-// mu-7rk (mu-yox): `dispatch` carries two extra daemon-wide handles:
+// mu-7rk (mu-yox): dispatch carries two extra daemon-wide handles:
 // a shared `AuthRegistry` (constructed once at serve start from
-// `[auth]` config) and a per-connection `AuthStateHandle`. The clippy
-// "too many arguments" lint stays silenced; bundling into a struct
-// would just push the same fields into a builder.
+// `[auth]` config) and a per-connection `AuthStateHandle`, both
+// bundled into `DispatchCtx`.
 //
 // mu-fnn (mu-7rk-c): the connect-time auth gate. Methods are split
 // into a pre-auth allowlist (`peer.auth_*`) and the protected
@@ -67,9 +69,9 @@ const PRE_AUTH_METHODS: &[&str] = &[
 ];
 
 /// Daemon-wide handles threaded to every dispatched request — bundled so
-/// `dispatch` takes the per-request `(request, notif)` plus one context struct
-/// rather than ten positional args. Built per request by the serve loop (the
-/// handles are cheap `Arc`/clone-able).
+/// `dispatch_inner` takes the per-request `(request, notif)` plus one context
+/// struct rather than ten positional args. Built per command by the pipeline
+/// consumer (the handles are cheap `Arc`/clone-able).
 pub struct DispatchCtx {
     pub sessions: Sessions,
     pub factory: ProviderFactory,
@@ -81,7 +83,52 @@ pub struct DispatchCtx {
     pub auth_state: AuthStateHandle,
 }
 
-pub async fn dispatch(
+/// The mu-fnn enforcement gate, extracted (spec mu-046 WP3) so the
+/// pipeline's control-plane consumer can apply it before routing —
+/// gate first, route second — and journal the rejection as a
+/// `CommandRejected { stage: AuthGate }` receipt. `Err((code,
+/// message))` is the rejection the caller turns into both the receipt
+/// and the wire error response.
+///
+/// Snapshot the AuthState (lock + clone + drop) so nothing downstream
+/// holds a Mutex across .await points. A poisoned lock fails closed:
+/// snapshot becomes a synthetic `Denied { MalformedExchange }` and
+/// every method is rejected.
+pub(crate) fn auth_gate(auth_state: &AuthStateHandle, method: &str) -> Result<(), (i32, String)> {
+    let state_snapshot: AuthState = match auth_state.lock() {
+        Ok(s) => s.clone(),
+        Err(_poisoned) => AuthState::Denied {
+            code: mu_core::protocol::AuthDenialCode::MalformedExchange,
+        },
+    };
+    match &state_snapshot {
+        AuthState::Authenticated { .. } => Ok(()),
+        AuthState::Unauthenticated => {
+            if PRE_AUTH_METHODS.contains(&method) {
+                Ok(())
+            } else {
+                Err((
+                    codes::AUTH_REQUIRED,
+                    format!("method `{method}` requires an authenticated connection"),
+                ))
+            }
+        }
+        AuthState::Denied { code } => {
+            // Denied is terminal — every method (including auth
+            // retries) is rejected until reconnect.
+            Err((
+                codes::AUTH_DENIED,
+                format!("connection auth denied (code={code:?}); reconnect required"),
+            ))
+        }
+    }
+}
+
+/// Method-routing core: the per-method match, with NO auth gate — the
+/// caller (the pipeline consumer) has already run [`auth_gate`]. The
+/// arms are the pre-mu-046 `dispatch()` arms, byte-identical; only the
+/// entry path around them changed.
+pub(crate) async fn dispatch_inner(
     request: Request<Value>,
     notif: NotificationWriter,
     ctx: DispatchCtx,
@@ -96,40 +143,7 @@ pub async fn dispatch(
         auth_registry,
         auth_state,
     } = ctx;
-    // mu-fnn enforcement gate. Snapshot the AuthState (lock + clone +
-    // drop) so the rest of the dispatcher doesn't hold a Mutex across
-    // .await points. A poisoned lock fails closed: snapshot becomes a
-    // synthetic `Denied { MalformedExchange }` and every method is
-    // rejected.
-    let state_snapshot: AuthState = match auth_state.lock() {
-        Ok(s) => s.clone(),
-        Err(_poisoned) => AuthState::Denied {
-            code: mu_core::protocol::AuthDenialCode::MalformedExchange,
-        },
-    };
     let method = request.method.as_str();
-    match &state_snapshot {
-        AuthState::Authenticated { .. } => { /* gate open */ }
-        AuthState::Unauthenticated => {
-            if !PRE_AUTH_METHODS.contains(&method) {
-                return err_response(
-                    request.id,
-                    codes::AUTH_REQUIRED,
-                    format!("method `{method}` requires an authenticated connection"),
-                );
-            }
-        }
-        AuthState::Denied { code } => {
-            // Denied is terminal — every method (including auth
-            // retries) is rejected until reconnect.
-            return err_response(
-                request.id,
-                codes::AUTH_DENIED,
-                format!("connection auth denied (code={code:?}); reconnect required"),
-            );
-        }
-    }
-
     match method {
         PingRequest::METHOD => handle_ping(request),
         // mu-kex4.6.4: in-process Layer-1 `t4c find` over RPC — rank the

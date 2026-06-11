@@ -20,6 +20,7 @@ mod handlers;
 mod mailbox;
 pub mod mcp;
 pub mod mcp_client;
+mod pipeline;
 mod provider_status;
 pub(crate) mod pty_spawn;
 mod sessions;
@@ -78,6 +79,31 @@ pub fn resolve_events_dir(config: &mu_core::config::Config) -> Option<PathBuf> {
         .as_ref()
         .map(|s| s.join("events"))
         .or_else(default_events_dir)
+}
+
+/// spec mu-046 (WP3): resolve the daemon control-plane journal path.
+///
+/// `[journal].dir` overrides; otherwise the resolution mirrors
+/// [`resolve_events_dir`] — `[session].state_dir` if set, else the
+/// platform default — landing at `journal/`, a sibling of `events/`,
+/// so the session-log scanners (`sessions_index`,
+/// `discovery/file_backend`) never see it.
+///
+/// Unlike events, the journal has NO opt-out: a daemon that cannot
+/// make commands durable does not serve (INV-2). Hermetic tests point
+/// `[journal].dir` at a tempdir.
+pub fn resolve_journal_path(config: &mu_core::config::Config, daemon_id: &str) -> PathBuf {
+    let dir = config
+        .journal
+        .dir
+        .clone()
+        .or_else(|| config.session.state_dir.as_ref().map(|s| s.join("journal")))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/share/mu/journal")))
+        // No home dir at all (stripped-down container): fall back to a
+        // per-user-less location rather than refusing to resolve — the
+        // open itself still fails closed if the path is unusable.
+        .unwrap_or_else(|| std::env::temp_dir().join("mu-journal"));
+    dir.join(format!("{daemon_id}.jsonl"))
 }
 
 /// Production entry point — serve over the process's stdin/stdout.
@@ -350,41 +376,54 @@ where
         }
         Arc::new(mu_core::skill::loader::discover_skills(&dirs))
     };
-    // spec mu-046 INV-8 (WP2): the daemon-wide tagged outbound stream —
-    // the one way bytes leave the daemon. Created here at daemon level
-    // and passed down; today the stdio connection's writer is its only
-    // subscriber, so wire behavior is unchanged. Moved (not cloned)
-    // into serve_with_stream so the shutdown cascade still sees every
-    // sender drop. WP3's pipeline gains its own clone via the handler
-    // seam when receipts start flowing.
-    let outbound = mu_core::transport::OutboundStream::new();
-    mu_core::transport::serve_with_stream(reader, writer, outbound, move |req, notif| {
-        let _ = &mcp_guard;
-        let sessions = sessions.clone();
-        let factory = factory.clone();
-        let tools = tools.clone();
-        let skills = skills.clone();
-        let daemon_info = daemon_info.clone();
-        let discovery = discovery.clone();
-        let auth_registry = auth_registry.clone();
-        let auth_state = auth_state.clone();
-        async move {
-            dispatch::dispatch(
-                req,
-                notif,
-                dispatch::DispatchCtx {
-                    sessions,
-                    factory,
-                    tools,
-                    skills,
-                    daemon_info,
-                    discovery,
-                    auth_registry,
-                    auth_state,
-                },
+    // spec mu-046 INV-1/INV-2 (WP3): open the control-plane command
+    // journal BEFORE accepting any traffic. Open failure ABORTS serve —
+    // a daemon that cannot make commands durable does not serve.
+    let journal_path = resolve_journal_path(daemon_info.config(), daemon_info.daemon_id());
+    let journal = Arc::new(
+        mu_core::command_journal::CommandJournal::open(
+            &journal_path,
+            daemon_info.daemon_id(),
+            daemon_info.config().journal.fsync_policy(),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot open command journal at {}: {e} (refusing to serve, spec mu-046 INV-2)",
+                journal_path.display()
             )
-            .await
-        }
+        })?,
+    );
+    // spec mu-046 INV-8 (WP2): the daemon-wide tagged outbound stream —
+    // the one way bytes leave the daemon. The stdio connection's writer
+    // subscribes inside serve_with_ingest; the pipeline consumer holds
+    // the only other sender clone and drops it on shutdown.
+    let outbound = mu_core::transport::OutboundStream::new();
+    // spec mu-046 INV-3/INV-7 (WP3): the single-writer control-plane
+    // consumer. It owns the daemon's session map et al. and exits —
+    // releasing them, continuing the shutdown cascade — when the last
+    // producer handle (held by the closure below) drops.
+    let control = Arc::new(pipeline::spawn_control_plane(
+        journal,
+        pipeline::PipelineCtx {
+            sessions,
+            factory,
+            tools,
+            skills,
+            daemon_info,
+            discovery,
+            auth_registry,
+        },
+        outbound.clone(),
+    ));
+    // The stdio transport is adapter #1 (INV-7, no side doors): every
+    // parsed request crosses pipeline::ingest — journaled before
+    // anything processes it. `Some` = immediate reject the transport
+    // sends; `None` = the pipeline owns the response.
+    mu_core::transport::serve_with_ingest(reader, writer, outbound, move |req, _notif, origin| {
+        let _ = &mcp_guard;
+        let control = control.clone();
+        let auth_state = auth_state.clone();
+        async move { pipeline::ingest(&control, req, origin, &auth_state) }
     })
     .await
     .map_err(Into::into)
@@ -477,6 +516,61 @@ mod tests {
         assert_eq!(
             resolve_events_dir(&config),
             Some(PathBuf::from("/var/lib/mu/events"))
+        );
+    }
+
+    #[test]
+    fn resolve_journal_path_prefers_journal_dir_override() {
+        let config = Config {
+            journal: mu_core::config::JournalConfig {
+                dir: Some(PathBuf::from("/tmp/mu-j")),
+                ..Default::default()
+            },
+            session: SessionConfig {
+                state_dir: Some(PathBuf::from("/var/lib/mu")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_journal_path(&config, "d1"),
+            PathBuf::from("/tmp/mu-j/d1.jsonl")
+        );
+    }
+
+    #[test]
+    fn resolve_journal_path_uses_state_dir_journal_sibling() {
+        let config = Config {
+            session: SessionConfig {
+                state_dir: Some(PathBuf::from("/var/lib/mu")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_journal_path(&config, "d1"),
+            PathBuf::from("/var/lib/mu/journal/d1.jsonl")
+        );
+    }
+
+    #[test]
+    fn resolve_journal_path_defaults_next_to_events() {
+        // No override, no state_dir: the platform default — a sibling
+        // of events/ so the session-log scanners never see it. Unlike
+        // events there is no opt-out: persist_events_to_disk=false
+        // does NOT turn the journal off (spec mu-046 INV-2).
+        let config = Config {
+            session: SessionConfig {
+                persist_events_to_disk: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let path = resolve_journal_path(&config, "d1");
+        assert!(
+            path.ends_with(".local/share/mu/journal/d1.jsonl")
+                || path.ends_with("mu-journal/d1.jsonl"),
+            "expected default journal path, got {path:?}",
         );
     }
 

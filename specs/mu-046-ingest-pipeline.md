@@ -124,10 +124,12 @@ This journal is load-bearing.
 
 ### Session pipelines journal into the session's own event log
 
-Session-scoped commands (`session.ask`, `session.cancel`,
-`session.cancel_outstanding`, `session.close`,
+Session-scoped commands (`ask_session`, `cancel_session`,
+`session.cancel_outstanding`, `close_session`,
 `session.respond_to_input_required`, `session.set_route`, mailbox posts
-addressed to the session) are journaled into the session's existing JSONL log —
+addressed to the session — note the wire mixes legacy `*_session` and newer
+`session.*` method names; the protocol METHOD constants are authoritative) are
+journaled into the session's existing JSONL log —
 already append-only, tombstoned, and projected. New `EventPayload` variants:
 
 ```rust

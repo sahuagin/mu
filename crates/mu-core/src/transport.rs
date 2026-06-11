@@ -7,7 +7,6 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
-use tokio::task::JoinSet;
 
 use crate::command_journal::Origin;
 use crate::protocol::{ErrorObject, Notification, Request, Response, JSONRPC_VERSION};
@@ -42,6 +41,10 @@ pub mod codes {
     /// The connection's `AuthState` is terminally `Denied` — including
     /// re-attempts of pre-auth methods are rejected until reconnect.
     pub const AUTH_DENIED: i32 = -32002;
+    /// spec mu-046 INV-2 (fail closed): the command could not be made
+    /// durable — the journal append errored — so it was rejected and
+    /// never processed.
+    pub const JOURNAL_UNAVAILABLE: i32 = -32003;
 }
 
 /// Build a successful Response<Value>. Caller has already serialized
@@ -243,6 +246,14 @@ fn next_stdio_origin() -> Origin {
 /// the handler's responses are enveloped with it (plus the request id)
 /// and sent to the stream, and the connection's writer subscribes,
 /// filtering to envelopes addressed to it (or broadcast).
+///
+/// Adapter shim over [`serve_with_ingest`] preserving the historical
+/// handler-returns-`Response` contract: each request's handler future
+/// is spawned (concurrent dispatch) and its response enveloped onto
+/// the stream when it resolves. The DAEMON does not use this — it
+/// flows through `serve_with_ingest` so every command is journaled
+/// before processing (spec mu-046 INV-7, no side doors); this stays
+/// for transports/tests that don't carry a journal.
 pub async fn serve_with_stream<R, W, F, Fut>(
     reader: R,
     writer: W,
@@ -255,33 +266,84 @@ where
     F: Fn(Request<Value>, NotificationWriter) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Response<Value>> + Send + 'static,
 {
+    let handler = Arc::new(handler);
+    let respond_stream = stream.clone();
+    serve_with_ingest(reader, writer, stream, move |request, notif, origin| {
+        let handler = Arc::clone(&handler);
+        let stream = respond_stream.clone();
+        async move {
+            let request_id = request.id.clone();
+            let response_fut = handler(request, notif);
+            // Spawned, not awaited inline: this shim keeps the
+            // pre-ingest concurrent-dispatch semantics (a slow request
+            // must not block the next line). The spawned task holds a
+            // stream sender clone, so the writer drains every response
+            // before observing Closed on shutdown.
+            tokio::spawn(async move {
+                let response = response_fut.await;
+                match serde_json::to_value(response) {
+                    Ok(value) => stream.send(OutboundEnvelope {
+                        origin: Some(origin),
+                        request_id: Some(request_id),
+                        command_seq: None,
+                        item: Outbound(value),
+                    }),
+                    Err(err) => tracing::warn!(%err, "response serialization failed"),
+                }
+            });
+            None
+        }
+    })
+    .await
+}
+
+/// The transport seam of the ingest pipeline (spec mu-046 WP3). Reads
+/// newline-delimited JSON requests and hands each parsed request — with
+/// this connection's [`Origin`] — to `handler`, which is the
+/// ingest/route step:
+///
+/// - `Some(response)` ⇒ immediate reject (parse-adjacent failure,
+///   journal unavailable): the transport envelopes and sends it, as it
+///   always did.
+/// - `None` ⇒ the pipeline owns the response; it arrives via the
+///   outbound stream, which [`write_loop`] already delivers (INV-8).
+///
+/// The handler is awaited INLINE, not spawned: ingest must observe
+/// commands in wire order so journal seq order == queue order (INV-3).
+/// Keep ingest fast — journal append + enqueue; the heavy work belongs
+/// to the pipeline consumer behind the queue.
+pub async fn serve_with_ingest<R, W, F, Fut>(
+    reader: R,
+    writer: W,
+    stream: OutboundStream,
+    handler: F,
+) -> Result<(), TransportError>
+where
+    R: AsyncBufRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+    F: Fn(Request<Value>, NotificationWriter, Origin) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Option<Response<Value>>> + Send + 'static,
+{
     let origin = next_stdio_origin();
     let notif = NotificationWriter::for_origin(stream.clone(), origin.clone());
     let writer_task = tokio::spawn(write_loop(writer, stream.subscribe(), origin.clone()));
-    let handler = Arc::new(handler);
-    let mut tasks = JoinSet::new();
     let mut lines = reader.lines();
 
     while let Some(line) = lines.next_line().await? {
         match parse_request_line(&line) {
             Ok(request) => {
                 let request_id = request.id.clone();
-                let handler = Arc::clone(&handler);
-                let notif = notif.clone();
-                let stream = stream.clone();
-                let origin = origin.clone();
-                tasks.spawn(async move {
-                    let response = handler(request, notif).await;
+                if let Some(response) = handler(request, notif.clone(), origin.clone()).await {
                     match serde_json::to_value(response) {
                         Ok(value) => stream.send(OutboundEnvelope {
-                            origin: Some(origin),
+                            origin: Some(origin.clone()),
                             request_id: Some(request_id),
                             command_seq: None,
                             item: Outbound(value),
                         }),
                         Err(err) => tracing::warn!(%err, "response serialization failed"),
                     }
-                });
+                }
             }
             Err(response) => {
                 let value = serde_json::to_value(response)?;
@@ -296,21 +358,21 @@ where
         }
     }
 
-    while let Some(result) = tasks.join_next().await {
-        if let Err(err) = result {
-            tracing::warn!(%err, "request handler task failed");
-        }
-    }
-
     // CRITICAL for clean shutdown post mu-035 Phase A (multi-turn fix):
     // dropping `handler` here releases the closure that captures the
-    // daemon's `sessions` map. Releasing sessions drops every
-    // SessionState, which drops every agent-loop input sender, which
-    // lets the per-session agent loops exit on recv()==None, which
-    // drops their events senders, which lets the per-session
-    // forwarders exit, which drops their NotificationWriter clones,
-    // which finally lets `writer_task` see every stream sender clone
-    // drop (broadcast recv -> Closed) and exit.
+    // daemon's state. On the ingest path (mu-046) that closure holds
+    // the control-plane queue sender: dropping it lets the pipeline
+    // consumer exit on recv()==None, which releases the daemon's
+    // `sessions` map. On the shim path above, the closure holds the
+    // sessions-capturing handler directly. Either way, releasing
+    // sessions drops every SessionState, which drops every agent-loop
+    // input sender, which lets the per-session agent loops exit on
+    // recv()==None, which drops their events senders, which lets the
+    // per-session forwarders exit, which drops their
+    // NotificationWriter clones, which finally lets `writer_task` see
+    // every stream sender clone drop (broadcast recv -> Closed) and
+    // exit. In-flight spawned request tasks hold their own clones and
+    // extend the writer's life exactly until their responses are sent.
     //
     // Pre-multi-turn this chain worked implicitly because the agent
     // loop returned after one Done — but with multi-turn the loop

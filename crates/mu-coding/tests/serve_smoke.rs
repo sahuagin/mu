@@ -96,6 +96,13 @@ async fn spawn_server_full(
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     let (server_read, server_write) = tokio::io::split(server);
     let server_buf = BufReader::new(server_read);
+    // spec mu-046: the command journal is NOT optional in the daemon
+    // path. Point it at a throwaway dir so tests never write into the
+    // developer's ~/.local/share/mu/journal.
+    let mut config = config;
+    if config.journal.dir.is_none() {
+        config.journal.dir = Some(unique_test_dir("journal"));
+    }
     // Adapt the single Arc<dyn Provider> into a per-session factory
     // that just hands out clones — preserves the smoke-test semantic
     // (one provider for all sessions) under the new factory API.
@@ -1457,16 +1464,20 @@ async fn mcp_unreachable_server_degrades_gracefully_mu_yc6() {
     let _ = timeout(Duration::from_millis(500), server_handle).await;
 }
 
-/// A unique throwaway directory under the system temp dir for the
-/// lifecycle test's `events_dir`. Avoids a `tempfile` dev-dep (none is
-/// configured) and avoids polluting the developer's `~/.local/share/mu`.
-/// Uniqueness = pid + a process-local counter, enough to keep parallel
-/// tests from colliding on the same path.
-fn unique_events_dir() -> std::path::PathBuf {
+/// A unique throwaway directory under the system temp dir (events
+/// dirs, journal dirs). Avoids polluting the developer's
+/// `~/.local/share/mu`. Uniqueness = pid + a process-local counter,
+/// enough to keep parallel tests from colliding on the same path.
+fn unique_test_dir(kind: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("mu-wnsp-lifecycle-{}-{}", std::process::id(), n))
+    std::env::temp_dir().join(format!("mu-smoke-{kind}-{}-{}", std::process::id(), n))
+}
+
+/// A unique throwaway directory for the lifecycle test's `events_dir`.
+fn unique_events_dir() -> std::path::PathBuf {
+    unique_test_dir("wnsp-lifecycle")
 }
 
 /// mu-wnsp / mu-qc08 regression: `mu serve` must exit cleanly on stdin-EOF

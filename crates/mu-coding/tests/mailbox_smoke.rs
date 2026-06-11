@@ -22,6 +22,19 @@ use mu_core::config::{AuthConfig, Config};
 /// returns an already-authed client.
 const TEST_BEARER_TOKEN: &str = "mailbox-test-token";
 
+/// A unique throwaway journal dir under the system temp dir —
+/// uniqueness = pid + a process-local counter.
+fn unique_journal_dir() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "mu-mailbox-smoke-journal-{}-{}",
+        std::process::id(),
+        n
+    ))
+}
+
 async fn spawn_server(
     provider: Arc<dyn Provider>,
 ) -> (
@@ -33,9 +46,16 @@ async fn spawn_server(
     let server_buf = BufReader::new(server_read);
     let factory: serve::ProviderFactory =
         std::sync::Arc::new(move |_selector, _cache_ttl| Ok(provider.clone()));
+    // spec mu-046: the command journal is NOT optional in the daemon
+    // path. Point it at a throwaway dir so tests never write into the
+    // developer's ~/.local/share/mu/journal.
     let config = Config {
         auth: AuthConfig::Bearer {
             tokens: vec![TEST_BEARER_TOKEN.to_string()],
+        },
+        journal: mu_core::config::JournalConfig {
+            dir: Some(unique_journal_dir()),
+            ..Default::default()
         },
         ..Default::default()
     };

@@ -318,6 +318,19 @@ fn duplicate_mechanism_registration_errors() {
 
 // ───────────────────────── test harness ─────────────────────────
 
+/// A unique throwaway journal dir under the system temp dir —
+/// uniqueness = pid + a process-local counter.
+fn unique_journal_dir() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "mu-auth-smoke-journal-{}-{}",
+        std::process::id(),
+        n
+    ))
+}
+
 fn config_with_bearer_tokens(tokens: &[&str]) -> Config {
     Config {
         auth: AuthConfig::Bearer {
@@ -337,6 +350,13 @@ fn spawn_server(
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (server_read, server_write) = tokio::io::split(server);
     let server_buf = BufReader::new(server_read);
+    // spec mu-046: the command journal is NOT optional in the daemon
+    // path. Point it at a throwaway dir so tests never write into the
+    // developer's ~/.local/share/mu/journal.
+    let mut config = config;
+    if config.journal.dir.is_none() {
+        config.journal.dir = Some(unique_journal_dir());
+    }
     let factory: serve::ProviderFactory =
         std::sync::Arc::new(move |_selector, _cache_ttl| Ok(provider.clone()));
     let handle = tokio::spawn(serve::serve_with_io_with_config(

@@ -95,7 +95,7 @@ pub enum ProviderSelector {
         model: String,
     },
     /// Local vLLM/OpenAI-compatible server. Wire kind `"vllm"`.
-    /// Endpoint defaults to `http://10.1.1.143:8000`, overridable via
+    /// Endpoint defaults to `http://127.0.0.1:8000`, overridable via
     /// `VLLM_API_BASE`; path overridable via `VLLM_API_PATH`.
     Vllm {
         model: String,

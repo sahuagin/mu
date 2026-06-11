@@ -6,6 +6,8 @@ use mu_core::agent::{Tool, ToolResult, ToolSpec};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
+use crate::tools::path::expand_leading_tilde;
+
 pub struct LsTool;
 
 impl LsTool {
@@ -79,7 +81,7 @@ fn path_argument(arguments: &Value) -> PathBuf {
     arguments
         .get("path")
         .and_then(Value::as_str)
-        .map(PathBuf::from)
+        .map(expand_leading_tilde)
         .unwrap_or_else(|| PathBuf::from("."))
 }
 

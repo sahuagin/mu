@@ -5,7 +5,7 @@
 //! already implemented by [`OpenRouterProvider`]. This provider composes
 //! that implementation with vLLM-specific env knobs and a `"vllm"` label.
 //!
-//! Env overrides: `VLLM_API_BASE` (default `http://10.1.1.143:8000`),
+//! Env overrides: `VLLM_API_BASE` (default `http://127.0.0.1:8000`),
 //! `VLLM_API_PATH` (default `/v1/chat/completions`), `VLLM_API_KEY`
 //! (optional; defaults empty — local vLLM usually ignores auth).
 
@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use super::openrouter::OpenRouterProvider;
 
-pub const VLLM_API_BASE: &str = "http://10.1.1.143:8000";
+pub const VLLM_API_BASE: &str = "http://127.0.0.1:8000";
 pub const VLLM_API_PATH: &str = "/v1/chat/completions";
 
 pub fn base_from_env() -> String {

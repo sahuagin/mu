@@ -667,6 +667,7 @@ impl SessionEventLog {
             if let Err(e) = std::fs::File::open(parent).and_then(|d| d.sync_all()) {
                 tracing::warn!(
                     session_id = %self.session_id,
+                    path = %parent.display(),
                     error = %e,
                     "parent-directory fsync failed after attaching disk writer; continuing"
                 );

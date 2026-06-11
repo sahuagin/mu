@@ -1317,46 +1317,8 @@ mod tests {
 
         // Log projection: only the significant events landed.
         let entries = log.snapshot();
-        let kinds: Vec<&str> = entries
-            .iter()
-            .map(|e| match &e.payload {
-                EventPayload::SessionCreated { .. } => "session_created",
-                EventPayload::UserMessage { .. } => "user_message",
-                EventPayload::AssistantMessageEvent { .. } => "assistant_message",
-                EventPayload::ToolCall { .. } => "tool_call",
-                EventPayload::ToolResult { .. } => "tool_result",
-                EventPayload::Done { .. } => "done",
-                EventPayload::Error { .. } => "error",
-                EventPayload::Callout { .. } => "callout",
-                EventPayload::SessionClosed => "session_closed",
-                EventPayload::ContextAssembly { .. } => "context_assembly",
-                EventPayload::CompactionAssembly { .. } => "compaction_assembly",
-                EventPayload::ProviderStatusUpdate { .. } => "provider_status_update",
-                EventPayload::AutonomousIterationStarted { .. } => "autonomous_iteration_started",
-                EventPayload::AutonomousIterationCompleted { .. } => {
-                    "autonomous_iteration_completed"
-                }
-                EventPayload::AutonomousScheduledWakeup { .. } => "autonomous_scheduled_wakeup",
-                EventPayload::AutonomousTerminated { .. } => "autonomous_terminated",
-                EventPayload::MailboxMessagePosted { .. } => "mailbox_message_posted",
-                EventPayload::MailboxMessageConsumed { .. } => "mailbox_message_consumed",
-                EventPayload::TaskTelemetry { .. } => "task_telemetry",
-                EventPayload::ErrorInvalidMessage { .. } => "error_invalid_message",
-                EventPayload::ProviderSwitched { .. } => "provider_switched",
-                EventPayload::WorkerSpawned { .. } => "worker_spawned",
-                EventPayload::WorkerExited { .. } => "worker_exited",
-                EventPayload::WorkerFailed { .. } => "worker_failed",
-                EventPayload::WorkerTimeout { .. } => "worker_timeout",
-                EventPayload::OperatorMark { .. } => "operator_mark",
-                EventPayload::Tombstone { .. } => "tombstone",
-                EventPayload::HeadAttached { .. } => "head_attached",
-                EventPayload::CommandReceived { .. } => "command_received",
-                EventPayload::CommandSucceeded { .. } => "command_succeeded",
-                EventPayload::CommandFailed { .. } => "command_failed",
-                EventPayload::CommandRejected { .. } => "command_rejected",
-            })
-            .collect();
-        assert_eq!(kinds, vec!["assistant_message", "done"]);
+        let kinds: Vec<&str> = entries.iter().map(|e| e.payload.kind_str()).collect();
+        assert_eq!(kinds, vec!["assistant_message_event", "done"]);
 
         // Cumulative usage derivation.
         let cumulative = log.cumulative_usage().expect("Done had usage");

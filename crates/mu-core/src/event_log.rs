@@ -537,6 +537,51 @@ pub enum EventPayload {
     },
 }
 
+impl EventPayload {
+    /// The serde `kind` tag of this payload, as a static string —
+    /// THE single source for displaying an event's kind. Must stay
+    /// in lockstep with the `#[serde(tag = "kind", rename_all =
+    /// "snake_case")]` derive above; the
+    /// `kind_str_matches_serde_tag_for_representative_variants` test
+    /// pins a representative set.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::SessionCreated { .. } => "session_created",
+            Self::UserMessage { .. } => "user_message",
+            Self::AssistantMessageEvent { .. } => "assistant_message_event",
+            Self::ToolCall { .. } => "tool_call",
+            Self::ToolResult { .. } => "tool_result",
+            Self::Done { .. } => "done",
+            Self::Error { .. } => "error",
+            Self::Callout { .. } => "callout",
+            Self::ErrorInvalidMessage { .. } => "error_invalid_message",
+            Self::ProviderSwitched { .. } => "provider_switched",
+            Self::SessionClosed => "session_closed",
+            Self::ContextAssembly { .. } => "context_assembly",
+            Self::CompactionAssembly { .. } => "compaction_assembly",
+            Self::AutonomousIterationStarted { .. } => "autonomous_iteration_started",
+            Self::AutonomousIterationCompleted { .. } => "autonomous_iteration_completed",
+            Self::AutonomousScheduledWakeup { .. } => "autonomous_scheduled_wakeup",
+            Self::AutonomousTerminated { .. } => "autonomous_terminated",
+            Self::ProviderStatusUpdate { .. } => "provider_status_update",
+            Self::MailboxMessagePosted { .. } => "mailbox_message_posted",
+            Self::MailboxMessageConsumed { .. } => "mailbox_message_consumed",
+            Self::TaskTelemetry { .. } => "task_telemetry",
+            Self::WorkerSpawned { .. } => "worker_spawned",
+            Self::WorkerExited { .. } => "worker_exited",
+            Self::WorkerFailed { .. } => "worker_failed",
+            Self::WorkerTimeout { .. } => "worker_timeout",
+            Self::OperatorMark { .. } => "operator_mark",
+            Self::HeadAttached { .. } => "head_attached",
+            Self::Tombstone { .. } => "tombstone",
+            Self::CommandReceived { .. } => "command_received",
+            Self::CommandSucceeded { .. } => "command_succeeded",
+            Self::CommandFailed { .. } => "command_failed",
+            Self::CommandRejected { .. } => "command_rejected",
+        }
+    }
+}
+
 /// Categorical exit reason for a task — what brought the task to its
 /// terminal state. Companion to `EventPayload::TaskTelemetry`. mu-5g7i.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1840,6 +1885,80 @@ mod tests {
         let v = serde_json::to_value(sample_command_received())?;
         assert_eq!(v["auth"], "authenticated");
         assert_eq!(v["origin"]["transport"], "stdio");
+        Ok(())
+    }
+
+    /// `kind_str` must agree with serde's `kind` tag — it exists so
+    /// consumers print ONE authoritative string instead of re-matching
+    /// the enum. A representative set of variants is pinned here; the
+    /// exhaustive match in `kind_str` covers the rest by construction.
+    #[test]
+    fn kind_str_matches_serde_tag_for_representative_variants() -> Result<(), serde_json::Error> {
+        let samples = [
+            EventPayload::SessionCreated {
+                provider_kind: "mock".into(),
+                model: "m1".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+            EventPayload::UserMessage {
+                content: "hi".into(),
+            },
+            EventPayload::ToolCall {
+                call_id: "c1".into(),
+                name: "read_file".into(),
+                arguments: json!({"path": "/tmp/x"}),
+            },
+            EventPayload::ToolResult {
+                call_id: "c1".into(),
+                content: "ok".into(),
+                is_error: false,
+            },
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: Some(sample_usage(1, 2)),
+                elapsed_ms: Some(10),
+            },
+            EventPayload::Error {
+                message: "boom".into(),
+            },
+            EventPayload::Tombstone {
+                target_event_id: 1,
+                reason: "incomplete record".into(),
+            },
+            sample_command_received(),
+            EventPayload::CommandSucceeded {
+                command_event_id: 1,
+                command: sample_echo(),
+                result: json!({"ok": true}),
+                elapsed_ms: 10,
+            },
+            EventPayload::CommandFailed {
+                command_event_id: 1,
+                command: sample_echo(),
+                code: -32603,
+                message: "provider exploded".into(),
+                elapsed_ms: 10,
+            },
+            EventPayload::CommandRejected {
+                command_event_id: 1,
+                command: sample_echo(),
+                code: -32600,
+                message: "not yours".into(),
+                stage: RejectStage::AuthGate,
+            },
+            EventPayload::SessionClosed,
+        ];
+        for payload in samples {
+            let v = serde_json::to_value(&payload)?;
+            assert_eq!(
+                v["kind"],
+                payload.kind_str(),
+                "kind_str drifted from the serde tag for {payload:?}"
+            );
+        }
         Ok(())
     }
 

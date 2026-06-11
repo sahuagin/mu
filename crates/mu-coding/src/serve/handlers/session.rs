@@ -31,7 +31,7 @@ use crate::serve::factory::ProviderFactory;
 use crate::serve::forwarder::forward_events;
 use crate::serve::sessions::Sessions;
 
-use super::to_value_or_null;
+use super::{ok_or_respond, some_or_respond, to_value_or_null};
 
 pub fn handle_ping(request: Request<Value>) -> Response<Value> {
     let resp = PingResponse {
@@ -50,16 +50,12 @@ pub fn handle_create_session(
     skills: Arc<Vec<mu_core::skill::loader::LoadedSkill>>,
     daemon_info: DaemonInfo,
 ) -> Response<Value> {
-    let params: CreateSessionRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("create_session: invalid params: {e}"),
-            );
-        }
-    };
+    let params: CreateSessionRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "create_session: invalid params"
+    );
 
     // mu-7e21: root capability, with autonomy granted IFF the client
     // asked at creation. INV-1 holds: `Capability::root()` itself stays
@@ -116,32 +112,24 @@ pub fn handle_delegate_session(
     skills: Arc<Vec<mu_core::skill::loader::LoadedSkill>>,
     daemon_info: DaemonInfo,
 ) -> Response<Value> {
-    let params: DelegateSessionRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("session.delegate: invalid params: {e}"),
-            );
-        }
-    };
+    let params: DelegateSessionRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "session.delegate: invalid params"
+    );
 
     // Verify the parent session exists, and snapshot its current
     // capability so we can attenuate it for the child (mu-033).
-    let parent_cap_handle = match sessions.capability(&params.parent_session_id) {
-        Some(c) => c,
-        None => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!(
-                    "session.delegate: parent session not found: {}",
-                    params.parent_session_id
-                ),
-            );
-        }
-    };
+    let parent_cap_handle = some_or_respond!(
+        sessions.capability(&params.parent_session_id),
+        request.id,
+        codes::INVALID_PARAMS,
+        format!(
+            "session.delegate: parent session not found: {}",
+            params.parent_session_id
+        )
+    );
 
     // Compute child capability = parent ∩ requested attenuations.
     // If the request didn't supply attenuations, the child inherits
@@ -225,47 +213,35 @@ pub fn handle_resume_session(
 ) -> Response<Value> {
     use mu_core::protocol::{ResumeSessionRequest, ResumeSessionResponse, SessionRef};
 
-    let params: ResumeSessionRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("session.resume: invalid params: {e}"),
-            );
-        }
-    };
+    let params: ResumeSessionRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "session.resume: invalid params"
+    );
 
     // Parse the session ref (daemon:session or mu:<daemon>/<session>).
-    let parsed = match SessionRef::parse(&params.session_ref) {
-        Ok(r) => r,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("session.resume: {e}"),
-            )
-        }
-    };
+    let parsed = ok_or_respond!(
+        SessionRef::parse(&params.session_ref),
+        request.id,
+        codes::INVALID_PARAMS,
+        "session.resume"
+    );
 
     // Resolve the predecessor's event log from the Sessions map (the
     // session id is the addressable key; rehydration loaded all daemons'
     // logs at startup).
-    let predecessor_log = match sessions.event_log(&parsed.session) {
-        Some(log) => log,
-        None => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!(
-                    "session.resume: predecessor session not found: {} \
-                     (looked up `{}`; is the daemon's events dir the one that holds it?)",
-                    parsed.to_canonical(),
-                    parsed.session
-                ),
-            );
-        }
-    };
+    let predecessor_log = some_or_respond!(
+        sessions.event_log(&parsed.session),
+        request.id,
+        codes::INVALID_PARAMS,
+        format!(
+            "session.resume: predecessor session not found: {} \
+             (looked up `{}`; is the daemon's events dir the one that holds it?)",
+            parsed.to_canonical(),
+            parsed.session
+        )
+    );
 
     // STRICT continuation projection. A ragged log is refused with a
     // diagnosis naming the damage + a --recover hint.
@@ -347,7 +323,7 @@ pub fn handle_resume_session(
         branched_at_event_id: continuation.fork_event_id,
     };
 
-    let new_session_id = match build_and_register_session(BuildSessionRequest {
+    let new_session_id = build_and_register_session(BuildSessionRequest {
         selector: &params.provider,
         system_prompt: None,
         cwd: params.cwd,
@@ -365,16 +341,13 @@ pub fn handle_resume_session(
         tools,
         skills,
         daemon_info: &daemon_info,
-    }) {
-        Ok(id) => id,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("session.resume: {e}"),
-            )
-        }
-    };
+    });
+    let new_session_id = ok_or_respond!(
+        new_session_id,
+        request.id,
+        codes::INVALID_PARAMS,
+        "session.resume"
+    );
 
     let resp = ResumeSessionResponse {
         session_id: new_session_id,
@@ -741,16 +714,12 @@ pub async fn handle_ask_session(
     sessions: Sessions,
     ticket: Option<mu_core::command_journal::CommandTicket>,
 ) -> Response<Value> {
-    let params: AskSessionRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("ask_session: invalid params: {e}"),
-            );
-        }
-    };
+    let params: AskSessionRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "ask_session: invalid params"
+    );
 
     // Brief sync lock to clone the sender; lock dropped before the
     // await below.
@@ -787,16 +756,12 @@ pub async fn handle_ask_session(
 }
 
 pub async fn handle_cancel_session(request: Request<Value>, sessions: Sessions) -> Response<Value> {
-    let params: CancelSessionRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("cancel_session: invalid params: {e}"),
-            );
-        }
-    };
+    let params: CancelSessionRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "cancel_session: invalid params"
+    );
 
     let sender = sessions.input_sender(&params.session_id);
     match sender {
@@ -824,16 +789,12 @@ pub async fn handle_cancel_outstanding(
     // channel; the agent loop aborts the in-flight stream / tool and
     // emits Done(Aborted), then continues to wait for the next ask.
     // Session stays alive.
-    let params: CancelOutstandingRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("cancel_outstanding: invalid params: {e}"),
-            );
-        }
-    };
+    let params: CancelOutstandingRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "cancel_outstanding: invalid params"
+    );
 
     let sender = sessions.input_sender(&params.session_id);
     match sender {
@@ -877,27 +838,19 @@ pub async fn handle_cancel_outstanding(
 }
 
 pub fn handle_session_stats(request: Request<Value>, sessions: Sessions) -> Response<Value> {
-    let params: SessionStatsRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("session.stats: invalid params: {e}"),
-            );
-        }
-    };
+    let params: SessionStatsRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "session.stats: invalid params"
+    );
 
-    let log = match sessions.event_log(&params.session_id) {
-        Some(l) => l,
-        None => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("session not found: {}", params.session_id),
-            );
-        }
-    };
+    let log = some_or_respond!(
+        sessions.event_log(&params.session_id),
+        request.id,
+        codes::INVALID_PARAMS,
+        format!("session not found: {}", params.session_id)
+    );
 
     let (provider_kind, model) = match log.provider_info() {
         Some((k, m)) => (Some(k), Some(m)),
@@ -924,17 +877,12 @@ pub fn handle_respond_to_input_required(
     request: Request<Value>,
     sessions: Sessions,
 ) -> Response<Value> {
-    let params: RespondToInputRequiredRequest = match serde_json::from_value(request.params.clone())
-    {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("respond_to_input_required: invalid params: {e}"),
-            );
-        }
-    };
+    let params: RespondToInputRequiredRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "respond_to_input_required: invalid params"
+    );
 
     // Look up the pending oneshot; if found, send the decision.
     let sender_opt = sessions.take_pending_approval(&params.session_id, &params.request_id);
@@ -947,16 +895,12 @@ pub fn handle_respond_to_input_required(
 }
 
 pub fn handle_close_session(request: Request<Value>, sessions: Sessions) -> Response<Value> {
-    let params: CloseSessionRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("close_session: invalid params: {e}"),
-            );
-        }
-    };
+    let params: CloseSessionRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "close_session: invalid params"
+    );
 
     // Emit SessionClosed into the log BEFORE removing the session
     // from the registry — once removed, the log handle is dropped.
@@ -987,16 +931,12 @@ pub async fn handle_session_list(
     request: Request<Value>,
     discovery: Arc<dyn SessionDiscovery>,
 ) -> Response<Value> {
-    let params: SessionListRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("session.list: invalid params: {e}"),
-            );
-        }
-    };
+    let params: SessionListRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "session.list: invalid params"
+    );
     let filter = params.filter.unwrap_or_default();
     let now_ms = super::super::discovery::now_unix_ms();
     match discovery.list(&filter).await {
@@ -1031,26 +971,18 @@ pub async fn handle_session_list(
 }
 
 pub fn handle_session_events(request: Request<Value>, sessions: Sessions) -> Response<Value> {
-    let params: SessionEventsRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("session.events: invalid params: {e}"),
-            );
-        }
-    };
-    let log = match sessions.event_log(&params.session_id) {
-        Some(l) => l,
-        None => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("session not found: {}", params.session_id),
-            );
-        }
-    };
+    let params: SessionEventsRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "session.events: invalid params"
+    );
+    let log = some_or_respond!(
+        sessions.event_log(&params.session_id),
+        request.id,
+        codes::INVALID_PARAMS,
+        format!("session not found: {}", params.session_id)
+    );
 
     let limit = params.limit.unwrap_or(200).clamp(1, 5000) as usize;
     let after = params.after_event_id.unwrap_or(0);
@@ -1063,7 +995,7 @@ pub fn handle_session_events(request: Request<Value>, sessions: Sessions) -> Res
     let mut end_of_log = true;
 
     for ev in all.iter().filter(|e| e.id > after) {
-        let payload_kind = payload_kind_str(&ev.payload);
+        let payload_kind = ev.payload.kind_str();
         if !kinds_filter.is_empty() && !kinds_filter.contains(payload_kind) {
             continue;
         }
@@ -1109,30 +1041,22 @@ pub async fn handle_start_autonomous(
 ) -> Response<Value> {
     use mu_core::capability::AutonomyCapability;
 
-    let params: StartAutonomousRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("session.start_autonomous: invalid params: {e}"),
-            );
-        }
-    };
+    let params: StartAutonomousRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "session.start_autonomous: invalid params"
+    );
 
-    let cap_handle = match sessions.capability(&params.session_id) {
-        Some(c) => c,
-        None => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!(
-                    "session.start_autonomous: session not found: {}",
-                    params.session_id
-                ),
-            );
-        }
-    };
+    let cap_handle = some_or_respond!(
+        sessions.capability(&params.session_id),
+        request.id,
+        codes::INVALID_PARAMS,
+        format!(
+            "session.start_autonomous: session not found: {}",
+            params.session_id
+        )
+    );
     let cap_snapshot = cap_handle
         .lock()
         .map(|c| c.clone())
@@ -1196,16 +1120,12 @@ pub async fn handle_schedule_wakeup(
 ) -> Response<Value> {
     use mu_core::capability::AutonomyCapability;
 
-    let params: ScheduleWakeupRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("session.schedule_wakeup: invalid params: {e}"),
-            );
-        }
-    };
+    let params: ScheduleWakeupRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "session.schedule_wakeup: invalid params"
+    );
     if params.wake_at_unix_ms.is_some() == params.sleep_for_ms.is_some() {
         return err_response(
             request.id,
@@ -1215,19 +1135,15 @@ pub async fn handle_schedule_wakeup(
                 .to_string(),
         );
     }
-    let cap_handle = match sessions.capability(&params.session_id) {
-        Some(c) => c,
-        None => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!(
-                    "session.schedule_wakeup: session not found: {}",
-                    params.session_id
-                ),
-            );
-        }
-    };
+    let cap_handle = some_or_respond!(
+        sessions.capability(&params.session_id),
+        request.id,
+        codes::INVALID_PARAMS,
+        format!(
+            "session.schedule_wakeup: session not found: {}",
+            params.session_id
+        )
+    );
     let cap_snapshot = cap_handle
         .lock()
         .map(|c| c.clone())
@@ -1306,16 +1222,12 @@ pub async fn handle_set_route(
     factory: ProviderFactory,
     daemon_info: DaemonInfo,
 ) -> Response<Value> {
-    let params: SetRouteRequest = match serde_json::from_value(request.params) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("invalid set_route params: {e}"),
-            )
-        }
-    };
+    let params: SetRouteRequest = ok_or_respond!(
+        serde_json::from_value(request.params),
+        request.id,
+        codes::INVALID_PARAMS,
+        "invalid set_route params"
+    );
 
     let (kind_str, model_str) = describe_selector(&params.provider);
 
@@ -1343,27 +1255,19 @@ pub async fn handle_set_route(
     // model switch would re-introduce the expiry re-pays the tier
     // exists to prevent.
     let route_ttl = sessions.cache_ttl(&params.session_id).unwrap_or_default();
-    let provider = match factory(&params.provider, route_ttl) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INTERNAL_ERROR,
-                format!("could not build provider: {e}"),
-            )
-        }
-    };
+    let provider = ok_or_respond!(
+        factory(&params.provider, route_ttl),
+        request.id,
+        codes::INTERNAL_ERROR,
+        "could not build provider"
+    );
 
-    let input_tx = match sessions.input_sender(&params.session_id) {
-        Some(tx) => tx,
-        None => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("session not found: {}", params.session_id),
-            )
-        }
-    };
+    let input_tx = some_or_respond!(
+        sessions.input_sender(&params.session_id),
+        request.id,
+        codes::INVALID_PARAMS,
+        format!("session not found: {}", params.session_id)
+    );
 
     let input = AgentInput::SwitchProvider {
         provider,
@@ -1389,45 +1293,6 @@ pub async fn handle_set_route(
     )
 }
 
-/// Wire `payload_kind` string for `kinds_filter`. Matches serde's
-/// rename_all snake_case on the EventPayload tag.
-fn payload_kind_str(p: &EventPayload) -> &'static str {
-    match p {
-        EventPayload::SessionCreated { .. } => "session_created",
-        EventPayload::UserMessage { .. } => "user_message",
-        EventPayload::AssistantMessageEvent { .. } => "assistant_message_event",
-        EventPayload::ToolCall { .. } => "tool_call",
-        EventPayload::ToolResult { .. } => "tool_result",
-        EventPayload::Done { .. } => "done",
-        EventPayload::Error { .. } => "error",
-        EventPayload::Callout { .. } => "callout",
-        EventPayload::SessionClosed => "session_closed",
-        EventPayload::ContextAssembly { .. } => "context_assembly",
-        EventPayload::CompactionAssembly { .. } => "compaction_assembly",
-        EventPayload::ProviderStatusUpdate { .. } => "provider_status_update",
-        EventPayload::AutonomousIterationStarted { .. } => "autonomous_iteration_started",
-        EventPayload::AutonomousIterationCompleted { .. } => "autonomous_iteration_completed",
-        EventPayload::AutonomousScheduledWakeup { .. } => "autonomous_scheduled_wakeup",
-        EventPayload::AutonomousTerminated { .. } => "autonomous_terminated",
-        EventPayload::MailboxMessagePosted { .. } => "mailbox_message_posted",
-        EventPayload::MailboxMessageConsumed { .. } => "mailbox_message_consumed",
-        EventPayload::TaskTelemetry { .. } => "task_telemetry",
-        EventPayload::ErrorInvalidMessage { .. } => "error_invalid_message",
-        EventPayload::ProviderSwitched { .. } => "provider_switched",
-        EventPayload::WorkerSpawned { .. } => "worker_spawned",
-        EventPayload::WorkerExited { .. } => "worker_exited",
-        EventPayload::WorkerFailed { .. } => "worker_failed",
-        EventPayload::WorkerTimeout { .. } => "worker_timeout",
-        EventPayload::OperatorMark { .. } => "operator_mark",
-        EventPayload::Tombstone { .. } => "tombstone",
-        EventPayload::HeadAttached { .. } => "head_attached",
-        EventPayload::CommandReceived { .. } => "command_received",
-        EventPayload::CommandSucceeded { .. } => "command_succeeded",
-        EventPayload::CommandFailed { .. } => "command_failed",
-        EventPayload::CommandRejected { .. } => "command_rejected",
-    }
-}
-
 // ── mu-slat: spawn_worker ────────────────────────────────────────────
 
 pub async fn handle_spawn_worker(
@@ -1435,16 +1300,12 @@ pub async fn handle_spawn_worker(
     sessions: Sessions,
     daemon_info: DaemonInfo,
 ) -> Response<Value> {
-    let req: SpawnWorkerRequest = match serde_json::from_value(request.params) {
-        Ok(r) => r,
-        Err(e) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("bad SpawnWorkerRequest: {e}"),
-            );
-        }
-    };
+    let req: SpawnWorkerRequest = ok_or_respond!(
+        serde_json::from_value(request.params),
+        request.id,
+        codes::INVALID_PARAMS,
+        "bad SpawnWorkerRequest"
+    );
 
     let config = crate::serve::worker::SpawnWorkerConfig {
         prompt: req.prompt.clone(),

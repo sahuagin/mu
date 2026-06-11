@@ -30,7 +30,9 @@ pub mod faux;
 pub mod providers;
 pub use context::{AnthropicCacheStrategy, AnthropicProviderRenderer};
 pub use faux::{FauxProvider, FauxResponse};
-pub use providers::{AnthropicProvider, OllamaProvider, OpenRouterProvider, OpenaiCodexProvider};
+pub use providers::{
+    AnthropicProvider, OllamaProvider, OpenRouterProvider, OpenaiCodexProvider, VllmProvider,
+};
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

@@ -29,14 +29,13 @@ check-quick:
 # Exactly what CI runs: fmt-check + clippy + test, fail-fast in CI order (mirrors .github/workflows/ci.yml; fmt is check-only, never edits files). bead: mu-608b
 ci: fmt-check clippy test
 
-# Pre-PR cross-provider review gate (bead mu-6qst): run CI, then have a
-# SEPARATE-provider model review the diff before a PR — a third check on top of
-# CI and the human/agent. Local only (needs provider auth + network; not a CI
-# step). Verdict comes from the reviewer's stdout, not its exit code. Reviewer
-# defaults to ollama/qwen3-coder:30b (local, free, non-Claude); use codex with
-# MU_REVIEW_PROVIDER=openai-codex MU_REVIEW_MODEL=gpt-5.5 when its OAuth is
-# healthy. Disagree with a REJECT via MU_REVIEW_OVERRIDE=1. See scripts/ai-review.sh.
-ci-aipr: ci
+# Pre-PR cross-provider review gate (bead mu-6qst): run the full PR checks
+# (fmt + clippy + tests + verify-claims), then have two independent reviewers
+# inspect the diff before a PR: one local Ollama model and one OpenRouter model.
+# Local only (needs provider auth + network; not a CI step). Verdict comes from
+# the reviewer's stdout, not its exit code. Disagree with a REJECT via
+# MU_REVIEW_OVERRIDE=1. See scripts/ai-review.sh.
+ci-aipr: check
     scripts/ai-review.sh
 
 # Trailing-PR sync of the canonical beads DB to .beads/issues.jsonl on main

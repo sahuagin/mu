@@ -86,6 +86,10 @@ impl RouteCatalog {
             .ok()
             .filter(|s| !s.is_empty())
             .is_some();
+        let vllm_configured = std::env::var("VLLM_API_BASE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .is_some();
 
         let mut entries = Vec::new();
 
@@ -111,6 +115,10 @@ impl RouteCatalog {
                 *soft,
                 *hard,
             ));
+        }
+
+        for (model, soft, hard) in VLLM_MODELS {
+            entries.push(build_entry("vllm", model, vllm_configured, *soft, *hard));
         }
 
         entries.push(build_entry("faux", "faux", true, 128_000, 128_000));
@@ -141,6 +149,27 @@ impl RouteCatalog {
                 true,
                 OLLAMA_DEFAULT_CONTEXT,
                 OLLAMA_DEFAULT_CONTEXT,
+            ));
+        }
+        self
+    }
+
+    /// Merge dynamically-discovered vLLM models into the catalog.
+    /// vLLM exposes OpenAI-compatible `/v1/models`; the daemon probes it
+    /// at startup and passes the returned ids here. Context defaults to
+    /// 32k until per-model enrichment exists.
+    pub fn with_vllm_models<I, S>(mut self, models: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for m in models {
+            self.entries.push(build_entry(
+                "vllm",
+                m.as_ref(),
+                true,
+                VLLM_DEFAULT_CONTEXT,
+                VLLM_DEFAULT_CONTEXT,
             ));
         }
         self
@@ -261,6 +290,10 @@ const OPENAI_CODEX_MODELS: &[(&str, u64, u64)] = &[("gpt-5.5", 1_000_000, 1_000_
 /// windows; per-model `/api/show` enrichment is a follow-up. (mu-818c)
 const OLLAMA_DEFAULT_CONTEXT: u64 = 32_768;
 
+/// Conservative placeholder context window for vLLM-served models.
+/// `/v1/models` reports ids, not context windows.
+const VLLM_DEFAULT_CONTEXT: u64 = 32_768;
+
 const OPENROUTER_MODELS: &[(&str, u64, u64)] = &[
     ("anthropic/claude-opus-4.7", 200_000, 1_000_000),
     ("anthropic/claude-sonnet-4.6", 200_000, 200_000),
@@ -269,9 +302,14 @@ const OPENROUTER_MODELS: &[(&str, u64, u64)] = &[
     ("google/gemini-2.5-pro", 1_000_000, 1_000_000),
 ];
 
+const VLLM_MODELS: &[(&str, u64, u64)] =
+    &[("Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8", 32_768, 32_768)];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn faux_always_configured() {
@@ -360,6 +398,23 @@ mod tests {
             .favorites
             .iter()
             .any(|f| f.name.as_ref() == "local_qwen36"));
+    }
+
+    #[test]
+    fn vllm_qwen_route_is_cataloged_when_base_configured() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("VLLM_API_BASE").ok();
+        std::env::set_var("VLLM_API_BASE", "http://rtx4000:8000");
+        let catalog = RouteCatalog::from_env();
+        let q = catalog
+            .find("vllm", "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8")
+            .expect("built-in vllm qwen route should be present");
+        assert!(q.configured);
+        assert_eq!(q.context_hard_limit, Some(32_768));
+        match prev {
+            Some(v) => std::env::set_var("VLLM_API_BASE", v),
+            None => std::env::remove_var("VLLM_API_BASE"),
+        }
     }
 
     #[test]

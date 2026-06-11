@@ -47,6 +47,7 @@ pub fn handle_create_session(
     sessions: Sessions,
     factory: ProviderFactory,
     tools: Arc<Vec<Arc<dyn Tool>>>,
+    skills: Arc<Vec<mu_core::skill::loader::LoadedSkill>>,
     daemon_info: DaemonInfo,
 ) -> Response<Value> {
     let params: CreateSessionRequest = match serde_json::from_value(request.params.clone()) {
@@ -91,6 +92,7 @@ pub fn handle_create_session(
         sessions,
         factory,
         tools,
+        skills,
         daemon_info: &daemon_info,
     }) {
         Ok(session_id) => {
@@ -111,6 +113,7 @@ pub fn handle_delegate_session(
     sessions: Sessions,
     factory: ProviderFactory,
     tools: Arc<Vec<Arc<dyn Tool>>>,
+    skills: Arc<Vec<mu_core::skill::loader::LoadedSkill>>,
     daemon_info: DaemonInfo,
 ) -> Response<Value> {
     let params: DelegateSessionRequest = match serde_json::from_value(request.params.clone()) {
@@ -175,6 +178,7 @@ pub fn handle_delegate_session(
         sessions,
         factory,
         tools,
+        skills,
         daemon_info: &daemon_info,
     }) {
         Ok(child_session_id) => {
@@ -216,6 +220,7 @@ pub fn handle_resume_session(
     sessions: Sessions,
     factory: ProviderFactory,
     tools: Arc<Vec<Arc<dyn Tool>>>,
+    skills: Arc<Vec<mu_core::skill::loader::LoadedSkill>>,
     daemon_info: DaemonInfo,
 ) -> Response<Value> {
     use mu_core::protocol::{ResumeSessionRequest, ResumeSessionResponse, SessionRef};
@@ -358,6 +363,7 @@ pub fn handle_resume_session(
         sessions: sessions.clone(),
         factory,
         tools,
+        skills,
         daemon_info: &daemon_info,
     }) {
         Ok(id) => id,
@@ -416,6 +422,7 @@ struct BuildSessionRequest<'a> {
     sessions: Sessions,
     factory: ProviderFactory,
     tools: Arc<Vec<Arc<dyn Tool>>>,
+    skills: Arc<Vec<mu_core::skill::loader::LoadedSkill>>,
     daemon_info: &'a DaemonInfo,
 }
 
@@ -495,6 +502,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         sessions,
         factory,
         tools,
+        skills,
         daemon_info,
         cache_ttl,
     } = req;
@@ -581,16 +589,14 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         &autonomy,
     );
     // mu-onq8: always-on in-loop capability discovery. Ranks the session's
-    // sibling tools (attenuated by this session's capability) against a
-    // free-text intent, so the agent can find the right tool in-loop instead
-    // of shelling out to the allowlist-blocked bash path. Built over a
-    // snapshot of the siblings (excludes itself). Skills are not yet threaded
-    // here (tools-only v1); the daemon's discovered skills join in the mu-onq8
-    // follow-up (pairs with mu-re0s).
+    // sibling tools (attenuated by this session's capability) plus the
+    // daemon-discovered skills against a free-text intent, so the agent can
+    // find the right capability in-loop instead of shelling out to the
+    // allowlist-blocked bash path.
     let discover_siblings = Arc::new(session_tools.clone());
     session_tools.push(Arc::new(crate::tools::DiscoverTool::new(
         discover_siblings,
-        Arc::new(Vec::<mu_core::skill::loader::LoadedSkill>::new()),
+        skills.clone(),
         capability_handle.clone(),
         // mu-kex4.6.3: semantic ranking is opt-in via [index].semantic_discover.
         daemon_info.config().index.semantic_discover,
@@ -716,6 +722,7 @@ fn describe_selector(selector: &ProviderSelector) -> (String, String) {
         ProviderSelector::OpenaiApi { model } => ("openai_api".into(), model.clone()),
         ProviderSelector::OpenaiCodex { model } => ("openai_codex".into(), model.clone()),
         ProviderSelector::Openrouter { model } => ("openrouter".into(), model.clone()),
+        ProviderSelector::Vllm { model } => ("vllm".into(), model.clone()),
         ProviderSelector::Ollama { model } => ("ollama".into(), model.clone()),
     }
 }
@@ -2073,6 +2080,7 @@ mod tests {
             sessions.clone(),
             factory,
             tools,
+            Arc::new(Vec::new()),
             di,
         );
         let value = serde_json::to_value(&resp).expect("serialize response");

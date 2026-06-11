@@ -16,6 +16,8 @@ use mu_core::agent::{
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
+use crate::tools::path::expand_leading_tilde;
+
 pub struct EditTool;
 
 impl EditTool {
@@ -213,7 +215,7 @@ fn path_argument(arguments: &Value) -> Result<PathBuf, ToolResult> {
     arguments
         .get("path")
         .and_then(Value::as_str)
-        .map(PathBuf::from)
+        .map(expand_leading_tilde)
         .ok_or_else(|| ToolResult {
             content: "edit: missing required `path` argument".to_owned(),
             is_error: true,

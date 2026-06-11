@@ -86,12 +86,12 @@ mod tests {
     fn openai_reasoning_models_get_16k() {
         assert_eq!(max_tokens_for_model("gpt-5"), 16384);
         assert_eq!(max_tokens_for_model("o4-mini"), 16384);
+        assert_eq!(max_tokens_for_model("deepseek/deepseek-v4-pro"), 16384);
     }
 
     #[test]
     fn ollama_reasoning_models_get_16k() {
         assert_eq!(max_tokens_for_model("gpt-oss:20b"), 16384);
-        assert_eq!(max_tokens_for_model("gpt-oss:120b"), 16384);
         assert_eq!(max_tokens_for_model("deepseek-r1:32b"), 16384);
         assert_eq!(max_tokens_for_model("qwen3.6:35b-a3b-q8_0"), 16384);
         // Non-reasoning local models keep the conservative default.

@@ -4,13 +4,14 @@
 //! `fd` respects `.gitignore` and is fast. See spec mu-024.
 
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 
 use mu_core::agent::{Tool, ToolResult, ToolSpec};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
+
+use crate::tools::path::expand_leading_tilde;
 
 pub struct GlobTool;
 
@@ -127,7 +128,7 @@ impl Tool for GlobTool {
             let path = arguments
                 .get("path")
                 .and_then(Value::as_str)
-                .map(PathBuf::from);
+                .map(expand_leading_tilde);
             // mu-wkn: a tool named "glob" should glob by default.
             // Legacy callers passing explicit `glob: true` still work;
             // regex behavior is preserved via explicit `glob: false`.
@@ -287,6 +288,7 @@ mod tests {
     use super::*;
     use std::error::Error;
     use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(name: &str) -> Result<PathBuf, Box<dyn Error>> {

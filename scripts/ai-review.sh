@@ -6,11 +6,12 @@
 # reviews green code.
 #
 # PANEL SHAPE (mu-f0ls): TWO primaries + a conditional TIEBREAKER.
-#   Primary 1 (local):  qwen-rev (qwen3.6:35b-a3b-q8_0 @ num_ctx 262144, temp 0.6)
-#                       over ollama — free, warm on the box, returns COMPLETE reviews.
-#   Primary 2:          gpt-5.5 over openai-codex — the strong generalist.
-#   Tiebreaker:         deepseek-v4-pro over openrouter — invoked ONLY when the
-#                       two primaries disagree (consensus short-circuits it).
+#   Primary 1 (local):  qwen3-coder-next-agent262k over ollama — 3-GPU local
+#                       agentic/code reviewer, 262k context, temp 0.6.
+#   Primary 2:          deepseek-v4-pro over openrouter — frontier-ish and cheap.
+#   Tiebreaker:         Claude over anthropic-api — invoked ONLY when the two
+#                       primaries disagree, so the Anthropic key/cost is reserved
+#                       for actual ties.
 #
 # WHY THIS SHAPE: the previous panel ran two LOCAL models co-resident (qwen +
 # gpt-oss:20b) and dead-ended a split at the operator. gpt-oss@49152 truncated its
@@ -51,13 +52,13 @@
 # Env:
 #   Primary 1 (default ollama / qwen-rev):
 #     MU_REVIEW_PROVIDER        provider (default: ollama)
-#     MU_REVIEW_MODEL           model    (default: qwen-rev — baked qwen3.6:35b-a3b-q8_0@262144, temp 0.6)
-#   Primary 2 (default openai-codex / gpt-5.5):
-#     MU_REVIEW_PROVIDER_2      provider (default: openai-codex)
-#     MU_REVIEW_MODEL_2         model    (default: gpt-5.5)
-#   Tiebreaker (default openrouter / deepseek-v4-pro; runs ONLY on a split):
-#     MU_REVIEW_PROVIDER_3      provider (default: openrouter)
-#     MU_REVIEW_MODEL_3         model    (default: deepseek/deepseek-v4-pro)
+#     MU_REVIEW_MODEL           model    (default: qwen3-coder-next-agent262k)
+#   Primary 2 (default openrouter / deepseek-v4-pro):
+#     MU_REVIEW_PROVIDER_2      provider (default: openrouter)
+#     MU_REVIEW_MODEL_2         model    (default: deepseek/deepseek-v4-pro)
+#   Tiebreaker (default anthropic-api / claude-sonnet-4-6; runs ONLY on a split):
+#     MU_REVIEW_PROVIDER_3      provider (default: anthropic-api)
+#     MU_REVIEW_MODEL_3         model    (default: claude-sonnet-4-6)
 #   Shared:
 #     MU_REVIEW_TOOLS           reviewer tools, e.g. "read,grep" (default: none, single-shot)
 #     MU_REVIEW_BASE            base ref to diff against (default: main)
@@ -85,42 +86,22 @@ set -u
 set -o pipefail
 
 # Primary 1 is local ollama: free, reliable, a non-Claude opinion, warm on the box
-# (24h keep-alive). It is the BAKED model qwen-rev (qwen3.6:35b-a3b-q8_0 @ num_ctx
-# 262144, temp 0.6) from scripts/ollama/, NOT a base tag. WHY BAKED: mu talks to
-# ollama over the Anthropic wire (mu-fmas) which sends NO num_ctx and NO sampling
-# params (verified 2026-06-09: build_request_body is model/system/messages/tools/
-# max_tokens only), so the model falls back to its baked defaults — baking is the
-# only lever for both the window AND the sampling (memory a721c14d, 41771769).
+# (24h keep-alive). It is a BAKED model tag so mu can avoid per-request sampling
+# and context overrides on the Ollama/Anthropic wire. With the 3-GPU review host,
+# qwen3-coder-next-agent262k fits at 262144 context, temp 0.6 and leaves headroom;
+# it has been the stronger local AGENTIC/code-exploration lane than gpt-oss.
 #
-# WHY THE FULL 35b (not the shrunk 27b): with a SINGLE local primary the old
-# co-residency squeeze is gone — qwen-rev gets the 48GB card to itself, so we run
-# the full q8 35b (best local quality) at its full 262144 window. It fits: an
-# SSM/attention HYBRID (full_attention_interval=4) keeps the KV cache ~1GB/64k, so
-# 262144 costs only ~5GB over the 38GB weights → 43GB/100% GPU (terrain-verified
-# 2026-06-09). temp 0.6 = Unsloth's precise-coding setting (NOT temp 0, which is
-# off-distribution and degenerates — memory 41771769); a fixed seed gives the gate
-# run-to-run reproducibility.
-#
-# WHY QWEN (not gpt-oss) FOR THE LOCAL SLOT: in our synthetic benchmarks gpt-oss:20b
-# leads single-shot CODE review and qwen leads AGENTIC — so gpt-oss is the stronger
-# pure code reviewer. BUT gpt-oss@49152 truncates its review before the VERDICT line
-# on larger diffs, and a model that can't return a complete verdict contributes no
-# signal regardless of its coding skill. Between "stronger coder that truncates" and
-# "complete reviewer," the complete one takes the always-on local slot; gpt-5.5 and
-# deepseek already supply aggressive code-level finding. gpt-oss keeps its Modelfile
-# for the review-gate v2 per-file worker (one file fits in 49152), just not here.
-# (gpt-oss:120b @ 65GB is a future single-local option once the box hits 72GB.)
-#
-# Primary 2 defaults to gpt-5.5 over openai-codex — the strong generalist. If its
-# OAuth is unhealthy it returns no verdict (UNCLEAR) and the tiebreaker covers it.
-# Tiebreaker is deepseek-v4-pro over openrouter, invoked only on a primary split.
+# Primary 2 defaults to deepseek-v4-pro over openrouter — frontier-ish, cheap,
+# and independent of the local runner. Tiebreaker is Claude over anthropic-api,
+# invoked only on a primary split so the Anthropic key/cost is used as the final
+# adjudicator, not the routine second opinion.
 # Bench provenance: ~/src/public_github/code-review-bench/reports/NOTES.md.
 PROVIDER="${MU_REVIEW_PROVIDER:-ollama}"
-MODEL="${MU_REVIEW_MODEL:-qwen-rev}"
-PROVIDER2="${MU_REVIEW_PROVIDER_2:-openai-codex}"
-MODEL2="${MU_REVIEW_MODEL_2:-gpt-5.5}"
-PROVIDER3="${MU_REVIEW_PROVIDER_3:-openrouter}"
-MODEL3="${MU_REVIEW_MODEL_3:-deepseek/deepseek-v4-pro}"
+MODEL="${MU_REVIEW_MODEL:-qwen3-coder-next-agent262k}"
+PROVIDER2="${MU_REVIEW_PROVIDER_2:-openrouter}"
+MODEL2="${MU_REVIEW_MODEL_2:-deepseek/deepseek-v4-pro}"
+PROVIDER3="${MU_REVIEW_PROVIDER_3:-anthropic-api}"
+MODEL3="${MU_REVIEW_MODEL_3:-claude-sonnet-4-6}"
 TOOLS="${MU_REVIEW_TOOLS:-}"   # empty = single-shot (default); e.g. "read,grep" lets the reviewer inspect surrounding code (slower, multi-turn)
 BASE="${MU_REVIEW_BASE:-main}"
 # Per-reviewer timeout: 2x a typical Claude response, with room for one ollama
@@ -210,7 +191,14 @@ if [ -n "$TOOLS" ]; then
 else
   TOOL_CLAUSE="Review the diff exactly as given below — do NOT call any tools and do NOT emit any function-call or tool-call syntax; respond with prose only."
 fi
-PROMPT="You are a strict pre-PR code reviewer. The DIFF below shows exactly what changed; review ONLY that change for: correctness bugs; concurrency / lifecycle hazards (e.g. a held reference that blocks shutdown, a clone that outlives its owner); missing error handling; and safeguards that nearby code already applies but this diff omits. The FULL CONTENT of each changed file is included after the diff so you can see definitions, helpers, and guards that live OUTSIDE the changed hunks — a variable or function used in the diff is often defined there, so CHECK the full content before reporting anything as undefined/unset, and do NOT raise findings about unchanged code. $TOOL_CLAUSE Be concise and specific; cite file:line. Your reply's LAST line MUST be exactly 'VERDICT: APPROVE' or 'VERDICT: REJECT' (those literal words). List the most important findings first.
+PROMPT="You are a strict pre-PR code reviewer. The DIFF below shows exactly what changed; review ONLY that change for: correctness bugs; concurrency / lifecycle hazards (e.g. a held reference that blocks shutdown, a clone that outlives its owner); missing error handling; and safeguards that nearby code already applies but this diff omits. The FULL CONTENT of each changed file is included after the diff so you can see definitions, helpers, and guards that live OUTSIDE the changed hunks — a variable or function used in the diff is often defined there, so CHECK the full content before reporting anything as undefined/unset, and do NOT raise findings about unchanged code. $TOOL_CLAUSE
+
+Output contract:
+- Do not narrate your review process or repeat the prompt.
+- Report at most 5 findings; omit low-confidence concerns.
+- If there is no blocking correctness/security/lifecycle issue in this diff, say so briefly.
+- Keep the review under 1200 words.
+- Your reply's LAST line MUST be exactly 'VERDICT: APPROVE' or 'VERDICT: REJECT' (those literal words). Do not continue after the verdict line.
 
 DIFF:
 $DIFF

@@ -146,6 +146,7 @@ pub async fn dispatch(
             sessions,
             factory,
             tools,
+            skills,
             daemon_info.clone(),
         ),
         DelegateSessionRequest::METHOD => handle_delegate_session(
@@ -154,6 +155,7 @@ pub async fn dispatch(
             sessions,
             factory,
             tools,
+            skills,
             daemon_info.clone(),
         ),
         // mu-mh4: strict fork-at-tail resume.
@@ -163,6 +165,7 @@ pub async fn dispatch(
             sessions,
             factory,
             tools,
+            skills,
             daemon_info.clone(),
         ),
         AskSessionRequest::METHOD => handle_ask_session(request, sessions).await,

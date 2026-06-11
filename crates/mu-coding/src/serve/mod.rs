@@ -134,22 +134,37 @@ pub async fn run(
     tools: Vec<Arc<dyn Tool>>,
     bare: bool,
 ) -> anyhow::Result<()> {
-    let mut config = mu_core::config::Config::load_default();
+    // spec mu-046 WP6: track config provenance — the file layers that
+    // contributed, plus the consumer-side overrides applied right
+    // here — so the journaled `ConfigLoaded` records where the
+    // effective config came from (INV-9).
+    let (mut config, mut config_sources) = mu_core::config::Config::load_default_with_sources();
     if let Ok(token) = std::env::var("MU_BEARER_TOKEN") {
         if !token.is_empty() {
             config.auth = mu_core::config::AuthConfig::Bearer {
                 tokens: vec![token],
             };
+            config_sources.push("env:MU_BEARER_TOKEN".to_string());
         }
     }
     if bare {
         config.recall.enabled = false;
         config.recall.bare = true;
+        config_sources.push("cli:--bare".to_string());
     }
     let events_dir = resolve_events_dir(&config);
     let stdin = BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();
-    serve_with_io_with_config(stdin, stdout, factory, tools, events_dir, config).await
+    serve_with_io_with_config_sources(
+        stdin,
+        stdout,
+        factory,
+        tools,
+        events_dir,
+        config,
+        config_sources,
+    )
+    .await
 }
 
 /// Test/integration hook — serve over generic reader/writer.
@@ -185,9 +200,12 @@ where
 }
 
 /// mu-l1z: test/integration hook with explicit `Config`. Production
-/// [`run`] loads `Config::load_default()` and calls this. Tests pass
+/// [`run`] loads `Config::load_default()` and calls
+/// [`serve_with_io_with_config_sources`]. Tests pass
 /// `Config::default()` (or a custom one if they're testing
-/// config-driven behavior).
+/// config-driven behavior); the journaled `ConfigLoaded` provenance is
+/// then the bare `["defaults"]` — an explicitly-passed config has no
+/// file/env/CLI layers to attribute.
 pub async fn serve_with_io_with_config<R, W>(
     reader: R,
     writer: W,
@@ -195,6 +213,35 @@ pub async fn serve_with_io_with_config<R, W>(
     tools: Vec<Arc<dyn Tool>>,
     events_dir: Option<PathBuf>,
     config: mu_core::config::Config,
+) -> anyhow::Result<()>
+where
+    R: AsyncBufRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    serve_with_io_with_config_sources(
+        reader,
+        writer,
+        factory,
+        tools,
+        events_dir,
+        config,
+        vec!["defaults".to_string()],
+    )
+    .await
+}
+
+/// [`serve_with_io_with_config`] plus config source provenance (spec
+/// mu-046 WP6): `config_sources` lists the layers that produced
+/// `config` (see [`mu_core::config::Config::load_with_sources`]) and
+/// is journaled verbatim in the boot-time `ConfigLoaded` record.
+pub async fn serve_with_io_with_config_sources<R, W>(
+    reader: R,
+    writer: W,
+    factory: ProviderFactory,
+    tools: Vec<Arc<dyn Tool>>,
+    events_dir: Option<PathBuf>,
+    config: mu_core::config::Config,
+    config_sources: Vec<String>,
 ) -> anyhow::Result<()>
 where
     R: AsyncBufRead + Unpin + Send + 'static,
@@ -375,6 +422,27 @@ where
         },
         outbound.clone(),
     ));
+    // spec mu-046 INV-9 (WP6): config is a message. The resolved
+    // effective config — redacted (INV-6) — enters the control plane
+    // as a journaled, sequenced `ConfigLoaded` HERE, after the journal
+    // opened (so it is record 2, behind open()'s `JournalOpened`) and
+    // strictly BEFORE any adapter exists (the MCP listener below, the
+    // stdio read loop at the bottom): every adapter command's seq is
+    // therefore greater than the config's. Append failure aborts
+    // serve — boot-time fail-closed, same posture as journal open
+    // failure (INV-2).
+    {
+        let mut effective = serde_json::to_value(daemon_info.config())
+            .map_err(|e| anyhow::anyhow!("cannot serialize effective config: {e}"))?;
+        mu_core::config::redact_config(&mut effective);
+        control
+            .inject_config_loaded(config_sources, effective)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot journal ConfigLoaded: {e} (refusing to serve, spec mu-046 INV-2/INV-9)"
+                )
+            })?;
+    }
     // mu-mb02: start MCP server on a unix socket if MU_MCP_SOCKET is
     // set or if the default socket path's parent exists. The MCP surface
     // shares Sessions + DaemonInfo with the primary JSON-RPC loop so

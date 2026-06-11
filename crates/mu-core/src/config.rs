@@ -123,8 +123,16 @@ pub struct JournalConfig {
     /// fast (see [`JournalConfig::fsync_policy`]).
     pub fsync: String,
     /// Journal read-only queries (`session.list`, `daemon.stats`, …)
-    /// too, not just mutating commands. Default `true`: the audit
-    /// trail records what was ASKED, not only what changed.
+    /// too, not just mutating commands. Default `true` — the locked
+    /// decision: the audit trail records what was ASKED, not only what
+    /// changed. `false` (test/ephemeral daemons) makes the pipeline's
+    /// recognized read-only query methods skip the journal entirely —
+    /// no `CommandReceived`, no receipt, no fsync on the hot read path
+    /// — while still flowing through the same ingest seam, auth gate,
+    /// and single-writer consumer (the border doesn't open; it just
+    /// stops writing for reads). Mutating commands always journal
+    /// regardless of this knob. The query set is the per-method
+    /// predicate in `serve/pipeline.rs` (`is_query`).
     #[serde(default = "default_true")]
     pub journal_queries: bool,
     /// Override the journal directory. `None` resolves to the
@@ -593,12 +601,33 @@ impl Config {
     /// panics; never returns Err. Worst case is "all files failed to
     /// parse" → equivalent to [`Config::default`].
     pub fn load<P: AsRef<Path>>(paths: &[P]) -> Self {
+        Self::load_with_sources(paths).0
+    }
+
+    /// [`Config::load`] plus source provenance (spec mu-046 WP6): the
+    /// second element lists the layers that actually CONTRIBUTED to the
+    /// resolved config — `"defaults"` first (always present), then the
+    /// path of each file that was present AND parsed. Missing or
+    /// malformed files are not listed: provenance records what was
+    /// applied, not what was probed. Consumer-side overrides (env, CLI
+    /// flags — resolution steps 4–5 in the module doc) append their own
+    /// entries at their call sites (e.g. `"env:MU_BEARER_TOKEN"`,
+    /// `"cli:--bare"` in `mu serve`'s boot path).
+    ///
+    /// The sources vec rides into the journal as
+    /// `JournalPayload::ConfigLoaded { sources, .. }` (INV-9) — the
+    /// durable answer to "where did this daemon's config come from".
+    pub fn load_with_sources<P: AsRef<Path>>(paths: &[P]) -> (Self, Vec<String>) {
+        let mut sources: Vec<String> = vec!["defaults".to_string()];
         let mut merged: toml::Value = toml::Value::Table(Default::default());
         for p in paths {
             let path = p.as_ref();
             match std::fs::read_to_string(path) {
                 Ok(content) => match content.parse::<toml::Value>() {
-                    Ok(v) => deep_merge(&mut merged, v),
+                    Ok(v) => {
+                        deep_merge(&mut merged, v);
+                        sources.push(path.display().to_string());
+                    }
                     Err(e) => {
                         tracing::warn!(
                             path = %path.display(),
@@ -622,13 +651,15 @@ impl Config {
             }
         }
         match merged.try_into::<Config>() {
-            Ok(c) => c,
+            Ok(c) => (c, sources),
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     "merged mu config failed deserialization; falling back to all-defaults",
                 );
-                Config::default()
+                // The files did NOT contribute to the effective config
+                // — provenance must say so.
+                (Config::default(), vec!["defaults".to_string()])
             }
         }
     }
@@ -642,11 +673,17 @@ impl Config {
     /// Tests should call [`Config::load`] with explicit paths to
     /// avoid pollution from the developer's real config.
     pub fn load_default() -> Self {
+        Self::load_default_with_sources().0
+    }
+
+    /// [`Config::load_default`] plus source provenance — see
+    /// [`Config::load_with_sources`].
+    pub fn load_default_with_sources() -> (Self, Vec<String>) {
         let mut paths: Vec<PathBuf> = vec![PathBuf::from("/etc/mu/config.toml")];
         if let Some(dir) = dirs::config_dir() {
             paths.push(dir.join("mu").join("config.toml"));
         }
-        Self::load(&paths)
+        Self::load_with_sources(&paths)
     }
 
     /// Whether session-start recall injection should run: the `[recall].enabled`
@@ -1131,6 +1168,35 @@ default_model = "operator/model"
         // journal_queries must not silently flip it off.
         let c: Config = toml::from_str("[journal]\nfsync = \"never\"\n").expect("parse");
         assert!(c.journal.journal_queries);
+    }
+
+    #[test]
+    fn load_with_sources_lists_only_contributing_layers() {
+        // spec mu-046 WP6: provenance records what was APPLIED —
+        // "defaults" always first, then each file that was present and
+        // parsed; missing and malformed files are absent.
+        let dir = std::env::temp_dir().join(format!("mu-046-sources-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let present = dir.join("present.toml");
+        std::fs::write(&present, "[recall]\nenabled = false\n").unwrap();
+        let missing = dir.join("never-written.toml");
+        let malformed = dir.join("malformed.toml");
+        std::fs::write(&malformed, "not toml ][[[").unwrap();
+
+        let (c, sources) = Config::load_with_sources(&[&present, &missing, &malformed]);
+        assert!(!c.recall.enabled, "the present layer applied");
+        assert_eq!(
+            sources,
+            vec!["defaults".to_string(), present.display().to_string()],
+            "only defaults + the contributing file are listed"
+        );
+
+        // No paths at all: pure defaults.
+        let (_, sources) = Config::load_with_sources::<&Path>(&[]);
+        assert_eq!(sources, vec!["defaults".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

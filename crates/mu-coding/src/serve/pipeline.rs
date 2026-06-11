@@ -96,9 +96,12 @@ use mu_core::command_journal::{
 use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
     AskSessionRequest, AuthInitiateRequest, CancelOutstandingRequest, CancelSessionRequest,
-    CloseSessionRequest, MailboxPostRequest, Request, RespondToInputRequiredRequest, Response,
-    ScheduleWakeupRequest, SessionEventsRequest, SessionStatsRequest, SetRouteRequest,
-    SpawnWorkerRequest, StartAutonomousRequest,
+    CapabilitiesDiscoverRequest, CloseSessionRequest, DaemonListRoutesRequest,
+    DaemonOutstandingCallsRequest, DaemonStatsRequest, DaemonUsageHistoryRequest,
+    MailboxListRequest, MailboxPostRequest, MailboxReadRequest, PingRequest, Request,
+    RespondToInputRequiredRequest, Response, ScheduleWakeupRequest, SessionEventsRequest,
+    SessionListRequest, SessionStatsRequest, SetRouteRequest, SpawnWorkerRequest,
+    StartAutonomousRequest,
 };
 use mu_core::skill::loader::LoadedSkill;
 use mu_core::transport::{
@@ -169,6 +172,38 @@ fn classify(method: &str) -> Scope {
     }
 }
 
+/// Read-only query methods (spec mu-046 WP6, the `[journal]
+/// .journal_queries` knob): daemon- and session-scoped READS whose
+/// processing mutates nothing. When `journal_queries = false` these
+/// skip the journal — no `CommandReceived`, no receipt — but still
+/// cross the same ingest seam, auth gate, and consumer.
+///
+/// Deliberately a closed allowlist, not a complement: an unlisted (or
+/// future) method fails SAFE by journaling. `mailbox.consume` is NOT
+/// here — consuming marks messages consumed, which is a mutation. The
+/// `mcp.*` twins of these reads are also absent (conservative: the
+/// foreign surface keeps its full paper trail; revisit if an ephemeral
+/// daemon ever fronts MCP).
+const QUERY_METHODS: &[&str] = &[
+    PingRequest::METHOD,
+    SessionListRequest::METHOD,
+    SessionEventsRequest::METHOD,
+    SessionStatsRequest::METHOD,
+    DaemonStatsRequest::METHOD,
+    DaemonUsageHistoryRequest::METHOD,
+    DaemonOutstandingCallsRequest::METHOD,
+    DaemonListRoutesRequest::METHOD,
+    CapabilitiesDiscoverRequest::METHOD,
+    MailboxListRequest::METHOD,
+    MailboxReadRequest::METHOD,
+];
+
+/// Whether `method` is a recognized read-only query (see
+/// [`QUERY_METHODS`]).
+fn is_query(method: &str) -> bool {
+    QUERY_METHODS.contains(&method)
+}
+
 /// The session a command addresses, by param. Session-scoped verbs
 /// carry `session_id`; `mailbox.post` addresses its target via
 /// `to_session_id` (the wire mixes the two shapes — the protocol
@@ -235,14 +270,23 @@ enum JournalSlot {
         log: Arc<SessionEventLog>,
         event_id: u64,
     },
+    /// Not journaled at all (spec mu-046 WP6): a recognized read-only
+    /// query on a daemon with `[journal].journal_queries = false`. No
+    /// `CommandReceived`, no receipt — [`append_receipt`] is a no-op
+    /// for this slot — and no command id for outbound correlation.
+    /// The command still crossed the same seam, gate, and consumer.
+    Unjournaled,
 }
 
 impl JournalSlot {
     /// The command id within its pipeline, for outbound correlation.
-    fn command_id(&self) -> u64 {
+    /// `None` for unjournaled queries — there is no journal record to
+    /// correlate to.
+    fn command_id(&self) -> Option<u64> {
         match self {
-            JournalSlot::Daemon { seq } => *seq,
-            JournalSlot::Session { event_id, .. } => *event_id,
+            JournalSlot::Daemon { seq } => Some(*seq),
+            JournalSlot::Session { event_id, .. } => Some(*event_id),
+            JournalSlot::Unjournaled => None,
         }
     }
 }
@@ -268,6 +312,23 @@ pub(crate) struct Command {
     auth_state: AuthStateHandle,
 }
 
+/// What rides the control-plane queue. Adapters produce
+/// [`Command`]s; the boot sequence produces exactly one
+/// [`ConfigLoaded`](PipelineInput::ConfigLoaded) (spec mu-046 INV-9)
+/// before any adapter exists. Both enter through the same seam lock,
+/// so journal seq order == queue order == processing order (INV-3)
+/// holds across message kinds.
+enum PipelineInput {
+    /// Boxed: a `Command` is ~240 bytes (request + params + echo
+    /// snapshot) vs. the 8-byte `ConfigLoaded` (clippy
+    /// large_enum_variant); commands are heap-allocated once at ingest.
+    Command(Box<Command>),
+    /// The resolved startup config entered the pipeline as a message.
+    /// Already journaled (under the seam lock) at `seq`; the consumer
+    /// "applies" it — a no-op today, see [`process_config_loaded`].
+    ConfigLoaded { seq: u64 },
+}
+
 /// Producer-side handle on the control plane, held by every adapter
 /// (stdio and MCP). Dropping every handle closes the queue and lets
 /// the consumer exit — the shutdown cascade's first domino.
@@ -278,6 +339,9 @@ pub(crate) struct ControlPlane {
     /// transport closure and drops on EOF, before the consumer's own
     /// `PipelineCtx` clone needs to be the last one standing.
     sessions: Sessions,
+    /// `[journal].journal_queries` (spec mu-046 WP6): `false` lets
+    /// recognized read-only queries ([`is_query`]) skip the journal.
+    journal_queries: bool,
     /// Journal-append + enqueue happen under this lock so journal seq
     /// order == queue order (INV-3) no matter how many adapters
     /// produce concurrently.
@@ -286,7 +350,49 @@ pub(crate) struct ControlPlane {
 
 struct IngestSeam {
     journal: Arc<CommandJournal>,
-    tx: mpsc::UnboundedSender<Command>,
+    tx: mpsc::UnboundedSender<PipelineInput>,
+}
+
+impl ControlPlane {
+    /// spec mu-046 INV-9 (WP6): inject the resolved (already redacted
+    /// — the caller runs [`mu_core::config::redact_config`], INV-6)
+    /// effective config as a journaled, sequenced control-plane
+    /// message: `ConfigLoaded { sources, config }` is appended and
+    /// enqueued under the SAME seam lock every adapter command crosses,
+    /// so it gets a seq and is processed by the single-writer consumer
+    /// like everything else — it is a message, not a side write.
+    ///
+    /// This is a narrow internal path rather than a [`ingest`] call
+    /// because `ingest` is request-shaped (JSON-RPC request + origin +
+    /// connection auth state) and `ConfigLoaded` is not a request —
+    /// there is no client, no request id, no response. It exists only
+    /// for the boot sequence today; a future `config.set` /
+    /// `ConfigAmended` (spec mu-046 "deferred") rides this exact seam:
+    /// journal the config message, sequence it, apply it in the
+    /// consumer.
+    ///
+    /// Errors propagate (journal append failure, consumer gone):
+    /// boot-time fail-closed — a daemon that cannot make its config
+    /// message durable does not serve (same posture as journal open
+    /// failure, INV-2).
+    pub(crate) fn inject_config_loaded(
+        &self,
+        sources: Vec<String>,
+        redacted_config: Value,
+    ) -> std::io::Result<u64> {
+        let seam = self
+            .seam
+            .lock()
+            .map_err(|_| std::io::Error::other("ingest seam poisoned"))?;
+        let seq = seam.journal.append(JournalPayload::ConfigLoaded {
+            sources,
+            config: redacted_config,
+        })?;
+        seam.tx
+            .send(PipelineInput::ConfigLoaded { seq })
+            .map_err(|_| std::io::Error::other("control plane consumer unavailable"))?;
+        Ok(seq)
+    }
 }
 
 #[cfg(test)]
@@ -342,18 +448,38 @@ pub(crate) fn spawn_control_plane(
     ctx: PipelineCtx,
     stream: OutboundStream,
 ) -> ControlPlane {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<PipelineInput>();
     let sessions = ctx.sessions.clone();
+    let journal_queries = ctx.daemon_info.config().journal.journal_queries;
     let consumer_journal = journal.clone();
     tokio::spawn(async move {
-        while let Some(cmd) = rx.recv().await {
-            process_command(cmd, &ctx, &consumer_journal, &stream).await;
+        while let Some(input) = rx.recv().await {
+            match input {
+                PipelineInput::Command(cmd) => {
+                    process_command(*cmd, &ctx, &consumer_journal, &stream).await;
+                }
+                PipelineInput::ConfigLoaded { seq } => process_config_loaded(seq),
+            }
         }
     });
     ControlPlane {
         sessions,
+        journal_queries,
         seam: Mutex::new(IngestSeam { journal, tx }),
     }
+}
+
+/// Apply a sequenced `ConfigLoaded` message (spec mu-046 INV-9). A
+/// no-op today by design: the startup config was already constructed
+/// and threaded into every component before the pipeline existed, so
+/// there is nothing to mutate — the point is the sequenced durable
+/// record, processed in order BEFORE any adapter command. When
+/// runtime-mutable config lands (`config.set` → `ConfigAmended`,
+/// deferred by the spec), THIS is where the new config value takes
+/// effect, with the journal seq as the total order over config
+/// changes vs. commands.
+fn process_config_loaded(seq: u64) {
+    tracing::debug!(seq, "control plane: ConfigLoaded applied (startup no-op)");
 }
 
 /// The border crossing (spec mu-046 INV-1/INV-2). Journal
@@ -377,6 +503,12 @@ pub(crate) fn ingest(
     let redacted_params = redact_params(&request.method, &request.params);
     let auth = snapshot_auth(auth_state);
     let received_at_unix_ms = now_unix_ms();
+    // WP6: with `[journal].journal_queries = false`, recognized
+    // read-only queries skip the journal (and receipts) entirely —
+    // they still cross the seam lock and the consumer below, so the
+    // border stays single and ordered; it just stops writing for
+    // reads. Mutating commands always journal.
+    let unjournaled_query = !control.journal_queries && is_query(&request.method);
 
     // WP4 routing: a session-scoped command journals into the
     // addressed session's own log IFF that session is in memory AND
@@ -384,11 +516,11 @@ pub(crate) fn ingest(
     // Resolved BEFORE the seam lock — the registry has its own locks
     // and nesting them under the seam invites ordering hazards.
     let session_log: Option<Arc<SessionEventLog>> = match scope {
-        Scope::Session => session_id
+        Scope::Session if !unjournaled_query => session_id
             .as_deref()
             .and_then(|id| control.sessions.event_log_in_memory(id))
             .filter(|log| log.has_disk_writer()),
-        Scope::Daemon => None,
+        _ => None,
     };
 
     let seam = match control.seam.lock() {
@@ -403,70 +535,74 @@ pub(crate) fn ingest(
             ));
         }
     };
-    let slot = match session_log {
-        // Session pipeline (WP4): strict fsync'd append into the
-        // session's own log, BEFORE the session's input queue can see
-        // the command (INV-1). The command crossed the border from
-        // the client, so the record's actor is `User`; receipts are
-        // written by the daemon and carry `System`.
-        Some(log) => {
-            let appended = log.append_command(
-                EventActor::User,
-                EventPayload::CommandReceived {
+    let slot = if unjournaled_query {
+        JournalSlot::Unjournaled
+    } else {
+        match session_log {
+            // Session pipeline (WP4): strict fsync'd append into the
+            // session's own log, BEFORE the session's input queue can see
+            // the command (INV-1). The command crossed the border from
+            // the client, so the record's actor is `User`; receipts are
+            // written by the daemon and carry `System`.
+            Some(log) => {
+                let appended = log.append_command(
+                    EventActor::User,
+                    EventPayload::CommandReceived {
+                        request_id: request.id.clone(),
+                        method: request.method.clone(),
+                        params: redacted_params.clone(),
+                        auth,
+                        origin: origin.clone(),
+                    },
+                );
+                match appended {
+                    Ok(event_id) => JournalSlot::Session { log, event_id },
+                    Err(err) => {
+                        // INV-2 (fail closed): not durable ⇒ never
+                        // enqueued, never processed. (`Unsupported` can't
+                        // reach here — has_disk_writer gated above — so
+                        // this is a real IO failure.)
+                        tracing::error!(
+                            %err,
+                            method = %request.method,
+                            session_id = ?session_id,
+                            "session event-log command append failed; rejecting command"
+                        );
+                        return Some(err_response(
+                            request.id,
+                            codes::JOURNAL_UNAVAILABLE,
+                            format!("command journal unavailable: {err}"),
+                        ));
+                    }
+                }
+            }
+            // Daemon control plane — daemon-scoped commands plus the
+            // session-scoped fallback cases (module doc).
+            None => {
+                let appended = seam.journal.append(JournalPayload::CommandReceived {
                     request_id: request.id.clone(),
                     method: request.method.clone(),
                     params: redacted_params.clone(),
+                    session_id,
                     auth,
                     origin: origin.clone(),
-                },
-            );
-            match appended {
-                Ok(event_id) => JournalSlot::Session { log, event_id },
-                Err(err) => {
-                    // INV-2 (fail closed): not durable ⇒ never
-                    // enqueued, never processed. (`Unsupported` can't
-                    // reach here — has_disk_writer gated above — so
-                    // this is a real IO failure.)
-                    tracing::error!(
-                        %err,
-                        method = %request.method,
-                        session_id = ?session_id,
-                        "session event-log command append failed; rejecting command"
-                    );
-                    return Some(err_response(
-                        request.id,
-                        codes::JOURNAL_UNAVAILABLE,
-                        format!("command journal unavailable: {err}"),
-                    ));
-                }
-            }
-        }
-        // Daemon control plane — daemon-scoped commands plus the
-        // session-scoped fallback cases (module doc).
-        None => {
-            let appended = seam.journal.append(JournalPayload::CommandReceived {
-                request_id: request.id.clone(),
-                method: request.method.clone(),
-                params: redacted_params.clone(),
-                session_id,
-                auth,
-                origin: origin.clone(),
-            });
-            match appended {
-                Ok(seq) => JournalSlot::Daemon { seq },
-                Err(err) => {
-                    // INV-2 (fail closed): not durable ⇒ never
-                    // enqueued, never processed.
-                    tracing::error!(
-                        %err,
-                        method = %request.method,
-                        "command journal append failed; rejecting command"
-                    );
-                    return Some(err_response(
-                        request.id,
-                        codes::JOURNAL_UNAVAILABLE,
-                        format!("command journal unavailable: {err}"),
-                    ));
+                });
+                match appended {
+                    Ok(seq) => JournalSlot::Daemon { seq },
+                    Err(err) => {
+                        // INV-2 (fail closed): not durable ⇒ never
+                        // enqueued, never processed.
+                        tracing::error!(
+                            %err,
+                            method = %request.method,
+                            "command journal append failed; rejecting command"
+                        );
+                        return Some(err_response(
+                            request.id,
+                            codes::JOURNAL_UNAVAILABLE,
+                            format!("command journal unavailable: {err}"),
+                        ));
+                    }
                 }
             }
         }
@@ -480,11 +616,15 @@ pub(crate) fn ingest(
         received_at_unix_ms,
         auth_state: auth_state.clone(),
     };
-    if let Err(send_err) = seam.tx.send(command) {
+    if let Err(send_err) = seam.tx.send(PipelineInput::Command(Box::new(command))) {
         // Consumer gone — daemon shutting down. The command is durable
         // (journaled, no receipt: a legible orphan) but won't run.
+        let request_id = match send_err.0 {
+            PipelineInput::Command(cmd) => cmd.request.id,
+            PipelineInput::ConfigLoaded { .. } => Value::Null,
+        };
         return Some(err_response(
-            send_err.0.request.id,
+            request_id,
             codes::INTERNAL_ERROR,
             "control plane unavailable (daemon shutting down)",
         ));
@@ -758,16 +898,21 @@ fn append_receipt(
                 );
             }
         }
+        // WP6: unjournaled query — no CommandReceived was written, so
+        // a receipt would dangle. Deliberate no-op.
+        JournalSlot::Unjournaled => {}
     }
 }
 
 /// One way out (INV-8): envelope the response with the originating
 /// connection + journal correlation and send it to the outbound
-/// stream; the connection's write loop delivers it.
+/// stream; the connection's write loop delivers it. `command_seq` is
+/// `None` for unjournaled queries (WP6) — there is no journal record
+/// to correlate to.
 fn emit_response(
     stream: &OutboundStream,
     origin: &Origin,
-    command_seq: u64,
+    command_seq: Option<u64>,
     response: Response<Value>,
 ) {
     let request_id = match &response {
@@ -777,7 +922,7 @@ fn emit_response(
         Ok(value) => stream.send(OutboundEnvelope {
             origin: Some(origin.clone()),
             request_id: Some(request_id),
-            command_seq: Some(command_seq),
+            command_seq,
             item: Outbound(value),
         }),
         Err(err) => tracing::warn!(%err, "response serialization failed"),
@@ -1307,5 +1452,161 @@ mod tests {
             "accepted ask must not be receipted at handler completion: {:?}",
             log.snapshot()
         );
+    }
+
+    // ─── spec mu-046 WP6 ────────────────────────────────────────────
+
+    /// The query allowlist (WP6): the daemon- and session-scoped reads
+    /// are queries; everything mutating — explicitly including
+    /// `mailbox.consume`, which marks messages consumed — is not.
+    #[test]
+    fn is_query_recognizes_reads_and_excludes_mutations() {
+        for m in [
+            "ping",
+            "session.list",
+            "session.events",
+            "session.stats",
+            "daemon.stats",
+            "daemon.usage_history",
+            "daemon.outstanding_calls",
+            "daemon.list_routes",
+            "capabilities/discover",
+            "mailbox.list",
+            "mailbox.read",
+        ] {
+            assert!(is_query(m), "{m} must be a query");
+        }
+        for m in [
+            "mailbox.consume",
+            "mailbox.post",
+            "create_session",
+            "ask_session",
+            "close_session",
+            "peer.auth_initiate",
+            "session.set_route",
+            "mcp.mu_mailbox_list", // mcp.* twins stay journaled (doc'd)
+            "no.such.method",      // unknown methods fail safe: journaled
+        ] {
+            assert!(!is_query(m), "{m} must NOT be a query");
+        }
+    }
+
+    /// INV-9 (WP6): `inject_config_loaded` goes through the same seam
+    /// as adapter commands — the ConfigLoaded record gets the next seq
+    /// after open()'s JournalOpened, and a command ingested AFTER the
+    /// injection gets a strictly greater seq.
+    #[tokio::test]
+    async fn inject_config_loaded_is_sequenced_before_later_commands() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("d.jsonl");
+        let journal = Arc::new(
+            CommandJournal::open(&journal_path, "d", FsyncPolicy::Never).expect("open journal"),
+        );
+        let stream = OutboundStream::new();
+        let control = spawn_control_plane(journal, test_ctx(), stream);
+
+        let config_seq = control
+            .inject_config_loaded(
+                vec!["defaults".to_string(), "cli:--bare".to_string()],
+                json!({ "recall": { "bare": true } }),
+            )
+            .expect("inject ConfigLoaded");
+        assert_eq!(config_seq, 2, "record 1 is JournalOpened");
+
+        let auth = authed_state();
+        assert!(ingest(&control, request("ping", json!(null)), test_origin(), &auth).is_none());
+
+        let (records, _) = CommandJournal::replay(&journal_path).expect("replay");
+        assert!(matches!(
+            records[0].payload,
+            JournalPayload::JournalOpened { .. }
+        ));
+        match &records[1].payload {
+            JournalPayload::ConfigLoaded { sources, config } => {
+                assert_eq!(records[1].seq, config_seq);
+                assert_eq!(sources[0], "defaults");
+                assert_eq!(sources[1], "cli:--bare");
+                assert_eq!(config["recall"]["bare"], true);
+            }
+            other => panic!("record 2 must be ConfigLoaded, got {other:?}"),
+        }
+        let ping_seq = received_seq(
+            &CommandJournal::replay(&journal_path).expect("replay").0,
+            "ping",
+        )[0];
+        assert!(
+            ping_seq > config_seq,
+            "adapter commands sequence AFTER ConfigLoaded ({ping_seq} > {config_seq})"
+        );
+    }
+
+    fn received_seq(records: &[mu_core::command_journal::JournalRecord], m: &str) -> Vec<u64> {
+        records
+            .iter()
+            .filter_map(|r| match &r.payload {
+                JournalPayload::CommandReceived { method, .. } if method == m => Some(r.seq),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `[journal].journal_queries = false` (WP6): a recognized query
+    /// crosses the seam and the consumer — it still gets its response
+    /// via the outbound stream — but leaves NO journal record and no
+    /// receipt. A mutating command on the same daemon still journals.
+    #[tokio::test]
+    async fn journal_queries_false_skips_query_journaling_but_responds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("d.jsonl");
+        let journal = Arc::new(
+            CommandJournal::open(&journal_path, "d", FsyncPolicy::Never).expect("open journal"),
+        );
+        let mut config = Config::default();
+        config.journal.journal_queries = false;
+        let mut ctx = test_ctx();
+        ctx.daemon_info = ctx.daemon_info.clone().with_config(config);
+        let stream = OutboundStream::new();
+        let mut outbound_rx = stream.subscribe();
+        let control = spawn_control_plane(journal, ctx, stream);
+
+        let auth = authed_state();
+        assert!(
+            ingest(&control, request("ping", json!(null)), test_origin(), &auth).is_none(),
+            "queries still cross the pipeline; response rides outbound"
+        );
+        let envelope = tokio::time::timeout(Duration::from_secs(2), outbound_rx.recv())
+            .await
+            .expect("ping response within 2s")
+            .expect("stream open");
+        assert_eq!(
+            envelope.command_seq, None,
+            "unjournaled query has no journal correlation"
+        );
+        assert_eq!(envelope.item.0["result"]["pong"], true);
+
+        // Nothing past JournalOpened: no CommandReceived, no receipt.
+        let (records, _) = CommandJournal::replay(&journal_path).expect("replay");
+        assert_eq!(
+            records.len(),
+            1,
+            "query left journal records behind: {records:?}"
+        );
+
+        // A mutating command (mailbox.consume — the documented
+        // NOT-a-query) still journals its border record.
+        let req = request(
+            mu_core::protocol::MailboxConsumeRequest::METHOD,
+            json!({ "session_id": "nope", "seqs": [1] }),
+        );
+        assert!(ingest(&control, req, test_origin(), &auth).is_none());
+        for _ in 0..200 {
+            let (records, _) = CommandJournal::replay(&journal_path).expect("replay");
+            if !received_seq(&records, mu_core::protocol::MailboxConsumeRequest::METHOD).is_empty()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("mutating command must still journal with journal_queries=false");
     }
 }

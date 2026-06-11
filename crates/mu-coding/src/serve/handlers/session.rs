@@ -722,6 +722,7 @@ fn describe_selector(selector: &ProviderSelector) -> (String, String) {
         ProviderSelector::OpenaiApi { model } => ("openai_api".into(), model.clone()),
         ProviderSelector::OpenaiCodex { model } => ("openai_codex".into(), model.clone()),
         ProviderSelector::Openrouter { model } => ("openrouter".into(), model.clone()),
+        ProviderSelector::Vllm { model } => ("vllm".into(), model.clone()),
         ProviderSelector::Ollama { model } => ("ollama".into(), model.clone()),
     }
 }

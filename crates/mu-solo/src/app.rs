@@ -66,6 +66,8 @@ const KNOWN_PROVIDERS: &[&str] = &[
     "anthropic-oauth",
     "openai-api",
     "openrouter",
+    "vllm",
+    "ollama",
     "faux",
 ];
 
@@ -98,6 +100,8 @@ fn known_models_for(provider: &str) -> &'static [&'static str] {
             "x-ai/grok-4.3",
             "meta-llama/llama-4-maverick",
         ],
+        "vllm" => &["Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"],
+        "ollama" => &["qwen3-coder:30b", "qwen3.6:35b-a3b-q8_0"],
         "faux" => &["faux"],
         _ => &[],
     }
@@ -195,6 +199,8 @@ fn normalize_provider_kind(provider: &str) -> String {
         "anthropic" | "anthropic-api" | "anthropic_api" | "claude" => "anthropic_api".into(),
         "openai" | "openai-codex" | "openai_codex" | "codex" => "openai_codex".into(),
         "openrouter" | "open-router" | "open_router" => "openrouter".into(),
+        "vllm" | "vllm-openai" | "local-vllm" | "local_vllm" => "vllm".into(),
+        "ollama" | "local" => "ollama".into(),
         "faux" => "faux".into(),
         _ => lc,
     }

@@ -18,6 +18,14 @@ label = "OpenRouter"
 requires_api_key = true
 usage_semantics = "openai_style"
 
+[providers.vllm]
+kind = "vllm"
+label = "vLLM"
+aliases = ["local-vllm"]
+requires_api_key = false
+usage_semantics = "openai_style"
+quirks = ["local_openai_compatible"]
+
 [providers.ollama]
 kind = "ollama"
 label = "Ollama"

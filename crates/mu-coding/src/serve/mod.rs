@@ -218,21 +218,14 @@ where
     // handle is freshly allocated here so cross-connection auth state
     // never leaks.
     let auth_registry = Arc::new(auth::registry_from_config(&config.auth));
-    // mu-ddua: auth is opt-in. When no configured mechanism actually
-    // enforces (the default config registers BEARER with an empty
-    // allowlist, which can never authenticate anyone), gating
-    // `create_session` would lock out every client with no way back in.
-    // Start such connections pre-authenticated under root — mirroring a
-    // successful BEARER handshake — so a default `mu serve` is usable
-    // out-of-box. The gate enforces only once `[auth]` tokens are set.
-    let initial_auth_state = if auth_registry.is_auth_required() {
-        auth::AuthState::Unauthenticated
-    } else {
-        auth::AuthState::Authenticated {
-            capability: mu_core::capability::Capability::root(),
-        }
-    };
-    let auth_state: auth::AuthStateHandle = Arc::new(std::sync::Mutex::new(initial_auth_state));
+    // mu-ddua: auth is opt-in — when no configured mechanism actually
+    // enforces, connections start pre-authenticated under root so a
+    // default `mu serve` is usable out-of-box. The shared posture lives
+    // in `auth::initial_connection_state` (the MCP adapter applies the
+    // same rule per accepted connection, spec mu-046 WP5).
+    let auth_state: auth::AuthStateHandle = Arc::new(std::sync::Mutex::new(
+        auth::initial_connection_state(&auth_registry),
+    ));
     // mu-phl v0 (mu-0bxv): wire up the canonical session-start recall
     // provider chain. Tests construct DaemonInfo without these (empty
     // vec) to skip recall; production runs the full chain.
@@ -301,39 +294,6 @@ where
         )),
         None => local,
     };
-    // mu-mb02: start MCP server on a unix socket if MU_MCP_SOCKET is
-    // set or if the default socket path's parent exists. The MCP surface
-    // shares Sessions + DaemonInfo with the primary JSON-RPC loop so
-    // mailbox operations are consistent across both surfaces.
-    //
-    // The MCP task holds a Sessions clone. transport::serve's shutdown
-    // cascade (drop handler → drop sessions → agent loops exit →
-    // NotificationWriters drop → writer_task completes) deadlocks if
-    // any external clone keeps sessions alive. AbortOnDrop is captured
-    // by the handler closure so that dropping the handler aborts the
-    // MCP task first, releasing its sessions clone.
-    let mcp_socket_path = std::env::var("MU_MCP_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| mcp::default_mcp_socket_path());
-    let mcp_guard = if mcp_socket_path
-        .parent()
-        .map(|p| p.exists())
-        .unwrap_or(false)
-    {
-        let mcp_sessions = sessions.clone();
-        let mcp_daemon_info = daemon_info.clone();
-        let handle = tokio::spawn(async move {
-            if let Err(e) =
-                mcp::serve_mcp_socket(mcp_socket_path, mcp_sessions, mcp_daemon_info).await
-            {
-                tracing::error!("MCP server exited: {e:#}");
-            }
-        });
-        Some(AbortOnDrop(std::sync::Mutex::new(Some(handle))))
-    } else {
-        None
-    };
-
     // mu-slat: the spawn_worker tool is injected per-session in
     // build_and_register_session (handlers/session.rs), not here — it
     // needs the calling session's id so worker results route back to
@@ -405,16 +365,73 @@ where
     let control = Arc::new(pipeline::spawn_control_plane(
         journal,
         pipeline::PipelineCtx {
-            sessions,
+            sessions: sessions.clone(),
             factory,
             tools,
             skills,
-            daemon_info,
+            daemon_info: daemon_info.clone(),
             discovery,
-            auth_registry,
+            auth_registry: auth_registry.clone(),
         },
         outbound.clone(),
     ));
+    // mu-mb02: start MCP server on a unix socket if MU_MCP_SOCKET is
+    // set or if the default socket path's parent exists. The MCP surface
+    // shares Sessions + DaemonInfo with the primary JSON-RPC loop so
+    // mailbox operations are consistent across both surfaces — and
+    // since spec mu-046 WP5 it is adapter #2 (INV-7): it holds a
+    // ControlPlane producer handle and the outbound stream, so it must
+    // be spawned AFTER the control plane exists (hence this block sits
+    // below `spawn_control_plane`, later in startup than pre-WP5).
+    //
+    // The MCP task holds Sessions + ControlPlane clones (the latter is
+    // a pipeline producer handle). transport::serve's shutdown cascade
+    // (drop handler → drop the control-plane sender → consumer exits →
+    // sessions release → agent loops exit → NotificationWriters drop →
+    // writer_task completes) deadlocks if any external clone keeps
+    // those alive. AbortOnDrop is captured by the handler closure so
+    // that dropping the handler aborts the MCP listener task first,
+    // releasing its clones. (Per-connection MCP tasks keep their own
+    // clones until the peer disconnects — pre-existing posture, now
+    // also covering the ControlPlane handle.)
+    let mcp_socket_path = std::env::var("MU_MCP_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| mcp::default_mcp_socket_path());
+    let mcp_guard = if mcp_socket_path
+        .parent()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+    {
+        let mcp_sessions = sessions.clone();
+        let mcp_daemon_info = daemon_info.clone();
+        let mcp_control = control.clone();
+        let mcp_outbound = outbound.clone();
+        let mcp_auth_registry = auth_registry.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = mcp::serve_mcp_socket(
+                mcp_socket_path,
+                mcp_sessions,
+                mcp_daemon_info,
+                mcp_control,
+                mcp_outbound,
+                mcp_auth_registry,
+            )
+            .await
+            {
+                tracing::error!("MCP server exited: {e:#}");
+            }
+        });
+        Some(AbortOnDrop(std::sync::Mutex::new(Some(handle))))
+    } else {
+        None
+    };
+    // The local Sessions handle must not outlive the transport closure:
+    // a clone held across the final await below would keep every
+    // SessionState alive and wedge the shutdown cascade documented in
+    // transport::serve_with_ingest (writer_task would never observe
+    // Closed). The pipeline consumer and the MCP guard own their own
+    // clones with their own release paths.
+    drop(sessions);
     // The stdio transport is adapter #1 (INV-7, no side doors): every
     // parsed request crosses pipeline::ingest — journaled before
     // anything processes it. `Some` = immediate reject the transport

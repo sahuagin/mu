@@ -1,8 +1,9 @@
-//! Ingest pipeline — the daemon's real border (spec mu-046, WP3+WP4).
+//! Ingest pipeline — the daemon's real border (spec mu-046, WP3–WP5).
 //!
 //! The named pattern: disruptor + event sourcing, with the core
 //! treated like a matching engine. Adapters at the edges (stdio
-//! JSON-RPC today; MCP in WP5), a sequenced durable journal in the
+//! JSON-RPC and the MCP socket — see `serve/mcp.rs`, adapter #2 since
+//! WP5), a sequenced durable journal in the
 //! middle, a single-writer consumer processing in seq order, receipts
 //! out. Every inbound request becomes a journaled command — fsync'd
 //! per policy — BEFORE anything processes it (INV-1); a command that
@@ -136,6 +137,15 @@ enum Scope {
 /// session (`to_session_id`) — everything else, including unknown
 /// methods (which the router rejects with `METHOD_NOT_FOUND` →
 /// `CommandRejected{Routing}`), is control-plane.
+///
+/// `mcp.*` methods (spec mu-046 WP5) mirror their underlying handler's
+/// scope: `mcp.mu_mailbox_post` is session-scoped exactly like
+/// `mailbox.post` (the raw MCP arguments carry the same top-level
+/// `to_session_id` that [`addressed_session_id`] reads); every other
+/// MCP tool — `mu_daemon_info`, `mu_peer_hello`, and the
+/// `mu_mailbox_list`/`read`/`consume` reads — mirrors a control-plane
+/// method and falls through to `Scope::Daemon` like its native twin
+/// (full table in the `serve/mcp.rs` module doc).
 fn classify(method: &str) -> Scope {
     match method {
         m if m == AskSessionRequest::METHOD
@@ -150,6 +160,7 @@ fn classify(method: &str) -> Scope {
             || m == SetRouteRequest::METHOD
             || m == SpawnWorkerRequest::METHOD
             || m == MailboxPostRequest::METHOD
+            || m == dispatch::MCP_MAILBOX_POST_METHOD
             || m == TEST_PANIC_METHOD =>
         {
             Scope::Session
@@ -258,8 +269,8 @@ pub(crate) struct Command {
 }
 
 /// Producer-side handle on the control plane, held by every adapter
-/// (stdio today, MCP in WP5). Dropping every handle closes the queue
-/// and lets the consumer exit — the shutdown cascade's first domino.
+/// (stdio and MCP). Dropping every handle closes the queue and lets
+/// the consumer exit — the shutdown cascade's first domino.
 pub(crate) struct ControlPlane {
     /// Session registry, consulted at ingest/route time to resolve a
     /// session-scoped command's own event log (WP4). A registry clone
@@ -276,6 +287,22 @@ pub(crate) struct ControlPlane {
 struct IngestSeam {
     journal: Arc<CommandJournal>,
     tx: mpsc::UnboundedSender<Command>,
+}
+
+#[cfg(test)]
+impl ControlPlane {
+    /// Test seam for the INV-2 fail-closed path: poison the ingest
+    /// seam (a thread panics while holding it) so every subsequent
+    /// [`ingest`] rejects with `JOURNAL_UNAVAILABLE` before any append
+    /// or enqueue. Used by the in-crate pipeline and MCP adapter tests.
+    pub(crate) fn poison_ingest_seam_for_tests(self: &Arc<Self>) {
+        let poisoner = Arc::clone(self);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.seam.lock().unwrap();
+            panic!("poison the ingest seam (test)");
+        })
+        .join();
+    }
 }
 
 /// Daemon-wide handles the consumer needs to build a [`DispatchCtx`]
@@ -902,12 +929,7 @@ mod tests {
         let control = Arc::new(spawn_control_plane(journal.clone(), ctx, stream));
 
         // Poison the ingest seam: a thread panics while holding it.
-        let poisoner = Arc::clone(&control);
-        let _ = std::thread::spawn(move || {
-            let _guard = poisoner.seam.lock().unwrap();
-            panic!("poison the ingest seam");
-        })
-        .join();
+        control.poison_ingest_seam_for_tests();
 
         let req = request(
             mu_core::protocol::CreateSessionRequest::METHOD,
@@ -958,6 +980,15 @@ mod tests {
         assert_eq!(classify("create_session"), Scope::Daemon);
         assert_eq!(classify("peer.auth_initiate"), Scope::Daemon);
         assert_eq!(classify("no.such.method"), Scope::Daemon);
+        // mcp.* mirrors the underlying handler's scope (WP5): the post
+        // is session-addressed; everything else is control-plane like
+        // its native twin.
+        assert_eq!(classify("mcp.mu_mailbox_post"), Scope::Session);
+        assert_eq!(classify("mcp.mu_daemon_info"), Scope::Daemon);
+        assert_eq!(classify("mcp.mu_peer_hello"), Scope::Daemon);
+        assert_eq!(classify("mcp.mu_mailbox_list"), Scope::Daemon);
+        assert_eq!(classify("mcp.mu_mailbox_read"), Scope::Daemon);
+        assert_eq!(classify("mcp.mu_mailbox_consume"), Scope::Daemon);
     }
 
     /// `mailbox.post` addresses its session via `to_session_id`.

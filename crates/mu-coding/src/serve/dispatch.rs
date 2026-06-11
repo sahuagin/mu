@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use mu_core::agent::Tool;
 use mu_core::protocol::{
@@ -20,10 +20,10 @@ use mu_core::protocol::{
     MailboxPostRequest, MailboxReadRequest, PeerHelloRequest, PingRequest, Request,
     RespondToInputRequiredRequest, Response, ResumeSessionRequest, ScheduleWakeupRequest,
     SessionEventsRequest, SessionListRequest, SessionStatsRequest, SetRouteRequest,
-    SpawnWorkerRequest, StartAutonomousRequest,
+    SpawnWorkerRequest, StartAutonomousRequest, JSONRPC_VERSION,
 };
 use mu_core::skill::loader::LoadedSkill;
-use mu_core::transport::{codes, err_response, NotificationWriter};
+use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
 
 use super::auth::{AuthRegistry, AuthState, AuthStateHandle};
 use super::daemon_info::DaemonInfo;
@@ -57,8 +57,23 @@ use super::sessions::Sessions;
 // route second — otherwise an unauthenticated `METHOD_NOT_FOUND`
 // reveals routing surface.
 
+/// spec mu-046 WP5: namespace prefix under which MCP tool invocations
+/// enter the pipeline — tool `<name>` becomes wire method
+/// `mcp.<name>`. The spec's stated default; no MCP tool maps onto a
+/// native wire method name, even where the shapes are close (one rule,
+/// uniformly applied — see the `serve/mcp.rs` module doc).
+pub(crate) const MCP_METHOD_PREFIX: &str = "mcp.";
+
+/// `mcp.mu_mailbox_post` — the one session-scoped MCP method (it
+/// addresses a target session via `to_session_id`, mirroring
+/// `mailbox.post`). Referenced by `pipeline::classify`, which keeps the
+/// mcp.* scope table aligned with the native methods'.
+pub(crate) const MCP_MAILBOX_POST_METHOD: &str = "mcp.mu_mailbox_post";
+
 /// Methods callable without an `Authenticated` `AuthState`. Anything
-/// outside this list requires the gate to pass.
+/// outside this list requires the gate to pass. Note `mcp.*` methods
+/// are deliberately absent: the MCP surface is gated exactly like the
+/// native one (spec mu-046 INV-7 — no side doors).
 const PRE_AUTH_METHODS: &[&str] = &[
     AuthOfferRequest::METHOD,
     AuthInitiateRequest::METHOD,
@@ -225,10 +240,186 @@ pub(crate) async fn dispatch_inner(
         SpawnWorkerRequest::METHOD => {
             handle_spawn_worker(request, sessions, daemon_info.clone()).await
         }
-        other => err_response(
-            request.id,
-            codes::METHOD_NOT_FOUND,
-            format!("unknown method: {other}"),
-        ),
+        other => {
+            // spec mu-046 WP5: `mcp.<tool>` commands produced by the MCP
+            // adapter route to the tool table below — same consumer, same
+            // gate, same receipts as native methods.
+            let mcp_tool = other.strip_prefix(MCP_METHOD_PREFIX).map(str::to_string);
+            match mcp_tool {
+                Some(tool) => dispatch_mcp_tool(&tool, request, notif, sessions, daemon_info).await,
+                None => err_response(
+                    request.id,
+                    codes::METHOD_NOT_FOUND,
+                    format!("unknown method: {}", request.method),
+                ),
+            }
+        }
     }
+}
+
+// ─── spec mu-046 WP5: MCP tool table ────────────────────────────────
+//
+// The MCP adapter (`serve/mcp.rs`) journals each tool invocation's RAW
+// MCP arguments as the command params — the faithful border record —
+// and the consumer routes it here, where the arguments are translated
+// into the native wire shapes and the SAME handlers the native methods
+// route to are invoked. These bodies are the pre-WP5
+// `serve/mcp.rs::dispatch_tool` arms, moved verbatim — handler logic
+// unchanged, only the entry path. Translation failures (missing or
+// mistyped fields) are `INVALID_PARAMS`, which the pipeline receipts as
+// `CommandRejected { Validation }`; unknown tools are
+// `METHOD_NOT_FOUND` → `CommandRejected { Routing }`.
+
+/// Route one `mcp.<tool>` command. `request.params` are the raw MCP
+/// tool arguments; `request.id` is the adapter's synthetic id, echoed
+/// on the response so the adapter can correlate the outbound envelope.
+async fn dispatch_mcp_tool(
+    tool: &str,
+    request: Request<Value>,
+    notif: NotificationWriter,
+    sessions: Sessions,
+    daemon_info: DaemonInfo,
+) -> Response<Value> {
+    let id = request.id.clone();
+    let args = request.params;
+    let outcome: Result<Response<Value>, String> = match tool {
+        "mu_daemon_info" => Ok(ok_response(
+            id.clone(),
+            json!({
+                "daemon_id": daemon_info.daemon_id(),
+                "version": daemon_info.version(),
+                "session_count": sessions.snapshot_for_listing().len(),
+            }),
+        )),
+        "mu_peer_hello" => peer_hello_params(&args).map(|rpc_params| {
+            handle_peer_hello(
+                native_request(id.clone(), PeerHelloRequest::METHOD, rpc_params),
+                sessions.clone(),
+                daemon_info.clone(),
+            )
+        }),
+        "mu_mailbox_post" => match mailbox_post_params(&args) {
+            Ok(rpc_params) => Ok(handle_mailbox_post(
+                native_request(id.clone(), MailboxPostRequest::METHOD, rpc_params),
+                sessions.clone(),
+                notif.clone(),
+                daemon_info.clone(),
+            )
+            .await),
+            Err(msg) => Err(msg),
+        },
+        "mu_mailbox_list" => mailbox_list_params(&args).map(|rpc_params| {
+            handle_mailbox_list(
+                native_request(id.clone(), MailboxListRequest::METHOD, rpc_params),
+                sessions.clone(),
+            )
+        }),
+        "mu_mailbox_read" => mailbox_read_params(&args).map(|rpc_params| {
+            handle_mailbox_read(
+                native_request(id.clone(), MailboxReadRequest::METHOD, rpc_params),
+                sessions.clone(),
+            )
+        }),
+        "mu_mailbox_consume" => mailbox_consume_params(&args).map(|rpc_params| {
+            handle_mailbox_consume(
+                native_request(id.clone(), MailboxConsumeRequest::METHOD, rpc_params),
+                sessions.clone(),
+            )
+        }),
+        other => {
+            return err_response(
+                id,
+                codes::METHOD_NOT_FOUND,
+                format!("unknown tool: {other}"),
+            )
+        }
+    };
+    match outcome {
+        Ok(response) => response,
+        Err(msg) => err_response(id, codes::INVALID_PARAMS, msg),
+    }
+}
+
+/// Build the native-shaped request a handler parses. The method string
+/// is the native one purely for handler-side legibility (handlers parse
+/// params and echo `id`; they never read `method`) — the journaled
+/// command keeps its `mcp.<tool>` name.
+fn native_request(id: Value, method: &str, params: Value) -> Request<Value> {
+    Request {
+        jsonrpc: JSONRPC_VERSION.to_string(),
+        id,
+        method: method.to_string(),
+        params,
+    }
+}
+
+fn str_field(args: &Value, field: &str) -> Result<String, String> {
+    args.get(field)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("missing required field: {field}"))
+}
+
+fn peer_hello_params(args: &Value) -> Result<Value, String> {
+    let to_session_id = str_field(args, "to_session_id")?;
+    let from_daemon_id = str_field(args, "from_daemon_id")?;
+    let from_session_id = str_field(args, "from_session_id")?;
+    let want_method = args
+        .get("want_method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("mailbox.post");
+    Ok(json!({
+        "to_session_id": to_session_id,
+        "from": {
+            "daemon_id": from_daemon_id,
+            "session_id": from_session_id,
+            "advertised_capabilities": []
+        },
+        "want": { "method": want_method }
+    }))
+}
+
+fn mailbox_post_params(args: &Value) -> Result<Value, String> {
+    Ok(json!({
+        "to_session_id": str_field(args, "to_session_id")?,
+        "peer_handle": str_field(args, "peer_handle")?,
+        "from": {
+            "daemon_id": str_field(args, "from_daemon_id")?,
+            "session_id": str_field(args, "from_session_id")?,
+        },
+        "kind": str_field(args, "kind")?,
+        "subject": str_field(args, "subject")?,
+        "body": args.get("body").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+fn mailbox_list_params(args: &Value) -> Result<Value, String> {
+    Ok(json!({
+        "session_id": str_field(args, "session_id")?,
+        "since_seq": args.get("since_seq").cloned(),
+        "include_consumed": args.get("include_consumed").and_then(|v| v.as_bool()).unwrap_or(false),
+    }))
+}
+
+fn mailbox_read_params(args: &Value) -> Result<Value, String> {
+    let seq = args
+        .get("seq")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "missing required field: seq".to_string())?;
+    Ok(json!({
+        "session_id": str_field(args, "session_id")?,
+        "seq": seq,
+    }))
+}
+
+fn mailbox_consume_params(args: &Value) -> Result<Value, String> {
+    let seqs = args
+        .get("seqs")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    Ok(json!({
+        "session_id": str_field(args, "session_id")?,
+        "seqs": seqs,
+    }))
 }

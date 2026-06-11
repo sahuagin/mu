@@ -202,7 +202,9 @@ impl Tool for BashTool {
             ),
             BashMode::Yolo => (
                 "YOLO MODE: any command runs via bash -c. Pipes, redirects, env vars all work. \
-                 Treat this as if you have a shell prompt; behave responsibly.",
+                 Treat this as if you have a shell prompt; behave responsibly. \
+                 Bash path quoting: unquoted ~/path expands, but quoted \"~/path\" and '~/path' do not. \
+                 For paths that need expansion and may need quoting, use \"$HOME/path\" or an absolute path.",
                 ToolPolicy {
                     side_effects: SideEffects::Destructive,
                     permission: PermissionLevel::Allow,

@@ -8,6 +8,7 @@ pub mod glob;
 pub mod grep;
 pub mod ls;
 pub mod memory_recall;
+pub mod path;
 pub mod read;
 pub mod spawn_worker;
 pub mod watch;

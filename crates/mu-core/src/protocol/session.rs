@@ -94,6 +94,12 @@ pub enum ProviderSelector {
     Openrouter {
         model: String,
     },
+    /// Local vLLM/OpenAI-compatible server. Wire kind `"vllm"`.
+    /// Endpoint defaults to `http://127.0.0.1:8000`, overridable via
+    /// `VLLM_API_BASE`; path overridable via `VLLM_API_PATH`.
+    Vllm {
+        model: String,
+    },
     /// Local ollama server (OpenAI-compatible). Wire kind `"ollama"`.
     /// Endpoint defaults to the LAN box (`http://10.1.1.143:11434`),
     /// overridable via `OLLAMA_API_BASE`. (bead mu-818c)

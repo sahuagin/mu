@@ -5,7 +5,6 @@
 //! Arguments map directly to ripgrep flags. See spec mu-023.
 
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 
@@ -13,6 +12,8 @@ use mu_core::agent::{Tool, ToolResult, ToolSpec};
 // grep is ReadOnly by default — no policy override needed.
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
+
+use crate::tools::path::expand_leading_tilde;
 
 /// mu-yyi: GrepTool now carries an optional `rg_path` field so the
 /// ripgrep binary location is injectable at construction. The old
@@ -162,7 +163,7 @@ impl Tool for GrepTool {
             let path = arguments
                 .get("path")
                 .and_then(Value::as_str)
-                .map(PathBuf::from);
+                .map(expand_leading_tilde);
             let glob = arguments
                 .get("glob")
                 .and_then(Value::as_str)
@@ -345,6 +346,7 @@ mod tests {
     use super::*;
     use std::error::Error;
     use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(name: &str) -> Result<PathBuf, Box<dyn Error>> {

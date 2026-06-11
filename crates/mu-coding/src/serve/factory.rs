@@ -10,6 +10,7 @@ use anyhow::Result;
 
 use mu_ai::{
     AnthropicProvider, FauxProvider, OllamaProvider, OpenRouterProvider, OpenaiCodexProvider,
+    VllmProvider,
 };
 use mu_core::agent::{Provider, Tool};
 use mu_core::context::CacheTtl;
@@ -112,6 +113,10 @@ pub fn build_provider_from_selector(
             log_thinking_ignored("openrouter", thinking);
             Ok(Arc::new(OpenRouterProvider::from_env(model.clone())?))
         }
+        ProviderSelector::Vllm { model } => {
+            log_thinking_ignored("vllm", thinking);
+            Ok(Arc::new(VllmProvider::from_env(model.clone())?))
+        }
         ProviderSelector::Ollama { model } => {
             log_thinking_ignored("ollama", thinking);
             Ok(Arc::new(OllamaProvider::from_env(model.clone())?))
@@ -139,11 +144,16 @@ pub fn selector_from_cli(name: &str, model: Option<&str>) -> Result<ProviderSele
         "openrouter" => Ok(ProviderSelector::Openrouter {
             model: model.unwrap_or("anthropic/claude-haiku-4.5").to_string(),
         }),
+        "vllm" => Ok(ProviderSelector::Vllm {
+            model: model
+                .unwrap_or("Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8")
+                .to_string(),
+        }),
         "ollama" => Ok(ProviderSelector::Ollama {
             model: model.unwrap_or("qwen3-coder:30b").to_string(),
         }),
         other => anyhow::bail!(
-            "unknown provider: {other} (expected: faux, anthropic-api, openai-codex, openrouter, ollama)"
+            "unknown provider: {other} (expected: faux, anthropic-api, openai-codex, openrouter, vllm, ollama)"
         ),
     }
 }
@@ -306,6 +316,14 @@ mod tests {
             }
             _ => panic!("expected Openrouter"),
         }
+
+        let s = selector_from_cli("vllm", None).unwrap();
+        assert_eq!(
+            s,
+            ProviderSelector::Vllm {
+                model: "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8".into()
+            }
+        );
 
         // ollama: default model + explicit override (mu-818c).
         let s = selector_from_cli("ollama", None).unwrap();

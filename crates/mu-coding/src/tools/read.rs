@@ -2,9 +2,11 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 
+use tokio::sync::oneshot;
+
+use crate::tools::path::expand_leading_tilde;
 use mu_core::agent::{Tool, ToolResult, ToolSpec};
 use serde_json::{json, Value};
-use tokio::sync::oneshot;
 
 pub struct ReadTool;
 
@@ -95,7 +97,7 @@ fn path_argument(arguments: &Value) -> Result<PathBuf, ToolResult> {
     arguments
         .get("path")
         .and_then(Value::as_str)
-        .map(PathBuf::from)
+        .map(expand_leading_tilde)
         .ok_or_else(|| ToolResult {
             content: "missing required `path` argument".to_owned(),
             is_error: true,
@@ -108,7 +110,31 @@ mod tests {
     use std::error::Error;
     use std::fs;
     use std::path::Path;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct EnvVarGuard {
+        name: &'static str,
+        old_value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &std::ffi::OsStr) -> Self {
+            let old_value = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, old_value }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.old_value {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
 
     fn temp_path(name: &str) -> Result<PathBuf, Box<dyn Error>> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -201,12 +227,35 @@ mod tests {
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let _ = cancel_tx.send(());
 
-        let result = ReadTool::new()
-            .execute(json!({ "path": path.to_string_lossy() }), cancel_rx)
-            .await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            ReadTool::new().execute(json!({ "path": path.to_string_lossy() }), cancel_rx),
+        )
+        .await?;
         let _ = fs::remove_file(&path);
 
         assert!(result.is_error || result.content == "content");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn b7_expands_home_shorthand() -> Result<(), Box<dyn Error>> {
+        let home = temp_path("home")?;
+        fs::create_dir(&home)?;
+        let path = home.join("tilde-file.txt");
+        fs::write(&path, "from home")?;
+
+        let _lock = ENV_LOCK.lock().await;
+        let _home_guard = EnvVarGuard::set("HOME", home.as_os_str());
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let result = ReadTool::new()
+            .execute(json!({ "path": "~/tilde-file.txt" }), cancel_rx)
+            .await;
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&home);
+
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.content, "from home");
         Ok(())
     }
 }

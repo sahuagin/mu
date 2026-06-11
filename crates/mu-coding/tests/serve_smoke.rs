@@ -51,6 +51,11 @@ async fn spawn_server_with_tools(
         auth: AuthConfig::Bearer {
             tokens: vec![TEST_BEARER_TOKEN.to_string()],
         },
+        // Hermetic: no startup ollama probe from tests (LAN-baked base
+        // is unroutable on CI runners).
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
         ..Default::default()
     };
     spawn_server_with_config(provider, tools, config).await
@@ -1338,6 +1343,11 @@ async fn mcp_tools_imported_from_config_mu_yc6() {
                 side_effects: Some(mu_core::agent::SideEffects::ReadOnly),
                 tool_side_effects: Default::default(),
             }],
+        },
+        // Hermetic: no startup ollama probe from tests (LAN-baked base
+        // is unroutable on CI runners).
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
         },
         ..Default::default()
     };

@@ -83,6 +83,29 @@ pub struct Config {
     pub mcp: McpConfig,
     /// `[journal]` — command-journal durability + location (spec mu-046).
     pub journal: JournalConfig,
+    /// `[routes]` — provider route-catalog discovery knobs.
+    pub routes: RoutesConfig,
+}
+
+/// `[routes]` section. Startup route-catalog discovery (mu-818c).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoutesConfig {
+    /// Probe the ollama box at daemon startup to populate the route
+    /// catalog. Default `true` (production daemons with an events dir).
+    /// Hermetic tests MUST set `false`: the baked-in ollama base is a
+    /// private LAN address, unroutable on CI runners, so the probe's
+    /// bounded connect timeout stalls boot for its full duration there
+    /// (observed as pipeline_smoke response timeouts on GitHub CI).
+    pub ollama_discover: bool,
+}
+
+impl Default for RoutesConfig {
+    fn default() -> Self {
+        Self {
+            ollama_discover: true,
+        }
+    }
 }
 
 /// `[index]` section. Knobs for the in-loop discovery surface. (Code-index

@@ -91,6 +91,11 @@ fn spawn_server_with_events(
             dir: Some(journal_dir),
             ..Default::default()
         },
+        // Hermetic: never probe the (LAN-baked) ollama base from tests —
+        // unroutable on CI runners, the connect timeout stalls boot.
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
         ..Default::default()
     };
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -149,9 +154,12 @@ async fn read_line<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Value {
 }
 
 /// Skim lines until the response with `id` arrives (notifications are
-/// dropped). Times out at 2s.
+/// dropped). Times out at 30s — generous on purpose: a passing test
+/// completes in milliseconds, and a tight budget only converts CI
+/// runner contention into flakes (the 2s original failed on GitHub
+/// runners when the since-removed startup probe ate the whole window).
 async fn await_response<R: tokio::io::AsyncRead + Unpin>(reader: &mut R, id: i64) -> Value {
-    timeout(Duration::from_millis(2000), async {
+    timeout(Duration::from_secs(30), async {
         loop {
             let line = read_line(reader).await;
             if line.get("id").and_then(|v| v.as_i64()) == Some(id) {
@@ -160,18 +168,17 @@ async fn await_response<R: tokio::io::AsyncRead + Unpin>(reader: &mut R, id: i64
         }
     })
     .await
-    .expect("response did not arrive within 2s")
+    .expect("response did not arrive within 30s")
 }
 
 /// Skim lines until the first NOTIFICATION with `method` arrives
-/// (responses and other notifications are dropped). Times out at 5s —
-/// generous because servers with an events dir run the (bounded)
-/// ollama route-discovery probe at startup.
+/// (responses and other notifications are dropped). Times out at 30s —
+/// same rationale as [`await_response`].
 async fn await_notification<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     method: &str,
 ) -> Value {
-    timeout(Duration::from_millis(5000), async {
+    timeout(Duration::from_secs(30), async {
         loop {
             let line = read_line(reader).await;
             if line.get("method").and_then(|v| v.as_str()) == Some(method) {
@@ -180,7 +187,7 @@ async fn await_notification<R: tokio::io::AsyncRead + Unpin>(
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("notification {method} did not arrive within 5s"))
+    .unwrap_or_else(|_| panic!("notification {method} did not arrive within 30s"))
 }
 
 /// Locate and parse `<events_dir>/<daemon_id>/<session_id>.jsonl`

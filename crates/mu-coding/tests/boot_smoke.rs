@@ -67,6 +67,11 @@ fn boot_config(journal_dir: PathBuf, journal_queries: bool) -> Config {
             bare: true,
             ..Default::default()
         },
+        // Hermetic: no startup ollama probe from tests (LAN-baked base
+        // is unroutable on CI runners).
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
         ..Default::default()
     }
 }
@@ -113,9 +118,11 @@ async fn read_line<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Value {
     serde_json::from_slice(&line).expect("parse JSON line")
 }
 
-/// Skim lines until the response with `id` arrives.
+/// Skim lines until the response with `id` arrives. 30s budget —
+/// generous on purpose: passing tests complete in milliseconds, and a
+/// tight budget only converts CI runner contention into flakes.
 async fn await_response<R: tokio::io::AsyncRead + Unpin>(reader: &mut R, id: i64) -> Value {
-    timeout(Duration::from_millis(2000), async {
+    timeout(Duration::from_secs(30), async {
         loop {
             let line = read_line(reader).await;
             if line.get("id").and_then(|v| v.as_i64()) == Some(id) {
@@ -124,7 +131,7 @@ async fn await_response<R: tokio::io::AsyncRead + Unpin>(reader: &mut R, id: i64
         }
     })
     .await
-    .expect("response did not arrive within 2s")
+    .expect("response did not arrive within 30s")
 }
 
 /// BEARER handshake so subsequent RPCs pass the gate.

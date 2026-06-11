@@ -278,14 +278,19 @@ where
     // vec) to skip recall; production runs the full chain.
     let recall_providers = build_recall_providers(&config);
     // mu-818c: best-effort ollama discovery → route catalog. Only in
-    // production (events_dir set) so tests stay hermetic and fast. A
-    // short timeout bounds startup, so a down/absent ollama box can't
-    // stall the daemon; any failure means "no ollama routes", logged at
-    // debug. `mu ask` (ephemeral, no events_dir) skips the probe — it
-    // resolves ollama via the selector, not the catalog.
+    // production (events_dir set AND `[routes].ollama_discover`, default
+    // true). The events_dir heuristic alone did NOT keep tests hermetic:
+    // disk-backed test daemons tripped it, and on CI runners the
+    // baked-in ollama base is an unroutable LAN address, so the probe's
+    // bounded connect timeout stalled boot for its full duration —
+    // hermetic tests set the knob false. A short timeout bounds
+    // startup, so a down/absent ollama box can't stall the daemon; any
+    // failure means "no ollama routes", logged at debug. `mu ask`
+    // (ephemeral, no events_dir) skips the probe — it resolves ollama
+    // via the selector, not the catalog.
     let route_catalog = {
         let mut catalog = mu_core::route_catalog::RouteCatalog::from_env();
-        if events_dir.is_some() {
+        if events_dir.is_some() && config.routes.ollama_discover {
             let base = mu_ai::providers::ollama::base_from_env();
             match mu_ai::OllamaProvider::discover_models(&base, std::time::Duration::from_secs(2))
                 .await

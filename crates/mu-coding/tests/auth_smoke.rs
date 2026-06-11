@@ -336,6 +336,11 @@ fn config_with_bearer_tokens(tokens: &[&str]) -> Config {
         auth: AuthConfig::Bearer {
             tokens: tokens.iter().map(|t| (*t).to_string()).collect(),
         },
+        // Hermetic: no startup ollama probe from tests (LAN-baked base
+        // is unroutable on CI runners).
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
         ..Default::default()
     }
 }

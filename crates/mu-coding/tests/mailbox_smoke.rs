@@ -57,6 +57,11 @@ async fn spawn_server(
             dir: Some(unique_journal_dir()),
             ..Default::default()
         },
+        // Hermetic: no startup ollama probe from tests (LAN-baked base
+        // is unroutable on CI runners).
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
         ..Default::default()
     };
     let handle = tokio::spawn(serve::serve_with_io_with_config(

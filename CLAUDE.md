@@ -5,8 +5,14 @@
 Events are persisted to JSONL on disk FIRST, then mapped into memory. The
 on-disk log at `~/.local/share/mu/events/<daemon_id>/<session_id>.jsonl` is
 the source of truth — the in-memory `Vec<SessionEvent>` is a projection that
-can be rebuilt from the log. This is write-ahead, not write-back: no event
-exists in memory that isn't already durable on disk.
+can be rebuilt from the log. Two durability tiers (spec mu-046): the command
+journal is the fail-closed write-ahead path — every inbound command is fsync'd
+to its pipeline's journal before processing (daemon-scoped commands to
+`~/.local/share/mu/journal/<daemon_id>.jsonl`, session-scoped commands to the
+session's own log via `append_command`); an append failure rejects the command
+(`JOURNAL_UNAVAILABLE`). Session-log gateway events (tool results, assistant
+messages) remain best-effort disk-before-memory appends WITHOUT fsync — IO
+errors are logged and ignored.
 
 Rehydration (rebuilding session state from a persisted log) is request-driven,
 not a startup pass (mu-lazy-session-rehydration-bh4f): `mu serve` parses nothing

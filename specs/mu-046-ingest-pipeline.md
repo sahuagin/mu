@@ -3,7 +3,7 @@
 | field      | value                                                          |
 | ---------- | -------------------------------------------------------------- |
 | spec_id    | mu-046                                                         |
-| status     | proposed                                                       |
+| status     | implemented                                                    |
 | created    | 2026-06-10                                                     |
 | updated    | 2026-06-10                                                     |
 | authors    | tcovert + claude                                               |
@@ -255,19 +255,62 @@ Order: WP1 → WP2 → WP3 → {WP4 ∥ WP5} → WP6 → WP7.
 
 ## Acceptance criteria (umbrella)
 
-- [ ] Crash test: a handler that panics after ingest leaves exactly one
+- [x] Crash test: a handler that panics after ingest leaves exactly one
   `CommandReceived` on disk, no receipt; replay surfaces it as an orphan.
-- [ ] Fail-closed test: journal append error ⇒ `-32003` response, handler
-  never runs.
-- [ ] Property test: journal seq order == processing order per pipeline.
-- [ ] Auth-rejection test: unauthenticated protected call yields
+  (`crash_after_ingest_leaves_orphaned_command_received_inv1_inv4`)
+- [x] Fail-closed test: journal append error ⇒ `-32003` response, handler
+  never runs. (`poisoned_seam_fails_closed_with_journal_unavailable_inv2`,
+  `journal_open_failure_aborts_serve_inv2`,
+  `broken_journal_fails_closed_with_no_effect` for MCP)
+- [x] Journal seq order == processing order per pipeline — landed as an
+  integration assertion over a batched 8-command run
+  (`daemon_commands_process_in_seq_order_inv3`), not a proptest.
+- [x] Auth-rejection test: unauthenticated protected call yields
   `CommandReceived` + `CommandRejected{stage: auth_gate}`; raw journal bytes
   do not contain the bearer token.
-- [ ] Boot test: journal record 1 = `JournalOpened`, record 2 = `ConfigLoaded`;
+  (`auth_rejection_journaled_and_token_redacted_inv6`)
+- [x] Boot test: journal record 1 = `JournalOpened`, record 2 = `ConfigLoaded`;
   `--bare` reflected; secrets absent.
-- [ ] MCP tool call appears in the journal as `mcp.<tool>` with receipt.
-- [ ] `mu telemetry compact` still rebuilds analytics from session logs.
-- [ ] `just ci` green at every WP boundary.
+  (`boot_journals_config_loaded_before_any_adapter_command_inv9`)
+- [x] MCP tool call appears in the journal as `mcp.<tool>` with receipt.
+  (`daemon_info_round_trips_and_is_journaled_with_receipt`,
+  `mailbox_post_journals_in_session_log_before_effect`)
+- [x] `mu telemetry compact` still rebuilds analytics from session logs
+  (analytics/compact.rs tests green in the full suite; new command/receipt
+  event kinds ride the skip-and-count path).
+- [x] `just ci` green at every WP boundary.
+
+## Landed notes / deviations (WP7, 2026-06-10)
+
+- **Wire method names are the protocol constants** — the wire mixes legacy
+  `*_session` (`ask_session`, `cancel_session`, `close_session`) and newer
+  `session.*` names; journals record whichever constant the protocol type
+  declares. No rename happened under this spec.
+- **MCP auth posture**: MCP connections now derive the same initial
+  connection state as stdio (`auth::initial_connection_state`) — root when no
+  `[auth]` mechanism enforces, `Unauthenticated` when bearer tokens are
+  configured. Since the MCP surface has no auth handshake yet, a
+  token-configured daemon makes MCP tools `AUTH_REQUIRED`-unusable (-32001).
+  Handshake/capability gating is future work (see Out of scope).
+- **Cancel mid-ask**: the agent loop closes out pending receipt tickets on
+  termination-without-Done by emitting a synthetic terminal `Done(Aborted)`
+  (`Done(Error)` for error outcomes) carrying the pending command receipts;
+  the forwarder writes each as `CommandFailed`. Asks queued but never started
+  remain orphans — the INV-4 crash marker.
+- **Queries journal by default**: `[journal].journal_queries = false` skips
+  journaling read-only queries but mutations always journal
+  (`journal_queries_false_skips_reads_but_journals_mutations`).
+- **Receipts use the strict path too**: session-slot receipts go through
+  `append_command` (fsync'd) just like intake — see
+  `pipeline.rs::append_receipt` and the forwarder's Done handling. Receipt
+  append *failures* are logged, never fatal: the command is already durable
+  and the orphaned `CommandReceived` is the legible marker. Daemon-slot
+  receipts use `CommandJournal::append` (fsync per policy), same
+  logged-orphan-on-failure semantics.
+- **Ask receipts without a disk-backed session log** fall back to the daemon
+  journal with the immediate accepted-receipt shape (pinned by
+  `receipts_wrap_the_original_command_inv5`); the session-log Done-time
+  receipt path is `ask_receipt_lands_in_session_log_at_done_wp4`.
 
 ## Out of scope (deferred)
 

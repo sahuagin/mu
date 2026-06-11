@@ -325,8 +325,11 @@ pub async fn forward_events(
 
         let recompute_status = should_recompute_status(&event);
 
-        // Durable projection: append significant events to the log.
-        // Streaming deltas + lifecycle ticks are dropped.
+        // Downstream record, not intake: commands are journaled
+        // upstream — fsync'd before processing (spec mu-046). What
+        // lands here are gateway RESULTS and state transitions
+        // flowing back into the session's log as sequenced inputs
+        // (INV-10). Streaming deltas + lifecycle ticks are dropped.
         if let Some((actor, mut payload)) = to_log_event(&event) {
             // ContextAssembly payload doesn't know the session's
             // provider/model when produced (the AgentLoop has the

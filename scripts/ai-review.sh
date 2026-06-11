@@ -137,7 +137,14 @@ if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then
 else
   DIFF="$(git diff "$BASE"...HEAD 2>/dev/null)"
 fi
-if [ -z "${DIFF//[[:space:]]/}" ]; then
+# All-whitespace check via grep, NOT bash pattern substitution:
+# `${DIFF//[[:space:]]/}` is quadratic in the string length and burned
+# 10+ MINUTES of pure CPU on a ~1MB diff before the first reviewer ever
+# ran (mu-ai-review-quadratic-diff-emptycheck-4v89). Herestring, NOT a
+# `printf | grep -q` pipeline: under `set -o pipefail`, grep -q's
+# early exit SIGPIPEs the printf (status 141) and a NON-empty diff
+# reads as empty.
+if ! grep -q '[^[:space:]]' <<<"$DIFF"; then
   echo "${C_DIM}ai-review: no diff vs $BASE — nothing to review.${C_OFF}"
   exit 0
 fi
@@ -180,9 +187,13 @@ EOF_CTX
 fi
 
 # --- reviewer client = freshly-built mu, never the (possibly stale) installed one
+# Prefer the DEBUG binary: it is the one the build line above just
+# refreshed. Preferring release here once handed the panel a weeks-old
+# release build that lacked a flag the script passed — every reviewer
+# died at clap with UNCLEAR (2026-06-11). Release is only a fallback.
 cargo build --bin mu -q 2>/dev/null || true
-if   [ -x ./target/release/mu ]; then MU=./target/release/mu
-elif [ -x ./target/debug/mu ];   then MU=./target/debug/mu
+if   [ -x ./target/debug/mu ];   then MU=./target/debug/mu
+elif [ -x ./target/release/mu ]; then MU=./target/release/mu
 else MU="$(command -v mu || true)"; fi
 [ -n "${MU:-}" ] || { echo "${C_RED}ai-review: no mu binary found${C_OFF}" >&2; exit 2; }
 
@@ -204,6 +215,14 @@ DIFF:
 $DIFF
 $CONTEXT"
 
+# The prompt goes to `mu ask` via --prompt-file, NEVER argv: a
+# megabyte-scale prompt as an exec argument overflows ARG_MAX and the
+# reviewer dies before it starts ("/bin/timeout: Argument list too
+# long" — mu-b6tl, observed live on a ~1MB review prompt 2026-06-11).
+PROMPT_FILE="$(mktemp "${TMPDIR:-/tmp}/ai-review-prompt.XXXXXX")"
+trap 'rm -f "$PROMPT_FILE"' EXIT
+printf '%s' "$PROMPT" > "$PROMPT_FILE"
+
 run_review() { # $1=provider $2=model — prints reviewer stdout; stderr -> $ERRLOG
   # The reviewer session must be hermetic: --bare (PR #187) guarantees
   # mu injects nothing — no session-start memory/project-file recall,
@@ -214,9 +233,9 @@ run_review() { # $1=provider $2=model — prints reviewer stdout; stderr -> $ERR
   SYS_FLAGS=""
   [ -r "$SYSPROMPT" ] && SYS_FLAGS="--append-system-prompt $SYSPROMPT"
   if [ -n "$TOOLS" ]; then
-    timeout "$TIMEOUT" "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS --tools "$TOOLS" "$PROMPT" 2>>"$ERRLOG"
+    timeout "$TIMEOUT" "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS --tools "$TOOLS" --prompt-file "$PROMPT_FILE" 2>>"$ERRLOG"
   else
-    timeout "$TIMEOUT" "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS "$PROMPT" 2>>"$ERRLOG"
+    timeout "$TIMEOUT" "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS --prompt-file "$PROMPT_FILE" 2>>"$ERRLOG"
   fi
 }
 verdict_of() { # stdin -> APPROVE | REJECT | UNCLEAR

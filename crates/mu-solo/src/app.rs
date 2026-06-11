@@ -400,10 +400,21 @@ enum MenuContext {
     Effort,
 }
 
-/// Provider-status-driven session phase for the status line. Tracks
-/// the daemon's ProviderStatusKind via `session.provider_status`
-/// notifications. Falls back to inference from other notifications
-/// when provider_status isn't available (e.g. faux provider).
+/// Session phase for the status line — a PROJECTION of current session
+/// state, re-derived on every event, never a sticky last-write (mu-d2hx:
+/// a done arm that didn't repaint left "⚙ tool (14.0s)" frozen for
+/// minutes and the operator read it as a hang).
+///
+/// State machine discipline:
+/// - firing an ask (`fire_ask` / `/btw`) → `AwaitingFirstToken`
+/// - `session.provider_status` (and the MCP status fallback) move
+///   between the LIVE states — but only while a turn is in flight, so
+///   a stale straggler can't resurrect a spinner after a terminal event
+///   (see [`SessionPhase::on_provider_status`])
+/// - every terminal arm transitions: `session.done` → `Idle` (or
+///   `TurnBudgetExhausted` on `stop_reason == "iteration_cap"`),
+///   `session.error` and RPC-level ask failures → `Errored`
+///   (see [`SessionPhase::on_turn_end`])
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum SessionPhase {
     #[default]
@@ -411,6 +422,26 @@ enum SessionPhase {
     AwaitingFirstToken,
     Streaming,
     ToolExecuting,
+    /// Terminal: the agent loop hit its turn budget
+    /// (`StopReason::IterationCap`). Sticky until the next ask so the
+    /// operator sees WHY the session stopped — it must never look like
+    /// work in progress (mu-d2hx item b).
+    TurnBudgetExhausted {
+        turn_count: Option<u32>,
+    },
+    /// Terminal: the turn ended with an error (session.error or an
+    /// RPC-level ask failure). Sticky until the next ask.
+    Errored,
+}
+
+/// The operator-facing copy for an iteration-cap stop (mu-d2hx /
+/// mu-779s). `turn_count` comes from the done event when the wire
+/// carries it; the copy degrades gracefully when it doesn't.
+fn turn_budget_copy(turn_count: Option<u32>) -> String {
+    match turn_count {
+        Some(n) => format!("turn budget exhausted ({n}) — say continue, or raise the cap"),
+        None => "turn budget exhausted — say continue, or raise the cap".to_string(),
+    }
 }
 
 impl SessionPhase {
@@ -420,15 +451,19 @@ impl SessionPhase {
             Self::AwaitingFirstToken => "◉",
             Self::Streaming => "●",
             Self::ToolExecuting => "⚙",
+            Self::TurnBudgetExhausted { .. } => "■",
+            Self::Errored => "×",
         }
     }
 
-    fn label(self) -> &'static str {
+    fn label(self) -> String {
         match self {
-            Self::Idle => "idle",
-            Self::AwaitingFirstToken => "thinking",
-            Self::Streaming => "streaming",
-            Self::ToolExecuting => "tool",
+            Self::Idle => "idle".to_string(),
+            Self::AwaitingFirstToken => "thinking".to_string(),
+            Self::Streaming => "streaming".to_string(),
+            Self::ToolExecuting => "tool".to_string(),
+            Self::TurnBudgetExhausted { turn_count } => turn_budget_copy(turn_count),
+            Self::Errored => "turn ended with error — see transcript".to_string(),
         }
     }
 
@@ -438,6 +473,54 @@ impl SessionPhase {
             Self::AwaitingFirstToken => Color::Cyan,
             Self::Streaming => Color::Green,
             Self::ToolExecuting => Color::Yellow,
+            Self::TurnBudgetExhausted { .. } => Color::Magenta,
+            Self::Errored => Color::Red,
+        }
+    }
+
+    /// True for the in-flight states (the only ones that may show a
+    /// ticking elapsed counter). Terminal/idle states never animate —
+    /// that's what made the frozen spinner read as a hang.
+    fn is_live(self) -> bool {
+        matches!(
+            self,
+            Self::AwaitingFirstToken | Self::Streaming | Self::ToolExecuting
+        )
+    }
+
+    /// Transition for a provider-status update (`session.provider_status`
+    /// wire notifications and the MCP `SessionStatus.phase` fallback).
+    ///
+    /// `in_flight` is "an ask is outstanding" (streaming_route set).
+    /// When the turn is over, live-phase claims are IGNORED: provider
+    /// status is an ephemeral stream and a straggler that arrives after
+    /// the terminal event must not overwrite the done/error repaint —
+    /// that resurrection is exactly the mu-d2hx freeze.
+    fn on_provider_status(self, kind: &str, in_flight: bool) -> SessionPhase {
+        if !in_flight {
+            return self;
+        }
+        match kind {
+            "awaiting_first_token" | "thinking" => Self::AwaitingFirstToken,
+            "streaming" => Self::Streaming,
+            "tool_executing" | "awaiting_tool_result" => Self::ToolExecuting,
+            "idle" => Self::Idle,
+            // Forward-compat: unknown kinds keep the current phase.
+            _ => self,
+        }
+    }
+
+    /// Terminal transition for a turn-ending event. Every done/error
+    /// path MUST route through here so no arm can forget to repaint.
+    /// `stop_reason` is the wire string off `session.done` params
+    /// (serde snake_case of `StopReason`, e.g. "iteration_cap").
+    fn on_turn_end(is_error: bool, stop_reason: Option<&str>, turn_count: Option<u32>) -> Self {
+        if is_error {
+            Self::Errored
+        } else if stop_reason == Some("iteration_cap") {
+            Self::TurnBudgetExhausted { turn_count }
+        } else {
+            Self::Idle
         }
     }
 }
@@ -632,6 +715,14 @@ impl App {
             notifications,
             terminal_focused: true,
         })
+    }
+
+    /// Shut the spawned daemon down, bounded
+    /// (mu-mu-solo-loop-terminate-5ek5): stdin-EOF grace, then
+    /// SIGKILL + reap. Called by the binary after `run` returns so
+    /// quit never orphans a wedged daemon and never waits on one.
+    pub fn shutdown_daemon(&mut self) {
+        self.client.shutdown(std::time::Duration::from_millis(1500));
     }
 
     /// Run the async event loop. Returns Ok(()) on clean exit.
@@ -1172,6 +1263,11 @@ impl App {
                     if let Some(err) = error {
                         self.streaming_route = None;
                         self.live_turn = None;
+                        // Terminal repaint (mu-d2hx): no session.done will
+                        // come for this ask, so THIS arm must transition
+                        // the status projection or the spinner freezes.
+                        self.session_phase = SessionPhase::on_turn_end(true, None, None);
+                        self.phase_elapsed_ms = 0;
                         let width = vp.area().width as usize;
                         let wrap = width.saturating_sub(2);
                         let lines = render::error_block(&format!("ask failed: {err}"), wrap);
@@ -1905,6 +2001,13 @@ impl App {
         vp.snap_to_bottom()?;
         self.streaming_route = Some(TurnRoute::Main);
         self.live_turn = Some(Turn::new(TurnRoute::Main));
+        // Repaint the status projection IMMEDIATELY (mu-d2hx sighting ii:
+        // after an error + manual retry the indicators stayed stale until
+        // the first provider_status arrived — if it ever did). Firing an
+        // ask both clears any terminal notice and starts the new turn's
+        // status from a known state.
+        self.session_phase = SessionPhase::AwaitingFirstToken;
+        self.phase_elapsed_ms = 0;
 
         // mu-d3v6: fire WITHOUT blocking. ask_session's response only
         // arrives when the turn completes; waiting here parked the
@@ -2019,6 +2122,10 @@ impl App {
         // Route this turn to the sidecar and start a fresh live turn.
         self.streaming_route = Some(route);
         self.live_turn = Some(Turn::new(route));
+        // Same status-projection repaint as fire_ask (mu-d2hx): a /btw
+        // turn is in flight now; the status must say so immediately.
+        self.session_phase = SessionPhase::AwaitingFirstToken;
+        self.phase_elapsed_ms = 0;
 
         // mu-d3v6: non-blocking, same as fire_ask.
         let id = self.client.request_nowait(
@@ -2873,11 +2980,11 @@ impl App {
     fn format_status_line(&self, width: usize) -> Line<'static> {
         let phase = self.session_phase;
         let dim = Style::default().fg(Color::DarkGray);
-        let not_idle = phase != SessionPhase::Idle;
+        let not_idle = phase.is_live();
 
-        let phase_text = if phase == SessionPhase::Idle {
-            format!("{} {}", phase.icon(), phase.label())
-        } else if self.phase_elapsed_ms > 0 {
+        // Only LIVE phases show the elapsed counter — a terminal state
+        // with a frozen "(14.0s)" reads as a hang (mu-d2hx).
+        let phase_text = if phase.is_live() && self.phase_elapsed_ms > 0 {
             let secs = self.phase_elapsed_ms as f64 / 1000.0;
             format!("{} {} ({secs:.1}s)", phase.icon(), phase.label())
         } else {
@@ -3071,15 +3178,18 @@ impl App {
     /// Apply a single MCP status update. Syncs the inline accumulators
     /// so both the status line and /status command reflect the latest data.
     fn apply_mcp_status(&mut self, status: SessionStatus) {
-        self.session_phase = match status.phase.as_str() {
-            "idle" => SessionPhase::Idle,
-            "awaiting_first_token" => SessionPhase::AwaitingFirstToken,
-            "streaming" => SessionPhase::Streaming,
-            "thinking" => SessionPhase::AwaitingFirstToken,
-            "tool_executing" | "awaiting_tool_result" => SessionPhase::ToolExecuting,
-            _ => self.session_phase,
-        };
-        self.phase_elapsed_ms = status.phase_elapsed_ms;
+        // Phase is a projection of CURRENT session state (mu-d2hx): the
+        // MCP push is an async secondary channel, so its phase claim only
+        // applies while a turn is actually in flight. A stale push landing
+        // after the terminal done/error repaint must not resurrect a
+        // spinner — that sticky last-write was the frozen-status bug.
+        let in_flight = self.streaming_route.is_some();
+        if in_flight {
+            self.session_phase = self
+                .session_phase
+                .on_provider_status(status.phase.as_str(), in_flight);
+            self.phase_elapsed_ms = status.phase_elapsed_ms;
+        }
         self.cumulative_input_tokens = status.input_tokens;
         self.cumulative_output_tokens = status.output_tokens;
         self.cumulative_cache_read = status.cache_read_tokens.unwrap_or(0);
@@ -3190,26 +3300,38 @@ impl App {
                     .push(render::TurnItem::ToolResult { kind, text });
             }
             "session.provider_status" => {
-                let kind = params
-                    .get("kind")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("idle");
-                let elapsed = params
-                    .get("elapsed_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let new_phase = match kind {
-                    "awaiting_first_token" => SessionPhase::AwaitingFirstToken,
-                    "streaming" => SessionPhase::Streaming,
-                    "tool_executing" | "awaiting_tool_result" => SessionPhase::ToolExecuting,
-                    "idle" => SessionPhase::Idle,
-                    _ => self.session_phase,
-                };
-                self.session_phase = new_phase;
-                self.phase_elapsed_ms = elapsed;
+                // Projection guard (mu-d2hx): provider_status is an
+                // ephemeral live stream. Once the turn is over (done/
+                // error/RPC failure cleared streaming_route) a straggler
+                // must not overwrite the terminal repaint — only apply
+                // while a turn is in flight.
+                let in_flight = self.streaming_route.is_some();
+                if in_flight {
+                    let kind = params
+                        .get("kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("idle");
+                    self.session_phase = self.session_phase.on_provider_status(kind, in_flight);
+                    self.phase_elapsed_ms = params
+                        .get("elapsed_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                }
             }
             "session.done" | "session.error" => {
-                self.session_phase = SessionPhase::Idle;
+                let is_error = method == "session.error";
+                // Terminal repaint (mu-d2hx): EVERY done/error transitions
+                // the phase projection — leaving the last live phase in
+                // place is the frozen "⚙ tool (14.0s)" hang-lookalike.
+                // IterationCap gets its own terminal state so a budget
+                // stop never looks like work in progress.
+                let stop_reason = params.get("stop_reason").and_then(|v| v.as_str());
+                let turn_count = params
+                    .get("turn_count")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32);
+                let iteration_cap = !is_error && stop_reason == Some("iteration_cap");
+                self.session_phase = SessionPhase::on_turn_end(is_error, stop_reason, turn_count);
                 self.phase_elapsed_ms = 0;
 
                 // mu-solo-osc-notify-mbmn: surface main-session turn
@@ -3226,7 +3348,16 @@ impl App {
                 if crate::notify::should_notify(self.notifications, self.terminal_focused)
                     && sid == self.session_id
                 {
-                    if method == "session.done" {
+                    if iteration_cap {
+                        // mu-d2hx item c: an iteration-cap stop is a
+                        // terminal state reached while the operator is
+                        // away — say WHY, not just "waiting for input".
+                        crate::notify::notify(&format!(
+                            "mu ({}): {}",
+                            self.model,
+                            turn_budget_copy(turn_count)
+                        ));
+                    } else if method == "session.done" {
                         crate::notify::notify(&format!(
                             "mu ({}) is waiting for your input",
                             self.model
@@ -3351,22 +3482,14 @@ impl App {
                         // No visible output (empty turn or none), and any
                         // error has no turn to attach to: stand-alone block.
                         let lines: Vec<Line<'static>> = if let Some(msg) = error_msg.as_deref() {
-                            // Truncate ridiculously long messages to keep
-                            // the scrollback usable; the full text lives
-                            // in the events JSONL if you need it.
-                            let short: String = msg.chars().take(400).collect();
-                            vec![
-                                Line::from(""),
-                                Line::from(Span::styled(
-                                    "× turn ended with error".to_string(),
-                                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                                )),
-                                Line::from(Span::styled(
-                                    format!("  {short}"),
-                                    Style::default().fg(Color::Red),
-                                )),
-                                Line::from(""),
-                            ]
+                            // mu-ka3c: render the FULL message, word-
+                            // wrapped (unbroken JSON runs hard-break) —
+                            // the old single-line truncation left a 402
+                            // provider error unreadable. Also record it
+                            // in the semantic transcript so it's visible
+                            // in fullscreen and to copy/export.
+                            self.transcript.push(TranscriptBlock::error(msg));
+                            render::error_notice("turn ended with error", msg, wrap_width)
                         } else {
                             vec![
                                 Line::from(Span::styled(
@@ -3384,6 +3507,31 @@ impl App {
                             ratatui::widgets::Widget::render(p, buf.area, buf);
                         })?;
                     }
+                }
+                // mu-d2hx item b: an iteration-cap stop renders DISTINCTLY
+                // in the transcript (in addition to the status line) — the
+                // turn budget ran out; the session did not hang and did not
+                // finish naturally. Semantic transcript first (fullscreen
+                // renders from it; copy/export read it), then scrollback.
+                if iteration_cap {
+                    let copy = turn_budget_copy(turn_count);
+                    self.transcript
+                        .push(TranscriptBlock::notice("turn budget", copy.clone()));
+                    let mut nlines: Vec<Line<'static>> = vec![Line::from("")];
+                    for row in render::wrap_line(&format!("■ {copy}"), wrap_width.max(1)) {
+                        nlines.push(Line::from(Span::styled(
+                            row,
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                    }
+                    nlines.push(Line::from(""));
+                    let h = nlines.len() as u16;
+                    vp.insert_before(h, |buf| {
+                        let p = Paragraph::new(nlines);
+                        ratatui::widgets::Widget::render(p, buf.area, buf);
+                    })?;
                 }
                 self.streaming_route = None;
             }
@@ -3669,3 +3817,181 @@ fn format_tokens(n: u64) -> String {
 const VIEWPORT_HEIGHT: u16 = 5;
 /// Maximum viewport height — cap to prevent eating the entire screen.
 const MAX_VIEWPORT_HEIGHT: u16 = 20;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ===== status-line state machine (mu-d2hx) =====
+    //
+    // The status line is a projection of `session_phase`; these tests
+    // drive the transition functions the notification handlers delegate
+    // to, asserting every ProviderStatusUpdate state and every terminal
+    // arm repaints — the frozen "⚙ tool (14.0s)" incident was a done arm
+    // that never cleared ToolExecuting.
+
+    /// Live incident (i): IterationCap landed right after a tool result;
+    /// the status stayed "⚙ tool". The done(iteration_cap) transition
+    /// must replace the tool spinner with the budget-exhausted copy.
+    #[test]
+    fn tool_executing_plus_done_iteration_cap_shows_budget_copy() {
+        let before = SessionPhase::ToolExecuting;
+        let after = SessionPhase::on_turn_end(false, Some("iteration_cap"), Some(20));
+        assert_ne!(after, before, "done must repaint the tool spinner");
+        assert_eq!(
+            after,
+            SessionPhase::TurnBudgetExhausted {
+                turn_count: Some(20)
+            }
+        );
+        assert_eq!(
+            after.label(),
+            "turn budget exhausted (20) — say continue, or raise the cap"
+        );
+        // Must NOT look like work in progress.
+        assert!(!after.is_live());
+        assert_ne!(after.icon(), SessionPhase::ToolExecuting.icon());
+        assert_ne!(after.color(), SessionPhase::ToolExecuting.color());
+    }
+
+    #[test]
+    fn turn_budget_copy_degrades_without_count() {
+        assert_eq!(
+            turn_budget_copy(None),
+            "turn budget exhausted — say continue, or raise the cap"
+        );
+        assert_eq!(
+            turn_budget_copy(Some(7)),
+            "turn budget exhausted (7) — say continue, or raise the cap"
+        );
+    }
+
+    /// Live incident (ii): after a transport-error turn + manual retry,
+    /// the indicators did not update during the recovered turn. The
+    /// sequence error → ask fired → provider updates must repaint at
+    /// every step.
+    #[test]
+    fn error_then_retry_streams_again() {
+        // The turn dies with an error → terminal Errored state.
+        let errored = SessionPhase::on_turn_end(true, None, None);
+        assert_eq!(errored, SessionPhase::Errored);
+        assert!(!errored.is_live());
+        // Operator retries: fire_ask seeds AwaitingFirstToken (the
+        // immediate repaint), then provider_status drives the live
+        // projection for the recovered turn.
+        let retrying = SessionPhase::AwaitingFirstToken; // what fire_ask sets
+        let streaming = retrying.on_provider_status("streaming", true);
+        assert_eq!(streaming, SessionPhase::Streaming);
+        let tooling = streaming.on_provider_status("tool_executing", true);
+        assert_eq!(tooling, SessionPhase::ToolExecuting);
+        // And the recovered turn's clean finish goes back to Idle.
+        assert_eq!(
+            SessionPhase::on_turn_end(false, Some("end_turn"), Some(3)),
+            SessionPhase::Idle
+        );
+    }
+
+    /// Every ProviderStatusUpdate kind maps to a phase (and unknown
+    /// kinds are forward-compatible no-ops).
+    #[test]
+    fn every_provider_status_kind_maps_to_a_phase() {
+        let cases = [
+            ("awaiting_first_token", SessionPhase::AwaitingFirstToken),
+            ("thinking", SessionPhase::AwaitingFirstToken),
+            ("streaming", SessionPhase::Streaming),
+            ("tool_executing", SessionPhase::ToolExecuting),
+            ("awaiting_tool_result", SessionPhase::ToolExecuting),
+            ("idle", SessionPhase::Idle),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(
+                SessionPhase::Idle.on_provider_status(kind, true),
+                expected,
+                "kind {kind:?} mapped wrong"
+            );
+        }
+        // Unknown kind: keep the current phase, don't reset.
+        assert_eq!(
+            SessionPhase::Streaming.on_provider_status("future_kind", true),
+            SessionPhase::Streaming
+        );
+    }
+
+    /// A stale provider_status straggler arriving AFTER the terminal
+    /// event (turn no longer in flight) must not resurrect a spinner
+    /// over the terminal repaint — the sticky-last-write freeze.
+    #[test]
+    fn stale_provider_status_cannot_resurrect_a_spinner() {
+        for terminal in [
+            SessionPhase::Idle,
+            SessionPhase::TurnBudgetExhausted {
+                turn_count: Some(20),
+            },
+            SessionPhase::Errored,
+        ] {
+            for kind in [
+                "awaiting_first_token",
+                "streaming",
+                "tool_executing",
+                "awaiting_tool_result",
+                "idle",
+            ] {
+                assert_eq!(
+                    terminal.on_provider_status(kind, false),
+                    terminal,
+                    "stale {kind:?} overwrote terminal {terminal:?}"
+                );
+            }
+        }
+    }
+
+    /// Every terminal arm's projection: done → Idle, done(iteration_cap)
+    /// → TurnBudgetExhausted, error (wire or RPC-level) → Errored.
+    #[test]
+    fn every_terminal_event_transitions_the_phase() {
+        for stop in [None, Some("end_turn"), Some("max_tokens"), Some("aborted")] {
+            assert_eq!(
+                SessionPhase::on_turn_end(false, stop, None),
+                SessionPhase::Idle,
+                "done({stop:?}) must land Idle"
+            );
+        }
+        assert_eq!(
+            SessionPhase::on_turn_end(false, Some("iteration_cap"), None),
+            SessionPhase::TurnBudgetExhausted { turn_count: None }
+        );
+        // session.error and RPC-level ask failures both route here with
+        // is_error = true; stop_reason is irrelevant.
+        assert_eq!(
+            SessionPhase::on_turn_end(true, Some("iteration_cap"), Some(20)),
+            SessionPhase::Errored
+        );
+    }
+
+    /// Each phase renders distinctly (icon+label pairs are unique) so a
+    /// status repaint is always visible.
+    #[test]
+    fn every_phase_renders_distinctly() {
+        let phases = [
+            SessionPhase::Idle,
+            SessionPhase::AwaitingFirstToken,
+            SessionPhase::Streaming,
+            SessionPhase::ToolExecuting,
+            SessionPhase::TurnBudgetExhausted {
+                turn_count: Some(20),
+            },
+            SessionPhase::Errored,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for p in phases {
+            assert!(
+                seen.insert(format!("{} {}", p.icon(), p.label())),
+                "duplicate status rendering for {p:?}"
+            );
+        }
+        // Terminal notices never animate.
+        assert!(!SessionPhase::TurnBudgetExhausted { turn_count: None }.is_live());
+        assert!(!SessionPhase::Errored.is_live());
+        assert!(!SessionPhase::Idle.is_live());
+    }
+}

@@ -25,6 +25,31 @@
 //! that it never touches lines already in native scrollback — those
 //! would appear twice (once in scrollback, once on-screen) when the
 //! user scrolls up.
+//!
+//! ## Emission strategies (mu-solo-zellij-blank-band-ptvm)
+//!
+//! The escape-sequence emission of `insert_before` is selected ONCE at
+//! startup (`EmissionStrategy`, see `detect_emission_strategy`):
+//!
+//! - **Fast** (default, codex-rs pattern, verified on kitty/xterm):
+//!   DECSTBM + `CSI T` push-down when the viewport isn't at the bottom,
+//!   then one `?2026`-wrapped burst that newline-scrolls the whole
+//!   payload through the top-margin-1 region.
+//! - **Conservative** (selected when `$ZELLIJ` is set): zellij's
+//!   compositor has been observed to blank-fill instead of moving
+//!   content for some margined-scroll bursts — a large turn commit left
+//!   a ~viewport-height blank band in scrollback while the renderer
+//!   journal showed a contiguous commit (the defect is in
+//!   emission × compositor, not history accounting).  The conservative
+//!   path avoids every suspect mechanism: no DECSTBM+`CSI T` reverse
+//!   scroll (hypothesis a), the payload is emitted in chunks strictly
+//!   smaller than the history region with margins reset, cursor
+//!   re-homed and output flushed between chunks (hypothesis b), and no
+//!   `?2026` synchronized-output brackets (hypothesis c).  Costs some
+//!   flicker/speed; buys contiguous scrollback under zellij.
+//!
+//! `MU_SOLO_FORCE_CONSERVATIVE_RENDER=1|0` overrides auto-detection in
+//! either direction for live bisection.
 
 use std::io::{self, Write};
 
@@ -53,6 +78,68 @@ struct HistoryLine {
 /// drain fires (8hva judge finding).
 pub(crate) const MAX_HISTORY: usize = 1000;
 
+/// How `insert_before` emits escape sequences (mu-solo-zellij-blank-band-ptvm).
+/// Selected once at startup; see the module docs for the rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmissionStrategy {
+    /// codex-rs pattern: DECSTBM+`CSI T` push-down, one `?2026`-wrapped
+    /// margined-scroll burst. Verified on kitty/xterm.
+    Fast,
+    /// zellij-safe: no reverse scroll, no sync brackets, chunked
+    /// margined-scroll smaller than the history region.
+    Conservative,
+}
+
+impl EmissionStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            EmissionStrategy::Fast => "fast",
+            EmissionStrategy::Conservative => "conservative",
+        }
+    }
+}
+
+/// Pure strategy selection — split from env reading so it's unit-testable.
+/// `force` is the value of `MU_SOLO_FORCE_CONSERVATIVE_RENDER` (if set);
+/// `zellij_set` is whether `$ZELLIJ` exists (zellij exports it in every pane).
+/// The force knob wins over auto-detection in both directions so the
+/// operator can live-bisect either path under either terminal.
+fn select_emission_strategy(
+    force: Option<&str>,
+    zellij_set: bool,
+) -> (EmissionStrategy, &'static str) {
+    match force {
+        Some("1") => (
+            EmissionStrategy::Conservative,
+            "forced: MU_SOLO_FORCE_CONSERVATIVE_RENDER=1",
+        ),
+        Some("0") => (
+            EmissionStrategy::Fast,
+            "forced: MU_SOLO_FORCE_CONSERVATIVE_RENDER=0",
+        ),
+        _ => {
+            if zellij_set {
+                (
+                    EmissionStrategy::Conservative,
+                    "ZELLIJ env var set (zellij pane detected)",
+                )
+            } else {
+                (
+                    EmissionStrategy::Fast,
+                    "no multiplexer detected (default codex-rs fast path)",
+                )
+            }
+        }
+    }
+}
+
+/// Read the environment ONCE and pick the emission strategy.  Called from
+/// `DynamicViewport::new` (startup), never per-emission.
+pub fn detect_emission_strategy() -> (EmissionStrategy, &'static str) {
+    let force = std::env::var("MU_SOLO_FORCE_CONSERVATIVE_RENDER").ok();
+    select_emission_strategy(force.as_deref(), std::env::var_os("ZELLIJ").is_some())
+}
+
 /// A minimal terminal that manages a dynamically-sized inline viewport.
 /// Content above the viewport lives in native terminal scrollback.
 pub struct DynamicViewport {
@@ -76,6 +163,9 @@ pub struct DynamicViewport {
     /// Optional renderer journal — appended by the commit paths.
     /// None when journalling is disabled (config knob renderer_journal).
     journal: Option<std::fs::File>,
+    /// How insert_before emits escape sequences. Read from the
+    /// environment exactly once, in `new` (mu-solo-zellij-blank-band-ptvm).
+    strategy: EmissionStrategy,
 }
 
 impl DynamicViewport {
@@ -120,7 +210,16 @@ impl DynamicViewport {
             }
         });
 
-        Ok(Self {
+        // Strategy is environment-derived state frozen at startup — one
+        // read here, never per-emission (mu-solo-zellij-blank-band-ptvm).
+        let (strategy, strategy_reason) = detect_emission_strategy();
+        tracing::info!(
+            strategy = strategy.as_str(),
+            reason = strategy_reason,
+            "renderer emission strategy selected"
+        );
+
+        let mut vp = Self {
             viewport,
             buffers: [Buffer::empty(viewport), Buffer::empty(viewport)],
             current: 0,
@@ -128,7 +227,12 @@ impl DynamicViewport {
             history: Vec::new(),
             scrollback_committed: 0,
             journal,
-        })
+            strategy,
+        };
+        // Make the selection visible in the flight recorder so a band
+        // report can be correlated with the path that produced it.
+        vp.journal_strategy(strategy_reason);
+        Ok(vp)
     }
 
     /// Get the current viewport area for rendering into.
@@ -328,14 +432,31 @@ impl DynamicViewport {
         let viewport_bottom = self.viewport.y + self.viewport.height;
         if viewport_bottom < screen_rows {
             let push_down = height.min(screen_rows - viewport_bottom);
-            // Scroll the viewport region DOWN using reverse index
-            let region_top = self.viewport.y + 1; // 1-based
-            let region_bottom = screen_rows;
-            write!(
-                stdout,
-                "\x1b[{};{}r\x1b[{}T\x1b[r",
-                region_top, region_bottom, push_down
-            )?;
+            match self.strategy {
+                EmissionStrategy::Fast => {
+                    // Scroll the viewport region DOWN using reverse index
+                    emit_push_down_fast(&mut stdout, self.viewport.y, screen_rows, push_down)?;
+                }
+                EmissionStrategy::Conservative => {
+                    // Hypothesis (a) of mu-solo-zellij-blank-band-ptvm:
+                    // zellij may blank-fill a margined reverse scroll
+                    // (DECSTBM + CSI T) instead of moving the viewport
+                    // image. We don't need the terminal to move anything:
+                    // flush() always repaints the whole viewport from the
+                    // buffers (which we reset below), and the history
+                    // emission that follows paints >= push_down fresh rows
+                    // at the bottom of the new history region — exactly
+                    // the rows the old viewport top vacates. So just clear
+                    // the old viewport rows (prevents stale viewport
+                    // pixels from scrolling up into history/scrollback)
+                    // and relocate the viewport logically.
+                    emit_push_down_conservative(
+                        &mut stdout,
+                        self.viewport.y,
+                        self.viewport.height,
+                    )?;
+                }
+            }
             self.viewport.y += push_down;
             self.buffers[0].resize(self.viewport);
             self.buffers[1].resize(self.viewport);
@@ -371,19 +492,28 @@ impl DynamicViewport {
         let mut buf = Buffer::empty(draw_area);
         draw_fn(&mut buf);
 
-        // Begin synchronized output so a multi-line history insert + viewport
-        // redraw does not visibly tear on terminals that support the extension.
-        write!(stdout, "\x1b[?2026h")?;
-        // ANSI scroll-region coordinates are 1-based and inclusive. The
-        // history region is terminal rows 0..viewport_top (exclusive), so the
-        // bottom row is `viewport_top` in 1-based coordinates.
-        write!(stdout, "\x1b[1;{}r", viewport_top)?;
-        queue!(stdout, MoveTo(0, viewport_top - 1))?;
+        match self.strategy {
+            EmissionStrategy::Fast => emit_insert_fast(
+                &mut stdout,
+                &buf,
+                viewport_top,
+                self.viewport.x,
+                self.viewport.y,
+            )?,
+            EmissionStrategy::Conservative => emit_insert_conservative(
+                &mut stdout,
+                &buf,
+                viewport_top,
+                self.viewport.x,
+                self.viewport.y,
+            )?,
+        }
+        self.buffers[1 - self.current].reset();
 
+        // Mirror the emitted rows into in-memory history (identical for both
+        // strategies — the strategies differ only in escape-sequence framing,
+        // never in content).
         for y in 0..draw_area.height {
-            queue!(stdout, Print("\r\n"))?;
-            write_buffer_row(&mut stdout, &buf, y)?;
-
             let mut hline = HistoryLine { cells: Vec::new() };
             for x in 0..draw_area.width {
                 let idx = (y as usize) * (draw_area.width as usize) + (x as usize);
@@ -394,14 +524,6 @@ impl DynamicViewport {
             }
             self.history.push(hline);
         }
-
-        // Reset scroll region and leave cursor in the viewport; the next
-        // `flush` repaints the viewport from scratch.
-        write!(stdout, "\x1b[r")?;
-        queue!(stdout, MoveTo(self.viewport.x, self.viewport.y))?;
-        write!(stdout, "\x1b[?2026l")?;
-        stdout.flush()?;
-        self.buffers[1 - self.current].reset();
 
         // Update scrollback_committed: lines that overflowed past
         // viewport_top went into native scrollback and must not be
@@ -498,6 +620,24 @@ impl DynamicViewport {
         let _ = f.write_all(line.as_bytes());
     }
 
+    /// Record the startup emission-strategy selection in the journal so a
+    /// blank-band report can be correlated with the path that produced it
+    /// (mu-solo-zellij-blank-band-ptvm). One line per process start.
+    fn journal_strategy(&mut self, reason: &str) {
+        let strategy = self.strategy.as_str();
+        let Some(ref mut f) = self.journal else {
+            return;
+        };
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let line = format!(
+            "{{\"ts_ms\":{ts_ms},\"kind\":\"strategy\",\"strategy\":\"{strategy}\",\"reason\":\"{reason}\"}}\n"
+        );
+        let _ = f.write_all(line.as_bytes());
+    }
+
     /// Emit a finalize-mismatch journal entry when the committed
     /// history length doesn't match the finalized text length.
     /// Also logs a tracing::warn — the journal and the warn fire
@@ -587,6 +727,131 @@ fn write_buffer_row<W: Write>(stdout: &mut W, buf: &Buffer, y: u16) -> io::Resul
         queue!(stdout, Print(cell.symbol()), SetAttribute(Attribute::Reset))?;
     }
     Ok(())
+}
+
+// ─── insert_before emission paths ─────────────────────────────────────────────
+//
+// Free functions generic over `W: Write` so tests can capture the exact byte
+// stream without a TTY. `insert_before` calls them with stdout.
+
+/// FAST push-down: scroll the region from the viewport top to the screen
+/// bottom DOWN by `push_down` rows via DECSTBM + `CSI T` (reverse scroll
+/// within margins). Byte-identical to the pre-strategy-split emission.
+fn emit_push_down_fast<W: Write>(
+    out: &mut W,
+    viewport_y: u16,
+    screen_rows: u16,
+    push_down: u16,
+) -> io::Result<()> {
+    let region_top = viewport_y + 1; // 1-based
+    let region_bottom = screen_rows;
+    write!(
+        out,
+        "\x1b[{};{}r\x1b[{}T\x1b[r",
+        region_top, region_bottom, push_down
+    )
+}
+
+/// CONSERVATIVE push-down: no DECSTBM, no `CSI T` — just clear the rows the
+/// viewport currently occupies. The caller relocates the viewport logically;
+/// the subsequent history emission repaints the vacated rows and the next
+/// `flush()` repaints the viewport at its new position (full repaint, buffers
+/// reset). Clearing prevents stale viewport pixels from being scrolled up
+/// into the history region / native scrollback by the chunked emission.
+fn emit_push_down_conservative<W: Write>(
+    out: &mut W,
+    viewport_y: u16,
+    viewport_height: u16,
+) -> io::Result<()> {
+    for row in viewport_y..(viewport_y + viewport_height) {
+        queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+    }
+    Ok(())
+}
+
+/// FAST history emission (codex-rs pattern, verified on kitty/xterm):
+/// one `?2026`-synchronized burst that sets DECSTBM to the history region
+/// (rows 1..=viewport_top, 1-based), parks the cursor on the region's bottom
+/// row, and newline-scrolls every payload row through it. Byte-identical to
+/// the pre-strategy-split emission — this is load-bearing: bare terminals
+/// must not regress (mu-solo-zellij-blank-band-ptvm).
+fn emit_insert_fast<W: Write>(
+    out: &mut W,
+    buf: &Buffer,
+    viewport_top: u16,
+    viewport_x: u16,
+    viewport_y: u16,
+) -> io::Result<()> {
+    // Begin synchronized output so a multi-line history insert + viewport
+    // redraw does not visibly tear on terminals that support the extension.
+    write!(out, "\x1b[?2026h")?;
+    // ANSI scroll-region coordinates are 1-based and inclusive. The
+    // history region is terminal rows 0..viewport_top (exclusive), so the
+    // bottom row is `viewport_top` in 1-based coordinates.
+    write!(out, "\x1b[1;{}r", viewport_top)?;
+    queue!(out, MoveTo(0, viewport_top - 1))?;
+
+    for y in 0..buf.area.height {
+        queue!(out, Print("\r\n"))?;
+        write_buffer_row(out, buf, y)?;
+    }
+
+    // Reset scroll region and leave cursor in the viewport; the next
+    // `flush` repaints the viewport from scratch.
+    write!(out, "\x1b[r")?;
+    queue!(out, MoveTo(viewport_x, viewport_y))?;
+    write!(out, "\x1b[?2026l")?;
+    out.flush()
+}
+
+/// CONSERVATIVE history emission (mu-solo-zellij-blank-band-ptvm).
+///
+/// Same content as the fast path — one CRLF-scroll + painted row per payload
+/// row through the top-margin-1 history region (this is the only primitive
+/// that feeds native scrollback, so it cannot be replaced) — but framed so
+/// that none of the bead's three suspect mechanisms is exercised:
+///
+/// - hypothesis (a): no DECSTBM+`CSI T` anywhere (the push-down variant
+///   above clears instead of reverse-scrolling);
+/// - hypothesis (b): the payload is split into chunks of at most
+///   `viewport_top − 1` rows (strictly smaller than the history region), and
+///   between chunks the margins are reset (`CSI r`), the cursor is re-homed
+///   to the region's bottom row, and the stream is FLUSHED — so zellij's
+///   compositor never has to track a scroll burst larger than the margined
+///   region, and gets a settled stream boundary between bursts;
+/// - hypothesis (c): no `?2026` synchronized-output brackets.
+///
+/// Cost: visible flicker on large commits and one extra flush per chunk.
+/// That trade is the point — contiguous scrollback beats smooth animation
+/// under a multiplexer we can't trust with the fancy protocol.
+fn emit_insert_conservative<W: Write>(
+    out: &mut W,
+    buf: &Buffer,
+    viewport_top: u16,
+    viewport_x: u16,
+    viewport_y: u16,
+) -> io::Result<()> {
+    // At most history-region-height − 1 rows per chunk; minimum 1 so a
+    // single-row history region still makes progress.
+    let chunk_rows = viewport_top.saturating_sub(1).max(1);
+    let total = buf.area.height;
+    let mut y = 0u16;
+    while y < total {
+        let end = (y + chunk_rows).min(total);
+        write!(out, "\x1b[1;{}r", viewport_top)?;
+        queue!(out, MoveTo(0, viewport_top - 1))?;
+        for row in y..end {
+            queue!(out, Print("\r\n"))?;
+            write_buffer_row(out, buf, row)?;
+        }
+        // Reset margins and flush BETWEEN chunks — the settled boundary is
+        // what distinguishes this from the fast path's single burst.
+        write!(out, "\x1b[r")?;
+        out.flush()?;
+        y = end;
+    }
+    queue!(out, MoveTo(viewport_x, viewport_y))?;
+    out.flush()
 }
 
 /// Scroll a region of the terminal up using DECSTBM.
@@ -852,5 +1117,268 @@ mod tests {
                 .unwrap_or(0)
         ));
         p
+    }
+
+    // ── emission-strategy tests (mu-solo-zellij-blank-band-ptvm) ─────────────
+    //
+    // The emission paths are free functions over `W: Write`, so the exact
+    // byte stream can be captured into a Vec<u8> without a TTY.
+
+    use super::{
+        emit_insert_conservative, emit_insert_fast, emit_push_down_conservative,
+        emit_push_down_fast, select_emission_strategy, write_buffer_row, EmissionStrategy,
+    };
+    use crossterm::cursor::MoveTo;
+    use crossterm::queue;
+    use crossterm::style::Print;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::Style;
+    use std::io::Write;
+
+    /// Build a payload buffer with a distinct marker per row so content
+    /// parity checks catch row loss/duplication, not just length.
+    fn payload(width: u16, height: u16) -> Buffer {
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+        for y in 0..height {
+            buf.set_string(0, y, format!("row{y:04}"), Style::default());
+        }
+        buf
+    }
+
+    /// Parse every CSI sequence in `bytes` into (parameter string, final byte).
+    fn parse_csi(bytes: &[u8]) -> Vec<(String, u8)> {
+        let mut seqs = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                i += 2;
+                let start = i;
+                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    seqs.push((
+                        String::from_utf8_lossy(&bytes[start..i]).into_owned(),
+                        bytes[i],
+                    ));
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        seqs
+    }
+
+    /// Strip every CSI sequence, leaving printed content (+ CR/LF) only.
+    fn strip_csi(bytes: &[u8]) -> String {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                i += 2;
+                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                    i += 1;
+                }
+                i += 1; // skip final byte
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    // ── strategy selection ────────────────────────────────────────────────────
+
+    #[test]
+    fn strategy_defaults_to_fast_without_zellij() {
+        let (s, _) = select_emission_strategy(None, false);
+        assert_eq!(s, EmissionStrategy::Fast);
+    }
+
+    #[test]
+    fn strategy_is_conservative_under_zellij() {
+        let (s, reason) = select_emission_strategy(None, true);
+        assert_eq!(s, EmissionStrategy::Conservative);
+        assert!(
+            reason.contains("ZELLIJ"),
+            "reason should name the env var: {reason}"
+        );
+    }
+
+    #[test]
+    fn strategy_force_knob_overrides_detection_both_ways() {
+        // Force conservative on a bare terminal.
+        let (s, r) = select_emission_strategy(Some("1"), false);
+        assert_eq!(s, EmissionStrategy::Conservative);
+        assert!(r.contains("forced"));
+        // Force fast under zellij (live-bisection knob).
+        let (s, r) = select_emission_strategy(Some("0"), true);
+        assert_eq!(s, EmissionStrategy::Fast);
+        assert!(r.contains("forced"));
+        // Unrecognized values fall through to detection.
+        let (s, _) = select_emission_strategy(Some("yes"), true);
+        assert_eq!(s, EmissionStrategy::Conservative);
+        let (s, _) = select_emission_strategy(Some("yes"), false);
+        assert_eq!(s, EmissionStrategy::Fast);
+    }
+
+    // ── fast path: byte-identical to the pre-split emission ──────────────────
+
+    /// The fast path must not regress bare terminals: its byte stream must be
+    /// EXACTLY what `insert_before` inlined before the strategy split. This
+    /// test reproduces the original emission code verbatim (modulo writing to
+    /// a Vec instead of stdout and pushing history) and compares streams.
+    #[test]
+    fn fast_path_byte_identical_to_legacy_emission() {
+        let viewport_top: u16 = 20;
+        let (vx, vy): (u16, u16) = (0, 20);
+        let buf = payload(12, 35);
+
+        let mut fast: Vec<u8> = Vec::new();
+        emit_insert_fast(&mut fast, &buf, viewport_top, vx, vy).unwrap();
+
+        // Verbatim copy of the pre-split insert_before emission lines
+        // (history bookkeeping removed — it never wrote to the stream).
+        let mut legacy: Vec<u8> = Vec::new();
+        write!(legacy, "\x1b[?2026h").unwrap();
+        write!(legacy, "\x1b[1;{}r", viewport_top).unwrap();
+        queue!(legacy, MoveTo(0, viewport_top - 1)).unwrap();
+        for y in 0..buf.area.height {
+            queue!(legacy, Print("\r\n")).unwrap();
+            write_buffer_row(&mut legacy, &buf, y).unwrap();
+        }
+        write!(legacy, "\x1b[r").unwrap();
+        queue!(legacy, MoveTo(vx, vy)).unwrap();
+        write!(legacy, "\x1b[?2026l").unwrap();
+        legacy.flush().unwrap();
+
+        assert_eq!(
+            fast, legacy,
+            "fast-path emission diverged from the pre-strategy-split byte stream"
+        );
+    }
+
+    #[test]
+    fn fast_push_down_byte_identical_to_legacy_emission() {
+        let mut fast: Vec<u8> = Vec::new();
+        emit_push_down_fast(&mut fast, 10, 40, 5).unwrap();
+        // Original inline: region_top = viewport.y + 1, region_bottom = rows.
+        let legacy = format!("\x1b[{};{}r\x1b[{}T\x1b[r", 11, 40, 5).into_bytes();
+        assert_eq!(fast, legacy);
+    }
+
+    /// Sanity: the fast path really does use the mechanisms the conservative
+    /// tests below assert the absence of — proves those assertions have teeth.
+    #[test]
+    fn fast_path_uses_sync_brackets() {
+        let buf = payload(12, 35);
+        let mut fast: Vec<u8> = Vec::new();
+        emit_insert_fast(&mut fast, &buf, 20, 0, 20).unwrap();
+        let s = String::from_utf8_lossy(&fast);
+        assert!(s.contains("\x1b[?2026h") && s.contains("\x1b[?2026l"));
+    }
+
+    // ── conservative path: suspect mechanisms absent ──────────────────────────
+
+    #[test]
+    fn conservative_large_insert_has_no_reverse_scroll_and_no_sync() {
+        let viewport_top: u16 = 20;
+        // Large commit: well over the history region (the bead's 388-line case
+        // in miniature).
+        let buf = payload(12, 100);
+        let mut out: Vec<u8> = Vec::new();
+        emit_insert_conservative(&mut out, &buf, viewport_top, 0, viewport_top).unwrap();
+
+        for (params, fin) in parse_csi(&out) {
+            assert_ne!(
+                fin, b'T',
+                "conservative path emitted CSI {params}T (reverse scroll)"
+            );
+            assert_ne!(
+                fin, b'S',
+                "conservative path emitted CSI {params}S (margined SU)"
+            );
+            assert!(
+                !params.contains("2026"),
+                "conservative path emitted ?2026 sync bracket (params {params:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn conservative_push_down_has_no_decstbm_or_reverse_scroll() {
+        let mut out: Vec<u8> = Vec::new();
+        emit_push_down_conservative(&mut out, 10, 8).unwrap();
+        for (params, fin) in parse_csi(&out) {
+            assert_ne!(fin, b'T', "push-down emitted CSI T");
+            assert_ne!(fin, b'r', "push-down set scroll margins (CSI {params}r)");
+        }
+        // It should clear exactly the viewport rows (8 clears).
+        let clears = parse_csi(&out).iter().filter(|(_, f)| *f == b'K').count();
+        assert_eq!(clears, 8);
+    }
+
+    // ── conservative path: chunk bound ────────────────────────────────────────
+
+    #[test]
+    fn conservative_chunks_never_exceed_history_region() {
+        let viewport_top: u16 = 20;
+        let buf = payload(12, 100);
+        let mut out: Vec<u8> = Vec::new();
+        emit_insert_conservative(&mut out, &buf, viewport_top, 0, viewport_top).unwrap();
+
+        // Each chunk opens with DECSTBM on the history region. Between
+        // consecutive openings, the number of scrolled rows (CRLFs) must be
+        // at most viewport_top − 1 (strictly smaller than the region).
+        let s = String::from_utf8_lossy(&out);
+        let marker = format!("\x1b[1;{viewport_top}r");
+        let chunks: Vec<&str> = s.split(marker.as_str()).skip(1).collect();
+        assert!(
+            chunks.len() > 1,
+            "100-row insert through a 20-row region must chunk"
+        );
+        for (i, chunk) in chunks.iter().enumerate() {
+            let rows = chunk.matches("\r\n").count();
+            assert!(
+                rows <= (viewport_top - 1) as usize,
+                "chunk {i} scrolled {rows} rows; max is {}",
+                viewport_top - 1
+            );
+            assert!(
+                chunk.contains("\x1b[r"),
+                "chunk {i} did not reset margins before the next chunk"
+            );
+        }
+        // No content loss across chunking: every row scrolled exactly once.
+        let total_rows: usize = chunks.iter().map(|c| c.matches("\r\n").count()).sum();
+        assert_eq!(total_rows, 100);
+    }
+
+    // ── content parity: chunked emission loses nothing ────────────────────────
+
+    #[test]
+    fn conservative_and_fast_emit_identical_content() {
+        let viewport_top: u16 = 20;
+        let buf = payload(12, 100);
+
+        let mut fast: Vec<u8> = Vec::new();
+        emit_insert_fast(&mut fast, &buf, viewport_top, 0, viewport_top).unwrap();
+        let mut cons: Vec<u8> = Vec::new();
+        emit_insert_conservative(&mut cons, &buf, viewport_top, 0, viewport_top).unwrap();
+
+        // With escape framing stripped, both paths must print exactly the
+        // same characters in the same order — the strategies may only differ
+        // in framing, never in content.
+        assert_eq!(
+            strip_csi(&fast),
+            strip_csi(&cons),
+            "conservative emission altered the printed content"
+        );
+        // And the content actually contains the distinct row markers.
+        let text = strip_csi(&cons);
+        assert!(text.contains("row0000") && text.contains("row0099"));
     }
 }

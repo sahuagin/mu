@@ -3399,3 +3399,202 @@ async fn mh4_no_seed_is_back_compatible() {
     .await;
     assert_eq!(unseeded, empty_seed, "empty seed == no seed");
 }
+
+// ============================================================================
+// mu-mu-solo-loop-terminate-5ek5: tool / compaction panics must not
+// kill the agent loop (2026-06-07 incident: a panic in the loop task
+// closed the input channel and every later ask got RPC -32603
+// "session loop has terminated").
+// ============================================================================
+
+/// Tool whose `execute` panics — models a tool bug (or a tool fed
+/// pathological input) that unwinds in the loop task's await.
+struct PanickingTool {
+    name: String,
+}
+
+#[async_trait]
+impl Tool for PanickingTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name.clone(),
+            description: "panics on execute".to_owned(),
+            input_schema: json!({"type": "object"}),
+            policy: crate::agent::tool::ToolPolicy::read_only(),
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, _arguments: Value, _cancel_rx: oneshot::Receiver<()>) -> ToolResult {
+        panic!("intentional test panic: tool blew up");
+    }
+}
+
+/// Drain events until the next `Done`, returning everything seen
+/// (Done included). Panics on a 5s stall — a dead loop task shows up
+/// here as a clean timeout instead of a hung test.
+async fn drain_until_done(rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
+    let mut seen = Vec::new();
+    loop {
+        match timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(e)) => {
+                let is_done = matches!(e, AgentEvent::Done { .. });
+                seen.push(e);
+                if is_done {
+                    return seen;
+                }
+            }
+            Ok(None) => panic!("event channel closed before Done"),
+            Err(_) => panic!(
+                "timed out waiting for Done; kinds: {:?}",
+                seen.iter().map(kind).collect::<Vec<_>>()
+            ),
+        }
+    }
+}
+
+/// A panicking tool surfaces as an is_error ToolResult — a normal turn
+/// event the model reacts to — and the loop keeps answering asks.
+/// Sequential asks (drain to Done between sends) so each ask gets its
+/// own Done — back-to-back sends would coalesce into one turn.
+#[tokio::test]
+async fn panicking_tool_becomes_error_result_and_loop_continues() {
+    let provider = MockProvider::new(vec![
+        // Ask 1, turn 1: call the panicking tool.
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "t1",
+            "boom",
+            json!({}),
+        ))],
+        // Ask 1, turn 2: model reacts to the error result.
+        vec![ProviderEvent::Done(assistant_text("saw the tool error"))],
+        // Ask 2: the loop is still alive and answers.
+        vec![ProviderEvent::Done(assistant_text("second answer"))],
+    ]);
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let provider: Arc<dyn Provider> = Arc::new(provider);
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(PanickingTool {
+        name: "boom".into(),
+    })];
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let loop_ = loop_with(
+        provider,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        tools,
+        AgentConfig::default(),
+        events_tx,
+        approvals,
+        capability,
+    );
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("run the tool"), None))
+        .await
+        .expect("first send");
+    let ask1 = drain_until_done(&mut events_rx).await;
+    assert!(
+        ask1.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCallCompleted {
+                content,
+                is_error: true,
+                ..
+            } if content.contains("panicked") && content.contains("tool blew up")
+        )),
+        "panic must surface as an is_error ToolCallCompleted; kinds: {:?}",
+        ask1.iter().map(kind).collect::<Vec<_>>(),
+    );
+
+    // The follow-up ask is the incident's failing operation: pre-fix,
+    // the loop task had unwound and this send returned Err (surfaced
+    // by the daemon as -32603 "session loop has terminated").
+    loop_
+        .send(AgentInput::UserMessage(user_msg("still there?"), None))
+        .await
+        .expect("loop must still accept input after a tool panic");
+    let ask2 = drain_until_done(&mut events_rx).await;
+    assert!(
+        ask2.iter().any(|e| matches!(
+            e,
+            AgentEvent::AssistantTextFinalized { text } if text == "second answer"
+        )),
+        "follow-up ask must be answered; kinds: {:?}",
+        ask2.iter().map(kind).collect::<Vec<_>>(),
+    );
+
+    let outcome = timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("join must not hang");
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// Sync compaction policy that panics in `compact` — models the
+/// incident's inline-compaction failure (tiktoken over a pathological
+/// span). The loop must continue the turn with the un-compacted rope.
+struct PanickingCompactionPolicy;
+
+impl CompactionPolicy for PanickingCompactionPolicy {
+    fn compact(&self, _rope: &ContextRope, _target_tokens: usize) -> CompactionResult {
+        panic!("intentional test panic: compaction blew up");
+    }
+
+    fn policy_label(&self) -> &'static str {
+        "panicking-mock"
+    }
+}
+
+#[tokio::test]
+async fn panicking_sync_compaction_does_not_kill_loop() {
+    let provider = MockProviderWithCompaction {
+        inner: MockProvider::new(vec![
+            vec![ProviderEvent::Done(assistant_text("first"))],
+            vec![ProviderEvent::Done(assistant_text("second"))],
+        ]),
+        policy: Arc::new(PanickingCompactionPolicy),
+    };
+    let (loop_, mut events_rx) = spawn_loop_with_provider(
+        Arc::new(provider),
+        AgentConfig {
+            // Any non-empty rope crosses threshold 1, so the panicking
+            // sync compact runs inline on every turn.
+            compaction_threshold: Some(1),
+            ..AgentConfig::default()
+        },
+    );
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None))
+        .await
+        .expect("first send");
+    let ask1 = drain_until_done(&mut events_rx).await;
+    // The panic is surfaced loudly as a warning callout…
+    assert!(
+        ask1.iter().any(|e| matches!(
+            e,
+            AgentEvent::Callout { title, .. } if title == "compaction policy panicked"
+        )),
+        "compaction panic must emit a warning callout; kinds: {:?}",
+        ask1.iter().map(kind).collect::<Vec<_>>(),
+    );
+    // …and the turn still completes (un-compacted rope, answered).
+    assert!(ask1
+        .iter()
+        .any(|e| matches!(e, AgentEvent::AssistantTextFinalized { text } if text == "first")));
+
+    // Loop survives for a follow-up ask.
+    loop_
+        .send(AgentInput::UserMessage(user_msg("again"), None))
+        .await
+        .expect("loop must still accept input after a compaction panic");
+    let ask2 = drain_until_done(&mut events_rx).await;
+    assert!(ask2
+        .iter()
+        .any(|e| matches!(e, AgentEvent::AssistantTextFinalized { text } if text == "second")));
+
+    let outcome = timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("join must not hang");
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}

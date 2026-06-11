@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent::{AssistantMessage, StopReason, Usage};
+use crate::command_journal::{AuthSnapshot, CommandEcho, Origin, RejectStage};
 
 /// A single event in a session's durable log.
 ///
@@ -489,6 +490,51 @@ pub enum EventPayload {
         /// `c1` has no matching ToolResult".
         reason: String,
     },
+    /// spec mu-046: a session-scoped command crossed the daemon's
+    /// border. Journaled into this log — via the strict
+    /// [`SessionEventLog::append_command`] path — BEFORE the command
+    /// enters the session's input queue (INV-1). The append happens
+    /// before the auth gate, so rejected commands are visible too.
+    CommandReceived {
+        /// JSON-RPC id (client-chosen, NOT unique).
+        request_id: Value,
+        method: String,
+        /// Secret-redacted params (INV-6).
+        params: Value,
+        auth: AuthSnapshot,
+        origin: Origin,
+    },
+    /// spec mu-046: receipt — the command completed. Wraps the
+    /// original command (INV-5) so the receipt is self-contained
+    /// evidence of what was asked and what came of it.
+    CommandSucceeded {
+        /// The event id of the `CommandReceived` this answers — same
+        /// correlation scheme as the daemon journal's `seq`.
+        command_event_id: u64,
+        command: CommandEcho,
+        result: Value,
+        elapsed_ms: u64,
+    },
+    /// spec mu-046: receipt — the command failed in processing.
+    CommandFailed {
+        command_event_id: u64,
+        command: CommandEcho,
+        code: i32,
+        message: String,
+        elapsed_ms: u64,
+    },
+    /// spec mu-046: receipt — the command was rejected before any
+    /// handler ran (auth gate, validation, routing). Rejections are
+    /// receipts too (INV-4: every CommandReceived eventually gains
+    /// exactly one receipt — or none, and the orphan IS the legible
+    /// crash marker).
+    CommandRejected {
+        command_event_id: u64,
+        command: CommandEcho,
+        code: i32,
+        message: String,
+        stage: RejectStage,
+    },
 }
 
 /// Categorical exit reason for a task — what brought the task to its
@@ -660,6 +706,56 @@ impl SessionEventLog {
             );
         }
         id
+    }
+
+    /// spec mu-046: like [`append`](Self::append), but for commands —
+    /// the strict path. Writes the JSONL line, `sync_data()`s, THEN
+    /// pushes to memory; IO errors propagate so the caller can fail
+    /// closed (reject with `JOURNAL_UNAVAILABLE`, never process —
+    /// INV-2). The inverse of `append`'s swallow-and-continue:
+    /// command durability is load-bearing, gateway-event durability
+    /// is best-effort.
+    ///
+    /// Errors `Unsupported` when no disk writer is attached — an
+    /// in-memory-only session cannot make a command durable, and
+    /// silently succeeding would forge the write-ahead guarantee.
+    pub fn append_command(&self, actor: EventActor, payload: EventPayload) -> std::io::Result<u64> {
+        // Hold the writer lock across assign-id → write → fsync so
+        // disk order matches id order for concurrent command appends.
+        let mut guard = self
+            .disk_writer
+            .lock()
+            .map_err(|_| std::io::Error::other("disk_writer mutex poisoned"))?;
+        let Some(file) = guard.as_mut() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "append_command requires a disk writer: commands must be durable before processing (spec mu-046 INV-1)",
+            ));
+        };
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let event = SessionEvent {
+            id,
+            session_id: self.session_id.clone(),
+            parent_event_ids: Vec::new(),
+            timestamp_unix_ms: now_unix_ms(),
+            actor,
+            payload,
+        };
+        let line = serde_json::to_string(&event).map_err(std::io::Error::other)?;
+        writeln!(file, "{line}")?;
+        file.sync_data()?;
+        drop(guard);
+        // Disk first, memory second: by the time the event is visible
+        // in any projection it is already durable. A poisoned events
+        // mutex after a durable write surfaces as an error — the
+        // on-disk record then reads as an orphan, which is the legible
+        // outcome (INV-4).
+        let mut events = self
+            .events
+            .lock()
+            .map_err(|_| std::io::Error::other("event log mutex poisoned after durable write"))?;
+        events.push(event);
+        Ok(id)
     }
 
     fn write_to_disk(&self, event: &SessionEvent) {
@@ -1586,5 +1682,146 @@ mod tests {
             },
         );
         assert_eq!(id, 2);
+    }
+
+    // ─── spec mu-046: command/receipt variants + append_command ───
+
+    use crate::command_journal::{AuthSnapshot, CommandEcho, Origin, RejectStage};
+
+    fn sample_command_received() -> EventPayload {
+        EventPayload::CommandReceived {
+            request_id: json!(7),
+            method: "session.ask".into(),
+            params: json!({"prompt": "hi"}),
+            auth: AuthSnapshot::Authenticated,
+            origin: Origin {
+                transport: "stdio".into(),
+                connection_id: Some("c1".into()),
+            },
+        }
+    }
+
+    fn sample_echo() -> CommandEcho {
+        CommandEcho {
+            request_id: json!(7),
+            method: "session.ask".into(),
+            params: json!({"prompt": "hi"}),
+        }
+    }
+
+    /// In-memory-only logs cannot make a command durable, and silently
+    /// succeeding would forge the write-ahead guarantee — the policy
+    /// is an explicit `Unsupported` error.
+    #[test]
+    fn append_command_errors_without_disk_writer() {
+        let log = SessionEventLog::new("s1");
+        let err = log
+            .append_command(EventActor::User, sample_command_received())
+            .expect_err("no disk writer must be an error, never a silent success");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        // Nothing reached memory and no id was consumed: the failed
+        // command left no trace, matching fail-closed semantics.
+        assert!(log.is_empty());
+        assert_eq!(
+            log.append(EventActor::System, EventPayload::SessionClosed),
+            1
+        );
+    }
+
+    /// The strict path writes to disk BEFORE the in-memory push: after
+    /// append_command returns, the JSONL line exists and `from_jsonl`
+    /// rebuilds the same event the snapshot holds.
+    #[test]
+    fn append_command_disk_write_precedes_memory_and_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s1.jsonl");
+        let log = SessionEventLog::new("s1");
+        log.attach_disk_writer(&path).expect("attach");
+
+        let received_id = log
+            .append_command(EventActor::User, sample_command_received())
+            .expect("append_command");
+        assert_eq!(received_id, 1);
+        let receipt_id = log
+            .append_command(
+                EventActor::System,
+                EventPayload::CommandSucceeded {
+                    command_event_id: received_id,
+                    command: sample_echo(),
+                    result: json!({"accepted": true}),
+                    elapsed_ms: 3,
+                },
+            )
+            .expect("append receipt");
+        assert_eq!(receipt_id, 2);
+
+        // Disk holds both lines (durable, fsync'd) …
+        let (recovered, malformed) = SessionEventLog::from_jsonl(&path).expect("from_jsonl");
+        assert_eq!(malformed, 0);
+        assert_eq!(recovered.snapshot(), log.snapshot());
+        // … and the recovered payloads are the command variants.
+        assert_eq!(recovered.snapshot()[0].payload, sample_command_received());
+    }
+
+    /// The four mu-046 variants' wire shape, pinned: internally tagged
+    /// `kind` in snake_case, shared border types in their snake_case
+    /// forms.
+    #[test]
+    fn command_variants_jsonl_round_trip() -> Result<(), serde_json::Error> {
+        let samples = [
+            (sample_command_received(), "command_received"),
+            (
+                EventPayload::CommandSucceeded {
+                    command_event_id: 1,
+                    command: sample_echo(),
+                    result: json!({"ok": true}),
+                    elapsed_ms: 10,
+                },
+                "command_succeeded",
+            ),
+            (
+                EventPayload::CommandFailed {
+                    command_event_id: 1,
+                    command: sample_echo(),
+                    code: -32603,
+                    message: "provider exploded".into(),
+                    elapsed_ms: 10,
+                },
+                "command_failed",
+            ),
+            (
+                EventPayload::CommandRejected {
+                    command_event_id: 1,
+                    command: sample_echo(),
+                    code: -32600,
+                    message: "not yours".into(),
+                    stage: RejectStage::AuthGate,
+                },
+                "command_rejected",
+            ),
+        ];
+        for (payload, kind) in samples {
+            let v = serde_json::to_value(&payload)?;
+            assert_eq!(v["kind"], kind);
+            let decoded: EventPayload = serde_json::from_value(v)?;
+            assert_eq!(decoded, payload);
+        }
+        // Shared border types ride along in snake_case.
+        let v = serde_json::to_value(sample_command_received())?;
+        assert_eq!(v["auth"], "authenticated");
+        assert_eq!(v["origin"]["transport"], "stdio");
+        Ok(())
+    }
+
+    /// Existing best-effort append is byte-for-byte unchanged: it
+    /// still returns a bare u64 and still swallows disk-less appends.
+    #[test]
+    fn plain_append_still_best_effort_for_command_variants() {
+        let log = SessionEventLog::new("s1");
+        // No disk writer: plain append happily records in memory only —
+        // the strictness lives in append_command, not in the variant.
+        let id = log.append(EventActor::User, sample_command_received());
+        assert_eq!(id, 1);
+        assert_eq!(log.len(), 1);
     }
 }

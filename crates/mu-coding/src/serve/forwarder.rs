@@ -1205,6 +1205,10 @@ mod tests {
                 EventPayload::OperatorMark { .. } => "operator_mark",
                 EventPayload::Tombstone { .. } => "tombstone",
                 EventPayload::HeadAttached { .. } => "head_attached",
+                EventPayload::CommandReceived { .. } => "command_received",
+                EventPayload::CommandSucceeded { .. } => "command_succeeded",
+                EventPayload::CommandFailed { .. } => "command_failed",
+                EventPayload::CommandRejected { .. } => "command_rejected",
             })
             .collect();
         assert_eq!(kinds, vec!["assistant_message", "done"]);

@@ -119,6 +119,11 @@ pub(crate) fn payload_kind(payload: &EventPayload) -> &'static str {
         EventPayload::Tombstone { .. } => "tombstone",
         // mu-mh4: a live head attached to a resumed session.
         EventPayload::HeadAttached { .. } => "head_attached",
+        // spec mu-046: session-scoped command + receipt records.
+        EventPayload::CommandReceived { .. } => "command_received",
+        EventPayload::CommandSucceeded { .. } => "command_succeeded",
+        EventPayload::CommandFailed { .. } => "command_failed",
+        EventPayload::CommandRejected { .. } => "command_rejected",
     }
 }
 

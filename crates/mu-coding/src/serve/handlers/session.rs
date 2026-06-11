@@ -1403,6 +1403,10 @@ fn payload_kind_str(p: &EventPayload) -> &'static str {
         EventPayload::OperatorMark { .. } => "operator_mark",
         EventPayload::Tombstone { .. } => "tombstone",
         EventPayload::HeadAttached { .. } => "head_attached",
+        EventPayload::CommandReceived { .. } => "command_received",
+        EventPayload::CommandSucceeded { .. } => "command_succeeded",
+        EventPayload::CommandFailed { .. } => "command_failed",
+        EventPayload::CommandRejected { .. } => "command_rejected",
     }
 }
 

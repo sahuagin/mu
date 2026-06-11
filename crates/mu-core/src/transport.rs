@@ -1,13 +1,15 @@
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 
+use crate::command_journal::Origin;
 use crate::protocol::{ErrorObject, Notification, Request, Response, JSONRPC_VERSION};
 
 // ===== Public API =====
@@ -65,12 +67,84 @@ pub fn err_response(id: Value, code: i32, message: impl Into<String>) -> Respons
     }
 }
 
-/// Handle on a single shared outbound channel. Cheap to clone (Arc-y
-/// internally). Pass into request handlers so they can emit
-/// notifications mid-flight.
+/// Capacity of the daemon-wide outbound broadcast stream. Generous so
+/// a healthy connection writer never lags under normal load; see
+/// [`write_loop`] for the (documented) lossy-under-extreme-lag
+/// tradeoff.
+pub const OUTBOUND_STREAM_CAPACITY: usize = 8192;
+
+/// A tagged item on the daemon-wide outbound stream (spec mu-046
+/// INV-8: all responses and notifications leave through this stream —
+/// no writer bypasses it).
+///
+/// `origin: None` means broadcast — every connection delivers it.
+/// `Some(o)` means only the connection whose [`Origin`] matches
+/// delivers.
+#[derive(Clone, Debug)]
+pub struct OutboundEnvelope {
+    /// Which connection this belongs to; `None` ⇒ broadcast.
+    pub origin: Option<Origin>,
+    /// JSON-RPC id for response correlation (`None` for notifications).
+    pub request_id: Option<Value>,
+    /// Command-journal correlation (spec mu-046). Tagged by the ingest
+    /// pipeline once commands are journaled (WP3); `None` until then.
+    pub command_seq: Option<u64>,
+    /// The serialized Response or Notification.
+    pub item: Outbound,
+}
+
+/// The daemon-wide outbound stream (spec mu-046 INV-8): the one way
+/// bytes leave the daemon. spmc over [`tokio::sync::broadcast`] —
+/// producers (handlers, forwarders, the response path) send tagged
+/// [`OutboundEnvelope`]s; each transport writer subscribes and forwards
+/// the envelopes addressed to its connection (or broadcasts).
+///
+/// Cheap to clone (the broadcast sender is Arc-y internally).
+#[derive(Clone, Debug)]
+pub struct OutboundStream {
+    tx: broadcast::Sender<OutboundEnvelope>,
+}
+
+impl OutboundStream {
+    /// Create a stream with [`OUTBOUND_STREAM_CAPACITY`].
+    pub fn new() -> Self {
+        let (tx, _rx) = broadcast::channel(OUTBOUND_STREAM_CAPACITY);
+        Self { tx }
+    }
+
+    /// Subscribe a new per-connection receiver. Only envelopes sent
+    /// after this call are observed.
+    pub fn subscribe(&self) -> broadcast::Receiver<OutboundEnvelope> {
+        self.tx.subscribe()
+    }
+
+    /// Send an envelope. Never panics: a send with zero receivers is
+    /// silently ignored — the daemon may emit before any connection
+    /// attaches.
+    pub fn send(&self, envelope: OutboundEnvelope) {
+        let _ = self.tx.send(envelope);
+    }
+}
+
+impl Default for OutboundStream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Handle on the daemon-wide outbound stream for emitting
+/// notifications. Cheap to clone. Pass into request handlers so they
+/// can emit notifications mid-flight.
+///
+/// Carries an `Option<Origin>`: a writer created for a connection tags
+/// its notifications with that connection's origin, so they deliver
+/// only there (today's semantics — a session's notifications go to the
+/// connection that spawned it). An origin-less writer broadcasts to
+/// every connection.
 #[derive(Clone, Debug)]
 pub struct NotificationWriter {
-    tx: mpsc::Sender<Outbound>,
+    origin: Option<Origin>,
+    stream: OutboundStream,
 }
 
 impl NotificationWriter {
@@ -78,12 +152,33 @@ impl NotificationWriter {
     /// Used by the MCP server surface where notifications don't need to
     /// be forwarded to the MCP client.
     pub fn sink() -> Self {
-        let (tx, _rx) = mpsc::channel(1);
-        Self { tx }
+        // A private stream with no subscribers: every send is ignored.
+        Self {
+            origin: None,
+            stream: OutboundStream::new(),
+        }
     }
 
-    /// Emit a notification. Returns `Ok(())` even if the channel is
-    /// closed — see §INV-5.
+    /// Origin-less writer: notifications fan out to every connection
+    /// subscribed to `stream`.
+    pub fn broadcast(stream: OutboundStream) -> Self {
+        Self {
+            origin: None,
+            stream,
+        }
+    }
+
+    /// Writer whose notifications deliver only to the connection whose
+    /// [`Origin`] matches `origin`.
+    pub fn for_origin(stream: OutboundStream, origin: Origin) -> Self {
+        Self {
+            origin: Some(origin),
+            stream,
+        }
+    }
+
+    /// Emit a notification. Returns `Ok(())` even with no subscribers —
+    /// see §INV-5.
     pub async fn emit<P: Serialize>(&self, method: &str, params: P) -> Result<(), TransportError> {
         let params = serde_json::to_value(params)?;
         let notif = Notification {
@@ -92,9 +187,12 @@ impl NotificationWriter {
             params,
         };
         let value = serde_json::to_value(&notif)?;
-        if self.tx.send(Outbound(value)).await.is_err() {
-            tracing::warn!("notification dropped: outbound channel closed");
-        }
+        self.stream.send(OutboundEnvelope {
+            origin: self.origin.clone(),
+            request_id: None,
+            command_seq: None,
+            item: Outbound(value),
+        });
         Ok(())
     }
 }
@@ -113,6 +211,10 @@ where
 /// Generic transport: read newline-delimited JSON requests from
 /// `reader`, dispatch each to `handler` on `tokio::spawn`, write
 /// responses and notifications back to `writer`.
+///
+/// Creates a private [`OutboundStream`] for this connection. Daemons
+/// that own a daemon-wide stream (spec mu-046 INV-8) should call
+/// [`serve_with_stream`] instead and pass it down.
 pub async fn serve<R, W, F, Fut>(reader: R, writer: W, handler: F) -> Result<(), TransportError>
 where
     R: AsyncBufRead + Unpin + Send + 'static,
@@ -120,9 +222,42 @@ where
     F: Fn(Request<Value>, NotificationWriter) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Response<Value>> + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel(64);
-    let notif = NotificationWriter { tx: tx.clone() };
-    let writer_task = tokio::spawn(write_loop(writer, rx));
+    serve_with_stream(reader, writer, OutboundStream::new(), handler).await
+}
+
+/// Process-wide connection counter so every connection served by this
+/// daemon gets a unique [`Origin`] at accept time.
+static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate this connection's identity at accept time.
+fn next_stdio_origin() -> Origin {
+    let id = CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    Origin {
+        transport: "stdio".into(),
+        connection_id: Some(id.to_string()),
+    }
+}
+
+/// [`serve`] over a caller-owned daemon-wide [`OutboundStream`] (spec
+/// mu-046 INV-8: one way out). This connection gets a fresh [`Origin`];
+/// the handler's responses are enveloped with it (plus the request id)
+/// and sent to the stream, and the connection's writer subscribes,
+/// filtering to envelopes addressed to it (or broadcast).
+pub async fn serve_with_stream<R, W, F, Fut>(
+    reader: R,
+    writer: W,
+    stream: OutboundStream,
+    handler: F,
+) -> Result<(), TransportError>
+where
+    R: AsyncBufRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+    F: Fn(Request<Value>, NotificationWriter) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Response<Value>> + Send + 'static,
+{
+    let origin = next_stdio_origin();
+    let notif = NotificationWriter::for_origin(stream.clone(), origin.clone());
+    let writer_task = tokio::spawn(write_loop(writer, stream.subscribe(), origin.clone()));
     let handler = Arc::new(handler);
     let mut tasks = JoinSet::new();
     let mut lines = reader.lines();
@@ -130,26 +265,33 @@ where
     while let Some(line) = lines.next_line().await? {
         match parse_request_line(&line) {
             Ok(request) => {
+                let request_id = request.id.clone();
                 let handler = Arc::clone(&handler);
                 let notif = notif.clone();
-                let response_tx = tx.clone();
+                let stream = stream.clone();
+                let origin = origin.clone();
                 tasks.spawn(async move {
                     let response = handler(request, notif).await;
                     match serde_json::to_value(response) {
-                        Ok(value) => {
-                            if response_tx.send(Outbound(value)).await.is_err() {
-                                tracing::warn!("response dropped: outbound channel closed");
-                            }
-                        }
+                        Ok(value) => stream.send(OutboundEnvelope {
+                            origin: Some(origin),
+                            request_id: Some(request_id),
+                            command_seq: None,
+                            item: Outbound(value),
+                        }),
                         Err(err) => tracing::warn!(%err, "response serialization failed"),
                     }
                 });
             }
             Err(response) => {
                 let value = serde_json::to_value(response)?;
-                if tx.send(Outbound(value)).await.is_err() {
-                    return Err(TransportError::OutboundClosed);
-                }
+                let request_id = value.get("id").cloned().unwrap_or(Value::Null);
+                stream.send(OutboundEnvelope {
+                    origin: Some(origin.clone()),
+                    request_id: Some(request_id),
+                    command_seq: None,
+                    item: Outbound(value),
+                });
             }
         }
     }
@@ -167,8 +309,8 @@ where
     // lets the per-session agent loops exit on recv()==None, which
     // drops their events senders, which lets the per-session
     // forwarders exit, which drops their NotificationWriter clones,
-    // which finally lets `writer_task` see all `tx` clones drop and
-    // exit.
+    // which finally lets `writer_task` see every stream sender clone
+    // drop (broadcast recv -> Closed) and exit.
     //
     // Pre-multi-turn this chain worked implicitly because the agent
     // loop returned after one Done — but with multi-turn the loop
@@ -177,7 +319,7 @@ where
     // explicit drop.
     drop(handler);
     drop(notif);
-    drop(tx);
+    drop(stream);
 
     match writer_task.await {
         Ok(result) => result,
@@ -188,23 +330,52 @@ where
     }
 }
 
+/// Anything destined for the outbound stream: a serialized Response
+/// or Notification, already as a Value so it can be flushed without
+/// re-borrowing the type. Public because it rides inside
+/// [`OutboundEnvelope`] (spec mu-046 INV-8).
+#[derive(Clone, Debug)]
+pub struct Outbound(pub Value);
+
 // ===== Internal =====
 
-/// Anything destined for the outbound channel: a serialized Response
-/// or Notification, already as a Value so it can be flushed without
-/// re-borrowing the type. Pub(crate) only.
-#[derive(Debug)]
-pub(crate) struct Outbound(pub(crate) Value);
-
+/// Per-connection delivery: subscribe to the daemon-wide stream,
+/// forward envelopes addressed to this connection (`origin` matches
+/// `self`) or broadcast (`origin` is `None`) as JSONL. Broadcast
+/// preserves global send order, so per-connection ordering matches the
+/// old single mpsc channel.
+///
+/// On `Lagged` (this subscriber fell more than the stream capacity
+/// behind) the skipped envelopes are gone: lossy-under-extreme-lag is
+/// a known MVP tradeoff of the spmc design — lossless per-connection
+/// delivery (e.g. a per-connection buffering layer) is a possible
+/// follow-up.
 async fn write_loop<W>(
     mut writer: W,
-    mut rx: mpsc::Receiver<Outbound>,
+    mut rx: broadcast::Receiver<OutboundEnvelope>,
+    origin: Origin,
 ) -> Result<(), TransportError>
 where
     W: AsyncWrite + Unpin,
 {
-    while let Some(Outbound(value)) = rx.recv().await {
-        let line = serde_json::to_string(&value)?;
+    loop {
+        let envelope = match rx.recv().await {
+            Ok(envelope) => envelope,
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    skipped,
+                    "outbound stream lagged: envelopes dropped for this connection"
+                );
+                continue;
+            }
+            // Every sender dropped — clean shutdown.
+            Err(broadcast::error::RecvError::Closed) => break,
+        };
+        match &envelope.origin {
+            Some(o) if *o != origin => continue,
+            _ => {}
+        }
+        let line = serde_json::to_string(&envelope.item.0)?;
         writer.write_all(line.as_bytes()).await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
@@ -249,11 +420,22 @@ mod tests {
         F: Fn(Request<Value>, NotificationWriter) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Response<Value>> + Send + 'static,
     {
+        spawn_harness_on_stream(OutboundStream::new(), handler)
+    }
+
+    /// Like [`spawn_harness`] but the connection joins a caller-owned
+    /// daemon-wide stream — lets tests attach multiple connections to
+    /// one stream (spec mu-046 INV-8).
+    fn spawn_harness_on_stream<F, Fut>(stream: OutboundStream, handler: F) -> Harness
+    where
+        F: Fn(Request<Value>, NotificationWriter) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Response<Value>> + Send + 'static,
+    {
         let (input, server_reader) = duplex(64 * 1024);
         let (server_writer, output) = duplex(64 * 1024);
         let reader = BufReader::new(server_reader);
         let output = BufReader::new(output).lines();
-        let serve_task = tokio::spawn(serve(reader, server_writer, handler));
+        let serve_task = tokio::spawn(serve_with_stream(reader, server_writer, stream, handler));
         Harness {
             input,
             output,
@@ -422,6 +604,82 @@ mod tests {
         assert_eq!(response["id"], json!(1));
         let result = harness.serve_task.await?;
         assert!(result.is_ok());
+        Ok(())
+    }
+
+    /// Two connections on one daemon-wide stream: a response envelope
+    /// tagged with connection A's origin is written only by A. B's
+    /// first output line is its own response — if A's response had
+    /// leaked through B's filter, broadcast ordering would have put it
+    /// first (spec mu-046 INV-8 per-connection filtering).
+    #[tokio::test]
+    async fn response_routes_only_to_originating_connection(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let stream = OutboundStream::new();
+        let handler =
+            |req: Request<Value>, _| async move { ok_response(req.id, json!({"pong": true})) };
+        let mut conn_a = spawn_harness_on_stream(stream.clone(), handler);
+        let mut conn_b = spawn_harness_on_stream(stream.clone(), handler);
+
+        write_json_line(
+            &mut conn_a.input,
+            json!({"jsonrpc":"2.0","id":"for-a","method":"ping","params":null}),
+        )
+        .await?;
+        let response_a = read_value(&mut conn_a.output).await?;
+        assert_eq!(response_a["id"], json!("for-a"));
+
+        // A's response is already on the stream; B subscribed before it
+        // was sent, so if B failed to filter it, it would precede B's
+        // own response in B's output.
+        write_json_line(
+            &mut conn_b.input,
+            json!({"jsonrpc":"2.0","id":"for-b","method":"ping","params":null}),
+        )
+        .await?;
+        let response_b = read_value(&mut conn_b.output).await?;
+        assert_eq!(response_b["id"], json!("for-b"));
+        Ok(())
+    }
+
+    /// An origin-less envelope (broadcast) reaches every connection on
+    /// the stream — emitted via the `NotificationWriter::broadcast`
+    /// constructor (spec mu-046 INV-8 fan-out).
+    #[tokio::test]
+    async fn broadcast_envelope_fans_out_to_all_connections(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let stream = OutboundStream::new();
+        let handler =
+            |req: Request<Value>, _| async move { ok_response(req.id, json!({"pong": true})) };
+        let mut conn_a = spawn_harness_on_stream(stream.clone(), handler);
+        let mut conn_b = spawn_harness_on_stream(stream.clone(), handler);
+
+        // Prove both write loops are subscribed before broadcasting: a
+        // delivered response means the connection's subscriber is live.
+        write_json_line(
+            &mut conn_a.input,
+            json!({"jsonrpc":"2.0","id":1,"method":"ping","params":null}),
+        )
+        .await?;
+        write_json_line(
+            &mut conn_b.input,
+            json!({"jsonrpc":"2.0","id":2,"method":"ping","params":null}),
+        )
+        .await?;
+        read_value(&mut conn_a.output).await?;
+        read_value(&mut conn_b.output).await?;
+
+        let broadcast_writer = NotificationWriter::broadcast(stream.clone());
+        broadcast_writer
+            .emit("daemon.announce", json!({"msg": "hello"}))
+            .await?;
+
+        let seen_a = read_value(&mut conn_a.output).await?;
+        let seen_b = read_value(&mut conn_b.output).await?;
+        assert_eq!(seen_a["method"], json!("daemon.announce"));
+        assert_eq!(seen_a["params"], json!({"msg": "hello"}));
+        assert_eq!(seen_b["method"], json!("daemon.announce"));
+        assert_eq!(seen_b["params"], json!({"msg": "hello"}));
         Ok(())
     }
 

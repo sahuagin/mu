@@ -350,7 +350,15 @@ where
         }
         Arc::new(mu_core::skill::loader::discover_skills(&dirs))
     };
-    mu_core::transport::serve(reader, writer, move |req, notif| {
+    // spec mu-046 INV-8 (WP2): the daemon-wide tagged outbound stream —
+    // the one way bytes leave the daemon. Created here at daemon level
+    // and passed down; today the stdio connection's writer is its only
+    // subscriber, so wire behavior is unchanged. Moved (not cloned)
+    // into serve_with_stream so the shutdown cascade still sees every
+    // sender drop. WP3's pipeline gains its own clone via the handler
+    // seam when receipts start flowing.
+    let outbound = mu_core::transport::OutboundStream::new();
+    mu_core::transport::serve_with_stream(reader, writer, outbound, move |req, notif| {
         let _ = &mcp_guard;
         let sessions = sessions.clone();
         let factory = factory.clone();

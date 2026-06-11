@@ -151,7 +151,7 @@ same correlation scheme as the daemon journal's `seq`.
 
 ```rust
 pub struct OutboundEnvelope {
-    pub origin: Origin,              // which connection this belongs to (None ⇒ broadcast)
+    pub origin: Option<Origin>,      // which connection this belongs to (None ⇒ broadcast)
     pub request_id: Option<Value>,   // response correlation
     pub command_seq: Option<u64>,    // journal correlation
     pub item: Outbound,              // existing Response/Notification union

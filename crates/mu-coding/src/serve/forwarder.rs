@@ -463,11 +463,28 @@ fn compute_status(
     // Context pressure from the last model call's total input tokens.
     if let Some(last_input) = last_call_input {
         status.last_call_context_tokens = Some(last_input);
-        let window = context_window_for(&provider_kind, &model);
-        if let Some(w) = window {
-            status.context_window_size = Some(w);
-            status.context_pressure_pct = Some((last_input as f64 / w as f64) * 100.0);
-        }
+        // Denominator: a provider's known *hardware* context window when
+        // we have one; otherwise fall back to mu's own local compaction
+        // budget. The fallback is provider-independent and needs nothing
+        // but local state (no capability query — mu has no such support
+        // yet, and the rejected per-call-discovery approach in PR #274 is
+        // explicitly not the path). It measures pressure toward the point
+        // where mu compacts rather than toward the model's true ceiling;
+        // for windows >= the budget that's conservative (warns early),
+        // which covers the providers we run (e.g. ollama's 262k coder vs
+        // the 150k budget). This is why ollama — which has no arm in
+        // context_window_for and reports no window — previously showed a
+        // blank context column.
+        //
+        // TODO(no-magic-values): both `context_window_for`'s table and
+        // this 150k default are magic values that should move into config
+        // (trigger_threshold_tokens is already a config field; it just
+        // isn't threaded into forward_events/compute_status). Once threaded,
+        // use the live configured budget here instead of the constant.
+        let window = context_window_for(&provider_kind, &model)
+            .unwrap_or(mu_core::agent::DEFAULT_COMPACTION_THRESHOLD as u64);
+        status.context_window_size = Some(window);
+        status.context_pressure_pct = Some((last_input as f64 / window as f64) * 100.0);
     }
 
     status

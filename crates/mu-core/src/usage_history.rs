@@ -243,6 +243,9 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
             // mu-za92: compaction audit is context-composition
             // signal, not usage/timing signal.
             | EventPayload::CompactionAssembly { .. }
+            // mu-recall-provenance-audit-vnc9.1: recall provenance
+            // refs are context-composition audit, not usage/timing.
+            | EventPayload::RecallProvenance { .. }
             | EventPayload::ProviderSwitched { .. }
             // mu-slat: worker lifecycle events are supervisor-side
             // bookkeeping, not per-call usage signals.

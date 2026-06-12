@@ -23,7 +23,7 @@ They look irreconcilable. They are not.
 
 ## Resolution: provenance without content
 
-Log a **reference** per injected span — `{source, content-hash, token-count}` — not the text. mu already computes the hash: every `RecalledItem` carries a `stable_id` that is a blake3 content-hash (`memory-<hash>`, `file-<hash>`). It simply never reaches an event. Emit it.
+Log a **reference** per injected span — `{source, content-hash, token-count}` — not the text. mu already computes a blake3 `stable_id` per `RecalledItem` (`memory-<hash>` is a content hash; `file-<hash>` hashes the canonical *path* — the rope-dedup identity — so P0 carries a separate full-width `content_hash` field for the actual tamper-evidence). It simply never reached an event. Emit it.
 
 This gives detection (every injection has a logged fingerprint), tamper-evidence (resolve the hash later: match → verbatim, mismatch → you *know* it changed and what), and no content spread (the bytes stay in one place; logs carry hashes).
 
@@ -52,7 +52,7 @@ This gives detection (every injection has a logged fingerprint), tamper-evidence
 
 This is an epic. The cheap audit/privacy win does **not** require the architectural refactor.
 
-- **P0 — provenance logging (cheap, additive, no architecture change).** Emit `source + content-hash + tokens` for *today's* synchronous recall (the `stable_id` is already computed), and define the redacted-tombstone format for sensitive spans. Immediate detection + shareable-log win, no agent-loop change.
+- **P0 — provenance logging (cheap, additive, no architecture change).** Emit `source + content-hash + tokens` for *today's* synchronous recall (the `stable_id` is already computed), and define the redacted-tombstone format for sensitive spans. Immediate detection + shareable-log win, no agent-loop change. **Shipped** (bead `mu-recall-provenance-audit-vnc9.1`): the `recall_provenance` event — one per session creation, emitted at `build_and_register_session` before the session becomes observable; `Memory` spans are redacted-tombstoned (`hash + source-type`, no name), file/bootloader spans carry their ref plus name in the clear.
 - **P1 — retention-pin.** Protect content-versions referenced by logs from GC/compaction. Store-side; ties to mu-phl v1.
 - **P2 — strike-through deletion.** Authorized + reasoned redaction (strike) events; release pin + purge bytes + keep the strike record.
 - **P3 — capability-gated resolution.** A biscuit capability to follow tombstone refs to the bytes (`mu-w4o`).

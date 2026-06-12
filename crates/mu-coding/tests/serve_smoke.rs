@@ -729,6 +729,170 @@ async fn b11_session_events_round_trip() {
     let _ = timeout(Duration::from_millis(500), server_handle).await;
 }
 
+/// mu-recall-provenance-audit-vnc9.1 (P0): session creation records the
+/// recall injection set as a `recall_provenance` event — refs only
+/// (source + content-hash + tokens), never the injected text — ordered
+/// after `session_created` on the same log.
+#[tokio::test]
+async fn recall_provenance_event_records_injection_refs_without_content() {
+    const SENTINEL: &str = "SENTINEL-PROJECT-CONTEXT-zq9";
+
+    // A project cwd with a deterministic MU.md: the project-file
+    // provider resolves `./MU.md` against the session cwd, so this
+    // guarantees at least one recalled item with no dependence on the
+    // host's memory binary (memory=false below) or env overrides.
+    let cwd = unique_test_dir("recall-provenance-cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(cwd.join("MU.md"), format!("# project\n{SENTINEL}\n")).unwrap();
+    // The provider canonicalizes file paths before reporting them, so
+    // compare against the canonical cwd (temp_dir may be a symlink).
+    let cwd = cwd.canonicalize().unwrap();
+
+    let config = Config {
+        auth: AuthConfig::Bearer {
+            tokens: vec![TEST_BEARER_TOKEN.to_string()],
+        },
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
+        recall: mu_core::config::RecallConfig {
+            // Hermetic: no subprocess to the host's agent binary.
+            memory: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) = spawn_server_with_config(provider, Vec::new(), config).await;
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "create_session",
+        "params": {
+            "provider": { "kind": "anthropic_api", "model": "x" },
+            "cwd": cwd,
+        }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 1).await;
+    let session_id = resp["result"]["session_id"].as_str().unwrap().to_string();
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "session.events",
+        "params": { "session_id": session_id }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 2).await;
+    let events = resp["result"]["events"].as_array().expect("events").clone();
+
+    // Exactly one provenance event per session creation, after
+    // session_created. Membership-based otherwise: the provider may
+    // also pick up the operator's config-dir MU.md on a dev host.
+    let created_idx = events
+        .iter()
+        .position(|e| e["payload"]["kind"] == "session_created")
+        .expect("session_created");
+    let provenance: Vec<(usize, &Value)> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e["payload"]["kind"] == "recall_provenance")
+        .collect();
+    assert_eq!(provenance.len(), 1, "one recall_provenance per creation");
+    let (idx, event) = provenance[0];
+    assert!(idx > created_idx, "provenance follows session_created");
+    assert_eq!(event["actor"]["kind"], "system");
+
+    let items = event["payload"]["items"].as_array().expect("items");
+    let mu_md = items
+        .iter()
+        .find(|i| {
+            i["source"] == "project_file"
+                && i["name"]
+                    .as_str()
+                    .is_some_and(|n| n.starts_with(cwd.to_str().unwrap()))
+        })
+        .expect("project_file entry for the session cwd's MU.md");
+    assert_eq!(mu_md["redacted"], false);
+    assert_eq!(mu_md["content_hash"].as_str().unwrap().len(), 64);
+    assert!(mu_md["token_count"].as_u64().unwrap() > 0);
+    assert!(mu_md["stable_id"].as_str().unwrap().starts_with("file-"));
+
+    // The invariants, over every entry: refs never carry content, and
+    // memory-sourced entries are always redacted tombstones.
+    let event_json = serde_json::to_string(event).unwrap();
+    assert!(
+        !event_json.contains(SENTINEL),
+        "injected content leaked into the provenance event"
+    );
+    for item in items {
+        if item["source"] == "memory" {
+            assert_eq!(item["redacted"], true, "memory entries must be redacted");
+            assert!(item.get("name").is_none(), "redacted entries carry no name");
+        }
+    }
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}
+
+/// mu-recall-provenance-audit-vnc9.1: recall disabled ⇒ no providers ⇒
+/// NO recall_provenance event. Absence means nothing was injected;
+/// `--bare` / disabled sessions stay byte-identical.
+#[tokio::test]
+async fn recall_disabled_emits_no_provenance_event() {
+    let config = Config {
+        auth: AuthConfig::Bearer {
+            tokens: vec![TEST_BEARER_TOKEN.to_string()],
+        },
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
+        recall: mu_core::config::RecallConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) = spawn_server_with_config(provider, Vec::new(), config).await;
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "create_session",
+        "params": { "provider": { "kind": "anthropic_api", "model": "x" } }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 1).await;
+    let session_id = resp["result"]["session_id"].as_str().unwrap().to_string();
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "session.events",
+        "params": { "session_id": session_id }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let resp = await_response(&mut client, 2).await;
+    let events = resp["result"]["events"].as_array().expect("events").clone();
+    assert!(
+        events
+            .iter()
+            .all(|e| e["payload"]["kind"] != "recall_provenance"),
+        "no recall_provenance event when recall is disabled"
+    );
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}
+
 /// B-12: daemon.stats reflects session creation + ask counts.
 #[tokio::test]
 async fn b12_daemon_stats_round_trip() {

@@ -262,6 +262,29 @@ pub enum EventPayload {
         /// Wall-clock duration of `policy.compact()` in microseconds.
         wall_clock_us: u64,
     },
+    /// mu-recall-provenance-audit-vnc9.1 (P0): provenance refs for the
+    /// session-start recall injection — one event per session creation,
+    /// emitted at `build_and_register_session` right after the recall
+    /// providers run, so the injection set is recorded atomically (no
+    /// reader can see a partially-provenanced injection). Refs only —
+    /// `{source, content-hash, tokens}` — NEVER the injected text
+    /// (specs/rfc-recall-provenance-audit.md: privacy + auditability
+    /// via provenance-without-content). Sensitive entries are the
+    /// RFC's redacted-tombstones (see [`RecallProvenanceEntry`]).
+    ///
+    /// Not emitted when recall produced nothing (`--bare`,
+    /// `MU_NO_RECALL`, `[recall].enabled=false`): absence means
+    /// nothing was injected.
+    ///
+    /// Known residual non-recall injections (out of scope here): the
+    /// operator system prompt and discovery-bootstrap text are
+    /// mu-static/operator-supplied, fingerprinted per-call by
+    /// `ContextAssembly::prefix_span_hashes`.
+    ///
+    /// Forward-compat: old binaries rehydrating a log containing this
+    /// variant skip it as a malformed line in `from_jsonl` — same as
+    /// every variant added historically.
+    RecallProvenance { items: Vec<RecallProvenanceEntry> },
     /// mu-036: autonomous loop iteration began. `iteration` is
     /// 0-indexed across the run; `motivation` is the model-reported
     /// one-sentence "what I'm doing this turn and why" (after a
@@ -559,6 +582,7 @@ impl EventPayload {
             Self::SessionClosed => "session_closed",
             Self::ContextAssembly { .. } => "context_assembly",
             Self::CompactionAssembly { .. } => "compaction_assembly",
+            Self::RecallProvenance { .. } => "recall_provenance",
             Self::AutonomousIterationStarted { .. } => "autonomous_iteration_started",
             Self::AutonomousIterationCompleted { .. } => "autonomous_iteration_completed",
             Self::AutonomousScheduledWakeup { .. } => "autonomous_scheduled_wakeup",
@@ -602,6 +626,79 @@ pub enum TaskExitReason {
     Timeout,
     /// Operator-issued stop distinct from Cancelled. Reserved.
     OperatorStopped,
+}
+
+/// mu-recall-provenance-audit-vnc9.1 (P0): source type of one injected
+/// recall span. Wire-stable snake_case strings; mirrors
+/// `crate::context::recall::RecallSource` minus the payload (the
+/// provenance entry carries name/path separately, policy-gated).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallSourceKind {
+    /// `agent memory context` output (the identity kernel). Sensitive.
+    Memory,
+    /// A project file (MU.md / AGENTS.md / …).
+    ProjectFile,
+    /// The static startup orientation preamble.
+    Bootloader,
+}
+
+/// One injected recall span's provenance ref — `{source, content-hash,
+/// tokens}`, never the text. When `redacted` is true this entry IS the
+/// RFC's redacted-tombstone (specs/rfc-recall-provenance-audit.md,
+/// principle 2): **parse-open** — any consumer reads/skips it as plain
+/// JSON — and **resolve-gated** — only a tool with store access can
+/// turn `content_hash` back into bytes. The log stays freely shareable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecallProvenanceEntry {
+    pub source: RecallSourceKind,
+    /// The `RecalledItem::stable_id` / rope span id stem, e.g.
+    /// `memory-<12hex>`. NOTE: for `ProjectFile` this hashes the
+    /// canonical PATH (the rope-dedup identity), not the content —
+    /// `content_hash` below is the tamper-evidence fingerprint.
+    pub stable_id: String,
+    /// blake3 of the injected span content, full 64 hex — uniform
+    /// across all sources (even where `stable_id` embeds a truncated
+    /// content hash) so consumers get one rule, zero special cases.
+    /// Resolve it later against the store: match ⇒ verbatim,
+    /// mismatch ⇒ the content changed and you know it.
+    pub content_hash: String,
+    /// cl100k estimate of the span content (chars/4 fallback),
+    /// computed at emission time. Present even when redacted (the
+    /// size side-channel is accepted by the RFC).
+    pub token_count: u64,
+    /// Redacted-tombstone marker: the log intentionally carries no
+    /// content or name for this span (RFC principle 2; granularity
+    /// `hash + source-type` for sensitive spans).
+    pub redacted: bool,
+    /// Name/path for NON-sensitive sources only (`ProjectFile`'s
+    /// canonical path). Always `None` when `redacted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl RecallProvenanceEntry {
+    /// Canonical human-readable rendering of the provenance marker,
+    /// shared by any consumer that displays one (console, analytics):
+    ///
+    /// `[redacted span ref=memory-3f9c2ab81d04 source=memory tokens=987]`
+    /// `[span ref=file-77aa01bc23de source=project_file name=/p/MU.md tokens=412]`
+    pub fn render_marker(&self) -> String {
+        let source = match self.source {
+            RecallSourceKind::Memory => "memory",
+            RecallSourceKind::ProjectFile => "project_file",
+            RecallSourceKind::Bootloader => "bootloader",
+        };
+        let redacted = if self.redacted { "redacted " } else { "" };
+        let name = match &self.name {
+            Some(n) => format!(" name={n}"),
+            None => String::new(),
+        };
+        format!(
+            "[{redacted}span ref={} source={source}{name} tokens={}]",
+            self.stable_id, self.token_count
+        )
+    }
 }
 
 /// Append-only per-session log.
@@ -1460,6 +1557,16 @@ mod tests {
                 actor: EventActor::System,
                 payload: EventPayload::SessionClosed,
             },
+            SessionEvent {
+                id: 6,
+                session_id: "s1".into(),
+                parent_event_ids: vec![],
+                timestamp_unix_ms: 1_700_000_004_000,
+                actor: EventActor::System,
+                payload: EventPayload::RecallProvenance {
+                    items: vec![sample_redacted_memory_entry(), sample_plain_file_entry()],
+                },
+            },
         ];
 
         for ev in samples {
@@ -1468,6 +1575,71 @@ mod tests {
             assert_eq!(decoded, ev);
         }
         Ok(())
+    }
+
+    fn sample_redacted_memory_entry() -> RecallProvenanceEntry {
+        RecallProvenanceEntry {
+            source: RecallSourceKind::Memory,
+            stable_id: "memory-3f9c2ab81d04".into(),
+            content_hash: "ab".repeat(32),
+            token_count: 987,
+            redacted: true,
+            name: None,
+        }
+    }
+
+    fn sample_plain_file_entry() -> RecallProvenanceEntry {
+        RecallProvenanceEntry {
+            source: RecallSourceKind::ProjectFile,
+            stable_id: "file-77aa01bc23de".into(),
+            content_hash: "cd".repeat(32),
+            token_count: 412,
+            redacted: false,
+            name: Some("/p/MU.md".into()),
+        }
+    }
+
+    /// mu-recall-provenance-audit-vnc9.1: the redacted-tombstone wire
+    /// shape, pinned — snake_case kind and source tags, and a redacted
+    /// entry carries NO `name` key (granularity hash + source-type).
+    #[test]
+    fn recall_provenance_wire_shape_is_pinned() -> Result<(), serde_json::Error> {
+        let payload = EventPayload::RecallProvenance {
+            items: vec![sample_redacted_memory_entry(), sample_plain_file_entry()],
+        };
+        let v = serde_json::to_value(&payload)?;
+        assert_eq!(v["kind"], "recall_provenance");
+        assert_eq!(v["items"][0]["source"], "memory");
+        assert_eq!(v["items"][0]["redacted"], true);
+        assert!(
+            v["items"][0].get("name").is_none(),
+            "redacted entry must not serialize a name key"
+        );
+        assert_eq!(v["items"][1]["source"], "project_file");
+        assert_eq!(v["items"][1]["name"], "/p/MU.md");
+        let decoded: EventPayload = serde_json::from_value(v)?;
+        assert_eq!(decoded, payload);
+        Ok(())
+    }
+
+    /// mu-recall-provenance-audit-vnc9.1: a log holding the new variant
+    /// rehydrates from disk with zero malformed lines (parse-open: the
+    /// JSONL stays consumable by anything that reads the log).
+    #[test]
+    fn recall_provenance_rehydrates_from_jsonl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s1.jsonl");
+        let log = SessionEventLog::new("s1");
+        log.attach_disk_writer(&path).expect("attach");
+        log.append(
+            EventActor::System,
+            EventPayload::RecallProvenance {
+                items: vec![sample_redacted_memory_entry()],
+            },
+        );
+        let (recovered, malformed) = SessionEventLog::from_jsonl(&path).expect("from_jsonl");
+        assert_eq!(malformed, 0);
+        assert_eq!(recovered.snapshot(), log.snapshot());
     }
 
     #[test]
@@ -1987,6 +2159,9 @@ mod tests {
             EventPayload::Tombstone {
                 target_event_id: 1,
                 reason: "incomplete record".into(),
+            },
+            EventPayload::RecallProvenance {
+                items: vec![sample_redacted_memory_entry()],
             },
             sample_command_received(),
             EventPayload::CommandSucceeded {

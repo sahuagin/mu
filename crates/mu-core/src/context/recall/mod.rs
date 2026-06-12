@@ -81,6 +81,23 @@ pub enum RecallSource {
     Bootloader,
 }
 
+impl RecallSource {
+    /// Whether content from this source is sensitive — i.e. its
+    /// provenance entry must be a redacted-tombstone (ref only, no
+    /// name) rather than a plain ref. mu-recall-provenance-audit-vnc9.1.
+    ///
+    /// RFC principle 5 (specs/rfc-recall-provenance-audit.md) keys
+    /// redaction off the source's sensitivity/scope tag. Today the
+    /// source KIND is the proxy: `Memory` (the personal identity
+    /// kernel from agent.sqlite) is sensitive; project files and the
+    /// bootloader preamble are operator-visible repo/static content.
+    /// When memory items grow per-item scope tags, this method is the
+    /// seam where they plug in.
+    pub fn sensitive(&self) -> bool {
+        matches!(self, RecallSource::Memory)
+    }
+}
+
 /// Bundle of recalled items handed to
 /// [`super::assembly::assemble_rope_with_context`] at session creation.
 /// Pre-built by the daemon (not on the agent loop's hot path) and
@@ -122,8 +139,10 @@ pub trait RecallProvider: Send + Sync + std::fmt::Debug {
 
 pub mod bootloader;
 pub mod project_files;
+pub mod provenance;
 pub mod subprocess;
 
 pub use bootloader::BootloaderRecallProvider;
 pub use project_files::ProjectFileRecallProvider;
+pub use provenance::recall_provenance_payload;
 pub use subprocess::SubprocessRecallProvider;

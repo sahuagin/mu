@@ -544,6 +544,18 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     // and the session's capability. Computed BEFORE capability is moved
     // into capability_handle so we can borrow it.
     let project_context = build_project_context(daemon_info, cwd.as_deref(), &capability);
+    // mu-recall-provenance-audit-vnc9.1 (P0): record the recall
+    // injection set as provenance refs — {source, content-hash,
+    // tokens}, never the text. Appended before `sessions.insert`
+    // below, so (same as the mu-mh4 seed-event guarantee) no reader
+    // can observe the session without the provenance event already
+    // durable on its log. Skipped when recall produced nothing.
+    if let Some(ctx) = &project_context {
+        event_log.append(
+            EventActor::System,
+            mu_core::context::recall::recall_provenance_payload(ctx),
+        );
+    }
     // mu-7e21: snapshot the autonomy grant before `capability` moves
     // into its handle — the tool list is built from it (injection is
     // capability-gated; see session_spawn_tools).

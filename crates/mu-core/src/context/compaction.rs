@@ -65,16 +65,33 @@ use super::rope::{RetainedRope, Span};
 /// Headline-comparable numbers require a real tokenizer; cl100k_base
 /// is the practical pick for a public Rust crate.
 pub fn estimate_tokens(spans: &[Span]) -> usize {
-    use std::sync::OnceLock;
-    static BPE: OnceLock<Option<tiktoken_rs::CoreBPE>> = OnceLock::new();
-    // One-time encoder construction per process via OnceLock. The
-    // wrapped Option lets us fall back to chars().count() if cl100k_base
-    // ever fails to load (downloaded BPE files, etc.). Never panics in
-    // the agent loop's hot path.
-    let bpe = BPE.get_or_init(|| tiktoken_rs::cl100k_base().ok());
-    match bpe {
+    match shared_bpe() {
         Some(b) => spans.iter().map(|s| bpe_span_tokens(b, s)).sum(),
         None => spans.iter().map(|s| s.content.chars().count()).sum(),
+    }
+}
+
+/// One-time encoder construction per process via OnceLock. The wrapped
+/// Option lets callers fall back to a chars-based approximation if
+/// cl100k_base ever fails to load (downloaded BPE files, etc.). Never
+/// panics in the agent loop's hot path.
+fn shared_bpe() -> Option<&'static tiktoken_rs::CoreBPE> {
+    use std::sync::OnceLock;
+    static BPE: OnceLock<Option<tiktoken_rs::CoreBPE>> = OnceLock::new();
+    BPE.get_or_init(|| tiktoken_rs::cl100k_base().ok()).as_ref()
+}
+
+/// Token estimate for a bare text, outside any rope/span context —
+/// for callers that need a count before a renderer exists (e.g. the
+/// recall-provenance event at session creation,
+/// mu-recall-provenance-audit-vnc9.1). Same cl100k estimator and
+/// [`BPE_SPAN_GUARD_BYTES`] guard as [`estimate_tokens`]; falls back
+/// to the chars/4 approximation when the BPE is unavailable or the
+/// text exceeds the guard.
+pub fn estimate_text_tokens(text: &str) -> usize {
+    match shared_bpe() {
+        Some(b) if text.len() <= BPE_SPAN_GUARD_BYTES => b.encode_with_special_tokens(text).len(),
+        _ => text.chars().count() / 4,
     }
 }
 
@@ -498,6 +515,25 @@ mod tests {
                 RetentionClass::Warm,
             ),
         ])
+    }
+
+    #[test]
+    fn estimate_text_tokens_nonempty_text_is_positive() {
+        assert!(estimate_text_tokens("the quick brown fox jumps over the lazy dog") > 0);
+    }
+
+    #[test]
+    fn estimate_text_tokens_empty_text_is_zero() {
+        assert_eq!(estimate_text_tokens(""), 0);
+    }
+
+    #[test]
+    fn estimate_text_tokens_over_guard_uses_chars_over_four() {
+        // A uniform run past BPE_SPAN_GUARD_BYTES must take the chars/4
+        // path (the cl100k regex is quadratic on uniform runs — see the
+        // guard's doc comment). chars/4 on ASCII is exactly len/4.
+        let text = " ".repeat(BPE_SPAN_GUARD_BYTES + 1);
+        assert_eq!(estimate_text_tokens(&text), text.len() / 4);
     }
 
     #[test]

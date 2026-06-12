@@ -59,6 +59,11 @@
 #   Tiebreaker (default anthropic-api / claude-sonnet-4-6; runs ONLY on a split):
 #     MU_REVIEW_PROVIDER_3      provider (default: anthropic-api)
 #     MU_REVIEW_MODEL_3         model    (default: claude-sonnet-4-6)
+#     MU_REVIEW_FALLBACK_PROVIDER  hosted provider primary-1 falls back to when
+#                               the local ollama MODEL is NOT already resident
+#                               (per /api/ps), so the gate never forces a model
+#                               load/eviction. (default: openai-codex)
+#     MU_REVIEW_FALLBACK_MODEL  hosted fallback model (default: gpt-5.5)
 #   Shared:
 #     MU_REVIEW_TOOLS           reviewer tools, e.g. "read,grep" (default: none, single-shot)
 #     MU_REVIEW_BASE            base ref to diff against (default: main)
@@ -120,6 +125,11 @@ PROVIDER2="${MU_REVIEW_PROVIDER_2:-openrouter}"
 MODEL2="${MU_REVIEW_MODEL_2:-deepseek/deepseek-v4-pro}"
 PROVIDER3="${MU_REVIEW_PROVIDER_3:-anthropic-api}"
 MODEL3="${MU_REVIEW_MODEL_3:-claude-sonnet-4-6}"
+# Hosted reviewer that primary-1 falls back to when the local ollama model
+# isn't safe to use (a DIFFERENT model is resident, or ollama is unreachable).
+# See ensure_local_reviewer_loaded below. gpt-5.5 is the decided paired reviewer.
+FALLBACK_PROVIDER="${MU_REVIEW_FALLBACK_PROVIDER:-openai-codex}"
+FALLBACK_MODEL="${MU_REVIEW_FALLBACK_MODEL:-gpt-5.5}"
 TOOLS="${MU_REVIEW_TOOLS:-}"   # empty = single-shot (default); e.g. "read,grep" lets the reviewer inspect surrounding code (slower, multi-turn)
 BASE="${MU_REVIEW_BASE:-main}"
 # Chunked-mode knobs (v2). Synthesis defaults to primary 2: the strong/cheap
@@ -230,6 +240,36 @@ if   [ -x ./target/debug/mu ];   then MU=./target/debug/mu
 elif [ -x ./target/release/mu ]; then MU=./target/release/mu
 else MU="$(command -v mu || true)"; fi
 [ -n "${MU:-}" ] || { echo "${C_RED}ai-review: no mu binary found${C_OFF}" >&2; exit 2; }
+
+# ── Local-reviewer pre-flight: never trigger an ollama model reload ─────────
+# The local ollama reviewer (primary-1 in single-shot, the per-commit leaf in
+# chunked) reads $PROVIDER/$MODEL — so resolving them here covers both modes.
+# A cold load of the 262k reviewer is minutes, and that reload has SIGTERM'd
+# reviewers mid-stream before (see the MU_REVIEW_TIMEOUT note above). So decide
+# from ollama's /api/ps what's actually resident:
+#   - same model already loaded  -> run local (no delay)
+#   - box reachable but empty     -> run local (a load evicts nobody)
+#   - a DIFFERENT model loaded    -> fall back (don't evict it / eat the reload)
+#   - ollama unreachable          -> fall back (can't run local against a dead box)
+# Match is tag-tolerant (ollama reports ':latest'). Synthesis (SYNTH_*) is
+# hosted by default and is not checked here.
+ensure_local_reviewer_loaded() {
+  [ "$PROVIDER" = ollama ] || return 0
+  local base want body loaded shown
+  base="${OLLAMA_API_BASE:-http://10.1.1.143:11434}"
+  want="$MODEL"; case "$want" in *:*) : ;; *) want="$want:latest" ;; esac
+  if ! body="$(curl -s --max-time 5 "$base/api/ps" 2>/dev/null)"; then
+    echo "${C_DIM}ai-review: ollama unreachable at $base; primary-1 -> $FALLBACK_PROVIDER/$FALLBACK_MODEL.${C_OFF}" >&2
+    PROVIDER="$FALLBACK_PROVIDER"; MODEL="$FALLBACK_MODEL"; return 0
+  fi
+  loaded="$(printf '%s' "$body" | grep -o '"name":"[^"]*"' | sed 's/^"name":"//; s/"$//')"
+  [ -z "$loaded" ] && return 0                      # reachable + empty -> safe load
+  printf '%s\n' "$loaded" | grep -qxF "$want" && return 0   # same model resident
+  shown="${loaded//$'\n'/, }"
+  echo "${C_DIM}ai-review: ollama has a different model resident at $base (loaded: $shown); primary-1 -> $FALLBACK_PROVIDER/$FALLBACK_MODEL to avoid an eviction/reload.${C_OFF}" >&2
+  PROVIDER="$FALLBACK_PROVIDER"; MODEL="$FALLBACK_MODEL"
+}
+ensure_local_reviewer_loaded
 
 if [ -n "$TOOLS" ]; then
   TOOL_CLAUSE="Use the read and grep tools to inspect surrounding code when a judgement needs it."

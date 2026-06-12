@@ -172,10 +172,98 @@ enum Scope {
     Session,
 }
 
-/// Route by method. Session-scoped methods are the session-addressed
-/// verbs — including `mailbox.post`, which is addressed to a target
-/// session (`to_session_id`) — everything else, including unknown
-/// methods (which the router rejects with `METHOD_NOT_FOUND` →
+/// How a method's addressed session id is encoded in params.
+///
+/// Today the ingest seam preserves the historical broad behavior:
+/// either `session_id` or `to_session_id` is accepted for every
+/// method, including unknown/daemon-scoped methods. The metadata
+/// table still owns the policy so the special case is explicit and
+/// future methods can narrow it deliberately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionIdParam {
+    EitherSessionOrToSession,
+}
+
+impl SessionIdParam {
+    fn extract(self, params: &Value) -> Option<String> {
+        match self {
+            SessionIdParam::EitherSessionOrToSession => params
+                .get("session_id")
+                .or_else(|| params.get("to_session_id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        }
+    }
+}
+
+/// Ingest-time metadata for one JSON-RPC method.
+///
+/// Keep routing scope, read/query behavior, session-address extraction,
+/// and journal redaction in ONE place. PR #275 introduced these as
+/// parallel truth tables; centralizing them prevents future method
+/// additions from updating dispatch while forgetting journaling,
+/// redaction, or query-elision policy.
+#[derive(Debug, Clone, Copy)]
+struct MethodMeta {
+    scope: Scope,
+    query: bool,
+    session_id_param: SessionIdParam,
+    secret_fields: &'static [&'static str],
+}
+
+impl MethodMeta {
+    const fn daemon() -> Self {
+        Self {
+            scope: Scope::Daemon,
+            query: false,
+            session_id_param: SessionIdParam::EitherSessionOrToSession,
+            secret_fields: &[],
+        }
+    }
+
+    const fn daemon_query() -> Self {
+        Self {
+            scope: Scope::Daemon,
+            query: true,
+            ..Self::daemon()
+        }
+    }
+
+    const fn daemon_secret(secret_fields: &'static [&'static str]) -> Self {
+        Self {
+            secret_fields,
+            ..Self::daemon()
+        }
+    }
+
+    const fn session() -> Self {
+        Self {
+            scope: Scope::Session,
+            ..Self::daemon()
+        }
+    }
+
+    const fn session_query() -> Self {
+        Self {
+            scope: Scope::Session,
+            query: true,
+            ..Self::session()
+        }
+    }
+
+    fn addressed_session_id(self, params: &Value) -> Option<String> {
+        self.session_id_param.extract(params)
+    }
+}
+
+const AUTH_INITIATE_SECRET_FIELDS: &[&str] = &["initial_response"];
+
+/// Route/query/redaction metadata by method.
+///
+/// Session-scoped methods are the session-addressed verbs — including
+/// `mailbox.post`, which is addressed to a target session
+/// (`to_session_id`) — everything else, including unknown methods
+/// (which the router rejects with `METHOD_NOT_FOUND` →
 /// `CommandRejected{Routing}`), is control-plane.
 ///
 /// `mcp.*` methods (spec mu-046 WP5) mirror their underlying handler's
@@ -186,14 +274,43 @@ enum Scope {
 /// `mu_mailbox_list`/`read`/`consume` reads — mirrors a control-plane
 /// method and falls through to `Scope::Daemon` like its native twin
 /// (full table in the `serve/mcp.rs` module doc).
-fn classify(method: &str) -> Scope {
+///
+/// Query methods are a closed allowlist (spec mu-046 WP6, the
+/// `[journal].journal_queries` knob): daemon- and session-scoped READS
+/// whose processing mutates nothing. When `journal_queries = false`
+/// these skip the journal — no `CommandReceived`, no receipt — but
+/// still cross the same ingest seam, auth gate, and consumer.
+/// Deliberately not a complement: an unlisted (or future) method fails
+/// SAFE by journaling. `mailbox.consume` is NOT a query — consuming
+/// marks messages consumed. The `mcp.*` twins of these reads are also
+/// absent (conservative: the foreign surface keeps its full paper
+/// trail; revisit if an ephemeral daemon ever fronts MCP).
+fn method_meta(method: &str) -> MethodMeta {
     match method {
+        // Daemon/control-plane read queries.
+        m if m == PingRequest::METHOD
+            || m == SessionListRequest::METHOD
+            || m == DaemonStatsRequest::METHOD
+            || m == DaemonUsageHistoryRequest::METHOD
+            || m == DaemonOutstandingCallsRequest::METHOD
+            || m == DaemonListRoutesRequest::METHOD
+            || m == CapabilitiesDiscoverRequest::METHOD
+            || m == MailboxListRequest::METHOD
+            || m == MailboxReadRequest::METHOD =>
+        {
+            MethodMeta::daemon_query()
+        }
+
+        // Session read queries.
+        m if m == SessionEventsRequest::METHOD || m == SessionStatsRequest::METHOD => {
+            MethodMeta::session_query()
+        }
+
+        // Session-addressed mutating commands.
         m if m == AskSessionRequest::METHOD
             || m == CancelSessionRequest::METHOD
             || m == CancelOutstandingRequest::METHOD
             || m == CloseSessionRequest::METHOD
-            || m == SessionStatsRequest::METHOD
-            || m == SessionEventsRequest::METHOD
             || m == StartAutonomousRequest::METHOD
             || m == ScheduleWakeupRequest::METHOD
             || m == RespondToInputRequiredRequest::METHOD
@@ -203,73 +320,47 @@ fn classify(method: &str) -> Scope {
             || m == dispatch::MCP_MAILBOX_POST_METHOD
             || m == TEST_PANIC_METHOD =>
         {
-            Scope::Session
+            MethodMeta::session()
         }
-        _ => Scope::Daemon,
+
+        // Secret-bearing daemon commands.
+        m if m == AuthInitiateRequest::METHOD => {
+            MethodMeta::daemon_secret(AUTH_INITIATE_SECRET_FIELDS)
+        }
+
+        // Unknown/future methods fail safe: daemon-scoped, journaled,
+        // no redaction unless explicitly registered above.
+        _ => MethodMeta::daemon(),
     }
 }
 
-/// Read-only query methods (spec mu-046 WP6, the `[journal]
-/// .journal_queries` knob): daemon- and session-scoped READS whose
-/// processing mutates nothing. When `journal_queries = false` these
-/// skip the journal — no `CommandReceived`, no receipt — but still
-/// cross the same ingest seam, auth gate, and consumer.
-///
-/// Deliberately a closed allowlist, not a complement: an unlisted (or
-/// future) method fails SAFE by journaling. `mailbox.consume` is NOT
-/// here — consuming marks messages consumed, which is a mutation. The
-/// `mcp.*` twins of these reads are also absent (conservative: the
-/// foreign surface keeps its full paper trail; revisit if an ephemeral
-/// daemon ever fronts MCP).
-const QUERY_METHODS: &[&str] = &[
-    PingRequest::METHOD,
-    SessionListRequest::METHOD,
-    SessionEventsRequest::METHOD,
-    SessionStatsRequest::METHOD,
-    DaemonStatsRequest::METHOD,
-    DaemonUsageHistoryRequest::METHOD,
-    DaemonOutstandingCallsRequest::METHOD,
-    DaemonListRoutesRequest::METHOD,
-    CapabilitiesDiscoverRequest::METHOD,
-    MailboxListRequest::METHOD,
-    MailboxReadRequest::METHOD,
-];
+fn classify(method: &str) -> Scope {
+    method_meta(method).scope
+}
 
 /// Whether `method` is a recognized read-only query (see
-/// [`QUERY_METHODS`]).
+/// [`method_meta`]).
 fn is_query(method: &str) -> bool {
-    QUERY_METHODS.contains(&method)
+    method_meta(method).query
 }
 
-/// The session a command addresses, by param. Session-scoped verbs
-/// carry `session_id`; `mailbox.post` addresses its target via
-/// `to_session_id` (the wire mixes the two shapes — the protocol
-/// request types are authoritative).
+/// The session a command addresses, by param. Current policy accepts
+/// either `session_id` or `to_session_id` for every method to preserve
+/// the pre-metadata ingest behavior; known session-scoped methods are
+/// still what decide routing scope.
 fn addressed_session_id(request: &Request<Value>) -> Option<String> {
-    request
-        .params
-        .get("session_id")
-        .or_else(|| request.params.get("to_session_id"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
+    method_meta(&request.method).addressed_session_id(&request.params)
 }
-
-/// Param fields that carry secrets, by method (spec mu-046 INV-6):
-/// redacted before the params reach the journal — both the
-/// `CommandReceived` record and the [`CommandEcho`] inside receipts.
-/// Same posture as `config::SECRET_KEY_DENYLIST`: grow this with every
-/// new secret-bearing method.
-const SECRET_PARAM_FIELDS: &[(&str, &[&str])] =
-    &[(AuthInitiateRequest::METHOD, &["initial_response"])];
 
 /// Clone `params` with secret-bearing fields replaced by
 /// `"[REDACTED]"`. Handlers still receive the original request — only
 /// the journal sees the redacted copy.
 fn redact_params(method: &str, params: &Value) -> Value {
     let mut params = params.clone();
-    if let Some((_, fields)) = SECRET_PARAM_FIELDS.iter().find(|(m, _)| *m == method) {
+    let fields = method_meta(method).secret_fields;
+    if !fields.is_empty() {
         if let Some(obj) = params.as_object_mut() {
-            for field in *fields {
+            for field in fields {
                 if let Some(v) = obj.get_mut(*field) {
                     *v = Value::String("[REDACTED]".to_string());
                 }

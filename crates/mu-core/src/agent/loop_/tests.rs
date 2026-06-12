@@ -693,11 +693,7 @@ async fn b3_iteration_cap() {
 
     let config = AgentConfig {
         max_turns: 3,
-        system_prompt: None,
-        compaction_threshold: None,
-        project_context: None,
-        compaction_policy_override: None,
-        seed_messages: Vec::new(),
+        ..AgentConfig::default()
     };
     let (loop_, events_rx) = spawn_loop(provider, tools, config);
 
@@ -746,11 +742,7 @@ async fn mu_779s_iteration_cap_done_event_uses_iteration_cap_stop_reason() {
 
     let config = AgentConfig {
         max_turns: 2,
-        system_prompt: None,
-        compaction_threshold: None,
-        project_context: None,
-        compaction_policy_override: None,
-        seed_messages: Vec::new(),
+        ..AgentConfig::default()
     };
     let (loop_, events_rx) = spawn_loop(provider, tools, config);
 
@@ -3398,6 +3390,125 @@ async fn mh4_no_seed_is_back_compatible() {
     })
     .await;
     assert_eq!(unseeded, empty_seed, "empty seed == no seed");
+}
+
+// ============================================================================
+// mu-uz0n: implicit capability discovery — per-turn hint injection.
+// ============================================================================
+
+/// The hint span lands immediately after the user span and HOLDS that
+/// position across tool rounds within the ask — the cache-discipline
+/// contract: nothing before the hint changes between rounds, so the
+/// cacheable prefix is never disturbed by the injection.
+///
+/// The tool name is deliberately obscure ("frobnicate_widget") so the
+/// lexical ranking matches it from the intent and cannot collide with
+/// the host-CLI catalog (which would make this test host-dependent).
+#[tokio::test]
+async fn uz0n_hint_span_follows_user_and_is_stable_across_rounds() {
+    let (provider, records) = RecordingProvider::new(vec![
+        // Round 1: assistant calls the tool.
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "t1",
+            "frobnicate_widget",
+            json!({}),
+        ))],
+        // Round 2: assistant finishes.
+        vec![ProviderEvent::Done(assistant_text("done"))],
+    ]);
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool::ok("frobnicate_widget", "ok"))];
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let config = AgentConfig {
+        discover_hints: Some(crate::context::capability_hints::DiscoverHints {
+            skills: Arc::new(Vec::new()),
+            limit: 3,
+        }),
+        ..AgentConfig::default()
+    };
+    let loop_ = loop_with(
+        provider,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        tools,
+        config,
+        events_tx,
+        approvals,
+        capability,
+    );
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("frobnicate the widget for me"),
+            None,
+        ))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let _ = events_handle.await.expect("drain");
+
+    let records = records.lock().expect("records").clone();
+    assert_eq!(records.len(), 2, "tool round-trip = two provider calls");
+    let mut hint_positions = Vec::new();
+    for (i, rec) in records.iter().enumerate() {
+        let user_pos = rec
+            .first_span_ids
+            .iter()
+            .position(|id| id == "msg-0-user")
+            .unwrap_or_else(|| panic!("call {i}: user span missing: {:?}", rec.first_span_ids));
+        let hint_pos = rec
+            .first_span_ids
+            .iter()
+            .position(|id| id == crate::context::capability_hints::HINT_SPAN_ID)
+            .unwrap_or_else(|| panic!("call {i}: hint span missing: {:?}", rec.first_span_ids));
+        assert_eq!(
+            hint_pos,
+            user_pos + 1,
+            "call {i}: hint must directly follow the user span"
+        );
+        hint_positions.push(hint_pos);
+    }
+    assert_eq!(
+        hint_positions[0], hint_positions[1],
+        "hint position must be byte-stable across rounds within an ask"
+    );
+}
+
+/// Off by default: `AgentConfig::default()` (discover_hints: None)
+/// produces no hint span — pre-mu-uz0n ropes are byte-identical.
+#[tokio::test]
+async fn uz0n_no_hint_without_config() {
+    let (provider, records) =
+        RecordingProvider::new(vec![vec![ProviderEvent::Done(assistant_text("ok"))]]);
+    let (loop_, events_rx) = spawn_loop_with_provider(provider, AgentConfig::default());
+    loop_
+        .send(AgentInput::UserMessage(user_msg("frobnicate"), None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let _ = events_handle.await.expect("drain");
+    let records = records.lock().expect("records").clone();
+    assert!(records.iter().all(|r| !r
+        .first_span_ids
+        .iter()
+        .any(|id| id == crate::context::capability_hints::HINT_SPAN_ID)));
+}
+
+/// mu-uz0n layer 2: an invented tool name comes back with ranked
+/// near-misses in the error text — discovery at the moment of failure.
+#[tokio::test]
+async fn uz0n_unknown_tool_error_suggests_near_misses() {
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool::ok("frobnicate_widget", "ok"))];
+    let suggestion =
+        crate::context::capability_hints::suggest_for_unknown_tool(&tools, "frobnicate");
+    assert_eq!(suggestion.as_deref(), Some("tool.frobnicate_widget"));
+    // Nothing remotely matching ⇒ no suggestion, bare error stands.
+    assert_eq!(
+        crate::context::capability_hints::suggest_for_unknown_tool(&tools, "zzqy"),
+        None
+    );
 }
 
 // ============================================================================

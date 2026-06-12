@@ -603,6 +603,16 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         recall_enabled,
         bare,
     );
+    // mu-uz0n: implicit capability discovery — per-turn hint injection,
+    // ranked by the same lexical engine as the `discover` tool. Bare
+    // sessions stay hermetic (no injection mu didn't get told to make).
+    let index_cfg = &daemon_info.config().index;
+    let discover_hints = (index_cfg.discover_injection && !bare).then(|| {
+        mu_core::context::capability_hints::DiscoverHints {
+            skills: skills.clone(),
+            limit: index_cfg.discover_injection_limit,
+        }
+    });
     let agent = AgentLoop::spawn(SpawnArgs {
         provider,
         provider_kind: kind_arc,
@@ -617,6 +627,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             // mu-mh4: seed the loop with the continuation history when
             // this session is a resume/fork-at-tail; empty otherwise.
             seed_messages,
+            discover_hints,
         },
         events: events_tx,
         pending_approvals: pending_approvals.clone(),

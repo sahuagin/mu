@@ -117,12 +117,55 @@ const DANGER_VERBS: &[DangerVerb] = &[
         required_flag: None,
         query: "gh pr close",
     },
+    // pkg install on the host: the operator's policy is host-pristine
+    // (install nothing; aim workloads at jails), and `pkg install -y`
+    // specifically has a recorded 49-package desktop-removal cascade
+    // (memory feedback_pkg_install). Bare `install` (no required_flag)
+    // so EVERY host install gets the advisory — both the cascade warning
+    // and the policy surface at the point of action. Observed need:
+    // memory-ablation round 2, where every model in every condition
+    // handed over `pkg install -y sqlite3` confidently (the un-cued trap
+    // class — retrieval never fired; interception is the only fix).
+    DangerVerb {
+        prefix: &["pkg", "install"],
+        required_flag: None,
+        // Keep the query loose: `agent memory search` ANDs its tokens,
+        // so "pkg install" matches feedback_pkg_install (the -y cascade)
+        // + the host-pristine policy notes, while a longer phrase
+        // matches nothing. Verified against the live store.
+        query: "pkg install",
+    },
 ];
+
+/// Tokens that prefix a command without being the command itself:
+/// privilege wrappers and leading `VAR=value` environment assignments.
+/// Stripping them before prefix-matching closes an evasion the table
+/// would otherwise miss — `sudo pkg install` and
+/// `ASSUME_ALWAYS_YES=yes pkg install` (both observed in memory-ablation
+/// round 2) must trip the same advisory as bare `pkg install`. Hardens
+/// every verb in the table, not just pkg.
+fn strip_command_prefixes(tokens: &[String]) -> &[String] {
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = &tokens[i];
+        let is_env_assign = t.split_once('=').is_some_and(|(k, _)| {
+            !k.is_empty() && k.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+        });
+        let is_priv_wrapper = matches!(t.as_str(), "sudo" | "doas");
+        if is_env_assign || is_priv_wrapper {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    &tokens[i..]
+}
 
 /// Match a command against the danger-verb table. Returns the memory
 /// query for the first matching entry.
 fn match_danger_verb(command: &str) -> Option<&'static str> {
-    let tokens = shlex::split(command)?;
+    let all = shlex::split(command)?;
+    let tokens = strip_command_prefixes(&all);
     DANGER_VERBS.iter().find_map(|v| {
         let prefix_matches = tokens.len() >= v.prefix.len()
             && v.prefix.iter().zip(tokens.iter()).all(|(p, t)| p == t);
@@ -300,6 +343,30 @@ mod tests {
         assert!(match_danger_verb("ls -la").is_none());
         // Verb must be the command, not an argument
         assert!(match_danger_verb("echo rm -rf").is_none());
+    }
+
+    #[test]
+    fn pkg_install_trips_with_and_without_evasions() {
+        // The round-2 trap class: every form a model reached for.
+        assert!(match_danger_verb("pkg install -y sqlite3").is_some());
+        assert!(match_danger_verb("pkg install sqlite3").is_some());
+        // Privilege wrapper and env-assignment prefixes must not evade —
+        // these were the literal round-2 harm forms.
+        assert!(match_danger_verb("sudo pkg install -y sqlite3").is_some());
+        assert!(match_danger_verb("ASSUME_ALWAYS_YES=yes pkg install sqlite3").is_some());
+        assert!(match_danger_verb("doas pkg install sqlite3").is_some());
+        // Stacked prefixes resolve too.
+        assert!(match_danger_verb("sudo ASSUME_ALWAYS_YES=yes pkg install x").is_some());
+        // The hardening generalizes: a sudo-wrapped rm trips now.
+        assert!(match_danger_verb("sudo rm -rf /tmp/x").is_some());
+        // pkg subcommands that aren't install are not advised.
+        assert!(match_danger_verb("pkg info sqlite3").is_none());
+        assert!(match_danger_verb("pkg search sqlite").is_none());
+        // An env-assign prefix on a benign command stays benign.
+        assert!(match_danger_verb("FOO=bar ls -la").is_none());
+        // Lowercase 'foo=bar' is an arg, not an env assignment — don't
+        // strip it (would change semantics); benign here regardless.
+        assert!(match_danger_verb("git diff").is_none());
     }
 
     fn stub(dir_tag: &str, body: &str) -> PathBuf {

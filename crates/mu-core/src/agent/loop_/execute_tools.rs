@@ -497,8 +497,21 @@ pub(crate) async fn handle_execute_tools(
                         }
                     }
                 }
+                // mu-uz0n layer 2: the moment the model invents a tool
+                // name is the one moment it's receptive to discovery —
+                // rank the bad name against the real surface and name
+                // the near-misses in the error itself.
                 None => ToolResult {
-                    content: format!("tool not found: {}", call.name),
+                    content: match crate::context::capability_hints::suggest_for_unknown_tool(
+                        tools, &call.name,
+                    ) {
+                        Some(near) => format!(
+                            "tool not found: {}. closest available: {near} — \
+                             call `discover` with your intent for the full ranked list",
+                            call.name
+                        ),
+                        None => format!("tool not found: {}", call.name),
+                    },
                     is_error: true,
                 },
             }

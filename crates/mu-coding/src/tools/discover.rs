@@ -65,11 +65,12 @@ impl Tool for DiscoverTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "discover",
-            "Find a tool or skill by intent. Given a free-text description of what you want to \
-             do, returns the ranked capabilities (tools + skills) available to THIS session that \
-             match. Use this whenever you need a capability and don't know which tool provides it \
-             — instead of guessing, or shelling out via bash. Read-only; it lists, it does not run \
-             anything.",
+            "Find a tool or skill by intent. Use this FIRST whenever you need a capability you \
+             do not see in your tool list — BEFORE guessing a tool name, writing a workaround, \
+             or shelling out via bash; a ready-made capability probably exists and this is how \
+             you find it. Given a free-text description of what you want to do, returns the \
+             ranked capabilities (tools + skills + host CLIs) available to THIS session that \
+             match. Read-only; it lists, it does not run anything.",
             json!({
                 "type": "object",
                 "properties": {

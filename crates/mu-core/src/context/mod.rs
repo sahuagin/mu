@@ -35,6 +35,7 @@
 
 pub mod assembly;
 pub mod cache;
+pub mod capability_hints;
 pub mod compaction;
 pub mod event;
 pub mod recall;

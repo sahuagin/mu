@@ -595,6 +595,15 @@ pub struct AgentConfig {
     /// predecessor's log, which the new `SessionCreated` event points
     /// back to via `branched_at_parent_event_id`.
     pub seed_messages: Vec<AgentMessage>,
+    /// mu-uz0n: implicit capability discovery. When `Some`, each turn
+    /// the loop ranks the last user-role message (operator ask or
+    /// autonomous iteration motivation) through the same lexical
+    /// ranking the `discover` tool uses and injects the top-N as a
+    /// compact transient hint span right after that user span — see
+    /// [`crate::context::capability_hints`] for the sizing and cache
+    /// discipline. `None` (the default) ⇒ feature off; wired by the
+    /// daemon from `[index].discover_injection` at session creation.
+    pub discover_hints: Option<crate::context::capability_hints::DiscoverHints>,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -608,6 +617,7 @@ impl std::fmt::Debug for AgentConfig {
                 "compaction_policy_override",
                 &self.compaction_policy_override.is_some(),
             )
+            .field("discover_hints", &self.discover_hints.is_some())
             .finish()
     }
 }
@@ -621,6 +631,7 @@ impl Default for AgentConfig {
             project_context: None,
             compaction_policy_override: None,
             seed_messages: Vec::new(),
+            discover_hints: None,
         }
     }
 }
@@ -923,6 +934,12 @@ async fn run_inner(
     let mut bg_compaction =
         crate::context::BackgroundCompactionState::new(crate::context::CompactionQuota::default());
     let mut compaction_baseline: Option<CompactionBaseline> = None;
+    // mu-uz0n: memoized capability hint for the current intent (the
+    // last user-role message). Re-ranked only when the intent changes
+    // — i.e. once per ask / autonomous iteration, not per tool round —
+    // so the hint content (and rope position) is byte-stable within an
+    // ask and the cacheable prefix is never disturbed.
+    let mut capability_hint_memo: Option<(String, Option<String>)> = None;
     // mu-wsgx: feedback anchor for the compaction-trigger measure.
     // None until the first provider-reported usage; reset on provider
     // switch (different tokenizer + accounting convention).
@@ -1454,6 +1471,53 @@ async fn run_inner(
                         &messages,
                         &tool_specs,
                     ),
+                };
+
+                // mu-uz0n: implicit capability discovery — rank the
+                // current intent against the session's capability
+                // surface and inject the top-N as a compact transient
+                // span after the last user span. Memoized per intent
+                // (see `capability_hint_memo`); covers both assembly
+                // paths above since it post-processes the rope.
+                let rope: RetainedRope = match &config.discover_hints {
+                    Some(hints) => {
+                        let intent = messages.iter().rev().find_map(|m| match m {
+                            AgentMessage::User { content } => Some(content.as_str()),
+                            _ => None,
+                        });
+                        match intent {
+                            Some(intent) => {
+                                let stale = capability_hint_memo
+                                    .as_ref()
+                                    .is_none_or(|(memo_intent, _)| memo_intent != intent);
+                                if stale {
+                                    let snapshot =
+                                        capability.lock().map(|c| c.clone()).unwrap_or_default();
+                                    let hint = crate::context::capability_hints::rank_hint(
+                                        &tools,
+                                        &snapshot,
+                                        &hints.skills,
+                                        intent,
+                                        hints.limit,
+                                    );
+                                    capability_hint_memo = Some((intent.to_owned(), hint));
+                                }
+                                match capability_hint_memo
+                                    .as_ref()
+                                    .and_then(|(_, h)| h.as_deref())
+                                {
+                                    Some(hint) => {
+                                        crate::context::capability_hints::with_hint_after_last_user(
+                                            &rope, hint,
+                                        )
+                                    }
+                                    None => rope,
+                                }
+                            }
+                            None => rope,
+                        }
+                    }
+                    None => rope,
                 };
 
                 let pre_compaction_tokens = renderer.estimate_tokens(&rope);

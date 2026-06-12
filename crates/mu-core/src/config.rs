@@ -110,7 +110,7 @@ impl Default for RoutesConfig {
 
 /// `[index]` section. Knobs for the in-loop discovery surface. (Code-index
 /// recall itself is imported over MCP — see [`McpConfig`].)
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IndexConfig {
     /// mu-kex4.6.3: rank the in-loop `discover` tool's results semantically
@@ -123,6 +123,37 @@ pub struct IndexConfig {
     /// floor, so enabling this never breaks discovery. Default `false` keeps
     /// prior behavior and keeps tests offline.
     pub semantic_discover: bool,
+    /// mu-uz0n: implicit capability discovery. Each turn the daemon ranks
+    /// the last user message / iteration motivation through the same
+    /// (lexical) ranking the `discover` tool uses and injects the top-N as
+    /// a compact transient hint span — always-AVAILABLE discovery is not
+    /// always-USED (observed: sessions working ON t4c never called
+    /// discover), so the hints arrive in-band, no opt-in tool call needed.
+    /// Default `true` (the injection IS the fix); suppressed by `--bare`.
+    /// Sizing: machine-view one-liners, hard-capped at ~700 bytes — see
+    /// [`crate::context::capability_hints::HINT_MAX_BYTES`].
+    #[serde(default = "default_true")]
+    pub discover_injection: bool,
+    /// mu-uz0n: top-N entries per injected hint. Keep small — the hint is
+    /// a pointer surface, not documentation; the `discover` tool remains
+    /// the full-list path.
+    #[serde(default = "default_discover_injection_limit")]
+    pub discover_injection_limit: usize,
+}
+
+/// serde default helper for [`IndexConfig::discover_injection_limit`].
+fn default_discover_injection_limit() -> usize {
+    3
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            semantic_discover: false,
+            discover_injection: true,
+            discover_injection_limit: default_discover_injection_limit(),
+        }
+    }
 }
 
 /// `[journal]` section (spec mu-046). Controls the daemon

@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 use mu_core::agent::{
-    AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
-    ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
+    AgentMessage, AssistantMessage, ContentBlock, MessageInput, ProbedModel, Provider,
+    ProviderError, ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
 };
 use mu_core::context::{
     extract_call_id_from_span_id, ProviderMessage, ProviderMessages, ProviderRole,
@@ -26,6 +26,10 @@ use mu_core::context::{
 use super::sse::{SseEvent, SseStream};
 
 const OPENROUTER_API_BASE: &str = "https://openrouter.ai";
+/// Timeout for the capability probe (mu-1gx5). Bounds a slow openrouter so
+/// `mu models refresh` cannot hang on it — the shared `stream()` client carries
+/// no timeout, so the probe sets one per-request (review-gate finding).
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Default chat-completions path. OpenRouter nests under `/api/v1`; the
 /// OpenAI-compatible endpoints exposed by ollama / LM Studio / vLLM serve
 /// `/v1/chat/completions` directly, so the path is overridable (mu-spawn).
@@ -194,6 +198,89 @@ impl Provider for OpenRouterProvider {
             usage_semantics: UsageSemantics::openai_style(),
         }
     }
+
+    /// mu-1gx5: GET `{api_base}/api/v1/models` — openrouter reports per-model
+    /// `context_length` and (the decisive field) `top_provider.max_completion_tokens`,
+    /// the real output ceiling that the hand-maintained prefix rules kept
+    /// guessing wrong (deepseek-v4-pro: reported 384000, fell to the 4096
+    /// fallback). The actual ceiling is read, never inferred.
+    async fn probe_model_capabilities(&self) -> Result<Vec<ProbedModel>, ProviderError> {
+        let url = format!("{}/api/v1/models", self.api_base.trim_end_matches('/'));
+        let mut req = self.client.get(&url).timeout(PROBE_TIMEOUT);
+        if !self.api_key.is_empty() {
+            req = req.bearer_auth(&self.api_key);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ProviderError::Other(format!("openrouter models GET {url}: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ProviderError::Other(format!(
+                "openrouter models GET {url}: HTTP {status}"
+            )));
+        }
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| ProviderError::Other(format!("openrouter models read: {e}")))?;
+        parse_openrouter_models(&text)
+    }
+}
+
+/// Parse an openrouter `/api/v1/models` body into [`ProbedModel`]s. Pure (no
+/// I/O) so it is unit-testable against a captured sample. mu-1gx5.
+pub(crate) fn parse_openrouter_models(json: &str) -> Result<Vec<ProbedModel>, ProviderError> {
+    #[derive(Deserialize)]
+    struct Resp {
+        data: Vec<OrModel>,
+    }
+    #[derive(Deserialize)]
+    struct OrModel {
+        id: String,
+        #[serde(default)]
+        context_length: Option<u64>,
+        #[serde(default)]
+        top_provider: Option<TopProvider>,
+        #[serde(default)]
+        supported_parameters: Vec<String>,
+    }
+    #[derive(Deserialize)]
+    struct TopProvider {
+        #[serde(default)]
+        max_completion_tokens: Option<u32>,
+        #[serde(default)]
+        context_length: Option<u64>,
+    }
+    let resp: Resp = serde_json::from_str(json)
+        .map_err(|e| ProviderError::Other(format!("openrouter models parse: {e}")))?;
+    Ok(resp
+        .data
+        .into_iter()
+        .map(|m| {
+            // openrouter advertises request-param support, not feature flags;
+            // map the two that matter into our capability vocabulary.
+            let mut capabilities = Vec::new();
+            if m.supported_parameters.iter().any(|p| p == "tools") {
+                capabilities.push("tools".to_string());
+            }
+            if m.supported_parameters
+                .iter()
+                .any(|p| p == "reasoning" || p == "include_reasoning")
+            {
+                capabilities.push("thinking".to_string());
+            }
+            let top = m.top_provider;
+            ProbedModel {
+                max_output_tokens: top.as_ref().and_then(|t| t.max_completion_tokens),
+                context_length: m
+                    .context_length
+                    .or_else(|| top.as_ref().and_then(|t| t.context_length)),
+                capabilities,
+                id: m.id,
+            }
+        })
+        .collect())
 }
 
 // ============================================================================

@@ -73,6 +73,27 @@ pub enum ProviderError {
     Other(String),
 }
 
+/// One model's capabilities as reported by a provider's models API
+/// (mu-1gx5). The provider is the source of truth for these — reading them
+/// replaces hand-maintained catalog limits that drift (e.g. a `deepseek-r1`
+/// prefix rule silently truncating `deepseek-v4-pro` to the 4096 fallback,
+/// while openrouter reports its real `max_completion_tokens` of 384000).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbedModel {
+    /// Provider-native model id — the exact string sent on the wire
+    /// (e.g. `deepseek/deepseek-v4-pro`, `qwen3.6:35b-a3b-q8_0`).
+    pub id: String,
+    /// Max output tokens the provider will generate for this model. `None`
+    /// when the provider has no hard per-model output cap — notably ollama,
+    /// where output is bounded by `num_ctx - input`, not a reported ceiling.
+    pub max_output_tokens: Option<u32>,
+    /// Total context window the model advertises, if reported.
+    pub context_length: Option<u64>,
+    /// Capability flags the provider exposes (e.g. `tools`, `thinking`,
+    /// `vision`). Empty when the provider's API doesn't report them.
+    pub capabilities: Vec<String>,
+}
+
 /// LLM provider abstraction.
 ///
 /// Concrete implementations live in mu-ai. mu-core only knows the
@@ -161,6 +182,24 @@ pub trait Provider: Send + Sync {
     /// to obtain the policy handle.
     fn compaction_policy(&self) -> Arc<dyn CompactionPolicy> {
         Arc::new(NoCompactionPolicy::new())
+    }
+
+    /// mu-1gx5: probe this provider's models API for per-model output/context
+    /// limits and capability flags, to populate the model catalog instead of
+    /// hand-maintaining (and drifting) those constants.
+    ///
+    /// Each impl uses ITS OWN transport — the endpoint carrying this metadata
+    /// is provider-specific and may DIFFER from the one `stream()` uses:
+    /// openrouter `/api/v1/models`, anthropic Models API `/v1/models`, and
+    /// ollama its NATIVE `/api/tags` + `/api/show` (ollama serves chat over the
+    /// anthropic wire but its `/v1/*` model surface is OpenAI-thin, so the
+    /// native API is the only place the capability data lives).
+    ///
+    /// Default returns empty — "this provider exposes no capability API" — and
+    /// callers fall back to the static catalog / prefix rules. Providers opt in
+    /// by overriding. The id in each [`ProbedModel`] is the wire model string.
+    async fn probe_model_capabilities(&self) -> Result<Vec<ProbedModel>, ProviderError> {
+        Ok(Vec::new())
     }
 }
 

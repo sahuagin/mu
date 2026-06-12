@@ -94,6 +94,39 @@ pub fn default_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|p| p.join("mu").join("models.toml"))
 }
 
+/// Path to the MACHINE-written probed catalog (mu-1gx5): `mu models refresh`
+/// writes provider-reported limits here. It layers ABOVE the built-in default
+/// but BELOW the user's `models.toml`, so a hand override always wins over a
+/// probed value.
+pub fn probed_config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| p.join("mu").join("models.probed.toml"))
+}
+
+/// Convert provider-probed models (mu-1gx5) into a catalog fragment suitable
+/// for writing to `models.probed.toml`. Each probed model becomes a
+/// `[models.<id>]` entry carrying its reported `max_output_tokens` and
+/// `context_hard_limit`; the `model` field holds the wire id so `resolve_model`
+/// matches it. Models reporting NEITHER limit are skipped — an empty entry adds
+/// no signal. Pure (no I/O): the CLI does the serialize + write.
+pub fn probed_models_to_catalog(models: &[crate::agent::ProbedModel]) -> ModelCatalogConfig {
+    let mut out = ModelCatalogConfig::default();
+    for m in models {
+        if m.max_output_tokens.is_none() && m.context_length.is_none() {
+            continue;
+        }
+        out.models.insert(
+            m.id.clone(),
+            ModelCatalogEntry {
+                model: Some(m.id.clone()),
+                max_output_tokens: m.max_output_tokens,
+                context_hard_limit: m.context_length,
+                ..Default::default()
+            },
+        );
+    }
+    out
+}
+
 pub fn built_in() -> ModelCatalogConfig {
     DEFAULT_CATALOG
         .get_or_init(|| {
@@ -106,6 +139,14 @@ pub fn built_in() -> ModelCatalogConfig {
 
 pub fn load(config_path: Option<&Path>) -> ModelCatalogConfig {
     let mut fig = Figment::from(Serialized::defaults(built_in()));
+    // mu-1gx5: probed catalog layers between built-in and the user file, so a
+    // machine-probed limit beats the built-in default but a hand override in
+    // models.toml still beats the probe.
+    if let Some(pp) = probed_config_path() {
+        if pp.exists() {
+            fig = fig.merge(Toml::file(pp));
+        }
+    }
     let path = config_path
         .map(Path::to_path_buf)
         .or_else(default_config_path);
@@ -320,6 +361,66 @@ mod tests {
         let q = cfg.models.get("q").unwrap();
         assert_eq!(q.family.as_deref(), Some("qwen3"));
         assert_eq!(q.max_output_tokens, Some(16384));
+    }
+
+    #[test]
+    fn probed_to_catalog_maps_limits_and_skips_empty() {
+        use crate::agent::ProbedModel;
+        let probed = vec![
+            ProbedModel {
+                id: "deepseek/deepseek-v4-pro".into(),
+                max_output_tokens: Some(384_000),
+                context_length: Some(1_048_576),
+                capabilities: vec!["tools".into()],
+            },
+            // Reports neither limit → skipped (no signal to record).
+            ProbedModel {
+                id: "nothing/useful".into(),
+                max_output_tokens: None,
+                context_length: None,
+                capabilities: vec![],
+            },
+        ];
+        let cat = probed_models_to_catalog(&probed);
+        assert_eq!(cat.models.len(), 1, "empty-limit entry must be skipped");
+        let e = cat.models.get("deepseek/deepseek-v4-pro").unwrap();
+        assert_eq!(e.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+        assert_eq!(e.max_output_tokens, Some(384_000));
+        assert_eq!(e.context_hard_limit, Some(1_048_576));
+        // resolve_model finds it by the wire id carried in `model`.
+        assert_eq!(
+            cat.resolve_model("deepseek/deepseek-v4-pro")
+                .max_output_tokens,
+            Some(384_000)
+        );
+    }
+
+    // mu-1gx5: the layering ORDER load() relies on — built-in < probed < user.
+    #[test]
+    fn probed_layer_sits_below_user_override() {
+        let built_in = r#"[models.x]
+            model = "m"
+            max_output_tokens = 4096"#;
+        let probed = r#"[models.x]
+            model = "m"
+            max_output_tokens = 16384"#;
+        let user = r#"[models.x]
+            max_output_tokens = 32768"#;
+
+        // Probe beats built-in when the user hasn't overridden.
+        let no_user: ModelCatalogConfig = Figment::from(Toml::string(built_in))
+            .merge(Toml::string(probed))
+            .extract()
+            .unwrap();
+        assert_eq!(no_user.resolve_model("m").max_output_tokens, Some(16384));
+
+        // User override beats the probe (the precedence we promise).
+        let with_user: ModelCatalogConfig = Figment::from(Toml::string(built_in))
+            .merge(Toml::string(probed))
+            .merge(Toml::string(user))
+            .extract()
+            .unwrap();
+        assert_eq!(with_user.resolve_model("m").max_output_tokens, Some(32768));
     }
 
     #[test]

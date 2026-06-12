@@ -997,3 +997,49 @@ mod live_tests {
         );
     }
 }
+
+// mu-1gx5: capability probe — parse openrouter /api/v1/models into ProbedModel.
+#[test]
+fn probe_parses_openrouter_models() {
+    // Captured-shape sample: the exact fields the probe reads, incl. the
+    // deepseek-v4-pro numbers that motivated this (max_completion 384000,
+    // context 1048576) — the values the 4096 prefix-fallback truncated.
+    let json = r#"{
+      "data": [
+        {
+          "id": "deepseek/deepseek-v4-pro",
+          "context_length": 1048576,
+          "supported_parameters": ["tools", "reasoning", "temperature"],
+          "top_provider": { "max_completion_tokens": 384000, "context_length": 1048576 }
+        },
+        {
+          "id": "some/plain-model",
+          "context_length": 32768,
+          "supported_parameters": ["temperature"],
+          "top_provider": { "max_completion_tokens": null, "context_length": 32768 }
+        }
+      ]
+    }"#;
+    let models = parse_openrouter_models(json).expect("parse");
+    assert_eq!(models.len(), 2);
+
+    let ds = &models[0];
+    assert_eq!(ds.id, "deepseek/deepseek-v4-pro");
+    assert_eq!(ds.max_output_tokens, Some(384_000));
+    assert_eq!(ds.context_length, Some(1_048_576));
+    assert!(ds.capabilities.contains(&"tools".to_string()));
+    assert!(ds.capabilities.contains(&"thinking".to_string()));
+
+    let plain = &models[1];
+    // No reported output cap → None (falls back to prefix rules downstream),
+    // not a fabricated number.
+    assert_eq!(plain.max_output_tokens, None);
+    assert_eq!(plain.context_length, Some(32_768));
+    assert!(plain.capabilities.is_empty());
+}
+
+// Malformed body is a clean Err, not a panic.
+#[test]
+fn probe_rejects_malformed_openrouter_body() {
+    assert!(parse_openrouter_models("not json ][").is_err());
+}

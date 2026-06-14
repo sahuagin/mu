@@ -66,6 +66,9 @@ impl BlockBuilder {
         match self {
             BlockBuilder::Text(text) => ContentBlock::Text {
                 text,
+                // Streaming citation accumulation (citations_delta) isn't modeled
+                // yet; the non-streaming response path preserves citations.
+                citations: Vec::new(),
                 cache_control: None,
             },
             BlockBuilder::Thinking {

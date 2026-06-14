@@ -14,6 +14,8 @@
 //! `system` is POLYMORPHIC exactly like message content — a bare string
 //! (:45088) or a block array (:6921). We reuse [`Content`] for it.
 
+use std::collections::BTreeMap;
+
 use crate::finite::{deserialize_option_finite, FiniteF64};
 use crate::json::JsonValue;
 use serde::{Deserialize, Serialize};
@@ -101,6 +103,67 @@ impl ToolChoice {
     }
 }
 
+/// Request-level `metadata`. The live beta wire carries `user_id`; the spec
+/// docs also mention `external_user_id`/`input_file`. The observed `user_id` is
+/// typed; any other key round-trips verbatim through `extra` (forward-compat).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Metadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// Any metadata key we don't model, preserved across a round-trip. An empty
+    /// map flattens to nothing (no key emitted).
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, JsonValue>,
+}
+
+/// Extended-thinking config (`thinking`). Internally tagged on `type`. Observed
+/// on the live beta wire: `adaptive`; documented standard forms: `enabled`
+/// (with a token budget) and `disabled`. This is an OUTBOUND type we construct,
+/// so the variant set is intentionally closed — a `type` we don't model
+/// deserializes as a hard error (a loud "the wire changed, update the lib"
+/// signal) rather than silently mis-modeling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThinkingConfig {
+    /// `{"type":"adaptive"}` — model self-budgets its reasoning (observed wire).
+    Adaptive,
+    /// `{"type":"enabled","budget_tokens":N}` — explicit reasoning budget.
+    Enabled { budget_tokens: u32 },
+    /// `{"type":"disabled"}` — no extended thinking.
+    Disabled,
+}
+
+/// Server-side context-editing directives (`context_management`). Observed:
+/// `{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ContextManagement {
+    pub edits: Vec<ContextEdit>,
+}
+
+/// One context-editing directive. `type` is a *versioned* identifier (e.g.
+/// `clear_thinking_20251015`) so it stays a `String`, not an enum — the version
+/// suffix is open-ended. Unmodeled keys round-trip via `extra`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextEdit {
+    #[serde(rename = "type")]
+    pub edit_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<String>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, JsonValue>,
+}
+
+/// Output controls (`output_config`). Observed: `{"effort":"high"}`. `effort`
+/// is a `String` (preserves the value losslessly; the value-space is small but
+/// unconfirmed from one capture). Unmodeled keys round-trip via `extra`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OutputConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, JsonValue>,
+}
+
 /// The request body for `POST /v1/messages`.
 ///
 /// Construct via [`MessagesRequest::new`] (the three required fields) then the
@@ -148,6 +211,17 @@ pub struct MessagesRequest {
     pub top_k: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop_sequences: Vec<String>,
+
+    // ---- wire-ahead envelope fields (observed on /v1/messages?beta=true,
+    //      ahead of the pinned spec snapshot). All optional, omitted-when-absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Metadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<ContextManagement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
 }
 
 impl MessagesRequest {
@@ -166,6 +240,10 @@ impl MessagesRequest {
             top_p: None,
             top_k: None,
             stop_sequences: Vec::new(),
+            metadata: None,
+            thinking: None,
+            context_management: None,
+            output_config: None,
         }
     }
 
@@ -186,6 +264,26 @@ impl MessagesRequest {
 
     pub fn with_stream(mut self, stream: bool) -> Self {
         self.stream = Some(stream);
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+        self.thinking = Some(thinking);
+        self
+    }
+
+    pub fn with_context_management(mut self, context_management: ContextManagement) -> Self {
+        self.context_management = Some(context_management);
+        self
+    }
+
+    pub fn with_output_config(mut self, output_config: OutputConfig) -> Self {
+        self.output_config = Some(output_config);
         self
     }
 
@@ -245,6 +343,10 @@ mod tests {
             "top_p",
             "top_k",
             "stop_sequences",
+            "metadata",
+            "thinking",
+            "context_management",
+            "output_config",
         ] {
             assert!(
                 v.get(absent).is_none(),
@@ -410,6 +512,78 @@ mod tests {
         assert_eq!(last["content"][0]["type"], "tool_result");
         assert_eq!(last["content"][1]["is_error"], json!(true));
         round_trip(&req);
+    }
+
+    #[test]
+    fn wire_ahead_fields_match_observed_beta_shapes() {
+        // Exact shapes captured from a real claude-opus-4-8 request on
+        // /v1/messages?beta=true (2026-06-13). These are ahead of the pinned
+        // spec snapshot; modeled for OUTBOUND completeness.
+        let req = MessagesRequest::new("claude-opus-4-8", 64000, vec![Message::user("hi")])
+            .with_metadata(Metadata {
+                user_id: Some("usr_x".into()),
+                extra: BTreeMap::new(),
+            })
+            .with_thinking(ThinkingConfig::Adaptive)
+            .with_context_management(ContextManagement {
+                edits: vec![ContextEdit {
+                    edit_type: "clear_thinking_20251015".into(),
+                    keep: Some("all".into()),
+                    extra: BTreeMap::new(),
+                }],
+            })
+            .with_output_config(OutputConfig {
+                effort: Some("high".into()),
+                extra: BTreeMap::new(),
+            });
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["metadata"], json!({"user_id": "usr_x"}));
+        assert_eq!(v["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(
+            v["context_management"],
+            json!({"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]})
+        );
+        assert_eq!(v["output_config"], json!({"effort": "high"}));
+        round_trip(&req);
+    }
+
+    #[test]
+    fn thinking_enabled_carries_budget_and_round_trips() {
+        let req = MessagesRequest::new("m", 10, vec![Message::user("hi")]).with_thinking(
+            ThinkingConfig::Enabled {
+                budget_tokens: 4096,
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(&req).unwrap()["thinking"],
+            json!({"type": "enabled", "budget_tokens": 4096})
+        );
+        round_trip(&req);
+    }
+
+    #[test]
+    fn wire_ahead_unknown_keys_round_trip_via_extra() {
+        // A future metadata/output_config key we don't model must survive a
+        // round-trip rather than being silently dropped.
+        let raw = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": "u", "external_user_id": "ext"},
+            "output_config": {"effort": "high", "verbosity": "low"}
+        });
+        let req: MessagesRequest = serde_json::from_value(raw.clone()).unwrap();
+        // unmodeled keys landed in extra…
+        assert_eq!(
+            req.metadata.as_ref().unwrap().extra["external_user_id"].as_value(),
+            &json!("ext")
+        );
+        assert_eq!(
+            req.output_config.as_ref().unwrap().extra["verbosity"].as_value(),
+            &json!("low")
+        );
+        // …and re-serialize verbatim.
+        assert_eq!(serde_json::to_value(&req).unwrap(), raw);
     }
 
     #[test]

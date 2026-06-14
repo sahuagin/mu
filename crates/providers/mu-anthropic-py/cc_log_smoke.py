@@ -14,7 +14,7 @@ import json
 import os
 import sys
 
-import mu_anthropic_py as ma
+import mu_anthropic_py as ma  # ty: ignore[unresolved-import]
 
 
 def load_cc_messages(limit: int = 1000):

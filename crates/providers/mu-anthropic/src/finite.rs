@@ -34,6 +34,23 @@ impl From<FiniteF64> for f64 {
     }
 }
 
+/// The error from [`FiniteF64::try_from`]: the source `f64` was NaN or ±Inf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("f64 is not finite (NaN or ±Inf)")]
+pub struct NonFinite;
+
+impl TryFrom<f64> for FiniteF64 {
+    type Error = NonFinite;
+    /// The fallible inbound conversion. There is deliberately NO `From<f64>`:
+    /// a non-finite float has no `FiniteF64` image, so a total `From` could only
+    /// panic or silently coerce — either would break the type's whole invariant.
+    /// `TryFrom` is the conversion seam; [`FiniteF64::new`] remains the `Option`
+    /// form for callers that prefer it. (Reverse: `From<FiniteF64> for f64`.)
+    fn try_from(v: f64) -> Result<Self, Self::Error> {
+        Self::new(v).ok_or(NonFinite)
+    }
+}
+
 /// Reads whatever is present and yields `Some(finite)` only for a finite
 /// number; `null`, a non-number, or a non-finite number all coerce to `None`.
 /// Field *absence* is handled by `#[serde(default)]` (yields `None` without
@@ -78,6 +95,17 @@ mod tests {
         assert!(FiniteF64::new(f64::INFINITY).is_none());
         assert!(FiniteF64::new(f64::NEG_INFINITY).is_none());
         assert_eq!(FiniteF64::new(0.7).map(|f| f.get()), Some(0.7));
+    }
+
+    #[test]
+    fn try_from_f64_is_fallible_and_round_trips_via_from() {
+        // Finite: TryFrom succeeds and the reverse From recovers the value.
+        let f = FiniteF64::try_from(0.7).expect("finite must convert");
+        assert_eq!(f64::from(f), 0.7);
+        // Non-finite: TryFrom is the seam that rejects, mirroring `new`.
+        assert_eq!(FiniteF64::try_from(f64::NAN), Err(NonFinite));
+        assert_eq!(FiniteF64::try_from(f64::INFINITY), Err(NonFinite));
+        assert_eq!(FiniteF64::try_from(f64::NEG_INFINITY), Err(NonFinite));
     }
 
     #[test]

@@ -8,6 +8,7 @@ export, feeding it the wire messages cc stores verbatim under `.message`.
 Run AFTER `maturin develop` (or with the built .so on sys.path):
     python3 cc_log_smoke.py
 """
+
 import glob
 import json
 import os
@@ -16,7 +17,7 @@ import sys
 import mu_anthropic_py as ma
 
 
-def load_cc_messages(limit=1000):
+def load_cc_messages(limit: int = 1000):
     msgs = []
     for f in sorted(glob.glob(os.path.expanduser("~/.claude-personal/projects/*/*.jsonl"))):
         try:

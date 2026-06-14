@@ -10,13 +10,16 @@
 //! [`Content`] / [`Role`]. Slice 3: [`MessagesRequest`] / [`Tool`].
 //! Slice 4: response [`ResponseMessage`] / [`Usage`] / [`StopReason`].
 //! Slice 5: [`StreamEvent`] (SSE events).
+//! Slice 6: async [`accumulate`] (StreamEvent stream -> assembled message).
 
+mod accumulate;
 mod content;
 mod message;
 mod request;
 mod response;
 mod stream;
 
+pub use accumulate::{accumulate, AccumulateError, Accumulated};
 pub use content::{CacheControl, ContentBlock};
 pub use message::{Content, Message, Role};
 pub use request::{MessagesRequest, Tool};

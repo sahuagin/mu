@@ -1,134 +1,93 @@
 # mu-anthropic — handoff / task note
 
-_Last updated: 2026-06-14 — reconciled against the actual tree after the founding
-session continued past the first draft (pyo3 layer + cc-log probe landed after
-the 23:59 handoff commit). Claims below were re-verified against the working copy._
+_Last updated: 2026-06-14 — after the protocol-completion + drift-canary session._
 
-A note to the next session (likely claude-code). Read PLAN.md, AGENTS.md,
-INTEGRATION.md first — those are the design. This file is **state + next
-actions**, not design.
+A note to the next session. Read `AGENTS.md` (the rules — still load-bearing) and
+`INTEGRATION.md` (the seam map) for design. **The next chunk of work is the
+mu-side integration — its step-by-step plan is `INTEGRATION-PLAN.md`.** This file
+is state + orientation, not design.
 
-## Status: structurally complete library, first ground-truth validation passing
+## Status: FULL protocol coverage, on `main`, with a live drift canary
 
-The Rust protocol library is built end-to-end. 58 unit tests + 3 integration
-tests green (2 tier-3 `tier3_opus48_ground_truth` + 1 `cc_log_parse_probe`);
-fmt + clippy clean throughout. Nothing depends on mu (the DAG holds). The chain
-is a sequence of coherent commits (one per slice), intended to be read in order.
-The pyo3 binding crate (`mu-anthropic-py`) is also scaffolded — see Done.
+The library models the entire Anthropic Messages wire protocol — request +
+response + streaming. **86 unit + 3 integration tests green; clippy `-D warnings`
++ fmt clean.** It is in the workspace and merged to `main` (PRs #291–#298, #304).
+Nothing depends on `mu` (the DAG holds). It is NOT yet wired into mu — that's the
+integration plan.
 
-### Done
+### What's modeled (the whole surface)
 
-- **specs** — pinned Anthropic docs snapshot (`specifications/`, xz'd full dump
-  + `llms.txt` index + MANIFEST). The wire is already *ahead* of this snapshot
-  (see "wire ahead of spec" below).
-- **slice 1** ContentBlock + CacheControl
-- **slice 2** Message / Content / Role
-- **slice 3** MessagesRequest envelope + Tool
-- **slice 4** response Message + Usage + StopReason
-- **slice 5** StreamEvent (SSE events)
-- **slice 6** async stream accumulator
-- **JsonValue** — quarantines `serde_json::Value` so its trait limits (no `Eq`,
-  NaN) can't dictate the trait surface of containing types. Validates finite on
-  construct + deserialize. Pattern mirrors mu-core's `ToolArgs` (referenced, NOT
-  imported — DAG).
-- **FiniteF64** — sampling knobs (`temperature`/`top_p`) coerce non-finite to
-  absent, both directions, never error. Dissolved the `MessagesRequest: !Eq`.
-- **tier-3** — first test against REAL captured `claude-opus-4-8` traffic
-  (anthropic-wiretap). All 7 SSE events deserialize; Usage ignores
-  service_tier/inference_geo (newer than spec) while parsing cache-tier split.
-- **cc-log probe** (`tests/cc_log_parse_probe.rs`) — parses every message in a
-  REAL captured Claude Code session log (`fixtures/cc_log_messages.json`, which
-  DOES contain `tool_use`/`tool_result` blocks) as `ResponseMessage`, asserting
-  100% parse. This is the capture that next-action #1 was blocked on; it is now
-  obtained and the assistant-output (`ToolUse`) path is exercised against real
-  traffic. See #1 for what's still missing (explicit round-trip assertion +
-  the user-input `ToolResult` path).
-- **pyo3 binding** (`crates/providers/mu-anthropic-py`) — thin cdylib per the
-  INTEGRATION.md plan: 4 `#[pyfunction]`s (`parse_response_message`,
-  `parse_stream_event`, `parse_request`, `is_valid_response_message`) that
-  delegate one-to-one to `mu-anthropic`, NO logic. `cc_log_smoke.py` imports the
-  wheel and calls every export against real cc session logs (the binding's test
-  lives in Python, by design). This was next-action #3; the scaffold is done —
-  remaining polish is noted in #3 below.
+- **Request envelope** (`request.rs`): `MessagesRequest` with model, max_tokens,
+  messages, system (polymorphic string|blocks), tools, **tool_choice**, stream,
+  temperature/top_p/top_k (via `FiniteF64`), stop_sequences, and the wire-ahead
+  beta fields **metadata, thinking, context_management, output_config**, plus
+  **service_tier, container, mcp_servers**. Omit-when-absent everywhere (never
+  emits `null`).
+- **Tool taxonomy** (`request.rs`): `ToolDef` = `Custom(Tool)` | `Server(ServerTool)`
+  | `Unknown`, hand-written `Deserialize` keyed on `type`. `ServerTool` normalizes
+  the versioned `type` (`web_search_20250305` → family `web_search` + version
+  `20250305`) with a `config` tail; `mcp_toolset` falls out as a Server with no
+  version. `ToolChoice` = auto|any|tool|none.
+- **Content blocks** (`content.rs`): `text` (+ **citations**), `tool_use`,
+  `tool_result`, `thinking`, `redacted_thinking`, `server_tool_use`, `fallback`,
+  `image`, `document`, and the **server-tool result family** (`web_search_tool_result`,
+  `bash_code_execution_tool_result`, … — generic `ServerToolResult` dispatched by
+  the `_tool_result` suffix, `content` kept as raw JSON since shape varies per
+  family). `Unknown(JsonValue)` is the forward-compat fallback for the rest.
+- **Response** (`response.rs`): `Message` (+ top-level **container**), full
+  `Usage` (service_tier, inference_geo, output_tokens_details, server_tool_use,
+  iterations, cache tiers), **stop_details**, `StopReason`.
+- **Streaming** (`stream.rs` + `accumulate.rs`): `StreamEvent` enum + async
+  `accumulate()` folding events → `Accumulated`.
+- **Invariants**: `JsonValue` (finite-validated `Value` wrapper, keeps `Eq`
+  crate-wide), `FiniteF64`. **pyo3 binding** (`mu-anthropic-py`) scaffolded (thin,
+  no logic).
 
-### Methodology (keep doing this — it's why the build stayed clean)
+### The drift canary (the standing guard)
 
-Reference-don't-inherit. The old `mu-ai/src/providers/anthropic.rs` is an
-**oracle**, not an ancestor — extract *facts and test-cases* from it, never copy
-its (string-typed `json!{}`) code. Build greenfield in **vertical slices**: one
-type + serde + tests (round-trip, spec-conformance, scar-regression), compiles +
-passes before commit, small enough to hold in head. One slice ≈ one commit.
+`examples/drift_check.rs` parses real `/v1/messages` responses with these types
+and reports DRIFT when the wire carries something unmodeled — a dropped/changed
+field (round-trip diff) or an `Unknown` block. The library is intentionally
+lenient (never errors on unknown fields → they land in `Unknown`/`extra`), so the
+canary re-serializes and diffs to surface drift. Exit 0 clean / 3 drift.
 
-## Next actions (rough priority)
+- Regression corpus: `tests/fixtures/server_tool_{web_search,code_execution}_response.json.xz`
+  (real opus-4-8 captures, scrubbed of `encrypted_content`, xz'd).
+- Orchestration: `~/src/claude-personal/scripts/anthropic-protocol-canary.sh`
+  (`--static` over fixtures = no spend; `--live` fires a server-tool curl matrix;
+  `--alert=bead|issue`). Reads the spend-capped key at
+  `anthropic.protocol-canary.api_key` (workspace "automation", $200/mo cap).
+- Scheduled: local cron Mondays 09:17 `--live --alert=bead`. **Builds from
+  `~/src/public_github/mu`, so that checkout must be on current `main`** (it is,
+  via the operator's `mu-solo` workflow). The loop is: canary finds an unmodeled
+  field → file bead → model it → fixture goes clean.
 
-1. **Real tool-call modeling — PARTIALLY DONE.** The capture this was blocked on
-   now exists: `fixtures/cc_log_messages.json` is real cc traffic containing
-   `tool_use`/`tool_result`, and `cc_log_parse_probe.rs` asserts mu-anthropic
-   parses all of it as `ResponseMessage`. So `ContentBlock::ToolUse` (assistant
-   output) IS now exercised against real traffic. STILL MISSING: (a) an explicit
-   *round-trip* assertion (parse → re-serialize → compare), not just parse-OK;
-   (b) the user-input `ToolResult` path — the probe only deserializes each
-   message as `ResponseMessage` (output side), so `tool_result` inside a
-   *request* message is not yet round-tripped. To extend coverage with fresh
-   captures: `ANTHROPIC_BASE_URL=http://127.0.0.1:8788 claude-code`, then
-   `parse-wire.py` (scrubs payloads — fixtures keep *shape*, drop content).
+### Deferred (the canary will catch these if they appear in traffic)
 
-2. **Wire-ahead-of-spec: model the new request fields.** Real requests carry
-   `metadata`, `thinking` (`{"type":"adaptive"}`), `context_management`
-   (`{"edits":[{"type":"clear_thinking_...","keep":"all"}]}`), `output_config`
-   (`{"effort":"high"}`), and the path is `/v1/messages?beta=true`. These are
-   OUTBOUND completeness — we can't *send* them yet. Decide which mu will use,
-   model them as typed fields (envelope-side), add to `MessagesRequest`.
+- streaming `citations_delta` accumulation (non-streaming path preserves citations);
+- `tool_result`-block citations (text-block citations ARE modeled);
+- `document` `citations` config + the `content`-kind source;
+- the pyo3 "curl with extra steps" REPL (actually *sending* requests over HTTP).
 
-3. **pyo3 layer — SCAFFOLDED (was "not started").** `mu-anthropic-py` exists:
-   thin pyo3 cdylib, 4 `#[pyfunction]`s delegating one-to-one to `mu-anthropic`,
-   no logic (per AGENTS.md rule, enforced in the module header). `cc_log_smoke.py`
-   imports the wheel and calls every export against real cc logs — the binding's
-   test, by design. REMAINING: the "curl with extra steps" REPL itself (actually
-   *sending* requests) is not built — `cc_log_smoke.py` only parses logs, it does
-   no HTTP. Python deps still want to stay minimal (`requests`, maybe `datetime`;
-   NO polars/pandas/scipy — host venv rule). Reference topology: tcovert's spline
-   project (`/jails/spline/.../jj_spline`) Rust→py skeleton — the double-nest was
-   meant to be killed; verify that was done.
+## NEXT: wire mu-anthropic into mu
 
-4. **mu-side integration (mu-ai work, separate, operator's call).** Write
-   `From<&ProviderMessages> for mu_anthropic::MessagesRequest` ON THE MU SIDE
-   (consumer owns the mapping). The stream accumulation loop STAYS in mu
-   (`next_event` is agent-loop+transport, not protocol). Final step: delete the
-   old `build_request_body*` — that deletion is the migration's done-signal,
-   all-at-once, not incremental in place.
+This is the only remaining major work. **See `INTEGRATION-PLAN.md`** for the
+step-by-step (dep → `From<&ProviderMessages> for MessagesRequest` mu-side → rewire
+`providers/anthropic.rs` → delete the old `build_request_body*`/`translate_*` as
+the done-signal). The old `crates/mu-ai/src/providers/anthropic.rs` stays running
+and untouched until the single cutover.
 
-5. **Re-run `just ci-aipr`.** The review panel last saw the pre-fix chain. It has
-   NOT seen: F2/F8 fixes, JsonValue, FiniteF64, tier-3. Expect it to flag
-   candidates (it's high-recall/low-precision — ~2 of 14 were real last time;
-   adjudicate each against code that compiles, don't obey blindly).
+## Traps / facts still live
 
-## Traps / facts the next session needs
-
-- **CORRECTED (2026-06-14): the PLAN/AGENTS docs ARE in this chain's ancestry.**
-  The original draft claimed `docs-mu-anthropic-plan` branched separately off
-  main and would be left behind on push. That is FALSE as of now — verify with
-  `jj log -r 'main | docs-mu-anthropic-plan | mu-anthropic-founding | @'`: the
-  graph is strictly linear
-  `main → docs-mu-anthropic-plan → [slice chain] → mu-anthropic-founding → @`.
-  Pushing the founding bookmark carries the docs with it; no rebase needed. (The
-  chain was presumably rebased onto the docs commit after the first draft was
-  written.) Lesson: run the graph query, don't trust a prose ancestry claim.
-- **Capture redaction is now a CONTROL, not a reminder.** `parse-wire.py` scrubs
-  request body (metadata.user_id, system[], tools[] descriptions, messages[]
-  content) AND headers (auth + `x-claude-*` prefix + session-id + cookie) before
-  anything reaches a fixture. Tool *names* are kept (innocuous, standard). Raw
-  `~/private/cc-capture.bin` still has live auth tokens verbatim — never commit.
-  (Those parse-wire.py edits are uncommitted in `claude-personal`, a SEPARATE
-  repo — operator lands them.)
-- **Session demux:** captures key on TCP `conn` id; multiple sessions in one
-  capture file demux cleanly. To group by *claude-code session* you'd use the
-  `X-Claude-Code-Session-Id` header — but that's now redacted; hash it instead of
-  blanking if session-grouping in fixtures matters.
-- **jj snapshot size:** this repo's `snapshot.max-new-file-size` was raised to
-  2MiB (per-repo) to allow the xz'd spec dump. jj silently EXCLUDES oversized
-  files from a snapshot — a `describe` can "succeed" while dropping a file.
-- **beads:** the shared `.beads/issues.jsonl` was repaired this session (one
-  record had unescaped literal newlines, blocking all imports). Operator regards
-  beads + claude_proxy as net-negative right now; replacement planned. Don't sink
-  time hardening either — route around, log friction, move on.
+- **jj snapshot size:** this repo's `snapshot.max-new-file-size` is 2 MiB (for the
+  xz'd spec). jj silently EXCLUDES oversized files — a `describe` can "succeed"
+  while dropping a file.
+- **Capture redaction is a CONTROL:** `~/src/claude-personal/scripts/parse-wire.py`
+  scrubs request bodies + auth headers before anything reaches a fixture; raw
+  `~/private/cc-capture.bin` has live tokens — never commit. Response captures
+  carry no auth, but scrub `encrypted_content` before committing (see the canary
+  fixtures).
+- **cc logs ≠ wire:** the cc session logs conflate Anthropic wire fields with cc
+  client annotations (`diagnostics`/`speed`/`cost`/`provider` are cc-only). The
+  anthropic-wiretap capture is the authority. (memory: cc-logs-conflate-wire-and-client.)
+- **fixtures are `.json.xz`** — `xzcat` to read; the canary script decompresses them.

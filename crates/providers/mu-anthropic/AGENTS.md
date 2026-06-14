@@ -139,9 +139,11 @@ mode this crate was created to escape.
   the announce-then-act drift signature. Honor that. Reads to ground yourself
   are fine; writes/commits/spawns wait for an explicit go.
 
-- **Spawning is currently BROKEN** (8-10 conflicting versions of spawn
-  machinery littered across the repos — part of the six-weeks cleanup). Do
-  NOT rely on background workers. Work independently in-session.
+- **Spawning:** sub-agents (Explore/general-purpose via the Agent tool) work
+  fine and are useful for read-only codebase mapping (the integration map was
+  built that way). The old warning about broken *mu* spawn machinery was about a
+  different system; for protocol/integration work, in-session Agent sub-tasks
+  are fair game.
 
 ## Where things are
 
@@ -154,7 +156,14 @@ mode this crate was created to escape.
 
 ## Status
 
-Planned, not started. No code yet. The crate is a STAKED, UNWIRED directory:
-it is intentionally NOT in the workspace `members` list until it builds and
-tier-2 tests pass (PLAN build-order step 4). Do not add it to the workspace
-prematurely.
+**Built and full-protocol-complete, in the workspace, merged to `main`** (PRs
+#291–#298, #304). The library models the entire Messages wire protocol (request
+envelope + all params + tool taxonomy, every content block incl. server-tool
+results + multimodal, response, streaming, usage, citations); 86 unit + 3
+integration tests; a drift canary (`examples/drift_check.rs`) guards it. The
+rules above are still load-bearing — they're WHY the build stayed clean; keep
+honoring them for any extension.
+
+The remaining work is the **mu-side integration** — see `HANDOFF.md` (current
+state) and `INTEGRATION-PLAN.md` (the step-by-step). PLAN.md's build phases are
+done (historical now).

@@ -371,6 +371,48 @@ mod tests {
     }
 
     #[test]
+    fn request_with_tool_result_turn_round_trips_through_envelope() {
+        // The request-side tool-call cycle: assistant asks (tool_use), then a
+        // user turn feeds results back as tool_result blocks (one errored).
+        // Exercises ToolResult on the INBOUND-to-the-model request path
+        // end-to-end through MessagesRequest — the path real traffic uses, here
+        // covered synthetically until a captured request fixture exists.
+        let req = MessagesRequest::new(
+            "claude-fable-5",
+            1024,
+            vec![
+                Message::user("what's the weather and the time?"),
+                Message::assistant(vec![ContentBlock::ToolUse {
+                    id: "toolu_w".into(),
+                    name: "get_weather".into(),
+                    input: JsonValue::new(json!({"location": "Paris"})).unwrap(),
+                    cache_control: None,
+                }]),
+                Message::user(vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "toolu_w".into(),
+                        content: "18C".into(),
+                        is_error: None,
+                        cache_control: None,
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "toolu_t".into(),
+                        content: "tool not found".into(),
+                        is_error: Some(true),
+                        cache_control: None,
+                    },
+                ]),
+            ],
+        );
+        let v = serde_json::to_value(&req).unwrap();
+        let last = &v["messages"][2];
+        assert_eq!(last["role"], "user");
+        assert_eq!(last["content"][0]["type"], "tool_result");
+        assert_eq!(last["content"][1]["is_error"], json!(true));
+        round_trip(&req);
+    }
+
+    #[test]
     fn stream_and_sampling_serialize_when_set() {
         let r = MessagesRequest::new("m", 10, vec![Message::user("hi")])
             .with_stream(true)

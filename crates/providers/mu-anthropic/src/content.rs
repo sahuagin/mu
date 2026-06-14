@@ -82,6 +82,12 @@ pub enum CacheKind {
 pub enum ContentBlock {
     Text {
         text: String,
+        /// Source citations the model attached to this text (web search / RAG /
+        /// documents). Shapes vary per citation kind (`web_search_result_location`,
+        /// `char_location`, `page_location`, …), so they're preserved verbatim as
+        /// JSON. Empty when absent. (Found by the drift canary on real web-search
+        /// traffic — text blocks carry `citations`.)
+        citations: Vec<JsonValue>,
         cache_control: Option<CacheControl>,
     },
     ToolUse {
@@ -197,6 +203,8 @@ pub enum Source {
 enum KnownContentBlock {
     Text {
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        citations: Vec<JsonValue>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
@@ -267,9 +275,11 @@ impl From<KnownContentBlock> for ContentBlock {
         match k {
             KnownContentBlock::Text {
                 text,
+                citations,
                 cache_control,
             } => ContentBlock::Text {
                 text,
+                citations,
                 cache_control,
             },
             KnownContentBlock::ToolUse {
@@ -419,9 +429,11 @@ impl Serialize for ContentBlock {
                 let known = match other.clone() {
                     ContentBlock::Text {
                         text,
+                        citations,
                         cache_control,
                     } => KnownContentBlock::Text {
                         text,
+                        citations,
                         cache_control,
                     },
                     ContentBlock::ToolUse {
@@ -501,6 +513,7 @@ impl ContentBlock {
     pub fn text(text: impl Into<String>) -> Self {
         ContentBlock::Text {
             text: text.into(),
+            citations: Vec::new(),
             cache_control: None,
         }
     }
@@ -854,10 +867,46 @@ mod tests {
     }
 
     #[test]
+    fn text_block_citations_round_trip() {
+        // Real web-search shape (the drift canary's first catch): text blocks
+        // carry a `citations` array. Preserved verbatim; omitted when empty.
+        let raw = json!({
+            "type": "text",
+            "text": "Rust 1.95 is the current stable.",
+            "citations": [{
+                "type": "web_search_result_location",
+                "cited_text": "Stable: 1.95.0", "url": "https://x", "title": "T"
+            }]
+        });
+        let b: ContentBlock = serde_json::from_value(raw.clone()).unwrap();
+        match &b {
+            ContentBlock::Text { citations, .. } => {
+                assert_eq!(citations.len(), 1);
+                assert_eq!(
+                    citations[0].as_value()["type"],
+                    "web_search_result_location"
+                );
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_value(&b).unwrap(),
+            raw,
+            "round-trips verbatim"
+        );
+        // a plain text block omits citations entirely (not an empty array)
+        assert!(serde_json::to_value(ContentBlock::text("hi"))
+            .unwrap()
+            .get("citations")
+            .is_none());
+    }
+
+    #[test]
     fn cache_control_ephemeral_matches_spec() {
         // spec llms-full.txt.xz:6929 — {"type":"ephemeral"}.
         let block = ContentBlock::Text {
             text: "<book>".into(),
+            citations: Vec::new(),
             cache_control: Some(CacheControl::ephemeral()),
         };
         let v = serde_json::to_value(&block).unwrap();

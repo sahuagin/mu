@@ -591,6 +591,7 @@ mod tests {
         let r = MessagesRequest::new("m", 10, vec![Message::user("hi")]).with_system(vec![
             ContentBlock::Text {
                 text: "<book>".into(),
+                citations: Vec::new(),
                 cache_control: Some(CacheControl::ephemeral()),
             },
         ]);

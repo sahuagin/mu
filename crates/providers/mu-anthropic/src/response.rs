@@ -14,9 +14,12 @@
 //!   STREAMING slice (slice 5); here usage is nested in the response body as
 //!   documented. A test pins that the non-streaming location is the body.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::content::ContentBlock;
+use crate::json::JsonValue;
 use crate::message::Role;
 
 /// Why the model stopped. Unknown values degrade to [`StopReason::Other`]
@@ -45,10 +48,58 @@ pub struct CacheCreation {
     pub ephemeral_1h_input_tokens: Option<u64>,
 }
 
+/// Output-token breakdown (`usage.output_tokens_details`). `thinking_tokens` is
+/// the reasoning portion of `output_tokens` (≤ output_tokens; observability
+/// only — `output_tokens` remains the billed total). spec: extended-thinking
+/// usage (`{"output_tokens_details":{"thinking_tokens":N}}`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OutputTokensDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_tokens: Option<u64>,
+}
+
+/// Server-side tool usage counters (`usage.server_tool_use`), e.g. web-search
+/// request counts. The known counter is typed; any other counter round-trips
+/// via `extra` (forward-compat).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ServerToolUseUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search_requests: Option<u64>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, JsonValue>,
+}
+
+/// One entry of `usage.iterations` — a per-iteration token breakdown the wire
+/// emits on the final `message_delta` (observed on real opus-4-8 traffic). Each
+/// mirrors the top-level usage buckets plus a `type` tag; unmodeled keys
+/// round-trip via `extra`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct IterationUsage {
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<CacheCreation>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, JsonValue>,
+}
+
 /// Token accounting. `input_tokens`/`output_tokens` are the disjoint buckets;
 /// cache read/creation are separate (Anthropic-style usage semantics). The
 /// flat `cache_creation_input_tokens` is the total write; `cache_creation` is
 /// the per-tier split when available.
+///
+/// The trailing fields are observed on real opus-4-8 wire traffic (ahead of the
+/// pinned spec snapshot): `service_tier`/`inference_geo` (echoed routing) on
+/// `message_start`, and `output_tokens_details`/`iterations` on the final
+/// `message_delta`. `server_tool_use` carries server-tool request counts.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,6 +112,21 @@ pub struct Usage {
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation: Option<CacheCreation>,
+
+    /// Service tier echoed on the response (e.g. `standard`). String —
+    /// lossless + forward-compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    /// Inference geography echoed on the response (e.g. `not_available`,
+    /// `global`, `us`). String — `not_available` rules out a global/us enum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_geo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens_details: Option<OutputTokensDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tool_use: Option<ServerToolUseUsage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iterations: Vec<IterationUsage>,
 }
 
 /// A non-streaming response body. `kind` is the literal `"message"` tag the
@@ -128,6 +194,70 @@ mod tests {
         assert_eq!(cc.ephemeral_1h_input_tokens, Some(100));
         // the flat total is preserved alongside the split.
         assert_eq!(u.cache_creation_input_tokens, Some(248));
+    }
+
+    #[test]
+    fn usage_models_service_tier_and_inference_geo() {
+        // Exact message_start.usage from real opus-4-8 wire (2026-06-13) —
+        // previously these were ignored as unmodeled extras; now typed.
+        let raw = json!({
+            "input_tokens": 4076,
+            "cache_creation_input_tokens": 47548,
+            "cache_read_input_tokens": 0,
+            "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 47548},
+            "output_tokens": 4,
+            "service_tier": "standard",
+            "inference_geo": "not_available"
+        });
+        let u: Usage = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(u.service_tier.as_deref(), Some("standard"));
+        assert_eq!(u.inference_geo.as_deref(), Some("not_available"));
+        assert_eq!(serde_json::to_value(&u).unwrap(), raw, "round-trips");
+    }
+
+    #[test]
+    fn usage_models_output_tokens_details_and_iterations() {
+        // Exact message_delta.usage from real wire.
+        let raw = json!({
+            "input_tokens": 4076,
+            "cache_creation_input_tokens": 47548,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 4,
+            "output_tokens_details": {"thinking_tokens": 0},
+            "iterations": [{
+                "input_tokens": 4076, "output_tokens": 4, "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 47548,
+                "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 47548},
+                "type": "message"
+            }]
+        });
+        let u: Usage = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(
+            u.output_tokens_details.as_ref().unwrap().thinking_tokens,
+            Some(0)
+        );
+        assert_eq!(u.iterations.len(), 1);
+        assert_eq!(u.iterations[0].kind.as_deref(), Some("message"));
+        assert_eq!(u.iterations[0].input_tokens, Some(4076));
+        assert_eq!(serde_json::to_value(&u).unwrap(), raw, "round-trips");
+    }
+
+    #[test]
+    fn usage_server_tool_use_counter_and_unknown_round_trip() {
+        // Known counter typed; an unmodeled counter survives via extra.
+        let raw = json!({
+            "input_tokens": 10, "output_tokens": 5,
+            "server_tool_use": {"web_search_requests": 3, "web_fetch_requests": 1}
+        });
+        let u: Usage = serde_json::from_value(raw.clone()).unwrap();
+        let stu = u.server_tool_use.as_ref().unwrap();
+        assert_eq!(stu.web_search_requests, Some(3));
+        assert_eq!(stu.extra["web_fetch_requests"].as_value(), &json!(1));
+        assert_eq!(
+            serde_json::to_value(&u).unwrap(),
+            raw,
+            "round-trips verbatim"
+        );
     }
 
     #[test]

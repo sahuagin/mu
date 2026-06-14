@@ -11,6 +11,7 @@
 //!  2. the fields we DO model must parse to the right values.
 
 use mu_anthropic::StreamEvent;
+use mu_anthropic::Usage;
 use serde_json::Value;
 
 fn load_events() -> Vec<(String, String)> {
@@ -44,10 +45,11 @@ fn real_opus48_sse_events_all_deserialize() {
 }
 
 #[test]
-fn real_message_start_usage_fields_survive_unmodeled_extras() {
+fn real_message_start_usage_parses_typed_incl_service_tier_and_inference_geo() {
     // The captured message_start.usage carries service_tier + inference_geo,
-    // which the pinned spec snapshot predates. Our Usage type must ignore the
-    // extras (not error) AND parse the cache-tier split correctly (mu-yz48 +
+    // which the pinned spec snapshot predates. These are now MODELLED on Usage
+    // (not merely tolerated): the nested usage must parse to a typed Usage and
+    // expose them, alongside the cache-creation tier split (mu-yz48 +
     // cache-write-tier-split scars).
     let events = load_events();
     let (_, data) = events
@@ -55,17 +57,19 @@ fn real_message_start_usage_fields_survive_unmodeled_extras() {
         .find(|(n, _)| n == "message_start")
         .expect("message_start present");
 
-    let ev: StreamEvent = serde_json::from_str(data)
-        .expect("message_start must deserialize despite extra usage fields");
+    let ev: StreamEvent =
+        serde_json::from_str(data).expect("message_start must deserialize from real wire");
     match ev {
         StreamEvent::MessageStart { message } => {
-            // The usage lives in the nested message object; assert we can reach
-            // the cache-creation tier split that real traffic carries.
-            let v = message.as_value();
-            let usage = &v["usage"];
-            assert_eq!(usage["cache_creation_input_tokens"], 47548);
-            assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 47548);
-            assert_eq!(usage["service_tier"], "standard"); // extra field present in raw
+            let usage: Usage = serde_json::from_value(message.as_value()["usage"].clone())
+                .expect("real wire usage parses into typed Usage");
+            assert_eq!(usage.cache_creation_input_tokens, Some(47548));
+            assert_eq!(
+                usage.cache_creation.unwrap().ephemeral_1h_input_tokens,
+                Some(47548)
+            );
+            assert_eq!(usage.service_tier.as_deref(), Some("standard"));
+            assert_eq!(usage.inference_geo.as_deref(), Some("not_available"));
         }
         other => panic!("expected MessageStart, got {other:?}"),
     }

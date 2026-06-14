@@ -14,6 +14,8 @@
 //! is modeled for INBOUND fidelity; mu strips it outbound (it must never echo
 //! the model's reasoning back as input — see INTEGRATION.md scar list).
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -138,11 +140,25 @@ pub enum ContentBlock {
         context: Option<String>,
         cache_control: Option<CacheControl>,
     },
+    /// A server-tool RESULT block — the inline result of a `server_tool_use`,
+    /// e.g. `web_search_tool_result`, `bash_code_execution_tool_result`,
+    /// `web_fetch_tool_result`, `mcp_tool_result`. Modeled GENERICALLY (verified
+    /// against real opus-4-8 traffic): the exact wire tag is kept in
+    /// `result_type`, and `content` — whose shape varies per family (an ARRAY of
+    /// results for web_search, a single result OBJECT for code-exec, an error
+    /// object on failure) — is preserved verbatim as JSON. Dispatched by the
+    /// `_tool_result` type suffix. Any other per-block field (e.g. web_search's
+    /// `caller`) round-trips via `extra`.
+    ServerToolResult {
+        result_type: String,
+        tool_use_id: String,
+        content: JsonValue,
+        extra: BTreeMap<String, JsonValue>,
+    },
     /// Forward-compat fallback: the `type` tag is one we do not model
-    /// (e.g. a server-tool result block, `search_result`, a future addition).
-    /// Captures the whole object verbatim so a consumer can inspect or
-    /// round-trip it. Reached ONLY for unknown tags, never for a known tag with
-    /// broken fields.
+    /// (e.g. `connector_text`, `search_result`, a future addition). Captures the
+    /// whole object verbatim so a consumer can inspect or round-trip it. Reached
+    /// ONLY for unknown tags, never for a known tag with broken fields.
     Unknown(JsonValue),
 }
 
@@ -335,6 +351,39 @@ impl<'de> Deserialize<'de> for ContentBlock {
                     serde_json::from_value(raw).map_err(serde::de::Error::custom)?;
                 Ok(known.into())
             }
+            // The server-tool result family (web_search_tool_result,
+            // bash_code_execution_tool_result, mcp_tool_result, …): modeled
+            // generically by the `_tool_result` suffix. Requires the canonical
+            // {tool_use_id, content} pair; a malformed one falls back to Unknown.
+            Some(t) if t.ends_with("_tool_result") => {
+                let parsed = raw.as_object().and_then(|o| {
+                    let id = o.get("tool_use_id")?.as_str()?.to_string();
+                    let content = o.get("content")?.clone();
+                    let extra: serde_json::Map<String, Value> = o
+                        .iter()
+                        .filter(|(k, _)| !matches!(k.as_str(), "type" | "tool_use_id" | "content"))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    Some((id, content, extra))
+                });
+                match parsed {
+                    Some((tool_use_id, content, extra_map)) => {
+                        let mut extra = BTreeMap::new();
+                        for (k, v) in extra_map {
+                            extra.insert(k, JsonValue::new(v).map_err(serde::de::Error::custom)?);
+                        }
+                        Ok(ContentBlock::ServerToolResult {
+                            result_type: t.to_string(),
+                            tool_use_id,
+                            content: JsonValue::new(content).map_err(serde::de::Error::custom)?,
+                            extra,
+                        })
+                    }
+                    None => Ok(ContentBlock::Unknown(
+                        JsonValue::new(raw).map_err(serde::de::Error::custom)?,
+                    )),
+                }
+            }
             _ => Ok(ContentBlock::Unknown(
                 JsonValue::new(raw).map_err(serde::de::Error::custom)?,
             )),
@@ -349,6 +398,21 @@ impl Serialize for ContentBlock {
     {
         match self {
             ContentBlock::Unknown(v) => v.serialize(serializer),
+            ContentBlock::ServerToolResult {
+                result_type,
+                tool_use_id,
+                content,
+                extra,
+            } => {
+                let mut map = serde_json::Map::new();
+                map.insert("type".into(), Value::String(result_type.clone()));
+                map.insert("tool_use_id".into(), Value::String(tool_use_id.clone()));
+                map.insert("content".into(), content.as_value().clone());
+                for (k, v) in extra {
+                    map.insert(k.clone(), v.as_value().clone());
+                }
+                Value::Object(map).serialize(serializer)
+            }
             other => {
                 // Re-express modeled variants via the derived KnownContentBlock
                 // so the wire shape (tag + skip_serializing_if) stays identical.
@@ -422,7 +486,9 @@ impl Serialize for ContentBlock {
                         context,
                         cache_control,
                     },
-                    ContentBlock::Unknown(_) => unreachable!("handled above"),
+                    ContentBlock::Unknown(_) | ContentBlock::ServerToolResult { .. } => {
+                        unreachable!("handled above")
+                    }
                 };
                 known.serialize(serializer)
             }
@@ -623,14 +689,70 @@ mod tests {
     }
 
     #[test]
-    fn server_tool_result_family_still_degrades_to_unknown() {
-        // The server-tool RESULT family (web_search_tool_result, etc.) is not
-        // yet modelled and must survive via Unknown (forward-compat).
-        let raw = json!({
+    fn server_tool_result_family_is_modeled_generically() {
+        // Shapes verified against real opus-4-8 traffic (2026-06-14).
+        // web_search_tool_result: content is an ARRAY of result items, plus a
+        // `caller` field (preserved via extra).
+        let ws = json!({
             "type": "web_search_tool_result",
             "tool_use_id": "srvtoolu_1",
-            "content": [{"type": "web_search_result", "url": "https://x", "title": "X"}]
+            "content": [{"type": "web_search_result", "title": "T", "url": "https://x",
+                         "encrypted_content": "ENC", "page_age": null}],
+            "caller": {"type": "direct"}
         });
+        let b: ContentBlock = serde_json::from_value(ws.clone()).unwrap();
+        match &b {
+            ContentBlock::ServerToolResult {
+                result_type,
+                tool_use_id,
+                content,
+                extra,
+            } => {
+                assert_eq!(result_type, "web_search_tool_result");
+                assert_eq!(tool_use_id, "srvtoolu_1");
+                assert!(
+                    content.as_value().is_array(),
+                    "web_search content is an array"
+                );
+                assert_eq!(extra["caller"].as_value(), &json!({"type": "direct"}));
+            }
+            other => panic!("expected ServerToolResult, got {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_value(&b).unwrap(),
+            ws,
+            "round-trips verbatim"
+        );
+
+        // bash_code_execution_tool_result: content is a single OBJECT.
+        let ce = json!({
+            "type": "bash_code_execution_tool_result",
+            "tool_use_id": "srvtoolu_2",
+            "content": {"type": "bash_code_execution_result", "stdout": "ok\n",
+                        "stderr": "", "return_code": 0, "content": []}
+        });
+        let b2: ContentBlock = serde_json::from_value(ce.clone()).unwrap();
+        match &b2 {
+            ContentBlock::ServerToolResult { content, .. } => {
+                assert!(
+                    content.as_value().is_object(),
+                    "code-exec content is an object"
+                )
+            }
+            other => panic!("expected ServerToolResult, got {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_value(&b2).unwrap(),
+            ce,
+            "object-content round-trips"
+        );
+    }
+
+    #[test]
+    fn malformed_tool_result_without_ids_degrades_to_unknown() {
+        // A `_tool_result` lacking the canonical {tool_use_id, content} can't be
+        // modeled generically, so it's preserved via Unknown rather than erroring.
+        let raw = json!({"type": "weird_tool_result", "foo": 1});
         let b: ContentBlock = serde_json::from_value(raw.clone()).unwrap();
         assert!(matches!(b, ContentBlock::Unknown(_)));
         assert_eq!(serde_json::to_value(&b).unwrap(), raw);

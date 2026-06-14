@@ -144,6 +144,18 @@ pub struct Usage {
     pub iterations: Vec<IterationUsage>,
 }
 
+/// A code-execution container handle, echoed at the TOP LEVEL of the response
+/// when a code-execution server tool ran (verified on real opus-4-8 traffic):
+/// `{"id":"container_…","expires_at":"…"}`. Unmodeled keys round-trip via `extra`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Container {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, JsonValue>,
+}
+
 /// A non-streaming response body. `kind` is the literal `"message"` tag the
 /// API stamps; kept for fidelity / round-trip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +166,9 @@ pub struct Message {
     pub role: Role,
     pub model: String,
     pub content: Vec<ContentBlock>,
+    /// Code-execution container handle (present when a code-exec tool ran).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<Container>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<StopReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,6 +207,28 @@ mod tests {
         assert_eq!(m.content.len(), 1);
         // round-trips back to the same JSON.
         assert_eq!(serde_json::to_value(&m).unwrap(), raw);
+    }
+
+    #[test]
+    fn container_parses_on_code_execution_response() {
+        // Real opus-4-8 code-execution response carries a top-level container.
+        let raw = json!({
+            "id": "msg_x", "type": "message", "role": "assistant", "model": "m",
+            "content": [],
+            "container": {"id": "container_01Sm", "expires_at": "2026-06-14T08:14:57.946777Z"},
+            "stop_reason": "end_turn"
+        });
+        let m: Message = serde_json::from_value(raw.clone()).unwrap();
+        let c = m.container.as_ref().unwrap();
+        assert_eq!(c.id, "container_01Sm");
+        assert_eq!(c.expires_at.as_deref(), Some("2026-06-14T08:14:57.946777Z"));
+        assert_eq!(serde_json::to_value(&m).unwrap(), raw, "round-trips");
+        // absent on a normal response
+        let plain: Message = serde_json::from_value(json!({
+            "id": "x", "type": "message", "role": "assistant", "model": "m", "content": []
+        }))
+        .unwrap();
+        assert!(plain.container.is_none());
     }
 
     #[test]

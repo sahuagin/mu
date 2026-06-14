@@ -38,3 +38,8 @@ MORNING*.md
 
 # br doctor per-run artifacts
 .doctor/
+
+# python venvs (maturin develop, etc.)
+.venv/
+__pycache__/
+*.pyc

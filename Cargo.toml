@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/mu-core",
     "crates/mu-ai",
+    "crates/providers/mu-anthropic",
     "crates/mu-coding",
     "crates/mu-tui",
     "crates/mu-solo",

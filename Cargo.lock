@@ -1688,6 +1688,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mu-anthropic"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "mu-bridge"
 version = "0.0.1"
 dependencies = [

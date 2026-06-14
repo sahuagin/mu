@@ -3,8 +3,8 @@
 //! Standalone. Knows nothing about mu (no `mu-core` dependency). The job of
 //! this crate is to make Anthropic's wire contract a *type* in both
 //! directions: typed structs whose `serde` (de)serialization byte-matches the
-//! documented + observed wire JSON. See `INTEGRATION.md` and `PLAN.md` in the
-//! crate root.
+//! documented + observed wire JSON. See `INTEGRATION.md` in the crate root,
+//! and `specs/plans/mu-anthropic-build-plan.md` (repo root) for the build plan.
 //!
 //! Built in vertical slices, leaf-first. Slice 1: [`ContentBlock`] / [`CacheControl`]. Slice 2: [`Message`] /
 //! [`Content`] / [`Role`]. Slice 3: [`MessagesRequest`] / [`Tool`].

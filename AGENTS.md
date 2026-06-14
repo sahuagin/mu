@@ -1,103 +1,101 @@
-# AGENTS.md — operating context for `mu`
+# AGENTS.md — mu
 
-This file is loaded by claude-code (all accounts) and pi-rust at session
-start. It captures things future-agents need that aren't reconstructible
-from the code or git history.
+The canonical agent/cc context for this repository: what mu is, how it's laid
+out, how to build and test it, the architecture invariants you must not break,
+and how work flows here. Universal operating conduct (VCS discipline, work
+claiming, tone) comes from the operator's environment-level config; this file is
+mu-specific.
 
-## What this is
+## What mu is
 
-`mu` is a coding agent toolkit. Pre-MVP. Architecture is event-sourced
-(typed events as substrate, context as projection, capability-bounded
-delegation); see `specs/architecture/` and the top-level README for the
-shape.
+A coding agent and standalone agent runtime, built as a Rust workspace. The core
+model: **`mu serve` is the JSON-RPC core daemon; everything else is a frontend**
+to it — the TUIs, the one-shot `ask`, the web console. Sessions are
+event-sourced (see the architecture invariants below).
 
-The name: μ (Greek small mu, U+03BC) — the response the agent gives
-when the question's premise is wrong. Logo is a cow. Don't fight it.
+## Workspace layout
 
-## Architecture in two sentences
+Nine crates (`Cargo.toml` `[workspace]`):
 
-One binary `mu` with multiple subcommands; `mu serve` is the JSON-RPC
-core daemon, every other subcommand (`tui`, `ask`, `orchestrate`) is a
-frontend that owns one or more daemons. The protocol — `mu-core`'s
-serde request/response types — is the contract; everything else
-conforms.
+| crate | role |
+|---|---|
+| `mu-core` | agent loop, JSON-RPC protocol, transport, session state |
+| `mu-ai` | LLM provider abstraction |
+| `providers/mu-anthropic` | Anthropic Messages API wire protocol as typed Rust (standalone; no `mu-core` dep) |
+| `providers/mu-anthropic-py` | thin pyo3 binding over `mu-anthropic` |
+| `mu-coding` | the coding agent; **owns the `mu` binary** (`src/bin/mu.rs`) |
+| `mu-tui` | terminal UI for `mu serve` |
+| `mu-solo` | standalone single-pane chat TUI for `mu serve` |
+| `mu-bridge` | Claude-code JSONL → mu event format (pyo3) |
+| `t4c` | tools4claude — capability/tool discovery |
 
-## Operating rules (project-specific)
+The `mu` CLI subcommands: `serve` (daemon), `ask` (one-shot), `resume`, `tui`,
+`orchestrate`, `console`, `login`/`logout`, `mark`, `list-sessions`,
+`analytics`, `capabilities`, `audit`, `versions`.
 
-These are *additions* to the global rules in `~/.pi/agent/AGENTS.md` —
-not replacements. Read that file first; this file extends it.
+## Build & test
 
-- **No 27k-line files.** If a module is approaching ~1000 lines, that's
-  the point to split. The tags.scm patterns won't accidentally produce
-  a 27k-line file, but human-and-agent decisions can.
-- **No async-ness leaking through traits unnecessarily.** Use
-  `async fn` in trait methods (Rust 1.75+) only when the implementation
-  actually does I/O. Pure-compute trait methods stay sync.
-- **Errors per crate.** Each library crate uses `thiserror` for its own
-  error type. The binary (`mu-coding/src/bin/mu.rs`) is the only place
-  `anyhow::Result` appears.
-- **Per-provider OAuth posture.** Each provider's OAuth flow gets
-  evaluated on its own merits, not lumped under a blanket rule:
-  - **Anthropic** (claude-code OAuth): Anthropic's ToS appears to
-    discourage third-party clients reimplementing their flow.
-    `anthropic-oauth` provider, if/when added, should subprocess-
-    wrap `claude --print`.
-  - **OpenAI Codex**: open-source CLI, public flow parameters,
-    multiple legit third-party implementations. mu implements
-    directly via `oauth2` crate. See mu-018 for the OAuth flow,
-    mu-019 (planned) for the API integration. Tokens stored at
-    `~/.config/mu/auth/openai-codex.json` with `0600` perms; opt
-    out via `--ephemeral` for memory-only.
-  - **Other providers**: evaluate per-provider when added.
-  Earlier versions of this file lumped these as "no third-party
-  OAuth token holding ever." That was overgeneralized; the actual
-  concern is Anthropic-specific.
-## Where to look
+- Toolchain: **stable** with `rustfmt` + `clippy` (`rust-toolchain.toml`).
+- **`just ci` is the gate** — `fmt-check` → `clippy` → `test`, fail-fast in that
+  order; it mirrors `.github/workflows/ci.yml` verbatim. A green `just ci` is the
+  local proxy for green CI. Run it before pushing. The three steps are:
+  - `cargo fmt --all -- --check` — **check-only, never rewrites files** (use
+    `just fmt` to actually format)
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  - `cargo test --workspace --all-features --no-fail-fast` — plain `cargo test`,
+    not nextest
+- `just check` runs the superset `scripts/pre-pr-check.sh` (the `just ci` checks
+  plus `verify-claims`). `scripts/gh-wrapper` runs it automatically at
+  `gh pr create` / `gh pr ready`, so the gate holds even if you skip the manual
+  run.
+- `just check-quick` — fmt + clippy only (fast inner loop).
+- `just ci-aipr` — local-only cross-provider AI review of the diff
+  (`scripts/ai-review.sh`); not a CI step.
 
-- `~/src/agent_tools/code_index` — semantic recall over the codebase;
-  also the eventual built-in MCP code-search server.
-- `~/src/agent_tools/agent` — the memory CLI, also the eventual
-  built-in MCP memory server.
+## Running it
 
-## Testing a TUI / driving a terminal
+- `just smoke` — faux-provider `mu ask` (no API key needed); the fastest
+  end-to-end smoke test.
+- `just ask "…"`, `just serve …`, `just tui …`, `just solo …` — pass-throughs.
+- Direct: `cargo run -p mu-coding --bin mu -- <subcommand>`.
 
-Don't build a new TUI test rig — the pieces exist (vt100 0.16 +
-portable-pty 0.9, workspace deps):
+## Architecture invariants — do not break these
 
-- `crates/mu-coding/src/serve/pty_spawn.rs` — production Rust-owned pty +
-  headless vt100 emulator (the "terminal Jody set up"): maintains a
-  screen-cell grid, detects prompt-ready (the `❯` glyph) instead of sleeping
-  blind, delivers keystrokes with human-ish cadence through the TUI's
-  bracketed-paste/debounce input path. Replaced the `script(1)`+stdin-pipe
-  kickstart hack (mu-slat Phase 3).
-- `crates/mu-coding/examples/pty_probe.rs` — drive any TUI (e.g. claude-code)
-  *through the terminal* instead of `--json`: spawn in a pty, poll the grid
-  until `❯`, type a message char-by-char, scrape the screen for a sentinel.
-  Run: `cargo run -p mu-coding --example pty_probe -- <pot-name>`.
+1. **The on-disk event log is the source of truth.** Events persist to JSONL at
+   `<state_dir>/events/<daemon_id>/<session_id>.jsonl` (`state_dir` defaults to
+   `~/.local/share/mu`). In-memory session state is a *projection* rebuildable
+   from the log: write to disk first, then map into memory.
+2. **Durability is two-tier (spec mu-046).** The command journal is the
+   fail-closed write-ahead path — an inbound command is journaled before
+   processing, and a failed append *rejects* the command
+   (`JOURNAL_UNAVAILABLE = -32003`). Session-log gateway events (tool results,
+   assistant messages) are best-effort disk-before-memory appends: IO errors are
+   logged and ignored, not fatal.
+3. **Rehydration is lazy and request-driven**
+   (`mu-lazy-session-rehydration-bh4f`). `mu serve` parses nothing on cold start;
+   a past session is loaded by id the first time it's addressed. Enumeration is
+   the offline `mu list-sessions` (reads each log's first record + mtime only).
+4. **Deep design lives in `specs/`** — the `architecture/` subdir, the numbered
+   `mu-NNN` specs, and `specs/plans/`. Read it for the *why*; put new design docs
+   there, **not** in crate roots.
 
-`mu-solo` (`crates/mu-solo`) is the real interactive front-end (crossterm),
-distinct from this headless harness.
+## How work flows here
 
-## Multi-agent build flow
-
-`mu`'s build itself uses the multi-agent dispatch tools at
-`~/src/claude-personal/scripts/`. Mechanical work (scaffolding,
-boilerplate trait impls, test writing once shapes are stable) goes to
-`agent-router --auth codex-oauth` (OpenAI Pro) or `--auth openrouter`
-(misc cheap-tier models). Architectural / cross-cutting work stays with
-the claude-code session. The routing policy lives in agent memory
-`2da785e5`.
-
-Delegations run in **isolated jj workspaces** under `.delegations/`.
-Use `scripts/delegate.sh <spec-id> <attempt> <auth>` to set one up;
-the script handles workspace creation, branch setup, and surfacing
-the diff for review. Workspace isolation replaces an earlier prompt-
-level "don't touch parallel-session files" rule (see
-`specs/delegations/CONVENTIONS.md` for the full rule set).
-
-Per-spec delegation prompts (`specs/mu-NNN-delegation.md`) reference
-`CONVENTIONS.md` for universal rules and add only spec-specific
-content (deliverable list, what NOT to do that's tied to the spec,
-verification commands particular to the work). Earlier prompts
-(mu-001 through mu-007) restate the universal rules inline; future
-prompts should not.
+- **VCS is `jj`** over a colocated git+jj repo. **`main` is protected and is
+  production** → branch + PR for everything. Local commits are ungated; push / PR
+  is the reviewed, ask-first step.
+- **Force-push and direct push to `main` are disabled for agents —
+  intentionally and permanently.** The branch ruleset requires every change to go
+  through a PR and its bypass list is empty. Do **not** try to force-push or
+  re-grant a bypass to "work around" a rejected push; that guardrail is
+  deliberate. The forward path is: a normal forward commit → PR → a human admin
+  merges.
+- **Work is tracked in beads (`br`).** Canonical DB: `.beads/beads.db`;
+  `.beads/issues.jsonl` is the exported mirror, reconciled onto `main` by
+  `just beads-sync` (run from the backing repo after a merge wave). Claim a bead
+  before editing its code. The `mu-NNN` / `mu-<slug>` ids that pepper code
+  comments and spec filenames are the durable link from a line back to its
+  rationale.
+- **Code search:** prefer semantic code-index recall (`code_recall`) for
+  orientation and concept-location when it's configured; fall back to `rg` for
+  literal / regex matches.

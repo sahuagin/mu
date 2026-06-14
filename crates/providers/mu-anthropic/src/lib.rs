@@ -7,10 +7,12 @@
 //! crate root.
 //!
 //! Built in vertical slices, leaf-first. Slice 1: [`ContentBlock`] / [`CacheControl`]. Slice 2: [`Message`] /
-//! [`Content`] / [`Role`].
+//! [`Content`] / [`Role`]. Slice 3: [`MessagesRequest`] / [`Tool`].
 
 mod content;
 mod message;
+mod request;
 
 pub use content::{CacheControl, ContentBlock};
 pub use message::{Content, Message, Role};
+pub use request::{MessagesRequest, Tool};

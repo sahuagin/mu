@@ -38,6 +38,21 @@ pub enum StopReason {
     Other,
 }
 
+/// Stop-reason detail (`stop_details`). Present on essentially every wire
+/// message (usually with null fields); populated on a `refusal` with
+/// fallback-credit info (spec: fallback-credit beta — `fallback_credit_token`
+/// is an opaque one-time credit; `fallback_has_prefill_claim` picks the retry
+/// body shape). Unmodeled keys round-trip via `extra` (forward-compat).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct StopDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_credit_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_has_prefill_claim: Option<bool>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, JsonValue>,
+}
+
 /// Per-TTL-tier cache-write breakdown (spec :55971). Present when the request
 /// wrote into named tiers. mu-cache-write-tier-split-umq6.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -143,6 +158,10 @@ pub struct Message {
     pub stop_reason: Option<StopReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_sequence: Option<String>,
+    /// Refusal/fallback-credit detail (see [`StopDetails`]). On the wire this
+    /// rides nearly every message (often all-null); omitted when absent here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_details: Option<StopDetails>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
 }
@@ -272,6 +291,45 @@ mod tests {
         }))
         .unwrap();
         assert!(m.usage.is_some(), "usage must parse from the body position");
+    }
+
+    #[test]
+    fn stop_details_refusal_credit_parses_and_round_trips() {
+        // spec: fallback-credit beta — a refusal carries the credit token in
+        // stop_details. Models the two documented fields + unknown-key passthrough.
+        let raw = json!({
+            "id": "msg_x", "type": "message", "role": "assistant", "model": "m",
+            "content": [], "stop_reason": "refusal",
+            "stop_details": {
+                "fallback_credit_token": "fct_abc",
+                "fallback_has_prefill_claim": false,
+                "some_future_key": 1
+            }
+        });
+        let m: Message = serde_json::from_value(raw.clone()).unwrap();
+        let sd = m.stop_details.as_ref().unwrap();
+        assert_eq!(sd.fallback_credit_token.as_deref(), Some("fct_abc"));
+        assert_eq!(sd.fallback_has_prefill_claim, Some(false));
+        assert_eq!(sd.extra["some_future_key"].as_value(), &json!(1));
+        assert_eq!(
+            serde_json::to_value(&m).unwrap(),
+            raw,
+            "round-trips verbatim"
+        );
+    }
+
+    #[test]
+    fn stop_details_absent_is_omitted() {
+        let m: Message = serde_json::from_value(json!({
+            "id": "x", "type": "message", "role": "assistant", "model": "m",
+            "content": [], "stop_reason": "end_turn"
+        }))
+        .unwrap();
+        assert!(m.stop_details.is_none());
+        assert!(serde_json::to_value(&m)
+            .unwrap()
+            .get("stop_details")
+            .is_none());
     }
 
     #[test]

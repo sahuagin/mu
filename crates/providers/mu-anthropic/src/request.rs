@@ -14,6 +14,7 @@
 //! `system` is POLYMORPHIC exactly like message content — a bare string
 //! (:45088) or a block array (:6921). We reuse [`Content`] for it.
 
+use crate::finite::{deserialize_option_finite, FiniteF64};
 use crate::json::JsonValue;
 use serde::{Deserialize, Serialize};
 
@@ -53,9 +54,9 @@ impl Tool {
 /// Construct via [`MessagesRequest::new`] (the three required fields) then the
 /// builder-style setters for optional envelope fields. The result is immutable
 /// once built and serializes to the exact wire shape.
-// NOT Eq: temperature/top_p are typed f64 (genuine floats, not blob).
-// !Eq stops HERE — nothing requires MessagesRequest: Eq.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// Eq holds: temperature/top_p are Option<FiniteF64> (finiteness guaranteed by
+// construction), so no raw f64 blocks the derive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessagesRequest {
     pub model: String,
     pub max_tokens: u32,
@@ -74,10 +75,18 @@ pub struct MessagesRequest {
     pub stream: Option<bool>,
 
     // ---- sampling knobs (all optional, omitted when absent) ----
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_option_finite"
+    )]
+    pub temperature: Option<FiniteF64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_option_finite"
+    )]
+    pub top_p: Option<FiniteF64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -117,8 +126,15 @@ impl MessagesRequest {
         self
     }
 
+    /// Set temperature. Non-finite (NaN/±Inf) coerces to absent.
     pub fn with_temperature(mut self, t: f64) -> Self {
-        self.temperature = Some(t);
+        self.temperature = FiniteF64::new(t);
+        self
+    }
+
+    /// Set top_p. Non-finite (NaN/±Inf) coerces to absent.
+    pub fn with_top_p(mut self, p: f64) -> Self {
+        self.top_p = FiniteF64::new(p);
         self
     }
 }

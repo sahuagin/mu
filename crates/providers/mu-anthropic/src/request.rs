@@ -49,6 +49,58 @@ impl Tool {
     }
 }
 
+/// How the model selects (or is forced to select) a tool. Wire shape: an
+/// object internally tagged on `type` (spec values: `auto`, `any`, `tool`,
+/// `none`). `disable_parallel_tool_use` is optional and applies to
+/// `auto`/`any`/`tool` (omitted when absent); `none` carries no fields.
+///
+/// Variant names mirror the wire `type` tag 1:1 (`None` → `{"type":"none"}`)
+/// so a protocol reader maps code to wire without a lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolChoice {
+    /// Model decides whether to call a tool (the default when tools are present).
+    Auto {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    /// Model must call one of the provided tools (its choice which).
+    Any {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    /// Model must call the specifically named tool.
+    Tool {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    /// Model will not call any tool (no fields).
+    None,
+}
+
+impl ToolChoice {
+    /// `{"type":"auto"}` — model decides.
+    pub fn auto() -> Self {
+        ToolChoice::Auto {
+            disable_parallel_tool_use: None,
+        }
+    }
+    /// `{"type":"any"}` — model must use some tool.
+    pub fn any() -> Self {
+        ToolChoice::Any {
+            disable_parallel_tool_use: None,
+        }
+    }
+    /// `{"type":"tool","name":...}` — model must use the named tool.
+    pub fn tool(name: impl Into<String>) -> Self {
+        ToolChoice::Tool {
+            name: name.into(),
+            disable_parallel_tool_use: None,
+        }
+    }
+}
+
 /// The request body for `POST /v1/messages`.
 ///
 /// Construct via [`MessagesRequest::new`] (the three required fields) then the
@@ -68,6 +120,11 @@ pub struct MessagesRequest {
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Tool>,
+
+    /// Tool-selection policy. Omitted when absent (the API then defaults to
+    /// `auto` if tools are present). See [`ToolChoice`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
 
     /// Whether the response is streamed (SSE). Anthropic always streams large
     /// requests; mu's production path sets this true. Omitted when None.
@@ -103,6 +160,7 @@ impl MessagesRequest {
             messages,
             system: None,
             tools: Vec::new(),
+            tool_choice: None,
             stream: None,
             temperature: None,
             top_p: None,
@@ -118,6 +176,11 @@ impl MessagesRequest {
 
     pub fn with_tools(mut self, tools: Vec<Tool>) -> Self {
         self.tools = tools;
+        self
+    }
+
+    pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+        self.tool_choice = Some(tool_choice);
         self
     }
 
@@ -176,6 +239,7 @@ mod tests {
         for absent in [
             "system",
             "tools",
+            "tool_choice",
             "stream",
             "temperature",
             "top_p",
@@ -249,6 +313,61 @@ mod tests {
             }])
         );
         round_trip(&r);
+    }
+
+    #[test]
+    fn tool_choice_variants_match_spec_shape() {
+        // spec values: auto | any | tool | none. disable_parallel_tool_use is
+        // omitted unless set.
+        let base = || MessagesRequest::new("m", 10, vec![Message::user("hi")]);
+
+        let auto = base().with_tool_choice(ToolChoice::auto());
+        assert_eq!(
+            serde_json::to_value(&auto).unwrap()["tool_choice"],
+            json!({"type": "auto"})
+        );
+        round_trip(&auto);
+
+        let any = base().with_tool_choice(ToolChoice::any());
+        assert_eq!(
+            serde_json::to_value(&any).unwrap()["tool_choice"],
+            json!({"type": "any"})
+        );
+        round_trip(&any);
+
+        let named = base().with_tool_choice(ToolChoice::tool("get_weather"));
+        assert_eq!(
+            serde_json::to_value(&named).unwrap()["tool_choice"],
+            json!({"type": "tool", "name": "get_weather"})
+        );
+        round_trip(&named);
+
+        let none = base().with_tool_choice(ToolChoice::None);
+        assert_eq!(
+            serde_json::to_value(&none).unwrap()["tool_choice"],
+            json!({"type": "none"})
+        );
+        round_trip(&none);
+    }
+
+    #[test]
+    fn tool_choice_disable_parallel_serializes_only_when_set() {
+        let r = MessagesRequest::new("m", 10, vec![Message::user("hi")]).with_tool_choice(
+            ToolChoice::Any {
+                disable_parallel_tool_use: Some(true),
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(&r).unwrap()["tool_choice"],
+            json!({"type": "any", "disable_parallel_tool_use": true})
+        );
+        round_trip(&r);
+        // and absent by default
+        let bare = serde_json::to_value(ToolChoice::any()).unwrap();
+        assert!(
+            bare.get("disable_parallel_tool_use").is_none(),
+            "must omit, not null"
+        );
     }
 
     #[test]

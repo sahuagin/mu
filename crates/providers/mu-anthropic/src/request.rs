@@ -14,6 +14,8 @@
 //! `system` is POLYMORPHIC exactly like message content — a bare string
 //! (:45088) or a block array (:6921). We reuse [`Content`] for it.
 
+use std::collections::BTreeMap;
+
 use crate::finite::{deserialize_option_finite, FiniteF64};
 use crate::json::JsonValue;
 use serde::{Deserialize, Serialize};
@@ -49,6 +51,119 @@ impl Tool {
     }
 }
 
+/// How the model selects (or is forced to select) a tool. Wire shape: an
+/// object internally tagged on `type` (spec values: `auto`, `any`, `tool`,
+/// `none`). `disable_parallel_tool_use` is optional and applies to
+/// `auto`/`any`/`tool` (omitted when absent); `none` carries no fields.
+///
+/// Variant names mirror the wire `type` tag 1:1 (`None` → `{"type":"none"}`)
+/// so a protocol reader maps code to wire without a lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolChoice {
+    /// Model decides whether to call a tool (the default when tools are present).
+    Auto {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    /// Model must call one of the provided tools (its choice which).
+    Any {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    /// Model must call the specifically named tool.
+    Tool {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    /// Model will not call any tool (no fields).
+    None,
+}
+
+impl ToolChoice {
+    /// `{"type":"auto"}` — model decides.
+    pub fn auto() -> Self {
+        ToolChoice::Auto {
+            disable_parallel_tool_use: None,
+        }
+    }
+    /// `{"type":"any"}` — model must use some tool.
+    pub fn any() -> Self {
+        ToolChoice::Any {
+            disable_parallel_tool_use: None,
+        }
+    }
+    /// `{"type":"tool","name":...}` — model must use the named tool.
+    pub fn tool(name: impl Into<String>) -> Self {
+        ToolChoice::Tool {
+            name: name.into(),
+            disable_parallel_tool_use: None,
+        }
+    }
+}
+
+/// Request-level `metadata`. The live beta wire carries `user_id`; the spec
+/// docs also mention `external_user_id`/`input_file`. The observed `user_id` is
+/// typed; any other key round-trips verbatim through `extra` (forward-compat).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Metadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// Any metadata key we don't model, preserved across a round-trip. An empty
+    /// map flattens to nothing (no key emitted).
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, JsonValue>,
+}
+
+/// Extended-thinking config (`thinking`). Internally tagged on `type`. Observed
+/// on the live beta wire: `adaptive`; documented standard forms: `enabled`
+/// (with a token budget) and `disabled`. This is an OUTBOUND type we construct,
+/// so the variant set is intentionally closed — a `type` we don't model
+/// deserializes as a hard error (a loud "the wire changed, update the lib"
+/// signal) rather than silently mis-modeling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThinkingConfig {
+    /// `{"type":"adaptive"}` — model self-budgets its reasoning (observed wire).
+    Adaptive,
+    /// `{"type":"enabled","budget_tokens":N}` — explicit reasoning budget.
+    Enabled { budget_tokens: u32 },
+    /// `{"type":"disabled"}` — no extended thinking.
+    Disabled,
+}
+
+/// Server-side context-editing directives (`context_management`). Observed:
+/// `{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ContextManagement {
+    pub edits: Vec<ContextEdit>,
+}
+
+/// One context-editing directive. `type` is a *versioned* identifier (e.g.
+/// `clear_thinking_20251015`) so it stays a `String`, not an enum — the version
+/// suffix is open-ended. Unmodeled keys round-trip via `extra`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextEdit {
+    #[serde(rename = "type")]
+    pub edit_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<String>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, JsonValue>,
+}
+
+/// Output controls (`output_config`). Observed: `{"effort":"high"}`. `effort`
+/// is a `String` (preserves the value losslessly; the value-space is small but
+/// unconfirmed from one capture). Unmodeled keys round-trip via `extra`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OutputConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, JsonValue>,
+}
+
 /// The request body for `POST /v1/messages`.
 ///
 /// Construct via [`MessagesRequest::new`] (the three required fields) then the
@@ -68,6 +183,11 @@ pub struct MessagesRequest {
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Tool>,
+
+    /// Tool-selection policy. Omitted when absent (the API then defaults to
+    /// `auto` if tools are present). See [`ToolChoice`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
 
     /// Whether the response is streamed (SSE). Anthropic always streams large
     /// requests; mu's production path sets this true. Omitted when None.
@@ -91,6 +211,25 @@ pub struct MessagesRequest {
     pub top_k: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop_sequences: Vec<String>,
+
+    // ---- wire-ahead envelope fields (observed on /v1/messages?beta=true,
+    //      ahead of the pinned spec snapshot). All optional, omitted-when-absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Metadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<ContextManagement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
+
+    /// Request service tier (spec, e.g. `auto`/`standard_only`). Kept as a
+    /// String — lossless + forward-compat over the small value set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    /// Code-execution container id to reuse (spec). Opaque string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
 }
 
 impl MessagesRequest {
@@ -103,11 +242,18 @@ impl MessagesRequest {
             messages,
             system: None,
             tools: Vec::new(),
+            tool_choice: None,
             stream: None,
             temperature: None,
             top_p: None,
             top_k: None,
             stop_sequences: Vec::new(),
+            metadata: None,
+            thinking: None,
+            context_management: None,
+            output_config: None,
+            service_tier: None,
+            container: None,
         }
     }
 
@@ -121,8 +267,43 @@ impl MessagesRequest {
         self
     }
 
+    pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+        self.tool_choice = Some(tool_choice);
+        self
+    }
+
     pub fn with_stream(mut self, stream: bool) -> Self {
         self.stream = Some(stream);
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+        self.thinking = Some(thinking);
+        self
+    }
+
+    pub fn with_context_management(mut self, context_management: ContextManagement) -> Self {
+        self.context_management = Some(context_management);
+        self
+    }
+
+    pub fn with_output_config(mut self, output_config: OutputConfig) -> Self {
+        self.output_config = Some(output_config);
+        self
+    }
+
+    pub fn with_service_tier(mut self, service_tier: impl Into<String>) -> Self {
+        self.service_tier = Some(service_tier.into());
+        self
+    }
+
+    pub fn with_container(mut self, container: impl Into<String>) -> Self {
+        self.container = Some(container.into());
         self
     }
 
@@ -176,11 +357,18 @@ mod tests {
         for absent in [
             "system",
             "tools",
+            "tool_choice",
             "stream",
             "temperature",
             "top_p",
             "top_k",
             "stop_sequences",
+            "metadata",
+            "thinking",
+            "context_management",
+            "output_config",
+            "service_tier",
+            "container",
         ] {
             assert!(
                 v.get(absent).is_none(),
@@ -249,6 +437,186 @@ mod tests {
             }])
         );
         round_trip(&r);
+    }
+
+    #[test]
+    fn tool_choice_variants_match_spec_shape() {
+        // spec values: auto | any | tool | none. disable_parallel_tool_use is
+        // omitted unless set.
+        let base = || MessagesRequest::new("m", 10, vec![Message::user("hi")]);
+
+        let auto = base().with_tool_choice(ToolChoice::auto());
+        assert_eq!(
+            serde_json::to_value(&auto).unwrap()["tool_choice"],
+            json!({"type": "auto"})
+        );
+        round_trip(&auto);
+
+        let any = base().with_tool_choice(ToolChoice::any());
+        assert_eq!(
+            serde_json::to_value(&any).unwrap()["tool_choice"],
+            json!({"type": "any"})
+        );
+        round_trip(&any);
+
+        let named = base().with_tool_choice(ToolChoice::tool("get_weather"));
+        assert_eq!(
+            serde_json::to_value(&named).unwrap()["tool_choice"],
+            json!({"type": "tool", "name": "get_weather"})
+        );
+        round_trip(&named);
+
+        let none = base().with_tool_choice(ToolChoice::None);
+        assert_eq!(
+            serde_json::to_value(&none).unwrap()["tool_choice"],
+            json!({"type": "none"})
+        );
+        round_trip(&none);
+    }
+
+    #[test]
+    fn tool_choice_disable_parallel_serializes_only_when_set() {
+        let r = MessagesRequest::new("m", 10, vec![Message::user("hi")]).with_tool_choice(
+            ToolChoice::Any {
+                disable_parallel_tool_use: Some(true),
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(&r).unwrap()["tool_choice"],
+            json!({"type": "any", "disable_parallel_tool_use": true})
+        );
+        round_trip(&r);
+        // and absent by default
+        let bare = serde_json::to_value(ToolChoice::any()).unwrap();
+        assert!(
+            bare.get("disable_parallel_tool_use").is_none(),
+            "must omit, not null"
+        );
+    }
+
+    #[test]
+    fn request_with_tool_result_turn_round_trips_through_envelope() {
+        // The request-side tool-call cycle: assistant asks (tool_use), then a
+        // user turn feeds results back as tool_result blocks (one errored).
+        // Exercises ToolResult on the INBOUND-to-the-model request path
+        // end-to-end through MessagesRequest — the path real traffic uses, here
+        // covered synthetically until a captured request fixture exists.
+        let req = MessagesRequest::new(
+            "claude-fable-5",
+            1024,
+            vec![
+                Message::user("what's the weather and the time?"),
+                Message::assistant(vec![ContentBlock::ToolUse {
+                    id: "toolu_w".into(),
+                    name: "get_weather".into(),
+                    input: JsonValue::new(json!({"location": "Paris"})).unwrap(),
+                    cache_control: None,
+                }]),
+                Message::user(vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "toolu_w".into(),
+                        content: "18C".into(),
+                        is_error: None,
+                        cache_control: None,
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "toolu_t".into(),
+                        content: "tool not found".into(),
+                        is_error: Some(true),
+                        cache_control: None,
+                    },
+                ]),
+            ],
+        );
+        let v = serde_json::to_value(&req).unwrap();
+        let last = &v["messages"][2];
+        assert_eq!(last["role"], "user");
+        assert_eq!(last["content"][0]["type"], "tool_result");
+        assert_eq!(last["content"][1]["is_error"], json!(true));
+        round_trip(&req);
+    }
+
+    #[test]
+    fn wire_ahead_fields_match_observed_beta_shapes() {
+        // Exact shapes captured from a real claude-opus-4-8 request on
+        // /v1/messages?beta=true (2026-06-13). These are ahead of the pinned
+        // spec snapshot; modeled for OUTBOUND completeness.
+        let req = MessagesRequest::new("claude-opus-4-8", 64000, vec![Message::user("hi")])
+            .with_metadata(Metadata {
+                user_id: Some("usr_x".into()),
+                extra: BTreeMap::new(),
+            })
+            .with_thinking(ThinkingConfig::Adaptive)
+            .with_context_management(ContextManagement {
+                edits: vec![ContextEdit {
+                    edit_type: "clear_thinking_20251015".into(),
+                    keep: Some("all".into()),
+                    extra: BTreeMap::new(),
+                }],
+            })
+            .with_output_config(OutputConfig {
+                effort: Some("high".into()),
+                extra: BTreeMap::new(),
+            });
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["metadata"], json!({"user_id": "usr_x"}));
+        assert_eq!(v["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(
+            v["context_management"],
+            json!({"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]})
+        );
+        assert_eq!(v["output_config"], json!({"effort": "high"}));
+        round_trip(&req);
+    }
+
+    #[test]
+    fn service_tier_and_container_serialize_when_set() {
+        let r = MessagesRequest::new("m", 10, vec![Message::user("hi")])
+            .with_service_tier("standard_only")
+            .with_container("cntr_abc");
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["service_tier"], json!("standard_only"));
+        assert_eq!(v["container"], json!("cntr_abc"));
+        round_trip(&r);
+    }
+
+    #[test]
+    fn thinking_enabled_carries_budget_and_round_trips() {
+        let req = MessagesRequest::new("m", 10, vec![Message::user("hi")]).with_thinking(
+            ThinkingConfig::Enabled {
+                budget_tokens: 4096,
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(&req).unwrap()["thinking"],
+            json!({"type": "enabled", "budget_tokens": 4096})
+        );
+        round_trip(&req);
+    }
+
+    #[test]
+    fn wire_ahead_unknown_keys_round_trip_via_extra() {
+        // A future metadata/output_config key we don't model must survive a
+        // round-trip rather than being silently dropped.
+        let raw = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": "u", "external_user_id": "ext"},
+            "output_config": {"effort": "high", "verbosity": "low"}
+        });
+        let req: MessagesRequest = serde_json::from_value(raw.clone()).unwrap();
+        // unmodeled keys landed in extra…
+        assert_eq!(
+            req.metadata.as_ref().unwrap().extra["external_user_id"].as_value(),
+            &json!("ext")
+        );
+        assert_eq!(
+            req.output_config.as_ref().unwrap().extra["verbosity"].as_value(),
+            &json!("low")
+        );
+        // …and re-serialize verbatim.
+        assert_eq!(serde_json::to_value(&req).unwrap(), raw);
     }
 
     #[test]

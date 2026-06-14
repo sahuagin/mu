@@ -355,6 +355,41 @@ mod tests {
         assert!(v.get("id").is_none(), "tool_result must not carry `id`");
     }
 
+    #[test]
+    fn tool_result_is_error_serializes_when_set_and_round_trips() {
+        // An errored tool result carries `"is_error": true`; the field is
+        // omitted (never null) when absent. spec: tool_result error reporting.
+        let errored = ContentBlock::ToolResult {
+            tool_use_id: "toolu_9".into(),
+            content: "boom".into(),
+            is_error: Some(true),
+            cache_control: None,
+        };
+        let v = serde_json::to_value(&errored).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_9",
+                "content": "boom",
+                "is_error": true
+            })
+        );
+        round_trip(&errored);
+
+        // absent is_error must not serialize as null
+        let ok = ContentBlock::ToolResult {
+            tool_use_id: "toolu_9".into(),
+            content: "fine".into(),
+            is_error: None,
+            cache_control: None,
+        };
+        assert!(
+            serde_json::to_value(&ok).unwrap().get("is_error").is_none(),
+            "absent is_error must be omitted, not null"
+        );
+    }
+
     // ----- cache_control: per-block, omitted when absent -----
 
     #[test]

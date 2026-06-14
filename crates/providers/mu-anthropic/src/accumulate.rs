@@ -22,6 +22,8 @@ use std::collections::BTreeMap;
 use futures::{Stream, StreamExt};
 use serde_json::Value;
 
+use crate::json::JsonValue;
+
 use crate::content::ContentBlock;
 use crate::response::{StopReason, Usage};
 use crate::stream::{BlockDelta, BlockStart, StreamEvent};
@@ -38,7 +40,7 @@ pub enum AccumulateError {
 }
 
 /// The assembled result of a completed stream.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Accumulated {
     pub content: Vec<ContentBlock>,
     pub stop_reason: Option<StopReason>,
@@ -87,17 +89,17 @@ impl BlockBuilder {
     }
 }
 
-/// Parse accumulated tool-input JSON. Empty → empty object. Valid object →
-/// itself. Anything else (malformed, or valid-but-not-object) → empty object,
-/// so a bad tool payload degrades the one tool call rather than failing the
-/// whole assembled message.
-fn parse_tool_input(json: &str) -> Value {
+/// Parse accumulated tool-input JSON into a [`JsonValue`]. Empty → empty
+/// object. Valid object → itself. Anything else (malformed, valid-but-not-
+/// object, or carrying a non-finite number) → empty object, so a bad tool
+/// payload degrades the one tool call rather than failing the whole message.
+fn parse_tool_input(json: &str) -> JsonValue {
     if json.is_empty() {
-        return Value::Object(serde_json::Map::new());
+        return JsonValue::empty_object();
     }
     match serde_json::from_str::<Value>(json) {
-        Ok(v) if v.is_object() => v,
-        _ => Value::Object(serde_json::Map::new()),
+        Ok(v) if v.is_object() => JsonValue::new(v).unwrap_or_else(|_| JsonValue::empty_object()),
+        _ => JsonValue::empty_object(),
     }
 }
 
@@ -136,9 +138,10 @@ where
     while let Some(ev) = events.next().await {
         match ev {
             StreamEvent::MessageStart { message } => {
-                if let Some(u) = message
+                let raw = message.as_value();
+                if let Some(u) = raw
                     .get("message")
-                    .or(Some(&message))
+                    .or(Some(raw))
                     .and_then(|m| m.get("usage"))
                     .and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok())
                 {
@@ -297,7 +300,7 @@ mod tests {
             vec![ContentBlock::ToolUse {
                 id: "toolu_1".into(),
                 name: "get_weather".into(),
-                input: json!({"location": "Paris"}),
+                input: JsonValue::new(json!({"location": "Paris"})).unwrap(),
                 cache_control: None,
             }]
         );
@@ -348,7 +351,7 @@ mod tests {
         ]);
         let acc = accumulate(s).await.unwrap();
         match &acc.content[0] {
-            ContentBlock::ToolUse { input, .. } => assert_eq!(input, &json!({})),
+            ContentBlock::ToolUse { input, .. } => assert_eq!(input.as_value(), &json!({})),
             other => panic!("expected ToolUse, got {other:?}"),
         }
     }

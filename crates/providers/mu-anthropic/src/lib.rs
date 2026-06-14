@@ -14,6 +14,7 @@
 
 mod accumulate;
 mod content;
+mod json;
 mod message;
 mod request;
 mod response;
@@ -21,6 +22,7 @@ mod stream;
 
 pub use accumulate::{accumulate, AccumulateError, Accumulated};
 pub use content::{CacheControl, ContentBlock};
+pub use json::{JsonValue, JsonValueError};
 pub use message::{Content, Message, Role};
 pub use request::{MessagesRequest, Tool};
 pub use response::{CacheCreation, Message as ResponseMessage, StopReason, Usage};

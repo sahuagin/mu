@@ -65,7 +65,7 @@ pub struct Usage {
 
 /// A non-streaming response body. `kind` is the literal `"message"` tag the
 /// API stamps; kept for fidelity / round-trip.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub id: String,
     #[serde(rename = "type")]

@@ -17,6 +17,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::json::JsonValue;
+
 /// Anthropic prompt-cache directive attached to a content block (or to an
 /// envelope position — system block / last tool spec). Wire shapes:
 /// `{"type":"ephemeral"}` and `{"type":"ephemeral","ttl":"1h"}`.
@@ -74,7 +76,7 @@ pub enum CacheKind {
 /// it does NOT silently degrade to `Unknown` (that would swallow real wire
 /// breakage, e.g. a renamed required field). This is enforced by a hand-written
 /// `Deserialize` that dispatches on `type` first. See [`KnownContentBlock`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentBlock {
     Text {
         text: String,
@@ -83,7 +85,7 @@ pub enum ContentBlock {
     ToolUse {
         id: String,
         name: String,
-        input: Value,
+        input: JsonValue,
         cache_control: Option<CacheControl>,
     },
     ToolResult {
@@ -100,7 +102,7 @@ pub enum ContentBlock {
     /// (e.g. `image`, `document`, a future addition). Captures the whole
     /// object verbatim so a consumer can inspect or round-trip it. Reached
     /// ONLY for unknown tags, never for a known tag with broken fields.
-    Unknown(Value),
+    Unknown(JsonValue),
 }
 
 /// The set of `type` tags we model, used to decide known-vs-unknown dispatch.
@@ -119,7 +121,7 @@ enum KnownContentBlock {
     ToolUse {
         id: String,
         name: String,
-        input: Value,
+        input: JsonValue,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
@@ -198,7 +200,9 @@ impl<'de> Deserialize<'de> for ContentBlock {
                     serde_json::from_value(raw).map_err(serde::de::Error::custom)?;
                 Ok(known.into())
             }
-            _ => Ok(ContentBlock::Unknown(raw)),
+            _ => Ok(ContentBlock::Unknown(
+                JsonValue::new(raw).map_err(serde::de::Error::custom)?,
+            )),
         }
     }
 }
@@ -287,7 +291,7 @@ mod tests {
         round_trip(&ContentBlock::ToolUse {
             id: "toolu_123".into(),
             name: "calculator".into(),
-            input: json!({"operation": "add", "a": 1, "b": 2}),
+            input: JsonValue::new(json!({"operation": "add", "a": 1, "b": 2})).unwrap(),
             cache_control: None,
         });
         round_trip(&ContentBlock::ToolResult {
@@ -318,7 +322,7 @@ mod tests {
         let block = ContentBlock::ToolUse {
             id: "toolu_123".into(),
             name: "calculator".into(),
-            input: json!({"operation": "add", "a": 1234, "b": 5678}),
+            input: JsonValue::new(json!({"operation": "add", "a": 1234, "b": 5678})).unwrap(),
             cache_control: None,
         };
         let v = serde_json::to_value(&block).unwrap();
@@ -400,7 +404,7 @@ mod tests {
         let block: ContentBlock =
             serde_json::from_value(raw.clone()).expect("unknown type must not error");
         match &block {
-            ContentBlock::Unknown(v) => assert_eq!(v, &raw),
+            ContentBlock::Unknown(v) => assert_eq!(v.as_value(), &raw),
             other => panic!("expected Unknown, got {other:?}"),
         }
         // and it round-trips byte-for-byte.
@@ -437,7 +441,10 @@ mod fallback_strictness {
     fn unknown_tag_still_degrades_to_unknown() {
         let raw = json!({"type": "image", "source": {"data": "..."}});
         let b: ContentBlock = serde_json::from_value(raw.clone()).unwrap();
-        assert_eq!(b, ContentBlock::Unknown(raw.clone()));
+        assert_eq!(
+            b,
+            ContentBlock::Unknown(JsonValue::new(raw.clone()).unwrap())
+        );
         assert_eq!(serde_json::to_value(&b).unwrap(), raw); // round-trips
     }
 
@@ -445,6 +452,6 @@ mod fallback_strictness {
     fn block_with_no_type_tag_degrades_to_unknown() {
         let raw = json!({"foo": "bar"});
         let b: ContentBlock = serde_json::from_value(raw.clone()).unwrap();
-        assert_eq!(b, ContentBlock::Unknown(raw));
+        assert_eq!(b, ContentBlock::Unknown(JsonValue::new(raw).unwrap()));
     }
 }

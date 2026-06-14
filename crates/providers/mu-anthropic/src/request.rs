@@ -14,8 +14,8 @@
 //! `system` is POLYMORPHIC exactly like message content — a bare string
 //! (:45088) or a block array (:6921). We reuse [`Content`] for it.
 
+use crate::json::JsonValue;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::content::CacheControl;
 use crate::message::{Content, Message};
@@ -24,11 +24,11 @@ use crate::message::{Content, Message};
 /// where `input_schema` is a JSON Schema object (spec :8990). `cache_control`
 /// may be attached to the LAST tool to cache the tool block (legacy mu marks
 /// the last spec); modeled as optional per-tool for fidelity.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tool {
     pub name: String,
     pub description: String,
-    pub input_schema: Value,
+    pub input_schema: JsonValue,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
 }
@@ -37,7 +37,7 @@ impl Tool {
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
-        input_schema: Value,
+        input_schema: JsonValue,
     ) -> Self {
         Self {
             name: name.into(),
@@ -53,6 +53,8 @@ impl Tool {
 /// Construct via [`MessagesRequest::new`] (the three required fields) then the
 /// builder-style setters for optional envelope fields. The result is immutable
 /// once built and serializes to the exact wire shape.
+// NOT Eq: temperature/top_p are typed f64 (genuine floats, not blob).
+// !Eq stops HERE — nothing requires MessagesRequest: Eq.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessagesRequest {
     pub model: String,
@@ -209,11 +211,12 @@ mod tests {
             Tool::new(
                 "get_weather",
                 "Get current weather for a location",
-                json!({
+                JsonValue::new(json!({
                     "type": "object",
                     "properties": {"location": {"type": "string"}},
                     "required": ["location"]
-                }),
+                }))
+                .unwrap(),
             ),
         ]);
         let v = serde_json::to_value(&r).unwrap();

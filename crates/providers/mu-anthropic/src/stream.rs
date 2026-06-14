@@ -14,18 +14,18 @@
 //! message_start baseline. [`StreamEvent::MessageDelta`] puts `usage` at the
 //! variant top level; a test pins it.
 
+use crate::json::JsonValue;
 use serde::Deserialize;
-use serde_json::Value;
 
 use crate::response::{StopReason, Usage};
 
 /// One SSE event from the Messages streaming API. Internally tagged on `type`.
 /// Unknown event types degrade to [`StreamEvent::Unknown`] (forward-compat).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
     MessageStart {
-        message: Value,
+        message: JsonValue,
     },
     ContentBlockStart {
         index: u32,
@@ -50,12 +50,12 @@ pub enum StreamEvent {
         error: StreamError,
     },
     #[serde(untagged)]
-    Unknown(Value),
+    Unknown(JsonValue),
 }
 
 /// The `content_block` of a `content_block_start`. Only the fields we need to
 /// open an accumulator; unknown block types degrade to [`BlockStart::Other`].
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BlockStart {
     Text {
@@ -76,7 +76,7 @@ pub enum BlockStart {
 /// The `delta` of a `content_block_delta`. `input_json_delta` carries the
 /// streamed-in-pieces tool arguments (`partial_json`); accumulate and parse at
 /// block stop.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BlockDelta {
     TextDelta {

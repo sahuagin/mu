@@ -36,7 +36,7 @@ pub enum Role {
 /// A message's `content`: either a bare string or an array of typed blocks.
 /// Untagged so it serializes to exactly the wire form (no wrapper) and
 /// deserializes by trying string first, then the block array.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Content {
     Text(String),
@@ -69,7 +69,7 @@ impl From<Vec<ContentBlock>> for Content {
 /// non-streaming assistant response body. Response-only envelope fields
 /// (`id`, `model`, `stop_reason`, `usage`, …) live on the response `Message`
 /// type in a later slice; this is the request/role+content core.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: Content,
@@ -95,6 +95,7 @@ impl Message {
 mod tests {
     use super::*;
     use crate::content::ContentBlock;
+    use crate::json::JsonValue;
     use serde_json::json;
 
     fn round_trip(m: &Message) {
@@ -149,7 +150,7 @@ mod tests {
             ContentBlock::ToolUse {
                 id: "toolu_123".into(),
                 name: "calculator".into(),
-                input: json!({"a": 1, "b": 2}),
+                input: JsonValue::new(json!({"a": 1, "b": 2})).unwrap(),
                 cache_control: None,
             },
         ]);

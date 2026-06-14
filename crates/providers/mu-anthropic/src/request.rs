@@ -164,6 +164,49 @@ pub struct OutputConfig {
     pub extra: BTreeMap<String, JsonValue>,
 }
 
+/// An MCP server the request exposes to the model (spec: MCP connector,
+/// `mcp-client-2025-11-20`). Wire: `{"type":"url","url":...,"name":...,
+/// "authorization_token"?:...,"tool_configuration"?:{...}}`. `type` is `url`
+/// today; kept as a String for forward-compat. Unmodeled keys round-trip via
+/// `extra`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServer {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub url: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_configuration: Option<McpToolConfiguration>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, JsonValue>,
+}
+
+impl McpServer {
+    /// A `url`-type MCP server with no auth token / tool config.
+    pub fn url(name: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            kind: "url".into(),
+            url: url.into(),
+            name: name.into(),
+            authorization_token: None,
+            tool_configuration: None,
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
+/// Which of an MCP server's tools are exposed (spec). `enabled: false` disables
+/// the server's tools; `allowed_tools` whitelists by name. Both optional.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct McpToolConfiguration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+}
+
 /// The request body for `POST /v1/messages`.
 ///
 /// Construct via [`MessagesRequest::new`] (the three required fields) then the
@@ -230,6 +273,9 @@ pub struct MessagesRequest {
     /// Code-execution container id to reuse (spec). Opaque string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
+    /// MCP servers exposed to the model (spec: MCP connector). Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<McpServer>,
 }
 
 impl MessagesRequest {
@@ -254,6 +300,7 @@ impl MessagesRequest {
             output_config: None,
             service_tier: None,
             container: None,
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -304,6 +351,11 @@ impl MessagesRequest {
 
     pub fn with_container(mut self, container: impl Into<String>) -> Self {
         self.container = Some(container.into());
+        self
+    }
+
+    pub fn with_mcp_servers(mut self, mcp_servers: Vec<McpServer>) -> Self {
+        self.mcp_servers = mcp_servers;
         self
     }
 
@@ -369,6 +421,7 @@ mod tests {
             "output_config",
             "service_tier",
             "container",
+            "mcp_servers",
         ] {
             assert!(
                 v.get(absent).is_none(),
@@ -567,6 +620,48 @@ mod tests {
         );
         assert_eq!(v["output_config"], json!({"effort": "high"}));
         round_trip(&req);
+    }
+
+    #[test]
+    fn mcp_servers_match_spec_shape_and_round_trip() {
+        // spec MCP connector: {"type":"url","url":..,"name":..,
+        // "authorization_token"?:..,"tool_configuration"?:{enabled,allowed_tools}}.
+        let bare = MessagesRequest::new("m", 10, vec![Message::user("hi")]).with_mcp_servers(vec![
+            McpServer::url("example-mcp", "https://example.modelcontextprotocol.io/sse"),
+        ]);
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap()["mcp_servers"],
+            json!([{
+                "type": "url",
+                "url": "https://example.modelcontextprotocol.io/sse",
+                "name": "example-mcp"
+            }])
+        );
+        round_trip(&bare);
+
+        // full server with auth + tool_configuration
+        let full = MessagesRequest::new("m", 10, vec![Message::user("hi")]).with_mcp_servers(vec![
+            McpServer {
+                kind: "url".into(),
+                url: "https://mcp.example.com/sse".into(),
+                name: "mcp-1".into(),
+                authorization_token: Some("TOK".into()),
+                tool_configuration: Some(McpToolConfiguration {
+                    enabled: Some(true),
+                    allowed_tools: vec!["tool1".into(), "tool2".into()],
+                }),
+                extra: BTreeMap::new(),
+            },
+        ]);
+        assert_eq!(
+            serde_json::to_value(&full).unwrap()["mcp_servers"][0],
+            json!({
+                "type": "url", "url": "https://mcp.example.com/sse", "name": "mcp-1",
+                "authorization_token": "TOK",
+                "tool_configuration": {"enabled": true, "allowed_tools": ["tool1", "tool2"]}
+            })
+        );
+        round_trip(&full);
     }
 
     #[test]

@@ -51,6 +51,147 @@ impl Tool {
     }
 }
 
+/// One entry of the request `tools` array. The array is heterogeneous on the
+/// wire: custom tools (a JSON-Schema `input_schema`, optionally tagged
+/// `"type":"custom"`) sit alongside built-in/server tools tagged with a
+/// *versioned* `type` (`web_search_20250305`, `text_editor_20250728`,
+/// `mcp_toolset`, …). Modeled like [`crate::ContentBlock`]: a hand-written
+/// `Deserialize` peeks at `type` and routes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolDef {
+    /// A user-defined tool (`{name, description, input_schema, cache_control?}`).
+    /// Reached for a type-less entry OR `"type":"custom"`; parsed STRICTLY — a
+    /// malformed custom tool errors rather than silently passing through.
+    Custom(Tool),
+    /// Any built-in/server tool, carried generically (see [`ServerTool`]).
+    /// `mcp_toolset` lands here too (family=`mcp_toolset`, version=None,
+    /// `mcp_server_name` in `config`).
+    Server(ServerTool),
+    /// A `tools` entry that isn't a JSON object — preserved verbatim.
+    Unknown(JsonValue),
+}
+
+/// A built-in/server tool, modeled generically. The versioned wire `type` is
+/// normalized: `web_search_20250305` → family `web_search` + version
+/// `20250305`; [`ServerTool::wire_type`] rejoins them. `name` is pulled out;
+/// every other field (`max_uses`, `allowed_domains`, `mcp_server_name`,
+/// `display_width_px`, …) rides in `config` verbatim, so new/unknown config
+/// keys round-trip without a code change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerTool {
+    pub family: String,
+    pub version: Option<String>,
+    pub name: Option<String>,
+    pub config: BTreeMap<String, JsonValue>,
+}
+
+impl ServerTool {
+    /// The wire `type`: `family` or `family_version`.
+    pub fn wire_type(&self) -> String {
+        match &self.version {
+            Some(v) => format!("{}_{}", self.family, v),
+            None => self.family.clone(),
+        }
+    }
+
+    /// Split a wire `type` into `(family, version)`. The version is the trailing
+    /// `_NNNN…` segment when it is non-empty and ALL ASCII digits (the
+    /// `_YYYYMMDD` convention); otherwise the whole string is the family and
+    /// there is no version (e.g. `mcp_toolset` → (`mcp_toolset`, None)).
+    fn split_type(t: &str) -> (String, Option<String>) {
+        if let Some((head, tail)) = t.rsplit_once('_') {
+            if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
+                return (head.to_string(), Some(tail.to_string()));
+            }
+        }
+        (t.to_string(), None)
+    }
+}
+
+impl From<Tool> for ToolDef {
+    fn from(t: Tool) -> Self {
+        ToolDef::Custom(t)
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolDef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let obj = match raw.as_object() {
+            Some(o) => o,
+            // A non-object tools entry: preserve verbatim rather than error.
+            None => {
+                return Ok(ToolDef::Unknown(
+                    JsonValue::new(raw).map_err(D::Error::custom)?,
+                ))
+            }
+        };
+        match obj.get("type").and_then(serde_json::Value::as_str) {
+            // type-less or explicit "custom": a user tool, parsed strictly.
+            None | Some("custom") => {
+                let mut m = obj.clone();
+                m.remove("type");
+                let tool: Tool = serde_json::from_value(serde_json::Value::Object(m))
+                    .map_err(D::Error::custom)?;
+                Ok(ToolDef::Custom(tool))
+            }
+            // any other type: a built-in/server tool, carried generically.
+            Some(t) => {
+                let (family, version) = ServerTool::split_type(t);
+                let name = obj
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from);
+                let mut config = BTreeMap::new();
+                for (k, v) in obj {
+                    if k == "type" || k == "name" {
+                        continue;
+                    }
+                    config.insert(
+                        k.clone(),
+                        JsonValue::new(v.clone()).map_err(D::Error::custom)?,
+                    );
+                }
+                Ok(ToolDef::Server(ServerTool {
+                    family,
+                    version,
+                    name,
+                    config,
+                }))
+            }
+        }
+    }
+}
+
+impl Serialize for ToolDef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            // Custom serializes type-less (the canonical form); an incoming
+            // "type":"custom" normalizes away.
+            ToolDef::Custom(tool) => tool.serialize(serializer),
+            ToolDef::Unknown(v) => v.serialize(serializer),
+            ToolDef::Server(s) => {
+                let mut map = serde_json::Map::new();
+                map.insert("type".into(), serde_json::Value::String(s.wire_type()));
+                if let Some(name) = &s.name {
+                    map.insert("name".into(), serde_json::Value::String(name.clone()));
+                }
+                for (k, v) in &s.config {
+                    map.insert(k.clone(), v.as_value().clone());
+                }
+                serde_json::Value::Object(map).serialize(serializer)
+            }
+        }
+    }
+}
+
 /// How the model selects (or is forced to select) a tool. Wire shape: an
 /// object internally tagged on `type` (spec values: `auto`, `any`, `tool`,
 /// `none`). `disable_parallel_tool_use` is optional and applies to
@@ -225,7 +366,7 @@ pub struct MessagesRequest {
     pub system: Option<Content>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<Tool>,
+    pub tools: Vec<ToolDef>,
 
     /// Tool-selection policy. Omitted when absent (the API then defaults to
     /// `auto` if tools are present). See [`ToolChoice`].
@@ -309,7 +450,7 @@ impl MessagesRequest {
         self
     }
 
-    pub fn with_tools(mut self, tools: Vec<Tool>) -> Self {
+    pub fn with_tools(mut self, tools: Vec<ToolDef>) -> Self {
         self.tools = tools;
         self
     }
@@ -474,7 +615,8 @@ mod tests {
                     "required": ["location"]
                 }))
                 .unwrap(),
-            ),
+            )
+            .into(),
         ]);
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(
@@ -490,6 +632,78 @@ mod tests {
             }])
         );
         round_trip(&r);
+    }
+
+    #[test]
+    fn server_tool_splits_version_and_round_trips() {
+        // web_search_20250305 -> family "web_search" + version "20250305";
+        // config (max_uses) preserved.
+        let raw = json!({"type": "web_search_20250305", "name": "web_search", "max_uses": 5});
+        let td: ToolDef = serde_json::from_value(raw.clone()).unwrap();
+        match &td {
+            ToolDef::Server(s) => {
+                assert_eq!(s.family, "web_search");
+                assert_eq!(s.version.as_deref(), Some("20250305"));
+                assert_eq!(s.name.as_deref(), Some("web_search"));
+                assert_eq!(s.config["max_uses"].as_value(), &json!(5));
+                assert_eq!(s.wire_type(), "web_search_20250305");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_value(&td).unwrap(),
+            raw,
+            "round-trips verbatim"
+        );
+    }
+
+    #[test]
+    fn mcp_toolset_is_a_server_tool_with_no_version() {
+        // mcp_toolset has no _NNNN date, so version=None and mcp_server_name
+        // rides in config — no special variant needed.
+        let raw = json!({"type": "mcp_toolset", "mcp_server_name": "example-mcp"});
+        let td: ToolDef = serde_json::from_value(raw.clone()).unwrap();
+        match &td {
+            ToolDef::Server(s) => {
+                assert_eq!(s.family, "mcp_toolset");
+                assert_eq!(s.version, None);
+                assert_eq!(
+                    s.config["mcp_server_name"].as_value(),
+                    &json!("example-mcp")
+                );
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+        assert_eq!(serde_json::to_value(&td).unwrap(), raw);
+    }
+
+    #[test]
+    fn custom_tool_typeless_and_explicit_both_parse_to_custom() {
+        let schema = json!({"type": "object", "properties": {}});
+        // type-less
+        let tl: ToolDef = serde_json::from_value(
+            json!({"name": "t", "description": "d", "input_schema": schema}),
+        )
+        .unwrap();
+        assert!(matches!(tl, ToolDef::Custom(_)));
+        // explicit "type":"custom" normalizes to the same Custom (type-less out)
+        let ex: ToolDef = serde_json::from_value(
+            json!({"type": "custom", "name": "t", "description": "d", "input_schema": schema}),
+        )
+        .unwrap();
+        assert_eq!(tl, ex, "explicit custom normalizes to type-less custom");
+        assert_eq!(
+            serde_json::to_value(&ex).unwrap(),
+            json!({"name": "t", "description": "d", "input_schema": {"type": "object", "properties": {}}})
+        );
+    }
+
+    #[test]
+    fn malformed_custom_tool_errors_not_silently_passed() {
+        // type-less but missing input_schema => a broken custom tool => error
+        // (NOT a silent Unknown/Server passthrough).
+        let r: Result<ToolDef, _> = serde_json::from_value(json!({"name": "t"}));
+        assert!(r.is_err(), "malformed custom tool must error, got {r:?}");
     }
 
     #[test]

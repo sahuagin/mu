@@ -67,9 +67,9 @@ pub enum CacheKind {
 /// One content block. Internally tagged on `"type"`.
 ///
 /// `Unknown` is the forward-compat fallback: any block whose `type` we do not
-/// model (e.g. `image`, `document`, `redacted_thinking`, a future addition)
-/// deserializes here instead of failing the whole message. It preserves the
-/// raw JSON so a consumer can still inspect or round-trip it.
+/// model (e.g. `image`, `document`, the server-tool result family, a future
+/// addition) deserializes here instead of failing the whole message. It
+/// preserves the raw JSON so a consumer can still inspect or round-trip it.
 ///
 /// IMPORTANT: `Unknown` is reached ONLY when the `type` tag itself is one we
 /// do not model. A KNOWN `type` with missing/invalid fields is a hard error —
@@ -98,11 +98,40 @@ pub enum ContentBlock {
         thinking: String,
         signature: Option<String>,
     },
+    /// Encrypted reasoning the API does not return in cleartext. Wire:
+    /// `{"type":"redacted_thinking","data":"..."}`.
+    RedactedThinking { data: String },
+    /// A server-executed tool invocation (e.g. `web_search`). Shape mirrors
+    /// `tool_use`: `{"type":"server_tool_use","id":"srvtoolu_...","name":...,
+    /// "input":{...}}`. (The matching server *result* family —
+    /// `web_search_tool_result` et al. — is not yet modeled; those still land in
+    /// `Unknown`.)
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: JsonValue,
+        cache_control: Option<CacheControl>,
+    },
+    /// Marks a point in `content` where one model handed off to another
+    /// (server-side fallback): `{"type":"fallback","from":{"model":...},
+    /// "to":{"model":...}}`.
+    Fallback {
+        from: FallbackModel,
+        to: FallbackModel,
+    },
     /// Forward-compat fallback: the `type` tag is one we do not model
-    /// (e.g. `image`, `document`, a future addition). Captures the whole
-    /// object verbatim so a consumer can inspect or round-trip it. Reached
-    /// ONLY for unknown tags, never for a known tag with broken fields.
+    /// (e.g. `image`, `document`, a server-tool result block, a future
+    /// addition). Captures the whole object verbatim so a consumer can inspect
+    /// or round-trip it. Reached ONLY for unknown tags, never for a known tag
+    /// with broken fields.
     Unknown(JsonValue),
+}
+
+/// One endpoint of a [`ContentBlock::Fallback`] marker — the model on either
+/// side of the handoff. Wire: `{"model":"..."}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FallbackModel {
+    pub model: String,
 }
 
 /// The set of `type` tags we model, used to decide known-vs-unknown dispatch.
@@ -138,9 +167,31 @@ enum KnownContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
+    RedactedThinking {
+        data: String,
+    },
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: JsonValue,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+    Fallback {
+        from: FallbackModel,
+        to: FallbackModel,
+    },
 }
 
-const KNOWN_TAGS: &[&str] = &["text", "tool_use", "tool_result", "thinking"];
+const KNOWN_TAGS: &[&str] = &[
+    "text",
+    "tool_use",
+    "tool_result",
+    "thinking",
+    "redacted_thinking",
+    "server_tool_use",
+    "fallback",
+];
 
 impl From<KnownContentBlock> for ContentBlock {
     fn from(k: KnownContentBlock) -> Self {
@@ -181,6 +232,19 @@ impl From<KnownContentBlock> for ContentBlock {
                 thinking,
                 signature,
             },
+            KnownContentBlock::RedactedThinking { data } => ContentBlock::RedactedThinking { data },
+            KnownContentBlock::ServerToolUse {
+                id,
+                name,
+                input,
+                cache_control,
+            } => ContentBlock::ServerToolUse {
+                id,
+                name,
+                input,
+                cache_control,
+            },
+            KnownContentBlock::Fallback { from, to } => ContentBlock::Fallback { from, to },
         }
     }
 }
@@ -254,6 +318,21 @@ impl Serialize for ContentBlock {
                         thinking,
                         signature,
                     },
+                    ContentBlock::RedactedThinking { data } => {
+                        KnownContentBlock::RedactedThinking { data }
+                    }
+                    ContentBlock::ServerToolUse {
+                        id,
+                        name,
+                        input,
+                        cache_control,
+                    } => KnownContentBlock::ServerToolUse {
+                        id,
+                        name,
+                        input,
+                        cache_control,
+                    },
+                    ContentBlock::Fallback { from, to } => KnownContentBlock::Fallback { from, to },
                     ContentBlock::Unknown(_) => unreachable!("handled above"),
                 };
                 known.serialize(serializer)
@@ -304,6 +383,90 @@ mod tests {
             thinking: "let me reason".into(),
             signature: Some("sig".into()),
         });
+    }
+
+    #[test]
+    fn redacted_thinking_server_tool_use_and_fallback_round_trip() {
+        round_trip(&ContentBlock::RedactedThinking {
+            data: "EncRypTed==".into(),
+        });
+        round_trip(&ContentBlock::ServerToolUse {
+            id: "srvtoolu_1".into(),
+            name: "web_search".into(),
+            input: JsonValue::new(json!({"query": "claude shannon"})).unwrap(),
+            cache_control: None,
+        });
+        round_trip(&ContentBlock::Fallback {
+            from: FallbackModel {
+                model: "claude-fable-5".into(),
+            },
+            to: FallbackModel {
+                model: "claude-opus-4-8".into(),
+            },
+        });
+    }
+
+    #[test]
+    fn new_block_types_match_spec_shape_and_are_not_unknown() {
+        // redacted_thinking: {"type":"redacted_thinking","data":"..."}
+        let rt = ContentBlock::RedactedThinking { data: "abc".into() };
+        assert_eq!(
+            serde_json::to_value(&rt).unwrap(),
+            json!({"type": "redacted_thinking", "data": "abc"})
+        );
+        // server_tool_use mirrors tool_use
+        let stu = ContentBlock::ServerToolUse {
+            id: "srvtoolu_abc123".into(),
+            name: "web_search".into(),
+            input: JsonValue::new(json!({"query": "x"})).unwrap(),
+            cache_control: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&stu).unwrap(),
+            json!({"type": "server_tool_use", "id": "srvtoolu_abc123",
+                   "name": "web_search", "input": {"query": "x"}})
+        );
+        // fallback: {"type":"fallback","from":{"model":..},"to":{"model":..}}
+        let fb = ContentBlock::Fallback {
+            from: FallbackModel {
+                model: "claude-fable-5".into(),
+            },
+            to: FallbackModel {
+                model: "claude-opus-4-8".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&fb).unwrap(),
+            json!({"type": "fallback", "from": {"model": "claude-fable-5"},
+                   "to": {"model": "claude-opus-4-8"}})
+        );
+
+        // And each now deserializes to its MODELLED variant, not Unknown.
+        for raw in [
+            json!({"type": "redacted_thinking", "data": "abc"}),
+            json!({"type": "server_tool_use", "id": "s", "name": "n", "input": {}}),
+            json!({"type": "fallback", "from": {"model": "a"}, "to": {"model": "b"}}),
+        ] {
+            let b: ContentBlock = serde_json::from_value(raw.clone()).unwrap();
+            assert!(
+                !matches!(b, ContentBlock::Unknown(_)),
+                "{raw} should be modelled, not Unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn server_tool_result_family_still_degrades_to_unknown() {
+        // The server-tool RESULT family (web_search_tool_result, etc.) is not
+        // yet modelled and must survive via Unknown (forward-compat).
+        let raw = json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_1",
+            "content": [{"type": "web_search_result", "url": "https://x", "title": "X"}]
+        });
+        let b: ContentBlock = serde_json::from_value(raw.clone()).unwrap();
+        assert!(matches!(b, ContentBlock::Unknown(_)));
+        assert_eq!(serde_json::to_value(&b).unwrap(), raw);
     }
 
     // ----- Tier 2: spec-conformance (our bytes == documented example) -----

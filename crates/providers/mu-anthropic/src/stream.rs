@@ -40,9 +40,11 @@ pub enum StreamEvent {
     },
     MessageDelta {
         delta: MessageDeltaBody,
-        /// mu-yz48: usage is HERE (event top level), not in `delta`.
+        /// mu-yz48: usage is HERE (event top level), not in `delta`. Boxed so
+        /// the now-sizable `Usage` doesn't bloat every `StreamEvent` variant
+        /// (clippy::large_enum_variant).
         #[serde(default)]
-        usage: Option<Usage>,
+        usage: Option<Box<Usage>>,
     },
     MessageStop,
     Ping,

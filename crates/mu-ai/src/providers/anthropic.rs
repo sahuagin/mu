@@ -13,10 +13,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{BoxStream, Stream, StreamExt};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
+use mu_anthropic::{
+    BlockDelta, BlockStart, StopReason as AnthropicStopReason, StreamEvent, Usage as AnthropicUsage,
+};
 use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
     ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
@@ -641,134 +643,71 @@ fn detect_cache_targets(pmsgs: &ProviderMessages) -> (bool, bool) {
     (system_should_cache, tools_should_cache)
 }
 
-// ============================================================================
-// Anthropic SSE event types — minimal subset we care about
-// ============================================================================
+// SSE/stream wire types now come from the mu-anthropic crate (StreamEvent,
+// BlockStart, BlockDelta, Usage, StopReason) — see the imports above.
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-#[allow(dead_code)] // Some fields are present for future use; keep deserializer faithful to API.
-enum AnthropicEvent {
-    #[serde(rename = "message_start")]
-    MessageStart { message: AnthropicMessageMeta },
-    #[serde(rename = "content_block_start")]
-    ContentBlockStart {
-        index: u32,
-        content_block: AnthropicBlock,
-    },
-    #[serde(rename = "content_block_delta")]
-    ContentBlockDelta { index: u32, delta: AnthropicDelta },
-    #[serde(rename = "content_block_stop")]
-    ContentBlockStop { index: u32 },
-    #[serde(rename = "message_delta")]
-    MessageDelta {
-        delta: AnthropicMessageDelta,
-        /// mu-yz48: Anthropic puts the cumulative stream `usage` at the
-        /// TOP level of the message_delta event, sibling to `delta` —
-        /// not nested inside it. Reading `delta.usage` always returns
-        /// None and leaves `output_tokens` stuck at the message_start
-        /// baseline (1-5). Capture it here.
-        #[serde(default)]
-        usage: Option<AnthropicUsage>,
-    },
-    #[serde(rename = "message_stop")]
-    MessageStop,
-    #[serde(rename = "ping")]
-    Ping,
-    #[serde(rename = "error")]
-    Error { error: AnthropicErrorBody },
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct AnthropicMessageMeta {
-    id: Option<String>,
-    role: Option<String>,
-    #[serde(default)]
-    usage: Option<AnthropicUsage>,
-}
-
-/// Per-tier breakdown from Anthropic's `usage.cache_creation` object.
-/// Present only when the response was written into a named TTL tier
-/// (ephemeral-5m or ephemeral-1h). mu-cache-write-tier-split-umq6.
-#[derive(Debug, Deserialize, Default, Clone)]
-struct AnthropicCacheCreation {
-    #[serde(default)]
-    ephemeral_5m_input_tokens: Option<u64>,
-    #[serde(default)]
-    ephemeral_1h_input_tokens: Option<u64>,
-}
-
-#[derive(Debug, Deserialize, Default, Clone)]
-#[allow(dead_code)]
-struct AnthropicUsage {
-    #[serde(default)]
-    input_tokens: Option<u64>,
-    #[serde(default)]
-    output_tokens: Option<u64>,
-    /// Flat total cache-write tokens (legacy field; always present when
-    /// any cache write occurred). The `cache_creation` breakdown object
-    /// carries the per-tier split when available.
-    #[serde(default)]
-    cache_creation_input_tokens: Option<u64>,
-    #[serde(default)]
-    cache_read_input_tokens: Option<u64>,
-    /// Per-TTL-tier write breakdown. Present when the request used a
-    /// named TTL (ephemeral-5m / ephemeral-1h). mu-cache-write-tier-split-umq6.
-    #[serde(default)]
-    cache_creation: Option<AnthropicCacheCreation>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-#[allow(dead_code)] // `text` is read from content_block_start to seed the
-                    // text block; other fields are present for future use.
-enum AnthropicBlock {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "tool_use")]
-    ToolUse { id: String, name: String },
-    #[serde(other)]
-    Other,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-enum AnthropicDelta {
-    #[serde(rename = "text_delta")]
-    TextDelta { text: String },
-    #[serde(rename = "input_json_delta")]
-    InputJsonDelta { partial_json: String },
-    #[serde(other)]
-    Other,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicMessageDelta {
-    stop_reason: Option<String>,
-    #[serde(default)]
-    usage: Option<AnthropicUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicErrorBody {
-    #[serde(rename = "type")]
-    err_type: Option<String>,
-    message: Option<String>,
-}
-
-fn map_stop_reason(s: Option<&str>) -> StopReason {
+/// Map mu_anthropic's wire `StopReason` onto mu-core's `StopReason`.
+fn map_stop_reason(s: Option<&AnthropicStopReason>) -> StopReason {
     match s {
-        Some("end_turn") => StopReason::EndTurn,
-        Some("tool_use") => StopReason::ToolUse,
-        Some("max_tokens") => StopReason::MaxTokens,
-        Some("stop_sequence") => StopReason::EndTurn,
+        Some(AnthropicStopReason::EndTurn) => StopReason::EndTurn,
+        Some(AnthropicStopReason::ToolUse) => StopReason::ToolUse,
+        Some(AnthropicStopReason::MaxTokens) => StopReason::MaxTokens,
+        Some(AnthropicStopReason::StopSequence) => StopReason::EndTurn,
         Some(other) => {
-            tracing::warn!(stop_reason = %other, "unrecognized anthropic stop_reason");
+            tracing::warn!(stop_reason = ?other, "unrecognized anthropic stop_reason");
             StopReason::EndTurn
         }
         None => StopReason::EndTurn,
     }
+}
+
+/// Fold a freshly-seen `usage` (from message_start or message_delta) into the
+/// running accumulator: any field the incoming event populates wins. Anthropic
+/// splits input/cache stats (message_start) from output_tokens (message_delta).
+fn merge_usage(acc: &mut AnthropicUsage, other: &AnthropicUsage) {
+    if other.input_tokens.is_some() {
+        acc.input_tokens = other.input_tokens;
+    }
+    if other.output_tokens.is_some() {
+        acc.output_tokens = other.output_tokens;
+    }
+    if other.cache_creation_input_tokens.is_some() {
+        acc.cache_creation_input_tokens = other.cache_creation_input_tokens;
+    }
+    if other.cache_read_input_tokens.is_some() {
+        acc.cache_read_input_tokens = other.cache_read_input_tokens;
+    }
+    if other.cache_creation.is_some() {
+        acc.cache_creation = other.cache_creation.clone();
+    }
+    if other.output_tokens_details.is_some() {
+        acc.output_tokens_details = other.output_tokens_details.clone();
+    }
+}
+
+/// Project mu_anthropic's rich `Usage` onto mu-core's `Usage`. Returns `None`
+/// when neither token count was reported (the loop treats that as "no usage").
+fn anthropic_usage_to_mu(u: &AnthropicUsage) -> Option<Usage> {
+    if u.input_tokens.is_none() && u.output_tokens.is_none() {
+        return None;
+    }
+    let (cache_5m, cache_1h) = u
+        .cache_creation
+        .as_ref()
+        .map(|cc| (cc.ephemeral_5m_input_tokens, cc.ephemeral_1h_input_tokens))
+        .unwrap_or((None, None));
+    Some(Usage {
+        input_tokens: u.input_tokens.unwrap_or(0),
+        output_tokens: u.output_tokens.unwrap_or(0),
+        cache_read_input_tokens: u.cache_read_input_tokens,
+        cache_creation_input_tokens: u.cache_creation_input_tokens,
+        cache_creation_5m_input_tokens: cache_5m,
+        cache_creation_1h_input_tokens: cache_1h,
+        reasoning_tokens: u
+            .output_tokens_details
+            .as_ref()
+            .and_then(|d| d.thinking_tokens),
+    })
 }
 
 // ============================================================================
@@ -822,57 +761,14 @@ struct StreamState {
     /// vec reflects Anthropic's intended order regardless of
     /// HashMap iteration order.
     block_order: Vec<u32>,
-    stop_reason: Option<String>,
-    /// Combined usage from message_start (input tokens, cache stats)
-    /// and message_delta (output tokens). Anthropic splits across two
-    /// events; we merge as we see them.
+    /// Terminal stop reason from `message_delta` (mu_anthropic wire type).
+    stop_reason: Option<AnthropicStopReason>,
+    /// Combined usage from message_start (input tokens, cache stats) and
+    /// message_delta (output tokens); `merge_usage` folds them as we see them.
     usage: AnthropicUsage,
     cancel_rx: Option<oneshot::Receiver<()>>,
     finished: bool,
     emitted_done: bool,
-}
-
-impl AnthropicUsage {
-    fn merge(&mut self, other: &AnthropicUsage) {
-        if other.input_tokens.is_some() {
-            self.input_tokens = other.input_tokens;
-        }
-        if other.output_tokens.is_some() {
-            self.output_tokens = other.output_tokens;
-        }
-        if other.cache_creation_input_tokens.is_some() {
-            self.cache_creation_input_tokens = other.cache_creation_input_tokens;
-        }
-        if other.cache_read_input_tokens.is_some() {
-            self.cache_read_input_tokens = other.cache_read_input_tokens;
-        }
-        // Merge per-tier breakdown: prefer whichever event carries it.
-        // In practice message_start carries input/cache stats; if either
-        // event surfaces the breakdown we take it. mu-cache-write-tier-split-umq6.
-        if other.cache_creation.is_some() {
-            self.cache_creation = other.cache_creation.clone();
-        }
-    }
-
-    fn to_usage(&self) -> Option<Usage> {
-        if self.input_tokens.is_none() && self.output_tokens.is_none() {
-            return None;
-        }
-        let (cache_5m, cache_1h) = self
-            .cache_creation
-            .as_ref()
-            .map(|cc| (cc.ephemeral_5m_input_tokens, cc.ephemeral_1h_input_tokens))
-            .unwrap_or((None, None));
-        Some(Usage {
-            input_tokens: self.input_tokens.unwrap_or(0),
-            output_tokens: self.output_tokens.unwrap_or(0),
-            cache_read_input_tokens: self.cache_read_input_tokens,
-            cache_creation_input_tokens: self.cache_creation_input_tokens,
-            cache_creation_5m_input_tokens: cache_5m,
-            cache_creation_1h_input_tokens: cache_1h,
-            reasoning_tokens: None,
-        })
-    }
 }
 
 async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamState)> {
@@ -887,7 +783,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 Ok(_) => {
                     state.finished = true;
                     state.cancel_rx = None;
-                    let usage = state.usage.to_usage();
+                    let usage = anthropic_usage_to_mu(&state.usage);
                     return Some((
                         ProviderEvent::Done(AssistantMessage {
                             content: assemble_content(&state.blocks, &state.block_order),
@@ -913,7 +809,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 state.finished = true;
                 if !state.emitted_done {
                     state.emitted_done = true;
-                    let usage = state.usage.to_usage();
+                    let usage = anthropic_usage_to_mu(&state.usage);
                     return Some((
                         ProviderEvent::Done(AssistantMessage {
                             content: assemble_content(&state.blocks, &state.block_order),
@@ -927,8 +823,8 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
             }
         };
 
-        // Parse the JSON payload as an Anthropic event.
-        let parsed: Result<AnthropicEvent, _> = serde_json::from_str(&sse_event.data);
+        // Parse the SSE payload as a mu_anthropic stream event.
+        let parsed: Result<StreamEvent, _> = serde_json::from_str(&sse_event.data);
         let parsed = match parsed {
             Ok(p) => p,
             Err(e) => {
@@ -938,28 +834,29 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
         };
 
         match parsed {
-            AnthropicEvent::ContentBlockStart {
+            StreamEvent::ContentBlockStart {
                 index,
                 content_block,
             } => {
                 // Register a new block. Re-registering an index is a
-                // protocol violation; we replace silently.
+                // protocol violation; we replace silently. Thinking and
+                // other block kinds are not surfaced on the minimal path.
                 let builder = match content_block {
-                    AnthropicBlock::Text { text } => BlockBuilder::Text(text),
-                    AnthropicBlock::ToolUse { id, name } => BlockBuilder::ToolUse {
+                    BlockStart::Text { text } => BlockBuilder::Text(text),
+                    BlockStart::ToolUse { id, name } => BlockBuilder::ToolUse {
                         id,
                         name,
                         input_json: String::new(),
                     },
-                    AnthropicBlock::Other => continue,
+                    BlockStart::Thinking { .. } | BlockStart::Other => continue,
                 };
                 if !state.blocks.contains_key(&index) {
                     state.block_order.push(index);
                 }
                 state.blocks.insert(index, builder);
             }
-            AnthropicEvent::ContentBlockDelta { index, delta } => match delta {
-                AnthropicDelta::TextDelta { text } => {
+            StreamEvent::ContentBlockDelta { index, delta } => match delta {
+                BlockDelta::TextDelta { text } => {
                     if let Some(BlockBuilder::Text(buf)) = state.blocks.get_mut(&index) {
                         buf.push_str(&text);
                     } else {
@@ -972,7 +869,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                     }
                     return Some((ProviderEvent::TextDelta(text), state));
                 }
-                AnthropicDelta::InputJsonDelta { partial_json } => {
+                BlockDelta::InputJsonDelta { partial_json } => {
                     if let Some(BlockBuilder::ToolUse { input_json, .. }) =
                         state.blocks.get_mut(&index)
                     {
@@ -985,33 +882,33 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                             "input_json_delta arrived for unknown or non-tool block"
                         );
                     }
-                    // v1: don't emit ProviderEvent::ToolCallDelta; the
-                    // loop ignores it. Final tool calls are surfaced
-                    // in the Done payload.
+                    // Minimal path: don't emit ProviderEvent::ToolCallDelta;
+                    // final tool calls are surfaced in the Done payload.
                 }
-                AnthropicDelta::Other => {
-                    // Unknown delta type (e.g., future thinking_delta);
-                    // ignore.
+                BlockDelta::ThinkingDelta { .. }
+                | BlockDelta::SignatureDelta { .. }
+                | BlockDelta::Other => {
+                    // Thinking/signature deltas are not surfaced on the
+                    // minimal path (parity with the pre-swap behavior).
                 }
             },
-            AnthropicEvent::ContentBlockStop { .. } => {
-                // No-op for v1; the block stays in the map until
-                // assembled at message_stop.
+            StreamEvent::ContentBlockStop { .. } => {
+                // No-op; the block stays in the map until assembled at
+                // message_stop.
             }
-            AnthropicEvent::MessageDelta { delta, usage } => {
+            StreamEvent::MessageDelta { delta, usage } => {
                 state.stop_reason = delta.stop_reason;
-                // Prefer the top-level usage (the real wire location).
-                // Fall back to nested delta.usage so older fixtures /
-                // servers that put it inside delta still work.
-                if let Some(u) = usage.as_ref().or(delta.usage.as_ref()) {
-                    state.usage.merge(u);
+                // mu-yz48: usage is the event-top-level sibling of `delta`
+                // (mu_anthropic models it there, boxed).
+                if let Some(u) = usage.as_deref() {
+                    merge_usage(&mut state.usage, u);
                 }
             }
-            AnthropicEvent::MessageStop => {
+            StreamEvent::MessageStop => {
                 state.finished = true;
                 state.emitted_done = true;
-                let stop = map_stop_reason(state.stop_reason.as_deref());
-                let usage = state.usage.to_usage();
+                let stop = map_stop_reason(state.stop_reason.as_ref());
+                let usage = anthropic_usage_to_mu(&state.usage);
                 return Some((
                     ProviderEvent::Done(AssistantMessage {
                         content: assemble_content(&state.blocks, &state.block_order),
@@ -1021,23 +918,32 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                     state,
                 ));
             }
-            AnthropicEvent::Error { error } => {
+            StreamEvent::Error { error } => {
                 state.finished = true;
                 state.emitted_done = true;
                 let msg = format!(
                     "anthropic stream error ({}): {}",
-                    error.err_type.unwrap_or_else(|| "unknown".to_string()),
+                    error.kind.unwrap_or_else(|| "unknown".to_string()),
                     error.message.unwrap_or_else(|| "(no message)".to_string()),
                 );
                 return Some((ProviderEvent::Error(msg), state));
             }
-            AnthropicEvent::MessageStart { message } => {
-                if let Some(u) = message.usage.as_ref() {
-                    state.usage.merge(u);
+            StreamEvent::MessageStart { message } => {
+                // Initial usage (input tokens, cache stats) rides on the
+                // message_start envelope.
+                if let Some(u) = message
+                    .as_value()
+                    .get("usage")
+                    .and_then(|v| serde_json::from_value::<AnthropicUsage>(v.clone()).ok())
+                {
+                    merge_usage(&mut state.usage, &u);
                 }
             }
-            AnthropicEvent::Ping => {
+            StreamEvent::Ping => {
                 // No-op.
+            }
+            StreamEvent::Unknown(_) => {
+                // Forward-compat: an event type mu_anthropic doesn't model.
             }
         }
     }

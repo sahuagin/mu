@@ -884,10 +884,14 @@ async fn eof_without_message_stop_emits_degraded_eof() {
 
 #[test]
 fn map_stop_reason_known_and_unknown() {
-    assert_eq!(map_stop_reason(Some("end_turn")), StopReason::EndTurn);
-    assert_eq!(map_stop_reason(Some("tool_use")), StopReason::ToolUse);
-    assert_eq!(map_stop_reason(Some("max_tokens")), StopReason::MaxTokens);
-    assert_eq!(map_stop_reason(Some("weird")), StopReason::EndTurn);
+    use mu_anthropic::StopReason as A;
+    assert_eq!(map_stop_reason(Some(&A::EndTurn)), StopReason::EndTurn);
+    assert_eq!(map_stop_reason(Some(&A::ToolUse)), StopReason::ToolUse);
+    assert_eq!(map_stop_reason(Some(&A::MaxTokens)), StopReason::MaxTokens);
+    // unmapped wire reasons (stop_sequence / refusal / pause_turn / unknown)
+    // all fold to EndTurn.
+    assert_eq!(map_stop_reason(Some(&A::StopSequence)), StopReason::EndTurn);
+    assert_eq!(map_stop_reason(Some(&A::Other)), StopReason::EndTurn);
     assert_eq!(map_stop_reason(None), StopReason::EndTurn);
 }
 

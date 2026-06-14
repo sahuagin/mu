@@ -222,6 +222,14 @@ pub struct MessagesRequest {
     pub context_management: Option<ContextManagement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_config: Option<OutputConfig>,
+
+    /// Request service tier (spec, e.g. `auto`/`standard_only`). Kept as a
+    /// String — lossless + forward-compat over the small value set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    /// Code-execution container id to reuse (spec). Opaque string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
 }
 
 impl MessagesRequest {
@@ -244,6 +252,8 @@ impl MessagesRequest {
             thinking: None,
             context_management: None,
             output_config: None,
+            service_tier: None,
+            container: None,
         }
     }
 
@@ -284,6 +294,16 @@ impl MessagesRequest {
 
     pub fn with_output_config(mut self, output_config: OutputConfig) -> Self {
         self.output_config = Some(output_config);
+        self
+    }
+
+    pub fn with_service_tier(mut self, service_tier: impl Into<String>) -> Self {
+        self.service_tier = Some(service_tier.into());
+        self
+    }
+
+    pub fn with_container(mut self, container: impl Into<String>) -> Self {
+        self.container = Some(container.into());
         self
     }
 
@@ -347,6 +367,8 @@ mod tests {
             "thinking",
             "context_management",
             "output_config",
+            "service_tier",
+            "container",
         ] {
             assert!(
                 v.get(absent).is_none(),
@@ -545,6 +567,17 @@ mod tests {
         );
         assert_eq!(v["output_config"], json!({"effort": "high"}));
         round_trip(&req);
+    }
+
+    #[test]
+    fn service_tier_and_container_serialize_when_set() {
+        let r = MessagesRequest::new("m", 10, vec![Message::user("hi")])
+            .with_service_tier("standard_only")
+            .with_container("cntr_abc");
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["service_tier"], json!("standard_only"));
+        assert_eq!(v["container"], json!("cntr_abc"));
+        round_trip(&r);
     }
 
     #[test]

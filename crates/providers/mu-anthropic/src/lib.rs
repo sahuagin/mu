@@ -9,13 +9,16 @@
 //! Built in vertical slices, leaf-first. Slice 1: [`ContentBlock`] / [`CacheControl`]. Slice 2: [`Message`] /
 //! [`Content`] / [`Role`]. Slice 3: [`MessagesRequest`] / [`Tool`].
 //! Slice 4: response [`ResponseMessage`] / [`Usage`] / [`StopReason`].
+//! Slice 5: [`StreamEvent`] (SSE events).
 
 mod content;
 mod message;
 mod request;
 mod response;
+mod stream;
 
 pub use content::{CacheControl, ContentBlock};
 pub use message::{Content, Message, Role};
 pub use request::{MessagesRequest, Tool};
 pub use response::{CacheCreation, Message as ResponseMessage, StopReason, Usage};
+pub use stream::{BlockDelta, BlockStart, MessageDeltaBody, StreamError, StreamEvent};

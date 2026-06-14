@@ -35,3 +35,6 @@ __pycache__/
 # Goal-session briefings live OUTSIDE the public repo (~/mu-briefings/).
 # History was rewritten 2026-06-04 to remove them; never re-add.
 MORNING*.md
+
+# br doctor per-run artifacts
+.doctor/

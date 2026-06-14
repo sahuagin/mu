@@ -15,13 +15,13 @@
 //! variant top level; a test pins it.
 
 use crate::json::JsonValue;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::response::{StopReason, Usage};
 
 /// One SSE event from the Messages streaming API. Internally tagged on `type`.
 /// Unknown event types degrade to [`StreamEvent::Unknown`] (forward-compat).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
     MessageStart {
@@ -55,7 +55,7 @@ pub enum StreamEvent {
 
 /// The `content_block` of a `content_block_start`. Only the fields we need to
 /// open an accumulator; unknown block types degrade to [`BlockStart::Other`].
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BlockStart {
     Text {
@@ -76,7 +76,7 @@ pub enum BlockStart {
 /// The `delta` of a `content_block_delta`. `input_json_delta` carries the
 /// streamed-in-pieces tool arguments (`partial_json`); accumulate and parse at
 /// block stop.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BlockDelta {
     TextDelta {
@@ -98,7 +98,7 @@ pub enum BlockDelta {
 
 /// The `delta` of a `message_delta` event — terminal metadata. NOTE: `usage`
 /// is NOT here (it's a sibling at the event level — see mu-yz48 above).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct MessageDeltaBody {
     #[serde(default)]
     pub stop_reason: Option<StopReason>,
@@ -107,7 +107,7 @@ pub struct MessageDeltaBody {
 }
 
 /// An `error` event body.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamError {
     #[serde(rename = "type", default)]
     pub kind: Option<String>,

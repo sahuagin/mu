@@ -1699,6 +1699,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mu-anthropic-py"
+version = "0.1.0"
+dependencies = [
+ "mu-anthropic",
+ "pyo3",
+ "serde_json",
+]
+
+[[package]]
 name = "mu-bridge"
 version = "0.0.1"
 dependencies = [

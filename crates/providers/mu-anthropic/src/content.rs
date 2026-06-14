@@ -67,7 +67,7 @@ pub enum CacheKind {
 /// One content block. Internally tagged on `"type"`.
 ///
 /// `Unknown` is the forward-compat fallback: any block whose `type` we do not
-/// model (e.g. `image`, `document`, the server-tool result family, a future
+/// model (e.g. the server-tool result family, `search_result`, a future
 /// addition) deserializes here instead of failing the whole message. It
 /// preserves the raw JSON so a consumer can still inspect or round-trip it.
 ///
@@ -119,11 +119,30 @@ pub enum ContentBlock {
         from: FallbackModel,
         to: FallbackModel,
     },
+    /// An image input block: `{"type":"image","source":{...}}`. `source` is
+    /// polymorphic (base64 / url / file — see [`Source`]).
+    Image {
+        source: Source,
+        cache_control: Option<CacheControl>,
+    },
+    /// A document input block: `{"type":"document","source":{...},"title"?,
+    /// "context"?}`. `source` adds a `text` kind for plain-text docs.
+    ///
+    /// NOTE: `citations` config and the `content`-kind source are NOT yet
+    /// modeled — a document carrying them would lose those fields on round-trip.
+    /// Explicitly deferred (not silently handled); model when real traffic shows
+    /// them.
+    Document {
+        source: Source,
+        title: Option<String>,
+        context: Option<String>,
+        cache_control: Option<CacheControl>,
+    },
     /// Forward-compat fallback: the `type` tag is one we do not model
-    /// (e.g. `image`, `document`, a server-tool result block, a future
-    /// addition). Captures the whole object verbatim so a consumer can inspect
-    /// or round-trip it. Reached ONLY for unknown tags, never for a known tag
-    /// with broken fields.
+    /// (e.g. a server-tool result block, `search_result`, a future addition).
+    /// Captures the whole object verbatim so a consumer can inspect or
+    /// round-trip it. Reached ONLY for unknown tags, never for a known tag with
+    /// broken fields.
     Unknown(JsonValue),
 }
 
@@ -132,6 +151,24 @@ pub enum ContentBlock {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FallbackModel {
     pub model: String,
+}
+
+/// The media `source` of an [`ContentBlock::Image`] / [`ContentBlock::Document`].
+/// Internally tagged on `type`; covers the documented source kinds. These are
+/// outbound (mu constructs them), so the set is closed — an unmodeled source
+/// `type` errors loudly rather than mis-modeling. (`base64` and `text` share a
+/// `{media_type, data}` shape but differ by tag: base64 bytes vs plain text.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Source {
+    /// `{"type":"base64","media_type":"image/png"|"application/pdf",...,"data":...}`.
+    Base64 { media_type: String, data: String },
+    /// `{"type":"url","url":"https://..."}`.
+    Url { url: String },
+    /// `{"type":"text","media_type":"text/plain","data":...}` (plain-text doc).
+    Text { media_type: String, data: String },
+    /// `{"type":"file","file_id":"..."}` (Files API reference).
+    File { file_id: String },
 }
 
 /// The set of `type` tags we model, used to decide known-vs-unknown dispatch.
@@ -181,6 +218,20 @@ enum KnownContentBlock {
         from: FallbackModel,
         to: FallbackModel,
     },
+    Image {
+        source: Source,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+    Document {
+        source: Source,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
 }
 
 const KNOWN_TAGS: &[&str] = &[
@@ -191,6 +242,8 @@ const KNOWN_TAGS: &[&str] = &[
     "redacted_thinking",
     "server_tool_use",
     "fallback",
+    "image",
+    "document",
 ];
 
 impl From<KnownContentBlock> for ContentBlock {
@@ -245,6 +298,24 @@ impl From<KnownContentBlock> for ContentBlock {
                 cache_control,
             },
             KnownContentBlock::Fallback { from, to } => ContentBlock::Fallback { from, to },
+            KnownContentBlock::Image {
+                source,
+                cache_control,
+            } => ContentBlock::Image {
+                source,
+                cache_control,
+            },
+            KnownContentBlock::Document {
+                source,
+                title,
+                context,
+                cache_control,
+            } => ContentBlock::Document {
+                source,
+                title,
+                context,
+                cache_control,
+            },
         }
     }
 }
@@ -333,6 +404,24 @@ impl Serialize for ContentBlock {
                         cache_control,
                     },
                     ContentBlock::Fallback { from, to } => KnownContentBlock::Fallback { from, to },
+                    ContentBlock::Image {
+                        source,
+                        cache_control,
+                    } => KnownContentBlock::Image {
+                        source,
+                        cache_control,
+                    },
+                    ContentBlock::Document {
+                        source,
+                        title,
+                        context,
+                        cache_control,
+                    } => KnownContentBlock::Document {
+                        source,
+                        title,
+                        context,
+                        cache_control,
+                    },
                     ContentBlock::Unknown(_) => unreachable!("handled above"),
                 };
                 known.serialize(serializer)
@@ -452,6 +541,84 @@ mod tests {
                 !matches!(b, ContentBlock::Unknown(_)),
                 "{raw} should be modelled, not Unknown"
             );
+        }
+    }
+
+    #[test]
+    fn image_block_sources_match_spec_and_round_trip() {
+        // base64 source (spec: image bytes)
+        let b64 = ContentBlock::Image {
+            source: Source::Base64 {
+                media_type: "image/png".into(),
+                data: "iVBOR==".into(),
+            },
+            cache_control: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&b64).unwrap(),
+            json!({"type": "image", "source": {"type": "base64",
+                   "media_type": "image/png", "data": "iVBOR=="}})
+        );
+        round_trip(&b64);
+
+        // url + file sources
+        round_trip(&ContentBlock::Image {
+            source: Source::Url {
+                url: "https://example.com/a.jpg".into(),
+            },
+            cache_control: Some(CacheControl::ephemeral()),
+        });
+        round_trip(&ContentBlock::Image {
+            source: Source::File {
+                file_id: "file_123".into(),
+            },
+            cache_control: None,
+        });
+    }
+
+    #[test]
+    fn document_block_matches_spec_and_round_trips() {
+        // spec: plain-text document with title + context.
+        let doc = ContentBlock::Document {
+            source: Source::Text {
+                media_type: "text/plain".into(),
+                data: "The grass is green.".into(),
+            },
+            title: Some("My Document".into()),
+            context: Some("This is a trustworthy document.".into()),
+            cache_control: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&doc).unwrap(),
+            json!({
+                "type": "document",
+                "source": {"type": "text", "media_type": "text/plain",
+                           "data": "The grass is green."},
+                "title": "My Document",
+                "context": "This is a trustworthy document."
+            })
+        );
+        round_trip(&doc);
+        // PDF document via base64
+        round_trip(&ContentBlock::Document {
+            source: Source::Base64 {
+                media_type: "application/pdf".into(),
+                data: "JVBERi0=".into(),
+            },
+            title: None,
+            context: None,
+            cache_control: None,
+        });
+    }
+
+    #[test]
+    fn image_and_document_are_not_unknown() {
+        for raw in [
+            json!({"type": "image", "source": {"type": "url", "url": "https://x"}}),
+            json!({"type": "document", "source": {"type": "file", "file_id": "f"}}),
+        ] {
+            let b: ContentBlock = serde_json::from_value(raw.clone()).unwrap();
+            assert!(!matches!(b, ContentBlock::Unknown(_)), "{raw} modelled");
         }
     }
 
@@ -594,10 +761,10 @@ mod tests {
 
     #[test]
     fn unknown_block_type_deserializes_to_unknown() {
-        // An `image` block (not yet modeled) must NOT fail deserialization.
+        // A `search_result` block (not yet modeled) must NOT fail deserialization.
         let raw = json!({
-            "type": "image",
-            "source": {"type": "base64", "media_type": "image/png", "data": "..."}
+            "type": "search_result",
+            "source": "https://x", "title": "t", "content": []
         });
         let block: ContentBlock =
             serde_json::from_value(raw.clone()).expect("unknown type must not error");
@@ -637,7 +804,7 @@ mod fallback_strictness {
 
     #[test]
     fn unknown_tag_still_degrades_to_unknown() {
-        let raw = json!({"type": "image", "source": {"data": "..."}});
+        let raw = json!({"type": "search_result", "source": "s", "content": []});
         let b: ContentBlock = serde_json::from_value(raw.clone()).unwrap();
         assert_eq!(
             b,

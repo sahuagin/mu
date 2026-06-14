@@ -84,13 +84,14 @@ Goal: SSE parsing + accumulation come from mu-anthropic; the stream driver and
 
 1. Replace the inline `AnthropicEvent` enum with `serde_json::from_str::<mu_anthropic::StreamEvent>`
    on each SSE `data:` line (keep `sse.rs` line framing).
-2. Replace `BlockBuilder`/`assemble_content` with `mu_anthropic::accumulate()` —
-   OR, if `next_event()`'s incremental `TextDelta` emission must stay (it streams
-   deltas to the UI), map each `StreamEvent` to the existing `ProviderEvent`
-   incrementally and use mu-anthropic's types only as the parsed shape. (Decide:
-   full `accumulate()` vs. incremental mapping. The UI wants live deltas, so
-   incremental mapping of `StreamEvent` → `ProviderEvent` is likely; `accumulate()`
-   is the non-streaming/get-final-message convenience.)
+2. **DECIDED: incremental mapping, not `accumulate()`.** Streaming is mu-solo's
+   default (production) path — `next_event()` streams `TextDelta` to the UI live —
+   so map each parsed `mu_anthropic::StreamEvent` to the existing `ProviderEvent`
+   incrementally, replacing the inline `BlockBuilder`/`assemble_content` logic but
+   keeping the per-delta emission. `mu_anthropic::accumulate()` is the
+   non-streaming "get the final message" convenience (use it for tests / any
+   non-streamed path), NOT the agent-loop driver. So: keep mu's incremental driver
+   shape, swap its hand-rolled event/accumulation internals for mu-anthropic types.
 3. Replace `AnthropicUsage` merge with `mu_anthropic::Usage` (the mu-yz48
    top-level-usage and cache-tier-split scars are already encoded there).
 4. `to_usage()` → map `mu_anthropic::Usage` → `mu_core::agent::Usage`.
@@ -125,8 +126,8 @@ That deletion is the migration's done-signal.
   old `translate_provider_*`; the parity tests are the safety net.
 - **Don't pull mu types into mu-anthropic** to make the mapping easier. The mapping
   is mu-side, mechanical against mu-anthropic's public types.
-- **Incremental deltas vs accumulate()**: the agent loop streams `TextDelta` to the
-  UI, so you probably map `StreamEvent`→`ProviderEvent` incrementally rather than
-  awaiting `accumulate()`. Decide this in Phase 2 step 2.
+- **Incremental deltas, not accumulate()** (decided — see Phase 2 step 2):
+  streaming is mu-solo's default, so map `StreamEvent`→`ProviderEvent` incrementally
+  and keep `accumulate()` for the non-streaming/test path.
 - **The drift canary** keeps guarding the wire during/after migration — if Anthropic
   changes something mid-migration, it surfaces as a bead, not a mystery.

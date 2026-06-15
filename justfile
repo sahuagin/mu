@@ -140,9 +140,14 @@ solo-debugrelease *args:
 # [positional-arguments] preserves shell quoting on the forwarded args so titles
 # like `feat(scope): foo` survive (parens would otherwise be re-tokenized as a
 # subshell by the recipe's shell).
+#
+# -R is derived from the origin remote (not let gh auto-discover): per-bead jj
+# workspaces (sprint-start) have a .jj/ but no .git/, so a bare `gh pr create`
+# dies with "fatal: not a git repository". Deriving owner/repo here makes the
+# recipe work from a workspace AND the colocated repo. (mu-a9r2)
 [positional-arguments]
 pr bookmark *gh_args:
     @echo "==> bookmark $1 on @ → push → gh pr create"
     jj bookmark create "$1" -r @ 2>/dev/null || jj bookmark set "$1" -r @
     jj git push --bookmark "$1"
-    gh pr create --base main --head "$1" "${@:2}"
+    gh pr create -R "$(jj git remote list | awk '$1=="origin"{print $2}' | sed -E 's#\.git$##; s#^.*[:/]([^/:]+/[^/]+)$#\1#')" --base main --head "$1" "${@:2}"

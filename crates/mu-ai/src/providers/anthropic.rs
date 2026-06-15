@@ -878,20 +878,30 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
             }
             StreamEvent::MessageStart { message } => {
                 // Initial usage (input tokens, cache stats) rides on the
-                // message_start envelope.
-                if let Some(u) = message
-                    .as_value()
-                    .get("usage")
-                    .and_then(|v| serde_json::from_value::<AnthropicUsage>(v.clone()).ok())
-                {
-                    merge_usage(&mut state.usage, &u);
+                // message_start envelope, which mu_anthropic models as raw JSON.
+                // Absent `usage` is normal; a present-but-unparseable `usage` is
+                // logged rather than silently dropped.
+                if let Some(usage_val) = message.as_value().get("usage") {
+                    match serde_json::from_value::<AnthropicUsage>(usage_val.clone()) {
+                        Ok(u) => merge_usage(&mut state.usage, &u),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "message_start usage failed to parse; token stats may be incomplete"
+                        ),
+                    }
                 }
             }
             StreamEvent::Ping => {
                 // No-op.
             }
-            StreamEvent::Unknown(_) => {
-                // Forward-compat: an event type mu_anthropic doesn't model.
+            StreamEvent::Unknown(v) => {
+                // Forward-compat: an event type mu_anthropic doesn't model. Log
+                // it so a new SSE event type doesn't vanish without a trace (the
+                // old hand-rolled parser surfaced these as parse warnings).
+                tracing::debug!(
+                    event_type = ?v.as_value().get("type"),
+                    "unhandled anthropic stream event"
+                );
             }
         }
     }

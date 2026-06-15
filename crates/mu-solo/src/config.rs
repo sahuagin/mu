@@ -196,10 +196,13 @@ pub struct SessionConfig {
     /// Anthropic provider consumes it today.
     pub cache_ttl: String,
     /// mu-upk2: extended-thinking directive, forwarded as `mu serve
-    /// --thinking <v>`. Empty string (the DEFAULT) = no directive (off).
-    /// Accepts effort levels (`minimal`|`low`|`medium`|`high`), a raw token
-    /// budget, `adaptive`, or `disabled`. Only the Anthropic provider acts on
-    /// it (natively-reasoning ollama models think regardless). Set once in
+    /// --thinking <v>`. Empty string (the DEFAULT) disables it; so do
+    /// `off`/`none`/`disabled`/`false`/`0`. Otherwise an effort level —
+    /// `low` (alias `minimal`), `medium`, `high`, `xhigh`, or `max` — which
+    /// the Anthropic provider sends as `thinking: {type: adaptive, display:
+    /// summarized}` plus `output_config.effort`. (An unrecognized value
+    /// falls back to `high`.) Only the Anthropic provider acts on it
+    /// (natively-reasoning ollama models think regardless). Set once in
     /// solo.toml (`[session] thinking = "high"`) — no flag needed each run.
     pub thinking: String,
     /// mu-n25a: the session's side-effects CEILING — the permission

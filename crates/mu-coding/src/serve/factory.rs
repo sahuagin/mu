@@ -80,7 +80,8 @@ pub fn build_provider_from_selector(
             }
             // mu-upk2: --thinking now enables Anthropic extended thinking
             // (was previously ignored). The provider parses the flag value
-            // into a ThinkingConfig and adjusts max_tokens for the budget.
+            // into an effort level and sends `thinking: {type: adaptive,
+            // display: summarized}` + `output_config.effort`.
             let mut provider =
                 AnthropicProvider::from_env(model.clone())?.with_cache_ttl(cache_ttl);
             if let Some(t) = thinking {

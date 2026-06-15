@@ -19,8 +19,8 @@ use tokio::sync::oneshot;
 
 use mu_anthropic::{
     BlockDelta, BlockStart, CacheControl, Content, ContentBlock as AnthBlock,
-    Message as AnthMessage, MessagesRequest, StopReason as AnthropicStopReason, StreamEvent,
-    ThinkingConfig, Tool, ToolDef, Usage as AnthropicUsage,
+    Message as AnthMessage, MessagesRequest, StopReason as AnthropicStopReason, StreamEvent, Tool,
+    ToolDef, Usage as AnthropicUsage,
 };
 use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
@@ -37,11 +37,6 @@ use super::sse::{SseEvent, SseStream};
 
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-/// mu-upk2: when an explicit thinking budget is set, raise `max_tokens` to the
-/// budget plus this answer headroom — the model must have room to think AND
-/// answer (Anthropic counts thinking against output and requires
-/// `max_tokens > budget_tokens`).
-const THINKING_ANSWER_HEADROOM: u32 = 4096;
 
 /// Direct API Provider. Holds an API key (ENV-sourced is fine — this
 /// isn't an OAuth token).
@@ -55,10 +50,11 @@ pub struct AnthropicProvider {
     /// pre-f1a0); OneHour adds `"ttl": "1h"` (2.0x write billing,
     /// survives human thinking gaps).
     cache_ttl: CacheTtl,
-    /// mu-upk2: extended-thinking directive sent on every request. `None`
-    /// leaves the wire body unchanged (no `thinking` field). Set via
-    /// [`with_thinking`](Self::with_thinking) from the `--thinking` flag.
-    thinking: Option<ThinkingConfig>,
+    /// mu-upk2: extended-thinking effort level (`low`|`medium`|`high`|`xhigh`
+    /// |`max`) sent on every request. `None` leaves the wire body unchanged (no
+    /// `thinking` / `output_config`). Set via [`with_thinking_flag`](Self::
+    /// with_thinking_flag) from the `--thinking` flag.
+    thinking_effort: Option<String>,
 }
 
 impl AnthropicProvider {
@@ -69,7 +65,7 @@ impl AnthropicProvider {
             model,
             api_base: ANTHROPIC_API_BASE.to_string(),
             cache_ttl: CacheTtl::default(),
-            thinking: None,
+            thinking_effort: None,
         }
     }
 
@@ -80,23 +76,13 @@ impl AnthropicProvider {
         self
     }
 
-    /// mu-upk2: enable extended thinking on this provider's requests. The
-    /// directive is injected into the wire body by [`apply_thinking`]; for an
-    /// explicit token budget, `max_tokens` is raised so it exceeds the budget
-    /// and still leaves room for the answer (Anthropic requires
-    /// `max_tokens > budget_tokens` and bills thinking against output).
-    pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
-        self.thinking = Some(thinking);
-        self
-    }
-
-    /// mu-upk2: set thinking from a raw `--thinking` flag value (the provider
-    /// owns the Anthropic-specific interpretation — see [`parse_thinking_flag`]).
-    /// An empty/whitespace flag leaves thinking off.
+    /// mu-upk2: set extended thinking from a raw `--thinking` flag value. The
+    /// provider owns the Anthropic-specific interpretation — see
+    /// [`parse_thinking_flag`] (an effort level) and [`apply_thinking`] (the
+    /// `adaptive` + `summarized` + `output_config.effort` wire shape current
+    /// Claude models require). An empty/`off` flag leaves thinking off.
     pub fn with_thinking_flag(mut self, flag: &str) -> Self {
-        if let Some(cfg) = parse_thinking_flag(flag) {
-            self.thinking = Some(cfg);
-        }
+        self.thinking_effort = parse_thinking_flag(flag);
         self
     }
 
@@ -130,7 +116,7 @@ impl AnthropicProvider {
             model,
             api_base,
             cache_ttl: CacheTtl::default(),
-            thinking: None,
+            thinking_effort: None,
         })
     }
 
@@ -185,7 +171,7 @@ impl Provider for AnthropicProvider {
         // body. Done here (not in build_request_body*) so the byte-parity test
         // suite keeps asserting the no-thinking shape; thinking is additive.
         let mut body = body;
-        apply_thinking(&mut body, self.thinking.as_ref());
+        apply_thinking(&mut body, self.thinking_effort.as_deref());
 
         let resp = self
             .client
@@ -397,69 +383,55 @@ fn map_agent_message_single(m: &AgentMessage) -> Option<AnthMessage> {
     }
 }
 
-/// Inject the extended-thinking directive into an already-built request body.
-/// `None` is a no-op (the body keeps its no-`thinking` shape — this is why the
-/// byte-parity tests still pass). For an explicit budget, raise `max_tokens` so
-/// it exceeds the budget with room for the answer ([`THINKING_ANSWER_HEADROOM`]);
-/// `adaptive`/`disabled` only set the directive (model self-budgets / opts out).
-/// (mu-upk2)
-fn apply_thinking(body: &mut Value, thinking: Option<&ThinkingConfig>) {
-    let Some(cfg) = thinking else {
+/// Inject the extended-thinking directive into an already-built request body,
+/// in the shape current Claude models require. `None` is a no-op (the body keeps
+/// its no-`thinking` shape — this is why the byte-parity tests still pass).
+///
+/// For `Some(effort)`, set `thinking: {type:"adaptive", display:"summarized"}`
+/// plus `output_config.effort = <level>`. Rationale (claude-api, 2026): on Opus
+/// 4.6+, Sonnet 4.6, and Fable, the legacy `{type:"enabled", budget_tokens}`
+/// form is removed (400) — `adaptive` is the on-mode and `output_config.effort`
+/// controls depth. `display:"summarized"` is required to surface readable
+/// reasoning: the default `"omitted"` returns `thinking` blocks with EMPTY text
+/// (the raw chain of thought is never exposed; only a summary). (mu-upk2)
+fn apply_thinking(body: &mut Value, effort: Option<&str>) {
+    let Some(level) = effort else {
         return;
     };
-    match serde_json::to_value(cfg) {
-        Ok(v) => body["thinking"] = v,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to serialize thinking config; sending request without it");
-            return;
-        }
-    }
-    if let ThinkingConfig::Enabled { budget_tokens } = cfg {
-        let needed = budget_tokens.saturating_add(THINKING_ANSWER_HEADROOM);
-        let current = body.get("max_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
-        if needed > current {
-            body["max_tokens"] = Value::from(needed);
-        }
+    body["thinking"] = serde_json::json!({ "type": "adaptive", "display": "summarized" });
+    if let Some(obj) = body.as_object_mut() {
+        let oc = obj
+            .entry("output_config")
+            .or_insert_with(|| serde_json::json!({}));
+        oc["effort"] = Value::from(level);
     }
 }
 
-/// Interpret a `--thinking` flag value as an Anthropic [`ThinkingConfig`].
-/// Accepts effort levels (`minimal`/`low`/`medium`/`high`) mapped to token
-/// budgets, a raw budget number, `adaptive` (model self-budgets), and
-/// `off`/`none`/`disabled` (explicit opt-out). An empty/whitespace flag is
-/// `None` (no thinking). An unrecognized non-empty value falls back to the
-/// `medium` budget rather than silently doing nothing. Budgets are clamped to
-/// Anthropic's 1024-token floor. (mu-upk2)
-fn parse_thinking_flag(flag: &str) -> Option<ThinkingConfig> {
+/// Interpret a `--thinking` flag value as an Anthropic effort level
+/// (`low`|`medium`|`high`|`xhigh`|`max`). `minimal` maps to `low`. An
+/// empty/whitespace flag or an explicit `off`/`none`/`false`/`0`/`disabled` is
+/// `None` (no thinking). An unrecognized non-empty value falls back to `high`
+/// rather than silently doing nothing. (mu-upk2)
+fn parse_thinking_flag(flag: &str) -> Option<String> {
     let f = flag.trim().to_ascii_lowercase();
-    // Empty OR an explicit "don't enable" word → send no `thinking` directive
-    // at all (absent == no extended thinking, the API default). This is
-    // distinct from the `disabled` keyword below, which sends the explicit
-    // `{"type":"disabled"}` opt-out directive. (mu-upk2)
-    if f.is_empty() || matches!(f.as_str(), "off" | "none" | "false" | "0") {
+    if f.is_empty() || matches!(f.as_str(), "off" | "none" | "false" | "0" | "disabled") {
         return None;
     }
-    let enabled = |n: u32| ThinkingConfig::Enabled {
-        budget_tokens: n.max(1024),
+    let level = match f.as_str() {
+        "minimal" | "low" => "low",
+        "medium" | "med" => "medium",
+        "high" => "high",
+        "xhigh" | "x-high" => "xhigh",
+        "max" => "max",
+        other => {
+            tracing::debug!(
+                flag = %other,
+                "unrecognized --thinking value for anthropic; using high effort"
+            );
+            "high"
+        }
     };
-    Some(match f.as_str() {
-        "adaptive" => ThinkingConfig::Adaptive,
-        "disabled" => ThinkingConfig::Disabled,
-        "minimal" => enabled(1024),
-        "low" => enabled(4096),
-        "medium" | "med" => enabled(10_240),
-        "high" => enabled(24_576),
-        other => match other.parse::<u32>() {
-            Ok(n) => enabled(n),
-            Err(_) => {
-                tracing::debug!(
-                    flag = %flag,
-                    "unrecognized --thinking value for anthropic; using medium budget"
-                );
-                enabled(10_240)
-            }
-        },
-    })
+    Some(level.to_string())
 }
 
 /// mu-yqeq.8 retired the unconditional `cache_control: ephemeral`

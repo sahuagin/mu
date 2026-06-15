@@ -400,4 +400,57 @@ mod tests {
         let v = json!({"a": {"b": {"c": {"d": [1, 2, {"e": 1.5}]}}}});
         assert!(ToolArgs::new(v).is_ok());
     }
+
+    /// cc full-fidelity unification (mu-cc-event-unification-lkma.1, WS1): a cc
+    /// assistant turn — thinking + text + tool_use, Anthropic-shaped usage with
+    /// the 5m/1h cache-write tier split, `ToolUse` stop — maps onto the EXISTING
+    /// schema and survives a JSONL round-trip with no information loss. This
+    /// pins WS1's finding: no mu-core schema change is needed for cc turn-level
+    /// fidelity (the gap was the emitter, not the schema). See
+    /// specs/architecture/cc-event-mapping.md.
+    #[test]
+    fn cc_shaped_assistant_turn_round_trips() -> Result<(), serde_json::Error> {
+        let message = AssistantMessage {
+            content: vec![
+                // cc `thinking{thinking,signature}` -> text-only (signature dropped,
+                // consistent with mu's own native handling).
+                ContentBlock::Thinking {
+                    text: "Let me read the file before claiming it's fixed.".into(),
+                },
+                ContentBlock::Text {
+                    text: "I'll check it now.".into(),
+                },
+                // cc `tool_use{id,name,input,caller}` -> ToolCall (caller deferred).
+                ContentBlock::ToolCall(ToolCall {
+                    id: "toolu_01YNTDGSQpMUKPRBJ9HLsgbW".to_owned(),
+                    name: "Read".to_owned(),
+                    arguments: ToolArgs::new(json!({ "file_path": "/x" })).unwrap(),
+                }),
+            ],
+            // cc `stop_reason:"tool_use"` -> ToolUse (and stop_sequence -> EndTurn,
+            // matching anthropic.rs:678).
+            stop_reason: StopReason::ToolUse,
+            usage: Some(Usage {
+                input_tokens: 1234,
+                output_tokens: 56,
+                cache_read_input_tokens: Some(9000),
+                cache_creation_input_tokens: Some(800),
+                // cc `usage.cache_creation.{ephemeral_5m,ephemeral_1h}` -> tier split.
+                cache_creation_5m_input_tokens: Some(500),
+                cache_creation_1h_input_tokens: Some(300),
+                reasoning_tokens: None,
+            }),
+        };
+        // Round-trip through the JSONL string form the event log persists.
+        let line = serde_json::to_string(&message)?;
+        let decoded: AssistantMessage = serde_json::from_str(&line)?;
+        assert_eq!(decoded, message);
+        // Tier split survives and stays self-consistent (5m + 1h == total).
+        let u = decoded.usage.expect("usage present");
+        assert_eq!(
+            u.cache_creation_5m_input_tokens.unwrap() + u.cache_creation_1h_input_tokens.unwrap(),
+            u.cache_creation_input_tokens.unwrap()
+        );
+        Ok(())
+    }
 }

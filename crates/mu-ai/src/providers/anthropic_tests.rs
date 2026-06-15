@@ -213,101 +213,56 @@ fn b5_build_request_body_omits_tools_when_empty() {
 
 #[test]
 fn apply_thinking_none_is_noop() {
-    // claude-test → 4096 max_tokens (unknown-model fallback).
     let mut body = build_request_body("claude-test", None, &[], &[]);
     let before = body.clone();
     apply_thinking(&mut body, None);
     assert_eq!(body, before, "None must not touch the wire body");
     assert!(body.get("thinking").is_none());
+    assert!(body.get("output_config").is_none());
 }
 
 #[test]
-fn apply_thinking_enabled_sets_directive_and_raises_max_tokens() {
-    let mut body = build_request_body("claude-test", None, &[], &[]);
-    assert_eq!(body["max_tokens"], 4096);
-    let cfg = ThinkingConfig::Enabled {
-        budget_tokens: 10_000,
-    };
-    apply_thinking(&mut body, Some(&cfg));
-    assert_eq!(body["thinking"]["type"], "enabled");
-    assert_eq!(body["thinking"]["budget_tokens"], 10_000);
-    // 10_000 budget + 4096 answer headroom > 4096 base → raised.
-    assert_eq!(body["max_tokens"], 14_096);
-}
-
-#[test]
-fn apply_thinking_does_not_lower_existing_max_tokens() {
-    // opus → 16384 base; a small budget must NOT shrink it.
-    let mut body = build_request_body("claude-opus-4-7", None, &[], &[]);
-    assert_eq!(body["max_tokens"], 16_384);
-    apply_thinking(
-        &mut body,
-        Some(&ThinkingConfig::Enabled {
-            budget_tokens: 2_000,
-        }),
-    );
-    assert_eq!(body["max_tokens"], 16_384, "2000+4096 < 16384, keep base");
-}
-
-#[test]
-fn apply_thinking_adaptive_sets_directive_without_touching_max_tokens() {
-    let mut body = build_request_body("claude-test", None, &[], &[]);
-    apply_thinking(&mut body, Some(&ThinkingConfig::Adaptive));
+fn apply_thinking_sets_adaptive_summarized_and_effort() {
+    // The modern Claude shape: adaptive + summarized display + output_config.effort.
+    // (display:summarized is required for readable reasoning; enabled+budget 400s
+    // on Opus 4.6+/Fable.)
+    let mut body = build_request_body("claude-opus-4-8", None, &[], &[]);
+    let base_max = body["max_tokens"].clone();
+    apply_thinking(&mut body, Some("high"));
     assert_eq!(body["thinking"]["type"], "adaptive");
-    assert_eq!(body["max_tokens"], 4096, "adaptive has no budget to fit");
+    assert_eq!(body["thinking"]["display"], "summarized");
+    assert_eq!(body["output_config"]["effort"], "high");
+    // No budget any more → max_tokens is untouched.
+    assert_eq!(body["max_tokens"], base_max);
 }
 
 #[test]
-fn parse_thinking_flag_levels_numbers_and_keywords() {
+fn apply_thinking_preserves_existing_output_config_fields() {
+    let mut body = build_request_body("claude-opus-4-8", None, &[], &[]);
+    body["output_config"] = serde_json::json!({ "verbosity": "low" });
+    apply_thinking(&mut body, Some("max"));
+    assert_eq!(body["output_config"]["verbosity"], "low", "kept");
+    assert_eq!(body["output_config"]["effort"], "max", "added");
+}
+
+#[test]
+fn parse_thinking_flag_maps_to_effort_levels() {
     assert_eq!(parse_thinking_flag(""), None);
     assert_eq!(parse_thinking_flag("   "), None);
-    assert_eq!(
-        parse_thinking_flag("adaptive"),
-        Some(ThinkingConfig::Adaptive)
-    );
-    // off/none/false/0 → no directive at all (absent), NOT explicit Disabled.
-    assert_eq!(parse_thinking_flag("off"), None);
-    assert_eq!(parse_thinking_flag("none"), None);
-    assert_eq!(parse_thinking_flag("false"), None);
-    assert_eq!(parse_thinking_flag("0"), None);
-    // The `disabled` keyword DOES send the explicit opt-out directive.
-    assert_eq!(
-        parse_thinking_flag("disabled"),
-        Some(ThinkingConfig::Disabled)
-    );
-    assert_eq!(
-        parse_thinking_flag("high"),
-        Some(ThinkingConfig::Enabled {
-            budget_tokens: 24_576
-        })
-    );
-    assert_eq!(
-        parse_thinking_flag("HIGH"),
-        Some(ThinkingConfig::Enabled {
-            budget_tokens: 24_576
-        }),
-        "case-insensitive"
-    );
-    assert_eq!(
-        parse_thinking_flag("3000"),
-        Some(ThinkingConfig::Enabled {
-            budget_tokens: 3000
-        })
-    );
-    assert_eq!(
-        parse_thinking_flag("500"),
-        Some(ThinkingConfig::Enabled {
-            budget_tokens: 1024
-        }),
-        "clamped to the 1024 floor"
-    );
-    // Unrecognized non-empty → medium, not silently nothing.
-    assert_eq!(
-        parse_thinking_flag("banana"),
-        Some(ThinkingConfig::Enabled {
-            budget_tokens: 10_240
-        })
-    );
+    // off/none/false/0/disabled → no thinking.
+    for off in ["off", "none", "false", "0", "disabled"] {
+        assert_eq!(parse_thinking_flag(off), None, "{off}");
+    }
+    assert_eq!(parse_thinking_flag("minimal").as_deref(), Some("low"));
+    assert_eq!(parse_thinking_flag("low").as_deref(), Some("low"));
+    assert_eq!(parse_thinking_flag("medium").as_deref(), Some("medium"));
+    assert_eq!(parse_thinking_flag("high").as_deref(), Some("high"));
+    assert_eq!(parse_thinking_flag("HIGH").as_deref(), Some("high"), "ci");
+    assert_eq!(parse_thinking_flag("xhigh").as_deref(), Some("xhigh"));
+    assert_eq!(parse_thinking_flag("max").as_deref(), Some("max"));
+    // Unrecognized non-empty → high, not silently nothing.
+    assert_eq!(parse_thinking_flag("banana").as_deref(), Some("high"));
+    assert_eq!(parse_thinking_flag("8000").as_deref(), Some("high"));
 }
 
 // mu-yqeq.8 retired the unconditional cache_control emission from

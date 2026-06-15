@@ -62,10 +62,11 @@ struct Cli {
     #[arg(long)]
     tools: Option<String>,
 
-    /// Extended-thinking directive forwarded to `mu serve` (effort level
-    /// minimal|low|medium|high, a raw token budget, `adaptive`, or
-    /// `disabled`). Overrides config.session.thinking. Prefer setting
-    /// `[session] thinking` in solo.toml so you don't pass it each run.
+    /// Extended-thinking effort forwarded to `mu serve`:
+    /// low|medium|high|xhigh|max (alias `minimal` = low; `off`/`none`/
+    /// `disabled` to turn off). Anthropic-only. Overrides
+    /// config.session.thinking. Prefer setting `[session] thinking` in
+    /// solo.toml so you don't pass it each run.
     #[arg(long)]
     thinking: Option<String>,
 

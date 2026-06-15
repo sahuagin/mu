@@ -49,7 +49,8 @@ use mu_core::protocol::{
     AssistantTextFinalizedEvent, AutonomousIterationCompletedEvent,
     AutonomousIterationStartedEvent, AutonomousTerminatedEvent, CalloutBody, CalloutEvent,
     DoneEvent, ErrorEvent, InputRequiredEvent, ProviderStatusEvent, TextDeltaEvent,
-    ToolCallCompletedEvent, ToolCallStartedEvent, ToolOutcome,
+    ThinkingDeltaEvent, ThinkingFinalizedEvent, ToolCallCompletedEvent, ToolCallDeltaEvent,
+    ToolCallStartedEvent, ToolOutcome,
 };
 use mu_core::session_status::SessionStatus;
 use mu_core::transport::codes;
@@ -74,9 +75,23 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
                 delta,
             },
         ),
+        AgentEvent::ThinkingDelta { delta } => to_pair(
+            ThinkingDeltaEvent::METHOD,
+            ThinkingDeltaEvent {
+                session_id: session_id.to_string(),
+                delta,
+            },
+        ),
         AgentEvent::AssistantTextFinalized { text } => to_pair(
             AssistantTextFinalizedEvent::METHOD,
             AssistantTextFinalizedEvent {
+                session_id: session_id.to_string(),
+                text,
+            },
+        ),
+        AgentEvent::AssistantThinkingFinalized { text } => to_pair(
+            ThinkingFinalizedEvent::METHOD,
+            ThinkingFinalizedEvent {
                 session_id: session_id.to_string(),
                 text,
             },
@@ -92,6 +107,19 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
                 tool_call_id,
                 tool_name,
                 arguments,
+            },
+        ),
+        AgentEvent::ToolCallDelta {
+            tool_call_id,
+            name_delta,
+            arguments_delta,
+        } => to_pair(
+            ToolCallDeltaEvent::METHOD,
+            ToolCallDeltaEvent {
+                session_id: session_id.to_string(),
+                tool_call_id,
+                name_delta,
+                arguments_delta,
             },
         ),
         AgentEvent::ToolCallCompleted {
@@ -857,6 +885,15 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
         // notification to prevent TUI flicker. The durable event is
         // the AssistantMessageEvent from MessageEnd.
         | AgentEvent::AssistantTextFinalized { .. }
+        // mu-upk2: thinking + partial-tool-call streaming are transient
+        // wire-level notifications too. Finalized reasoning persists
+        // durably inside the AssistantMessageEvent (its ContentBlock::
+        // Thinking blocks), and the finalized tool call lands as the
+        // ToolCall payload (ToolCallStarted, above) — so the deltas and
+        // the thinking-finalized signal carry no extra durable record.
+        | AgentEvent::ThinkingDelta { .. }
+        | AgentEvent::AssistantThinkingFinalized { .. }
+        | AgentEvent::ToolCallDelta { .. }
         | AgentEvent::MessageStart { .. }
         | AgentEvent::AgentStart
         | AgentEvent::TurnStart
@@ -1022,7 +1059,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn translate_thinking_and_tool_call_delta_events() {
+        // ThinkingDelta → session.thinking_delta
+        let (method, params) = translate_event(
+            "s1",
+            AgentEvent::ThinkingDelta {
+                delta: "pondering".into(),
+            },
+        )
+        .expect("thinking delta translates");
+        assert_eq!(method, "session.thinking_delta");
+        assert_eq!(params["session_id"], "s1");
+        assert_eq!(params["delta"], "pondering");
+
+        // AssistantThinkingFinalized → session.thinking_finalized
+        let (method, params) = translate_event(
+            "s1",
+            AgentEvent::AssistantThinkingFinalized {
+                text: "final reasoning".into(),
+            },
+        )
+        .expect("thinking finalized translates");
+        assert_eq!(method, "session.thinking_finalized");
+        assert_eq!(params["text"], "final reasoning");
+
+        // ToolCallDelta(start: name only) → session.tool_call_delta, args omitted.
+        let (method, params) = translate_event(
+            "s1",
+            AgentEvent::ToolCallDelta {
+                tool_call_id: "toolu_1".into(),
+                name_delta: Some("read".into()),
+                arguments_delta: None,
+            },
+        )
+        .expect("tool call delta translates");
+        assert_eq!(method, "session.tool_call_delta");
+        assert_eq!(params["tool_call_id"], "toolu_1");
+        assert_eq!(params["name_delta"], "read");
+        assert!(params.get("arguments_delta").is_none());
+
+        // ToolCallDelta(args fragment) → arguments_delta present, name omitted.
+        let (_method, params) = translate_event(
+            "s1",
+            AgentEvent::ToolCallDelta {
+                tool_call_id: "toolu_1".into(),
+                name_delta: None,
+                arguments_delta: Some("{\"path\":".into()),
+            },
+        )
+        .expect("tool call delta translates");
+        assert_eq!(params["arguments_delta"], "{\"path\":");
+        assert!(params.get("name_delta").is_none());
+    }
+
     // ─── event-log projection tests ──────────────────────────────
+
+    #[test]
+    fn log_drops_thinking_and_tool_call_delta_events() {
+        for ev in [
+            AgentEvent::ThinkingDelta { delta: "x".into() },
+            AgentEvent::AssistantThinkingFinalized { text: "x".into() },
+            AgentEvent::ToolCallDelta {
+                tool_call_id: "t".into(),
+                name_delta: None,
+                arguments_delta: Some("{".into()),
+            },
+        ] {
+            assert!(
+                to_log_event(&ev).is_none(),
+                "thinking/tool-delta events carry no durable log row: {ev:?}"
+            );
+        }
+    }
 
     #[test]
     fn log_drops_streaming_and_lifecycle_events() {

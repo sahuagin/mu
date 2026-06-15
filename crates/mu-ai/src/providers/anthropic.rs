@@ -3,8 +3,9 @@
 //! Streams responses from `/v1/messages` with `stream: true`, parses
 //! the SSE event format, translates to mu-core's `ProviderEvent`.
 //!
-//! See spec mu-006. v1 supports text-only responses; tools, extended
-//! thinking, and image content are deferred.
+//! See spec mu-006. Supports streamed text, tool calls (streamed deltas +
+//! finalized), and extended thinking — inbound display plus the outbound
+//! `thinking` request directive (mu-upk2). Image content is still deferred.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -18,8 +19,8 @@ use tokio::sync::oneshot;
 
 use mu_anthropic::{
     BlockDelta, BlockStart, CacheControl, Content, ContentBlock as AnthBlock,
-    Message as AnthMessage, MessagesRequest, StopReason as AnthropicStopReason, StreamEvent, Tool,
-    ToolDef, Usage as AnthropicUsage,
+    Message as AnthMessage, MessagesRequest, StopReason as AnthropicStopReason, StreamEvent,
+    ThinkingConfig, Tool, ToolDef, Usage as AnthropicUsage,
 };
 use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
@@ -36,6 +37,11 @@ use super::sse::{SseEvent, SseStream};
 
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// mu-upk2: when an explicit thinking budget is set, raise `max_tokens` to the
+/// budget plus this answer headroom — the model must have room to think AND
+/// answer (Anthropic counts thinking against output and requires
+/// `max_tokens > budget_tokens`).
+const THINKING_ANSWER_HEADROOM: u32 = 4096;
 
 /// Direct API Provider. Holds an API key (ENV-sourced is fine — this
 /// isn't an OAuth token).
@@ -49,6 +55,10 @@ pub struct AnthropicProvider {
     /// pre-f1a0); OneHour adds `"ttl": "1h"` (2.0x write billing,
     /// survives human thinking gaps).
     cache_ttl: CacheTtl,
+    /// mu-upk2: extended-thinking directive sent on every request. `None`
+    /// leaves the wire body unchanged (no `thinking` field). Set via
+    /// [`with_thinking`](Self::with_thinking) from the `--thinking` flag.
+    thinking: Option<ThinkingConfig>,
 }
 
 impl AnthropicProvider {
@@ -59,6 +69,7 @@ impl AnthropicProvider {
             model,
             api_base: ANTHROPIC_API_BASE.to_string(),
             cache_ttl: CacheTtl::default(),
+            thinking: None,
         }
     }
 
@@ -66,6 +77,26 @@ impl AnthropicProvider {
     /// requests. Builder-style, applied at session construction.
     pub fn with_cache_ttl(mut self, ttl: CacheTtl) -> Self {
         self.cache_ttl = ttl;
+        self
+    }
+
+    /// mu-upk2: enable extended thinking on this provider's requests. The
+    /// directive is injected into the wire body by [`apply_thinking`]; for an
+    /// explicit token budget, `max_tokens` is raised so it exceeds the budget
+    /// and still leaves room for the answer (Anthropic requires
+    /// `max_tokens > budget_tokens` and bills thinking against output).
+    pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+        self.thinking = Some(thinking);
+        self
+    }
+
+    /// mu-upk2: set thinking from a raw `--thinking` flag value (the provider
+    /// owns the Anthropic-specific interpretation — see [`parse_thinking_flag`]).
+    /// An empty/whitespace flag leaves thinking off.
+    pub fn with_thinking_flag(mut self, flag: &str) -> Self {
+        if let Some(cfg) = parse_thinking_flag(flag) {
+            self.thinking = Some(cfg);
+        }
         self
     }
 
@@ -99,6 +130,7 @@ impl AnthropicProvider {
             model,
             api_base,
             cache_ttl: CacheTtl::default(),
+            thinking: None,
         })
     }
 
@@ -148,6 +180,12 @@ impl Provider for AnthropicProvider {
                 ));
             }
         };
+
+        // mu-upk2: layer the extended-thinking directive onto the built wire
+        // body. Done here (not in build_request_body*) so the byte-parity test
+        // suite keeps asserting the no-thinking shape; thinking is additive.
+        let mut body = body;
+        apply_thinking(&mut body, self.thinking.as_ref());
 
         let resp = self
             .client
@@ -357,6 +395,71 @@ fn map_agent_message_single(m: &AgentMessage) -> Option<AnthMessage> {
         }
         AgentMessage::ToolResult { .. } => None,
     }
+}
+
+/// Inject the extended-thinking directive into an already-built request body.
+/// `None` is a no-op (the body keeps its no-`thinking` shape — this is why the
+/// byte-parity tests still pass). For an explicit budget, raise `max_tokens` so
+/// it exceeds the budget with room for the answer ([`THINKING_ANSWER_HEADROOM`]);
+/// `adaptive`/`disabled` only set the directive (model self-budgets / opts out).
+/// (mu-upk2)
+fn apply_thinking(body: &mut Value, thinking: Option<&ThinkingConfig>) {
+    let Some(cfg) = thinking else {
+        return;
+    };
+    match serde_json::to_value(cfg) {
+        Ok(v) => body["thinking"] = v,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to serialize thinking config; sending request without it");
+            return;
+        }
+    }
+    if let ThinkingConfig::Enabled { budget_tokens } = cfg {
+        let needed = budget_tokens.saturating_add(THINKING_ANSWER_HEADROOM);
+        let current = body.get("max_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
+        if needed > current {
+            body["max_tokens"] = Value::from(needed);
+        }
+    }
+}
+
+/// Interpret a `--thinking` flag value as an Anthropic [`ThinkingConfig`].
+/// Accepts effort levels (`minimal`/`low`/`medium`/`high`) mapped to token
+/// budgets, a raw budget number, `adaptive` (model self-budgets), and
+/// `off`/`none`/`disabled` (explicit opt-out). An empty/whitespace flag is
+/// `None` (no thinking). An unrecognized non-empty value falls back to the
+/// `medium` budget rather than silently doing nothing. Budgets are clamped to
+/// Anthropic's 1024-token floor. (mu-upk2)
+fn parse_thinking_flag(flag: &str) -> Option<ThinkingConfig> {
+    let f = flag.trim().to_ascii_lowercase();
+    // Empty OR an explicit "don't enable" word → send no `thinking` directive
+    // at all (absent == no extended thinking, the API default). This is
+    // distinct from the `disabled` keyword below, which sends the explicit
+    // `{"type":"disabled"}` opt-out directive. (mu-upk2)
+    if f.is_empty() || matches!(f.as_str(), "off" | "none" | "false" | "0") {
+        return None;
+    }
+    let enabled = |n: u32| ThinkingConfig::Enabled {
+        budget_tokens: n.max(1024),
+    };
+    Some(match f.as_str() {
+        "adaptive" => ThinkingConfig::Adaptive,
+        "disabled" => ThinkingConfig::Disabled,
+        "minimal" => enabled(1024),
+        "low" => enabled(4096),
+        "medium" | "med" => enabled(10_240),
+        "high" => enabled(24_576),
+        other => match other.parse::<u32>() {
+            Ok(n) => enabled(n),
+            Err(_) => {
+                tracing::debug!(
+                    flag = %flag,
+                    "unrecognized --thinking value for anthropic; using medium budget"
+                );
+                enabled(10_240)
+            }
+        },
+    })
 }
 
 /// mu-yqeq.8 retired the unconditional `cache_control: ephemeral`
@@ -697,6 +800,12 @@ enum BlockBuilder {
         /// Accumulated input JSON; parsed at `message_stop` time.
         input_json: String,
     },
+    /// Accumulated extended-thinking text. The block's `signature_delta`
+    /// (mu_anthropic `BlockDelta::SignatureDelta`) is intentionally NOT
+    /// retained: `ContentBlock::Thinking` carries display text only, and
+    /// thinking is stripped on the way back TO the model (spec mu-044),
+    /// so the signature has no consumer.
+    Thinking(String),
 }
 
 struct StreamState {
@@ -787,8 +896,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 content_block,
             } => {
                 // Register a new block. Re-registering an index is a
-                // protocol violation; we replace silently. Thinking and
-                // other block kinds are not surfaced on the minimal path.
+                // protocol violation; we replace silently.
                 let builder = match content_block {
                     BlockStart::Text { text } => BlockBuilder::Text(text),
                     BlockStart::ToolUse { id, name } => BlockBuilder::ToolUse {
@@ -796,12 +904,32 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                         name,
                         input_json: String::new(),
                     },
-                    BlockStart::Thinking { .. } | BlockStart::Other => continue,
+                    BlockStart::Thinking { thinking } => BlockBuilder::Thinking(thinking),
+                    BlockStart::Other => continue,
                 };
                 if !state.blocks.contains_key(&index) {
                     state.block_order.push(index);
                 }
+                // Surface the block's opening as a live event before
+                // storing it, so the agent loop sees thinking starts and
+                // tool-call starts in stream order (mirrors how TextDelta
+                // is surfaced live). A tool_use start announces the call
+                // id+name; subsequent input_json deltas carry the args.
+                let opening = match &builder {
+                    BlockBuilder::Thinking(text) if !text.is_empty() => {
+                        Some(ProviderEvent::ThinkingDelta(text.clone()))
+                    }
+                    BlockBuilder::ToolUse { id, name, .. } => Some(ProviderEvent::ToolCallDelta {
+                        id: id.clone(),
+                        name_delta: Some(name.clone()),
+                        arguments_delta: None,
+                    }),
+                    _ => None,
+                };
                 state.blocks.insert(index, builder);
+                if let Some(ev) = opening {
+                    return Some((ev, state));
+                }
             }
             StreamEvent::ContentBlockDelta { index, delta } => match delta {
                 BlockDelta::TextDelta { text } => {
@@ -818,26 +946,57 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                     return Some((ProviderEvent::TextDelta(text), state));
                 }
                 BlockDelta::InputJsonDelta { partial_json } => {
-                    if let Some(BlockBuilder::ToolUse { input_json, .. }) =
-                        state.blocks.get_mut(&index)
-                    {
-                        input_json.push_str(&partial_json);
-                    } else {
-                        // Delta for a tool block we never saw start —
-                        // protocol violation. Log and ignore.
-                        tracing::warn!(
-                            index,
-                            "input_json_delta arrived for unknown or non-tool block"
-                        );
+                    // Accumulate for the final assembled tool call (the
+                    // Done payload stays authoritative/complete) AND
+                    // surface the fragment live so the loop can stream
+                    // partial tool args.
+                    match state.blocks.get_mut(&index) {
+                        Some(BlockBuilder::ToolUse { id, input_json, .. }) => {
+                            input_json.push_str(&partial_json);
+                            let id = id.clone();
+                            return Some((
+                                ProviderEvent::ToolCallDelta {
+                                    id,
+                                    name_delta: None,
+                                    arguments_delta: Some(partial_json),
+                                },
+                                state,
+                            ));
+                        }
+                        _ => {
+                            // Delta for a tool block we never saw start —
+                            // protocol violation. Log and ignore.
+                            tracing::warn!(
+                                index,
+                                "input_json_delta arrived for unknown or non-tool block"
+                            );
+                        }
                     }
-                    // Minimal path: don't emit ProviderEvent::ToolCallDelta;
-                    // final tool calls are surfaced in the Done payload.
                 }
-                BlockDelta::ThinkingDelta { .. }
-                | BlockDelta::SignatureDelta { .. }
-                | BlockDelta::Other => {
-                    // Thinking/signature deltas are not surfaced on the
-                    // minimal path (parity with the pre-swap behavior).
+                BlockDelta::ThinkingDelta { thinking } => {
+                    match state.blocks.get_mut(&index) {
+                        Some(BlockBuilder::Thinking(buf)) => buf.push_str(&thinking),
+                        _ => {
+                            // No matching thinking block — treat as an
+                            // implicit start (mirrors the TextDelta path).
+                            if !state.blocks.contains_key(&index) {
+                                state.block_order.push(index);
+                            }
+                            state
+                                .blocks
+                                .insert(index, BlockBuilder::Thinking(thinking.clone()));
+                        }
+                    }
+                    return Some((ProviderEvent::ThinkingDelta(thinking), state));
+                }
+                BlockDelta::SignatureDelta { .. } => {
+                    // Extended-thinking blocks carry a cryptographic
+                    // signature here. Not retained — see the BlockBuilder
+                    // ::Thinking doc (display-only; stripped outbound per
+                    // mu-044, so no consumer).
+                }
+                BlockDelta::Other => {
+                    // Unknown delta type (forward-compat); ignore.
                 }
             },
             StreamEvent::ContentBlockStop { .. } => {
@@ -932,6 +1091,9 @@ fn assemble_content(blocks: &HashMap<u32, BlockBuilder>, block_order: &[u32]) ->
                     arguments,
                 })
             }
+            BlockBuilder::Thinking(text) => ContentBlock::Thinking {
+                text: text.as_str().into(),
+            },
         })
         .collect()
 }

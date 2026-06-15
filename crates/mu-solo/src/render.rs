@@ -153,10 +153,24 @@ pub fn into_paragraph(lines: Vec<Line<'static>>) -> Paragraph<'static> {
 pub enum TurnItem {
     /// Streamed assistant prose. Appended-to in place as deltas arrive.
     Text(String),
+    /// Streamed model reasoning (Anthropic extended thinking, ollama
+    /// reasoning models). Appended-to in place as deltas arrive; rendered
+    /// dimmed to set it apart from the answer prose. (mu-upk2)
+    Thinking(String),
     /// A model tool call: `● Name(primary_arg)`.
     ToolCall {
+        /// Provider tool-call id — retained so the committed turn carries the
+        /// intact typed call, not just a display projection. (mu-upk2)
+        tool_call_id: String,
         display_name: String,
         primary_arg: String,
+        /// Full structured arguments (lossless). `Null` until the call
+        /// finalizes via `session.tool_call_started`. (mu-upk2)
+        arguments: serde_json::Value,
+        /// Live partial-JSON args accumulated from `session.tool_call_delta`
+        /// before finalization; cleared once finalized (empty when the
+        /// provider didn't stream tool args). (mu-upk2)
+        partial_args: String,
     },
     /// A tool result. `kind` is the outcome kind ("ok" | "err" | other);
     /// `text` is the result body (ok) or message (err).
@@ -201,6 +215,7 @@ pub fn render_turn(
             if let TurnItem::ToolCall {
                 display_name,
                 primary_arg,
+                ..
             } = &items[j]
             {
                 if matches!(items.get(j + 1), Some(TurnItem::ToolResult { .. })) {
@@ -221,6 +236,7 @@ pub fn render_turn(
             if let TurnItem::ToolCall {
                 display_name,
                 primary_arg,
+                ..
             } = &items[i]
             {
                 if let Some(TurnItem::ToolResult { kind, text }) = items.get(i + 1) {
@@ -340,10 +356,40 @@ pub fn render_turn_item(
             }
             lines
         }
+        TurnItem::Thinking(body) => {
+            // Reasoning trace, dimmed and prefixed so it reads as the model's
+            // private thinking, distinct from the answer. Wrapped like Text.
+            let inner = wrap_width.saturating_sub(4).max(1);
+            let mut lines = Vec::new();
+            let mut first = true;
+            for raw in body.lines() {
+                for row in wrap_line(raw, inner) {
+                    let marker = if first { "✻ " } else { "  " };
+                    first = false;
+                    lines.push(Line::from(vec![
+                        Span::styled("│ ", Style::default().fg(color)),
+                        Span::styled(
+                            format!("{marker}{row}"),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        ),
+                    ]));
+                }
+            }
+            lines
+        }
         TurnItem::ToolCall {
             display_name,
             primary_arg,
+            partial_args,
+            ..
         } => {
+            let display_name = if display_name.is_empty() {
+                "…"
+            } else {
+                display_name.as_str()
+            };
             let header_text = if primary_arg.is_empty() {
                 format!("● {display_name}")
             } else {
@@ -360,7 +406,7 @@ pub fn render_turn_item(
                 };
                 format!("● {display_name}({arg})")
             };
-            vec![Line::from(vec![
+            let mut lines = vec![Line::from(vec![
                 Span::styled("│ ", Style::default().fg(color)),
                 Span::styled(
                     header_text,
@@ -368,7 +414,18 @@ pub fn render_turn_item(
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
-            ])]
+            ])];
+            // While the call is still streaming (no finalized primary_arg yet),
+            // show the raw args building up live, dimmed and truncated. (mu-upk2)
+            if primary_arg.is_empty() && !partial_args.is_empty() {
+                let inner = wrap_width.saturating_sub(6).max(1);
+                let preview: String = partial_args.chars().take(inner).collect();
+                lines.push(Line::from(vec![
+                    Span::styled("│   ", Style::default().fg(color)),
+                    Span::styled(preview, Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+            lines
         }
         TurnItem::ToolResult { kind, text } => {
             render_tool_result(kind, text, color, wrap_width, tool_preview_lines)
@@ -597,6 +654,18 @@ mod tests {
             .collect()
     }
 
+    /// A finalized ToolCall item. The streaming/lossless fields (id,
+    /// arguments, partial_args) don't affect the layout these tests check.
+    fn tc(name: &str, arg: &str) -> TurnItem {
+        TurnItem::ToolCall {
+            tool_call_id: format!("toolu_{name}"),
+            display_name: name.into(),
+            primary_arg: arg.into(),
+            arguments: serde_json::Value::Null,
+            partial_args: String::new(),
+        }
+    }
+
     #[test]
     fn render_turn_header_then_items_no_closer() {
         let items = vec![TurnItem::Text("hello".into())];
@@ -612,10 +681,7 @@ mod tests {
     fn collapse_folds_completed_tool_to_one_line() {
         // ToolCall + ToolResult → a single `● Name(arg)  ⎿ ok · N lines` line.
         let items = vec![
-            TurnItem::ToolCall {
-                display_name: "Bash".into(),
-                primary_arg: "cat f".into(),
-            },
+            tc("Bash", "cat f"),
             TurnItem::ToolResult {
                 kind: "ok".into(),
                 text: "a\nb\nc".into(),
@@ -630,10 +696,7 @@ mod tests {
     #[test]
     fn collapse_leaves_inflight_call_expanded() {
         // A ToolCall with no following ToolResult (in-flight) is not folded.
-        let items = vec![TurnItem::ToolCall {
-            display_name: "Bash".into(),
-            primary_arg: "sleep 1".into(),
-        }];
+        let items = vec![tc("Bash", "sleep 1")];
         let p = plain(&render_turn("assistant", Color::White, &items, 80, 4, true));
         assert_eq!(p[1], "│ ● Bash(sleep 1)");
     }
@@ -641,10 +704,7 @@ mod tests {
     #[test]
     fn collapse_err_result_summary() {
         let items = vec![
-            TurnItem::ToolCall {
-                display_name: "Bash".into(),
-                primary_arg: "false".into(),
-            },
+            tc("Bash", "false"),
             TurnItem::ToolResult {
                 kind: "err".into(),
                 text: "boom".into(),
@@ -659,18 +719,12 @@ mod tests {
         // Two collapsed calls of different widths → the shorter is padded so
         // both `⎿` summaries start at the same column.
         let items = vec![
-            TurnItem::ToolCall {
-                display_name: "Bash".into(),
-                primary_arg: "ls".into(),
-            },
+            tc("Bash", "ls"),
             TurnItem::ToolResult {
                 kind: "ok".into(),
                 text: "x".into(),
             },
-            TurnItem::ToolCall {
-                display_name: "Read".into(),
-                primary_arg: "a/longer/path.rs".into(),
-            },
+            tc("Read", "a/longer/path.rs"),
             TurnItem::ToolResult {
                 kind: "ok".into(),
                 text: "y\nz".into(),
@@ -685,12 +739,33 @@ mod tests {
 
     #[test]
     fn render_tool_call_header_format() {
-        let item = TurnItem::ToolCall {
-            display_name: "Bash".into(),
-            primary_arg: "ls -la".into(),
-        };
+        let item = tc("Bash", "ls -la");
         let lines = render_turn_item(&item, Color::White, 80, 4);
         assert_eq!(plain(&lines)[0], "│ ● Bash(ls -la)");
+    }
+
+    #[test]
+    fn render_thinking_item_is_marked_and_wrapped() {
+        let item = TurnItem::Thinking("let me reason\nabout this".into());
+        let p = plain(&render_turn_item(&item, Color::White, 80, 4));
+        assert_eq!(p[0], "│ ✻ let me reason");
+        assert_eq!(p[1], "│   about this");
+    }
+
+    #[test]
+    fn render_streaming_tool_call_shows_partial_args() {
+        // No finalized primary_arg yet, but args are streaming in: show the
+        // name header plus a dim partial-args preview line. (mu-upk2)
+        let item = TurnItem::ToolCall {
+            tool_call_id: "toolu_1".into(),
+            display_name: "Read".into(),
+            primary_arg: String::new(),
+            arguments: serde_json::Value::Null,
+            partial_args: "{\"path\":\"Cargo".into(),
+        };
+        let p = plain(&render_turn_item(&item, Color::White, 80, 4));
+        assert_eq!(p[0], "│ ● Read");
+        assert_eq!(p[1], "│   {\"path\":\"Cargo");
     }
 
     #[test]

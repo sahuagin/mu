@@ -141,9 +141,17 @@ pub fn render_turn_items_plain(items: &[TurnItem]) -> String {
                 out.push_str(text.trim_end());
                 out.push('\n');
             }
+            TurnItem::Thinking(text) => {
+                // mu-upk2: reasoning is part of the copyable/exported
+                // transcript, tagged so it reads as the model's thinking.
+                let _ = writeln!(out, "[thinking]");
+                out.push_str(text.trim_end());
+                out.push('\n');
+            }
             TurnItem::ToolCall {
                 display_name,
                 primary_arg,
+                ..
             } => {
                 if primary_arg.is_empty() {
                     let _ = writeln!(out, "[tool] {display_name}");
@@ -188,8 +196,11 @@ mod tests {
         let items = vec![
             TurnItem::Text("hi".into()),
             TurnItem::ToolCall {
+                tool_call_id: "toolu_1".into(),
                 display_name: "Bash".into(),
                 primary_arg: "echo ok".into(),
+                arguments: serde_json::json!({"command": "echo ok"}),
+                partial_args: String::new(),
             },
             TurnItem::ToolResult {
                 kind: "ok".into(),
@@ -200,5 +211,16 @@ mod tests {
         assert!(plain.contains("hi"));
         assert!(plain.contains("[tool] Bash(echo ok)"));
         assert!(plain.contains("[tool result: ok]\nok"));
+    }
+
+    #[test]
+    fn turn_items_plain_includes_thinking() {
+        let items = vec![
+            TurnItem::Thinking("weighing options".into()),
+            TurnItem::Text("the answer".into()),
+        ];
+        let plain = render_turn_items_plain(&items);
+        assert!(plain.contains("[thinking]\nweighing options"));
+        assert!(plain.contains("the answer"));
     }
 }

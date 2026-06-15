@@ -17,7 +17,9 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 use mu_anthropic::{
-    BlockDelta, BlockStart, StopReason as AnthropicStopReason, StreamEvent, Usage as AnthropicUsage,
+    BlockDelta, BlockStart, CacheControl, Content, ContentBlock as AnthBlock,
+    Message as AnthMessage, MessagesRequest, StopReason as AnthropicStopReason, StreamEvent, Tool,
+    Usage as AnthropicUsage,
 };
 use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
@@ -206,23 +208,111 @@ impl Provider for AnthropicProvider {
     }
 }
 
-/// Translate a mu `ToolSpec` into Anthropic's tool descriptor shape.
-pub(crate) fn translate_tool_spec(spec: &ToolSpec) -> Value {
-    json!({
-        "name": spec.name,
-        "description": spec.description,
-        "input_schema": spec.input_schema,
+// ============================================================================
+// mu -> mu_anthropic request mapping (typed; request bytes come from the crate)
+// ============================================================================
+
+/// mu cache-TTL tier -> a mu_anthropic `CacheControl` directive.
+fn cache_control(ttl: CacheTtl) -> CacheControl {
+    match ttl {
+        CacheTtl::FiveMinutes => CacheControl::ephemeral(),
+        CacheTtl::OneHour => CacheControl::ephemeral_with_ttl("1h"),
+    }
+}
+
+/// Wrap a `serde_json::Value` as a mu_anthropic `JsonValue`. The values we feed
+/// (tool input schemas, already-validated tool arguments) are finite by
+/// construction; the impossible non-finite case degrades to an empty object
+/// rather than panicking.
+fn json_value(v: Value) -> mu_anthropic::JsonValue {
+    mu_anthropic::JsonValue::new(v).unwrap_or_else(|_| mu_anthropic::JsonValue::empty_object())
+}
+
+/// Translate a mu `ToolSpec` into a mu_anthropic `Tool`, optionally caching it.
+/// Returns `Tool` (not `ToolDef`): the crate doesn't re-export `ToolDef`, so the
+/// `Tool -> ToolDef` conversion is left to the `with_tools` call site via `Into`.
+fn map_tool_spec(spec: &ToolSpec, cache: Option<CacheControl>) -> Tool {
+    let mut tool = Tool::new(
+        spec.name.clone(),
+        spec.description.clone(),
+        json_value(spec.input_schema.clone()),
+    );
+    tool.cache_control = cache;
+    tool
+}
+
+/// Build the request `tools`, attaching `cache_control` to the LAST tool when
+/// `cache_last` (mu's tool-cache position). The `Vec<Tool>` is turned into the
+/// `Vec<ToolDef>` `with_tools` wants at the call site (inference + `From<Tool>`).
+fn map_tools(tools: &[ToolSpec], cache_last: bool, ttl: CacheTtl) -> Vec<Tool> {
+    let last = tools.len().saturating_sub(1);
+    tools
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| map_tool_spec(spec, (cache_last && i == last).then(|| cache_control(ttl))))
+        .collect()
+}
+
+/// The top-level `system` content: a single text block (the historical wire
+/// shape), carrying `cache_control` when the system span is marked.
+fn system_content(text: String, cache: bool, ttl: CacheTtl) -> Content {
+    Content::Blocks(vec![AnthBlock::Text {
+        text,
+        citations: Vec::new(),
+        cache_control: cache.then(|| cache_control(ttl)),
+    }])
+}
+
+/// Attach `cache_control` to whichever block kind carries it (the last block of
+/// a marked message).
+fn set_block_cache_control(block: &mut AnthBlock, cc: CacheControl) {
+    match block {
+        AnthBlock::Text { cache_control, .. }
+        | AnthBlock::ToolUse { cache_control, .. }
+        | AnthBlock::ToolResult { cache_control, .. } => *cache_control = Some(cc),
+        _ => {}
+    }
+}
+
+/// Map an assistant's mu-core content blocks to mu_anthropic blocks. Text and
+/// tool calls translate; `Thinking` is dropped outbound — mu never echoes the
+/// model's own reasoning back as input (spec mu-044).
+fn map_assistant_blocks(blocks: &[ContentBlock]) -> Vec<AnthBlock> {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(AnthBlock::Text {
+                text: text.as_ref().to_string(),
+                citations: Vec::new(),
+                cache_control: None,
+            }),
+            ContentBlock::ToolCall(tc) => Some(AnthBlock::ToolUse {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+                input: json_value(tc.arguments.as_value().clone()),
+                cache_control: None,
+            }),
+            ContentBlock::Thinking { .. } => None,
+        })
+        .collect()
+}
+
+/// Serialize a built `MessagesRequest` to the wire `Value`. Infallible in
+/// practice (the request holds only finite, serializable data); a serialization
+/// failure degrades to an empty object and is logged rather than panicking.
+fn request_to_value(req: MessagesRequest) -> Value {
+    serde_json::to_value(&req).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "failed to serialize MessagesRequest");
+        json!({})
     })
 }
 
-/// Translate messages into Anthropic's API message shape.
-///
-/// Consecutive tool results are batched into a single user message
-/// containing multiple `tool_result` content blocks, as required by
-/// Anthropic's tool-use protocol.
-pub(crate) fn translate_messages(messages: &[AgentMessage]) -> Vec<Value> {
+/// Translate Legacy `&[AgentMessage]` into mu_anthropic messages. Consecutive
+/// tool results batch into one user message of `tool_result` blocks, as
+/// Anthropic's tool-use protocol requires.
+pub(crate) fn map_agent_messages(messages: &[AgentMessage]) -> Vec<AnthMessage> {
     let mut out = Vec::with_capacity(messages.len());
-    let mut tool_result_buf = Vec::new();
+    let mut tool_result_buf: Vec<AnthBlock> = Vec::new();
 
     for message in messages {
         match message {
@@ -231,71 +321,41 @@ pub(crate) fn translate_messages(messages: &[AgentMessage]) -> Vec<Value> {
                 content,
                 is_error,
             } => {
-                tool_result_buf.push(json!({
-                    "type": "tool_result",
-                    "tool_use_id": call_id,
-                    "content": content,
-                    "is_error": is_error,
-                }));
+                tool_result_buf.push(AnthBlock::ToolResult {
+                    tool_use_id: call_id.clone(),
+                    content: content.clone(),
+                    is_error: Some(*is_error),
+                    cache_control: None,
+                });
             }
             other => {
                 if !tool_result_buf.is_empty() {
-                    out.push(json!({
-                        "role": "user",
-                        "content": std::mem::take(&mut tool_result_buf),
-                    }));
+                    out.push(AnthMessage::user(std::mem::take(&mut tool_result_buf)));
                 }
-                if let Some(translated) = translate_message_single(other) {
-                    out.push(translated);
+                if let Some(m) = map_agent_message_single(other) {
+                    out.push(m);
                 }
             }
         }
     }
 
     if !tool_result_buf.is_empty() {
-        out.push(json!({
-            "role": "user",
-            "content": tool_result_buf,
-        }));
+        out.push(AnthMessage::user(tool_result_buf));
     }
 
     out
 }
 
-/// Single-message translation for non-ToolResult variants. ToolResult
-/// is handled by `translate_messages` because Anthropic requires
-/// consecutive tool results to be grouped in one user message.
-fn translate_message_single(m: &AgentMessage) -> Option<Value> {
+/// Single-message translation for non-ToolResult Legacy variants.
+fn map_agent_message_single(m: &AgentMessage) -> Option<AnthMessage> {
     match m {
-        AgentMessage::User { content } => Some(json!({
-            "role": "user",
-            "content": content,
-        })),
+        AgentMessage::User { content } => Some(AnthMessage::user(content.as_str())),
         AgentMessage::Assistant(a) => {
-            let blocks: Vec<Value> = a
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(json!({
-                        "type": "text",
-                        "text": text,
-                    })),
-                    ContentBlock::ToolCall(tool_call) => Some(json!({
-                        "type": "tool_use",
-                        "id": tool_call.id,
-                        "name": tool_call.name,
-                        "input": tool_call.arguments,
-                    })),
-                    ContentBlock::Thinking { .. } => None,
-                })
-                .collect();
+            let blocks = map_assistant_blocks(&a.content);
             if blocks.is_empty() {
                 None
             } else {
-                Some(json!({
-                    "role": "assistant",
-                    "content": blocks,
-                }))
+                Some(AnthMessage::assistant(blocks))
             }
         }
         AgentMessage::ToolResult { .. } => None,
@@ -316,96 +376,55 @@ pub(crate) fn build_request_body(
     messages: &[AgentMessage],
     tools: &[ToolSpec],
 ) -> Value {
-    let api_messages = translate_messages(messages);
-    let mut body = json!({
-        "model": model,
-        "max_tokens": super::output_limits::max_tokens_for_model(model),
-        "stream": true,
-        "messages": api_messages,
-    });
+    let mut req = MessagesRequest::new(
+        model,
+        super::output_limits::max_tokens_for_model(model),
+        map_agent_messages(messages),
+    )
+    .with_stream(true);
     if let Some(s) = system_prompt {
         if !s.is_empty() {
-            body["system"] = json!([
-                {
-                    "type": "text",
-                    "text": s,
-                }
-            ]);
+            // Legacy path emits no cache_control (mu-yqeq.8).
+            req = req.with_system(system_content(s.to_string(), false, CacheTtl::default()));
         }
     }
     if !tools.is_empty() {
-        let tool_specs: Vec<Value> = tools.iter().map(translate_tool_spec).collect();
-        body["tools"] = json!(tool_specs);
+        req = req.with_tools(
+            map_tools(tools, false, CacheTtl::default())
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        );
     }
-    body
+    request_to_value(req)
 }
 
 // ============================================================================
-// mu-yqeq.4: Projected path — wire body built from &ProviderMessages
+// mu -> mu_anthropic request mapping for the Projected (production) path
 // ============================================================================
 //
-// Mirrors `translate_messages` + `build_request_body` semantics but
-// reads structural `ContentBlock`s from `ProviderMessage.blocks`
-// instead of `AgentMessage::Assistant.content`. Tool-result binding
-// (`tool_use_id`) is recovered from each `ToolResult` message's
-// `source_span_ids[0]` via the `extract_call_id_from_span_id` helper
-// (mu-yqeq.3).
-//
-// Wire-format byte equivalence with the Legacy path is the contract;
-// see `parity_*` tests below for the canonical scenarios.
+// Reads structural ContentBlocks from ProviderMessage.blocks; tool-result
+// binding (tool_use_id) is recovered from each ToolResult message's
+// source_span_ids[0] via extract_call_id_from_span_id (mu-yqeq.3). System spans
+// are hoisted into the top-level system field; tool-schema spans are skipped
+// (the `tools` parameter is authoritative for body.tools).
 
-/// Translate a [`ProviderMessages`] projection into Anthropic's API
-/// message array shape, returning the hoisted system-content text (if
-/// any) separately for [`build_request_body_from_projection`] to
-/// place in the top-level `system` field.
+/// Translate a ProviderMessages projection into mu_anthropic messages plus the
+/// hoisted system text (placed in the top-level `system` field by the caller).
 ///
-/// Hoisting rule (mu-s855, post-mu-phl v0):
-///   - All `ProviderRole::System` messages EXCEPT tool-schema spans
-///     get their content hoisted into `system_text`, concatenated
-///     with "\n\n" between spans. This covers:
-///       - "system-prompt" (the session system_prompt)
-///       - "memory-recall:*" (SubprocessRecallProvider per mu-phl v0)
-///       - "project-file:*" (ProjectFileRecallProvider per mu-phl v0)
-///       - any other future System-role span kind
-///   - Tool-schema spans are skipped (the `tools` parameter on
-///     Provider::stream is authoritative for `body.tools`; the rope's
-///     ToolSchema spans exist for operator-view + cache positioning,
-///     not wire emission).
-///
-/// Pre-fix this branch only hoisted the literal "system-prompt" span
-/// and silently dropped every other System-role span — invisible in
-/// yqeq4_parity_* tests because pre-mu-phl ropes had no other
-/// System-role spans. Codex sibling: mu-2puu. OpenRouter sibling:
-/// mu-745h.
-///
-/// All other roles are translated per the Legacy `translate_messages`
-/// rules, with consecutive `ToolResult` messages batched into a
-/// single user message — Anthropic's tool-use protocol requires that
-/// grouping.
-/// mu-f1a0: the one place the TTL tier becomes wire JSON. FiveMinutes
-/// omits the `ttl` field — byte-identical to the pre-f1a0 emission, so
-/// the default path needs no parity re-verification.
-fn cache_control_value(ttl: CacheTtl) -> Value {
-    match ttl {
-        CacheTtl::FiveMinutes => json!({ "type": "ephemeral" }),
-        CacheTtl::OneHour => json!({ "type": "ephemeral", "ttl": "1h" }),
-    }
-}
-
-fn translate_provider_messages(
+/// Hoisting rule (mu-s855, post-mu-phl v0): every System-role span EXCEPT
+/// tool-schema spans contributes to system_text, joined with a blank line.
+/// Per-message cache markers land on the marked content block; system/tool
+/// cache placement is handled separately by detect_cache_targets.
+fn map_provider_messages(
     pmsgs: &ProviderMessages,
     ttl: CacheTtl,
-) -> (Vec<Value>, Option<String>) {
-    let mut out: Vec<Value> = Vec::with_capacity(pmsgs.messages.len());
-    let mut tool_result_buf: Vec<Value> = Vec::new();
+) -> (Vec<AnthMessage>, Option<String>) {
+    let mut out: Vec<AnthMessage> = Vec::with_capacity(pmsgs.messages.len());
+    let mut tool_result_buf: Vec<AnthBlock> = Vec::new();
     let mut system_text: Option<String> = None;
 
     for msg in &pmsgs.messages {
-        // mu-chiw: conversation-anchor markers land on User /
-        // Assistant / ToolResult messages and emit `cache_control` on
-        // a content block at the marked position. System-role markers
-        // are handled separately (detect_cache_targets → body.system
-        // / body.tools), unchanged.
         let marked = msg.cache_marker() == Some(CacheMarker::Ephemeral);
         match msg.role() {
             ProviderRole::System => {
@@ -422,179 +441,121 @@ fn translate_provider_messages(
                                 existing.push_str("\n\n");
                                 existing.push_str(content);
                             }
-                            None => {
-                                system_text = Some(content.to_string());
-                            }
+                            None => system_text = Some(content.to_string()),
                         }
                     }
                 }
             }
             ProviderRole::ToolResult => {
-                let mut block = translate_provider_tool_result(msg);
-                if marked {
-                    block["cache_control"] = cache_control_value(ttl);
-                }
-                tool_result_buf.push(block);
+                tool_result_buf.push(map_provider_tool_result(
+                    msg,
+                    marked.then(|| cache_control(ttl)),
+                ));
             }
             ProviderRole::User => {
-                flush_tool_result_buf(&mut out, &mut tool_result_buf);
+                flush_tool_results(&mut out, &mut tool_result_buf);
                 if marked {
-                    // cache_control needs a content BLOCK; the plain
-                    // string form stays for unmarked messages (wire
-                    // parity with the legacy path).
-                    out.push(json!({
-                        "role": "user",
-                        "content": [{
-                            "type": "text",
-                            "text": msg.content(),
-                            "cache_control": cache_control_value(ttl),
-                        }],
-                    }));
+                    out.push(AnthMessage::user(vec![AnthBlock::Text {
+                        text: msg.content().to_string(),
+                        citations: Vec::new(),
+                        cache_control: Some(cache_control(ttl)),
+                    }]));
                 } else {
-                    out.push(json!({
-                        "role": "user",
-                        "content": msg.content(),
-                    }));
+                    out.push(AnthMessage::user(msg.content()));
                 }
             }
             ProviderRole::Assistant => {
-                flush_tool_result_buf(&mut out, &mut tool_result_buf);
-                if let Some(mut translated) = translate_provider_assistant(msg) {
-                    if marked {
-                        if let Some(last) = translated["content"]
-                            .as_array_mut()
-                            .and_then(|blocks| blocks.last_mut())
-                        {
-                            last["cache_control"] = cache_control_value(ttl);
-                        }
-                    }
-                    out.push(translated);
+                flush_tool_results(&mut out, &mut tool_result_buf);
+                if let Some(m) = map_provider_assistant(msg, marked.then(|| cache_control(ttl))) {
+                    out.push(m);
                 }
             }
         }
     }
-    flush_tool_result_buf(&mut out, &mut tool_result_buf);
+    flush_tool_results(&mut out, &mut tool_result_buf);
 
     (out, system_text)
 }
 
-fn flush_tool_result_buf(out: &mut Vec<Value>, buf: &mut Vec<Value>) {
+fn flush_tool_results(out: &mut Vec<AnthMessage>, buf: &mut Vec<AnthBlock>) {
     if !buf.is_empty() {
-        out.push(json!({
-            "role": "user",
-            "content": std::mem::take(buf),
-        }));
+        out.push(AnthMessage::user(std::mem::take(buf)));
     }
 }
 
-fn translate_provider_tool_result(msg: &ProviderMessage) -> Value {
-    // call_id recovered from the synthesized span id
-    // (`msg-{idx}-tool-result:{call_id}` — see assembly.rs). Fall back
-    // to empty string if absent so a malformed projection produces a
-    // visibly wrong wire payload rather than silently swallowing the
-    // tool-call binding.
-    let call_id: &str = msg
+/// One ToolResult ProviderMessage to a mu_anthropic tool_result block. call_id
+/// comes from the synthesized span id; is_error from the "error: " content
+/// prefix that assembly.rs adds for errored tool results.
+fn map_provider_tool_result(msg: &ProviderMessage, cache: Option<CacheControl>) -> AnthBlock {
+    let call_id = msg
         .source_span_ids()
         .first()
         .and_then(|sid| extract_call_id_from_span_id(sid.as_ref()))
-        .unwrap_or("");
-    // is_error recovered from the "error: " prefix that
-    // assembly.rs:message_to_span adds when AgentMessage::ToolResult
-    // had is_error=true.
+        .unwrap_or("")
+        .to_string();
     let (is_error, content) = match msg.content().strip_prefix("error: ") {
-        Some(stripped) => (true, stripped),
-        None => (false, msg.content()),
+        Some(stripped) => (true, stripped.to_string()),
+        None => (false, msg.content().to_string()),
     };
-    json!({
-        "type": "tool_result",
-        "tool_use_id": call_id,
-        "content": content,
-        "is_error": is_error,
-    })
-}
-
-/// Translate one assistant-role [`ProviderMessage`] into Anthropic's
-/// `{role: "assistant", content: [...]}` block. Reads structural
-/// blocks from `msg.blocks()` — populated by `assemble_rope` for
-/// `AgentMessage::Assistant`. `Thinking` blocks are intentionally
-/// skipped per spec mu-044 §"Thinking-block skip" (provider never
-/// receives the model's own reasoning trace as input). Returns `None`
-/// if the assistant produced no wire-bearing blocks (e.g. only
-/// thinking) — mirrors `translate_message_single`'s elision rule.
-fn translate_provider_assistant(msg: &ProviderMessage) -> Option<Value> {
-    let blocks = msg.blocks()?;
-    let translated: Vec<Value> = blocks
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(json!({
-                "type": "text",
-                "text": text.as_ref(),
-            })),
-            ContentBlock::ToolCall(tool_call) => Some(json!({
-                "type": "tool_use",
-                "id": tool_call.id,
-                "name": tool_call.name,
-                "input": tool_call.arguments,
-            })),
-            ContentBlock::Thinking { .. } => None,
-        })
-        .collect();
-    if translated.is_empty() {
-        None
-    } else {
-        Some(json!({
-            "role": "assistant",
-            "content": translated,
-        }))
+    AnthBlock::ToolResult {
+        tool_use_id: call_id,
+        content,
+        is_error: Some(is_error),
+        cache_control: cache,
     }
 }
 
-/// Sibling of [`build_request_body`] that builds Anthropic's request
-/// body from a [`ProviderMessages`] projection instead of a raw
-/// `&[AgentMessage]` slice. After mu-yqeq.8, `cache_control` emission
-/// is driven by per-message [`CacheMarker`] flags set by
-/// [`AnthropicCacheStrategy`]: a marker on the projection's
-/// `"system-prompt"` message triggers `cache_control` on `body.system`;
-/// a marker on any `"tool-schema:*"` message triggers `cache_control`
-/// on the last tool spec. The wire shape (minus cache_control) is
-/// byte-identical to the Legacy path for the canonical scenarios —
-/// asserted by `yqeq4_parity_*` tests in anthropic_tests.rs.
+/// One assistant-role ProviderMessage to a mu_anthropic assistant message.
+/// Reads structural blocks from msg.blocks(); Thinking blocks are dropped
+/// outbound (spec mu-044). Returns None when the assistant produced no
+/// wire-bearing blocks. A cache marker attaches cache_control to the last block.
+fn map_provider_assistant(
+    msg: &ProviderMessage,
+    cache_last: Option<CacheControl>,
+) -> Option<AnthMessage> {
+    let mut mapped = map_assistant_blocks(msg.blocks()?);
+    if mapped.is_empty() {
+        return None;
+    }
+    if let (Some(cc), Some(last)) = (cache_last, mapped.last_mut()) {
+        set_block_cache_control(last, cc);
+    }
+    Some(AnthMessage::assistant(mapped))
+}
+
+/// Sibling of build_request_body that builds the request from a ProviderMessages
+/// projection. cache_control placement is driven by per-message CacheMarker
+/// flags (AnthropicCacheStrategy): a marked system span caches body.system; a
+/// marked tool-schema span caches the last tool spec.
 pub(crate) fn build_request_body_from_projection(
     model: &str,
     pmsgs: &ProviderMessages,
     tools: &[ToolSpec],
     ttl: CacheTtl,
 ) -> Value {
-    let (api_messages, hoisted_system) = translate_provider_messages(pmsgs, ttl);
+    let (messages, hoisted_system) = map_provider_messages(pmsgs, ttl);
     let (system_should_cache, tools_should_cache) = detect_cache_targets(pmsgs);
-    let mut body = json!({
-        "model": model,
-        "max_tokens": super::output_limits::max_tokens_for_model(model),
-        "stream": true,
-        "messages": api_messages,
-    });
+
+    let mut req = MessagesRequest::new(
+        model,
+        super::output_limits::max_tokens_for_model(model),
+        messages,
+    )
+    .with_stream(true);
     if let Some(s) = hoisted_system {
         if !s.is_empty() {
-            let mut system_block = json!({
-                "type": "text",
-                "text": s,
-            });
-            if system_should_cache {
-                system_block["cache_control"] = cache_control_value(ttl);
-            }
-            body["system"] = json!([system_block]);
+            req = req.with_system(system_content(s, system_should_cache, ttl));
         }
     }
     if !tools.is_empty() {
-        let mut tool_specs: Vec<Value> = tools.iter().map(translate_tool_spec).collect();
-        if tools_should_cache {
-            if let Some(last) = tool_specs.last_mut() {
-                last["cache_control"] = cache_control_value(ttl);
-            }
-        }
-        body["tools"] = json!(tool_specs);
+        req = req.with_tools(
+            map_tools(tools, tools_should_cache, ttl)
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        );
     }
-    body
+    request_to_value(req)
 }
 
 /// Walk the projection and determine which Anthropic wire positions

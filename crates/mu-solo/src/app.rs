@@ -179,11 +179,33 @@ impl Turn {
         }
     }
 
+    /// Append a reasoning delta, mirroring [`push_text`](Self::push_text):
+    /// extend the trailing `Thinking` item or open a new one. (mu-upk2)
+    fn push_thinking(&mut self, delta: &str) {
+        match self.items.last_mut() {
+            Some(render::TurnItem::Thinking(s)) => s.push_str(delta),
+            _ => self
+                .items
+                .push(render::TurnItem::Thinking(delta.to_string())),
+        }
+    }
+
+    /// The most recent in-flight `ToolCall` item with this id, if any. Used to
+    /// fold streamed `session.tool_call_delta` fragments and the finalizing
+    /// `session.tool_call_started` into one item. (mu-upk2)
+    fn tool_call_mut(&mut self, id: &str) -> Option<&mut render::TurnItem> {
+        self.items.iter_mut().rev().find(|it| match it {
+            render::TurnItem::ToolCall { tool_call_id, .. } => tool_call_id == id,
+            _ => false,
+        })
+    }
+
     /// True if any item carries visible content (replaces the old
     /// `ask_had_output` flag for the live turn).
     fn has_output(&self) -> bool {
         self.items.iter().any(|it| match it {
             render::TurnItem::Text(s) => !s.is_empty(),
+            render::TurnItem::Thinking(s) => !s.is_empty(),
             _ => true,
         })
     }
@@ -535,6 +557,9 @@ pub struct AppOptions<'a> {
     pub model: &'a str,
     pub bash_yolo: bool,
     pub tools: &'a str,
+    /// mu-upk2: extended-thinking directive forwarded as `mu serve
+    /// --thinking <v>`. Empty = off.
+    pub thinking: &'a str,
     pub effort: &'a str,
     pub focus_mode: bool,
     /// mu-f1a0: cache TTL tier ("5m" | "1h") for the initial session.
@@ -569,6 +594,7 @@ impl App {
             model,
             bash_yolo,
             tools,
+            thinking,
             effort,
             focus_mode,
             clipboard_command,
@@ -581,7 +607,7 @@ impl App {
         let effort = EffortLevel::parse(effort).ok_or_else(|| {
             anyhow!("invalid effort {effort:?} (valid: low|medium|high|xhigh|max)")
         })?;
-        let mut client = Client::spawn(mu_binary, cwd, bash_yolo, tools)?;
+        let mut client = Client::spawn(mu_binary, cwd, bash_yolo, tools, thinking)?;
 
         let search_dirs = skills::default_search_dirs(Some(cwd));
         let skills = skills::discover(&search_dirs);
@@ -3255,23 +3281,126 @@ impl App {
                     }
                 }
             }
+            "session.thinking_delta" => {
+                // Reasoning streams exactly like text (mu-upk2). focus_mode
+                // suppression is handled in render_viewport, same as text.
+                let delta = params.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+                if delta.is_empty() {
+                    return Ok(());
+                }
+                let route = self.streaming_route.unwrap_or(TurnRoute::Main);
+                self.live_turn
+                    .get_or_insert_with(|| Turn::new(route))
+                    .push_thinking(delta);
+            }
+            "session.thinking_finalized" => {
+                // Mirror assistant_text_finalized: replace the streamed
+                // reasoning with the canonical text from the assistant
+                // message's Thinking blocks. The reasoning item precedes the
+                // answer text in the turn, so target the most recent Thinking
+                // item rather than the trailing item.
+                let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                if !text.is_empty() {
+                    let route = self.streaming_route.unwrap_or(TurnRoute::Main);
+                    let turn = self.live_turn.get_or_insert_with(|| Turn::new(route));
+                    match turn
+                        .items
+                        .iter_mut()
+                        .rev()
+                        .find(|it| matches!(it, render::TurnItem::Thinking(_)))
+                    {
+                        Some(render::TurnItem::Thinking(s)) => *s = text.to_string(),
+                        _ => turn
+                            .items
+                            .push(render::TurnItem::Thinking(text.to_string())),
+                    }
+                }
+            }
+            "session.tool_call_delta" => {
+                // Live partial tool call (mu-upk2): the tool name arrives on
+                // the block start, then arg fragments stream in. Fold both
+                // into one in-flight ToolCall item, keyed by tool_call_id;
+                // session.tool_call_started finalizes it below.
+                let id = params
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if id.is_empty() {
+                    return Ok(());
+                }
+                let route = self.streaming_route.unwrap_or(TurnRoute::Main);
+                let turn = self.live_turn.get_or_insert_with(|| Turn::new(route));
+                if turn.tool_call_mut(id).is_none() {
+                    turn.items.push(render::TurnItem::ToolCall {
+                        tool_call_id: id.to_string(),
+                        display_name: String::new(),
+                        primary_arg: String::new(),
+                        arguments: serde_json::Value::Null,
+                        partial_args: String::new(),
+                    });
+                }
+                if let Some(render::TurnItem::ToolCall {
+                    display_name,
+                    partial_args,
+                    ..
+                }) = turn.tool_call_mut(id)
+                {
+                    if let Some(name) = params.get("name_delta").and_then(|v| v.as_str()) {
+                        if !name.is_empty() {
+                            *display_name = titlecase_tool(name);
+                        }
+                    }
+                    if let Some(args) = params.get("arguments_delta").and_then(|v| v.as_str()) {
+                        partial_args.push_str(args);
+                    }
+                }
+            }
             "session.tool_call_started" => {
                 // Titlecase + primary-arg extraction happen here (build
-                // time) so the renderer stays pure.
+                // time) so the renderer stays pure. mu-upk2: finalize the
+                // in-flight item the streamed deltas already opened (keyed by
+                // id) and retain the full typed call (id + arguments); if no
+                // deltas streamed (e.g. a provider without tool-arg
+                // streaming), open the item now.
                 let name = params
                     .get("tool_name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("?");
+                let id = params
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let primary_arg = extract_primary_arg(name, params.get("arguments"));
                 let display_name = titlecase_tool(name);
+                let arguments = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-                self.live_turn
-                    .get_or_insert_with(|| Turn::new(route))
-                    .items
-                    .push(render::TurnItem::ToolCall {
+                let turn = self.live_turn.get_or_insert_with(|| Turn::new(route));
+                if turn.tool_call_mut(id).is_some() {
+                    if let Some(render::TurnItem::ToolCall {
+                        display_name: dn,
+                        primary_arg: pa,
+                        arguments: ar,
+                        partial_args,
+                        ..
+                    }) = turn.tool_call_mut(id)
+                    {
+                        *dn = display_name;
+                        *pa = primary_arg;
+                        *ar = arguments;
+                        partial_args.clear();
+                    }
+                } else {
+                    turn.items.push(render::TurnItem::ToolCall {
+                        tool_call_id: id.to_string(),
                         display_name,
                         primary_arg,
+                        arguments,
+                        partial_args: String::new(),
                     });
+                }
             }
             "session.tool_call_completed" => {
                 let outcome = params.get("outcome");

@@ -340,6 +340,9 @@ pub(crate) async fn ask_and_drain(
     // final message that already went out as deltas.
     let mut finalized = String::new();
     let mut current = String::new();
+    // mu-upk2: reasoning is surfaced on STDERR so stdout stays exactly the
+    // answer. Deltas accumulate here; thinking_finalized flushes the block.
+    let mut thinking_current = String::new();
     let mut got_done = false;
     let mut got_response = false;
     let mut stop_reason: Option<String> = None;
@@ -362,6 +365,46 @@ pub(crate) async fn ask_and_drain(
                     }
                 }
             }
+            Some("session.thinking_delta") => {
+                if line["params"]["session_id"] == session_id {
+                    if let Some(delta) = line["params"]["delta"].as_str() {
+                        thinking_current.push_str(delta);
+                    }
+                }
+            }
+            Some("session.thinking_finalized") => {
+                if line["params"]["session_id"] == session_id {
+                    // Reasoning → stderr (stdout is reserved for the answer).
+                    let text = line["params"]["text"].as_str().unwrap_or("");
+                    let body = if text.is_empty() {
+                        thinking_current.as_str()
+                    } else {
+                        text
+                    };
+                    if !body.trim().is_empty() {
+                        eprintln!("[thinking] {body}");
+                    }
+                    thinking_current.clear();
+                }
+            }
+            Some("session.tool_call_started") => {
+                if line["params"]["session_id"] == session_id {
+                    // mu-upk2: surface tool calls on stderr (these were
+                    // dropped "in v1"). The streamed session.tool_call_delta
+                    // fragments are intentionally NOT echoed here — partial
+                    // JSON is noise in a headless answer pipe; the finalized
+                    // call below is the useful unit.
+                    let name = line["params"]["tool_name"].as_str().unwrap_or("?");
+                    let args = &line["params"]["arguments"];
+                    eprintln!("[tool] {name} {args}");
+                }
+            }
+            Some("session.tool_call_completed") => {
+                if line["params"]["session_id"] == session_id {
+                    let kind = line["params"]["outcome"]["kind"].as_str().unwrap_or("?");
+                    eprintln!("[tool result: {kind}]");
+                }
+            }
             Some("session.done") => {
                 if line["params"]["session_id"] == session_id {
                     got_done = true;
@@ -382,7 +425,8 @@ pub(crate) async fn ask_and_drain(
                     }
                     got_response = true;
                 }
-                // Else: tool events or other notifications — drop in v1.
+                // Else: streamed tool-arg deltas (session.tool_call_delta) or
+                // other notifications — not surfaced in the headless pipe.
             }
         }
         if got_done && got_response {

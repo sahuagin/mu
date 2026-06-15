@@ -72,16 +72,23 @@ pub fn build_provider_from_selector(
         // the protocol — keep it accessible only via in-process tests
         // for now. (Could add later if useful.)
         ProviderSelector::AnthropicApi { model } => {
-            log_thinking_ignored("anthropic-api", thinking);
             // Special-case sentinel models that map to FauxProvider —
             // makes the smoke-test path work without changing the
             // protocol. Any actual claude model id falls through.
             if model == "faux" {
                 return Ok(Arc::new(FauxProvider::echo()));
             }
-            Ok(Arc::new(
-                AnthropicProvider::from_env(model.clone())?.with_cache_ttl(cache_ttl),
-            ))
+            // mu-upk2: --thinking now enables Anthropic extended thinking
+            // (was previously ignored). The provider parses the flag value
+            // into a ThinkingConfig and adjusts max_tokens for the budget.
+            let mut provider =
+                AnthropicProvider::from_env(model.clone())?.with_cache_ttl(cache_ttl);
+            if let Some(t) = thinking {
+                if !t.is_empty() {
+                    provider = provider.with_thinking_flag(t);
+                }
+            }
+            Ok(Arc::new(provider))
         }
         ProviderSelector::AnthropicOauth { .. } => {
             anyhow::bail!(

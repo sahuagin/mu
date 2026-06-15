@@ -211,6 +211,105 @@ fn b5_build_request_body_omits_tools_when_empty() {
     assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
 }
 
+#[test]
+fn apply_thinking_none_is_noop() {
+    // claude-test → 4096 max_tokens (unknown-model fallback).
+    let mut body = build_request_body("claude-test", None, &[], &[]);
+    let before = body.clone();
+    apply_thinking(&mut body, None);
+    assert_eq!(body, before, "None must not touch the wire body");
+    assert!(body.get("thinking").is_none());
+}
+
+#[test]
+fn apply_thinking_enabled_sets_directive_and_raises_max_tokens() {
+    let mut body = build_request_body("claude-test", None, &[], &[]);
+    assert_eq!(body["max_tokens"], 4096);
+    let cfg = ThinkingConfig::Enabled {
+        budget_tokens: 10_000,
+    };
+    apply_thinking(&mut body, Some(&cfg));
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["thinking"]["budget_tokens"], 10_000);
+    // 10_000 budget + 4096 answer headroom > 4096 base → raised.
+    assert_eq!(body["max_tokens"], 14_096);
+}
+
+#[test]
+fn apply_thinking_does_not_lower_existing_max_tokens() {
+    // opus → 16384 base; a small budget must NOT shrink it.
+    let mut body = build_request_body("claude-opus-4-7", None, &[], &[]);
+    assert_eq!(body["max_tokens"], 16_384);
+    apply_thinking(
+        &mut body,
+        Some(&ThinkingConfig::Enabled {
+            budget_tokens: 2_000,
+        }),
+    );
+    assert_eq!(body["max_tokens"], 16_384, "2000+4096 < 16384, keep base");
+}
+
+#[test]
+fn apply_thinking_adaptive_sets_directive_without_touching_max_tokens() {
+    let mut body = build_request_body("claude-test", None, &[], &[]);
+    apply_thinking(&mut body, Some(&ThinkingConfig::Adaptive));
+    assert_eq!(body["thinking"]["type"], "adaptive");
+    assert_eq!(body["max_tokens"], 4096, "adaptive has no budget to fit");
+}
+
+#[test]
+fn parse_thinking_flag_levels_numbers_and_keywords() {
+    assert_eq!(parse_thinking_flag(""), None);
+    assert_eq!(parse_thinking_flag("   "), None);
+    assert_eq!(
+        parse_thinking_flag("adaptive"),
+        Some(ThinkingConfig::Adaptive)
+    );
+    // off/none/false/0 → no directive at all (absent), NOT explicit Disabled.
+    assert_eq!(parse_thinking_flag("off"), None);
+    assert_eq!(parse_thinking_flag("none"), None);
+    assert_eq!(parse_thinking_flag("false"), None);
+    assert_eq!(parse_thinking_flag("0"), None);
+    // The `disabled` keyword DOES send the explicit opt-out directive.
+    assert_eq!(
+        parse_thinking_flag("disabled"),
+        Some(ThinkingConfig::Disabled)
+    );
+    assert_eq!(
+        parse_thinking_flag("high"),
+        Some(ThinkingConfig::Enabled {
+            budget_tokens: 24_576
+        })
+    );
+    assert_eq!(
+        parse_thinking_flag("HIGH"),
+        Some(ThinkingConfig::Enabled {
+            budget_tokens: 24_576
+        }),
+        "case-insensitive"
+    );
+    assert_eq!(
+        parse_thinking_flag("3000"),
+        Some(ThinkingConfig::Enabled {
+            budget_tokens: 3000
+        })
+    );
+    assert_eq!(
+        parse_thinking_flag("500"),
+        Some(ThinkingConfig::Enabled {
+            budget_tokens: 1024
+        }),
+        "clamped to the 1024 floor"
+    );
+    // Unrecognized non-empty → medium, not silently nothing.
+    assert_eq!(
+        parse_thinking_flag("banana"),
+        Some(ThinkingConfig::Enabled {
+            budget_tokens: 10_240
+        })
+    );
+}
+
 // mu-yqeq.8 retired the unconditional cache_control emission from
 // the Legacy build_request_body. AnthropicCacheStrategy is now the
 // sole source; the projected wire emitter propagates per-message
@@ -970,13 +1069,22 @@ async fn b6_sse_mixed_text_and_tool_use() {
         events.push(e);
     }
 
-    // Should be 2 events: TextDelta("I will read it. "), Done.
-    assert_eq!(events.len(), 2, "got {events:?}");
+    // TextDelta, then the tool_use block streams ToolCallDelta (name on start,
+    // args on each input_json_delta), then Done:
+    //   TextDelta, ToolCallDelta(name), ToolCallDelta(args), ToolCallDelta(args), Done.
+    assert_eq!(events.len(), 5, "got {events:?}");
     match &events[0] {
         ProviderEvent::TextDelta(t) => assert_eq!(t, "I will read it. "),
         other => panic!("expected TextDelta, got {other:?}"),
     }
-    let done = match events.into_iter().nth(1).unwrap() {
+    match &events[1] {
+        ProviderEvent::ToolCallDelta { id, name_delta, .. } => {
+            assert_eq!(id, "toolu_X");
+            assert_eq!(name_delta.as_deref(), Some("read"));
+        }
+        other => panic!("expected ToolCallDelta(start), got {other:?}"),
+    }
+    let done = match events.into_iter().nth(4).unwrap() {
         ProviderEvent::Done(msg) => msg,
         other => panic!("expected Done, got {other:?}"),
     };
@@ -1035,9 +1143,204 @@ async fn b7_sse_tool_use_only() {
         v
     };
 
-    // Just one Done event (no text deltas because no text block).
-    assert_eq!(events.len(), 1);
-    let done = match events.into_iter().next().unwrap() {
+    // No text block, so no TextDelta — but the tool_use block streams:
+    //   ToolCallDelta(name), ToolCallDelta(args), Done.
+    assert_eq!(events.len(), 3, "got {events:?}");
+    match &events[0] {
+        ProviderEvent::ToolCallDelta { id, name_delta, .. } => {
+            assert_eq!(id, "toolu_Y");
+            assert_eq!(name_delta.as_deref(), Some("echo"));
+        }
+        other => panic!("expected ToolCallDelta(start), got {other:?}"),
+    }
+    let done = match events.into_iter().nth(2).unwrap() {
+        ProviderEvent::Done(msg) => msg,
+        other => panic!("expected Done, got {other:?}"),
+    };
+    assert_eq!(done.content.len(), 1);
+    match &done.content[0] {
+        ContentBlock::ToolCall(tc) => {
+            assert_eq!(tc.id, "toolu_Y");
+            assert_eq!(tc.name, "echo");
+            assert_eq!(tc.arguments.as_value()["text"], "hi");
+        }
+        other => panic!("expected ToolCall, got {other:?}"),
+    }
+}
+
+/// Thinking: a thinking block streams ThinkingDelta events (signature_delta
+/// produces none) and assembles into a ContentBlock::Thinking, in document
+/// order ahead of the answer text. Covers the Anthropic extended-thinking and
+/// ollama-reasoning-model paths (same Anthropic SSE wire).
+#[tokio::test]
+async fn thinking_sse_streams_deltas_and_assembles_block() {
+    let raw = concat!(
+        r#"event: message_start"#,
+        "\n",
+        r#"data: {"type":"message_start","message":{"id":"m_1","role":"assistant"}}"#,
+        "\n\n",
+        // Block 0: thinking (start carries empty thinking; content arrives as deltas)
+        r#"event: content_block_start"#,
+        "\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        "\n\n",
+        r#"event: content_block_delta"#,
+        "\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me "}}"#,
+        "\n\n",
+        r#"event: content_block_delta"#,
+        "\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"think."}}"#,
+        "\n\n",
+        // signature_delta is consumed but surfaces no event
+        r#"event: content_block_delta"#,
+        "\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-abc"}}"#,
+        "\n\n",
+        r#"event: content_block_stop"#,
+        "\n",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        // Block 1: the visible answer text
+        r#"event: content_block_start"#,
+        "\n",
+        r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"event: content_block_delta"#,
+        "\n",
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Answer"}}"#,
+        "\n\n",
+        r#"event: content_block_stop"#,
+        "\n",
+        r#"data: {"type":"content_block_stop","index":1}"#,
+        "\n\n",
+        r#"event: message_delta"#,
+        "\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        "\n\n",
+        r#"event: message_stop"#,
+        "\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+        raw.as_bytes(),
+    ))]);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let mut stream = test_events_stream(bytes, rx);
+
+    let mut events = Vec::new();
+    while let Some(e) = stream.next().await {
+        events.push(e);
+    }
+
+    // ThinkingDelta("Let me "), ThinkingDelta("think."), TextDelta("Answer"), Done.
+    // signature_delta surfaces nothing.
+    assert_eq!(events.len(), 4, "got {events:?}");
+    match &events[0] {
+        ProviderEvent::ThinkingDelta(t) => assert_eq!(t, "Let me "),
+        other => panic!("expected ThinkingDelta, got {other:?}"),
+    }
+    match &events[1] {
+        ProviderEvent::ThinkingDelta(t) => assert_eq!(t, "think."),
+        other => panic!("expected ThinkingDelta, got {other:?}"),
+    }
+    match &events[2] {
+        ProviderEvent::TextDelta(t) => assert_eq!(t, "Answer"),
+        other => panic!("expected TextDelta, got {other:?}"),
+    }
+    let done = match events.into_iter().nth(3).unwrap() {
+        ProviderEvent::Done(msg) => msg,
+        other => panic!("expected Done, got {other:?}"),
+    };
+    assert_eq!(done.stop_reason, StopReason::EndTurn);
+    assert_eq!(done.content.len(), 2, "thinking block then text block");
+    match &done.content[0] {
+        ContentBlock::Thinking { text } => assert_eq!(text.as_ref(), "Let me think."),
+        other => panic!("expected Thinking, got {other:?}"),
+    }
+    match &done.content[1] {
+        ContentBlock::Text { text } => assert_eq!(text.as_ref(), "Answer"),
+        other => panic!("expected Text, got {other:?}"),
+    }
+}
+
+/// Tool-use args stream live as ToolCallDelta events (name on the block start,
+/// argument fragments on each input_json_delta) while the Done payload still
+/// carries the fully-assembled tool call.
+#[tokio::test]
+async fn tool_use_args_stream_as_deltas_and_finalize() {
+    let raw = concat!(
+        r#"event: content_block_start"#,
+        "\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_Y","name":"echo","input":{}}}"#,
+        "\n\n",
+        r#"event: content_block_delta"#,
+        "\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"text\":"}}"#,
+        "\n\n",
+        r#"event: content_block_delta"#,
+        "\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"hi\"}"}}"#,
+        "\n\n",
+        r#"event: content_block_stop"#,
+        "\n",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        r#"event: message_delta"#,
+        "\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+        "\n\n",
+        r#"event: message_stop"#,
+        "\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+        raw.as_bytes(),
+    ))]);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let mut stream = test_events_stream(bytes, rx);
+
+    let mut events = Vec::new();
+    while let Some(e) = stream.next().await {
+        events.push(e);
+    }
+
+    // ToolCallDelta(name=echo), ToolCallDelta(args="{\"text\":"),
+    // ToolCallDelta(args="\"hi\"}"), Done.
+    assert_eq!(events.len(), 4, "got {events:?}");
+    match &events[0] {
+        ProviderEvent::ToolCallDelta {
+            id,
+            name_delta,
+            arguments_delta,
+        } => {
+            assert_eq!(id, "toolu_Y");
+            assert_eq!(name_delta.as_deref(), Some("echo"));
+            assert_eq!(arguments_delta.as_deref(), None);
+        }
+        other => panic!("expected ToolCallDelta(start), got {other:?}"),
+    }
+    match &events[1] {
+        ProviderEvent::ToolCallDelta {
+            id,
+            name_delta,
+            arguments_delta,
+        } => {
+            assert_eq!(id, "toolu_Y");
+            assert_eq!(name_delta.as_deref(), None);
+            assert_eq!(arguments_delta.as_deref(), Some("{\"text\":"));
+        }
+        other => panic!("expected ToolCallDelta(args), got {other:?}"),
+    }
+    match &events[2] {
+        ProviderEvent::ToolCallDelta {
+            arguments_delta, ..
+        } => assert_eq!(arguments_delta.as_deref(), Some("\"hi\"}")),
+        other => panic!("expected ToolCallDelta(args), got {other:?}"),
+    }
+    let done = match events.into_iter().nth(3).unwrap() {
         ProviderEvent::Done(msg) => msg,
         other => panic!("expected Done, got {other:?}"),
     };

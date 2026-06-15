@@ -64,7 +64,19 @@ pub(crate) fn rescue_assistant_message(
     let Some((remainder, calls)) = parse_dialect_calls(&text, tools) else {
         return msg;
     };
-    let mut content: Vec<ContentBlock> = Vec::with_capacity(calls.len() + 1);
+    // Preserve any reasoning blocks. The rebuild below sources its text from
+    // Text blocks only, so a reasoning model that BOTH thinks AND leaks tool
+    // calls as dialect text would otherwise lose its thinking here. Thinking
+    // precedes text/tool_use in Anthropic block order, so re-emit it first.
+    // (mu-upk2)
+    let thinking: Vec<ContentBlock> = msg
+        .content
+        .iter()
+        .filter(|b| matches!(b, ContentBlock::Thinking { .. }))
+        .cloned()
+        .collect();
+    let mut content: Vec<ContentBlock> = Vec::with_capacity(thinking.len() + calls.len() + 1);
+    content.extend(thinking);
     if !remainder.is_empty() {
         content.push(ContentBlock::Text {
             text: remainder.into(),
@@ -306,6 +318,36 @@ mod tests {
             other => panic!("expected leading text block, got {other:?}"),
         }
         assert_eq!(rescued_calls(&out).len(), 1);
+    }
+
+    /// A reasoning model that BOTH thinks AND leaks tool dialect as text must
+    /// keep its thinking — the rescue rebuild used to drop non-Text blocks,
+    /// losing the reasoning trace for ollama reasoning models. (mu-upk2)
+    #[test]
+    fn preserves_thinking_block_through_rescue() {
+        let msg = AssistantMessage {
+            content: vec![
+                ContentBlock::Thinking {
+                    text: "I should read the file.".into(),
+                },
+                ContentBlock::Text {
+                    text: "<function=read>\n<parameter=path>Cargo.toml</parameter>\n</function>"
+                        .into(),
+                },
+            ],
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        };
+        let out = rescue_assistant_message(msg, &grep_read_tools());
+        assert_eq!(out.stop_reason, StopReason::ToolUse);
+        // Thinking survives and stays first (Anthropic block order).
+        match &out.content[0] {
+            ContentBlock::Thinking { text } => assert_eq!(&**text, "I should read the file."),
+            other => panic!("expected leading Thinking block, got {other:?}"),
+        }
+        let calls = rescued_calls(&out);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
     }
 
     #[test]

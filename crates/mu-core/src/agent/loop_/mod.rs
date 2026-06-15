@@ -267,6 +267,13 @@ pub enum AgentEvent {
     TextDelta {
         delta: String,
     },
+    /// Streaming reasoning chunk (Anthropic extended thinking, ollama
+    /// reasoning models). Mirrors `TextDelta`; the forwarder maps it to a
+    /// `session.thinking_delta` notification. Inbound/display only — thinking
+    /// is never echoed back TO the model (spec mu-044).
+    ThinkingDelta {
+        delta: String,
+    },
     /// Streaming complete — provider returned its final assistant message with the
     /// final assembled text. Fires before MessageEnd and before session.done,
     /// allowing clients to swap from streaming-text accumulator to finalized
@@ -275,10 +282,28 @@ pub enum AgentEvent {
     AssistantTextFinalized {
         text: String,
     },
+    /// Reasoning complete — the finalized thinking text from the provider's
+    /// assembled `ContentBlock::Thinking` blocks. Mirror of
+    /// `AssistantTextFinalized` (mu-wk2) for the thinking channel: lets a
+    /// client swap its streaming-thinking accumulator for authoritative
+    /// reasoning text. The loop only emits it when the turn actually produced
+    /// thinking (non-empty), so text-only turns are unchanged on the wire.
+    AssistantThinkingFinalized {
+        text: String,
+    },
     ToolCallStarted {
         tool_call_id: String,
         tool_name: String,
         arguments: serde_json::Value,
+    },
+    /// Streaming partial tool call (Anthropic tool_use streamed args). The
+    /// provider emits the tool name on the block start and argument fragments
+    /// as they arrive; the forwarder maps this to `session.tool_call_delta`.
+    /// `ToolCallStarted` remains the authoritative fully-assembled call.
+    ToolCallDelta {
+        tool_call_id: String,
+        name_delta: Option<String>,
+        arguments_delta: Option<String>,
     },
     ToolCallCompleted {
         tool_call_id: String,

@@ -94,19 +94,31 @@ pub(crate) async fn handle_invoke_llm(
                     let _ = events.send(AgentEvent::TextDelta { delta: d }).await;
                 }
                 Some(super::super::provider::ProviderEvent::Done(msg)) => {
-                    // mu-wk2: extract text from the message's content blocks
-                    // (non-reasoning) and emit AssistantTextFinalized before
-                    // signalling done, so clients can swap from the streaming
-                    // accumulator to the finalized text atomically.
+                    // mu-wk2: extract text from the message's content blocks and
+                    // emit AssistantTextFinalized before signalling done, so
+                    // clients can swap from the streaming accumulator to the
+                    // finalized text atomically. mu-upk2: do the same for the
+                    // reasoning channel — collect Thinking blocks and emit
+                    // AssistantThinkingFinalized when the turn produced any.
                     let mut text = String::new();
+                    let mut thinking = String::new();
                     for block in &msg.content {
-                        if let ContentBlock::Text { text: block_text } = block {
-                            text.push_str(block_text);
+                        match block {
+                            ContentBlock::Text { text: block_text } => text.push_str(block_text),
+                            ContentBlock::Thinking { text: block_text } => {
+                                thinking.push_str(block_text)
+                            }
+                            ContentBlock::ToolCall(_) => {}
                         }
                     }
                     let _ = events
                         .send(AgentEvent::AssistantTextFinalized { text })
                         .await;
+                    if !thinking.is_empty() {
+                        let _ = events
+                            .send(AgentEvent::AssistantThinkingFinalized { text: thinking })
+                            .await;
+                    }
                     let _ = cancel_tx.send(());
                     return Ok((msg, buffered));
                 }
@@ -114,9 +126,61 @@ pub(crate) async fn handle_invoke_llm(
                     let _ = cancel_tx.send(());
                     return Err(Outcome::Error(e));
                 }
-                Some(super::super::provider::ProviderEvent::ThinkingDelta(_)) => {
+                Some(super::super::provider::ProviderEvent::ThinkingDelta(d)) => {
+                    // Reasoning streams just like text: count its bytes and,
+                    // since reasoning models emit thinking BEFORE any answer
+                    // text, treat it as the first token so the session leaves
+                    // AwaitingFirstToken instead of looking stalled.
+                    bytes_received = bytes_received.saturating_add(d.len() as u64);
+                    if !seen_first_token {
+                        seen_first_token = true;
+                        current_state = ProviderStatusKind::Streaming;
+                        state_started_at = Instant::now();
+                        state_started_unix_ms = now_unix_ms();
+                        let _ = events
+                            .send(AgentEvent::ProviderStatus {
+                                state: current_state,
+                                started_at_unix_ms: state_started_unix_ms,
+                                elapsed_ms: call_started_at.elapsed().as_millis() as u64,
+                                bytes_received: Some(bytes_received),
+                                tool_call_id: None,
+                            })
+                            .await;
+                    }
+                    let _ = events.send(AgentEvent::ThinkingDelta { delta: d }).await;
                 }
-                Some(super::super::provider::ProviderEvent::ToolCallDelta { .. }) => {
+                Some(super::super::provider::ProviderEvent::ToolCallDelta {
+                    id,
+                    name_delta,
+                    arguments_delta,
+                }) => {
+                    // Partial tool-call args also count as streaming output (a
+                    // tool-only turn may produce no text at all).
+                    if let Some(args) = arguments_delta.as_deref() {
+                        bytes_received = bytes_received.saturating_add(args.len() as u64);
+                    }
+                    if !seen_first_token {
+                        seen_first_token = true;
+                        current_state = ProviderStatusKind::Streaming;
+                        state_started_at = Instant::now();
+                        state_started_unix_ms = now_unix_ms();
+                        let _ = events
+                            .send(AgentEvent::ProviderStatus {
+                                state: current_state,
+                                started_at_unix_ms: state_started_unix_ms,
+                                elapsed_ms: call_started_at.elapsed().as_millis() as u64,
+                                bytes_received: Some(bytes_received),
+                                tool_call_id: Some(id.clone()),
+                            })
+                            .await;
+                    }
+                    let _ = events
+                        .send(AgentEvent::ToolCallDelta {
+                            tool_call_id: id,
+                            name_delta,
+                            arguments_delta,
+                        })
+                        .await;
                 }
                 None => {
                     let _ = cancel_tx.send(());

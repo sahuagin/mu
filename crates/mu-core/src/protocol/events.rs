@@ -87,6 +87,21 @@ impl TextDeltaEvent {
     pub const METHOD: &'static str = "session.text_delta";
 }
 
+/// `session.thinking_delta` — a streamed reasoning chunk (Anthropic extended
+/// thinking, ollama reasoning models). Sibling of [`TextDeltaEvent`] on a
+/// separate channel so clients can render reasoning distinctly from the
+/// answer. Inbound/display only (thinking is never sent back to the model;
+/// spec mu-044).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThinkingDeltaEvent {
+    pub session_id: String,
+    pub delta: String,
+}
+
+impl ThinkingDeltaEvent {
+    pub const METHOD: &'static str = "session.thinking_delta";
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssistantTextFinalizedEvent {
     pub session_id: String,
@@ -102,6 +117,21 @@ impl AssistantTextFinalizedEvent {
     pub const METHOD: &'static str = "session.assistant_text_finalized";
 }
 
+/// `session.thinking_finalized` — the finalized reasoning text from the
+/// assistant message's `Thinking` blocks. Mirror of
+/// [`AssistantTextFinalizedEvent`] (mu-wk2) for the thinking channel: lets a
+/// client swap its streaming-thinking accumulator for authoritative reasoning
+/// text. Only emitted when the turn produced thinking.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThinkingFinalizedEvent {
+    pub session_id: String,
+    pub text: String,
+}
+
+impl ThinkingFinalizedEvent {
+    pub const METHOD: &'static str = "session.thinking_finalized";
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallStartedEvent {
     pub session_id: String,
@@ -112,6 +142,24 @@ pub struct ToolCallStartedEvent {
 
 impl ToolCallStartedEvent {
     pub const METHOD: &'static str = "session.tool_call_started";
+}
+
+/// `session.tool_call_delta` — a streamed fragment of a tool call as the
+/// provider emits it: the tool name arrives on the block start, then the
+/// arguments stream in pieces (`arguments_delta`). [`ToolCallStartedEvent`]
+/// remains the authoritative fully-assembled call; this is for live preview.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallDeltaEvent {
+    pub session_id: String,
+    pub tool_call_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_delta: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments_delta: Option<String>,
+}
+
+impl ToolCallDeltaEvent {
+    pub const METHOD: &'static str = "session.tool_call_delta";
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -195,6 +195,13 @@ pub struct SessionConfig {
     /// session ~20%). Set "5m" for batch-shaped usage. Only the
     /// Anthropic provider consumes it today.
     pub cache_ttl: String,
+    /// mu-upk2: extended-thinking directive, forwarded as `mu serve
+    /// --thinking <v>`. Empty string (the DEFAULT) = no directive (off).
+    /// Accepts effort levels (`minimal`|`low`|`medium`|`high`), a raw token
+    /// budget, `adaptive`, or `disabled`. Only the Anthropic provider acts on
+    /// it (natively-reasoning ollama models think regardless). Set once in
+    /// solo.toml (`[session] thinking = "high"`) — no flag needed each run.
+    pub thinking: String,
     /// mu-n25a: the session's side-effects CEILING — the permission
     /// posture an operator's "read only" binds to, forwarded as
     /// `CreateSessionRequest.max_side_effects`. A tool whose declared
@@ -227,6 +234,8 @@ impl Default for SessionConfig {
             mu_binary: "./target/release/mu".into(),
             cwd: None,
             cache_ttl: "1h".into(),
+            // mu-upk2: thinking off by default ("" = no directive; opt-in).
+            thinking: String::new(),
             // mu-n25a: unrestricted by default — opt-in posture, so
             // existing solo configs are unaffected.
             max_side_effects: String::new(),
@@ -304,6 +313,7 @@ pub struct CliOverrides {
     pub tools: Option<String>,
     pub bash_yolo: Option<bool>,
     pub mu_binary: Option<String>,
+    pub thinking: Option<String>,
     pub cwd: Option<PathBuf>,
     pub effort: Option<String>,
     pub focus_mode: Option<bool>,
@@ -328,6 +338,9 @@ pub fn apply_cli_overrides(config: &mut SoloConfig, cli: &CliOverrides) {
     }
     if let Some(v) = &cli.mu_binary {
         config.session.mu_binary = v.clone();
+    }
+    if let Some(v) = &cli.thinking {
+        config.session.thinking = v.clone();
     }
     if let Some(v) = &cli.cwd {
         config.session.cwd = Some(v.clone());
@@ -462,16 +475,28 @@ mod tests {
     #[test]
     fn cli_overrides_replace_some_fields() {
         let mut c = SoloConfig::default();
+        assert_eq!(c.session.thinking, "", "thinking defaults off");
         let cli = CliOverrides {
             provider: Some("anthropic".into()),
             bash_yolo: Some(true),
+            thinking: Some("high".into()),
             ..Default::default()
         };
         apply_cli_overrides(&mut c, &cli);
         assert_eq!(c.session.provider, "anthropic");
         assert!(c.session.bash_yolo);
+        assert_eq!(c.session.thinking, "high");
         // Untouched fields keep their defaults.
         assert_eq!(c.session.model, "gpt-5.5");
+    }
+
+    #[test]
+    fn thinking_round_trips_through_session_toml() {
+        let c: SoloConfig = toml::from_str("[session]\nthinking = \"medium\"\n").expect("parse");
+        assert_eq!(c.session.thinking, "medium");
+        // Absent ⇒ off.
+        let d: SoloConfig = toml::from_str("[session]\nmodel = \"x\"\n").expect("parse");
+        assert_eq!(d.session.thinking, "");
     }
 
     #[test]

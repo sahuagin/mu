@@ -557,6 +557,9 @@ pub struct AppOptions<'a> {
     pub model: &'a str,
     pub bash_yolo: bool,
     pub tools: &'a str,
+    /// mu-upk2: extended-thinking directive forwarded as `mu serve
+    /// --thinking <v>`. Empty = off.
+    pub thinking: &'a str,
     pub effort: &'a str,
     pub focus_mode: bool,
     /// mu-f1a0: cache TTL tier ("5m" | "1h") for the initial session.
@@ -591,6 +594,7 @@ impl App {
             model,
             bash_yolo,
             tools,
+            thinking,
             effort,
             focus_mode,
             clipboard_command,
@@ -603,7 +607,7 @@ impl App {
         let effort = EffortLevel::parse(effort).ok_or_else(|| {
             anyhow!("invalid effort {effort:?} (valid: low|medium|high|xhigh|max)")
         })?;
-        let mut client = Client::spawn(mu_binary, cwd, bash_yolo, tools)?;
+        let mut client = Client::spawn(mu_binary, cwd, bash_yolo, tools, thinking)?;
 
         let search_dirs = skills::default_search_dirs(Some(cwd));
         let skills = skills::discover(&search_dirs);

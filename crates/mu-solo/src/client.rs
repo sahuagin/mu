@@ -118,6 +118,7 @@ impl Client {
         cwd: &std::path::Path,
         bash_yolo: bool,
         tools: &str,
+        thinking: &str,
     ) -> Result<Self> {
         // Per-spawn bearer token, set via env. Daemon reads
         // `MU_BEARER_TOKEN`, requires every protected RPC to present
@@ -132,6 +133,11 @@ impl Client {
         }
         if bash_yolo {
             cmd.arg("--bash-yolo");
+        }
+        // mu-upk2: forward the extended-thinking directive. Empty = off (no
+        // flag), so the serve-side default (no thinking) is unchanged.
+        if !thinking.is_empty() {
+            cmd.arg("--thinking").arg(thinking);
         }
         cmd.current_dir(cwd)
             .stdin(Stdio::piped())

@@ -62,6 +62,13 @@ struct Cli {
     #[arg(long)]
     tools: Option<String>,
 
+    /// Extended-thinking directive forwarded to `mu serve` (effort level
+    /// minimal|low|medium|high, a raw token budget, `adaptive`, or
+    /// `disabled`). Overrides config.session.thinking. Prefer setting
+    /// `[session] thinking` in solo.toml so you don't pass it each run.
+    #[arg(long)]
+    thinking: Option<String>,
+
     /// Initial /effort value: low|medium|high|xhigh|max. Overrides
     /// config.tui.effort.
     #[arg(long)]
@@ -83,6 +90,7 @@ impl Cli {
             // can still set them true if the CLI flag is absent.
             bash_yolo: if self.bash_yolo { Some(true) } else { None },
             mu_binary: self.mu_binary.clone(),
+            thinking: self.thinking.clone(),
             cwd: self.cwd.clone(),
             effort: self.effort.clone(),
             focus_mode: if self.focus { Some(true) } else { None },
@@ -123,6 +131,7 @@ async fn main() -> Result<()> {
         model: &cfg.session.model,
         bash_yolo: cfg.session.bash_yolo,
         tools: &cfg.session.tools,
+        thinking: &cfg.session.thinking,
         effort: &cfg.tui.effort,
         focus_mode: cfg.tui.focus_mode,
         cache_ttl: &cfg.session.cache_ttl,

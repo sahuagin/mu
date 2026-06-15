@@ -1670,6 +1670,7 @@ dependencies = [
  "bytes",
  "dirs",
  "futures",
+ "mu-anthropic",
  "mu-core",
  "oauth2",
  "rand 0.8.6",

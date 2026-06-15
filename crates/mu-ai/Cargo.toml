@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 mu-core = { path = "../mu-core" }
+mu-anthropic = { path = "../providers/mu-anthropic" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 # mu-sqn: anchors the workspace rustls-webpki security floor (see root

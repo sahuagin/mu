@@ -13,10 +13,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{BoxStream, Stream, StreamExt};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
+use mu_anthropic::{
+    BlockDelta, BlockStart, CacheControl, Content, ContentBlock as AnthBlock,
+    Message as AnthMessage, MessagesRequest, StopReason as AnthropicStopReason, StreamEvent, Tool,
+    ToolDef, Usage as AnthropicUsage,
+};
 use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
     ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
@@ -204,23 +208,108 @@ impl Provider for AnthropicProvider {
     }
 }
 
-/// Translate a mu `ToolSpec` into Anthropic's tool descriptor shape.
-pub(crate) fn translate_tool_spec(spec: &ToolSpec) -> Value {
-    json!({
-        "name": spec.name,
-        "description": spec.description,
-        "input_schema": spec.input_schema,
+// ============================================================================
+// mu -> mu_anthropic request mapping (typed; request bytes come from the crate)
+// ============================================================================
+
+/// mu cache-TTL tier -> a mu_anthropic `CacheControl` directive.
+fn cache_control(ttl: CacheTtl) -> CacheControl {
+    match ttl {
+        CacheTtl::FiveMinutes => CacheControl::ephemeral(),
+        CacheTtl::OneHour => CacheControl::ephemeral_with_ttl("1h"),
+    }
+}
+
+/// Wrap a `serde_json::Value` as a mu_anthropic `JsonValue`. The values we feed
+/// (tool input schemas, already-validated tool arguments) are finite by
+/// construction; the impossible non-finite case degrades to an empty object
+/// rather than panicking.
+fn json_value(v: Value) -> mu_anthropic::JsonValue {
+    mu_anthropic::JsonValue::new(v).unwrap_or_else(|_| mu_anthropic::JsonValue::empty_object())
+}
+
+/// Translate a mu `ToolSpec` into a mu_anthropic `ToolDef`, optionally caching it.
+fn map_tool_spec(spec: &ToolSpec, cache: Option<CacheControl>) -> ToolDef {
+    let mut tool = Tool::new(
+        spec.name.clone(),
+        spec.description.clone(),
+        json_value(spec.input_schema.clone()),
+    );
+    tool.cache_control = cache;
+    tool.into()
+}
+
+/// Build the request `tools`, attaching `cache_control` to the LAST tool when
+/// `cache_last` (mu's tool-cache position).
+fn map_tools(tools: &[ToolSpec], cache_last: bool, ttl: CacheTtl) -> Vec<ToolDef> {
+    let last = tools.len().saturating_sub(1);
+    tools
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| map_tool_spec(spec, (cache_last && i == last).then(|| cache_control(ttl))))
+        .collect()
+}
+
+/// The top-level `system` content: a single text block (the historical wire
+/// shape), carrying `cache_control` when the system span is marked.
+fn system_content(text: String, cache: bool, ttl: CacheTtl) -> Content {
+    Content::Blocks(vec![AnthBlock::Text {
+        text,
+        citations: Vec::new(),
+        cache_control: cache.then(|| cache_control(ttl)),
+    }])
+}
+
+/// Attach `cache_control` to whichever block kind carries it (the last block of
+/// a marked message).
+fn set_block_cache_control(block: &mut AnthBlock, cc: CacheControl) {
+    match block {
+        AnthBlock::Text { cache_control, .. }
+        | AnthBlock::ToolUse { cache_control, .. }
+        | AnthBlock::ToolResult { cache_control, .. } => *cache_control = Some(cc),
+        _ => {}
+    }
+}
+
+/// Map an assistant's mu-core content blocks to mu_anthropic blocks. Text and
+/// tool calls translate; `Thinking` is dropped outbound — mu never echoes the
+/// model's own reasoning back as input (spec mu-044).
+fn map_assistant_blocks(blocks: &[ContentBlock]) -> Vec<AnthBlock> {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(AnthBlock::Text {
+                text: text.as_ref().to_string(),
+                citations: Vec::new(),
+                cache_control: None,
+            }),
+            ContentBlock::ToolCall(tc) => Some(AnthBlock::ToolUse {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+                input: json_value(tc.arguments.as_value().clone()),
+                cache_control: None,
+            }),
+            ContentBlock::Thinking { .. } => None,
+        })
+        .collect()
+}
+
+/// Serialize a built `MessagesRequest` to the wire `Value`. Infallible in
+/// practice (the request holds only finite, serializable data); a serialization
+/// failure degrades to an empty object and is logged rather than panicking.
+fn request_to_value(req: MessagesRequest) -> Value {
+    serde_json::to_value(&req).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "failed to serialize MessagesRequest");
+        json!({})
     })
 }
 
-/// Translate messages into Anthropic's API message shape.
-///
-/// Consecutive tool results are batched into a single user message
-/// containing multiple `tool_result` content blocks, as required by
-/// Anthropic's tool-use protocol.
-pub(crate) fn translate_messages(messages: &[AgentMessage]) -> Vec<Value> {
+/// Translate Legacy `&[AgentMessage]` into mu_anthropic messages. Consecutive
+/// tool results batch into one user message of `tool_result` blocks, as
+/// Anthropic's tool-use protocol requires.
+pub(crate) fn map_agent_messages(messages: &[AgentMessage]) -> Vec<AnthMessage> {
     let mut out = Vec::with_capacity(messages.len());
-    let mut tool_result_buf = Vec::new();
+    let mut tool_result_buf: Vec<AnthBlock> = Vec::new();
 
     for message in messages {
         match message {
@@ -229,71 +318,41 @@ pub(crate) fn translate_messages(messages: &[AgentMessage]) -> Vec<Value> {
                 content,
                 is_error,
             } => {
-                tool_result_buf.push(json!({
-                    "type": "tool_result",
-                    "tool_use_id": call_id,
-                    "content": content,
-                    "is_error": is_error,
-                }));
+                tool_result_buf.push(AnthBlock::ToolResult {
+                    tool_use_id: call_id.clone(),
+                    content: content.clone(),
+                    is_error: Some(*is_error),
+                    cache_control: None,
+                });
             }
             other => {
                 if !tool_result_buf.is_empty() {
-                    out.push(json!({
-                        "role": "user",
-                        "content": std::mem::take(&mut tool_result_buf),
-                    }));
+                    out.push(AnthMessage::user(std::mem::take(&mut tool_result_buf)));
                 }
-                if let Some(translated) = translate_message_single(other) {
-                    out.push(translated);
+                if let Some(m) = map_agent_message_single(other) {
+                    out.push(m);
                 }
             }
         }
     }
 
     if !tool_result_buf.is_empty() {
-        out.push(json!({
-            "role": "user",
-            "content": tool_result_buf,
-        }));
+        out.push(AnthMessage::user(tool_result_buf));
     }
 
     out
 }
 
-/// Single-message translation for non-ToolResult variants. ToolResult
-/// is handled by `translate_messages` because Anthropic requires
-/// consecutive tool results to be grouped in one user message.
-fn translate_message_single(m: &AgentMessage) -> Option<Value> {
+/// Single-message translation for non-ToolResult Legacy variants.
+fn map_agent_message_single(m: &AgentMessage) -> Option<AnthMessage> {
     match m {
-        AgentMessage::User { content } => Some(json!({
-            "role": "user",
-            "content": content,
-        })),
+        AgentMessage::User { content } => Some(AnthMessage::user(content.as_str())),
         AgentMessage::Assistant(a) => {
-            let blocks: Vec<Value> = a
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(json!({
-                        "type": "text",
-                        "text": text,
-                    })),
-                    ContentBlock::ToolCall(tool_call) => Some(json!({
-                        "type": "tool_use",
-                        "id": tool_call.id,
-                        "name": tool_call.name,
-                        "input": tool_call.arguments,
-                    })),
-                    ContentBlock::Thinking { .. } => None,
-                })
-                .collect();
+            let blocks = map_assistant_blocks(&a.content);
             if blocks.is_empty() {
                 None
             } else {
-                Some(json!({
-                    "role": "assistant",
-                    "content": blocks,
-                }))
+                Some(AnthMessage::assistant(blocks))
             }
         }
         AgentMessage::ToolResult { .. } => None,
@@ -314,96 +373,50 @@ pub(crate) fn build_request_body(
     messages: &[AgentMessage],
     tools: &[ToolSpec],
 ) -> Value {
-    let api_messages = translate_messages(messages);
-    let mut body = json!({
-        "model": model,
-        "max_tokens": super::output_limits::max_tokens_for_model(model),
-        "stream": true,
-        "messages": api_messages,
-    });
+    let mut req = MessagesRequest::new(
+        model,
+        super::output_limits::max_tokens_for_model(model),
+        map_agent_messages(messages),
+    )
+    .with_stream(true);
     if let Some(s) = system_prompt {
         if !s.is_empty() {
-            body["system"] = json!([
-                {
-                    "type": "text",
-                    "text": s,
-                }
-            ]);
+            // Legacy path emits no cache_control (mu-yqeq.8).
+            req = req.with_system(system_content(s.to_string(), false, CacheTtl::default()));
         }
     }
     if !tools.is_empty() {
-        let tool_specs: Vec<Value> = tools.iter().map(translate_tool_spec).collect();
-        body["tools"] = json!(tool_specs);
+        req = req.with_tools(map_tools(tools, false, CacheTtl::default()));
     }
-    body
+    request_to_value(req)
 }
 
 // ============================================================================
-// mu-yqeq.4: Projected path — wire body built from &ProviderMessages
+// mu -> mu_anthropic request mapping for the Projected (production) path
 // ============================================================================
 //
-// Mirrors `translate_messages` + `build_request_body` semantics but
-// reads structural `ContentBlock`s from `ProviderMessage.blocks`
-// instead of `AgentMessage::Assistant.content`. Tool-result binding
-// (`tool_use_id`) is recovered from each `ToolResult` message's
-// `source_span_ids[0]` via the `extract_call_id_from_span_id` helper
-// (mu-yqeq.3).
-//
-// Wire-format byte equivalence with the Legacy path is the contract;
-// see `parity_*` tests below for the canonical scenarios.
+// Reads structural ContentBlocks from ProviderMessage.blocks; tool-result
+// binding (tool_use_id) is recovered from each ToolResult message's
+// source_span_ids[0] via extract_call_id_from_span_id (mu-yqeq.3). System spans
+// are hoisted into the top-level system field; tool-schema spans are skipped
+// (the `tools` parameter is authoritative for body.tools).
 
-/// Translate a [`ProviderMessages`] projection into Anthropic's API
-/// message array shape, returning the hoisted system-content text (if
-/// any) separately for [`build_request_body_from_projection`] to
-/// place in the top-level `system` field.
+/// Translate a ProviderMessages projection into mu_anthropic messages plus the
+/// hoisted system text (placed in the top-level `system` field by the caller).
 ///
-/// Hoisting rule (mu-s855, post-mu-phl v0):
-///   - All `ProviderRole::System` messages EXCEPT tool-schema spans
-///     get their content hoisted into `system_text`, concatenated
-///     with "\n\n" between spans. This covers:
-///       - "system-prompt" (the session system_prompt)
-///       - "memory-recall:*" (SubprocessRecallProvider per mu-phl v0)
-///       - "project-file:*" (ProjectFileRecallProvider per mu-phl v0)
-///       - any other future System-role span kind
-///   - Tool-schema spans are skipped (the `tools` parameter on
-///     Provider::stream is authoritative for `body.tools`; the rope's
-///     ToolSchema spans exist for operator-view + cache positioning,
-///     not wire emission).
-///
-/// Pre-fix this branch only hoisted the literal "system-prompt" span
-/// and silently dropped every other System-role span — invisible in
-/// yqeq4_parity_* tests because pre-mu-phl ropes had no other
-/// System-role spans. Codex sibling: mu-2puu. OpenRouter sibling:
-/// mu-745h.
-///
-/// All other roles are translated per the Legacy `translate_messages`
-/// rules, with consecutive `ToolResult` messages batched into a
-/// single user message — Anthropic's tool-use protocol requires that
-/// grouping.
-/// mu-f1a0: the one place the TTL tier becomes wire JSON. FiveMinutes
-/// omits the `ttl` field — byte-identical to the pre-f1a0 emission, so
-/// the default path needs no parity re-verification.
-fn cache_control_value(ttl: CacheTtl) -> Value {
-    match ttl {
-        CacheTtl::FiveMinutes => json!({ "type": "ephemeral" }),
-        CacheTtl::OneHour => json!({ "type": "ephemeral", "ttl": "1h" }),
-    }
-}
-
-fn translate_provider_messages(
+/// Hoisting rule (mu-s855, post-mu-phl v0): every System-role span EXCEPT
+/// tool-schema spans contributes to system_text, joined with a blank line.
+/// Per-message cache markers land on the marked content block; system/tool
+/// cache placement is handled separately by detect_cache_targets.
+fn map_provider_messages(
     pmsgs: &ProviderMessages,
     ttl: CacheTtl,
-) -> (Vec<Value>, Option<String>) {
-    let mut out: Vec<Value> = Vec::with_capacity(pmsgs.messages.len());
-    let mut tool_result_buf: Vec<Value> = Vec::new();
+) -> (Vec<AnthMessage>, Option<String>) {
+    let mut out: Vec<AnthMessage> = Vec::with_capacity(pmsgs.messages.len());
+    let mut tool_result_buf: Vec<AnthBlock> = Vec::new();
     let mut system_text: Option<String> = None;
 
     for msg in &pmsgs.messages {
-        // mu-chiw: conversation-anchor markers land on User /
-        // Assistant / ToolResult messages and emit `cache_control` on
-        // a content block at the marked position. System-role markers
-        // are handled separately (detect_cache_targets → body.system
-        // / body.tools), unchanged.
         let marked = msg.cache_marker() == Some(CacheMarker::Ephemeral);
         match msg.role() {
             ProviderRole::System => {
@@ -420,179 +433,116 @@ fn translate_provider_messages(
                                 existing.push_str("\n\n");
                                 existing.push_str(content);
                             }
-                            None => {
-                                system_text = Some(content.to_string());
-                            }
+                            None => system_text = Some(content.to_string()),
                         }
                     }
                 }
             }
             ProviderRole::ToolResult => {
-                let mut block = translate_provider_tool_result(msg);
-                if marked {
-                    block["cache_control"] = cache_control_value(ttl);
-                }
-                tool_result_buf.push(block);
+                tool_result_buf.push(map_provider_tool_result(
+                    msg,
+                    marked.then(|| cache_control(ttl)),
+                ));
             }
             ProviderRole::User => {
-                flush_tool_result_buf(&mut out, &mut tool_result_buf);
+                flush_tool_results(&mut out, &mut tool_result_buf);
                 if marked {
-                    // cache_control needs a content BLOCK; the plain
-                    // string form stays for unmarked messages (wire
-                    // parity with the legacy path).
-                    out.push(json!({
-                        "role": "user",
-                        "content": [{
-                            "type": "text",
-                            "text": msg.content(),
-                            "cache_control": cache_control_value(ttl),
-                        }],
-                    }));
+                    out.push(AnthMessage::user(vec![AnthBlock::Text {
+                        text: msg.content().to_string(),
+                        citations: Vec::new(),
+                        cache_control: Some(cache_control(ttl)),
+                    }]));
                 } else {
-                    out.push(json!({
-                        "role": "user",
-                        "content": msg.content(),
-                    }));
+                    out.push(AnthMessage::user(msg.content()));
                 }
             }
             ProviderRole::Assistant => {
-                flush_tool_result_buf(&mut out, &mut tool_result_buf);
-                if let Some(mut translated) = translate_provider_assistant(msg) {
-                    if marked {
-                        if let Some(last) = translated["content"]
-                            .as_array_mut()
-                            .and_then(|blocks| blocks.last_mut())
-                        {
-                            last["cache_control"] = cache_control_value(ttl);
-                        }
-                    }
-                    out.push(translated);
+                flush_tool_results(&mut out, &mut tool_result_buf);
+                if let Some(m) = map_provider_assistant(msg, marked.then(|| cache_control(ttl))) {
+                    out.push(m);
                 }
             }
         }
     }
-    flush_tool_result_buf(&mut out, &mut tool_result_buf);
+    flush_tool_results(&mut out, &mut tool_result_buf);
 
     (out, system_text)
 }
 
-fn flush_tool_result_buf(out: &mut Vec<Value>, buf: &mut Vec<Value>) {
+fn flush_tool_results(out: &mut Vec<AnthMessage>, buf: &mut Vec<AnthBlock>) {
     if !buf.is_empty() {
-        out.push(json!({
-            "role": "user",
-            "content": std::mem::take(buf),
-        }));
+        out.push(AnthMessage::user(std::mem::take(buf)));
     }
 }
 
-fn translate_provider_tool_result(msg: &ProviderMessage) -> Value {
-    // call_id recovered from the synthesized span id
-    // (`msg-{idx}-tool-result:{call_id}` — see assembly.rs). Fall back
-    // to empty string if absent so a malformed projection produces a
-    // visibly wrong wire payload rather than silently swallowing the
-    // tool-call binding.
-    let call_id: &str = msg
+/// One ToolResult ProviderMessage to a mu_anthropic tool_result block. call_id
+/// comes from the synthesized span id; is_error from the "error: " content
+/// prefix that assembly.rs adds for errored tool results.
+fn map_provider_tool_result(msg: &ProviderMessage, cache: Option<CacheControl>) -> AnthBlock {
+    let call_id = msg
         .source_span_ids()
         .first()
         .and_then(|sid| extract_call_id_from_span_id(sid.as_ref()))
-        .unwrap_or("");
-    // is_error recovered from the "error: " prefix that
-    // assembly.rs:message_to_span adds when AgentMessage::ToolResult
-    // had is_error=true.
+        .unwrap_or("")
+        .to_string();
     let (is_error, content) = match msg.content().strip_prefix("error: ") {
-        Some(stripped) => (true, stripped),
-        None => (false, msg.content()),
+        Some(stripped) => (true, stripped.to_string()),
+        None => (false, msg.content().to_string()),
     };
-    json!({
-        "type": "tool_result",
-        "tool_use_id": call_id,
-        "content": content,
-        "is_error": is_error,
-    })
-}
-
-/// Translate one assistant-role [`ProviderMessage`] into Anthropic's
-/// `{role: "assistant", content: [...]}` block. Reads structural
-/// blocks from `msg.blocks()` — populated by `assemble_rope` for
-/// `AgentMessage::Assistant`. `Thinking` blocks are intentionally
-/// skipped per spec mu-044 §"Thinking-block skip" (provider never
-/// receives the model's own reasoning trace as input). Returns `None`
-/// if the assistant produced no wire-bearing blocks (e.g. only
-/// thinking) — mirrors `translate_message_single`'s elision rule.
-fn translate_provider_assistant(msg: &ProviderMessage) -> Option<Value> {
-    let blocks = msg.blocks()?;
-    let translated: Vec<Value> = blocks
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(json!({
-                "type": "text",
-                "text": text.as_ref(),
-            })),
-            ContentBlock::ToolCall(tool_call) => Some(json!({
-                "type": "tool_use",
-                "id": tool_call.id,
-                "name": tool_call.name,
-                "input": tool_call.arguments,
-            })),
-            ContentBlock::Thinking { .. } => None,
-        })
-        .collect();
-    if translated.is_empty() {
-        None
-    } else {
-        Some(json!({
-            "role": "assistant",
-            "content": translated,
-        }))
+    AnthBlock::ToolResult {
+        tool_use_id: call_id,
+        content,
+        is_error: Some(is_error),
+        cache_control: cache,
     }
 }
 
-/// Sibling of [`build_request_body`] that builds Anthropic's request
-/// body from a [`ProviderMessages`] projection instead of a raw
-/// `&[AgentMessage]` slice. After mu-yqeq.8, `cache_control` emission
-/// is driven by per-message [`CacheMarker`] flags set by
-/// [`AnthropicCacheStrategy`]: a marker on the projection's
-/// `"system-prompt"` message triggers `cache_control` on `body.system`;
-/// a marker on any `"tool-schema:*"` message triggers `cache_control`
-/// on the last tool spec. The wire shape (minus cache_control) is
-/// byte-identical to the Legacy path for the canonical scenarios —
-/// asserted by `yqeq4_parity_*` tests in anthropic_tests.rs.
+/// One assistant-role ProviderMessage to a mu_anthropic assistant message.
+/// Reads structural blocks from msg.blocks(); Thinking blocks are dropped
+/// outbound (spec mu-044). Returns None when the assistant produced no
+/// wire-bearing blocks. A cache marker attaches cache_control to the last block.
+fn map_provider_assistant(
+    msg: &ProviderMessage,
+    cache_last: Option<CacheControl>,
+) -> Option<AnthMessage> {
+    let mut mapped = map_assistant_blocks(msg.blocks()?);
+    if mapped.is_empty() {
+        return None;
+    }
+    if let (Some(cc), Some(last)) = (cache_last, mapped.last_mut()) {
+        set_block_cache_control(last, cc);
+    }
+    Some(AnthMessage::assistant(mapped))
+}
+
+/// Sibling of build_request_body that builds the request from a ProviderMessages
+/// projection. cache_control placement is driven by per-message CacheMarker
+/// flags (AnthropicCacheStrategy): a marked system span caches body.system; a
+/// marked tool-schema span caches the last tool spec.
 pub(crate) fn build_request_body_from_projection(
     model: &str,
     pmsgs: &ProviderMessages,
     tools: &[ToolSpec],
     ttl: CacheTtl,
 ) -> Value {
-    let (api_messages, hoisted_system) = translate_provider_messages(pmsgs, ttl);
+    let (messages, hoisted_system) = map_provider_messages(pmsgs, ttl);
     let (system_should_cache, tools_should_cache) = detect_cache_targets(pmsgs);
-    let mut body = json!({
-        "model": model,
-        "max_tokens": super::output_limits::max_tokens_for_model(model),
-        "stream": true,
-        "messages": api_messages,
-    });
+
+    let mut req = MessagesRequest::new(
+        model,
+        super::output_limits::max_tokens_for_model(model),
+        messages,
+    )
+    .with_stream(true);
     if let Some(s) = hoisted_system {
         if !s.is_empty() {
-            let mut system_block = json!({
-                "type": "text",
-                "text": s,
-            });
-            if system_should_cache {
-                system_block["cache_control"] = cache_control_value(ttl);
-            }
-            body["system"] = json!([system_block]);
+            req = req.with_system(system_content(s, system_should_cache, ttl));
         }
     }
     if !tools.is_empty() {
-        let mut tool_specs: Vec<Value> = tools.iter().map(translate_tool_spec).collect();
-        if tools_should_cache {
-            if let Some(last) = tool_specs.last_mut() {
-                last["cache_control"] = cache_control_value(ttl);
-            }
-        }
-        body["tools"] = json!(tool_specs);
+        req = req.with_tools(map_tools(tools, tools_should_cache, ttl));
     }
-    body
+    request_to_value(req)
 }
 
 /// Walk the projection and determine which Anthropic wire positions
@@ -641,134 +591,71 @@ fn detect_cache_targets(pmsgs: &ProviderMessages) -> (bool, bool) {
     (system_should_cache, tools_should_cache)
 }
 
-// ============================================================================
-// Anthropic SSE event types — minimal subset we care about
-// ============================================================================
+// SSE/stream wire types now come from the mu-anthropic crate (StreamEvent,
+// BlockStart, BlockDelta, Usage, StopReason) — see the imports above.
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-#[allow(dead_code)] // Some fields are present for future use; keep deserializer faithful to API.
-enum AnthropicEvent {
-    #[serde(rename = "message_start")]
-    MessageStart { message: AnthropicMessageMeta },
-    #[serde(rename = "content_block_start")]
-    ContentBlockStart {
-        index: u32,
-        content_block: AnthropicBlock,
-    },
-    #[serde(rename = "content_block_delta")]
-    ContentBlockDelta { index: u32, delta: AnthropicDelta },
-    #[serde(rename = "content_block_stop")]
-    ContentBlockStop { index: u32 },
-    #[serde(rename = "message_delta")]
-    MessageDelta {
-        delta: AnthropicMessageDelta,
-        /// mu-yz48: Anthropic puts the cumulative stream `usage` at the
-        /// TOP level of the message_delta event, sibling to `delta` —
-        /// not nested inside it. Reading `delta.usage` always returns
-        /// None and leaves `output_tokens` stuck at the message_start
-        /// baseline (1-5). Capture it here.
-        #[serde(default)]
-        usage: Option<AnthropicUsage>,
-    },
-    #[serde(rename = "message_stop")]
-    MessageStop,
-    #[serde(rename = "ping")]
-    Ping,
-    #[serde(rename = "error")]
-    Error { error: AnthropicErrorBody },
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct AnthropicMessageMeta {
-    id: Option<String>,
-    role: Option<String>,
-    #[serde(default)]
-    usage: Option<AnthropicUsage>,
-}
-
-/// Per-tier breakdown from Anthropic's `usage.cache_creation` object.
-/// Present only when the response was written into a named TTL tier
-/// (ephemeral-5m or ephemeral-1h). mu-cache-write-tier-split-umq6.
-#[derive(Debug, Deserialize, Default, Clone)]
-struct AnthropicCacheCreation {
-    #[serde(default)]
-    ephemeral_5m_input_tokens: Option<u64>,
-    #[serde(default)]
-    ephemeral_1h_input_tokens: Option<u64>,
-}
-
-#[derive(Debug, Deserialize, Default, Clone)]
-#[allow(dead_code)]
-struct AnthropicUsage {
-    #[serde(default)]
-    input_tokens: Option<u64>,
-    #[serde(default)]
-    output_tokens: Option<u64>,
-    /// Flat total cache-write tokens (legacy field; always present when
-    /// any cache write occurred). The `cache_creation` breakdown object
-    /// carries the per-tier split when available.
-    #[serde(default)]
-    cache_creation_input_tokens: Option<u64>,
-    #[serde(default)]
-    cache_read_input_tokens: Option<u64>,
-    /// Per-TTL-tier write breakdown. Present when the request used a
-    /// named TTL (ephemeral-5m / ephemeral-1h). mu-cache-write-tier-split-umq6.
-    #[serde(default)]
-    cache_creation: Option<AnthropicCacheCreation>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-#[allow(dead_code)] // `text` is read from content_block_start to seed the
-                    // text block; other fields are present for future use.
-enum AnthropicBlock {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "tool_use")]
-    ToolUse { id: String, name: String },
-    #[serde(other)]
-    Other,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-enum AnthropicDelta {
-    #[serde(rename = "text_delta")]
-    TextDelta { text: String },
-    #[serde(rename = "input_json_delta")]
-    InputJsonDelta { partial_json: String },
-    #[serde(other)]
-    Other,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicMessageDelta {
-    stop_reason: Option<String>,
-    #[serde(default)]
-    usage: Option<AnthropicUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicErrorBody {
-    #[serde(rename = "type")]
-    err_type: Option<String>,
-    message: Option<String>,
-}
-
-fn map_stop_reason(s: Option<&str>) -> StopReason {
+/// Map mu_anthropic's wire `StopReason` onto mu-core's `StopReason`.
+fn map_stop_reason(s: Option<&AnthropicStopReason>) -> StopReason {
     match s {
-        Some("end_turn") => StopReason::EndTurn,
-        Some("tool_use") => StopReason::ToolUse,
-        Some("max_tokens") => StopReason::MaxTokens,
-        Some("stop_sequence") => StopReason::EndTurn,
+        Some(AnthropicStopReason::EndTurn) => StopReason::EndTurn,
+        Some(AnthropicStopReason::ToolUse) => StopReason::ToolUse,
+        Some(AnthropicStopReason::MaxTokens) => StopReason::MaxTokens,
+        Some(AnthropicStopReason::StopSequence) => StopReason::EndTurn,
         Some(other) => {
-            tracing::warn!(stop_reason = %other, "unrecognized anthropic stop_reason");
+            tracing::warn!(stop_reason = ?other, "unrecognized anthropic stop_reason");
             StopReason::EndTurn
         }
         None => StopReason::EndTurn,
     }
+}
+
+/// Fold a freshly-seen `usage` (from message_start or message_delta) into the
+/// running accumulator: any field the incoming event populates wins. Anthropic
+/// splits input/cache stats (message_start) from output_tokens (message_delta).
+fn merge_usage(acc: &mut AnthropicUsage, other: &AnthropicUsage) {
+    if other.input_tokens.is_some() {
+        acc.input_tokens = other.input_tokens;
+    }
+    if other.output_tokens.is_some() {
+        acc.output_tokens = other.output_tokens;
+    }
+    if other.cache_creation_input_tokens.is_some() {
+        acc.cache_creation_input_tokens = other.cache_creation_input_tokens;
+    }
+    if other.cache_read_input_tokens.is_some() {
+        acc.cache_read_input_tokens = other.cache_read_input_tokens;
+    }
+    if other.cache_creation.is_some() {
+        acc.cache_creation = other.cache_creation.clone();
+    }
+    if other.output_tokens_details.is_some() {
+        acc.output_tokens_details = other.output_tokens_details.clone();
+    }
+}
+
+/// Project mu_anthropic's rich `Usage` onto mu-core's `Usage`. Returns `None`
+/// when neither token count was reported (the loop treats that as "no usage").
+fn anthropic_usage_to_mu(u: &AnthropicUsage) -> Option<Usage> {
+    if u.input_tokens.is_none() && u.output_tokens.is_none() {
+        return None;
+    }
+    let (cache_5m, cache_1h) = u
+        .cache_creation
+        .as_ref()
+        .map(|cc| (cc.ephemeral_5m_input_tokens, cc.ephemeral_1h_input_tokens))
+        .unwrap_or((None, None));
+    Some(Usage {
+        input_tokens: u.input_tokens.unwrap_or(0),
+        output_tokens: u.output_tokens.unwrap_or(0),
+        cache_read_input_tokens: u.cache_read_input_tokens,
+        cache_creation_input_tokens: u.cache_creation_input_tokens,
+        cache_creation_5m_input_tokens: cache_5m,
+        cache_creation_1h_input_tokens: cache_1h,
+        reasoning_tokens: u
+            .output_tokens_details
+            .as_ref()
+            .and_then(|d| d.thinking_tokens),
+    })
 }
 
 // ============================================================================
@@ -822,57 +709,14 @@ struct StreamState {
     /// vec reflects Anthropic's intended order regardless of
     /// HashMap iteration order.
     block_order: Vec<u32>,
-    stop_reason: Option<String>,
-    /// Combined usage from message_start (input tokens, cache stats)
-    /// and message_delta (output tokens). Anthropic splits across two
-    /// events; we merge as we see them.
+    /// Terminal stop reason from `message_delta` (mu_anthropic wire type).
+    stop_reason: Option<AnthropicStopReason>,
+    /// Combined usage from message_start (input tokens, cache stats) and
+    /// message_delta (output tokens); `merge_usage` folds them as we see them.
     usage: AnthropicUsage,
     cancel_rx: Option<oneshot::Receiver<()>>,
     finished: bool,
     emitted_done: bool,
-}
-
-impl AnthropicUsage {
-    fn merge(&mut self, other: &AnthropicUsage) {
-        if other.input_tokens.is_some() {
-            self.input_tokens = other.input_tokens;
-        }
-        if other.output_tokens.is_some() {
-            self.output_tokens = other.output_tokens;
-        }
-        if other.cache_creation_input_tokens.is_some() {
-            self.cache_creation_input_tokens = other.cache_creation_input_tokens;
-        }
-        if other.cache_read_input_tokens.is_some() {
-            self.cache_read_input_tokens = other.cache_read_input_tokens;
-        }
-        // Merge per-tier breakdown: prefer whichever event carries it.
-        // In practice message_start carries input/cache stats; if either
-        // event surfaces the breakdown we take it. mu-cache-write-tier-split-umq6.
-        if other.cache_creation.is_some() {
-            self.cache_creation = other.cache_creation.clone();
-        }
-    }
-
-    fn to_usage(&self) -> Option<Usage> {
-        if self.input_tokens.is_none() && self.output_tokens.is_none() {
-            return None;
-        }
-        let (cache_5m, cache_1h) = self
-            .cache_creation
-            .as_ref()
-            .map(|cc| (cc.ephemeral_5m_input_tokens, cc.ephemeral_1h_input_tokens))
-            .unwrap_or((None, None));
-        Some(Usage {
-            input_tokens: self.input_tokens.unwrap_or(0),
-            output_tokens: self.output_tokens.unwrap_or(0),
-            cache_read_input_tokens: self.cache_read_input_tokens,
-            cache_creation_input_tokens: self.cache_creation_input_tokens,
-            cache_creation_5m_input_tokens: cache_5m,
-            cache_creation_1h_input_tokens: cache_1h,
-            reasoning_tokens: None,
-        })
-    }
 }
 
 async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamState)> {
@@ -887,7 +731,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 Ok(_) => {
                     state.finished = true;
                     state.cancel_rx = None;
-                    let usage = state.usage.to_usage();
+                    let usage = anthropic_usage_to_mu(&state.usage);
                     return Some((
                         ProviderEvent::Done(AssistantMessage {
                             content: assemble_content(&state.blocks, &state.block_order),
@@ -913,7 +757,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 state.finished = true;
                 if !state.emitted_done {
                     state.emitted_done = true;
-                    let usage = state.usage.to_usage();
+                    let usage = anthropic_usage_to_mu(&state.usage);
                     return Some((
                         ProviderEvent::Done(AssistantMessage {
                             content: assemble_content(&state.blocks, &state.block_order),
@@ -927,8 +771,8 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
             }
         };
 
-        // Parse the JSON payload as an Anthropic event.
-        let parsed: Result<AnthropicEvent, _> = serde_json::from_str(&sse_event.data);
+        // Parse the SSE payload as a mu_anthropic stream event.
+        let parsed: Result<StreamEvent, _> = serde_json::from_str(&sse_event.data);
         let parsed = match parsed {
             Ok(p) => p,
             Err(e) => {
@@ -938,28 +782,29 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
         };
 
         match parsed {
-            AnthropicEvent::ContentBlockStart {
+            StreamEvent::ContentBlockStart {
                 index,
                 content_block,
             } => {
                 // Register a new block. Re-registering an index is a
-                // protocol violation; we replace silently.
+                // protocol violation; we replace silently. Thinking and
+                // other block kinds are not surfaced on the minimal path.
                 let builder = match content_block {
-                    AnthropicBlock::Text { text } => BlockBuilder::Text(text),
-                    AnthropicBlock::ToolUse { id, name } => BlockBuilder::ToolUse {
+                    BlockStart::Text { text } => BlockBuilder::Text(text),
+                    BlockStart::ToolUse { id, name } => BlockBuilder::ToolUse {
                         id,
                         name,
                         input_json: String::new(),
                     },
-                    AnthropicBlock::Other => continue,
+                    BlockStart::Thinking { .. } | BlockStart::Other => continue,
                 };
                 if !state.blocks.contains_key(&index) {
                     state.block_order.push(index);
                 }
                 state.blocks.insert(index, builder);
             }
-            AnthropicEvent::ContentBlockDelta { index, delta } => match delta {
-                AnthropicDelta::TextDelta { text } => {
+            StreamEvent::ContentBlockDelta { index, delta } => match delta {
+                BlockDelta::TextDelta { text } => {
                     if let Some(BlockBuilder::Text(buf)) = state.blocks.get_mut(&index) {
                         buf.push_str(&text);
                     } else {
@@ -972,7 +817,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                     }
                     return Some((ProviderEvent::TextDelta(text), state));
                 }
-                AnthropicDelta::InputJsonDelta { partial_json } => {
+                BlockDelta::InputJsonDelta { partial_json } => {
                     if let Some(BlockBuilder::ToolUse { input_json, .. }) =
                         state.blocks.get_mut(&index)
                     {
@@ -985,33 +830,33 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                             "input_json_delta arrived for unknown or non-tool block"
                         );
                     }
-                    // v1: don't emit ProviderEvent::ToolCallDelta; the
-                    // loop ignores it. Final tool calls are surfaced
-                    // in the Done payload.
+                    // Minimal path: don't emit ProviderEvent::ToolCallDelta;
+                    // final tool calls are surfaced in the Done payload.
                 }
-                AnthropicDelta::Other => {
-                    // Unknown delta type (e.g., future thinking_delta);
-                    // ignore.
+                BlockDelta::ThinkingDelta { .. }
+                | BlockDelta::SignatureDelta { .. }
+                | BlockDelta::Other => {
+                    // Thinking/signature deltas are not surfaced on the
+                    // minimal path (parity with the pre-swap behavior).
                 }
             },
-            AnthropicEvent::ContentBlockStop { .. } => {
-                // No-op for v1; the block stays in the map until
-                // assembled at message_stop.
+            StreamEvent::ContentBlockStop { .. } => {
+                // No-op; the block stays in the map until assembled at
+                // message_stop.
             }
-            AnthropicEvent::MessageDelta { delta, usage } => {
+            StreamEvent::MessageDelta { delta, usage } => {
                 state.stop_reason = delta.stop_reason;
-                // Prefer the top-level usage (the real wire location).
-                // Fall back to nested delta.usage so older fixtures /
-                // servers that put it inside delta still work.
-                if let Some(u) = usage.as_ref().or(delta.usage.as_ref()) {
-                    state.usage.merge(u);
+                // mu-yz48: usage is the event-top-level sibling of `delta`
+                // (mu_anthropic models it there, boxed).
+                if let Some(u) = usage.as_deref() {
+                    merge_usage(&mut state.usage, u);
                 }
             }
-            AnthropicEvent::MessageStop => {
+            StreamEvent::MessageStop => {
                 state.finished = true;
                 state.emitted_done = true;
-                let stop = map_stop_reason(state.stop_reason.as_deref());
-                let usage = state.usage.to_usage();
+                let stop = map_stop_reason(state.stop_reason.as_ref());
+                let usage = anthropic_usage_to_mu(&state.usage);
                 return Some((
                     ProviderEvent::Done(AssistantMessage {
                         content: assemble_content(&state.blocks, &state.block_order),
@@ -1021,23 +866,42 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                     state,
                 ));
             }
-            AnthropicEvent::Error { error } => {
+            StreamEvent::Error { error } => {
                 state.finished = true;
                 state.emitted_done = true;
                 let msg = format!(
                     "anthropic stream error ({}): {}",
-                    error.err_type.unwrap_or_else(|| "unknown".to_string()),
+                    error.kind.unwrap_or_else(|| "unknown".to_string()),
                     error.message.unwrap_or_else(|| "(no message)".to_string()),
                 );
                 return Some((ProviderEvent::Error(msg), state));
             }
-            AnthropicEvent::MessageStart { message } => {
-                if let Some(u) = message.usage.as_ref() {
-                    state.usage.merge(u);
+            StreamEvent::MessageStart { message } => {
+                // Initial usage (input tokens, cache stats) rides on the
+                // message_start envelope, which mu_anthropic models as raw JSON.
+                // Absent `usage` is normal; a present-but-unparseable `usage` is
+                // logged rather than silently dropped.
+                if let Some(usage_val) = message.as_value().get("usage") {
+                    match serde_json::from_value::<AnthropicUsage>(usage_val.clone()) {
+                        Ok(u) => merge_usage(&mut state.usage, &u),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "message_start usage failed to parse; token stats may be incomplete"
+                        ),
+                    }
                 }
             }
-            AnthropicEvent::Ping => {
+            StreamEvent::Ping => {
                 // No-op.
+            }
+            StreamEvent::Unknown(v) => {
+                // Forward-compat: an event type mu_anthropic doesn't model. Log
+                // it so a new SSE event type doesn't vanish without a trace (the
+                // old hand-rolled parser surfaced these as parse warnings).
+                tracing::debug!(
+                    event_type = ?v.as_value().get("type"),
+                    "unhandled anthropic stream event"
+                );
             }
         }
     }

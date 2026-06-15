@@ -26,6 +26,9 @@ pub use content::{CacheControl, ContentBlock};
 pub use finite::FiniteF64;
 pub use json::{JsonValue, JsonValueError};
 pub use message::{Content, Message, Role};
-pub use request::{MessagesRequest, Tool};
+pub use request::{
+    ContextEdit, ContextManagement, McpServer, McpToolConfiguration, MessagesRequest, Metadata,
+    OutputConfig, ServerTool, ThinkingConfig, Tool, ToolChoice, ToolDef,
+};
 pub use response::{CacheCreation, Message as ResponseMessage, StopReason, Usage};
 pub use stream::{BlockDelta, BlockStart, MessageDeltaBody, StreamError, StreamEvent};

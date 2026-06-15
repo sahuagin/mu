@@ -64,11 +64,16 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
 use ratatui::widgets::Widget;
 
+/// A rendered viewport cell, reduced to the fields `flush` actually writes.
+/// Kept small/cloneable so diff-based flushing can skip unchanged cells instead
+/// of repainting the whole viewport on every prompt keypress.
+type RenderCell = (String, Color, Color, Modifier);
+
 /// A stored line of history content (what insert_before rendered).
 /// Kept so we can replay on viewport shrink.
 #[derive(Clone)]
 struct HistoryLine {
-    cells: Vec<(String, Color, Color, Modifier)>,
+    cells: Vec<RenderCell>,
 }
 
 /// Cap on retained `history` lines — `insert_before` drains the oldest
@@ -147,6 +152,10 @@ pub struct DynamicViewport {
     viewport: Rect,
     /// Double buffer for diff-based rendering.
     buffers: [Buffer; 2],
+    /// Last cell image written by `flush`, aligned with `viewport`. `None`
+    /// forces a full repaint (after resize/move/insert_before); otherwise the
+    /// prompt hot path writes only cells that changed.
+    screen_cache: Vec<Option<RenderCell>>,
     current: usize,
     /// Terminal screen size (columns, rows).
     screen_size: (u16, u16),
@@ -222,6 +231,7 @@ impl DynamicViewport {
         let mut vp = Self {
             viewport,
             buffers: [Buffer::empty(viewport), Buffer::empty(viewport)],
+            screen_cache: vec![None; viewport.width as usize * viewport.height as usize],
             current: 0,
             screen_size: (cols, rows),
             history: Vec::new(),
@@ -261,6 +271,7 @@ impl DynamicViewport {
                 self.viewport.width = cols;
                 self.buffers[0].resize(self.viewport);
                 self.buffers[1].resize(self.viewport);
+                self.invalidate_screen_cache();
             }
             return Ok(());
         }
@@ -312,17 +323,19 @@ impl DynamicViewport {
             queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
         }
         self.buffers[1 - self.current].reset();
+        self.invalidate_screen_cache();
         stdout.flush()?;
         Ok(())
     }
 
     /// Clear the viewport area on screen (used before insert_before
     /// to erase the raw prompt before the formatted "you" block replaces it).
-    pub fn clear_viewport(&self) -> io::Result<()> {
+    pub fn clear_viewport(&mut self) -> io::Result<()> {
         let mut stdout = io::stdout();
         for row in self.viewport.y..(self.viewport.y + self.viewport.height) {
             queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
         }
+        self.invalidate_screen_cache();
         stdout.flush()
     }
 
@@ -342,6 +355,7 @@ impl DynamicViewport {
             self.buffers[0].resize(self.viewport);
             self.buffers[1].resize(self.viewport);
             self.buffers[1 - self.current].reset();
+            self.invalidate_screen_cache();
             stdout.flush()?;
         }
         Ok(())
@@ -353,61 +367,78 @@ impl DynamicViewport {
         widget.render(area, self.current_buffer_mut());
     }
 
-    /// Flush the viewport to the terminal. Always does a full repaint
-    /// (no diff optimization) to avoid state confusion after insert_before.
-    /// Wrapped in synchronized output brackets to prevent flicker.
+    /// Flush the viewport to the terminal. Diff against the last flushed cell
+    /// image so prompt edits repaint only changed cells; structural terminal
+    /// operations call `invalidate_screen_cache` to force a full repaint when
+    /// the viewport moves/resizes or scrollback is inserted.
     pub fn flush(&mut self) -> io::Result<()> {
-        let mut stdout = io::stdout();
-        // Begin synchronized output (terminal buffers until end bracket)
-        write!(stdout, "\x1b[?2026h")?;
-        queue!(stdout, Hide)?;
-
+        self.ensure_screen_cache_shape();
         let area = self.viewport;
         let curr = &self.buffers[self.current];
+        let mut changes: Vec<(u16, u16, usize, RenderCell)> = Vec::new();
 
         for y in 0..area.height {
             for x in 0..area.width {
                 let idx = (y as usize) * (area.width as usize) + (x as usize);
                 let curr_cell = &curr.content[idx];
-
-                {
-                    let screen_y = area.y + y;
-                    let screen_x = area.x + x;
-                    queue!(stdout, MoveTo(screen_x, screen_y))?;
-
-                    // Apply style
-                    let fg = to_crossterm_color(curr_cell.fg);
-                    let bg = to_crossterm_color(curr_cell.bg);
-                    queue!(stdout, SetForegroundColor(fg), SetBackgroundColor(bg))?;
-
-                    let mods = curr_cell.modifier;
-                    if mods.contains(Modifier::BOLD) {
-                        queue!(stdout, SetAttribute(Attribute::Bold))?;
-                    }
-                    if mods.contains(Modifier::DIM) {
-                        queue!(stdout, SetAttribute(Attribute::Dim))?;
-                    }
-                    if mods.contains(Modifier::ITALIC) {
-                        queue!(stdout, SetAttribute(Attribute::Italic))?;
-                    }
-                    if mods.contains(Modifier::UNDERLINED) {
-                        queue!(stdout, SetAttribute(Attribute::Underlined))?;
-                    }
-                    if mods.contains(Modifier::REVERSED) {
-                        queue!(stdout, SetAttribute(Attribute::Reverse))?;
-                    }
-
-                    queue!(stdout, Print(curr_cell.symbol()))?;
-                    queue!(stdout, SetAttribute(Attribute::Reset))?;
+                let image = (
+                    curr_cell.symbol().to_string(),
+                    curr_cell.fg,
+                    curr_cell.bg,
+                    curr_cell.modifier,
+                );
+                if self.screen_cache[idx].as_ref() != Some(&image) {
+                    changes.push((x, y, idx, image));
                 }
             }
+        }
+
+        if changes.is_empty() {
+            self.current_buffer_mut().reset();
+            return Ok(());
+        }
+
+        let mut stdout = io::stdout();
+        // Begin synchronized output (terminal buffers until end bracket)
+        write!(stdout, "\x1b[?2026h")?;
+        queue!(stdout, Hide)?;
+
+        for (x, y, idx, image) in changes {
+            let (symbol, fg, bg, mods) = image.clone();
+            let screen_y = area.y + y;
+            let screen_x = area.x + x;
+            queue!(stdout, MoveTo(screen_x, screen_y))?;
+
+            // Apply style
+            let ct_fg = to_crossterm_color(fg);
+            let ct_bg = to_crossterm_color(bg);
+            queue!(stdout, SetForegroundColor(ct_fg), SetBackgroundColor(ct_bg))?;
+
+            if mods.contains(Modifier::BOLD) {
+                queue!(stdout, SetAttribute(Attribute::Bold))?;
+            }
+            if mods.contains(Modifier::DIM) {
+                queue!(stdout, SetAttribute(Attribute::Dim))?;
+            }
+            if mods.contains(Modifier::ITALIC) {
+                queue!(stdout, SetAttribute(Attribute::Italic))?;
+            }
+            if mods.contains(Modifier::UNDERLINED) {
+                queue!(stdout, SetAttribute(Attribute::Underlined))?;
+            }
+            if mods.contains(Modifier::REVERSED) {
+                queue!(stdout, SetAttribute(Attribute::Reverse))?;
+            }
+
+            queue!(stdout, Print(&symbol))?;
+            queue!(stdout, SetAttribute(Attribute::Reset))?;
+            self.screen_cache[idx] = Some(image);
         }
 
         // End synchronized output (terminal renders atomically)
         write!(stdout, "\x1b[?2026l")?;
         stdout.flush()?;
 
-        // Reset buffer for next frame (full repaint each time).
         self.current_buffer_mut().reset();
         Ok(())
     }
@@ -442,8 +473,7 @@ impl DynamicViewport {
                     // zellij may blank-fill a margined reverse scroll
                     // (DECSTBM + CSI T) instead of moving the viewport
                     // image. We don't need the terminal to move anything:
-                    // flush() always repaints the whole viewport from the
-                    // buffers (which we reset below), and the history
+                    // the viewport is invalidated below, and the history
                     // emission that follows paints >= push_down fresh rows
                     // at the bottom of the new history region — exactly
                     // the rows the old viewport top vacates. So just clear
@@ -462,6 +492,7 @@ impl DynamicViewport {
             self.buffers[1].resize(self.viewport);
             // Force full redraw since viewport moved
             self.buffers[1 - self.current].reset();
+            self.invalidate_screen_cache();
         }
 
         let viewport_top = self.viewport.y;
@@ -509,6 +540,7 @@ impl DynamicViewport {
             )?,
         }
         self.buffers[1 - self.current].reset();
+        self.invalidate_screen_cache();
 
         // Mirror the emitted rows into in-memory history (identical for both
         // strategies — the strategies differ only in escape-sequence framing,
@@ -557,6 +589,18 @@ impl DynamicViewport {
 
     fn current_buffer_mut(&mut self) -> &mut Buffer {
         &mut self.buffers[self.current]
+    }
+
+    fn ensure_screen_cache_shape(&mut self) {
+        let expected = self.viewport.width as usize * self.viewport.height as usize;
+        if self.screen_cache.len() != expected {
+            self.screen_cache = vec![None; expected];
+        }
+    }
+
+    fn invalidate_screen_cache(&mut self) {
+        let expected = self.viewport.width as usize * self.viewport.height as usize;
+        self.screen_cache = vec![None; expected];
     }
 
     /// Repaint the visible history tail above the viewport from the in-memory
@@ -754,10 +798,10 @@ fn emit_push_down_fast<W: Write>(
 
 /// CONSERVATIVE push-down: no DECSTBM, no `CSI T` — just clear the rows the
 /// viewport currently occupies. The caller relocates the viewport logically;
-/// the subsequent history emission repaints the vacated rows and the next
-/// `flush()` repaints the viewport at its new position (full repaint, buffers
-/// reset). Clearing prevents stale viewport pixels from being scrolled up
-/// into the history region / native scrollback by the chunked emission.
+/// the subsequent history emission repaints the vacated rows and invalidates
+/// the viewport cache so the next `flush()` repaints its new position. Clearing
+/// prevents stale viewport pixels from being scrolled up into the history
+/// region / native scrollback by the chunked emission.
 fn emit_push_down_conservative<W: Write>(
     out: &mut W,
     viewport_y: u16,

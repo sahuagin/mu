@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use mu_anthropic::{
     BlockDelta, BlockStart, CacheControl, Content, ContentBlock as AnthBlock,
     Message as AnthMessage, MessagesRequest, StopReason as AnthropicStopReason, StreamEvent, Tool,
-    Usage as AnthropicUsage,
+    ToolDef, Usage as AnthropicUsage,
 };
 use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
@@ -228,23 +228,20 @@ fn json_value(v: Value) -> mu_anthropic::JsonValue {
     mu_anthropic::JsonValue::new(v).unwrap_or_else(|_| mu_anthropic::JsonValue::empty_object())
 }
 
-/// Translate a mu `ToolSpec` into a mu_anthropic `Tool`, optionally caching it.
-/// Returns `Tool` (not `ToolDef`): the crate doesn't re-export `ToolDef`, so the
-/// `Tool -> ToolDef` conversion is left to the `with_tools` call site via `Into`.
-fn map_tool_spec(spec: &ToolSpec, cache: Option<CacheControl>) -> Tool {
+/// Translate a mu `ToolSpec` into a mu_anthropic `ToolDef`, optionally caching it.
+fn map_tool_spec(spec: &ToolSpec, cache: Option<CacheControl>) -> ToolDef {
     let mut tool = Tool::new(
         spec.name.clone(),
         spec.description.clone(),
         json_value(spec.input_schema.clone()),
     );
     tool.cache_control = cache;
-    tool
+    tool.into()
 }
 
 /// Build the request `tools`, attaching `cache_control` to the LAST tool when
-/// `cache_last` (mu's tool-cache position). The `Vec<Tool>` is turned into the
-/// `Vec<ToolDef>` `with_tools` wants at the call site (inference + `From<Tool>`).
-fn map_tools(tools: &[ToolSpec], cache_last: bool, ttl: CacheTtl) -> Vec<Tool> {
+/// `cache_last` (mu's tool-cache position).
+fn map_tools(tools: &[ToolSpec], cache_last: bool, ttl: CacheTtl) -> Vec<ToolDef> {
     let last = tools.len().saturating_sub(1);
     tools
         .iter()
@@ -389,12 +386,7 @@ pub(crate) fn build_request_body(
         }
     }
     if !tools.is_empty() {
-        req = req.with_tools(
-            map_tools(tools, false, CacheTtl::default())
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-        );
+        req = req.with_tools(map_tools(tools, false, CacheTtl::default()));
     }
     request_to_value(req)
 }
@@ -548,12 +540,7 @@ pub(crate) fn build_request_body_from_projection(
         }
     }
     if !tools.is_empty() {
-        req = req.with_tools(
-            map_tools(tools, tools_should_cache, ttl)
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-        );
+        req = req.with_tools(map_tools(tools, tools_should_cache, ttl));
     }
     request_to_value(req)
 }

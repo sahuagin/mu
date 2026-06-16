@@ -39,6 +39,11 @@ pub struct AskOptions {
     /// `mu serve` — no recall injection, no discovery bootstrap.
     /// (mu-mu-bare-flag-fxc8)
     pub bare: bool,
+    /// mu-779s: cap on assistant-message turns. `None` → use the
+    /// provider-aware default (20 for Anthropic, 35 for OpenAI).
+    /// `Some(n)` → cap at `n` turns. `Some(0)` → disable entirely.
+    /// Forwarded as `CreateSessionRequest.max_turns` to the daemon.
+    pub max_turns: Option<u32>,
 }
 
 /// Run a single `mu ask` invocation. Flags (`provider`, `model`,
@@ -90,6 +95,7 @@ pub async fn run(opts: AskOptions) -> Result<()> {
         &selector,
         opts.system_prompt.as_deref(),
         invocation_cwd,
+        opts.max_turns,
     )
     .await?;
     let (text, stop_reason) = ask_and_drain(
@@ -252,6 +258,7 @@ async fn create_session(
     selector: &mu_core::protocol::ProviderSelector,
     system_prompt: Option<&str>,
     cwd: Option<std::path::PathBuf>,
+    max_turns: Option<u32>,
 ) -> Result<String> {
     let id = *next_id;
     *next_id += 1;
@@ -280,6 +287,9 @@ async fn create_session(
         // unrestricted ceiling). solo.toml's `[session] max_side_effects`
         // is the first operator knob.
         max_side_effects: None,
+        // mu-779s: per-session max_turns cap. `None` → use provider default.
+        // `Some(0)` → disable cap entirely.
+        max_turns,
     };
     let req = json!({
         "jsonrpc": "2.0",

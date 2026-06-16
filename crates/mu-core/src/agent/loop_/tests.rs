@@ -695,7 +695,7 @@ async fn b3_iteration_cap() {
     let tools = vec![MockTool::always_ok("echo", "ok")];
 
     let config = AgentConfig {
-        max_turns: 3,
+        max_turns: Some(3),
         ..AgentConfig::default()
     };
     let (loop_, events_rx) = spawn_loop(provider, tools, config);
@@ -744,7 +744,7 @@ async fn mu_779s_iteration_cap_done_event_uses_iteration_cap_stop_reason() {
     let tools = vec![MockTool::always_ok("echo", "ok")];
 
     let config = AgentConfig {
-        max_turns: 2,
+        max_turns: Some(2),
         ..AgentConfig::default()
     };
     let (loop_, events_rx) = spawn_loop(provider, tools, config);

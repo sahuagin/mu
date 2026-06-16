@@ -498,6 +498,13 @@ pub struct SessionConfig {
     /// compacted-snapshot blobs). `None` resolves to the platform
     /// default at runtime (typically `~/.local/share/mu`).
     pub state_dir: Option<PathBuf>,
+    /// mu-779s: default cap on assistant-message turns for new sessions.
+    /// `None` → use provider-aware default (20 for Anthropic, 35 for
+    /// OpenAI). `Some(0)` → disable cap entirely. `Some(n)` → cap at
+    /// `n` turns. Forwarded as `CreateSessionRequest.max_turns` to the
+    /// daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_max_turns: Option<u32>,
 }
 
 impl Default for SessionConfig {
@@ -506,6 +513,7 @@ impl Default for SessionConfig {
             persist_events_to_disk: true,
             resume_on_daemon_restart: false,
             state_dir: None,
+            default_max_turns: None,
         }
     }
 }

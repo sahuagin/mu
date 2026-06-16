@@ -562,7 +562,9 @@ pub struct AgentConfig {
     /// Cap on assistant-message turns. The loop emits
     /// `AgentEvent::Done(EndTurn)` and returns `Outcome::IterationCap`
     /// when this is reached. Default 20.
-    pub max_turns: u32,
+    ///
+    /// Set to `None` to disable the iteration cap entirely.
+    pub max_turns: Option<u32>,
     /// mu-n48: optional system prompt forwarded to every
     /// `Provider::stream` call in this session. None ⇒ no system
     /// content sent (pre-mu-n48 behavior). When set, providers render
@@ -650,7 +652,7 @@ impl std::fmt::Debug for AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_turns: 20,
+            max_turns: Some(20),
             system_prompt: None,
             compaction_threshold: None,
             project_context: None,
@@ -1430,7 +1432,62 @@ async fn run_inner(
                 queue.push_back(Action::InvokeLlm);
             }
             Action::InvokeLlm => {
-                if turn_count >= config.max_turns {
+                // mu-779s: iteration cap check with progressive warnings
+                // and dynamic cap (None = disabled)
+                let reserved_turns = 2u32;
+                let (warning_threshold, cap_enabled) = if let Some(max) = config.max_turns {
+                    (max.saturating_sub(reserved_turns), true)
+                } else {
+                    (0, false)
+                };
+
+                // Emit progressive warnings at 75% and 90% of cap
+                // Only warn if the cap is enabled and large enough to have meaningful thresholds
+                if cap_enabled && warning_threshold > 0 {
+                    let warning_threshold_75 = (warning_threshold as f64 * 0.75).ceil() as u32;
+                    let warning_threshold_90 = (warning_threshold as f64 * 0.90).ceil() as u32;
+
+                    if turn_count >= warning_threshold_90 && turn_count < warning_threshold_90 + 1 {
+                        let _ = events
+                            .send(AgentEvent::Callout {
+                                category: "warning".to_owned(),
+                                title: "iteration cap approaching".to_owned(),
+                                body: serde_json::json!({
+                                    "turn_count": turn_count,
+                                    "warning_threshold": warning_threshold,
+                                    "reserved_turns": reserved_turns,
+                                    "reason": "90% of turn budget exhausted"
+                                }),
+                                theme: Some("warning".to_owned()),
+                                context_refs: vec!["spec:mu-003".to_owned()],
+                            })
+                            .await;
+                    } else if turn_count >= warning_threshold_75
+                        && turn_count < warning_threshold_75 + 1
+                    {
+                        let _ = events
+                            .send(AgentEvent::Callout {
+                                category: "info".to_owned(),
+                                title: "iteration cap approaching".to_owned(),
+                                body: serde_json::json!({
+                                    "turn_count": turn_count,
+                                    "warning_threshold": warning_threshold,
+                                    "reserved_turns": reserved_turns,
+                                    "reason": "75% of turn budget exhausted"
+                                }),
+                                theme: Some("info".to_owned()),
+                                context_refs: vec!["spec:mu-003".to_owned()],
+                            })
+                            .await;
+                    }
+                }
+
+                // Check cap (only if enabled)
+                // mu-779s: Some(0) means disable cap (per protocol doc).
+                // Only cap if Some(n) where n > 0.
+                if config.max_turns.is_some_and(|n| n > 0)
+                    && turn_count >= config.max_turns.unwrap_or(0)
+                {
                     // mu-779s: distinguish iteration-cap exit from natural
                     // end_turn so downstream consumers (TUI, transcript,
                     // telemetry) can surface "turn budget exhausted" rather

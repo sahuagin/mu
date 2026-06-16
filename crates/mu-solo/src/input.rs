@@ -373,6 +373,11 @@ impl InputBuffer {
     }
 
     /// Layout a text segment with word-wrap, updating lines and cursor state.
+    ///
+    /// Keep this strictly linear in the segment length. This runs in the
+    /// keystroke/render hot path; repeated `nth()` scans over char iterators
+    /// made long prompt lines superlinear exactly where typing latency is most
+    /// visible. (mu-mu-solo-typing-lag-8y5g)
     fn layout_text_segment(
         &self,
         text: &str,
@@ -381,19 +386,13 @@ impl InputBuffer {
         lines: &mut Vec<VisualLine>,
         cursor: &mut CursorLoc,
     ) {
-        for (logical_idx, logical_line) in text.split('\n').enumerate() {
-            let line_start = if logical_idx == 0 {
-                byte_offset
-            } else {
-                byte_offset
-                    + text[..text.len()]
-                        .match_indices('\n')
-                        .nth(logical_idx - 1)
-                        .map(|(i, _)| i + 1)
-                        .unwrap_or(0)
-            };
+        let mut logical_start = 0usize;
+        for logical_line in text.split_inclusive('\n') {
+            let has_newline = logical_line.ends_with('\n');
+            let line_body = logical_line.strip_suffix('\n').unwrap_or(logical_line);
+            let line_start = byte_offset + logical_start;
 
-            if logical_line.is_empty() {
+            if line_body.is_empty() {
                 let row_idx = lines.len();
                 lines.push(VisualLine {
                     text: String::new(),
@@ -405,62 +404,72 @@ impl InputBuffer {
                     cursor.col = 0;
                     cursor.found = true;
                 }
-                continue;
-            }
+            } else {
+                let mut row_text = String::new();
+                let mut row_start_byte = line_start;
+                let mut col = 0usize;
 
-            let chars: Vec<char> = logical_line.chars().collect();
-            let mut col = 0;
-            let mut row_start_byte = line_start;
-            let mut row_start_char = 0;
+                for (rel_byte, ch) in line_body.char_indices() {
+                    let char_byte_pos = line_start + rel_byte;
 
-            for (ci, _ch) in chars.iter().enumerate() {
-                let char_byte_pos = line_start
-                    + logical_line
-                        .char_indices()
-                        .nth(ci)
-                        .map(|(b, _)| b)
-                        .unwrap_or(0);
+                    if col >= wrap_width && col > 0 {
+                        let byte_end = char_byte_pos;
+                        let row_idx = lines.len();
+                        lines.push(VisualLine {
+                            text: std::mem::take(&mut row_text),
+                            byte_start: row_start_byte,
+                            byte_end,
+                        });
+                        if !cursor.found && self.cursor >= row_start_byte && self.cursor < byte_end
+                        {
+                            cursor.row = row_idx;
+                            cursor.col = self.content[row_start_byte..self.cursor].chars().count();
+                            cursor.found = true;
+                        }
+                        row_start_byte = byte_end;
+                        col = 0;
+                    }
 
-                if col >= wrap_width && col > 0 {
-                    let row_text: String = chars[row_start_char..ci].iter().collect();
-                    let byte_end = char_byte_pos;
-                    let row_idx = lines.len();
-                    lines.push(VisualLine {
-                        text: row_text,
-                        byte_start: row_start_byte,
-                        byte_end,
-                    });
-                    if !cursor.found && self.cursor >= row_start_byte && self.cursor < byte_end {
-                        cursor.row = row_idx;
-                        cursor.col = self.content[row_start_byte..self.cursor].chars().count();
+                    if !cursor.found && self.cursor == char_byte_pos {
+                        cursor.row = lines.len();
+                        cursor.col = col;
                         cursor.found = true;
                     }
-                    row_start_byte = byte_end;
-                    row_start_char = ci;
-                    col = 0;
-                }
-                col += 1;
 
-                if !cursor.found && self.cursor == char_byte_pos {
-                    cursor.row = lines.len();
-                    cursor.col = col - 1;
+                    row_text.push(ch);
+                    col += 1;
+                }
+
+                let byte_end = line_start + line_body.len();
+                let row_idx = lines.len();
+                lines.push(VisualLine {
+                    text: row_text,
+                    byte_start: row_start_byte,
+                    byte_end,
+                });
+                if !cursor.found && self.cursor >= row_start_byte && self.cursor <= byte_end {
+                    cursor.row = row_idx;
+                    cursor.col = self.content[row_start_byte..self.cursor].chars().count();
                     cursor.found = true;
                 }
             }
 
-            // Flush remaining chars in this logical line
-            let row_text: String = chars[row_start_char..].iter().collect();
-            let byte_end = line_start + logical_line.len();
-            let row_idx = lines.len();
-            lines.push(VisualLine {
-                text: row_text,
-                byte_start: row_start_byte,
-                byte_end,
-            });
-            if !cursor.found && self.cursor >= row_start_byte && self.cursor <= byte_end {
-                cursor.row = row_idx;
-                cursor.col = self.content[row_start_byte..self.cursor].chars().count();
-                cursor.found = true;
+            logical_start += logical_line.len();
+            if has_newline && logical_start == text.len() {
+                // Preserve a trailing newline as an empty visual row so the
+                // caret appears at the start of the newly-created line.
+                let line_start = byte_offset + logical_start;
+                let row_idx = lines.len();
+                lines.push(VisualLine {
+                    text: String::new(),
+                    byte_start: line_start,
+                    byte_end: line_start,
+                });
+                if !cursor.found && self.cursor == line_start {
+                    cursor.row = row_idx;
+                    cursor.col = 0;
+                    cursor.found = true;
+                }
             }
         }
     }
@@ -569,6 +578,31 @@ mod tests {
         assert_eq!(layout.lines[1].text, "b");
         assert_eq!(layout.cursor_row, 1);
         assert_eq!(layout.cursor_col, 0);
+    }
+
+    #[test]
+    fn trailing_newline_creates_empty_cursor_row() {
+        let mut buf = InputBuffer::new();
+        buf.insert_str("ab");
+        buf.insert_char('\n');
+        let layout = buf.visual_layout(80);
+        assert_eq!(layout.lines.len(), 2);
+        assert_eq!(layout.lines[0].text, "ab");
+        assert_eq!(layout.lines[1].text, "");
+        assert_eq!(layout.cursor_row, 1);
+        assert_eq!(layout.cursor_col, 0);
+    }
+
+    #[test]
+    fn wraps_unicode_line_without_quadratic_rescans() {
+        let mut buf = InputBuffer::new();
+        buf.insert_str("åßçdé");
+        let layout = buf.visual_layout(3);
+        assert_eq!(layout.lines.len(), 2);
+        assert_eq!(layout.lines[0].text, "åßç");
+        assert_eq!(layout.lines[1].text, "dé");
+        assert_eq!(layout.cursor_row, 1);
+        assert_eq!(layout.cursor_col, 2);
     }
 
     #[test]

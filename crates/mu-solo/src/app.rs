@@ -1108,8 +1108,9 @@ impl App {
         let selection_rows = if self.selected_block.is_some() { 2 } else { 0 };
         let preview_rows = preview.len();
 
+        let desired_prompt_rows = layout.lines.len().max(PROMPT_ROW_SLACK);
         let desired_height = (preview_rows as u16
-            + layout.lines.len() as u16
+            + desired_prompt_rows as u16
             + 4
             + menu_rows as u16
             + selection_rows as u16) // +preview +separator +prompt +selection +separator +status +info
@@ -1121,7 +1122,14 @@ impl App {
         let area = vp.area();
         let vp_w = area.width as usize;
         let vp_wrap = vp_w.saturating_sub(4);
-        let vp_layout = self.prompt.visual_layout(vp_wrap);
+        // Reuse the layout computed above when the viewport width did not
+        // change during set_height. Prompt layout runs on every keypress; doing
+        // it twice per frame is needless work in the typing hot path.
+        let vp_layout = if vp_w == w {
+            layout
+        } else {
+            self.prompt.visual_layout(vp_wrap)
+        };
         let max_prompt_rows =
             (area.height as usize).saturating_sub(4 + menu_rows + preview_rows + selection_rows);
         let prompt_rows = vp_layout.lines.len().min(max_prompt_rows);
@@ -3942,8 +3950,13 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
-/// Minimum viewport height (separator + prompt + separator + status + info).
+/// Minimum viewport height (separator + 1 prompt row + separator + status + info).
 const VIEWPORT_HEIGHT: u16 = 5;
+/// Keep a few prompt rows allocated so crossing a visual-line boundary while
+/// typing does not synchronously resize the terminal viewport. The input buffer
+/// is local state; starting a new line should be a cheap row repaint, not a
+/// scroll-region operation plus full repaint. (mu-mu-solo-typing-lag-8y5g)
+const PROMPT_ROW_SLACK: usize = 3;
 /// Maximum viewport height — cap to prevent eating the entire screen.
 const MAX_VIEWPORT_HEIGHT: u16 = 20;
 

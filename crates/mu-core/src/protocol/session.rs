@@ -57,6 +57,12 @@ pub struct CreateSessionRequest {
     /// (attenuation is intersect-only, narrower-wins).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_side_effects: Option<crate::agent::tool::SideEffects>,
+    /// mu-779s: cap on assistant-message turns. `None` → use the
+    /// provider-aware default (20 for Anthropic, 35 for OpenAI, etc.).
+    /// `Some(n)` → cap at `n` turns. `Some(0)` → disable entirely.
+    /// Forwarded as `AgentConfig::max_turns` to the agent loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
 }
 
 impl CreateSessionRequest {

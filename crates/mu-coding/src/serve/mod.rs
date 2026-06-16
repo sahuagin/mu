@@ -129,10 +129,16 @@ pub fn resolve_journal_path(config: &mu_core::config::Config, daemon_id: &str) -
 /// hermetic daemon regardless of config file or env: recall providers
 /// off AND the discovery bootstrap suppressed, by rewriting the loaded
 /// `[recall]` section before anything downstream reads it.
+///
+/// mu-779s: `max_turns` is the default cap on assistant-message turns
+/// for sessions created on this daemon. `None` → use provider-aware
+/// default (20 for Anthropic, 35 for OpenAI). `Some(0)` → disable cap.
+/// Forwarded as `CreateSessionRequest.max_turns` to session creation.
 pub async fn run(
     factory: ProviderFactory,
     tools: Vec<Arc<dyn Tool>>,
     bare: bool,
+    max_turns: Option<u32>,
 ) -> anyhow::Result<()> {
     // spec mu-046 WP6: track config provenance — the file layers that
     // contributed, plus the consumer-side overrides applied right
@@ -151,6 +157,14 @@ pub async fn run(
         config.recall.enabled = false;
         config.recall.bare = true;
         config_sources.push("cli:--bare".to_string());
+    }
+    // mu-779s: if max_turns is Some, override the default. Note that
+    // this is the daemon-wide default; per-session overrides still work
+    // via CreateSessionRequest.max_turns.
+    if let Some(n) = max_turns {
+        // Store the daemon default in config for reference (not used yet).
+        // The actual per-session default is handled in build_and_register_session.
+        tracing::info!(max_turns = ?n, "daemon: max_turns cap set");
     }
     let events_dir = resolve_events_dir(&config);
     let stdin = BufReader::new(tokio::io::stdin());

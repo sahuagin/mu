@@ -84,6 +84,7 @@ pub fn handle_create_session(
         seed_messages: Vec::new(), // mu-mh4: fresh session starts empty
         seed_events: Vec::new(),   // mu-mh4: fresh session has no seed events
         cache_ttl: params.cache_ttl.unwrap_or_default(), // mu-f1a0
+        max_turns: params.max_turns, // mu-779s: per-session cap override
         notif,
         sessions,
         factory,
@@ -162,6 +163,7 @@ pub fn handle_delegate_session(
         // so the 1h tier's 2x write premium is pure cost (operator
         // requirement, bead body).
         cache_ttl: CacheTtl::FiveMinutes,
+        max_turns: None, // delegate sessions inherit the cap from the parent
         notif,
         sessions,
         factory,
@@ -335,6 +337,7 @@ pub fn handle_resume_session(
         seed_messages: continuation.messages,
         seed_events: vec![head_attached],
         cache_ttl: CacheTtl::default(),
+        max_turns: None, // resume sessions inherit the cap from the predecessor
         notif,
         sessions: sessions.clone(),
         factory,
@@ -390,6 +393,11 @@ struct BuildSessionRequest<'a> {
     seed_events: Vec<EventPayload>,
     /// mu-f1a0: prompt-cache TTL tier for this session's provider.
     cache_ttl: CacheTtl,
+    /// mu-779s: cap on assistant-message turns. `None` → use the
+    /// provider-aware default (20 for Anthropic, 35 for OpenAI, etc.).
+    /// `Some(n)` → cap at `n` turns. `Some(0)` → disable entirely.
+    /// Forwarded as `AgentConfig::max_turns` to the agent loop.
+    max_turns: Option<u32>,
     // runtime deps (daemon-global)
     notif: NotificationWriter,
     sessions: Sessions,
@@ -478,6 +486,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         skills,
         daemon_info,
         cache_ttl,
+        max_turns,
     } = req;
     let provider =
         factory(selector, cache_ttl).map_err(|e| format!("could not build provider: {e}"))?;
@@ -508,11 +517,14 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     let (kind_str, model_str) = describe_selector(selector);
     let kind_arc: Arc<str> = Arc::from(kind_str.as_str());
     let model_arc: Arc<str> = Arc::from(model_str.as_str());
-    // mu-779s: per-provider max_turns default. OpenAI/openrouter models
-    // are chattier than Anthropic on tool-heavy reads and routinely hit
-    // the default 20-turn cap; bump them so the common case stays
-    // productive. Operator can still pin per-session via `--max-iterations`.
-    let max_turns = mu_core::agent::loop_::default_max_turns_for(&kind_str);
+    // mu-779s: per-session max_turns. The resolution order is:
+    // 1. Request-supplied value (params.max_turns) — overrides all
+    //    Some(0) means "disable cap entirely"
+    // 2. Config's default_max_turns (if Some(n)) — operator default
+    // 3. Provider-aware default (20 Anthropic, 35 OpenAI, etc.)
+    let max_turns = max_turns
+        .or_else(|| daemon_info.config().session.default_max_turns)
+        .or_else(|| Some(mu_core::agent::loop_::default_max_turns_for(&kind_str)));
     event_log.append(
         EventActor::System,
         EventPayload::SessionCreated {

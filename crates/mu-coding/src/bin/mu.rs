@@ -67,6 +67,12 @@ enum Command {
         /// (mu-mu-bare-flag-fxc8)
         #[arg(long)]
         bare: bool,
+        /// mu-779s: cap on assistant-message turns. `n` → cap at `n`
+        /// turns. `0` → disable entirely. When omitted, use the
+        /// provider-aware default (20 for Anthropic, 35 for OpenAI).
+        /// Forwarded as `CreateSessionRequest.max_turns` to the daemon.
+        #[arg(long)]
+        max_turns: Option<u32>,
     },
     /// One-shot ask — spawn the daemon, single roundtrip, exit.
     Ask {
@@ -122,6 +128,12 @@ enum Command {
         /// --append-system-prompt supplies. (mu-mu-bare-flag-fxc8)
         #[arg(long)]
         bare: bool,
+        /// mu-779s: cap on assistant-message turns (forwarded).
+        /// `n` → cap at `n` turns. `0` → disable entirely.
+        /// When omitted, use the provider-aware default (20 for
+        /// Anthropic, 35 for OpenAI).
+        #[arg(long)]
+        max_turns: Option<u32>,
     },
     /// Resume a dead session by forking a fresh live head at its last
     /// clean boundary (mu-mh4). STRICT: refuses a ragged log (incomplete
@@ -397,6 +409,7 @@ async fn main() -> Result<()> {
             bash_allow,
             bash_prompt,
             bare,
+            max_turns,
         } => {
             let factory = mu_coding::serve::make_provider_factory(ephemeral, thinking);
             let tool_names = mu_coding::serve::parse_tools_csv(&tools);
@@ -407,7 +420,7 @@ async fn main() -> Result<()> {
             };
             let tool_vec = mu_coding::serve::build_tools(&tool_names, &bash_settings)?;
 
-            mu_coding::serve::run(factory, tool_vec, bare).await
+            mu_coding::serve::run(factory, tool_vec, bare, max_turns).await
         }
         Command::Ask {
             prompt,
@@ -422,6 +435,7 @@ async fn main() -> Result<()> {
             bash_prompt,
             append_system_prompt,
             bare,
+            max_turns,
         } => {
             let system_prompt = match append_system_prompt {
                 Some(path) => Some(std::fs::read_to_string(&path).with_context(|| {
@@ -447,6 +461,7 @@ async fn main() -> Result<()> {
                 bash_prompt,
                 system_prompt,
                 bare,
+                max_turns,
             })
             .await
         }

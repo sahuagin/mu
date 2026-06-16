@@ -1,0 +1,18 @@
+[package]
+name = "mu-events-py"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "mu_events_py"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mu-core = { path = "../mu-core" }
+pyo3 = { version = "0.25", features = ["extension-module"] }
+serde_json = "1"
+
+[features]
+# default off so a plain `cargo build --workspace` doesn't require a python lib
+extension-module = ["pyo3/extension-module"]

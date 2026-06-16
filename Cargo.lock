@@ -1770,6 +1770,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mu-events-py"
+version = "0.1.0"
+dependencies = [
+ "mu-core",
+ "pyo3",
+ "serde_json",
+]
+
+[[package]]
 name = "mu-solo"
 version = "0.0.1"
 dependencies = [

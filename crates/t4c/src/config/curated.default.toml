@@ -114,6 +114,44 @@ requires = []
 argv = ["antagonist_log", "--help"]
 ai = false
 
+# ── beads / issue tracking (plan + claim + close work via the bead worklist) ──
+
+[[capability]]
+path = "bash.sprint-start"
+summary = "claim a bead (issue) and enter a unique jj workspace, atomically — the correct-by-construction way to start work on a bead. Pairs with sprint-end."
+keywords = [
+    "bead", "claim", "issue", "ticket", "workspace", "sprint", "start", "work", "task", "begin",
+]
+invoke = ["sprint-start", "BEAD-ID"]
+requires = []
+[capability.help]
+argv = ["sprint-start", "--help"]
+ai = false
+
+[[capability]]
+path = "bash.sprint-end"
+summary = "release a claimed bead and tear down its sprint-start workspace (`--close` to close the bead). Bare sprint-end unclaims back to open — close first, or use sprint-end --close."
+keywords = [
+    "bead", "release", "unclaim", "close", "finish", "issue", "workspace", "sprint", "end", "teardown",
+]
+invoke = ["sprint-end", "BEAD-ID"]
+requires = []
+[capability.help]
+argv = ["sprint-end", "--help"]
+ai = false
+
+[[capability]]
+path = "bash.beads"
+summary = "beads client for the central issue/bead tracker (beadsd over rmcp HTTP): list ready, show, create, claim, close, and `exec -- <br ...>` for the full br surface. Needs `--url <beadsd>`; the local `br` shim resolves the url per-repo."
+keywords = [
+    "bead", "beads", "issue", "ticket", "tracker", "worklist", "backlog", "ready", "create", "close", "claim", "br",
+]
+invoke = ["beads", "--url", "URL", "ready"]
+requires = []
+[capability.help]
+argv = ["beads", "--help"]
+ai = false
+
 # ─────────────────────────────────── chains ─────────────────────────────────
 
 [[chain]]

@@ -429,7 +429,32 @@ fn session_spawn_tools(
 ) -> Vec<Arc<dyn Tool>> {
     use mu_core::capability::AutonomyCapability;
 
-    let mut tools = base.to_vec();
+    // mu-dialogue per-session identity: the dialogue MCP connection is
+    // daemon-shared (one pipe for all sessions, handshake fires once at
+    // startup), so a session's peer id can only be bound at the tool layer —
+    // the same idiom as spawn_worker/watch below. dialogue_say.from is forced
+    // to this session's id; dialogue_poll.to defaults to it (so polling your
+    // own inbox needs no argument). Tools the daemon didn't import (dialogue
+    // server absent/unreachable) simply aren't present and pass through.
+    let dialogue_identity = format!("mu:{}:{}", daemon_info.daemon_id(), session_id);
+    let mut tools: Vec<Arc<dyn Tool>> = base
+        .iter()
+        .map(|t| match t.spec().name.as_str() {
+            "dialogue_say" => Arc::new(crate::tools::SessionDialogueTool::new(
+                t.clone(),
+                dialogue_identity.clone(),
+                "from",
+                crate::tools::DialogueBind::Force,
+            )) as Arc<dyn Tool>,
+            "dialogue_poll" => Arc::new(crate::tools::SessionDialogueTool::new(
+                t.clone(),
+                dialogue_identity.clone(),
+                "to",
+                crate::tools::DialogueBind::Default,
+            )) as Arc<dyn Tool>,
+            _ => t.clone(),
+        })
+        .collect();
     if daemon_info.events_dir().is_some() {
         tools.push(Arc::new(crate::tools::SpawnWorkerTool::new(
             // mu-qc08: a WEAK handle — a strong clone here deadlocks

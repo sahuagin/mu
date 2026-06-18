@@ -1,0 +1,82 @@
+#!/bin/sh
+#
+# mu_dialogue — rc.d service for the mu-dialogue MCP server (HTTP).
+#
+# Serves dialogue_say / dialogue_poll / dialogue_history over rmcp Streamable
+# HTTP (axum, route /mcp) — the multi-peer inter-agent messaging channel
+# (email/inbox model) for cc, mu, warden subagents, and orchestrators. Writes
+# the `dialogue` table in agent.sqlite alongside agent-mcp:7700 / beadsd.
+#
+# Install:
+#   sudo install -m 0555 mu-dialogue-serve /home/tcovert/.local/bin/mu-dialogue-serve
+#   sudo install -m 0555 mu_dialogue.rc /usr/local/etc/rc.d/mu_dialogue
+#   sudo sysrc mu_dialogue_enable="YES"
+#   sudo sysrc mu_dialogue_user="tcovert"
+#   sudo sysrc mu_dialogue_listen="0.0.0.0:7740"
+#   sudo service mu_dialogue start
+#
+# rc.conf knobs (all prefixed mu_dialogue_):
+#   enable        — required: YES to start at boot / via 'service start'
+#   user          — user to run as (rc.subr su -m switch). Default tcovert.
+#   group         — primary group. Default = user.
+#   listen        — host:port to bind. Default 0.0.0.0:7740.
+#   db            — sqlite path. Default ~/.local/share/agent.sqlite.
+#   allowed_hosts — comma-separated Host allow-list. Default empty = allow any
+#                   (trusted-network default; lock a public bind down here).
+#   serve         — wrapper path. Default ~/.local/bin/mu-dialogue-serve
+#   logfile       — Default /var/log/mu_dialogue.log
+#
+# PROVIDE: mu_dialogue
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="mu_dialogue"
+rcvar="${name}_enable"
+
+load_rc_config "$name"
+
+: ${mu_dialogue_enable:="NO"}
+: ${mu_dialogue_user:="tcovert"}
+: ${mu_dialogue_listen:="0.0.0.0:7740"}
+: ${mu_dialogue_db:=""}
+: ${mu_dialogue_allowed_hosts:=""}
+: ${mu_dialogue_serve:="/home/tcovert/.local/bin/mu-dialogue-serve"}
+: ${mu_dialogue_logfile:="/var/log/${name}.log"}
+
+# Resolve the run-user's home for HOME and chdir.
+mu_dialogue_home="$(getent passwd ${mu_dialogue_user} 2>/dev/null | cut -d: -f6)"
+: ${mu_dialogue_home:="/home/${mu_dialogue_user}"}
+: ${mu_dialogue_group:="${mu_dialogue_user}"}
+: ${mu_dialogue_chdir:="${mu_dialogue_home}"}
+: ${mu_dialogue_db:="${mu_dialogue_home}/.local/share/agent.sqlite"}
+
+# We set ${name}_user/_group (rc.subr does the su -m switch) and deliberately do
+# NOT pass `daemon -u`: on this box that combination + `-r` loops in
+# setusercontext() and crashes on every restart. (Same lesson as code_index_mcp
+# / claude_proxy / c137_memory_worker — see their rc.d comments.) HOME is
+# injected via env because the su -m switch doesn't reliably carry it.
+pidfile="/var/run/${name}/${name}.pid"
+command="/usr/sbin/daemon"
+command_args="-r -t ${name} -P ${pidfile} -o ${mu_dialogue_logfile} \
+    /usr/bin/env HOME=${mu_dialogue_home} \
+    LISTEN=${mu_dialogue_listen} DATABASE_PATH=${mu_dialogue_db} \
+    MU_DIALOGUE_ALLOWED_HOSTS=${mu_dialogue_allowed_hosts} \
+    ${mu_dialogue_serve}"
+required_files="${mu_dialogue_serve}"
+
+start_precmd="mu_dialogue_prestart"
+mu_dialogue_prestart() {
+    if [ ! -x "${mu_dialogue_serve}" ]; then
+        err 1 "wrapper not found or not executable: ${mu_dialogue_serve}"
+    fi
+    # Pidfile dir must be writable by the unprivileged run-user: daemon runs as
+    # ${mu_dialogue_user} (via rc.subr's su -m) and /var/run is root:wheel 0755.
+    install -d -o "${mu_dialogue_user}" -g "${mu_dialogue_group}" -m 0755 "/var/run/${name}"
+    install -o "${mu_dialogue_user}" -g "${mu_dialogue_group}" -m 0644 \
+        /dev/null "${mu_dialogue_logfile}" 2>/dev/null || \
+        chown "${mu_dialogue_user}:${mu_dialogue_group}" "${mu_dialogue_logfile}"
+}
+
+run_rc_command "$1"

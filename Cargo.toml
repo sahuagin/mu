@@ -11,6 +11,7 @@ members = [
     "crates/mu-solo",
     "crates/mu-bridge",
     "crates/t4c",
+    "crates/mu-dialogue",
 ]
 
 [workspace.package]

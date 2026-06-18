@@ -85,6 +85,29 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage_semantics: Option<crate::agent::capabilities::UsageSemantics>,
     },
+    /// The resolved per-session configuration subset, recorded so the
+    /// status projections (forwarder/mcp) and the frontend can read the
+    /// *effective* values without re-deriving them from the daemon
+    /// config + route catalog. Recorded at session creation and
+    /// re-recorded after a live route change (`set_route`), so the
+    /// limits track the active model. Extensible: additional
+    /// resolved-config fields land here as they are wired into the
+    /// event path (this is the seam the bidirectional config message
+    /// reuses).
+    ///
+    /// See [`crate::session_status`] for the canonical definitions of
+    /// soft limit / hard limit / fill.
+    SessionConfigResolved {
+        /// Soft limit (tokens): the budget mu manages context against —
+        /// the TUI denominator, the pressure-% basis, and the point at
+        /// which mu compacts. Always present once resolved.
+        context_soft_limit: u64,
+        /// Hard limit (tokens): the model's absolute maximum context
+        /// size. `None` when the route catalog has no hard limit for
+        /// this model.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_hard_limit: Option<u64>,
+    },
     /// User-side input message arrived.
     UserMessage { content: String },
     /// Assistant turn completed. Carries text content, tool calls,
@@ -570,6 +593,7 @@ impl EventPayload {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::SessionCreated { .. } => "session_created",
+            Self::SessionConfigResolved { .. } => "session_config_resolved",
             Self::UserMessage { .. } => "user_message",
             Self::AssistantMessageEvent { .. } => "assistant_message_event",
             Self::ToolCall { .. } => "tool_call",
@@ -1200,6 +1224,27 @@ impl SessionEventLog {
         }
         None
     }
+
+    /// Pull the effective `(context_soft_limit, context_hard_limit)` out
+    /// of the most recent [`EventPayload::SessionConfigResolved`] event.
+    /// The soft limit is always present once resolved; the hard limit is
+    /// `None` when the route catalog has none for the active model.
+    ///
+    /// Mirrors [`Self::provider_info`]: a backward scan so a re-recorded
+    /// snapshot after a live `set_route` shadows the one from session
+    /// creation. `None` only when no snapshot has been recorded (e.g. a
+    /// log built manually without going through dispatch). See
+    /// [`crate::session_status`] for the term definitions.
+    pub fn context_limits(&self) -> Option<(u64, Option<u64>)> {
+        let events = self.events.lock().ok()?;
+        events.iter().rev().find_map(|ev| match &ev.payload {
+            EventPayload::SessionConfigResolved {
+                context_soft_limit,
+                context_hard_limit,
+            } => Some((*context_soft_limit, *context_hard_limit)),
+            _ => None,
+        })
+    }
 }
 
 /// mu-mh4: collect the set of event ids invalidated by `Tombstone`
@@ -1240,6 +1285,31 @@ mod tests {
             cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
         }
+    }
+
+    #[test]
+    fn context_limits_reads_latest_resolved_snapshot() {
+        let log = SessionEventLog::new("s1");
+        // No snapshot yet.
+        assert_eq!(log.context_limits(), None);
+        // Creation-time snapshot.
+        log.append(
+            EventActor::System,
+            EventPayload::SessionConfigResolved {
+                context_soft_limit: 150_000,
+                context_hard_limit: Some(200_000),
+            },
+        );
+        assert_eq!(log.context_limits(), Some((150_000, Some(200_000))));
+        // A live set_route re-records; the backward scan takes the latest.
+        log.append(
+            EventActor::System,
+            EventPayload::SessionConfigResolved {
+                context_soft_limit: 262_144,
+                context_hard_limit: Some(262_144),
+            },
+        );
+        assert_eq!(log.context_limits(), Some((262_144, Some(262_144))));
     }
 
     #[test]

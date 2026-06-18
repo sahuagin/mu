@@ -3033,28 +3033,45 @@ impl App {
         ));
 
         // Build metrics from MCP status or inline accumulators
-        let (in_tok, out_tok, cache_read, cache_creation, cost, ctx_pct, ctx_window) =
-            if let Some(ref s) = self.mcp_status {
-                (
-                    s.input_tokens,
-                    s.output_tokens,
-                    s.cache_read_tokens.unwrap_or(0),
-                    s.cache_creation_tokens.unwrap_or(0),
-                    s.cost_usd,
-                    s.context_pressure_pct,
-                    s.context_window_size,
-                )
-            } else {
-                (
-                    self.cumulative_input_tokens,
-                    self.cumulative_output_tokens,
-                    self.cumulative_cache_read,
-                    self.cumulative_cache_creation,
-                    self.compute_cost(),
-                    None,
-                    None,
-                )
-            };
+        // Context meter inputs. soft = the budget mu manages against (the
+        // denominator + pressure basis), fill = current occupancy, hard =
+        // the model's absolute ceiling (informational). See
+        // mu_core::session_status for the vocabulary.
+        let (
+            in_tok,
+            out_tok,
+            cache_read,
+            cache_creation,
+            cost,
+            ctx_pct,
+            ctx_soft,
+            ctx_used,
+            ctx_hard,
+        ) = if let Some(ref s) = self.mcp_status {
+            (
+                s.input_tokens,
+                s.output_tokens,
+                s.cache_read_tokens.unwrap_or(0),
+                s.cache_creation_tokens.unwrap_or(0),
+                s.cost_usd,
+                s.context_pressure_pct,
+                s.context_soft_limit,
+                s.context_used_tokens,
+                s.context_hard_limit,
+            )
+        } else {
+            (
+                self.cumulative_input_tokens,
+                self.cumulative_output_tokens,
+                self.cumulative_cache_read,
+                self.cumulative_cache_creation,
+                self.compute_cost(),
+                None,
+                None,
+                None,
+                None,
+            )
+        };
 
         let mut metrics_text_len = 0;
         if in_tok > 0 || out_tok > 0 {
@@ -3085,9 +3102,12 @@ impl App {
                 metrics_text_len += cs.len();
                 spans.push(Span::styled(cs, dim));
             }
-            if let (Some(pct), Some(window)) = (ctx_pct, ctx_window) {
-                let used = (pct / 100.0 * window as f64) as u64;
-                let cs = format!(" {}/{}", format_tokens(used), format_tokens(window));
+            if let (Some(pct), Some(soft)) = (ctx_pct, ctx_soft) {
+                // fill / soft-limit: the meter fills toward the budget mu
+                // compacts at. Prefer the reported fill; fall back to
+                // pct*soft only if the fill is somehow absent.
+                let used = ctx_used.unwrap_or((pct / 100.0 * soft as f64) as u64);
+                let cs = format!(" {}/{}", format_tokens(used), format_tokens(soft));
                 metrics_text_len += cs.len();
                 let ctx_style = if pct >= 90.0 {
                     Style::default().fg(Color::Red)
@@ -3097,6 +3117,15 @@ impl App {
                     dim
                 };
                 spans.push(Span::styled(cs, ctx_style));
+                // Hard ceiling, shown dim only when it adds information
+                // (known and above the soft budget).
+                if let Some(hard) = ctx_hard {
+                    if hard > soft {
+                        let hs = format!(" ⌈{}", format_tokens(hard));
+                        metrics_text_len += hs.len();
+                        spans.push(Span::styled(hs, dim));
+                    }
+                }
             }
         }
 

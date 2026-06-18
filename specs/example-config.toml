@@ -21,18 +21,51 @@
 
 # ── Compaction ────────────────────────────────────────────────────
 
+# Context-size vocabulary (one definition, used throughout mu):
+#   hard limit — the model's ABSOLUTE maximum context size (per-model,
+#                from the model catalog / models.toml). The ceiling.
+#                Shown in the TUI for reference; mu never drives to it.
+#   soft limit — the BUDGET mu manages context against. This single
+#                number is, at once: the denominator the TUI context
+#                meter fills toward, the basis of the ctx:% reading, AND
+#                the point at which the agent loop compacts. Per-model
+#                via the catalog's context_soft_limit; optionally
+#                overridden globally here (see context_soft_limit below).
+#   fill       — how full the context currently is (the last model
+#                call's input tokens). The meter shows fill / soft.
+# Because the soft limit drives BOTH the meter and compaction, changing
+# it moves the displayed bar and the compaction point together.
+
 [compaction]
 # Policy to instantiate at session creation:
-#   "no-compaction"     — identity policy (pre-mu-kgu behavior)
-#   "heuristic"         — SpanFamilyDropPolicy (mu-kgu.2)
+#   "heuristic"         — SpanFamilyDropPolicy (mu-kgu.2); drops
+#                         low-retention spans when the soft limit is
+#                         crossed. The default; needs no judge model.
 #   "hash-and-summary"  — HashAndSummaryPolicy (mu-kgu.3) — needs a
 #                         judge model; see [compaction.judge] below.
-default_policy = "no-compaction"
+#   "no-compaction"     — identity policy; the soft limit is still shown
+#                         in status but context is NEVER compacted.
+# Default (code): "heuristic".
+default_policy = "heuristic"
 
-# Token threshold above which the agent loop runs the compaction
-# policy between turns. Default 150_000 — matches Anthropic's
-# documented auto-compaction trigger for comparable headline numbers.
-trigger_threshold_tokens = 150_000
+# GLOBAL soft-limit override, in tokens. Same name as the per-model
+# context_soft_limit in the model catalog (models.toml) on purpose: this
+# is that same knob at a wider scope. It is the budget mu manages context
+# against — the TUI meter denominator AND the compaction trigger (one
+# number, by design).
+#
+# Leave this UNSET (the default) to let each session use its MODEL's own
+# context_soft_limit — so a 1M-context model and a 32k model get
+# appropriately different budgets. Set it to force ONE budget across every
+# model regardless of the catalog. Precedence: this override > per-model
+# context_soft_limit > (last resort) the model's context_hard_limit. There
+# is no magic constant fallback: a model the catalog doesn't know at all
+# simply shows no meter and isn't compacted.
+#
+# Tune per-model limits in models.toml instead, e.g. claude-opus-4-8
+# already ships context_soft_limit = 200000, context_hard_limit = 1000000.
+#
+# context_soft_limit = 200_000
 
 [compaction.judge]
 # Output mode for HashAndSummaryPolicy:

@@ -399,10 +399,29 @@ pub struct CompactionConfig {
     /// - `"no-compaction"` — explicit identity (pre-mu-kgu behavior); context is never
     ///   compacted regardless of threshold.
     pub default_policy: String,
-    /// Token threshold above which the agent loop runs
-    /// `compaction_policy().compact(...)` between turns. Matches
-    /// [`crate::agent::DEFAULT_COMPACTION_THRESHOLD`] when defaulted.
-    pub trigger_threshold_tokens: usize,
+    /// Global override of the **soft limit** — the token budget mu
+    /// manages context against. The soft limit is, at once, the point
+    /// above which the agent loop runs `compaction_policy().compact(...)`
+    /// between turns, the denominator the TUI context meter fills toward,
+    /// and the basis of `context_pressure_pct`. (See
+    /// [`crate::session_status`] for the full vocabulary: hard limit /
+    /// soft limit / fill.)
+    ///
+    /// Deliberately the SAME name as the per-model `context_soft_limit`
+    /// in the model catalog (`models.toml`): this is that same knob at a
+    /// wider scope. Precedence: this global override (if `Some`) beats the
+    /// model's per-model `context_soft_limit`, which beats — as a final
+    /// fallback when a model declares no soft limit — its
+    /// `context_hard_limit`.
+    ///
+    /// `None` (the default) ⇒ each session uses its model's own
+    /// `context_soft_limit` from the route catalog, so a 1M-context model
+    /// and a 32k model get appropriately different budgets. `Some(n)` ⇒
+    /// force every session's soft limit to `n` tokens regardless of
+    /// model. Use the override only when you want one number across all
+    /// models; prefer per-model `context_soft_limit` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_soft_limit: Option<usize>,
     /// Judge model preference list (mu-kgu.11 consumer).
     pub judge: CompactionJudgeConfig,
 }
@@ -414,11 +433,13 @@ impl Default for CompactionConfig {
             // nothing-and-warn".  The previous "no-compaction" default meant
             // that a threshold set but no policy configured silently did nothing.
             // "heuristic" is always constructible (no judge needed) and is the
-            // right safe-default for operators who set trigger_threshold_tokens
+            // right safe-default for operators who set a soft-limit override
             // without reading the full compaction docs.  Explicit "no-compaction"
             // remains selectable.
             default_policy: "heuristic".to_string(),
-            trigger_threshold_tokens: crate::agent::DEFAULT_COMPACTION_THRESHOLD,
+            // None ⇒ defer to the model's per-model context_soft_limit
+            // (route catalog). An explicit Some(n) is a global override.
+            context_soft_limit: None,
             judge: CompactionJudgeConfig::default(),
         }
     }
@@ -872,10 +893,9 @@ mod tests {
         // so a threshold-configured daemon runs real compaction out of the box.
         let c = Config::default();
         assert_eq!(c.compaction.default_policy, "heuristic");
-        assert_eq!(
-            c.compaction.trigger_threshold_tokens,
-            crate::agent::DEFAULT_COMPACTION_THRESHOLD
-        );
+        // None by default: each session defers to its model's per-model
+        // context_soft_limit rather than a global override.
+        assert_eq!(c.compaction.context_soft_limit, None);
         assert!(c.session.persist_events_to_disk);
         assert!(!c.session.resume_on_daemon_restart);
         assert_eq!(c.session.state_dir, None);
@@ -1096,7 +1116,7 @@ mod tests {
     fn round_trip_through_toml() {
         let mut c = Config::default();
         c.compaction.default_policy = "hash-and-summary".into();
-        c.compaction.trigger_threshold_tokens = 100_000;
+        c.compaction.context_soft_limit = Some(100_000);
         c.compaction.judge.ranking = vec![
             JudgeRankingEntry {
                 provider: "openrouter".into(),
@@ -1195,11 +1215,8 @@ default_model = "operator/model"
         assert_eq!(c.ui.tui.default_model, "operator/model");
         // Site wins for fields operator didn't redefine.
         assert_eq!(c.ui.tui.default_provider, "openrouter");
-        // Untouched stays at code default.
-        assert_eq!(
-            c.compaction.trigger_threshold_tokens,
-            crate::agent::DEFAULT_COMPACTION_THRESHOLD
-        );
+        // Untouched stays at code default (None ⇒ per-model soft limit).
+        assert_eq!(c.compaction.context_soft_limit, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1222,7 +1239,11 @@ default_model = "operator/model"
         );
         let c = Config::load(&[&example_path]);
         // Spot-check that the example's fields landed on the struct.
-        assert_eq!(c.compaction.default_policy, "no-compaction");
+        assert_eq!(c.compaction.default_policy, "heuristic");
+        // The example leaves the global context_soft_limit override
+        // commented out, so each session defers to its model's per-model
+        // context_soft_limit.
+        assert_eq!(c.compaction.context_soft_limit, None);
         assert_eq!(c.compaction.judge.output_mode, "index_keep");
         assert_eq!(c.compaction.judge.ranking.len(), 3);
         assert_eq!(c.compaction.judge.ranking[0].provider, "openrouter");

@@ -202,7 +202,10 @@ pub fn derive_status_from_events(
             | EventPayload::CommandReceived { .. }
             | EventPayload::CommandSucceeded { .. }
             | EventPayload::CommandFailed { .. }
-            | EventPayload::CommandRejected { .. } => {}
+            | EventPayload::CommandRejected { .. }
+            // mu-context-limits-wire: resolved-config snapshot is config
+            // audit, not session-status-driving.
+            | EventPayload::SessionConfigResolved { .. } => {}
         }
         last_kind = Some(&ev.payload);
     }

@@ -550,6 +550,14 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     let max_turns = max_turns
         .or_else(|| daemon_info.config().session.default_max_turns)
         .or_else(|| Some(mu_core::agent::loop_::default_max_turns_for(&kind_str)));
+    // Resolve this session's context limits once, here, where both the
+    // route catalog and the daemon config are reachable, then record
+    // them on the log so the status projections (forwarder/mcp) read the
+    // effective soft/hard limits straight off the event stream rather
+    // than re-deriving them. See `mu_core::session_status` for the
+    // soft-limit / hard-limit / fill vocabulary.
+    let (context_soft_limit, context_hard_limit) =
+        resolve_context_limits(daemon_info, &kind_str, &model_str);
     event_log.append(
         EventActor::System,
         EventPayload::SessionCreated {
@@ -563,6 +571,18 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             usage_semantics: Some(provider.capabilities().usage_semantics),
         },
     );
+    // Only record a snapshot when we actually have a soft limit — a route
+    // the catalog doesn't know yields no limits, and a missing event is
+    // truer than a fabricated number (the meter simply stays blank).
+    if let Some(soft) = context_soft_limit {
+        event_log.append(
+            EventActor::System,
+            EventPayload::SessionConfigResolved {
+                context_soft_limit: soft,
+                context_hard_limit,
+            },
+        );
+    }
 
     // mu-mh4 (panel finding 4): append any seed events (e.g. resume's
     // HeadAttached) AFTER SessionCreated but BEFORE the session is
@@ -659,7 +679,12 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             system_prompt: effective_system_prompt.map(SpanText::from),
             max_turns,
             project_context,
-            compaction_threshold: Some(compaction_cfg.trigger_threshold_tokens),
+            // The compaction trigger IS the soft limit (resolved above and
+            // recorded as SessionConfigResolved), so the point mu compacts
+            // and the denominator the status meter shows are one number.
+            // None (unknown route) ⇒ the loop falls back to its own
+            // default; the daemon never injects a magic constant here.
+            compaction_threshold: context_soft_limit.map(|s| s as usize),
             compaction_policy_override,
             // mu-mh4: seed the loop with the continuation history when
             // this session is a resume/fork-at-tail; empty otherwise.
@@ -1329,6 +1354,12 @@ pub async fn handle_set_route(
         format!("session not found: {}", params.session_id)
     );
 
+    // Resolve the NEW model's context limits before the switch so we can
+    // re-record them; the catalog lookup above already proved the route
+    // exists.
+    let (context_soft_limit, context_hard_limit) =
+        resolve_context_limits(&daemon_info, &kind_str, &model_str);
+
     let input = AgentInput::SwitchProvider {
         provider,
         provider_kind: Arc::from(kind_str.as_str()),
@@ -1340,6 +1371,22 @@ pub async fn handle_set_route(
             request.id,
             codes::INTERNAL_ERROR,
             "session agent loop has terminated".to_string(),
+        );
+    }
+
+    // Re-record the resolved config for the new model so `context_limits()`
+    // (and thus the status meter + compaction trigger) tracks the switch.
+    // A backward scan means this shadows the creation-time snapshot. The
+    // loop separately logs ProviderSwitched for provider/model identity;
+    // this carries the limits that event's reserved fields don't yet.
+    // Skip when the new route has no soft limit (nothing truthful to say).
+    if let (Some(soft), Some(log)) = (context_soft_limit, sessions.event_log(&params.session_id)) {
+        log.append(
+            EventActor::System,
+            EventPayload::SessionConfigResolved {
+                context_soft_limit: soft,
+                context_hard_limit,
+            },
         );
     }
 
@@ -1387,11 +1434,43 @@ pub async fn handle_spawn_worker(
     }
 }
 
+/// Resolve a session's effective context limits in tokens — the single
+/// place that turns config + route catalog into the `(soft, hard)` pair
+/// recorded as [`EventPayload::SessionConfigResolved`]. See
+/// [`mu_core::session_status`] for what soft/hard mean.
+///
+/// - **hard**: the model's `context_hard_limit` from the route catalog
+///   (`None` when the catalog has none — informational only).
+/// - **soft** precedence (no magic constant): the global override
+///   `[compaction] context_soft_limit` if set, else the model's per-model
+///   `context_soft_limit`, else — as a last resort when a model declares
+///   no soft budget — its `context_hard_limit`. `None` only for a route
+///   the catalog doesn't know at all (e.g. a hand-built test log); then
+///   there is no meter denominator and no compaction trigger, which is
+///   the honest answer rather than a guessed number.
+fn resolve_context_limits(
+    daemon_info: &DaemonInfo,
+    provider_kind: &str,
+    model: &str,
+) -> (Option<u64>, Option<u64>) {
+    let route = daemon_info.route_catalog().find(provider_kind, model);
+    let model_soft = route.and_then(|r| r.context_soft_limit);
+    let hard = route.and_then(|r| r.context_hard_limit);
+    let soft = daemon_info
+        .config()
+        .compaction
+        .context_soft_limit
+        .map(|v| v as u64)
+        .or(model_soft)
+        .or(hard);
+    (soft, hard)
+}
+
 /// Resolve the per-session compaction policy from config, with legible
 /// diagnostics. Closes mu-8bkf: the previous inline match wired only
 /// `"heuristic"` and silently fell through to a no-op for every other
 /// value — including the documented `"hash-and-summary"` — so a configured
-/// `trigger_threshold_tokens` produced no compaction with no signal.
+/// soft-limit override produced no compaction with no signal.
 fn resolve_compaction_policy(
     cfg: &mu_core::config::CompactionConfig,
 ) -> Option<Arc<dyn mu_core::context::compaction::CompactionPolicy>> {
@@ -1401,8 +1480,11 @@ fn resolve_compaction_policy(
     };
     match cfg.default_policy.as_str() {
         "heuristic" => {
+            // `[compaction] context_soft_limit` is an optional GLOBAL
+            // soft-limit override; None means the effective budget is each
+            // model's per-model context_soft_limit (resolved at creation).
             tracing::info!(
-                threshold = cfg.trigger_threshold_tokens,
+                soft_limit_override = ?cfg.context_soft_limit,
                 "compaction: heuristic span-family drop active"
             );
             Some(heuristic())
@@ -1416,15 +1498,19 @@ fn resolve_compaction_policy(
                      (valid: heuristic, hash-and-summary, no-compaction)"
                 );
             }
-            if cfg.trigger_threshold_tokens > 0 && matches!(other, "no-compaction" | "none" | "") {
+            if matches!(other, "no-compaction" | "none" | "") {
+                // Every session has an effective soft limit (per-model or
+                // the global override), so "no-compaction" means that
+                // budget is observed by the meter but never acted on.
                 tracing::warn!(
-                    threshold = cfg.trigger_threshold_tokens,
+                    soft_limit_override = ?cfg.context_soft_limit,
                     default_policy = %other,
-                    "compaction: trigger_threshold_tokens is set but default_policy is \
-                     explicitly \"no-compaction\" — context will NOT be compacted. \
-                     Remove the explicit no-compaction override to use the default \
-                     heuristic policy, or set [compaction].default_policy = \
-                     \"hash-and-summary\" for judge-backed compaction (mu-8bkf)."
+                    "compaction: default_policy is explicitly \"no-compaction\" — the \
+                     context soft limit is shown in status but context will NOT be \
+                     compacted when it is crossed. Remove the explicit no-compaction \
+                     override to use the default heuristic policy, or set \
+                     [compaction].default_policy = \"hash-and-summary\" for judge-backed \
+                     compaction (mu-8bkf)."
                 );
             }
             None
@@ -1614,7 +1700,7 @@ mod tests {
         use mu_core::context::compaction::hash_summary::DEFAULT_POLICY_ID;
         let cfg = |p: &str| CompactionConfig {
             default_policy: p.to_string(),
-            trigger_threshold_tokens: 150_000,
+            context_soft_limit: Some(150_000),
             ..Default::default()
         };
         // Heuristic resolves to Some(SpanFamilyDropPolicy).
@@ -1653,7 +1739,7 @@ mod tests {
 
         let cfg = CompactionConfig {
             default_policy: "hash-and-summary".to_string(),
-            trigger_threshold_tokens: 150_000,
+            context_soft_limit: Some(150_000),
             judge: CompactionJudgeConfig {
                 ranking: vec![JudgeRankingEntry {
                     provider: "not-a-real-provider".to_string(),
@@ -1674,7 +1760,7 @@ mod tests {
         // Contrast: the deliberate empty-ranking path stays hash-and-summary.
         let zero_config = CompactionConfig {
             default_policy: "hash-and-summary".to_string(),
-            trigger_threshold_tokens: 150_000,
+            context_soft_limit: Some(150_000),
             ..Default::default()
         };
         assert_eq!(

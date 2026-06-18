@@ -256,6 +256,15 @@ impl MuMcpHandler {
         let log = self.sessions.event_log(session_id)?;
         let (provider_kind, model) = log.provider_info().unwrap_or_default();
         let usage = log.cumulative_usage();
+        // mu-context-limits-wire: this pull path used to leave the context
+        // fields unset, so it disagreed with the forwarder's push path.
+        // Both now read the same recorded soft/hard limits and report the
+        // fill (last call input) so a freshly-read resource matches the
+        // last pushed status. See `mu_core::session_status` for the terms.
+        let (context_soft_limit, context_hard_limit) = log
+            .context_limits()
+            .map_or((None, None), |(soft, hard)| (Some(soft), hard));
+        let (_, context_used_tokens) = log.live_usage();
         let provider_status = self
             .sessions
             .provider_status_snapshot(session_id)
@@ -275,6 +284,9 @@ impl MuMcpHandler {
             tool_call_count: log.tool_call_count(),
             elapsed_total_ms: log.elapsed_total_ms(),
             provider_status,
+            context_soft_limit,
+            context_hard_limit,
+            context_used_tokens,
         }))
     }
 }

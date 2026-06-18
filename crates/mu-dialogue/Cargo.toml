@@ -1,0 +1,31 @@
+[package]
+name = "mu-dialogue"
+description = "Networked multi-peer inter-agent dialogue channel (say/poll/history) over MCP."
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mu-dialogue"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Pure rmcp transport — StreamableHttpService (HTTP) + stdio, matching
+# agent-mcp/beadsd. No hand-rolled MCP. (at-revive-dialogue-mcp-8rk)
+rmcp = { workspace = true, features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+axum = "0.8"
+ulid = "1"

@@ -1,0 +1,47 @@
+name: FreeBSD
+
+# FreeBSD-native clippy. mu is built and deployed on FreeBSD, but the rest of CI
+# (ci.yml) runs only on ubuntu-latest — so a warning that appears *only* under
+# FreeBSD's cfg (e.g. cfg(target_os) / cfg(unix) import differences) slips past a
+# green CI. There is no GitHub-hosted FreeBSD runner, so this boots a FreeBSD
+# guest (QEMU) inside an ubuntu runner via vmactions.
+#
+# NOT a PR gate and NOT on push: the VM cold-builds the whole workspace
+# (~20-40 min) and main moves fast, so it runs nightly + on demand as a
+# safety net. (mu is a public repo: hosted-runner minutes are free, so the
+# only cost here is wall-clock, off the PR critical path.)
+
+on:
+  schedule:
+    - cron: "37 9 * * *" # ~09:37 UTC nightly
+  workflow_dispatch:
+
+concurrency:
+  group: freebsd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  clippy-freebsd:
+    name: cargo clippy -D warnings (FreeBSD)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: clippy in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          # Omit `release` to use vmactions' default supported FreeBSD image;
+          # pin it (e.g. release: "14.2") to match the deploy boxes once that
+          # image is available. The FreeBSD-vs-Linux cfg differences this job
+          # exists to catch are largely version-independent.
+          usesh: true
+          prepare: |
+            pkg install -y rust
+          run: |
+            # default features first (what emu / the boxes actually build),
+            # then --all-features. `-- -D warnings` makes any warning (incl.
+            # unused_imports) a hard error, same as ci.yml.
+            cargo clippy --workspace --all-targets -- -D warnings
+            cargo clippy --workspace --all-targets --all-features -- -D warnings

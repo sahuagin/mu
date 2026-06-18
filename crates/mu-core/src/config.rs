@@ -680,6 +680,33 @@ impl Config {
     /// `JournalPayload::ConfigLoaded { sources, .. }` (INV-9) — the
     /// durable answer to "where did this daemon's config come from".
     pub fn load_with_sources<P: AsRef<Path>>(paths: &[P]) -> (Self, Vec<String>) {
+        // Loud, unconditional notice that operator-written config was dropped.
+        // The graceful-degradation posture (missing files / unreachable MCP
+        // servers contribute nothing, never fail) is right for *optional*
+        // inputs — but a config the operator WROTE being silently discarded is
+        // a footgun: one unknown/renamed field makes `deny_unknown_fields`
+        // reject the ENTIRE file, and the old behavior was a single quiet WARN
+        // before running all-defaults (every setting, every MCP server, gone).
+        // This goes to ERROR-level tracing AND stderr — visible even with
+        // RUST_LOG unset/filtering — plus an opt-in hard-fail.
+        fn loud_config_drop(headline: &str, detail: &str, what_dropped: &str) {
+            tracing::error!(error = %detail, "{headline}");
+            eprintln!("\nmu: CONFIG ERROR — {headline}");
+            for line in detail.lines() {
+                eprintln!("    {line}");
+            }
+            eprintln!("    -> {what_dropped} was ignored; mu is using built-in defaults.");
+            eprintln!(
+                "    Fix the config and restart. (MU_CONFIG_STRICT=1 = refuse to start instead.)\n"
+            );
+            if std::env::var("MU_CONFIG_STRICT")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+            {
+                std::process::exit(78); // EX_CONFIG (sysexits.h)
+            }
+        }
+
         let mut sources: Vec<String> = vec!["defaults".to_string()];
         let mut merged: toml::Value = toml::Value::Table(Default::default());
         for p in paths {
@@ -691,10 +718,10 @@ impl Config {
                         sources.push(path.display().to_string());
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            path = %path.display(),
-                            error = %e,
-                            "ignoring malformed mu config; falling back to defaults",
+                        loud_config_drop(
+                            &format!("malformed config file {} (invalid TOML)", path.display()),
+                            &e.to_string(),
+                            "that file",
                         );
                     }
                 },
@@ -715,9 +742,15 @@ impl Config {
         match merged.try_into::<Config>() {
             Ok(c) => (c, sources),
             Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "merged mu config failed deserialization; falling back to all-defaults",
+                // The whole merged config is schema-invalid — almost always one
+                // unknown/renamed field (deny_unknown_fields rejects the ENTIRE
+                // file). Catastrophic: every setting the operator wrote, every
+                // MCP server, is discarded. This is the case that silently hid
+                // a broken config behind a single WARN (at-loud-config).
+                loud_config_drop(
+                    "mu config failed to load — your ENTIRE config was IGNORED",
+                    &e.to_string(),
+                    "the entire config",
                 );
                 // The files did NOT contribute to the effective config
                 // — provenance must say so.
@@ -1101,6 +1134,23 @@ mod tests {
         let c = Config::load(&[&path]);
         assert_eq!(c, Config::default());
         // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_unknown_field_returns_defaults() {
+        // Valid TOML but a schema-invalid field makes deny_unknown_fields reject
+        // the WHOLE merged config. We still degrade to defaults in the default
+        // (non-strict) mode — but loudly now (at-loud-config). This locks the
+        // degrade behavior; the ERROR/stderr/strict-exit are side effects not
+        // asserted here. The motivating real case was a config carrying a field
+        // a schema change had (temporarily) dropped — same shape as this.
+        let dir = std::env::temp_dir().join(format!("mu-loud-unknown-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[session]\nno_such_field_xyz = 1\n").unwrap();
+        let c = Config::load(&[&path]);
+        assert_eq!(c, Config::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -8,7 +8,10 @@
 # the `dialogue` table in agent.sqlite alongside agent-mcp:7700 / beadsd.
 #
 # Install:
-#   sudo install -m 0555 mu-dialogue-serve /home/tcovert/.local/bin/mu-dialogue-serve
+#   # Launcher is the `emu` build-on-launch symlink, like every other tool.
+#   # Run from the workspace you want the server built from — it tracks that
+#   # checkout; this installs ~/.local/bin/mu-dialogue-serve -> that emu.
+#   (cd ~/src/public_github/mu && .mu/emu install mu-dialogue-serve)
 #   sudo install -m 0555 mu_dialogue.rc /usr/local/etc/rc.d/mu_dialogue
 #   sudo sysrc mu_dialogue_enable="YES"
 #   sudo sysrc mu_dialogue_user="tcovert"
@@ -23,7 +26,7 @@
 #   db            — sqlite path. Default ~/.local/share/agent.sqlite.
 #   allowed_hosts — comma-separated Host allow-list. Default empty = allow any
 #                   (trusted-network default; lock a public bind down here).
-#   serve         — wrapper path. Default ~/.local/bin/mu-dialogue-serve
+#   serve         — launcher path (emu symlink). Default ~/.local/bin/mu-dialogue-serve
 #   logfile       — Default /var/log/mu_dialogue.log
 #
 # PROVIDE: mu_dialogue

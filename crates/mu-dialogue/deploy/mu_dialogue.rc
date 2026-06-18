@@ -8,14 +8,18 @@
 # the `dialogue` table in agent.sqlite alongside agent-mcp:7700 / beadsd.
 #
 # Install:
-#   # Launcher is the `emu` build-on-launch symlink, like every other tool.
-#   # Run from the workspace you want the server built from — it tracks that
-#   # checkout; this installs ~/.local/bin/mu-dialogue-serve -> that emu.
-#   (cd ~/src/public_github/mu && .mu/emu install mu-dialogue-serve)
+#   # Build the pre-built binary in whatever workspace you deploy from, then
+#   # point the service at it. Like the other daemons (code_index_mcp,
+#   # c137_memory_worker) the service execs a prebuilt artifact — it does NOT
+#   # build on launch. Build elsewhere; the service just runs what `bin` names.
+#   (cd <workspace> && TMPDIR=$HOME/tmp cargo build --release -p mu-dialogue)
 #   sudo install -m 0555 mu_dialogue.rc /usr/local/etc/rc.d/mu_dialogue
 #   sudo sysrc mu_dialogue_enable="YES"
 #   sudo sysrc mu_dialogue_user="tcovert"
 #   sudo sysrc mu_dialogue_listen="0.0.0.0:7740"
+#   # default bin is <home>/src/public_github/mu/target/release/mu-dialogue;
+#   # override if you build/deploy from a different checkout:
+#   sudo sysrc mu_dialogue_bin="$HOME/src/public_github/thaddeus_mu/target/release/mu-dialogue"
 #   sudo service mu_dialogue start
 #
 # rc.conf knobs (all prefixed mu_dialogue_):
@@ -26,7 +30,9 @@
 #   db            — sqlite path. Default ~/.local/share/agent.sqlite.
 #   allowed_hosts — comma-separated Host allow-list. Default empty = allow any
 #                   (trusted-network default; lock a public bind down here).
-#   serve         — launcher path (emu symlink). Default ~/.local/bin/mu-dialogue-serve
+#   bin           — path to the PRE-BUILT mu-dialogue binary the service execs.
+#                   Default <home>/src/public_github/mu/target/release/mu-dialogue;
+#                   sysrc it to whichever workspace you build/deploy from.
 #   logfile       — Default /var/log/mu_dialogue.log
 #
 # PROVIDE: mu_dialogue
@@ -45,7 +51,6 @@ load_rc_config "$name"
 : ${mu_dialogue_listen:="0.0.0.0:7740"}
 : ${mu_dialogue_db:=""}
 : ${mu_dialogue_allowed_hosts:=""}
-: ${mu_dialogue_serve:="/home/tcovert/.local/bin/mu-dialogue-serve"}
 : ${mu_dialogue_logfile:="/var/log/${name}.log"}
 
 # Resolve the run-user's home for HOME and chdir.
@@ -54,6 +59,9 @@ mu_dialogue_home="$(getent passwd ${mu_dialogue_user} 2>/dev/null | cut -d: -f6)
 : ${mu_dialogue_group:="${mu_dialogue_user}"}
 : ${mu_dialogue_chdir:="${mu_dialogue_home}"}
 : ${mu_dialogue_db:="${mu_dialogue_home}/.local/share/agent.sqlite"}
+# Pre-built artifact the service execs (no build-on-launch). Default tracks the
+# canonical work checkout; sysrc mu_dialogue_bin to deploy from another.
+: ${mu_dialogue_bin:="${mu_dialogue_home}/src/public_github/mu/target/release/mu-dialogue"}
 
 # We set ${name}_user/_group (rc.subr does the su -m switch) and deliberately do
 # NOT pass `daemon -u`: on this box that combination + `-r` loops in
@@ -62,17 +70,19 @@ mu_dialogue_home="$(getent passwd ${mu_dialogue_user} 2>/dev/null | cut -d: -f6)
 # injected via env because the su -m switch doesn't reliably carry it.
 pidfile="/var/run/${name}/${name}.pid"
 command="/usr/sbin/daemon"
+# The binary reads LISTEN / DATABASE_PATH / MU_DIALOGUE_ALLOWED_HOSTS from the
+# environment, so the daemon execs it directly — no launcher/wrapper.
 command_args="-r -t ${name} -P ${pidfile} -o ${mu_dialogue_logfile} \
     /usr/bin/env HOME=${mu_dialogue_home} \
     LISTEN=${mu_dialogue_listen} DATABASE_PATH=${mu_dialogue_db} \
     MU_DIALOGUE_ALLOWED_HOSTS=${mu_dialogue_allowed_hosts} \
-    ${mu_dialogue_serve}"
-required_files="${mu_dialogue_serve}"
+    ${mu_dialogue_bin}"
+required_files="${mu_dialogue_bin}"
 
 start_precmd="mu_dialogue_prestart"
 mu_dialogue_prestart() {
-    if [ ! -x "${mu_dialogue_serve}" ]; then
-        err 1 "wrapper not found or not executable: ${mu_dialogue_serve}"
+    if [ ! -x "${mu_dialogue_bin}" ]; then
+        err 1 "mu-dialogue binary not found or not executable: ${mu_dialogue_bin} — build it (cargo build --release -p mu-dialogue) or set mu_dialogue_bin"
     fi
     # Pidfile dir must be writable by the unprivileged run-user: daemon runs as
     # ${mu_dialogue_user} (via rc.subr's su -m) and /var/run is root:wheel 0755.

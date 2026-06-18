@@ -64,15 +64,6 @@ case "$name" in
             --bash-yolo \
             --mu-binary "$target/mu" \
             "$@" ;;
-    mu-dialogue-serve)
-        # The mu-dialogue MCP server, launched by the mu_dialogue rc.d service.
-        # Identical to the default case except (a) the launch name
-        # (mu-dialogue-serve) differs from the bin (mu-dialogue), and (b) the
-        # server needs a bind address. LISTEN is set by the rc.d service's env
-        # (default here mirrors the old standalone wrapper); DATABASE_PATH and
-        # MU_DIALOGUE_ALLOWED_HOSTS are read from the environment by the binary.
-        ( cd "$root" && cargo build --release --bin mu-dialogue )
-        exec "$target/mu-dialogue" --listen "${LISTEN:-0.0.0.0:7740}" "$@" ;;
     *)
         ( cd "$root" && cargo build --release --bin "$name" )
         exec "$target/$name" "$@" ;;

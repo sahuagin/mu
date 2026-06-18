@@ -267,7 +267,10 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
             | EventPayload::CommandReceived { .. }
             | EventPayload::CommandSucceeded { .. }
             | EventPayload::CommandFailed { .. }
-            | EventPayload::CommandRejected { .. } => {}
+            | EventPayload::CommandRejected { .. }
+            // the resolved-config snapshot is configuration audit, not a
+            // usage/timing signal.
+            | EventPayload::SessionConfigResolved { .. } => {}
         }
     }
 

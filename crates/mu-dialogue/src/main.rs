@@ -78,6 +78,23 @@ fn migrate(conn: &Connection) -> Result<()> {
             ON dialogue(to_peer, ts);
         CREATE INDEX IF NOT EXISTS idx_dialogue_thread_ts
             ON dialogue(session_thread, ts);
+
+        -- Presence registry: one row per distinct peer id ever seen on the
+        -- channel. There is no explicit register step — a peer is recorded the
+        -- first time it sends (dialogue_say.from) or polls (dialogue_poll.to),
+        -- and last_seen advances on every subsequent say/poll. `role` is the
+        -- prefix before the first ':' (e.g. "mu" from "mu:<daemon>:<session>",
+        -- "cc" from "cc:<uuid>") so dialogue_peers can filter by kind. This is
+        -- activity-derived presence: a peer that has never spoken or polled is
+        -- not listed (see dialogue_peers).
+        CREATE TABLE IF NOT EXISTS peers (
+            peer_id     TEXT PRIMARY KEY,
+            role        TEXT NOT NULL,
+            first_seen  INTEGER NOT NULL,
+            last_seen   INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_peers_role_seen
+            ON peers(role, last_seen);
         "#,
     )?;
     Ok(())
@@ -156,6 +173,52 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    /// Record (or refresh) a peer's presence. Called with the `from` of a say
+    /// and the `to` of a poll — the two acts that prove a peer is live. Upsert:
+    /// first_seen is set once, last_seen advances every time. `role` is the
+    /// prefix before the first ':' (the whole id if there is none). A blank id
+    /// is ignored rather than recorded as a ghost peer.
+    async fn touch_peer(&self, peer_id: &str, ts: i64) -> Result<()> {
+        if peer_id.is_empty() {
+            return Ok(());
+        }
+        let role = peer_id.split(':').next().unwrap_or(peer_id);
+        let conn = self.db.lock().await;
+        conn.execute(
+            "INSERT INTO peers (peer_id, role, first_seen, last_seen)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(peer_id) DO UPDATE SET
+                 last_seen = excluded.last_seen,
+                 role      = excluded.role",
+            params![peer_id, role, ts],
+        )?;
+        Ok(())
+    }
+
+    /// List known peers, most-recently-active first. `role` filters by kind
+    /// (e.g. "cc", "mu"); `active_since_ms` drops anyone whose last_seen is
+    /// older than the cutoff (0 = no recency filter).
+    async fn list_peers(&self, role: Option<&str>, active_since_ms: i64) -> Result<Vec<PeerRow>> {
+        let conn = self.db.lock().await;
+        let mut sql = String::from(
+            "SELECT peer_id, role, first_seen, last_seen FROM peers WHERE last_seen >= ?1",
+        );
+        if role.is_some() {
+            sql.push_str(" AND role = ?2");
+        }
+        sql.push_str(" ORDER BY last_seen DESC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = match role {
+            Some(r) => stmt
+                .query_map(params![active_since_ms, r], peer_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+            None => stmt
+                .query_map(params![active_since_ms], peer_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(rows)
+    }
 }
 
 fn dialogue_row(row: &rusqlite::Row) -> rusqlite::Result<DialogueRow> {
@@ -166,6 +229,23 @@ fn dialogue_row(row: &rusqlite::Row) -> rusqlite::Result<DialogueRow> {
         session_thread: row.get(3)?,
         content: row.get(4)?,
         ts: row.get(5)?,
+    })
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct PeerRow {
+    peer_id: String,
+    role: String,
+    first_seen: i64,
+    last_seen: i64,
+}
+
+fn peer_row(row: &rusqlite::Row) -> rusqlite::Result<PeerRow> {
+    Ok(PeerRow {
+        peer_id: row.get(0)?,
+        role: row.get(1)?,
+        first_seen: row.get(2)?,
+        last_seen: row.get(3)?,
     })
 }
 
@@ -197,6 +277,17 @@ struct HistoryArgs {
     limit: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct PeersArgs {
+    /// Filter to one kind of peer ("cc", "mu", …). None = all kinds.
+    #[serde(default)]
+    role: Option<String>,
+    /// Only return peers whose last_seen is within this many ms of now.
+    /// None or 0 = no recency filter (every peer ever seen).
+    #[serde(default)]
+    active_within_ms: Option<i64>,
+}
+
 async fn handle_say(store: &Store, args: SayArgs) -> Result<Value> {
     let (id, ts) = store
         .say(
@@ -206,6 +297,8 @@ async fn handle_say(store: &Store, args: SayArgs) -> Result<Value> {
             args.session_thread.as_deref(),
         )
         .await?;
+    // Sending proves the sender is live — register/refresh its presence.
+    store.touch_peer(&args.from, ts).await?;
     Ok(json!({ "id": id, "ts": ts }))
 }
 
@@ -213,6 +306,9 @@ async fn handle_poll(store: &Store, args: PollArgs) -> Result<Value> {
     let limit = args.limit.unwrap_or(25).clamp(1, 200);
     let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_POLL_TIMEOUT_MS);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+    // Polling its own inbox proves the poller (`to`) is live.
+    store.touch_peer(&args.to, now_ms()).await?;
 
     loop {
         let rows = store.fetch_for(&args.to, args.since, limit).await?;
@@ -236,6 +332,18 @@ async fn handle_history(store: &Store, args: HistoryArgs) -> Result<Value> {
     let limit = args.limit.unwrap_or(50).clamp(1, 1000);
     let rows = store.history(&args.session_thread, limit).await?;
     Ok(json!({ "messages": rows }))
+}
+
+async fn handle_peers(store: &Store, args: PeersArgs) -> Result<Value> {
+    let now = now_ms();
+    // active_within_ms → an absolute last_seen cutoff; 0/None means no filter.
+    let active_since = args
+        .active_within_ms
+        .filter(|w| *w > 0)
+        .map(|w| now - w)
+        .unwrap_or(0);
+    let peers = store.list_peers(args.role.as_deref(), active_since).await?;
+    Ok(json!({ "peers": peers, "now": now }))
 }
 
 // ─────────────────────────── rmcp ServerHandler ─────────────────────────────
@@ -299,6 +407,20 @@ fn tools_list() -> Vec<Tool> {
                 "required": ["session_thread"]
             })),
         ),
+        Tool::new(
+            "dialogue_peers",
+            "Discover peers on the channel. Presence is activity-derived: a peer \
+             is listed once it has sent (dialogue_say) or polled (dialogue_poll), \
+             with last_seen advancing on each. Returns {peers:[{peer_id, role, \
+             first_seen, last_seen}], now}; compare last_seen to now for staleness.",
+            schema(json!({
+                "type": "object",
+                "properties": {
+                    "role":             {"type": "string", "description": "Filter to one kind of peer ('cc', 'mu', …). Omit for all."},
+                    "active_within_ms": {"type": "number", "description": "Only peers whose last_seen is within this many ms of now. Omit/0 = no recency filter."}
+                }
+            })),
+        ),
     ]
 }
 
@@ -328,6 +450,13 @@ impl DialogueHandler {
                     .await
                     .map_err(|e| format!("dialogue_history failed: {e:#}"))
             }
+            "dialogue_peers" => {
+                let args: PeersArgs = serde_json::from_value(arguments)
+                    .map_err(|e| format!("dialogue_peers bad args: {e}"))?;
+                handle_peers(&self.store, args)
+                    .await
+                    .map_err(|e| format!("dialogue_peers failed: {e:#}"))
+            }
             other => Err(format!("unknown tool: {other}")),
         }
     }
@@ -340,7 +469,15 @@ impl ServerHandler for DialogueHandler {
             .with_instructions(
                 "Multi-peer inter-agent dialogue channel (the email/inbox-over-MCP model). \
                  dialogue_say to send, dialogue_poll to long-poll an inbox, dialogue_history \
-                 to replay a thread. Peers: cc, mu, warden subagents, orchestrators.",
+                 to replay a thread, dialogue_peers to discover who is on the channel. \
+                 Peers: cc, mu, warden subagents, orchestrators.\n\
+                 \n\
+                 Peer ids are 'role:identity'. Identify yourself consistently in the \
+                 'from'/'to' fields: a Claude Code peer uses 'cc:' + its \
+                 CLAUDE_CODE_SESSION_ID (e.g. 'cc:2257560e-...'); an mu session uses \
+                 'mu:<daemon_id>:<session_id>'. The 'role:' prefix is what dialogue_peers \
+                 groups on. Presence is activity-derived — you appear to others the first \
+                 time you say or poll, not at connect.",
             )
     }
 
@@ -640,8 +777,84 @@ mod tests {
     }
 
     #[test]
-    fn advertises_three_tools() {
+    fn advertises_four_tools() {
         let names: Vec<_> = tools_list().iter().map(|t| t.name.to_string()).collect();
-        assert_eq!(names, ["dialogue_say", "dialogue_poll", "dialogue_history"]);
+        assert_eq!(
+            names,
+            [
+                "dialogue_say",
+                "dialogue_poll",
+                "dialogue_history",
+                "dialogue_peers"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn say_and_poll_register_peers_for_discovery() {
+        let h = DialogueHandler {
+            store: test_store().await,
+        };
+        // A sender is registered from `from`; a poller from `to`.
+        h.dispatch(
+            "dialogue_say",
+            json!({"from": "cc:abc123", "to": "mu:d1:s1", "content": "hi"}),
+        )
+        .await
+        .unwrap();
+        h.dispatch(
+            "dialogue_poll",
+            json!({"to": "mu:d1:s1", "since": 0, "timeout_ms": 0}),
+        )
+        .await
+        .unwrap();
+
+        // Both peers are now discoverable; role is the prefix before ':'.
+        let all = h.dispatch("dialogue_peers", json!({})).await.unwrap();
+        let peers = all["peers"].as_array().unwrap();
+        assert_eq!(peers.len(), 2);
+        let by_id = |id: &str| peers.iter().find(|p| p["peer_id"] == id).unwrap().clone();
+        assert_eq!(by_id("cc:abc123")["role"], "cc");
+        assert_eq!(by_id("mu:d1:s1")["role"], "mu");
+
+        // role filter narrows to one kind.
+        let just_mu = h
+            .dispatch("dialogue_peers", json!({"role": "mu"}))
+            .await
+            .unwrap();
+        let mu_peers = just_mu["peers"].as_array().unwrap();
+        assert_eq!(mu_peers.len(), 1);
+        assert_eq!(mu_peers[0]["peer_id"], "mu:d1:s1");
+    }
+
+    #[tokio::test]
+    async fn peers_recency_filter_and_unprefixed_role() {
+        let h = DialogueHandler {
+            store: test_store().await,
+        };
+        // An id with no ':' takes the whole string as its role.
+        h.dispatch(
+            "dialogue_say",
+            json!({"from": "warden", "to": "mu:d1:s1", "content": "x"}),
+        )
+        .await
+        .unwrap();
+        let all = h.dispatch("dialogue_peers", json!({})).await.unwrap();
+        let warden = all["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["peer_id"] == "warden")
+            .unwrap();
+        assert_eq!(warden["role"], "warden");
+
+        // A tiny recency window excludes everyone (last_seen is in the past
+        // relative to a fresh `now`, and the window is sub-millisecond-ish).
+        let recent = h
+            .dispatch("dialogue_peers", json!({"active_within_ms": 0_i64}))
+            .await
+            .unwrap();
+        // active_within_ms = 0 means "no filter", so this still returns peers.
+        assert!(!recent["peers"].as_array().unwrap().is_empty());
     }
 }

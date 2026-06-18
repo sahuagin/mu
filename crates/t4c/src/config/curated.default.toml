@@ -118,9 +118,10 @@ ai = false
 
 [[capability]]
 path = "bash.sprint-start"
-summary = "claim a bead (issue) and enter a unique jj workspace, atomically — the correct-by-construction way to start work on a bead. Pairs with sprint-end."
+summary = "claim a bead (issue) and enter a unique jj workspace, atomically — the correct-by-construction way to start work on a bead. Pairs with sprint-end. Claims in the CURRENT repo's tracker (per remotes.env); if the bead lives in ANOTHER repo's tracker (e.g. an `at-*`/agent_tools bead while you're in the mu repo → fails ISSUE_NOT_FOUND), claim it there with `beads --url <that-remote> claim <bead> --actor <a>` and use `sprint-start --no-bead <label>` for the isolated workspace."
 keywords = [
     "bead", "claim", "issue", "ticket", "workspace", "sprint", "start", "work", "task", "begin",
+    "not found", "issue_not_found", "remote", "wrong tracker",
 ]
 invoke = ["sprint-start", "BEAD-ID"]
 requires = []
@@ -142,15 +143,42 @@ ai = false
 
 [[capability]]
 path = "bash.beads"
-summary = "beads client for the central issue/bead tracker (beadsd over rmcp HTTP): list ready, show, create, claim, close, and `exec -- <br ...>` for the full br surface. Needs `--url <beadsd>`; the local `br` shim resolves the url per-repo."
+summary = "beads client for the central issue/bead tracker (beadsd over rmcp HTTP): list ready, show, create, claim, close, and `exec -- <br ...>` for the full br surface. Needs `--url <beadsd>`; the url is resolved per-repo from ~/.config/beads/remotes.env (agent_tools→:7772, mu→:7771). A bead may live in a DIFFERENT remote than your current repo (e.g. an `at-*` bead is in agent_tools/:7772 even when the work lands in mu) — if show/claim returns ISSUE_NOT_FOUND, try the OTHER endpoints in remotes.env before assuming the bead is gone."
 keywords = [
     "bead", "beads", "issue", "ticket", "tracker", "worklist", "backlog", "ready", "create", "close", "claim", "br",
+    "not found", "issue_not_found", "remote", "remotes.env", "endpoint", "url", "7771", "7772",
 ]
 invoke = ["beads", "--url", "URL", "ready"]
 requires = []
 [capability.help]
 argv = ["beads", "--help"]
 ai = false
+
+# ── mu-dialogue / inter-agent messaging (the email/inbox-over-MCP channel) ───
+# MCP-only tools served by the mu-dialogue server (rmcp StreamableHttp, route
+# /mcp). The only inter-agent *messaging* the stack has (c137-blink is
+# telemetry). Peers: cc, mu, warden subagents, orchestrators; prime use cc<->mu.
+# No CLI — call these as MCP tools over your mu-dialogue connection.
+
+[[capability]]
+path = "mcp.dialogue.say"
+summary = "send a message to another agent/peer over the mu-dialogue MCP channel (the email/inbox model). dialogue_say(from, to, content, session_thread?) -> {id, ts}; omit session_thread to start a thread (the returned id becomes the thread id). MCP-only — call it on your mu-dialogue server connection, not a shell. Pair with mcp.dialogue.poll to receive."
+keywords = [
+    "message", "send", "say", "dialogue", "peer", "agent", "inbox", "mailbox",
+    "talk", "notify", "tell", "inter-agent", "back-channel", "cc", "mu", "channel",
+]
+invoke = ["dialogue_say"]
+requires = []
+
+[[capability]]
+path = "mcp.dialogue.poll"
+summary = "receive messages addressed to a peer over the mu-dialogue MCP channel — notify-driven long-poll. dialogue_poll(to, since?, timeout_ms?, limit?) -> {messages}; blocks up to timeout_ms (default 30s) or until a message arrives. dialogue_history(session_thread, limit?) replays a thread oldest-first. MCP-only — call on your mu-dialogue server connection."
+keywords = [
+    "message", "receive", "poll", "dialogue", "inbox", "mailbox", "wait", "check",
+    "long-poll", "messages", "peer", "agent", "history", "thread", "replay", "inter-agent",
+]
+invoke = ["dialogue_poll"]
+requires = []
 
 # ─────────────────────────────────── chains ─────────────────────────────────
 

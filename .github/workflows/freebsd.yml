@@ -38,7 +38,11 @@ jobs:
           # exists to catch are largely version-independent.
           usesh: true
           prepare: |
-            pkg install -y rust
+            # rust = toolchain (incl. clippy); python3 = build-time interpreter
+            # required by the pyo3 crates (mu-anthropic-py, mu-events-py), which
+            # are workspace members so even `--workspace` default-features needs
+            # it. The deploy boxes already have Python; a fresh VM does not.
+            pkg install -y rust python3
           run: |
             # default features first (what emu / the boxes actually build),
             # then --all-features. `-- -D warnings` makes any warning (incl.

@@ -1,6 +1,7 @@
 //! Session-domain request handlers (session.*, autonomy-related).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -16,12 +17,14 @@ use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
     AskSessionRequest, AskSessionResponse, CancelOutstandingRequest, CancelOutstandingResponse,
     CancelSessionRequest, CancelSessionResponse, CloseSessionRequest, CloseSessionResponse,
-    CreateSessionRequest, CreateSessionResponse, DelegateSessionRequest, DelegateSessionResponse,
+    ConfigApplied, ConfigRejected, CreateSessionRequest, CreateSessionResponse,
+    DelegateSessionRequest, DelegateSessionResponse, GetConfigRequest, GetConfigResponse,
     PingResponse, ProviderSelector, Request, RespondToInputRequiredRequest,
     RespondToInputRequiredResponse, Response, ScheduleWakeupRequest, ScheduleWakeupResponse,
     SessionEventsRequest, SessionEventsResponse, SessionListRequest, SessionListResponse,
-    SessionStatsRequest, SessionStatsResponse, SetRouteRequest, SetRouteResponse,
-    SpawnWorkerRequest, SpawnWorkerResponse, StartAutonomousRequest, StartAutonomousResponse,
+    SessionStatsRequest, SessionStatsResponse, SetConfigRequest, SetConfigResponse,
+    SetRouteRequest, SetRouteResponse, SpawnWorkerRequest, SpawnWorkerResponse,
+    StartAutonomousRequest, StartAutonomousResponse,
 };
 use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
 
@@ -670,11 +673,17 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             limit: index_cfg.discover_injection_limit,
         }
     });
+    // mu-context-limits-wire phase 2: shared live soft limit. Seeded with
+    // the resolved soft limit (0 = unknown ⇒ loop uses its config/default
+    // fallback). session.set_config writes this atomic and the loop reads
+    // it at each compaction check — no restart needed.
+    let live_context_soft_limit = Arc::new(AtomicU64::new(context_soft_limit.unwrap_or(0)));
     let agent = AgentLoop::spawn(SpawnArgs {
         provider,
         provider_kind: kind_arc,
         model: model_arc,
         tools: session_tools,
+        live_context_soft_limit: live_context_soft_limit.clone(),
         config: AgentConfig {
             system_prompt: effective_system_prompt.map(SpanText::from),
             max_turns,
@@ -724,6 +733,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             provider_status,
             mailbox,
             status_watch: Some(status_rx),
+            live_context_soft_limit,
         },
     );
 
@@ -1400,6 +1410,190 @@ pub async fn handle_set_route(
     )
 }
 
+// ── generic config-plane handlers (mu-context-limits-wire phase 2) ───
+//
+// `session.get_config` / `session.set_config` are generic key→value
+// messages; this is the daemon-side REGISTRY of addressable keys. The
+// wire types never change as keys are added — only this module does.
+// Both are gated on the session's `ConfigCapability` axis.
+
+/// The config keys this daemon understands. A finite, explicit set —
+/// adding one is a match arm in [`read_config_key`]/[`apply_config_entry`],
+/// never a new wire message (that's the "don't hardcode the threshold as
+/// THE update event" requirement: the message is generic, the keys are
+/// data).
+mod config_keys {
+    /// The context soft limit (= compaction trigger). Read **and** write.
+    pub const SOFT_LIMIT: &str = "context.soft_limit";
+    /// The model's hard context ceiling. Read-only at session scope
+    /// (tune per-model in models.toml).
+    pub const HARD_LIMIT: &str = "context.hard_limit";
+    /// Current context fill (last call's input tokens). Read-only.
+    pub const USED_TOKENS: &str = "context.used_tokens";
+    /// Every key returned for the explicit `"*"` whole-config request.
+    pub const ALL_READABLE: &[&str] = &[SOFT_LIMIT, HARD_LIMIT, USED_TOKENS];
+}
+
+/// Read one key's current value. `None` ⇒ unknown key (omitted from the
+/// response — the daemon never volunteers a value that wasn't asked for).
+/// `Some(Value::Null)` ⇒ a known key with no value yet.
+fn read_config_key(log: &SessionEventLog, key: &str) -> Option<Value> {
+    let (soft, hard) = log
+        .context_limits()
+        .map_or((None, None), |(s, h)| (Some(s), h));
+    match key {
+        config_keys::SOFT_LIMIT => Some(soft.map_or(Value::Null, Value::from)),
+        config_keys::HARD_LIMIT => Some(hard.map_or(Value::Null, Value::from)),
+        config_keys::USED_TOKENS => Some(log.live_usage().1.map_or(Value::Null, Value::from)),
+        _ => None,
+    }
+}
+
+/// `session.get_config` — read named keys. Gated on `ConfigCapability`
+/// (needs ≥ ReadOnly). Returns ONLY the requested keys; the sentinel
+/// `"*"` (explicit) expands to every readable key.
+pub async fn handle_get_config(request: Request<Value>, sessions: Sessions) -> Response<Value> {
+    let params: GetConfigRequest = ok_or_respond!(
+        serde_json::from_value(request.params),
+        request.id,
+        codes::INVALID_PARAMS,
+        "invalid get_config params"
+    );
+    let cap = some_or_respond!(
+        sessions.capability(&params.session_id),
+        request.id,
+        codes::INVALID_PARAMS,
+        format!(
+            "session.get_config: session not found: {}",
+            params.session_id
+        )
+    );
+    let can_read = cap.lock().map(|c| c.config.can_read()).unwrap_or(false);
+    if !can_read {
+        return err_response(
+            request.id,
+            codes::AUTH_DENIED,
+            "session.get_config: capability denies config read (config = none)".to_string(),
+        );
+    }
+    let log = some_or_respond!(
+        sessions.event_log(&params.session_id),
+        request.id,
+        codes::INVALID_PARAMS,
+        format!(
+            "session.get_config: session not found: {}",
+            params.session_id
+        )
+    );
+
+    let keys: Vec<String> = if params.keys.iter().any(|k| k == GetConfigRequest::ALL) {
+        config_keys::ALL_READABLE
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        params.keys.clone()
+    };
+    let mut values = std::collections::BTreeMap::new();
+    for key in keys {
+        if let Some(v) = read_config_key(&log, &key) {
+            values.insert(key, v);
+        }
+        // Unknown keys are silently omitted: never return more than asked.
+    }
+    ok_response(request.id, to_value_or_null(GetConfigResponse { values }))
+}
+
+/// `session.set_config` — write named keys. Gated on `ConfigCapability`
+/// (needs ReadWrite). Each entry validated + applied independently; the
+/// response reports per-key success/failure. The `context.soft_limit`
+/// key records a `SessionConfigResolved` event (so the status meter
+/// reflects it) AND pushes `AgentInput::SetContextSoftLimit` to the live
+/// loop (so compaction uses it) — one change, both halves, via the event
+/// path.
+pub async fn handle_set_config(request: Request<Value>, sessions: Sessions) -> Response<Value> {
+    let params: SetConfigRequest = ok_or_respond!(
+        serde_json::from_value(request.params),
+        request.id,
+        codes::INVALID_PARAMS,
+        "invalid set_config params"
+    );
+    let cap = some_or_respond!(
+        sessions.capability(&params.session_id),
+        request.id,
+        codes::INVALID_PARAMS,
+        format!(
+            "session.set_config: session not found: {}",
+            params.session_id
+        )
+    );
+    let can_write = cap.lock().map(|c| c.config.can_write()).unwrap_or(false);
+    if !can_write {
+        return err_response(
+            request.id,
+            codes::AUTH_DENIED,
+            "session.set_config: capability denies config write (config != read_write)".to_string(),
+        );
+    }
+    let log = some_or_respond!(
+        sessions.event_log(&params.session_id),
+        request.id,
+        codes::INVALID_PARAMS,
+        format!(
+            "session.set_config: session not found: {}",
+            params.session_id
+        )
+    );
+    let live_soft_limit = some_or_respond!(
+        sessions.live_context_soft_limit(&params.session_id),
+        request.id,
+        codes::INVALID_PARAMS,
+        format!(
+            "session.set_config: session not found: {}",
+            params.session_id
+        )
+    );
+
+    let mut applied = Vec::new();
+    let mut rejected = Vec::new();
+    for entry in params.entries {
+        let key = entry.key;
+        let value = entry.value;
+        let result: Result<Value, String> = match key.as_str() {
+            config_keys::SOFT_LIMIT => match value.as_u64() {
+                Some(tokens) if tokens > 0 => {
+                    // Two halves of one change: (1) update the live cell
+                    // the agent loop reads at its next compaction check
+                    // (no restart); (2) record a SessionConfigResolved
+                    // event so the status meter reflects the same value.
+                    // Both flow from this one write.
+                    live_soft_limit.store(tokens, Ordering::Relaxed);
+                    let hard = log.context_limits().and_then(|(_, h)| h);
+                    log.append(
+                        EventActor::System,
+                        EventPayload::SessionConfigResolved {
+                            context_soft_limit: tokens,
+                            context_hard_limit: hard,
+                        },
+                    );
+                    Ok(Value::from(tokens))
+                }
+                _ => Err("context.soft_limit expects a positive integer token count".to_string()),
+            },
+            config_keys::HARD_LIMIT | config_keys::USED_TOKENS => Err("read-only key".to_string()),
+            _ => Err("unknown config key".to_string()),
+        };
+        match result {
+            Ok(value) => applied.push(ConfigApplied { key, value }),
+            Err(reason) => rejected.push(ConfigRejected { key, reason }),
+        }
+    }
+    ok_response(
+        request.id,
+        to_value_or_null(SetConfigResponse { applied, rejected }),
+    )
+}
+
 // ── mu-slat: spawn_worker ────────────────────────────────────────────
 
 pub async fn handle_spawn_worker(
@@ -1686,9 +1880,155 @@ mod tests {
     //! tests pin that contract.
 
     use super::*;
+    use mu_core::capability::ConfigCapability;
     use mu_core::event_log::SessionEventLog;
     use mu_core::protocol::JSONRPC_VERSION;
     use serde_json::json;
+
+    // ── mu-context-limits-wire phase 2: config-plane handlers ────────
+
+    /// Insert a minimal LIVE session (real input channel + event log +
+    /// shared live soft-limit cell) so the config handlers have a target.
+    fn insert_live_session(
+        sessions: &Sessions,
+        id: &str,
+        cap: Capability,
+    ) -> (Arc<SessionEventLog>, Arc<AtomicU64>) {
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel(8);
+        let log = Arc::new(SessionEventLog::new(id.to_string()));
+        let live = Arc::new(AtomicU64::new(0));
+        sessions.insert(
+            id.to_string(),
+            crate::serve::sessions::NewSession {
+                input_tx,
+                forwarder: tokio::spawn(async {}),
+                agent: tokio::spawn(async {}),
+                event_log: log.clone(),
+                pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+                parent_session_id: None,
+                capability: Arc::new(Mutex::new(cap)),
+                cache_ttl: CacheTtl::default(),
+                provider_status: Arc::new(Mutex::new(
+                    crate::serve::provider_status::ProviderStatusTracker::new(),
+                )),
+                mailbox: Arc::new(crate::serve::mailbox::MailboxState::new()),
+                status_watch: None,
+                live_context_soft_limit: live.clone(),
+            },
+        );
+        (log, live)
+    }
+
+    fn cfg_req(method: &str, params: Value) -> Request<Value> {
+        Request {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id: json!(1),
+            method: method.into(),
+            params,
+        }
+    }
+
+    #[tokio::test]
+    async fn set_config_soft_limit_updates_live_and_meter_then_gate_denies() {
+        let sessions = Sessions::new();
+        let (log, live) = insert_live_session(&sessions, "s1", Capability::root());
+        // Seed a resolved snapshot so the hard limit is known.
+        log.append(
+            EventActor::System,
+            EventPayload::SessionConfigResolved {
+                context_soft_limit: 200_000,
+                context_hard_limit: Some(1_000_000),
+            },
+        );
+        live.store(200_000, Ordering::Relaxed);
+
+        // get returns ONLY the requested keys.
+        let resp = handle_get_config(
+            cfg_req(
+                GetConfigRequest::METHOD,
+                json!({"session_id": "s1", "keys": ["context.soft_limit", "context.hard_limit"]}),
+            ),
+            sessions.clone(),
+        )
+        .await;
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["result"]["values"]["context.soft_limit"], json!(200_000));
+        assert_eq!(
+            v["result"]["values"]["context.hard_limit"],
+            json!(1_000_000)
+        );
+        assert!(
+            v["result"]["values"].get("context.used_tokens").is_none(),
+            "an unrequested key must never appear in the response"
+        );
+
+        // set soft limit → applied; live cell AND the meter (event) update.
+        let resp = handle_set_config(
+            cfg_req(
+                SetConfigRequest::METHOD,
+                json!({"session_id": "s1", "entries": [{"key": "context.soft_limit", "value": 120_000}]}),
+            ),
+            sessions.clone(),
+        )
+        .await;
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            v["result"]["applied"][0]["key"],
+            json!("context.soft_limit")
+        );
+        assert!(v["result"]["rejected"].as_array().unwrap().is_empty());
+        assert_eq!(live.load(Ordering::Relaxed), 120_000);
+        assert_eq!(log.context_limits(), Some((120_000, Some(1_000_000))));
+
+        // read-only key + unknown key are both rejected (others still apply).
+        let resp = handle_set_config(
+            cfg_req(
+                SetConfigRequest::METHOD,
+                json!({"session_id": "s1", "entries": [
+                    {"key": "context.hard_limit", "value": 5},
+                    {"key": "nope.key", "value": 1}
+                ]}),
+            ),
+            sessions.clone(),
+        )
+        .await;
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["result"]["rejected"].as_array().unwrap().len(), 2);
+
+        // capability gate: downgrade to ReadOnly → set denied, value unchanged.
+        if let Some(c) = sessions.capability("s1") {
+            c.lock().unwrap().config = ConfigCapability::ReadOnly;
+        }
+        let resp = handle_set_config(
+            cfg_req(
+                SetConfigRequest::METHOD,
+                json!({"session_id": "s1", "entries": [{"key": "context.soft_limit", "value": 99_000}]}),
+            ),
+            sessions.clone(),
+        )
+        .await;
+        let v = serde_json::to_value(&resp).unwrap();
+        assert!(
+            v["error"].is_object(),
+            "set_config must be denied when config capability is ReadOnly"
+        );
+        assert_eq!(
+            live.load(Ordering::Relaxed),
+            120_000,
+            "a denied set must not change the live value"
+        );
+        // ReadOnly can still read.
+        let resp = handle_get_config(
+            cfg_req(
+                GetConfigRequest::METHOD,
+                json!({"session_id": "s1", "keys": ["context.soft_limit"]}),
+            ),
+            sessions.clone(),
+        )
+        .await;
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["result"]["values"]["context.soft_limit"], json!(120_000));
+    }
 
     // mu-8bkf: compaction policy resolution from config.  Pins that
     // all named policies resolve to Some (hash-and-summary now wires the

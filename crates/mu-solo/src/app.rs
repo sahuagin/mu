@@ -1356,6 +1356,7 @@ impl App {
                                             | "/effort"
                                             | "/provider"
                                             | "/model"
+                                            | "/config"
                                             | "/focus"
                                             | "/collapse"
                                     ) || self.skills.contains_key(cmd.trim_start_matches('/'));
@@ -1566,6 +1567,10 @@ impl App {
                     }
                     "/model" => {
                         self.cmd_model(vp, tail)?;
+                        return Ok(false);
+                    }
+                    "/config" => {
+                        self.cmd_config(vp, tail)?;
                         return Ok(false);
                     }
                     "/cancel" if tail.is_empty() => {
@@ -2582,6 +2587,118 @@ impl App {
         }
     }
 
+    /// /config — read or write session config over the generic
+    /// capability-gated config message (mu-context-limits-wire phase 2).
+    ///
+    ///   /config [get] [key...]      read keys (default: context.soft_limit;
+    ///                               `*` for the whole readable config)
+    ///   /config set <key> <value>   write one key, e.g.
+    ///                               `/config set context.soft_limit 120000`
+    ///
+    /// The set takes effect live: the daemon updates the running loop's
+    /// compaction trigger AND records the change so the context meter
+    /// reflects it on the next status tick.
+    fn cmd_config(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
+        let mut parts = arg.split_whitespace();
+        let first = parts.next().unwrap_or("get");
+        let mut lines: Vec<Line> = vec![Line::from("")];
+        match first {
+            "set" => {
+                let key = match parts.next() {
+                    Some(k) => k.to_string(),
+                    None => {
+                        self.set_flash("usage: /config set <key> <value>");
+                        return Ok(());
+                    }
+                };
+                let raw = parts.next().unwrap_or("");
+                // Integers parse as JSON numbers (what context.soft_limit
+                // wants); anything else is sent as a string and the daemon
+                // validates per key.
+                let value: serde_json::Value = raw
+                    .parse::<u64>()
+                    .map(serde_json::Value::from)
+                    .unwrap_or_else(|_| serde_json::Value::from(raw));
+                let params = serde_json::json!({
+                    "session_id": self.session_id,
+                    "entries": [{ "key": key, "value": value }],
+                });
+                match self.client.request("session.set_config", params) {
+                    Ok(v) => {
+                        let applied = v
+                            .get("applied")
+                            .and_then(|a| a.as_array())
+                            .map(|a| !a.is_empty())
+                            .unwrap_or(false);
+                        if applied {
+                            lines.push(Line::from(Span::styled(
+                                format!("config set: {key} = {value}"),
+                                Style::default().fg(Color::Green),
+                            )));
+                            self.set_flash(format!("config set {key}"));
+                        }
+                        if let Some(rej) = v.get("rejected").and_then(|r| r.as_array()) {
+                            for r in rej {
+                                let k = r.get("key").and_then(|x| x.as_str()).unwrap_or("?");
+                                let reason =
+                                    r.get("reason").and_then(|x| x.as_str()).unwrap_or("?");
+                                lines.push(Line::from(Span::styled(
+                                    format!("rejected {k}: {reason}"),
+                                    Style::default().fg(Color::Red),
+                                )));
+                            }
+                        }
+                    }
+                    Err(e) => lines.push(Line::from(Span::styled(
+                        format!("set_config failed: {e}"),
+                        Style::default().fg(Color::Red),
+                    ))),
+                }
+            }
+            sub => {
+                // "get" (explicit) or bare keys; default to the soft limit.
+                let mut keys: Vec<String> = parts.map(|s| s.to_string()).collect();
+                if sub != "get" {
+                    keys.insert(0, sub.to_string());
+                }
+                if keys.is_empty() {
+                    keys.push("context.soft_limit".to_string());
+                }
+                let params = serde_json::json!({
+                    "session_id": self.session_id,
+                    "keys": keys,
+                });
+                match self.client.request("session.get_config", params) {
+                    Ok(v) => {
+                        lines.push(Line::from(Span::styled(
+                            "config:",
+                            Style::default().fg(Color::Cyan),
+                        )));
+                        match v.get("values").and_then(|x| x.as_object()) {
+                            Some(map) if !map.is_empty() => {
+                                for (k, val) in map {
+                                    lines.push(Line::from(format!("  {k} = {val}")));
+                                }
+                            }
+                            _ => lines.push(Line::from("  (no matching keys)")),
+                        }
+                    }
+                    Err(e) => lines.push(Line::from(Span::styled(
+                        format!("get_config failed: {e}"),
+                        Style::default().fg(Color::Red),
+                    ))),
+                }
+            }
+        }
+        lines.push(Line::from(""));
+        let h = lines.len() as u16;
+        vp.insert_before(h, |buf| {
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
+        Ok(())
+    }
+
     /// /cancel — abort the in-flight provider call without ending the
     /// session. Maps to `session.cancel_outstanding` (mu-035). Routes
     /// to whichever session owns the current streaming turn (main or
@@ -2920,6 +3037,10 @@ impl App {
             MenuItem::new("/collapse", "Fold tool call+result blocks to one-liners"),
             MenuItem::new("/provider ›", "Select provider"),
             MenuItem::new("/model ›", "Select model"),
+            MenuItem::new(
+                "/config",
+                "Read/set session config (e.g. context.soft_limit)",
+            ),
             MenuItem::new(
                 "/btw",
                 "Side question via sidecar (main history unaffected)",

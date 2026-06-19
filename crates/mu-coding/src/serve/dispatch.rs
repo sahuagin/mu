@@ -16,11 +16,11 @@ use mu_core::protocol::{
     AskSessionRequest, AuthInitiateRequest, AuthOfferRequest, CancelOutstandingRequest,
     CancelSessionRequest, CapabilitiesDiscoverRequest, CloseSessionRequest, CreateSessionRequest,
     DaemonListRoutesRequest, DaemonOutstandingCallsRequest, DaemonStatsRequest,
-    DaemonUsageHistoryRequest, DelegateSessionRequest, MailboxConsumeRequest, MailboxListRequest,
-    MailboxPostRequest, MailboxReadRequest, PeerHelloRequest, PingRequest, Request,
-    RespondToInputRequiredRequest, Response, ResumeSessionRequest, ScheduleWakeupRequest,
-    SessionEventsRequest, SessionListRequest, SessionStatsRequest, SetRouteRequest,
-    SpawnWorkerRequest, StartAutonomousRequest, JSONRPC_VERSION,
+    DaemonUsageHistoryRequest, DelegateSessionRequest, GetConfigRequest, MailboxConsumeRequest,
+    MailboxListRequest, MailboxPostRequest, MailboxReadRequest, PeerHelloRequest, PingRequest,
+    Request, RespondToInputRequiredRequest, Response, ResumeSessionRequest, ScheduleWakeupRequest,
+    SessionEventsRequest, SessionListRequest, SessionStatsRequest, SetConfigRequest,
+    SetRouteRequest, SpawnWorkerRequest, StartAutonomousRequest, JSONRPC_VERSION,
 };
 use mu_core::skill::loader::LoadedSkill;
 use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
@@ -236,6 +236,8 @@ pub(crate) async fn dispatch_inner(
         SetRouteRequest::METHOD => {
             handle_set_route(request, sessions, factory, daemon_info.clone()).await
         }
+        GetConfigRequest::METHOD => handle_get_config(request, sessions).await,
+        SetConfigRequest::METHOD => handle_set_config(request, sessions).await,
         DaemonListRoutesRequest::METHOD => handle_list_routes(request, daemon_info),
         SpawnWorkerRequest::METHOD => {
             handle_spawn_worker(request, sessions, daemon_info.clone()).await

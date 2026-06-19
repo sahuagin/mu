@@ -139,6 +139,7 @@ mod tests {
                 provider_status,
                 mailbox: Arc::new(crate::serve::mailbox::MailboxState::new()),
                 status_watch: None,
+                live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
         );
         log

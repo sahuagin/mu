@@ -98,13 +98,19 @@ impl RouteCatalog {
                 "anthropic_api",
                 model,
                 anthropic_key,
-                *soft,
-                *hard,
+                Some(*soft),
+                Some(*hard),
             ));
         }
 
         for (model, soft, hard) in OPENAI_CODEX_MODELS {
-            entries.push(build_entry("openai_codex", model, openai_key, *soft, *hard));
+            entries.push(build_entry(
+                "openai_codex",
+                model,
+                openai_key,
+                Some(*soft),
+                Some(*hard),
+            ));
         }
 
         for (model, soft, hard) in OPENROUTER_MODELS {
@@ -112,16 +118,28 @@ impl RouteCatalog {
                 "openrouter",
                 model,
                 openrouter_key,
-                *soft,
-                *hard,
+                Some(*soft),
+                Some(*hard),
             ));
         }
 
         for (model, soft, hard) in VLLM_MODELS {
-            entries.push(build_entry("vllm", model, vllm_configured, *soft, *hard));
+            entries.push(build_entry(
+                "vllm",
+                model,
+                vllm_configured,
+                Some(*soft),
+                Some(*hard),
+            ));
         }
 
-        entries.push(build_entry("faux", "faux", true, 128_000, 128_000));
+        entries.push(build_entry(
+            "faux",
+            "faux",
+            true,
+            Some(128_000),
+            Some(128_000),
+        ));
 
         Self { entries }
     }
@@ -133,10 +151,12 @@ impl RouteCatalog {
     /// via `mu_ai::OllamaProvider::discover_models` and passes them in
     /// here. `configured = true` for every entry, because the names
     /// only exist if the endpoint answered `/api/tags`. Context limits
-    /// use a conservative placeholder ([`OLLAMA_DEFAULT_CONTEXT`]) since
-    /// `/api/tags` doesn't report context windows; per-model enrichment
-    /// via `/api/show` is a follow-up. Pricing is `None` (local = free).
-    /// (bead mu-818c)
+    /// are left `None` (unknown) — `/api/tags` doesn't report windows and
+    /// a fabricated placeholder must never drive compaction. A per-model
+    /// `models.toml` entry or the catalog sync tool supplies the real
+    /// window; until then an unknown window falls back to the safe
+    /// `DEFAULT_COMPACTION_THRESHOLD` for compaction. Pricing is `None`
+    /// (local = free). (bead mu-818c; context-limit-harden-sync)
     pub fn with_ollama_models<I, S>(mut self, models: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -147,8 +167,13 @@ impl RouteCatalog {
                 "ollama",
                 m.as_ref(),
                 true,
-                OLLAMA_DEFAULT_CONTEXT,
-                OLLAMA_DEFAULT_CONTEXT,
+                // Unknown window: /api/tags reports none. Leave it None
+                // (not a fabricated placeholder) so it can't drive
+                // compaction; a per-model models.toml entry or the catalog
+                // sync tool fills it in. Until then compaction uses the
+                // safe DEFAULT, and the meter shows no fake denominator.
+                None,
+                None,
             ));
         }
         self
@@ -156,8 +181,9 @@ impl RouteCatalog {
 
     /// Merge dynamically-discovered vLLM models into the catalog.
     /// vLLM exposes OpenAI-compatible `/v1/models`; the daemon probes it
-    /// at startup and passes the returned ids here. Context defaults to
-    /// 32k until per-model enrichment exists.
+    /// at startup and passes the returned ids here. Context limits are
+    /// left `None` (unknown) until a `models.toml` entry or the catalog
+    /// sync tool supplies them — see `with_ollama_models`.
     pub fn with_vllm_models<I, S>(mut self, models: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -168,8 +194,10 @@ impl RouteCatalog {
                 "vllm",
                 m.as_ref(),
                 true,
-                VLLM_DEFAULT_CONTEXT,
-                VLLM_DEFAULT_CONTEXT,
+                // Unknown window (see with_ollama_models) — None, not a
+                // fabricated placeholder.
+                None,
+                None,
             ));
         }
         self
@@ -198,16 +226,23 @@ fn build_entry(
     provider_kind: &str,
     model: &str,
     configured: bool,
-    context_soft: u64,
-    context_hard: u64,
+    context_soft: Option<u64>,
+    context_hard: Option<u64>,
 ) -> RouteEntry {
     let catalog = model_catalog::global();
     let pricing = pricing::for_model(provider_kind, model);
     let model_settings = catalog.resolve_model(model);
     let provider_settings = catalog.provider(provider_kind);
 
-    let context_soft = model_settings.context_soft_limit.unwrap_or(context_soft);
-    let context_hard = model_settings.context_hard_limit.unwrap_or(context_hard);
+    // The per-model catalog value wins; otherwise the caller's fallback.
+    // Discovered-but-unenriched providers (ollama/vllm) pass `None` so an
+    // unknown context window stays `None` rather than a fabricated small
+    // placeholder — a placeholder must never drive compaction (it did:
+    // ollama's 32k placeholder made the agent loop compact every turn).
+    // Unknown -> None -> the compaction trigger falls back to the safe
+    // DEFAULT_COMPACTION_THRESHOLD instead. (bead context-limit-harden-sync)
+    let context_soft = model_settings.context_soft_limit.or(context_soft);
+    let context_hard = model_settings.context_hard_limit.or(context_hard);
     let favorites = catalog
         .favorites_for(provider_kind, model)
         .into_iter()
@@ -239,7 +274,11 @@ fn build_entry(
         _ => None,
     };
 
-    let hash_input = format!("{provider_kind}:{model}:{context_soft}:{context_hard}");
+    let hash_input = format!(
+        "{provider_kind}:{model}:{}:{}",
+        context_soft.unwrap_or(0),
+        context_hard.unwrap_or(0)
+    );
     let hash: Arc<str> = Arc::from(
         blake3::hash(hash_input.as_bytes())
             .to_hex()
@@ -266,8 +305,8 @@ fn build_entry(
         quirks: model_settings.quirks.into_iter().map(Arc::from).collect(),
         max_output_tokens: model_settings.max_output_tokens,
         favorites,
-        context_soft_limit: Some(context_soft),
-        context_hard_limit: Some(context_hard),
+        context_soft_limit: context_soft,
+        context_hard_limit: context_hard,
         valid_effort_levels: valid_effort,
         pricing_input_per_mtok: pricing.map(|p| p.input_per_mtok),
         pricing_output_per_mtok: pricing.map(|p| p.output_per_mtok),
@@ -284,15 +323,6 @@ const ANTHROPIC_MODELS: &[(&str, u64, u64)] = &[
 ];
 
 const OPENAI_CODEX_MODELS: &[(&str, u64, u64)] = &[("gpt-5.5", 1_000_000, 1_000_000)];
-
-/// Conservative placeholder context window for ollama models, applied
-/// to both soft and hard limits. `/api/tags` doesn't report context
-/// windows; per-model `/api/show` enrichment is a follow-up. (mu-818c)
-const OLLAMA_DEFAULT_CONTEXT: u64 = 32_768;
-
-/// Conservative placeholder context window for vLLM-served models.
-/// `/v1/models` reports ids, not context windows.
-const VLLM_DEFAULT_CONTEXT: u64 = 32_768;
 
 const OPENROUTER_MODELS: &[(&str, u64, u64)] = &[
     ("anthropic/claude-opus-4.7", 200_000, 1_000_000),
@@ -320,8 +350,20 @@ mod tests {
 
     #[test]
     fn hash_is_deterministic() {
-        let a = build_entry("anthropic_api", "claude-opus-4-7", true, 200_000, 1_000_000);
-        let b = build_entry("anthropic_api", "claude-opus-4-7", true, 200_000, 1_000_000);
+        let a = build_entry(
+            "anthropic_api",
+            "claude-opus-4-7",
+            true,
+            Some(200_000),
+            Some(1_000_000),
+        );
+        let b = build_entry(
+            "anthropic_api",
+            "claude-opus-4-7",
+            true,
+            Some(200_000),
+            Some(1_000_000),
+        );
         assert_eq!(a.hash, b.hash);
     }
 
@@ -331,15 +373,15 @@ mod tests {
             "anthropic_api",
             "claude-test-hash",
             true,
-            200_000,
-            1_000_000,
+            Some(200_000),
+            Some(1_000_000),
         );
         let b = build_entry(
             "anthropic_api",
             "claude-test-hash",
             true,
-            500_000,
-            1_000_000,
+            Some(500_000),
+            Some(1_000_000),
         );
         assert_ne!(a.hash, b.hash);
     }
@@ -376,7 +418,10 @@ mod tests {
             .find("ollama", "qwen3-coder:30b")
             .expect("ollama model should be present");
         assert!(q.configured, "discovered ollama models are configured");
-        assert_eq!(q.context_soft_limit, Some(OLLAMA_DEFAULT_CONTEXT));
+        // Unknown window: discovered but not in the catalog and no longer
+        // fabricated — stays None so it can't drive compaction.
+        assert_eq!(q.context_soft_limit, None);
+        assert_eq!(q.context_hard_limit, None);
         // Local inference: no pricing.
         assert_eq!(q.pricing_input_per_mtok, None);
         assert_eq!(q.pricing_output_per_mtok, None);

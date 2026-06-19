@@ -94,6 +94,18 @@ pub fn default_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|p| p.join("mu").join("models.toml"))
 }
 
+/// The generated catalog layer sits next to the operator `models.toml`
+/// and is merged BELOW it (operator wins). Written by the catalog sync
+/// tool; the loader merges it if present.
+pub fn generated_path_for(operator_config: &Path) -> PathBuf {
+    operator_config.with_file_name("models.generated.toml")
+}
+
+/// `~/.config/mu/models.generated.toml` — the sync tool's write target.
+pub fn default_generated_path() -> Option<PathBuf> {
+    default_config_path().map(|p| generated_path_for(&p))
+}
+
 pub fn built_in() -> ModelCatalogConfig {
     DEFAULT_CATALOG
         .get_or_init(|| {
@@ -109,8 +121,20 @@ pub fn load(config_path: Option<&Path>) -> ModelCatalogConfig {
     let path = config_path
         .map(Path::to_path_buf)
         .or_else(default_config_path);
+    // Merge order (ascending precedence): built-in defaults < generated
+    // layer < operator models.toml < env. The generated layer
+    // (`models.generated.toml`, written by the catalog sync tool) sits
+    // BELOW the operator file on purpose: a hand edit in models.toml
+    // always wins over a probed value, and re-running the sync never
+    // clobbers operator overrides. No-op until the sync tool writes it.
+    if let Some(g) = path.as_ref().map(|p| generated_path_for(p)) {
+        if g.exists() {
+            fig = fig.merge(Toml::file(&g));
+        }
+    }
     if let Some(p) = path.as_ref() {
         if p.exists() {
+            warn_mis_keyed_model_tables(p);
             fig = fig.merge(Toml::file(p));
         }
     }
@@ -120,6 +144,51 @@ pub fn load(config_path: Option<&Path>) -> ModelCatalogConfig {
             tracing::warn!(error = %e, "invalid model catalog config; using built-in defaults");
             built_in()
         })
+}
+
+/// Warn on the `["models.x:y"]` footgun. Quoting the *whole* dotted path
+/// makes a TOP-LEVEL key literally named `models.x:y` instead of an entry
+/// under `[models]`, so the `#[serde(default)]` catalog silently drops it
+/// and the operator's override never applies (the 2026-06-19 ollama
+/// incident: `["models.qwen3.6:27b"]` -> ignored -> fell to the placeholder).
+/// Detect such stray top-level keys and point at the correct form. Best
+/// effort: unreadable/unparseable files are left to the normal load path.
+/// Pure detector: stray top-level keys shaped like `models.x` /
+/// `model_rules.x` (the `["models.x:y"]` mis-key). Returns them so the
+/// warner can report and tests can assert. Unparseable TOML -> empty
+/// (the normal load path surfaces parse errors).
+fn mis_keyed_model_tables(text: &str) -> Vec<String> {
+    let Ok(value) = toml::from_str::<toml::Value>(text) else {
+        return Vec::new();
+    };
+    let Some(table) = value.as_table() else {
+        return Vec::new();
+    };
+    table
+        .keys()
+        .filter(|k| k.starts_with("models.") || k.starts_with("model_rules."))
+        .cloned()
+        .collect()
+}
+
+fn warn_mis_keyed_model_tables(p: &Path) {
+    let Ok(text) = std::fs::read_to_string(p) else {
+        return;
+    };
+    for key in mis_keyed_model_tables(&text) {
+        let section = if key.starts_with("models.") {
+            "models"
+        } else {
+            "model_rules"
+        };
+        let entry = &key[section.len() + 1..];
+        tracing::warn!(
+            stray_key = %key,
+            "model catalog: top-level key `{key}` looks like a mis-keyed table — \
+             quoting the whole path makes it a top-level key, not an entry under \
+             [{section}], so it is SILENTLY IGNORED. Use [{section}.\"{entry}\"] instead."
+        );
+    }
 }
 
 pub fn global() -> &'static ModelCatalogConfig {
@@ -271,6 +340,69 @@ pub fn max_output_tokens_for_model(model: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_mis_keyed_model_tables() {
+        // The footgun: whole path quoted -> top-level stray key, silently
+        // ignored. The correct forms (nested) must NOT be flagged.
+        let toml = r#"
+["models.qwen3.6:27b"]
+model = "qwen3.6:27b"
+context_soft_limit = 200000
+
+["model_rules.deepseek:v4"]
+prefix = "deepseek"
+
+[models."qwen3-coder:30b"]
+model = "qwen3-coder:30b"
+
+[model_rules.deepseek]
+prefix = "deepseek"
+
+[models.gpt-oss-rev]
+model = "gpt-oss-rev"
+"#;
+        let mut stray = mis_keyed_model_tables(toml);
+        stray.sort();
+        assert_eq!(
+            stray,
+            vec![
+                "model_rules.deepseek:v4".to_string(),
+                "models.qwen3.6:27b".to_string(),
+            ],
+            "only the whole-path-quoted tables are flagged; nested forms are fine"
+        );
+    }
+
+    #[test]
+    fn generated_layer_merges_under_operator() {
+        // The sync tool's models.generated.toml is merged BELOW the
+        // operator models.toml: operator values win per-field, generated
+        // fills the gaps the operator didn't set.
+        let dir = std::env::temp_dir().join(format!("mu-catalog-gen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let op = dir.join("models.toml");
+        let gen = generated_path_for(&op);
+        std::fs::write(
+            &gen,
+            "[models.\"m1\"]\nmodel = \"m1\"\ncontext_hard_limit = 999\nmax_output_tokens = 111\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &op,
+            "[models.\"m1\"]\nmodel = \"m1\"\ncontext_hard_limit = 222\n",
+        )
+        .unwrap();
+        let cfg = load(Some(&op));
+        let m = cfg.models.get("m1").expect("m1 present from merged layers");
+        assert_eq!(m.context_hard_limit, Some(222), "operator value wins");
+        assert_eq!(
+            m.max_output_tokens,
+            Some(111),
+            "generated fills the field the operator left unset"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn built_in_qwen36_gets_reasoning_budget() {

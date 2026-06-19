@@ -75,6 +75,12 @@ struct SessionState {
     /// updates. The forwarder sends on status-changing events; MCP
     /// subscribers clone this receiver and watch for changes.
     status_watch: Option<tokio::sync::watch::Receiver<Option<SessionStatus>>>,
+    /// mu-context-limits-wire phase 2: the live context soft limit (=
+    /// compaction trigger) in tokens, shared with the running agent loop.
+    /// `session.set_config` stores the new value here; the loop reads it
+    /// at each compaction check. `0` ⇒ unset (loop uses its config /
+    /// default fallback). Wrapped so the daemon and loop share one cell.
+    live_context_soft_limit: Arc<AtomicU64>,
 }
 
 /// A session loaded from disk at daemon startup (mu-u1ld). The
@@ -200,6 +206,11 @@ pub struct NewSession {
     pub provider_status: Arc<Mutex<ProviderStatusTracker>>,
     pub mailbox: MailboxStateHandle,
     pub status_watch: Option<tokio::sync::watch::Receiver<Option<SessionStatus>>>,
+    /// mu-context-limits-wire phase 2: shared live context soft limit
+    /// (= compaction trigger), the same `Arc` handed to the agent loop's
+    /// `SpawnArgs`. `session.set_config` writes it via
+    /// [`Sessions::live_context_soft_limit`].
+    pub live_context_soft_limit: Arc<AtomicU64>,
 }
 
 impl Sessions {
@@ -263,6 +274,7 @@ impl Sessions {
                     provider_status: new.provider_status,
                     mailbox: new.mailbox,
                     status_watch: new.status_watch,
+                    live_context_soft_limit: new.live_context_soft_limit,
                 },
             );
         }
@@ -547,6 +559,18 @@ impl Sessions {
         self.inner.lock().ok()?.get(id)?.status_watch.clone()
     }
 
+    /// mu-context-limits-wire phase 2: the shared live context soft-limit
+    /// cell for a session, so `session.set_config` can update the
+    /// compaction trigger the running loop reads. `None` if no such live
+    /// session exists.
+    pub fn live_context_soft_limit(&self, id: &str) -> Option<Arc<AtomicU64>> {
+        self.inner
+            .lock()
+            .ok()?
+            .get(id)
+            .map(|s| s.live_context_soft_limit.clone())
+    }
+
     /// Snapshot every outstanding provider call across all sessions
     /// (mu-035 Phase D). Returns one [`OutstandingCall`] per session
     /// currently in a non-idle state. Sessions that are between asks
@@ -731,6 +755,7 @@ mod tests {
                 provider_status: tracker,
                 mailbox: Arc::new(MailboxState::new()),
                 status_watch: None,
+                live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
         );
         assert!(sessions.input_sender(&id).is_some());
@@ -811,6 +836,7 @@ mod tests {
                 provider_status: Arc::new(Mutex::new(ProviderStatusTracker::new())),
                 mailbox: Arc::new(MailboxState::new()),
                 status_watch: None,
+                live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
         );
 
@@ -862,6 +888,7 @@ mod tests {
                 provider_status: tracker,
                 mailbox: Arc::new(MailboxState::new()),
                 status_watch: None,
+                live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
         );
 
@@ -928,6 +955,7 @@ mod tests {
                 provider_status: tracker.clone(),
                 mailbox: Arc::new(MailboxState::new()),
                 status_watch: None,
+                live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
         );
         (log, tracker)

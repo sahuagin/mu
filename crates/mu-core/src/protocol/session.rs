@@ -568,6 +568,81 @@ pub struct SetRouteResponse {
     pub model: String,
 }
 
+// ── generic config-plane message (mu-context-limits-wire phase 2) ────
+//
+// `session.get_config` / `session.set_config` are deliberately GENERIC:
+// they carry key→value pairs, not a fixed field per setting. The set of
+// addressable keys lives in the daemon handler's registry (the first is
+// `context.soft_limit`); adding a key never changes these wire types.
+// Both are gated on the session's `ConfigCapability` axis (get needs
+// ReadOnly+, set needs ReadWrite). Selective by construction: get returns
+// ONLY the requested keys; the daemon never volunteers the whole config.
+
+/// Read named config keys. Each key is a dotted path (e.g.
+/// `"context.soft_limit"`). The sentinel `"*"` asks for the entire
+/// readable config and must be sent explicitly; an empty `keys`
+/// returns nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetConfigRequest {
+    pub session_id: String,
+    #[serde(default)]
+    pub keys: Vec<String>,
+}
+
+impl GetConfigRequest {
+    pub const METHOD: &'static str = "session.get_config";
+    /// Explicit sentinel for "the whole readable config".
+    pub const ALL: &'static str = "*";
+}
+
+/// The requested keys and their current values — never more than asked.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetConfigResponse {
+    pub values: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// One `key → value` assignment in a [`SetConfigRequest`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigEntry {
+    pub key: String,
+    pub value: serde_json::Value,
+}
+
+/// Write named config keys. Each entry is validated and applied
+/// independently; the response reports per-key success/failure (one bad
+/// key doesn't sink the others).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetConfigRequest {
+    pub session_id: String,
+    pub entries: Vec<ConfigEntry>,
+}
+
+impl SetConfigRequest {
+    pub const METHOD: &'static str = "session.set_config";
+}
+
+/// One successfully-applied key, with its effective (possibly
+/// normalized) value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigApplied {
+    pub key: String,
+    pub value: serde_json::Value,
+}
+
+/// One rejected key, with a human-readable reason (unknown key,
+/// validation failure, read-only key, …).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigRejected {
+    pub key: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetConfigResponse {
+    pub applied: Vec<ConfigApplied>,
+    pub rejected: Vec<ConfigRejected>,
+}
+
 // ── mu-slat: pot-hosted worker sessions ──────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -133,10 +133,10 @@ use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
     AskSessionRequest, AuthInitiateRequest, CancelOutstandingRequest, CancelSessionRequest,
     CapabilitiesDiscoverRequest, CloseSessionRequest, DaemonListRoutesRequest,
-    DaemonOutstandingCallsRequest, DaemonStatsRequest, DaemonUsageHistoryRequest,
+    DaemonOutstandingCallsRequest, DaemonStatsRequest, DaemonUsageHistoryRequest, GetConfigRequest,
     MailboxListRequest, MailboxPostRequest, MailboxReadRequest, PingRequest, Request,
     RespondToInputRequiredRequest, Response, ScheduleWakeupRequest, SessionEventsRequest,
-    SessionListRequest, SessionStatsRequest, SetRouteRequest, SpawnWorkerRequest,
+    SessionListRequest, SessionStatsRequest, SetConfigRequest, SetRouteRequest, SpawnWorkerRequest,
     StartAutonomousRequest,
 };
 use mu_core::skill::loader::LoadedSkill;
@@ -302,7 +302,10 @@ fn method_meta(method: &str) -> MethodMeta {
         }
 
         // Session read queries.
-        m if m == SessionEventsRequest::METHOD || m == SessionStatsRequest::METHOD => {
+        m if m == SessionEventsRequest::METHOD
+            || m == SessionStatsRequest::METHOD
+            || m == GetConfigRequest::METHOD =>
+        {
             MethodMeta::session_query()
         }
 
@@ -315,6 +318,7 @@ fn method_meta(method: &str) -> MethodMeta {
             || m == ScheduleWakeupRequest::METHOD
             || m == RespondToInputRequiredRequest::METHOD
             || m == SetRouteRequest::METHOD
+            || m == SetConfigRequest::METHOD
             || m == SpawnWorkerRequest::METHOD
             || m == MailboxPostRequest::METHOD
             || m == dispatch::MCP_MAILBOX_POST_METHOD
@@ -1317,6 +1321,7 @@ mod tests {
                 )),
                 mailbox: Arc::new(super::super::mailbox::MailboxState::new()),
                 status_watch: None,
+                live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
         );
         log
@@ -1413,6 +1418,13 @@ mod tests {
         assert_eq!(classify(CloseSessionRequest::METHOD), Scope::Session);
         assert_eq!(classify(SpawnWorkerRequest::METHOD), Scope::Session);
         assert_eq!(classify(MailboxPostRequest::METHOD), Scope::Session);
+        // mu-context-limits-wire phase 2: config plane. set_config is a
+        // session mutation (journaled like other commands); get_config is
+        // a session read query.
+        assert_eq!(classify(SetConfigRequest::METHOD), Scope::Session);
+        assert_eq!(classify(GetConfigRequest::METHOD), Scope::Session);
+        assert!(is_query(GetConfigRequest::METHOD));
+        assert!(!is_query(SetConfigRequest::METHOD));
         assert_eq!(classify("ping"), Scope::Daemon);
         assert_eq!(classify("create_session"), Scope::Daemon);
         assert_eq!(classify("peer.auth_initiate"), Scope::Daemon);

@@ -81,6 +81,68 @@ pub struct Capability {
     /// the capability serde (`"max_side_effects": "read_only"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_side_effects: Option<SideEffects>,
+    /// Config-plane access: whether the session may read and/or write
+    /// session configuration over the `session.get_config` /
+    /// `session.set_config` RPCs (the generic, key-addressed config
+    /// message). `ReadWrite` is the unrestricted default (`root()`);
+    /// narrowing-only on `attenuate`/`intersect` — a delegate can drop
+    /// to `ReadOnly` or `None`, never gain write it wasn't granted.
+    /// This is the capability axis the config message is gated on
+    /// (the "eventually everything is gated by capabilities" axis,
+    /// realized for the config plane).
+    #[serde(default)]
+    pub config: ConfigCapability,
+}
+
+/// Config-plane grant. Ordered by privilege: `None` < `ReadOnly` <
+/// `ReadWrite`. Intersection takes the lower (narrower) of two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigCapability {
+    /// No config-plane access: both get and set are refused.
+    None,
+    /// May read config (`session.get_config`) but not change it.
+    ReadOnly,
+    /// May read and write config (`get_config` + `set_config`).
+    ReadWrite,
+}
+
+impl Default for ConfigCapability {
+    /// Unrestricted — `Capability::root()` (and thus an
+    /// operator-created session) gets full config access.
+    fn default() -> Self {
+        ConfigCapability::ReadWrite
+    }
+}
+
+impl ConfigCapability {
+    /// Privilege rank for narrowing (`intersect` takes the min).
+    fn rank(self) -> u8 {
+        match self {
+            ConfigCapability::None => 0,
+            ConfigCapability::ReadOnly => 1,
+            ConfigCapability::ReadWrite => 2,
+        }
+    }
+
+    /// The narrower (lower-privilege) of two grants — narrowing-only.
+    pub fn intersect(self, other: Self) -> Self {
+        if self.rank() <= other.rank() {
+            self
+        } else {
+            other
+        }
+    }
+
+    /// May the holder read config?
+    pub fn can_read(self) -> bool {
+        self.rank() >= ConfigCapability::ReadOnly.rank()
+    }
+
+    /// May the holder write config?
+    pub fn can_write(self) -> bool {
+        self == ConfigCapability::ReadWrite
+    }
 }
 
 /// mu-036: whether a session may run autonomously (without an
@@ -391,6 +453,8 @@ impl Capability {
             autonomy: AutonomyCapability::Disallowed,
             aws: HashSet::new(),
             max_side_effects: Some(SideEffects::ReadOnly),
+            // Fail-closed baseline may observe config but not mutate it.
+            config: ConfigCapability::ReadOnly,
         }
     }
 
@@ -480,6 +544,9 @@ impl Capability {
             autonomy,
             aws,
             max_side_effects,
+            // No config-narrowing request shape exists yet; a delegate
+            // inherits the parent's grant unchanged (⊆ parent holds).
+            config: self.config,
         }
     }
 
@@ -525,6 +592,7 @@ impl Capability {
         let aws = intersect_aws_sets(&self.aws, &other.aws);
         let max_side_effects =
             intersect_side_effects(self.max_side_effects, other.max_side_effects);
+        let config = self.config.intersect(other.config);
 
         Capability {
             allowed_tools,
@@ -533,6 +601,7 @@ impl Capability {
             autonomy,
             aws,
             max_side_effects,
+            config,
         }
     }
 
@@ -718,6 +787,36 @@ mod tests {
     }
 
     #[test]
+    fn config_capability_default_and_baseline() {
+        // root() is unrestricted: full config access.
+        assert_eq!(Capability::root().config, ConfigCapability::ReadWrite);
+        assert!(Capability::root().config.can_read());
+        assert!(Capability::root().config.can_write());
+        // read_only() baseline observes but cannot mutate.
+        assert_eq!(Capability::read_only().config, ConfigCapability::ReadOnly);
+        assert!(Capability::read_only().config.can_read());
+        assert!(!Capability::read_only().config.can_write());
+        // None denies both.
+        assert!(!ConfigCapability::None.can_read());
+        assert!(!ConfigCapability::None.can_write());
+    }
+
+    #[test]
+    fn config_capability_intersect_narrows_only() {
+        use ConfigCapability::*;
+        // min by privilege rank; order-independent.
+        assert_eq!(ReadWrite.intersect(ReadOnly), ReadOnly);
+        assert_eq!(ReadOnly.intersect(ReadWrite), ReadOnly);
+        assert_eq!(ReadOnly.intersect(None), None);
+        assert_eq!(ReadWrite.intersect(ReadWrite), ReadWrite);
+        // capability intersect carries the narrower config grant.
+        let parent = Capability::root(); // ReadWrite
+        let mut child = Capability::root();
+        child.config = ConfigCapability::ReadOnly;
+        assert_eq!(parent.intersect(&child).config, ConfigCapability::ReadOnly);
+    }
+
+    #[test]
     fn root_capability_allows_everything() {
         let cap = Capability::root();
         assert!(cap.check_allow("bash").is_allowed());
@@ -848,6 +947,7 @@ mod tests {
             autonomy: AutonomyCapability::default(),
             aws: HashSet::new(),
             max_side_effects: None,
+            config: ConfigCapability::ReadWrite,
         };
         let v = serde_json::to_value(&cap)?;
         let decoded: Capability = serde_json::from_value(v)?;
@@ -1325,6 +1425,7 @@ mod tests {
             autonomy: AutonomyCapability::Disallowed,
             aws: aws_set(&[aws("aws.scout.readonly"), aws("aws.sandbox.build")]),
             max_side_effects: None,
+            config: ConfigCapability::ReadWrite,
         };
         let b = Capability {
             allowed_tools: Some(set(&["read", "edit", "bash"])),
@@ -1333,6 +1434,7 @@ mod tests {
             autonomy: AutonomyCapability::Disallowed,
             aws: aws_set(&[aws("aws.scout.readonly"), aws("aws.auditor.read")]),
             max_side_effects: None,
+            config: ConfigCapability::ReadWrite,
         };
         let r = a.intersect(&b);
 
@@ -1379,6 +1481,7 @@ mod tests {
             autonomy: AutonomyCapability::Disallowed,
             aws: aws_set(&[aws("aws.scout.readonly")]),
             max_side_effects: None,
+            config: ConfigCapability::ReadWrite,
         };
         let r = unconstrained.intersect(&constrained);
         // Every axis takes constrained's value (it's the narrower side).
@@ -1576,6 +1679,7 @@ mod tests {
                 ),
             ]),
             max_side_effects: None,
+            config: ConfigCapability::ReadWrite,
         };
         let v = serde_json::to_value(&cap)?;
         // aws field serializes as a JSON array of {name, session_policy?}.

@@ -25,6 +25,7 @@ pub use execute_tools::TOOL_HISTORY_WINDOW;
 use execute_tools::ToolHistory;
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -828,6 +829,14 @@ pub struct SpawnArgs {
     pub events: mpsc::Sender<AgentEvent>,
     pub pending_approvals: PendingApprovals,
     pub capability: SessionCapability,
+    /// mu-context-limits-wire phase 2: the LIVE context soft limit (=
+    /// compaction trigger) in tokens, shared with the daemon so
+    /// `session.set_config` can change it mid-session. The loop reads it
+    /// at each compaction check; `0` means "unset — fall back to
+    /// `config.compaction_threshold`, then `DEFAULT_COMPACTION_THRESHOLD`".
+    /// A shared atomic (not an `AgentInput`) so a set during streaming or
+    /// a tool call isn't intercepted/lost by the mid-turn input drains.
+    pub live_context_soft_limit: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for SpawnArgs {
@@ -939,6 +948,7 @@ async fn run_inner(
         events,
         pending_approvals,
         capability,
+        live_context_soft_limit,
     } = args;
     let mut provider = provider;
     let mut current_provider_kind = provider_kind;
@@ -1603,9 +1613,17 @@ async fn run_inner(
                 };
 
                 let pre_compaction_tokens = renderer.estimate_tokens(&rope);
-                let compaction_threshold = config
-                    .compaction_threshold
-                    .unwrap_or(DEFAULT_COMPACTION_THRESHOLD);
+                // mu-context-limits-wire phase 2: read the LIVE soft limit
+                // from the shared handle (the daemon's session.set_config
+                // updates it), not the spawn-time config, so a mid-session
+                // change takes effect. `0` ⇒ unset → fall back to the
+                // spawn config, then DEFAULT_COMPACTION_THRESHOLD.
+                let compaction_threshold = match live_context_soft_limit.load(Ordering::Relaxed) {
+                    0 => config
+                        .compaction_threshold
+                        .unwrap_or(DEFAULT_COMPACTION_THRESHOLD),
+                    n => n as usize,
+                };
                 // mu-wsgx: the trigger compares a feedback-predicted
                 // prompt total, not the raw estimate. The incident
                 // measure (session c76f6949): raw estimate ran ~15%

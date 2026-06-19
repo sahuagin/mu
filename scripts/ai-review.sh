@@ -130,16 +130,29 @@ MODEL3="${MU_REVIEW_MODEL_3:-claude-sonnet-4-6}"
 # See ensure_local_reviewer_loaded below. gpt-5.5 is the decided paired reviewer.
 FALLBACK_PROVIDER="${MU_REVIEW_FALLBACK_PROVIDER:-openai-codex}"
 FALLBACK_MODEL="${MU_REVIEW_FALLBACK_MODEL:-gpt-5.5}"
-TOOLS="${MU_REVIEW_TOOLS:-}"   # empty = single-shot (default); e.g. "read,grep" lets the reviewer inspect surrounding code (slower, multi-turn)
+# Read-only tools ON by default: a reviewer that can `read`/`grep` checks a
+# definition instead of hallucinating "undefined X", and can inspect the
+# COMPLEMENT of the diff (what a change omitted) — the two blind spots that let
+# whole-artifact defects (the Anthropic-core rewrite class) pass a diff-only
+# review. This is a correctness lever; the extra wall-clock is irrelevant next
+# to the cost of a missed rewrite. Set MU_REVIEW_TOOLS="" to force single-shot.
+TOOLS="${MU_REVIEW_TOOLS:-read,grep}"
+# Turn cap is an anti-FLAIL backstop (stop a model looping forever), NOT a
+# throttle — set generous so it never truncates a legitimate investigation;
+# TIMEOUT is the wall-clock backstop. Forwarded to `mu ask --max-turns`.
+MAX_TURNS="${MU_REVIEW_MAX_TURNS:-15}"
 BASE="${MU_REVIEW_BASE:-main}"
 # Chunked-mode knobs (v2). Synthesis defaults to primary 2: the strong/cheap
 # frontier lane is the right place for the one cross-commit judgement call.
 SS_MAX="${MU_REVIEW_SINGLE_SHOT_MAX_BYTES:-300000}"
 SYNTH_PROVIDER="${MU_REVIEW_SYNTH_PROVIDER:-$PROVIDER2}"
 SYNTH_MODEL="${MU_REVIEW_SYNTH_MODEL:-$MODEL2}"
-# Per-reviewer timeout: 2x a typical Claude response, with room for one ollama
-# reload. The two reviewers run sequentially, so panel wall-clock is up to ~2x.
-TIMEOUT="${MU_REVIEW_TIMEOUT:-600}"
+# Per-reviewer timeout: generous because tool-using reviews are multi-turn and
+# thoroughness beats wall-clock for a correctness gate (a slow correct verdict
+# >> a fast wrong one). The two reviewers run sequentially. Bumped from 600 to
+# give read/grep investigation room without SIGTERM'ing mid-check (a truncated
+# reviewer returns UNCLEAR — the failure mode we're eliminating).
+TIMEOUT="${MU_REVIEW_TIMEOUT:-900}"
 LOG="${MU_REVIEW_LOG:-$HOME/.local/share/mu/review-events.jsonl}"
 # Minimal reviewer system prompt (mu-ai-review-minimal-sysprompt-9esh).
 # Without this, `mu ask` sessions get the daemon-default system prompt —
@@ -276,7 +289,25 @@ if [ -n "$TOOLS" ]; then
 else
   TOOL_CLAUSE="Review the diff exactly as given below — do NOT call any tools and do NOT emit any function-call or tool-call syntax; respond with prose only."
 fi
-PROMPT="You are a strict pre-PR code reviewer. The DIFF below shows exactly what changed; review ONLY that change for: correctness bugs; concurrency / lifecycle hazards (e.g. a held reference that blocks shutdown, a clone that outlives its owner); missing error handling; and safeguards that nearby code already applies but this diff omits. The FULL CONTENT of each changed file is included after the diff so you can see definitions, helpers, and guards that live OUTSIDE the changed hunks — a variable or function used in the diff is often defined there, so CHECK the full content before reporting anything as undefined/unset, and do NOT raise findings about unchanged code. $TOOL_CLAUSE
+
+# Architecture-invariant conformance: the operator's rules live in the repo's
+# AGENTS.md "## Architecture invariants" section. Feed them to the reviewer so
+# EVERY review checks the change against the declared invariants — the
+# whole-artifact defect class (event-log-first, capability representation, ...)
+# that a hunk-level review structurally cannot see. Empty when AGENTS.md absent.
+INVARIANTS=""
+if [ -r "$ROOT/AGENTS.md" ]; then
+  INVARIANTS="$(awk '/^## Architecture invariants/{f=1} /^## /{if(f && !/^## Architecture invariants/) exit} f' "$ROOT/AGENTS.md")"
+fi
+INVARIANTS_CLAUSE=""; INVARIANTS_BLOCK=""
+if [ -n "$INVARIANTS" ]; then
+  INVARIANTS_CLAUSE=" ALSO check the change against the project ARCHITECTURE INVARIANTS shown below: a diff that violates one — or moves the code toward violating it — is a finding even when every line is locally correct; use read/grep to confirm a suspected violation before reporting it."
+  INVARIANTS_BLOCK="
+PROJECT ARCHITECTURE INVARIANTS (the change MUST uphold these):
+$INVARIANTS
+"
+fi
+PROMPT="You are a strict pre-PR code reviewer. The DIFF below shows exactly what changed; review ONLY that change for: correctness bugs; concurrency / lifecycle hazards (e.g. a held reference that blocks shutdown, a clone that outlives its owner); missing error handling; and safeguards that nearby code already applies but this diff omits. The FULL CONTENT of each changed file is included after the diff so you can see definitions, helpers, and guards that live OUTSIDE the changed hunks — a variable or function used in the diff is often defined there, so CHECK the full content before reporting anything as undefined/unset, and do NOT raise findings about unchanged code.$INVARIANTS_CLAUSE $TOOL_CLAUSE
 
 Output contract:
 - Do not narrate your review process or repeat the prompt.
@@ -284,7 +315,7 @@ Output contract:
 - If there is no blocking correctness/security/lifecycle issue in this diff, say so briefly.
 - Keep the review under 1200 words.
 - Your reply's LAST line MUST be exactly 'VERDICT: APPROVE' or 'VERDICT: REJECT' (those literal words). Do not continue after the verdict line.
-
+$INVARIANTS_BLOCK
 DIFF:
 $DIFF
 $CONTEXT"
@@ -308,7 +339,7 @@ run_review() { # $1=provider $2=model [$3=prompt-file, default $PROMPT_FILE] —
   SYS_FLAGS=""
   [ -r "$SYSPROMPT" ] && SYS_FLAGS="--append-system-prompt $SYSPROMPT"
   if [ -n "$TOOLS" ]; then
-    timeout "$TIMEOUT" "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS --tools "$TOOLS" --prompt-file "$PF" 2>>"$ERRLOG"
+    timeout "$TIMEOUT" "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS --max-turns "$MAX_TURNS" --tools "$TOOLS" --prompt-file "$PF" 2>>"$ERRLOG"
   else
     timeout "$TIMEOUT" "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS --prompt-file "$PF" 2>>"$ERRLOG"
   fi
@@ -597,7 +628,7 @@ $content"
 
   echo "${C_DIM}── synthesis: $SYNTH_PROVIDER/$SYNTH_MODEL ─────────────────────${C_OFF}"
   {
-    printf '%s\n' "You are the SYNTHESIS reviewer of a chunked pre-PR review. The branch was too large for one review, so each commit was reviewed in isolation by a leaf reviewer; their findings are below, verbatim, in the form FINDING|<severity>|<file>|<claim>. You hold the only branch-wide view: judge which findings are REAL (leaves can be wrong — each saw one commit, and a later commit may already fix what an earlier leaf flagged) and whether any findings INTERACT across commits into a larger hazard no single commit shows. Units marked 'REVIEW FAILED — treat as unreviewed' carry unknown risk; weigh that. If a SPEC section is included, also judge whether the branch delivers what the spec claims."
+    printf '%s\n' "You are the SYNTHESIS reviewer of a chunked pre-PR review. The branch was too large for one review, so each commit was reviewed in isolation by a leaf reviewer; their findings are below, verbatim, in the form FINDING|<severity>|<file>|<claim>. You hold the only branch-wide view: judge which findings are REAL (leaves can be wrong — each saw one commit, and a later commit may already fix what an earlier leaf flagged) and whether any findings INTERACT across commits into a larger hazard no single commit shows. Units marked 'REVIEW FAILED — treat as unreviewed' carry unknown risk; weigh that. If a SPEC section is included, also judge whether the branch delivers what the spec claims. If PROJECT ARCHITECTURE INVARIANTS are included below, judge whether the branch upholds them — a violation (or a move toward one) is a REJECT-worthy finding even when each commit is locally correct."
     printf '%s\n' ""
     printf '%s\n' "Output contract:"
     printf '%s\n' "- Brief judgement on each finding you accept or reject (cite its unit); under 1200 words total."
@@ -608,6 +639,7 @@ $content"
     printf '%s\n' "TOTAL BRANCH DIFFSTAT:"
     printf '%s\n' "$DIFFSTAT"
     printf '%s\n' "$spec_text"
+    printf '%s\n' "$INVARIANTS_BLOCK"
     printf '%s\n' ""
     printf '%s\n' "LEAF FINDINGS ($leaves units, $failed unreviewed):"
     printf '%s\n' "$SYNTH_FINDINGS"

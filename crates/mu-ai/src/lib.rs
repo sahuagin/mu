@@ -25,6 +25,7 @@
 #![deny(unsafe_code)]
 
 pub mod auth;
+pub mod catalog_probe; // bead context-limit-harden-sync: HTTP probes for `mu models sync`
 pub mod context;
 pub mod faux;
 pub mod providers;

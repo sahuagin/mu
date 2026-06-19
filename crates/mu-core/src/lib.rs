@@ -21,6 +21,7 @@ pub mod agent;
 pub mod auditor;
 pub mod aws;
 pub mod capability;
+pub mod catalog_sync; // bead context-limit-harden-sync: `mu models sync` data half (no HTTP)
 pub mod command_journal; // spec mu-046: daemon control-plane command journal
 pub mod config;
 pub mod context;

@@ -94,16 +94,43 @@ pub fn default_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|p| p.join("mu").join("models.toml"))
 }
 
-/// The generated catalog layer sits next to the operator `models.toml`
-/// and is merged BELOW it (operator wins). Written by the catalog sync
-/// tool; the loader merges it if present.
-pub fn generated_path_for(operator_config: &Path) -> PathBuf {
-    operator_config.with_file_name("models.generated.toml")
+/// The sync tool writes one generated layer **per provider** next to the
+/// operator `models.toml`: `models.generated.<provider>.toml`. Each is
+/// merged BELOW the operator file (operator wins, per field). Per-provider
+/// files make the sync's "replace one provider, preserve the rest on
+/// failure" trivially atomic — one temp+rename per file, no read-modify-
+/// write of a shared file. Written by `mu models sync`.
+pub fn generated_path_for_provider(operator_config: &Path, provider: &str) -> PathBuf {
+    operator_config.with_file_name(format!("models.generated.{provider}.toml"))
 }
 
-/// `~/.config/mu/models.generated.toml` — the sync tool's write target.
-pub fn default_generated_path() -> Option<PathBuf> {
-    default_config_path().map(|p| generated_path_for(&p))
+/// `~/.config/mu/models.generated.<provider>.toml` — the sync tool's write
+/// target for `provider`.
+pub fn default_generated_path_for_provider(provider: &str) -> Option<PathBuf> {
+    default_config_path().map(|p| generated_path_for_provider(&p, provider))
+}
+
+/// Enumerate the existing `models.generated.*.toml` layers next to
+/// `operator_config`, sorted for a deterministic merge order. Providers are
+/// disjoint across files, so order doesn't affect the merged result — the
+/// sort just keeps it stable. Missing dir / none present -> empty.
+pub fn generated_layers_for(operator_config: &Path) -> Vec<PathBuf> {
+    let Some(dir) = operator_config.parent() else {
+        return Vec::new();
+    };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("models.generated.") && n.ends_with(".toml"))
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 pub fn built_in() -> ModelCatalogConfig {
@@ -122,13 +149,13 @@ pub fn load(config_path: Option<&Path>) -> ModelCatalogConfig {
         .map(Path::to_path_buf)
         .or_else(default_config_path);
     // Merge order (ascending precedence): built-in defaults < generated
-    // layer < operator models.toml < env. The generated layer
-    // (`models.generated.toml`, written by the catalog sync tool) sits
-    // BELOW the operator file on purpose: a hand edit in models.toml
-    // always wins over a probed value, and re-running the sync never
-    // clobbers operator overrides. No-op until the sync tool writes it.
-    if let Some(g) = path.as_ref().map(|p| generated_path_for(p)) {
-        if g.exists() {
+    // layers < operator models.toml < env. The generated layers
+    // (`models.generated.<provider>.toml`, written by `mu models sync`) sit
+    // BELOW the operator file on purpose: a hand edit in models.toml always
+    // wins over a probed value, and re-running the sync never clobbers
+    // operator overrides. No-op until the sync tool writes them.
+    if let Some(p) = path.as_ref() {
+        for g in generated_layers_for(p) {
             fig = fig.merge(Toml::file(&g));
         }
     }
@@ -193,6 +220,27 @@ fn warn_mis_keyed_model_tables(p: &Path) {
 
 pub fn global() -> &'static ModelCatalogConfig {
     LOADED_CATALOG.get_or_init(|| load(None))
+}
+
+/// Load ONLY the operator `models.toml` — no built-in defaults, generated
+/// layers, or env. This is the explicit selection surface for `mu models
+/// sync`: it must reflect exactly the models the operator referenced, not
+/// the built-in catalog. Missing file -> empty (nothing selected). Parse
+/// error -> empty + warn (the normal [`load`] path surfaces the detail).
+pub fn load_operator_only(config_path: &Path) -> ModelCatalogConfig {
+    if !config_path.exists() {
+        return ModelCatalogConfig::default();
+    }
+    warn_mis_keyed_model_tables(config_path);
+    Figment::from(Toml::file(config_path))
+        .extract()
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                "operator models.toml parse failed; treating as empty for sync selection"
+            );
+            ModelCatalogConfig::default()
+        })
 }
 
 impl ModelCatalogConfig {
@@ -376,13 +424,15 @@ model = "gpt-oss-rev"
 
     #[test]
     fn generated_layer_merges_under_operator() {
-        // The sync tool's models.generated.toml is merged BELOW the
-        // operator models.toml: operator values win per-field, generated
-        // fills the gaps the operator didn't set.
+        // The sync tool's per-provider models.generated.<provider>.toml is
+        // merged BELOW the operator models.toml: operator values win
+        // per-field, generated fills the gaps the operator didn't set. The
+        // loader discovers the layer by glob, so the provider suffix is
+        // immaterial here.
         let dir = std::env::temp_dir().join(format!("mu-catalog-gen-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let op = dir.join("models.toml");
-        let gen = generated_path_for(&op);
+        let gen = generated_path_for_provider(&op, "openrouter");
         std::fs::write(
             &gen,
             "[models.\"m1\"]\nmodel = \"m1\"\ncontext_hard_limit = 999\nmax_output_tokens = 111\n",

@@ -258,6 +258,15 @@ enum Command {
         #[command(subcommand)]
         cmd: AnalyticsCmd,
     },
+    /// Provider/model catalog sync (bead context-limit-harden-sync).
+    /// `sync` probes configured providers and writes per-provider generated
+    /// layers (`models.generated.<provider>.toml`) enriching the models your
+    /// `models.toml` references — operator overrides always win. `list`
+    /// discovers a provider's models live (writes nothing).
+    Models {
+        #[command(subcommand)]
+        cmd: ModelsCmd,
+    },
     /// Discover capabilities by intent — the in-process Layer-1 `t4c find`
     /// over mu's manifest (registered tools + discovered skills). Standalone:
     /// builds the manifest in-process, no running daemon required (mu-kex4.6.4).
@@ -292,6 +301,42 @@ enum Command {
         /// Events directory. Default: ~/.local/share/mu/events/.
         #[arg(long, value_name = "PATH")]
         events_dir: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ModelsCmd {
+    /// Probe each configured provider and write
+    /// `models.generated.<provider>.toml` for the models referenced in
+    /// `models.toml`. Operator overrides always win; the SOFT limit is never
+    /// probed (policy stays operator/default, so a probe can't drive
+    /// compaction). Unreachable providers are skipped, preserving their
+    /// existing layer.
+    Sync {
+        /// Probe only this provider (repeatable: openrouter, vllm, ollama).
+        /// Default: every configured provider.
+        #[arg(long = "provider", value_name = "NAME")]
+        providers: Vec<String>,
+        /// Per-request timeout, seconds.
+        #[arg(long, default_value = "30")]
+        timeout: u64,
+        /// Show what would be written without writing any file.
+        #[arg(long)]
+        dry_run: bool,
+        /// Operator `models.toml` path. Default: `~/.config/mu/models.toml`.
+        #[arg(long, value_name = "PATH")]
+        config: Option<std::path::PathBuf>,
+    },
+    /// List a provider's available models live (writes nothing) — the
+    /// discovery surface for choosing what to put in `models.toml`.
+    List {
+        /// Provider: openrouter | vllm | ollama.
+        provider: String,
+        /// Optional case-insensitive substring filter on the model id.
+        query: Option<String>,
+        /// Per-request timeout, seconds.
+        #[arg(long, default_value = "30")]
+        timeout: u64,
     },
 }
 
@@ -586,6 +631,30 @@ async fn main() -> Result<()> {
         }
         Command::Analytics { cmd } => run_analytics(cmd),
         Command::Capabilities { cmd } => run_capabilities(cmd),
+        Command::Models { cmd } => run_models(cmd).await,
+    }
+}
+
+async fn run_models(cmd: ModelsCmd) -> Result<()> {
+    use std::time::Duration;
+    match cmd {
+        ModelsCmd::Sync {
+            providers,
+            timeout,
+            dry_run,
+            config,
+        } => {
+            mu_coding::models_sync::sync(config, providers, Duration::from_secs(timeout), dry_run)
+                .await
+        }
+        ModelsCmd::List {
+            provider,
+            query,
+            timeout,
+        } => {
+            mu_coding::models_sync::list(&provider, query.as_deref(), Duration::from_secs(timeout))
+                .await
+        }
     }
 }
 

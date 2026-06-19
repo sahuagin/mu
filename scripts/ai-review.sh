@@ -120,7 +120,7 @@ set -o pipefail
 # adjudicator, not the routine second opinion.
 # Bench provenance: ~/src/public_github/code-review-bench/reports/NOTES.md.
 PROVIDER="${MU_REVIEW_PROVIDER:-ollama}"
-MODEL="${MU_REVIEW_MODEL:-qwen3-coder-next-agent262k}"
+MODEL="${MU_REVIEW_MODEL:-qwen3.6:27b}"
 PROVIDER2="${MU_REVIEW_PROVIDER_2:-openrouter}"
 MODEL2="${MU_REVIEW_MODEL_2:-deepseek/deepseek-v4-pro}"
 PROVIDER3="${MU_REVIEW_PROVIDER_3:-anthropic-api}"

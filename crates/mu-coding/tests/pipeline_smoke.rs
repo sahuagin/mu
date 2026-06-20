@@ -28,9 +28,12 @@ use tokio::time::timeout;
 use mu_ai::FauxProvider;
 use mu_coding::serve;
 use mu_core::agent::Provider;
-use mu_core::command_journal::{
-    orphaned_command_seqs, CommandJournal, JournalPayload, JournalRecord, RejectStage,
-};
+use mu_core::command_journal::{CommandJournal, JournalPayload, JournalRecord, RejectStage};
+// `orphaned_command_seqs` is used only by the `#[cfg(debug_assertions)]` crash
+// test below; gate its import the same way, or it's an unused import in release
+// builds where that test is compiled out.
+#[cfg(debug_assertions)]
+use mu_core::command_journal::orphaned_command_seqs;
 use mu_core::config::{AuthConfig, Config, JournalConfig};
 use mu_core::event_log::{EventPayload, SessionEvent, SessionEventLog};
 

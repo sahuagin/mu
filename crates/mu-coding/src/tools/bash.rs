@@ -257,6 +257,23 @@ impl Tool for BashTool {
         // commands fail immediately without prompting the user for
         // approval on a doomed call.
         let command = parse_command_arg(arguments)?;
+
+        // Anti-pattern guard (Yolo mode only — strict mode already rejects via allowlist):
+        // Block bare `jj describe` which opens $EDITOR and hijacks stdin,
+        // wrecking the terminal session. The `-m` flag is mandatory.
+        if let Err(suggestion) = check_bare_jj_describe(&command) {
+            return Err(format!(
+                "bash: anti-pattern detected — bare `jj describe` without -m flag. \
+                 This opens $EDITOR and hijacks stdin, corrupting the terminal session. \
+                 {}\n\n\
+                 Use `jj describe -m \"<message>\"` instead.\n\
+                 Alternatively, if you meant to edit an existing commit's message:\n\
+                 `jj git commit --reset-author` or `jj squash`\n\
+                 If you need this command despite the guard, use --bash-yolo again.",
+                suggestion
+            ));
+        }
+
         match &self.mode {
             BashMode::Strict { allowlist, .. } => {
                 validate_strict_command(&command, allowlist)?;
@@ -488,6 +505,36 @@ fn fmt_allowlist(allowlist: &[Vec<String>]) -> String {
     }
 }
 
+/// Anti-pattern guard: detect bare `jj describe` (without -m flag).
+/// In Yolo mode this is the sole gate before execution. Bare `jj describe`
+/// opens $EDITOR and hijacks stdin/TTY, which corrupts the agent session.
+///
+/// Returns an Err with a helpful suggestion if an anti-pattern is detected;
+/// Ok(()) otherwise. The caller (validate) converts the Err into a rejection
+/// with context about why it was blocked.
+fn check_bare_jj_describe(command: &str) -> Result<(), String> {
+    let tokens = match shlex::split(command) {
+        Some(t) if !t.is_empty() => t,
+        _ => return Ok(()), // couldn't tokenize, skip guard (won't be jj describe anyway)
+    };
+
+    // Match: [jj, describe] with nothing else — bare form.
+    // Anything with -m or other flags/positional args is fine.
+    if tokens.len() == 2
+        && tokens[0].to_lowercase() == "jj"
+        && tokens[1].to_lowercase() == "describe"
+    {
+        return Err(
+            "The `jj describe` command opens an interactive editor when called \
+             without arguments, which hijacks stdin and breaks the agent's terminal. \
+             Always use -m to provide the message inline."
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Truncate UTF-8 bytes to ~cap chars (best effort — char boundary aware).
 fn truncate_to_cap(bytes: &[u8], cap: usize) -> String {
     if bytes.len() <= cap {
@@ -591,6 +638,27 @@ mod tests {
             .is_ok());
         // But still rejects missing/empty.
         assert!(tool.validate(&json!({})).is_err());
+    }
+
+    #[test]
+    fn validate_yolo_rejects_bare_jj_describe() {
+        let tool = BashTool::new(BashMode::Yolo);
+
+        // Bare `jj describe` is blocked.
+        assert!(tool.validate(&json!({ "command": "jj describe" })).is_err());
+
+        // With -m flag, it's allowed.
+        assert!(tool
+            .validate(&json!({ "command": "jj describe -m \"message\"" }))
+            .is_ok());
+
+        // With positional change ID, it's allowed (not bare).
+        assert!(tool
+            .validate(&json!({ "command": "jj describe abc123" }))
+            .is_ok());
+
+        // Case-insensitive match on command name.
+        assert!(tool.validate(&json!({ "command": "JJ DESCRIBE" })).is_err());
     }
 
     #[test]

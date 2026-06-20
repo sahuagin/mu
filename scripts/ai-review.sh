@@ -5,46 +5,25 @@
 # the human/agent. Run it via `just ci-aipr`, which runs `just ci` first and only
 # reviews green code.
 #
-# PANEL SHAPE (mu-f0ls): TWO primaries + a conditional TIEBREAKER.
-#   Primary 1 (local):  qwen3-coder-next-agent262k over ollama — 3-GPU local
-#                       agentic/code reviewer, 262k context, temp 0.6.
-#   Primary 2:          deepseek-v4-pro over openrouter — frontier-ish and cheap.
-#   Tiebreaker:         Claude over anthropic-api — invoked ONLY when the two
-#                       primaries disagree, so the Anthropic key/cost is reserved
-#                       for actual ties.
+# PANEL SHAPE (mu-feur): the goal-protocol CONSENSUS panel. The `code_review`
+# role in ~/.config/mu/agent_roles.toml is the single source of truth for WHICH
+# models review and EACH one's tools — change models/tools there, never here. The
+# panel reviews, then CONVERGES over antagonistic rounds (scripts/review-panel/):
+# each round every reviewer is shown the others' findings and is pushed to press
+# objections, concede points it now accepts, and move toward ONE agreed verdict
+# (<= MU_REVIEW_MAX_ROUNDS, default 4). Reviewers emit JSON. This replaces the
+# previous two-primary + conditional-tiebreaker single-shot panel; the legacy
+# chunked path (oversized diffs) still runs that pending migration (mu-feur).
 #
-# WHY THIS SHAPE: the previous panel ran two LOCAL models co-resident (qwen +
-# gpt-oss:20b) and dead-ended a split at the operator. gpt-oss@49152 truncated its
-# review on larger diffs before the VERDICT line — a model that can't return a
-# complete verdict adds no signal — and it over-flags (high recall, low precision),
-# the wrong failure mode for a primary, where every noisy REJECT would drag a good
-# PR to a tiebreak. So we drop the co-residency compromise: one PRECISE local
-# primary that always answers, paired with gpt-5.5, and an INDEPENDENT third model
-# (deepseek) to BREAK a genuine tie rather than bouncing every disagreement to the
-# operator. gpt-oss keeps its Modelfile for the future review-gate v2 per-file
-# worker role; it is just not a flat-panel primary. (co-residency bench: memory
-# a721c14d; reviewers-as-team: d88e133e.)
+# PANEL SEMANTICS (verdict read from reviewer JSON, NOT process exit code — `mu
+# ask` historically exits non-zero on a shutdown wart, mu-qc08):
 #
-# PANEL SEMANTICS (each verdict is read from reviewer STDOUT, NOT its process exit
-# code — `mu ask` historically exits non-zero on a shutdown wart (mu-qc08) even on
-# success, so the exit code is not load-bearing here):
+#   consensus APPROVE          → PASS     (exit 0)
+#   consensus NEEDS-CHANGES    → BLOCK    (exit 1)  — a real correctness/design call
+#   no convergence in N rounds → ESCALATE (exit 3)  — operator decides
 #
-#   both primaries APPROVE   → PASS     (exit 0)
-#   both primaries REJECT    → BLOCK    (exit 1)  — a real design/correctness call
-#   primaries disagree       → TIEBREAK: run deepseek; its verdict decides —
-#         tiebreaker APPROVE → PASS     (exit 0)  — tiebroken
-#         tiebreaker REJECT  → BLOCK    (exit 1)  — tiebroken
-#         tiebreaker UNCLEAR → ESCALATE (exit 3)  — tie unbroken; operator decides
-#   both primaries UNCLEAR   → ESCALATE (exit 3)  — no verdict to tiebreak (infra?)
-#
-# "disagree" INCLUDES the case where exactly one primary is UNCLEAR (no VERDICT
-# line parsed): one real opinion + one missing is still a tie for deepseek to
-# resolve. "both UNCLEAR" is held out — a tiebreaker breaks a tie between OPINIONS;
-# with zero usable opinions there is nothing to break (likely a provider/infra
-# fault), and a lone third model must not stand in for a dead panel. The non-pass
-# paths have DISTINCT exit codes (BLOCK 1 vs ESCALATE 3) and verdict-naming
-# messages. MU_REVIEW_OVERRIDE=1 is the operator's override on BLOCK *or* ESCALATE:
-# it proceeds (exit 0) and is logged as a calibration signal.
+# MU_REVIEW_OVERRIDE=1 is the operator's override on BLOCK *or* ESCALATE: it
+# proceeds (exit 0) and is logged as a calibration signal.
 #
 # Design: ~/.claude-personal/notes/design-prepr-review-and-degradation-gate.md
 # Process-layer auditors / correlation: bead mu-pr6r.
@@ -415,6 +394,14 @@ log_panel() { # $1=outcome(PASS|BLOCK|ESCALATE) $2=override(true|false)
     "$(json_escape "$PROVIDER3")" "$(json_escape "$MODEL3")" "$(json_escape "$V3")" \
     "$(json_escape "$BASE")" "$FILES" "$2" >> "$LOG"
 }
+log_panel_consensus() { # $1=outcome(PASS|BLOCK|ESCALATE) $2=verdict $3=rounds $4=override(true|false)
+  # Consensus-panel telemetry (mu-feur). Distinct schema from log_panel's
+  # single_shot shape: the converged verdict + the round count replace the
+  # fixed r1/r2/r3 slots, since the panel is N reviewers over variable rounds.
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+  printf '{"ts":"%s","event":"panel","mode":"consensus","outcome":"%s","verdict":"%s","rounds":%s,"base":"%s","files_changed":%s,"override":%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$(json_escape "$2")" "$3" "$(json_escape "$BASE")" "$FILES" "$4" >> "$LOG"
+}
 
 # ── CHUNKED MODE (review-gate v2: beads mu-ja1x, mu-u1it) ───────────────────
 #
@@ -709,93 +696,57 @@ if [ "$PROMPT_BYTES" -gt "$SS_MAX" ]; then
   run_chunked
 fi
 
-# --- run the panel: two primaries, same diff, sequentially -----------------
-echo "${C_DIM}ai-review: PANEL reviewing $FILES file(s) vs $BASE — primaries: $PROVIDER/$MODEL + $PROVIDER2/$MODEL2 (tiebreaker $PROVIDER3/$MODEL3 on split)${C_OFF}"
+# --- run the CONSENSUS panel (goal-protocol antagonistic convergence) -------
+# Replaces the old two-primary + tiebreaker single-shot panel (mu-feur). The
+# code_review role in agent_roles.toml (single source of truth for models AND
+# per-rank tools) reviews, then converges over <=N rounds to one verdict: each
+# round every reviewer sees the others' findings and is pushed to object/concede
+# toward agreement. Reuses this script's diff, full-file CONTEXT, and the
+# architecture-invariants block; reviewers emit JSON so convergence can quote each
+# the others' findings. (Large diffs still take the legacy chunked path above —
+# migrating chunked onto consensus is a follow-up.)
+PANEL_DIR="$(dirname "$0")/review-panel"
+CONS_OUT="$(mktemp -d "${TMPDIR:-/tmp}/ai-review-consensus.XXXXXX")"
+CONS_PROMPT="$CONS_OUT/round1.prompt.txt"
+{
+  printf 'You are a strict pre-PR code reviewer for `mu` (a Rust agent runtime). Review ONLY the change in the diff for: correctness bugs; concurrency/lifecycle hazards (a held reference that blocks shutdown, a clone that outlives its owner); missing error handling; safeguards nearby code applies but this diff omits. The FULL CONTENT of each changed file follows the diff, so CHECK it before reporting anything as undefined, and do NOT raise findings about unchanged code.%s %s\n\n' \
+    "$INVARIANTS_CLAUSE" "$TOOL_CLAUSE"
+  printf 'Respond with ONLY one JSON object (no prose, no markdown fence):\n'
+  printf '{"verdict":"approve"|"needs-changes","summary":"<1-2 sentences>","findings":[{"file":"<path>","line":<int>,"severity":"high"|"medium"|"low","issue":"<desc>"}]}\n'
+  [ -n "$INVARIANTS_BLOCK" ] && printf '%s\n' "$INVARIANTS_BLOCK"
+  printf '\nPR diff under review:\n```diff\n%s\n```\n' "$DIFF"
+  [ -n "$CONTEXT" ] && printf '\nFull content of changed files (CONTEXT only — definitions/guards outside the hunks; NOT part of the proposed change):\n%s\n' "$CONTEXT"
+} > "$CONS_PROMPT"
 
-echo "${C_DIM}── primary 1: $PROVIDER/$MODEL ─────────────────────────────${C_OFF}"
-REVIEW1="$(run_review "$PROVIDER" "$MODEL")"
-printf '%s\n' "$REVIEW1"
-V1="$(printf '%s' "$REVIEW1" | verdict_of)"
-log_reviewer r1 "$PROVIDER" "$MODEL" "$V1"
-echo "${C_DIM}  → primary 1 ($MODEL): $V1${C_OFF}"
-
-echo "${C_DIM}── primary 2: $PROVIDER2/$MODEL2 ─────────────────────────────${C_OFF}"
-REVIEW2="$(run_review "$PROVIDER2" "$MODEL2")"
-printf '%s\n' "$REVIEW2"
-V2="$(printf '%s' "$REVIEW2" | verdict_of)"
-log_reviewer r2 "$PROVIDER2" "$MODEL2" "$V2"
-echo "${C_DIM}  → primary 2 ($MODEL2): $V2${C_OFF}"
-
-V3=""   # set only if the tiebreaker runs; kept in the panel log either way
+echo "${C_DIM}ai-review: CONSENSUS panel (code_review role, <=${MU_REVIEW_MAX_ROUNDS:-4} rounds) reviewing $FILES file(s) vs $BASE${C_OFF}"
+CONS_RESULT="$(MU_BIN="$MU" sh "$PANEL_DIR/consensus.sh" "$CONS_PROMPT" "$CONS_OUT" "$ROOT" "${MU_REVIEW_MAX_ROUNDS:-4}" 2>&1)"
+printf '%s\n' "$CONS_RESULT"
+VERDICT_LINE="$(printf '%s\n' "$CONS_RESULT" | grep -E '^CONSENSUS |^NO CONSENSUS' | tail -1)"
+ROUNDS="$(printf '%s\n' "$CONS_RESULT" | grep -cE '^round [0-9]')"
 OVERRIDE_BOOL=false; [ "${MU_REVIEW_OVERRIDE:-}" = "1" ] && OVERRIDE_BOOL=true
 
-# --- primaries agree: short-circuit (no tiebreaker / openrouter call) ------
-if [ "$V1" = APPROVE ] && [ "$V2" = APPROVE ]; then
-  log_panel PASS false
-  echo "${C_GREEN}ai-review: PANEL PASS — both primaries APPROVE ($MODEL + $MODEL2).${C_OFF}"
-  exit 0
-fi
-if [ "$V1" = REJECT ] && [ "$V2" = REJECT ]; then
-  if [ "$OVERRIDE_BOOL" = true ]; then
-    log_panel BLOCK true
-    echo "${C_YEL}ai-review: PANEL BLOCK ($MODEL=REJECT, $MODEL2=REJECT) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
-    exit 0
-  fi
-  log_panel BLOCK false
-  echo "${C_RED}ai-review: PANEL BLOCK — both primaries REJECT ($MODEL=REJECT, $MODEL2=REJECT). Set MU_REVIEW_OVERRIDE=1 to proceed if you disagree.${C_OFF}" >&2
-  exit 1
-fi
-
-# --- both primaries UNCLEAR: no verdict to tiebreak — escalate -------------
-# A tiebreaker breaks a tie between OPINIONS. If NEITHER primary produced a
-# verdict (likely infra: provider auth, model-reload overrun, truncation), there
-# is nothing to break; surfacing ESCALATE is more honest than letting a lone
-# third model stand in for a dead panel.
-if [ "$V1" = UNCLEAR ] && [ "$V2" = UNCLEAR ]; then
-  echo "${C_DIM}  (both primaries UNCLEAR — no VERDICT line parsed; likely a provider/infra fault. stderr: $ERRLOG)${C_OFF}"
-  if [ "$OVERRIDE_BOOL" = true ]; then
-    log_panel ESCALATE true
-    echo "${C_YEL}ai-review: PANEL ESCALATE (both primaries UNCLEAR) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
-    exit 0
-  fi
-  log_panel ESCALATE false
-  echo "${C_YEL}ai-review: PANEL ESCALATE — both primaries returned no verdict ($MODEL=$V1, $MODEL2=$V2); not a tie to break. Check $ERRLOG.${C_OFF}" >&2
-  echo "${C_DIM}  Set MU_REVIEW_OVERRIDE=1 to proceed once you've adjudicated.${C_OFF}" >&2
-  exit 3
-fi
-
-# --- primaries disagree (split, or exactly one UNCLEAR): run the tiebreaker -
-echo "${C_YEL}ai-review: primaries SPLIT ($MODEL=$V1, $MODEL2=$V2) → tiebreaker $PROVIDER3/$MODEL3${C_OFF}"
-echo "${C_DIM}── tiebreaker: $PROVIDER3/$MODEL3 ─────────────────────────────${C_OFF}"
-REVIEW3="$(run_review "$PROVIDER3" "$MODEL3")"
-printf '%s\n' "$REVIEW3"
-V3="$(printf '%s' "$REVIEW3" | verdict_of)"
-log_reviewer r3 "$PROVIDER3" "$MODEL3" "$V3"
-echo "${C_DIM}  → tiebreaker ($MODEL3): $V3${C_OFF}"
-
-if [ "$V3" = APPROVE ]; then
-  log_panel PASS false
-  echo "${C_GREEN}ai-review: PANEL PASS (tiebroken) — primaries split $MODEL=$V1/$MODEL2=$V2, tiebreaker $MODEL3=APPROVE.${C_OFF}"
-  exit 0
-fi
-if [ "$V3" = REJECT ]; then
-  if [ "$OVERRIDE_BOOL" = true ]; then
-    log_panel BLOCK true
-    echo "${C_YEL}ai-review: PANEL BLOCK (tiebroken: $MODEL3=REJECT) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
-    exit 0
-  fi
-  log_panel BLOCK false
-  echo "${C_RED}ai-review: PANEL BLOCK (tiebroken) — primaries split $MODEL=$V1/$MODEL2=$V2, tiebreaker $MODEL3=REJECT. Set MU_REVIEW_OVERRIDE=1 to proceed if you disagree.${C_OFF}" >&2
-  exit 1
-fi
-
-# Tiebreaker itself returned no verdict: the tie is UNBROKEN — operator decides.
-if [ "$OVERRIDE_BOOL" = true ]; then
-  log_panel ESCALATE true
-  echo "${C_YEL}ai-review: PANEL ESCALATE (tiebreaker UNCLEAR) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
-  exit 0
-fi
-log_panel ESCALATE false
-echo "${C_YEL}ai-review: PANEL ESCALATE — primaries split ($MODEL=$V1, $MODEL2=$V2) and tiebreaker $MODEL3 returned no verdict.${C_OFF}" >&2
-echo "${C_YEL}  → operator decision required. Set MU_REVIEW_OVERRIDE=1 to proceed once you've adjudicated.${C_OFF}" >&2
-exit 3
+case "$VERDICT_LINE" in
+  "CONSENSUS approve")
+    log_panel_consensus PASS approve "$ROUNDS" false
+    echo "${C_GREEN}ai-review: PANEL PASS — consensus APPROVE after $ROUNDS round(s).${C_OFF}"
+    exit 0 ;;
+  "CONSENSUS needs-changes")
+    if [ "$OVERRIDE_BOOL" = true ]; then
+      log_panel_consensus BLOCK needs-changes "$ROUNDS" true
+      echo "${C_YEL}ai-review: PANEL BLOCK (consensus needs-changes) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
+      exit 0
+    fi
+    log_panel_consensus BLOCK needs-changes "$ROUNDS" false
+    echo "${C_RED}ai-review: PANEL BLOCK — consensus NEEDS-CHANGES after $ROUNDS round(s). Set MU_REVIEW_OVERRIDE=1 to proceed if you disagree.${C_OFF}" >&2
+    exit 1 ;;
+  *)
+    # consensus.sh exited 3 (no convergence within max rounds) or emitted no verdict line
+    if [ "$OVERRIDE_BOOL" = true ]; then
+      log_panel_consensus ESCALATE "${VERDICT_LINE:-none}" "$ROUNDS" true
+      echo "${C_YEL}ai-review: PANEL ESCALATE (no consensus) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
+      exit 0
+    fi
+    log_panel_consensus ESCALATE "${VERDICT_LINE:-none}" "$ROUNDS" false
+    echo "${C_YEL}ai-review: PANEL ESCALATE — panel did not converge after $ROUNDS round(s); operator decides. Per-round artifacts in $CONS_OUT. Set MU_REVIEW_OVERRIDE=1 to proceed once adjudicated.${C_OFF}" >&2
+    exit 3 ;;
+esac

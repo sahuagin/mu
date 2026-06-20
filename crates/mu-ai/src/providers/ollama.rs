@@ -122,6 +122,35 @@ impl OllamaProvider {
     }
 }
 
+/// Rewrite the wrapped [`AnthropicProvider`]'s self-label out of an
+/// error message so an ollama failure never surfaces as "anthropic".
+///
+/// OllamaProvider composes AnthropicProvider — ollama speaks the
+/// Anthropic Messages wire against the box (see the module docs), so the
+/// inner provider does the actual HTTP. But AnthropicProvider hardcodes
+/// its own [`provider_label`](Provider::provider_label) into every error
+/// string it builds: `"anthropic request: {e}"`, `"anthropic returned
+/// {status}: {text}"`, and the mid-stream `"anthropic stream error
+/// (...): ..."`. Surfaced verbatim from an ollama session that
+/// "anthropic" is actively misleading: a one-char model-name typo
+/// (`qwen3.6:35-a3b-q8_0`, missing the `b`) printed `provider: anthropic
+/// returned 404 ... model not found`, sending debugging toward real
+/// Anthropic / provider-selection for hours when the 404 came from the
+/// ollama box all along (bead mu-eb98, work item 1).
+///
+/// The rewrite is a blanket `"anthropic" -> "ollama"` rather than a
+/// prefix-only fix on purpose: the guarantee is "no ollama error ever
+/// leaks the word anthropic", and only a total replace delivers that —
+/// a prefix match would still pass an `anthropic` buried in the error
+/// body through. In practice the body is an ollama JSON error / a
+/// reqwest message, neither of which legitimately contains "anthropic",
+/// so nothing meaningful is clobbered; the inner label tokens become
+/// `ollama returned {status}`, `ollama request: {e}`, `ollama stream
+/// error (...)`.
+fn relabel_inner_error(msg: String) -> String {
+    msg.replace("anthropic", "ollama")
+}
+
 #[async_trait]
 impl Provider for OllamaProvider {
     async fn stream(
@@ -131,11 +160,22 @@ impl Provider for OllamaProvider {
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
-        // Identical wire protocol to Anthropic; delegate wholesale.
+        // Identical wire protocol to Anthropic; delegate wholesale —
+        // but relabel any inner error so it never leaks "anthropic"
+        // (see `relabel_inner_error` and bead mu-eb98). This `await?`
+        // is the SYNCHRONOUS surfacing path: request-send failures
+        // ("anthropic request: {e}") and non-2xx status
+        // ("anthropic returned {status}: {text}", e.g. a 404 for a
+        // mistyped model tag) come through here.
         let inner = self
             .inner
             .stream(system_prompt, input, tools, cancel_rx)
-            .await?;
+            .await
+            .map_err(|e| match e {
+                ProviderError::Other(msg) => ProviderError::Other(relabel_inner_error(msg)),
+                // Io carries no provider label to leak.
+                other => other,
+            })?;
         // Locally-served models flakily emit tool calls as plain text
         // in their training-native dialect, and ollama's template
         // parser doesn't always recover them into native tool_use
@@ -149,6 +189,11 @@ impl Provider for OllamaProvider {
                 ProviderEvent::Done(msg) => {
                     ProviderEvent::Done(super::tool_dialect::rescue_assistant_message(msg, &specs))
                 }
+                // MID-STREAM surfacing path: the inner provider emits
+                // SSE `error` events as `ProviderEvent::Error("anthropic
+                // stream error (...): ...")`. Relabel here for the same
+                // reason as the synchronous path above (bead mu-eb98).
+                ProviderEvent::Error(msg) => ProviderEvent::Error(relabel_inner_error(msg)),
                 other => other,
             })
             .boxed())
@@ -258,6 +303,41 @@ mod tests {
         );
         // anthropic_style usage carried through from the inner provider.
         assert_eq!(caps.usage_semantics.cache_read_in_input, Some(false));
+    }
+
+    #[test]
+    fn relabels_every_inner_anthropic_error_shape_to_ollama() {
+        // The wrapped AnthropicProvider hardcodes its own label into
+        // every error string it builds (anthropic.rs): the synchronous
+        // request/status errors and the mid-stream SSE error. From an
+        // ollama session that "anthropic" misleads debugging (bead
+        // mu-eb98). Guard the invariant on all three shapes: no leftover
+        // "anthropic", and the ollama label present in its place.
+        let cases = [
+            // non-2xx status — the 404-typo case that cost hours.
+            "anthropic returned 404: {\"error\":{\"message\":\"model 'qwen3.6:35-a3b-q8_0' not found\"}}",
+            // request-send failure.
+            "anthropic request: error sending request for url (http://10.1.1.143:11434/v1/messages)",
+            // mid-stream SSE error event.
+            "anthropic stream error (not_found): model 'x' not found",
+        ];
+        for c in cases {
+            let out = relabel_inner_error(c.to_string());
+            assert!(!out.contains("anthropic"), "leaked 'anthropic': {out}");
+            assert!(out.contains("ollama"), "missing 'ollama' label: {out}");
+        }
+        // The model tag in the body is preserved (only the label moves).
+        let out = relabel_inner_error(
+            "anthropic returned 404: model 'qwen3.6:35-a3b-q8_0' not found".to_string(),
+        );
+        assert!(
+            out.contains("qwen3.6:35-a3b-q8_0"),
+            "clobbered the body: {out}"
+        );
+        assert_eq!(
+            out,
+            "ollama returned 404: model 'qwen3.6:35-a3b-q8_0' not found"
+        );
     }
 
     #[test]

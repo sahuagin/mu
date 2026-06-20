@@ -123,7 +123,10 @@ PROVIDER="${MU_REVIEW_PROVIDER:-ollama}"
 MODEL="${MU_REVIEW_MODEL:-qwen3.6:27b}"
 PROVIDER2="${MU_REVIEW_PROVIDER_2:-openrouter}"
 MODEL2="${MU_REVIEW_MODEL_2:-deepseek/deepseek-v4-pro}"
-PROVIDER3="${MU_REVIEW_PROVIDER_3:-anthropic-api}"
+# reviewer-3 (tiebreaker) = claude-sonnet-4-6 via the Max SUBSCRIPTION
+# (claude-oauth → `claude -p`, handled in run_review). Was anthropic-api, which
+# is per-token AND operator-deactivated, so the tiebreaker was failing every run.
+PROVIDER3="${MU_REVIEW_PROVIDER_3:-claude-oauth}"
 MODEL3="${MU_REVIEW_MODEL_3:-claude-sonnet-4-6}"
 # Hosted reviewer that primary-1 falls back to when the local ollama model
 # isn't safe to use (a DIFFERENT model is resident, or ollama is unreachable).
@@ -336,6 +339,22 @@ run_review() { # $1=provider $2=model [$3=prompt-file, default $PROMPT_FILE] —
   # is missing). Replaces the MU_NO_RECALL=1 env spelling from #185.
   # shellcheck disable=SC2086 — $SYS_FLAGS intentionally word-splits
   local PF="${3:-$PROMPT_FILE}"   # chunked mode passes leaf/synthesis prompt files
+  # claude subscription reviewer: `mu ask` has no path to the Max sub —
+  # anthropic-api is per-token (and the operator deactivated it), and the
+  # OAuth provider is unimplemented in mu. So reach the $0 sub by shelling to
+  # `claude -p`. Prompt on STDIN, not argv: the review prompt can be ~1MB and
+  # would overflow ARG_MAX (mu-b6tl). Read-only tools (Read,Grep) mirror the
+  # mu-path TOOLS default; --exclude-dynamic-system-prompt-sections strips
+  # claude's agent scaffolding so the reviewer sees only $SYSPROMPT + the diff.
+  if [ "$1" = "claude-oauth" ]; then
+    local CL_SYS=""
+    [ -r "$SYSPROMPT" ] && CL_SYS="--append-system-prompt-file $SYSPROMPT"
+    # shellcheck disable=SC2086 — $CL_SYS intentionally word-splits
+    timeout "$TIMEOUT" claude -p --model "$2" $CL_SYS \
+      --exclude-dynamic-system-prompt-sections \
+      --allowedTools Read Grep --output-format text <"$PF" 2>>"$ERRLOG"
+    return
+  fi
   SYS_FLAGS=""
   [ -r "$SYSPROMPT" ] && SYS_FLAGS="--append-system-prompt $SYSPROMPT"
   if [ -n "$TOOLS" ]; then

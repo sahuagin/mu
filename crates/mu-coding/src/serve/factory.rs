@@ -14,6 +14,7 @@ use mu_ai::{
 };
 use mu_core::agent::{Provider, Tool};
 use mu_core::context::CacheTtl;
+use mu_core::model_catalog::ModelCatalogConfig;
 use mu_core::protocol::ProviderSelector;
 
 use crate::tools::{
@@ -164,6 +165,49 @@ pub fn selector_from_cli(name: &str, model: Option<&str>) -> Result<ProviderSele
             "unknown provider: {other} (expected: faux, anthropic-api, openai-codex, openrouter, vllm, ollama)"
         ),
     }
+}
+
+/// Resolve a possible SELECTION alias before `(provider, model)` reach
+/// [`selector_from_cli`]. If `model` names a favorite — its
+/// `[favorites.<name>]` table key or one of its `aliases` — the favorite's
+/// `{provider, model}` replaces BOTH inputs (a favorite is a complete
+/// selection, so it overrides the provider flag too). Otherwise the inputs
+/// pass through unchanged.
+///
+/// This is what lets a short name stand in for a long, typo-prone model tag
+/// that then lives in exactly one place (the favorite) instead of being
+/// retyped every run. Wiring it as a pre-step here (rather than inside
+/// `selector_from_cli`) keeps the wire-level mapping pure. (bead mu-eb98,
+/// work item 2)
+pub fn resolve_launch_selection(provider: &str, model: Option<&str>) -> (String, Option<String>) {
+    resolve_launch_selection_with_catalog(mu_core::model_catalog::global(), provider, model)
+}
+
+/// [`resolve_launch_selection`] against an explicit catalog — the testable
+/// seam (the public entry point passes the process-global catalog).
+fn resolve_launch_selection_with_catalog(
+    catalog: &ModelCatalogConfig,
+    provider: &str,
+    model: Option<&str>,
+) -> (String, Option<String>) {
+    if let Some(alias) = model {
+        if let Some((fav_provider, fav_model)) = catalog.resolve_selection_alias(alias) {
+            // The favorite's `provider` may be a catalog provider key/alias;
+            // map it to its canonical wire kind so selector_from_cli accepts it.
+            let resolved_provider = catalog
+                .provider(fav_provider)
+                .and_then(|p| p.kind.as_deref())
+                .unwrap_or(fav_provider);
+            tracing::info!(
+                alias,
+                provider = resolved_provider,
+                model = fav_model,
+                "selection alias resolved to favorite"
+            );
+            return (resolved_provider.to_string(), Some(fav_model.to_string()));
+        }
+    }
+    (provider.to_string(), model.map(str::to_string))
 }
 
 fn log_thinking_ignored(provider: &str, thinking: Option<&str>) {
@@ -366,6 +410,54 @@ mod tests {
             Ok(_) => panic!("expected error"),
             Err(e) => assert!(e.to_string().contains("unknown provider")),
         }
+    }
+
+    #[test]
+    fn selection_alias_rewrites_provider_and_model() {
+        use mu_core::model_catalog::{FavoriteConfig, ProviderCatalogConfig};
+        let mut catalog = ModelCatalogConfig::default();
+        // provider registered under a non-kind key + alias, to exercise the
+        // provider-kind mapping (favorite.provider -> canonical wire kind).
+        catalog.providers.insert(
+            "local".to_string(),
+            ProviderCatalogConfig {
+                kind: Some("ollama".to_string()),
+                aliases: vec!["box".to_string()],
+                ..Default::default()
+            },
+        );
+        catalog.favorites.insert(
+            "local_reasoner".to_string(),
+            FavoriteConfig {
+                provider: "local".to_string(), // catalog key, not the wire kind
+                model: "qwen3.6:35b-a3b-q8_0".to_string(),
+                aliases: vec!["lr".to_string()],
+                ..Default::default()
+            },
+        );
+
+        // A favorite alias as --model rewrites BOTH provider and model, and
+        // the favorite's catalog-key provider maps to its wire kind "ollama".
+        // The caller-supplied provider ("anthropic-api") is overridden.
+        let (p, m) = resolve_launch_selection_with_catalog(&catalog, "anthropic-api", Some("lr"));
+        assert_eq!(p, "ollama");
+        assert_eq!(m.as_deref(), Some("qwen3.6:35b-a3b-q8_0"));
+        // And the resolved pair maps to the right wire selector.
+        match selector_from_cli(&p, m.as_deref()).unwrap() {
+            ProviderSelector::Ollama { model } => assert_eq!(model, "qwen3.6:35b-a3b-q8_0"),
+            other => panic!("expected Ollama selector, got {other:?}"),
+        }
+
+        // A non-favorite model passes through untouched (provider preserved).
+        let (p2, m2) =
+            resolve_launch_selection_with_catalog(&catalog, "ollama", Some("deepseek-r1:32b"));
+        assert_eq!(p2, "ollama");
+        assert_eq!(m2.as_deref(), Some("deepseek-r1:32b"));
+
+        // No model -> nothing to resolve, passthrough.
+        let (p3, m3) = resolve_launch_selection_with_catalog(&catalog, "openai-codex", None);
+        assert_eq!(p3, "openai-codex");
+        assert_eq!(m3, None);
     }
 
     #[test]

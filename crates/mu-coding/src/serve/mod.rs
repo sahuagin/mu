@@ -30,7 +30,7 @@ pub use daemon_info::DaemonInfo;
 pub use discovery::{FileBackend, LocalRegistryBackend, SessionDiscovery};
 pub use factory::{
     build_provider_from_selector, build_tools, make_provider_factory, parse_tools_csv,
-    selector_from_cli, BashSettings, ProviderFactory,
+    resolve_launch_selection, selector_from_cli, BashSettings, ProviderFactory,
 };
 pub use sessions::{Sessions, WeakSessions};
 

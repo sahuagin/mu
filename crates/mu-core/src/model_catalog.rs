@@ -198,6 +198,44 @@ fn mis_keyed_model_tables(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The OTHER mis-key flavor: an UNQUOTED dotted key like `[models.gpt-5.5]`.
+/// An unquoted `.` is a table separator in TOML, so that parses as `models`
+/// -> `gpt-5` -> `5` (a table two levels down) instead of a model named
+/// `gpt-5.5`; the real fields land in a nested table the `#[serde(default)]`
+/// catalog ignores, so the entry is silently dropped (the 2026-06-20
+/// `[models.gpt-5.5]` incident). [`mis_keyed_model_tables`] above misses this:
+/// it makes a *valid* top-level `models` key, just over-nested. The tell — a
+/// `[models]` / `[model_rules]` entry whose value holds a NESTED TABLE, since
+/// real entries carry only scalar/array fields. Returns `(section,
+/// reconstructed_dotted_key)` so the warner can point at the quoted form.
+/// Pure; unparseable -> empty.
+fn dotted_nested_model_entries(text: &str) -> Vec<(String, String)> {
+    let Ok(value) = toml::from_str::<toml::Value>(text) else {
+        return Vec::new();
+    };
+    let Some(root) = value.as_table() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for section in ["models", "model_rules"] {
+        let Some(tbl) = root.get(section).and_then(|v| v.as_table()) else {
+            continue;
+        };
+        for (entry_key, entry_val) in tbl {
+            let Some(entry_tbl) = entry_val.as_table() else {
+                continue;
+            };
+            for (nested_key, nested_val) in entry_tbl {
+                if nested_val.is_table() {
+                    // best-effort reconstruct: `gpt-5` + `5` -> `gpt-5.5`.
+                    out.push((section.to_string(), format!("{entry_key}.{nested_key}")));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn warn_mis_keyed_model_tables(p: &Path) {
     let Ok(text) = std::fs::read_to_string(p) else {
         return;
@@ -214,6 +252,15 @@ fn warn_mis_keyed_model_tables(p: &Path) {
             "model catalog: top-level key `{key}` looks like a mis-keyed table — \
              quoting the whole path makes it a top-level key, not an entry under \
              [{section}], so it is SILENTLY IGNORED. Use [{section}.\"{entry}\"] instead."
+        );
+    }
+    for (section, dotted) in dotted_nested_model_entries(&text) {
+        tracing::warn!(
+            nested_key = %dotted,
+            "model catalog: `[{section}.{dotted}]` was read as NESTED tables, not a \
+             single entry named `{dotted}` — an unquoted `.` is a table separator in \
+             TOML, so the fields are buried and SILENTLY IGNORED. Quote the key: \
+             [{section}.\"{dotted}\"]."
         );
     }
 }
@@ -419,6 +466,40 @@ model = "gpt-oss-rev"
                 "models.qwen3.6:27b".to_string(),
             ],
             "only the whole-path-quoted tables are flagged; nested forms are fine"
+        );
+    }
+
+    #[test]
+    fn detects_dotted_nested_model_keys() {
+        // The 2026-06-20 footgun: an UNQUOTED dotted key. `[models.gpt-5.5]`
+        // parses as models -> gpt-5 -> 5, burying the fields in a nested table
+        // the catalog drops. The quoted form and ordinary single-segment keys
+        // must NOT be flagged.
+        let toml = r#"
+[models.gpt-5.5]
+model = "gpt-5.5"
+context_hard_limit = 1000000
+context_soft_limit = 262144
+
+[models."claude-opus-4-8"]
+model = "claude-opus-4-8"
+context_soft_limit = 200000
+
+[models.gpt-oss-rev]
+model = "gpt-oss-rev"
+
+[model_rules.deepseek.v4]
+prefix = "deepseek"
+"#;
+        let mut found = dotted_nested_model_entries(toml);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                ("model_rules".to_string(), "deepseek.v4".to_string()),
+                ("models".to_string(), "gpt-5.5".to_string()),
+            ],
+            "only the unquoted-dotted keys nest; quoted and single-segment keys are fine"
         );
     }
 

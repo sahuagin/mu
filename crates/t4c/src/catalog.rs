@@ -100,7 +100,7 @@ mod tests {
         // coexist in one file.
         let caps = curated();
         let chains = default_chains();
-        assert_eq!(caps.len(), 13, "expected 13 [[capability]] entries");
+        assert_eq!(caps.len(), 14, "expected 14 [[capability]] entries");
         assert_eq!(chains.len(), 4, "expected 4 [[chain]] entries");
         // chains carry their per-impl mandatory flags through the TOML round-trip
         let find = chains

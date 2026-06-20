@@ -82,6 +82,18 @@ argv = ["gh", "pr", "--help"]
 ai = false
 
 [[capability]]
+path = "bash.jj.describe"
+summary = "jujutsu — describe/rewrite commit messages. MUST always use -m flag (e.g., `jj describe -m \"message\"`). NEVER run bare `jj describe` without -m — it opens $EDITOR and hijacks stdin, wrecking the terminal session. This is a hard guard: editor invocation corrupts the agent's TTY state."
+keywords = [
+    "jj", "describe", "commit", "message", "rewrite", "jujutsu", "vcs", "change", "revision",
+]
+invoke = ["jj", "describe", "-m", "MESSAGE"]
+requires = []
+[capability.help]
+argv = ["jj", "describe", "--help"]
+ai = false
+
+[[capability]]
 path = "bash.jq"
 summary = "jq — query and transform JSON"
 keywords = ["json", "query", "filter", "transform", "parse"]

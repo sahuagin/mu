@@ -51,8 +51,12 @@ pub struct AskOptions {
 pub async fn run(opts: AskOptions) -> Result<()> {
     // Map the CLI provider flag to a wire-level selector. This is what
     // gets sent in create_session; the daemon constructs the provider
-    // per session from this.
-    let selector = crate::serve::selector_from_cli(&opts.provider, opts.model.as_deref())?;
+    // per session from this. First resolve a possible SELECTION alias
+    // (mu-eb98 item 2): a favorite name/alias passed as --model rewrites
+    // {provider, model} to the favorite's, so the long tag lives in one place.
+    let (provider, model) =
+        crate::serve::resolve_launch_selection(&opts.provider, opts.model.as_deref());
+    let selector = crate::serve::selector_from_cli(&provider, model.as_deref())?;
 
     // mu-fnn: generate a per-spawn bearer token for the trust-on-spawn
     // handshake with the child `mu serve`. The child reads

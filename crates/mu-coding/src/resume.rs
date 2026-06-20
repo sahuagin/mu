@@ -55,7 +55,11 @@ pub struct ResumeOptions {
 
 /// Run a single `mu resume` invocation.
 pub async fn run(opts: ResumeOptions) -> Result<()> {
-    let selector = crate::serve::selector_from_cli(&opts.provider, opts.model.as_deref())?;
+    // Resolve a possible SELECTION alias before the wire mapping (mu-eb98
+    // item 2): a favorite name/alias as --model rewrites {provider, model}.
+    let (provider, model) =
+        crate::serve::resolve_launch_selection(&opts.provider, opts.model.as_deref());
+    let selector = crate::serve::selector_from_cli(&provider, model.as_deref())?;
     let bearer_token = generate_bearer_token();
 
     let mut child = spawn_serve(

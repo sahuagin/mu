@@ -319,6 +319,23 @@ impl ModelCatalogConfig {
         })
     }
 
+    /// Resolve a SELECTION alias: a favorite name (the `[favorites.<name>]`
+    /// table key) or one of its `aliases` → that favorite's
+    /// `(provider, model)`. Returns `None` if `name` matches no favorite.
+    ///
+    /// This is the SELECTION counterpart to [`resolve_model`](Self::resolve_model)'s
+    /// ENRICHMENT: `resolve_model` attaches metadata to a model you already
+    /// chose; this *rewrites what to launch* — a short name standing in for a
+    /// full `{provider, model}` pair, so the long, typo-prone tag lives in
+    /// exactly one place (the favorite) instead of being retyped every run.
+    /// (bead mu-eb98, work item 2)
+    pub fn resolve_selection_alias(&self, name: &str) -> Option<(&str, &str)> {
+        self.favorites.iter().find_map(|(key, fav)| {
+            (key == name || fav.aliases.iter().any(|a| a == name))
+                .then_some((fav.provider.as_str(), fav.model.as_str()))
+        })
+    }
+
     pub fn favorites_for(&self, provider_kind: &str, model: &str) -> Vec<(&str, &FavoriteConfig)> {
         self.favorites
             .iter()
@@ -606,5 +623,36 @@ prefix = "deepseek"
         let favs = cfg.favorites_for("ollama", "qwen3.6:35b");
         assert_eq!(favs.len(), 1);
         assert_eq!(favs[0].0, "local_reasoner");
+    }
+
+    #[test]
+    fn resolve_selection_alias_matches_favorite_name_and_aliases() {
+        // A favorite is a selection alias: its table key OR any of its
+        // `aliases` resolves to the favorite's {provider, model} — the full
+        // tag lives only in the favorite (bead mu-eb98 item 2).
+        let toml = r#"
+            [favorites.local_reasoner]
+            provider = "ollama"
+            model = "qwen3.6:35b-a3b-q8_0"
+            aliases = ["lr", "qwen35"]
+        "#;
+        let cfg: ModelCatalogConfig = Figment::from(Toml::string(toml)).extract().unwrap();
+        // by table key
+        assert_eq!(
+            cfg.resolve_selection_alias("local_reasoner"),
+            Some(("ollama", "qwen3.6:35b-a3b-q8_0"))
+        );
+        // by each alias
+        assert_eq!(
+            cfg.resolve_selection_alias("lr"),
+            Some(("ollama", "qwen3.6:35b-a3b-q8_0"))
+        );
+        assert_eq!(
+            cfg.resolve_selection_alias("qwen35"),
+            Some(("ollama", "qwen3.6:35b-a3b-q8_0"))
+        );
+        // a non-favorite (e.g. a raw full tag) does not resolve
+        assert_eq!(cfg.resolve_selection_alias("qwen3.6:35b-a3b-q8_0"), None);
+        assert_eq!(cfg.resolve_selection_alias("nope"), None);
     }
 }

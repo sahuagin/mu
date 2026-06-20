@@ -63,7 +63,13 @@ memmap2 = { version = "0.9" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "1"
-tracing = "0.1"
+# `release_max_level_info` compiles out debug!/trace! in any build with
+# debug_assertions OFF — i.e. the `release` profile ships info+ only, no
+# debug logging. The `debugrelease` profile sets debug-assertions = true,
+# which flips that gate back on, so it keeps debug!/trace! (gated at runtime
+# by RUST_LOG) while staying release-fast. `debug` keeps them too. This is
+# the "fast + debuggable, stripped in release" split the profiles intend.
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # crypto / OAuth helpers

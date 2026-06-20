@@ -23,7 +23,38 @@ impl ClientHandler for StatusHandler {
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         let method = notification.method.clone();
         let status = if method == "mu/session_status" {
-            notification.params_as::<SessionStatus>().ok().flatten()
+            // Surface the outcome instead of silently swallowing it (was
+            // `.ok().flatten()`). A deserialize failure here is the exact
+            // silent drop that leaves the status meter blank: one field that
+            // doesn't round-trip nukes the WHOLE status and the meter stays
+            // empty with no signal. The warn survives `release`
+            // (release_max_level_info keeps warn+); the success/empty lines
+            // are debug! — run `debugrelease` + RUST_LOG=mu_solo=debug.
+            match notification.params_as::<SessionStatus>() {
+                Ok(Some(s)) => {
+                    debug!(
+                        provider_kind = %s.provider_kind,
+                        model = %s.model,
+                        context_soft_limit = ?s.context_soft_limit,
+                        context_hard_limit = ?s.context_hard_limit,
+                        context_used_tokens = ?s.context_used_tokens,
+                        "mu/session_status applied"
+                    );
+                    Some(s)
+                }
+                Ok(None) => {
+                    debug!("mu/session_status notification carried no params");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "mu/session_status DESERIALIZE FAILED — status dropped; \
+                         the meter will stay blank (a field did not round-trip)"
+                    );
+                    None
+                }
+            }
         } else {
             None
         };

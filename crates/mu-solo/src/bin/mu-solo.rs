@@ -102,6 +102,12 @@ impl Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // mu-solo owns the terminal, so its logs go to a FILE (the daemon
+    // writes stderr; a TUI can't). Default ~/.local/share/mu/solo/solo.log
+    // (override MU_SOLO_LOG), honoring RUST_LOG (default mu_solo=info). In a
+    // `release` build debug!/trace! are compiled out; use the `debugrelease`
+    // profile + RUST_LOG=mu_solo=debug to see them. Best-effort.
+    init_solo_tracing();
     let cli = Cli::parse();
     let mut cfg = config::load(cli.config.as_deref()).context("failed to load mu-solo config")?;
     config::apply_cli_overrides(&mut cfg, &cli.to_overrides());
@@ -191,6 +197,39 @@ async fn main() -> Result<()> {
     app.shutdown_daemon();
 
     run_result
+}
+
+/// Install a file-writing tracing subscriber for mu-solo. Mirrors the
+/// daemon's subscriber (`mu serve`) but writes to a file rather than stderr,
+/// because the TUI owns the terminal. Path = `MU_SOLO_LOG` or
+/// `~/.local/share/mu/solo/solo.log`; filter from `RUST_LOG`, default
+/// `mu_solo=info`. Every failure is swallowed — logging setup must never
+/// stop the app from starting.
+fn init_solo_tracing() {
+    let path = match std::env::var_os("MU_SOLO_LOG") {
+        Some(p) => PathBuf::from(p),
+        None => match dirs::data_dir() {
+            Some(d) => d.join("mu").join("solo").join("solo.log"),
+            None => return,
+        },
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("mu_solo=info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
+        .try_init();
 }
 
 /// Restores the terminal when dropped — including on panic unwind.

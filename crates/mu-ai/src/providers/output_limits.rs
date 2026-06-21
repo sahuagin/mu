@@ -21,10 +21,21 @@
 /// `claude-haiku-4-5-...` from accidentally hitting a generic
 /// `claude-*` rule.
 pub fn max_tokens_for_model(model: &str) -> u32 {
-    if let Some(v) = mu_core::model_catalog::global()
-        .resolve_model(model)
-        .max_output_tokens
-    {
+    max_tokens_for_model_with_catalog(mu_core::model_catalog::global(), model)
+}
+
+/// [`max_tokens_for_model`] against an explicit catalog — the testable seam.
+///
+/// The public entry point passes the process-global catalog; tests pass a
+/// controlled one (e.g. [`mu_core::model_catalog::built_in`]) so a user's
+/// `~/.config/mu/models.toml` cannot change the asserted value. (A test that
+/// read `global()` broke the build the moment an operator tuned their own
+/// per-model `max_output_tokens`. bead mu-nzxa.)
+pub fn max_tokens_for_model_with_catalog(
+    catalog: &mu_core::model_catalog::ModelCatalogConfig,
+    model: &str,
+) -> u32 {
+    if let Some(v) = catalog.resolve_model(model).max_output_tokens {
         return v;
     }
     let m = model.to_ascii_lowercase();
@@ -52,49 +63,56 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
 mod tests {
     use super::*;
 
+    // Assert against the compiled-in DEFAULT catalog, never the operator's
+    // ~/.config/mu/models.toml — a test must not break when the user tunes
+    // their own per-model limits (bead mu-nzxa).
+    fn mt(model: &str) -> u32 {
+        max_tokens_for_model_with_catalog(&mu_core::model_catalog::built_in(), model)
+    }
+
     #[test]
     fn opus_4_7_gets_16k() {
-        assert_eq!(max_tokens_for_model("claude-opus-4-7"), 16384);
-        assert_eq!(max_tokens_for_model("claude-opus-4-7-20260301"), 16384);
+        assert_eq!(mt("claude-opus-4-7"), 16384);
+        assert_eq!(mt("claude-opus-4-7-20260301"), 16384);
     }
 
     #[test]
     fn haiku_4_5_gets_8k() {
-        assert_eq!(max_tokens_for_model("claude-haiku-4-5"), 8192);
-        assert_eq!(max_tokens_for_model("claude-haiku-4-5-20251001"), 8192);
+        assert_eq!(mt("claude-haiku-4-5"), 8192);
+        assert_eq!(mt("claude-haiku-4-5-20251001"), 8192);
     }
 
     #[test]
     fn sonnet_4_6_gets_8k() {
-        assert_eq!(max_tokens_for_model("claude-sonnet-4-6"), 8192);
+        assert_eq!(mt("claude-sonnet-4-6"), 8192);
     }
 
     #[test]
     fn unknown_model_gets_safe_fallback() {
-        assert_eq!(max_tokens_for_model("some-future-model-v9"), 4096);
-        assert_eq!(max_tokens_for_model("claude-test"), 4096);
-        assert_eq!(max_tokens_for_model(""), 4096);
+        assert_eq!(mt("some-future-model-v9"), 4096);
+        assert_eq!(mt("claude-test"), 4096);
+        assert_eq!(mt(""), 4096);
     }
 
     #[test]
     fn case_insensitive() {
-        assert_eq!(max_tokens_for_model("Claude-Opus-4-7"), 16384);
-        assert_eq!(max_tokens_for_model("CLAUDE-HAIKU-4-5"), 8192);
+        assert_eq!(mt("Claude-Opus-4-7"), 16384);
+        assert_eq!(mt("CLAUDE-HAIKU-4-5"), 8192);
     }
 
     #[test]
     fn openai_reasoning_models_get_16k() {
-        assert_eq!(max_tokens_for_model("gpt-5"), 16384);
-        assert_eq!(max_tokens_for_model("o4-mini"), 16384);
-        assert_eq!(max_tokens_for_model("deepseek/deepseek-v4-pro"), 16384);
+        assert_eq!(mt("gpt-5"), 16384);
+        assert_eq!(mt("o4-mini"), 16384);
+        assert_eq!(mt("deepseek/deepseek-v4-pro"), 16384);
     }
 
     #[test]
     fn ollama_reasoning_models_get_16k() {
-        assert_eq!(max_tokens_for_model("gpt-oss:20b"), 16384);
-        assert_eq!(max_tokens_for_model("deepseek-r1:32b"), 16384);
-        assert_eq!(max_tokens_for_model("qwen3.6:35b-a3b-q8_0"), 16384);
+        assert_eq!(mt("gpt-oss:20b"), 16384);
+        assert_eq!(mt("deepseek-r1:32b"), 16384);
+        assert_eq!(mt("qwen3.6:35b-a3b-q8_0"), 16384);
         // Non-reasoning local models keep the conservative default.
-        assert_eq!(max_tokens_for_model("qwen3-coder:30b"), 4096);
+        assert_eq!(mt("qwen3-coder:30b"), 4096);
     }
 }

@@ -28,7 +28,7 @@ jobs:
     name: cargo clippy -D warnings (FreeBSD)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: clippy in a FreeBSD VM
         uses: vmactions/freebsd-vm@v1
         with:

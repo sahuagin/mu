@@ -24,6 +24,7 @@
 //!   `MU_SOLO_TUI__EFFORT=high`
 //!   `MU_SOLO_SESSION__MODEL=claude-haiku-4-5`
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -44,6 +45,40 @@ pub struct SoloConfig {
     pub session: SessionConfig,
     #[serde(default)]
     pub autonomy: AutonomyConfig,
+    /// mu-f7f6: named session presets — the user's reusable "plates".
+    /// `mu-solo -p <name>` uses `[profile.<name>]` as the session config
+    /// instead of `[session]`. Each profile is a (partial) [`SessionConfig`]:
+    /// any field it omits falls through to the SessionConfig defaults, so a
+    /// profile can be as small as `model` + `provider`. The `model` value is
+    /// a `[models]` label (resolved to a concrete name at launch via
+    /// [`mu_core::model_catalog::ModelCatalogConfig::resolve_model_name`]).
+    ///
+    /// ```toml
+    /// [profile.work]
+    /// model    = "architect"   # a [models] label, not the raw tag
+    /// provider = "openai-codex"
+    /// ```
+    #[serde(default)]
+    pub profile: BTreeMap<String, SessionConfig>,
+}
+
+impl SoloConfig {
+    /// Select the named profile as the session config. Errors — listing the
+    /// defined names — when `name` is unknown, so a typo fails loudly instead
+    /// of silently launching the default session. (bead mu-f7f6)
+    pub fn select_profile(&self, name: &str) -> Result<SessionConfig> {
+        self.profile.get(name).cloned().ok_or_else(|| {
+            let known: Vec<&str> = self.profile.keys().map(String::as_str).collect();
+            anyhow::anyhow!(
+                "unknown profile {name:?}; defined profiles: {}",
+                if known.is_empty() {
+                    "(none — add a [profile.<name>] block to solo.toml)".to_string()
+                } else {
+                    known.join(", ")
+                }
+            )
+        })
+    }
 }
 
 /// mu-7e21: autonomy grant for the solo session, forwarded as
@@ -500,6 +535,41 @@ mod tests {
         // Absent ⇒ off.
         let d: SoloConfig = toml::from_str("[session]\nmodel = \"x\"\n").expect("parse");
         assert_eq!(d.session.thinking, "");
+    }
+
+    #[test]
+    fn profile_selection_inherits_defaults_and_fails_loudly_on_typo() {
+        // A [profile.<name>] is a partial SessionConfig: it sets what it
+        // cares about (model label + provider) and inherits the rest. An
+        // unknown name is a hard error listing the known profiles. (mu-f7f6)
+        let toml = r#"
+            [profile.work]
+            model = "architect"
+            provider = "openai-codex"
+
+            [profile.review]
+            model = "deepseek"
+            provider = "openrouter"
+            bash_yolo = true
+        "#;
+        let c: SoloConfig = toml::from_str(toml).expect("parse");
+
+        let work = c.select_profile("work").expect("work profile exists");
+        assert_eq!(work.model, "architect"); // a label; resolved at launch
+        assert_eq!(work.provider, "openai-codex");
+        // omitted fields fall through to SessionConfig defaults
+        assert_eq!(work.tools, "read,write,edit,glob,grep,memory_recall,bash");
+        assert!(!work.bash_yolo);
+
+        let review = c.select_profile("review").expect("review profile exists");
+        assert_eq!(review.provider, "openrouter");
+        assert!(review.bash_yolo);
+
+        // typo → loud error naming the known profiles, not a silent default
+        let err = c.select_profile("wrok").expect_err("typo must error");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown profile"), "{msg}");
+        assert!(msg.contains("review") && msg.contains("work"), "{msg}");
     }
 
     #[test]

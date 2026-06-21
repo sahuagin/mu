@@ -78,6 +78,14 @@ struct Cli {
     /// Start with /focus mode on. Sets config.tui.focus_mode = true.
     #[arg(long)]
     focus: bool,
+
+    /// mu-f7f6: use the named `[profile.<name>]` from solo.toml as the
+    /// session config (instead of `[session]`) — your reusable "plate".
+    /// Its `model` is a `[models]` label, resolved at launch. Individual
+    /// `--provider`/`--model`/etc. flags still override the profile.
+    /// Omit to use `[session]`.
+    #[arg(short = 'p', long, value_name = "NAME")]
+    profile: Option<String>,
 }
 
 impl Cli {
@@ -110,7 +118,19 @@ async fn main() -> Result<()> {
     init_solo_tracing();
     let cli = Cli::parse();
     let mut cfg = config::load(cli.config.as_deref()).context("failed to load mu-solo config")?;
+    // mu-f7f6: `-p <name>` swaps in the named profile as the session config
+    // (its omitted fields inherit SessionConfig defaults), BEFORE CLI
+    // overrides so an explicit `--model`/`--provider` still wins.
+    if let Some(name) = cli.profile.as_deref() {
+        cfg.session = cfg
+            .select_profile(name)
+            .with_context(|| format!("--profile {name}"))?;
+    }
     config::apply_cli_overrides(&mut cfg, &cli.to_overrides());
+    // mu-f7f6: the resulting `model` may be a `[models]` label (its own or a
+    // profile's) — resolve the alias chain to the concrete upstream name the
+    // provider expects. Idempotent for a raw, non-label model id.
+    cfg.session.model = mu_core::model_catalog::global().resolve_model_name(&cfg.session.model);
 
     // Resolve cwd once: None ⇒ current process cwd. Held here (not in
     // the config struct after resolution) because the resolution time

@@ -55,7 +55,7 @@ case "$name" in
         # solo.toml ([session] or `-p <profile>`). Forcing them here only
         # clobbered the config; MU_SOLO_PROVIDER/MODEL existed solely to work
         # around that and are gone now.
-        ( cd "$root" && cargo build --release --bin mu --bin mu-solo )
+        # ( cd "$root" && cargo build --release --bin mu --bin mu-solo )
         TQ="${TQ:-$HOME/.cargo/bin/tq}"
         unset ANTHROPIC_BASE_URL
         ANTHROPIC_API_KEY=$("$TQ" -f "$HOME/.config/agent/config.toml" -r anthropic.api_key 2>/dev/null || true) \

@@ -91,10 +91,16 @@ impl RouteCatalog {
             .filter(|s| !s.is_empty())
             .is_some();
 
+        // mu-nzxa: resolve the enrichment catalog ONCE and thread it into
+        // build_entry, rather than each entry reaching for global(). The
+        // public path passes the process-global catalog; tests pass a
+        // controlled one so a user's models.toml can't change asserted values.
+        let catalog = model_catalog::global();
         let mut entries = Vec::new();
 
         for (model, soft, hard) in ANTHROPIC_MODELS {
             entries.push(build_entry(
+                catalog,
                 "anthropic_api",
                 model,
                 anthropic_key,
@@ -105,6 +111,7 @@ impl RouteCatalog {
 
         for (model, soft, hard) in OPENAI_CODEX_MODELS {
             entries.push(build_entry(
+                catalog,
                 "openai_codex",
                 model,
                 openai_key,
@@ -115,6 +122,7 @@ impl RouteCatalog {
 
         for (model, soft, hard) in OPENROUTER_MODELS {
             entries.push(build_entry(
+                catalog,
                 "openrouter",
                 model,
                 openrouter_key,
@@ -125,6 +133,7 @@ impl RouteCatalog {
 
         for (model, soft, hard) in VLLM_MODELS {
             entries.push(build_entry(
+                catalog,
                 "vllm",
                 model,
                 vllm_configured,
@@ -134,6 +143,7 @@ impl RouteCatalog {
         }
 
         entries.push(build_entry(
+            catalog,
             "faux",
             "faux",
             true,
@@ -157,13 +167,30 @@ impl RouteCatalog {
     /// window; until then an unknown window falls back to the safe
     /// `DEFAULT_COMPACTION_THRESHOLD` for compaction. Pricing is `None`
     /// (local = free). (bead mu-818c; context-limit-harden-sync)
-    pub fn with_ollama_models<I, S>(mut self, models: I) -> Self
+    pub fn with_ollama_models<I, S>(self, models: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.with_ollama_models_using(model_catalog::global(), models)
+    }
+
+    /// [`with_ollama_models`] against an explicit enrichment catalog — the
+    /// testable seam, so a unit test can supply the deterministic
+    /// [`model_catalog::built_in`] instead of the operator's live config.
+    /// The public method passes the process-global catalog. (bead mu-nzxa)
+    pub fn with_ollama_models_using<I, S>(
+        mut self,
+        catalog: &model_catalog::ModelCatalogConfig,
+        models: I,
+    ) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
         for m in models {
             self.entries.push(build_entry(
+                catalog,
                 "ollama",
                 m.as_ref(),
                 true,
@@ -189,8 +216,10 @@ impl RouteCatalog {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        let catalog = model_catalog::global();
         for m in models {
             self.entries.push(build_entry(
+                catalog,
                 "vllm",
                 m.as_ref(),
                 true,
@@ -223,13 +252,13 @@ impl RouteCatalog {
 }
 
 fn build_entry(
+    catalog: &model_catalog::ModelCatalogConfig,
     provider_kind: &str,
     model: &str,
     configured: bool,
     context_soft: Option<u64>,
     context_hard: Option<u64>,
 ) -> RouteEntry {
-    let catalog = model_catalog::global();
     let pricing = pricing::for_model(provider_kind, model);
     let model_settings = catalog.resolve_model(model);
     let provider_settings = catalog.provider(provider_kind);
@@ -351,6 +380,7 @@ mod tests {
     #[test]
     fn hash_is_deterministic() {
         let a = build_entry(
+            &model_catalog::built_in(),
             "anthropic_api",
             "claude-opus-4-7",
             true,
@@ -358,6 +388,7 @@ mod tests {
             Some(1_000_000),
         );
         let b = build_entry(
+            &model_catalog::built_in(),
             "anthropic_api",
             "claude-opus-4-7",
             true,
@@ -370,6 +401,7 @@ mod tests {
     #[test]
     fn hash_changes_with_limits() {
         let a = build_entry(
+            &model_catalog::built_in(),
             "anthropic_api",
             "claude-test-hash",
             true,
@@ -377,6 +409,7 @@ mod tests {
             Some(1_000_000),
         );
         let b = build_entry(
+            &model_catalog::built_in(),
             "anthropic_api",
             "claude-test-hash",
             true,
@@ -430,7 +463,11 @@ mod tests {
 
     #[test]
     fn ollama_qwen36_route_is_catalog_enriched() {
-        let catalog = RouteCatalog::from_env().with_ollama_models(["qwen3.6:35b-a3b-q8_0"]);
+        // Enrich against the deterministic built-in catalog, NOT the operator's
+        // live models.toml — otherwise a user tuning their own qwen3.6
+        // max_output_tokens breaks this test (bead mu-nzxa).
+        let catalog = RouteCatalog::from_env()
+            .with_ollama_models_using(&model_catalog::built_in(), ["qwen3.6:35b-a3b-q8_0"]);
         let q = catalog
             .find("ollama", "qwen3.6:35b-a3b-q8_0")
             .expect("discovered qwen3.6 route should be present");

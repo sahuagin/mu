@@ -132,6 +132,7 @@ impl Provider for AnthropicProvider {
     async fn stream(
         &self,
         system_prompt: Option<&str>,
+        effort: Option<&str>,
         input: MessageInput<'_>,
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
@@ -170,8 +171,17 @@ impl Provider for AnthropicProvider {
         // mu-upk2: layer the extended-thinking directive onto the built wire
         // body. Done here (not in build_request_body*) so the byte-parity test
         // suite keeps asserting the no-thinking shape; thinking is additive.
+        //
+        // mu-vcbm: a per-turn `/effort` selection wins over the launch-time
+        // `--thinking` default, normalized through the same flag mapping
+        // (so `off`/`none` disables for this turn, unknown ⇒ high). `None`
+        // falls back to the construction-time `thinking_effort`.
         let mut body = body;
-        apply_thinking(&mut body, self.thinking_effort.as_deref());
+        let call_effort: Option<String> = match effort {
+            Some(e) => parse_thinking_flag(e),
+            None => self.thinking_effort.clone(),
+        };
+        apply_thinking(&mut body, call_effort.as_deref());
 
         let resp = self
             .client

@@ -1227,7 +1227,7 @@ mod live_tests {
         }];
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let mut stream = provider
-            .stream(None, MessageInput::Legacy(&messages), &[], rx)
+            .stream(None, None, MessageInput::Legacy(&messages), &[], rx)
             .await
             .expect("provider.stream");
 
@@ -1282,6 +1282,7 @@ mod live_tests {
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let mut stream = provider
             .stream(
+                None,
                 None,
                 MessageInput::Legacy(&messages),
                 std::slice::from_ref(&echo_tool),

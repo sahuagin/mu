@@ -120,6 +120,7 @@ impl Provider for MockProvider {
     async fn stream(
         &self,
         _system_prompt: Option<&str>,
+        _effort: Option<&str>,
         _input: MessageInput<'_>,
         _tools: &[ToolSpec],
         _cancel_rx: oneshot::Receiver<()>,
@@ -416,7 +417,7 @@ async fn b1_single_turn_no_tools() {
     let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
 
     loop_
-        .send(AgentInput::UserMessage(user_msg("hello"), None))
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
         .await
         .expect("send");
     let events_handle = tokio::spawn(collect_events(events_rx));
@@ -475,6 +476,7 @@ async fn s5h_done_propagates_max_tokens_from_per_turn_stop_reason() {
         .send(AgentInput::UserMessage(
             user_msg("write a long thing"),
             None,
+            None,
         ))
         .await
         .expect("send");
@@ -509,7 +511,7 @@ async fn s5h_done_propagates_end_turn_when_provider_reports_end_turn() {
     let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
 
     loop_
-        .send(AgentInput::UserMessage(user_msg("hello"), None))
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
         .await
         .expect("send");
     let events_handle = tokio::spawn(collect_events(events_rx));
@@ -541,7 +543,7 @@ async fn b6_provider_error_recoverable() {
     let (loop_, mut events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
 
     loop_
-        .send(AgentInput::UserMessage(user_msg("hello"), None))
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
         .await
         .expect("send");
 
@@ -573,7 +575,7 @@ async fn b6_provider_error_recoverable() {
 
     // Loop is still alive — send another message.
     loop_
-        .send(AgentInput::UserMessage(user_msg("try again"), None))
+        .send(AgentInput::UserMessage(user_msg("try again"), None, None))
         .await
         .expect("loop should still be alive for second ask");
 }
@@ -597,7 +599,7 @@ async fn b2_single_tool_call() {
     let (loop_, events_rx) = spawn_loop(provider, tools, AgentConfig::default());
 
     loop_
-        .send(AgentInput::UserMessage(user_msg("hello"), None))
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
         .await
         .expect("send");
     let events_handle = tokio::spawn(collect_events(events_rx));
@@ -658,7 +660,7 @@ async fn b5_tool_error_continues() {
     let (loop_, events_rx) = spawn_loop(provider, tools, AgentConfig::default());
 
     loop_
-        .send(AgentInput::UserMessage(user_msg("hello"), None))
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
         .await
         .expect("send");
     let events_handle = tokio::spawn(collect_events(events_rx));
@@ -702,7 +704,7 @@ async fn b3_iteration_cap() {
     let (loop_, events_rx) = spawn_loop(provider, tools, config);
 
     loop_
-        .send(AgentInput::UserMessage(user_msg("hello"), None))
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
         .await
         .expect("send");
     let events_handle = tokio::spawn(collect_events(events_rx));
@@ -751,7 +753,7 @@ async fn mu_779s_iteration_cap_done_event_uses_iteration_cap_stop_reason() {
     let (loop_, events_rx) = spawn_loop(provider, tools, config);
 
     loop_
-        .send(AgentInput::UserMessage(user_msg("trigger cap"), None))
+        .send(AgentInput::UserMessage(user_msg("trigger cap"), None, None))
         .await
         .expect("send");
     let events_handle = tokio::spawn(collect_events(events_rx));
@@ -804,7 +806,7 @@ async fn b4_cancel_during_stream() {
     let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
 
     loop_
-        .send(AgentInput::UserMessage(user_msg("hello"), None))
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
         .await
         .expect("send user");
     // Give the loop a beat to enter the stream.
@@ -841,13 +843,13 @@ async fn b7_user_message_during_tool_pushes_to_back() {
     let (loop_, events_rx) = spawn_loop(provider, tools, AgentConfig::default());
 
     loop_
-        .send(AgentInput::UserMessage(user_msg("first"), None))
+        .send(AgentInput::UserMessage(user_msg("first"), None, None))
         .await
         .expect("send first");
     // Wait for the tool to start, then send a UserMessage.
     tokio::time::sleep(Duration::from_millis(20)).await;
     loop_
-        .send(AgentInput::UserMessage(user_msg("second"), None))
+        .send(AgentInput::UserMessage(user_msg("second"), None, None))
         .await
         .expect("send second");
 
@@ -939,14 +941,14 @@ async fn wf5w_buffered_um_does_not_suppress_done() {
     let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
 
     loop_
-        .send(AgentInput::UserMessage(user_msg("ask one"), None))
+        .send(AgentInput::UserMessage(user_msg("ask one"), None, None))
         .await
         .expect("send 1");
     // Let the loop enter the (gated) provider stream, then race the
     // follow-up in: it lands in handle_invoke_llm's `buffered`.
     tokio::time::sleep(Duration::from_millis(20)).await;
     loop_
-        .send(AgentInput::UserMessage(user_msg("ask two"), None))
+        .send(AgentInput::UserMessage(user_msg("ask two"), None, None))
         .await
         .expect("send 2");
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1033,7 +1035,7 @@ async fn mu_2e0h_tool_result_filter_applies_unless_verbatim() {
         };
         let (loop_, events_rx) = spawn_loop(provider, vec![tool], AgentConfig::default());
         loop_
-            .send(AgentInput::UserMessage(user_msg("go"), None))
+            .send(AgentInput::UserMessage(user_msg("go"), None, None))
             .await
             .expect("send");
         let events_handle = tokio::spawn(collect_events(events_rx));
@@ -1098,7 +1100,7 @@ fn plan_post_invoke_llm_text_only_no_buffered() {
 
 #[test]
 fn plan_post_invoke_llm_text_only_with_buffered() {
-    let buffered = vec![AgentInput::UserMessage(user_msg("more"), None)];
+    let buffered = vec![AgentInput::UserMessage(user_msg("more"), None, None)];
     let plan = plan_post_invoke_llm(&assistant_text_msg("ok"), buffered);
     // mu-wf5w: MaybeFinish comes FIRST so the completed ask emits its
     // `done` terminus before the buffered UM starts the next ask. The
@@ -1135,7 +1137,7 @@ fn plan_post_invoke_llm_with_tools_and_buffered() {
     // Tool calls + buffered UMs: both go on the queue, ExecuteTools
     // first so tools run before the user's queued message is
     // processed.
-    let buffered = vec![AgentInput::UserMessage(user_msg("inject"), None)];
+    let buffered = vec![AgentInput::UserMessage(user_msg("inject"), None, None)];
     let plan = plan_post_invoke_llm(&assistant_tool_msg("t1", "echo"), buffered);
     assert_eq!(plan.actions.len(), 2);
     assert!(matches!(plan.actions[0], Action::ExecuteTools(_)));
@@ -1155,8 +1157,8 @@ fn plan_post_execute_tools_basic() {
 #[test]
 fn plan_post_execute_tools_with_buffered_orders_inputs_first() {
     let buffered = vec![
-        AgentInput::UserMessage(user_msg("first"), None),
-        AgentInput::UserMessage(user_msg("second"), None),
+        AgentInput::UserMessage(user_msg("first"), None, None),
+        AgentInput::UserMessage(user_msg("second"), None, None),
     ];
     let actions = plan_post_execute_tools(buffered);
     // External(first), External(second), InvokeLlm — buffered go
@@ -1192,6 +1194,7 @@ fn should_push_invoke_llm_other_actions_yes() {
     q.push_back(Action::MaybeFinish);
     q.push_back(Action::External(AgentInput::UserMessage(
         user_msg("x"),
+        None,
         None,
     )));
     assert!(should_push_invoke_llm(&q));
@@ -1345,7 +1348,11 @@ async fn ask_permission_emits_input_required_and_dispatches_on_approve() {
         cap,
     );
     loop_
-        .send(AgentInput::UserMessage(user_msg("please use gated"), None))
+        .send(AgentInput::UserMessage(
+            user_msg("please use gated"),
+            None,
+            None,
+        ))
         .await
         .expect("send");
 
@@ -1434,7 +1441,11 @@ async fn ask_permission_times_out_and_denies_when_no_approver() {
         cap,
     );
     loop_
-        .send(AgentInput::UserMessage(user_msg("please use gated"), None))
+        .send(AgentInput::UserMessage(
+            user_msg("please use gated"),
+            None,
+            None,
+        ))
         .await
         .expect("send");
 
@@ -1505,7 +1516,11 @@ async fn mu_bkjr_validate_rejection_short_circuits_before_input_required() {
         cap,
     );
     loop_
-        .send(AgentInput::UserMessage(user_msg("trigger gated"), None))
+        .send(AgentInput::UserMessage(
+            user_msg("trigger gated"),
+            None,
+            None,
+        ))
         .await
         .expect("send");
     let events_handle = tokio::spawn(collect_events(events_rx));
@@ -1576,7 +1591,7 @@ async fn capability_refuses_tool_outside_allowed_set() {
         cap,
     );
     loop_
-        .send(AgentInput::UserMessage(user_msg("try blocked"), None))
+        .send(AgentInput::UserMessage(user_msg("try blocked"), None, None))
         .await
         .unwrap();
 
@@ -1646,7 +1661,11 @@ async fn capability_refuses_tool_missing_required_aws_capability() {
         cap,
     );
     loop_
-        .send(AgentInput::UserMessage(user_msg("run aws recon"), None))
+        .send(AgentInput::UserMessage(
+            user_msg("run aws recon"),
+            None,
+            None,
+        ))
         .await
         .unwrap();
 
@@ -1719,7 +1738,11 @@ async fn capability_allows_tool_when_required_aws_capability_is_held() {
         cap,
     );
     loop_
-        .send(AgentInput::UserMessage(user_msg("run aws recon"), None))
+        .send(AgentInput::UserMessage(
+            user_msg("run aws recon"),
+            None,
+            None,
+        ))
         .await
         .unwrap();
 
@@ -1778,7 +1801,11 @@ async fn run_one_tool_with_side_effects(
         cap,
     );
     loop_
-        .send(AgentInput::UserMessage(user_msg("call effecter"), None))
+        .send(AgentInput::UserMessage(
+            user_msg("call effecter"),
+            None,
+            None,
+        ))
         .await
         .unwrap();
 
@@ -1921,7 +1948,11 @@ async fn ask_permission_deny_synthesizes_error_result_without_running_tool() {
         cap,
     );
     loop_
-        .send(AgentInput::UserMessage(user_msg("please use gated"), None))
+        .send(AgentInput::UserMessage(
+            user_msg("please use gated"),
+            None,
+            None,
+        ))
         .await
         .unwrap();
 
@@ -2289,12 +2320,13 @@ impl Provider for MockProviderWithCompaction {
     async fn stream(
         &self,
         system_prompt: Option<&str>,
+        effort: Option<&str>,
         input: MessageInput<'_>,
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
         self.inner
-            .stream(system_prompt, input, tools, cancel_rx)
+            .stream(system_prompt, effort, input, tools, cancel_rx)
             .await
     }
 
@@ -2346,7 +2378,7 @@ async fn kgu4_default_config_does_not_emit_compaction_assembly() {
     let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
 
     loop_
-        .send(AgentInput::UserMessage(user_msg("hello there"), None))
+        .send(AgentInput::UserMessage(user_msg("hello there"), None, None))
         .await
         .expect("send");
     let events_handle = tokio::spawn(collect_events(events_rx));
@@ -2395,6 +2427,7 @@ async fn kgu4_evict_half_policy_fires_compaction_assembly_when_threshold_crossed
     loop_
         .send(AgentInput::UserMessage(
             user_msg("this user message has enough text to estimate non-zero tokens"),
+            None,
             None,
         ))
         .await
@@ -2487,7 +2520,7 @@ async fn kgu4_evict_half_policy_does_not_fire_when_threshold_not_crossed() {
     };
     let (loop_, events_rx) = spawn_loop_with_provider(provider, config);
     loop_
-        .send(AgentInput::UserMessage(user_msg("hi"), None))
+        .send(AgentInput::UserMessage(user_msg("hi"), None, None))
         .await
         .expect("send");
     let events_handle = tokio::spawn(collect_events(events_rx));
@@ -2582,6 +2615,7 @@ async fn mu_8bkf_hash_and_summary_policy_fires_compaction_assembly_with_correct_
                 "first message: long enough to guarantee at least one token and trigger compaction",
             ),
             None,
+            None,
         ))
         .await
         .expect("send first");
@@ -2603,6 +2637,7 @@ async fn mu_8bkf_hash_and_summary_policy_fires_compaction_assembly_with_correct_
                     let _ = tx
                         .send(AgentInput::UserMessage(
                             user_msg("second message: turn 2 picks up bg compaction"),
+                            None,
                             None,
                         ))
                         .await;
@@ -2691,6 +2726,8 @@ struct InputRecord {
     /// First five source span ids in the projection — a structural
     /// fingerprint that catches reshape regressions.
     first_span_ids: Vec<String>,
+    /// mu-vcbm: the per-call effort the loop passed to `stream()`.
+    effort: Option<String>,
 }
 
 impl RecordingProvider {
@@ -2709,15 +2746,18 @@ impl Provider for RecordingProvider {
     async fn stream(
         &self,
         _system_prompt: Option<&str>,
+        effort: Option<&str>,
         input: MessageInput<'_>,
         _tools: &[ToolSpec],
         _cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+        let effort = effort.map(str::to_owned);
         let record = match input {
             MessageInput::Legacy(msgs) => InputRecord {
                 variant: InputVariant::Legacy,
                 message_count: msgs.len(),
                 first_span_ids: Vec::new(),
+                effort,
             },
             MessageInput::Projected(pmsgs) => InputRecord {
                 variant: InputVariant::Projected,
@@ -2728,6 +2768,7 @@ impl Provider for RecordingProvider {
                     .take(5)
                     .filter_map(|m| m.source_span_ids().first().map(|s| s.as_ref().to_string()))
                     .collect(),
+                effort,
             },
         };
         self.records.lock().expect("records mutex").push(record);
@@ -2779,7 +2820,11 @@ async fn yqeq8_phase_d_smoke_tool_call_round_trip_uses_projected_path() {
     );
 
     loop_
-        .send(AgentInput::UserMessage(user_msg("call the tool"), None))
+        .send(AgentInput::UserMessage(
+            user_msg("call the tool"),
+            None,
+            None,
+        ))
         .await
         .expect("send");
     let events_handle = tokio::spawn(collect_events(events_rx));
@@ -2836,6 +2881,111 @@ async fn yqeq8_phase_d_smoke_tool_call_round_trip_uses_projected_path() {
             "msg-1-assistant",
             "msg-2-tool-result:t1",
         ],
+    );
+}
+
+// =============================================================================
+// mu-vcbm: per-turn reasoning effort threads the loop → Provider::stream
+// =============================================================================
+
+/// One scripted text-only turn, run to completion via the standard
+/// send → join → drain harness.
+fn effort_loop(
+    provider: Arc<dyn Provider>,
+    config: AgentConfig,
+    events_tx: mpsc::Sender<AgentEvent>,
+) -> AgentLoop {
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    loop_with(
+        provider,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        Vec::<Arc<dyn Tool>>::new(),
+        config,
+        events_tx,
+        approvals,
+        capability,
+    )
+}
+
+fn one_text_turn() -> Vec<Vec<ProviderEvent>> {
+    vec![vec![
+        ProviderEvent::TextDelta("ok".into()),
+        ProviderEvent::Done(assistant_text("ok")),
+    ]]
+}
+
+/// The launch-time effort default (`AgentConfig::effort`) seeds the
+/// session's standing effort and reaches `Provider::stream` when the ask
+/// carries no per-turn override.
+#[tokio::test]
+async fn vcbm_launch_default_effort_reaches_stream() {
+    let (provider, records) = RecordingProvider::new(one_text_turn());
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let loop_ = effort_loop(
+        provider as Arc<dyn Provider>,
+        AgentConfig {
+            effort: Some(Arc::from("high")),
+            ..AgentConfig::default()
+        },
+        events_tx,
+    );
+
+    // No per-turn effort on the ask → the launch default stands.
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hi"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    let _ = events_handle.await.expect("events drain");
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+    let records = records.lock().expect("records mutex").clone();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].effort.as_deref(),
+        Some("high"),
+        "launch-default effort should reach the provider when the ask omits one",
+    );
+}
+
+/// A per-turn `/effort` change carried on the ask (the UserMessage's
+/// third field) overrides the launch default for that turn.
+#[tokio::test]
+async fn vcbm_per_turn_effort_overrides_launch_default() {
+    let (provider, records) = RecordingProvider::new(one_text_turn());
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let loop_ = effort_loop(
+        provider as Arc<dyn Provider>,
+        AgentConfig {
+            effort: Some(Arc::from("high")),
+            ..AgentConfig::default()
+        },
+        events_tx,
+    );
+
+    // The ask carries effort=max → it wins over the launch default.
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("go deep"),
+            None,
+            Some(Arc::from("max")),
+        ))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    let _ = events_handle.await.expect("events drain");
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+    let records = records.lock().expect("records mutex").clone();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].effort.as_deref(),
+        Some("max"),
+        "per-turn /effort should override the launch default",
     );
 }
 
@@ -2930,7 +3080,11 @@ async fn wsgx_provider_feedback_triggers_compaction_raw_estimate_would_not() {
     );
 
     loop_
-        .send(AgentInput::UserMessage(user_msg("use the tool"), None))
+        .send(AgentInput::UserMessage(
+            user_msg("use the tool"),
+            None,
+            None,
+        ))
         .await
         .expect("send");
     let events_handle = tokio::spawn(collect_events(events_rx));
@@ -3334,7 +3488,11 @@ async fn first_call_message_count(config: AgentConfig) -> usize {
     ]]);
     let (loop_, events_rx) = spawn_loop_with_provider(provider, config);
     loop_
-        .send(AgentInput::UserMessage(user_msg("the new message"), None))
+        .send(AgentInput::UserMessage(
+            user_msg("the new message"),
+            None,
+            None,
+        ))
         .await
         .expect("send");
     let events_handle = tokio::spawn(collect_events(events_rx));
@@ -3445,6 +3603,7 @@ async fn uz0n_hint_span_follows_user_and_is_stable_across_rounds() {
         .send(AgentInput::UserMessage(
             user_msg("frobnicate the widget for me"),
             None,
+            None,
         ))
         .await
         .expect("send");
@@ -3487,7 +3646,7 @@ async fn uz0n_no_hint_without_config() {
         RecordingProvider::new(vec![vec![ProviderEvent::Done(assistant_text("ok"))]]);
     let (loop_, events_rx) = spawn_loop_with_provider(provider, AgentConfig::default());
     loop_
-        .send(AgentInput::UserMessage(user_msg("frobnicate"), None))
+        .send(AgentInput::UserMessage(user_msg("frobnicate"), None, None))
         .await
         .expect("send");
     let events_handle = tokio::spawn(collect_events(events_rx));
@@ -3605,7 +3764,11 @@ async fn panicking_tool_becomes_error_result_and_loop_continues() {
     );
 
     loop_
-        .send(AgentInput::UserMessage(user_msg("run the tool"), None))
+        .send(AgentInput::UserMessage(
+            user_msg("run the tool"),
+            None,
+            None,
+        ))
         .await
         .expect("first send");
     let ask1 = drain_until_done(&mut events_rx).await;
@@ -3626,7 +3789,11 @@ async fn panicking_tool_becomes_error_result_and_loop_continues() {
     // the loop task had unwound and this send returned Err (surfaced
     // by the daemon as -32603 "session loop has terminated").
     loop_
-        .send(AgentInput::UserMessage(user_msg("still there?"), None))
+        .send(AgentInput::UserMessage(
+            user_msg("still there?"),
+            None,
+            None,
+        ))
         .await
         .expect("loop must still accept input after a tool panic");
     let ask2 = drain_until_done(&mut events_rx).await;
@@ -3680,7 +3847,7 @@ async fn panicking_sync_compaction_does_not_kill_loop() {
     );
 
     loop_
-        .send(AgentInput::UserMessage(user_msg("hello"), None))
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
         .await
         .expect("first send");
     let ask1 = drain_until_done(&mut events_rx).await;
@@ -3700,7 +3867,7 @@ async fn panicking_sync_compaction_does_not_kill_loop() {
 
     // Loop survives for a follow-up ask.
     loop_
-        .send(AgentInput::UserMessage(user_msg("again"), None))
+        .send(AgentInput::UserMessage(user_msg("again"), None, None))
         .await
         .expect("loop must still accept input after a compaction panic");
     let ask2 = drain_until_done(&mut events_rx).await;

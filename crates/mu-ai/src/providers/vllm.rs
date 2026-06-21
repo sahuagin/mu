@@ -86,13 +86,14 @@ impl Provider for VllmProvider {
     async fn stream(
         &self,
         system_prompt: Option<&str>,
+        effort: Option<&str>,
         input: MessageInput<'_>,
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
         let inner = self
             .inner
-            .stream(system_prompt, input, tools, cancel_rx)
+            .stream(system_prompt, effort, input, tools, cancel_rx)
             .await?;
         Ok(inner.boxed())
     }

@@ -146,7 +146,7 @@ async fn call_provider(
 
     let work = async {
         let mut stream = provider
-            .stream(None, MessageInput::Legacy(&messages), &[], cancel_rx)
+            .stream(None, None, MessageInput::Legacy(&messages), &[], cancel_rx)
             .await
             .map_err(|e| JudgeError::Call(format!("provider.stream open: {e}")))?;
         let mut text = String::new();
@@ -230,6 +230,7 @@ mod tests {
         async fn stream(
             &self,
             _system_prompt: Option<&str>,
+            _effort: Option<&str>,
             _input: MessageInput<'_>,
             _tools: &[ToolSpec],
             _cancel_rx: tokio::sync::oneshot::Receiver<()>,

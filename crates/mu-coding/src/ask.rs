@@ -294,6 +294,9 @@ async fn create_session(
         // mu-779s: per-session max_turns cap. `None` → use provider default.
         // `Some(0)` → disable cap entirely.
         max_turns,
+        // mu-vcbm: `mu ask` is a batch one-shot with no interactive
+        // `/effort` dial — use the provider's launch default.
+        effort: None,
     };
     let req = json!({
         "jsonrpc": "2.0",

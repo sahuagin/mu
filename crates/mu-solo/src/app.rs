@@ -240,9 +240,11 @@ fn truncate_at_word(s: &str, max: usize) -> String {
 }
 
 /// Session-level effort dial. Layer on top of model selection per
-/// claude-code-feature-mapping §17. v0 is display-only — `ask_session`'s
-/// wire schema doesn't carry effort yet, so this knob exists in the
-/// TUI surface ready to attach when the daemon learns the field.
+/// claude-code-feature-mapping §17. mu-vcbm: live — `fire_ask` carries
+/// the selected level on every `ask_session.effort`; the daemon applies
+/// it stickily and maps it onto the provider's thinking/reasoning
+/// directive. (mu-vcbm slice 2 will config-drive the allowed levels and
+/// default, retiring this hardcoded enum.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffortLevel {
     Low,
@@ -302,8 +304,8 @@ pub struct App {
     daemon_id: String,
     /// Daemon version string. Surfaced via /status.
     daemon_version: String,
-    /// Session-level effort dial (§17). Display-only in v0 — attached
-    /// to `ask_session` params once the daemon learns the field.
+    /// Session-level effort dial (§17). mu-vcbm: sent on every
+    /// `ask_session.effort` by `fire_ask`; the daemon applies it stickily.
     effort: EffortLevel,
     /// Focus mode (§16): when true, suppress streaming text_delta
     /// previews and render the assistant block in one shot on
@@ -2054,11 +2056,15 @@ impl App {
         // longer than the RPC timeout spuriously errored). The
         // response is delivered to the select loop as a
         // Message::Response and handled in handle_message.
+        // mu-vcbm: carry the current `/effort` dial selection on every
+        // ask. The daemon applies it stickily (idempotent when unchanged),
+        // so the session's standing effort always tracks the dial.
         let id = self.client.request_nowait(
             "ask_session",
             serde_json::json!({
                 "session_id": self.session_id,
                 "user_message": wire_text,
+                "effort": self.effort.as_str(),
             }),
         )?;
         self.pending_ask_ids.insert(id);

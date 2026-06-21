@@ -1624,7 +1624,7 @@ mod tests {
             .expect("input delivered")
             .expect("channel open");
         match delivered {
-            AgentInput::UserMessage(_, ticket) => {
+            AgentInput::UserMessage(_, ticket, _) => {
                 assert!(ticket.is_none(), "daemon-slot asks carry no ticket");
             }
             other => panic!("expected UserMessage, got {other:?}"),
@@ -1727,7 +1727,7 @@ mod tests {
             .expect("input delivered")
             .expect("channel open");
         let ticket = match delivered {
-            AgentInput::UserMessage(_, Some(t)) => t,
+            AgentInput::UserMessage(_, Some(t), _) => t,
             other => panic!("expected ticketed UserMessage, got {other:?}"),
         };
         let received_id = log
@@ -1967,7 +1967,7 @@ mod tests {
                 .unwrap_or_else(|_| panic!("input {i} (ask) not delivered"))
                 .expect("channel open");
             match delivered {
-                AgentInput::UserMessage(mu_core::agent::AgentMessage::User { content }, _) => {
+                AgentInput::UserMessage(mu_core::agent::AgentMessage::User { content }, _, _) => {
                     assert!(
                         content.starts_with(&format!("m{i}:")),
                         "asks must arrive in journal order: expected m{i}, got {}…",
@@ -2029,7 +2029,7 @@ mod tests {
             .await
             .expect("session B must not be delayed by session A's wedge")
             .expect("channel open");
-        assert!(matches!(delivered, AgentInput::UserMessage(_, _)));
+        assert!(matches!(delivered, AgentInput::UserMessage(_, _, _)));
 
         // …and the control plane still answers daemon-scoped commands.
         assert!(ingest(&control, request("ping", json!(null)), test_origin(), &auth).is_none());

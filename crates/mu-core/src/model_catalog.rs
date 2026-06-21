@@ -5,7 +5,7 @@
 //! This is the configuration half; [`crate::route_catalog`] turns it
 //! into provider×model route entries for front ends.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -165,12 +165,96 @@ pub fn load(config_path: Option<&Path>) -> ModelCatalogConfig {
             fig = fig.merge(Toml::file(p));
         }
     }
-    fig.merge(Env::prefixed("MU_MODELS_").split("__"))
+    let mut merged: ModelCatalogConfig = fig
+        .merge(Env::prefixed("MU_MODELS_").split("__"))
         .extract()
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "invalid model catalog config; using built-in defaults");
             built_in()
-        })
+        });
+    // mu-ply3: an operator [models] override keyed under a custom alias (e.g.
+    // [models.opus]) must win over a built-in/generated entry for the SAME
+    // `model` under a DIFFERENT key (e.g. the built-in [models.claude_opus_4_8]).
+    // Figment merges by KEY, so the differently-keyed operator entry became a
+    // duplicate that resolve_model's key-ordered scan silently shadowed — the
+    // operator could edit their values forever with no effect. Collapse the
+    // duplicates, operator-wins, so resolve_model sees one preferred entry.
+    if let Some(p) = path.as_ref().filter(|p| p.exists()) {
+        let operator_keys: BTreeSet<String> = load_operator_only(p).models.into_keys().collect();
+        fold_operator_overrides(&mut merged.models, &operator_keys);
+    }
+    merged
+}
+
+/// Collapse operator overrides keyed under a custom alias onto the
+/// built-in/generated entry they're meant to override (bead mu-ply3; called
+/// from [`load`]). For each model an operator-layer entry defines, every OTHER
+/// entry (a non-operator key) with the same `model` is folded into the operator
+/// entry — operator values win, the shadow fills only the fields the operator
+/// left unset (matching same-key Figment merge) — then the shadow is removed.
+/// One operator-preferred entry survives, so [`ModelCatalogConfig::resolve_model`]'s
+/// `.values().find()` can no longer return a built-in entry that sorts ahead of it.
+fn fold_operator_overrides(
+    models: &mut BTreeMap<String, ModelCatalogEntry>,
+    operator_keys: &BTreeSet<String>,
+) {
+    let op_pairs: Vec<(String, String)> = models
+        .iter()
+        .filter(|(k, _)| operator_keys.contains(k.as_str()))
+        .filter_map(|(k, m)| m.model.clone().map(|model| (k.clone(), model)))
+        .collect();
+    for (op_key, model) in op_pairs {
+        let shadow_keys: Vec<String> = models
+            .iter()
+            .filter(|(k, m)| {
+                k.as_str() != op_key
+                    && !operator_keys.contains(k.as_str())
+                    && m.model.as_deref() == Some(model.as_str())
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for sk in shadow_keys {
+            if let Some(shadow) = models.get(&sk).cloned() {
+                if let Some(op_entry) = models.get_mut(&op_key) {
+                    fill_missing_fields(op_entry, &shadow);
+                }
+            }
+            models.remove(&sk);
+        }
+    }
+}
+
+/// Copy `src`'s set fields into `dst` ONLY where `dst` left them unset, so an
+/// operator override keeps its explicit values and inherits the built-in's for
+/// everything it didn't specify. (bead mu-ply3)
+fn fill_missing_fields(dst: &mut ModelCatalogEntry, src: &ModelCatalogEntry) {
+    if dst.model.is_none() {
+        dst.model = src.model.clone();
+    }
+    if dst.family.is_none() {
+        dst.family = src.family.clone();
+    }
+    if dst.label.is_none() {
+        dst.label = src.label.clone();
+    }
+    if dst.aliases.is_empty() {
+        dst.aliases = src.aliases.clone();
+    }
+    if dst.context_soft_limit.is_none() {
+        dst.context_soft_limit = src.context_soft_limit;
+    }
+    if dst.context_hard_limit.is_none() {
+        dst.context_hard_limit = src.context_hard_limit;
+    }
+    if dst.max_output_tokens.is_none() {
+        dst.max_output_tokens = src.max_output_tokens;
+    }
+    if dst.reasoning_in_output.is_none() {
+        dst.reasoning_in_output = src.reasoning_in_output;
+    }
+    if dst.quirks.is_empty() {
+        dst.quirks = src.quirks.clone();
+    }
 }
 
 /// Warn on the `["models.x:y"]` footgun. Quoting the *whole* dotted path
@@ -718,5 +802,65 @@ prefix = "deepseek"
         assert_eq!(cfg.resolve_model_name("selfref"), "selfref");
         // unknown label passes through (it's treated as already-a-name)
         assert_eq!(cfg.resolve_model_name("nope"), "nope");
+    }
+
+    #[test]
+    fn operator_alias_override_wins_over_builtin_same_model_different_key() {
+        // The built-in keys opus under `claude_opus_4_8`; the operator overrides
+        // it under a custom alias `opus` — different key, SAME model. Without the
+        // fold, resolve_model's key-ordered scan returns the built-in (sorts
+        // first) and the operator's edits are silently shadowed (bead mu-ply3,
+        // the live 2026-06-21 opus-context bug).
+        let toml = r#"
+            [models.claude_opus_4_8]
+            model = "claude-opus-4-8"
+            family = "claude-opus-4"
+            context_soft_limit = 200000
+            context_hard_limit = 1000000
+            max_output_tokens = 16384
+
+            [models.opus]
+            model = "claude-opus-4-8"
+            context_soft_limit = 500000
+            context_hard_limit = 750000
+        "#;
+        let mut cfg: ModelCatalogConfig = Figment::from(Toml::string(toml)).extract().unwrap();
+
+        // Pre-fold: the built-in (sorts first) shadows the alias override.
+        assert_eq!(
+            cfg.resolve_model("claude-opus-4-8").context_soft_limit,
+            Some(200000),
+            "pre-fix: built-in shadows the operator's alias-keyed override"
+        );
+
+        // Mark `opus` as the operator-layer key and fold.
+        let operator_keys: BTreeSet<String> = ["opus".to_string()].into_iter().collect();
+        fold_operator_overrides(&mut cfg.models, &operator_keys);
+
+        // The built-in shadow is gone; the operator entry kept its values and
+        // inherited the built-in's for fields it didn't set.
+        assert!(
+            !cfg.models.contains_key("claude_opus_4_8"),
+            "built-in shadow removed"
+        );
+        let opus = &cfg.models["opus"];
+        assert_eq!(opus.context_soft_limit, Some(500000), "operator value wins");
+        assert_eq!(opus.context_hard_limit, Some(750000), "operator value wins");
+        assert_eq!(
+            opus.max_output_tokens,
+            Some(16384),
+            "inherited from built-in"
+        );
+        assert_eq!(opus.family.as_deref(), Some("claude-opus-4"), "inherited");
+
+        // Post-fold: resolve_model now returns the operator's values.
+        assert_eq!(
+            cfg.resolve_model("claude-opus-4-8").context_soft_limit,
+            Some(500000)
+        );
+        assert_eq!(
+            cfg.resolve_model("claude-opus-4-8").context_hard_limit,
+            Some(750000)
+        );
     }
 }

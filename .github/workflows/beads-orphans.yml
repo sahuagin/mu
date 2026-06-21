@@ -22,7 +22,7 @@ jobs:
     name: beads orphans (PR-scoped, informational)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # need base..head commits to scan for bead references
 

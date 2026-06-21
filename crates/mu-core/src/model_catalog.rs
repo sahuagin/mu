@@ -336,6 +336,32 @@ impl ModelCatalogConfig {
         })
     }
 
+    /// Resolve a model LABEL to a concrete model name.
+    ///
+    /// A `[models.<label>]` table key is a memorable, arbitrary alias (e.g.
+    /// `architect`, `coding`); its `model` field is the name it stands for
+    /// (which may itself be another label, or the exact upstream tag). This
+    /// follows the chain — `coding → gpt-5.5`, `local → qwen3-6 →
+    /// qwen3.6:35b-a3b-q8_0` — and returns the terminal name. An input that
+    /// is NOT a `[models]` key is already a concrete name and passes through
+    /// unchanged, so calling this on any model string is safe and idempotent.
+    ///
+    /// Loop-safe: a self-referential entry (`[models.x] model = "x"`) or a
+    /// cycle (`a → b → a`) terminates at the first repeat. (bead mu-f7f6)
+    pub fn resolve_model_name(&self, input: &str) -> String {
+        let mut name = input.to_string();
+        let mut seen = std::collections::HashSet::new();
+        while seen.insert(name.clone()) {
+            match self.models.get(&name).and_then(|m| m.model.as_deref()) {
+                // Points at a *different* name → keep following the chain.
+                Some(next) if next != name => name = next.to_string(),
+                // No `model` field, or it points at itself → terminal.
+                _ => break,
+            }
+        }
+        name
+    }
+
     pub fn favorites_for(&self, provider_kind: &str, model: &str) -> Vec<(&str, &FavoriteConfig)> {
         self.favorites
             .iter()
@@ -654,5 +680,43 @@ prefix = "deepseek"
         // a non-favorite (e.g. a raw full tag) does not resolve
         assert_eq!(cfg.resolve_selection_alias("qwen3.6:35b-a3b-q8_0"), None);
         assert_eq!(cfg.resolve_selection_alias("nope"), None);
+    }
+
+    #[test]
+    fn resolve_model_name_follows_label_chains_and_passes_raw_through() {
+        // `[models.<label>]` keys are arbitrary aliases; `model` is the name
+        // they stand for, which may be another label. resolve_model_name
+        // follows the chain to the terminal name (bead mu-f7f6).
+        let toml = r#"
+            [models.architect]
+            model = "gpt-5.5-codex"
+
+            [models.coding]
+            model = "gpt-5.5"
+
+            [models.local]
+            model = "qwen3-6"
+            [models.qwen3-6]
+            model = "qwen3.6:35b-a3b-q8_0"
+
+            [models.selfref]
+            model = "selfref"
+        "#;
+        let cfg: ModelCatalogConfig = Figment::from(Toml::string(toml)).extract().unwrap();
+        // single hop: label -> upstream name
+        assert_eq!(cfg.resolve_model_name("architect"), "gpt-5.5-codex");
+        assert_eq!(cfg.resolve_model_name("coding"), "gpt-5.5");
+        // two hops: local -> qwen3-6 -> the exact tag
+        assert_eq!(cfg.resolve_model_name("local"), "qwen3.6:35b-a3b-q8_0");
+        // a raw name that is not a label passes through unchanged
+        assert_eq!(cfg.resolve_model_name("gpt-5.5"), "gpt-5.5");
+        assert_eq!(
+            cfg.resolve_model_name("qwen3.6:35b-a3b-q8_0"),
+            "qwen3.6:35b-a3b-q8_0"
+        );
+        // self-reference terminates (does not loop) and yields the key
+        assert_eq!(cfg.resolve_model_name("selfref"), "selfref");
+        // unknown label passes through (it's treated as already-a-name)
+        assert_eq!(cfg.resolve_model_name("nope"), "nope");
     }
 }

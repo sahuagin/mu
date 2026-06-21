@@ -311,38 +311,17 @@ PROMPT_FILE="$(mktemp "${TMPDIR:-/tmp}/ai-review-prompt.XXXXXX")"
 trap 'rm -f "$PROMPT_FILE"' EXIT
 printf '%s' "$PROMPT" > "$PROMPT_FILE"
 
-run_review() { # $1=provider $2=model [$3=prompt-file, default $PROMPT_FILE] — prints reviewer stdout; stderr -> $ERRLOG
-  # The reviewer session must be hermetic: --bare (PR #187) guarantees
-  # mu injects nothing — no session-start memory/project-file recall,
-  # no discovery bootstrap — so the session's system prompt is exactly
-  # the minimal reviewer prompt below (and nothing at all if the file
-  # is missing). Replaces the MU_NO_RECALL=1 env spelling from #185.
-  # shellcheck disable=SC2086 — $SYS_FLAGS intentionally word-splits
-  local PF="${3:-$PROMPT_FILE}"   # chunked mode passes leaf/synthesis prompt files
-  # claude subscription reviewer: `mu ask` has no path to the Max sub —
-  # anthropic-api is per-token (and the operator deactivated it), and the
-  # OAuth provider is unimplemented in mu. So reach the $0 sub by shelling to
-  # `claude -p`. Prompt on STDIN, not argv: the review prompt can be ~1MB and
-  # would overflow ARG_MAX (mu-b6tl). Read-only tools (Read,Grep) mirror the
-  # mu-path TOOLS default; --exclude-dynamic-system-prompt-sections strips
-  # claude's agent scaffolding so the reviewer sees only $SYSPROMPT + the diff.
-  if [ "$1" = "claude-oauth" ]; then
-    local CL_SYS=""
-    [ -r "$SYSPROMPT" ] && CL_SYS="--append-system-prompt-file $SYSPROMPT"
-    # shellcheck disable=SC2086 — $CL_SYS intentionally word-splits
-    timeout "$TIMEOUT" claude -p --model "$2" $CL_SYS \
-      --exclude-dynamic-system-prompt-sections \
-      --allowedTools Read Grep --output-format text <"$PF" 2>>"$ERRLOG"
-    return
-  fi
-  SYS_FLAGS=""
-  [ -r "$SYSPROMPT" ] && SYS_FLAGS="--append-system-prompt $SYSPROMPT"
-  if [ -n "$TOOLS" ]; then
-    timeout "$TIMEOUT" "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS --max-turns "$MAX_TURNS" --tools "$TOOLS" --prompt-file "$PF" 2>>"$ERRLOG"
-  else
-    timeout "$TIMEOUT" "$MU" ask --bare --provider "$1" --model "$2" --thinking low $SYS_FLAGS --prompt-file "$PF" 2>>"$ERRLOG"
-  fi
-}
+# Model dispatch lives in the shared agent-dispatch lib (reused by the orchestrator
+# pipeline + future spawns): claude-oauth -> `claude -p` (the $0 Max sub via the
+# approved client), else -> `mu ask --bare`. It reads TOOLS/SYSPROMPT/TIMEOUT/
+# MAX_TURNS/MU/ERRLOG/PROMPT_FILE from this scope; --bare (mu) and --exclude-
+# dynamic-system-prompt-sections (claude) keep the reviewer session hermetic.
+# Behaviour is identical to the prior inline run_review. (Lib is untracked, like
+# agent-role / sprint-lib.sh; override its path with AGENT_DISPATCH_LIB.)
+AGENT_DISPATCH_LIB="${AGENT_DISPATCH_LIB:-$HOME/.local/lib/agent-dispatch.sh}"
+[ -r "$AGENT_DISPATCH_LIB" ] || { echo "ai-review: missing dispatch lib: $AGENT_DISPATCH_LIB" >&2; exit 2; }
+. "$AGENT_DISPATCH_LIB"
+run_review() { agent_dispatch "$@"; }   # $1=provider $2=model [$3=prompt-file, default $PROMPT_FILE]
 verdict_of() { # stdin -> APPROVE | REJECT | UNCLEAR
   local out last; out="$(cat)"
   # The verdict is the reviewer's LAST line ("VERDICT: APPROVE"/"REJECT" per the

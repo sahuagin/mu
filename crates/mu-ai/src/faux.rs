@@ -69,6 +69,8 @@ impl Provider for FauxProvider {
         // echo / scripted provider; no need to thread it through the
         // synthetic event sequence.
         _system_prompt: Option<&str>,
+        // mu-vcbm: faux has no reasoning knob — effort is ignored.
+        _effort: Option<&str>,
         input: MessageInput<'_>,
         _tools: &[ToolSpec],
         _cancel_rx: oneshot::Receiver<()>,
@@ -169,7 +171,7 @@ mod tests {
         let (_cancel_tx, cancel_rx) = oneshot::channel();
 
         let events: Vec<ProviderEvent> = provider
-            .stream(None, MessageInput::Legacy(&messages), &[], cancel_rx)
+            .stream(None, None, MessageInput::Legacy(&messages), &[], cancel_rx)
             .await?
             .collect()
             .await;
@@ -223,7 +225,7 @@ mod tests {
     async fn collect_stream(provider: &FauxProvider) -> Result<Vec<ProviderEvent>, ProviderError> {
         let (_cancel_tx, cancel_rx) = oneshot::channel();
         let stream = provider
-            .stream(None, MessageInput::Legacy(&[]), &[], cancel_rx)
+            .stream(None, None, MessageInput::Legacy(&[]), &[], cancel_rx)
             .await?;
         Ok(stream.collect().await)
     }
@@ -267,7 +269,7 @@ mod tests {
         let legacy_provider = FauxProvider::echo();
         let (_tx_l, rx_l) = oneshot::channel();
         let legacy_events: Vec<ProviderEvent> = legacy_provider
-            .stream(None, MessageInput::Legacy(&messages), &[], rx_l)
+            .stream(None, None, MessageInput::Legacy(&messages), &[], rx_l)
             .await?
             .collect()
             .await;
@@ -278,7 +280,7 @@ mod tests {
         let projected_provider = FauxProvider::echo();
         let (_tx_p, rx_p) = oneshot::channel();
         let projected_events: Vec<ProviderEvent> = projected_provider
-            .stream(None, MessageInput::Projected(&projection), &[], rx_p)
+            .stream(None, None, MessageInput::Projected(&projection), &[], rx_p)
             .await?
             .collect()
             .await;
@@ -312,7 +314,7 @@ mod tests {
 
         let (_tx, rx) = oneshot::channel();
         let events: Vec<ProviderEvent> = provider
-            .stream(None, MessageInput::Projected(&projection), &[], rx)
+            .stream(None, None, MessageInput::Projected(&projection), &[], rx)
             .await?
             .collect()
             .await;

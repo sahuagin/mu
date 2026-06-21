@@ -1128,10 +1128,18 @@ impl Provider for OpenaiCodexProvider {
     async fn stream(
         &self,
         system_prompt: Option<&str>,
+        effort: Option<&str>,
         input: MessageInput<'_>,
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+        // mu-vcbm: a per-turn `/effort` selection maps onto Codex's
+        // `reasoning.effort`, overriding the construction-time
+        // `--thinking` default (`self.thinking`) for THIS call. Codex's
+        // accepted vocabulary is `minimal|low|medium|high`; an
+        // out-of-vocabulary level surfaces as a provider 400 (level
+        // validation is config-driven in a later slice — mu-vcbm step 2).
+        let eff_thinking: &str = effort.unwrap_or(&self.thinking);
         // mu-yqeq.5: sealed-enum dispatch (Legacy + Projected). The
         // `_` arm remains for forward-compat with future MessageInput
         // variants — adding one will compile-warn here for review.
@@ -1148,7 +1156,7 @@ impl Provider for OpenaiCodexProvider {
                 let instructions: &str = system_prompt
                     .filter(|s| !s.is_empty())
                     .unwrap_or(&self.instructions);
-                build_request_body(&self.model, &self.thinking, instructions, msgs, tools)
+                build_request_body(&self.model, eff_thinking, instructions, msgs, tools)
             }
             MessageInput::Projected(pmsgs) => {
                 // In the Projected path the projection itself carries
@@ -1160,7 +1168,7 @@ impl Provider for OpenaiCodexProvider {
                 // `.filter(|s| !s.is_empty()).unwrap_or(...)` rule.
                 build_request_body_from_projection(
                     &self.model,
-                    &self.thinking,
+                    eff_thinking,
                     &self.instructions,
                     pmsgs,
                     tools,

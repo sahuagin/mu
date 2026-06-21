@@ -157,9 +157,10 @@ impl AutonomyConfig {
 #[serde(default)]
 pub struct TuiConfig {
     /// Initial value of the `/effort` dial (claude-code-feature-mapping
-    /// §17). Display-only in v0 — `ask_session` doesn't carry effort
-    /// yet, so the value lives in `App::effort` and surfaces via
-    /// /status. Valid values: low, medium, high, xhigh, max.
+    /// §17). mu-vcbm: live — seeds `App::effort`, which `fire_ask` sends
+    /// on every `ask_session.effort` (the daemon applies it stickily and
+    /// maps it onto the provider's thinking/reasoning directive). Valid
+    /// values: low, medium, high, xhigh, max.
     pub effort: String,
     /// Whether to start with `/focus` mode on (§16). Default off.
     pub focus_mode: bool,

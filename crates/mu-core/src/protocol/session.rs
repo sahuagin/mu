@@ -63,6 +63,15 @@ pub struct CreateSessionRequest {
     /// Forwarded as `AgentConfig::max_turns` to the agent loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
+    /// mu-vcbm: launch-time reasoning-effort default for this session
+    /// (e.g. `low` .. `max`, provider-specific vocabulary). Forwarded as
+    /// `AgentConfig::effort` to the agent loop, which seeds the session's
+    /// standing effort and passes it to `Provider::stream` each turn.
+    /// `None` ⇒ the provider's own construction-time default (its
+    /// `--thinking` launch value, if any). A live `/effort` change rides
+    /// in later on [`AskSessionRequest::effort`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 impl CreateSessionRequest {
@@ -118,6 +127,14 @@ pub enum ProviderSelector {
 pub struct AskSessionRequest {
     pub session_id: String,
     pub user_message: String,
+    /// mu-vcbm: per-turn reasoning-effort selection (`/effort`). `None`
+    /// ⇒ leave the session's standing effort unchanged. `Some(level)`
+    /// updates it STICKILY — it applies to this turn and persists for
+    /// subsequent turns until changed again. The daemon carries it on
+    /// the resulting `AgentInput::UserMessage`; the agent loop maps it
+    /// onto the provider's thinking/reasoning directive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 impl AskSessionRequest {

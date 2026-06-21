@@ -108,6 +108,9 @@ impl Provider for OpenRouterProvider {
     async fn stream(
         &self,
         system_prompt: Option<&str>,
+        // mu-vcbm: OpenRouter has no first-class reasoning-effort knob
+        // in mu's request shape yet — effort is accepted and ignored.
+        _effort: Option<&str>,
         input: MessageInput<'_>,
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,

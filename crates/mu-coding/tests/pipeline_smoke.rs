@@ -712,6 +712,7 @@ impl Provider for StallProvider {
     async fn stream(
         &self,
         _system_prompt: Option<&str>,
+        _effort: Option<&str>,
         _input: mu_core::agent::MessageInput<'_>,
         _tools: &[mu_core::agent::ToolSpec],
         _cancel_rx: tokio::sync::oneshot::Receiver<()>,

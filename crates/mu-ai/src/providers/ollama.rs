@@ -156,6 +156,7 @@ impl Provider for OllamaProvider {
     async fn stream(
         &self,
         system_prompt: Option<&str>,
+        effort: Option<&str>,
         input: MessageInput<'_>,
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
@@ -169,7 +170,7 @@ impl Provider for OllamaProvider {
         // mistyped model tag) come through here.
         let inner = self
             .inner
-            .stream(system_prompt, input, tools, cancel_rx)
+            .stream(system_prompt, effort, input, tools, cancel_rx)
             .await
             .map_err(|e| match e {
                 ProviderError::Other(msg) => ProviderError::Other(relabel_inner_error(msg)),

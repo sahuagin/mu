@@ -136,7 +136,14 @@ pub enum AgentInput {
     /// event log with explicit pairing (no side tables). `None` for
     /// internal/synthetic messages (tools, tests, autonomy
     /// continuations).
-    UserMessage(AgentMessage, Option<Box<CommandTicket>>),
+    ///
+    /// mu-vcbm: the third field is the per-turn reasoning-effort
+    /// selection that arrived with this ask (`/effort` →
+    /// `AskSessionRequest.effort`). `Some(level)` updates the session's
+    /// standing effort STICKILY (it persists for subsequent turns until
+    /// changed again); `None` leaves the standing effort untouched.
+    /// Synthetic/internal user messages pass `None`.
+    UserMessage(AgentMessage, Option<Box<CommandTicket>>, Option<Arc<str>>),
     /// Stop. In-flight provider stream and tool execution are
     /// cancelled; loop returns `Outcome::Cancelled`.
     Cancel,
@@ -210,10 +217,11 @@ pub enum AgentInput {
 impl std::fmt::Debug for AgentInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UserMessage(m, ticket) => f
+            Self::UserMessage(m, ticket, effort) => f
                 .debug_tuple("UserMessage")
                 .field(m)
                 .field(&ticket.as_ref().map(|t| t.command_event_id))
+                .field(effort)
                 .finish(),
             Self::Cancel => write!(f, "Cancel"),
             Self::CancelOutstanding { reason } => f
@@ -632,6 +640,12 @@ pub struct AgentConfig {
     /// discipline. `None` (the default) ⇒ feature off; wired by the
     /// daemon from `[index].discover_injection` at session creation.
     pub discover_hints: Option<crate::context::capability_hints::DiscoverHints>,
+    /// mu-vcbm: the session's launch-time reasoning-effort default
+    /// (`CreateSessionRequest.effort`). Seeds the loop's standing effort
+    /// at session start; subsequent `/effort` changes ride in on
+    /// `AgentInput::UserMessage` and override it. `None` ⇒ the provider's
+    /// own construction-time default (its `--thinking` value, if any).
+    pub effort: Option<Arc<str>>,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -646,6 +660,7 @@ impl std::fmt::Debug for AgentConfig {
                 &self.compaction_policy_override.is_some(),
             )
             .field("discover_hints", &self.discover_hints.is_some())
+            .field("effort", &self.effort)
             .finish()
     }
 }
@@ -660,6 +675,7 @@ impl Default for AgentConfig {
             compaction_policy_override: None,
             seed_messages: Vec::new(),
             discover_hints: None,
+            effort: None,
         }
     }
 }
@@ -953,6 +969,11 @@ async fn run_inner(
     let mut provider = provider;
     let mut current_provider_kind = provider_kind;
     let mut current_model = model;
+    // mu-vcbm: the session's standing reasoning effort. Seeded from the
+    // launch-time default, then updated stickily whenever a UserMessage
+    // arrives carrying a `/effort` change. Passed to `Provider::stream`
+    // each turn; `None` ⇒ the provider's own construction-time default.
+    let mut current_effort: Option<Arc<str>> = config.effort.clone();
     // mu-mh4: a resumed (forked) session starts mid-conversation, seeded
     // with the continuation projection of its predecessor's log; a fresh
     // session starts empty (the default — seed_messages is `Vec::new()`).
@@ -1064,7 +1085,7 @@ async fn run_inner(
         };
 
         match action {
-            Action::External(AgentInput::UserMessage(msg, ticket)) => {
+            Action::External(AgentInput::UserMessage(msg, ticket, effort)) => {
                 // spec mu-046 WP4: a journaled ask's ticket joins the
                 // current ask's pending set; it is drained into the
                 // terminal Done below (back-to-back asks that share
@@ -1072,6 +1093,12 @@ async fn run_inner(
                 // gets its own receipt, paired to that Done).
                 if let Some(t) = ticket {
                     pending_tickets.push(*t);
+                }
+                // mu-vcbm: a `/effort` change rides in with the ask and
+                // updates the standing effort stickily — it stays in
+                // force for this and subsequent turns until changed.
+                if let Some(e) = effort {
+                    current_effort = Some(e);
                 }
                 let _ = events
                     .send(AgentEvent::MessageStart {
@@ -1761,6 +1788,7 @@ async fn run_inner(
                 match handle_invoke_llm(
                     provider.as_ref(),
                     effective_system_prompt.as_deref(),
+                    current_effort.as_deref(),
                     &projection,
                     &tool_specs,
                     &mut input_rx,

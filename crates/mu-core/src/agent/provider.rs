@@ -96,6 +96,13 @@ pub trait Provider: Send + Sync {
         // prepend a {role: "system"} message). None preserves the
         // pre-mu-n48 behavior of "no system prompt sent."
         system_prompt: Option<&str>,
+        // mu-vcbm: per-turn reasoning effort for this call (`low` ..
+        // `max`, provider-specific vocabulary). `None` ⇒ the provider's
+        // construction-time default (its `--thinking` launch value, if
+        // any). `Some(level)` overrides it for THIS call only — the
+        // agent loop carries the session's current `/effort` selection
+        // here each turn. Providers without a reasoning knob ignore it.
+        effort: Option<&str>,
         // mu-yqeq.3: sealed-enum dispatch. Each provider's impl
         // matches on the variant. `Legacy` carries the pre-cutover
         // agent-loop messages; `Projected` carries the rope-derived

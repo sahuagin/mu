@@ -88,6 +88,7 @@ pub fn handle_create_session(
         seed_events: Vec::new(),   // mu-mh4: fresh session has no seed events
         cache_ttl: params.cache_ttl.unwrap_or_default(), // mu-f1a0
         max_turns: params.max_turns, // mu-779s: per-session cap override
+        effort: params.effort,     // mu-vcbm: launch-time effort default
         notif,
         sessions,
         factory,
@@ -167,6 +168,7 @@ pub fn handle_delegate_session(
         // requirement, bead body).
         cache_ttl: CacheTtl::FiveMinutes,
         max_turns: None, // delegate sessions inherit the cap from the parent
+        effort: None,    // mu-vcbm: delegates use the provider default
         notif,
         sessions,
         factory,
@@ -341,6 +343,7 @@ pub fn handle_resume_session(
         seed_events: vec![head_attached],
         cache_ttl: CacheTtl::default(),
         max_turns: None, // resume sessions inherit the cap from the predecessor
+        effort: None,    // mu-vcbm: resumed sessions use the provider default
         notif,
         sessions: sessions.clone(),
         factory,
@@ -401,6 +404,9 @@ struct BuildSessionRequest<'a> {
     /// `Some(n)` → cap at `n` turns. `Some(0)` → disable entirely.
     /// Forwarded as `AgentConfig::max_turns` to the agent loop.
     max_turns: Option<u32>,
+    /// mu-vcbm: launch-time reasoning-effort default. Forwarded as
+    /// `AgentConfig::effort`. `None` → provider's own default.
+    effort: Option<String>,
     // runtime deps (daemon-global)
     notif: NotificationWriter,
     sessions: Sessions,
@@ -515,6 +521,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         daemon_info,
         cache_ttl,
         max_turns,
+        effort,
     } = req;
     let provider =
         factory(selector, cache_ttl).map_err(|e| format!("could not build provider: {e}"))?;
@@ -699,6 +706,8 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             // this session is a resume/fork-at-tail; empty otherwise.
             seed_messages,
             discover_hints,
+            // mu-vcbm: launch-time effort default → loop's standing effort.
+            effort: effort.map(|e| Arc::from(e.as_str())),
         },
         events: events_tx,
         pending_approvals: pending_approvals.clone(),
@@ -830,10 +839,13 @@ pub async fn handle_ask_session(
             let msg = AgentMessage::User {
                 content: params.user_message,
             };
+            // mu-vcbm: a per-turn `/effort` selection rides in with the
+            // ask and updates the session's standing effort stickily.
+            let effort = params.effort.map(|e| Arc::from(e.as_str()));
             // Boxed to keep AgentInput's variant size small (clippy
             // large_enum_variant) — tickets ride rarely-hot paths.
             match tx
-                .send(AgentInput::UserMessage(msg, ticket.map(Box::new)))
+                .send(AgentInput::UserMessage(msg, ticket.map(Box::new), effort))
                 .await
             {
                 Ok(_) => {

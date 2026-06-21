@@ -24,6 +24,10 @@ fn now_unix_ms() -> u64 {
 pub(crate) async fn handle_invoke_llm(
     provider: &dyn Provider,
     system_prompt: Option<&str>,
+    // mu-vcbm: the session's current `/effort` selection, forwarded to
+    // `Provider::stream` for this call. `None` ⇒ the provider's
+    // construction-time default.
+    effort: Option<&str>,
     projection: &ProviderMessages,
     tool_specs: &[ToolSpec],
     input_rx: &mut mpsc::Receiver<AgentInput>,
@@ -53,6 +57,7 @@ pub(crate) async fn handle_invoke_llm(
     let mut stream = provider
         .stream(
             system_prompt,
+            effort,
             MessageInput::Projected(projection),
             tool_specs,
             cancel_rx,

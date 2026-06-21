@@ -12,8 +12,9 @@
 # each round every reviewer is shown the others' findings and is pushed to press
 # objections, concede points it now accepts, and move toward ONE agreed verdict
 # (<= MU_REVIEW_MAX_ROUNDS, default 4). Reviewers emit JSON. This replaces the
-# previous two-primary + conditional-tiebreaker single-shot panel; the legacy
-# chunked path (oversized diffs) still runs that pending migration (mu-feur).
+# previous two-primary + conditional-tiebreaker single-shot panel; the chunked
+# path (oversized diffs) now converges this SAME panel over the aggregated leaf
+# findings (mu-feur follow-up).
 #
 # PANEL SEMANTICS (verdict read from reviewer JSON, NOT process exit code — `mu
 # ask` historically exits non-zero on a shutdown wart, mu-qc08):
@@ -411,10 +412,11 @@ log_panel_consensus() { # $1=outcome(PASS|BLOCK|ESCALATE) $2=verdict $3=rounds $
 # the assembled single-shot prompt exceeds $SS_MAX the review splits BY COMMIT,
 # never by file: a commit carries the author's stated intent, and review checks
 # change-against-claim — a bare file slice has no claim attached. Each LEAF
-# (primary 1: cheap, local) reports FINDINGS ONLY, no verdict; one SYNTHESIS
-# pass (primary 2's lane: strong, cross-cutting) judges which findings are real
-# and whether they interact across commits, and its verdict IS the gate verdict
-# — the leaves are its eyes; no second panel vote in v1. A commit whose lone
+# (leaf lane: cheap, local) reports FINDINGS ONLY, no verdict; the consensus
+# panel (the same code_review role the single-shot path uses) then CONVERGES
+# over the aggregated leaf findings — compact enough for one context even though
+# the leaf diffs are not — and its converged verdict IS the gate verdict (mu-feur
+# follow-up; replaced the old single synthesis reviewer). A commit whose lone
 # diff exceeds the cap is split per-file (same message, one file's diff per
 # leaf). Failure honesty: a leaf that errors/times out/breaks the contract is
 # logged as leaf_error and shown to synthesis as UNREVIEWED; if >1/3 of leaves
@@ -510,10 +512,9 @@ $f"
 }
 
 run_chunked() { # never returns — exits with the gate verdict
-  local LEAF_FILE SYNTH_FILE
+  local LEAF_FILE
   LEAF_FILE="$(mktemp "${TMPDIR:-/tmp}/ai-review-leaf.XXXXXX")"
-  SYNTH_FILE="$(mktemp "${TMPDIR:-/tmp}/ai-review-synth.XXXXXX")"
-  trap 'rm -f "$PROMPT_FILE" "$LEAF_FILE" "$SYNTH_FILE"' EXIT
+  trap 'rm -f "$PROMPT_FILE" "$LEAF_FILE"' EXIT
 
   local ov=false
   [ "${MU_REVIEW_OVERRIDE:-}" = "1" ] && ov=true
@@ -632,58 +633,65 @@ $content"
 [spec context truncated at 60000 bytes]"
   fi
 
-  echo "${C_DIM}── synthesis: $SYNTH_PROVIDER/$SYNTH_MODEL ─────────────────────${C_OFF}"
+  echo "${C_DIM}── synthesis: CONSENSUS panel (code_review role, <=${MU_REVIEW_MAX_ROUNDS:-4} rounds) over $leaves leaf unit(s) ──${C_OFF}"
+  # mu-feur follow-up: chunked now converges the SAME antagonistic panel the
+  # single-shot path uses, over the aggregated leaf FINDINGS — which are compact
+  # and fit one context, even though the leaf diffs (the reason chunked exists)
+  # do not. Mirrors the single-shot consensus block's exit/override/telemetry.
+  local PANEL_DIR CONS_OUT CONS_PROMPT CONS_RESULT VERDICT_LINE ROUNDS
+  PANEL_DIR="$(dirname "$0")/review-panel"
+  CONS_OUT="$(mktemp -d "${TMPDIR:-/tmp}/ai-review-chunked-consensus.XXXXXX")"
+  CONS_PROMPT="$CONS_OUT/round1.prompt.txt"
   {
-    printf '%s\n' "You are the SYNTHESIS reviewer of a chunked pre-PR review. The branch was too large for one review, so each commit was reviewed in isolation by a leaf reviewer; their findings are below, verbatim, in the form FINDING|<severity>|<file>|<claim>. You hold the only branch-wide view: judge which findings are REAL (leaves can be wrong — each saw one commit, and a later commit may already fix what an earlier leaf flagged) and whether any findings INTERACT across commits into a larger hazard no single commit shows. Units marked 'REVIEW FAILED — treat as unreviewed' carry unknown risk; weigh that. If a SPEC section is included, also judge whether the branch delivers what the spec claims. If PROJECT ARCHITECTURE INVARIANTS are included below, judge whether the branch upholds them — a violation (or a move toward one) is a REJECT-worthy finding even when each commit is locally correct."
-    printf '%s\n' ""
-    printf '%s\n' "Output contract:"
-    printf '%s\n' "- Brief judgement on each finding you accept or reject (cite its unit); under 1200 words total."
-    printf '%s\n' "- Your reply's LAST line MUST be exactly 'VERDICT: APPROVE' or 'VERDICT: REJECT' (those literal words). Do not continue after the verdict line."
-    printf '%s\n' ""
-    printf '%s\n' "BRANCH COMMITS (oldest first):"
-    printf '%s\n' "$COMMIT_LIST"
-    printf '%s\n' "TOTAL BRANCH DIFFSTAT:"
-    printf '%s\n' "$DIFFSTAT"
+    printf '%s\n' "You are a strict pre-PR code reviewer for mu (a Rust agent runtime). This branch was too large for one review, so each commit was reviewed in isolation by a leaf reviewer; their findings are the review material below, in the form FINDING|<severity>|<file>|<claim>. You hold the only branch-wide view: judge which findings are REAL (a later commit may already fix what an earlier leaf flagged) and whether any INTERACT across commits into a larger hazard no single commit shows. Units marked 'REVIEW FAILED — treat as unreviewed' carry unknown risk; weigh that. If a SPEC section is included, judge whether the branch delivers what it claims. If PROJECT ARCHITECTURE INVARIANTS are included, a violation (or a move toward one) is needs-changes even when each commit is locally correct. Do NOT raise findings about code not represented here."
+    printf 'Respond with ONLY one JSON object (no prose, no markdown fence):\n'
+    printf '{"verdict":"approve"|"needs-changes","summary":"<1-2 sentences>","findings":[{"file":"<path>","line":<int>,"severity":"high"|"medium"|"low","issue":"<desc>"}]}\n'
     printf '%s\n' "$spec_text"
-    printf '%s\n' "$INVARIANTS_BLOCK"
-    printf '%s\n' ""
-    printf '%s\n' "LEAF FINDINGS ($leaves units, $failed unreviewed):"
-    printf '%s\n' "$SYNTH_FINDINGS"
-  } > "$SYNTH_FILE"
+    [ -n "$INVARIANTS_BLOCK" ] && printf '%s\n' "$INVARIANTS_BLOCK"
+    printf '\nBRANCH COMMITS (oldest first):\n%s\n' "$COMMIT_LIST"
+    printf 'TOTAL BRANCH DIFFSTAT:\n%s\n' "$DIFFSTAT"
+    # consensus.sh carries the FIRST ```diff fence into each convergence round as
+    # the shared artifact; here that fence holds the aggregated leaf findings (not
+    # a raw diff), and the prose above tells the panel exactly that.
+    printf '\nAGGREGATED LEAF FINDINGS (%s unit(s), %s unreviewed) — the review material:\n```diff\n%s\n```\n' \
+      "$leaves" "$failed" "$SYNTH_FINDINGS"
+  } > "$CONS_PROMPT"
 
-  local SREV SV
-  SREV="$(run_review "$SYNTH_PROVIDER" "$SYNTH_MODEL" "$SYNTH_FILE")"
-  printf '%s\n' "$SREV"
-  SV="$(printf '%s' "$SREV" | verdict_of)"
-  log_reviewer synth "$SYNTH_PROVIDER" "$SYNTH_MODEL" "$SV"
-  echo "${C_DIM}  → synthesis ($SYNTH_MODEL): $SV${C_OFF}"
+  # log_panel_chunked records $SYNTH_PROVIDER/$SYNTH_MODEL as the synth lane; that
+  # lane is now the consensus panel, not one model.
+  SYNTH_PROVIDER=consensus; SYNTH_MODEL=code_review
 
-  # Synthesis verdict IS the gate verdict (single reviewer; the leaves are its
-  # eyes). Outcome/override/exit semantics mirror the single-shot panel.
-  if [ "$SV" = APPROVE ]; then
-    log_panel_chunked PASS false "$SV" "$leaves" "$failed"
-    echo "${C_GREEN}ai-review: CHUNKED PASS — synthesis APPROVE over $leaves leaf review(s) ($findings_total finding(s), $failed unreviewed).${C_OFF}"
-    exit 0
-  fi
-  if [ "$SV" = REJECT ]; then
-    if [ "$ov" = true ]; then
-      log_panel_chunked BLOCK true "$SV" "$leaves" "$failed"
-      echo "${C_YEL}ai-review: CHUNKED BLOCK (synthesis $SYNTH_MODEL=REJECT) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
-      exit 0
-    fi
-    log_panel_chunked BLOCK false "$SV" "$leaves" "$failed"
-    echo "${C_RED}ai-review: CHUNKED BLOCK — synthesis $SYNTH_MODEL=REJECT over $leaves leaf review(s). Set MU_REVIEW_OVERRIDE=1 to proceed if you disagree.${C_OFF}" >&2
-    exit 1
-  fi
-  # Synthesis returned no verdict: nothing decided the gate — operator's call.
-  if [ "$ov" = true ]; then
-    log_panel_chunked ESCALATE true "$SV" "$leaves" "$failed"
-    echo "${C_YEL}ai-review: CHUNKED ESCALATE (synthesis UNCLEAR) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
-    exit 0
-  fi
-  log_panel_chunked ESCALATE false "$SV" "$leaves" "$failed"
-  echo "${C_YEL}ai-review: CHUNKED ESCALATE — synthesis $SYNTH_MODEL returned no verdict (check $ERRLOG). Set MU_REVIEW_OVERRIDE=1 to proceed once you've adjudicated.${C_OFF}" >&2
-  exit 3
+  CONS_RESULT="$(MU_BIN="$MU" sh "$PANEL_DIR/consensus.sh" "$CONS_PROMPT" "$CONS_OUT" "$ROOT" "${MU_REVIEW_MAX_ROUNDS:-4}" 2>&1)"
+  printf '%s\n' "$CONS_RESULT"
+  VERDICT_LINE="$(printf '%s\n' "$CONS_RESULT" | grep -E '^CONSENSUS |^NO CONSENSUS' | tail -1)"
+  ROUNDS="$(printf '%s\n' "$CONS_RESULT" | grep -cE '^round [0-9]')"
+
+  # Consensus verdict IS the gate verdict; outcome/override/exit semantics mirror
+  # the single-shot panel, telemetry stays in the chunked schema (mode:"chunked").
+  case "$VERDICT_LINE" in
+    "CONSENSUS approve")
+      log_panel_chunked PASS false approve "$leaves" "$failed"
+      echo "${C_GREEN}ai-review: CHUNKED PASS — consensus APPROVE after $ROUNDS round(s) over $leaves leaf unit(s) ($findings_total finding(s), $failed unreviewed).${C_OFF}"
+      exit 0 ;;
+    "CONSENSUS needs-changes")
+      if [ "$ov" = true ]; then
+        log_panel_chunked BLOCK true needs-changes "$leaves" "$failed"
+        echo "${C_YEL}ai-review: CHUNKED BLOCK (consensus needs-changes) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
+        exit 0
+      fi
+      log_panel_chunked BLOCK false needs-changes "$leaves" "$failed"
+      echo "${C_RED}ai-review: CHUNKED BLOCK — consensus NEEDS-CHANGES after $ROUNDS round(s) over $leaves leaf unit(s). Set MU_REVIEW_OVERRIDE=1 to proceed if you disagree.${C_OFF}" >&2
+      exit 1 ;;
+    *)
+      if [ "$ov" = true ]; then
+        log_panel_chunked ESCALATE true "${VERDICT_LINE:-none}" "$leaves" "$failed"
+        echo "${C_YEL}ai-review: CHUNKED ESCALATE (no consensus) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
+        exit 0
+      fi
+      log_panel_chunked ESCALATE false "${VERDICT_LINE:-none}" "$leaves" "$failed"
+      echo "${C_YEL}ai-review: CHUNKED ESCALATE — panel did not converge after $ROUNDS round(s) over $leaves leaf unit(s); operator decides. Per-round artifacts in $CONS_OUT. Set MU_REVIEW_OVERRIDE=1 to proceed once adjudicated.${C_OFF}" >&2
+      exit 3 ;;
+  esac
 }
 
 # ── MODE GATE (mu-ja1x): chunk only when the single-shot prompt cannot fit ──
@@ -703,8 +711,8 @@ fi
 # round every reviewer sees the others' findings and is pushed to object/concede
 # toward agreement. Reuses this script's diff, full-file CONTEXT, and the
 # architecture-invariants block; reviewers emit JSON so convergence can quote each
-# the others' findings. (Large diffs still take the legacy chunked path above —
-# migrating chunked onto consensus is a follow-up.)
+# the others' findings. (Large diffs take the chunked path above, which now also
+# converges this same panel over the aggregated leaf findings — mu-feur.)
 PANEL_DIR="$(dirname "$0")/review-panel"
 CONS_OUT="$(mktemp -d "${TMPDIR:-/tmp}/ai-review-consensus.XXXXXX")"
 CONS_PROMPT="$CONS_OUT/round1.prompt.txt"

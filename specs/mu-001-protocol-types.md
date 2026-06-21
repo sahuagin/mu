@@ -155,6 +155,8 @@ pub enum ProviderSelector {
     OpenaiApi      { model: String },
     OpenaiOauth    { model: String },   // wraps `codex` CLI
     Openrouter     { model: String },
+    Vllm           { model: String },   // local vLLM (OpenAI-compatible); wire kind "vllm", VLLM_API_BASE
+    Ollama         { model: String },   // local ollama (OpenAI-compatible); wire kind "ollama", OLLAMA_API_BASE — bead mu-818c
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -310,7 +312,7 @@ impl ErrorEvent {
    `id = json!("a-uuid")` both round-trip. (Test both shapes.)
 5. **B-5 (provider tagged enum wire format)**: Encoding
    `ProviderSelector::AnthropicApi { model: "x" }` produces JSON
-   `{"kind":"anthropic_api","model":"x"}`. Test all 5 variants.
+   `{"kind":"anthropic_api","model":"x"}`. Test all 7 variants.
 6. **B-6 (error response with optional data)**: `Response::Err` with
    `error.data = None` does NOT include a `"data"` key in the encoded
    form; with `error.data = Some(...)` it does. Verifies the

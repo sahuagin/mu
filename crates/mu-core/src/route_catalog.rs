@@ -624,4 +624,81 @@ mod vcbm_effort_tests {
         assert_eq!(levels, vec!["low", "max"]);
         assert_eq!(entry.default_effort.as_deref(), Some("max"));
     }
+
+    #[test]
+    fn synced_generated_layer_drives_per_model_effort_end_to_end() {
+        // mu-lcck: regression guard for the mu-ggb3 -> session integration. A
+        // generated anthropic layer (exactly as `mu models sync` writes it) must
+        // drive the resolved effort levels through the REAL
+        // load -> resolve -> effort_config path that the mu-solo `/effort` dial
+        // uses (via effort_config_for). Locks the mu-53kt distinction
+        // end-to-end: opus-4-8 keeps xhigh, sonnet-4-6 must never gain it.
+        use crate::catalog_sync::{
+            build_generated_entries_all, operator_selection, write_generated_provider, ProbedModel,
+        };
+        use crate::model_catalog;
+
+        let dir = std::env::temp_dir().join(format!("mu-effort-integ-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let op = dir.join("models.toml");
+        // Operator references opus by table key (merge target); sonnet + haiku
+        // unreferenced (id-keyed) — exercises both full-catalog write paths.
+        std::fs::write(&op, "[models.opus]\nmodel = \"claude-opus-4-8\"\n").unwrap();
+
+        let effort = |ls: &[&str]| ls.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let probed = vec![
+            ProbedModel {
+                id: "claude-opus-4-8".into(),
+                effort_levels: effort(&["low", "medium", "high", "xhigh", "max"]),
+                ..Default::default()
+            },
+            ProbedModel {
+                id: "claude-sonnet-4-6".into(),
+                effort_levels: effort(&["low", "medium", "high", "max"]),
+                ..Default::default()
+            },
+            // Anthropic reports no effort surface -> omitted in the generated layer.
+            ProbedModel {
+                id: "claude-haiku-4-5-20251001".into(),
+                effort_levels: Vec::new(),
+                ..Default::default()
+            },
+        ];
+        let sel = operator_selection(&model_catalog::load_operator_only(&op));
+        let entries = build_generated_entries_all(&probed, &sel);
+        write_generated_provider(&op, "anthropic_api", &entries).unwrap();
+
+        let cfg = model_catalog::load(Some(&op));
+        let levels_for = |model: &str| -> Vec<String> {
+            super::effort_config("anthropic_api", &cfg.resolve_model(model))
+                .0
+                .unwrap_or_default()
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        };
+
+        // opus via the operator-key merge -> keeps xhigh.
+        assert_eq!(
+            levels_for("claude-opus-4-8"),
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        // sonnet via the id-keyed entry -> xhigh stays ABSENT (the mu-53kt fix,
+        // now flowing from the synced catalog all the way to the dial).
+        let sonnet = levels_for("claude-sonnet-4-6");
+        assert_eq!(sonnet, vec!["low", "medium", "high", "max"]);
+        assert!(!sonnet.iter().any(|l| l == "xhigh"));
+
+        // haiku has no effort surface: today the omitted effort_levels means the
+        // provider fallback applies (the empty-vs-none gap, bead mu-xwbe). Pinned
+        // as CURRENT behavior so its eventual fix updates this assertion on purpose.
+        assert_eq!(
+            levels_for("claude-haiku-4-5-20251001"),
+            vec!["low", "medium", "high", "xhigh", "max"],
+            "documents mu-xwbe: a no-effort model currently inherits the provider fallback"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -32,7 +32,8 @@ pub mod providers;
 pub use context::{AnthropicCacheStrategy, AnthropicProviderRenderer};
 pub use faux::{FauxProvider, FauxResponse};
 pub use providers::{
-    AnthropicProvider, OllamaProvider, OpenRouterProvider, OpenaiCodexProvider, VllmProvider,
+    AnthropicProvider, OllamaProvider, OpenRouterProvider, OpenaiApiProvider, OpenaiCodexProvider,
+    VllmProvider,
 };
 
 pub fn version() -> &'static str {

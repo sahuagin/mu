@@ -9,8 +9,8 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use mu_ai::{
-    AnthropicProvider, FauxProvider, OllamaProvider, OpenRouterProvider, OpenaiCodexProvider,
-    VllmProvider,
+    AnthropicProvider, FauxProvider, OllamaProvider, OpenRouterProvider, OpenaiApiProvider,
+    OpenaiCodexProvider, VllmProvider,
 };
 use mu_core::agent::{Provider, Tool};
 use mu_core::context::CacheTtl;
@@ -99,11 +99,14 @@ pub fn build_provider_from_selector(
                  the claude CLI for the foreseeable future"
             )
         }
-        ProviderSelector::OpenaiApi { .. } => {
-            anyhow::bail!(
-                "openai_api (direct API-key) is not yet implemented in mu — \
-                 OpenAI access today goes through openai_codex (OAuth)"
-            )
+        ProviderSelector::OpenaiApi { model } => {
+            let mut provider = OpenaiApiProvider::from_env(model.clone())?;
+            if let Some(t) = thinking {
+                if !t.is_empty() {
+                    provider = provider.with_thinking(t.to_string());
+                }
+            }
+            Ok(Arc::new(provider))
         }
         ProviderSelector::OpenaiCodex { model } => {
             let provider = if ephemeral {
@@ -152,6 +155,9 @@ pub fn selector_from_cli(name: &str, model: Option<&str>) -> Result<ProviderSele
         "anthropic-api" => Ok(ProviderSelector::AnthropicApi {
             model: model.unwrap_or("claude-haiku-4-5-20251001").to_string(),
         }),
+        "openai-api" | "openai" => Ok(ProviderSelector::OpenaiApi {
+            model: model.unwrap_or("gpt-4.1-mini").to_string(),
+        }),
         "openai-codex" => Ok(ProviderSelector::OpenaiCodex {
             model: model.unwrap_or("gpt-5.5").to_string(),
         }),
@@ -167,7 +173,7 @@ pub fn selector_from_cli(name: &str, model: Option<&str>) -> Result<ProviderSele
             model: model.unwrap_or("qwen3-coder:30b").to_string(),
         }),
         other => anyhow::bail!(
-            "unknown provider: {other} (expected: faux, anthropic-api, openai-codex, openrouter, vllm, ollama)"
+            "unknown provider: {other} (expected: faux, anthropic-api, openai-api, openai-codex, openrouter, vllm, ollama)"
         ),
     }
 }
@@ -337,14 +343,11 @@ mod tests {
     }
 
     #[test]
-    fn build_from_selector_openai_api_errors() {
+    fn build_from_selector_openai_api_constructs_when_key_configured() {
         let sel = ProviderSelector::OpenaiApi {
-            model: "gpt-5".into(),
+            model: "gpt-4.1-mini".into(),
         };
-        match build_provider_from_selector(&sel, false, None, CacheTtl::default()) {
-            Ok(_) => panic!("openai_api should not be implemented"),
-            Err(e) => assert!(e.to_string().contains("not yet implemented")),
-        }
+        assert!(build_provider_from_selector(&sel, false, None, CacheTtl::default()).is_ok());
     }
 
     #[test]
@@ -357,6 +360,14 @@ mod tests {
 
         let s = selector_from_cli("anthropic-api", None).unwrap();
         assert!(matches!(s, ProviderSelector::AnthropicApi { .. }));
+
+        let s = selector_from_cli("openai-api", Some("gpt-4.1-mini")).unwrap();
+        assert_eq!(
+            s,
+            ProviderSelector::OpenaiApi {
+                model: "gpt-4.1-mini".into()
+            }
+        );
 
         let s = selector_from_cli("openai-codex", Some("gpt-5.4")).unwrap();
         assert_eq!(

@@ -9,7 +9,9 @@
 
 pub mod anthropic;
 pub mod ollama;
+pub mod openai_api;
 pub mod openai_codex;
+mod openai_responses;
 pub mod openrouter;
 pub mod output_limits;
 pub mod sse;
@@ -18,6 +20,7 @@ pub mod vllm;
 
 pub use anthropic::AnthropicProvider;
 pub use ollama::OllamaProvider;
+pub use openai_api::OpenaiApiProvider;
 pub use openai_codex::OpenaiCodexProvider;
 pub use openrouter::OpenRouterProvider;
 pub use vllm::VllmProvider;

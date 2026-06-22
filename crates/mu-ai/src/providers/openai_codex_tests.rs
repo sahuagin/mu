@@ -1219,7 +1219,9 @@ mod live_tests {
             return;
         }
 
-        let provider = OpenaiCodexProvider::from_store("gpt-5-codex".into())
+        let model =
+            std::env::var("MU_LIVE_OPENAI_CODEX_MODEL").unwrap_or_else(|_| "gpt-5.5".into());
+        let provider = OpenaiCodexProvider::from_store(model)
             .expect("must be logged in via `mu login --provider openai-codex`");
 
         let messages = vec![AgentMessage::User {
@@ -1260,8 +1262,9 @@ mod live_tests {
             return;
         }
 
-        let provider =
-            OpenaiCodexProvider::from_store("gpt-5-codex".into()).expect("must be logged in");
+        let model =
+            std::env::var("MU_LIVE_OPENAI_CODEX_MODEL").unwrap_or_else(|_| "gpt-5.5".into());
+        let provider = OpenaiCodexProvider::from_store(model).expect("must be logged in");
 
         let echo_tool = ToolSpec {
             name: "echo".into(),

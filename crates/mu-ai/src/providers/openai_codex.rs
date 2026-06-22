@@ -12,7 +12,9 @@
 //!   4. On 401, refresh exactly once and retry. Persist the rotated
 //!      bundle unless ephemeral.
 
+#[cfg(test)]
 use std::collections::HashMap;
+#[cfg(test)]
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -26,15 +28,17 @@ use tokio::sync::{oneshot, Mutex};
 use tracing::debug;
 
 use mu_core::agent::{
-    AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
-    ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
+    AgentMessage, ContentBlock, MessageInput, Provider, ProviderError, ProviderEvent, ToolSpec,
 };
+#[cfg(test)]
+use mu_core::agent::{AssistantMessage, StopReason, ToolCall, Usage};
 use mu_core::context::{
     extract_call_id_from_span_id, ProviderMessage, ProviderMessages, ProviderRole,
 };
 
 use crate::auth::{self, FileSystemTokenStore, OAuthToken, TokenStore};
 
+#[cfg(test)]
 use super::sse::{SseEvent, SseStream};
 
 // ============================================================================
@@ -589,6 +593,7 @@ pub(crate) fn build_request_body_from_projection(
 // are noise — ignored.
 // ============================================================================
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SseFrame {
@@ -696,6 +701,7 @@ struct ResponsesApiOutputDetails {
     reasoning_tokens: Option<u64>,
 }
 
+#[cfg(test)]
 impl ResponsesApiUsage {
     fn to_usage(&self) -> Usage {
         Usage {
@@ -733,6 +739,7 @@ struct IncompleteDetails {
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct ToolCallBuilder {
     /// item id (e.g. `fc_...`) — internal
     _item_id: String,
@@ -742,6 +749,7 @@ struct ToolCallBuilder {
     args_json: String,
 }
 
+#[cfg(test)]
 struct StreamState {
     sse: Pin<Box<dyn Stream<Item = SseEvent> + Send>>,
     accumulated_text: String,
@@ -763,24 +771,25 @@ fn events_stream(
     bytes: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
     cancel_rx: oneshot::Receiver<()>,
 ) -> BoxStream<'static, ProviderEvent> {
-    let bytes: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> = Box::pin(bytes);
-    let sse = SseStream::new(bytes);
-    let state = StreamState {
-        sse: Box::pin(sse),
-        accumulated_text: String::new(),
-        tool_calls: HashMap::new(),
-        tool_call_order: Vec::new(),
-        final_status: None,
-        incomplete_reason: None,
-        usage: None,
-        cancel_rx: Some(cancel_rx),
-        finished: false,
-        emitted_done: false,
-        error_message: None,
-    };
-    Box::pin(futures::stream::unfold(state, next_event))
+    // New typed OpenAI protocol path. The old StreamState/next_event parser is
+    // still kept below for fixture-level tests during the cutover, but live
+    // Codex traffic now parses through mu-openai's Responses event enum and
+    // this crate's mu-specific interpretive adapter.
+    let sse = mu_openai::SseStream::new(Box::pin(bytes));
+    let events = sse.filter_map(|ev| async move {
+        match ev {
+            Err(e) => Some(Err(e.to_string())),
+            Ok(e) if e.data.trim().is_empty() || e.data.trim() == "[DONE]" => None,
+            Ok(e) => Some(
+                serde_json::from_str::<mu_openai::ResponseStreamEvent>(&e.data)
+                    .map_err(|err| format!("parse openai SSE event: {err}; data={}", e.data)),
+            ),
+        }
+    });
+    super::openai_responses::events_from_openai_stream(Box::pin(events), cancel_rx)
 }
 
+#[cfg(test)]
 fn map_stop(state: &StreamState) -> StopReason {
     if state.error_message.is_some() {
         return StopReason::Error;
@@ -802,6 +811,7 @@ fn map_stop(state: &StreamState) -> StopReason {
     }
 }
 
+#[cfg(test)]
 fn assemble_content(state: &StreamState) -> Vec<ContentBlock> {
     let mut out: Vec<ContentBlock> = Vec::new();
     if !state.accumulated_text.is_empty() {
@@ -822,6 +832,7 @@ fn assemble_content(state: &StreamState) -> Vec<ContentBlock> {
     out
 }
 
+#[cfg(test)]
 fn parse_tool_input(input_json: &str) -> mu_core::agent::ToolArgs {
     use mu_core::agent::ToolArgs;
 
@@ -846,6 +857,7 @@ fn parse_tool_input(input_json: &str) -> mu_core::agent::ToolArgs {
     })
 }
 
+#[cfg(test)]
 async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamState)> {
     if state.finished {
         return None;

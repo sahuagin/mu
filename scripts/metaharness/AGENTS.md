@@ -83,6 +83,20 @@ from the event log → **select = deterministic `argmax(score)`**.
 - **Cost:** `agentic-bench/run_benchmark.py` records wall-time only; the `arch_*` path
   emits a cost report. Use `arch`, or pull cost from the event log via mu-analytics.
 
+## Recommendation discipline — prior-art gate
+
+Findings off a moving `main` can be correct yet **already addressed**. Before any
+finding becomes a "build X" recommendation (a new bead, a proposed PR), run the gate:
+
+```sh
+./prior_art.py "<finding description>" [keyword ...]
+```
+
+It searches beads (open+closed), agent memory, PRs (all states), and jj history, and
+verdicts `POSSIBLE PRIOR ART` / `INCONCLUSIVE` / likely-novel. (2026-06-22: 2 of 3
+findings were instances of already-tracked themes; the gate catches that before the
+recommendation escapes.) Design + worked example: [`path-a-loop.md`](./path-a-loop.md).
+
 ## Pointers
 
 - Sibling (code-diff) pipeline: [`scripts/orchestrator/`](../orchestrator/) — `orchestrate.sh`, prompts.

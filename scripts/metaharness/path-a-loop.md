@@ -27,6 +27,30 @@ rebuilds:
 | grader | `agentic-bench/arch_score.grade_agentic` (via `grade_one.py`) |
 | run discipline (RUN_DIR / provenance.jsonl / summary.md) | `orchestrate.sh` shape |
 
+## Prior-art gate (`prior_art.py`) — run before recommending new work
+
+A harness that reads a *moving* `main` can produce findings that are correct yet
+**already addressed** — the analysis is right, it just arrived late. On 2026-06-22,
+two of three findings (unbounded tool grep; `timeout` not reaping children) turned
+out to be instances of already-tracked themes (`mu-bkjr`/`mu-gqi1`; `mu-e6qa`); only
+one (addendum/sampling cross-provider coverage) was novel. Recommending the first two
+as "new" would have duplicated existing work.
+
+So the gate is a **standing discipline**: before any finding becomes a "build X"
+recommendation (a new bead, a proposed PR), run
+
+```sh
+./prior_art.py "<finding description>" [keyword ...]
+```
+
+It fans out across the places work is recorded — **beads (open AND closed)**, **agent
+memory**, **GitHub PRs (all states)**, and **jj history (main)** — and prints ranked
+candidates plus a verdict (`POSSIBLE PRIOR ART` / `INCONCLUSIVE` / likely novel). A
+failed channel reports as an error, never a silent zero (a silent-empty beads channel
+once produced a false "novel" — see the channel's loud-empty guard). Treat a non-novel
+verdict as "go read these and decide already-addressed | partial | novel," not a hard
+block.
+
 ## A profile = one `*.env` file
 
 Sourced in an isolated subshell (so catalog overlays don't leak between arms):
@@ -50,18 +74,32 @@ Sourced in an isolated subshell (so catalog overlays don't leak between arms):
    `agent_dispatch` gives exactly that (it reads `THINKING`/`SYSPROMPT`/`TOOLS` from
    scope). We reuse `arch_bench`'s *corpus* and *grader*, not its driver.
 2. **Provider × knob × cost matrix** (verified against mu `crates/mu-ai/src/providers`):
-   | backend | catalog sampling | catalog addendum | dispatch `SYSPROMPT` | cost |
+   | backend | wire | catalog sampling/addendum | dispatch `SYSPROMPT` | cost |
    |---|---|---|---|---|
-   | ollama | ✗ (Modelfile only) | ✗ | ✓ | free |
-   | vllm | ✓ (composes OpenRouterProvider) | ✓ | ✓ | free* |
-   | openrouter | ✓ | ✓ | ✓ | $ |
-   `vllm.rs` composes `OpenRouterProvider`; `ollama.rs` is standalone — which is why
-   catalog sampling/addendum never reach ollama on the wire. **But the
-   provider-agnostic `--append-system-prompt` (dispatch `SYSPROMPT`) reaches ollama**,
-   so the addendum *hypothesis* can be tested **free on ollama** even though the
-   production catalog field (slice #4) only fires for openrouter/vllm.
-   *vllm is free but **not currently running** (127.0.0.1:8000 dead); standing one up
-   is the path to a free *catalog*-addendum / sampling test.
+   | openrouter | OpenAI chat/completions | ✓ | ✓ | $ |
+   | vllm | OpenAI chat/completions (composes `OpenRouterProvider`) | ✓ | ✓ | free* |
+   | ollama | Anthropic Messages (composes `AnthropicProvider`, `/v1/messages`) | ✗ | ✓ | free |
+   | openai | OpenAI **Responses** (typed `mu-openai` crate) | ✗ | ✓ | $ |
+   | anthropic | Anthropic Messages | ✗ | ✓ | $ |
+   The catalog `system_prompt_addendum` (slice #4) and `sampling` (mu-y8gp) live **only
+   in `OpenRouterProvider`**, so they reach **only the OpenRouter-path providers
+   (openrouter, and vllm via composition)** — *not* the predicate "OpenAI-compatible"
+   (mu's `openai` provider speaks the Responses API and is a separate path). `ollama`
+   composes `AnthropicProvider` (native `tool_use`, top-level `system`), so it gets
+   neither. **But the provider-agnostic `--append-system-prompt` (dispatch `SYSPROMPT`)
+   reaches every provider including ollama** — so the addendum *hypothesis* is testable
+   **free on ollama**, even though the production catalog field only fires for the
+   OpenRouter-path providers.
+   - *Coverage gap (harness-fit follow-up):* the per-model addendum/sampling are
+     OpenRouter-path-only — `openai`/`anthropic`/`ollama` models get neither. Covering
+     them needs the field plumbed into those providers, or hoisted to a
+     provider-agnostic layer.
+   - *Dialect leak note:* the tool-dialect-leak failure (`<function=...>` as text) is an
+     OpenAI-compat-dialect phenomenon. On ollama's current Anthropic-native `tool_use`
+     path there is no text dialect to leak, so the leak hypothesis really only applies
+     to the OpenRouter-path providers — exactly where the catalog addendum fires.
+   - *vllm is free but **not currently running** (127.0.0.1:8000 dead); standing one up
+     is the path to a free *catalog*-addendum / sampling test.
 3. **`mu` in PATH is `emu`** — an auto-build launcher (`.mu/emu`). Running it can
    rebuild `target/release/mu` mid-experiment. The loop **pins a frozen copy** of the
    binary into `RUN_DIR/mu` so every arm sees byte-identical mu.

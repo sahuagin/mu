@@ -302,8 +302,13 @@ fn provider_effort_fallback(provider_kind: &str) -> Vec<&'static str> {
         // gpt-5.5 (the codex model in use) accepts none/low/medium/high/xhigh.
         // `minimal` was dropped — gpt-5.5 rejects it with a 400 (live-verified,
         // mu-53kt) — and `xhigh` added. Any other codex model sets its own set
-        // via `[models.<label>]` (the slice-2 override path).
-        "openai_codex" => vec!["low", "medium", "high", "xhigh"],
+        // via `[models.<label>]` (the slice-2 override path). `openai_api` — the
+        // public-key Responses path (ProviderSelector::OpenaiApi -> gpt-5.5 over
+        // api.openai.com/v1/responses) — shares gpt-5.5's effort vocabulary, and
+        // the single OpenaiProvider already threads per-turn `effort` into
+        // reasoning.effort for both wire kinds, so the same fallback applies
+        // (mu-kaf8).
+        "openai_codex" | "openai_api" => vec!["low", "medium", "high", "xhigh"],
         // Ollama Anthropic-compat exposes a thinking switch, not effort depth.
         "ollama" => vec!["off", "on"],
         _ => Vec::new(),
@@ -312,7 +317,7 @@ fn provider_effort_fallback(provider_kind: &str) -> Vec<&'static str> {
 
 fn provider_default_effort(provider_kind: &str, levels: &[Arc<str>]) -> Option<Arc<str>> {
     let preferred = match provider_kind {
-        "anthropic_api" | "anthropic_oauth" | "openai_codex" => "medium",
+        "anthropic_api" | "anthropic_oauth" | "openai_codex" | "openai_api" => "medium",
         "ollama" => "on",
         _ => return None,
     };
@@ -596,6 +601,22 @@ mod vcbm_effort_tests {
         // must match — no `minimal`, includes `xhigh`; default stays `medium`.
         let (levels, default) =
             super::effort_config("openai_codex", &ResolvedModelSettings::default());
+        let levels: Vec<String> = levels.unwrap().iter().map(|s| s.to_string()).collect();
+        assert_eq!(levels, vec!["low", "medium", "high", "xhigh"]);
+        assert!(!levels.iter().any(|l| l == "minimal"));
+        assert_eq!(default.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn openai_api_fallback_matches_codex() {
+        // mu-kaf8: the public-key OpenAI provider (wire kind `openai_api`,
+        // ProviderSelector::OpenaiApi -> gpt-5.5 over api.openai.com/v1/responses)
+        // shares gpt-5.5's effort vocabulary with the codex path. Without an
+        // `openai_api` arm the dial fell through to `_ => Vec::new()` and offered
+        // nothing; the fallback must mirror codex — low/medium/high/xhigh, no
+        // `minimal`, default `medium`.
+        let (levels, default) =
+            super::effort_config("openai_api", &ResolvedModelSettings::default());
         let levels: Vec<String> = levels.unwrap().iter().map(|s| s.to_string()).collect();
         assert_eq!(levels, vec!["low", "medium", "high", "xhigh"]);
         assert!(!levels.iter().any(|l| l == "minimal"));

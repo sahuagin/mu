@@ -59,6 +59,36 @@ The `mu` CLI subcommands: `serve` (daemon), `ask` (one-shot), `resume`, `tui`,
 - `just ask "…"`, `just serve …`, `just tui …`, `just solo …` — pass-throughs.
 - Direct: `cargo run -p mu-coding --bin mu -- <subcommand>`.
 
+## Orchestration pipeline (`scripts/orchestrator/`)
+
+A gated multi-model pipeline for autonomous coding tasks, layered on `mu ask` — local tooling
+(like `ci-aipr`), not a CI step. Flow: **SPEC-CRITIC** (request coherence; halts a contradictory
+/ ambiguous request) → **ARCHITECT** (invariant veto) → **PLAN** → **IMPLEMENT** (worker in an
+isolated `sprint-start` workspace) → **\[CONVERGE** — `CONVERGE_WORKERS≥2` fans out competing
+workers, a converger picks the best**]** → **REVIEW** (`ci-aipr`) → **ADJUDICATE**
+(`SHIP`/`ITERATE`/`ESCALATE`).
+
+- **Run:** `scripts/orchestrator/orchestrate.sh <task-file> <repo-dir>`. Artifacts land in
+  `RUN_DIR` (default `~/orchestrator-runs/run-<ts>/`): `summary.md`, per-stage `<stage>.out`,
+  `worker.diff`, `provenance.jsonl`.
+- **Defaults:** gate seats + planner/adjudicator = `openai-codex/gpt-5.5`, worker =
+  `ollama/qwen3.6:27b` (one provider, no Anthropic dep). Knobs: `SEAT_`/`WORKER_`/`ARCHITECT_`/
+  `SPEC_CRITIC_`/`CONVERGER_` `PROVIDER`+`MODEL`; `CONVERGE_WORKERS` (1 = single worker);
+  `SPEC_GATE=0` / `ARCHITECT_GATE=0` to skip a gate; override a gate to
+  `claude-oauth/claude-opus-4-8` for opus's deeper skepticism.
+- **The worker writes autonomously and merges nothing** — review `worker.diff`. The neutral
+  per-stage role prompts sit beside `orchestrate.sh`
+  (`{spec-critic,architect,conductor,worker,converge}-prompt.txt`); role→model ranks live in
+  `~/.config/mu/agent_roles.toml` via `scripts/agent-role`. The REVIEW stage pulls a metered
+  `openrouter/deepseek` reviewer — the one non-free path.
+- **Reusable dispatch — `scripts/lib/agent-dispatch.sh`.** `agent_dispatch <provider> <model>
+  [<prompt-file>]` runs one model and prints its stdout, reading `TOOLS` / `SYSPROMPT` /
+  `MAX_TURNS` / `THINKING` / `ERRLOG` from the caller's scope and routing ToS-cleanly
+  (`claude-oauth` → `claude -p`; anything else → `mu ask --bare`). It backs both
+  `orchestrate.sh` and `ci-aipr` — **source it** to build sibling loops (e.g. a
+  benchmark/score-select loop) rather than re-implementing dispatch; copy `orchestrate.sh`'s
+  `dispatch()` wrapper (one `provenance.jsonl` line per call) for reproducible runs.
+
 ## Architecture invariants — do not break these
 
 1. **The on-disk event log is the source of truth.** Events persist to JSONL at

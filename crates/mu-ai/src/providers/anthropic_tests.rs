@@ -1211,7 +1211,7 @@ async fn thinking_sse_streams_deltas_and_assembles_block() {
     assert_eq!(done.stop_reason, StopReason::EndTurn);
     assert_eq!(done.content.len(), 2, "thinking block then text block");
     match &done.content[0] {
-        ContentBlock::Thinking { text } => assert_eq!(text.as_ref(), "Let me think."),
+        ContentBlock::Thinking { text, .. } => assert_eq!(text.as_ref(), "Let me think."),
         other => panic!("expected Thinking, got {other:?}"),
     }
     match &done.content[1] {
@@ -1798,6 +1798,7 @@ fn yqeq4_thinking_blocks_are_skipped_in_projected_wire_output() {
         content: vec![
             ContentBlock::Thinking {
                 text: "INTERNAL_REASONING_DO_NOT_LEAK".into(),
+                opaque: None,
             },
             ContentBlock::Text {
                 text: "public answer".into(),

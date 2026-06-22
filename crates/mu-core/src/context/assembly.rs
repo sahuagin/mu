@@ -455,6 +455,7 @@ mod tests {
             }),
             ContentBlock::Thinking {
                 text: "user wants the hostname".into(),
+                opaque: None,
             },
         ];
         let messages = vec![AgentMessage::Assistant(AssistantMessage {

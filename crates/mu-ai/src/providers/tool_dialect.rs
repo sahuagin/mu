@@ -329,6 +329,7 @@ mod tests {
             content: vec![
                 ContentBlock::Thinking {
                     text: "I should read the file.".into(),
+                    opaque: None,
                 },
                 ContentBlock::Text {
                     text: "<function=read>\n<parameter=path>Cargo.toml</parameter>\n</function>"
@@ -342,7 +343,9 @@ mod tests {
         assert_eq!(out.stop_reason, StopReason::ToolUse);
         // Thinking survives and stays first (Anthropic block order).
         match &out.content[0] {
-            ContentBlock::Thinking { text } => assert_eq!(&**text, "I should read the file."),
+            ContentBlock::Thinking { text, .. } => {
+                assert_eq!(&**text, "I should read the file.")
+            }
             other => panic!("expected leading Thinking block, got {other:?}"),
         }
         let calls = rescued_calls(&out);

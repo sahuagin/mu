@@ -197,8 +197,19 @@ pub enum ContentBlock {
     },
     ToolCall(ToolCall),
     /// Reasoning trace (Anthropic extended thinking, OpenAI reasoning).
+    ///
+    /// `text` is the human-displayable summary (may be empty). `opaque`
+    /// is a PROVIDER-OWNED round-trip token that must be echoed back
+    /// verbatim on the next turn to preserve chain-of-thought across
+    /// tool calls. mu-core never interprets it — it only stores and
+    /// projects it losslessly. The OpenAI provider packs a reasoning
+    /// item (id + encrypted_content + summary) into it; other providers
+    /// leave it `None` (and the OpenAI outbound path drops `None`
+    /// Thinking blocks, matching pre-PR-B behavior).
     Thinking {
         text: BlockText,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        opaque: Option<BlockText>,
     },
 }
 
@@ -281,6 +292,11 @@ mod tests {
             ContentBlock::ToolCall(tool_call()),
             ContentBlock::Thinking {
                 text: "reasoning".into(),
+                opaque: None,
+            },
+            ContentBlock::Thinking {
+                text: "with state".into(),
+                opaque: Some("opaque-token".into()),
             },
         ];
 
@@ -289,6 +305,38 @@ mod tests {
             let decoded: ContentBlock = serde_json::from_value(value)?;
             assert_eq!(decoded, block);
         }
+        Ok(())
+    }
+
+    /// `Thinking.opaque` round-trips through serde in both states:
+    /// absent (None → field omitted on the wire) and present (Some →
+    /// echoed verbatim). The provider-owned token must survive
+    /// persistence so chain-of-thought is preserved across tool calls.
+    #[test]
+    fn thinking_opaque_round_trips_present_and_absent() -> Result<(), serde_json::Error> {
+        // Absent: the field is omitted entirely (skip_serializing_if).
+        let none = ContentBlock::Thinking {
+            text: "summary".into(),
+            opaque: None,
+        };
+        let value = serde_json::to_value(&none)?;
+        assert!(
+            value.get("opaque").is_none(),
+            "opaque=None must be omitted on the wire, got {value}"
+        );
+        assert_eq!(serde_json::from_value::<ContentBlock>(value)?, none);
+
+        // Present: the token is carried verbatim.
+        let some = ContentBlock::Thinking {
+            text: String::new().into(),
+            opaque: Some("{\"id\":\"rs_1\",\"encrypted_content\":\"enc==\"}".into()),
+        };
+        let value = serde_json::to_value(&some)?;
+        assert_eq!(
+            value["opaque"],
+            serde_json::json!("{\"id\":\"rs_1\",\"encrypted_content\":\"enc==\"}")
+        );
+        assert_eq!(serde_json::from_value::<ContentBlock>(value)?, some);
         Ok(())
     }
 
@@ -332,6 +380,7 @@ mod tests {
                 ContentBlock::ToolCall(tool_call()),
                 ContentBlock::Thinking {
                     text: "thinking".into(),
+                    opaque: None,
                 },
             ],
             stop_reason: StopReason::ToolUse,
@@ -416,6 +465,7 @@ mod tests {
                 // consistent with mu's own native handling).
                 ContentBlock::Thinking {
                     text: "Let me read the file before claiming it's fixed.".into(),
+                    opaque: None,
                 },
                 ContentBlock::Text {
                     text: "I'll check it now.".into(),

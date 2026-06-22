@@ -376,6 +376,7 @@ fn thinking_block_dropped_outbound() {
         content: vec![
             ContentBlock::Thinking {
                 text: "INTERNAL_REASONING_DO_NOT_LEAK".into(),
+                opaque: None,
             },
             ContentBlock::Text {
                 text: "public answer".into(),
@@ -428,6 +429,69 @@ fn sse_text_only() {
         }
         other => panic!("expected Done, got {other:?}"),
     }
+}
+
+/// Codex streams reasoning items (with `encrypted_content`) on
+/// `output_item.done` and sends an EMPTY terminal snapshot. We must capture the
+/// reasoning into a `Thinking { opaque }` block from the STREAM (not the
+/// snapshot), ordered before the function_call it reasoned about. (PR-B codex
+/// path — the live-verified case.)
+#[test]
+fn sse_codex_reasoning_captured_from_stream_ahead_of_tool_call() {
+    let raw = concat!(
+        r#"data: {"type":"response.output_item.done","output_index":0,"sequence_number":1,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"enc==","summary":[{"type":"summary_text","text":"planning"}],"content":[]}}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_item.added","output_index":1,"sequence_number":2,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":""}}"#,
+        "\n\n",
+        r#"data: {"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":1,"arguments":"{\"p\":1}","sequence_number":3}"#,
+        "\n\n",
+        // The codex terminal snapshot omits the reasoning item (empty output).
+        r#"data: {"type":"response.completed","sequence_number":4,"response":{"id":"r","status":"completed"}}"#,
+        "\n\n",
+    );
+    let msg = match run(raw).into_iter().last() {
+        Some(ProviderEvent::Done(m)) => m,
+        other => panic!("expected Done last, got {other:?}"),
+    };
+    assert!(
+        matches!(&msg.content[0], ContentBlock::Thinking { opaque: Some(_), text } if text.as_ref() == "planning"),
+        "content[0] must be the captured reasoning Thinking{{opaque}}; got {:?}",
+        msg.content
+    );
+    assert!(
+        matches!(&msg.content[1], ContentBlock::ToolCall(tc) if tc.name == "read"),
+        "content[1] must be the tool call; got {:?}",
+        msg.content
+    );
+}
+
+/// When the terminal snapshot carries output (a function_call) but NOT the
+/// reasoning item (codex), the streamed reasoning is prepended rather than
+/// dropped. (PR-B codex path)
+#[test]
+fn sse_streamed_reasoning_prepended_when_snapshot_lacks_it() {
+    let raw = concat!(
+        r#"data: {"type":"response.output_item.done","output_index":0,"sequence_number":1,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"enc==","summary":[],"content":[]}}"#,
+        "\n\n",
+        r#"data: {"type":"response.completed","sequence_number":2,"response":{"id":"r","status":"completed","output":[{"id":"fc_1","type":"function_call","call_id":"c1","name":"read","arguments":"{}"}]}}"#,
+        "\n\n",
+    );
+    let msg = match run(raw).into_iter().last() {
+        Some(ProviderEvent::Done(m)) => m,
+        other => panic!("expected Done last, got {other:?}"),
+    };
+    assert!(
+        matches!(
+            &msg.content[0],
+            ContentBlock::Thinking {
+                opaque: Some(_),
+                ..
+            }
+        ),
+        "reasoning must be prepended ahead of the snapshot function_call; got {:?}",
+        msg.content
+    );
+    assert!(matches!(&msg.content[1], ContentBlock::ToolCall(_)));
 }
 
 /// Terminal snapshot with an authoritative `output` adopts it over the
@@ -978,6 +1042,7 @@ fn parity_thinking_blocks_skipped() {
         content: vec![
             ContentBlock::Thinking {
                 text: "INTERNAL_REASONING_DO_NOT_LEAK".into(),
+                opaque: None,
             },
             ContentBlock::Text {
                 text: "public answer".into(),
@@ -987,6 +1052,280 @@ fn parity_thinking_blocks_skipped() {
         usage: None,
     })];
     parity_compare(None, &messages, &[dummy_tool()]);
+}
+
+// ============================================================================
+// Reasoning threading (PR-B)
+//
+// INBOUND: a terminal snapshot carrying an OutputItem::Reasoning becomes a
+// Thinking block with the encoded opaque token, in order ahead of the
+// function_call. OUTBOUND: that Thinking{opaque} decodes back to an
+// InputItem::Reasoning emitted BEFORE the function_call, and the request
+// carries include:["reasoning.encrypted_content"].
+// ============================================================================
+
+/// Pull the decoded `{id, encrypted_content, summary}` back out of a Thinking
+/// block's opaque token (the encoding is a compact JSON object).
+fn decode_opaque(block: &ContentBlock) -> serde_json::Value {
+    match block {
+        ContentBlock::Thinking {
+            opaque: Some(tok), ..
+        } => serde_json::from_str(tok).expect("opaque is valid JSON"),
+        other => panic!("expected Thinking with opaque, got {other:?}"),
+    }
+}
+
+/// A terminal snapshot whose `output` is `[reasoning, function_call]` (the
+/// stalling shape: the model reasons, then calls a tool). `encrypted_content`
+/// is present because the request asked for it via `include`.
+#[test]
+fn inbound_reasoning_snapshot_becomes_threaded_thinking_block() {
+    let raw = concat!(
+        r#"data: {"type":"response.completed","sequence_number":0,"response":{"id":"r","status":"completed","output":["#,
+        r#"{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"I should read the file"}],"encrypted_content":"ENC_BLOB=="},"#,
+        r#"{"id":"fc_1","type":"function_call","call_id":"call_a","name":"read","arguments":"{\"path\":\"/x\"}"}"#,
+        r#"]}}"#,
+        "\n\n",
+    );
+    let events = run(raw);
+    let done = events
+        .iter()
+        .find_map(|e| match e {
+            ProviderEvent::Done(m) => Some(m),
+            _ => None,
+        })
+        .expect("Done");
+    assert_eq!(done.stop_reason, StopReason::ToolUse);
+    // Order: reasoning (Thinking) precedes the tool call.
+    assert_eq!(done.content.len(), 2, "got {:?}", done.content);
+    match &done.content[0] {
+        ContentBlock::Thinking { text, opaque } => {
+            // `text` = displayable summary; chain-of-thought rides in `opaque`.
+            assert_eq!(text.as_ref(), "I should read the file");
+            let decoded = serde_json::from_str::<serde_json::Value>(
+                opaque.as_deref().expect("opaque present"),
+            )
+            .unwrap();
+            assert_eq!(decoded["id"], "rs_1");
+            assert_eq!(decoded["encrypted_content"], "ENC_BLOB==");
+            assert_eq!(decoded["summary"][0]["text"], "I should read the file");
+        }
+        other => panic!("expected leading Thinking, got {other:?}"),
+    }
+    match &done.content[1] {
+        ContentBlock::ToolCall(tc) => {
+            assert_eq!(tc.id, "call_a");
+            assert_eq!(tc.name, "read");
+            assert_eq!(tc.arguments.as_value()["path"], "/x");
+        }
+        other => panic!("expected ToolCall after Thinking, got {other:?}"),
+    }
+}
+
+/// A reasoning item with an EMPTY summary (encrypted-only) still produces a
+/// Thinking block: empty `text`, opaque carrying the encrypted blob.
+#[test]
+fn inbound_reasoning_empty_summary_still_carries_opaque() {
+    let raw = concat!(
+        r#"data: {"type":"response.completed","sequence_number":0,"response":{"id":"r","status":"completed","output":["#,
+        r#"{"id":"rs_9","type":"reasoning","encrypted_content":"ONLY_ENC=="}"#,
+        r#"]}}"#,
+        "\n\n",
+    );
+    let events = run(raw);
+    let done = events
+        .iter()
+        .find_map(|e| match e {
+            ProviderEvent::Done(m) => Some(m),
+            _ => None,
+        })
+        .expect("Done");
+    match &done.content[0] {
+        ContentBlock::Thinking { text, opaque } => {
+            assert_eq!(text.as_ref(), "", "empty summary → empty display text");
+            let decoded =
+                serde_json::from_str::<serde_json::Value>(opaque.as_deref().unwrap()).unwrap();
+            assert_eq!(decoded["encrypted_content"], "ONLY_ENC==");
+        }
+        other => panic!("expected Thinking, got {other:?}"),
+    }
+}
+
+/// OUTBOUND: an assistant turn carrying a Thinking{opaque} + a tool call must
+/// re-emit the reasoning item as `InputItem::Reasoning` BEFORE the
+/// `function_call`, and the request must carry the `include` knob.
+#[test]
+fn outbound_reasoning_item_precedes_function_call() {
+    // Round-trip the exact opaque the inbound path would produce.
+    let opaque = serde_json::json!({
+        "id": "rs_1",
+        "encrypted_content": "ENC_BLOB==",
+        "summary": [{"type": "summary_text", "text": "plan"}]
+    })
+    .to_string();
+    let m = AgentMessage::Assistant(AssistantMessage {
+        content: vec![
+            ContentBlock::Thinking {
+                text: "plan".into(),
+                opaque: Some(opaque.into()),
+            },
+            ContentBlock::ToolCall(ToolCall {
+                id: "call_a".into(),
+                name: "read".into(),
+                arguments: ToolArgs::new(json!({"path": "/x"})).unwrap(),
+            }),
+        ],
+        stop_reason: StopReason::ToolUse,
+        usage: None,
+    });
+    let body = build_request_value("m", "high", "sys", std::slice::from_ref(&m), &[]);
+
+    // include is present so the backend returns encrypted_content.
+    assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+
+    let input = body["input"].as_array().unwrap();
+    // No assistant text in this turn ⇒ just [reasoning, function_call].
+    assert_eq!(input.len(), 2, "got {input:#?}");
+    assert_eq!(input[0]["type"], "reasoning", "reasoning must come first");
+    assert_eq!(input[0]["id"], "rs_1");
+    assert_eq!(input[0]["encrypted_content"], "ENC_BLOB==");
+    assert_eq!(input[0]["summary"][0]["text"], "plan");
+    assert_eq!(input[1]["type"], "function_call");
+    assert_eq!(input[1]["call_id"], "call_a");
+}
+
+/// A Thinking block WITHOUT opaque is still dropped outbound (anthropic-origin
+/// / summary-only reasoning the API can't consume as input).
+#[test]
+fn outbound_thinking_without_opaque_is_dropped() {
+    let m = AgentMessage::Assistant(AssistantMessage {
+        content: vec![
+            ContentBlock::Thinking {
+                text: "NO_OPAQUE_DROP_ME".into(),
+                opaque: None,
+            },
+            ContentBlock::ToolCall(ToolCall {
+                id: "call_a".into(),
+                name: "read".into(),
+                arguments: ToolArgs::new(json!({"path": "/x"})).unwrap(),
+            }),
+        ],
+        stop_reason: StopReason::ToolUse,
+        usage: None,
+    });
+    let body = build_request_value("m", "high", "sys", std::slice::from_ref(&m), &[]);
+    let wire = serde_json::to_string(&body).unwrap();
+    assert!(
+        !wire.contains("NO_OPAQUE_DROP_ME"),
+        "no-opaque Thinking leaked to wire: {wire}"
+    );
+    let input = body["input"].as_array().unwrap();
+    // Only the function_call survives — no reasoning item.
+    assert_eq!(input.len(), 1, "got {input:#?}");
+    assert_eq!(input[0]["type"], "function_call");
+}
+
+/// End-to-end round-trip: inbound snapshot → AssistantMessage → outbound
+/// request yields a reasoning item bearing the SAME id/encrypted_content the
+/// snapshot supplied (the actual chain-of-thought-preservation contract).
+#[test]
+fn reasoning_round_trips_inbound_then_outbound() {
+    let raw = concat!(
+        r#"data: {"type":"response.completed","sequence_number":0,"response":{"id":"r","status":"completed","output":["#,
+        r#"{"id":"rs_42","type":"reasoning","summary":[{"type":"summary_text","text":"think"}],"encrypted_content":"E42=="},"#,
+        r#"{"id":"fc_1","type":"function_call","call_id":"call_z","name":"read","arguments":"{}"}"#,
+        r#"]}}"#,
+        "\n\n",
+    );
+    let done = run(raw)
+        .into_iter()
+        .find_map(|e| match e {
+            ProviderEvent::Done(m) => Some(m),
+            _ => None,
+        })
+        .expect("Done");
+    let decoded = decode_opaque(&done.content[0]);
+    assert_eq!(decoded["id"], "rs_42");
+
+    // Feed the assembled assistant message straight back out.
+    let m = AgentMessage::Assistant(done);
+    let body = build_request_value("m", "high", "sys", std::slice::from_ref(&m), &[]);
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input[0]["type"], "reasoning");
+    assert_eq!(input[0]["id"], "rs_42");
+    assert_eq!(input[0]["encrypted_content"], "E42==");
+    assert_eq!(input[1]["type"], "function_call");
+    assert_eq!(input[1]["call_id"], "call_z");
+}
+
+/// Legacy vs Projected wire bodies stay byte-identical for a turn that carries
+/// a threaded reasoning item (both paths run the same translate logic; this
+/// pins it through the rope projection round-trip).
+#[test]
+fn parity_reasoning_carrying_turn() {
+    let opaque = serde_json::json!({
+        "id": "rs_1",
+        "encrypted_content": "ENC==",
+        "summary": [{"type": "summary_text", "text": "plan"}]
+    })
+    .to_string();
+    let messages = vec![
+        AgentMessage::User {
+            content: "read /tmp/x".into(),
+        },
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::Thinking {
+                    text: "plan".into(),
+                    opaque: Some(opaque.into()),
+                },
+                ContentBlock::Text {
+                    text: "reading it".into(),
+                },
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_42".into(),
+                    name: "read".into(),
+                    arguments: ToolArgs::new(json!({"path": "/tmp/x"})).unwrap(),
+                }),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        }),
+        AgentMessage::ToolResult {
+            call_id: "call_42".into(),
+            content: "contents".into(),
+            is_error: false,
+        },
+    ];
+    parity_compare(None, &messages, &[dummy_tool()]);
+
+    // And confirm the reasoning item actually survived the projection
+    // round-trip (not just that the two empty-of-reasoning paths matched).
+    use mu_core::context::{
+        assemble_rope, FauxProviderRenderer, ProjectionTarget, ProviderRenderer,
+    };
+    let rope = assemble_rope(None, &messages, &[dummy_tool()]);
+    let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let projected = build_request_value_from_projection(
+        "gpt-5-codex",
+        "high",
+        PARITY_DEFAULT_INSTRUCTIONS,
+        &projection,
+        &[dummy_tool()],
+    );
+    let wire = serde_json::to_string(&projected).unwrap();
+    assert!(
+        wire.contains("ENC=="),
+        "reasoning encrypted_content lost in projection: {wire}"
+    );
+    // And it precedes the function_call in the projected input too.
+    let input = projected["input"].as_array().unwrap();
+    let reasoning_pos = input.iter().position(|i| i["type"] == "reasoning");
+    let fc_pos = input.iter().position(|i| i["type"] == "function_call");
+    assert!(
+        reasoning_pos < fc_pos,
+        "reasoning must precede function_call: {input:#?}"
+    );
 }
 
 #[test]

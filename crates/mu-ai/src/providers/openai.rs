@@ -20,16 +20,27 @@
 //! crate's `INTEGRATION.md` for the seam, and `anthropic.rs` for the
 //! template.
 //!
-//! NOTE (reasoning threading is DEFERRED — PR-B): this is a
-//! behavior-preserving cutover from the hand-rolled `openai_codex.rs`.
-//! Assistant `ContentBlock::Thinking` is still DROPPED on re-send (see
-//! `translate_assistant_blocks`), and reasoning items returned by the
-//! model are not yet threaded back into `input`. The `mu_openai` crate
-//! already models the full shape (`InputItem::Reasoning`,
-//! `OutputItem::Reasoning`, `include`); PR-B hooks the round-trip in at
-//! `translate_assistant_blocks` / `build_request` (outbound) and the
-//! stream fold's terminal-snapshot handling (inbound). The mode enum
-//! and the `reasoning` knob are already in place.
+//! REASONING THREADING (PR-B): the OpenAI Responses contract requires a
+//! `reasoning` item returned in a prior response's `output` to be fed
+//! back verbatim on the next turn (alongside
+//! `include: ["reasoning.encrypted_content"]` when running stateless
+//! with `store=false`), or the model loses its chain-of-thought across
+//! tool calls and can stall with an empty reasoning-only turn. We thread
+//! it through `ContentBlock::Thinking`:
+//!
+//! - INBOUND (terminal snapshot → `AssistantMessage`):
+//!   [`adopt_snapshot_output`] turns each `OutputItem::Reasoning` into a
+//!   `ContentBlock::Thinking { text, opaque }` where `text` is the
+//!   summary's concatenated display text and `opaque` is the encoded
+//!   reasoning item (id + encrypted_content + summary + content), kept
+//!   in output ORDER ahead of the function_call it reasoned about.
+//! - OUTBOUND ([`translate_assistant_blocks`]): a `Thinking` block WITH
+//!   `opaque` decodes back to an `InputItem::Reasoning`, emitted BEFORE
+//!   the turn's `function_call` items. A `Thinking` block WITHOUT
+//!   `opaque` (anthropic-origin, or none) is still dropped.
+//! - REQUEST ([`build_request`]): adds
+//!   `include: ["reasoning.encrypted_content"]` so the backend returns
+//!   `encrypted_content`.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -39,7 +50,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use bytes::Bytes;
 use futures::stream::{BoxStream, Stream, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{oneshot, Mutex};
 use tracing::debug;
@@ -339,6 +350,83 @@ fn openai_json(v: Value) -> OpenaiJsonValue {
     OpenaiJsonValue::new(v).unwrap_or_else(|_| OpenaiJsonValue::empty_object())
 }
 
+// ============================================================================
+// Reasoning round-trip token (PR-B)
+//
+// `ContentBlock::Thinking.opaque` is a provider-owned string mu-core never
+// interprets. For OpenAI it carries one `OutputItem::Reasoning` (id +
+// encrypted_content + summary + content) serialized as a compact JSON object so
+// the next turn can re-emit it verbatim as `InputItem::Reasoning`, preserving
+// chain-of-thought across tool calls.
+// ============================================================================
+
+/// The reasoning-item fields we round-trip. `summary` and `content` are the
+/// wire-typed `JsonValue` vecs (echoed back untouched); `encrypted_content` is
+/// the opaque blob the backend returns under `include:
+/// ["reasoning.encrypted_content"]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReasoningToken {
+    id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encrypted_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    summary: Vec<OpenaiJsonValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    content: Vec<OpenaiJsonValue>,
+}
+
+/// Serialize a reasoning item into the compact JSON string stored in
+/// `ContentBlock::Thinking.opaque`. Infallible in practice (the fields hold only
+/// finite, serializable data); a failure degrades to `None` so the block becomes
+/// a plain (drop-on-resend) Thinking block rather than poisoning the turn.
+fn encode_reasoning_token(
+    id: &str,
+    encrypted_content: &Option<String>,
+    summary: &[OpenaiJsonValue],
+    content: &[OpenaiJsonValue],
+) -> Option<String> {
+    let tok = ReasoningToken {
+        id: id.to_string(),
+        encrypted_content: encrypted_content.clone(),
+        summary: summary.to_vec(),
+        content: content.to_vec(),
+    };
+    serde_json::to_string(&tok)
+        .map_err(|e| tracing::warn!(error = %e, "failed to encode reasoning token"))
+        .ok()
+}
+
+/// Decode a `ContentBlock::Thinking.opaque` token back into an
+/// `InputItem::Reasoning`. Returns `None` for any token that isn't our encoding
+/// (e.g. a future/foreign opaque shape), so a non-OpenAI Thinking block is
+/// simply dropped rather than mistranslated.
+fn decode_reasoning_token(opaque: &str) -> Option<InputItem> {
+    let tok: ReasoningToken = serde_json::from_str(opaque).ok()?;
+    Some(InputItem::Reasoning {
+        id: tok.id,
+        summary: tok.summary,
+        encrypted_content: tok.encrypted_content,
+        content: tok.content,
+    })
+}
+
+/// Concatenate the human-displayable text out of a reasoning item's `summary`
+/// parts. Each summary part is typically `{"type":"summary_text","text":"…"}`;
+/// we pull `.text` from each and join with "\n". Returns "" when the summary is
+/// empty (encrypted-only reasoning) — the chain-of-thought still rides in
+/// `opaque`.
+fn summary_display_text(summary: &[OpenaiJsonValue]) -> String {
+    let mut pieces: Vec<&str> = Vec::new();
+    for part in summary {
+        if let Some(t) = part.as_value().get("text").and_then(Value::as_str) {
+            if !t.is_empty() {
+                pieces.push(t);
+            }
+        }
+    }
+    pieces.join("\n")
+}
+
 /// Translate a mu `ToolSpec` into a mu_openai `Tool::Function`.
 fn translate_tool_spec(spec: &ToolSpec) -> Tool {
     Tool::Function(FunctionTool {
@@ -380,12 +468,17 @@ fn translate_message(m: &AgentMessage) -> Vec<InputItem> {
 }
 
 /// Translate an assistant's content blocks into the Responses API's
-/// split shape: a `message` item carrying any combined text, followed
-/// by one `function_call` item per [`ContentBlock::ToolCall`]. Returns
-/// an empty `Vec` when the assistant has no wire-bearing blocks.
+/// split shape: any `reasoning` items and `function_call` items in block
+/// order, with a single `message` item (carrying the combined text)
+/// prepended. Returns an empty `Vec` when the assistant has no
+/// wire-bearing blocks.
 ///
-/// `Thinking` is dropped (spec mu-044; PR-B will thread reasoning items
-/// here instead of dropping).
+/// Reasoning threading (PR-B): a `Thinking` block WITH `opaque` decodes
+/// to an `InputItem::Reasoning` and is emitted IN ORDER — crucially
+/// BEFORE the `function_call` it reasoned about, which the Responses API
+/// requires. A `Thinking` block WITHOUT `opaque` (anthropic-origin or
+/// none) is dropped: the model can't consume foreign reasoning text as
+/// input on this API.
 fn translate_assistant_blocks(blocks: &[ContentBlock]) -> Vec<InputItem> {
     let mut out: Vec<InputItem> = Vec::new();
     let mut text_parts: Vec<String> = Vec::new();
@@ -402,13 +495,24 @@ fn translate_assistant_blocks(blocks: &[ContentBlock]) -> Vec<InputItem> {
                     id: None,
                 });
             }
-            // PR-B: thread reasoning back instead of dropping.
-            ContentBlock::Thinking { .. } => {}
+            // Reasoning round-trip: re-emit the verbatim reasoning item
+            // (kept ahead of the function_call below). A Thinking block
+            // without an opaque token, or one whose token we can't
+            // decode, is dropped.
+            ContentBlock::Thinking {
+                opaque: Some(opaque),
+                ..
+            } => {
+                if let Some(item) = decode_reasoning_token(opaque) {
+                    out.push(item);
+                }
+            }
+            ContentBlock::Thinking { opaque: None, .. } => {}
         }
     }
     if !text_parts.is_empty() {
-        // Prepend the assistant text message so it sits before
-        // function_calls in turn order.
+        // Prepend the assistant text message so it sits before the
+        // reasoning / function_call items in turn order.
         out.insert(0, InputItem::assistant_text(text_parts.join("")));
     }
     out
@@ -469,6 +573,11 @@ fn build_request(
     // mu runs stateless (store=false); CreateResponseRequest::new
     // already defaults store to Some(false), but be explicit.
     req.store = Some(false);
+    // Ask the backend to return the reasoning item's encrypted_content
+    // so we can thread it back verbatim on the next turn (stateless
+    // chain-of-thought; PR-B). Required because store=false means the
+    // backend won't recall the reasoning server-side.
+    req.include = vec!["reasoning.encrypted_content".to_string()];
 
     if !tools.is_empty() {
         req = req.with_tools(tools.iter().map(translate_tool_spec).collect());
@@ -691,8 +800,23 @@ struct StreamState {
     /// `item_id` → `output_index`, so argument-delta events (which carry
     /// only `item_id`) can find their accumulator.
     item_id_to_index: HashMap<String, u32>,
+    /// Reasoning items captured from streamed `response.output_item.done`
+    /// (codex sends them there, with `encrypted_content`, and the terminal
+    /// snapshot often omits them), keyed by `output_index` so they stay
+    /// ahead of the function_call they reason about. Each is an encoded
+    /// `ContentBlock::Thinking { opaque }`. Used by [`assemble_content`]'s
+    /// streamed fallback (the snapshot path carries its own reasoning).
+    streamed_reasoning: Vec<(u32, ContentBlock)>,
     final_status: Option<ResponseStatus>,
     incomplete_reason: Option<String>,
+    /// Authoritative, fully-ordered content blocks adopted from a terminal
+    /// response snapshot (reasoning / text / tool calls in `output` order).
+    /// `Some` once a terminal snapshot with non-empty `output` has been
+    /// applied; [`assemble_content`] prefers it so reasoning stays threaded
+    /// ahead of the function_call it belongs to. The streamed `tool_calls` /
+    /// `accumulated_text` are still populated alongside (they drive
+    /// `map_stop` and the EOF diagnostics).
+    snapshot_content: Option<Vec<ContentBlock>>,
     /// Usage from the terminal lifecycle event's `response.usage`.
     usage: Option<Usage>,
     cancel_rx: Option<oneshot::Receiver<()>>,
@@ -722,8 +846,10 @@ fn new_stream_state(
         tool_calls: HashMap::new(),
         tool_call_order: Vec::new(),
         item_id_to_index: HashMap::new(),
+        streamed_reasoning: Vec::new(),
         final_status: None,
         incomplete_reason: None,
+        snapshot_content: None,
         usage: None,
         cancel_rx: Some(cancel_rx),
         finished: false,
@@ -774,8 +900,70 @@ fn map_stop(state: &StreamState) -> StopReason {
     }
 }
 
+/// Capture a streamed reasoning item (from `response.output_item.added/done`)
+/// into `streamed_reasoning`, keyed by `output_index`. A later event at the same
+/// index supersedes an earlier one (`.done` over `.added`). The item is encoded
+/// into a `ContentBlock::Thinking { opaque }` that round-trips the full reasoning
+/// item (id + encrypted_content + summary + content) for re-emission next turn.
+fn capture_streamed_reasoning(
+    state: &mut StreamState,
+    output_index: u32,
+    id: String,
+    encrypted_content: Option<String>,
+    summary: Vec<OpenaiJsonValue>,
+    content: Vec<OpenaiJsonValue>,
+) {
+    let opaque = encode_reasoning_token(&id, &encrypted_content, &summary, &content);
+    let block = ContentBlock::Thinking {
+        text: summary_display_text(&summary).as_str().into(),
+        opaque: opaque.map(|s| s.as_str().into()),
+    };
+    match state
+        .streamed_reasoning
+        .iter_mut()
+        .find(|(i, _)| *i == output_index)
+    {
+        Some(slot) => slot.1 = block,
+        None => state.streamed_reasoning.push((output_index, block)),
+    }
+}
+
 fn assemble_content(state: &StreamState) -> Vec<ContentBlock> {
-    let mut out: Vec<ContentBlock> = Vec::new();
+    // Streamed reasoning blocks (from `output_item.done`), ordered by
+    // output_index so they precede the function_call they reason about.
+    let reasoning: Vec<ContentBlock> = {
+        let mut v: Vec<&(u32, ContentBlock)> = state.streamed_reasoning.iter().collect();
+        v.sort_by_key(|(idx, _)| *idx);
+        v.into_iter().map(|(_, b)| b.clone()).collect()
+    };
+
+    // A terminal snapshot, when present, is authoritative AND fully ordered.
+    // The public Responses API includes reasoning items in it; the ChatGPT/
+    // codex backend OMITS them from the snapshot but streams them on
+    // `output_item.done`. So: use the snapshot as-is when it already carries
+    // reasoning (or we caught none); otherwise prepend the streamed reasoning
+    // we captured, which is the codex path's only reasoning source.
+    if let Some(blocks) = &state.snapshot_content {
+        let snapshot_has_reasoning = blocks.iter().any(|b| {
+            matches!(
+                b,
+                ContentBlock::Thinking {
+                    opaque: Some(_),
+                    ..
+                }
+            )
+        });
+        if snapshot_has_reasoning || reasoning.is_empty() {
+            return blocks.clone();
+        }
+        let mut out = reasoning;
+        out.extend(blocks.iter().cloned());
+        return out;
+    }
+
+    // Streamed fallback (no terminal snapshot): reasoning, then text, then
+    // tool calls.
+    let mut out: Vec<ContentBlock> = reasoning;
     if !state.accumulated_text.is_empty() {
         out.push(ContentBlock::Text {
             text: state.accumulated_text.as_str().into(),
@@ -889,11 +1077,16 @@ fn apply_terminal_response(state: &mut StreamState, response: &Response) {
 }
 
 /// Replace streamed accumulation with the authoritative `output` items
-/// from a terminal response snapshot. Text from all `message` items is
-/// joined with "\n\n" (mirrors the mu-s545 message-boundary rule);
-/// function-calls are taken in snapshot order.
+/// from a terminal response snapshot. Builds a fully-ordered
+/// `Vec<ContentBlock>` (reasoning → `Thinking{opaque}`, message → `Text`,
+/// function_call → `ToolCall`) into [`StreamState::snapshot_content`],
+/// preserving output order so each `reasoning` item precedes the
+/// `function_call` it reasoned about. Text from contiguous `message`
+/// items is joined with "\n\n" (the mu-s545 message-boundary rule) into a
+/// single `Text` block. The streamed `tool_calls` / `accumulated_text`
+/// are repopulated alongside so `map_stop` and the EOF diagnostics keep
+/// working.
 fn adopt_snapshot_output(state: &mut StreamState, output: &[OutputItem]) {
-    let mut text = String::new();
     state.tool_calls.clear();
     state.tool_call_order.clear();
     // Clear the streamed item_id→index map too: we're replacing the
@@ -902,7 +1095,23 @@ fn adopt_snapshot_output(state: &mut StreamState, output: &[OutputItem]) {
     // map is not read afterward, but leaving stale entries is a trap for any
     // future post-snapshot delta handling.)
     state.item_id_to_index.clear();
+
+    let mut blocks: Vec<ContentBlock> = Vec::new();
+    let mut all_text = String::new();
+    // Pending text from a contiguous run of message items, flushed as one
+    // Text block when a non-message item interrupts the run (or at end).
+    let mut pending_text = String::new();
     let mut next_idx: u32 = 0;
+
+    fn flush_text(pending: &mut String, blocks: &mut Vec<ContentBlock>) {
+        if !pending.is_empty() {
+            blocks.push(ContentBlock::Text {
+                text: pending.as_str().into(),
+            });
+            pending.clear();
+        }
+    }
+
     for item in output {
         match item {
             OutputItem::Message { content, .. } => {
@@ -913,10 +1122,14 @@ fn adopt_snapshot_output(state: &mut StreamState, output: &[OutputItem]) {
                     }
                 }
                 if !piece.is_empty() {
-                    if !text.is_empty() {
-                        text.push_str("\n\n");
+                    if !pending_text.is_empty() {
+                        pending_text.push_str("\n\n");
                     }
-                    text.push_str(&piece);
+                    pending_text.push_str(&piece);
+                    if !all_text.is_empty() {
+                        all_text.push_str("\n\n");
+                    }
+                    all_text.push_str(&piece);
                 }
             }
             OutputItem::FunctionCall {
@@ -926,6 +1139,7 @@ fn adopt_snapshot_output(state: &mut StreamState, output: &[OutputItem]) {
                 id,
                 ..
             } => {
+                flush_text(&mut pending_text, &mut blocks);
                 let idx = next_idx;
                 next_idx += 1;
                 state.tool_call_order.push(idx);
@@ -938,12 +1152,40 @@ fn adopt_snapshot_output(state: &mut StreamState, output: &[OutputItem]) {
                         args_json: arguments.clone().unwrap_or_default(),
                     },
                 );
+                let arguments = parse_tool_input(arguments.as_deref().unwrap_or(""));
+                blocks.push(ContentBlock::ToolCall(ToolCall {
+                    id: call_id.clone().unwrap_or_default(),
+                    name: name.clone().unwrap_or_default(),
+                    arguments,
+                }));
             }
-            // Reasoning items: PR-B threads these back. Unknown items: ignored.
-            _ => {}
+            OutputItem::Reasoning {
+                id,
+                summary,
+                encrypted_content,
+                content,
+                ..
+            } => {
+                flush_text(&mut pending_text, &mut blocks);
+                // `text` = displayable summary (may be empty); `opaque`
+                // = the encoded reasoning item (id + encrypted_content +
+                // summary + content) for verbatim re-emission next turn.
+                let opaque =
+                    encode_reasoning_token(id, encrypted_content, summary, content).map(Into::into);
+                blocks.push(ContentBlock::Thinking {
+                    text: summary_display_text(summary).into(),
+                    opaque,
+                });
+            }
+            // Unknown items: ignored (the drift canary in mu-openai owns
+            // surfacing un-modeled shapes).
+            OutputItem::Unknown(_) => {}
         }
     }
-    state.accumulated_text = text;
+    flush_text(&mut pending_text, &mut blocks);
+
+    state.accumulated_text = all_text;
+    state.snapshot_content = Some(blocks);
 }
 
 /// Build the terminal `Done` event from current state.
@@ -1086,6 +1328,23 @@ fn fold_frame(state: &mut StreamState, frame: ResponseStreamEvent) -> Option<Pro
                 state.accumulated_text.push_str("\n\n");
                 Some(ProviderEvent::TextDelta("\n\n".into()))
             }
+            OutputItem::Reasoning {
+                id,
+                summary,
+                encrypted_content,
+                content,
+                ..
+            } => {
+                capture_streamed_reasoning(
+                    state,
+                    output_index,
+                    id,
+                    encrypted_content,
+                    summary,
+                    content,
+                );
+                None
+            }
             _ => None,
         },
         ResponseStreamEvent::FunctionCallArgumentsDelta {
@@ -1131,24 +1390,45 @@ fn fold_frame(state: &mut StreamState, frame: ResponseStreamEvent) -> Option<Pro
         ResponseStreamEvent::OutputItemDone {
             output_index, item, ..
         } => {
-            if let OutputItem::FunctionCall {
-                id,
-                call_id,
-                name,
-                arguments,
-                ..
-            } = item
-            {
-                // Final `arguments` (if present) override accumulation.
-                seed_function_call(
-                    state,
-                    output_index,
-                    Some(id),
+            match item {
+                OutputItem::FunctionCall {
+                    id,
                     call_id,
                     name,
                     arguments,
-                    true,
-                );
+                    ..
+                } => {
+                    // Final `arguments` (if present) override accumulation.
+                    seed_function_call(
+                        state,
+                        output_index,
+                        Some(id),
+                        call_id,
+                        name,
+                        arguments,
+                        true,
+                    );
+                }
+                // The finalized reasoning item carries the full
+                // encrypted_content (the `.added` event does too, but `.done`
+                // supersedes). This is the codex path's reasoning source.
+                OutputItem::Reasoning {
+                    id,
+                    summary,
+                    encrypted_content,
+                    content,
+                    ..
+                } => {
+                    capture_streamed_reasoning(
+                        state,
+                        output_index,
+                        id,
+                        encrypted_content,
+                        summary,
+                        content,
+                    );
+                }
+                _ => {}
             }
             None
         }

@@ -149,7 +149,12 @@ pub enum InputItem {
     /// chain-of-thought across tool calls.
     Reasoning {
         id: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        /// REQUIRED on the wire even when empty: the Responses backend rejects a
+        /// reasoning input item without `summary` (`missing_required_parameter`
+        /// for `input[N].summary`). Always serialize it (as `[]` when empty —
+        /// encrypted-only reasoning has no summary text but still threads via
+        /// `encrypted_content`). Hence NO `skip_serializing_if` here.
+        #[serde(default)]
         summary: Vec<JsonValue>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
@@ -373,5 +378,29 @@ mod tests {
         assert_eq!(v["input"][3]["type"], "reasoning");
         assert_eq!(v["input"][3]["encrypted_content"], "enc==");
         round_trip(&req);
+    }
+
+    #[test]
+    fn reasoning_input_item_always_emits_summary_even_when_empty() {
+        // The Responses backend rejects a reasoning input item that omits
+        // `summary` (400: `input[N].summary` missing_required_parameter). An
+        // encrypted-only reasoning item has no summary text but must still send
+        // `summary: []`.
+        let item = InputItem::Reasoning {
+            id: "rs_1".into(),
+            summary: Vec::new(),
+            encrypted_content: Some("enc==".into()),
+            content: Vec::new(),
+        };
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["type"], "reasoning");
+        assert_eq!(
+            v["summary"],
+            json!([]),
+            "summary must serialize as []; got {v}"
+        );
+        assert_eq!(v["encrypted_content"], "enc==");
+        // content stays omitted when empty (it is genuinely optional).
+        assert!(v.get("content").is_none());
     }
 }

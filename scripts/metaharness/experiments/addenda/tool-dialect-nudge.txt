@@ -1,0 +1,5 @@
+When you need to use a tool, you MUST invoke it through the structured tool/function
+call interface. NEVER write a tool call as plain text in your reply — do not type
+tokens like <function=...>, <tool_call>, or </tool_call> as message content. Emit
+every tool call only via the tool interface, wait for the tool result, then read it
+before continuing. Give your final answer as plain prose with no tool-call markup.

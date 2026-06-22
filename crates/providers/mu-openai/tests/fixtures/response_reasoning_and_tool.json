@@ -1,0 +1,32 @@
+{
+  "id": "resp_def456",
+  "object": "response",
+  "created_at": 1782115600,
+  "model": "gpt-5.5",
+  "status": "completed",
+  "output": [
+    {
+      "id": "rs_1",
+      "type": "reasoning",
+      "summary": [
+        { "type": "summary_text", "text": "The user wants the file read." }
+      ],
+      "encrypted_content": "gAAAAABl_encrypted_reasoning_blob=="
+    },
+    {
+      "id": "fc_1",
+      "type": "function_call",
+      "call_id": "call_xyz",
+      "name": "read_file",
+      "arguments": "{\"path\":\"src/lib.rs\"}",
+      "status": "completed"
+    }
+  ],
+  "usage": {
+    "input_tokens": 340,
+    "output_tokens": 95,
+    "total_tokens": 435,
+    "input_tokens_details": { "cached_tokens": 256 },
+    "output_tokens_details": { "reasoning_tokens": 66 }
+  }
+}

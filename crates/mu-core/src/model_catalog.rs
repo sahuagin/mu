@@ -61,6 +61,11 @@ pub struct ModelCatalogEntry {
     /// bake those into the Modelfile instead.
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    /// mu-g1f2: per-model system-prompt addendum appended to the system message
+    /// by providers that consume it on the wire (OpenRouter / vLLM today) — a
+    /// behavioral nudge (e.g. "call tools via the function interface, never as
+    /// text"). `None` / empty → nothing appended.
+    pub system_prompt_addendum: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -79,6 +84,8 @@ pub struct ModelRuleConfig {
     /// mu-y8gp: prefix-rule sampling defaults; see [`ModelCatalogEntry`].
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    /// mu-g1f2: prefix-rule system-prompt addendum; see [`ModelCatalogEntry`].
+    pub system_prompt_addendum: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -107,6 +114,8 @@ pub struct ResolvedModelSettings {
     /// mu-y8gp: resolved per-model sampling; see [`ModelCatalogEntry`].
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    /// mu-g1f2: resolved per-model system-prompt addendum; see [`ModelCatalogEntry`].
+    pub system_prompt_addendum: Option<String>,
 }
 
 static DEFAULT_CATALOG: OnceLock<ModelCatalogConfig> = OnceLock::new();
@@ -288,6 +297,9 @@ fn fill_missing_fields(dst: &mut ModelCatalogEntry, src: &ModelCatalogEntry) {
     }
     if dst.top_p.is_none() {
         dst.top_p = src.top_p;
+    }
+    if dst.system_prompt_addendum.is_none() {
+        dst.system_prompt_addendum = src.system_prompt_addendum.clone();
     }
 }
 
@@ -516,6 +528,7 @@ impl ModelCatalogConfig {
             out.quirks = rule.quirks.clone();
             out.temperature = rule.temperature;
             out.top_p = rule.top_p;
+            out.system_prompt_addendum = rule.system_prompt_addendum.clone();
         }
 
         if let Some(m) = exact {
@@ -554,6 +567,9 @@ impl ModelCatalogConfig {
             }
             if m.top_p.is_some() {
                 out.top_p = m.top_p;
+            }
+            if m.system_prompt_addendum.is_some() {
+                out.system_prompt_addendum = m.system_prompt_addendum.clone();
             }
         }
 

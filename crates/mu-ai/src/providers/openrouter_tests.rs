@@ -817,6 +817,70 @@ fn clamp_sampling_bounds_and_drops_non_finite() {
     assert_eq!(clamp_sampling(None, 0.0, 2.0), None);
 }
 
+// mu-g1f2: per-model system-prompt addendum.
+#[test]
+fn addendum_resolves_from_catalog() {
+    use mu_core::model_catalog::{ModelCatalogConfig, ModelCatalogEntry};
+    let mut catalog = ModelCatalogConfig::default();
+    catalog.models.insert(
+        "glm".to_string(),
+        ModelCatalogEntry {
+            model: Some("z-ai/glm-5.2".to_string()),
+            system_prompt_addendum: Some("Call tools via the function interface.".to_string()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        addendum_for_model_with_catalog(&catalog, "z-ai/glm-5.2").as_deref(),
+        Some("Call tools via the function interface.")
+    );
+    // No entry → None.
+    assert_eq!(
+        addendum_for_model_with_catalog(&catalog, "openai/gpt-5.5"),
+        None
+    );
+    // Empty addendum → None (not an empty system message).
+    catalog.models.insert(
+        "blank".to_string(),
+        ModelCatalogEntry {
+            model: Some("blank/addendum".to_string()),
+            system_prompt_addendum: Some(String::new()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        addendum_for_model_with_catalog(&catalog, "blank/addendum"),
+        None
+    );
+}
+
+#[test]
+fn combine_system_joins_base_and_addendum() {
+    assert_eq!(combine_system(None, None), None);
+    assert_eq!(combine_system(Some(""), None), None); // empty base, no add → None (parity)
+    assert_eq!(
+        combine_system(Some("be terse"), None),
+        Some("be terse".to_string())
+    );
+    assert_eq!(
+        combine_system(None, Some("call tools".to_string())),
+        Some("call tools".to_string())
+    );
+    assert_eq!(
+        combine_system(Some(""), Some("call tools".to_string())),
+        Some("call tools".to_string())
+    );
+    assert_eq!(
+        combine_system(Some("be terse"), Some("call tools".to_string())),
+        Some("be terse\n\ncall tools".to_string())
+    );
+    // Empty addendum is dropped; base passes through.
+    assert_eq!(
+        combine_system(Some("be terse"), Some(String::new())),
+        Some("be terse".to_string())
+    );
+}
+
 #[tokio::test]
 async fn b7_sse_text_only() {
     let raw = concat!(

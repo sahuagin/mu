@@ -319,6 +319,45 @@ fn clamp_sampling(v: Option<f64>, lo: f64, hi: f64) -> Option<f64> {
     v.filter(|x| x.is_finite()).map(|x| x.clamp(lo, hi))
 }
 
+/// Per-model system-prompt addendum resolved from the model catalog (mu-g1f2),
+/// mirroring [`sampling_for_model`]'s catalog lookup. Empty → `None`.
+fn system_prompt_addendum_for_model(model: &str) -> Option<String> {
+    addendum_for_model_with_catalog(mu_core::model_catalog::global(), model)
+}
+
+/// [`system_prompt_addendum_for_model`] against an explicit catalog — the
+/// testable seam (a test must not depend on the operator's `models.toml`).
+fn addendum_for_model_with_catalog(
+    catalog: &mu_core::model_catalog::ModelCatalogConfig,
+    model: &str,
+) -> Option<String> {
+    catalog
+        .resolve_model(model)
+        .system_prompt_addendum
+        .filter(|s| !s.is_empty())
+}
+
+/// Compose the effective OpenRouter system-message content for `model` (mu-g1f2):
+/// the base system content (when non-empty) with the per-model addendum appended.
+/// `None` when there is neither — so no system message is emitted and the
+/// pre-mu-g1f2 request body is byte-for-byte unchanged (yqeq6 parity).
+fn system_with_addendum(base: Option<&str>, model: &str) -> Option<String> {
+    combine_system(base, system_prompt_addendum_for_model(model))
+}
+
+/// Pure combine step of [`system_with_addendum`] — testable without the global
+/// catalog. Base (when non-empty) joined to the addendum by a blank line;
+/// neither present → `None`.
+fn combine_system(base: Option<&str>, addendum: Option<String>) -> Option<String> {
+    let base = base.filter(|s| !s.is_empty());
+    match (base, addendum.filter(|s| !s.is_empty())) {
+        (None, None) => None,
+        (Some(b), None) => Some(b.to_string()),
+        (None, Some(a)) => Some(a),
+        (Some(b), Some(a)) => Some(format!("{b}\n\n{a}")),
+    }
+}
+
 /// Pure injection step of [`apply_sampling`] — testable without the global
 /// catalog. Adds `temperature`/`top_p` only when `Some`, so all-`None` leaves
 /// the body byte-for-byte unchanged.
@@ -414,10 +453,9 @@ pub(crate) fn build_request_body(
     // messages list with the system message PREPENDED (when set) so
     // the rest of the wire format stays untouched.
     let mut api_messages: Vec<Value> = Vec::new();
-    if let Some(s) = system_prompt {
-        if !s.is_empty() {
-            api_messages.push(json!({ "role": "system", "content": s }));
-        }
+    // mu-g1f2: base system content + per-model addendum (None → no system message).
+    if let Some(system) = system_with_addendum(system_prompt, model) {
+        api_messages.push(json!({ "role": "system", "content": system }));
     }
     api_messages.extend(messages.iter().filter_map(translate_message));
     let mut body = json!({
@@ -460,7 +498,7 @@ pub(crate) fn build_request_body(
 /// system-prompt (if any, and non-empty) is emitted as the FIRST
 /// message with `role: "system"`, matching Legacy's `mu-n48`
 /// prepend behavior.
-fn translate_provider_messages_openrouter(pmsgs: &ProviderMessages) -> Vec<Value> {
+fn translate_provider_messages_openrouter(pmsgs: &ProviderMessages, model: &str) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::with_capacity(pmsgs.messages.len());
     // mu-745h: accumulator for all non-tool-schema System-role spans.
     // Concatenated and prepended as a single leading role=system
@@ -523,7 +561,9 @@ fn translate_provider_messages_openrouter(pmsgs: &ProviderMessages) -> Vec<Value
     // expects one system slot at the start; concatenating
     // produces consistent behavior across upstream OpenRouter
     // models that handle multiple system messages inconsistently.
-    if let Some(content) = system_content {
+    // mu-g1f2: append the per-model system-prompt addendum to the accumulated
+    // system content (parity with the Legacy path's system_with_addendum).
+    if let Some(content) = system_with_addendum(system_content.as_deref(), model) {
         out.insert(
             0,
             json!({
@@ -615,7 +655,7 @@ pub(crate) fn build_request_body_from_projection(
     pmsgs: &ProviderMessages,
     tools: &[ToolSpec],
 ) -> Value {
-    let api_messages = translate_provider_messages_openrouter(pmsgs);
+    let api_messages = translate_provider_messages_openrouter(pmsgs, model);
     let mut body = json!({
         "model": model,
         "max_tokens": super::output_limits::max_tokens_for_model(model),

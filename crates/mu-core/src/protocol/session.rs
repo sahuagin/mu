@@ -660,14 +660,17 @@ pub struct SetConfigResponse {
     pub rejected: Vec<ConfigRejected>,
 }
 
-// ── mu-slat: pot-hosted worker sessions ──────────────────────────────
+// ── mu-slat: spawned worker sessions ─────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpawnWorkerRequest {
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Legacy wire name; now interpreted as optional worker name.
     pub pot_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pot_template: Option<String>,
@@ -684,6 +687,7 @@ impl SpawnWorkerRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpawnWorkerResponse {
     pub session_id: String,
+    // Legacy wire name; now interpreted as worker name.
     pub pot_name: String,
 }
 

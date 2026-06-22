@@ -1622,6 +1622,7 @@ pub async fn handle_spawn_worker(
 
     let config = crate::serve::worker::SpawnWorkerConfig {
         prompt: req.prompt.clone(),
+        provider: req.provider,
         model: req.model,
         pot_name: req.pot_name,
         timeout_secs: req.timeout_secs,

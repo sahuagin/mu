@@ -88,10 +88,6 @@ dirs = "5"
 # shell-arg tokenization (bash tool)
 shlex = "1"
 
-# mu-slat Phase 3: Rust-owned pty for pot worker spawn + vt100 screen
-# scraping (readiness detection + observability). Both offline-cached.
-portable-pty = "0.9"
-vt100 = "0.16"
 
 # TUI (used by mu-coding's interactive mode; later)
 ratatui = "0.30"

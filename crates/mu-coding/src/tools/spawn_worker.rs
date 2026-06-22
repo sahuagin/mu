@@ -1,9 +1,9 @@
-//! mu-slat Phase 2: agent tool for spawning pot-hosted workers.
+//! mu-slat Phase 2: agent tool for spawning worker agents.
 //!
 //! The LLM calls this tool to delegate work to a new worker session.
 //! The tool calls the existing `spawn_worker` function and returns
-//! the session_id and pot_name. Results arrive back via mailbox
-//! (injected as AgentInput::MailboxMessage by the mailbox.post handler).
+//! the session id and worker name. Results arrive back via mailbox
+//! (injected as AgentInput::MailboxMessage by the monitor or mailbox.post handler).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -48,19 +48,28 @@ impl SpawnWorkerTool {
     /// Build the spawn config from the model's tool arguments, stamping
     /// in THIS tool's `parent_session_id` as the worker's reply_to so
     /// results route back to the calling session. Factored out of
-    /// `execute` so the wiring is unit-testable without spawning a pot.
+    /// `execute` so the wiring is unit-testable without spawning a worker process.
     fn build_config(&self, arguments: &Value) -> Result<SpawnWorkerConfig, String> {
         let prompt = arguments
             .get("prompt")
             .and_then(Value::as_str)
             .ok_or_else(|| "missing required argument: prompt".to_string())?
             .to_string();
+        let provider = arguments
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let model = arguments
+            .get("model")
+            .and_then(Value::as_str)
+            .map(String::from);
+        if model.is_some() && provider.is_none() {
+            return Err("model override requires provider (for example provider=ollama model=qwen3.6:35b-a3b-q8_0, or omit both for the configured coding role)".into());
+        }
         Ok(SpawnWorkerConfig {
             prompt,
-            model: arguments
-                .get("model")
-                .and_then(Value::as_str)
-                .map(String::from),
+            provider,
+            model,
             pot_name: None,
             timeout_secs: arguments.get("timeout_secs").and_then(Value::as_u64),
             parent_session_id: self.parent_session_id.clone(),
@@ -72,9 +81,10 @@ impl Tool for SpawnWorkerTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "spawn_worker",
-            "Spawn a pot-hosted claude-code worker to perform a task autonomously. \
-             The worker runs in an isolated FreeBSD jail with full tool access. \
-             Post results back to your mailbox when done. Returns session_id and pot_name.",
+            "Spawn a worker agent to perform a task autonomously. \
+             The worker is launched through mu-spawn using current non-POT runtimes \
+             (mu ask or claude -p). Results are posted back to your mailbox when \
+             done. Returns session_id and worker name.",
             json!({
                 "type": "object",
                 "properties": {
@@ -82,9 +92,13 @@ impl Tool for SpawnWorkerTool {
                         "type": "string",
                         "description": "The task instruction for the worker."
                     },
+                    "provider": {
+                        "type": "string",
+                        "description": "Optional provider override. Use with model, e.g. provider=ollama or provider=openai-codex. Omit provider+model for the configured coding role resolved by scripts/agent-role."
+                    },
                     "model": {
                         "type": "string",
-                        "description": "Model to use (default: claude-opus-4-7)."
+                        "description": "Optional model override; requires provider. Omit provider+model for the configured coding role resolved by scripts/agent-role."
                     },
                     "timeout_secs": {
                         "type": "integer",
@@ -154,7 +168,7 @@ impl Tool for SpawnWorkerTool {
                         content: format!(
                             "Worker spawned successfully.\n\
                              session_id: {}\n\
-                             pot_name: {}\n\n\
+                             worker_name: {}\n\n\
                              The task has been posted to the worker's mailbox. \
                              Results will arrive in your mailbox when the worker finishes.",
                             r.session_id, r.pot_name,
@@ -202,6 +216,7 @@ mod tests {
             .expect("config builds");
         assert_eq!(cfg.parent_session_id.as_deref(), Some("session-7"));
         assert_eq!(cfg.prompt, "do the thing");
+        assert!(cfg.provider.is_none());
         assert!(cfg.model.is_none());
         assert!(cfg.timeout_secs.is_none());
     }
@@ -211,12 +226,26 @@ mod tests {
         let cfg = tool(Some("session-1"))
             .build_config(&json!({
                 "prompt": "p",
-                "model": "claude-sonnet-4-6",
+                "provider": "openai-codex",
+                "model": "gpt-5.5",
                 "timeout_secs": 42
             }))
             .expect("config builds");
-        assert_eq!(cfg.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(cfg.provider.as_deref(), Some("openai-codex"));
+        assert_eq!(cfg.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(cfg.timeout_secs, Some(42));
+    }
+
+    #[test]
+    fn build_config_rejects_model_without_provider() {
+        let result = tool(Some("session-1")).build_config(&json!({
+            "prompt": "p",
+            "model": "claude-opus-4-7"
+        }));
+        let Err(err) = result else {
+            panic!("model-only override must fail");
+        };
+        assert!(err.contains("requires provider"), "{err}");
     }
 
     #[test]

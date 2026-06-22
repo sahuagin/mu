@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::{mpsc, oneshot};
@@ -97,10 +97,10 @@ struct RehydratedSession {
     mailbox: MailboxStateHandle,
 }
 
-/// mu-slat: a pot-hosted claude-code subprocess session. Has an event
-/// log and mailbox (can participate in peer.hello and receive messages)
-/// but no agent loop or provider — the agent runs inside the pot as a
-/// separate claude-code process. The supervisor monitors the child and
+/// mu-slat: a spawned worker subprocess session. Has an event log and
+/// mailbox (can participate in peer.hello and receive messages) but no
+/// in-process agent loop/provider — the agent runs as a child process
+/// (`mu ask` or `claude -p`). The supervisor monitors the child and
 /// records lifecycle events.
 #[allow(dead_code)] // Fields used by worker.rs (Task 4).
 pub(crate) struct SubprocessSession {
@@ -111,16 +111,6 @@ pub(crate) struct SubprocessSession {
     pub status: Mutex<WorkerStatus>,
     pub started_at_unix_ms: u64,
     pub child_handle: Option<JoinHandle<()>>,
-    /// mu-slat Phase 3: host-side pty killer. Set after the pty is
-    /// spawned (None until then). The mailbox handler calls this to
-    /// reap the worker when it posts its result — host-side kill works
-    /// where the in-pot hook can't (linuxulator pkill blindness).
-    pub killer: Mutex<Option<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
-    /// mu-slat Phase 3: set when we kill the worker intentionally
-    /// (because it posted its result). The monitor reads this so an
-    /// intentional reap is logged as a clean exit, not a signal-kill
-    /// "failure" — the worker succeeded; we just terminated idle claude.
-    pub reaped: AtomicBool,
 }
 
 /// In-memory session registry. Cheap to clone (Arc-backed).
@@ -128,7 +118,7 @@ pub(crate) struct SubprocessSession {
 /// Three parallel maps:
 /// - `inner` — fully live sessions (agent loop running, input channel
 ///   open). Created by `insert`.
-/// - `workers` (mu-slat) — pot-hosted subprocess sessions. No agent loop;
+/// - `workers` (mu-slat) — spawned subprocess sessions. No agent loop;
 ///   monitored by a supervisor task. Created by `insert_worker`.
 /// - `rehydrated` (mu-u1ld) — read-only ghost sessions loaded from the
 ///   on-disk event log at daemon startup. Created by `insert_rehydrated`.
@@ -642,7 +632,7 @@ impl Sessions {
         live || worker || ghost
     }
 
-    /// mu-slat: insert a subprocess (pot-hosted worker) session.
+    /// mu-slat: insert a spawned worker subprocess session.
     pub(crate) fn insert_worker(&self, id: String, session: SubprocessSession) {
         if let Ok(mut map) = self.workers.lock() {
             map.insert(id, session);
@@ -659,54 +649,15 @@ impl Sessions {
             .and_then(|s| s.status.lock().ok().map(|st| st.clone()))
     }
 
-    /// mu-slat Phase 3: attach the host-side pty killer to a worker
-    /// after its pty is spawned. No-op if the id isn't a worker.
-    pub(crate) fn set_worker_killer(
-        &self,
-        id: &str,
-        killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
-    ) {
+    /// mu-slat: update a worker's registry status. No-op if the worker vanished.
+    pub(crate) fn set_worker_status(&self, id: &str, status: WorkerStatus) {
         if let Ok(map) = self.workers.lock() {
-            if let Some(s) = map.get(id) {
-                if let Ok(mut k) = s.killer.lock() {
-                    *k = Some(killer);
+            if let Some(session) = map.get(id) {
+                if let Ok(mut current) = session.status.lock() {
+                    *current = status;
                 }
             }
         }
-    }
-
-    /// mu-slat Phase 3: reap a worker host-side. Called by the mailbox
-    /// handler when a worker posts its result. Killing the pty child
-    /// makes claude exit → pty EOF → `monitor_worker`'s normal exit
-    /// path runs. Returns true if the id was a worker with a killer set.
-    pub fn reap_worker(&self, id: &str) -> bool {
-        let Ok(map) = self.workers.lock() else {
-            return false;
-        };
-        let Some(s) = map.get(id) else {
-            return false;
-        };
-        let Ok(mut k) = s.killer.lock() else {
-            return false;
-        };
-        if let Some(killer) = k.as_mut() {
-            s.reaped.store(true, Ordering::SeqCst);
-            let _ = killer.kill();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// mu-slat Phase 3: did we intentionally reap this worker (after it
-    /// posted its result)? The monitor uses this to log the resulting
-    /// signal-kill as a clean exit rather than a failure.
-    pub fn worker_was_reaped(&self, id: &str) -> bool {
-        self.workers
-            .lock()
-            .ok()
-            .and_then(|m| m.get(id).map(|s| s.reaped.load(Ordering::SeqCst)))
-            .unwrap_or(false)
     }
 }
 

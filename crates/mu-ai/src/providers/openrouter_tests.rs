@@ -716,6 +716,53 @@ fn reasoning_param_is_case_and_whitespace_insensitive() {
     );
 }
 
+// mu-xblz: dialect rescue is wired into the OpenRouter Done event.
+#[tokio::test]
+async fn dialect_rescue_rewrites_leaked_tool_call_on_done() {
+    let tools = vec![ToolSpec {
+        name: "read".into(),
+        description: "Read".into(),
+        input_schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        ..Default::default()
+    }];
+    // A turn that "ended" as prose but is really a training-native XML tool call.
+    let leaked = AssistantMessage {
+        content: vec![ContentBlock::Text {
+            text: "<function=read>\n<parameter=path>Cargo.toml</parameter>\n</function>".into(),
+        }],
+        stop_reason: StopReason::EndTurn,
+        usage: None,
+    };
+    let input = futures::stream::iter(vec![ProviderEvent::Done(leaked)]).boxed();
+    let mut out = apply_dialect_rescue(input, &tools);
+    match out.next().await.expect("one event") {
+        ProviderEvent::Done(msg) => {
+            assert_eq!(msg.stop_reason, StopReason::ToolUse);
+            let calls = msg
+                .content
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::ToolCall(_)))
+                .count();
+            assert_eq!(calls, 1, "leaked dialect should become one tool call");
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dialect_rescue_passes_non_done_events_through() {
+    let tools: Vec<ToolSpec> = vec![];
+    let input = futures::stream::iter(vec![
+        ProviderEvent::TextDelta("hello".into()),
+        ProviderEvent::ThinkingDelta("hmm".into()),
+    ])
+    .boxed();
+    let mut out = apply_dialect_rescue(input, &tools);
+    assert!(matches!(out.next().await, Some(ProviderEvent::TextDelta(t)) if t == "hello"));
+    assert!(matches!(out.next().await, Some(ProviderEvent::ThinkingDelta(t)) if t == "hmm"));
+    assert!(out.next().await.is_none());
+}
+
 #[tokio::test]
 async fn b7_sse_text_only() {
     let raw = concat!(

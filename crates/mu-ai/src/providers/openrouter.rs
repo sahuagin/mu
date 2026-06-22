@@ -169,7 +169,10 @@ impl Provider for OpenRouterProvider {
         }
 
         let bytes = resp.bytes_stream();
-        Ok(events_stream(bytes, cancel_rx))
+        // mu-xblz: recover training-native tool-call dialect that GLM/Qwen-class
+        // models (served via OpenRouter / vLLM) sometimes leak as assistant text
+        // instead of structured `tool_calls`. No-op for well-behaved models.
+        Ok(apply_dialect_rescue(events_stream(bytes, cancel_rx), tools))
     }
 
     /// Identify as `"openrouter"` so ContextAssembly events and
@@ -242,6 +245,36 @@ fn reasoning_param(effort: Option<&str>) -> Option<Value> {
         _ => return None,
     };
     Some(json!({ "effort": level }))
+}
+
+/// Wrap a provider event stream so a terminal [`ProviderEvent::Done`] whose
+/// assistant message is actually a leaked training-native tool-call dialect
+/// (XML `<function=…>` or `<tool_call>{…}` text instead of structured
+/// `tool_calls`) is rewritten into real tool calls (mu-xblz).
+///
+/// GLM/Qwen-class models served over the OpenAI chat-completions wire
+/// (OpenRouter, and vLLM via composition) do this nondeterministically; unlike
+/// ollama's Anthropic wire — where `ollama.rs` already applies this same
+/// rescue — that wire has no other recovery path, so a leaked call ends the
+/// agent loop as if the turn were prose.
+///
+/// Conservative-by-construction: [`super::tool_dialect::rescue_assistant_message`]
+/// is a no-op unless the turn EndTurns with no structured calls AND the text
+/// parses cleanly as a call against a KNOWN tool, so well-behaved models pass
+/// through untouched.
+fn apply_dialect_rescue(
+    stream: BoxStream<'static, ProviderEvent>,
+    tools: &[ToolSpec],
+) -> BoxStream<'static, ProviderEvent> {
+    let specs: Vec<ToolSpec> = tools.to_vec();
+    stream
+        .map(move |ev| match ev {
+            ProviderEvent::Done(msg) => {
+                ProviderEvent::Done(super::tool_dialect::rescue_assistant_message(msg, &specs))
+            }
+            other => other,
+        })
+        .boxed()
 }
 
 /// Translate mu's AgentMessage into the OpenAI/OpenRouter shape.

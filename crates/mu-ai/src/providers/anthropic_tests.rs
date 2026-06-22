@@ -2064,3 +2064,48 @@ async fn umq6_streaming_no_tier_object_fields_remain_none() {
     );
     assert!(usage.cache_creation_1h_input_tokens.is_none());
 }
+
+#[test]
+fn ollama_thinking_flag_is_switch_not_effort() {
+    assert_eq!(parse_ollama_thinking_flag(""), None);
+    assert_eq!(parse_ollama_thinking_flag("   "), None);
+    for off in ["off", "none", "false", "0", "disabled"] {
+        assert_eq!(
+            parse_ollama_thinking_flag(off).as_deref(),
+            Some("off"),
+            "{off}"
+        );
+    }
+    for on in ["on", "true", "enabled", "low", "high", "xhigh", "banana"] {
+        assert_eq!(
+            parse_ollama_thinking_flag(on).as_deref(),
+            Some("on"),
+            "{on}"
+        );
+    }
+}
+
+#[test]
+fn apply_ollama_thinking_on_sets_only_thinking_object() {
+    let mut body = build_request_body("gpt-oss:20b", None, &[], &[]);
+    apply_ollama_thinking(&mut body, Some("on"));
+    assert_eq!(
+        body["thinking"],
+        json!({"type":"adaptive", "display":"summarized"})
+    );
+    assert!(
+        body.get("output_config").is_none(),
+        "ollama must not get Anthropic effort"
+    );
+}
+
+#[test]
+fn apply_ollama_thinking_off_disables_without_output_config() {
+    let mut body = build_request_body("gpt-oss:20b", None, &[], &[]);
+    apply_ollama_thinking(&mut body, Some("off"));
+    assert_eq!(body["thinking"], json!({"type":"disabled"}));
+    assert!(
+        body.get("output_config").is_none(),
+        "ollama must not get Anthropic effort"
+    );
+}

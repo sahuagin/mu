@@ -85,8 +85,18 @@ impl OllamaProvider {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_default();
-        let inner = AnthropicProvider::new(key, model).with_api_base(base);
+        let inner = AnthropicProvider::new(key, model)
+            .with_api_base(base)
+            .with_ollama_thinking_flag("");
         Ok(Self { inner })
+    }
+
+    /// Configure ollama's Anthropic-compat thinking switch. Ollama treats
+    /// thinking as on/off: explicit off forms disable reasoning; any other
+    /// non-empty value enables summarized thinking.
+    pub fn with_thinking_flag(mut self, flag: &str) -> Self {
+        self.inner = self.inner.with_ollama_thinking_flag(flag);
+        self
     }
 
     /// Query the ollama server for its locally-available models via the

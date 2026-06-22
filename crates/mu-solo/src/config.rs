@@ -232,14 +232,14 @@ pub struct SessionConfig {
     /// Anthropic provider consumes it today.
     pub cache_ttl: String,
     /// mu-upk2: extended-thinking directive, forwarded as `mu serve
-    /// --thinking <v>`. Empty string (the DEFAULT) disables it; so do
-    /// `off`/`none`/`disabled`/`false`/`0`. Otherwise an effort level —
-    /// `low` (alias `minimal`), `medium`, `high`, `xhigh`, or `max` — which
-    /// the Anthropic provider sends as `thinking: {type: adaptive, display:
-    /// summarized}` plus `output_config.effort`. (An unrecognized value
-    /// falls back to `high`.) Only the Anthropic provider acts on it
-    /// (natively-reasoning ollama models think regardless). Set once in
-    /// solo.toml (`[session] thinking = "high"`) — no flag needed each run.
+    /// --thinking <v>`. Empty string (the DEFAULT) sends no launch-time
+    /// directive; explicit off forms are `off`/`none`/`disabled`/`false`/`0`.
+    /// Otherwise an effort level — `low` (alias `minimal`), `medium`, `high`,
+    /// `xhigh`, or `max` — drives Anthropic `output_config.effort` and Codex
+    /// reasoning. Ollama's Anthropic-compat path treats the same non-empty
+    /// values as an on/off thinking switch because it does not honor
+    /// `output_config.effort`. Set once in solo.toml (`[session] thinking =
+    /// "high"`) — no flag needed each run.
     pub thinking: String,
     /// mu-n25a: the session's side-effects CEILING — the permission
     /// posture an operator's "read only" binds to, forwarded as

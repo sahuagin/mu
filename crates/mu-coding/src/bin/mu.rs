@@ -38,8 +38,9 @@ enum Command {
         /// Reasoning / extended-thinking effort: low | medium | high |
         /// xhigh | max (alias `minimal` = low; `off`/`none`/`disabled`
         /// to turn off). Drives Anthropic extended thinking (adaptive +
-        /// summarized) and openai-codex reasoning; ignored by providers
-        /// without a reasoning surface.
+        /// summarized), openai-codex reasoning, and ollama Anthropic-compat
+        /// thinking as an on/off switch; ignored by providers without a
+        /// reasoning surface.
         #[arg(long)]
         thinking: Option<String>,
         /// Bash tool: YOLO MODE. Bypass allowlist + metachar

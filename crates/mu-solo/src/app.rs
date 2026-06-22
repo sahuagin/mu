@@ -560,7 +560,7 @@ pub struct AppOptions<'a> {
     pub bash_yolo: bool,
     pub tools: &'a str,
     /// mu-upk2: extended-thinking directive forwarded as `mu serve
-    /// --thinking <v>`. Empty = off.
+    /// --thinking <v>`. Empty = no launch-time directive.
     pub thinking: &'a str,
     pub effort: &'a str,
     pub focus_mode: bool,

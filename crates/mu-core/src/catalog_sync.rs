@@ -61,6 +61,12 @@ pub struct ProbedModel {
     pub pricing_input_per_mtok: Option<f64>,
     /// USD per million output tokens (openrouter `pricing.completion` × 1e6).
     pub pricing_output_per_mtok: Option<f64>,
+    /// Supported reasoning-effort levels, in dial order (e.g.
+    /// `["low","medium","high","xhigh","max"]`). Probed from a provider's
+    /// machine-readable capability surface (Anthropic Models API); providers
+    /// without one leave it empty. Empty is honest "not reported", never a
+    /// fabricated set. (mu-ggb3)
+    pub effort_levels: Vec<String>,
 }
 
 /// A generated `[models."<key>"]` entry — serialize-only, minimal, and with
@@ -80,6 +86,13 @@ pub struct GeneratedModelEntry {
     pub pricing_input_per_mtok: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing_output_per_mtok: Option<f64>,
+    /// Supported reasoning-effort levels (mu-ggb3). Consumed by
+    /// `ModelCatalogEntry.effort_levels` (operator entry still wins). Empty →
+    /// omitted, so a model whose provider reports no effort surface falls back
+    /// to the route_catalog provider default rather than getting a fabricated
+    /// set written under it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub effort_levels: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -125,18 +138,50 @@ pub fn build_generated_entries(
         let Some(key) = selection.get(&p.id) else {
             continue;
         };
-        out.insert(
-            key.clone(),
-            GeneratedModelEntry {
-                model: p.id.clone(),
-                context_hard_limit: p.context_hard_limit,
-                max_output_tokens: p.max_output_tokens,
-                pricing_input_per_mtok: p.pricing_input_per_mtok,
-                pricing_output_per_mtok: p.pricing_output_per_mtok,
-            },
-        );
+        out.insert(key.clone(), entry_from_probed(p));
     }
     out
+}
+
+/// Like [`build_generated_entries`] but writes EVERY probed model, not only
+/// the operator-referenced ones. A model the operator referenced in
+/// `models.toml` is keyed by their table KEY (so figment's per-field merge
+/// lands on their entry, operator-wins); an unreferenced model is keyed by its
+/// own id, becoming a new id-keyed catalog entry available for direct use.
+///
+/// For **bounded-catalog** providers (Anthropic returns ~9 account models)
+/// where the operator wants every model carried — so a session can route to a
+/// model that was never pre-declared and still get its correct probed effort
+/// levels and limits, instead of the route_catalog provider fallback that went
+/// stale (mu-53kt). Do NOT use this for openrouter (~300 models → the bloat the
+/// selection intersection exists to prevent).
+pub fn build_generated_entries_all(
+    probed: &[ProbedModel],
+    selection: &BTreeMap<String, String>,
+) -> BTreeMap<String, GeneratedModelEntry> {
+    let mut out = BTreeMap::new();
+    for p in probed {
+        let key = selection
+            .get(&p.id)
+            .cloned()
+            .unwrap_or_else(|| p.id.clone());
+        out.insert(key, entry_from_probed(p));
+    }
+    out
+}
+
+/// Project a [`ProbedModel`] into its serialize-only generated entry. The soft
+/// limit is structurally absent (see module docs); every probed fact is copied
+/// verbatim, `None`/empty when the provider didn't report it.
+fn entry_from_probed(p: &ProbedModel) -> GeneratedModelEntry {
+    GeneratedModelEntry {
+        model: p.id.clone(),
+        context_hard_limit: p.context_hard_limit,
+        max_output_tokens: p.max_output_tokens,
+        pricing_input_per_mtok: p.pricing_input_per_mtok,
+        pricing_output_per_mtok: p.pricing_output_per_mtok,
+        effort_levels: p.effort_levels.clone(),
+    }
 }
 
 fn header(provider: &str) -> String {
@@ -267,6 +312,7 @@ mod tests {
             max_output_tokens: None,
             pricing_input_per_mtok: None,
             pricing_output_per_mtok: None,
+            effort_levels: Vec::new(),
         };
         let mut models = BTreeMap::new();
         models.insert("m".to_string(), e);
@@ -275,6 +321,63 @@ mod tests {
         assert!(
             !s.contains("context_soft_limit"),
             "generated layer must never carry a soft limit"
+        );
+        // empty effort_levels is omitted (skip_serializing_if), so a no-effort
+        // probe leaves the route_catalog provider fallback in charge.
+        assert!(!s.contains("effort_levels"));
+    }
+
+    #[test]
+    fn build_all_writes_every_model_keyed_by_operator_key_or_id() {
+        // mu-ggb3: the anthropic path writes all probed models. A referenced
+        // model lands on the operator's table key (merge target); an
+        // unreferenced one becomes a new id-keyed entry.
+        let mut selection = BTreeMap::new();
+        selection.insert("claude-opus-4-8".to_string(), "opus".to_string());
+        let mut opus = probed("claude-opus-4-8", Some(1_000_000), Some(128_000));
+        opus.effort_levels = vec![
+            "low".into(),
+            "medium".into(),
+            "high".into(),
+            "xhigh".into(),
+            "max".into(),
+        ];
+        let mut sonnet = probed("claude-sonnet-4-6", Some(1_000_000), Some(64_000));
+        // sonnet 4.6 lacks xhigh — exactly the per-model distinction mu-53kt needed.
+        sonnet.effort_levels = vec!["low".into(), "medium".into(), "high".into(), "max".into()];
+        let entries = build_generated_entries_all(&[opus, sonnet], &selection);
+
+        // referenced -> operator key; carries the probed effort set verbatim
+        let o = entries
+            .get("opus")
+            .expect("referenced model keyed by operator key");
+        assert_eq!(o.model, "claude-opus-4-8");
+        assert_eq!(
+            o.effort_levels,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        // unreferenced -> id key; xhigh correctly absent
+        let s = entries
+            .get("claude-sonnet-4-6")
+            .expect("unreferenced model keyed by id");
+        assert_eq!(s.effort_levels, vec!["low", "medium", "high", "max"]);
+        assert!(!s.effort_levels.iter().any(|l| l == "xhigh"));
+    }
+
+    #[test]
+    fn effort_levels_serialize_into_generated_toml() {
+        let mut e = entry_from_probed(&{
+            let mut p = probed("claude-opus-4-8", Some(1_000_000), Some(128_000));
+            p.effort_levels = vec!["low".into(), "xhigh".into()];
+            p
+        });
+        e.model = "claude-opus-4-8".into();
+        let mut models = BTreeMap::new();
+        models.insert("opus".to_string(), e);
+        let s = toml::to_string(&GeneratedFile { models: &models }).unwrap();
+        assert!(
+            s.contains(r#"effort_levels = ["low", "xhigh"]"#),
+            "got:\n{s}"
         );
     }
 

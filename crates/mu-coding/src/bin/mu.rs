@@ -325,7 +325,9 @@ enum ModelsCmd {
     /// compaction). Unreachable providers are skipped, preserving their
     /// existing layer.
     Sync {
-        /// Probe only this provider (repeatable: openrouter, vllm, ollama).
+        /// Probe only this provider (repeatable: openrouter, vllm, ollama,
+        /// anthropic_api). `anthropic_api` is full-catalog — it writes effort
+        /// levels + limits for EVERY account model, not just referenced ones.
         /// Default: every configured provider.
         #[arg(long = "provider", value_name = "NAME")]
         providers: Vec<String>,
@@ -342,7 +344,7 @@ enum ModelsCmd {
     /// List a provider's available models live (writes nothing) — the
     /// discovery surface for choosing what to put in `models.toml`.
     List {
-        /// Provider: openrouter | vllm | ollama.
+        /// Provider: openrouter | vllm | ollama | anthropic_api.
         provider: String,
         /// Optional case-insensitive substring filter on the model id.
         query: Option<String>,

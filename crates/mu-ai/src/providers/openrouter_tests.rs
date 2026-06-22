@@ -667,6 +667,55 @@ async fn sse_reasoning_then_text_captures_thinking_mu_mdds() {
     }
 }
 
+// mu-13ve: effort -> OpenRouter `reasoning` field mapping.
+#[test]
+fn reasoning_param_none_when_effort_absent_or_off() {
+    // None, "off", and "" → no reasoning key (byte-identical request).
+    assert_eq!(reasoning_param(None), None);
+    assert_eq!(reasoning_param(Some("off")), None);
+    assert_eq!(reasoning_param(Some("")), None);
+    // Unrecognized values are dropped, not forwarded raw.
+    assert_eq!(reasoning_param(Some("turbo")), None);
+}
+
+#[test]
+fn reasoning_param_maps_levels() {
+    assert_eq!(reasoning_param(Some("low")), Some(json!({"effort": "low"})));
+    assert_eq!(
+        reasoning_param(Some("medium")),
+        Some(json!({"effort": "medium"}))
+    );
+    assert_eq!(
+        reasoning_param(Some("high")),
+        Some(json!({"effort": "high"}))
+    );
+}
+
+#[test]
+fn reasoning_param_clamps_above_high_to_high() {
+    // mu's xhigh/max have no OpenRouter level above `high`.
+    assert_eq!(
+        reasoning_param(Some("xhigh")),
+        Some(json!({"effort": "high"}))
+    );
+    assert_eq!(
+        reasoning_param(Some("max")),
+        Some(json!({"effort": "high"}))
+    );
+}
+
+#[test]
+fn reasoning_param_is_case_and_whitespace_insensitive() {
+    assert_eq!(
+        reasoning_param(Some(" HIGH ")),
+        Some(json!({"effort": "high"}))
+    );
+    assert_eq!(
+        reasoning_param(Some("Medium")),
+        Some(json!({"effort": "medium"}))
+    );
+}
+
 #[tokio::test]
 async fn b7_sse_text_only() {
     let raw = concat!(

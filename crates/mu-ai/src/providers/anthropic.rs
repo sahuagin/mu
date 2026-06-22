@@ -1133,6 +1133,11 @@ fn assemble_content(blocks: &HashMap<u32, BlockBuilder>, block_order: &[u32]) ->
             }
             BlockBuilder::Thinking(text) => ContentBlock::Thinking {
                 text: text.as_str().into(),
+                // Anthropic thinking-signature threading isn't wired yet
+                // (PR-B is OpenAI-only). Leave the round-trip token empty
+                // so the OpenAI outbound path treats an anthropic-origin
+                // Thinking block as drop-on-resend, same as before.
+                opaque: None,
             },
         })
         .collect()

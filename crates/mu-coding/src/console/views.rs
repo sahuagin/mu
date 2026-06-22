@@ -508,7 +508,7 @@ fn render_transcript(events: &[SessionEvent]) -> String {
                             text.push_str(t);
                             text.push('\n');
                         }
-                        ContentBlock::Thinking { text: t } => {
+                        ContentBlock::Thinking { text: t, .. } => {
                             text.push_str("[thinking] ");
                             text.push_str(t);
                             text.push('\n');

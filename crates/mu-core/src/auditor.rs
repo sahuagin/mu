@@ -272,7 +272,10 @@ mod tests {
             EventActor::Agent,
             EventPayload::AssistantMessageEvent {
                 message: AssistantMessage {
-                    content: vec![ContentBlock::Thinking { text: text.into() }],
+                    content: vec![ContentBlock::Thinking {
+                        text: text.into(),
+                        opaque: None,
+                    }],
                     stop_reason: StopReason::ToolUse,
                     usage: None,
                 },

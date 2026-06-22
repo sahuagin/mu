@@ -946,6 +946,9 @@ fn assemble_content(state: &StreamState) -> Vec<ContentBlock> {
     if !state.accumulated_thinking.is_empty() {
         out.push(ContentBlock::Thinking {
             text: state.accumulated_thinking.as_str().into(),
+            // OpenRouter has no opaque reasoning round-trip token; leave
+            // it None (and the v1 outbound path drops Thinking anyway).
+            opaque: None,
         });
     }
     if !state.accumulated_text.is_empty() {

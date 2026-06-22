@@ -544,6 +544,7 @@ fn yqeq6_thinking_blocks_are_skipped_in_projected_wire_output() {
         content: vec![
             ContentBlock::Thinking {
                 text: "INTERNAL_REASONING_DO_NOT_LEAK".into(),
+                opaque: None,
             },
             ContentBlock::Text {
                 text: "public answer".into(),
@@ -653,7 +654,7 @@ async fn sse_reasoning_then_text_captures_thinking_mu_mdds() {
             // Thinking block first, then Text.
             assert_eq!(msg.content.len(), 2, "got {:?}", msg.content);
             match &msg.content[0] {
-                ContentBlock::Thinking { text } => {
+                ContentBlock::Thinking { text, .. } => {
                     assert_eq!(text.as_ref(), "let me think about it")
                 }
                 other => panic!("expected Thinking first, got {other:?}"),

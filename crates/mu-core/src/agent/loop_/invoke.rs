@@ -110,9 +110,9 @@ pub(crate) async fn handle_invoke_llm(
                     for block in &msg.content {
                         match block {
                             ContentBlock::Text { text: block_text } => text.push_str(block_text),
-                            ContentBlock::Thinking { text: block_text } => {
-                                thinking.push_str(block_text)
-                            }
+                            ContentBlock::Thinking {
+                                text: block_text, ..
+                            } => thinking.push_str(block_text),
                             ContentBlock::ToolCall(_) => {}
                         }
                     }

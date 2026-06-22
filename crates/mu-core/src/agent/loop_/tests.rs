@@ -3908,7 +3908,10 @@ fn rb4u_is_actionless_turn_classifies_empty_and_reasoning_only() {
     }));
     // Reasoning-only (a Thinking block, no text/tool) → actionless.
     assert!(is_actionless_turn(&AssistantMessage {
-        content: vec![ContentBlock::Thinking { text: "hmm".into() }],
+        content: vec![ContentBlock::Thinking {
+            text: "hmm".into(),
+            opaque: None,
+        }],
         stop_reason: StopReason::EndTurn,
         usage: None,
     }));

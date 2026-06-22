@@ -105,6 +105,17 @@ enum Command {
         /// Forwarded as `--thinking` to `mu serve`. See `mu serve --help`.
         #[arg(long)]
         thinking: Option<String>,
+        /// Per-turn reasoning effort (`/effort`): low | medium | high |
+        /// xhigh | max (provider/model dependent; codex also takes
+        /// `minimal`). Unlike `--thinking` — a launch-time default baked
+        /// into the daemon's providers — this rides `ask_session.effort`,
+        /// the same sticky per-turn carrier the mu-solo `/effort` dial
+        /// uses, so it exercises (and regression-tests) that path
+        /// headlessly. When set, overrides `--thinking` for the turn.
+        /// Maps to Anthropic `output_config.effort` / openai-codex
+        /// `reasoning.effort` / ollama thinking on-off. (mu-bez6)
+        #[arg(long)]
+        effort: Option<String>,
         /// Forwarded as `--bash-yolo` to `mu serve`. See `mu serve --help`.
         #[arg(long)]
         bash_yolo: bool,
@@ -476,6 +487,7 @@ async fn main() -> Result<()> {
             tools,
             ephemeral,
             thinking,
+            effort,
             bash_yolo,
             bash_allow,
             bash_prompt,
@@ -502,6 +514,7 @@ async fn main() -> Result<()> {
                 tools,
                 ephemeral,
                 thinking,
+                effort,
                 bash_yolo,
                 bash_allow,
                 bash_prompt,

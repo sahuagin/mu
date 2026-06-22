@@ -26,6 +26,12 @@ pub struct AskOptions {
     pub tools: String,
     pub ephemeral: bool,
     pub thinking: Option<String>,
+    /// Per-turn reasoning effort, carried on `ask_session.effort` — the
+    /// same sticky `/effort` selection the mu-solo dial uses (mu-vcbm).
+    /// `None` ⇒ leave the session's standing effort unchanged (the daemon
+    /// falls back to the provider launch default, including `--thinking`).
+    /// `Some(level)` updates it for this turn and onward. (mu-bez6)
+    pub effort: Option<String>,
     pub bash_yolo: bool,
     pub bash_allow: Vec<String>,
     pub bash_prompt: bool,
@@ -107,6 +113,7 @@ pub async fn run(opts: AskOptions) -> Result<()> {
         &mut stdout,
         &session_id,
         &opts.prompt,
+        opts.effort.as_deref(),
         &mut next_id,
     )
     .await?;
@@ -324,6 +331,21 @@ async fn create_session(
     }
 }
 
+/// Build the `ask_session` JSON-RPC params from the typed
+/// [`AskSessionRequest`]. Split out so the `skip_serializing_if =
+/// "Option::is_none"` omission of an unset per-turn `/effort` override is
+/// unit-testable without driving the daemon I/O: `effort = None` must
+/// produce NO `effort` key (not an explicit null), mirroring how
+/// `create_session` builds its body. (mu-bez6)
+pub(crate) fn build_ask_params(session_id: &str, prompt: &str, effort: Option<&str>) -> Value {
+    let params = AskSessionRequest {
+        session_id: session_id.to_owned(),
+        user_message: prompt.to_owned(),
+        effort: effort.map(str::to_owned),
+    };
+    serde_json::to_value(params).expect("AskSessionRequest serializes")
+}
+
 /// Send the ask and drain notifications until `session.done`. Returns
 /// the assistant text plus the done event's `stop_reason` (None when
 /// the daemon omits it — older daemons or malformed events), so the
@@ -334,6 +356,7 @@ pub(crate) async fn ask_and_drain(
     stdout: &mut BufReader<ChildStdout>,
     session_id: &str,
     prompt: &str,
+    effort: Option<&str>,
     next_id: &mut u64,
 ) -> Result<(String, Option<String>)> {
     let id = *next_id;
@@ -342,10 +365,7 @@ pub(crate) async fn ask_and_drain(
         "jsonrpc": "2.0",
         "id": id,
         "method": AskSessionRequest::METHOD,
-        "params": {
-            "session_id": session_id,
-            "user_message": prompt,
-        }
+        "params": build_ask_params(session_id, prompt, effort),
     });
     write_line(stdin, &req).await?;
 
@@ -471,4 +491,30 @@ pub(crate) async fn read_line(stdout: &mut BufReader<ChildStdout>) -> Result<Val
         bail!("mu serve closed stdout unexpectedly");
     }
     serde_json::from_str(line.trim_end_matches('\n')).context("parse JSON line from daemon")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // mu-bez6: the headless `--effort` carrier must put the per-turn
+    // `/effort` selection on `ask_session.effort` exactly as the mu-solo
+    // dial does — present when set, ABSENT (not null) when unset, so the
+    // daemon leaves the session's standing effort unchanged.
+    #[test]
+    fn ask_params_carry_effort_when_set() {
+        let p = build_ask_params("sess-1", "hello", Some("high"));
+        assert_eq!(p["session_id"], "sess-1");
+        assert_eq!(p["user_message"], "hello");
+        assert_eq!(p["effort"], "high");
+    }
+
+    #[test]
+    fn ask_params_omit_effort_when_unset() {
+        let p = build_ask_params("sess-1", "hello", None);
+        assert!(
+            p.get("effort").is_none(),
+            "no `/effort` override ⇒ the field must be omitted, not null: {p}"
+        );
+    }
 }

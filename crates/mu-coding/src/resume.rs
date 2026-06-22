@@ -106,6 +106,9 @@ pub async fn run(opts: ResumeOptions) -> Result<()> {
             &mut stdout,
             &resp.session_id,
             prompt,
+            // `mu resume` has no per-turn `/effort` flag (yet); leave the
+            // resumed session's standing effort untouched. (mu-bez6)
+            None,
             &mut next_id,
         )
         .await?;

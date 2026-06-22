@@ -124,3 +124,14 @@ model = "qwen3.6:35b-a3b-q8_0"
 label = "Local Qwen 3.6 35B"
 aliases = ["qwen36", "local-reasoner"]
 default_effort = "on"
+
+# mu-y8gp: per-model sampling (temperature/top_p) is sent to providers that take
+# it on the wire — OpenRouter and vLLM. ollama is intentionally excluded:
+# sending sampling there reloads the model; bake those into the Modelfile.
+# Z.ai recommends temperature 0.6 for GLM agentic tool loops. The default
+# catalog ships no provider-specific guess; set the id(s) your provider exposes
+# in ~/.config/mu/models.toml, e.g.:
+#
+# [model_rules.glm_sampling]
+# prefixes = ["z-ai/glm", "zhipu/glm"]
+# temperature = 0.6

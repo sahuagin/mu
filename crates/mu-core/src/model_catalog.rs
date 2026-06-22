@@ -37,7 +37,11 @@ pub struct ProviderCatalogConfig {
     pub api_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+// mu-y8gp: per-model sampling (temperature/top_p) is `f64`, which is not `Eq`,
+// so the three sampling-carrying catalog structs drop the `Eq` derive (they
+// keep `PartialEq`). `Eq` was unused — the `ModelCatalogConfig` container is
+// `PartialEq`-only and nothing keys a HashSet/HashMap on these.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ModelCatalogEntry {
     pub model: Option<String>,
@@ -51,9 +55,15 @@ pub struct ModelCatalogEntry {
     pub effort_levels: Vec<String>,
     pub default_effort: Option<String>,
     pub quirks: Vec<String>,
+    /// mu-y8gp: per-model sampling forwarded to providers that take it on the
+    /// wire (OpenRouter / vLLM today). `None` → provider default. ollama is
+    /// deliberately NOT wired to these — sending sampling reloads the model;
+    /// bake those into the Modelfile instead.
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ModelRuleConfig {
     pub prefix: Option<String>,
@@ -66,6 +76,9 @@ pub struct ModelRuleConfig {
     pub effort_levels: Vec<String>,
     pub default_effort: Option<String>,
     pub quirks: Vec<String>,
+    /// mu-y8gp: prefix-rule sampling defaults; see [`ModelCatalogEntry`].
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,7 +92,7 @@ pub struct FavoriteConfig {
     pub tools: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ResolvedModelSettings {
     pub label: Option<String>,
     pub aliases: Vec<String>,
@@ -91,6 +104,9 @@ pub struct ResolvedModelSettings {
     pub effort_levels: Vec<String>,
     pub default_effort: Option<String>,
     pub quirks: Vec<String>,
+    /// mu-y8gp: resolved per-model sampling; see [`ModelCatalogEntry`].
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
 }
 
 static DEFAULT_CATALOG: OnceLock<ModelCatalogConfig> = OnceLock::new();
@@ -266,6 +282,12 @@ fn fill_missing_fields(dst: &mut ModelCatalogEntry, src: &ModelCatalogEntry) {
     }
     if dst.quirks.is_empty() {
         dst.quirks = src.quirks.clone();
+    }
+    if dst.temperature.is_none() {
+        dst.temperature = src.temperature;
+    }
+    if dst.top_p.is_none() {
+        dst.top_p = src.top_p;
     }
 }
 
@@ -492,6 +514,8 @@ impl ModelCatalogConfig {
             out.effort_levels = rule.effort_levels.clone();
             out.default_effort = rule.default_effort.clone();
             out.quirks = rule.quirks.clone();
+            out.temperature = rule.temperature;
+            out.top_p = rule.top_p;
         }
 
         if let Some(m) = exact {
@@ -524,6 +548,12 @@ impl ModelCatalogConfig {
             }
             if !m.quirks.is_empty() {
                 out.quirks = merge_strings(&out.quirks, &m.quirks);
+            }
+            if m.temperature.is_some() {
+                out.temperature = m.temperature;
+            }
+            if m.top_p.is_some() {
+                out.top_p = m.top_p;
             }
         }
 

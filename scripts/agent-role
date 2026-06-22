@@ -1,0 +1,60 @@
+#!/bin/sh
+# agent-role — resolve a role's ranked dispatch target(s) from agent_roles.toml.
+#
+# One config names the provider:model hierarchy for each role, so scripts
+# (ci-aipr, goal-protocol workers, …) ask for a ROLE and a RANK instead of
+# hardcoding a model. Change the model for a role in one place.
+#
+# Usage:
+#   agent-role <role>              every rank, one per line: "<provider> <model>"
+#   agent-role <role> <rank>       one rank (0-based):       "<provider> <model>"
+#   agent-role --cmd <role> [<rank>]   a ready-to-run dispatch command:
+#                                        claude-oauth  → `claude -p --model <m>`   (Max sub, ToS-clean)
+#                                        otherwise     → `mu ask --bare --provider <p> --model <m>`
+#
+# Resolution: `tq -o json <role>.ranked` emits the ranked array as JSON; `jq`
+# indexes it. Per-model params come from ~/.config/mu/models.toml via mu's
+# id-match at dispatch — not from here.
+set -eu
+
+ROLES="${AGENT_ROLES:-$HOME/.config/mu/agent_roles.toml}"
+TQ="${TQ:-$HOME/.cargo/bin/tq}"
+command -v "$TQ" >/dev/null 2>&1 || TQ=tq
+
+die() { printf 'agent-role: %s\n' "$1" >&2; exit 1; }
+
+CMD=0
+[ "${1:-}" = "--cmd" ] && { CMD=1; shift; }
+ROLE="${1:-}"; RANK="${2:-}"
+[ -n "$ROLE" ] || die "usage: agent-role [--cmd] <role> [<rank>]"
+[ -f "$ROLES" ] || die "no roles file: $ROLES (set AGENT_ROLES to override)"
+
+json=$("$TQ" -o json -f "$ROLES" "$ROLE.ranked" 2>/dev/null) \
+    || die "role '$ROLE' not found in $ROLES"
+
+emit() {  # $1=provider $2=model
+    if [ "$CMD" -eq 1 ]; then
+        case "$1" in
+            claude-oauth) printf 'claude -p --model %s\n' "$2" ;;
+            *)            printf 'mu ask --bare --provider %s --model %s\n' "$1" "$2" ;;
+        esac
+    else
+        printf '%s %s\n' "$1" "$2"
+    fi
+}
+
+if [ -n "$RANK" ]; then
+    p=$(printf '%s' "$json" | jq -r ".[$RANK].provider // empty")
+    m=$(printf '%s' "$json" | jq -r ".[$RANK].model // empty")
+    [ -n "$p" ] && [ -n "$m" ] || die "role '$ROLE' has no rank $RANK"
+    emit "$p" "$m"
+else
+    n=$(printf '%s' "$json" | jq -r 'length')
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        p=$(printf '%s' "$json" | jq -r ".[$i].provider")
+        m=$(printf '%s' "$json" | jq -r ".[$i].model")
+        emit "$p" "$m"
+        i=$((i + 1))
+    done
+fi

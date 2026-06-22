@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 /// version treats the snapshot as absent and rediscovers — it never migrates.
 /// (The catalog-hash and PATH-hash guard *content* drift; this const guards
 /// *shape* drift.)
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// One capability as it lives in the archive: flat, all-owned, no newtypes.
 /// rkyv archives `String`/`Vec` directly; we reconstruct the [`Capability`]
@@ -46,6 +46,10 @@ pub struct ArchCapability {
     pub path: String,
     pub summary: String,
     pub keywords: Vec<String>,
+    /// Explicit hierarchy weight (see [`Capability::priority`]). Carried through
+    /// the snapshot so warm-start `find` honors the same ordering as a cold
+    /// `discover` — unlike `effects`, which the archive does not preserve.
+    pub priority: i32,
     pub invoke: Vec<String>,
     /// Help argv, if known (probed or curated). Empty vec => no help spec.
     pub help_argv: Vec<String>,
@@ -123,6 +127,7 @@ impl Snapshot {
                     path: c.path.to_string(),
                     summary: c.summary.clone(),
                     keywords: c.keywords.clone(),
+                    priority: c.priority,
                     invoke: c.invoke.clone(),
                     help_argv,
                     help_ai,
@@ -205,6 +210,7 @@ impl Snapshot {
                 path,
                 summary: a.summary.clone(),
                 keywords: a.keywords.clone(),
+                priority: a.priority,
                 invoke: a.invoke.clone(),
                 help,
                 requires: a.requires.clone(),
@@ -448,6 +454,7 @@ mod tests {
             path: p,
             summary: summary.to_string(),
             keywords: vec!["kw".to_string()],
+            priority: 0,
             help: Some(HelpSpec {
                 argv: vec!["tool".to_string(), "--help".to_string()],
                 ai: true,

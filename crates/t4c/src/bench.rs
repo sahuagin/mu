@@ -27,6 +27,7 @@ fn cap(path: &str, summary: &str, kw: &[&str]) -> Capability {
         path: CapPath::parse(path).expect("fixture path is valid"),
         summary: summary.to_string(),
         keywords: kw.iter().map(|s| s.to_string()).collect(),
+        priority: 0,
         invoke: vec![],
         help: None,
         requires: vec![],

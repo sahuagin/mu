@@ -103,6 +103,7 @@ mod tests {
             path: p,
             summary: summary.to_string(),
             keywords: vec![],
+            priority: 0,
             help: None,
             requires: vec![],
             effects: None,

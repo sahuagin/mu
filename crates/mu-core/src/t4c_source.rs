@@ -353,6 +353,8 @@ fn capability_for(
         path,
         summary,
         keywords,
+        // In-process tools carry no operator-assigned hierarchy; neutral weight.
+        priority: 0,
         // In-process: invocation is a tool-call routed by the daemon
         // (mu-kex4.6.4), not a shell argv.
         invoke: Vec::new(),

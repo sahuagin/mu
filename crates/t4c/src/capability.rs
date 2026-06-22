@@ -13,6 +13,15 @@ pub struct Capability {
     pub path: CapPath,
     pub summary: String,
     pub keywords: Vec<String>,
+    /// Explicit hierarchy weight (higher = preferred). Applied as a
+    /// *deterministic tie-break* after the relevance score and before the path
+    /// name, so an operator-declared ordering decides among comparably-relevant
+    /// capabilities — e.g. `bash.sprint-start` over `bash.git.*` for an
+    /// "isolated workspace" intent — without ever lifting an irrelevant
+    /// capability above a relevant one. `0` is neutral (the default for probed,
+    /// chained, and reconstructed-from-snapshot capabilities); curated catalog
+    /// entries may set it. See [`crate::rank::sort_ranked`].
+    pub priority: i32,
     pub invoke: Vec<String>,
     pub help: Option<HelpSpec>,
     pub requires: Vec<String>,

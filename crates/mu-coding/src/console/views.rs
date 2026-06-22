@@ -320,6 +320,9 @@ pub(crate) fn render_compaction_one(
             tokens_after,
             decisions,
             wall_clock_us,
+            predicted_tokens,
+            compaction_threshold,
+            output_reserve,
         } = &ev.payload
         {
             if *id == model_call_id {
@@ -330,6 +333,22 @@ pub(crate) fn render_compaction_one(
                 kv(&mut body, "tokens after", &tokens_after.to_string());
                 kv(&mut body, "wall clock us", &wall_clock_us.to_string());
                 kv(&mut body, "decisions", &decisions.len().to_string());
+                // mu-a79g: the trigger inputs and the reconstructed
+                // effective compaction point (threshold − reserve).
+                kv(&mut body, "predicted tokens", &predicted_tokens.to_string());
+                kv(
+                    &mut body,
+                    "compaction threshold",
+                    &compaction_threshold.to_string(),
+                );
+                kv(&mut body, "output reserve", &output_reserve.to_string());
+                kv(
+                    &mut body,
+                    "effective threshold",
+                    &compaction_threshold
+                        .saturating_sub(*output_reserve)
+                        .to_string(),
+                );
                 body.push_str("</dl><h3>decisions</h3><pre>");
                 body.push_str(&esc(&truncate(&format!("{decisions:#?}"), 80_000)));
                 body.push_str("</pre>");
@@ -698,7 +717,7 @@ fn render_compaction_list(
     session_id: &str,
     events: &[SessionEvent],
 ) -> String {
-    let mut out = String::from("<h2>CompactionAssembly</h2><table><thead><tr><th>call</th><th>event</th><th>policy</th><th>before</th><th>after</th><th>decisions</th><th>wall us</th></tr></thead><tbody>");
+    let mut out = String::from("<h2>CompactionAssembly</h2><table><thead><tr><th>call</th><th>event</th><th>policy</th><th>before</th><th>after</th><th>decisions</th><th>wall us</th><th>predicted</th><th>threshold</th><th>reserve</th><th>effective</th></tr></thead><tbody>");
     let mut n = 0;
     for ev in events {
         if let EventPayload::CompactionAssembly {
@@ -708,6 +727,9 @@ fn render_compaction_list(
             tokens_after,
             decisions,
             wall_clock_us,
+            predicted_tokens,
+            compaction_threshold,
+            output_reserve,
         } = &ev.payload
         {
             n += 1;
@@ -729,6 +751,13 @@ fn render_compaction_list(
             out.push_str(&td_num(*tokens_after));
             out.push_str(&td_num(decisions.len()));
             out.push_str(&td_num(*wall_clock_us));
+            // mu-a79g: trigger inputs + reconstructed effective point.
+            out.push_str(&td_num(*predicted_tokens));
+            out.push_str(&td_num(*compaction_threshold));
+            out.push_str(&td_num(*output_reserve));
+            out.push_str(&td_num(
+                compaction_threshold.saturating_sub(*output_reserve),
+            ));
             out.push_str("</tr>");
         }
     }

@@ -263,7 +263,7 @@ impl MuMcpHandler {
         // last pushed status. See `mu_core::session_status` for the terms.
         let (context_soft_limit, context_hard_limit) = log
             .context_limits()
-            .map_or((None, None), |(soft, hard)| (Some(soft), hard));
+            .map_or((None, None), |(soft, hard, _max_output)| (Some(soft), hard));
         let (_, context_used_tokens) = log.live_usage();
         let provider_status = self
             .sessions

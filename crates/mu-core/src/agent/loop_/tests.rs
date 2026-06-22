@@ -3880,3 +3880,138 @@ async fn panicking_sync_compaction_does_not_kill_loop() {
         .expect("join must not hang");
     assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
 }
+
+// ============================================================================
+// mu-rb4u: empty / reasoning-only turn auto-continue
+// ============================================================================
+
+/// A Responses-API reasoning-only completion: no tool call, no text.
+fn assistant_actionless() -> AssistantMessage {
+    AssistantMessage {
+        content: vec![],
+        stop_reason: StopReason::EndTurn,
+        usage: None,
+    }
+}
+
+#[test]
+fn rb4u_is_actionless_turn_classifies_empty_and_reasoning_only() {
+    // Empty content → actionless.
+    assert!(is_actionless_turn(&assistant_actionless()));
+    // Whitespace-only text → actionless.
+    assert!(is_actionless_turn(&AssistantMessage {
+        content: vec![ContentBlock::Text {
+            text: "  \n".into()
+        }],
+        stop_reason: StopReason::EndTurn,
+        usage: None,
+    }));
+    // Reasoning-only (a Thinking block, no text/tool) → actionless.
+    assert!(is_actionless_turn(&AssistantMessage {
+        content: vec![ContentBlock::Thinking { text: "hmm".into() }],
+        stop_reason: StopReason::EndTurn,
+        usage: None,
+    }));
+    // A real answer → NOT actionless.
+    assert!(!is_actionless_turn(&assistant_text("here is the answer")));
+    // A tool call → NOT actionless.
+    assert!(!is_actionless_turn(&assistant_tool_call(
+        "c1",
+        "grep",
+        json!({ "q": "x" })
+    )));
+}
+
+/// An actionless turn is auto-continued instead of ending the ask: the
+/// loop re-invokes and the next turn's real answer lands. (mu-rb4u)
+#[tokio::test]
+async fn rb4u_empty_turn_auto_continues_then_recovers() {
+    // turn 1: actionless (reasoning-only). turn 2: a real answer.
+    let provider = MockProvider::new(vec![
+        vec![ProviderEvent::Done(assistant_actionless())],
+        vec![
+            ProviderEvent::TextDelta("recovered".into()),
+            ProviderEvent::Done(assistant_text("recovered")),
+        ],
+    ]);
+    let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
+    loop_
+        .send(AgentInput::UserMessage(user_msg("go"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("join must not hang");
+    let events = events_handle.await.expect("events drain");
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+
+    // Auto-continued exactly once on the empty turn...
+    let auto = events
+        .iter()
+        .filter(|e| {
+            matches!(e, AgentEvent::Callout { title, .. }
+                if title == "empty model turn — auto-continuing")
+        })
+        .count();
+    assert_eq!(auto, 1, "expected one auto-continue callout, got {auto}");
+    // ...did NOT give up...
+    assert!(
+        !events.iter().any(|e| {
+            matches!(e, AgentEvent::Callout { title, .. }
+                if title == "empty model turns persisted — ending ask")
+        }),
+        "should not have given up",
+    );
+    // ...re-invoked (two turn_starts: the empty turn + the retry)...
+    let turn_starts = events.iter().filter(|e| kind(e) == "turn_start").count();
+    assert_eq!(turn_starts, 2, "expected a re-invoke after the empty turn");
+    // ...and the recovered answer landed.
+    assert!(
+        events.iter().any(
+            |e| matches!(e, AgentEvent::AssistantTextFinalized { text } if text == "recovered")
+        ),
+        "expected the recovered answer from the re-invoke",
+    );
+}
+
+/// A provider stuck emitting actionless turns is bounded: the loop
+/// auto-continues `MAX_EMPTY_TURN_RETRIES` times, then gives up and ends
+/// the ask rather than spinning forever. (mu-rb4u)
+#[tokio::test]
+async fn rb4u_persistent_empty_turns_give_up_after_bound() {
+    let provider = MockProvider::forever(vec![ProviderEvent::Done(assistant_actionless())]);
+    let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
+    loop_
+        .send(AgentInput::UserMessage(user_msg("go"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("join must not hang");
+    let events = events_handle.await.expect("events drain");
+
+    // Bounded — it ends the ask instead of looping forever.
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+    let auto = events
+        .iter()
+        .filter(|e| {
+            matches!(e, AgentEvent::Callout { title, .. }
+                if title == "empty model turn — auto-continuing")
+        })
+        .count();
+    let gave_up = events
+        .iter()
+        .filter(|e| {
+            matches!(e, AgentEvent::Callout { title, .. }
+                if title == "empty model turns persisted — ending ask")
+        })
+        .count();
+    assert_eq!(
+        auto as u32, MAX_EMPTY_TURN_RETRIES,
+        "auto-continued {auto} times (bound is {MAX_EMPTY_TURN_RETRIES})",
+    );
+    assert_eq!(gave_up, 1, "should give up exactly once");
+}

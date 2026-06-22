@@ -846,6 +846,55 @@ fn parse_tool_input(input_json: &str) -> mu_core::agent::ToolArgs {
     })
 }
 
+/// Render a non-2xx Codex response into a legible provider error.
+///
+/// The Responses backend returns a structured `{"error":{...}}` body. The
+/// common case in the wild is a 429 `usage_limit_reached` — a
+/// per-subscription cap with a `resets_in_seconds` window, NOT a transient
+/// rate limit. Surfacing it cleanly (plan + reset window) tells the
+/// operator it's a cap and when it clears, instead of dumping the raw JSON
+/// into the agent's error event. (mu-rb4u)
+fn render_codex_http_error(status: reqwest::StatusCode, body: &str) -> String {
+    #[derive(Deserialize)]
+    struct ErrBody {
+        error: Option<ErrInner>,
+    }
+    #[derive(Deserialize)]
+    struct ErrInner {
+        #[serde(default, rename = "type")]
+        type_: Option<String>,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        plan_type: Option<String>,
+        #[serde(default)]
+        resets_in_seconds: Option<u64>,
+    }
+
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        if let Ok(ErrBody { error: Some(e) }) = serde_json::from_str::<ErrBody>(body) {
+            if e.type_.as_deref() == Some("usage_limit_reached") {
+                let plan = e.plan_type.as_deref().unwrap_or("unknown");
+                let resets = match e.resets_in_seconds {
+                    Some(s) => format!("; resets in ~{}m{:02}s", s / 60, s % 60),
+                    None => String::new(),
+                };
+                return format!(
+                    "codex usage limit reached (plan {plan}){resets}. This is a \
+                     per-subscription cap, not a transient rate limit — wait for the \
+                     reset or switch providers (e.g. `/model`, or `--provider`)."
+                );
+            }
+            if let Some(msg) = e.message.as_deref() {
+                return format!("codex rate limited (429): {msg}");
+            }
+        }
+        return format!("codex rate limited (429): {body}");
+    }
+
+    format!("codex returned {status}: {body}")
+}
+
 async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamState)> {
     if state.finished {
         return None;
@@ -1220,9 +1269,7 @@ impl Provider for OpenaiCodexProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Other(format!(
-                "codex returned {status}: {text}"
-            )));
+            return Err(ProviderError::Other(render_codex_http_error(status, &text)));
         }
 
         let bytes = resp.bytes_stream();

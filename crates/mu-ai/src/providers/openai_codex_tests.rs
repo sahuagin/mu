@@ -1314,3 +1314,40 @@ mod live_tests {
         assert!(tc.arguments.as_value().is_object());
     }
 }
+
+// ============================================================================
+// mu-rb4u: 429 / usage-limit error rendering
+// ============================================================================
+
+#[test]
+fn rb4u_render_codex_http_error_surfaces_usage_limit() {
+    // The exact shape codex returns for a subscription cap (observed in
+    // the wild: resets_in_seconds=3501 → ~58m21s).
+    let body = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"prolite","resets_at":1782114418,"resets_in_seconds":3501}}"#;
+    let msg = render_codex_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, body);
+    assert!(msg.contains("usage limit reached"), "got: {msg}");
+    assert!(msg.contains("prolite"), "should name the plan; got: {msg}");
+    assert!(
+        msg.contains("58m21s"),
+        "should state the reset window; got: {msg}"
+    );
+    // Not a raw JSON dump.
+    assert!(
+        !msg.contains("resets_in_seconds"),
+        "should not dump raw JSON; got: {msg}"
+    );
+}
+
+#[test]
+fn rb4u_render_codex_http_error_generic_429_and_other_status() {
+    // A 429 without a usage cap → concise rate-limit message.
+    let body = r#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#;
+    let msg = render_codex_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, body);
+    assert!(msg.contains("rate limited (429)"), "got: {msg}");
+    assert!(msg.contains("slow down"), "got: {msg}");
+
+    // A non-429 falls back to the status + body verbatim.
+    let msg = render_codex_http_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom");
+    assert!(msg.contains("500"), "got: {msg}");
+    assert!(msg.contains("boom"), "got: {msg}");
+}

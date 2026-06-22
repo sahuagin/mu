@@ -491,9 +491,9 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tz: Option<String>,
     },
-    /// mu-slat: a pot-hosted claude-code worker was spawned as a
-    /// subprocess session. Emitted once by the supervisor when the
-    /// worker process starts successfully.
+    /// mu-slat: a worker subprocess was spawned as a subprocess
+    /// session. Emitted once by the supervisor when the worker process
+    /// starts successfully.
     WorkerSpawned {
         pot_name: String,
         model: String,

@@ -1,129 +1,144 @@
-#!/usr/local/bin/zsh
-# mu-spawn — launch an interactive claude-code session inside a pot,
-# connected to mu via MCP mailbox.
+#!/bin/sh
+# mu-spawn — launch a non-POT worker agent.
+#
+# Current contract (mu-ktj0): POTs/jails are gone. This wrapper is the small,
+# boring dispatch surface used by mu's spawn_worker path and by humans who want
+# an ad-hoc child agent. It selects a provider/model through scripts/agent-role
+# (unless explicitly overridden), then runs either:
+#   - claude -p              for provider=claude-oauth
+#   - mu ask --bare          for all other providers
 #
 # Usage:
-#   mu-spawn [pot-name]        # interactive session (subscription billing)
-#   mu-spawn -p [pot-name]     # headless with prompt on stdin (credit pool)
+#   mu-spawn [options] [prompt...]
+#   echo "task" | mu-spawn --session-id session-9 --daemon-id d1
 #
-# The pot must already be running with:
-#   - claude binary accessible
-#   - linuxulator mounts
-#   - ~/.local/share/mu/ nullfs-mounted (for MCP socket)
-#   - socat installed
+# Options:
+#   --role ROLE          agent_roles.toml role to resolve (default: coding)
+#   --rank N            role rank, 0-based (default: 0)
+#   --provider P        provider override (skips role provider)
+#   --model M           model override (skips role model)
+#   --session-id ID     spawned worker session id (default: env MU_SESSION_ID)
+#   --daemon-id ID      daemon id for dialogue identity (default: env MU_DAEMON_ID)
+#   --reply-to ID       parent session id (default: env MU_REPLY_TO)
+#   --cwd DIR           working directory for the child (default: cwd)
+#   --timeout SECS      wall-clock timeout (default: env MU_SPAWN_TIMEOUT or 3600)
+#   --mcp-config FILE   claude MCP config file (default: env MU_SPAWN_MCP_CONFIG)
+#   --dry-run           print the resolved command and exit
+#   -h, --help          show this help
 #
-# If no pot-name given, defaults to mu-slat-test.
-# If the pot isn't running, attempts to clone+start from agent-runtime.
+# Prompt is read from argv when present, otherwise stdin. The child is told its
+# mcp-dialogue peer id, which is mu:<daemon_id>:<session_id> when both pieces are
+# known. mu-native sessions bind dialogue_say/dialogue_poll identity in the tool
+# layer; claude workers get this as prompt guidance and can use an MCP config if
+# supplied.
+set -eu
 
-set -e
+usage() { sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'; }
+die() { printf 'mu-spawn: %s\n' "$1" >&2; exit 2; }
+q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\''/g")"; }
 
-# ─── Config ───────────────────────────────────────────────────────────
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+AGENT_ROLE=${AGENT_ROLE:-$SCRIPT_DIR/agent-role}
+ROLE=coding
+RANK=0
+PROVIDER=${MU_SPAWN_PROVIDER:-}
+MODEL=${MU_SPAWN_MODEL:-}
+SESSION_ID=${MU_SESSION_ID:-}
+DAEMON_ID=${MU_DAEMON_ID:-}
+REPLY_TO=${MU_REPLY_TO:-}
+CWD=$(pwd)
+TIMEOUT_SECS=${MU_SPAWN_TIMEOUT:-3600}
+MCP_CONFIG=${MU_SPAWN_MCP_CONFIG:-}
+MU_BIN=${MU:-mu}
+DRY_RUN=0
 
-POT_NAME="${1:-mu-slat-test}"
-POT_IP="${MU_SPAWN_IP:-10.1.1.220}"
-POT_USER="${MU_SPAWN_USER:-tcovert}"
-POT_TEMPLATE="${MU_SPAWN_TEMPLATE:-agent-runtime}"
-SOCK="$HOME/.local/share/mu/mcp.sock"
-MCP_CONFIG_HOST="/tmp/mu-mcp-${POT_NAME}.json"
-MCP_CONFIG_IN_POT="/compat/linux/tmp/mu-mcp-${POT_NAME}.json"
-POT_SOCK="/usr/home/tcovert/.local/share/mu/mcp.sock"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --role) ROLE=${2:?--role needs a value}; shift 2 ;;
+    --rank) RANK=${2:?--rank needs a value}; shift 2 ;;
+    --provider) PROVIDER=${2:?--provider needs a value}; shift 2 ;;
+    --model) MODEL=${2:?--model needs a value}; shift 2 ;;
+    --session-id) SESSION_ID=${2:?--session-id needs a value}; shift 2 ;;
+    --daemon-id) DAEMON_ID=${2:?--daemon-id needs a value}; shift 2 ;;
+    --reply-to) REPLY_TO=${2:?--reply-to needs a value}; shift 2 ;;
+    --cwd) CWD=${2:?--cwd needs a value}; shift 2 ;;
+    --timeout) TIMEOUT_SECS=${2:?--timeout needs a value}; shift 2 ;;
+    --mcp-config) MCP_CONFIG=${2:?--mcp-config needs a value}; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) die "unknown option: $1" ;;
+    *) break ;;
+  esac
+done
 
-# ─── Ensure mu serve is running ───────────────────────────────────────
-
-if ! echo '{"jsonrpc":"2.0","id":0,"method":"ping","params":{}}' \
-    | socat -T1 - UNIX-CONNECT:"$SOCK" >/dev/null 2>&1; then
-    echo "[mu-spawn] Starting mu serve..." >&2
-    ~/.local/bin/mu-mcp-bridge <<< '{"jsonrpc":"2.0","id":0,"method":"ping","params":{}}' >/dev/null 2>&1
+if [ -z "$PROVIDER" ] || [ -z "$MODEL" ]; then
+  [ -x "$AGENT_ROLE" ] || die "agent-role not executable at $AGENT_ROLE"
+  role_line=$($AGENT_ROLE "$ROLE" "$RANK") || exit $?
+  role_provider=$(printf '%s
+' "$role_line" | awk 'NR==1 {print $1}')
+  role_model=$(printf '%s
+' "$role_line" | awk 'NR==1 {$1=""; sub(/^ /, ""); print}')
+  [ -n "$role_provider" ] && [ -n "$role_model" ] || die "agent-role returned no provider/model for $ROLE rank $RANK"
+  [ -n "$PROVIDER" ] || PROVIDER=$role_provider
+  [ -n "$MODEL" ] || MODEL=$role_model
 fi
 
-# ─── Ensure pot is running ────────────────────────────────────────────
+PROMPT_FILE=$(mktemp "${TMPDIR:-/tmp}/mu-spawn.prompt.XXXXXX")
+SYS_FILE=$(mktemp "${TMPDIR:-/tmp}/mu-spawn.system.XXXXXX")
+trap 'rm -f "$PROMPT_FILE" "$SYS_FILE"' EXIT INT TERM
 
-POT_ACTIVE=$(sudo pot ls 2>/dev/null | grep -A3 "pot name : $POT_NAME" | grep 'active' | awk '{print $3}')
-
-if [[ "$POT_ACTIVE" != "true" ]]; then
-    echo "[mu-spawn] Pot $POT_NAME not running. Setting up..." >&2
-
-    # Check if pot exists but is stopped
-    if sudo pot ls 2>/dev/null | grep -q "pot name : $POT_NAME"; then
-        echo "[mu-spawn] Starting existing pot $POT_NAME..." >&2
-        sudo pot start "$POT_NAME" 2>&1 | tail -1 >&2
-    else
-        echo "[mu-spawn] Cloning $POT_TEMPLATE → $POT_NAME at $POT_IP..." >&2
-        sudo pot clone -P "$POT_TEMPLATE" -p "$POT_NAME" -i "$POT_IP" -d off 2>&1 >&2
-
-        # ~/.local/share (including mu/ with MCP socket) is in the
-        # template's fscomp.conf — no per-pot mount-in needed.
-        sudo pot start "$POT_NAME" 2>&1 | tail -1 >&2
-    fi
-
-    # Fix DNS
-    sudo sh -c "echo 'nameserver 10.1.1.1' > /opt/pot/jails/$POT_NAME/m/etc/resolv.conf"
-
-    # Verify claude is accessible
-    if ! sudo jexec "$POT_NAME" /usr/local/bin/claude --version >/dev/null 2>&1; then
-        echo "[mu-spawn] ERROR: claude not available in $POT_NAME" >&2
-        exit 1
-    fi
+if [ "$#" -gt 0 ]; then
+  printf '%s\n' "$*" > "$PROMPT_FILE"
+else
+  cat > "$PROMPT_FILE"
 fi
 
-echo "[mu-spawn] Pot $POT_NAME ready" >&2
+PEER_ID=""
+if [ -n "$DAEMON_ID" ] && [ -n "$SESSION_ID" ]; then
+  PEER_ID="mu:$DAEMON_ID:$SESSION_ID"
+fi
 
-# ─── Write MCP config (shared via /tmp ↔ /compat/linux/tmp) ──────────
+cat > "$SYS_FILE" <<EOF
+You are a spawned worker agent. Execute the user's task and print a concise result.
 
-cat > "$MCP_CONFIG_HOST" << EOF
-{
-  "mcpServers": {
-    "mu-mailbox": {
-      "command": "/usr/local/bin/socat",
-      "args": ["STDIO", "UNIX-CONNECT:$POT_SOCK"]
-    }
-  }
-}
+Worker identity:
+- daemon_id: ${DAEMON_ID:-unknown}
+- session_id: ${SESSION_ID:-unknown}
+- dialogue peer id: ${PEER_ID:-unknown}
+- reply_to session: ${REPLY_TO:-unknown}
+
+If mcp-dialogue tools are available, register presence before work by polling your own inbox once (dialogue_poll with a short timeout is enough). Use peer id '${PEER_ID:-unknown}'. For mu-native dialogue_say, the 'from' field is bound automatically by the runtime; do not spoof it. If you need to notify the parent and know its peer id, send a short result there as well as printing stdout. If dialogue tools are unavailable, stdout is the fallback result channel.
 EOF
 
-# ─── Get daemon info for the system prompt ────────────────────────────
+printf '[mu-spawn] provider=%s model=%s role=%s rank=%s session=%s peer=%s\n' \
+  "$PROVIDER" "$MODEL" "$ROLE" "$RANK" "${SESSION_ID:-unknown}" "${PEER_ID:-unknown}" >&2
 
-DAEMON_ID=$(echo '{"jsonrpc":"2.0","id":0,"method":"tools/call","params":{"name":"mu_daemon_info","arguments":{}}}' \
-    | socat -T2 - UNIX-CONNECT:"$SOCK" 2>/dev/null \
-    | python3 -c "import sys,json; r=json.loads(json.loads(sys.stdin.read())['result']['content'][0]['text']); print(r['daemon_id'])" 2>/dev/null)
+if [ "$DRY_RUN" -eq 1 ]; then
+  if [ "$PROVIDER" = claude-oauth ]; then
+    printf 'cd %s && timeout %s claude -p --model %s --append-system-prompt-file %s --output-format text < %s\n' \
+      "$(q "$CWD")" "$(q "$TIMEOUT_SECS")" "$(q "$MODEL")" "$(q "$SYS_FILE")" "$(q "$PROMPT_FILE")"
+  else
+    printf 'cd %s && timeout %s %s ask --bare --provider %s --model %s --append-system-prompt %s --prompt-file %s\n' \
+      "$(q "$CWD")" "$(q "$TIMEOUT_SECS")" "$(q "$MU_BIN")" "$(q "$PROVIDER")" "$(q "$MODEL")" "$(q "$SYS_FILE")" "$(q "$PROMPT_FILE")"
+  fi
+  exit 0
+fi
 
-# ─── Build system prompt appendix ─────────────────────────────────────
+cd "$CWD"
 
-SYSTEM_APPEND="You are running inside a FreeBSD pot (jail: $POT_NAME). You have access to mu-mailbox MCP tools for coordinating with the mu orchestrator on the host.
+if [ "$PROVIDER" = claude-oauth ]; then
+  set -- claude -p --model "$MODEL" --append-system-prompt-file "$SYS_FILE" \
+    --output-format text --allowedTools Read,Grep,Glob,LS,Bash,Edit,Write \
+    --permission-mode bypassPermissions
+  [ -z "$MCP_CONFIG" ] || set -- "$@" --mcp-config "$MCP_CONFIG"
+  exec timeout "$TIMEOUT_SECS" "$@" < "$PROMPT_FILE"
+fi
 
-Available mu-mailbox tools:
-- mu_daemon_info: get daemon_id and session info
-- mu_peer_hello: get a mailbox handle (needed before posting)
-- mu_mailbox_list: list messages in a session's mailbox
-- mu_mailbox_read: read a message's full body
-- mu_mailbox_post: post a message to a session's mailbox
-- mu_mailbox_consume: mark messages as consumed
-
-When posting messages, use daemon_id '$DAEMON_ID'.
-
-You have full tool access. Use agent-teams, subagents, /goal, and all other capabilities normally. Everything runs inside the jail."
-
-# ─── Launch ───────────────────────────────────────────────────────────
-
-echo "[mu-spawn] Launching interactive claude in $POT_NAME (subscription billing)" >&2
-echo "[mu-spawn] MCP mailbox connected (daemon $DAEMON_ID)" >&2
-echo "[mu-spawn] Ctrl-C to exit" >&2
-
-sudo jexec -U "$POT_USER" "$POT_NAME" /bin/sh -c "
-    unset ANTHROPIC_API_KEY
-    unset ANTHROPIC_BASE_URL
-    unset CLAUDE_CODE_OAUTH_TOKEN
-    export HOME=/usr/home/tcovert
-    export LANG=C.UTF-8
-    export PATH=/usr/local/pot-bin:/usr/home/tcovert/.cargo/bin:/usr/home/tcovert/.local/bin:\$PATH
-    export CLAUDE_CONFIG_DIR=/usr/home/tcovert/.claude-personal
-    export SSH_AUTH_SOCK=/compat/linux${SSH_AUTH_SOCK}
-    export MU_DAEMON_ID='$DAEMON_ID'
-    export MU_SESSION_ID='session-1'
-    export MU_POT_NAME='$POT_NAME'
-    exec /usr/local/bin/claude \
-        --dangerously-skip-permissions \
-        --model claude-opus-4-7 \
-        --mcp-config '$MCP_CONFIG_IN_POT' \
-        --append-system-prompt '$SYSTEM_APPEND'
-"
+# For mu providers, keep the worker hermetic but useful. Dialogue tools come
+# from the operator's configured MCP servers; built-in tools are granted here.
+exec timeout "$TIMEOUT_SECS" "$MU_BIN" ask --bare \
+  --provider "$PROVIDER" --model "$MODEL" \
+  --append-system-prompt "$SYS_FILE" \
+  --tools read,write,edit,glob,grep,ls,bash --bash-yolo --max-turns 40 \
+  --prompt-file "$PROMPT_FILE"

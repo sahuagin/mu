@@ -22,7 +22,6 @@ pub mod mcp;
 pub mod mcp_client;
 mod pipeline;
 mod provider_status;
-pub(crate) mod pty_spawn;
 mod sessions;
 pub(crate) mod worker;
 

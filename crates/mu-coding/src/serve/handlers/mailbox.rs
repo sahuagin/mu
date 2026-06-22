@@ -193,15 +193,6 @@ pub async fn handle_mailbox_post(
         });
     }
 
-    // mu-slat Phase 3: if the SENDER is a pot worker reporting its
-    // result, reap it host-side. Interactive claude doesn't exit on its
-    // own (it idles at the prompt pegging cores until the deadline), and
-    // its in-pot hook can't self-kill under linuxulator. Killing the pty
-    // here makes claude exit → EOF → monitor_worker's normal exit path.
-    if params.kind == "result" {
-        let _ = sessions.reap_worker(&params.from.session_id);
-    }
-
     ok_response(
         request.id,
         to_value_or_null(MailboxPostResponse { posted: true, seq }),

@@ -344,10 +344,17 @@ mod tests {
 
     #[test]
     fn build_from_selector_openai_api_constructs_when_key_configured() {
+        let prior = std::env::var("OPENAI_API_KEY").ok();
+        std::env::set_var("OPENAI_API_KEY", "test-key");
         let sel = ProviderSelector::OpenaiApi {
             model: "gpt-4.1-mini".into(),
         };
-        assert!(build_provider_from_selector(&sel, false, None, CacheTtl::default()).is_ok());
+        let result = build_provider_from_selector(&sel, false, None, CacheTtl::default());
+        match prior {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+        assert!(result.is_ok());
     }
 
     #[test]

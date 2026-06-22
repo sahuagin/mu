@@ -277,6 +277,60 @@ fn apply_dialect_rescue(
         .boxed()
 }
 
+/// Per-model sampling resolved from the model catalog (mu-y8gp), mirroring
+/// [`super::output_limits::max_tokens_for_model`]'s catalog lookup. Returns
+/// `(temperature, top_p)`; either is `None` when the catalog declares none,
+/// in which case the caller sends no such field and the request body is
+/// byte-for-byte unchanged.
+fn sampling_for_model(model: &str) -> (Option<f64>, Option<f64>) {
+    sampling_for_model_with_catalog(mu_core::model_catalog::global(), model)
+}
+
+/// [`sampling_for_model`] against an explicit catalog — the testable seam (a
+/// test must not depend on the operator's `~/.config/mu/models.toml`; mirrors
+/// `output_limits::max_tokens_for_model_with_catalog`, bead mu-nzxa).
+fn sampling_for_model_with_catalog(
+    catalog: &mu_core::model_catalog::ModelCatalogConfig,
+    model: &str,
+) -> (Option<f64>, Option<f64>) {
+    let r = catalog.resolve_model(model);
+    (r.temperature, r.top_p)
+}
+
+/// Inject per-model sampling (mu-y8gp) into an OpenRouter request body. No-op
+/// when the catalog declares no temperature/top_p for `model`, so the body is
+/// byte-for-byte unchanged — preserving the yqeq6 Legacy/Projected parity.
+fn apply_sampling(body: &mut Value, model: &str) {
+    let (temperature, top_p) = sampling_for_model(model);
+    // mu-y8gp: clamp to provider-valid ranges and drop non-finite, so an
+    // operator catalog typo (temperature = 5.0, a NaN, …) can't ship an
+    // invalid sampling value — temperature ∈ [0, 2], top_p ∈ [0, 1].
+    inject_sampling(
+        body,
+        clamp_sampling(temperature, 0.0, 2.0),
+        clamp_sampling(top_p, 0.0, 1.0),
+    );
+}
+
+/// Clamp a catalog sampling value into `[lo, hi]` and drop non-finite
+/// (NaN / ±Inf) → `None`, keeping the wire to valid numbers regardless of
+/// operator config (mu-y8gp).
+fn clamp_sampling(v: Option<f64>, lo: f64, hi: f64) -> Option<f64> {
+    v.filter(|x| x.is_finite()).map(|x| x.clamp(lo, hi))
+}
+
+/// Pure injection step of [`apply_sampling`] — testable without the global
+/// catalog. Adds `temperature`/`top_p` only when `Some`, so all-`None` leaves
+/// the body byte-for-byte unchanged.
+fn inject_sampling(body: &mut Value, temperature: Option<f64>, top_p: Option<f64>) {
+    if let Some(t) = temperature {
+        body["temperature"] = json!(t);
+    }
+    if let Some(p) = top_p {
+        body["top_p"] = json!(p);
+    }
+}
+
 /// Translate mu's AgentMessage into the OpenAI/OpenRouter shape.
 /// Returns None for messages that don't have a wire equivalent in
 /// v1 (Thinking content blocks, etc.).
@@ -379,6 +433,8 @@ pub(crate) fn build_request_body(
     if !tools.is_empty() {
         body["tools"] = json!(tools.iter().map(translate_tool_spec).collect::<Vec<_>>());
     }
+    // mu-y8gp: per-model sampling from the catalog (no-op when unset).
+    apply_sampling(&mut body, model);
     body
 }
 
@@ -570,6 +626,8 @@ pub(crate) fn build_request_body_from_projection(
     if !tools.is_empty() {
         body["tools"] = json!(tools.iter().map(translate_tool_spec).collect::<Vec<_>>());
     }
+    // mu-y8gp: per-model sampling from the catalog (no-op when unset).
+    apply_sampling(&mut body, model);
     body
 }
 

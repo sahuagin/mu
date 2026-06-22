@@ -123,4 +123,4 @@ provider = "ollama"
 model = "qwen3.6:35b-a3b-q8_0"
 label = "Local Qwen 3.6 35B"
 aliases = ["qwen36", "local-reasoner"]
-default_effort = "medium"
+default_effort = "on"

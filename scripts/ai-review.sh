@@ -88,19 +88,21 @@
 set -u
 set -o pipefail
 
-# Primary 1 is local ollama: free, reliable, a non-Claude opinion, warm on the box
-# (24h keep-alive). It is a BAKED model tag so mu can avoid per-request sampling
-# and context overrides on the Ollama/Anthropic wire. With the 3-GPU review host,
-# qwen3-coder-next-agent262k fits at 262144 context, temp 0.6 and leaves headroom;
-# it has been the stronger local AGENTIC/code-exploration lane than gpt-oss.
-#
-# Primary 2 defaults to deepseek-v4-pro over openrouter — frontier-ish, cheap,
-# and independent of the local runner. Tiebreaker is Claude over anthropic-api,
-# invoked only on a primary split so the Anthropic key/cost is used as the final
-# adjudicator, not the routine second opinion.
+# Leaf lane (chunked mode): a single local-first reviewer per commit. WHICH model
+# is config, not code — `agent-role code_review_leaf` resolves it from
+# ~/.config/mu/agent_roles.toml so the leaf can't drift from the panel the way a
+# hand-maintained default did (this used to hardcode a stale ollama tag). rank 0 =
+# the cheap LOCAL lane (free, a non-Claude opinion, warm on the box), rank 1 = the
+# hosted fallback ensure_local_reviewer_loaded swaps to when the local model isn't
+# already resident. Precedence: MU_REVIEW_* env override -> agent-role -> a literal
+# last-ditch default, so the gate still runs on a host without agent-role/tq/jq
+# (this script deliberately degrades when jq is absent — see json_escape).
 # Bench provenance: ~/src/public_github/code-review-bench/reports/NOTES.md.
-PROVIDER="${MU_REVIEW_PROVIDER:-ollama}"
-MODEL="${MU_REVIEW_MODEL:-qwen3.6:27b}"
+_leaf_prov=""; _leaf_model=""; _leaf_fb_prov=""; _leaf_fb_model=""
+read -r _leaf_prov    _leaf_model    < <(agent-role code_review_leaf 0 2>/dev/null) || true
+read -r _leaf_fb_prov _leaf_fb_model < <(agent-role code_review_leaf 1 2>/dev/null) || true
+PROVIDER="${MU_REVIEW_PROVIDER:-${_leaf_prov:-ollama}}"
+MODEL="${MU_REVIEW_MODEL:-${_leaf_model:-qwen3.6:35b-a3b-q8_0}}"
 PROVIDER2="${MU_REVIEW_PROVIDER_2:-openrouter}"
 MODEL2="${MU_REVIEW_MODEL_2:-deepseek/deepseek-v4-pro}"
 # reviewer-3 (tiebreaker) = claude-sonnet-4-6 via the Max SUBSCRIPTION
@@ -108,11 +110,12 @@ MODEL2="${MU_REVIEW_MODEL_2:-deepseek/deepseek-v4-pro}"
 # is per-token AND operator-deactivated, so the tiebreaker was failing every run.
 PROVIDER3="${MU_REVIEW_PROVIDER_3:-claude-oauth}"
 MODEL3="${MU_REVIEW_MODEL_3:-claude-sonnet-4-6}"
-# Hosted reviewer that primary-1 falls back to when the local ollama model
-# isn't safe to use (a DIFFERENT model is resident, or ollama is unreachable).
-# See ensure_local_reviewer_loaded below. gpt-5.5 is the decided paired reviewer.
-FALLBACK_PROVIDER="${MU_REVIEW_FALLBACK_PROVIDER:-openai-codex}"
-FALLBACK_MODEL="${MU_REVIEW_FALLBACK_MODEL:-gpt-5.5}"
+# Hosted reviewer the leaf falls back to when the local ollama model isn't safe to
+# use (a DIFFERENT model is resident, or ollama is unreachable). Same source as the
+# leaf itself: rank 1 of code_review_leaf (resolved into _leaf_fb_* above), with the
+# env override and literal last-ditch default preserved. See ensure_local_reviewer_loaded.
+FALLBACK_PROVIDER="${MU_REVIEW_FALLBACK_PROVIDER:-${_leaf_fb_prov:-openai-codex}}"
+FALLBACK_MODEL="${MU_REVIEW_FALLBACK_MODEL:-${_leaf_fb_model:-gpt-5.5}}"
 # Read-only tools ON by default: a reviewer that can `read`/`grep` checks a
 # definition instead of hallucinating "undefined X", and can inspect the
 # COMPLEMENT of the diff (what a change omitted) — the two blind spots that let

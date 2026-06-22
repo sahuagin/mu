@@ -2539,6 +2539,279 @@ async fn kgu4_evict_half_policy_does_not_fire_when_threshold_not_crossed() {
     );
 }
 
+/// mu-ub6q: the compaction trigger reserves `max_output_tokens` of
+/// headroom below the soft limit. Holding the threshold and the message
+/// fixed and varying ONLY the reservation isolates the effect: a
+/// sub-threshold input that does not trigger on its own DOES trigger
+/// once enough output budget is reserved (effective threshold =
+/// `soft_limit - max_output_tokens`). This is the fix for a soft limit
+/// pinned at the model's window, where the input-only trigger is
+/// unreachable and compaction otherwise never fires.
+#[tokio::test]
+async fn ub6q_max_output_headroom_lowers_effective_trigger() {
+    // Fresh loop driving EvictHalfPolicy with the given output
+    // reservation; returns the number of CompactionAssembly events.
+    async fn fired_count(max_output_tokens: usize) -> usize {
+        let inner = MockProvider::new(vec![vec![
+            ProviderEvent::TextDelta("hi".into()),
+            ProviderEvent::Done(assistant_text("hi")),
+        ]]);
+        let provider: Arc<dyn Provider> = Arc::new(MockProviderWithCompaction {
+            inner,
+            policy: Arc::new(EvictHalfPolicy),
+        });
+        // First-call predicted total = rope estimate + the ~8K
+        // structural-overhead constant ⇒ ~8K for this short message:
+        // comfortably under the 12_000 threshold (no input-only trigger)
+        // but over 6_000 (the effective threshold once 6_000 of output
+        // headroom is reserved). 6_000 == threshold/2, so the clamp is a
+        // no-op here — this isolates the headroom effect, not the clamp.
+        let config = AgentConfig {
+            compaction_threshold: Some(12_000),
+            max_output_tokens,
+            compaction_policy_override: None,
+            ..AgentConfig::default()
+        };
+        let (loop_, events_rx) = spawn_loop_with_provider(provider, config);
+        loop_
+            .send(AgentInput::UserMessage(
+                user_msg("a short user message, well under the raw threshold"),
+                None,
+                None,
+            ))
+            .await
+            .expect("send");
+        let events_handle = tokio::spawn(collect_events(events_rx));
+        let outcome = loop_.join().await;
+        let events = events_handle.await.expect("events drain");
+        assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::CompactionAssembly { .. }))
+            .count()
+    }
+
+    // No reservation: input (~8K) is below the 12_000 threshold.
+    assert_eq!(
+        fired_count(0).await,
+        0,
+        "without output headroom, a sub-threshold input must not trigger compaction"
+    );
+    // Reserve 6_000: effective threshold = 6_000 < predicted input (~8K).
+    assert_eq!(
+        fired_count(6_000).await,
+        1,
+        "reserving max_output_tokens lowers the effective trigger so compaction fires"
+    );
+}
+
+/// mu-ub6q: a mid-session model switch re-reserves the new model's
+/// output budget. `SwitchProvider` carries `max_output_tokens`; the loop
+/// updates its live reservation so the effective compaction trigger
+/// tracks the model now in force (the soft limit already updates live
+/// the same way). Creation-time reservation is 0; only the switch sets
+/// it, so the contrast isolates the switch path.
+#[tokio::test]
+async fn ub6q_switch_provider_updates_output_reservation() {
+    async fn fired_after_switch(switch_max_output: usize) -> usize {
+        // The initial provider is replaced before any turn runs.
+        let initial = MockProvider::new(vec![vec![
+            ProviderEvent::TextDelta("init".into()),
+            ProviderEvent::Done(assistant_text("init")),
+        ]]);
+        let initial_provider: Arc<dyn Provider> = Arc::new(MockProviderWithCompaction {
+            inner: initial,
+            policy: Arc::new(EvictHalfPolicy),
+        });
+        // The post-switch provider handles the one turn.
+        let switched = MockProvider::new(vec![vec![
+            ProviderEvent::TextDelta("hi".into()),
+            ProviderEvent::Done(assistant_text("hi")),
+        ]]);
+        let switched_provider: Arc<dyn Provider> = Arc::new(MockProviderWithCompaction {
+            inner: switched,
+            policy: Arc::new(EvictHalfPolicy),
+        });
+        let config = AgentConfig {
+            compaction_threshold: Some(12_000),
+            max_output_tokens: 0, // only the switch sets a reservation
+            compaction_policy_override: None,
+            ..AgentConfig::default()
+        };
+        let (loop_, events_rx) = spawn_loop_with_provider(initial_provider, config);
+        // The switch (processed before the queued turn) sets the
+        // reservation; the turn then runs under the switched provider.
+        loop_
+            .send(AgentInput::SwitchProvider {
+                provider: switched_provider,
+                provider_kind: Arc::from("faux"),
+                model: Arc::from("faux"),
+                max_output_tokens: switch_max_output,
+                // 0 ⇒ keep the config threshold (12_000); this test
+                // isolates the output-reservation half of the switch.
+                context_soft_limit: 0,
+            })
+            .await
+            .expect("send switch");
+        loop_
+            .send(AgentInput::UserMessage(
+                user_msg("a short user message, well under the raw threshold"),
+                None,
+                None,
+            ))
+            .await
+            .expect("send msg");
+        let events_handle = tokio::spawn(collect_events(events_rx));
+        let outcome = loop_.join().await;
+        let events = events_handle.await.expect("events drain");
+        assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::CompactionAssembly { .. }))
+            .count()
+    }
+
+    // Switch reserves nothing → input (~8K) is below the 12K threshold.
+    assert_eq!(
+        fired_after_switch(0).await,
+        0,
+        "a switch carrying no output reservation leaves the input-only trigger (no compaction)"
+    );
+    // Switch reserves 6K (== threshold/2) → effective 6K < predicted (~8K).
+    assert_eq!(
+        fired_after_switch(6_000).await,
+        1,
+        "the switch's max_output_tokens reaches the trigger (compaction fires)"
+    );
+}
+
+/// mu-ub6q: a model switch also re-applies the new model's soft limit
+/// (the other half of the effective trigger), stored to the live atomic
+/// in the SAME handler as the reservation — so the two move together and
+/// a queued turn can't pair a new reservation with the old soft limit.
+/// Creation threshold is huge; only the switch's soft limit can bring
+/// compaction within reach. Without the in-handler store the live atomic
+/// stays 0 and the loop falls back to the (huge) config threshold, so the
+/// 5K case would not fire — i.e. this asserts the store, with teeth.
+#[tokio::test]
+async fn ub6q_switch_provider_updates_soft_limit() {
+    async fn fired_after_switch(switch_soft: u64) -> usize {
+        let initial = MockProvider::new(vec![vec![
+            ProviderEvent::TextDelta("init".into()),
+            ProviderEvent::Done(assistant_text("init")),
+        ]]);
+        let initial_provider: Arc<dyn Provider> = Arc::new(MockProviderWithCompaction {
+            inner: initial,
+            policy: Arc::new(EvictHalfPolicy),
+        });
+        let switched = MockProvider::new(vec![vec![
+            ProviderEvent::TextDelta("hi".into()),
+            ProviderEvent::Done(assistant_text("hi")),
+        ]]);
+        let switched_provider: Arc<dyn Provider> = Arc::new(MockProviderWithCompaction {
+            inner: switched,
+            policy: Arc::new(EvictHalfPolicy),
+        });
+        // Huge creation threshold + no reservation: nothing fires on its
+        // own; only the switch's soft limit can lower the live trigger.
+        let config = AgentConfig {
+            compaction_threshold: Some(1_000_000),
+            max_output_tokens: 0,
+            compaction_policy_override: None,
+            ..AgentConfig::default()
+        };
+        let (loop_, events_rx) = spawn_loop_with_provider(initial_provider, config);
+        loop_
+            .send(AgentInput::SwitchProvider {
+                provider: switched_provider,
+                provider_kind: Arc::from("faux"),
+                model: Arc::from("faux"),
+                max_output_tokens: 0,
+                context_soft_limit: switch_soft,
+            })
+            .await
+            .expect("send switch");
+        loop_
+            .send(AgentInput::UserMessage(
+                user_msg("a short user message, well under the raw threshold"),
+                None,
+                None,
+            ))
+            .await
+            .expect("send msg");
+        let events_handle = tokio::spawn(collect_events(events_rx));
+        let outcome = loop_.join().await;
+        let events = events_handle.await.expect("events drain");
+        assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::CompactionAssembly { .. }))
+            .count()
+    }
+
+    // Switch to a large soft limit → predicted (~8K) far below → no fire.
+    assert_eq!(
+        fired_after_switch(1_000_000).await,
+        0,
+        "a switch to a large soft limit leaves the input below the trigger"
+    );
+    // Switch to a small soft limit (5K) → predicted (~8K) above → fires.
+    assert_eq!(
+        fired_after_switch(5_000).await,
+        1,
+        "the switch's context_soft_limit reaches the live trigger (compaction fires)"
+    );
+}
+
+/// mu-ub6q: a model whose output budget rivals or exceeds its window —
+/// real today for ollama qwen/glm, where max_output == context — must not
+/// zero the input budget. The reservation is clamped to the compaction
+/// target (threshold/2), so the effective trigger stays > 0 and a small
+/// input does NOT force perpetual compaction. Unclamped, the effective
+/// threshold would be 0 and the ~8K input below would compact — i.e. this
+/// asserts the clamp, with teeth.
+#[tokio::test]
+async fn ub6q_oversized_max_output_does_not_zero_the_budget() {
+    let inner = MockProvider::new(vec![vec![
+        ProviderEvent::TextDelta("hi".into()),
+        ProviderEvent::Done(assistant_text("hi")),
+    ]]);
+    let provider: Arc<dyn Provider> = Arc::new(MockProviderWithCompaction {
+        inner,
+        policy: Arc::new(EvictHalfPolicy),
+    });
+    // max_output (1M) far exceeds the threshold (20K). Unclamped,
+    // effective_threshold = 0 and ANY input compacts; clamped at
+    // threshold/2 = 10K, the ~8K predicted input stays under it.
+    let config = AgentConfig {
+        compaction_threshold: Some(20_000),
+        max_output_tokens: 1_000_000,
+        compaction_policy_override: None,
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop_with_provider(provider, config);
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("a short message, comfortably under threshold/2"),
+            None,
+            None,
+        ))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+    let fired = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::CompactionAssembly { .. }))
+        .count();
+    assert_eq!(
+        fired, 0,
+        "clamped reservation keeps the effective threshold > 0; a small input must not compact"
+    );
+}
+
 /// mu-8bkf proof test — HashAndSummaryPolicy (with KeepHalfJudge canned judge,
 /// no model spend) fires a CompactionAssembly with policy_id matching
 /// HashAndSummaryPolicy::policy_label() == DEFAULT_POLICY_ID.

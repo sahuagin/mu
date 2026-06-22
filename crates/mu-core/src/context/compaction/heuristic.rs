@@ -13,9 +13,16 @@
 //!    position (earlier = older). Future: mtime-based staleness.
 //! 2. **Old `ToolCall`/`ToolResult` clusters** — adjacent runs of
 //!    tool-call/tool-result spans are dropped as a unit, oldest
-//!    cluster first. v1 proxy for "paired by `call_id`": the rope
-//!    layer carries no `call_id` field, so adjacency is the
-//!    structural pairing rule.
+//!    cluster first. Adjacency is the *eviction-ordering* heuristic;
+//!    it is no longer the correctness rule. mu-4n8u: a final
+//!    [`reconcile_tool_pairs`] pass closes every drop set to whole
+//!    exchange units keyed by `call_id` (recoverable from the
+//!    assistant span's `blocks` and the `ToolResult` span id), so
+//!    parallel / non-contiguous / reordered results can never leave an
+//!    orphaned `tool_use` or `tool_result` — the invalid shape that
+//!    makes a provider reject the next request (OpenAI "No tool output
+//!    found for function call"; Anthropic tool_use/tool_result
+//!    mismatch).
 //! 3. **Old `Assistant` turns** — older than the [`KEEP_RECENT_ASSISTANT`]
 //!    most-recent assistant spans.
 //! 4. **`SkillActivation`** — oldest first. v1 proxy: in the current
@@ -51,10 +58,12 @@
 //! lifetime anyway. A future bead can extend rope.rs with a
 //! span-filter primitive that preserves provenance.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use super::{CompactionDecision, CompactionPolicy, CompactionResult};
+use crate::agent::types::ContentBlock;
+use crate::context::assembly::extract_call_id_from_span_id;
 use crate::context::rope::{RetainedRope, RetentionClass, Span, SpanKind};
 
 /// Number of most-recent `Assistant` spans preserved across a
@@ -154,6 +163,140 @@ fn tool_clusters(spans: &[Span]) -> Vec<Vec<usize>> {
         }
     }
     clusters
+}
+
+/// mu-4n8u: the `call_id`s an assistant span PRODUCES via its
+/// `tool_use` blocks. Empty for assistant turns with no tool calls and
+/// for spans whose `blocks` were never populated (synthetic/test spans,
+/// or pre-`mu-yqeq.3` ropes) — those fall back to the adjacency tiers.
+fn assistant_call_ids(span: &Span) -> Vec<&str> {
+    span.blocks()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolCall(tc) => Some(tc.id.as_str()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// mu-4n8u: reverse a [`record_drop`] — restore the span, give its
+/// tokens back, and remove its drop decision. Used by
+/// [`reconcile_tool_pairs`] when an exchange unit must be kept whole
+/// because one member is non-evictable (standing). Idempotent.
+fn undrop(
+    idx: usize,
+    spans: &[Span],
+    sizes: &[usize],
+    dropped: &mut [bool],
+    tokens_after: &mut usize,
+    decisions: &mut Vec<CompactionDecision>,
+) {
+    if !dropped[idx] {
+        return;
+    }
+    dropped[idx] = false;
+    *tokens_after = tokens_after.saturating_add(sizes[idx]);
+    let id = spans[idx].id();
+    decisions
+        .retain(|d| !matches!(d, CompactionDecision::Dropped { span_id, .. } if span_id == id));
+}
+
+/// mu-4n8u: enforce tool_use/tool_result pairing by `call_id`, not
+/// position. The tier heuristics pair an assistant `tool_use` with its
+/// results by adjacency, which is correct only for the tidy
+/// `assistant → contiguous results` shape. Parallel calls whose results
+/// interleave, results separated by an intervening span, or two
+/// assistants whose results land adjacent all break that assumption and
+/// can leave a `tool_use` with no matching `tool_result` (or the
+/// reverse) — an invalid conversation the next provider request rejects.
+///
+/// This pass runs after every tier and closes the drop set to whole
+/// exchange units: an assistant's `tool_use` and ALL its results share
+/// drop-status. A unit is dropped whole only when it is *fully*
+/// droppable — every member is evictable AND its assistant is not one
+/// of the [`KEEP_RECENT_ASSISTANT`] preserved turns (`preserved`).
+/// Otherwise the whole unit is *kept*: any already-dropped member is
+/// undropped. A standing (`Startup`/`Pinned`) or recent member must
+/// survive, and an orphaned half is invalid, so the rest of the unit
+/// comes back with it. Over-budget beats an invalid request (the
+/// no-self-lobotomy guard), and keeping the recent unit honors the
+/// `KEEP_RECENT_ASSISTANT` invariant the adjacency tiers track only by
+/// position — without this the cascade could drop a preserved assistant
+/// just because one of its old results was selected for eviction.
+///
+/// No-op for ropes without recoverable `call_id`s (the assistant span
+/// has no `tool_use` blocks, or the result span id isn't the
+/// `…-tool-result:{call_id}` shape), so the adjacency tiers remain the
+/// sole mechanism there.
+fn reconcile_tool_pairs(
+    spans: &[Span],
+    preserved: &HashSet<usize>,
+    sizes: &[usize],
+    dropped: &mut [bool],
+    tokens_after: &mut usize,
+    decisions: &mut Vec<CompactionDecision>,
+) {
+    // call_id → indices of the ToolResult spans answering it.
+    let mut results_by_call: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, s) in spans.iter().enumerate() {
+        if *s.kind() == SpanKind::ToolResult {
+            if let Some(cid) = extract_call_id_from_span_id(s.id()) {
+                results_by_call.entry(cid).or_default().push(i);
+            }
+        }
+    }
+    if results_by_call.is_empty() {
+        return;
+    }
+
+    // One exchange unit per assistant tool_use turn: the assistant span
+    // plus every result span answering one of its calls. Units are
+    // disjoint (a call_id has exactly one producing tool_use), so order
+    // doesn't matter.
+    for (i, s) in spans.iter().enumerate() {
+        if *s.kind() != SpanKind::Assistant {
+            continue;
+        }
+        let call_ids = assistant_call_ids(s);
+        if call_ids.is_empty() {
+            continue;
+        }
+        let mut members = vec![i];
+        for cid in &call_ids {
+            if let Some(idxs) = results_by_call.get(cid) {
+                members.extend(idxs.iter().copied());
+            }
+        }
+        if !members.iter().any(|&m| dropped[m]) {
+            continue; // whole unit survives — nothing to reconcile
+        }
+        // Drop the unit whole only if it is fully droppable: every
+        // member evictable AND the assistant not a preserved-recent
+        // turn. Otherwise keep it whole (undrop), so the cascade can
+        // never drop a standing or recent member to close an orphan.
+        let droppable = !preserved.contains(&i) && members.iter().all(|&m| evictable(&spans[m]));
+        if droppable {
+            for &m in &members {
+                record_drop(
+                    m,
+                    "tool-pair reconciliation (call_id): closed orphaned exchange unit",
+                    spans,
+                    sizes,
+                    dropped,
+                    tokens_after,
+                    decisions,
+                );
+            }
+        } else {
+            for &m in &members {
+                undrop(m, spans, sizes, dropped, tokens_after, decisions);
+            }
+        }
+    }
 }
 
 impl CompactionPolicy for SpanFamilyDropPolicy {
@@ -340,6 +483,20 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
                 );
             }
         }
+
+        // mu-4n8u: tool_use/tool_result pairing safety net. The tiers
+        // above pair by adjacency; reconcile by call_id so no orphaned
+        // pair can survive into the next provider request (the
+        // compaction→400 failure class). Runs last, on the final drop
+        // set, regardless of which tier touched a given span.
+        reconcile_tool_pairs(
+            spans,
+            &preserved_assistants,
+            &sizes,
+            &mut dropped,
+            &mut tokens_after,
+            &mut decisions,
+        );
 
         let survivors: Vec<Span> = spans
             .iter()
@@ -801,5 +958,197 @@ mod tests {
             survivors.contains(&"a1") && survivors.contains(&"t1"),
             "assistant+cluster unit with a standing member survives intact; got {survivors:?}"
         );
+    }
+
+    // ── mu-4n8u: call_id pairing (realistic spans) ──────────────
+    //
+    // These build spans the way `assembly::message_to_span` does:
+    // assistant turns carry `tool_use` blocks (real call_ids), and
+    // ToolResult span ids are `msg-{idx}-tool-result:{call_id}`. The
+    // synthetic spans used by the tests above carry no recoverable
+    // call_id, so they exercise only the adjacency tiers; these
+    // exercise the `reconcile_tool_pairs` safety net.
+
+    fn tool_args() -> crate::agent::types::ToolArgs {
+        crate::agent::types::ToolArgs::new(serde_json::json!({})).unwrap()
+    }
+
+    /// Assistant span with real `tool_use` blocks, as assembly emits.
+    fn assistant_calls(id: &str, calls: &[&str]) -> Span {
+        let blocks: Vec<ContentBlock> = calls
+            .iter()
+            .map(|c| {
+                ContentBlock::ToolCall(crate::agent::types::ToolCall {
+                    id: (*c).to_owned(),
+                    name: "tool".to_owned(),
+                    arguments: tool_args(),
+                })
+            })
+            .collect();
+        Span::new(id, SpanKind::Assistant, "0123456789", RetentionClass::Hot).with_blocks(blocks)
+    }
+
+    /// ToolResult span whose id encodes its call_id (assembly shape).
+    fn tool_result(call_id: &str, content: &str) -> Span {
+        Span::new(
+            format!("msg-0-tool-result:{call_id}"),
+            SpanKind::ToolResult,
+            content,
+            RetentionClass::Warm,
+        )
+    }
+
+    /// The correctness invariant: every surviving tool_use has a
+    /// surviving result and vice versa (paired by call_id).
+    fn assert_no_orphans(result: &CompactionResult) {
+        let spans = result.rope.spans();
+        let ids: Vec<&str> = spans.iter().map(|s| s.id()).collect();
+        let surviving_results: HashSet<&str> = spans
+            .iter()
+            .filter(|s| *s.kind() == SpanKind::ToolResult)
+            .filter_map(|s| extract_call_id_from_span_id(s.id()))
+            .collect();
+        let surviving_calls: HashSet<&str> = spans.iter().flat_map(assistant_call_ids).collect();
+        for c in &surviving_calls {
+            assert!(
+                surviving_results.contains(c),
+                "orphaned tool_use {c}: survives with no matching tool_result. survivors={ids:?}"
+            );
+        }
+        for r in &surviving_results {
+            assert!(
+                surviving_calls.contains(r),
+                "orphaned tool_result {r}: survives with no matching tool_use. survivors={ids:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_calls_results_drop_as_one_unit() {
+        // One assistant turn fans out to three calls; results are
+        // contiguous. Aggressive target forces the unit out. Two recent
+        // assistants are preserved so the old unit is the drop target.
+        let rope = RetainedRope::from_spans(vec![
+            assistant_calls("a_old", &["c1", "c2", "c3"]),
+            tool_result("c1", "r1 0123456789"),
+            tool_result("c2", "r2 0123456789"),
+            tool_result("c3", "r3 0123456789"),
+            span("a_keep1", SpanKind::Assistant, "recent one"),
+            span("a_keep2", SpanKind::Assistant, "recent two"),
+        ]);
+        let target = target_from_rope(&rope, 0.4);
+        let r = SpanFamilyDropPolicy::new().compact(&rope, target);
+        assert_no_orphans(&r);
+    }
+
+    #[test]
+    fn preserved_tooluse_with_dropped_nonadjacent_result() {
+        // The hard case the adjacency tiers can't see: a recent
+        // (preserved) assistant's tool_use, whose result is separated
+        // from it (e.g. by a prior compaction's reordering). Tier 2
+        // drops the lone result cluster (its preceding span is a User,
+        // not the assistant), and tier 3 won't drop the assistant
+        // because it's preserved — so the tool_use is left orphaned.
+        // call_id pairing drops the whole unit instead.
+        let rope = RetainedRope::from_spans(vec![
+            span("a_old", SpanKind::Assistant, "old turn 0123456789"),
+            assistant_calls("a_tool", &["c1"]), // 2nd-most-recent → preserved
+            span("u_mid", SpanKind::User, "responding 0123456789"),
+            tool_result("c1", "r1 0123456789"), // non-adjacent to a_tool
+            span("a_last", SpanKind::Assistant, "most recent 0123456789"),
+        ]);
+        let target = target_from_rope(&rope, 0.3);
+        let r = SpanFamilyDropPolicy::new().compact(&rope, target);
+        assert_no_orphans(&r);
+        // a_tool is one of the two most-recent assistants — preserved.
+        // Reconciliation must keep the WHOLE unit (undrop its result),
+        // never drop the preserved assistant to close the orphan.
+        let survivors = surviving_ids(&r);
+        assert!(
+            survivors.contains(&"a_tool") && survivors.contains(&"msg-0-tool-result:c1"),
+            "preserved tool_use keeps its result (cascade-keep), not dropped; got {survivors:?}"
+        );
+    }
+
+    #[test]
+    fn adjacent_results_from_two_turns_no_cross_orphan() {
+        // Pathological layout (e.g. post-compaction reordering): two
+        // assistants' results land in one adjacency run. The cluster's
+        // preceding span is the WRONG assistant (aB), so adjacency drops
+        // aB+both results and orphans aA's tool_use. call_id pairing
+        // keeps each (assistant, result) consistent.
+        let rope = RetainedRope::from_spans(vec![
+            assistant_calls("aA", &["cA"]),
+            assistant_calls("aB", &["cB"]),
+            tool_result("cA", "rA 0123456789"),
+            tool_result("cB", "rB 0123456789"),
+            span("a_keep1", SpanKind::Assistant, "recent one"),
+            span("a_keep2", SpanKind::Assistant, "recent two"),
+        ]);
+        let target = target_from_rope(&rope, 0.4);
+        let r = SpanFamilyDropPolicy::new().compact(&rope, target);
+        assert_no_orphans(&r);
+    }
+
+    #[test]
+    fn dropping_old_assistant_drops_its_result() {
+        // Tier 3 drops an old assistant turn; its result must go too,
+        // or the surviving result is orphaned.
+        let rope = RetainedRope::from_spans(vec![
+            assistant_calls("a_old", &["c1"]),
+            tool_result("c1", "r1 0123456789"),
+            span("a_keep1", SpanKind::Assistant, "recent one 0123456789"),
+            span("a_keep2", SpanKind::Assistant, "recent two 0123456789"),
+        ]);
+        let r = SpanFamilyDropPolicy::new().compact(&rope, 1);
+        assert_no_orphans(&r);
+    }
+
+    #[test]
+    fn standing_result_keeps_the_whole_unit_by_call_id() {
+        // A non-adjacent, Pinned result: tier 3 would drop the (Hot, old)
+        // assistant tool_use and leave the standing result orphaned.
+        // Reconciliation cascades the other way — keep the whole unit.
+        let rope = RetainedRope::from_spans(vec![
+            assistant_calls("a_old", &["c1"]),
+            span("u_mid", SpanKind::User, "interjecting 0123456789"),
+            Span::new(
+                "msg-0-tool-result:c1",
+                SpanKind::ToolResult,
+                "pinned result 0123456789",
+                RetentionClass::Pinned,
+            ),
+            span("a_keep1", SpanKind::Assistant, "recent one"),
+            span("a_keep2", SpanKind::Assistant, "recent two"),
+        ]);
+        let r = SpanFamilyDropPolicy::new().compact(&rope, 1);
+        assert_no_orphans(&r);
+        let survivors = surviving_ids(&r);
+        assert!(
+            survivors.contains(&"a_old") && survivors.contains(&"msg-0-tool-result:c1"),
+            "standing member keeps the whole unit; got {survivors:?}"
+        );
+    }
+
+    #[test]
+    fn aggressive_compaction_preserves_pairing_invariant() {
+        // Mixed sequential + parallel exchanges, compacted hard. The
+        // invariant must hold across the whole rope.
+        let rope = RetainedRope::from_spans(vec![
+            span("sys", SpanKind::System, "system"),
+            assistant_calls("a1", &["c1"]),
+            tool_result("c1", "r1 0123456789"),
+            span("u1", SpanKind::User, "next 0123456789"),
+            assistant_calls("a2", &["c2", "c3"]),
+            tool_result("c2", "r2 0123456789"),
+            tool_result("c3", "r3 0123456789"),
+            assistant_calls("a3", &["c4"]),
+            tool_result("c4", "r4 0123456789"),
+            span("a4", SpanKind::Assistant, "recent text one"),
+            span("a5", SpanKind::Assistant, "recent text two"),
+        ]);
+        let target = target_from_rope(&rope, 0.3);
+        let r = SpanFamilyDropPolicy::new().compact(&rope, target);
+        assert_no_orphans(&r);
     }
 }

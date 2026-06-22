@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 mu-core = { path = "../mu-core" }
 mu-anthropic = { path = "../providers/mu-anthropic" }
+mu-openai = { path = "../providers/mu-openai" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 # mu-sqn: anchors the workspace rustls-webpki security floor (see root
@@ -22,6 +23,7 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = "1"

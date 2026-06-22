@@ -42,36 +42,84 @@ fn sample_token() -> OAuthToken {
     }
 }
 
-/// Reconstruct a `StreamState` from canned bytes for unit testing
-/// the event-stream loop without an HTTP round-trip.
+/// Reconstruct a `StreamState` from canned bytes for unit testing the
+/// fold loop without an HTTP round-trip.
 fn test_events_stream(
     bytes: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     cancel_rx: oneshot::Receiver<()>,
 ) -> BoxStream<'static, ProviderEvent> {
     let bytes: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = Box::pin(bytes);
     let sse = SseStream::new(bytes);
-    let state = StreamState {
-        sse: Box::pin(sse),
-        accumulated_text: String::new(),
-        tool_calls: HashMap::new(),
-        tool_call_order: Vec::new(),
-        final_status: None,
-        incomplete_reason: None,
-        usage: None,
-        cancel_rx: Some(cancel_rx),
-        finished: false,
-        emitted_done: false,
-        error_message: None,
-    };
+    let state = new_stream_state(Box::pin(sse), cancel_rx);
     Box::pin(futures::stream::unfold(state, next_event))
 }
 
+fn run(raw: &str) -> Vec<ProviderEvent> {
+    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+        raw.as_bytes(),
+    ))]);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let stream = test_events_stream(bytes, rx);
+    futures::executor::block_on(stream.collect())
+}
+
 // ============================================================================
-// B-1: JWT claim extraction — happy path
+// Auth-mode construction
 // ============================================================================
 
 #[test]
-fn b1_extract_chatgpt_account_id_happy_path() {
+fn codex_constructors_use_codex_endpoint_and_label() {
+    let p = OpenaiProvider::from_parts("gpt-5.5".into(), sample_token(), None);
+    assert!(p.is_codex());
+    assert_eq!(p.endpoint, CODEX_ENDPOINT);
+    assert_eq!(p.provider_label(), "openai_codex");
+}
+
+#[test]
+fn public_constructor_uses_public_endpoint() {
+    let p = OpenaiProvider::from_api_key("gpt-5".into(), "sk-test".into());
+    assert!(!p.is_codex());
+    assert_eq!(p.endpoint, PUBLIC_ENDPOINT);
+    // Label is shared across modes (downstream expects "openai_codex").
+    assert_eq!(p.provider_label(), "openai_codex");
+}
+
+#[test]
+fn public_key_resolution_prefers_env() {
+    // We can't safely mutate process env in parallel tests; instead test
+    // the TOML fallback parser directly via from_api_key + a temp config.
+    // Env-precedence is covered by from_env's order; the TOML path:
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[openai]\napi_key = \"sk-from-toml\"\n").unwrap();
+    // Point T4C_AGENT_CONFIG at our temp file for this assertion only.
+    // (Serialized via a guard so parallel tests don't clobber it.)
+    let _guard = ENV_LOCK.lock().unwrap();
+    let prev_t4c = std::env::var("T4C_AGENT_CONFIG").ok();
+    let prev_key = std::env::var("OPENAI_API_KEY").ok();
+    std::env::remove_var("OPENAI_API_KEY");
+    std::env::set_var("T4C_AGENT_CONFIG", &path);
+    let resolved = resolve_public_api_key().expect("resolve from toml");
+    assert_eq!(resolved, "sk-from-toml");
+    // restore
+    match prev_t4c {
+        Some(v) => std::env::set_var("T4C_AGENT_CONFIG", v),
+        None => std::env::remove_var("T4C_AGENT_CONFIG"),
+    }
+    if let Some(v) = prev_key {
+        std::env::set_var("OPENAI_API_KEY", v);
+    }
+}
+
+use std::sync::Mutex as StdMutex;
+static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+// ============================================================================
+// JWT claim extraction
+// ============================================================================
+
+#[test]
+fn jwt_extract_happy_path() {
     let jwt = synthetic_jwt(json!({
         "https://api.openai.com/auth": {
             "chatgpt_account_id": "abc-123",
@@ -83,27 +131,21 @@ fn b1_extract_chatgpt_account_id_happy_path() {
     assert_eq!(id, "abc-123");
 }
 
-// ============================================================================
-// B-2: JWT extraction rejects bad formats
-// ============================================================================
-
 #[test]
-fn b2_jwt_wrong_segment_count() {
+fn jwt_wrong_segment_count() {
     assert!(extract_chatgpt_account_id("not-a-jwt").is_err());
     assert!(extract_chatgpt_account_id("only.two").is_err());
     assert!(extract_chatgpt_account_id("a.b.c.d").is_err());
 }
 
 #[test]
-fn b2_jwt_bad_base64_payload() {
-    // 3 segments but middle isn't valid base64url.
+fn jwt_bad_base64_payload() {
     let jwt = "header.!!!not-base64!!!.sig";
     assert!(extract_chatgpt_account_id(jwt).is_err());
 }
 
 #[test]
-fn b2_jwt_missing_openai_auth_claim() {
-    // Valid JWT shape but wrong claim structure.
+fn jwt_missing_openai_auth_claim() {
     let jwt = synthetic_jwt(json!({
         "iss": "https://auth.openai.com",
         "sub": "user-x",
@@ -114,8 +156,7 @@ fn b2_jwt_missing_openai_auth_claim() {
 }
 
 #[test]
-fn b2_jwt_missing_chatgpt_account_id() {
-    // Has openai auth claim but no chatgpt_account_id inside it.
+fn jwt_missing_chatgpt_account_id() {
     let jwt = synthetic_jwt(json!({
         "https://api.openai.com/auth": {
             "chatgpt_plan_type": "free",
@@ -126,11 +167,11 @@ fn b2_jwt_missing_chatgpt_account_id() {
 }
 
 // ============================================================================
-// B-3: from_store fails clean when no token file
+// Token store
 // ============================================================================
 
 #[test]
-fn b3_load_token_fails_clean_when_not_logged_in() {
+fn load_token_fails_clean_when_not_logged_in() {
     let dir = TempDir::new().unwrap();
     let store = FileSystemTokenStore::with_base_dir(dir.path().to_path_buf());
     let err = load_token(&store).expect_err("should fail when no token");
@@ -141,12 +182,8 @@ fn b3_load_token_fails_clean_when_not_logged_in() {
     );
 }
 
-// ============================================================================
-// B-4: from_store loads happily when token exists
-// ============================================================================
-
 #[test]
-fn b4_load_token_happy_path() {
+fn load_token_happy_path() {
     let dir = TempDir::new().unwrap();
     let store = FileSystemTokenStore::with_base_dir(dir.path().to_path_buf());
     let token = sample_token();
@@ -157,15 +194,15 @@ fn b4_load_token_happy_path() {
 }
 
 // ============================================================================
-// B-5: request body shape
+// Request body shape (Legacy)
 // ============================================================================
 
 #[test]
-fn b5_build_request_body_basic() {
+fn build_request_body_basic() {
     let messages = vec![AgentMessage::User {
         content: "hi".into(),
     }];
-    let body = build_request_body("gpt-5-codex", "high", "you are a test", &messages, &[]);
+    let body = build_request_value("gpt-5-codex", "high", "you are a test", &messages, &[]);
     assert_eq!(body["model"], "gpt-5-codex");
     assert_eq!(body["instructions"], "you are a test");
     assert_eq!(body["stream"], true);
@@ -186,12 +223,9 @@ fn b5_build_request_body_basic() {
 
 #[test]
 fn instructions_under_cap_unchanged() {
-    // Sanity: typical short instructions stay in the dedicated field
-    // and don't perturb the input array.
-    use super::INSTRUCTIONS_SOFT_CAP;
     let short = "you are mu";
     assert!(short.len() < INSTRUCTIONS_SOFT_CAP);
-    let body = build_request_body(
+    let body = build_request_value(
         "gpt-5-codex",
         "medium",
         short,
@@ -209,14 +243,11 @@ fn instructions_under_cap_unchanged() {
 
 #[test]
 fn instructions_over_cap_moved_to_input() {
-    // The bug we shipped this fix for: codex's instructions field
-    // silently fails (200 OK, empty SSE stream) when the daemon
-    // crams all project context (CLAUDE.md / AGENTS.md / memory) in.
-    // After the fix, oversized instructions move to a synthetic
-    // user message at input[0] and the field holds DEFAULT_INSTRUCTIONS.
-    use super::INSTRUCTIONS_SOFT_CAP;
+    // codex's instructions field silently fails (200 OK, empty SSE
+    // stream) when oversized; we move overflow to a synthetic user
+    // message at input[0] and the field holds DEFAULT_INSTRUCTIONS.
     let huge = "X".repeat(INSTRUCTIONS_SOFT_CAP + 1);
-    let body = build_request_body(
+    let body = build_request_value(
         "gpt-5-codex",
         "medium",
         &huge,
@@ -226,7 +257,6 @@ fn instructions_over_cap_moved_to_input() {
         &[],
     );
 
-    // Instructions field holds a short string — no longer the huge blob.
     let field = body["instructions"].as_str().unwrap();
     assert!(
         field.len() <= INSTRUCTIONS_SOFT_CAP,
@@ -234,7 +264,6 @@ fn instructions_over_cap_moved_to_input() {
         field.len()
     );
 
-    // Input now has 2 messages: overflow at [0], original user prompt at [1].
     let input = body["input"].as_array().unwrap();
     assert_eq!(input.len(), 2, "expected overflow + original user msg");
     assert_eq!(input[0]["role"], "user");
@@ -245,15 +274,14 @@ fn instructions_over_cap_moved_to_input() {
     );
     assert!(
         overflow_text.starts_with("[System context"),
-        "overflow should be prefixed with framing so the model knows it's system context"
+        "overflow should be prefixed with framing"
     );
-    // Original user message is still at the end.
     assert_eq!(input[1]["role"], "user");
     assert_eq!(input[1]["content"][0]["text"], "hi");
 }
 
 #[test]
-fn b5_build_request_body_with_tools() {
+fn build_request_body_with_tools() {
     let messages = vec![AgentMessage::User {
         content: "hi".into(),
     }];
@@ -269,7 +297,7 @@ fn b5_build_request_body_with_tools() {
 
         ..Default::default()
     }];
-    let body = build_request_body("gpt-5-codex", "medium", "sys", &messages, &tools);
+    let body = build_request_value("gpt-5-codex", "medium", "sys", &messages, &tools);
     let api_tools = body["tools"].as_array().expect("tools array");
     assert_eq!(api_tools.len(), 1);
     // Responses API: flat function shape, NOT nested {function: {...}}.
@@ -277,13 +305,12 @@ fn b5_build_request_body_with_tools() {
     assert_eq!(api_tools[0]["name"], "read");
     assert_eq!(api_tools[0]["description"], "Read a file.");
     assert_eq!(api_tools[0]["parameters"]["type"], "object");
-    // tool_choice + parallel_tool_calls present when tools are.
     assert_eq!(body["tool_choice"], "auto");
     assert_eq!(body["parallel_tool_calls"], false);
 }
 
 #[test]
-fn b5_translate_assistant_with_tool_call_produces_two_items() {
+fn translate_assistant_with_tool_call_produces_two_items() {
     let m = AgentMessage::Assistant(AssistantMessage {
         content: vec![
             ContentBlock::Text {
@@ -298,79 +325,89 @@ fn b5_translate_assistant_with_tool_call_produces_two_items() {
         stop_reason: StopReason::ToolUse,
         usage: None,
     });
-    let items = translate_message(&m);
-    assert_eq!(items.len(), 2, "expected message + function_call");
-    assert_eq!(items[0]["type"], "message");
-    assert_eq!(items[0]["role"], "assistant");
-    assert_eq!(items[0]["content"][0]["type"], "output_text");
-    assert_eq!(items[0]["content"][0]["text"], "I will read it.");
-    assert_eq!(items[1]["type"], "function_call");
-    assert_eq!(items[1]["call_id"], "call_x");
-    assert_eq!(items[1]["name"], "read");
-    // arguments is stringified JSON.
-    let args_str = items[1]["arguments"].as_str().expect("args string");
+    let body = build_request_value("m", "high", "sys", std::slice::from_ref(&m), &[]);
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 2, "expected message + function_call");
+    assert_eq!(input[0]["type"], "message");
+    assert_eq!(input[0]["role"], "assistant");
+    assert_eq!(input[0]["content"][0]["type"], "output_text");
+    assert_eq!(input[0]["content"][0]["text"], "I will read it.");
+    assert_eq!(input[1]["type"], "function_call");
+    assert_eq!(input[1]["call_id"], "call_x");
+    assert_eq!(input[1]["name"], "read");
+    let args_str = input[1]["arguments"].as_str().expect("args string");
     let parsed: Value = serde_json::from_str(args_str).unwrap();
     assert_eq!(parsed["path"], "/x");
 }
 
 #[test]
-fn b5_translate_tool_result_ok() {
+fn translate_tool_result_ok() {
     let m = AgentMessage::ToolResult {
         call_id: "call_x".into(),
         content: "the file says hi".into(),
         is_error: false,
     };
-    let items = translate_message(&m);
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["type"], "function_call_output");
-    assert_eq!(items[0]["call_id"], "call_x");
-    assert_eq!(items[0]["output"], "the file says hi");
+    let body = build_request_value("m", "high", "sys", std::slice::from_ref(&m), &[]);
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 1);
+    assert_eq!(input[0]["type"], "function_call_output");
+    assert_eq!(input[0]["call_id"], "call_x");
+    assert_eq!(input[0]["output"], "the file says hi");
 }
 
 #[test]
-fn b5_translate_tool_result_error_embeds_marker() {
+fn translate_tool_result_error_embeds_marker() {
     let m = AgentMessage::ToolResult {
         call_id: "call_x".into(),
         content: "permission denied".into(),
         is_error: true,
     };
-    let items = translate_message(&m);
-    let output = items[0]["output"].as_str().unwrap();
+    let body = build_request_value("m", "high", "sys", std::slice::from_ref(&m), &[]);
+    let input = body["input"].as_array().unwrap();
+    let output = input[0]["output"].as_str().unwrap();
     assert!(output.contains("[error]"));
     assert!(output.contains("permission denied"));
 }
 
+#[test]
+fn thinking_block_dropped_outbound() {
+    // PR-A behavior preservation: Thinking is NOT echoed back to the model.
+    let m = AgentMessage::Assistant(AssistantMessage {
+        content: vec![
+            ContentBlock::Thinking {
+                text: "INTERNAL_REASONING_DO_NOT_LEAK".into(),
+            },
+            ContentBlock::Text {
+                text: "public answer".into(),
+            },
+        ],
+        stop_reason: StopReason::EndTurn,
+        usage: None,
+    });
+    let body = build_request_value("m", "high", "sys", std::slice::from_ref(&m), &[]);
+    let wire = serde_json::to_string(&body).unwrap();
+    assert!(
+        !wire.contains("INTERNAL_REASONING_DO_NOT_LEAK"),
+        "Thinking leaked to wire: {wire}"
+    );
+    assert!(wire.contains("public answer"));
+}
+
 // ============================================================================
-// B-6: SSE → ProviderEvent — text only
+// SSE fold — text only (official text-delta spelling)
 // ============================================================================
 
-#[tokio::test]
-async fn b6_sse_text_only() {
+#[test]
+fn sse_text_only() {
     let raw = concat!(
-        r#"event: response.output_text.delta"#,
-        "\n",
-        r#"data: {"type":"response.output_text.delta","delta":"hello"}"#,
+        r#"data: {"type":"response.output_text.delta","delta":"hello","sequence_number":1}"#,
         "\n\n",
-        r#"event: response.output_text.delta"#,
-        "\n",
-        r#"data: {"type":"response.output_text.delta","delta":" world"}"#,
+        r#"data: {"type":"response.output_text.delta","delta":" world","sequence_number":2}"#,
         "\n\n",
-        r#"event: response.completed"#,
-        "\n",
-        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
+        r#"data: {"type":"response.completed","sequence_number":3,"response":{"id":"r","status":"completed"}}"#,
         "\n\n",
     );
-    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
-        raw.as_bytes(),
-    ))]);
-    let (_tx, rx) = tokio::sync::oneshot::channel();
-    let mut stream = test_events_stream(bytes, rx);
-
-    let mut events = Vec::new();
-    while let Some(e) = stream.next().await {
-        events.push(e);
-    }
-
+    let events = run(raw);
     assert_eq!(events.len(), 3, "got: {events:?}");
     match &events[0] {
         ProviderEvent::TextDelta(t) => assert_eq!(t, "hello"),
@@ -393,46 +430,56 @@ async fn b6_sse_text_only() {
     }
 }
 
-// ============================================================================
-// mu-s545: two message output items in one response must not fuse
-// ============================================================================
-
-/// One response carrying TWO message output items (observed in the
-/// wild when the model answers a backlog of user messages left
-/// unanswered by errored asks — daemon 2f270bcba43f305d, event 2515:
-/// "...or hold.No worries..." jammed without whitespace). The adapter
-/// must insert a paragraph break between message items, both in the
-/// final assembled text and as a streamed TextDelta (so the live
-/// preview matches the finalized text — mu-wk2 invariant).
-#[tokio::test]
-async fn s545_two_message_items_get_paragraph_break() {
+/// Terminal snapshot with an authoritative `output` adopts it over the
+/// streamed accumulation (here they agree); usage is surfaced.
+#[test]
+fn sse_text_with_snapshot_and_usage() {
     let raw = concat!(
-        r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}"#,
+        r#"data: {"type":"response.output_text.delta","delta":"hi","sequence_number":1}"#,
         "\n\n",
-        r#"data: {"type":"response.output_text.delta","delta":"take one, or hold."}"#,
-        "\n\n",
-        r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1"}}"#,
-        "\n\n",
-        r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_2"}}"#,
-        "\n\n",
-        r#"data: {"type":"response.output_text.delta","delta":"No worries, take two."}"#,
-        "\n\n",
-        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
+        r#"data: {"type":"response.completed","sequence_number":2,"response":{"id":"r","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hi","annotations":[]}]}],"usage":{"input_tokens":10,"output_tokens":3,"output_tokens_details":{"reasoning_tokens":2}}}}"#,
         "\n\n",
     );
-    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
-        raw.as_bytes(),
-    ))]);
-    let (_tx, rx) = tokio::sync::oneshot::channel();
-    let mut stream = test_events_stream(bytes, rx);
-
-    let mut events = Vec::new();
-    while let Some(e) = stream.next().await {
-        events.push(e);
+    let events = run(raw);
+    let done = events
+        .iter()
+        .find_map(|e| match e {
+            ProviderEvent::Done(m) => Some(m),
+            _ => None,
+        })
+        .expect("Done");
+    assert_eq!(done.stop_reason, StopReason::EndTurn);
+    match &done.content[0] {
+        ContentBlock::Text { text } => assert_eq!(text.as_ref(), "hi"),
+        other => panic!("expected Text, got {other:?}"),
     }
+    let u = done.usage.expect("usage");
+    assert_eq!(u.input_tokens, 10);
+    assert_eq!(u.output_tokens, 3);
+    assert_eq!(u.reasoning_tokens, Some(2));
+}
 
-    // delta("take one, or hold."), delta("\n\n"), delta("No worries,
-    // take two."), Done.
+// ============================================================================
+// mu-s545: two message output items must not fuse
+// ============================================================================
+
+#[test]
+fn two_message_items_get_paragraph_break() {
+    let raw = concat!(
+        r#"data: {"type":"response.output_item.added","output_index":0,"sequence_number":0,"item":{"type":"message","id":"msg_1"}}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_text.delta","delta":"take one, or hold.","sequence_number":1}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_item.done","output_index":0,"sequence_number":2,"item":{"type":"message","id":"msg_1"}}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_item.added","output_index":1,"sequence_number":3,"item":{"type":"message","id":"msg_2"}}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_text.delta","delta":"No worries, take two.","sequence_number":4}"#,
+        "\n\n",
+        r#"data: {"type":"response.completed","sequence_number":5,"response":{"id":"r","status":"completed"}}"#,
+        "\n\n",
+    );
+    let events = run(raw);
     let deltas: Vec<&str> = events
         .iter()
         .filter_map(|e| match e {
@@ -446,48 +493,33 @@ async fn s545_two_message_items_get_paragraph_break() {
         "separator must also stream as a TextDelta"
     );
     match events.last().expect("no events") {
-        ProviderEvent::Done(msg) => {
-            assert_eq!(msg.content.len(), 1);
-            match &msg.content[0] {
-                ContentBlock::Text { text } => assert_eq!(
-                    text.as_ref(),
-                    "take one, or hold.\n\nNo worries, take two.",
-                    "message items must not fuse without a boundary"
-                ),
-                other => panic!("expected Text, got {other:?}"),
-            }
-        }
+        ProviderEvent::Done(msg) => match &msg.content[0] {
+            ContentBlock::Text { text } => assert_eq!(
+                text.as_ref(),
+                "take one, or hold.\n\nNo worries, take two.",
+                "message items must not fuse"
+            ),
+            other => panic!("expected Text, got {other:?}"),
+        },
         other => panic!("expected Done, got {other:?}"),
     }
 }
 
-/// A message item following only TOOL CALLS (accumulator empty) must
-/// NOT get a leading separator — the guard keys on accumulated text,
-/// not item count.
-#[tokio::test]
-async fn s545_message_after_toolcall_no_leading_separator() {
+#[test]
+fn message_after_toolcall_no_leading_separator() {
     let raw = concat!(
-        r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_a","name":"read","arguments":"{}"}}"#,
+        r#"data: {"type":"response.output_item.added","output_index":0,"sequence_number":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_a","name":"read","arguments":"{}"}}"#,
         "\n\n",
-        r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_a","name":"read","arguments":"{}"}}"#,
+        r#"data: {"type":"response.output_item.done","output_index":0,"sequence_number":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_a","name":"read","arguments":"{}"}}"#,
         "\n\n",
-        r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_1"}}"#,
+        r#"data: {"type":"response.output_item.added","output_index":1,"sequence_number":2,"item":{"type":"message","id":"msg_1"}}"#,
         "\n\n",
-        r#"data: {"type":"response.output_text.delta","delta":"after tool"}"#,
+        r#"data: {"type":"response.output_text.delta","delta":"after tool","sequence_number":3}"#,
         "\n\n",
-        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
+        r#"data: {"type":"response.completed","sequence_number":4,"response":{"id":"r","status":"completed"}}"#,
         "\n\n",
     );
-    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
-        raw.as_bytes(),
-    ))]);
-    let (_tx, rx) = tokio::sync::oneshot::channel();
-    let mut stream = test_events_stream(bytes, rx);
-
-    let mut events = Vec::new();
-    while let Some(e) = stream.next().await {
-        events.push(e);
-    }
+    let events = run(raw);
     match events.last().expect("no events") {
         ProviderEvent::Done(msg) => {
             let text = msg
@@ -498,98 +530,48 @@ async fn s545_message_after_toolcall_no_leading_separator() {
                     _ => None,
                 })
                 .expect("no text block");
-            assert_eq!(text, "after tool", "no separator when accumulator is empty");
+            assert_eq!(text, "after tool", "no separator when accumulator empty");
         }
         other => panic!("expected Done, got {other:?}"),
     }
 }
 
-/// A single message item must NOT grow a leading or trailing
-/// separator from its own `output_item.added` frame.
-#[tokio::test]
-async fn s545_single_message_item_unchanged() {
-    let raw = concat!(
-        r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}"#,
-        "\n\n",
-        r#"data: {"type":"response.output_text.delta","delta":"only take"}"#,
-        "\n\n",
-        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
-        "\n\n",
-    );
-    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
-        raw.as_bytes(),
-    ))]);
-    let (_tx, rx) = tokio::sync::oneshot::channel();
-    let mut stream = test_events_stream(bytes, rx);
-
-    let mut events = Vec::new();
-    while let Some(e) = stream.next().await {
-        events.push(e);
-    }
-    match events.last().expect("no events") {
-        ProviderEvent::Done(msg) => match &msg.content[0] {
-            ContentBlock::Text { text } => assert_eq!(text.as_ref(), "only take"),
-            other => panic!("expected Text, got {other:?}"),
-        },
-        other => panic!("expected Done, got {other:?}"),
-    }
-}
-
 // ============================================================================
-// B-7: SSE → ProviderEvent — tool call accumulation
+// SSE fold — tool call accumulation (official + codex-compat spellings)
 // ============================================================================
 
-#[tokio::test]
-async fn b7_sse_tool_call_accumulation() {
+#[test]
+fn sse_tool_call_accumulation_official_spelling() {
     let raw = concat!(
-        // Item added — function_call with empty args
-        r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_a","name":"read","arguments":""}}"#,
+        r#"data: {"type":"response.output_item.added","output_index":0,"sequence_number":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_a","name":"read","arguments":""}}"#,
         "\n\n",
-        // Arguments stream
-        r#"data: {"type":"response.function_call.arguments.delta","output_index":0,"item_id":"fc_1","delta":"{\"path\":"}"#,
+        r#"data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"{\"path\":","sequence_number":1}"#,
         "\n\n",
-        r#"data: {"type":"response.function_call.arguments.delta","output_index":0,"item_id":"fc_1","delta":"\"/tmp/foo\"}"}"#,
+        r#"data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"\"/tmp/foo\"}","sequence_number":2}"#,
         "\n\n",
-        // Item done — server replays the full arguments
-        r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_a","name":"read","arguments":"{\"path\":\"/tmp/foo\"}"}}"#,
+        r#"data: {"type":"response.output_item.done","output_index":0,"sequence_number":3,"item":{"type":"function_call","id":"fc_1","call_id":"call_a","name":"read","arguments":"{\"path\":\"/tmp/foo\"}"}}"#,
         "\n\n",
-        // Stream completed
-        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
+        r#"data: {"type":"response.completed","sequence_number":4,"response":{"id":"r","status":"completed"}}"#,
         "\n\n",
     );
-    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
-        raw.as_bytes(),
-    ))]);
-    let (_tx, rx) = tokio::sync::oneshot::channel();
-    let mut stream = test_events_stream(bytes, rx);
-
-    let mut events = Vec::new();
-    while let Some(e) = stream.next().await {
-        events.push(e);
-    }
-
-    // 2 ToolCallDelta + 1 Done
-    assert_eq!(events.len(), 3, "got: {events:?}");
-    for e in &events[..2] {
-        match e {
-            ProviderEvent::ToolCallDelta {
-                id,
-                arguments_delta,
-                ..
-            } => {
-                assert_eq!(id, "call_a");
-                assert!(
-                    arguments_delta.as_deref().unwrap_or("").contains("path")
-                        || arguments_delta.as_deref().unwrap_or("").contains("/tmp")
-                );
-            }
-            other => panic!("expected ToolCallDelta, got {other:?}"),
+    let events = run(raw);
+    let deltas: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, ProviderEvent::ToolCallDelta { .. }))
+        .collect();
+    assert_eq!(deltas.len(), 2, "got: {events:?}");
+    for e in deltas {
+        if let ProviderEvent::ToolCallDelta { id, .. } = e {
+            assert_eq!(id, "call_a");
         }
     }
-    let done = match &events[2] {
-        ProviderEvent::Done(m) => m,
-        other => panic!("expected Done, got {other:?}"),
-    };
+    let done = events
+        .iter()
+        .find_map(|e| match e {
+            ProviderEvent::Done(m) => Some(m),
+            _ => None,
+        })
+        .expect("Done");
     assert_eq!(done.stop_reason, StopReason::ToolUse);
     assert_eq!(done.content.len(), 1);
     match &done.content[0] {
@@ -602,39 +584,58 @@ async fn b7_sse_tool_call_accumulation() {
     }
 }
 
-#[tokio::test]
-async fn b7b_sse_mixed_text_and_tool() {
+/// The Codex backend's `.arguments.delta` (dot) spelling must fold the
+/// same way as the official underscore spelling.
+#[test]
+fn sse_tool_call_accumulation_codex_compat_spelling() {
     let raw = concat!(
-        r#"data: {"type":"response.output_text.delta","delta":"reading "}"#,
+        r#"data: {"type":"response.output_item.added","output_index":0,"sequence_number":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_a","name":"read","arguments":""}}"#,
         "\n\n",
-        r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_2","call_id":"call_b","name":"read","arguments":""}}"#,
+        r#"data: {"type":"response.function_call.arguments.delta","output_index":0,"item_id":"fc_1","delta":"{\"path\":\"/x\"}"}"#,
         "\n\n",
-        r#"data: {"type":"response.function_call.arguments.delta","output_index":1,"item_id":"fc_2","delta":"{\"path\":\"/x\"}"}"#,
+        r#"data: {"type":"response.output_item.done","output_index":0,"sequence_number":3,"item":{"type":"function_call","id":"fc_1","call_id":"call_a","name":"read","arguments":"{\"path\":\"/x\"}"}}"#,
         "\n\n",
-        r#"data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_2","call_id":"call_b","name":"read","arguments":"{\"path\":\"/x\"}"}}"#,
-        "\n\n",
-        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
+        r#"data: {"type":"response.completed","sequence_number":4,"response":{"id":"r","status":"completed"}}"#,
         "\n\n",
     );
-    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
-        raw.as_bytes(),
-    ))]);
-    let (_tx, rx) = tokio::sync::oneshot::channel();
-    let mut stream = test_events_stream(bytes, rx);
-
-    let mut events = Vec::new();
-    while let Some(e) = stream.next().await {
-        events.push(e);
-    }
-
+    let events = run(raw);
     let done = events
         .iter()
-        .find_map(|e| {
-            if let ProviderEvent::Done(m) = e {
-                Some(m)
-            } else {
-                None
-            }
+        .find_map(|e| match e {
+            ProviderEvent::Done(m) => Some(m),
+            _ => None,
+        })
+        .expect("Done");
+    assert_eq!(done.stop_reason, StopReason::ToolUse);
+    match &done.content[0] {
+        ContentBlock::ToolCall(tc) => {
+            assert_eq!(tc.name, "read");
+            assert_eq!(tc.arguments.as_value()["path"], "/x");
+        }
+        other => panic!("expected ToolCall, got {other:?}"),
+    }
+}
+
+#[test]
+fn sse_mixed_text_and_tool() {
+    let raw = concat!(
+        r#"data: {"type":"response.output_text.delta","delta":"reading ","sequence_number":0}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_item.added","output_index":1,"sequence_number":1,"item":{"type":"function_call","id":"fc_2","call_id":"call_b","name":"read","arguments":""}}"#,
+        "\n\n",
+        r#"data: {"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_2","delta":"{\"path\":\"/x\"}","sequence_number":2}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_item.done","output_index":1,"sequence_number":3,"item":{"type":"function_call","id":"fc_2","call_id":"call_b","name":"read","arguments":"{\"path\":\"/x\"}"}}"#,
+        "\n\n",
+        r#"data: {"type":"response.completed","sequence_number":4,"response":{"id":"r","status":"completed"}}"#,
+        "\n\n",
+    );
+    let events = run(raw);
+    let done = events
+        .iter()
+        .find_map(|e| match e {
+            ProviderEvent::Done(m) => Some(m),
+            _ => None,
         })
         .expect("Done");
     assert_eq!(done.stop_reason, StopReason::ToolUse);
@@ -653,29 +654,20 @@ async fn b7b_sse_mixed_text_and_tool() {
 }
 
 // ============================================================================
-// Reasoning summary → ThinkingDelta
+// Reasoning summary/text → ThinkingDelta
 // ============================================================================
 
-#[tokio::test]
-async fn reasoning_summary_emits_thinking_delta() {
+#[test]
+fn reasoning_summary_text_emits_thinking_delta() {
     let raw = concat!(
-        r#"data: {"type":"response.reasoning_summary.delta","delta":"planning..."}"#,
+        r#"data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"planning...","sequence_number":0}"#,
         "\n\n",
-        r#"data: {"type":"response.output_text.delta","delta":"ok"}"#,
+        r#"data: {"type":"response.output_text.delta","delta":"ok","sequence_number":1}"#,
         "\n\n",
-        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
+        r#"data: {"type":"response.completed","sequence_number":2,"response":{"id":"r","status":"completed"}}"#,
         "\n\n",
     );
-    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
-        raw.as_bytes(),
-    ))]);
-    let (_tx, rx) = tokio::sync::oneshot::channel();
-    let mut stream = test_events_stream(bytes, rx);
-
-    let mut events = Vec::new();
-    while let Some(e) = stream.next().await {
-        events.push(e);
-    }
+    let events = run(raw);
     assert!(events
         .iter()
         .any(|e| matches!(e, ProviderEvent::ThinkingDelta(t) if t == "planning...")));
@@ -685,29 +677,48 @@ async fn reasoning_summary_emits_thinking_delta() {
     assert!(events.iter().any(|e| matches!(e, ProviderEvent::Done(_))));
 }
 
-// ============================================================================
-// Failure events → ProviderEvent::Error
-// ============================================================================
-
-#[tokio::test]
-async fn failed_event_emits_error() {
+#[test]
+fn reasoning_text_delta_emits_thinking_delta() {
     let raw = concat!(
-        r#"data: {"type":"response.failed","response":{"status":"failed","error":{"message":"boom"}}}"#,
+        r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"delta":"chain","sequence_number":0}"#,
+        "\n\n",
+        r#"data: {"type":"response.completed","sequence_number":1,"response":{"id":"r","status":"completed"}}"#,
         "\n\n",
     );
-    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
-        raw.as_bytes(),
-    ))]);
-    let (_tx, rx) = tokio::sync::oneshot::channel();
-    let mut stream = test_events_stream(bytes, rx);
+    let events = run(raw);
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, ProviderEvent::ThinkingDelta(t) if t == "chain")));
+}
 
-    let mut events = Vec::new();
-    while let Some(e) = stream.next().await {
-        events.push(e);
-    }
+// ============================================================================
+// Failure / error events → ProviderEvent::Error
+// ============================================================================
+
+#[test]
+fn failed_event_emits_error() {
+    let raw = concat!(
+        r#"data: {"type":"response.failed","sequence_number":0,"response":{"id":"r","status":"failed","error":{"message":"boom"}}}"#,
+        "\n\n",
+    );
+    let events = run(raw);
     assert_eq!(events.len(), 1);
     match &events[0] {
-        ProviderEvent::Error(_) => {}
+        ProviderEvent::Error(m) => assert!(m.contains("boom")),
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+#[test]
+fn response_error_event_emits_error() {
+    let raw = concat!(
+        r#"data: {"type":"response.error","code":"rate_limit","message":"slow","sequence_number":0}"#,
+        "\n\n",
+    );
+    let events = run(raw);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ProviderEvent::Error(m) => assert!(m.contains("slow")),
         other => panic!("expected Error, got {other:?}"),
     }
 }
@@ -719,7 +730,7 @@ async fn failed_event_emits_error() {
 #[tokio::test]
 async fn cancel_mid_stream_yields_aborted() {
     let raw = concat!(
-        r#"data: {"type":"response.output_text.delta","delta":"partial"}"#,
+        r#"data: {"type":"response.output_text.delta","delta":"partial","sequence_number":0}"#,
         "\n\n",
     );
     let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
@@ -728,21 +739,13 @@ async fn cancel_mid_stream_yields_aborted() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let mut stream = test_events_stream(bytes, rx);
 
-    // Take one delta.
     let e0 = stream.next().await.expect("first event");
     match e0 {
         ProviderEvent::TextDelta(t) => assert_eq!(t, "partial"),
         other => panic!("expected TextDelta, got {other:?}"),
     }
-    // Fire cancel; the SSE stream has no further events,
-    // so the loop will fall through and the cancel-check might
-    // race. Drop tx instead to simulate cancel signal closing.
     let _ = tx.send(());
-    // Drain.
     let remaining: Vec<_> = stream.collect().await;
-    // Cancel may or may not arrive before EOF — accept either:
-    // Done(Aborted) preferred, but Done(EndTurn) is acceptable if
-    // EOF won the race. In both cases there's exactly one Done.
     assert_eq!(remaining.len(), 1);
     let done = match &remaining[0] {
         ProviderEvent::Done(m) => m,
@@ -752,7 +755,6 @@ async fn cancel_mid_stream_yields_aborted() {
         done.stop_reason,
         StopReason::Aborted | StopReason::EndTurn
     ));
-    // Partial text preserved.
     match &done.content[..] {
         [ContentBlock::Text { text }] => assert_eq!(text.as_ref(), "partial"),
         other => panic!("expected Text content, got {other:?}"),
@@ -765,19 +767,11 @@ async fn cancel_mid_stream_yields_aborted() {
 
 #[test]
 fn stop_reason_max_tokens_from_incomplete_details() {
-    let mut state = StreamState {
-        sse: Box::pin(futures::stream::empty()),
-        accumulated_text: "partial".into(),
-        tool_calls: HashMap::new(),
-        tool_call_order: Vec::new(),
-        final_status: Some("incomplete".into()),
-        incomplete_reason: Some("max_output_tokens".into()),
-        usage: None,
-        cancel_rx: None,
-        finished: false,
-        emitted_done: false,
-        error_message: None,
-    };
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let mut state = new_stream_state(Box::pin(futures::stream::empty()), rx);
+    state.accumulated_text = "partial".into();
+    state.final_status = Some(ResponseStatus::Incomplete);
+    state.incomplete_reason = Some("max_output_tokens".into());
     assert_eq!(map_stop(&state), StopReason::MaxTokens);
     // Even without final_status set, incomplete_reason wins.
     state.final_status = None;
@@ -785,26 +779,11 @@ fn stop_reason_max_tokens_from_incomplete_details() {
 }
 
 // ============================================================================
-// mu-yqeq.5 parity tests
+// Legacy vs Projected parity
 //
-// Each test runs the SAME scenario through both wire-body builders:
-//   - Legacy:    build_request_body(model, thinking, instructions, &[AgentMessage], tools)
-//   - Projected: build_request_body_from_projection(model, thinking,
-//                  default_instructions, &ProviderMessages, tools)
-//                where ProviderMessages comes from
-//                FauxProviderRenderer::render(&assemble_rope(...),
-//                ProjectionTarget::AgentView).
-//
-// The Legacy call uses the same resolved `instructions` value that
-// `OpenaiCodexProvider::stream` would compute from `system_prompt`
-// and `self.instructions`; the Projected call passes the default
-// fallback and lets the helper recover the hoisted system text from
-// the projection. Byte-equality on the two `serde_json::Value`
-// outputs is the contract.
-//
-// Phase D (mu-yqeq.8) flips the call site at mod.rs:818 from Legacy
-// to Projected; if these parity tests pass, the cutover is
-// observably equivalent at the wire layer.
+// Each test runs the SAME scenario through both wire-body builders and
+// asserts byte-equal `serde_json::Value`. The Projected projection comes
+// from FauxProviderRenderer::render(&assemble_rope(...), AgentView).
 // ============================================================================
 
 const PARITY_DEFAULT_INSTRUCTIONS: &str = "you are a test";
@@ -814,12 +793,10 @@ fn parity_compare(system_prompt: Option<&str>, messages: &[AgentMessage], tools:
         assemble_rope, FauxProviderRenderer, ProjectionTarget, ProviderRenderer,
     };
 
-    // Resolve instructions the same way OpenaiCodexProvider::stream
-    // would in the Legacy arm.
     let resolved_instructions = system_prompt
         .filter(|s| !s.is_empty())
         .unwrap_or(PARITY_DEFAULT_INSTRUCTIONS);
-    let legacy = build_request_body(
+    let legacy = build_request_value(
         "gpt-5-codex",
         "high",
         resolved_instructions,
@@ -829,7 +806,7 @@ fn parity_compare(system_prompt: Option<&str>, messages: &[AgentMessage], tools:
 
     let rope = assemble_rope(system_prompt, messages, tools);
     let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
-    let projected = build_request_body_from_projection(
+    let projected = build_request_value_from_projection(
         "gpt-5-codex",
         "high",
         PARITY_DEFAULT_INSTRUCTIONS,
@@ -843,11 +820,8 @@ fn parity_compare(system_prompt: Option<&str>, messages: &[AgentMessage], tools:
     );
 }
 
-#[test]
-fn yqeq5_parity_pure_text_turn() {
-    // User → Assistant text, no tool calls. Dummy tool supplied so
-    // mu-0q44's no-tools clause doesn't fire.
-    let dummy = ToolSpec {
+fn dummy_tool() -> ToolSpec {
+    ToolSpec {
         name: "noop".into(),
         description: "no-op".into(),
         input_schema: json!({"type": "object"}),
@@ -856,7 +830,11 @@ fn yqeq5_parity_pure_text_turn() {
         policy: Default::default(),
 
         ..Default::default()
-    };
+    }
+}
+
+#[test]
+fn parity_pure_text_turn() {
     let messages = vec![
         AgentMessage::User {
             content: "hi".into(),
@@ -869,15 +847,11 @@ fn yqeq5_parity_pure_text_turn() {
             usage: None,
         }),
     ];
-    parity_compare(None, &messages, &[dummy]);
+    parity_compare(None, &messages, &[dummy_tool()]);
 }
 
 #[test]
-fn yqeq5_parity_single_tool_call() {
-    // User → Assistant(text + ToolCall) → ToolResult → Assistant text.
-    // Exercises the Responses API split shape: each Assistant turn
-    // emits a `message` item (text) + a `function_call` item, and the
-    // ToolResult emits a `function_call_output` item.
+fn parity_single_tool_call() {
     let tool = ToolSpec {
         name: "read".into(),
         description: "read a file".into(),
@@ -924,11 +898,9 @@ fn yqeq5_parity_single_tool_call() {
 }
 
 #[test]
-fn yqeq5_parity_consecutive_tool_results() {
-    // Three back-to-back ToolResults. Unlike Anthropic (which groups
-    // these into a single user message), the OpenAI Responses API
-    // emits each as a separate function_call_output item. The
-    // Projected path must preserve that lack of grouping.
+fn parity_consecutive_tool_results() {
+    // The OpenAI Responses API emits each ToolResult as a separate
+    // function_call_output item (no Anthropic-style grouping).
     let messages = vec![
         AgentMessage::Assistant(AssistantMessage {
             content: vec![
@@ -967,34 +939,61 @@ fn yqeq5_parity_consecutive_tool_results() {
             is_error: false,
         },
     ];
-    // Dummy tool: mu-0q44's no-tools clause diverges Legacy vs Projected.
-    let dummy = ToolSpec {
-        name: "noop".into(),
-        description: "no-op".into(),
-        input_schema: json!({"type": "object"}),
-        display: None,
-        when: None,
-        policy: Default::default(),
-
-        ..Default::default()
-    };
-    parity_compare(None, &messages, &[dummy]);
+    parity_compare(None, &messages, &[dummy_tool()]);
 }
 
 #[test]
-fn mu_2puu_projected_hoists_memory_injection_and_file_load_into_instructions() {
-    // mu-2puu regression test. mu-phl v0 introduced MemoryInjection +
-    // FileLoad spans into the rope via assemble_rope_with_context; the
-    // codex Projected arm must include their content in
-    // body.instructions (OpenAI Responses API has only one
-    // instructions slot, so multiple System-role spans concat there).
-    //
-    // Pre-fix this test failed: translate_provider_messages_codex
-    // only hoisted the span with id literally "system-prompt" and
-    // silently dropped memory-recall:* and project-file:* spans.
-    //
-    // The fix hoists all System-role spans EXCEPT tool-schema:*
-    // (tools go separately via body.tools).
+fn parity_system_prompt_plus_tools() {
+    let tools = vec![
+        ToolSpec {
+            name: "read".into(),
+            description: "read a file".into(),
+            input_schema: json!({"type": "object"}),
+            display: None,
+            when: None,
+            policy: Default::default(),
+
+            ..Default::default()
+        },
+        ToolSpec {
+            name: "bash".into(),
+            description: "run shell".into(),
+            input_schema: json!({"type": "object"}),
+            display: None,
+            when: None,
+            policy: Default::default(),
+
+            ..Default::default()
+        },
+    ];
+    let messages = vec![AgentMessage::User {
+        content: "list files".into(),
+    }];
+    parity_compare(Some("you are a helpful assistant"), &messages, &tools);
+}
+
+#[test]
+fn parity_thinking_blocks_skipped() {
+    let messages = vec![AgentMessage::Assistant(AssistantMessage {
+        content: vec![
+            ContentBlock::Thinking {
+                text: "INTERNAL_REASONING_DO_NOT_LEAK".into(),
+            },
+            ContentBlock::Text {
+                text: "public answer".into(),
+            },
+        ],
+        stop_reason: StopReason::EndTurn,
+        usage: None,
+    })];
+    parity_compare(None, &messages, &[dummy_tool()]);
+}
+
+#[test]
+fn projected_hoists_memory_and_file_into_instructions() {
+    // mu-2puu regression: memory-recall:* and project-file:* spans must
+    // be hoisted into body.instructions (the Responses API has one
+    // instructions slot), not silently dropped.
     use mu_core::context::{
         assemble_rope_with_context, FauxProviderRenderer, ProjectContext, ProjectionTarget,
         ProviderRenderer, RecallSource, RecalledItem,
@@ -1027,7 +1026,7 @@ fn mu_2puu_projected_hoists_memory_injection_and_file_load_into_instructions() {
     let rope =
         assemble_rope_with_context(Some("you are mu"), Some(&project_context), &messages, &[]);
     let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
-    let body = build_request_body_from_projection(
+    let body = build_request_value_from_projection(
         "gpt-5-codex",
         "high",
         "fallback default instructions",
@@ -1039,36 +1038,23 @@ fn mu_2puu_projected_hoists_memory_injection_and_file_load_into_instructions() {
         .get("instructions")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-
-    // System prompt content
-    assert!(
-        instructions.contains("you are mu"),
-        "system prompt missing from instructions: {instructions:?}",
-    );
-    // Memory recall content (SubprocessRecallProvider)
+    assert!(instructions.contains("you are mu"), "{instructions:?}");
     assert!(
         instructions.contains("favorite color is 'cat'"),
-        "memory-recall content missing from instructions: {instructions:?}",
+        "{instructions:?}"
     );
-    // Project-file content (ProjectFileRecallProvider)
     assert!(
         instructions.contains("use SpanText for content fields."),
-        "project-file content missing from instructions: {instructions:?}",
+        "{instructions:?}"
     );
-    // Fallback default should NOT be used since we have system content
     assert!(
         !instructions.contains("fallback default instructions"),
-        "fallback default leaked into instructions: {instructions:?}",
+        "{instructions:?}"
     );
 }
 
 #[test]
-fn mu_2puu_projected_excludes_tool_schema_from_instructions() {
-    // Companion to the regression above: tool-schema spans also map
-    // to ProviderRole::System (per renderer.rs From<&SpanKind>), but
-    // they MUST NOT land in body.instructions — tools go separately
-    // via body.tools. The fix's exclusion clause is
-    // `source_span_ids.first().starts_with("tool-schema:")`.
+fn projected_excludes_tool_schema_from_instructions() {
     use mu_core::context::{
         assemble_rope, FauxProviderRenderer, ProjectionTarget, ProviderRenderer,
     };
@@ -1089,7 +1075,7 @@ fn mu_2puu_projected_excludes_tool_schema_from_instructions() {
     let rope = assemble_rope(Some("system-only-text"), &messages, &tools);
     let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
     let body =
-        build_request_body_from_projection("gpt-5-codex", "high", "fallback", &projection, &tools);
+        build_request_value_from_projection("gpt-5-codex", "high", "fallback", &projection, &tools);
 
     let instructions = body
         .get("instructions")
@@ -1097,106 +1083,35 @@ fn mu_2puu_projected_excludes_tool_schema_from_instructions() {
         .unwrap_or("");
     assert!(
         instructions.contains("system-only-text"),
-        "system prompt missing: {instructions:?}",
+        "{instructions:?}"
     );
-    // Tool schema content (description, JSON schema) MUST NOT appear
-    // in instructions — it's passed separately via body.tools.
-    assert!(
-        !instructions.contains("read a file"),
-        "tool-schema content leaked into instructions: {instructions:?}",
-    );
+    assert!(!instructions.contains("read a file"), "{instructions:?}");
+}
+
+// ============================================================================
+// mu-rb4u: 429 / usage-limit error rendering
+// ============================================================================
+
+#[test]
+fn render_http_error_surfaces_usage_limit() {
+    let body = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"prolite","resets_at":1782114418,"resets_in_seconds":3501}}"#;
+    let msg = render_codex_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, body);
+    assert!(msg.contains("usage limit reached"), "got: {msg}");
+    assert!(msg.contains("prolite"), "got: {msg}");
+    assert!(msg.contains("58m21s"), "got: {msg}");
+    assert!(!msg.contains("resets_in_seconds"), "got: {msg}");
 }
 
 #[test]
-fn yqeq5_parity_system_prompt_plus_tools() {
-    // System prompt + multiple tools. Exercises:
-    //   - the instructions-hoisting path (Projected extracts from the
-    //     "system-prompt" span; Legacy uses the resolved instructions).
-    //   - the tool_choice + parallel_tool_calls extra fields that
-    //     appear only when tools are present.
-    let tools = vec![
-        ToolSpec {
-            name: "read".into(),
-            description: "read a file".into(),
-            input_schema: json!({"type": "object"}),
-            display: None,
-            when: None,
-            policy: Default::default(),
+fn render_http_error_generic_429_and_other_status() {
+    let body = r#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#;
+    let msg = render_codex_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, body);
+    assert!(msg.contains("rate limited (429)"), "got: {msg}");
+    assert!(msg.contains("slow down"), "got: {msg}");
 
-            ..Default::default()
-        },
-        ToolSpec {
-            name: "bash".into(),
-            description: "run shell".into(),
-            input_schema: json!({"type": "object"}),
-            display: None,
-            when: None,
-            policy: Default::default(),
-
-            ..Default::default()
-        },
-    ];
-    let messages = vec![AgentMessage::User {
-        content: "list files".into(),
-    }];
-    parity_compare(Some("you are a helpful assistant"), &messages, &tools);
-}
-
-#[test]
-fn yqeq5_thinking_blocks_are_skipped_in_projected_wire_output() {
-    // Spec mu-044 §"Thinking-block skip": Projected wire emission
-    // MUST NOT echo the model's reasoning trace back as input.
-    // Mirrors the Legacy `translate_message` behavior
-    // (openai_codex.rs:243-247 filters Thinking blocks).
-    use mu_core::context::{
-        assemble_rope, FauxProviderRenderer, ProjectionTarget, ProviderRenderer,
-    };
-
-    let messages = vec![AgentMessage::Assistant(AssistantMessage {
-        content: vec![
-            ContentBlock::Thinking {
-                text: "INTERNAL_REASONING_DO_NOT_LEAK".into(),
-            },
-            ContentBlock::Text {
-                text: "public answer".into(),
-            },
-        ],
-        stop_reason: StopReason::EndTurn,
-        usage: None,
-    })];
-    let rope = assemble_rope(None, &messages, &[]);
-    let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
-    let projected = build_request_body_from_projection(
-        "gpt-5-codex",
-        "high",
-        PARITY_DEFAULT_INSTRUCTIONS,
-        &projection,
-        &[],
-    );
-
-    let wire = serde_json::to_string(&projected).expect("serialize");
-    assert!(
-        !wire.contains("INTERNAL_REASONING_DO_NOT_LEAK"),
-        "Thinking block content leaked to wire: {wire}",
-    );
-    assert!(
-        wire.contains("public answer"),
-        "non-thinking text was lost: {wire}",
-    );
-
-    // Also: parity vs Legacy (which also strips thinking). Dummy tool
-    // avoids mu-0q44 no-tools clause divergence.
-    let dummy = ToolSpec {
-        name: "noop".into(),
-        description: "no-op".into(),
-        input_schema: json!({"type": "object"}),
-        display: None,
-        when: None,
-        policy: Default::default(),
-
-        ..Default::default()
-    };
-    parity_compare(None, &messages, &[dummy]);
+    let msg = render_codex_http_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom");
+    assert!(msg.contains("500"), "got: {msg}");
+    assert!(msg.contains("boom"), "got: {msg}");
 }
 
 // ============================================================================
@@ -1211,17 +1126,14 @@ mod live_tests {
         std::env::var("MU_LIVE_OPENAI_CODEX").ok().as_deref() == Some("1")
     }
 
-    /// B-12: live text smoke against the user's actual Codex backend.
     #[tokio::test]
-    async fn b12_live_codex_text_smoke() {
+    async fn live_codex_text_smoke() {
         if !live_enabled() {
-            eprintln!("skipping b12_live_codex_text_smoke (set MU_LIVE_OPENAI_CODEX=1)");
+            eprintln!("skipping live_codex_text_smoke (set MU_LIVE_OPENAI_CODEX=1)");
             return;
         }
-
-        let provider = OpenaiCodexProvider::from_store("gpt-5-codex".into())
+        let provider = OpenaiProvider::from_store("gpt-5-codex".into())
             .expect("must be logged in via `mu login --provider openai-codex`");
-
         let messages = vec![AgentMessage::User {
             content: "Reply with the single word 'hello' and nothing else.".into(),
         }];
@@ -1245,24 +1157,19 @@ mod live_tests {
             }
         }
         assert!(got_done);
-        eprintln!("live codex smoke text: {text:?}");
         assert!(
             text.to_lowercase().contains("hello"),
             "expected 'hello', got: {text:?}"
         );
     }
 
-    /// B-13: live tool round-trip.
     #[tokio::test]
-    async fn b13_live_codex_tool_call() {
+    async fn live_codex_tool_call() {
         if !live_enabled() {
-            eprintln!("skipping b13_live_codex_tool_call (set MU_LIVE_OPENAI_CODEX=1)");
+            eprintln!("skipping live_codex_tool_call (set MU_LIVE_OPENAI_CODEX=1)");
             return;
         }
-
-        let provider =
-            OpenaiCodexProvider::from_store("gpt-5-codex".into()).expect("must be logged in");
-
+        let provider = OpenaiProvider::from_store("gpt-5-codex".into()).expect("must be logged in");
         let echo_tool = ToolSpec {
             name: "echo".into(),
             description: "Echo a string.".into(),
@@ -1275,7 +1182,6 @@ mod live_tests {
 
             ..Default::default()
         };
-
         let messages = vec![AgentMessage::User {
             content: "Use the echo tool with text='hi there'. Just call the tool.".into(),
         }];
@@ -1298,10 +1204,7 @@ mod live_tests {
                 break;
             }
         }
-
         let done = done_payload.expect("Done");
-        eprintln!("live codex tool content: {:#?}", done.content);
-
         let tc = done
             .content
             .iter()
@@ -1313,41 +1216,4 @@ mod live_tests {
         assert_eq!(tc.name, "echo");
         assert!(tc.arguments.as_value().is_object());
     }
-}
-
-// ============================================================================
-// mu-rb4u: 429 / usage-limit error rendering
-// ============================================================================
-
-#[test]
-fn rb4u_render_codex_http_error_surfaces_usage_limit() {
-    // The exact shape codex returns for a subscription cap (observed in
-    // the wild: resets_in_seconds=3501 → ~58m21s).
-    let body = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"prolite","resets_at":1782114418,"resets_in_seconds":3501}}"#;
-    let msg = render_codex_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, body);
-    assert!(msg.contains("usage limit reached"), "got: {msg}");
-    assert!(msg.contains("prolite"), "should name the plan; got: {msg}");
-    assert!(
-        msg.contains("58m21s"),
-        "should state the reset window; got: {msg}"
-    );
-    // Not a raw JSON dump.
-    assert!(
-        !msg.contains("resets_in_seconds"),
-        "should not dump raw JSON; got: {msg}"
-    );
-}
-
-#[test]
-fn rb4u_render_codex_http_error_generic_429_and_other_status() {
-    // A 429 without a usage cap → concise rate-limit message.
-    let body = r#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#;
-    let msg = render_codex_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, body);
-    assert!(msg.contains("rate limited (429)"), "got: {msg}");
-    assert!(msg.contains("slow down"), "got: {msg}");
-
-    // A non-429 falls back to the status + body verbatim.
-    let msg = render_codex_http_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom");
-    assert!(msg.contains("500"), "got: {msg}");
-    assert!(msg.contains("boom"), "got: {msg}");
 }

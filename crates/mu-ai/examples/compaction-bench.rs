@@ -49,7 +49,7 @@ use mu_core::context::compaction::NoCompactionPolicy;
 // the operator route the judge's LLM call through their preferred
 // provider (e.g., subscription-priced OpenAI Codex OAuth instead of
 // pay-per-token Anthropic API).
-use mu_ai::{AnthropicProvider, OpenRouterProvider, OpenaiCodexProvider};
+use mu_ai::{AnthropicProvider, OpenRouterProvider, OpenaiProvider};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Format {
@@ -240,7 +240,7 @@ fn build_policies(
                     Arc::new(p)
                 }
                 JudgeProvider::OpenaiCodex => {
-                    let p = OpenaiCodexProvider::from_store(model.clone())
+                    let p = OpenaiProvider::from_store(model.clone())
                         .map_err(|e| format!("--judge live (openai-codex): {e}"))?;
                     Arc::new(p)
                 }

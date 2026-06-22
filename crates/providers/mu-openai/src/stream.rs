@@ -70,6 +70,18 @@ pub enum ResponseStreamEvent {
         delta: String,
         sequence_number: u64,
     },
+    /// Compatibility with the ChatGPT/Codex backend spelling observed in older
+    /// mu fixtures. The public OpenAPI spelling is
+    /// `response.function_call_arguments.delta`; keep accepting this so the
+    /// subscription path does not break if Codex lags or forks the public API.
+    #[serde(rename = "response.function_call.arguments.delta")]
+    FunctionCallArgumentsDeltaCompat {
+        item_id: String,
+        output_index: u32,
+        delta: String,
+        #[serde(default)]
+        sequence_number: u64,
+    },
     #[serde(rename = "response.function_call_arguments.done")]
     FunctionCallArgumentsDone {
         item_id: String,
@@ -130,6 +142,18 @@ mod tests {
             json!({"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"{\"x\":","sequence_number":4}),
         ) {
             ResponseStreamEvent::FunctionCallArgumentsDelta { delta, .. } => {
+                assert_eq!(delta, "{\"x\":")
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_compat_function_call_arguments_delta_parses() {
+        match parse(
+            json!({"type":"response.function_call.arguments.delta","item_id":"fc_1","output_index":0,"delta":"{\"x\":"}),
+        ) {
+            ResponseStreamEvent::FunctionCallArgumentsDeltaCompat { delta, .. } => {
                 assert_eq!(delta, "{\"x\":")
             }
             other => panic!("got {other:?}"),

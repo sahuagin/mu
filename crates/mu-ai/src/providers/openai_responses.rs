@@ -89,6 +89,11 @@ pub(crate) fn events_from_openai_stream(
                     output_index,
                     delta,
                     ..
+                }
+                | mu_openai::ResponseStreamEvent::FunctionCallArgumentsDeltaCompat {
+                    output_index,
+                    delta,
+                    ..
                 } => {
                     let e = tool_entry(acc, output_index);
                     e.args_json.push_str(&delta);

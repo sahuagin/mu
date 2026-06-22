@@ -215,10 +215,11 @@ impl Turn {
 /// (`ProviderSelector::kind`, snake_case). Accept the common spellings
 /// users type at the CLI. Shared between session create and
 /// `session.delegate` (sidecar creation for /btw).
-fn normalize_provider_kind(provider: &str) -> String {
+pub fn normalize_provider_kind(provider: &str) -> String {
     let lc = provider.to_lowercase();
     match lc.as_str() {
         "anthropic" | "anthropic-api" | "anthropic_api" | "claude" => "anthropic_api".into(),
+        "anthropic-oauth" | "anthropic_oauth" | "claude-oauth" => "anthropic_oauth".into(),
         "openai" | "openai-codex" | "openai_codex" | "codex" => "openai_codex".into(),
         "openrouter" | "open-router" | "open_router" => "openrouter".into(),
         "vllm" | "vllm-openai" | "local-vllm" | "local_vllm" => "vllm".into(),
@@ -239,44 +240,65 @@ fn truncate_at_word(s: &str, max: usize) -> String {
     }
 }
 
-/// Session-level effort dial. Layer on top of model selection per
-/// claude-code-feature-mapping §17. mu-vcbm: live — `fire_ask` carries
-/// the selected level on every `ask_session.effort`; the daemon applies
-/// it stickily and maps it onto the provider's thinking/reasoning
-/// directive. (mu-vcbm slice 2 will config-drive the allowed levels and
-/// default, retiring this hardcoded enum.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EffortLevel {
-    Low,
-    Medium,
-    High,
-    XHigh,
-    Max,
+/// User-facing descriptions for common effort levels. Custom configured levels
+/// fall back to a neutral description rather than being rejected.
+fn effort_description(level: &str) -> &'static str {
+    match level {
+        "off" => "Disable model thinking/reasoning when supported",
+        "on" => "Enable model thinking/reasoning when supported",
+        "minimal" => "Minimal reasoning depth",
+        "low" => "Quick, concise responses",
+        "medium" => "Balanced depth and speed",
+        "high" => "Thorough, detailed work",
+        "xhigh" => "Extra thorough, multi-angle",
+        "max" => "Maximum depth, no shortcuts",
+        _ => "Configured effort level",
+    }
 }
 
-impl EffortLevel {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_lowercase().as_str() {
-            "low" | "l" => Some(Self::Low),
-            "medium" | "med" | "m" => Some(Self::Medium),
-            "high" | "h" => Some(Self::High),
-            "xhigh" | "x-high" | "extra-high" | "x" => Some(Self::XHigh),
-            "max" => Some(Self::Max),
-            _ => None,
-        }
-    }
+fn normalize_effort(s: &str) -> String {
+    s.trim().to_ascii_lowercase()
+}
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::XHigh => "xhigh",
-            Self::Max => "max",
-        }
+fn effort_alias(input: &str) -> &str {
+    match input {
+        "l" => "low",
+        "m" | "med" => "medium",
+        "h" => "high",
+        "x" | "x-high" | "extra-high" => "xhigh",
+        _ => input,
     }
+}
 
-    pub const ALL: &'static [Self] = &[Self::Low, Self::Medium, Self::High, Self::XHigh, Self::Max];
+fn parse_effort_against(input: &str, valid: &[String]) -> Option<String> {
+    let normalized = normalize_effort(input);
+    if normalized.is_empty() {
+        return None;
+    }
+    let aliased = effort_alias(&normalized);
+    valid.iter().find(|v| v.as_str() == aliased).cloned()
+}
+
+fn generic_effort_levels() -> Vec<String> {
+    ["low", "medium", "high", "xhigh", "max"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn route_effort_config(provider_kind: &str, model: &str) -> (Vec<String>, Option<String>) {
+    let (levels, default) = mu_core::route_catalog::effort_config_for(provider_kind, model);
+    let levels: Vec<String> = levels
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+    let levels = if levels.is_empty() {
+        generic_effort_levels()
+    } else {
+        levels
+    };
+    (levels, default.map(|s| s.to_string()))
 }
 
 /// User-visible app state. Held across the run loop.
@@ -304,9 +326,13 @@ pub struct App {
     daemon_id: String,
     /// Daemon version string. Surfaced via /status.
     daemon_version: String,
-    /// Session-level effort dial (§17). mu-vcbm: sent on every
-    /// `ask_session.effort` by `fire_ask`; the daemon applies it stickily.
-    effort: EffortLevel,
+    /// Session-level effort dial (§17). Sent on every `ask_session.effort`;
+    /// the daemon applies it stickily. Free string from the route/profile
+    /// resolved levels, not a protocol enum.
+    effort: String,
+    valid_effort_levels: Vec<String>,
+    effort_levels_override: bool,
+    default_effort_override: Option<String>,
     /// Focus mode (§16): when true, suppress streaming text_delta
     /// previews and render the assistant block in one shot on
     /// `assistant_text_finalized`. Default off.
@@ -563,6 +589,9 @@ pub struct AppOptions<'a> {
     /// --thinking <v>`. Empty = no launch-time directive.
     pub thinking: &'a str,
     pub effort: &'a str,
+    pub effort_levels: Vec<String>,
+    pub effort_levels_override: bool,
+    pub default_effort_override: Option<String>,
     pub focus_mode: bool,
     /// mu-f1a0: cache TTL tier ("5m" | "1h") for the initial session.
     pub cache_ttl: &'a str,
@@ -585,9 +614,9 @@ impl App {
     /// Spawn `mu serve`, authenticate, create a session, and return an
     /// App ready to run.
     ///
-    /// `effort` is parsed via [`EffortLevel::parse`]; invalid values
-    /// surface as an error so a typo in `solo.toml` doesn't silently
-    /// fall back to Medium. `focus_mode` seeds the /focus toggle.
+    /// `effort` is parsed against the resolved route/profile effort levels;
+    /// invalid values surface as an error so a typo in `solo.toml` doesn't
+    /// silently fall back. `focus_mode` seeds the /focus toggle.
     pub fn new(opts: AppOptions) -> Result<Self> {
         let AppOptions {
             mu_binary,
@@ -598,6 +627,9 @@ impl App {
             tools,
             thinking,
             effort,
+            effort_levels,
+            effort_levels_override,
+            default_effort_override,
             focus_mode,
             clipboard_command,
             cache_ttl,
@@ -606,8 +638,21 @@ impl App {
             autonomy,
             max_side_effects,
         } = opts;
-        let effort = EffortLevel::parse(effort).ok_or_else(|| {
-            anyhow!("invalid effort {effort:?} (valid: low|medium|high|xhigh|max)")
+        let valid_effort_levels: Vec<String> = effort_levels
+            .into_iter()
+            .map(|s| normalize_effort(&s))
+            .filter(|s| !s.is_empty())
+            .collect();
+        let valid_effort_levels = if valid_effort_levels.is_empty() {
+            generic_effort_levels()
+        } else {
+            valid_effort_levels
+        };
+        let effort = parse_effort_against(effort, &valid_effort_levels).ok_or_else(|| {
+            anyhow!(
+                "invalid effort {effort:?} for {provider}/{model} (valid: {})",
+                valid_effort_levels.join("|")
+            )
         })?;
         let mut client = Client::spawn(mu_binary, cwd, bash_yolo, tools, thinking)?;
 
@@ -627,6 +672,7 @@ impl App {
         // than failing session creation.
         let mut create_params = serde_json::json!({
             "provider": { "kind": kind, "model": model },
+            "effort": effort.clone(),
         });
         if matches!(cache_ttl, "5m" | "1h") {
             create_params["cache_ttl"] = serde_json::json!(cache_ttl);
@@ -706,6 +752,9 @@ impl App {
             daemon_id,
             daemon_version,
             effort,
+            valid_effort_levels,
+            effort_levels_override,
+            default_effort_override,
             focus_mode,
             clipboard_command: clipboard_command.map(<[String]>::to_vec),
             sidecar_session_id: None,
@@ -784,7 +833,7 @@ impl App {
             Line::from(Span::styled(
                 format!(
                     "effort: {} · focus: {} · /help for commands · /q to quit",
-                    self.effort.as_str(),
+                    self.effort,
                     if self.focus_mode { "on" } else { "off" }
                 ),
                 Style::default().fg(Color::DarkGray),
@@ -1375,9 +1424,9 @@ impl App {
                             }
                         }
                         MenuContext::Effort => {
-                            if let Some(level) = EffortLevel::ALL.get(idx) {
-                                self.effort = *level;
-                                self.set_flash(format!("effort → {}", level.as_str()));
+                            if let Some(level) = self.valid_effort_levels.get(idx).cloned() {
+                                self.effort = level.clone();
+                                self.set_flash(format!("effort → {level}"));
                             }
                         }
                     }
@@ -2064,7 +2113,7 @@ impl App {
             serde_json::json!({
                 "session_id": self.session_id,
                 "user_message": wire_text,
-                "effort": self.effort.as_str(),
+                "effort": self.effort.clone(),
             }),
         )?;
         self.pending_ask_ids.insert(id);
@@ -2215,7 +2264,11 @@ impl App {
                     Line::from(text)
                 }
             },
-            Line::from(format!("  effort:      {}", self.effort.as_str())),
+            Line::from(format!("  effort:      {}", self.effort)),
+            Line::from(format!(
+                "  effort lvls: {}",
+                self.valid_effort_levels.join(" · ")
+            )),
             Line::from(format!(
                 "  focus:       {} (suppress streaming preview)",
                 if self.focus_mode { "on" } else { "off" }
@@ -2262,42 +2315,30 @@ impl App {
     }
 
     /// /effort — show or set the session-level effort dial (§17).
-    /// Bare `/effort` prints the current value plus valid choices;
-    /// `/effort <level>` sets it. v0 is display-only — the value
-    /// surfaces in /status and the banner; once the daemon learns
-    /// an effort field on `ask_session`, it will attach here.
+    /// Bare `/effort` opens the configured choices; `/effort <level>` sets it.
+    /// The selected value is sent on create_session and every ask_session so the
+    /// daemon applies it stickily.
     fn cmd_effort(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
         let lines: Vec<Line<'static>> = if arg.is_empty() {
-            let items: Vec<MenuItem> = EffortLevel::ALL
+            let items: Vec<MenuItem> = self
+                .valid_effort_levels
                 .iter()
                 .map(|e| {
-                    let current = if *e == self.effort { " (current)" } else { "" };
-                    MenuItem::new(
-                        e.as_str(),
-                        format!(
-                            "{}{current}",
-                            match e {
-                                EffortLevel::Low => "Quick, concise responses",
-                                EffortLevel::Medium => "Balanced depth and speed",
-                                EffortLevel::High => "Thorough, detailed work",
-                                EffortLevel::XHigh => "Extra thorough, multi-angle",
-                                EffortLevel::Max => "Maximum depth, no shortcuts",
-                            }
-                        ),
-                    )
+                    let current = if e == &self.effort { " (current)" } else { "" };
+                    MenuItem::new(e, format!("{}{current}", effort_description(e)))
                 })
                 .collect();
             let max_visible = vp.area().height.saturating_sub(3) as usize;
             self.inline_menu = Some(InlineMenu::new(items, max_visible.max(5)));
             self.menu_context = MenuContext::Effort;
             return Ok(());
-        } else if let Some(level) = EffortLevel::parse(arg) {
-            self.effort = level;
-            self.set_flash(format!("effort → {}", level.as_str()));
+        } else if let Some(level) = parse_effort_against(arg, &self.valid_effort_levels) {
+            self.effort = level.clone();
+            self.set_flash(format!("effort → {level}"));
             vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    format!("effort → {}", level.as_str()),
+                    format!("effort → {level}"),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -2305,10 +2346,7 @@ impl App {
                 Line::from(""),
             ]
         } else {
-            let choices: Vec<String> = EffortLevel::ALL
-                .iter()
-                .map(|e| e.as_str().to_string())
-                .collect();
+            let choices: Vec<String> = self.valid_effort_levels.clone();
             vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -2439,6 +2477,25 @@ impl App {
         Ok(())
     }
 
+    fn refresh_effort_for_route(&mut self, provider_kind: &str, model: &str) {
+        if !self.effort_levels_override {
+            let (levels, default) = route_effort_config(provider_kind, model);
+            self.valid_effort_levels = levels;
+            if !self.valid_effort_levels.iter().any(|e| e == &self.effort) {
+                self.effort = default
+                    .or_else(|| self.default_effort_override.clone())
+                    .and_then(|d| parse_effort_against(&d, &self.valid_effort_levels))
+                    .unwrap_or_else(|| self.valid_effort_levels[0].clone());
+            }
+        } else if !self.valid_effort_levels.iter().any(|e| e == &self.effort) {
+            self.effort = self
+                .default_effort_override
+                .as_deref()
+                .and_then(|d| parse_effort_against(d, &self.valid_effort_levels))
+                .unwrap_or_else(|| self.valid_effort_levels[0].clone());
+        }
+    }
+
     /// /provider [name] — switch the session's provider. Bare
     /// `/provider` opens a modal picker; `/provider <name>` sets
     /// directly. Sends `session.set_route` to the daemon; the switch
@@ -2466,6 +2523,8 @@ impl App {
             Ok(()) => {
                 self.provider = new_provider;
                 self.model = default_model;
+                let model = self.model.clone();
+                self.refresh_effort_for_route(&kind, &model);
                 self.set_flash(format!("provider → {} · {}", self.provider, self.model));
             }
             Err(e) => {
@@ -2532,6 +2591,8 @@ impl App {
         match self.send_set_route(vp, &kind, &new_model) {
             Ok(()) => {
                 self.model = new_model;
+                let model = self.model.clone();
+                self.refresh_effort_for_route(&kind, &model);
                 self.set_flash(format!("model → {}", self.model));
             }
             Err(e) => {
@@ -3079,7 +3140,7 @@ impl App {
             )),
             Line::from("  /status            current provider / model / session / daemon"),
             Line::from("  /help              show this list"),
-            Line::from("  /effort [LEVEL]    show or set effort: low|medium|high|xhigh|max"),
+            Line::from("  /effort [LEVEL]    show or set effort (configured per route)"),
             Line::from("  /focus [on|off]    toggle focus mode (suppress streaming preview)"),
             Line::from(
                 "  /collapse [on|off] fold completed tool blocks to one-liners (fullscreen)",
@@ -3256,12 +3317,7 @@ impl App {
             }
         }
 
-        let right = format!(
-            "({}) {} · {}",
-            self.provider,
-            self.model,
-            self.effort.as_str()
-        );
+        let right = format!("({}) {} · {}", self.provider, self.model, self.effort);
 
         let left_len = 1 + phase_text.len() + metrics_text_len;
         let gap = width.saturating_sub(left_len + right.len() + 1);
@@ -4119,6 +4175,30 @@ const MAX_VIEWPORT_HEIGHT: u16 = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vcbm_effort_parses_against_configured_levels_and_aliases() {
+        let valid = vec!["low".to_string(), "xhigh".to_string(), "max".to_string()];
+        assert_eq!(parse_effort_against("x", &valid).as_deref(), Some("xhigh"));
+        assert_eq!(parse_effort_against("MAX", &valid).as_deref(), Some("max"));
+        assert_eq!(parse_effort_against("medium", &valid), None);
+    }
+
+    #[test]
+    fn vcbm_generic_effort_fallback_preserves_non_effort_providers() {
+        let (levels, default) = route_effort_config("openrouter", "some/model");
+        assert_eq!(levels, vec!["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(default, None);
+    }
+
+    #[test]
+    fn vcbm_normalize_provider_kind_handles_anthropic_oauth_hyphen() {
+        assert_eq!(
+            normalize_provider_kind("anthropic-oauth"),
+            "anthropic_oauth"
+        );
+        assert_eq!(normalize_provider_kind("claude-oauth"), "anthropic_oauth");
+    }
 
     // ===== status-line state machine (mu-d2hx) =====
     //

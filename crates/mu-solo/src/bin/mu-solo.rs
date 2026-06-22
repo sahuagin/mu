@@ -14,7 +14,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use mu_solo::app::{App, AppOptions};
+use mu_solo::app::{normalize_provider_kind, App, AppOptions};
 use mu_solo::config::{self, CliOverrides};
 
 /// CLI flags. Every override flag is Optional so we can distinguish
@@ -62,16 +62,15 @@ struct Cli {
     #[arg(long)]
     tools: Option<String>,
 
-    /// Extended-thinking effort forwarded to `mu serve`:
-    /// low|medium|high|xhigh|max (alias `minimal` = low; `off`/`none`/
-    /// `disabled` to turn off). Anthropic-only. Overrides
+    /// Extended-thinking directive forwarded to `mu serve`. Provider-specific:
+    /// Anthropic/Codex use effort levels; ollama uses an on/off switch. Overrides
     /// config.session.thinking. Prefer setting `[session] thinking` in
     /// solo.toml so you don't pass it each run.
     #[arg(long)]
     thinking: Option<String>,
 
-    /// Initial /effort value: low|medium|high|xhigh|max. Overrides
-    /// config.tui.effort.
+    /// Initial /effort value. Valid choices are resolved from the selected
+    /// profile/model/provider. Overrides config/default effort.
     #[arg(long)]
     effort: Option<String>,
 
@@ -149,6 +148,31 @@ async fn main() -> Result<()> {
         .max_side_effects_capability()
         .context("invalid [session] max_side_effects in solo config")?;
 
+    let provider_kind = normalize_provider_kind(&cfg.session.provider);
+    let (fallback_effort_levels, fallback_default_effort) =
+        mu_core::route_catalog::effort_config_for(&provider_kind, &cfg.session.model);
+    let effort_levels: Vec<String> = if !cfg.session.effort_levels.is_empty() {
+        cfg.session.effort_levels.clone()
+    } else {
+        fallback_effort_levels
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect()
+    };
+    let resolved_effort = if !cfg.tui.effort.trim().is_empty() {
+        cfg.tui.effort.clone()
+    } else if let Some(e) = cfg.session.default_effort.clone() {
+        e
+    } else if let Some(e) = fallback_default_effort {
+        e.to_string()
+    } else {
+        effort_levels
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "medium".to_string())
+    };
+
     // Build the app FIRST (spawns daemon, creates session). Errors
     // here shouldn't leave the terminal in a weird state.
     let mut app = App::new(AppOptions {
@@ -159,7 +183,10 @@ async fn main() -> Result<()> {
         bash_yolo: cfg.session.bash_yolo,
         tools: &cfg.session.tools,
         thinking: &cfg.session.thinking,
-        effort: &cfg.tui.effort,
+        effort: &resolved_effort,
+        effort_levels,
+        effort_levels_override: !cfg.session.effort_levels.is_empty(),
+        default_effort_override: cfg.session.default_effort.clone(),
         focus_mode: cfg.tui.focus_mode,
         cache_ttl: &cfg.session.cache_ttl,
         clipboard_command: cfg.tui.clipboard_command.as_deref(),

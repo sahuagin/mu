@@ -156,11 +156,9 @@ impl AutonomyConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct TuiConfig {
-    /// Initial value of the `/effort` dial (claude-code-feature-mapping
-    /// §17). mu-vcbm: live — seeds `App::effort`, which `fire_ask` sends
-    /// on every `ask_session.effort` (the daemon applies it stickily and
-    /// maps it onto the provider's thinking/reasoning directive). Valid
-    /// values: low, medium, high, xhigh, max.
+    /// Optional global initial `/effort` override. Empty (the default) means
+    /// use the resolved model/profile/provider default; a CLI `--effort` or
+    /// explicit `[tui] effort = "..."` wins for the initial dial value.
     pub effort: String,
     /// Whether to start with `/focus` mode on (§16). Default off.
     pub focus_mode: bool,
@@ -184,7 +182,7 @@ pub struct TuiConfig {
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
-            effort: "medium".into(),
+            effort: String::new(),
             focus_mode: false,
             clipboard_command: None,
             renderer_journal: true,
@@ -241,6 +239,13 @@ pub struct SessionConfig {
     /// `output_config.effort`. Set once in solo.toml (`[session] thinking =
     /// "high"`) — no flag needed each run.
     pub thinking: String,
+    /// Optional profile/session override for the `/effort` dial's allowed
+    /// values. Empty means use the model catalog, then provider fallback.
+    pub effort_levels: Vec<String>,
+    /// Optional profile/session default for the `/effort` dial. Overrides the
+    /// model catalog default when set.
+    pub default_effort: Option<String>,
+
     /// mu-n25a: the session's side-effects CEILING — the permission
     /// posture an operator's "read only" binds to, forwarded as
     /// `CreateSessionRequest.max_side_effects`. A tool whose declared
@@ -275,6 +280,8 @@ impl Default for SessionConfig {
             cache_ttl: "1h".into(),
             // mu-upk2: thinking off by default ("" = no directive; opt-in).
             thinking: String::new(),
+            effort_levels: Vec::new(),
+            default_effort: None,
             // mu-n25a: unrestricted by default — opt-in posture, so
             // existing solo configs are unaffected.
             max_side_effects: String::new(),
@@ -552,6 +559,8 @@ mod tests {
             model = "deepseek"
             provider = "openrouter"
             bash_yolo = true
+            effort_levels = ["low", "high"]
+            default_effort = "high"
         "#;
         let c: SoloConfig = toml::from_str(toml).expect("parse");
 
@@ -565,6 +574,8 @@ mod tests {
         let review = c.select_profile("review").expect("review profile exists");
         assert_eq!(review.provider, "openrouter");
         assert!(review.bash_yolo);
+        assert_eq!(review.effort_levels, vec!["low", "high"]);
+        assert_eq!(review.default_effort.as_deref(), Some("high"));
 
         // typo → loud error naming the known profiles, not a silent default
         let err = c.select_profile("wrok").expect_err("typo must error");
@@ -583,6 +594,6 @@ mod tests {
         assert_eq!(c.session.model, "claude-haiku-4-5");
         // Other fields default.
         assert_eq!(c.session.provider, "openai-codex");
-        assert_eq!(c.tui.effort, "medium");
+        assert_eq!(c.tui.effort, "");
     }
 }

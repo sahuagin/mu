@@ -48,6 +48,8 @@ pub struct ModelCatalogEntry {
     pub context_hard_limit: Option<u64>,
     pub max_output_tokens: Option<u32>,
     pub reasoning_in_output: Option<bool>,
+    pub effort_levels: Vec<String>,
+    pub default_effort: Option<String>,
     pub quirks: Vec<String>,
 }
 
@@ -61,6 +63,8 @@ pub struct ModelRuleConfig {
     pub context_hard_limit: Option<u64>,
     pub max_output_tokens: Option<u32>,
     pub reasoning_in_output: Option<bool>,
+    pub effort_levels: Vec<String>,
+    pub default_effort: Option<String>,
     pub quirks: Vec<String>,
 }
 
@@ -84,6 +88,8 @@ pub struct ResolvedModelSettings {
     pub context_hard_limit: Option<u64>,
     pub max_output_tokens: Option<u32>,
     pub reasoning_in_output: Option<bool>,
+    pub effort_levels: Vec<String>,
+    pub default_effort: Option<String>,
     pub quirks: Vec<String>,
 }
 
@@ -251,6 +257,12 @@ fn fill_missing_fields(dst: &mut ModelCatalogEntry, src: &ModelCatalogEntry) {
     }
     if dst.reasoning_in_output.is_none() {
         dst.reasoning_in_output = src.reasoning_in_output;
+    }
+    if dst.effort_levels.is_empty() {
+        dst.effort_levels = src.effort_levels.clone();
+    }
+    if dst.default_effort.is_none() {
+        dst.default_effort = src.default_effort.clone();
     }
     if dst.quirks.is_empty() {
         dst.quirks = src.quirks.clone();
@@ -477,6 +489,8 @@ impl ModelCatalogConfig {
             out.context_hard_limit = rule.context_hard_limit;
             out.max_output_tokens = rule.max_output_tokens;
             out.reasoning_in_output = rule.reasoning_in_output;
+            out.effort_levels = rule.effort_levels.clone();
+            out.default_effort = rule.default_effort.clone();
             out.quirks = rule.quirks.clone();
         }
 
@@ -501,6 +515,12 @@ impl ModelCatalogConfig {
             }
             if m.reasoning_in_output.is_some() {
                 out.reasoning_in_output = m.reasoning_in_output;
+            }
+            if !m.effort_levels.is_empty() {
+                out.effort_levels = m.effort_levels.clone();
+            }
+            if m.default_effort.is_some() {
+                out.default_effort = m.default_effort.clone();
             }
             if !m.quirks.is_empty() {
                 out.quirks = merge_strings(&out.quirks, &m.quirks);
@@ -862,5 +882,34 @@ prefix = "deepseek"
             cfg.resolve_model("claude-opus-4-8").context_hard_limit,
             Some(750000)
         );
+    }
+}
+
+#[cfg(test)]
+mod vcbm_effort_tests {
+    use super::*;
+    use figment::providers::{Format, Toml};
+    use figment::Figment;
+
+    #[test]
+    fn model_effort_levels_and_default_resolve() {
+        let toml = r#"
+            [model_rules.claude]
+            prefix = "claude-opus"
+            effort_levels = ["low", "medium", "high"]
+            default_effort = "medium"
+
+            [models.opus]
+            model = "claude-opus-4-8"
+            effort_levels = ["low", "medium", "high", "xhigh", "max"]
+            default_effort = "xhigh"
+        "#;
+        let cfg: ModelCatalogConfig = Figment::from(Toml::string(toml)).extract().unwrap();
+        let s = cfg.resolve_model("claude-opus-4-8");
+        assert_eq!(
+            s.effort_levels,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(s.default_effort.as_deref(), Some("xhigh"));
     }
 }

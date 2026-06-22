@@ -58,6 +58,8 @@ pub struct RouteEntry {
     pub context_hard_limit: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_effort_levels: Option<Vec<Arc<str>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<Arc<str>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_input_per_mtok: Option<f64>,
@@ -251,6 +253,72 @@ impl RouteCatalog {
     }
 }
 
+/// Resolve reasoning effort levels/default for a route. Operator/model catalog
+/// values own the vocabulary; provider-kind fallbacks exist only when config
+/// omits them (mu-vcbm slice 2).
+pub fn effort_config_for(
+    provider_kind: &str,
+    model: &str,
+) -> (Option<Vec<Arc<str>>>, Option<Arc<str>>) {
+    let settings = model_catalog::global().resolve_model(model);
+    effort_config(provider_kind, &settings)
+}
+
+fn effort_config(
+    provider_kind: &str,
+    model_settings: &model_catalog::ResolvedModelSettings,
+) -> (Option<Vec<Arc<str>>>, Option<Arc<str>>) {
+    let levels: Vec<Arc<str>> = if !model_settings.effort_levels.is_empty() {
+        model_settings
+            .effort_levels
+            .iter()
+            .map(|s| Arc::from(s.as_str()))
+            .collect()
+    } else {
+        provider_effort_fallback(provider_kind)
+            .into_iter()
+            .map(Arc::from)
+            .collect()
+    };
+    let levels = (!levels.is_empty()).then_some(levels);
+    let default = model_settings
+        .default_effort
+        .as_deref()
+        .map(Arc::from)
+        .or_else(|| {
+            levels
+                .as_ref()
+                .and_then(|l| provider_default_effort(provider_kind, l))
+        });
+    (levels, default)
+}
+
+fn provider_effort_fallback(provider_kind: &str) -> Vec<&'static str> {
+    match provider_kind {
+        // Anthropic's modern depth knob is output_config.effort; xhigh is
+        // valid on Opus 4.7+ and was the missing stale value in the old route
+        // catalog fallback.
+        "anthropic_api" | "anthropic_oauth" => vec!["low", "medium", "high", "xhigh", "max"],
+        "openai_codex" => vec!["minimal", "low", "medium", "high"],
+        // Ollama Anthropic-compat exposes a thinking switch, not effort depth.
+        "ollama" => vec!["off", "on"],
+        _ => Vec::new(),
+    }
+}
+
+fn provider_default_effort(provider_kind: &str, levels: &[Arc<str>]) -> Option<Arc<str>> {
+    let preferred = match provider_kind {
+        "anthropic_api" | "anthropic_oauth" | "openai_codex" => "medium",
+        "ollama" => "on",
+        _ => return None,
+    };
+    levels
+        .iter()
+        .find(|l| l.as_ref() == preferred)
+        .cloned()
+        .or_else(|| levels.first().cloned())
+}
+
 fn build_entry(
     catalog: &model_catalog::ModelCatalogConfig,
     provider_kind: &str,
@@ -287,21 +355,7 @@ fn build_entry(
         })
         .collect();
 
-    let valid_effort = match provider_kind {
-        "anthropic_api" | "anthropic_oauth" => Some(vec![
-            Arc::from("low"),
-            Arc::from("medium"),
-            Arc::from("high"),
-            Arc::from("max"),
-        ]),
-        "openai_codex" => Some(vec![
-            Arc::from("minimal"),
-            Arc::from("low"),
-            Arc::from("medium"),
-            Arc::from("high"),
-        ]),
-        _ => None,
-    };
+    let (valid_effort, default_effort) = effort_config(provider_kind, &model_settings);
 
     let hash_input = format!(
         "{provider_kind}:{model}:{}:{}",
@@ -337,6 +391,7 @@ fn build_entry(
         context_soft_limit: context_soft,
         context_hard_limit: context_hard,
         valid_effort_levels: valid_effort,
+        default_effort,
         pricing_input_per_mtok: pricing.map(|p| p.input_per_mtok),
         pricing_output_per_mtok: pricing.map(|p| p.output_per_mtok),
         hash,
@@ -480,6 +535,13 @@ mod tests {
             .favorites
             .iter()
             .any(|f| f.name.as_ref() == "local_qwen36"));
+        assert_eq!(q.default_effort.as_deref(), Some("on"));
+        assert_eq!(
+            q.valid_effort_levels
+                .as_ref()
+                .map(|levels| { levels.iter().map(|s| s.to_string()).collect::<Vec<_>>() }),
+            Some(vec!["off".to_string(), "on".to_string()])
+        );
     }
 
     #[test]
@@ -507,5 +569,42 @@ mod tests {
             .entries()
             .len();
         assert_eq!(base, merged);
+    }
+}
+
+#[cfg(test)]
+mod vcbm_effort_tests {
+    use crate::model_catalog::{ModelCatalogConfig, ModelCatalogEntry, ResolvedModelSettings};
+
+    #[test]
+    fn anthropic_fallback_includes_xhigh() {
+        let (levels, default) =
+            super::effort_config("anthropic_api", &ResolvedModelSettings::default());
+        let levels: Vec<String> = levels.unwrap().iter().map(|s| s.to_string()).collect();
+        assert_eq!(levels, vec!["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(default.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn model_catalog_effort_overrides_provider_fallback() {
+        let mut cfg = ModelCatalogConfig::default();
+        cfg.models.insert(
+            "opus".into(),
+            ModelCatalogEntry {
+                model: Some("claude-opus-4-8".into()),
+                effort_levels: vec!["low".into(), "max".into()],
+                default_effort: Some("max".into()),
+                ..Default::default()
+            },
+        );
+        let entry = super::build_entry(&cfg, "anthropic_api", "claude-opus-4-8", true, None, None);
+        let levels: Vec<String> = entry
+            .valid_effort_levels
+            .unwrap()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(levels, vec!["low", "max"]);
+        assert_eq!(entry.default_effort.as_deref(), Some("max"));
     }
 }

@@ -299,7 +299,11 @@ fn provider_effort_fallback(provider_kind: &str) -> Vec<&'static str> {
         // valid on Opus 4.7+ and was the missing stale value in the old route
         // catalog fallback.
         "anthropic_api" | "anthropic_oauth" => vec!["low", "medium", "high", "xhigh", "max"],
-        "openai_codex" => vec!["minimal", "low", "medium", "high"],
+        // gpt-5.5 (the codex model in use) accepts none/low/medium/high/xhigh.
+        // `minimal` was dropped — gpt-5.5 rejects it with a 400 (live-verified,
+        // mu-53kt) — and `xhigh` added. Any other codex model sets its own set
+        // via `[models.<label>]` (the slice-2 override path).
+        "openai_codex" => vec!["low", "medium", "high", "xhigh"],
         // Ollama Anthropic-compat exposes a thinking switch, not effort depth.
         "ollama" => vec!["off", "on"],
         _ => Vec::new(),
@@ -582,6 +586,19 @@ mod vcbm_effort_tests {
             super::effort_config("anthropic_api", &ResolvedModelSettings::default());
         let levels: Vec<String> = levels.unwrap().iter().map(|s| s.to_string()).collect();
         assert_eq!(levels, vec!["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(default.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn codex_fallback_drops_minimal_adds_xhigh() {
+        // mu-53kt: gpt-5.5 (the codex model in use) rejects `minimal` with a
+        // 400 and supports `xhigh` (live-verified). The dial's fallback set
+        // must match — no `minimal`, includes `xhigh`; default stays `medium`.
+        let (levels, default) =
+            super::effort_config("openai_codex", &ResolvedModelSettings::default());
+        let levels: Vec<String> = levels.unwrap().iter().map(|s| s.to_string()).collect();
+        assert_eq!(levels, vec!["low", "medium", "high", "xhigh"]);
+        assert!(!levels.iter().any(|l| l == "minimal"));
         assert_eq!(default.as_deref(), Some("medium"));
     }
 

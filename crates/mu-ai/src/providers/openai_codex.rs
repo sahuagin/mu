@@ -1184,10 +1184,12 @@ impl Provider for OpenaiCodexProvider {
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
         // mu-vcbm: a per-turn `/effort` selection maps onto Codex's
         // `reasoning.effort`, overriding the construction-time
-        // `--thinking` default (`self.thinking`) for THIS call. Codex's
-        // accepted vocabulary is `minimal|low|medium|high`; an
-        // out-of-vocabulary level surfaces as a provider 400 (level
-        // validation is config-driven in a later slice — mu-vcbm step 2).
+        // `--thinking` default (`self.thinking`) for THIS call. The
+        // accepted vocabulary is MODEL-dependent — gpt-5.5 takes
+        // none/low/medium/high/xhigh (NB `minimal` is rejected with a 400,
+        // `xhigh` is added; live-verified, mu-53kt). An out-of-vocabulary
+        // level surfaces as a provider 400; valid levels are config-driven
+        // (route_catalog fallback + `[models.<label>]` override).
         let eff_thinking: &str = effort.unwrap_or(&self.thinking);
         // mu-yqeq.5: sealed-enum dispatch (Legacy + Projected). The
         // `_` arm remains for forward-compat with future MessageInput

@@ -23,15 +23,16 @@ use base64::Engine;
 use bytes::Bytes;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use serde::Deserialize;
-use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 use tokio::sync::{oneshot, Mutex};
 use tracing::debug;
 
-use mu_core::agent::{
-    AgentMessage, ContentBlock, MessageInput, Provider, ProviderError, ProviderEvent, ToolSpec,
-};
 #[cfg(test)]
-use mu_core::agent::{AssistantMessage, StopReason, ToolCall, Usage};
+use mu_core::agent::{AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolCall, Usage};
+use mu_core::agent::{MessageInput, Provider, ProviderError, ProviderEvent, ToolSpec};
+#[cfg(test)]
 use mu_core::context::{
     extract_call_id_from_span_id, ProviderMessage, ProviderMessages, ProviderRole,
 };
@@ -214,6 +215,7 @@ pub(crate) fn extract_chatgpt_account_id(access_token: &str) -> Result<String, P
 // chunks of choices[].
 // ============================================================================
 
+#[cfg(test)]
 pub(crate) fn translate_tool_spec(spec: &ToolSpec) -> Value {
     json!({
         "type": "function",
@@ -223,6 +225,7 @@ pub(crate) fn translate_tool_spec(spec: &ToolSpec) -> Value {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn translate_message(m: &AgentMessage) -> Vec<Value> {
     match m {
         AgentMessage::User { content } => vec![json!({
@@ -313,6 +316,7 @@ pub(crate) const INSTRUCTIONS_SOFT_CAP: usize = 8 * 1024;
 /// At or above → `(DEFAULT_INSTRUCTIONS, Some(actual))`, so the model
 /// still receives a short "you are mu" instruction in the dedicated
 /// field and the long context lands as a regular input message.
+#[cfg(test)]
 fn split_oversized_instructions(actual: &str) -> (&str, Option<&str>) {
     if actual.len() > INSTRUCTIONS_SOFT_CAP {
         (DEFAULT_INSTRUCTIONS, Some(actual))
@@ -326,6 +330,7 @@ fn split_oversized_instructions(actual: &str) -> (&str, Option<&str>) {
 /// `role: "user"` rather than `developer` because the Responses API's
 /// developer role is newer and not universally supported on all model
 /// variants we might target via the same wire path.
+#[cfg(test)]
 fn make_instructions_overflow_message(content: &str) -> Value {
     let framed = format!(
         "[System context — too large for the instructions field. \
@@ -339,6 +344,7 @@ fn make_instructions_overflow_message(content: &str) -> Value {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn build_request_body(
     model: &str,
     thinking: &str,
@@ -395,6 +401,7 @@ pub(crate) fn build_request_body(
 /// Tool-schema spans (`source_span_ids[0]` starts with `"tool-schema:"`)
 /// are silently skipped — the `tools` parameter on `Provider::stream`
 /// is authoritative for `body.tools`.
+#[cfg(test)]
 fn translate_provider_messages_codex(pmsgs: &ProviderMessages) -> (Vec<Value>, Option<String>) {
     let mut out: Vec<Value> = Vec::with_capacity(pmsgs.messages.len());
     let mut system_text: Option<String> = None;
@@ -465,6 +472,7 @@ fn translate_provider_messages_codex(pmsgs: &ProviderMessages) -> (Vec<Value>, O
 /// receives its own reasoning trace as input. Returns an empty `Vec`
 /// when the assistant has no wire-bearing blocks (mirrors the Legacy
 /// `translate_message` behavior).
+#[cfg(test)]
 fn translate_provider_assistant_codex(msg: &ProviderMessage) -> Vec<Value> {
     let blocks = match msg.blocks() {
         Some(b) => b,
@@ -510,6 +518,7 @@ fn translate_provider_assistant_codex(msg: &ProviderMessage) -> Vec<Value> {
 /// `AgentMessage::ToolResult.is_error` was `true`. Errors are
 /// re-encoded as `"[error] {content}"` to match the Legacy
 /// `translate_message` shape.
+#[cfg(test)]
 fn translate_provider_tool_result_codex(msg: &ProviderMessage) -> Value {
     let call_id: &str = msg
         .source_span_ids()
@@ -537,6 +546,8 @@ fn translate_provider_tool_result_codex(msg: &ProviderMessage) -> Value {
 /// when the projection has no hoisted system span or the span's
 /// content is empty) — matches Legacy's
 /// `system_prompt.filter(|s| !s.is_empty()).unwrap_or(&self.instructions)`.
+#[cfg(test)]
+#[cfg(test)]
 pub(crate) fn build_request_body_from_projection(
     model: &str,
     thinking: &str,
@@ -1161,14 +1172,21 @@ impl Provider for OpenaiCodexProvider {
         // openai_codex_tests.rs assert that invariant for the
         // canonical scenarios. The agent loop's mod.rs:818 still
         // passes Legacy until mu-yqeq.8 wires the cutover.
-        let body = match input {
+        let req = match input {
             MessageInput::Legacy(msgs) => {
                 // mu-n48: a session-level system_prompt overrides
                 // the provider's default `instructions`.
                 let instructions: &str = system_prompt
                     .filter(|s| !s.is_empty())
                     .unwrap_or(&self.instructions);
-                build_request_body(&self.model, eff_thinking, instructions, msgs, tools)
+                super::openai_responses::build_request_from_legacy(
+                    &self.model,
+                    eff_thinking,
+                    instructions,
+                    msgs,
+                    tools,
+                    true,
+                )
             }
             MessageInput::Projected(pmsgs) => {
                 // In the Projected path the projection itself carries
@@ -1178,12 +1196,13 @@ impl Provider for OpenaiCodexProvider {
                 // `self.instructions` when the projection has no
                 // (or an empty) system span — matching Legacy's
                 // `.filter(|s| !s.is_empty()).unwrap_or(...)` rule.
-                build_request_body_from_projection(
+                super::openai_responses::build_request_from_projection(
                     &self.model,
                     eff_thinking,
                     &self.instructions,
                     pmsgs,
                     tools,
+                    true,
                 )
             }
             _ => {
@@ -1192,6 +1211,8 @@ impl Provider for OpenaiCodexProvider {
                 ));
             }
         };
+        let body = serde_json::to_value(&req)
+            .map_err(|e| ProviderError::Other(format!("serialize codex request: {e}")))?;
 
         // mu-solo debug: surface the actual wire body for codex calls
         // so we can diff what's being sent across sessions. Gated by

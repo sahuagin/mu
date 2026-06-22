@@ -1,0 +1,20 @@
+[package]
+name = "mu-openai"
+description = "OpenAI Responses API wire protocol: typed request/response/streaming + clients. Standalone — knows nothing about mu."
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+bytes = "1"
+
+[dev-dependencies]
+tokio = { workspace = true }

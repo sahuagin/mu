@@ -1795,6 +1795,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mu-openai"
+version = "0.0.1"
+dependencies = [
+ "bytes",
+ "futures",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "mu-solo"
 version = "0.0.1"
 dependencies = [

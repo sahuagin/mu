@@ -182,6 +182,18 @@ pub enum AgentInput {
         provider: Arc<dyn Provider>,
         provider_kind: Arc<str>,
         model: Arc<str>,
+        /// mu-ub6q: the new model's output budget, so the loop re-reserves
+        /// compaction headroom on a model switch. Resolved from the route
+        /// catalog by the daemon's `handle_set_route`. `0` ⇒ no reservation.
+        max_output_tokens: usize,
+        /// mu-ub6q: the new model's soft limit. The loop stores it to
+        /// `live_context_soft_limit` IN THE SAME handler that applies
+        /// `max_output_tokens`, so a switch updates both halves of the
+        /// effective trigger atomically (from the loop's view) — a queued
+        /// turn can never pair the new reservation with the old soft
+        /// limit. `0` ⇒ unset (loop falls back to config/default), as at
+        /// creation.
+        context_soft_limit: u64,
     },
     /// mu-slat Phase 2: a mailbox message arrived for this session.
     /// Injected by the mailbox.post handler when the target is a live
@@ -602,6 +614,23 @@ pub struct AgentConfig {
     /// identity and the loop proceeds with the original rope —
     /// compaction failure never blocks a turn.
     pub compaction_threshold: Option<usize>,
+    /// mu-ub6q: the model's max output-token budget, reserved as
+    /// headroom in the compaction trigger. A request sends the input
+    /// AND lets the model generate up to this many tokens on top; both
+    /// must fit the context window. The trigger therefore fires when
+    /// `predicted_input + max_output_tokens` crosses
+    /// [`Self::compaction_threshold`], i.e. while the input still leaves
+    /// room for the output — not only when the input alone crosses it.
+    /// Without this reservation a soft limit set at (or near) the
+    /// model's window is unreachable: input+output overflows and the
+    /// provider errors mid-stream before the input-only predicted total
+    /// can cross the threshold, so compaction never fires. `0` ⇒ no
+    /// reservation (pre-mu-ub6q behavior; tests and unknown routes rely
+    /// on this default). This is the *creation-time* seed: the loop
+    /// tracks the live value in `current_max_output_tokens` and updates
+    /// it on every `SwitchProvider`, so a mid-session model switch
+    /// re-reserves the new model's output budget.
+    pub max_output_tokens: usize,
     /// mu-phl v0 (bead mu-vm81): pre-built recall context to inject at
     /// session start. Built by the daemon at create-session time
     /// (see `crates/mu-coding/src/serve/handlers/session.rs`) so the
@@ -671,6 +700,7 @@ impl Default for AgentConfig {
             max_turns: Some(20),
             system_prompt: None,
             compaction_threshold: None,
+            max_output_tokens: 0,
             project_context: None,
             compaction_policy_override: None,
             seed_messages: Vec::new(),
@@ -991,6 +1021,13 @@ async fn run_inner(
     let mut provider = provider;
     let mut current_provider_kind = provider_kind;
     let mut current_model = model;
+    // mu-ub6q: the compaction-trigger output reservation for the model
+    // currently in force. Seeded from the creation-time config and
+    // updated on every `SwitchProvider` so a mid-session model switch
+    // re-reserves the new model's output budget. The switch handler
+    // updates its companion (the `live_context_soft_limit` atomic) in the
+    // same step, so the two halves of the effective trigger never diverge.
+    let mut current_max_output_tokens = config.max_output_tokens;
     // mu-vcbm: the session's standing reasoning effort. Seeded from the
     // launch-time default, then updated stickily whenever a UserMessage
     // arrives carrying a `/effort` change. Passed to `Provider::stream`
@@ -1041,12 +1078,19 @@ async fn run_inner(
                     provider: new,
                     provider_kind: new_kind,
                     model: new_model,
+                    max_output_tokens: new_max_output,
+                    context_soft_limit: new_soft,
                 } => {
                     let old_kind: Arc<str> = Arc::from(current_provider_kind.as_ref());
                     let old_model: Arc<str> = Arc::from(current_model.as_ref());
                     provider = new;
                     current_provider_kind = new_kind.clone();
                     current_model = new_model.clone();
+                    current_max_output_tokens = new_max_output;
+                    // mu-ub6q: store the new soft limit in the SAME handler
+                    // that sets the reservation, so the effective trigger
+                    // never pairs a new reservation with the old soft limit.
+                    live_context_soft_limit.store(new_soft, Ordering::Relaxed);
                     // mu-wsgx: the old provider's actuals don't
                     // transfer (different tokenizer + accounting).
                     feedback_anchor = None;
@@ -1084,12 +1128,19 @@ async fn run_inner(
                     provider: new,
                     provider_kind: new_kind,
                     model: new_model,
+                    max_output_tokens: new_max_output,
+                    context_soft_limit: new_soft,
                 }) => {
                     let old_kind: Arc<str> = Arc::from(current_provider_kind.as_ref());
                     let old_model: Arc<str> = Arc::from(current_model.as_ref());
                     provider = new;
                     current_provider_kind = new_kind.clone();
                     current_model = new_model.clone();
+                    current_max_output_tokens = new_max_output;
+                    // mu-ub6q: store the new soft limit in the SAME handler
+                    // that sets the reservation, so the effective trigger
+                    // never pairs a new reservation with the old soft limit.
+                    live_context_soft_limit.store(new_soft, Ordering::Relaxed);
                     // mu-wsgx: the old provider's actuals don't
                     // transfer (different tokenizer + accounting).
                     feedback_anchor = None;
@@ -1690,12 +1741,38 @@ async fn run_inner(
                 // the delta.
                 let predicted_tokens =
                     predicted_prompt_total(feedback_anchor.as_ref(), pre_compaction_tokens);
-                let rope = if predicted_tokens > compaction_threshold {
+                // mu-ub6q: honor the provider's send constraint
+                // `input + output ≤ window`. The next request sends
+                // `predicted_tokens` of input and lets the model generate
+                // up to its output budget on top, so compact while the
+                // input still leaves room — fire when
+                // `predicted + reserve > threshold`. Without this a soft
+                // limit at the window is unreachable: input+output
+                // overflows and the provider errors mid-stream before the
+                // input-only total can cross `compaction_threshold`, so
+                // compaction never runs. (The rope itself can hold more
+                // than the window; only what we SEND is constrained.)
+                //
+                // Cap the reservation at the compaction target
+                // (`threshold/2`): some models report an output budget as
+                // large as their whole window (e.g. ollama qwen/glm:
+                // max_output == context). Reserving that verbatim drives
+                // the effective trigger to 0 — compact-every-turn with no
+                // input budget, a dead session. The target is the most
+                // compaction can recover to, so a reservation beyond it
+                // can never be satisfied anyway; clamping there keeps a
+                // working budget (effective ≥ threshold/2 > 0) and leaves
+                // the common case (max_output ≪ threshold) untouched.
+                let target_tokens = compaction_threshold / 2;
+                let output_reserve = current_max_output_tokens.min(target_tokens);
+                let effective_threshold = compaction_threshold.saturating_sub(output_reserve);
+                let rope = if predicted_tokens > effective_threshold {
                     let policy = config
                         .compaction_policy_override
                         .clone()
                         .unwrap_or_else(|| provider.compaction_policy());
-                    let target_tokens = compaction_threshold / 2;
+                    // `target_tokens` (the post-compaction goal) is
+                    // computed above and shared with the reservation cap.
                     if policy.is_async() && bg_compaction.can_start() {
                         bg_compaction.start(
                             policy.clone(),
@@ -2048,12 +2125,19 @@ async fn run_inner(
                             provider: new,
                             provider_kind: new_kind,
                             model: new_model,
+                            max_output_tokens: new_max_output,
+                            context_soft_limit: new_soft,
                         } => {
                             let old_kind: Arc<str> = Arc::from(current_provider_kind.as_ref());
                             let old_model: Arc<str> = Arc::from(current_model.as_ref());
                             provider = new;
                             current_provider_kind = new_kind.clone();
                             current_model = new_model.clone();
+                            current_max_output_tokens = new_max_output;
+                            // mu-ub6q: store the new soft limit in the
+                            // same handler that sets the reservation (see
+                            // the sibling switch paths above).
+                            live_context_soft_limit.store(new_soft, Ordering::Relaxed);
                             let _ = events
                                 .send(AgentEvent::ProviderSwitched {
                                     old_provider_kind: old_kind,

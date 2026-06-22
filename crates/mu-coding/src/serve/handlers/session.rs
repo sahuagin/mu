@@ -566,7 +566,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     // effective soft/hard limits straight off the event stream rather
     // than re-deriving them. See `mu_core::session_status` for the
     // soft-limit / hard-limit / fill vocabulary.
-    let (context_soft_limit, context_hard_limit) =
+    let (context_soft_limit, context_hard_limit, max_output_tokens) =
         resolve_context_limits(daemon_info, &kind_str, &model_str);
     event_log.append(
         EventActor::System,
@@ -701,6 +701,11 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             // None (unknown route) ⇒ the loop falls back to its own
             // default; the daemon never injects a magic constant here.
             compaction_threshold: context_soft_limit.map(|s| s as usize),
+            // mu-ub6q: reserve the model's output budget below the soft
+            // limit so compaction fires with room for the response, not
+            // only once the input alone reaches the window. None route ⇒
+            // 0 ⇒ no reservation (unchanged behavior).
+            max_output_tokens: max_output_tokens.unwrap_or(0) as usize,
             compaction_policy_override,
             // mu-mh4: seed the loop with the continuation history when
             // this session is a resume/fork-at-tail; empty otherwise.
@@ -1379,13 +1384,21 @@ pub async fn handle_set_route(
     // Resolve the NEW model's context limits before the switch so we can
     // re-record them; the catalog lookup above already proved the route
     // exists.
-    let (context_soft_limit, context_hard_limit) =
+    // mu-ub6q: both route-derived compaction budgets (soft limit and
+    // output reservation) ride on the switch input below so the loop
+    // applies them together for the model now in force.
+    let (context_soft_limit, context_hard_limit, max_output_tokens) =
         resolve_context_limits(&daemon_info, &kind_str, &model_str);
 
+    // mu-ub6q: carry BOTH route-derived compaction budgets on the switch
+    // input so the loop applies them in one handler — no window where a
+    // turn sees the new reservation paired with the old soft limit.
     let input = AgentInput::SwitchProvider {
         provider,
         provider_kind: Arc::from(kind_str.as_str()),
         model: Arc::from(model_str.as_str()),
+        max_output_tokens: max_output_tokens.unwrap_or(0) as usize,
+        context_soft_limit: context_soft_limit.unwrap_or(0),
     };
 
     if input_tx.send(input).await.is_err() {
@@ -1411,6 +1424,13 @@ pub async fn handle_set_route(
             },
         );
     }
+
+    // mu-ub6q: the LIVE soft-limit atomic is updated by the agent loop's
+    // SwitchProvider handler (carrying context_soft_limit above), in the
+    // same step it applies the output reservation — so the two halves of
+    // the effective compaction trigger move together and a queued turn
+    // can't observe a half-updated pair. (set_config still updates the
+    // atomic daemon-side; this is the switch path.)
 
     ok_response(
         request.id,
@@ -1641,8 +1661,10 @@ pub async fn handle_spawn_worker(
 }
 
 /// Resolve a session's effective context limits in tokens — the single
-/// place that turns config + route catalog into the `(soft, hard)` pair
-/// recorded as [`EventPayload::SessionConfigResolved`]. See
+/// place that turns config + route catalog into the
+/// `(soft, hard, max_output)` triple — `(soft, hard)` recorded as
+/// [`EventPayload::SessionConfigResolved`], `max_output` threaded to the
+/// agent loop as compaction headroom (mu-ub6q). See
 /// [`mu_core::session_status`] for what soft/hard mean.
 ///
 /// - **hard**: the model's `context_hard_limit` from the route catalog
@@ -1658,10 +1680,14 @@ fn resolve_context_limits(
     daemon_info: &DaemonInfo,
     provider_kind: &str,
     model: &str,
-) -> (Option<u64>, Option<u64>) {
+) -> (Option<u64>, Option<u64>, Option<u32>) {
     let route = daemon_info.route_catalog().find(provider_kind, model);
     let model_soft = route.and_then(|r| r.context_soft_limit);
     let hard = route.and_then(|r| r.context_hard_limit);
+    // mu-ub6q: the model's output budget, reserved as compaction
+    // headroom by the agent loop (AgentConfig::max_output_tokens) so a
+    // soft limit set at the window still leaves room for the output.
+    let max_output = route.and_then(|r| r.max_output_tokens);
     let soft = daemon_info
         .config()
         .compaction
@@ -1669,7 +1695,7 @@ fn resolve_context_limits(
         .map(|v| v as u64)
         .or(model_soft)
         .or(hard);
-    (soft, hard)
+    (soft, hard, max_output)
 }
 
 /// Resolve the per-session compaction policy from config, with legible

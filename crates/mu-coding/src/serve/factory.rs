@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use mu_ai::{
-    AnthropicProvider, FauxProvider, OllamaProvider, OpenRouterProvider, OpenaiCodexProvider,
+    AnthropicProvider, FauxProvider, OllamaProvider, OpenRouterProvider, OpenaiProvider,
     VllmProvider,
 };
 use mu_core::agent::{Provider, Tool};
@@ -99,17 +99,22 @@ pub fn build_provider_from_selector(
                  the claude CLI for the foreseeable future"
             )
         }
-        ProviderSelector::OpenaiApi { .. } => {
-            anyhow::bail!(
-                "openai_api (direct API-key) is not yet implemented in mu — \
-                 OpenAI access today goes through openai_codex (OAuth)"
-            )
+        ProviderSelector::OpenaiApi { model } => {
+            // Public OpenAI Responses API (direct API key). Same provider
+            // struct as the codex/OAuth path, in its API-key mode.
+            let provider = OpenaiProvider::from_env(model.clone())
+                .map_err(|e| anyhow::anyhow!("openai-api: {e}"))?;
+            let provider = match thinking {
+                Some(t) if !t.is_empty() => provider.with_thinking(t.to_string()),
+                _ => provider,
+            };
+            Ok(Arc::new(provider))
         }
         ProviderSelector::OpenaiCodex { model } => {
             let provider = if ephemeral {
-                OpenaiCodexProvider::from_store_ephemeral(model.clone())
+                OpenaiProvider::from_store_ephemeral(model.clone())
             } else {
-                OpenaiCodexProvider::from_store(model.clone())
+                OpenaiProvider::from_store(model.clone())
             }
             .map_err(|e| anyhow::anyhow!("openai-codex: {e}"))?;
             let provider = match thinking {
@@ -155,6 +160,10 @@ pub fn selector_from_cli(name: &str, model: Option<&str>) -> Result<ProviderSele
         "openai-codex" => Ok(ProviderSelector::OpenaiCodex {
             model: model.unwrap_or("gpt-5.5").to_string(),
         }),
+        // Public OpenAI Responses API (direct API key).
+        "openai" | "openai-api" => Ok(ProviderSelector::OpenaiApi {
+            model: model.unwrap_or("gpt-5.5").to_string(),
+        }),
         "openrouter" => Ok(ProviderSelector::Openrouter {
             model: model.unwrap_or("anthropic/claude-haiku-4.5").to_string(),
         }),
@@ -167,7 +176,7 @@ pub fn selector_from_cli(name: &str, model: Option<&str>) -> Result<ProviderSele
             model: model.unwrap_or("qwen3-coder:30b").to_string(),
         }),
         other => anyhow::bail!(
-            "unknown provider: {other} (expected: faux, anthropic-api, openai-codex, openrouter, vllm, ollama)"
+            "unknown provider: {other} (expected: faux, anthropic-api, openai-codex, openai, openrouter, vllm, ollama)"
         ),
     }
 }
@@ -337,13 +346,27 @@ mod tests {
     }
 
     #[test]
-    fn build_from_selector_openai_api_errors() {
+    fn build_from_selector_openai_api_constructs_or_needs_key() {
+        // openai_api is now implemented (public OpenAI Responses API).
+        // Construction succeeds when an API key is configured
+        // (OPENAI_API_KEY or ~/.config/agent/config.toml); otherwise it
+        // fails with a key-missing message — NEVER "not yet implemented".
         let sel = ProviderSelector::OpenaiApi {
             model: "gpt-5".into(),
         };
         match build_provider_from_selector(&sel, false, None, CacheTtl::default()) {
-            Ok(_) => panic!("openai_api should not be implemented"),
-            Err(e) => assert!(e.to_string().contains("not yet implemented")),
+            Ok(_) => {} // a key was available in this environment
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("not yet implemented"),
+                    "openai_api should be implemented now; got: {msg}"
+                );
+                assert!(
+                    msg.contains("API key") || msg.contains("OPENAI_API_KEY"),
+                    "error should be about the missing key; got: {msg}"
+                );
+            }
         }
     }
 

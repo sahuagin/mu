@@ -763,6 +763,59 @@ async fn dialect_rescue_passes_non_done_events_through() {
     assert!(out.next().await.is_none());
 }
 
+// mu-y8gp: per-model sampling from the catalog.
+#[test]
+fn sampling_for_model_resolves_catalog_temperature_top_p() {
+    use mu_core::model_catalog::{ModelCatalogConfig, ModelCatalogEntry};
+    let mut catalog = ModelCatalogConfig::default();
+    catalog.models.insert(
+        "glm".to_string(),
+        ModelCatalogEntry {
+            model: Some("z-ai/glm-5.2".to_string()),
+            temperature: Some(0.6),
+            top_p: Some(0.95),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        sampling_for_model_with_catalog(&catalog, "z-ai/glm-5.2"),
+        (Some(0.6), Some(0.95))
+    );
+    // A model with no catalog entry → no sampling (provider default).
+    assert_eq!(
+        sampling_for_model_with_catalog(&catalog, "openai/gpt-5.5"),
+        (None, None)
+    );
+}
+
+#[test]
+fn inject_sampling_adds_fields_only_when_set() {
+    // All-None leaves the body untouched (byte-for-byte parity).
+    let mut body = json!({"model": "m"});
+    inject_sampling(&mut body, None, None);
+    assert_eq!(body, json!({"model": "m"}));
+    // Both set → JSON numbers.
+    let mut body = json!({"model": "m"});
+    inject_sampling(&mut body, Some(0.6), Some(0.95));
+    assert_eq!(body["temperature"], json!(0.6));
+    assert_eq!(body["top_p"], json!(0.95));
+    // Only temperature → no top_p key.
+    let mut body = json!({});
+    inject_sampling(&mut body, Some(0.2), None);
+    assert_eq!(body["temperature"], json!(0.2));
+    assert!(body.get("top_p").is_none());
+}
+
+#[test]
+fn clamp_sampling_bounds_and_drops_non_finite() {
+    assert_eq!(clamp_sampling(Some(0.6), 0.0, 2.0), Some(0.6)); // in range
+    assert_eq!(clamp_sampling(Some(5.0), 0.0, 2.0), Some(2.0)); // clamp high
+    assert_eq!(clamp_sampling(Some(-1.0), 0.0, 1.0), Some(0.0)); // clamp low
+    assert_eq!(clamp_sampling(Some(f64::NAN), 0.0, 2.0), None); // drop NaN
+    assert_eq!(clamp_sampling(Some(f64::INFINITY), 0.0, 2.0), None); // drop Inf
+    assert_eq!(clamp_sampling(None, 0.0, 2.0), None);
+}
+
 #[tokio::test]
 async fn b7_sse_text_only() {
     let raw = concat!(

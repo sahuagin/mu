@@ -1,8 +1,14 @@
 #!/bin/sh
 # orchestrate.sh — v0 pipeline spine (Plan A skeleton).
 #
-# Flow:  PLAN (seat) -> IMPLEMENT (worker, isolated jj workspace) -> REVIEW (ci-aipr)
-#        -> ADJUDICATE (seat: SHIP | ITERATE <focus> | ESCALATE).
+# Flow:  ARCHITECT (invariant guardian: GO | VETO) -> PLAN (seat) -> IMPLEMENT (worker,
+#        isolated jj workspace) -> REVIEW (ci-aipr) -> ADJUDICATE (seat: SHIP | ITERATE
+#        <focus> | ESCALATE). A VETO short-circuits the pipeline to the operator.
+#
+# The ARCHITECT is the invariant-guardian gate (default opus — the seat-A/B 2026-06-22
+# result: its skepticism + verify-before-assert depth is the FEATURE for a veto seat). It
+# reads the repo's invariant sources (AGENTS.md + specs/) and either VETOes a task that
+# violates them or hands the planner a brief of the invariants the task must honor.
 #
 # The SEAT is the orchestrator model under test. Default gpt-5.5; set
 # SEAT_PROVIDER/SEAT_MODEL to claude-oauth/claude-opus-4-8 to run the other arm.
@@ -16,13 +22,16 @@ TASK_FILE="${1:?usage: orchestrate.sh <task-file> <repo-dir>}"
 REPO_DIR="${2:?usage: orchestrate.sh <task-file> <repo-dir>}"
 
 # --- roles ---
+ARCHITECT_PROVIDER="${ARCHITECT_PROVIDER:-claude-oauth}"; ARCHITECT_MODEL="${ARCHITECT_MODEL:-claude-opus-4-8}"  # invariant-guardian veto gate (opus: the skeptic)
 SEAT_PROVIDER="${SEAT_PROVIDER:-openai-codex}";    SEAT_MODEL="${SEAT_MODEL:-gpt-5.5}"            # the conductor under test
 WORKER_PROVIDER="${WORKER_PROVIDER:-ollama}"; WORKER_MODEL="${WORKER_MODEL:-qwen3.6:27b}"  # coding rank-1 (free, local; claude needs the proxy, absent on this box)
 AIREVIEW="${AIREVIEW:-$REPO_DIR/scripts/ai-review.sh}"
+ARCHITECT_GATE="${ARCHITECT_GATE:-1}"   # set 0 to skip the architect gate (e.g. seat A/B isolation)
 # Fixed, neutral system prompts (role + minimal tool-orientation) kept CONSTANT
 # across seat arms so identity/recall don't confound the A/B (--bare strips the rest).
 CONDUCTOR_PROMPT="${CONDUCTOR_PROMPT:-$(dirname "$0")/conductor-prompt.txt}"
 WORKER_PROMPT="${WORKER_PROMPT:-$(dirname "$0")/worker-prompt.txt}"
+ARCHITECT_PROMPT="${ARCHITECT_PROMPT:-$(dirname "$0")/architect-prompt.txt}"
 
 RUN_DIR="${RUN_DIR:-$HOME/orchestrator-runs/run-$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$RUN_DIR"
@@ -49,6 +58,41 @@ dispatch(){  # $1=label $2=provider $3=model $4=tools $5=prompt-file
   return $rc
 }
 
+# ── 0. ARCHITECT (invariant-guardian veto gate) ──────────────────────────────
+# Runs BEFORE planning: reads the repo's invariant sources and either VETOes the task
+# (short-circuit to the operator) or hands the planner the invariant brief. Skippable
+# with ARCHITECT_GATE=0 (e.g. the seat A/B, which isolates the conductor stages).
+INVARIANT_BRIEF=""
+if [ "$ARCHITECT_GATE" = 1 ]; then
+  cat > "$RUN_DIR/architect.prompt" <<EOF
+Judge the task below against THIS repository's architecture invariants BEFORE any plan is
+written. Read the invariant sources (the repo's AGENTS.md "Architecture invariants" section
+and the specs/ that the task touches) with read/grep/ls — do not edit. Then output your
+invariant brief and verdict in the required shape.
+
+TASK:
+$TASK
+EOF
+  SYSPROMPT="$ARCHITECT_PROMPT"
+  ( cd "$REPO_DIR" && dispatch architect "$ARCHITECT_PROVIDER" "$ARCHITECT_MODEL" "read,grep,ls" "$RUN_DIR/architect.prompt" )
+  ARCH_VERDICT="$(grep -m1 '^VERDICT:' "$RUN_DIR/architect.out" 2>/dev/null || echo 'VERDICT: (none parsed)')"
+  log "architect -> $ARCH_VERDICT"
+  case "$ARCH_VERDICT" in
+    "VERDICT: VETO"*)
+      { echo "# Run $RUN_DIR"
+        echo "architect: $ARCHITECT_PROVIDER/$ARCHITECT_MODEL"
+        echo "$ARCH_VERDICT"
+        echo "PIPELINE HALTED at the architect gate — operator review required."
+      } | tee "$RUN_DIR/summary.md"
+      exit 3 ;;
+    "VERDICT: GO"*)
+      # Hand the planner everything the architect wrote ABOVE its verdict line (the brief).
+      INVARIANT_BRIEF="$(sed '/^VERDICT:/,$d' "$RUN_DIR/architect.out")" ;;
+    *)
+      log "architect verdict unparsed — proceeding WITHOUT a brief (review architect.out)" ;;
+  esac
+fi
+
 # ── 1. PLAN (seat) ───────────────────────────────────────────────────────────
 cat > "$RUN_DIR/plan.prompt" <<EOF
 You are the PLANNER. Read the repo (read/grep/ls only — do not edit) and produce a
@@ -60,7 +104,11 @@ STRUCTURED plan for the task below. Output exactly these sections, nothing else:
 ## Steps                (numbered, each a single concrete edit)
 ## Tests / verification  (how we'll know it worked)
 ## Risks
-
+${INVARIANT_BRIEF:+
+The ARCHITECT gate cleared this task with the invariant brief below. Your plan MUST honor it
+— treat these as hard constraints, and reflect the relevant ones in "Invariants touched":
+$INVARIANT_BRIEF
+}
 TASK:
 $TASK
 EOF
@@ -128,6 +176,7 @@ DECISION="$(grep -m1 '^DECISION:' "$RUN_DIR/adjudicate.out" 2>/dev/null || echo 
 # ── summary ──────────────────────────────────────────────────────────────────
 {
   echo "# Run $RUN_DIR"
+  [ "$ARCHITECT_GATE" = 1 ] && echo "architect: $ARCHITECT_PROVIDER/$ARCHITECT_MODEL — ${ARCH_VERDICT:-(skipped)}"
   echo "seat:   $SEAT_PROVIDER/$SEAT_MODEL"
   echo "worker: $WORKER_PROVIDER/$WORKER_MODEL"
   echo "workspace: $WS"

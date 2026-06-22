@@ -547,7 +547,6 @@ fn translate_provider_tool_result_codex(msg: &ProviderMessage) -> Value {
 /// content is empty) — matches Legacy's
 /// `system_prompt.filter(|s| !s.is_empty()).unwrap_or(&self.instructions)`.
 #[cfg(test)]
-#[cfg(test)]
 pub(crate) fn build_request_body_from_projection(
     model: &str,
     thinking: &str,

@@ -42,8 +42,8 @@ where
     type Item = Result<SseEvent, SseError>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            if let Some(pos) = find_double_newline(&self.buf) {
-                let frame = self.buf.drain(..pos + 2).collect::<Vec<_>>();
+            if let Some((pos, len)) = find_frame_boundary(&self.buf) {
+                let frame = self.buf.drain(..pos + len).collect::<Vec<_>>();
                 return Poll::Ready(Some(parse_frame(&frame)));
             }
             if self.done {
@@ -64,11 +64,19 @@ where
         }
     }
 }
-fn find_double_newline(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\n\n")
+fn find_frame_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+    for i in 0..buf.len() {
+        if buf[i..].starts_with(b"\r\n\r\n") {
+            return Some((i, 4));
+        }
+        if buf[i..].starts_with(b"\n\n") {
+            return Some((i, 2));
+        }
+    }
+    None
 }
 fn parse_frame(frame: &[u8]) -> Result<SseEvent, SseError> {
-    let s = std::str::from_utf8(frame)?.trim_end_matches('\n');
+    let s = std::str::from_utf8(frame)?.trim_end_matches(['\r', '\n']);
     let mut event = None;
     let mut data = String::new();
     for line in s.lines() {
@@ -82,4 +90,30 @@ fn parse_frame(frame: &[u8]) -> Result<SseEvent, SseError> {
         }
     }
     Ok(SseEvent { event, data })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn parses_lf_delimited_frame() {
+        let bytes = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: message\ndata: {\"x\":1}\n\n",
+        ))]);
+        let ev = SseStream::new(bytes).next().await.unwrap().unwrap();
+        assert_eq!(ev.event.as_deref(), Some("message"));
+        assert_eq!(ev.data, "{\"x\":1}");
+    }
+
+    #[tokio::test]
+    async fn parses_crlf_delimited_frame() {
+        let bytes = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: message\r\ndata: {\"x\":1}\r\n\r\n",
+        ))]);
+        let ev = SseStream::new(bytes).next().await.unwrap().unwrap();
+        assert_eq!(ev.event.as_deref(), Some("message"));
+        assert_eq!(ev.data, "{\"x\":1}");
+    }
 }

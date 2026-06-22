@@ -345,6 +345,14 @@ pub(crate) fn events_from_openai_stream(
                         st,
                     ));
                 }
+                mu_openai::ResponseStreamEvent::ResponseError { message, code, .. } => {
+                    *done = true;
+                    let msg = match code {
+                        Some(c) if !c.is_empty() => format!("{c}: {message}"),
+                        _ => message,
+                    };
+                    return Some((ProviderEvent::Error(msg), st));
+                }
                 _ => {}
             }
         }
@@ -445,5 +453,31 @@ fn to_mu_usage(u: mu_openai::Usage) -> Usage {
         cache_creation_5m_input_tokens: None,
         cache_creation_1h_input_tokens: None,
         reasoning_tokens: u.output_tokens_details.and_then(|d| d.reasoning_tokens),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+
+    fn drain(events: Vec<Result<mu_openai::ResponseStreamEvent, String>>) -> Vec<ProviderEvent> {
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        futures::executor::block_on(
+            events_from_openai_stream(Box::pin(stream::iter(events)), rx).collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn response_error_event_surfaces_as_provider_error() {
+        let events = drain(vec![Ok(mu_openai::ResponseStreamEvent::ResponseError {
+            code: Some("rate_limit".into()),
+            message: "slow down".into(),
+            sequence_number: 1,
+        })]);
+        assert!(matches!(
+            events.as_slice(),
+            [ProviderEvent::Error(msg)] if msg == "rate_limit: slow down"
+        ));
     }
 }

@@ -921,6 +921,7 @@ fn probe_and_classify(cmd: &str) -> Result<Vec<Candidate>> {
         path: CapPath::parse(&format!("bash.{cmd}"))?,
         summary,
         keywords: vec![],
+        priority: 0,
         invoke: vec![cmd.to_string()],
         help: Some(crate::capability::HelpSpec {
             argv: vec![cmd.to_string(), "--help".to_string()],

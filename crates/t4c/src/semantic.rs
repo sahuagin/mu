@@ -101,12 +101,7 @@ impl<E: Embedder> Ranker for SemanticRanker<E> {
                 Ranked { cap, score }
             })
             .collect();
-        out.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.cap.path.to_string().cmp(&b.cap.path.to_string()))
-        });
+        crate::rank::sort_ranked(&mut out);
         out
     }
 }
@@ -122,6 +117,7 @@ mod tests {
             path: CapPath::parse(path).unwrap(),
             summary: summary.to_string(),
             keywords: kw.iter().map(|s| s.to_string()).collect(),
+            priority: 0,
             invoke: vec![],
             help: None,
             requires: vec![],

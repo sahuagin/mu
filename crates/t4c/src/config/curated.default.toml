@@ -14,6 +14,10 @@
 # Two grammars share this file (chain.rs comment: unknown sections are ignored
 # by each parser, so they coexist):
 #   [[capability]] — a distinct tool/subcommand node (neighborhood members).
+#                    Optional `priority = <int>` (default 0) is an explicit
+#                    hierarchy weight: a deterministic tie-break applied AFTER
+#                    relevance, so it orders comparably-matching tools (e.g.
+#                    sprint-start over git) without surfacing irrelevant ones.
 #   [[chain]]      — an ordered, best-first list of INTERCHANGEABLE impls of one
 #                    slot; `discover` resolves to the first installed impl and
 #                    tombstones the rest. Per-impl mandatory_flags bake in
@@ -135,6 +139,10 @@ keywords = [
     "bead", "claim", "issue", "ticket", "workspace", "sprint", "start", "work", "task", "begin",
     "not found", "issue_not_found", "remote", "wrong tracker",
 ]
+# Outrank raw `git`/`jj` worktree commands for "start work / isolated workspace"
+# intents: sprint-start is the ordained, correct-by-construction entrypoint here,
+# and reaching for a hand-rolled git worktree instead is a known failure mode.
+priority = 10
 invoke = ["sprint-start", "BEAD-ID"]
 requires = []
 [capability.help]

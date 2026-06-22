@@ -197,6 +197,7 @@ impl Chain {
                     })?,
                     summary: self.summary.clone(),
                     keywords: self.keywords.clone(),
+                    priority: 0,
                     invoke,
                     help: Some(HelpSpec {
                         argv: vec![cmd.clone(), "--help".to_string()],

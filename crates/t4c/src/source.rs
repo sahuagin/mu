@@ -85,6 +85,7 @@ impl TomlConfigSource {
                 path,
                 summary: c.summary,
                 keywords: c.keywords,
+                priority: c.priority,
                 invoke,
                 help: c.help.map(|h| HelpSpec {
                     argv: h.argv,
@@ -107,6 +108,7 @@ impl TomlConfigSource {
                     path: c.path.to_string(),
                     summary: c.summary.clone(),
                     keywords: c.keywords.clone(),
+                    priority: c.priority,
                     invoke: c.invoke.clone(),
                     requires: c.requires.clone(),
                     help: c.help.as_ref().map(|h| TomlHelp {
@@ -159,6 +161,12 @@ impl RegistrySource for TomlConfigSource {
     }
 }
 
+/// `skip_serializing_if` predicate for the neutral priority, so `to_toml`
+/// doesn't write `priority = 0` onto every capability in the persisted registry.
+fn is_zero(n: &i32) -> bool {
+    *n == 0
+}
+
 #[derive(Deserialize, Serialize)]
 struct TomlFile {
     #[serde(default)]
@@ -172,6 +180,9 @@ struct TomlCap {
     summary: String,
     #[serde(default)]
     keywords: Vec<String>,
+    /// Explicit hierarchy weight; omitted (and not re-serialized) when neutral.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    priority: i32,
     #[serde(default)]
     invoke: Vec<String>,
     #[serde(default)]
@@ -215,6 +226,7 @@ impl HelpAiProbeSource {
             path: tool_path,
             summary: doc.summary,
             keywords: doc.keywords,
+            priority: 0,
             invoke: vec![cmd.to_string()],
             help: Some(HelpSpec {
                 argv: vec![cmd.to_string(), "--help-ai".to_string()],
@@ -229,6 +241,7 @@ impl HelpAiProbeSource {
                 path,
                 summary: sub.summary,
                 keywords: vec![],
+                priority: 0,
                 invoke: vec![cmd.to_string(), sub.name.clone()],
                 help: Some(HelpSpec {
                     argv: vec![cmd.to_string(), sub.name, "--help-ai".to_string()],

@@ -13,6 +13,201 @@ use mu_core::agent::{
 use serde_json::Value;
 use tokio::sync::oneshot;
 
+const DEFAULT_INSTRUCTIONS: &str = "You are mu, a coding agent. Respond concisely. \
+     When tools are provided, prefer to use them rather than asking \
+     the user for information you could obtain yourself.";
+
+/// Soft cap for Codex's `instructions` field. Public OpenAI handles larger
+/// instructions, but this adapter is shared by the Codex subscription path,
+/// where oversized instructions have been observed to produce empty streams.
+pub(crate) const CODEX_INSTRUCTIONS_SOFT_CAP: usize = 8 * 1024;
+
+pub(crate) fn build_request_from_legacy(
+    model: &str,
+    thinking: &str,
+    instructions: &str,
+    messages: &[mu_core::agent::AgentMessage],
+    tools: &[mu_core::agent::ToolSpec],
+    cap_instructions: bool,
+) -> mu_openai::CreateResponseRequest {
+    let (instructions_field, overflow) = split_instructions(instructions, cap_instructions);
+    let mut input = Vec::new();
+    if let Some(o) = overflow {
+        input.push(instructions_overflow_message(o));
+    }
+    for m in messages {
+        input.extend(input_items_from_agent_message(m));
+    }
+    finish_request(model, thinking, instructions_field, input, tools)
+}
+
+pub(crate) fn build_request_from_projection(
+    model: &str,
+    thinking: &str,
+    default_instructions: &str,
+    pmsgs: &mu_core::context::ProviderMessages,
+    tools: &[mu_core::agent::ToolSpec],
+    cap_instructions: bool,
+) -> mu_openai::CreateResponseRequest {
+    let (mut input, hoisted_system) = input_items_from_projection(pmsgs);
+    let instructions = hoisted_system
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_instructions);
+    let (instructions_field, overflow) = split_instructions(instructions, cap_instructions);
+    if let Some(o) = overflow {
+        input.insert(0, instructions_overflow_message(o));
+    }
+    finish_request(model, thinking, instructions_field, input, tools)
+}
+
+fn finish_request(
+    model: &str,
+    thinking: &str,
+    instructions: &str,
+    input: Vec<mu_openai::InputItem>,
+    tools: &[mu_core::agent::ToolSpec],
+) -> mu_openai::CreateResponseRequest {
+    let mut req = mu_openai::CreateResponseRequest {
+        model: model.to_string(),
+        instructions: Some(instructions.to_string()),
+        input,
+        stream: Some(true),
+        store: Some(false),
+        reasoning: Some(mu_openai::Reasoning {
+            effort: Some(thinking.to_string()),
+            summary: Some("auto".into()),
+        }),
+        tools: tools.iter().map(openai_tool_from_mu).collect(),
+        tool_choice: None,
+        parallel_tool_calls: None,
+        max_output_tokens: None,
+    };
+    if !req.tools.is_empty() {
+        req.tool_choice = Some(mu_openai::ToolChoice::Auto);
+        req.parallel_tool_calls = Some(false);
+    }
+    req
+}
+
+fn openai_tool_from_mu(spec: &mu_core::agent::ToolSpec) -> mu_openai::Tool {
+    mu_openai::Tool::Function(mu_openai::FunctionTool {
+        name: spec.name.to_string(),
+        description: spec.description.to_string(),
+        parameters: mu_openai::JsonValue::new(spec.input_schema.clone())
+            .expect("ToolSpec schema is valid JSON"),
+    })
+}
+
+fn input_items_from_agent_message(m: &mu_core::agent::AgentMessage) -> Vec<mu_openai::InputItem> {
+    use mu_core::agent::AgentMessage;
+    match m {
+        AgentMessage::User { content } => {
+            vec![mu_openai::InputItem::user_text(content.to_string())]
+        }
+        AgentMessage::Assistant(a) => input_items_from_blocks(&a.content),
+        AgentMessage::ToolResult {
+            call_id,
+            content,
+            is_error,
+        } => vec![mu_openai::InputItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: if *is_error {
+                format!("[error] {content}")
+            } else {
+                content.to_string()
+            },
+        }],
+    }
+}
+
+fn input_items_from_blocks(blocks: &[mu_core::agent::ContentBlock]) -> Vec<mu_openai::InputItem> {
+    use mu_core::agent::ContentBlock;
+    let mut out = Vec::new();
+    let mut text = String::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text: t } => text.push_str(t),
+            ContentBlock::ToolCall(tc) => out.push(mu_openai::InputItem::FunctionCall {
+                call_id: tc.id.clone(),
+                name: tc.name.clone(),
+                arguments: serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".into()),
+            }),
+            ContentBlock::Thinking { .. } => {}
+        }
+    }
+    if !text.is_empty() {
+        out.insert(0, mu_openai::InputItem::assistant_text(text));
+    }
+    out
+}
+
+fn input_items_from_projection(
+    pmsgs: &mu_core::context::ProviderMessages,
+) -> (Vec<mu_openai::InputItem>, Option<String>) {
+    use mu_core::context::ProviderRole;
+    let mut out = Vec::new();
+    let mut system = None::<String>;
+    for msg in &pmsgs.messages {
+        match msg.role() {
+            ProviderRole::System => {
+                let is_tool_schema = msg
+                    .source_span_ids()
+                    .first()
+                    .map(|sid| sid.as_ref().starts_with("tool-schema:"))
+                    .unwrap_or(false);
+                if !is_tool_schema && !msg.content().is_empty() {
+                    match system.as_mut() {
+                        Some(s) => {
+                            s.push_str("\n\n");
+                            s.push_str(msg.content());
+                        }
+                        None => system = Some(msg.content().to_string()),
+                    }
+                }
+            }
+            ProviderRole::User => {
+                out.push(mu_openai::InputItem::user_text(msg.content().to_string()))
+            }
+            ProviderRole::Assistant => {
+                if let Some(blocks) = msg.blocks() {
+                    out.extend(input_items_from_blocks(blocks));
+                }
+            }
+            ProviderRole::ToolResult => {
+                let call_id = msg
+                    .source_span_ids()
+                    .first()
+                    .and_then(|sid| mu_core::context::extract_call_id_from_span_id(sid.as_ref()))
+                    .unwrap_or("");
+                let output = match msg.content().strip_prefix("error: ") {
+                    Some(stripped) => format!("[error] {stripped}"),
+                    None => msg.content().to_string(),
+                };
+                out.push(mu_openai::InputItem::FunctionCallOutput {
+                    call_id: call_id.into(),
+                    output,
+                });
+            }
+        }
+    }
+    (out, system)
+}
+
+fn split_instructions(instructions: &str, cap: bool) -> (&str, Option<&str>) {
+    if cap && instructions.len() > CODEX_INSTRUCTIONS_SOFT_CAP {
+        (DEFAULT_INSTRUCTIONS, Some(instructions))
+    } else {
+        (instructions, None)
+    }
+}
+
+fn instructions_overflow_message(content: &str) -> mu_openai::InputItem {
+    mu_openai::InputItem::user_text(format!(
+        "[System context — too large for the instructions field. Treat this as your standing instructions and project context, not as a question to respond to directly.]\n\n{content}"
+    ))
+}
+
 #[derive(Default)]
 struct ToolCallBuilder {
     call_id: String,
@@ -28,12 +223,6 @@ struct Accum {
     usage: Option<Usage>,
     status: Option<String>,
     incomplete_reason: Option<String>,
-}
-
-pub(crate) fn request_from_value(
-    v: Value,
-) -> Result<mu_openai::CreateResponseRequest, serde_json::Error> {
-    serde_json::from_value(v)
 }
 
 pub(crate) fn events_from_openai_stream(

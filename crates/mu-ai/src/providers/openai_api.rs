@@ -79,26 +79,28 @@ impl Provider for OpenaiApiProvider {
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
         let eff_thinking = effort.unwrap_or(&self.thinking);
-        let body = match input {
+        let req = match input {
             MessageInput::Legacy(msgs) => {
                 let instructions = system_prompt
                     .filter(|s| !s.is_empty())
                     .unwrap_or(&self.instructions);
-                super::openai_codex::build_request_body(
+                super::openai_responses::build_request_from_legacy(
                     &self.model,
                     eff_thinking,
                     instructions,
                     msgs,
                     tools,
+                    false,
                 )
             }
             MessageInput::Projected(pmsgs) => {
-                super::openai_codex::build_request_body_from_projection(
+                super::openai_responses::build_request_from_projection(
                     &self.model,
                     eff_thinking,
                     &self.instructions,
                     pmsgs,
                     tools,
+                    false,
                 )
             }
             _ => {
@@ -107,8 +109,6 @@ impl Provider for OpenaiApiProvider {
                 ));
             }
         };
-        let req = super::openai_responses::request_from_value(body)
-            .map_err(|e| ProviderError::Other(format!("build OpenAI Responses request: {e}")))?;
         let stream = self
             .client
             .stream_response(&req)

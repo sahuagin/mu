@@ -108,9 +108,10 @@ impl Provider for OpenRouterProvider {
     async fn stream(
         &self,
         system_prompt: Option<&str>,
-        // mu-vcbm: OpenRouter has no first-class reasoning-effort knob
-        // in mu's request shape yet — effort is accepted and ignored.
-        _effort: Option<&str>,
+        // mu-13ve: per-turn reasoning effort, mapped to OpenRouter's
+        // normalized `reasoning` field below (mu-vcbm threaded it; the
+        // OpenRouter arm previously accepted-and-ignored it).
+        effort: Option<&str>,
         input: MessageInput<'_>,
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
@@ -124,7 +125,7 @@ impl Provider for OpenRouterProvider {
         // openrouter_tests.rs assert that invariant for the canonical
         // scenarios. The agent loop's mod.rs:818 still passes Legacy
         // until mu-yqeq.8 wires the cutover.
-        let body = match input {
+        let mut body = match input {
             MessageInput::Legacy(msgs) => {
                 build_request_body(&self.model, system_prompt, msgs, tools)
             }
@@ -142,6 +143,12 @@ impl Provider for OpenRouterProvider {
                 ));
             }
         };
+        // mu-13ve: thread the per-turn reasoning effort into OpenRouter's
+        // normalized `reasoning` field. None / "off" / unrecognized → no
+        // key, so the pre-mu-13ve request body stays byte-for-byte intact.
+        if let Some(reasoning) = reasoning_param(effort) {
+            body["reasoning"] = reasoning;
+        }
         let resp = self
             .client
             .post(format!("{}{}", self.api_base, self.api_path))
@@ -212,6 +219,29 @@ pub(crate) fn translate_tool_spec(spec: &ToolSpec) -> Value {
             "parameters": spec.input_schema,
         }
     })
+}
+
+/// Map mu's per-turn reasoning-effort selection to OpenRouter's
+/// normalized `reasoning` request field (mu-13ve).
+///
+/// OpenRouter accepts `reasoning.effort` ∈ {`low`, `medium`, `high`}
+/// and maps the requested level to the nearest one a given backing
+/// model supports, so one knob works across providers (OpenRouter
+/// "Reasoning Tokens" docs). mu's effort vocabulary
+/// (`low|medium|high|xhigh|max`, via `parse_thinking_flag`) extends
+/// above `high`; `xhigh`/`max` clamp to `high` (OpenRouter's ceiling).
+///
+/// Returns `None` for `None`, `off`/`""`, or any unrecognized value —
+/// the caller then sends no `reasoning` key, leaving the request body
+/// byte-for-byte as it was before mu-13ve.
+fn reasoning_param(effort: Option<&str>) -> Option<Value> {
+    let level = match effort?.trim().to_ascii_lowercase().as_str() {
+        "low" => "low",
+        "medium" => "medium",
+        "high" | "xhigh" | "max" => "high",
+        _ => return None,
+    };
+    Some(json!({ "effort": level }))
 }
 
 /// Translate mu's AgentMessage into the OpenAI/OpenRouter shape.

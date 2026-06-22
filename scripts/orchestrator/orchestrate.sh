@@ -1,9 +1,11 @@
 #!/bin/sh
 # orchestrate.sh — v0 pipeline spine (Plan A skeleton).
 #
-# Flow:  ARCHITECT (invariant guardian: GO | VETO) -> PLAN (seat) -> IMPLEMENT (worker,
-#        isolated jj workspace) -> REVIEW (ci-aipr) -> ADJUDICATE (seat: SHIP | ITERATE
-#        <focus> | ESCALATE). A VETO short-circuits the pipeline to the operator.
+# Flow:  ARCHITECT (invariant guardian: GO | VETO) -> PLAN (seat) -> IMPLEMENT (worker(s),
+#        isolated jj workspace) -> [CONVERGE: N>=2 competing workers -> select best] ->
+#        REVIEW (ci-aipr) -> ADJUDICATE (seat: SHIP | ITERATE <focus> | ESCALATE). A VETO
+#        short-circuits to the operator; CONVERGE (CONVERGE_WORKERS>=2) fans out competing
+#        candidates and a converger selects the best (antagonistic, citation-gated).
 #
 # The ARCHITECT is the invariant-guardian gate (default opus — the seat-A/B 2026-06-22
 # result: its skepticism + verify-before-assert depth is the FEATURE for a veto seat). It
@@ -27,10 +29,21 @@ SEAT_PROVIDER="${SEAT_PROVIDER:-openai-codex}";    SEAT_MODEL="${SEAT_MODEL:-gpt
 WORKER_PROVIDER="${WORKER_PROVIDER:-ollama}"; WORKER_MODEL="${WORKER_MODEL:-qwen3.6:27b}"  # coding rank-1 (free, local; claude needs the proxy, absent on this box)
 AIREVIEW="${AIREVIEW:-$REPO_DIR/scripts/ai-review.sh}"
 ARCHITECT_GATE="${ARCHITECT_GATE:-1}"   # set 0 to skip the architect gate (e.g. seat A/B isolation)
+# CONVERGE: >=2 fans out N competing workers (each its own isolated workspace) on the SAME
+# plan, then a CONVERGER selects the best candidate (antagonistic, citation-gated — the
+# consensus discipline). Default 1 = single worker (behavior unchanged). Roster is
+# provider:model per slot (diverse $0 coding ranks); slots beyond it fall back to WORKER_*.
+CONVERGE_WORKERS="${CONVERGE_WORKERS:-1}"
+CONVERGE_ROSTER="${CONVERGE_ROSTER:-ollama:qwen3.6:27b,claude-oauth:claude-sonnet-4-6,openai-codex:gpt-5.5}"
+# The converger is a skeptical SELECTION gate (antagonistic, citation-gated) — opus's
+# validated role (seat A/B 2026-06-22), and it sidesteps the codex/gpt-5.5 empty-turn bug
+# (mu-rb4u) that silently defaulted the pick. Overridable.
+CONVERGER_PROVIDER="${CONVERGER_PROVIDER:-claude-oauth}"; CONVERGER_MODEL="${CONVERGER_MODEL:-claude-opus-4-8}"
 # Fixed, neutral system prompts (role + minimal tool-orientation) kept CONSTANT
 # across seat arms so identity/recall don't confound the A/B (--bare strips the rest).
 CONDUCTOR_PROMPT="${CONDUCTOR_PROMPT:-$(dirname "$0")/conductor-prompt.txt}"
 WORKER_PROMPT="${WORKER_PROMPT:-$(dirname "$0")/worker-prompt.txt}"
+CONVERGE_PROMPT="${CONVERGE_PROMPT:-$(dirname "$0")/converge-prompt.txt}"
 ARCHITECT_PROMPT="${ARCHITECT_PROMPT:-$(dirname "$0")/architect-prompt.txt}"
 
 RUN_DIR="${RUN_DIR:-$HOME/orchestrator-runs/run-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -117,10 +130,8 @@ SYSPROMPT="$CONDUCTOR_PROMPT"
 cp "$RUN_DIR/plan.out" "$RUN_DIR/plan.md"
 log "plan -> $RUN_DIR/plan.md"
 
-# ── 2. IMPLEMENT (worker, isolated jj workspace) ─────────────────────────────
-WS_LINE="$( cd "$REPO_DIR" && sprint-start --no-bead "orch-$(date -u +%H%M%S)" 2>/dev/null | sed -n 's/^cd //p' )"
-WS="${WS_LINE:-$REPO_DIR}"
-log "worker workspace: $WS"
+# ── 2. IMPLEMENT (worker(s), isolated jj workspace) ──────────────────────────
+# Shared implementer prompt — every worker gets the SAME approved plan.
 cat > "$RUN_DIR/impl.prompt" <<EOF
 You are the IMPLEMENTER. Follow the approved plan EXACTLY. Make the edits, then stop.
 If the plan is wrong or blocked, STOP and write a one-line BLOCKER — do not improvise
@@ -129,14 +140,64 @@ beyond the plan's scope.
 APPROVED PLAN:
 $(cat "$RUN_DIR/plan.md")
 EOF
-# Worker now routes through the shared dispatch too: agent_dispatch is write-capable
-# (maps the write/bash tools + adds --bash-yolo / --permission-mode bypassPermissions
-# as needed), so a Claude editing worker (WORKER_PROVIDER=claude-oauth) would route
-# through `claude -p` correctly. MAX_TURNS bumped for an implementation loop.
-MAX_TURNS=40; SYSPROMPT="$WORKER_PROMPT"
-( cd "$WS" && dispatch implement "$WORKER_PROVIDER" "$WORKER_MODEL" \
-    "read,write,edit,glob,grep,ls,bash" "$RUN_DIR/impl.prompt" )
-( cd "$WS" && jj diff --git > "$RUN_DIR/worker.diff" 2>/dev/null )
+# run_worker <slot> <provider> <model>: implement the plan in a FRESH isolated workspace;
+# record the candidate diff (worker.<slot>.diff) + its workspace path (worker.<slot>.ws).
+# agent_dispatch is write-capable (maps write/bash tools + --bash-yolo / bypassPermissions),
+# so a Claude editing worker (provider=claude-oauth) routes through `claude -p` correctly.
+run_worker(){  # $1=slot $2=provider $3=model
+  rw_slot="$1"; rw_prov="$2"; rw_model="$3"
+  rw_ws="$( cd "$REPO_DIR" && sprint-start --no-bead "orch-$(date -u +%H%M%S)-$rw_slot" 2>/dev/null | sed -n 's/^cd //p' )"
+  rw_ws="${rw_ws:-$REPO_DIR}"
+  printf '%s\n' "$rw_ws" > "$RUN_DIR/worker.$rw_slot.ws"
+  MAX_TURNS=40; SYSPROMPT="$WORKER_PROMPT"
+  ( cd "$rw_ws" && dispatch "implement-$rw_slot" "$rw_prov" "$rw_model" \
+      "read,write,edit,glob,grep,ls,bash" "$RUN_DIR/impl.prompt" )
+  ( cd "$rw_ws" && jj diff --git > "$RUN_DIR/worker.$rw_slot.diff" 2>/dev/null )
+  log "worker[$rw_slot] $rw_prov/$rw_model -> worker.$rw_slot.diff ($(wc -l < "$RUN_DIR/worker.$rw_slot.diff") lines), ws $rw_ws"
+}
+
+if [ "${CONVERGE_WORKERS:-1}" -le 1 ]; then
+  run_worker 1 "$WORKER_PROVIDER" "$WORKER_MODEL"
+  WS="$(cat "$RUN_DIR/worker.1.ws")"; cp "$RUN_DIR/worker.1.diff" "$RUN_DIR/worker.diff"
+else
+  # ── 2b. CONVERGE: fan out N competing workers, then SELECT the best ──────────
+  i=1
+  while [ "$i" -le "$CONVERGE_WORKERS" ]; do
+    entry="$(printf '%s' "$CONVERGE_ROSTER" | cut -d, -f"$i")"
+    if [ -z "$entry" ]; then rwp="$WORKER_PROVIDER"; rwm="$WORKER_MODEL"; else rwp="${entry%%:*}"; rwm="${entry#*:}"; fi
+    run_worker "$i" "$rwp" "$rwm"
+    i=$((i+1))
+  done
+  # Converger prompt: plan + (architect) invariant brief + each candidate's diff.
+  {
+    echo "APPROVED PLAN:"; cat "$RUN_DIR/plan.md"
+    [ -n "${INVARIANT_BRIEF:-}" ] && { echo; echo "ARCHITECT INVARIANT BRIEF (hard constraints the winner must honor):"; echo "$INVARIANT_BRIEF"; }
+    i=1
+    while [ "$i" -le "$CONVERGE_WORKERS" ]; do
+      echo; echo "===== CANDIDATE $i ====="
+      echo '```diff'; tail -c 12000 "$RUN_DIR/worker.$i.diff"; echo '```'
+      i=$((i+1))
+    done
+    echo; echo "Select the candidate that best satisfies the plan. End with 'WINNER: <n>' (or 'WINNER: none | <why>')."
+  } > "$RUN_DIR/converge.prompt"
+  SYSPROMPT="$CONVERGE_PROMPT"
+  ( cd "$REPO_DIR" && dispatch converge "$CONVERGER_PROVIDER" "$CONVERGER_MODEL" "read,grep" "$RUN_DIR/converge.prompt" )
+  WINNER="$(grep -m1 '^WINNER:' "$RUN_DIR/converge.out" 2>/dev/null | sed -E 's/^WINNER:[[:space:]]*([0-9]+).*/\1/')"
+  case "$WINNER" in ''|*[!0-9]*) log "converge: WINNER unparsed or 'none' — defaulting to candidate 1 (review gate is the backstop); see converge.out"; WINNER=1 ;; esac
+  WS="$(cat "$RUN_DIR/worker.$WINNER.ws")"; cp "$RUN_DIR/worker.$WINNER.diff" "$RUN_DIR/worker.diff"
+  log "converge: WINNER=$WINNER -> $WS"
+  # Abandon the loser sub-workspaces; keep the winner for REVIEW/ADJUDICATE.
+  i=1
+  while [ "$i" -le "$CONVERGE_WORKERS" ]; do
+    if [ "$i" != "$WINNER" ]; then
+      lws="$(cat "$RUN_DIR/worker.$i.ws" 2>/dev/null)"
+      if [ -n "$lws" ] && [ "$lws" != "$REPO_DIR" ]; then
+        ( cd "$lws" && sprint-end --force >/dev/null 2>&1 ); log "converge: abandoned loser candidate $i ($lws)"
+      fi
+    fi
+    i=$((i+1))
+  done
+fi
 log "worker diff -> $RUN_DIR/worker.diff ($(wc -l < "$RUN_DIR/worker.diff") lines)"
 
 # ── 3. REVIEW (existing ci-aipr gate) ────────────────────────────────────────
@@ -178,7 +239,11 @@ DECISION="$(grep -m1 '^DECISION:' "$RUN_DIR/adjudicate.out" 2>/dev/null || echo 
   echo "# Run $RUN_DIR"
   [ "$ARCHITECT_GATE" = 1 ] && echo "architect: $ARCHITECT_PROVIDER/$ARCHITECT_MODEL — ${ARCH_VERDICT:-(skipped)}"
   echo "seat:   $SEAT_PROVIDER/$SEAT_MODEL"
-  echo "worker: $WORKER_PROVIDER/$WORKER_MODEL"
+  if [ "${CONVERGE_WORKERS:-1}" -gt 1 ]; then
+    echo "converge: $CONVERGE_WORKERS workers [$CONVERGE_ROSTER] -> ${CONVERGER_PROVIDER}/${CONVERGER_MODEL} picked candidate ${WINNER:-?}"
+  else
+    echo "worker: $WORKER_PROVIDER/$WORKER_MODEL"
+  fi
   echo "workspace: $WS"
   echo "review exit: $REVIEW_RC"
   echo "$DECISION"

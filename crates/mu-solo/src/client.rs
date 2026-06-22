@@ -134,8 +134,8 @@ impl Client {
         if bash_yolo {
             cmd.arg("--bash-yolo");
         }
-        // mu-upk2: forward the extended-thinking directive. Empty = off (no
-        // flag), so the serve-side default (no thinking) is unchanged.
+        // mu-upk2: forward the extended-thinking directive. Empty = no
+        // launch-time directive, so the serve-side provider default is unchanged.
         if !thinking.is_empty() {
             cmd.arg("--thinking").arg(thinking);
         }

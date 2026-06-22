@@ -55,6 +55,13 @@ pub struct AnthropicProvider {
     /// `thinking` / `output_config`). Set via [`with_thinking_flag`](Self::
     /// with_thinking_flag) from the `--thinking` flag.
     thinking_effort: Option<String>,
+    thinking_wire: ThinkingWire,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingWire {
+    AnthropicAdaptive,
+    OllamaSwitch,
 }
 
 impl AnthropicProvider {
@@ -66,6 +73,7 @@ impl AnthropicProvider {
             api_base: ANTHROPIC_API_BASE.to_string(),
             cache_ttl: CacheTtl::default(),
             thinking_effort: None,
+            thinking_wire: ThinkingWire::AnthropicAdaptive,
         }
     }
 
@@ -83,6 +91,16 @@ impl AnthropicProvider {
     /// Claude models require). An empty/`off` flag leaves thinking off.
     pub fn with_thinking_flag(mut self, flag: &str) -> Self {
         self.thinking_effort = parse_thinking_flag(flag);
+        self.thinking_wire = ThinkingWire::AnthropicAdaptive;
+        self
+    }
+
+    /// Select ollama's Anthropic-compat thinking switch. Ollama accepts a
+    /// `thinking` object but not Anthropic's `output_config.effort` depth knob,
+    /// so this constrains `--thinking` / per-turn `/effort` to on vs off.
+    pub fn with_ollama_thinking_flag(mut self, flag: &str) -> Self {
+        self.thinking_effort = parse_ollama_thinking_flag(flag);
+        self.thinking_wire = ThinkingWire::OllamaSwitch;
         self
     }
 
@@ -117,6 +135,7 @@ impl AnthropicProvider {
             api_base,
             cache_ttl: CacheTtl::default(),
             thinking_effort: None,
+            thinking_wire: ThinkingWire::AnthropicAdaptive,
         })
     }
 
@@ -177,11 +196,22 @@ impl Provider for AnthropicProvider {
         // (so `off`/`none` disables for this turn, unknown ⇒ high). `None`
         // falls back to the construction-time `thinking_effort`.
         let mut body = body;
-        let call_effort: Option<String> = match effort {
-            Some(e) => parse_thinking_flag(e),
-            None => self.thinking_effort.clone(),
-        };
-        apply_thinking(&mut body, call_effort.as_deref());
+        match self.thinking_wire {
+            ThinkingWire::AnthropicAdaptive => {
+                let call_effort: Option<String> = match effort {
+                    Some(e) => parse_thinking_flag(e),
+                    None => self.thinking_effort.clone(),
+                };
+                apply_thinking(&mut body, call_effort.as_deref());
+            }
+            ThinkingWire::OllamaSwitch => {
+                let call_switch = match effort {
+                    Some(e) => parse_ollama_thinking_flag(e),
+                    None => self.thinking_effort.clone(),
+                };
+                apply_ollama_thinking(&mut body, call_switch.as_deref());
+            }
+        }
 
         let resp = self
             .client
@@ -442,6 +472,34 @@ fn parse_thinking_flag(flag: &str) -> Option<String> {
         }
     };
     Some(level.to_string())
+}
+
+/// Interpret a value as ollama's Anthropic-compat thinking switch. Ollama
+/// accepts a `thinking` object but treats it as on/off; it does not honor
+/// Anthropic's `output_config.effort` depth knob. Empty means inherit ollama's
+/// model default, explicit off forms send `thinking:{type:disabled}`, and any
+/// other non-empty value enables summarized thinking.
+fn parse_ollama_thinking_flag(flag: &str) -> Option<String> {
+    let f = flag.trim().to_ascii_lowercase();
+    if f.is_empty() {
+        None
+    } else if matches!(f.as_str(), "off" | "none" | "false" | "0" | "disabled") {
+        Some("off".to_string())
+    } else {
+        Some("on".to_string())
+    }
+}
+
+fn apply_ollama_thinking(body: &mut Value, thinking: Option<&str>) {
+    match thinking {
+        Some("off") => {
+            body["thinking"] = serde_json::json!({ "type": "disabled" });
+        }
+        Some(_) => {
+            body["thinking"] = serde_json::json!({ "type": "adaptive", "display": "summarized" });
+        }
+        None => {}
+    }
 }
 
 /// mu-yqeq.8 retired the unconditional `cache_control: ephemeral`

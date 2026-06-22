@@ -127,8 +127,13 @@ pub fn build_provider_from_selector(
             Ok(Arc::new(VllmProvider::from_env(model.clone())?))
         }
         ProviderSelector::Ollama { model } => {
-            log_thinking_ignored("ollama", thinking);
-            Ok(Arc::new(OllamaProvider::from_env(model.clone())?))
+            let mut provider = OllamaProvider::from_env(model.clone())?;
+            if let Some(t) = thinking {
+                if !t.is_empty() {
+                    provider = provider.with_thinking_flag(t);
+                }
+            }
+            Ok(Arc::new(provider))
         }
     }
 }

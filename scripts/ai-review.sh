@@ -316,9 +316,9 @@ printf '%s' "$PROMPT" > "$PROMPT_FILE"
 # approved client), else -> `mu ask --bare`. It reads TOOLS/SYSPROMPT/TIMEOUT/
 # MAX_TURNS/MU/ERRLOG/PROMPT_FILE from this scope; --bare (mu) and --exclude-
 # dynamic-system-prompt-sections (claude) keep the reviewer session hermetic.
-# Behaviour is identical to the prior inline run_review. (Lib is untracked, like
-# agent-role / sprint-lib.sh; override its path with AGENT_DISPATCH_LIB.)
-AGENT_DISPATCH_LIB="${AGENT_DISPATCH_LIB:-$HOME/.local/lib/agent-dispatch.sh}"
+# Behaviour is identical to the prior inline run_review. (Lib lives in-repo at
+# scripts/lib/; override its path with AGENT_DISPATCH_LIB.)
+AGENT_DISPATCH_LIB="${AGENT_DISPATCH_LIB:-$(dirname "$0")/lib/agent-dispatch.sh}"
 [ -r "$AGENT_DISPATCH_LIB" ] || { echo "ai-review: missing dispatch lib: $AGENT_DISPATCH_LIB" >&2; exit 2; }
 . "$AGENT_DISPATCH_LIB"
 run_review() { agent_dispatch "$@"; }   # $1=provider $2=model [$3=prompt-file, default $PROMPT_FILE]

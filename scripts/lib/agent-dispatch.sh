@@ -1,0 +1,94 @@
+#!/bin/sh
+# agent-dispatch.sh — shared model dispatch for the agent toolchain.
+#
+# ONE function, agent_dispatch, runs a single model on a prompt file and prints
+# its stdout (stderr -> $ERRLOG). It routes by provider, ToS-cleanly:
+#   claude-oauth   -> `claude -p`              (the $0 Max subscription via the
+#                                               approved client; NEVER OAuth-via-mu)
+#   anything else  -> `mu ask --bare --provider <p>`  (codex / ollama / openrouter / ...)
+# Both are HERMETIC: mu's --bare and claude's --exclude-dynamic-system-prompt-
+# sections strip recall / product scaffolding, so the model sees only the prompt
+# (+ $SYSPROMPT if set) — not a CLAUDE.md kernel that would make every model
+# self-identify as "claude".
+#
+# Tool grant is driven by $TOOLS (mu names: read,write,edit,glob,grep,ls,bash):
+#   - mu path passes `--tools $TOOLS`, and adds `--bash-yolo` when `bash` is granted.
+#   - claude path maps the names to `--allowedTools Read Write Edit Glob Grep LS Bash`,
+#     and adds `--permission-mode bypassPermissions` when a WRITE tool (write/edit/
+#     bash) is granted (a `-p` worker can't answer per-command prompts).
+# Read-only callers (review/plan/adjudicate: TOOLS=read,grep[,ls]) get NO bypass
+# and NO --bash-yolo — byte-identical to the original review dispatch.
+#
+# Extracted from scripts/ai-review.sh::run_review (mu repo) so the review gate,
+# the orchestrator pipeline, and future spawns share ONE dispatch.
+#
+# Usage — source this file, then:
+#   agent_dispatch <provider> <model> [<prompt-file>]   # prompt-file default $PROMPT_FILE
+#
+# Tunables (read from the CALLER's scope; defaults applied when unset):
+#   TOOLS      mu tool CSV                                      default "read,grep"
+#              ("" => zero tools: omits --tools/--max-turns/--allowedTools)
+#   SYSPROMPT  system-prompt file (optional; overrides daemon)  default unset
+#   TIMEOUT    wall-clock backstop, seconds                     default 900
+#   MAX_TURNS  mu --max-turns (mu path, when TOOLS non-empty)   default 15
+#   THINKING   mu/claude thinking level                         default low
+#   MU         mu binary                                        default `command -v mu`
+#   ERRLOG     stderr sink (appended)                           default /tmp/agent-dispatch.$$.err
+
+# Map a mu tool CSV -> claude `--allowedTools` names (space-separated).
+_ad_claude_tools() {  # $1=csv
+  printf '%s\n' "$1" | tr ',' '\n' | while IFS= read -r _t; do
+    case "$_t" in
+      read) printf 'Read ' ;; write) printf 'Write ' ;; edit) printf 'Edit ' ;;
+      glob) printf 'Glob ' ;; grep) printf 'Grep ' ;; ls) printf 'LS ' ;;
+      bash) printf 'Bash ' ;;
+    esac
+  done
+}
+
+agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
+  local ad_prov ad_model ad_pf ad_tools ad_timeout ad_maxturns ad_thinking ad_mu ad_errlog
+  local ad_clsys ad_sysflags ad_cltools ad_perm ad_yolo
+  ad_prov="$1"; ad_model="$2"
+  ad_pf="${3:-${PROMPT_FILE:-}}"
+  [ -n "$ad_pf" ] || { echo "agent_dispatch: no prompt file (arg 3 or \$PROMPT_FILE)" >&2; return 2; }
+  ad_tools="${TOOLS-read,grep}"            # '-' not ':-': honour an explicit empty TOOLS
+  ad_timeout="${TIMEOUT:-900}"
+  ad_maxturns="${MAX_TURNS:-15}"
+  ad_thinking="${THINKING:-low}"
+  ad_mu="${MU:-$(command -v mu || true)}"
+  ad_errlog="${ERRLOG:-${TMPDIR:-/tmp}/agent-dispatch.$$.err}"
+
+  # Write tools (write/edit/bash) need extra flags so a non-interactive worker
+  # doesn't deadlock (claude) and can run a shell (mu). Read-only sets stay clean.
+  ad_perm=""; ad_yolo=""
+  case ",$ad_tools," in *,write,*|*,edit,*|*,bash,*) ad_perm="--permission-mode bypassPermissions" ;; esac
+  case ",$ad_tools," in *,bash,*) ad_yolo="--bash-yolo" ;; esac
+
+  # claude-oauth: reach the $0 Max subscription via the approved client. Prompt on
+  # STDIN, not argv (a ~1MB prompt overflows ARG_MAX, mu-b6tl). --exclude-dynamic-
+  # system-prompt-sections strips claude's agent scaffolding.
+  if [ "$ad_prov" = "claude-oauth" ]; then
+    ad_clsys=""
+    [ -n "${SYSPROMPT:-}" ] && [ -r "$SYSPROMPT" ] && ad_clsys="--append-system-prompt-file $SYSPROMPT"
+    ad_cltools="$(_ad_claude_tools "$ad_tools")"; [ -n "$ad_cltools" ] || ad_cltools="Read Grep"
+    # shellcheck disable=SC2086 — $ad_clsys/$ad_perm/$ad_cltools intentionally word-split
+    timeout "$ad_timeout" claude -p --model "$ad_model" $ad_clsys $ad_perm \
+      --exclude-dynamic-system-prompt-sections \
+      --allowedTools $ad_cltools --output-format text <"$ad_pf" 2>>"$ad_errlog"
+    return
+  fi
+
+  # mu providers (codex / ollama / openrouter / ...): hermetic --bare session.
+  ad_sysflags=""
+  [ -n "${SYSPROMPT:-}" ] && [ -r "$SYSPROMPT" ] && ad_sysflags="--append-system-prompt $SYSPROMPT"
+  # shellcheck disable=SC2086 — $ad_sysflags/$ad_yolo/tool flags intentionally word-split
+  if [ -n "$ad_tools" ]; then
+    timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
+      --thinking "$ad_thinking" $ad_sysflags $ad_yolo --max-turns "$ad_maxturns" --tools "$ad_tools" \
+      --prompt-file "$ad_pf" 2>>"$ad_errlog"
+  else
+    timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
+      --thinking "$ad_thinking" $ad_sysflags --prompt-file "$ad_pf" 2>>"$ad_errlog"
+  fi
+}

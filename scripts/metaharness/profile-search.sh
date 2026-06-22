@@ -1,34 +1,36 @@
 #!/bin/sh
 # profile-search.sh — meta-harness Path A: the profile-search sibling loop.
 #
-# The "remaining glue" for harness-model-fit (see ./AGENTS.md). Fans out N harness
-# PROFILES, runs the agentic-bench corpus per profile, grades each answer, computes a
-# numeric OBJECTIVE per profile, and SELECTS by deterministic argmax(score).
+# Searches the HARNESS-FIT KNOBS (effort / addendum / sampling) for a model that is
+# RESOLVED BY ROLE (never hardcoded), over the agentic-bench corpus, and selects by
+# deterministic argmax(score). Model SELECTION is `agent-role`'s job (and the benches
+# behind it: arch-bench / code-review-bench); this loop only tunes the harness to
+# whatever model the role resolves — which is what "harness-model-fit" means.
 #
-#   fan out profiles --> run agentic cases (agent-dispatch) --> grade (arch_score)
-#                    --> aggregate objective --> argmax(score) --> summary.md
+#   resolve model (agent-role) --> fan out KNOB profiles --> run agentic cases
+#   (agent-dispatch; ollama HELD via with-ollama-lease, never evicted) --> grade
+#   (arch_score) --> aggregate objective --> argmax(score) --> summary.md
 #
-# This is the NUMERIC sibling of scripts/orchestrator/orchestrate.sh — NOT the LLM
-# converger / ci-aipr (those grade unquantifiable code diffs; this has a number, so
-# argmax is strictly better and free; see ./AGENTS.md "The loop"). It REUSES, never
-# rebuilds:
-#   - worker:  scripts/lib/agent-dispatch.sh  (one hermetic model run; reads
-#              TOOLS/SYSPROMPT/THINKING/MAX_TURNS/TIMEOUT/ERRLOG from this scope)
-#   - corpus:  agentic-bench/arch_cases/agentic_*.json
-#   - grader:  agentic-bench/arch_score.grade_agentic (via grade_one.py)
+# REUSES, never rebuilds:
+#   - model choice: `agent-role <role> <rank>`  (~/.config/mu/agent_roles.toml)
+#   - ollama box:   `with-ollama-lease`         (cooperative etcd mutex; never evict)
+#   - worker:       scripts/lib/agent-dispatch.sh
+#   - corpus:       agentic-bench/arch_cases/agentic_*.json
+#   - grader:       agentic-bench/arch_score.grade_agentic (via grade_one.py)
 # and copies orchestrate.sh's RUN_DIR + provenance.jsonl + summary.md discipline.
 #
-# A PROFILE is one *.env file in <profiles-dir>, sourced in an isolated subshell. It
-# sets the search-space unit (see ./AGENTS.md "What a profile is"):
+# A PROFILE is one *.env file in <profiles-dir> setting only KNOBS (NEVER a model):
 #   PROFILE_ID   required  short label, also the per-profile result subdir
-#   PROVIDER     required  agent-dispatch provider (ollama / openrouter / vllm / claude-oauth)
-#   MODEL        required  model id for that provider
-#   THINKING     optional  effort: low|medium|high (default low) — the effort knob
+#   THINKING     optional  effort low|medium|high (default low) — the effort knob
 #   SYSPROMPT    optional  path to a system-prompt-addendum file — the addendum knob
-#                          (provider-agnostic; works on ollama, unlike the catalog field)
 #   TOOLS        optional  mu tool CSV (default $TOOLS_DEFAULT)
-#   plus any MU_MODELS_* env to overlay the catalog (sampling/addendum) for
-#   openrouter/vllm — isolated per profile by the subshell.
+#   plus any MU_MODELS_* env to overlay the catalog (sampling/addendum) for the
+#   OpenRouter-path providers — isolated per profile by the subshell.
+#
+# The MODEL is the SAME across all profiles (the search varies knobs, not models):
+#   ROLE  role to resolve (default harness_fit)   RANK  rank within the role (default 0)
+# To probe a different model, re-point the role in agent_roles.toml (or pass ROLE/RANK)
+# — do NOT add a model to a profile. Cross-MODEL sweeps are arch-bench's job.
 #
 # usage: profile-search.sh <profiles-dir> [run-tag]
 set -u
@@ -44,16 +46,34 @@ CASES_GLOB="${CASES_GLOB:-agentic_rust.json agentic_python.json}"  # case files 
 CASE_LIMIT="${CASE_LIMIT:-0}"                  # 0 = all cases in each file
 PER_CASE_TIMEOUT="${PER_CASE_TIMEOUT:-300}"    # wall-clock backstop per case (s)
 MAX_TURNS="${MAX_TURNS:-20}"
-TOOLS_DEFAULT="${TOOLS_DEFAULT:-read,grep,ls,glob}"  # agentic tool grant (matches arch_bench)
+TOOLS_DEFAULT="${TOOLS_DEFAULT:-read,grep,ls,glob}"  # agentic tool grant
 OBJECTIVE="${OBJECTIVE:-pass_rate}"            # pass_rate | pass_per_dollar
-WARMUP="${WARMUP:-0}"                           # 1 = untimed warm of each ollama model.
-                                                # DEFAULT OFF: the ollama box is SHARED —
-                                                # warming/loading a model evicts whatever
-                                                # others are using. Only set WARMUP=1 (and
-                                                # only run ollama profiles at all) once you
-                                                # hold EXCLUSIVE use of the box.
+ROLE="${ROLE:-harness_fit}"; RANK="${RANK:-0}"; export ROLE RANK
 RUN_DIR="${RUN_DIR:-$HOME/metaharness-runs/run-$RUN_TAG}"
-OLLAMA_ENDPOINT="${OLLAMA_ENDPOINT:-http://10.1.1.143:11434}"
+
+log(){ printf '[profile-search] %s\n' "$*" >&2; }
+
+# ---- resolve the MODEL by ROLE (config, never hardcoded) ----
+command -v agent-role >/dev/null 2>&1 || { log "FATAL: agent-role not found (needed to resolve the model)"; exit 1; }
+set -- $(agent-role "$ROLE" "$RANK" 2>/dev/null)   # "<provider> <model>"; clobbers $1/$2 (saved above)
+PROVIDER="${1:-}"; MODEL="${2:-}"
+[ -n "$PROVIDER" ] && [ -n "$MODEL" ] || { log "FATAL: agent-role '$ROLE' rank $RANK resolved no provider/model"; exit 1; }
+log "model: role=$ROLE rank=$RANK -> $PROVIDER/$MODEL"
+
+# ---- cooperative ollama box lock ----
+# A benchmark is a box consumer that MUST hold the lease, never evict whatever other
+# sessions are using (the shared 10.1.1.143 box can't co-resident two large models).
+# Self-wrap ONCE under with-ollama-lease (WAIT mode: acquire, hold for the WHOLE sweep,
+# release on exit) so every arm runs on the resident model without thrashing others.
+# Non-ollama providers (subscription / cloud) need no lease and skip this.
+if [ "$PROVIDER" = ollama ] && [ -z "${MH_LEASED:-}" ]; then
+  if command -v with-ollama-lease >/dev/null 2>&1; then
+    log "ollama -> acquiring shared-box lease (with-ollama-lease) for the whole run"
+    exec with-ollama-lease env MH_LEASED=1 "$0" "$PROFILES_DIR" "$RUN_TAG"
+  fi
+  log "FATAL: ollama model resolved but with-ollama-lease not found — refusing to run uncoordinated on the shared box"
+  exit 1
+fi
 
 fixture_for(){  # $1=lang -> repo cwd the agentic case is graded against (mirrors arch_bench)
   case "$1" in
@@ -64,7 +84,6 @@ fixture_for(){  # $1=lang -> repo cwd the agentic case is graded against (mirror
 }
 
 mkdir -p "$RUN_DIR"
-log(){ printf '[profile-search] %s\n' "$*" >&2; }
 
 # Pin a STABLE mu binary into the run dir: `mu` in PATH is `emu`, an auto-build
 # launcher, and a concurrent session's emu run could rebuild target/release/mu out
@@ -108,28 +127,16 @@ log "cases: $NCASES from [$CASES_GLOB] (limit=${CASE_LIMIT})"
 
 TAB=$(printf '\t')
 
-warm_ollama(){  # $1=model — untimed load so cold-start doesn't burn a scored case
-  [ "$WARMUP" = 1 ] || return 0
-  log "  warming $1 ..."
-  curl -sS --max-time 1800 "$OLLAMA_ENDPOINT/api/chat" \
-    -H 'Content-Type: application/json' \
-    -d "$(printf '{"model":"%s","messages":[{"role":"user","content":"ok"}],"stream":false,"options":{"num_predict":1}}' "$1")" \
-    >/dev/null 2>&1 || log "  warmup $1 failed (continuing)"
-}
-
-run_profile(){  # $1 = profile env file (runs in a per-profile subshell from the caller)
+run_profile(){  # $1 = knob env file; PROVIDER/MODEL are the resolved globals
   pf="$1"
-  PROFILE_ID=""; PROVIDER=""; MODEL=""; THINKING="low"; SYSPROMPT=""; TOOLS="$TOOLS_DEFAULT"
+  PROFILE_ID=""; THINKING="low"; SYSPROMPT=""; TOOLS="$TOOLS_DEFAULT"
   . "$pf"
-  if [ -z "$PROFILE_ID" ] || [ -z "$PROVIDER" ] || [ -z "$MODEL" ]; then
-    log "SKIP $pf: a profile needs PROFILE_ID + PROVIDER + MODEL"; return 0
-  fi
+  [ -n "$PROFILE_ID" ] || { log "SKIP $pf: a knob profile needs PROFILE_ID"; return 0; }
   pdir="$RUN_DIR/$PROFILE_ID"; mkdir -p "$pdir"
   rows="$pdir/rows.jsonl"; : > "$rows"
-  printf '{"profile":"%s","provider":"%s","model":"%s","thinking":"%s","sysprompt":"%s","tools":"%s"}\n' \
-    "$PROFILE_ID" "$PROVIDER" "$MODEL" "$THINKING" "${SYSPROMPT:-}" "$TOOLS" > "$pdir/profile.json"
+  printf '{"profile":"%s","role":"%s","rank":"%s","provider":"%s","model":"%s","thinking":"%s","sysprompt":"%s","tools":"%s"}\n' \
+    "$PROFILE_ID" "$ROLE" "$RANK" "$PROVIDER" "$MODEL" "$THINKING" "${SYSPROMPT:-}" "$TOOLS" > "$pdir/profile.json"
   log "=== profile $PROFILE_ID: $PROVIDER/$MODEL think=$THINKING addendum=${SYSPROMPT:+yes} ==="
-  [ "$PROVIDER" = ollama ] && warm_ollama "$MODEL"
 
   while IFS="$TAB" read -r lang cid; do
     [ -n "$cid" ] || continue
@@ -175,11 +182,11 @@ for pf in "$PROFILES_DIR"/*.env; do
   found=1
   ( run_profile "$pf" )   # subshell isolates each profile's env overlay (MU_MODELS_*, etc.)
 done
-[ "$found" = 1 ] || { log "FATAL: no *.env profiles in $PROFILES_DIR"; exit 1; }
+[ "$found" = 1 ] || { log "FATAL: no *.env knob profiles in $PROFILES_DIR"; exit 1; }
 
 # ---- aggregate + deterministic argmax(score) -> summary.md ----
-python3 - "$RUN_DIR" "$OBJECTIVE" > "$RUN_DIR/summary.md" <<'PY'
-import glob, json, sys
+MODEL="$MODEL" PROVIDER="$PROVIDER" ROLE="$ROLE" python3 - "$RUN_DIR" "$OBJECTIVE" > "$RUN_DIR/summary.md" <<'PY'
+import glob, json, os, sys
 run_dir, objective = sys.argv[1], sys.argv[2]
 profs = []
 for rows_path in sorted(glob.glob(f"{run_dir}/*/rows.jsonl")):
@@ -205,9 +212,10 @@ for rows_path in sorted(glob.glob(f"{run_dir}/*/rows.jsonl")):
                       pass_rate=pass_rate, score=score))
 # argmax: score desc, then fewer leaks, then cheaper (deterministic tie-break)
 profs.sort(key=lambda p: (-p["score"], p["leaks"], p["cost"], p["pid"]))
-print(f"# meta-harness Path A — profile search\n")
+print(f"# meta-harness Path A — knob search\n")
 print(f"`{run_dir}`\n")
-print(f"objective: **{objective}** | profiles: {len(profs)}\n")
+print(f"model: **{os.environ.get('PROVIDER','?')}/{os.environ.get('MODEL','?')}** "
+      f"(role `{os.environ.get('ROLE','?')}`) | objective: **{objective}** | profiles: {len(profs)}\n")
 print("| rank | profile | pass_rate | pass/graded | leaks | fab | timeout | err | cost$ | score |")
 print("|---|---|--:|--:|--:|--:|--:|--:|--:|--:|")
 for i, p in enumerate(profs, 1):

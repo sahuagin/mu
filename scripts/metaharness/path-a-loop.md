@@ -8,10 +8,16 @@ methodology ("pre-register the design to disk before the first model call").
 
 ## What it does
 
+It searches the **harness-fit KNOBS** (effort / addendum / sampling) for a model that
+is **resolved by ROLE**, not hardcoded. Model *selection* is `agent-role`'s job (and
+the benches behind it); this loop only tunes the harness to whatever model the role
+resolves — which is what "harness-model-fit" means. Cross-*model* sweeps stay
+arch-bench's job.
+
 ```
-fan out N profiles --> run the agentic-bench corpus per profile (agent-dispatch)
-                   --> grade each answer (arch_score) --> aggregate a numeric
-                   --> OBJECTIVE per profile --> select = argmax(score)
+resolve model (agent-role) --> fan out N KNOB profiles --> run the agentic-bench
+  corpus per profile (agent-dispatch; ollama HELD via with-ollama-lease, never
+  evicted) --> grade (arch_score) --> aggregate a numeric OBJECTIVE --> argmax(score)
 ```
 
 It is the **numeric** sibling of `scripts/orchestrator/orchestrate.sh`. The
@@ -22,6 +28,8 @@ rebuilds:
 
 | Piece | Reused from |
 |---|---|
+| model choice | `agent-role <role> <rank>` (`~/.config/mu/agent_roles.toml`) |
+| ollama box coordination | `with-ollama-lease` (cooperative etcd mutex; never evict) |
 | worker (one hermetic model run) | `scripts/lib/agent-dispatch.sh` |
 | task corpus | `agentic-bench/arch_cases/agentic_*.json` |
 | grader | `agentic-bench/arch_score.grade_agentic` (via `grade_one.py`) |
@@ -51,28 +59,34 @@ once produced a false "novel" — see the channel's loud-empty guard). Treat a n
 verdict as "go read these and decide already-addressed | partial | novel," not a hard
 block.
 
-## A profile = one `*.env` file
+## A profile = one `*.env` file (KNOBS only — never a model)
 
-Sourced in an isolated subshell (so catalog overlays don't leak between arms):
+Sourced in an isolated subshell (so catalog overlays don't leak between arms). A
+profile sets only knobs; the **model is the same across all profiles**, resolved once
+by role:
 
 | var | req | meaning |
 |---|---|---|
 | `PROFILE_ID` | ✓ | label + per-profile result subdir |
-| `PROVIDER` | ✓ | agent-dispatch provider (ollama / openrouter / vllm / claude-oauth) |
-| `MODEL` | ✓ | model id |
 | `THINKING` | | effort low\|medium\|high (default low) — **the effort knob** |
 | `SYSPROMPT` | | path to a system-prompt-addendum file — **the addendum knob** |
 | `TOOLS` | | mu tool CSV (default `read,grep,ls,glob`) |
-| `MU_MODELS_*` | | catalog overlay (sampling / catalog-addendum) for openrouter/vllm |
+| `MU_MODELS_*` | | catalog overlay (sampling / catalog-addendum) for the OpenRouter-path |
+
+The model comes from `ROLE` / `RANK` at the loop level (default `harness_fit` / `0`),
+resolved via `agent-role`. **Never put a `PROVIDER`/`MODEL` in a profile** — to probe a
+different model, re-point the role in `agent_roles.toml` (or pass `ROLE=`/`RANK=`).
 
 ## Terrain that shaped this (the expensive-to-rediscover bits)
 
-1. **`agent-dispatch.sh` is the right driver, not `arch_bench.py`.** `arch_bench` is a
-   *sweep* tool: its model set comes from `config_models.json` and it takes **no**
-   `--model`/`--provider` flag, and its agentic path does **not** pass `--thinking`.
-   A profile search needs per-profile single-model control *with* the effort knob —
-   `agent_dispatch` gives exactly that (it reads `THINKING`/`SYSPROMPT`/`TOOLS` from
-   scope). We reuse `arch_bench`'s *corpus* and *grader*, not its driver.
+1. **Resolve the model by role; dispatch via `agent-dispatch.sh`, not `arch_bench.py`.**
+   Model choice is `agent-role`'s job (config in `agent_roles.toml`) — the loop never
+   hardcodes a model. For the *run*, `arch_bench` is a *sweep* tool: its model set comes
+   from `config_models.json`, it takes **no** `--model`/`--provider`, and its agentic
+   path doesn't pass `--thinking`. The knob search needs single-model control *with* the
+   effort/addendum knobs — `agent_dispatch` gives exactly that (it reads
+   `THINKING`/`SYSPROMPT`/`TOOLS` from scope). We reuse `arch_bench`'s *corpus* and
+   *grader*, not its driver.
 2. **Provider × knob × cost matrix** (verified against mu `crates/mu-ai/src/providers`):
    | backend | wire | catalog sampling/addendum | dispatch `SYSPROMPT` | cost |
    |---|---|---|---|---|
@@ -103,16 +117,18 @@ Sourced in an isolated subshell (so catalog overlays don't leak between arms):
 3. **`mu` in PATH is `emu`** — an auto-build launcher (`.mu/emu`). Running it can
    rebuild `target/release/mu` mid-experiment. The loop **pins a frozen copy** of the
    binary into `RUN_DIR/mu` so every arm sees byte-identical mu.
-4. **The ollama box (10.1.1.143) is a SHARED resource.** Loading/warming/evicting a
-   model evicts whatever other sessions are actively using. Do **not** run ollama
-   profiles — and never set `WARMUP=1` — without **exclusive use** of the box
-   (coordinate with the operator, who stops other models first). `WARMUP` defaults
-   OFF for this reason. The free-but-uncontended alternatives are a local vllm
-   server or a tiny openrouter run.
+4. **The ollama box (10.1.1.143) is SHARED — the loop holds it cooperatively.** It
+   can't co-resident two large models, so loading a different model evicts whatever
+   others are using (the DoS this loop must not cause). When the resolved provider is
+   `ollama`, the loop **self-wraps under `with-ollama-lease`** (WAIT mode: acquire the
+   `ollama-box` mutex, hold it for the whole sweep, release on exit) and resolves the
+   **resident** model (`harness_fit` rank 0 = `qwen3.6:35b-a3b-q8_0`), so there's no
+   load/evict thrash — it waits its turn and cooperates. No `with-ollama-lease` on PATH
+   ⇒ the loop refuses to run ollama rather than go uncoordinated.
 5. **ollama sampling on the wire reloads the model** (13+ min cold start). So a
    sampling grid does **not** belong on ollama — bake sampling into the Modelfile, or
-   run the sampling grid on vllm/openrouter. This is why the first experiment varies
-   **effort × addendum, not sampling** (correcting the original handoff default).
+   run the sampling grid on an OpenRouter-path role. This is why the first experiment
+   varies **effort × addendum, not sampling** (correcting the original handoff default).
 6. **Cost.** `agent_dispatch` uses `mu ask --bare`, which persists no event log, so
    per-run tokens aren't metered here. For free (ollama) runs cost = 0 and the
    objective is `pass_rate`. `pass_per_dollar` is wired but degenerate at $0; the
@@ -129,48 +145,45 @@ specifically targets leaks).
 
 ## First experiment (pre-registered)
 
-`experiments/effort-addendum-ollama/` — **{effort low|high} ×
-{addendum none|tool-dialect-nudge}** = 4 profiles, the full 12-case agentic corpus.
-
-> **Backend/model pending operator coordination.** The `*.env` files are templates
-> (they currently name `gpt-oss:20b`, the initial pick — *rejected*: don't load it on
-> the shared box). Before the scored run, confirm with the operator: either (a)
-> **exclusive** ollama use + the agreed model, or (b) a local **vllm** server, or (c)
-> a tiny **openrouter** run. See terrain note #4 (shared box). The loop is validated
-> (grading/argmax on synthetic + real data; live-dispatch mechanics via smoke); only
-> a live *passing* run remains, which is what this scored run delivers.
+`experiments/effort-addendum/` — **{effort low|high} × {addendum none|tool-dialect-nudge}**
+= 4 knob profiles, over the 12-case agentic corpus, on the model the `harness_fit` role
+resolves (rank 0 = `qwen3.6:35b-a3b-q8_0`, the resident local agentic model — free,
+held cooperatively via `with-ollama-lease`).
 
 - **Hypothesis H1 (addendum):** the tool-dialect nudge (`experiments/addenda/
   tool-dialect-nudge.txt`) reduces dialect leak and/or raises pass_rate vs the
-  no-addendum control. (This is the agentic-bench founding signal — the benchmark was
-  born from ~50% dialect-flake; if the rescue layer already catches it, expect a null
-  result, which is still informative.)
+  no-addendum control. (Founding agentic-bench signal — born from ~50% dialect-flake;
+  on ollama's Anthropic-native `tool_use` path the rescue/native path may already catch
+  it, so expect a possible null, which is still informative.)
 - **Hypothesis H2 (effort):** higher effort raises pass_rate on multi-hop cases.
-- **Controlled:** model + corpus + dispatch held byte-identical across arms; only the
-  profile varies. Served model = whatever `--provider/--model` says (never trust model
-  self-report).
+- **Controlled:** model (role-resolved) + corpus + dispatch held byte-identical across
+  arms; only the knob profile varies. Served model = whatever the role resolved (never
+  trust model self-report; read it from `profile.json`).
 - **Null results count.** The deliverable is the loop; an honest "no difference"
   selection is a valid outcome.
 
 ## Run
 
+The model is whatever `ROLE`/`RANK` resolves; ollama is auto-held via `with-ollama-lease`.
+
 ```sh
-# smoke (loop mechanics, ~minutes):
+# smoke (loop mechanics, ~minutes) — one rust case, default harness_fit role:
 CASE_LIMIT=1 CASES_GLOB="agentic_rust.json" RUN_DIR=/tmp/mh-smoke \
-  ./profile-search.sh experiments/_smoke smoke
+  ./profile-search.sh experiments/effort-addendum smoke
 
-# addendum A/B on OpenRouter (BILLED ~pennies; no shared-box contention):
-CASE_LIMIT=2 CASES_GLOB="agentic_rust.json" \
-  ./profile-search.sh experiments/addendum-openrouter
-
-# ollama grid (FREE, but EXCLUSIVE-USE ONLY — see terrain note #4):
-WARMUP=1 ./profile-search.sh experiments/effort-addendum-ollama
+# first experiment (FREE local; cooperatively leases the box):
+./profile-search.sh experiments/effort-addendum
 # -> ~/metaharness-runs/run-<stamp>/summary.md  (leaderboard + WINNER)
+
+# same knob search on a different model — re-point the role, don't edit profiles:
+ROLE=harness_fit RANK=1 ./profile-search.sh experiments/effort-addendum   # rank 1 = gpt-5.5 ($0 sub)
 ```
 
-**Billed providers:** the loop does not meter spend (`--bare` persists no event log),
-so there is no in-loop `$` cap. Bound cost the only ways available: small `CASE_LIMIT`,
-a tight `MAX_TURNS`, and a few profiles. Start tiny, read `summary.md`, then widen.
+**Billed providers** (a role rank that resolves to `openrouter`): the loop does not
+meter spend (`--bare` persists no event log), so there is no in-loop `$` cap. Bound
+cost with a small `CASE_LIMIT`, a tight `MAX_TURNS`, and few profiles; never route a
+subscription-covered model through openrouter (the documented $15.59 lesson — see the
+`model-routing` skill). Start tiny, read `summary.md`, then widen.
 
-Knobs: `CASE_LIMIT`, `CASES_GLOB`, `PER_CASE_TIMEOUT`, `MAX_TURNS`, `OBJECTIVE`,
-`WARMUP`, `MU_REPO`, `ARCH_BENCH`, `RUN_DIR`, `MU`.
+Knobs: `ROLE`, `RANK`, `CASE_LIMIT`, `CASES_GLOB`, `PER_CASE_TIMEOUT`, `MAX_TURNS`,
+`OBJECTIVE`, `MU_REPO`, `ARCH_BENCH`, `RUN_DIR`, `MU`.

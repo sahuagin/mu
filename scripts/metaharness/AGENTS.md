@@ -27,6 +27,14 @@ A profile is the model-fit knobs, set in **two** places — don't look for them 
 
 ## Reuse map — DO NOT rebuild these
 
+- **Model choice** (resolve, never hardcode): `agent-role <role> <rank>` →
+  `<provider> <model>` from `~/.config/mu/agent_roles.toml`. The harness uses the
+  `harness_fit` role. NEVER write a provider/model literal into a profile or script —
+  re-point the role instead. (See ~/.claude/AGENTS.md "Model selection".)
+- **ollama box** (cooperative lock): `with-ollama-lease <cmd>` — the shared box can't
+  co-resident two large models; a benchmark MUST hold the lease (WAIT to acquire) or
+  route around (`--skip-if-held`), never load/evict uncoordinated. The loop self-wraps
+  in it for ollama-resolved models.
 - **Worker** (run one model on a prompt, hermetically): [`../lib/agent-dispatch.sh`](../lib/agent-dispatch.sh).
   `agent_dispatch <provider> <model> [<prompt-file>]` → stdout; reads
   `TOOLS / SYSPROMPT / THINKING / MAX_TURNS / TIMEOUT / ERRLOG` from caller scope.

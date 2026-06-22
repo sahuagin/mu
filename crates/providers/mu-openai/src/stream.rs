@@ -41,6 +41,22 @@ pub enum ResponseStreamEvent {
         item: OutputItem,
         sequence_number: u64,
     },
+    #[serde(rename = "response.content_part.added")]
+    ContentPartAdded {
+        item_id: String,
+        output_index: u32,
+        content_index: u32,
+        part: crate::OutputContent,
+        sequence_number: u64,
+    },
+    #[serde(rename = "response.content_part.done")]
+    ContentPartDone {
+        item_id: String,
+        output_index: u32,
+        content_index: u32,
+        part: crate::OutputContent,
+        sequence_number: u64,
+    },
     #[serde(rename = "response.output_text.delta")]
     OutputTextDelta {
         delta: String,
@@ -91,12 +107,36 @@ pub enum ResponseStreamEvent {
         arguments: String,
         sequence_number: u64,
     },
+    #[serde(rename = "response.reasoning_summary_part.added")]
+    ReasoningSummaryPartAdded {
+        item_id: String,
+        output_index: u32,
+        summary_index: u32,
+        part: JsonValue,
+        sequence_number: u64,
+    },
+    #[serde(rename = "response.reasoning_summary_part.done")]
+    ReasoningSummaryPartDone {
+        item_id: String,
+        output_index: u32,
+        summary_index: u32,
+        part: JsonValue,
+        sequence_number: u64,
+    },
     #[serde(rename = "response.reasoning_summary_text.delta")]
     ReasoningSummaryTextDelta {
         item_id: String,
         output_index: u32,
         summary_index: u32,
         delta: String,
+        sequence_number: u64,
+    },
+    #[serde(rename = "response.reasoning_summary_text.done")]
+    ReasoningSummaryTextDone {
+        item_id: String,
+        output_index: u32,
+        summary_index: u32,
+        text: String,
         sequence_number: u64,
     },
     #[serde(rename = "response.reasoning_text.delta")]
@@ -106,8 +146,27 @@ pub enum ResponseStreamEvent {
         delta: String,
         sequence_number: u64,
     },
+    #[serde(rename = "response.reasoning_text.done")]
+    ReasoningTextDone {
+        item_id: String,
+        output_index: u32,
+        text: String,
+        sequence_number: u64,
+    },
     #[serde(rename = "response.refusal.delta")]
     RefusalDelta { delta: String, sequence_number: u64 },
+    #[serde(rename = "response.refusal.done")]
+    RefusalDone {
+        refusal: String,
+        sequence_number: u64,
+    },
+    #[serde(rename = "response.error")]
+    ResponseError {
+        #[serde(default)]
+        code: Option<String>,
+        message: String,
+        sequence_number: u64,
+    },
     #[serde(rename = "error")]
     Error {
         #[serde(default)]
@@ -159,6 +218,42 @@ mod tests {
             other => panic!("got {other:?}"),
         }
     }
+    #[test]
+    fn content_part_and_refusal_events_parse() {
+        assert!(matches!(
+            parse(
+                json!({"type":"response.content_part.added","item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"hi","annotations":[]},"sequence_number":2})
+            ),
+            ResponseStreamEvent::ContentPartAdded { .. }
+        ));
+        assert!(matches!(
+            parse(json!({"type":"response.refusal.done","refusal":"no","sequence_number":7})),
+            ResponseStreamEvent::RefusalDone { .. }
+        ));
+    }
+
+    #[test]
+    fn reasoning_and_response_error_events_parse() {
+        assert!(matches!(
+            parse(
+                json!({"type":"response.reasoning_summary_part.added","item_id":"rs_1","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":"plan"},"sequence_number":3})
+            ),
+            ResponseStreamEvent::ReasoningSummaryPartAdded { .. }
+        ));
+        assert!(matches!(
+            parse(
+                json!({"type":"response.reasoning_text.done","item_id":"rs_1","output_index":0,"text":"hidden","sequence_number":4})
+            ),
+            ResponseStreamEvent::ReasoningTextDone { .. }
+        ));
+        assert!(matches!(
+            parse(
+                json!({"type":"response.error","code":"rate_limit","message":"slow down","sequence_number":5})
+            ),
+            ResponseStreamEvent::ResponseError { .. }
+        ));
+    }
+
     #[test]
     fn completed_event_parses() {
         assert!(matches!(

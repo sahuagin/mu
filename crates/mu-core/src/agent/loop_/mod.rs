@@ -743,6 +743,28 @@ enum Action {
 // queue-flow integration is covered by the existing behavior tests
 // (B-1..B-7) using mock providers and tools.
 
+/// How many consecutive actionless turns the loop will auto-continue
+/// through before giving up and ending the ask. Bounds a provider stuck
+/// emitting empties so it can't spin forever (also backstopped by the
+/// `max_turns` iteration cap, which every re-invoke counts against).
+/// (mu-rb4u)
+const MAX_EMPTY_TURN_RETRIES: u32 = 3;
+
+/// A turn is "actionless" when the model returned neither a tool call nor
+/// any visible text — e.g. an OpenAI Responses-API reasoning-only
+/// completion (`content: []`, `stop_reason: end_turn`, no usage). Such a
+/// turn carries no answer and no action; routing it straight to
+/// `MaybeFinish` ends the ask and forces the operator to type "continue".
+/// The loop auto-continues on it instead (bounded). (mu-rb4u)
+fn is_actionless_turn(msg: &AssistantMessage) -> bool {
+    msg.content.iter().all(|block| match block {
+        ContentBlock::ToolCall(_) => false,
+        ContentBlock::Text { text } => text.trim().is_empty(),
+        // Reasoning-only output is not, on its own, an actionable turn.
+        ContentBlock::Thinking { .. } => true,
+    })
+}
+
 /// Output of `plan_post_invoke_llm`.
 struct PostInvokeLlmPlan {
     /// True iff the loop should emit `AgentEvent::TurnEnd` before
@@ -980,6 +1002,11 @@ async fn run_inner(
     let mut messages: Vec<AgentMessage> = config.seed_messages.clone();
     let mut queue: VecDeque<Action> = VecDeque::new();
     let mut turn_count: u32 = 0;
+    // mu-rb4u: consecutive actionless (empty / reasoning-only) turns since
+    // the last turn that produced a tool call or visible text. Reset at
+    // ask start and on any non-actionless turn; bounds the empty-turn
+    // auto-continue at `MAX_EMPTY_TURN_RETRIES`.
+    let mut consecutive_empty_turns: u32 = 0;
     let mut mode: RunMode = RunMode::Idle;
     let mut aggregated_usage: Option<Usage> = None;
     let mut last_stop_reason: Option<StopReason> = None;
@@ -1548,6 +1575,8 @@ async fn run_inner(
                 }
                 if started_at.is_none() {
                     started_at = Some(Instant::now());
+                    // mu-rb4u: a fresh ask gets a fresh empty-turn budget.
+                    consecutive_empty_turns = 0;
                 }
                 turn_count += 1;
                 let _ = events.send(AgentEvent::TurnStart).await;
@@ -1817,24 +1846,82 @@ async fn run_inner(
                                 });
                             }
                         }
-                        last_stop_reason = Some(assistant_msg.stop_reason);
-                        let assistant = AgentMessage::Assistant(assistant_msg.clone());
-                        let _ = events
-                            .send(AgentEvent::MessageStart {
-                                message: assistant.clone(),
-                            })
-                            .await;
-                        messages.push(assistant.clone());
-                        let _ = events
-                            .send(AgentEvent::MessageEnd { message: assistant })
-                            .await;
+                        // mu-rb4u: a codex/gpt-5.5 reasoning-only
+                        // completion arrives as an actionless turn (no tool
+                        // call, no text). plan_post_invoke_llm would route
+                        // it to MaybeFinish, ending the ask and forcing the
+                        // operator to type "continue". Treat it as a
+                        // transient hiccup: drop the empty turn (don't
+                        // pollute history) and re-invoke — bounded by
+                        // MAX_EMPTY_TURN_RETRIES, backstopped by max_turns.
+                        // Skipped when a buffered UserMessage is waiting:
+                        // that's the operator's own next ask; let it run.
+                        if is_actionless_turn(&assistant_msg)
+                            && buffered.is_empty()
+                            && consecutive_empty_turns < MAX_EMPTY_TURN_RETRIES
+                        {
+                            consecutive_empty_turns += 1;
+                            let _ = events
+                                .send(AgentEvent::Callout {
+                                    category: "warning".to_owned(),
+                                    title: "empty model turn — auto-continuing".to_owned(),
+                                    body: serde_json::json!({
+                                        "provider": provider.provider_label(),
+                                        "stop_reason": format!("{:?}", assistant_msg.stop_reason),
+                                        "attempt": consecutive_empty_turns,
+                                        "max_attempts": MAX_EMPTY_TURN_RETRIES,
+                                        "reason": "model returned no tool call and no text; \
+                                                   re-invoking instead of ending the ask",
+                                    }),
+                                    theme: Some("warning".to_owned()),
+                                    context_refs: vec!["bead:mu-rb4u".to_owned()],
+                                })
+                                .await;
+                            queue.push_back(Action::InvokeLlm);
+                        } else {
+                            // Only the true budget-exhaustion case is a
+                            // give-up worth surfacing. An actionless turn
+                            // with a buffered UM waiting isn't exhaustion —
+                            // we end the ask precisely so the operator's
+                            // queued message runs next; no callout needed.
+                            if is_actionless_turn(&assistant_msg)
+                                && consecutive_empty_turns >= MAX_EMPTY_TURN_RETRIES
+                            {
+                                let _ = events
+                                    .send(AgentEvent::Callout {
+                                        category: "warning".to_owned(),
+                                        title: "empty model turns persisted — ending ask"
+                                            .to_owned(),
+                                        body: serde_json::json!({
+                                            "provider": provider.provider_label(),
+                                            "consecutive_empty_turns": consecutive_empty_turns,
+                                            "max_attempts": MAX_EMPTY_TURN_RETRIES,
+                                        }),
+                                        theme: Some("warning".to_owned()),
+                                        context_refs: vec!["bead:mu-rb4u".to_owned()],
+                                    })
+                                    .await;
+                            }
+                            consecutive_empty_turns = 0;
+                            last_stop_reason = Some(assistant_msg.stop_reason);
+                            let assistant = AgentMessage::Assistant(assistant_msg.clone());
+                            let _ = events
+                                .send(AgentEvent::MessageStart {
+                                    message: assistant.clone(),
+                                })
+                                .await;
+                            messages.push(assistant.clone());
+                            let _ = events
+                                .send(AgentEvent::MessageEnd { message: assistant })
+                                .await;
 
-                        let plan = plan_post_invoke_llm(&assistant_msg, buffered);
-                        if plan.emit_turn_end {
-                            let _ = events.send(AgentEvent::TurnEnd).await;
-                        }
-                        for action in plan.actions {
-                            queue.push_back(action);
+                            let plan = plan_post_invoke_llm(&assistant_msg, buffered);
+                            if plan.emit_turn_end {
+                                let _ = events.send(AgentEvent::TurnEnd).await;
+                            }
+                            for action in plan.actions {
+                                queue.push_back(action);
+                            }
                         }
                     }
                     Err(Outcome::OutstandingCancelled { reason }) => {

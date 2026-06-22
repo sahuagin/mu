@@ -590,6 +590,10 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             EventPayload::SessionConfigResolved {
                 context_soft_limit: soft,
                 context_hard_limit,
+                // mu-a79g: record the output budget the compaction
+                // trigger reserves against, so the effective compaction
+                // point is reconstructable from the event stream alone.
+                max_output_tokens,
             },
         );
     }
@@ -1415,12 +1419,31 @@ pub async fn handle_set_route(
     // loop separately logs ProviderSwitched for provider/model identity;
     // this carries the limits that event's reserved fields don't yet.
     // Skip when the new route has no soft limit (nothing truthful to say).
+    //
+    // mu-a79g — ordering rationale (ci-aipr panel raised this, conceded on
+    // convergence): this append intentionally FOLLOWS `input_tx.send` above
+    // and is guarded on it — we record the snapshot only for a switch the
+    // loop actually accepted (a send failure returns early, recording
+    // nothing). A reviewer may flag that a config effect can precede its
+    // durable snapshot (the loop could emit a CompactionAssembly using the
+    // new `max_output` reserve before this event lands). That is NOT a
+    // source-of-truth gap: CompactionAssembly is self-describing — it
+    // carries the predicted/threshold/output_reserve it fired on, so
+    // reconstructing a compaction never depends on correlating it with this
+    // snapshot. This snapshot serves the status/config seam (the model's
+    // current budget), not per-compaction interpretation. The inverse order
+    // (append-first) would be worse: it would record config for a switch
+    // that may never be delivered.
     if let (Some(soft), Some(log)) = (context_soft_limit, sessions.event_log(&params.session_id)) {
         log.append(
             EventActor::System,
             EventPayload::SessionConfigResolved {
                 context_soft_limit: soft,
                 context_hard_limit,
+                // mu-a79g: the new model's output budget tracks the
+                // switch, mirroring the reservation the SwitchProvider
+                // handler just applied above.
+                max_output_tokens,
             },
         );
     }
@@ -1472,7 +1495,7 @@ mod config_keys {
 fn read_config_key(log: &SessionEventLog, key: &str) -> Option<Value> {
     let (soft, hard) = log
         .context_limits()
-        .map_or((None, None), |(s, h)| (Some(s), h));
+        .map_or((None, None), |(s, h, _max_output)| (Some(s), h));
     match key {
         config_keys::SOFT_LIMIT => Some(soft.map_or(Value::Null, Value::from)),
         config_keys::HARD_LIMIT => Some(hard.map_or(Value::Null, Value::from)),
@@ -1600,12 +1623,21 @@ pub async fn handle_set_config(request: Request<Value>, sessions: Sessions) -> R
                     // event so the status meter reflects the same value.
                     // Both flow from this one write.
                     live_soft_limit.store(tokens, Ordering::Relaxed);
-                    let hard = log.context_limits().and_then(|(_, h)| h);
+                    // mu-a79g: this seam has no route catalog, so carry
+                    // BOTH the hard limit and the output budget forward
+                    // from the latest recorded snapshot — otherwise a
+                    // soft-limit change would silently drop max_output and
+                    // the effective compaction point would stop being
+                    // reconstructable from the event stream.
+                    let (hard, max_output) = log
+                        .context_limits()
+                        .map_or((None, None), |(_, h, m)| (h, m));
                     log.append(
                         EventActor::System,
                         EventPayload::SessionConfigResolved {
                             context_soft_limit: tokens,
                             context_hard_limit: hard,
+                            max_output_tokens: max_output,
                         },
                     );
                     Ok(Value::from(tokens))
@@ -1970,12 +2002,15 @@ mod tests {
     async fn set_config_soft_limit_updates_live_and_meter_then_gate_denies() {
         let sessions = Sessions::new();
         let (log, live) = insert_live_session(&sessions, "s1", Capability::root());
-        // Seed a resolved snapshot so the hard limit is known.
+        // Seed a resolved snapshot so the hard limit (and mu-a79g output
+        // budget) are known — the latter must survive the set_config
+        // soft-limit change below (carry-forward, no route catalog here).
         log.append(
             EventActor::System,
             EventPayload::SessionConfigResolved {
                 context_soft_limit: 200_000,
                 context_hard_limit: Some(1_000_000),
+                max_output_tokens: Some(32_000),
             },
         );
         live.store(200_000, Ordering::Relaxed);
@@ -2016,7 +2051,12 @@ mod tests {
         );
         assert!(v["result"]["rejected"].as_array().unwrap().is_empty());
         assert_eq!(live.load(Ordering::Relaxed), 120_000);
-        assert_eq!(log.context_limits(), Some((120_000, Some(1_000_000))));
+        // mu-a79g: soft limit updated, hard limit + output budget carried
+        // forward from the seeded snapshot (set_config has no catalog).
+        assert_eq!(
+            log.context_limits(),
+            Some((120_000, Some(1_000_000), Some(32_000)))
+        );
 
         // read-only key + unknown key are both rejected (others still apply).
         let resp = handle_set_config(

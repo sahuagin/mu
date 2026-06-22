@@ -36,7 +36,9 @@ use tokio::task::JoinHandle;
 use crate::capability::{AutonomyCapability, Capability};
 use crate::command_journal::CommandTicket;
 use crate::context::rope::SpanText;
-use crate::context::{ProjectContext, ProjectionTarget, ProviderMessages, RetainedRope};
+use crate::context::{
+    CompactionTrigger, ProjectContext, ProjectionTarget, ProviderMessages, RetainedRope,
+};
 
 /// mu-kgu.4: default compaction threshold in tokens. Matches the
 /// Anthropic API's documented automatic-compaction trigger (150k
@@ -507,6 +509,19 @@ pub enum AgentEvent {
         decisions: Vec<crate::context::CompactionDecision>,
         /// Wall-clock duration of `policy.compact()` in milliseconds.
         wall_clock_us: u64,
+        /// mu-a79g: the feedback-predicted prompt total (mu-wsgx) the
+        /// threshold check compared — what made this compaction fire.
+        predicted_tokens: usize,
+        /// mu-a79g: the soft-limit-derived compaction threshold in
+        /// effect for this turn.
+        compaction_threshold: usize,
+        /// mu-a79g: the mu-ub6q output headroom reserved from the
+        /// threshold (`min(max_output, threshold/2)`). The effective
+        /// trigger point is `compaction_threshold - output_reserve`;
+        /// recording all three makes the event self-describing — a
+        /// consumer reconstructs and validates the trigger without
+        /// re-deriving the loop's inputs.
+        output_reserve: usize,
     },
     /// Provider-call lifecycle marker (mu-035 Phase A). Emitted on
     /// state transitions; Phase B will additionally emit periodic
@@ -1649,6 +1664,14 @@ async fn run_inner(
                                 tokens_after,
                                 decisions: complete.result.decisions.clone(),
                                 wall_clock_us: complete.result.wall_clock_us,
+                                // mu-a79g: the trigger captured when this
+                                // bg compaction was SPAWNED (a prior turn),
+                                // not this turn's values — replayed off the
+                                // completion so the event describes the
+                                // compaction that actually ran.
+                                predicted_tokens: complete.trigger.predicted_tokens,
+                                compaction_threshold: complete.trigger.compaction_threshold,
+                                output_reserve: complete.trigger.output_reserve,
                             })
                             .await;
                         compaction_baseline = Some(CompactionBaseline {
@@ -1766,6 +1789,15 @@ async fn run_inner(
                 let target_tokens = compaction_threshold / 2;
                 let output_reserve = current_max_output_tokens.min(target_tokens);
                 let effective_threshold = compaction_threshold.saturating_sub(output_reserve);
+                // mu-a79g: capture the trigger inputs so the emitted
+                // CompactionAssembly is self-describing — for the async
+                // path these ride through BgCompaction to the later emit
+                // turn (the values aren't in scope there).
+                let compaction_trigger = CompactionTrigger {
+                    predicted_tokens,
+                    compaction_threshold,
+                    output_reserve,
+                };
                 let rope = if predicted_tokens > effective_threshold {
                     let policy = config
                         .compaction_policy_override
@@ -1779,6 +1811,7 @@ async fn run_inner(
                             rope.clone(),
                             target_tokens,
                             messages.len(),
+                            compaction_trigger,
                         );
                         rope
                     } else {
@@ -1804,6 +1837,12 @@ async fn run_inner(
                                         tokens_after: renderer.estimate_tokens(&result.rope),
                                         decisions: result.decisions.clone(),
                                         wall_clock_us: result.wall_clock_us,
+                                        // mu-a79g: this turn's trigger,
+                                        // in scope on the sync path.
+                                        predicted_tokens: compaction_trigger.predicted_tokens,
+                                        compaction_threshold: compaction_trigger
+                                            .compaction_threshold,
+                                        output_reserve: compaction_trigger.output_reserve,
                                     })
                                     .await;
                                 compaction_baseline = Some(CompactionBaseline {

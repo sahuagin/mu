@@ -333,6 +333,25 @@ impl Default for CompactionQuota {
     }
 }
 
+/// mu-a79g: the compaction-trigger inputs, carried from the agent
+/// loop's decision point to the emitted `CompactionAssembly` event so
+/// the event is self-describing. For the async path the trigger is
+/// computed in one turn but the event is emitted in a later turn (when
+/// `try_take` adopts the result), so the values must ride along through
+/// [`BackgroundCompactionState`] rather than being re-read at emit time
+/// (when they no longer describe the compaction that actually ran).
+/// The effective trigger point is `compaction_threshold -
+/// output_reserve` (mu-ub6q).
+#[derive(Debug, Clone, Copy)]
+pub struct CompactionTrigger {
+    /// Feedback-predicted prompt total (mu-wsgx) the threshold check saw.
+    pub predicted_tokens: usize,
+    /// Soft-limit-derived compaction threshold in effect this turn.
+    pub compaction_threshold: usize,
+    /// Output headroom reserved from the threshold (mu-ub6q).
+    pub output_reserve: usize,
+}
+
 /// Per-session state machine for the background-compaction path.
 ///
 /// The agent loop calls [`Self::can_start`] before deciding whether
@@ -360,6 +379,9 @@ struct PendingCompaction {
     /// messages; the agent loop appends spans for messages added
     /// since then via [`append_messages_to_baseline`].
     messages_at_spawn: usize,
+    /// mu-a79g: the trigger inputs captured at spawn time, replayed
+    /// onto the `CompactionAssembly` event when this completes.
+    trigger: CompactionTrigger,
 }
 
 impl std::fmt::Debug for BackgroundCompactionState {
@@ -379,6 +401,10 @@ impl std::fmt::Debug for BackgroundCompactionState {
 pub struct CompletedBackgroundCompaction {
     pub result: CompactionResult,
     pub messages_at_spawn: usize,
+    /// mu-a79g: the trigger inputs this compaction fired on, captured at
+    /// spawn time (the values at emit time would describe a different
+    /// turn). Emitted on the `CompactionAssembly` event.
+    pub trigger: CompactionTrigger,
 }
 
 impl BackgroundCompactionState {
@@ -419,12 +445,15 @@ impl BackgroundCompactionState {
     /// is the snapshot of `messages.len()` at spawn time — recorded
     /// so the agent loop can append later-added message spans on
     /// apply (see [`crate::context::append_messages_to_baseline`]).
+    /// `trigger` (mu-a79g) is the trigger inputs captured here so the
+    /// later `CompactionAssembly` event describes the turn that fired.
     pub fn start(
         &mut self,
         policy: std::sync::Arc<dyn CompactionPolicy>,
         rope_snapshot: RetainedRope,
         target_tokens: usize,
         messages_len: usize,
+        trigger: CompactionTrigger,
     ) {
         debug_assert!(
             self.can_start(),
@@ -443,6 +472,7 @@ impl BackgroundCompactionState {
             handle,
             started_at: now,
             messages_at_spawn: messages_len,
+            trigger,
         });
         self.last_start = Some(now);
         self.attempt_count = self.attempt_count.saturating_add(1);
@@ -473,6 +503,7 @@ impl BackgroundCompactionState {
             Ok(result) => Some(Some(CompletedBackgroundCompaction {
                 result,
                 messages_at_spawn: pending.messages_at_spawn,
+                trigger: pending.trigger,
             })),
             // Task panicked or was aborted — surface as "no compaction
             // this round" rather than crashing the session.
@@ -497,6 +528,14 @@ impl Drop for BackgroundCompactionState {
 mod tests {
     use super::*;
     use crate::context::rope::{RetainedRope, RetentionClass, Span, SpanKind};
+
+    /// mu-a79g: a placeholder trigger for scheduling tests that don't
+    /// assert on the trigger values themselves.
+    const TEST_TRIGGER: CompactionTrigger = CompactionTrigger {
+        predicted_tokens: 0,
+        compaction_threshold: 0,
+        output_reserve: 0,
+    };
 
     fn sample_rope() -> RetainedRope {
         RetainedRope::from_spans(vec![
@@ -719,7 +758,7 @@ mod tests {
         let mut s = BackgroundCompactionState::new(CompactionQuota::default());
         let rope = sample_rope();
         let policy: std::sync::Arc<dyn CompactionPolicy> = std::sync::Arc::new(AsyncShrinkPolicy);
-        s.start(policy, rope.clone(), 100, 5);
+        s.start(policy, rope.clone(), 100, 5, TEST_TRIGGER);
         assert!(!s.can_start(), "should be blocked while pending");
         // Let the spawned task run.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -739,7 +778,7 @@ mod tests {
         let mut s = BackgroundCompactionState::new(quota);
         let rope = sample_rope();
         let policy: std::sync::Arc<dyn CompactionPolicy> = std::sync::Arc::new(AsyncShrinkPolicy);
-        s.start(policy, rope.clone(), 100, 0);
+        s.start(policy, rope.clone(), 100, 0, TEST_TRIGGER);
         // Drain the result so pending is None.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let _ = s.try_take().await;
@@ -760,7 +799,7 @@ mod tests {
         let mut s = BackgroundCompactionState::new(quota);
         let rope = sample_rope();
         let policy: std::sync::Arc<dyn CompactionPolicy> = std::sync::Arc::new(AsyncShrinkPolicy);
-        s.start(policy.clone(), rope.clone(), 100, 0);
+        s.start(policy.clone(), rope.clone(), 100, 0, TEST_TRIGGER);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let _ = s.try_take().await;
         assert!(!s.can_start(), "max_attempts_per_session=1 should block");

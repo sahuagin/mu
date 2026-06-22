@@ -487,7 +487,7 @@ fn compute_status(
     // soft-limit / hard-limit / fill vocabulary.
     let (context_soft_limit, context_hard_limit) = event_log
         .context_limits()
-        .map_or((None, None), |(soft, hard)| (Some(soft), hard));
+        .map_or((None, None), |(soft, hard, _max_output)| (Some(soft), hard));
 
     SessionStatus::compute(mu_core::session_status::StatusInputs {
         session_id,
@@ -877,6 +877,9 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
             tokens_after,
             decisions,
             wall_clock_us,
+            predicted_tokens,
+            compaction_threshold,
+            output_reserve,
         } => Some((
             EventActor::System,
             EventPayload::CompactionAssembly {
@@ -886,6 +889,12 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
                 tokens_after: *tokens_after as u64,
                 decisions: decisions.clone(),
                 wall_clock_us: *wall_clock_us,
+                // mu-a79g: carry the trigger inputs onto the durable
+                // event so the effective compaction point is
+                // reconstructable from the JSONL alone.
+                predicted_tokens: *predicted_tokens as u64,
+                compaction_threshold: *compaction_threshold as u64,
+                output_reserve: *output_reserve as u64,
             },
         )),
         AgentEvent::ProviderSwitched {
@@ -1737,6 +1746,12 @@ mod tests {
                 },
             ],
             wall_clock_us: 1234,
+            // mu-a79g: trigger inputs must round-trip onto the durable
+            // event so the effective compaction point (threshold -
+            // reserve) is reconstructable from the JSONL.
+            predicted_tokens: 158_000,
+            compaction_threshold: 150_000,
+            output_reserve: 16_000,
         };
         let (actor, payload) = to_log_event(&ev).expect("CompactionAssembly → durable log");
         assert_eq!(actor, EventActor::System);
@@ -1748,12 +1763,18 @@ mod tests {
                 tokens_after,
                 decisions,
                 wall_clock_us,
+                predicted_tokens,
+                compaction_threshold,
+                output_reserve,
             } => {
                 assert_eq!(model_call_id, 7);
                 assert_eq!(policy_id, "heuristic-span-family-drop");
                 assert_eq!(tokens_before, 160_000);
                 assert_eq!(tokens_after, 78_000);
                 assert_eq!(wall_clock_us, 1234);
+                assert_eq!(predicted_tokens, 158_000);
+                assert_eq!(compaction_threshold, 150_000);
+                assert_eq!(output_reserve, 16_000);
                 assert_eq!(decisions.len(), 2, "full audit, not a count");
                 match &decisions[1] {
                     CompactionDecision::Dropped { span_id, reason } => {

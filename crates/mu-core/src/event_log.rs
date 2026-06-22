@@ -107,6 +107,17 @@ pub enum EventPayload {
         /// this model.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_hard_limit: Option<u64>,
+        /// mu-a79g: the active model's output-token budget (route
+        /// catalog `max_output_tokens`). The compaction trigger reserves
+        /// `min(max_output, threshold/2)` of headroom (mu-ub6q), so
+        /// recording it here lets an event-log/status/audit consumer
+        /// reconstruct the *effective* compaction point without
+        /// re-deriving from the route catalog. `None` when the catalog
+        /// declares no output budget for this model. Carried forward
+        /// across a `set_config` soft-limit change (no route catalog at
+        /// that seam) via [`Self::context_limits`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_output_tokens: Option<u32>,
     },
     /// User-side input message arrived.
     UserMessage { content: String },
@@ -284,6 +295,26 @@ pub enum EventPayload {
         decisions: Vec<crate::context::CompactionDecision>,
         /// Wall-clock duration of `policy.compact()` in microseconds.
         wall_clock_us: u64,
+        /// mu-a79g: the trigger inputs this compaction fired on, so the
+        /// event is self-describing — a consumer reconstructs the
+        /// *effective* compaction point (`compaction_threshold -
+        /// output_reserve`) and validates it against the rope, rather
+        /// than re-deriving the policy's inputs from config + route
+        /// catalog. `predicted_tokens` is the feedback-predicted prompt
+        /// total (mu-wsgx) the threshold check actually compared. All
+        /// three default to 0 on read for events written before mu-a79g
+        /// (the trigger was unrecorded then).
+        #[serde(default)]
+        predicted_tokens: u64,
+        /// The soft-limit-derived compaction threshold in effect. See
+        /// [`crate::session_status`] for soft-limit vocabulary.
+        #[serde(default)]
+        compaction_threshold: u64,
+        /// mu-ub6q output headroom reserved from the threshold:
+        /// `min(max_output, threshold/2)`. Effective trigger point is
+        /// `compaction_threshold - output_reserve`.
+        #[serde(default)]
+        output_reserve: u64,
     },
     /// mu-recall-provenance-audit-vnc9.1 (P0): provenance refs for the
     /// session-start recall injection — one event per session creation,
@@ -1225,23 +1256,30 @@ impl SessionEventLog {
         None
     }
 
-    /// Pull the effective `(context_soft_limit, context_hard_limit)` out
-    /// of the most recent [`EventPayload::SessionConfigResolved`] event.
-    /// The soft limit is always present once resolved; the hard limit is
-    /// `None` when the route catalog has none for the active model.
+    /// Pull the effective `(context_soft_limit, context_hard_limit,
+    /// max_output_tokens)` out of the most recent
+    /// [`EventPayload::SessionConfigResolved`] event. The soft limit is
+    /// always present once resolved; the hard limit is `None` when the
+    /// route catalog has none for the active model; max_output is `None`
+    /// when the catalog declares no output budget.
     ///
     /// Mirrors [`Self::provider_info`]: a backward scan so a re-recorded
     /// snapshot after a live `set_route` shadows the one from session
     /// creation. `None` only when no snapshot has been recorded (e.g. a
     /// log built manually without going through dispatch). See
     /// [`crate::session_status`] for the term definitions.
-    pub fn context_limits(&self) -> Option<(u64, Option<u64>)> {
+    ///
+    /// mu-a79g: max_output rides along so `set_config` (which has no
+    /// route catalog) can carry it forward when it re-records the
+    /// soft-limit snapshot.
+    pub fn context_limits(&self) -> Option<(u64, Option<u64>, Option<u32>)> {
         let events = self.events.lock().ok()?;
         events.iter().rev().find_map(|ev| match &ev.payload {
             EventPayload::SessionConfigResolved {
                 context_soft_limit,
                 context_hard_limit,
-            } => Some((*context_soft_limit, *context_hard_limit)),
+                max_output_tokens,
+            } => Some((*context_soft_limit, *context_hard_limit, *max_output_tokens)),
             _ => None,
         })
     }
@@ -1298,18 +1336,27 @@ mod tests {
             EventPayload::SessionConfigResolved {
                 context_soft_limit: 150_000,
                 context_hard_limit: Some(200_000),
+                max_output_tokens: Some(8_192),
             },
         );
-        assert_eq!(log.context_limits(), Some((150_000, Some(200_000))));
-        // A live set_route re-records; the backward scan takes the latest.
+        assert_eq!(
+            log.context_limits(),
+            Some((150_000, Some(200_000), Some(8_192)))
+        );
+        // A live set_route re-records; the backward scan takes the latest
+        // — including max_output for the new model (mu-a79g).
         log.append(
             EventActor::System,
             EventPayload::SessionConfigResolved {
                 context_soft_limit: 262_144,
                 context_hard_limit: Some(262_144),
+                max_output_tokens: Some(262_144),
             },
         );
-        assert_eq!(log.context_limits(), Some((262_144, Some(262_144))));
+        assert_eq!(
+            log.context_limits(),
+            Some((262_144, Some(262_144), Some(262_144)))
+        );
     }
 
     #[test]

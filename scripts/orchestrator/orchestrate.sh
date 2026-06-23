@@ -27,14 +27,38 @@ TASK_FILE="${1:?usage: orchestrate.sh <task-file> <repo-dir>}"
 REPO_DIR="${2:?usage: orchestrate.sh <task-file> <repo-dir>}"
 
 # --- roles ---
-# Gate seats default to gpt-5.5: mu-rb4u fixed its reasoning-only empty-turns, so the whole
-# pipeline runs one provider with no anthropic dependency. The 2026-06-22 seat A/B found opus
-# the DEEPER skeptic for gate roles — set the matching *_PROVIDER/*_MODEL to
-# claude-oauth/claude-opus-4-8 to trade reliability for that depth.
-SPEC_CRITIC_PROVIDER="${SPEC_CRITIC_PROVIDER:-openai-codex}"; SPEC_CRITIC_MODEL="${SPEC_CRITIC_MODEL:-gpt-5.5}"  # spec-critic gate (forks before code)
-ARCHITECT_PROVIDER="${ARCHITECT_PROVIDER:-openai-codex}"; ARCHITECT_MODEL="${ARCHITECT_MODEL:-gpt-5.5}"  # invariant-guardian veto gate
-SEAT_PROVIDER="${SEAT_PROVIDER:-openai-codex}";    SEAT_MODEL="${SEAT_MODEL:-gpt-5.5}"            # the conductor under test
-WORKER_PROVIDER="${WORKER_PROVIDER:-ollama}"; WORKER_MODEL="${WORKER_MODEL:-qwen3.6:27b}"  # coding rank-1 (free, local; claude needs the proxy, absent on this box)
+# Gate seats (spec-critic, architect, conductor, converger) resolve from the
+# `orchestrate_gate` role in agent_roles.toml: rank 0 = gpt-5.5 (the reliable $0
+# default the pipeline was tuned on), rank 1 = opus (the 2026-06-22 A/B's "deeper
+# skeptic" — now a config-driven fallback, not a manual env override). Per-seat
+# *_PROVIDER/*_MODEL env vars still override one gate at a time; hardcoded gpt-5.5
+# is the fallback if agent-role or the role is absent. (No ollama rank in that
+# role — gate judgment is local models' weak lane, and the gates must not depend
+# on the shared ollama lease.)
+GATE_PROVIDER=""; GATE_MODEL=""
+if command -v agent-role >/dev/null 2>&1; then
+  # shellcheck disable=SC2046
+  set -- $(agent-role orchestrate_gate 0 2>/dev/null)
+  GATE_PROVIDER="${1:-}"; GATE_MODEL="${2:-}"
+fi
+GATE_PROVIDER="${GATE_PROVIDER:-openai-codex}"; GATE_MODEL="${GATE_MODEL:-gpt-5.5}"
+SPEC_CRITIC_PROVIDER="${SPEC_CRITIC_PROVIDER:-$GATE_PROVIDER}"; SPEC_CRITIC_MODEL="${SPEC_CRITIC_MODEL:-$GATE_MODEL}"  # spec-critic gate (forks before code)
+ARCHITECT_PROVIDER="${ARCHITECT_PROVIDER:-$GATE_PROVIDER}"; ARCHITECT_MODEL="${ARCHITECT_MODEL:-$GATE_MODEL}"  # invariant-guardian veto gate
+SEAT_PROVIDER="${SEAT_PROVIDER:-$GATE_PROVIDER}"; SEAT_MODEL="${SEAT_MODEL:-$GATE_MODEL}"  # the conductor under test
+# Worker seat: resolve from the lock-aware role registry (`agent-role coding`)
+# so a HELD ollama box demotes to a non-ollama coding rank automatically (the
+# #383 LOTO demote/sink) instead of hammering a box another session owns. An
+# explicit env override (WORKER_PROVIDER/WORKER_MODEL) still wins; the hardcoded
+# pair is the fallback when agent-role is unavailable. (Lease ACQUIRE is NOT done
+# here — it lands in the shared scripts/lib/agent-dispatch.sh so orchestrate +
+# ai-review inherit it at the dispatch layer; coordinated split, mu-dialogue
+# 2026-06-23.)
+if [ -z "${WORKER_PROVIDER:-}" ] && command -v agent-role >/dev/null 2>&1; then
+  # shellcheck disable=SC2046
+  set -- $(agent-role coding 0 2>/dev/null)
+  WORKER_PROVIDER="${1:-}"; WORKER_MODEL="${2:-}"
+fi
+WORKER_PROVIDER="${WORKER_PROVIDER:-ollama}"; WORKER_MODEL="${WORKER_MODEL:-qwen3.6:27b}"  # fallback if agent-role is absent
 AIREVIEW="${AIREVIEW:-$REPO_DIR/scripts/ai-review.sh}"
 SPEC_GATE="${SPEC_GATE:-1}"             # set 0 to skip the spec-critic gate (request-coherence check)
 ARCHITECT_GATE="${ARCHITECT_GATE:-1}"   # set 0 to skip the architect gate (e.g. seat A/B isolation)
@@ -44,10 +68,10 @@ ARCHITECT_GATE="${ARCHITECT_GATE:-1}"   # set 0 to skip the architect gate (e.g.
 # provider:model per slot (diverse $0 coding ranks); slots beyond it fall back to WORKER_*.
 CONVERGE_WORKERS="${CONVERGE_WORKERS:-1}"
 CONVERGE_ROSTER="${CONVERGE_ROSTER:-ollama:qwen3.6:27b,claude-oauth:claude-sonnet-4-6,openai-codex:gpt-5.5}"
-# The converger is a skeptical SELECTION gate (antagonistic, citation-gated). Defaults to
-# gpt-5.5 like the other gates now that mu-rb4u fixed the codex empty-turn bug that used to
-# return empty and silently default the pick; set claude-oauth/claude-opus-4-8 for opus depth.
-CONVERGER_PROVIDER="${CONVERGER_PROVIDER:-openai-codex}"; CONVERGER_MODEL="${CONVERGER_MODEL:-gpt-5.5}"
+# The converger is a skeptical SELECTION gate (antagonistic, citation-gated). It
+# shares the orchestrate_gate role with the other gates (gpt-5.5 first, opus
+# fallback); per-seat CONVERGER_PROVIDER/MODEL still overrides.
+CONVERGER_PROVIDER="${CONVERGER_PROVIDER:-$GATE_PROVIDER}"; CONVERGER_MODEL="${CONVERGER_MODEL:-$GATE_MODEL}"
 # Fixed, neutral system prompts (role + minimal tool-orientation) kept CONSTANT
 # across seat arms so identity/recall don't confound the A/B (--bare strips the rest).
 CONDUCTOR_PROMPT="${CONDUCTOR_PROMPT:-$(dirname "$0")/conductor-prompt.txt}"

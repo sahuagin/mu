@@ -66,6 +66,19 @@ impl InlineMenu {
         }
     }
 
+    /// Like [`new`](Self::new) but opens with the cursor on `initial`
+    /// (clamped to the item range). Value pickers use this so a bare confirm
+    /// keeps the *current* selection instead of jumping to item 0 — the
+    /// behavior the alt-screen modal had via its `initial` argument. (mu-zbmp)
+    pub fn with_cursor(items: Vec<MenuItem>, max_visible: usize, initial: usize) -> Self {
+        let mut menu = Self::new(items, max_visible);
+        if !menu.filtered.is_empty() {
+            menu.cursor = initial.min(menu.filtered.len() - 1);
+            menu.ensure_visible();
+        }
+        menu
+    }
+
     /// Process a key event. Returns what the caller should do.
     pub fn handle_key(&mut self, key: KeyEvent) -> MenuAction {
         match (key.modifiers, key.code) {
@@ -169,12 +182,12 @@ impl InlineMenu {
             })
             .map(|(i, _)| i)
             .collect();
-        // Clamp cursor
-        if self.filtered.is_empty() {
-            self.cursor = 0;
-        } else if self.cursor >= self.filtered.len() {
-            self.cursor = self.filtered.len() - 1;
-        }
+        // Reset the highlight to the first match whenever the filter
+        // changes — a narrower filter must not strand the cursor on an
+        // arbitrary later row. This matters now that value pickers can open
+        // on a nonzero initial cursor (`with_cursor`); the old modal picker
+        // reset to the top match on filter too. (mu-zbmp)
+        self.cursor = 0;
         self.scroll = 0;
         self.ensure_visible();
     }
@@ -225,6 +238,20 @@ mod tests {
     }
 
     #[test]
+    fn filter_resets_cursor_to_first_match() {
+        // Opened on the last item, then filtered: the highlight moves to the
+        // FIRST match, not a stale clamped row (mu-zbmp — the with_cursor /
+        // refilter interaction gpt-5.5 flagged).
+        let mut menu = InlineMenu::with_cursor(test_items(), 20, 8);
+        menu.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        // First name containing "o" is "/model" (original index 1).
+        match menu.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            MenuAction::Select(idx) => assert_eq!(idx, 1),
+            _ => panic!("expected Select(first match)"),
+        }
+    }
+
+    #[test]
     fn backspace_widens() {
         let mut menu = InlineMenu::new(test_items(), 20);
         let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
@@ -240,6 +267,21 @@ mod tests {
         let mut menu = InlineMenu::new(test_items(), 20);
         let bs = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
         assert!(matches!(menu.handle_key(bs), MenuAction::Dismiss));
+    }
+
+    #[test]
+    fn with_cursor_starts_on_initial_and_clamps() {
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        // Opens on `initial`, so a bare Enter selects it (not item 0).
+        let mut m = InlineMenu::with_cursor(test_items(), 20, 2);
+        assert!(matches!(m.handle_key(enter), MenuAction::Select(2)));
+        // Out-of-range initial clamps to the last item.
+        let mut m2 = InlineMenu::with_cursor(test_items(), 20, 999);
+        let last = test_items().len() - 1;
+        match m2.handle_key(enter) {
+            MenuAction::Select(idx) => assert_eq!(idx, last),
+            _ => panic!("expected clamp to last item"),
+        }
     }
 
     #[test]

@@ -26,7 +26,6 @@ use serde_json::Value;
 
 use crate::client::{Client, Message};
 use crate::input::InputBuffer;
-use crate::picker;
 use crate::render;
 use crate::skills::{self, DiscoveredSkill};
 use crate::transcript::{Transcript, TranscriptBlock, TranscriptKind};
@@ -221,6 +220,11 @@ pub fn normalize_provider_kind(provider: &str) -> String {
         "anthropic" | "anthropic-api" | "anthropic_api" | "claude" => "anthropic_api".into(),
         "anthropic-oauth" | "anthropic_oauth" | "claude-oauth" => "anthropic_oauth".into(),
         "openai" | "openai-codex" | "openai_codex" | "codex" => "openai_codex".into(),
+        // mu-zbmp: the public-key OpenAI path. Without this arm "openai-api"
+        // fell through to the passthrough and stayed hyphenated, so it matched
+        // neither known_models_for nor the daemon's `openai_api` wire kind —
+        // the provider picker offered a dead entry.
+        "openai-api" | "openai_api" => "openai_api".into(),
         "openrouter" | "open-router" | "open_router" => "openrouter".into(),
         "vllm" | "vllm-openai" | "local-vllm" | "local_vllm" => "vllm".into(),
         "ollama" | "local" => "ollama".into(),
@@ -448,6 +452,18 @@ enum MenuContext {
     SlashCommand,
     /// Effort-level picker: selection applies the effort level directly.
     Effort,
+    /// Provider picker: selection switches the session provider (mu-zbmp).
+    Provider,
+    /// Model picker: selection switches the session model (mu-zbmp).
+    Model,
+}
+
+/// Slash commands that open a populated value picker when chosen from the
+/// slash menu (the `›` affordance), rather than inserting `<cmd> ` for the
+/// user to type a value blind. The pickers reuse the inline-menu widget so
+/// they render in both the inline and fullscreen render paths. (mu-zbmp)
+fn is_picker_command(cmd: &str) -> bool {
+    matches!(cmd, "/effort" | "/provider" | "/model")
 }
 
 /// Session phase for the status line — a PROJECTION of current session
@@ -1400,18 +1416,27 @@ impl App {
                                 } else {
                                     format!("/{raw}")
                                 };
+                                self.prompt.clear();
+                                // mu-zbmp: picker-backed commands open their
+                                // populated value picker on select (the `›`
+                                // affordance) instead of inserting "<cmd> "
+                                // for the user to type a value blind.
+                                if is_picker_command(&cmd) {
+                                    match cmd.as_str() {
+                                        "/effort" => self.cmd_effort(vp, "")?,
+                                        "/provider" => self.cmd_provider(vp, "")?,
+                                        "/model" => self.cmd_model(vp, "")?,
+                                        _ => {}
+                                    }
+                                    return Ok(false);
+                                }
+                                // Free-form arg commands: insert "<cmd> " and
+                                // let the user type the argument.
                                 let takes_arg =
                                     matches!(
                                         cmd.as_str(),
-                                        "/btw"
-                                            | "/effort"
-                                            | "/provider"
-                                            | "/model"
-                                            | "/config"
-                                            | "/focus"
-                                            | "/collapse"
+                                        "/btw" | "/config" | "/focus" | "/collapse"
                                     ) || self.skills.contains_key(cmd.trim_start_matches('/'));
-                                self.prompt.clear();
                                 for c in cmd.chars() {
                                     self.prompt.insert_char(c);
                                 }
@@ -1429,23 +1454,37 @@ impl App {
                                 self.set_flash(format!("effort → {level}"));
                             }
                         }
+                        MenuContext::Provider => {
+                            if let Some(p) = KNOWN_PROVIDERS.get(idx) {
+                                self.apply_provider(vp, (*p).to_string())?;
+                            }
+                        }
+                        MenuContext::Model => {
+                            if let Some(m) = self.model_picker_strings().get(idx).cloned() {
+                                self.apply_model(vp, m)?;
+                            }
+                        }
                     }
                     return Ok(false);
                 }
                 MenuAction::Dismiss => {
                     let filter = menu.filter().to_string();
+                    // Only the slash-command menu writes its filter back to
+                    // the prompt (the user was typing a command). Value
+                    // pickers (effort/provider/model) discard the filter on
+                    // dismiss — it was picker filtering, not prompt text, so
+                    // cancelling can't leak e.g. "gpt" into the chat. (mu-zbmp)
+                    let keep_filter = matches!(self.menu_context, MenuContext::SlashCommand);
                     self.inline_menu = None;
                     self.menu_context = MenuContext::default();
-                    if filter.is_empty() {
-                        self.prompt.clear();
-                    } else {
-                        // Keep the typed text — the user was typing a
-                        // command that didn't match the menu filter.
-                        // Prompt already has "/" from the trigger; add
-                        // the filter chars.
+                    if keep_filter && !filter.is_empty() {
+                        // Prompt already has "/" from the trigger; add the
+                        // filter chars so the typed command survives.
                         for c in filter.chars() {
                             self.prompt.insert_char(c);
                         }
+                    } else {
+                        self.prompt.clear();
                     }
                     return Ok(false);
                 }
@@ -2328,8 +2367,14 @@ impl App {
                     MenuItem::new(e, format!("{}{current}", effort_description(e)))
                 })
                 .collect();
+            // mu-zbmp: open on the current effort so a bare confirm keeps it.
+            let cursor = self
+                .valid_effort_levels
+                .iter()
+                .position(|e| e == &self.effort)
+                .unwrap_or(0);
             let max_visible = vp.area().height.saturating_sub(3) as usize;
-            self.inline_menu = Some(InlineMenu::new(items, max_visible.max(5)));
+            self.inline_menu = Some(InlineMenu::with_cursor(items, max_visible.max(5), cursor));
             self.menu_context = MenuContext::Effort;
             return Ok(());
         } else if let Some(level) = parse_effort_against(arg, &self.valid_effort_levels) {
@@ -2501,17 +2546,41 @@ impl App {
     /// directly. Sends `session.set_route` to the daemon; the switch
     /// takes effect on the next turn.
     fn cmd_provider(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
-        let new_provider = if arg.is_empty() {
-            let items: Vec<String> = KNOWN_PROVIDERS.iter().map(|s| (*s).to_string()).collect();
-            let current = items.iter().position(|s| s == &self.provider).unwrap_or(0);
-            match picker::run_picker("/provider", &items, current)? {
-                Some(idx) => items[idx].clone(),
-                None => return Ok(()),
-            }
-        } else {
-            arg.to_string()
-        };
+        if arg.is_empty() {
+            // mu-zbmp: inline picker over the known providers — reuses the
+            // inline-menu widget (renders in both inline and fullscreen
+            // modes, unlike the old alt-screen modal) so the values are
+            // actually visible. Selection applies via the
+            // MenuContext::Provider arm -> apply_provider.
+            let items: Vec<MenuItem> = KNOWN_PROVIDERS
+                .iter()
+                .map(|p| {
+                    let current = if *p == self.provider {
+                        " (current)"
+                    } else {
+                        ""
+                    };
+                    MenuItem::new(*p, format!("provider{current}"))
+                })
+                .collect();
+            // mu-zbmp: open on the current provider so a bare confirm keeps
+            // it (the old modal passed `current`; cursor-0 would switch).
+            let cursor = KNOWN_PROVIDERS
+                .iter()
+                .position(|p| *p == self.provider)
+                .unwrap_or(0);
+            let max_visible = vp.area().height.saturating_sub(3) as usize;
+            self.inline_menu = Some(InlineMenu::with_cursor(items, max_visible.max(5), cursor));
+            self.menu_context = MenuContext::Provider;
+            return Ok(());
+        }
+        self.apply_provider(vp, arg.to_string())
+    }
 
+    /// Apply a provider switch: derive the provider's default model, send
+    /// `session.set_route`, and update state. Shared by `/provider <name>`
+    /// and the inline provider picker. (mu-zbmp)
+    fn apply_provider(&mut self, vp: &mut DynamicViewport, new_provider: String) -> Result<()> {
         let kind = normalize_provider_kind(&new_provider);
         let models = known_models_for(&kind);
         let default_model = models
@@ -2550,11 +2619,25 @@ impl App {
     /// /model [name] — switch the session's model. Bare `/model` opens
     /// a picker scoped to the current provider; `/model <name>` sets
     /// directly. Sends `session.set_route` to the daemon.
+    /// The model picker's value list for the current provider: the curated
+    /// models, with the current model prepended if it isn't among them.
+    /// Shared by the picker builder and its selection handler so the menu
+    /// indices line up. (mu-zbmp)
+    fn model_picker_strings(&self) -> Vec<String> {
+        let kind = normalize_provider_kind(&self.provider);
+        let known = known_models_for(&kind);
+        let mut items: Vec<String> = Vec::with_capacity(known.len() + 1);
+        if !known.iter().any(|m| *m == self.model) {
+            items.push(self.model.clone());
+        }
+        items.extend(known.iter().map(|s| (*s).to_string()));
+        items
+    }
+
     fn cmd_model(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
-        let new_model = if arg.is_empty() {
+        if arg.is_empty() {
             let kind = normalize_provider_kind(&self.provider);
-            let known = known_models_for(&kind);
-            if known.is_empty() {
+            if known_models_for(&kind).is_empty() {
                 let lines: Vec<Line<'static>> = vec![
                     Line::from(""),
                     Line::from(Span::styled(
@@ -2573,20 +2656,29 @@ impl App {
                 })?;
                 return Ok(());
             }
-            let mut items: Vec<String> = Vec::with_capacity(known.len() + 1);
-            if !known.iter().any(|m| *m == self.model) {
-                items.push(self.model.clone());
-            }
-            items.extend(known.iter().map(|s| (*s).to_string()));
-            let current = items.iter().position(|s| s == &self.model).unwrap_or(0);
-            match picker::run_picker("/model", &items, current)? {
-                Some(idx) => items[idx].clone(),
-                None => return Ok(()),
-            }
-        } else {
-            arg.to_string()
-        };
+            // mu-zbmp: inline picker over the curated models — mirrors the
+            // provider/effort pickers (renders in fullscreen too).
+            let strings = self.model_picker_strings();
+            // mu-zbmp: open on the current model so a bare confirm keeps it.
+            let cursor = strings.iter().position(|m| m == &self.model).unwrap_or(0);
+            let items: Vec<MenuItem> = strings
+                .into_iter()
+                .map(|m| {
+                    let current = if m == self.model { " (current)" } else { "" };
+                    MenuItem::new(m, format!("model{current}"))
+                })
+                .collect();
+            let max_visible = vp.area().height.saturating_sub(3) as usize;
+            self.inline_menu = Some(InlineMenu::with_cursor(items, max_visible.max(5), cursor));
+            self.menu_context = MenuContext::Model;
+            return Ok(());
+        }
+        self.apply_model(vp, arg.to_string())
+    }
 
+    /// Apply a model switch: send `session.set_route` and update state.
+    /// Shared by `/model <name>` and the inline model picker. (mu-zbmp)
+    fn apply_model(&mut self, vp: &mut DynamicViewport, new_model: String) -> Result<()> {
         let kind = normalize_provider_kind(&self.provider);
         match self.send_set_route(vp, &kind, &new_model) {
             Ok(()) => {
@@ -4198,6 +4290,39 @@ mod tests {
             "anthropic_oauth"
         );
         assert_eq!(normalize_provider_kind("claude-oauth"), "anthropic_oauth");
+    }
+
+    #[test]
+    fn zbmp_picker_commands_classified() {
+        // The three `›` value-picker commands open their populated picker on
+        // select; free-form / no-arg commands keep their text-insert path.
+        // This is the routing decision the mu-zbmp fix turns on.
+        for c in ["/effort", "/provider", "/model"] {
+            assert!(is_picker_command(c), "{c} should open a value picker");
+        }
+        for c in ["/btw", "/config", "/help", "/status", "/focus", "/collapse"] {
+            assert!(!is_picker_command(c), "{c} should not open a picker");
+        }
+    }
+
+    #[test]
+    fn zbmp_provider_and_model_pickers_are_nonempty() {
+        // A blank picker is the exact failure mu-zbmp fixes: every known
+        // provider must offer values, and each must resolve to a non-empty
+        // curated model list (so the model picker isn't blank after a
+        // provider switch either).
+        assert!(!KNOWN_PROVIDERS.is_empty());
+        // Every picker entry must normalize to a kind the daemon and the
+        // model catalog both recognize (mu-zbmp: "openai-api" used to fall
+        // through unnormalized).
+        assert_eq!(normalize_provider_kind("openai-api"), "openai_api");
+        for p in KNOWN_PROVIDERS {
+            let kind = normalize_provider_kind(p);
+            assert!(
+                !known_models_for(&kind).is_empty(),
+                "no curated models for provider {p:?} (kind {kind:?})"
+            );
+        }
     }
 
     // ===== status-line state machine (mu-d2hx) =====

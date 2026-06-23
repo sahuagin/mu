@@ -34,6 +34,10 @@
 #   THINKING   mu/claude thinking level                         default low
 #   MU         mu binary                                        default `command -v mu`
 #   ERRLOG     stderr sink (appended)                           default /tmp/agent-dispatch.$$.err
+#   AGENT_DISPATCH_NO_LEASE  =1 skips the shared-ollama-box lease    default unset
+#              (see the LOTO-acquire note in the mu-providers branch)
+#   AGENT_SESSION_OWNER/_TTL passed through to with-ollama-lease when it wraps an
+#              ollama dispatch (export one OWNER to let a multi-call run share the lease)
 
 # Map a mu tool CSV -> claude `--allowedTools` names (space-separated).
 _ad_claude_tools() {  # $1=csv
@@ -48,7 +52,7 @@ _ad_claude_tools() {  # $1=csv
 
 agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   local ad_prov ad_model ad_pf ad_tools ad_timeout ad_maxturns ad_thinking ad_mu ad_errlog
-  local ad_clsys ad_sysflags ad_cltools ad_perm ad_yolo
+  local ad_clsys ad_sysflags ad_cltools ad_perm ad_yolo ad_lease
   ad_prov="$1"; ad_model="$2"
   ad_pf="${3:-${PROMPT_FILE:-}}"
   [ -n "$ad_pf" ] || { echo "agent_dispatch: no prompt file (arg 3 or \$PROMPT_FILE)" >&2; return 2; }
@@ -82,13 +86,37 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   # mu providers (codex / ollama / openrouter / ...): hermetic --bare session.
   ad_sysflags=""
   [ -n "${SYSPROMPT:-}" ] && [ -r "$SYSPROMPT" ] && ad_sysflags="--append-system-prompt $SYSPROMPT"
-  # shellcheck disable=SC2086 — $ad_sysflags/$ad_yolo/tool flags intentionally word-split
+
+  # LOTO acquire: when dispatching to the shared ollama box, hold the cooperative
+  # lease for the run so concurrent ollama workers SERIALISE instead of evicting
+  # each other (bead mu-0pqk: 256k-context models don't co-reside). This is the
+  # acquire half that composes with agent-role's demote-when-held half (#383):
+  # demote steers *resolvers* off a box already held; this serialises the workers
+  # that still land on ollama (e.g. several resolved to it while the box was free).
+  # Bare WAIT mode + with-ollama-lease's own fail-open mean an etcd outage runs
+  # WITHOUT the lease rather than blocking. Opt out with AGENT_DISPATCH_NO_LEASE=1.
+  ad_lease=""
+  case "$ad_prov" in
+    ollama|ollama-*)
+      if [ -z "${AGENT_DISPATCH_NO_LEASE:-}" ] && command -v with-ollama-lease >/dev/null 2>&1; then
+        ad_lease="with-ollama-lease"
+        # Ensure the lease outlives a long run (with-ollama-lease defaults TTL to
+        # 1200s > the 900s reviewer cap; only override for a larger timeout, and
+        # never clobber a caller-set TTL).
+        if [ -z "${AGENT_SESSION_TTL:-}" ] && [ "$ad_timeout" -gt 1080 ]; then
+          AGENT_SESSION_TTL=$((ad_timeout + 120)); export AGENT_SESSION_TTL
+        fi
+      fi
+      ;;
+  esac
+
+  # shellcheck disable=SC2086 — $ad_lease/$ad_sysflags/$ad_yolo/tool flags intentionally word-split
   if [ -n "$ad_tools" ]; then
-    timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
+    $ad_lease timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
       --thinking "$ad_thinking" $ad_sysflags $ad_yolo --max-turns "$ad_maxturns" --tools "$ad_tools" \
       --prompt-file "$ad_pf" 2>>"$ad_errlog"
   else
-    timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
+    $ad_lease timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
       --thinking "$ad_thinking" $ad_sysflags --prompt-file "$ad_pf" 2>>"$ad_errlog"
   fi
 }

@@ -32,6 +32,18 @@ ROLE="${1:-}"; RANK="${2:-}"
 json=$("$TQ" -o json -f "$ROLES" "$ROLE.ranked" 2>/dev/null) \
     || die "role '$ROLE' not found in $ROLES"
 
+# Lease-aware (LOTO): if this role has a provider=ollama target and the shared
+# ollama box is held by ANOTHER owner, sink ollama targets to the bottom of the
+# ranked list so rank-0 becomes a usable non-ollama fallback. Probes only when an
+# ollama target exists; fail-open (etcd down -> --held non-zero -> no reorder);
+# opt out with AGENT_ROLE_NO_LEASE=1.
+if [ -z "${AGENT_ROLE_NO_LEASE:-}" ] \
+    && printf '%s' "$json" | jq -e 'any(.[]; .provider=="ollama")' >/dev/null 2>&1 \
+    && command -v with-ollama-lease >/dev/null 2>&1 \
+    && with-ollama-lease --held >/dev/null 2>&1; then
+    json=$(printf '%s' "$json" | jq 'to_entries|sort_by([(.value.provider=="ollama"),.key])|map(.value)')
+fi
+
 emit() {  # $1=provider $2=model
     if [ "$CMD" -eq 1 ]; then
         case "$1" in

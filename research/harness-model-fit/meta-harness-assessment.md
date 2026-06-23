@@ -8,12 +8,41 @@ is mine. Sources inline.*
   commits, research prototype — "not tested beyond verifying that it runs").
 - Paper: <https://arxiv.org/abs/2603.28052> · Site: <https://yoonholee.com/meta-harness/>
 
-> **Reconciled 2026-06-22 — Path A is now actionable.** When this was written the
-> model-fit knobs didn't exist yet. They do now (effort→reasoning, tool-dialect
-> rescue, per-model sampling — all merged to `main`), so the config-space search
-> space Path A needs is **real**: it would tune exactly those landed knobs. This is
-> the recommended forward direction for the whole epic. The `mu-analytics` substrate
-> is confirmed present (a DuckDB layer over both fleets' event-log JSONL); see §"Path A".
+## CONCLUSION (2026-06-22) — Path A NOT pursued; mu already has the better system
+
+Acted on, then closed. After building toward Path A (the profile-search loop, PR #378)
+**and reading the actual paper**, the "build Path A" recommendation in this doc is
+**superseded — do not rebuild it.** Recorded here so a future pass short-circuits:
+
+1. **The paper is a METHOD, not a transferable catalog.** Read 2026-06-22
+   (arxiv 2603.28052): Meta-Harness is an outer loop that *searches over harness code*
+   with an agentic proposer (text-classification / math / agentic-coding). Fixes are
+   *discovered by the search, per-domain* — there is **no enumerated "deficiency →
+   prescribed fix" catalog** to harvest. The reusable idea is "iterate the harness
+   using metrics," which mu already does.
+2. **mu already has the more substantive system.** The full cycle (run → event log →
+   mu-analytics) + the analysis layer — `scans.py` (message-signal markers) →
+   `degradation.py` (ML probe: telemetry → signed good/bad sentiment, with
+   model/provider features + unnoticed-degraded detection) → `anomaly_worklist.py`
+   (IsolationForest outliers) — is richer than what the paper assumes a target harness
+   provides. mu *is* the rich-trace substrate; it doesn't need their loop.
+3. **The automation doesn't pay off at our scale.** A propose→evaluate→store loop earns
+   its cost only with too many model×config combos to hand-tune. At ~10 curated models
+   in rotation, hand-tuning the landed knobs (effort / rescue / sampling / addendum)
+   suffices — and those knobs are merged.
+4. **There was never a runner to build.** "Run a config then read its log" is just
+   generic `mu ask` launching + the event log; no benchmark/runner needed. The #378
+   loop re-implemented arch-bench and re-searched *models* (a non-problem — the ~10 in
+   rotation are given) and is closed.
+
+**The one real, optional lever** is the *underutilized* `degradation.py`: get it to
+surface *unexpected* per-model signals (the point of ML over ripgrep) and feed it
+richer message-derived failure-mode features (dialect-leak / stall / tool-error → the
+knob that fixes each). That's mu-analytics work, not a Stanford thing. The valuable
+harness-model-fit output — the on-the-wire knobs — is already landed.
+
+*(The 2026-06-21 assessment below — "strong fit, build Path A" — is kept as the dated
+research record; the CONCLUSION above supersedes its recommendation.)*
 
 ## Verdict up front
 

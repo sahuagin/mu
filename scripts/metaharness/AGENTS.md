@@ -1,5 +1,14 @@
 # AGENTS.md — meta-harness (Path A)
 
+> **SUPERSEDED 2026-06-22 — Path A was NOT pursued.** Investigated and closed (PR #378).
+> The Stanford paper is a *method*, not a transferable deficiency→fix catalog, and mu's
+> existing analytics (`scans` → `degradation.py` → `anomaly_worklist`) are the more
+> substantive system; the landed on-the-wire knobs are the value and hand-tuning suffices
+> at ~10 curated models. **Don't build the loop described below.** The real lever is the
+> underutilized `degradation.py`. Full reasoning:
+> [`research/harness-model-fit/meta-harness-assessment.md`](../../research/harness-model-fit/meta-harness-assessment.md)
+> §CONCLUSION. The notes below are kept only as the record of what was considered.
+
 Operating procedure + load-bearing nuances for the **meta-harness "Path A"**: a
 config-space outer loop that self-improves mu's per-model harness fit by
 **searching harness *profiles*** and selecting by a **numeric score from the

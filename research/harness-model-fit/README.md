@@ -7,9 +7,12 @@ change to be well-suited to all models rather than implicitly Claude-shaped? And
 the founding framing — can the Stanford IRIS **meta-harness** approach let `mu`
 *self-improve* toward that fit, with receipts?
 
-**Status:** 2026-06-21 research → **2026-06-22: the on-the-wire knobs landed.** The
-three "model-fit on the wire" changes are merged to `main`; the forward direction
-is now the **meta-harness Path A** — config-space self-improvement over those knobs.
+**Status:** 2026-06-21 research → **2026-06-22: the on-the-wire knobs landed (the epic's
+value is delivered); meta-harness Path A then investigated and NOT pursued.** The
+"model-fit on the wire" changes are merged to `main`. Path A (a config-space search
+loop) was built toward, reviewed, and closed — see
+[meta-harness-assessment.md](meta-harness-assessment.md) §CONCLUSION. The only remaining
+(optional) lever is the underutilized `degradation.py` in mu-analytics, not a new loop.
 
 ## What landed (2026-06-22)
 
@@ -28,16 +31,21 @@ models on OpenRouter/vLLM now get effort, dialect recovery, and per-model
 sampling. The deeper docs below are the **dated research record**; each carries a
 short *Reconciled 2026-06-22* note where its pre-merge claims have since changed.
 
-## The forward direction: meta-harness Path A
+## Forward direction (resolved 2026-06-22): NOT Path A
 
-With the knobs now real, they **are** the search space a Stanford-IRIS-style outer
-loop would optimize. The next lever isn't another hand-tuned knob — it's letting
-`mu` *search* for the best per-model harness profile, scored from its own event
-log. See [meta-harness-assessment.md](meta-harness-assessment.md) §"Path A": a
-config-space loop hosted in **mu-analytics** (Python over the event-log JSONL,
-which already reads both fleets), proposing profile changes, running `mu` headless,
-and scoring per-model — *score-per-dollar*, since `mu` logs cost. That closes the
-loop back to the founding question of using the IRIS frame to self-improve `mu`.
+Path A (a config-space propose→evaluate→store loop) was investigated and **closed** —
+see [meta-harness-assessment.md](meta-harness-assessment.md) §CONCLUSION for the full
+reasoning. In short: the Stanford paper is a *method*, not a transferable
+deficiency→fix catalog (nothing to harvest); mu already has the full cycle plus a more
+substantive analysis layer (`scans` → `degradation.py` → `anomaly_worklist`); and an
+automated search doesn't pay off at ~10 curated models, where hand-tuning the landed
+knobs suffices.
+
+The remaining, optional lever is the **underutilized `degradation.py`** (mu-analytics):
+get its ML probe to surface *unexpected* per-model signals, and feed it richer
+message-derived failure-mode features (dialect-leak / stall / tool-error → the knob that
+fixes each). That's analytics work on the existing substrate — not a new loop, not the
+Stanford repo.
 
 ## The one-line answer (unchanged)
 
@@ -54,18 +62,19 @@ assumptions; a harness "fits" when its adaptation layers match them.
 |---|---|
 | [findings.md](findings.md) | The research report: mechanisms of harness–model fit, the GLM specifics, the evidence, and a scorecard of where `mu` stood (now reconciled — the on-the-wire gaps are closed). |
 | [model-catalog-tooling.md](model-catalog-tooling.md) | Teardown of `mu models sync` / `catalog_probe` / `model_catalog` (closed loop, manual refresh). Reconciled: the catalog now carries `temperature`/`top_p`. |
-| [meta-harness-assessment.md](meta-harness-assessment.md) | Whether the Stanford IRIS [meta-harness](https://github.com/stanford-iris-lab/meta-harness) can help `mu` self-improve. Verdict: strong conceptual fit (mu's event log *is* the rich-trace substrate); build a mu-native config-space loop (Path A). **The forward direction.** |
+| [meta-harness-assessment.md](meta-harness-assessment.md) | Whether the Stanford IRIS [meta-harness](https://github.com/stanford-iris-lab/meta-harness) can help `mu` self-improve. **Verdict (2026-06-22 §CONCLUSION): NO — the paper is a *method*, not a transferable deficiency→fix catalog; mu's analytics are already more substantive; Path A investigated and not pursued.** |
 | [implementation-plan.md](implementation-plan.md) | The sequenced plan. Reconciled: the effort / rescue / sampling phases are **done**; remaining = prompt addendum, `discover()`→`t4c` parity, and the meta-harness eval (Path A). |
 
 See also the operator reference [`docs/mu-solo-runbook.md`](../../docs/mu-solo-runbook.md).
 
 ## Open questions / next
 
-- **Stand up meta-harness Path A** (the headline) — the eval harness in mu-analytics
-  + a proposer loop over the landed knobs. Needs scope sign-off.
+- ~~Stand up meta-harness Path A~~ — **investigated and dropped 2026-06-22** (see
+  "Forward direction" above + the assessment §CONCLUSION). The optional lever instead:
+  get the underutilized `degradation.py` to surface *unexpected* per-model signals.
 - Remaining hand-knobs: per-model **system-prompt addendum** (modest now that
   dialect rescue landed) and **`discover()` → `t4c` parity** (the tool-surface lever).
-- Live GLM-5.2 numbers *through mu* now that the knobs exist (the Path A eval
-  generates them with receipts).
+- Live GLM-5.2 numbers *through mu* now that the knobs exist — read them from the event
+  log / mu-analytics on real runs (no dedicated eval loop needed).
 - Whether to consume probed **pricing** (written by `mu models sync` but inert) —
   needed for *score-per-dollar* in the Path A eval.

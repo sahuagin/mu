@@ -1066,9 +1066,12 @@ fn write_snapshot(
 /// Dispatch a parsed [`Cli`] to its handler. Returns the process exit code.
 pub fn run(cli: Cli) -> Result<i32> {
     if cli.help_ai {
-        // Self-registration: t4c describes itself via the same standard it consumes.
-        let doc = crate::helpai::from_clap(&<Cli as clap::CommandFactory>::command());
-        println!("{}", crate::helpai::to_json(&doc)?);
+        // Self-registration via clap-catalog — the single canonical clap→JSON
+        // introspector. t4c is a tool in its own registry (the turtle): this
+        // document is consumed by HelpAiProbeSource exactly like any other
+        // tool's `--help-ai`. (Replaced the hand-rolled helpai::from_clap.)
+        let cat = clap_catalog::catalog::<Cli>();
+        println!("{}", serde_json::to_string_pretty(&cat)?);
         return Ok(0);
     }
     // Commands that DON'T need the resolved registry tree dispatch first, before

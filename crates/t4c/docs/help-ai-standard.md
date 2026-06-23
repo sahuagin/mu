@@ -92,10 +92,10 @@ so producers should emit `name` / `summary`.
 
 - **Rust + clap:** use the [`clap-catalog`] crate — it walks the live
   `clap::Command` tree and renders this schema (recursive subcommands + rich
-  `args`), so the catalog can never drift from the actual CLI. t4c also ships a
-  minimal `helpai::from_clap` that emits just the required core (`name`,
-  `summary`, `keywords`, one level of subcommands) and self-registers with it;
-  the core alone is a conforming subset.
+  `args`), so the catalog can never drift from the actual CLI. t4c self-registers
+  with it — `t4c --help-ai --json` *is* `clap_catalog::catalog`'s output — so t4c
+  is a tool in its own registry (turtles), consumed by `HelpAiProbeSource` like
+  any other tool.
 - **Shell tools:** see `templates/help-ai.sh` — a heredoc that prints the JSON.
 
 [`clap-catalog`]: https://github.com/sahuagin/agent_tools/tree/main/clap-catalog

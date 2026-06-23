@@ -130,29 +130,92 @@ pub struct HelpSpec {
     pub ai: bool,
 }
 
-/// Deserialization target for a tool's `--help-ai --json` output.
-///
-/// This is the de-facto schema the probe consumes. mu-kex4.5 turns it into the
-/// published standard and ships emitters (a clap derive + a shell template) so
-/// any tool can produce conforming output for free.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `skip_serializing_if` predicate for a false bool — keeps a minimal producer's
+/// emitted `--help-ai` lean (no `"positional": false` noise on every arg).
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// One CLI argument as described by `--help-ai --json` (the standard's `args`
+/// entry). Only `name` is required; the rest is optional so a producer emits
+/// just what it knows — enough for a consumer to build an invocation or a
+/// JSON-Schema input.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HelpAiArg {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positional: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub takes_value: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub multiple: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub help: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub possible_values: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default: Vec<String>,
+}
+
+/// Deserialization target for a tool's `--help-ai --json` output — the superset
+/// standard (`crates/t4c/docs/help-ai-standard.md`). A single RECURSIVE node:
+/// the root document and every subcommand share this shape. Required core is
+/// `name` plus the discovery-facing `summary`; every rich field is optional, so
+/// a minimal `{name, summary}` producer still deserializes and unknown fields
+/// are ignored (forward-compatible).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HelpAiDoc {
     pub name: String,
     #[serde(default)]
     pub summary: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keywords: Vec<String>,
-    #[serde(default)]
-    pub subcommands: Vec<HelpAiSub>,
+    /// Recursive: each entry is itself a node with this same schema.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subcommands: Vec<HelpAiDoc>,
+    // ── optional rich fields (the superset) ──
+    /// Per-argument calling convention.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<HelpAiArg>,
+    /// One-line usage / synopsis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<String>,
+    /// JSON Schema of this command's stdout, when it has structured output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
+    /// Alternate names that invoke this node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    /// Explicit runnability. `None` ⇒ infer it: a node with no `subcommands` is
+    /// a runnable leaf, a node with children is a group. See
+    /// [`crate::source::HelpAiProbeSource::doc_to_caps`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invokable: Option<bool>,
+    /// Producer-stated invocation path. PARSE-ONLY — t4c computes its own
+    /// capability path from tree position; this never overrides addressing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
-/// One subcommand entry within a [`HelpAiDoc`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HelpAiSub {
-    pub name: String,
-    #[serde(default)]
-    pub summary: String,
+impl HelpAiDoc {
+    /// Resolve this node's runnability per the standard: the explicit
+    /// `invokable` flag when present, else true iff it has no subcommands.
+    pub fn is_invokable(&self) -> bool {
+        self.invokable.unwrap_or(self.subcommands.is_empty())
+    }
 }
+
+/// Back-compat alias: the producer/consumer historically named the subcommand
+/// node `HelpAiSub`. It is now the same recursive node as [`HelpAiDoc`].
+pub type HelpAiSub = HelpAiDoc;
 
 #[cfg(test)]
 mod tests {
@@ -240,5 +303,83 @@ mod tests {
         assert!(e.network);
         assert_eq!(e.filesystem, FsEffect::None);
         assert!(!e.vcs);
+    }
+
+    #[test]
+    fn superset_doc_round_trips_with_rich_and_nested() {
+        let doc = HelpAiDoc {
+            name: "tool".to_string(),
+            summary: "does things".to_string(),
+            keywords: vec!["kw".to_string()],
+            subcommands: vec![HelpAiDoc {
+                name: "run".to_string(),
+                summary: "run it".to_string(),
+                args: vec![HelpAiArg {
+                    name: "target".to_string(),
+                    positional: true,
+                    required: true,
+                    ..Default::default()
+                }],
+                usage: Some("tool run <target>".to_string()),
+                output_schema: Some(serde_json::json!({"type": "object"})),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let back: HelpAiDoc = serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
+        assert_eq!(back.subcommands.len(), 1);
+        let run = &back.subcommands[0];
+        assert_eq!(run.name, "run");
+        assert_eq!(run.args.len(), 1);
+        assert_eq!(run.args[0].name, "target");
+        assert!(run.args[0].required);
+        assert_eq!(run.usage.as_deref(), Some("tool run <target>"));
+        assert!(run.output_schema.is_some());
+    }
+
+    #[test]
+    fn minimal_doc_still_parses() {
+        // back-compat: a producer emitting only name + summary deserializes,
+        // every rich field defaulted.
+        let doc: HelpAiDoc = serde_json::from_str(r#"{"name":"t","summary":"s"}"#).unwrap();
+        assert_eq!(doc.name, "t");
+        assert_eq!(doc.summary, "s");
+        assert!(doc.args.is_empty());
+        assert!(doc.usage.is_none());
+        assert!(doc.subcommands.is_empty());
+        assert!(doc.is_invokable(), "a childless node is a runnable leaf");
+    }
+
+    #[test]
+    fn is_invokable_explicit_overrides_then_infers() {
+        let mut n = HelpAiDoc {
+            name: "x".to_string(),
+            invokable: Some(false),
+            ..Default::default()
+        };
+        assert!(!n.is_invokable(), "explicit invokable:false wins");
+        n.invokable = Some(true);
+        n.subcommands = vec![HelpAiDoc {
+            name: "c".to_string(),
+            ..Default::default()
+        }];
+        assert!(
+            n.is_invokable(),
+            "explicit invokable:true wins over children"
+        );
+        let group = HelpAiDoc {
+            name: "g".to_string(),
+            subcommands: vec![HelpAiDoc {
+                name: "c".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!group.is_invokable(), "children + no flag => group");
+        let leaf = HelpAiDoc {
+            name: "l".to_string(),
+            ..Default::default()
+        };
+        assert!(leaf.is_invokable(), "no children + no flag => leaf");
     }
 }

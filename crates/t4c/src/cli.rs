@@ -1266,21 +1266,14 @@ fn do_help(tree: &Tree, path_str: &str, full: bool, schema: bool, json: bool) ->
     if argv.is_empty() {
         anyhow::bail!("help for {path} has empty argv");
     }
-    // schema/json mode: ask the tool for its machine help when it speaks --help-ai.
-    if (schema || json) && help.ai {
-        argv.push("--json".to_string());
-    }
-    let out = Command::new(&argv[0])
-        .args(&argv[1..])
-        .output()
-        .with_context(|| format!("running help: {}", argv.join(" ")))?;
-    let text = if out.stdout.is_empty() {
-        String::from_utf8_lossy(&out.stderr).into_owned()
-    } else {
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    };
 
+    // --schema / --json: hand back the raw machine document. When the tool
+    // speaks --help-ai, ask for --json explicitly.
     if schema || json {
+        if help.ai {
+            argv.push("--json".to_string());
+        }
+        let text = run_help_text(&argv)?;
         print!("{text}");
         if !text.ends_with('\n') {
             println!();
@@ -1288,7 +1281,24 @@ fn do_help(tree: &Tree, path_str: &str, full: bool, schema: bool, json: bool) ->
         return Ok(0);
     }
 
-    // terse by default — don't dump the wall; --full for the rest.
+    // Default: for a --help-ai tool, parse the ROOT document, walk to this
+    // capability's node by its invoke chain, and render the rich superset
+    // fields (usage / args / output_schema). Parsing the root + walking — rather
+    // than probing the subcommand directly — is deliberate: many tools emit the
+    // full recursive document only at the root. Falls through to plain text when
+    // the tool can't be probed / parsed / the node isn't found.
+    if help.ai {
+        if let Some(rich) = render_help_ai(cap) {
+            print!("{rich}");
+            if !rich.ends_with('\n') {
+                println!();
+            }
+            return Ok(0);
+        }
+    }
+
+    // Fallback: the tool's plain help text — terse by default, --full for the rest.
+    let text = run_help_text(&argv)?;
     let lines: Vec<&str> = text.lines().collect();
     const LIMIT: usize = 16;
     if full || lines.len() <= LIMIT {
@@ -1307,6 +1317,103 @@ fn do_help(tree: &Tree, path_str: &str, full: bool, schema: bool, json: bool) ->
         );
     }
     Ok(0)
+}
+
+/// Run a help argv and return stdout (or stderr if stdout is empty).
+fn run_help_text(argv: &[String]) -> Result<String> {
+    let out = Command::new(&argv[0])
+        .args(&argv[1..])
+        .output()
+        .with_context(|| format!("running help: {}", argv.join(" ")))?;
+    Ok(if out.stdout.is_empty() {
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    } else {
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    })
+}
+
+/// Probe the root tool's `--help-ai --json`, walk to `cap`'s node by its invoke
+/// chain, and render the node's rich superset fields. `None` (→ caller falls
+/// back to plain help) when the tool can't be run, the JSON doesn't parse, or
+/// the node isn't present in the document.
+fn render_help_ai(cap: &Capability) -> Option<String> {
+    let root_cmd = cap.invoke.first()?;
+    let out = Command::new(root_cmd)
+        .args(["--help-ai", "--json"])
+        .output()
+        .ok()?;
+    let doc: crate::capability::HelpAiDoc = serde_json::from_slice(&out.stdout).ok()?;
+    // The capability's invoke is [root, sub1, sub2, …]; walk the doc by the tail.
+    let mut node = &doc;
+    for seg in cap.invoke.iter().skip(1) {
+        node = node.subcommands.iter().find(|s| &s.name == seg)?;
+    }
+    Some(format_help_ai_node(node))
+}
+
+/// Render one `--help-ai` node for a CLI caller: summary, usage, an args table,
+/// a subcommands list, and a pretty-printed output_schema. Absent sections are
+/// omitted (no empty headers).
+fn format_help_ai_node(node: &crate::capability::HelpAiDoc) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    if !node.summary.is_empty() {
+        let _ = writeln!(s, "{}", node.summary);
+    }
+    if let Some(u) = &node.usage {
+        let _ = writeln!(s, "\nusage: {u}");
+    }
+    if !node.args.is_empty() {
+        let _ = writeln!(s, "\narguments:");
+        for a in &node.args {
+            let flag = match (&a.long, &a.short) {
+                (Some(l), Some(sh)) => format!("{sh}, {l}"),
+                (Some(l), None) => l.clone(),
+                (None, Some(sh)) => sh.clone(),
+                (None, None) => a.name.clone(),
+            };
+            let val = if a.takes_value {
+                format!(" <{}>", a.value_name.as_deref().unwrap_or("VALUE"))
+            } else {
+                String::new()
+            };
+            let mut meta = Vec::new();
+            if a.required {
+                meta.push("required".to_string());
+            }
+            if a.multiple {
+                meta.push("repeatable".to_string());
+            }
+            if !a.possible_values.is_empty() {
+                meta.push(format!("one of: {}", a.possible_values.join(", ")));
+            }
+            if !a.default.is_empty() {
+                meta.push(format!("default: {}", a.default.join(", ")));
+            }
+            let meta = if meta.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", meta.join("; "))
+            };
+            let help = a.help.as_deref().unwrap_or("");
+            let _ = writeln!(
+                s,
+                "  {flag}{val}{meta}{}{help}",
+                if help.is_empty() { "" } else { "  " }
+            );
+        }
+    }
+    if !node.subcommands.is_empty() {
+        let _ = writeln!(s, "\nsubcommands:");
+        for sub in &node.subcommands {
+            let _ = writeln!(s, "  {:<16} {}", sub.name, sub.summary);
+        }
+    }
+    if let Some(schema) = &node.output_schema {
+        let pretty = serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string());
+        let _ = writeln!(s, "\noutput schema:\n{pretty}");
+    }
+    s
 }
 
 /// A path miss is not an error wall: rank the query and offer did-you-mean.
@@ -1393,6 +1500,45 @@ mod tests {
 
     fn toks(s: &str) -> Vec<String> {
         s.split_whitespace().map(|t| t.to_string()).collect()
+    }
+
+    #[test]
+    fn format_help_ai_node_renders_rich_and_omits_absent() {
+        use crate::capability::{HelpAiArg, HelpAiDoc};
+        let node = HelpAiDoc {
+            name: "run".to_string(),
+            summary: "run the thing".to_string(),
+            usage: Some("tool run <target>".to_string()),
+            args: vec![HelpAiArg {
+                name: "top".to_string(),
+                long: Some("--top".to_string()),
+                takes_value: true,
+                value_name: Some("N".to_string()),
+                help: Some("max hits".to_string()),
+                ..Default::default()
+            }],
+            output_schema: Some(serde_json::json!({"type":"array"})),
+            ..Default::default()
+        };
+        let out = format_help_ai_node(&node);
+        assert!(out.contains("run the thing"));
+        assert!(out.contains("usage: tool run <target>"));
+        assert!(out.contains("--top"));
+        assert!(out.contains("max hits"));
+        assert!(out.contains("output schema"));
+        assert!(!out.contains("subcommands:"), "no subcommands => no header");
+
+        // a bare node omits every rich section
+        let bare = HelpAiDoc {
+            name: "x".to_string(),
+            summary: "just a summary".to_string(),
+            ..Default::default()
+        };
+        let bo = format_help_ai_node(&bare);
+        assert!(bo.contains("just a summary"));
+        assert!(!bo.contains("usage:"));
+        assert!(!bo.contains("arguments:"));
+        assert!(!bo.contains("output schema"));
     }
 
     #[test]

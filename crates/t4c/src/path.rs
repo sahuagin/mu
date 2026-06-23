@@ -8,8 +8,22 @@
 
 use std::fmt;
 
-/// Maximum addressable depth. Beyond this, content is arguments, not path.
-pub const MAX_DEPTH: usize = 3;
+/// Default maximum addressable depth (number of dotted segments). Beyond this,
+/// the tail is arguments, not path. Override at runtime with `T4C_MAX_PATH_DEPTH`.
+/// Sized for the deepest real tools — `git remote add`, `agent memory add`,
+/// `gh pr create`, `jj git push` are all `class.tool.sub.sub` (depth 4) — with
+/// one level of headroom.
+pub const DEFAULT_MAX_DEPTH: usize = 5;
+
+/// The active maximum path depth: `T4C_MAX_PATH_DEPTH` when set to a valid usize
+/// (>= 1), else [`DEFAULT_MAX_DEPTH`].
+pub fn max_depth() -> usize {
+    std::env::var("T4C_MAX_PATH_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(DEFAULT_MAX_DEPTH)
+}
 
 /// A dotted capability path, e.g. `bash.jj.status` or `mcp.code-index.recall`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -18,17 +32,20 @@ pub struct CapPath {
 }
 
 impl CapPath {
-    /// Parse a dotted path. Rejects empty segments and depth greater than
-    /// [`MAX_DEPTH`].
+    /// Parse a dotted path. Rejects empty segments and depth greater than the
+    /// active [`max_depth`] ([`DEFAULT_MAX_DEPTH`], overridable via
+    /// `T4C_MAX_PATH_DEPTH`).
     pub fn parse(s: &str) -> Result<Self, PathError> {
         let segments: Vec<String> = s.split('.').map(|p| p.trim().to_string()).collect();
         if segments.iter().any(String::is_empty) {
             return Err(PathError::EmptySegment(s.to_string()));
         }
-        if segments.len() > MAX_DEPTH {
+        let max = max_depth();
+        if segments.len() > max {
             return Err(PathError::TooDeep {
                 path: s.to_string(),
                 depth: segments.len(),
+                max,
             });
         }
         Ok(Self { segments })
@@ -78,17 +95,21 @@ impl fmt::Display for CapPath {
 pub enum PathError {
     /// A segment was empty (e.g. `bash..status` or a leading/trailing dot).
     EmptySegment(String),
-    /// The path exceeded [`MAX_DEPTH`].
-    TooDeep { path: String, depth: usize },
+    /// The path exceeded the active [`max_depth`].
+    TooDeep {
+        path: String,
+        depth: usize,
+        max: usize,
+    },
 }
 
 impl fmt::Display for PathError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PathError::EmptySegment(p) => write!(f, "empty segment in path {p:?}"),
-            PathError::TooDeep { path, depth } => write!(
+            PathError::TooDeep { path, depth, max } => write!(
                 f,
-                "path {path:?} has depth {depth}, exceeds max {MAX_DEPTH} \
+                "path {path:?} has depth {depth}, exceeds max {max} \
                  (the tail should be arguments, not path)"
             ),
         }
@@ -114,10 +135,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_too_deep() {
+    fn rejects_beyond_max_depth() {
+        // Under the default cap of 5, depth 4 (e.g. `bash.gh.pr.create`) and
+        // depth 5 parse; depth 6 is too deep.
+        assert!(CapPath::parse("a.b.c.d").is_ok());
+        assert!(CapPath::parse("a.b.c.d.e").is_ok());
         assert!(matches!(
-            CapPath::parse("a.b.c.d"),
-            Err(PathError::TooDeep { depth: 4, .. })
+            CapPath::parse("a.b.c.d.e.f"),
+            Err(PathError::TooDeep { depth: 6, .. })
         ));
     }
 

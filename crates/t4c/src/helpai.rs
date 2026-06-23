@@ -23,8 +23,13 @@ pub fn from_clap(cmd: &clap::Command) -> HelpAiDoc {
             .map(|s| HelpAiSub {
                 name: s.get_name().to_string(),
                 summary: s.get_about().map(|a| a.to_string()).unwrap_or_default(),
+                // from_clap stays a MINIMAL producer (core fields only); the
+                // rich superset fields default to empty. Producer convergence
+                // onto clap-catalog is a separate bead.
+                ..Default::default()
             })
             .collect(),
+        ..Default::default()
     }
 }
 

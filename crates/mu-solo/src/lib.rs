@@ -67,7 +67,6 @@ pub mod input;
 pub mod mcp_status;
 pub mod menu;
 pub mod notify;
-pub mod picker;
 pub mod render;
 pub mod skills;
 pub mod transcript;

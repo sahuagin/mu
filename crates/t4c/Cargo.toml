@@ -8,12 +8,19 @@ license-file.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-# LEAF CRATE INVARIANT (goal mu-kex4): t4c depends ONLY on published crates,
+# LEAF CRATE INVARIANT (goal mu-kex4): t4c depends ONLY on standalone crates,
 # NEVER on workspace siblings (mu-core, mu-ai, …). The dependency arrow points
-# mu -> t4c, never t4c -> mu, so this builds and publishes as a standalone
-# external library while mu links it in-process. `workspace = true` below
-# inherits third-party VERSIONS from the workspace table — it does not create a
-# path-dependency on any sibling crate.
+# mu -> t4c, never t4c -> mu, so this stays a self-contained external library
+# while mu links it in-process. `workspace = true` below inherits third-party
+# VERSIONS from the workspace table — it does not create a path-dependency on any
+# sibling crate.
+#
+# EXCEPTION (mu-apxv): clap-catalog — our own standalone leaf tool (deps:
+# clap + serde_json only) — is a GIT dependency for now, pending its crates.io
+# publish. It carries no mu coupling, so the "stands alone" spirit holds; the one
+# cost is that t4c cannot `cargo publish` while git-depping it (nothing publishes
+# t4c today — restored when clap-catalog lands on crates.io and this becomes a
+# version dep).
 
 [lib]
 name = "t4c"
@@ -40,3 +47,7 @@ reqwest = { workspace = true, features = ["blocking"] }
 rkyv = { workspace = true }
 memmap2 = { workspace = true }
 blake3 = { workspace = true }
+# Producer convergence (mu-apxv): t4c self-emits its own `--help-ai` via
+# clap-catalog's introspection — one canonical clap→JSON emitter, replacing the
+# hand-rolled helpai::from_clap. Git dep until clap-catalog is on crates.io.
+clap-catalog = { git = "https://github.com/sahuagin/agent_tools" }

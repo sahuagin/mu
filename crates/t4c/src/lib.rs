@@ -31,7 +31,6 @@ pub mod chain;
 pub mod classify;
 pub mod cli;
 pub mod embedder;
-pub mod helpai;
 pub mod path;
 pub mod rank;
 pub mod registry;

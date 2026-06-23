@@ -168,6 +168,11 @@ TASK:
 $TASK
 EOF
 SYSPROMPT="$CONDUCTOR_PROMPT"
+# The planner must investigate across the codebase before it can conclude; the dispatch default
+# (15) is a GATE-sized budget and starves a thorough seat — mu-uvuo run #5: deepseek-v4-pro spent
+# all 15 turns reading and was cancelled ONE turn before emitting the plan, so plan.md captured
+# only its trailing "let me verify a few more details" line. Give the planner the worker's budget.
+MAX_TURNS="${PLAN_MAX_TURNS:-40}"
 ( cd "$REPO_DIR" && dispatch plan "$SEAT_PROVIDER" "$SEAT_MODEL" "read,grep,ls" "$RUN_DIR/plan.prompt" )
 cp "$RUN_DIR/plan.out" "$RUN_DIR/plan.md"
 log "plan -> $RUN_DIR/plan.md"
@@ -191,7 +196,7 @@ run_worker(){  # $1=slot $2=provider $3=model
   rw_ws="$( cd "$REPO_DIR" && sprint-start --no-bead "orch-$(date -u +%H%M%S)-$rw_slot" 2>/dev/null | sed -n 's/^cd //p' )"
   rw_ws="${rw_ws:-$REPO_DIR}"
   printf '%s\n' "$rw_ws" > "$RUN_DIR/worker.$rw_slot.ws"
-  MAX_TURNS=40; SYSPROMPT="$WORKER_PROMPT"
+  MAX_TURNS="${WORKER_MAX_TURNS:-40}"; SYSPROMPT="$WORKER_PROMPT"  # WORKER_MAX_TURNS=0 ⇒ uncapped (safe for a free local worker; pair with a raised TIMEOUT)
   ( cd "$rw_ws" && dispatch "implement-$rw_slot" "$rw_prov" "$rw_model" \
       "read,write,edit,glob,grep,ls,bash" "$RUN_DIR/impl.prompt" )
   ( cd "$rw_ws" && jj diff --git > "$RUN_DIR/worker.$rw_slot.diff" 2>/dev/null )

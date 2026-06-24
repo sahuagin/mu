@@ -43,3 +43,6 @@ MORNING*.md
 .venv/
 __pycache__/
 *.pyc
+
+# local beads mirror — central beadsd is canonical
+.beads/

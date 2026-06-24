@@ -263,7 +263,12 @@ else
     if [ "$i" != "$WINNER" ]; then
       lws="$(cat "$RUN_DIR/worker.$i.ws" 2>/dev/null)"
       if [ -n "$lws" ] && [ "$lws" != "$REPO_DIR" ]; then
-        ( cd "$lws" && sprint-end --force >/dev/null 2>&1 ); log "converge: abandoned loser candidate $i ($lws)"
+        # Tear down via the arg form from the repo root, not bare-from-inside:
+        # bare `sprint-end` inside a workspace now refuses (it would strand the
+        # shell on getcwd). The token is the workspace basename minus the
+        # "<repo>-" prefix that sprint-start adds.
+        ltok="$(basename "$lws")"; ltok="${ltok#"$(basename "$REPO_DIR")-"}"
+        ( cd "$REPO_DIR" && sprint-end --force "$ltok" >/dev/null 2>&1 ); log "converge: abandoned loser candidate $i ($lws)"
       fi
     fi
     i=$((i+1))

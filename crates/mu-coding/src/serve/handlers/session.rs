@@ -644,6 +644,14 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         &session_id,
         &autonomy,
     );
+    // mu-dialogue-inbound-wakeup: retain this session's bound `dialogue_poll`
+    // tool (present only when the dialogue MCP server was imported) so a
+    // background poller can drive event-driven inbound delivery. Captured
+    // before `session_tools` is moved into the agent loop below.
+    let dialogue_poll_tool = session_tools
+        .iter()
+        .find(|t| t.spec().name == "dialogue_poll")
+        .cloned();
     // mu-onq8: always-on in-loop capability discovery. Ranks the session's
     // sibling tools (attenuated by this session's capability) plus the
     // daemon-discovered skills against a free-text intent, so the agent can
@@ -726,6 +734,17 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     let agent_handle = tokio::spawn(async move {
         let _ = agent.join().await;
     });
+    // mu-dialogue-inbound-wakeup: spawn the per-session dialogue poller iff a
+    // bound `dialogue_poll` tool exists. It long-polls and injects inbound
+    // messages over the loop's input channel (a clone of `input_tx`), so a
+    // peer's message wakes the session without the model having to poll.
+    let dialogue_poller = dialogue_poll_tool.map(|tool| {
+        super::super::dialogue_poller::spawn_dialogue_poller(
+            tool,
+            input_tx.clone(),
+            format!("mu:{}:{}", daemon_info.daemon_id(), session_id),
+        )
+    });
     let (status_tx, status_rx) = tokio::sync::watch::channel(None);
     let forwarder_handle = tokio::spawn(forward_events(
         session_id.clone(),
@@ -752,6 +771,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             mailbox,
             status_watch: Some(status_rx),
             live_context_soft_limit,
+            dialogue_poller,
         },
     );
 
@@ -1010,7 +1030,7 @@ pub fn handle_respond_to_input_required(
     ok_response(request.id, to_value_or_null(resp))
 }
 
-pub fn handle_close_session(request: Request<Value>, sessions: Sessions) -> Response<Value> {
+pub async fn handle_close_session(request: Request<Value>, sessions: Sessions) -> Response<Value> {
     let params: CloseSessionRequest = ok_or_respond!(
         serde_json::from_value(request.params.clone()),
         request.id,
@@ -1028,7 +1048,11 @@ pub fn handle_close_session(request: Request<Value>, sessions: Sessions) -> Resp
         log.append(EventActor::System, EventPayload::SessionClosed);
     }
 
-    let removed = sessions.remove(&params.session_id);
+    // mu-dialogue-inbound-wakeup: tear the session down deterministically —
+    // signal its dialogue poller (if any) and await the task — instead of
+    // dropping it and relying on the loop's input channel closing. The
+    // sessions mutex is never held across the await (see `remove_with_teardown`).
+    let removed = sessions.remove_with_teardown(&params.session_id).await;
     let resp = CloseSessionResponse { closed: removed };
     ok_response(request.id, to_value_or_null(resp))
 }
@@ -1985,6 +2009,7 @@ mod tests {
                 mailbox: Arc::new(crate::serve::mailbox::MailboxState::new()),
                 status_watch: None,
                 live_context_soft_limit: live.clone(),
+                dialogue_poller: None,
             },
         );
         (log, live)

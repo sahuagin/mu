@@ -3744,6 +3744,62 @@ async fn w1_watch_completed_wakes_idle_session_with_inline_result() {
 }
 
 // ============================================================================
+// mu-dialogue-inbound-wakeup: AgentInput::DialogueMessage
+// ============================================================================
+//
+// A peer's inbound dialogue message wakes a session over the same input
+// channel as WatchCompleted: the loop synthesizes a user message carrying
+// the sender + content INLINE and runs the LLM, so the message lands as
+// the woken turn's motivation.
+
+/// D-1: a DialogueMessage input wakes an idle session, injects the
+/// sender + content as a user message, and drives exactly one LLM turn.
+#[tokio::test]
+async fn d1_dialogue_message_wakes_idle_session_with_inline_content() {
+    let provider = MockProvider::new(vec![vec![
+        ProviderEvent::TextDelta("ack".into()),
+        ProviderEvent::Done(assistant_text("ack")),
+    ]]);
+    let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
+
+    loop_
+        .send(AgentInput::DialogueMessage {
+            from: "cc:peer-7".to_owned(),
+            content: "can you take a look at PR 99?".to_owned(),
+        })
+        .await
+        .expect("send dialogue-message");
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+
+    // The synthesized wake message carries both the sender and the body.
+    let woke_with_content = events.iter().any(|e| match e {
+        AgentEvent::MessageStart {
+            message: AgentMessage::User { content },
+        } => content.contains("cc:peer-7") && content.contains("can you take a look at PR 99?"),
+        _ => false,
+    });
+    assert!(
+        woke_with_content,
+        "dialogue message must be injected inline as a user message; kinds={:?}",
+        events.iter().map(kind).collect::<Vec<_>>()
+    );
+
+    // The wake drove exactly one provider turn.
+    let turns = events.iter().filter(|e| kind(e) == "turn_start").count();
+    assert_eq!(turns, 1, "exactly one LLM turn after the wake");
+    if let Some(AgentEvent::Done { turn_count, .. }) = events.last() {
+        assert_eq!(*turn_count, 1);
+    } else {
+        panic!("last event must be Done");
+    }
+}
+
+// ============================================================================
 // mu-mh4: seed_messages (fork-at-tail continuation) — the resumed loop
 // starts mid-conversation rather than empty. Reuses the existing
 // RecordingProvider (captures per-call message_count via `records`).

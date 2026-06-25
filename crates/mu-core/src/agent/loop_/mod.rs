@@ -226,6 +226,21 @@ pub enum AgentInput {
         /// Human-readable result: exit status line + output tail.
         summary: String,
     },
+    /// mu-dialogue-inbound-wakeup: an inbound dialogue message addressed
+    /// to this session arrived on the mu-dialogue channel. Injected by
+    /// the per-session dialogue poller (a background task that long-polls
+    /// `dialogue_poll`) over the same input channel — the "wakeup
+    /// channel" — as `WatchCompleted` / `MailboxMessage`. The loop
+    /// synthesizes a User message carrying `from` + `content` INLINE and
+    /// queues InvokeLlm so the message lands directly as the woken turn's
+    /// motivation, whether the session was idle (parked on
+    /// `input_rx.recv`) or mid-run (queued behind the current work).
+    DialogueMessage {
+        /// The peer id that sent the message (e.g. "cc:abcd").
+        from: String,
+        /// The message body.
+        content: String,
+    },
 }
 
 impl std::fmt::Debug for AgentInput {
@@ -271,6 +286,10 @@ impl std::fmt::Debug for AgentInput {
             }
             Self::WatchCompleted { note, .. } => {
                 write!(f, "WatchCompleted(note={note})")
+            }
+            // Avoid dumping the full message body in Debug output.
+            Self::DialogueMessage { from, .. } => {
+                write!(f, "DialogueMessage(from={from})")
             }
         }
     }
@@ -1125,6 +1144,7 @@ async fn run_inner(
                 | AgentInput::StartAutonomous { .. }
                 | AgentInput::ScheduleWakeup { .. }
                 | AgentInput::WatchCompleted { .. }
+                | AgentInput::DialogueMessage { .. }
                 | AgentInput::MailboxMessage { .. } => {
                     queue.push_back(Action::External(input));
                 }
@@ -1249,6 +1269,32 @@ async fn run_inner(
                 // or mid-autonomous-run (queued behind the current work).
                 let notification =
                     format!("[Watch] '{note}' finished.\n{summary}\n\nAct on this result.");
+                let msg = AgentMessage::User {
+                    content: notification,
+                };
+                let _ = events
+                    .send(AgentEvent::MessageStart {
+                        message: msg.clone(),
+                    })
+                    .await;
+                messages.push(msg.clone());
+                let _ = events.send(AgentEvent::MessageEnd { message: msg }).await;
+                if should_push_invoke_llm(&queue) {
+                    queue.push_back(Action::InvokeLlm);
+                }
+            }
+            Action::External(AgentInput::DialogueMessage { from, content }) => {
+                // mu-dialogue-inbound-wakeup: an inbound dialogue message
+                // arrived for this session. Inject it as a User message and
+                // run the LLM — same "external attention wakes a session"
+                // shape as WatchCompleted, carried INLINE so the message
+                // lands directly as the woken turn's motivation. The model
+                // sees who spoke and what they said, plus a nudge that it
+                // may reply on the same channel.
+                let notification = format!(
+                    "[Dialogue] {from}: {content}\n\n\
+                     You may reply with dialogue_say if appropriate."
+                );
                 let msg = AgentMessage::User {
                     content: notification,
                 };
@@ -2193,6 +2239,7 @@ async fn run_inner(
                         | AgentInput::StartAutonomous { .. }
                         | AgentInput::ScheduleWakeup { .. }
                         | AgentInput::WatchCompleted { .. }
+                        | AgentInput::DialogueMessage { .. }
                         | AgentInput::MailboxMessage { .. } => {
                             queue.push_back(Action::External(input));
                         }

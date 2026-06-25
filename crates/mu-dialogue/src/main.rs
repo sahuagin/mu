@@ -6,7 +6,7 @@
 //! agent.sqlite:
 //!
 //!   - dialogue_say(from, to, content, session_thread?)  → {id, ts}
-//!   - dialogue_poll(to, since?, timeout_ms?, limit?)     → {messages: [...]}   (notify long-poll)
+//!   - dialogue_poll(to, since?, after_seq?, timeout_ms?, limit?) → {messages: [...]}  (notify long-poll; rowid `seq` keyset cursor)
 //!   - dialogue_history(session_thread, limit?)           → {messages: [...]}
 //!
 //! Transport: **pure rmcp** — `StreamableHttpService` over HTTP at `/mcp`
@@ -109,6 +109,13 @@ fn now_ms() -> i64 {
 
 #[derive(Debug, Serialize, Clone)]
 struct DialogueRow {
+    /// Opaque monotonic cursor token = the row's insertion order (`rowid`).
+    /// Clients pass the last delivered `seq` back as `after_seq` to page
+    /// forward exactly. Unlike `ts` (millisecond-coarse) or `id` (a ULID whose
+    /// within-millisecond order is RANDOM), `seq` strictly increases with
+    /// insertion, so a keyset on it never skips or repeats a concurrently
+    /// inserted same-millisecond message.
+    seq: i64,
     id: String,
     from: String,
     to: String,
@@ -144,28 +151,68 @@ impl Store {
         Ok((id, ts))
     }
 
-    async fn fetch_for(&self, to: &str, since_ms: i64, limit: i64) -> Result<Vec<DialogueRow>> {
+    /// Fetch messages for `to` after the cursor, oldest-first by insertion.
+    ///
+    /// Two cursor modes:
+    /// - `after_seq = None` (a poll's first fetch): forward-only by timestamp,
+    ///   `ts > since_ms` — establishes the starting point without replaying
+    ///   anything older than the poller.
+    /// - `after_seq = Some(seq)` (every fetch after the first message): a keyset
+    ///   on `rowid`, `rowid > seq`. `rowid` is the only strictly
+    ///   insertion-monotonic key the table has — `ts` is millisecond-coarse and
+    ///   a ULID `id`'s within-millisecond order is RANDOM, so neither can page a
+    ///   same-millisecond burst without either starving the tail (timestamp) or
+    ///   skipping a concurrent insert (random id). `rowid` does both correctly,
+    ///   and once anchored makes `ts` irrelevant: a later insert always has a
+    ///   higher rowid, so it is always delivered, exactly once.
+    ///
+    /// Correctness relies on `dialogue` being append-only (no row is ever
+    /// deleted, so a rowid is never reused) — which it is.
+    async fn fetch_for(
+        &self,
+        to: &str,
+        since_ms: i64,
+        after_seq: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<DialogueRow>> {
         let conn = self.db.lock().await;
-        let mut stmt = conn.prepare(
-            "SELECT id, from_peer, to_peer, session_thread, content, ts
-               FROM dialogue
-              WHERE to_peer = ? AND ts > ?
-              ORDER BY ts ASC
-              LIMIT ?",
-        )?;
-        let rows = stmt
-            .query_map(params![to, since_ms, limit], dialogue_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        match after_seq {
+            Some(after_seq) => {
+                let mut stmt = conn.prepare(
+                    "SELECT rowid AS seq, id, from_peer, to_peer, session_thread, content, ts
+                       FROM dialogue
+                      WHERE to_peer = ?1 AND rowid > ?2
+                      ORDER BY rowid ASC
+                      LIMIT ?3",
+                )?;
+                let rows = stmt
+                    .query_map(params![to, after_seq, limit], dialogue_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT rowid AS seq, id, from_peer, to_peer, session_thread, content, ts
+                       FROM dialogue
+                      WHERE to_peer = ?1 AND ts > ?2
+                      ORDER BY rowid ASC
+                      LIMIT ?3",
+                )?;
+                let rows = stmt
+                    .query_map(params![to, since_ms, limit], dialogue_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            }
+        }
     }
 
     async fn history(&self, session_thread: &str, limit: i64) -> Result<Vec<DialogueRow>> {
         let conn = self.db.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT id, from_peer, to_peer, session_thread, content, ts
+            "SELECT rowid AS seq, id, from_peer, to_peer, session_thread, content, ts
                FROM dialogue
               WHERE session_thread = ?
-              ORDER BY ts ASC
+              ORDER BY rowid ASC
               LIMIT ?",
         )?;
         let rows = stmt
@@ -223,12 +270,13 @@ impl Store {
 
 fn dialogue_row(row: &rusqlite::Row) -> rusqlite::Result<DialogueRow> {
     Ok(DialogueRow {
-        id: row.get(0)?,
-        from: row.get(1)?,
-        to: row.get(2)?,
-        session_thread: row.get(3)?,
-        content: row.get(4)?,
-        ts: row.get(5)?,
+        seq: row.get(0)?,
+        id: row.get(1)?,
+        from: row.get(2)?,
+        to: row.get(3)?,
+        session_thread: row.get(4)?,
+        content: row.get(5)?,
+        ts: row.get(6)?,
     })
 }
 
@@ -264,6 +312,12 @@ struct PollArgs {
     to: String,
     #[serde(default)]
     since: i64,
+    /// Keyset cursor: with this set, only messages whose `seq` (insertion
+    /// order) is strictly greater are returned, in `seq` order — paging through
+    /// a same-millisecond burst of any size with no skips or repeats. Omit (or
+    /// null) on the first poll, then pass the last delivered message's `seq`.
+    #[serde(default)]
+    after_seq: Option<i64>,
     #[serde(default)]
     timeout_ms: Option<u64>,
     #[serde(default)]
@@ -311,7 +365,9 @@ async fn handle_poll(store: &Store, args: PollArgs) -> Result<Value> {
     store.touch_peer(&args.to, now_ms()).await?;
 
     loop {
-        let rows = store.fetch_for(&args.to, args.since, limit).await?;
+        let rows = store
+            .fetch_for(&args.to, args.since, args.after_seq, limit)
+            .await?;
         if !rows.is_empty() {
             return Ok(json!({ "messages": rows }));
         }
@@ -387,7 +443,8 @@ fn tools_list() -> Vec<Tool> {
                 "type": "object",
                 "properties": {
                     "to":         {"type": "string", "description": "Peer id to poll for"},
-                    "since":      {"type": "number", "description": "epoch_ms cutoff; only messages with ts > since are returned (default 0)"},
+                    "since":      {"type": "number", "description": "epoch_ms cutoff; only messages with ts > since are returned (default 0). Used only on the first poll (when after_seq is absent)."},
+                    "after_seq":  {"type": "number", "description": "keyset cursor: returns only messages whose seq (insertion order) is > after_seq, in seq order. Pages a same-millisecond burst of any size with no skips or repeats. Omit on the first poll; then pass the last delivered message's seq."},
                     "timeout_ms": {"type": "number", "description": "Max wait in ms (default 30000)"},
                     "limit":      {"type": "number", "description": "Max messages per response (default 25, max 200)"}
                 },
@@ -761,6 +818,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(p2["messages"].as_array().unwrap().len(), 0);
+    }
+
+    /// A burst larger than the page limit that lands in a single millisecond
+    /// must page through completely: the `seq` (rowid) keyset walks every row
+    /// exactly once, in insertion order, with no repeats and no starved tail.
+    /// The ids are inserted in DESCENDING lexical order, so a cursor that keyed
+    /// on the ULID `id` (or any non-insertion order) would mis-page — proving
+    /// the cursor follows `seq`, not `id`.
+    #[tokio::test]
+    async fn poll_keyset_pages_through_same_ms_burst() {
+        let store = test_store().await;
+        // Five messages to "b", all at the same ts. Insertion order 0..5 but
+        // ids descend (id-4, id-3, …), so id order is the REVERSE of insertion.
+        {
+            let conn = store.db.lock().await;
+            for i in 0..5 {
+                conn.execute(
+                    "INSERT INTO dialogue (id, from_peer, to_peer, session_thread, content, ts)
+                     VALUES (?1, 'a', 'b', ?1, ?2, 1000)",
+                    rusqlite::params![format!("id-{}", 4 - i), format!("msg-{i}")],
+                )
+                .unwrap();
+            }
+        }
+        // Page size 2 (< 5): forces the cursor to advance within one ts.
+        let since = 0i64;
+        let mut after: Option<i64> = None;
+        let mut got: Vec<String> = Vec::new();
+        loop {
+            let rows = store.fetch_for("b", since, after, 2).await.unwrap();
+            if rows.is_empty() {
+                break;
+            }
+            for r in &rows {
+                got.push(r.content.clone());
+            }
+            after = Some(rows.last().unwrap().seq);
+        }
+        assert_eq!(
+            got,
+            vec!["msg-0", "msg-1", "msg-2", "msg-3", "msg-4"],
+            "keyset must page a same-ms burst exactly once, in INSERTION order (by seq, not id)"
+        );
     }
 
     #[tokio::test]

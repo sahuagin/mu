@@ -310,6 +310,7 @@ pub(crate) async fn handle_execute_tools(
                             | Some(AgentInput::ScheduleWakeup { .. })
                             | Some(AgentInput::SwitchProvider { .. })
                             | Some(AgentInput::WatchCompleted { .. })
+                            | Some(AgentInput::DialogueMessage { .. })
                             | Some(AgentInput::MailboxMessage { .. }) => {
                                 if let Ok(mut pending) = pending_approvals.lock() {
                                     pending.remove(&request_id);
@@ -474,6 +475,7 @@ pub(crate) async fn handle_execute_tools(
                                 | Some(input @ AgentInput::ScheduleWakeup { .. })
                                 | Some(input @ AgentInput::SwitchProvider { .. })
                                 | Some(input @ AgentInput::WatchCompleted { .. })
+                                | Some(input @ AgentInput::DialogueMessage { .. })
                                 | Some(input @ AgentInput::MailboxMessage { .. }) => {
                                     buffered.push(input);
                                 }

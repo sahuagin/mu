@@ -26,6 +26,43 @@ die() { printf 'agent-role: %s\n' "$1" >&2; exit 1; }
 CMD=0
 [ "${1:-}" = "--cmd" ] && { CMD=1; shift; }
 ROLE="${1:-}"; RANK="${2:-}"
+
+emit() {  # $1=provider $2=model
+    if [ "$CMD" -eq 1 ]; then
+        case "$1" in
+            claude-oauth) printf 'claude -p --model %s\n' "$2" ;;
+            *)            printf 'mu ask --bare --provider %s --model %s\n' "$1" "$2" ;;
+        esac
+    else
+        printf '%s %s\n' "$1" "$2"
+    fi
+}
+
+# Explicit-model OVERRIDE — the escape hatch so a special-case caller can pin a
+# model WITHOUT hardcoding the dispatch and bypassing the router entirely. Set
+# AGENT_ROLE_PIN="<model>" (provider inferred) or "<provider> <model>" (explicit);
+# agent-role emits THAT target, skipping the ranking + the roles file. Still routes
+# through emit() so the dispatch-path map (claude-oauth -> claude -p) and future
+# per-model params apply. Role/rank args are ignored when pinned. Inference covers
+# the common cases; pass the explicit two-token form for anything it guesses wrong.
+if [ -n "${AGENT_ROLE_PIN:-}" ]; then
+    # shellcheck disable=SC2086
+    set -- $AGENT_ROLE_PIN
+    if [ "$#" -ge 2 ]; then
+        emit "$1" "$2"
+    else
+        case "$1" in
+            */*)                            pp=openrouter ;;    # vendor/model
+            claude-*)                       pp=claude-oauth ;;  # claude-opus-4-8, claude-sonnet-4-6
+            gpt-oss*|*:*|qwen*|gemma*|glm*) pp=ollama ;;        # local tags (model:tag, gpt-oss, ...)
+            gpt-*|o[0-9]*|codex*)           pp=openai-codex ;;  # gpt-5.5, o-series
+            *)                              pp=ollama ;;
+        esac
+        emit "$pp" "$1"
+    fi
+    exit 0
+fi
+
 [ -n "$ROLE" ] || die "usage: agent-role [--cmd] <role> [<rank>]"
 [ -f "$ROLES" ] || die "no roles file: $ROLES (set AGENT_ROLES to override)"
 
@@ -43,17 +80,6 @@ if [ -z "${AGENT_ROLE_NO_LEASE:-}" ] \
     && with-ollama-lease --held >/dev/null 2>&1; then
     json=$(printf '%s' "$json" | jq 'to_entries|sort_by([(.value.provider=="ollama"),.key])|map(.value)')
 fi
-
-emit() {  # $1=provider $2=model
-    if [ "$CMD" -eq 1 ]; then
-        case "$1" in
-            claude-oauth) printf 'claude -p --model %s\n' "$2" ;;
-            *)            printf 'mu ask --bare --provider %s --model %s\n' "$1" "$2" ;;
-        esac
-    else
-        printf '%s %s\n' "$1" "$2"
-    fi
-}
 
 if [ -n "$RANK" ]; then
     p=$(printf '%s' "$json" | jq -r ".[$RANK].provider // empty")

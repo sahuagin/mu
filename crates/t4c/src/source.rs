@@ -287,17 +287,30 @@ impl HelpAiProbeSource {
         });
     }
 
-    fn probe_one(&self, cmd: &str) -> Result<Vec<Capability>> {
-        let out = Command::new(cmd)
+    /// Probe a single command (optionally scoped to a subcommand path) for its
+    /// `--help-ai --json` document, returning the parsed [`HelpAiDoc`] for that
+    /// node. This is the subprocess/parse primitive [`Self::probe_one`] builds
+    /// on; it is also exposed so an embedding host (e.g. mu's MCP `mu/aiHelp`
+    /// surface) can fetch the rich doc for one scoped node — `<command>
+    /// <scope...> --help-ai --json` — without going through the flattened
+    /// capability projection. `scope` is the subcommand argv between the command
+    /// and `--help-ai` (empty for the root document).
+    pub fn probe_help_ai(command: &str, scope: &[String]) -> Result<HelpAiDoc> {
+        let out = Command::new(command)
+            .args(scope)
             .arg("--help-ai")
             .arg("--json")
             .output()
-            .with_context(|| format!("spawning {cmd} --help-ai --json"))?;
+            .with_context(|| format!("spawning {command} {scope:?} --help-ai --json"))?;
         if !out.status.success() {
-            anyhow::bail!("{cmd} --help-ai --json exited {}", out.status);
+            anyhow::bail!("{command} {scope:?} --help-ai --json exited {}", out.status);
         }
-        let doc: HelpAiDoc = serde_json::from_slice(&out.stdout)
-            .with_context(|| format!("parsing {cmd} --help-ai --json output"))?;
+        serde_json::from_slice(&out.stdout)
+            .with_context(|| format!("parsing {command} {scope:?} --help-ai --json output"))
+    }
+
+    fn probe_one(&self, cmd: &str) -> Result<Vec<Capability>> {
+        let doc = Self::probe_help_ai(cmd, &[])?;
         Self::doc_to_caps(&self.source_class, cmd, doc)
     }
 }

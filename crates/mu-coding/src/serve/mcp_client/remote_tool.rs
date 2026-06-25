@@ -47,7 +47,7 @@ impl RemoteMcpTool {
     /// `classified` is whether that classification was operator-supplied
     /// (true) or the fail-safe `Execute` default (false) — it selects the
     /// permission level (see `translate_spec`).
-    pub fn new(
+    pub(crate) fn new(
         server: &str,
         prefix: Option<&str>,
         def: &rmcp::model::Tool,

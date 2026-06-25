@@ -16,12 +16,18 @@
 mod remote_tool;
 pub use remote_tool::RemoteMcpTool;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use mu_core::agent::{SideEffects, Tool};
 use mu_core::config::McpServerConfig;
+use rmcp::model::{
+    ClientCapabilities, ClientInfo, ClientRequest, CustomRequest, ExperimentalCapabilities,
+    Implementation, ServerResult,
+};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::ServiceExt;
+use serde_json::Value;
 
 /// mu-cvm5 (mu-n25a Phase 4): resolve the side-effects class for one imported
 /// MCP tool, fail-safe. MCP carries no side-effects metadata, so there is no
@@ -55,10 +61,72 @@ fn resolve_side_effects(cfg: &McpServerConfig, remote_name: &str) -> (SideEffect
     }
 }
 
-/// The long-lived client handle for one remote server. `()` is the trivial
-/// rmcp `ClientHandler` — we consume server-offered tools and need none of
-/// the client-offered features (sampling/roots/elicitation) yet.
-pub(crate) type McpPeer = rmcp::service::RunningService<rmcp::service::RoleClient, ()>;
+/// Outbound MCP client handler. Replaces the trivial `()` `ClientHandler`:
+/// it still needs none of the client-offered features (sampling / roots /
+/// elicitation), but it advertises `experimental.mu.aiHelp` so a mu-aware peer
+/// offers its negotiated `mu/aiHelp` surface, and it carries a per-connection
+/// cache for the scoped help nodes fetched lazily from that peer.
+#[derive(Clone, Default)]
+pub(crate) struct MuMcpClient {
+    /// Scoped AI-help nodes fetched on demand from the peer, keyed by their
+    /// scope path. PARTIAL at rest: only the paths a caller actually asked for
+    /// are materialized — the tree is never fetched whole, and nothing is
+    /// fetched during import/handshake. Read only through [`fetch_ai_help`],
+    /// which the live agent loop does not yet drive (navigation wiring is out
+    /// of this change's scope), so it is dead outside tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    help_cache: Arc<Mutex<HashMap<Vec<String>, Value>>>,
+}
+
+impl rmcp::ClientHandler for MuMcpClient {
+    fn get_info(&self) -> ClientInfo {
+        // Advertise the experimental feature flag the mu server negotiates on:
+        // `experimental.mu.aiHelp: true`. A non-mu server simply ignores an
+        // experimental key it doesn't recognize.
+        let mut mu = serde_json::Map::new();
+        mu.insert("aiHelp".to_string(), Value::Bool(true));
+        let mut experimental = ExperimentalCapabilities::new();
+        experimental.insert("mu".to_string(), mu);
+        ClientInfo::new(
+            ClientCapabilities::builder()
+                .enable_experimental_with(experimental)
+                .build(),
+            Implementation::new("mu", env!("CARGO_PKG_VERSION")),
+        )
+    }
+}
+
+/// The long-lived client handle for one remote server. One connection, shared
+/// (Arc) by every `RemoteMcpTool` and by [`fetch_ai_help`].
+pub(crate) type McpPeer = rmcp::service::RunningService<rmcp::service::RoleClient, MuMcpClient>;
+
+/// Lazily fetch the AI-help node for `path` from a peer, caching it on the
+/// connection. The first call for a path issues the `mu/aiHelp` custom request
+/// and stores the result; later calls for the same path return the cached node
+/// with no round trip. Only the requested scope is ever materialized — this is
+/// the "partial at rest" ingestion: navigation pulls one node at a time, on
+/// demand, NEVER during import. A peer that did not negotiate the feature
+/// answers `METHOD_NOT_FOUND`, surfaced here as an error.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn fetch_ai_help(peer: &McpPeer, path: &[String]) -> anyhow::Result<Value> {
+    fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    if let Some(hit) = lock(&peer.service().help_cache).get(path).cloned() {
+        return Ok(hit);
+    }
+    let request = ClientRequest::CustomRequest(CustomRequest::new(
+        "mu/aiHelp",
+        Some(serde_json::json!({ "path": path })),
+    ));
+    let node = match peer.send_request(request).await {
+        Ok(ServerResult::CustomResult(custom)) => custom.0,
+        Ok(other) => anyhow::bail!("mu/aiHelp returned an unexpected result: {other:?}"),
+        Err(e) => anyhow::bail!("mu/aiHelp request failed: {e}"),
+    };
+    lock(&peer.service().help_cache).insert(path.to_vec(), node.clone());
+    Ok(node)
+}
 
 /// Connect to every configured server and return the imported tools.
 /// Failures are per-server and non-fatal.
@@ -100,8 +168,10 @@ pub async fn import_remote_tools(servers: &[McpServerConfig]) -> Vec<Arc<dyn Too
 async fn import_from_server(cfg: &McpServerConfig) -> anyhow::Result<Vec<Arc<dyn Tool>>> {
     let transport = StreamableHttpClientTransport::from_uri(cfg.url.as_str());
     // `initialize` handshake; the returned service owns the connection and
-    // is shared (Arc) by every RemoteMcpTool imported from this server.
-    let peer: Arc<McpPeer> = Arc::new(().serve(transport).await?);
+    // is shared (Arc) by every RemoteMcpTool imported from this server. The
+    // handshake advertises `experimental.mu.aiHelp` but does NOT fetch any
+    // help — scoped help is pulled lazily later via [`fetch_ai_help`].
+    let peer: Arc<McpPeer> = Arc::new(MuMcpClient::default().serve(transport).await?);
     let remote = peer.list_all_tools().await?;
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     for def in remote {

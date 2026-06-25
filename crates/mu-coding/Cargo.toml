@@ -15,6 +15,10 @@ path = "src/bin/mu.rs"
 [dependencies]
 mu-core = { path = "../mu-core" }
 mu-ai = { path = "../mu-ai" }
+# mu -> t4c (the allowed direction; t4c is a leaf crate, never depends back).
+# The MCP server's mu/aiHelp surface probes external producers through t4c's
+# HelpAiProbeSource and reuses its HelpAiDoc superset model.
+t4c = { path = "../t4c" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

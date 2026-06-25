@@ -86,13 +86,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rmcp::model::*;
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
 use serde_json::{json, Map as JsonMap, Value};
+use t4c::{HelpAiDoc, HelpAiProbeSource};
 use tokio::net::UnixListener;
 use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, info};
@@ -226,6 +227,13 @@ struct MuMcpHandler {
     /// This connection's auth state — the pipeline's gate reads it at
     /// processing time (module doc, "Auth").
     auth_state: AuthStateHandle,
+    /// Whether THIS connection negotiated `experimental.mu.aiHelp` at
+    /// `initialize` (the client advertised it; we mirrored it back). Set once
+    /// during the handshake and read by [`Self::on_custom_request`] to gate
+    /// `mu/aiHelp`: a client that never negotiated the feature sees the method
+    /// as `METHOD_NOT_FOUND`, exactly as if it were unimplemented. Per
+    /// connection (`Arc<AtomicBool>`), not process-wide.
+    ai_help_negotiated: Arc<AtomicBool>,
     /// Active subscription tasks keyed by resource URI. Each entry
     /// holds a JoinHandle that watches the session's status channel
     /// and pushes notifications to the peer. Dropped on unsubscribe.
@@ -248,6 +256,7 @@ impl MuMcpHandler {
             demux,
             origin,
             auth_state,
+            ai_help_negotiated: Arc::new(AtomicBool::new(false)),
             watch_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -289,10 +298,157 @@ impl MuMcpHandler {
             context_used_tokens,
         }))
     }
+
+    /// The `initialize` response for this connection: the base [`Self::get_info`]
+    /// capabilities, plus `experimental.mu.aiHelp: true` ONLY when `negotiated`
+    /// (the client asked for it). Built by injecting into the base rather than
+    /// duplicating it, so the server-info/instructions never drift.
+    fn info_with_ai_help(&self, negotiated: bool) -> InitializeResult {
+        let mut info = self.get_info();
+        if negotiated {
+            let mut mu = JsonMap::new();
+            mu.insert("aiHelp".to_string(), Value::Bool(true));
+            info.capabilities
+                .experimental
+                .get_or_insert_with(Default::default)
+                .insert("mu".to_string(), mu);
+        }
+        info
+    }
+}
+
+// ─── Experimental mu/aiHelp surface ─────────────────────────────────
+//
+// A negotiated, gated custom request that serves t4c-style `--help-ai`
+// documentation over MCP. The wire feature flag rides in the experimental
+// capabilities map as `experimental.mu.aiHelp` on BOTH sides of the
+// handshake; the request itself is the custom JSON-RPC method `mu/aiHelp`
+// with params `{ "path": [...] }`. The response reuses the `HelpAiDoc`
+// superset fields for the addressed node, with its immediate `subcommands`
+// trimmed to `children: [{name, summary}]` (no recursive grandchildren) so a
+// consumer navigates the tree one level at a time.
+
+/// The custom JSON-RPC method name for the AI-help surface.
+const AI_HELP_METHOD: &str = "mu/aiHelp";
+
+/// One registered external `--help-ai` producer the surface can probe. The
+/// registry is static and small (a curated set of mu-adjacent agent tools);
+/// `command` is the executable resolved on `PATH`.
+struct AiHelpProducer {
+    /// Path segment / display name (e.g. `agent`).
+    name: &'static str,
+    /// One-line, discovery-facing summary for the registry listing and for the
+    /// shallow fallback node when the producer can't be probed.
+    summary: &'static str,
+    /// The executable to invoke for `<command> <scope...> --help-ai --json`.
+    command: &'static str,
+}
+
+/// The registered producers. Kept deliberately minimal; `agent` is the
+/// canonical mu-adjacent tool that already speaks `--help-ai --json`.
+static AI_HELP_PRODUCERS: &[AiHelpProducer] = &[AiHelpProducer {
+    name: "agent",
+    summary: "agent memory / tasks / metrics CLI (agent memory, agent task, …)",
+    command: "agent",
+}];
+
+/// True iff `caps.experimental.mu.aiHelp == true` — the client opting into the
+/// experimental surface during `initialize`. A bare `experimental.mu` without
+/// `aiHelp` (or a non-`true` value) does NOT negotiate the feature.
+fn client_requested_ai_help(caps: &ClientCapabilities) -> bool {
+    caps.experimental
+        .as_ref()
+        .and_then(|e| e.get("mu"))
+        .and_then(|mu| mu.get("aiHelp"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Parse the `mu/aiHelp` params into a scope path. Absent params or an absent
+/// `path` resolve to the root (`[]`); a present `path` MUST be an array of
+/// strings, else `INVALID_PARAMS`.
+fn parse_ai_help_path(params: Option<&Value>) -> Result<Vec<String>, McpError> {
+    let Some(path_val) = params.and_then(|p| p.get("path")) else {
+        return Ok(Vec::new());
+    };
+    let arr = path_val
+        .as_array()
+        .ok_or_else(|| McpError::invalid_params("`path` must be an array of strings", None))?;
+    arr.iter()
+        .map(|seg| {
+            seg.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| McpError::invalid_params("`path` segments must be strings", None))
+        })
+        .collect()
+}
+
+/// Resolve a scope path to its trimmed help node.
+///
+/// - `[]` → a synthetic root node listing the registered producers as
+///   `children: [{name, summary}]` (no invented own scalar content).
+/// - `[producer, scope...]` → the producer's `<command> <scope...> --help-ai
+///   --json` doc, trimmed one level. A registered producer that is absent or
+///   emits non-conforming output degrades to a shallow `{name, summary}` node
+///   rather than failing the request.
+/// - an unregistered top-level producer → `INVALID_PARAMS`.
+fn resolve_ai_help(path: &[String]) -> Result<Value, McpError> {
+    let Some((producer_name, scope)) = path.split_first() else {
+        return Ok(ai_help_root());
+    };
+    let Some(producer) = AI_HELP_PRODUCERS.iter().find(|p| p.name == producer_name) else {
+        return Err(McpError::invalid_params(
+            format!("unknown mu/aiHelp producer: {producer_name}"),
+            None,
+        ));
+    };
+    match HelpAiProbeSource::probe_help_ai(producer.command, scope) {
+        Ok(doc) => Ok(trim_help_node(&doc)),
+        Err(_) => Ok(json!({ "name": producer.name, "summary": producer.summary })),
+    }
+}
+
+/// The synthetic root node: the registry surface itself. Carries only its own
+/// identity plus the producer list — no fabricated args/usage/output_schema.
+fn ai_help_root() -> Value {
+    let children: Vec<Value> = AI_HELP_PRODUCERS
+        .iter()
+        .map(|p| json!({ "name": p.name, "summary": p.summary }))
+        .collect();
+    json!({
+        "name": "mu",
+        "summary": "mu MCP AI-help surface — children are registered --help-ai producers",
+        "children": children,
+    })
+}
+
+/// Trim one [`HelpAiDoc`] node for the wire: keep this node's OWN rich fields
+/// (name, summary, args, usage, output_schema, …) but replace its recursive
+/// `subcommands` with a shallow `children: [{name, summary}]` list, dropping
+/// grandchildren. Navigation is one level per request.
+fn trim_help_node(doc: &HelpAiDoc) -> Value {
+    let mut v = serde_json::to_value(doc).unwrap_or(Value::Null);
+    if let Value::Object(map) = &mut v {
+        map.remove("subcommands");
+        if !doc.subcommands.is_empty() {
+            let children: Vec<Value> = doc
+                .subcommands
+                .iter()
+                .map(|s| json!({ "name": s.name, "summary": s.summary }))
+                .collect();
+            map.insert("children".to_string(), Value::Array(children));
+        }
+    }
+    v
 }
 
 impl ServerHandler for MuMcpHandler {
     fn get_info(&self) -> InitializeResult {
+        // The BASE, non-negotiated server capabilities. Deliberately carries NO
+        // `experimental.mu.aiHelp`: a client that does not ask for the feature
+        // gets no unilateral advertisement of it. The negotiated superset is
+        // assembled in [`Self::initialize`] from this base — see
+        // [`Self::info_with_ai_help`].
         InitializeResult::new(
             ServerCapabilities::builder()
                 .enable_tools()
@@ -302,6 +458,60 @@ impl ServerHandler for MuMcpHandler {
         )
         .with_server_info(Implementation::new("mu", env!("CARGO_PKG_VERSION")))
         .with_instructions("mu daemon — session status resources + mailbox tools")
+    }
+
+    /// Override the handshake so the experimental `mu/aiHelp` feature is
+    /// *negotiated*, not asserted: we advertise it back ONLY when the client
+    /// advertised `experimental.mu.aiHelp == true`. The negotiation state is
+    /// remembered on this connection and gates [`Self::on_custom_request`].
+    /// (Replicates rmcp's default `set_peer_info` step so peer info is still
+    /// recorded.)
+    fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<InitializeResult, McpError>> + Send + '_ {
+        let negotiated = client_requested_ai_help(&request.capabilities);
+        if context.peer.peer_info().is_none() {
+            context.peer.set_peer_info(request);
+        }
+        self.ai_help_negotiated.store(negotiated, Ordering::Relaxed);
+        let info = self.info_with_ai_help(negotiated);
+        std::future::ready(Ok(info))
+    }
+
+    /// Handle the experimental `mu/aiHelp` custom request (and nothing else —
+    /// any other method keeps rmcp's `METHOD_NOT_FOUND` default). Gated on this
+    /// connection having negotiated the feature at `initialize`; an
+    /// un-negotiated caller sees `METHOD_NOT_FOUND` (-32601) as if the method
+    /// did not exist. Params are `{ "path": [...] }`; the resolver returns the
+    /// trimmed help node for that scope (root registry for `[]`, a producer's
+    /// scoped `--help-ai` doc otherwise).
+    fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<CustomResult, McpError>> + Send + '_ {
+        async move {
+            if request.method != AI_HELP_METHOD {
+                return Err(McpError::new(
+                    ErrorCode::METHOD_NOT_FOUND,
+                    request.method,
+                    None,
+                ));
+            }
+            if !self.ai_help_negotiated.load(Ordering::Relaxed) {
+                // Not negotiated on this connection: behave as unimplemented.
+                return Err(McpError::new(
+                    ErrorCode::METHOD_NOT_FOUND,
+                    AI_HELP_METHOD,
+                    None,
+                ));
+            }
+            let path = parse_ai_help_path(request.params.as_ref())?;
+            let node = resolve_ai_help(&path)?;
+            Ok(CustomResult::new(node))
+        }
     }
 
     // ─── Resources ──────────────────────────────────────────────────
@@ -870,9 +1080,25 @@ mod tests {
         ))
     }
 
-    /// Full adapter stack: journal (tempdir, [journal].dir pattern) →
-    /// control plane → MCP socket → connected rmcp client.
-    async fn spawn_harness(auth_registry: Arc<AuthRegistry>) -> Harness {
+    /// A running server over a tempdir unix socket, WITHOUT a connected
+    /// client. The handshake-level tests connect their own clients (with a
+    /// chosen [`ClientInfo`]) so they can inspect the negotiated
+    /// `initialize` response; [`spawn_harness`] layers a `()` client on top
+    /// for the WP5 tool round-trip tests.
+    struct ServerHandle {
+        _dir: tempfile::TempDir,
+        journal_path: std::path::PathBuf,
+        sessions: Sessions,
+        daemon_info: DaemonInfo,
+        control: Arc<ControlPlane>,
+        outbound: Router,
+        socket_path: std::path::PathBuf,
+        _server: tokio::task::JoinHandle<()>,
+    }
+
+    /// Stand up the adapter stack (journal → control plane → MCP socket) and
+    /// wait until the socket accepts. No client is connected.
+    async fn spawn_server_socket(auth_registry: Arc<AuthRegistry>) -> ServerHandle {
         let dir = tempfile::tempdir().expect("tempdir");
         let journal_path = dir.path().join("daemon.jsonl");
         let journal = Arc::new(
@@ -927,19 +1153,36 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let stream = tokio::net::UnixStream::connect(&socket_path)
-            .await
-            .expect("connect mcp socket");
-        let client = ().serve(stream.into_split()).await.expect("mcp client handshake");
-        Harness {
+        ServerHandle {
             _dir: dir,
             journal_path,
             sessions,
             daemon_info,
             control,
             outbound,
-            client,
+            socket_path,
             _server: server,
+        }
+    }
+
+    /// Full adapter stack: [`spawn_server_socket`] plus a connected `()`
+    /// rmcp client — the same trivial client shape the WP5 round-trip tests
+    /// drive.
+    async fn spawn_harness(auth_registry: Arc<AuthRegistry>) -> Harness {
+        let server = spawn_server_socket(auth_registry).await;
+        let stream = tokio::net::UnixStream::connect(&server.socket_path)
+            .await
+            .expect("connect mcp socket");
+        let client = ().serve(stream.into_split()).await.expect("mcp client handshake");
+        Harness {
+            _dir: server._dir,
+            journal_path: server.journal_path,
+            sessions: server.sessions,
+            daemon_info: server.daemon_info,
+            control: server.control,
+            outbound: server.outbound,
+            client,
+            _server: server._server,
         }
     }
 
@@ -1353,6 +1596,63 @@ mod tests {
         assert!(
             reason.contains("source of truth"),
             "reason points at the journal: {reason}"
+        );
+    }
+
+    /// A negotiated client gets the `mu/aiHelp` surface: the handshake mirrors
+    /// `experimental.mu.aiHelp` (the client advertises it), and `fetch_ai_help`
+    /// round-trips a scoped node. Root (`[]`) lists the registered producers —
+    /// `agent` is one. A second fetch of the same scope is served from the
+    /// per-connection cache, exercising the client plumbing end to end.
+    #[tokio::test]
+    async fn ai_help_round_trips_for_a_negotiated_client() {
+        use super::super::mcp_client::{fetch_ai_help, MuMcpClient};
+        let server = spawn_server_socket(open_registry()).await;
+        let stream = tokio::net::UnixStream::connect(&server.socket_path)
+            .await
+            .expect("connect mcp socket");
+        let peer = MuMcpClient::default()
+            .serve(stream.into_split())
+            .await
+            .expect("mu client handshake (negotiated)");
+
+        let root = fetch_ai_help(&peer, &[]).await.expect("fetch root ai-help");
+        let producers: Vec<&str> = root["children"]
+            .as_array()
+            .expect("root carries a children array")
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        assert!(producers.contains(&"agent"), "root children: {root}");
+
+        // Second fetch of the same scope: served from the connection cache.
+        let cached = fetch_ai_help(&peer, &[]).await.expect("cached fetch");
+        assert_eq!(root, cached, "cached node must match the first fetch");
+    }
+
+    /// A client that did NOT negotiate `experimental.mu.aiHelp` (the trivial
+    /// `()` handler advertises nothing) sees `mu/aiHelp` as METHOD_NOT_FOUND
+    /// (-32601) — indistinguishable from an unimplemented method. The feature
+    /// is invisible to a vanilla client.
+    #[tokio::test]
+    async fn ai_help_is_method_not_found_without_negotiation() {
+        use rmcp::model::{ClientRequest, CustomRequest};
+        let server = spawn_server_socket(open_registry()).await;
+        let stream = tokio::net::UnixStream::connect(&server.socket_path)
+            .await
+            .expect("connect mcp socket");
+        let client = ().serve(stream.into_split()).await.expect("client handshake");
+        let resp = client
+            .send_request(ClientRequest::CustomRequest(CustomRequest::new(
+                "mu/aiHelp",
+                Some(json!({ "path": [] })),
+            )))
+            .await;
+        let err = resp.expect_err("un-negotiated mu/aiHelp must be rejected");
+        let shown = format!("{err}").to_lowercase();
+        assert!(
+            shown.contains("-32601") || shown.contains("method not found"),
+            "expected METHOD_NOT_FOUND, got: {shown}"
         );
     }
 }

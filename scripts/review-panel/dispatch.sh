@@ -18,6 +18,14 @@ PF="$1"; OUT="$2"; CWD="${3:-$PWD}"; TMO="${4:-600}"
 MU="${MU_BIN:-$HOME/src/public_github/mu/target/release/mu}"
 ROLES="${AGENT_ROLES:-$HOME/.config/mu/agent_roles.toml}"
 TQ="${TQ:-$HOME/.cargo/bin/tq}"; command -v "$TQ" >/dev/null 2>&1 || TQ=tq
+# Dispatch via the shared lib (mu-q0xl): provider routing — incl. claude-oauth ->
+# `claude -p` — lives in ONE place. Calling `mu ask --provider` directly here meant
+# a claude-oauth rank hit "unknown provider" and emitted nothing every round. $HERE
+# is captured before any cd so the relative lib path resolves regardless of $CWD.
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+AGENT_DISPATCH_LIB="${AGENT_DISPATCH_LIB:-$HERE/../lib/agent-dispatch.sh}"
+[ -r "$AGENT_DISPATCH_LIB" ] || { echo "dispatch.sh: missing dispatch lib: $AGENT_DISPATCH_LIB" >&2; exit 2; }
+. "$AGENT_DISPATCH_LIB"
 # OpenRouter key for the metered rank — exported silently, never printed.
 OPENROUTER_API_KEY=$(tq -f "$HOME/.config/agent/config.toml" -r openrouter.api_key)
 export OPENROUTER_API_KEY
@@ -41,9 +49,11 @@ while [ "$r" -lt "$N" ]; do
   tag="rank${r}.$(printf '%s' "$model" | tr '/:' '__')"
   (
     warmup "$prov" "$model"
-    timeout "$TMO" "$MU" ask --bare --provider "$prov" --model "$model" \
-      --tools "$tools" --prompt-file "$PF" \
-      > "${OUT}.${tag}.out" 2> "${OUT}.${tag}.err"
+    # agent_dispatch reads TOOLS/TIMEOUT/MU/ERRLOG from scope; stdout = the model's
+    # output (-> .out), stderr -> $ERRLOG (per-rank .err). claude-oauth now routes
+    # to `claude -p` instead of erroring. (Subshell-local assignments: no leakage.)
+    TOOLS="$tools"; TIMEOUT="$TMO"; ERRLOG="${OUT}.${tag}.err"
+    agent_dispatch "$prov" "$model" "$PF" > "${OUT}.${tag}.out"
     echo "exit=$? prov=$prov model=$model tools=[$tools]" > "${OUT}.${tag}.done"
   ) &
   r=$((r + 1))

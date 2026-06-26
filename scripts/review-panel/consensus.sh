@@ -16,6 +16,13 @@ P1="$1"; OUT="$2"; CWD="${3:-$PWD}"; MAXR="${4:-4}"
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROLES="${AGENT_ROLES:-$HOME/.config/mu/agent_roles.toml}"
 MU="${MU_BIN:-mu}"; TQ="${TQ:-tq}"
+# Convergence rounds dispatch via the shared lib (mu-q0xl) so provider routing —
+# incl. claude-oauth -> `claude -p` — matches round 1 (dispatch.sh) and ai-review.
+# Calling `mu ask --provider` directly here made a claude-oauth rank emit nothing
+# every round -> permanent SPLIT/false NO CONSENSUS.
+AGENT_DISPATCH_LIB="${AGENT_DISPATCH_LIB:-$HERE/../lib/agent-dispatch.sh}"
+[ -r "$AGENT_DISPATCH_LIB" ] || { echo "consensus.sh: missing dispatch lib: $AGENT_DISPATCH_LIB" >&2; exit 2; }
+. "$AGENT_DISPATCH_LIB"
 mkdir -p "$OUT"
 # the diff that convergence prompts quote = the content of the first ```diff fence.
 awk '/^```diff/{f=1;next} /^```/{if(f)exit} f' "$P1" > "$OUT/diff.txt"
@@ -42,9 +49,12 @@ while [ "$round" -lt "$MAXR" ]; do
     python3 "$HERE/converge.py" prompt "$OUT/r$prev" "$round" "$OUT/diff.txt" "$tag" \
       "$OUT/r${round}.${tag}.prompt" >/dev/null
     (
-      cd "$CWD" && timeout 900 "$MU" ask --bare --provider "$prov" --model "$model" \
-        --tools "$tools" --prompt-file "$OUT/r${round}.${tag}.prompt" \
-        > "$OUT/r${round}.${tag}.out" 2> "$OUT/r${round}.${tag}.err"
+      cd "$CWD" || exit 1
+      # agent_dispatch reads TOOLS/TIMEOUT/MU/ERRLOG from scope; stdout -> .out,
+      # stderr -> $ERRLOG. claude-oauth now routes to `claude -p` instead of erroring.
+      TOOLS="$tools"; TIMEOUT=900; ERRLOG="$OUT/r${round}.${tag}.err"
+      agent_dispatch "$prov" "$model" "$OUT/r${round}.${tag}.prompt" \
+        > "$OUT/r${round}.${tag}.out"
       echo "exit=$? $prov/$model" > "$OUT/r${round}.${tag}.done"
     ) &
     r=$((r + 1))

@@ -45,11 +45,12 @@ use std::time::Duration;
 
 use mu_core::agent::{AgentInput, Tool, ToolResult, ToolSpec};
 use serde_json::{json, Value};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 
 use crate::serve::WeakSessions;
+use crate::tools::{bash, BashMode};
 
 /// Max live watches per session. A turn that fans out more than this is
 /// almost certainly a mistake (and risks a fork-bomb of background
@@ -82,14 +83,21 @@ pub struct WatchTool {
     /// The session that owns this tool — the one a finished watch wakes.
     parent_session_id: String,
     registry: WatchRegistry,
+    /// mu-qnag: the daemon's command-execution policy. Every watched
+    /// command is gated through this — the SAME [`BashMode`] the `bash`
+    /// tool uses — so a session's watch authority matches its bash
+    /// authority. A strict session (no `--bash-*` flags) rejects anything
+    /// outside the read-only allowlist; yolo runs anything.
+    bash_mode: BashMode,
 }
 
 impl WatchTool {
-    pub fn new(sessions: WeakSessions, parent_session_id: String) -> Self {
+    pub fn new(sessions: WeakSessions, parent_session_id: String, bash_mode: BashMode) -> Self {
         Self {
             sessions,
             parent_session_id,
             registry: Arc::new(Mutex::new(Vec::new())),
+            bash_mode,
         }
     }
 
@@ -127,19 +135,22 @@ impl Drop for WatchTool {
     }
 }
 
-/// Spawn `command` under `sh -c`, with `kill_on_drop` so a dropped
-/// (aborted / timed-out) task kills the process. Synchronous: surfaces
-/// spawn failures to the caller immediately, before the watch is
-/// registered.
-fn spawn_command(command: &str) -> std::io::Result<Child> {
-    Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .stdin(Stdio::null())
+/// Build the watched child through the SHARED bash gate (mu-qnag) and
+/// spawn it, with `kill_on_drop` so a dropped (aborted / timed-out) task
+/// kills the process. The command is validated against `mode` FIRST: a
+/// strict session rejects anything outside its allowlist with bash's own
+/// message, BEFORE any process starts — so a rejected command surfaces an
+/// error THIS turn and never parks the session on a wakeup that won't
+/// come. Returns the rejection (or a spawn failure) as a `String` so the
+/// caller can surface it directly.
+fn spawn_command(mode: &BashMode, command: &str) -> Result<Child, String> {
+    let mut cmd = bash::build_command(mode, command)?;
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
+        .map_err(|e| format!("watch: failed to spawn command: {e}"))
 }
 
 /// Await `child` to exit (or `timeout_secs` to elapse) and render a
@@ -202,6 +213,17 @@ fn tail_bytes(s: &str, max: usize) -> String {
 
 impl Tool for WatchTool {
     fn spec(&self) -> ToolSpec {
+        // mu-qnag: watch inherits the FULL bash command policy, including the
+        // `--bash-prompt` approval posture. When the daemon's BashMode is
+        // Strict { prompt: true }, `bash` advertises PermissionLevel::Ask
+        // (per-call approval) for allowlisted commands — watch must too, or
+        // watch authority would still exceed bash authority. Strict-without-
+        // prompt and yolo run on Allow (the substantive gate is the allowlist
+        // in `validate` / `build_command`, not holding the tool).
+        let permission = match &self.bash_mode {
+            BashMode::Strict { prompt: true, .. } => mu_core::agent::PermissionLevel::Ask,
+            _ => mu_core::agent::PermissionLevel::Allow,
+        };
         ToolSpec::new(
             "watch",
             "Run a command in the background and wake this session with its result when it \
@@ -216,7 +238,12 @@ impl Tool for WatchTool {
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Shell command to run (executed via `sh -c`)."
+                        "description": "Command to run. Gated by the SAME policy as the `bash` \
+                                        tool: in a strict session only allowlisted (read-only) \
+                                        commands run and shell metacharacters are rejected; a \
+                                        `--bash-yolo` session runs anything via `bash -c`; a \
+                                        `--bash-prompt` session requires per-call approval. A \
+                                        rejected command errors immediately (it is not registered)."
                     },
                     "note": {
                         "type": "string",
@@ -232,21 +259,35 @@ impl Tool for WatchTool {
                 "required": ["command", "note"]
             }),
         )
-        // mu-usfj: watch runs arbitrary `sh -c` — it is Execute, NOT the
-        // defaulted ReadOnly. The previous default policy let a watch
-        // bypass the gate `bash` faces (a `watch("rm -rf x")` sailed
-        // through). Honest declaration now; the side-effects-aware gate
-        // that ACTS on Execute is mu-n25a Phase 2. `idempotent: false`
-        // (the world changes between runs), permission left Allow until
-        // the gate + session posture exist to narrow it correctly
-        // without breaking the autonomous watch flow.
+        // mu-usfj / mu-qnag: watch runs a command — it is Execute, NOT the
+        // defaulted ReadOnly. It no longer ships its own ungated `sh -c`:
+        // every command is validated through the SHARED bash gate
+        // (`validate` / `bash::build_command`), so a `watch("rm -rf x")` /
+        // `watch("cargo test")` in a strict session is rejected by the exact
+        // allowlist that gates `bash`, and a `--bash-prompt` session requires
+        // the same per-call approval (`permission` above). `idempotent: false`
+        // (the world changes between runs).
         .with_policy(mu_core::agent::ToolPolicy {
             side_effects: mu_core::agent::SideEffects::Execute,
-            permission: mu_core::agent::PermissionLevel::Allow,
+            permission,
             retry: mu_core::agent::RetryPolicy::ModelDecides,
             required_aws_capability: None,
             idempotent: false,
         })
+    }
+
+    fn validate(&self, arguments: &Value) -> Result<(), String> {
+        // mu-qnag: mirror bash's pre-flight (mu-bkjr). The dispatcher runs
+        // `validate` BEFORE the PermissionLevel::Ask approval gate, so a
+        // command the allowlist will reject fails immediately WITHOUT
+        // prompting, and watch's command authority matches bash's exactly
+        // (allowlist + metachars + the `--bash-prompt` approval posture).
+        // `execute` re-gates via `build_command` for direct-call paths.
+        let command = arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "watch: missing required argument: command".to_string())?;
+        bash::validate_command(&self.bash_mode, command)
     }
 
     fn execute<'life0, 'async_trait>(
@@ -281,10 +322,11 @@ impl Tool for WatchTool {
             let command = command.ok_or("watch: missing required argument: command")?;
             let note = note.ok_or("watch: missing required argument: note")?;
 
-            // Spawn first so a bad command is reported NOW (the model can
-            // fix it this turn) rather than only via a delayed wakeup.
-            let child = spawn_command(&command)
-                .map_err(|e| format!("watch: failed to spawn command: {e}"))?;
+            // Gate + spawn synchronously so a rejected (allowlist miss) or
+            // un-spawnable command is reported NOW — the model can fix it
+            // this turn, and a rejected watch is never registered, so the
+            // session is never parked on a wakeup that won't come. mu-qnag.
+            let child = spawn_command(&self.bash_mode, &command)?;
 
             let weak = self.sessions.clone();
             let parent = self.parent_session_id.clone();
@@ -341,15 +383,21 @@ mod tests {
     use crate::serve::Sessions;
     use serde_json::json;
 
-    fn tool() -> WatchTool {
+    fn tool_with_mode(mode: BashMode) -> WatchTool {
         // Tests of execute/reserve don't need a live registry — a dead
         // weak from the dropped temporary is fine (wakeups become no-ops).
-        WatchTool::new(Sessions::new().downgrade(), "session-1".to_string())
+        WatchTool::new(Sessions::new().downgrade(), "session-1".to_string(), mode)
+    }
+
+    fn tool() -> WatchTool {
+        // Default to yolo so the pre-mu-qnag execute/reserve tests (which
+        // use shell features / non-allowlisted commands) keep their meaning.
+        tool_with_mode(BashMode::Yolo)
     }
 
     #[tokio::test]
     async fn summarize_echo_reports_exit_zero_and_output() {
-        let child = spawn_command("echo hello-watch").expect("spawn echo");
+        let child = spawn_command(&BashMode::Yolo, "echo hello-watch").expect("spawn echo");
         let summary = wait_and_summarize(child, 30).await;
         assert!(summary.contains("Exit status: 0"), "summary: {summary}");
         assert!(summary.contains("hello-watch"), "summary: {summary}");
@@ -357,14 +405,14 @@ mod tests {
 
     #[tokio::test]
     async fn summarize_nonzero_exit_reports_code() {
-        let child = spawn_command("exit 3").expect("spawn");
+        let child = spawn_command(&BashMode::Yolo, "exit 3").expect("spawn");
         let summary = wait_and_summarize(child, 30).await;
         assert!(summary.contains("Exit status: 3"), "summary: {summary}");
     }
 
     #[tokio::test]
     async fn summarize_stderr_is_captured() {
-        let child = spawn_command("echo oops 1>&2; exit 1").expect("spawn");
+        let child = spawn_command(&BashMode::Yolo, "echo oops 1>&2; exit 1").expect("spawn");
         let summary = wait_and_summarize(child, 30).await;
         assert!(summary.contains("Exit status: 1"), "summary: {summary}");
         assert!(summary.contains("oops"), "stderr captured: {summary}");
@@ -375,7 +423,7 @@ mod tests {
         // A long sleeper with a sub-second timeout: the watch must NOT
         // hang — it returns a TIMED OUT summary (and the child is killed
         // when `child` drops). Silence is impossible.
-        let child = spawn_command("sleep 30").expect("spawn sleep");
+        let child = spawn_command(&BashMode::Yolo, "sleep 30").expect("spawn sleep");
         let summary = tokio::time::timeout(Duration::from_secs(5), wait_and_summarize(child, 1))
             .await
             .expect("wait_and_summarize must return well before 5s");
@@ -419,6 +467,126 @@ mod tests {
             .reserve_slot(extra.abort_handle())
             .expect_err("over cap must reject");
         assert!(err.contains("cap"), "{err}");
+    }
+
+    // ── mu-qnag: watch routes commands through the shared bash gate ──
+
+    #[tokio::test]
+    async fn strict_mode_rejects_non_allowlisted_command() {
+        // The reported incident: a read-only reviewer (no `--bash-*` flags
+        // ⇒ strict) ran `cargo test` via watch. The command must now be
+        // rejected by the SAME allowlist that gates `bash`, BEFORE any
+        // process spawns — so a rejected watch is never registered and the
+        // turn is never parked.
+        let t = tool_with_mode(BashMode::strict_with_extras(&[], false));
+        let (_tx, rx) = oneshot::channel();
+        let res = t
+            .execute(
+                json!({ "command": "cargo test --workspace", "note": "tests" }),
+                rx,
+            )
+            .await;
+        assert!(
+            res.is_error,
+            "strict watch must reject cargo test: {}",
+            res.content
+        );
+        assert!(
+            res.content.contains("not in the strict-mode allowlist"),
+            "expected the bash allowlist message, got: {}",
+            res.content
+        );
+        assert!(
+            !res.content.contains("Watch registered"),
+            "a rejected command must not be registered: {}",
+            res.content
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_mode_rejects_shell_metacharacters() {
+        // The strict metachar gate applies to watch too — no allowlist
+        // bypass via chaining/substitution/redirect.
+        let t = tool_with_mode(BashMode::strict_with_extras(&[], false));
+        let (_tx, rx) = oneshot::channel();
+        let res = t
+            .execute(json!({ "command": "echo hi; cargo test", "note": "x" }), rx)
+            .await;
+        assert!(res.is_error, "metachar must be rejected: {}", res.content);
+        assert!(
+            res.content.contains("metacharacter"),
+            "expected metachar rejection, got: {}",
+            res.content
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_mode_allows_allowlisted_command() {
+        // `echo` is in the default read-only allowlist, so a strict session
+        // can still watch it — the gate is on WHAT runs, not on holding the
+        // tool.
+        let t = tool_with_mode(BashMode::strict_with_extras(&[], false));
+        let (_tx, rx) = oneshot::channel();
+        let res = t
+            .execute(json!({ "command": "echo waiting", "note": "ok" }), rx)
+            .await;
+        assert!(
+            !res.is_error,
+            "allowlisted command should register: {}",
+            res.content
+        );
+        assert!(res.content.contains("Watch registered"), "{}", res.content);
+    }
+
+    #[test]
+    fn validate_preflight_gates_like_bash() {
+        // mu-qnag: validate mirrors bash's mu-bkjr pre-flight so the
+        // dispatcher rejects a doomed command BEFORE the approval gate.
+        let t = tool_with_mode(BashMode::strict_with_extras(&[], false));
+        let err = t
+            .validate(&json!({ "command": "cargo test", "note": "x" }))
+            .expect_err("strict validate must reject cargo test");
+        assert!(err.contains("not in the strict-mode allowlist"), "{err}");
+        assert!(t
+            .validate(&json!({ "command": "echo ok", "note": "x" }))
+            .is_ok());
+        // Yolo validate passes anything.
+        assert!(tool_with_mode(BashMode::Yolo)
+            .validate(&json!({ "command": "cargo build", "note": "x" }))
+            .is_ok());
+    }
+
+    #[test]
+    fn permission_tracks_bash_prompt_posture() {
+        // mu-qnag: in a --bash-prompt (Strict { prompt: true }) daemon, bash
+        // requires per-call approval; watch must advertise the same Ask
+        // posture instead of running allowlisted commands unapproved.
+        use mu_core::agent::PermissionLevel;
+        let ask = tool_with_mode(BashMode::strict_with_extras(&[], true));
+        assert_eq!(ask.spec().policy.permission, PermissionLevel::Ask);
+        let allow = tool_with_mode(BashMode::strict_with_extras(&[], false));
+        assert_eq!(allow.spec().policy.permission, PermissionLevel::Allow);
+        assert_eq!(
+            tool_with_mode(BashMode::Yolo).spec().policy.permission,
+            PermissionLevel::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn yolo_mode_allows_non_allowlisted_command() {
+        // A `--bash-yolo` session (e.g. the orchestrator worker) keeps
+        // running arbitrary commands via watch — unchanged by mu-qnag.
+        let t = tool_with_mode(BashMode::Yolo);
+        let (_tx, rx) = oneshot::channel();
+        let res = t
+            .execute(json!({ "command": "echo a | cat", "note": "pipe" }), rx)
+            .await;
+        assert!(
+            !res.is_error,
+            "yolo watch should allow anything: {}",
+            res.content
+        );
+        assert!(res.content.contains("Watch registered"), "{}", res.content);
     }
 
     #[tokio::test]

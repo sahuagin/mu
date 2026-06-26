@@ -139,6 +139,7 @@ pub async fn run(
     tools: Vec<Arc<dyn Tool>>,
     bare: bool,
     max_turns: Option<u32>,
+    bash_settings: BashSettings,
 ) -> anyhow::Result<()> {
     // spec mu-046 WP6: track config provenance — the file layers that
     // contributed, plus the consumer-side overrides applied right
@@ -177,6 +178,7 @@ pub async fn run(
         events_dir,
         config,
         config_sources,
+        bash_settings,
     )
     .await
 }
@@ -240,6 +242,11 @@ where
         events_dir,
         config,
         vec!["defaults".to_string()],
+        // mu-qnag: test/default hook — strict bash policy (the safe floor).
+        // Production `run` threads the real settings from the `--bash-*`
+        // flags; tests that exercise watch's gate construct DaemonInfo
+        // directly with the mode they want.
+        BashSettings::default(),
     )
     .await
 }
@@ -248,6 +255,10 @@ where
 /// mu-046 WP6): `config_sources` lists the layers that produced
 /// `config` (see [`mu_core::config::Config::load_with_sources`]) and
 /// is journaled verbatim in the boot-time `ConfigLoaded` record.
+// The arg list is the daemon's full boot bundle (io, factory, tools,
+// events_dir, config (+sources), and the bash/command policy — mu-qnag);
+// threading a struct here would obscure the one production call site.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_with_io_with_config_sources<R, W>(
     reader: R,
     writer: W,
@@ -256,6 +267,7 @@ pub async fn serve_with_io_with_config_sources<R, W>(
     events_dir: Option<PathBuf>,
     config: mu_core::config::Config,
     config_sources: Vec<String>,
+    bash_settings: BashSettings,
 ) -> anyhow::Result<()>
 where
     R: AsyncBufRead + Unpin + Send + 'static,
@@ -329,7 +341,10 @@ where
         .with_events_dir(events_dir)
         .with_config(config)
         .with_recall_providers(recall_providers)
-        .with_route_catalog(route_catalog);
+        .with_route_catalog(route_catalog)
+        // mu-qnag: carry the daemon's command policy so the per-session
+        // `watch` tool gates through the SAME BashMode as `bash`.
+        .with_bash_settings(bash_settings);
     // mu-slat: register the well-known "supervisor" session so workers
     // always have a stable mailbox target for posting results back.
     // Only in production (events_dir set) — tests don't spawn workers.

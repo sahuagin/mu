@@ -39,6 +39,22 @@ pub struct BashSettings {
     pub prompt: bool,
 }
 
+impl BashSettings {
+    /// Resolve these daemon-level settings into the [`BashMode`] that
+    /// gates command execution. PURE — no logging; the `bash` tool's
+    /// build path emits the yolo/approval notices. Both the `bash` tool
+    /// and the `watch` tool gate commands through this SAME mode, so a
+    /// session's watch authority always matches its bash authority
+    /// (mu-qnag).
+    pub fn resolve_mode(&self) -> BashMode {
+        if self.yolo {
+            BashMode::Yolo
+        } else {
+            BashMode::strict_with_extras(&self.extra_allow, self.prompt)
+        }
+    }
+}
+
 /// Factory closure for constructing a provider per session, from
 /// a wire-level `ProviderSelector`. Closes over daemon-startup flags
 /// (`ephemeral`, `thinking`) that parameterize *how* providers get
@@ -260,19 +276,19 @@ pub fn build_tools(names: &[String], bash: &BashSettings) -> Result<Vec<Arc<dyn 
                     as Arc<dyn Tool>,
             ),
             "bash" => {
-                let mode = if bash.yolo {
+                // Emit the operator-facing posture notices here (the build
+                // path); the mode itself is resolved by the shared
+                // `BashSettings::resolve_mode` so the `watch` tool gates
+                // through the identical mode (mu-qnag).
+                if bash.yolo {
                     tracing::warn!(
                         "bash tool: YOLO MODE active. All allowlist checks bypassed. \
                          Confirm you trust the prompt source."
                     );
-                    BashMode::Yolo
-                } else {
-                    if bash.prompt {
-                        tracing::info!("bash tool: strict + per-call approval (mu-029) active.");
-                    }
-                    BashMode::strict_with_extras(&bash.extra_allow, bash.prompt)
-                };
-                Ok(Arc::new(BashTool::new(mode)) as Arc<dyn Tool>)
+                } else if bash.prompt {
+                    tracing::info!("bash tool: strict + per-call approval (mu-029) active.");
+                }
+                Ok(Arc::new(BashTool::new(bash.resolve_mode())) as Arc<dyn Tool>)
             }
             other => anyhow::bail!(
                 "unknown tool: {other} (expected: read, write, ls, edit, grep, glob, \

@@ -1,0 +1,4 @@
+{
+  "project_desc": "mu (a Rust agent runtime)",
+  "spec": { "id_pattern": "mu-[0-9]{3}", "dir": "specs/" }
+}

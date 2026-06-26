@@ -29,6 +29,18 @@
 # Design: ~/.claude-personal/notes/design-prepr-review-and-degradation-gate.md
 # Process-layer auditors / correlation: bead mu-pr6r.
 #
+# Subject template (mu-599y): the SUBJECT (repo under review) is configured by a
+# REQUIRED JSON file at the repo root, $ROOT/.ai-review.json (override the path
+# with MU_REVIEW_SUBJECT_FILE):
+#     { "project_desc": "mu (a Rust agent runtime)",
+#       "spec": { "id_pattern": "mu-[0-9]{3}", "dir": "specs/" } }
+#   project_desc    one-liner spliced into the reviewer prompts ("...reviewer for X").
+#   spec.id_pattern ERE matched against commit messages to find referenced specs.
+#   spec.dir        directory those specs live under.
+# Missing file or empty field => the gate ERRORS (exit 2) with the schema, rather
+# than silently reviewing as mu. This separates ENGINE (this gate, the mu binary,
+# the code_review role) from SUBJECT so the same scripts review any repo.
+#
 # Env:
 #   Primary 1 (default ollama / qwen-rev):
 #     MU_REVIEW_PROVIDER        provider (default: ollama)
@@ -189,6 +201,60 @@ if ! grep -q '[^[:space:]]' <<<"$DIFF"; then
   exit 0
 fi
 FILES=$(printf '%s\n' "$DIFF" | grep -c '^diff --git ')
+
+# Subject identity (mu-599y): SUBJECT (the repo under review) vs ENGINE (this
+# gate). Every subject-identity bit — the project one-liner in the reviewer
+# prompts and the spec-inclusion id-pattern / dir — comes from a REQUIRED JSON
+# template at the subject repo root ($ROOT/.ai-review.json), read repo-relatively
+# like the AGENTS.md block below. Validated HERE (before the cargo build / ollama
+# preflight) so a misconfigured subject fails fast, not after a multi-minute build.
+# Required ON PURPOSE: a missing file or empty field ERRORS loudly instead of
+# silently reviewing another repo AS mu (the old failure mode). mu ships its own
+# .ai-review.json with the historical literals, so mu stays byte-identical. jq is
+# the supported parser; a minimal grep/sed fallback preserves the gate's
+# deliberate no-jq degradation (see json_escape).
+SUBJECT_FILE="${MU_REVIEW_SUBJECT_FILE:-$ROOT/.ai-review.json}"
+_subj_example='{
+  "project_desc": "mu (a Rust agent runtime)",
+  "spec": { "id_pattern": "mu-[0-9]{3}", "dir": "specs/" }
+}'
+subject_die() {
+  echo "${C_RED}ai-review: $1${C_OFF}" >&2
+  echo "  expected subject template at: $SUBJECT_FILE" >&2
+  echo "  every repo reviewed by this gate must ship one; schema:" >&2
+  printf '%s\n' "$_subj_example" | sed 's/^/    /' >&2
+  exit 2
+}
+[ -r "$SUBJECT_FILE" ] || subject_die "no subject template (.ai-review.json)"
+if command -v jq >/dev/null 2>&1; then
+  PROJECT_DESC="$(jq -er '.project_desc // empty'  "$SUBJECT_FILE" 2>/dev/null || true)"
+  SPEC_ID_PATTERN="$(jq -er '.spec.id_pattern // empty' "$SUBJECT_FILE" 2>/dev/null || true)"
+  SPEC_DIR="$(jq -er '.spec.dir // empty'          "$SUBJECT_FILE" 2>/dev/null || true)"
+else
+  # No-jq fallback: extract the three known scalar fields. Handles plain JSON
+  # strings (no embedded \-escapes); jq is the path for anything fancier.
+  _subj_str() { grep -oE "\"$1\"[[:space:]]*:[[:space:]]*\"([^\"]*)\"" "$SUBJECT_FILE" | head -1 | sed -E 's/^.*:[[:space:]]*"(.*)"$/\1/'; }
+  PROJECT_DESC="$(_subj_str project_desc)"
+  SPEC_ID_PATTERN="$(_subj_str id_pattern)"
+  SPEC_DIR="$(_subj_str dir)"
+fi
+[ -n "$PROJECT_DESC" ]    || subject_die "subject template field missing/empty: project_desc"
+[ -n "$SPEC_ID_PATTERN" ] || subject_die "subject template field missing/empty: spec.id_pattern"
+[ -n "$SPEC_DIR" ]        || subject_die "subject template field missing/empty: spec.dir"
+# Normalize SPEC_DIR to exactly one trailing slash. The lookup below builds the
+# anchor "^${SPEC_DIR}${id}-..." and the pathspec "-- $SPEC_DIR", so a value
+# without the slash (e.g. "specs") would fuse into "^specsmu-123-" and SILENTLY
+# match no specs — the precise silent-degradation failure this template exists to
+# kill. "specs/" is unchanged. (self-review panel: deepseek + gpt-5.5, mu-599y.)
+SPEC_DIR="${SPEC_DIR%/}/"
+# project_desc is spliced into the reviewer / convergence prompts; collapse any
+# newlines so a multi-line value can't forge extra prompt lines. (It already
+# shares the prompt with the diff and AGENTS.md, which carry the same repo-trust
+# assumption — this just removes the cheap multi-line vector.) (gpt-5.5, mu-599y.)
+PROJECT_DESC="$(printf '%s' "$PROJECT_DESC" | tr '\n\r' '  ')"
+# Internal handoff to review-panel/converge.py (a child via consensus.sh); a
+# DISTINCT name from any user knob so the template stays the single source of truth.
+export _AI_REVIEW_PROJECT_DESC="$PROJECT_DESC"
 
 # Full content of each changed file, appended to the prompt as CONTEXT. A thin
 # (-U3) diff hides definitions/guards that live outside the changed hunks, so
@@ -591,12 +657,12 @@ $msg"
   # from HEADREV, not the working copy — the spec usually lands IN the branch
   # under review, and @'s tree may predate (or postdate) it.
   local spec_ids spec_text="" id sf matches content
-  spec_ids="$(printf '%s\n' "$ALL_MSGS" | grep -oE 'mu-[0-9]{3}' | sort -u || true)"
+  spec_ids="$(printf '%s\n' "$ALL_MSGS" | grep -oE "$SPEC_ID_PATTERN" | sort -u || true)"
   for id in $spec_ids; do
     if [ -n "$IS_JJ" ]; then
-      matches="$(jj file list -r "$HEADREV" -- specs/ 2>/dev/null | grep -E "^specs/${id}-[^/]*\.md$" || true)"
+      matches="$(jj file list -r "$HEADREV" -- "$SPEC_DIR" 2>/dev/null | grep -E "^${SPEC_DIR}${id}-[^/]*\.md$" || true)"
     else
-      matches="$(git ls-tree -r --name-only "$HEADREV" -- specs/ 2>/dev/null | grep -E "^specs/${id}-[^/]*\.md$" || true)"
+      matches="$(git ls-tree -r --name-only "$HEADREV" -- "$SPEC_DIR" 2>/dev/null | grep -E "^${SPEC_DIR}${id}-[^/]*\.md$" || true)"
     fi
     for sf in $matches; do
       if [ -n "$IS_JJ" ]; then
@@ -625,7 +691,7 @@ $content"
   CONS_OUT="$(mktemp -d "${TMPDIR:-/tmp}/ai-review-chunked-consensus.XXXXXX")"
   CONS_PROMPT="$CONS_OUT/round1.prompt.txt"
   {
-    printf '%s\n' "You are a strict pre-PR code reviewer for mu (a Rust agent runtime). This branch was too large for one review, so each commit was reviewed in isolation by a leaf reviewer; their findings are the review material below, in the form FINDING|<severity>|<file>|<claim>. You hold the only branch-wide view: judge which findings are REAL (a later commit may already fix what an earlier leaf flagged) and whether any INTERACT across commits into a larger hazard no single commit shows. Units marked 'REVIEW FAILED — treat as unreviewed' carry unknown risk; weigh that. If a SPEC section is included, judge whether the branch delivers what it claims. If PROJECT ARCHITECTURE INVARIANTS are included, a violation (or a move toward one) is needs-changes even when each commit is locally correct. Do NOT raise findings about code not represented here."
+    printf '%s\n' "You are a strict pre-PR code reviewer for ${PROJECT_DESC}. This branch was too large for one review, so each commit was reviewed in isolation by a leaf reviewer; their findings are the review material below, in the form FINDING|<severity>|<file>|<claim>. You hold the only branch-wide view: judge which findings are REAL (a later commit may already fix what an earlier leaf flagged) and whether any INTERACT across commits into a larger hazard no single commit shows. Units marked 'REVIEW FAILED — treat as unreviewed' carry unknown risk; weigh that. If a SPEC section is included, judge whether the branch delivers what it claims. If PROJECT ARCHITECTURE INVARIANTS are included, a violation (or a move toward one) is needs-changes even when each commit is locally correct. Do NOT raise findings about code not represented here."
     printf 'Respond with ONLY one JSON object (no prose, no markdown fence):\n'
     printf '{"verdict":"approve"|"needs-changes","summary":"<1-2 sentences>","findings":[{"file":"<path>","line":<int>,"severity":"high"|"medium"|"low","issue":"<desc>"}]}\n'
     printf '%s\n' "$spec_text"
@@ -699,8 +765,8 @@ PANEL_DIR="$(dirname "$0")/review-panel"
 CONS_OUT="$(mktemp -d "${TMPDIR:-/tmp}/ai-review-consensus.XXXXXX")"
 CONS_PROMPT="$CONS_OUT/round1.prompt.txt"
 {
-  printf 'You are a strict pre-PR code reviewer for `mu` (a Rust agent runtime). Review ONLY the change in the diff for: correctness bugs; concurrency/lifecycle hazards (a held reference that blocks shutdown, a clone that outlives its owner); missing error handling; safeguards nearby code applies but this diff omits. The FULL CONTENT of each changed file follows the diff, so CHECK it before reporting anything as undefined, and do NOT raise findings about unchanged code.%s %s\n\n' \
-    "$INVARIANTS_CLAUSE" "$TOOL_CLAUSE"
+  printf 'You are a strict pre-PR code reviewer for %s. Review ONLY the change in the diff for: correctness bugs; concurrency/lifecycle hazards (a held reference that blocks shutdown, a clone that outlives its owner); missing error handling; safeguards nearby code applies but this diff omits. The FULL CONTENT of each changed file follows the diff, so CHECK it before reporting anything as undefined, and do NOT raise findings about unchanged code.%s %s\n\n' \
+    "$PROJECT_DESC" "$INVARIANTS_CLAUSE" "$TOOL_CLAUSE"
   printf 'Respond with ONLY one JSON object (no prose, no markdown fence):\n'
   printf '{"verdict":"approve"|"needs-changes","summary":"<1-2 sentences>","findings":[{"file":"<path>","line":<int>,"severity":"high"|"medium"|"low","issue":"<desc>"}]}\n'
   [ -n "$INVARIANTS_BLOCK" ] && printf '%s\n' "$INVARIANTS_BLOCK"

@@ -13,6 +13,8 @@ use mu_core::config::Config;
 use mu_core::context::RecallProvider;
 use mu_core::route_catalog::RouteCatalog;
 
+use super::factory::BashSettings;
+
 #[derive(Debug, Clone)]
 pub struct DaemonInfo {
     inner: Arc<DaemonInfoInner>,
@@ -46,6 +48,13 @@ struct DaemonInfoInner {
     /// [`ProjectFileRecallProvider`] via [`with_recall_providers`].
     recall_providers: Arc<Vec<Arc<dyn RecallProvider>>>,
     route_catalog: Arc<RouteCatalog>,
+    /// mu-qnag: the daemon's resolved command-execution policy (from
+    /// `--bash-yolo` / `--bash-allow` / `--bash-prompt`). Both the `bash`
+    /// tool and the per-session `watch` tool gate commands through this,
+    /// so a restricted session's `watch` cannot run what its `bash`
+    /// couldn't. Default = strict, no extras (the safe floor) for tests
+    /// and a bare `new`.
+    bash_settings: BashSettings,
 }
 
 impl DaemonInfo {
@@ -67,6 +76,7 @@ impl DaemonInfo {
                 config: Arc::new(Config::default()),
                 recall_providers: Arc::new(Vec::new()),
                 route_catalog: Arc::new(RouteCatalog::from_env()),
+                bash_settings: BashSettings::default(),
             }),
         }
     }
@@ -129,8 +139,29 @@ impl DaemonInfo {
         }
     }
 
+    /// mu-qnag: builder-style setter for the daemon's bash/command
+    /// policy. Production `serve::run` passes the settings resolved from
+    /// the `--bash-*` flags; tests and the default path keep
+    /// `BashSettings::default()` (strict, no extras).
+    pub fn with_bash_settings(self, bash_settings: BashSettings) -> Self {
+        let inner = (*self.inner).clone();
+        Self {
+            inner: Arc::new(DaemonInfoInner {
+                bash_settings,
+                ..inner
+            }),
+        }
+    }
+
     pub fn events_dir(&self) -> Option<&std::path::Path> {
         self.inner.events_dir.as_deref()
+    }
+
+    /// mu-qnag: read access to the daemon's command-execution policy.
+    /// `session_spawn_tools` resolves a `BashMode` from this for the
+    /// per-session `watch` tool, so watch and bash share one gate.
+    pub fn bash_settings(&self) -> &BashSettings {
+        &self.inner.bash_settings
     }
 
     /// mu-l1z: read access to the loaded config. Dispatch handlers
@@ -165,6 +196,7 @@ impl DaemonInfo {
                 config: Arc::new(Config::default()),
                 recall_providers: Arc::new(Vec::new()),
                 route_catalog: Arc::new(RouteCatalog::from_env()),
+                bash_settings: BashSettings::default(),
             }),
         }
     }

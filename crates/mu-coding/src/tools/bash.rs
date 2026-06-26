@@ -274,13 +274,10 @@ impl Tool for BashTool {
             ));
         }
 
-        match &self.mode {
-            BashMode::Strict { allowlist, .. } => {
-                validate_strict_command(&command, allowlist)?;
-                Ok(())
-            }
-            BashMode::Yolo => Ok(()),
-        }
+        // The security gate proper (metachar + allowlist for strict, pass
+        // for yolo) lives in the shared `validate_command` so other
+        // command-runners enforce the IDENTICAL policy (mu-qnag).
+        validate_command(&self.mode, &command)
     }
 
     fn execute<'life0, 'async_trait>(
@@ -329,30 +326,18 @@ impl Tool for BashTool {
                 .clamp(1, MAX_TIMEOUT_SECS);
             let timeout = Duration::from_secs(timeout_secs);
 
-            let mut cmd = match &mode {
-                BashMode::Strict { allowlist, .. } => {
-                    // validate() already accepted this command; re-run the
-                    // strict check to obtain the tokenized argv.
-                    let tokens = validate_strict_command(&command, allowlist)
-                        .expect("validate_strict_command succeeded in validate() just above");
-                    let mut c = tokio::process::Command::new(&tokens[0]);
-                    if tokens.len() > 1 {
-                        c.args(&tokens[1..]);
+            // Build the child through the shared gate (mu-qnag) — the same
+            // path the `watch` tool uses. validate() already accepted this
+            // command above; build_command re-applies the strict gate to
+            // obtain the tokenized argv and can never construct an ungated
+            // command.
+            let mut cmd = match build_command(&mode, &command) {
+                Ok(c) => c,
+                Err(reason) => {
+                    return ToolResult {
+                        content: reason,
+                        is_error: true,
                     }
-                    c.env_clear();
-                    // Strict mode inherits only explicit non-secret whitelist entries.
-                    for (k, v) in std::env::vars() {
-                        if ENV_WHITELIST.contains(&k.as_str()) && !is_secret_env_var(&k) {
-                            c.env(&k, &v);
-                        }
-                    }
-                    c
-                }
-                BashMode::Yolo => {
-                    let mut c = tokio::process::Command::new("bash");
-                    c.arg("-c").arg(&command);
-                    // Yolo passes the full env. Inherited from parent.
-                    c
                 }
             };
             cmd.stdin(Stdio::null())
@@ -480,6 +465,55 @@ fn validate_strict_command(
         ));
     }
     Ok(tokens)
+}
+
+/// Gate a raw command string against a [`BashMode`]'s policy: the
+/// metachar + allowlist check for strict mode, an unconditional pass for
+/// yolo. Public so other command-runners route through the IDENTICAL
+/// policy instead of shipping their own ungated execution path — the
+/// `watch` tool validates every command here before spawning (mu-qnag).
+/// The bare-`jj describe` UX guard stays in [`BashTool::validate`]; this
+/// is the security gate proper.
+pub fn validate_command(mode: &BashMode, command: &str) -> Result<(), String> {
+    match mode {
+        BashMode::Strict { allowlist, .. } => {
+            validate_strict_command(command, allowlist).map(|_| ())
+        }
+        BashMode::Yolo => Ok(()),
+    }
+}
+
+/// Construct the child process for `command` under `mode`, applying the
+/// same gate as [`validate_command`] FIRST so an ungated command can
+/// never be built. Strict mode execs the tokenized argv directly with a
+/// scrubbed env (no shell); yolo runs it via `bash -c` with the full
+/// inherited env. The caller owns lifecycle (stdio, `kill_on_drop`,
+/// timeout). Shared by the `bash` tool and the `watch` tool so both run
+/// commands through one path (mu-qnag).
+pub fn build_command(mode: &BashMode, command: &str) -> Result<tokio::process::Command, String> {
+    match mode {
+        BashMode::Strict { allowlist, .. } => {
+            let tokens = validate_strict_command(command, allowlist)?;
+            let mut c = tokio::process::Command::new(&tokens[0]);
+            if tokens.len() > 1 {
+                c.args(&tokens[1..]);
+            }
+            c.env_clear();
+            // Strict mode inherits only explicit non-secret whitelist entries.
+            for (k, v) in std::env::vars() {
+                if ENV_WHITELIST.contains(&k.as_str()) && !is_secret_env_var(&k) {
+                    c.env(&k, &v);
+                }
+            }
+            Ok(c)
+        }
+        BashMode::Yolo => {
+            let mut c = tokio::process::Command::new("bash");
+            c.arg("-c").arg(command);
+            // Yolo passes the full env, inherited from the parent.
+            Ok(c)
+        }
+    }
 }
 
 fn is_allowed(tokens: &[String], allowlist: &[Vec<String>]) -> bool {

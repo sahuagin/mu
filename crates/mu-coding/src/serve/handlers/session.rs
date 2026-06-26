@@ -479,6 +479,12 @@ fn session_spawn_tools(
         tools.push(Arc::new(crate::tools::WatchTool::new(
             sessions.downgrade(),
             session_id.to_string(),
+            // mu-qnag: watch gates every command through the daemon's bash
+            // policy. A session with no `--bash-*` flags resolves to strict
+            // (read-only allowlist), so a read-only reviewer's
+            // watch("cargo test") is rejected by the SAME gate bash uses;
+            // a `--bash-yolo` worker keeps watch("cargo build") unchanged.
+            daemon_info.bash_settings().resolve_mode(),
         )));
     }
     if let AutonomyCapability::Allowed {

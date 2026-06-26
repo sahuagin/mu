@@ -106,7 +106,11 @@ mod policy_invariants {
             Arc::new(GlobTool::new()),
             Arc::new(MemoryRecallTool::new()),
             Arc::new(BashTool::new(BashMode::Yolo)),
-            Arc::new(WatchTool::new(sessions.downgrade(), "s".into())),
+            Arc::new(WatchTool::new(
+                sessions.downgrade(),
+                "s".into(),
+                BashMode::Yolo,
+            )),
             Arc::new(SpawnWorkerTool::new(sessions.downgrade(), di.clone(), None)),
             Arc::new(StartAutonomousTool::new(sessions.downgrade(), "s".into())),
             Arc::new(ScheduleWakeupTool::new(sessions.downgrade(), "s".into())),

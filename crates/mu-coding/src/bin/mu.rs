@@ -479,7 +479,9 @@ async fn main() -> Result<()> {
             };
             let tool_vec = mu_coding::serve::build_tools(&tool_names, &bash_settings)?;
 
-            mu_coding::serve::run(factory, tool_vec, bare, max_turns).await
+            // mu-qnag: hand the daemon its command policy so `watch` gates
+            // through the SAME BashMode as `bash` (build_tools borrowed it).
+            mu_coding::serve::run(factory, tool_vec, bare, max_turns, bash_settings).await
         }
         Command::Ask {
             prompt,

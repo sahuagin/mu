@@ -66,9 +66,12 @@ def main():
             others.append(f"- reviewer {tag}: verdict={d.get('verdict', '?')} :: {fs}")
         me = data.get(self_tag)
         mine = f"verdict={me.get('verdict', '?')}" if me else "(your previous reply was unparseable)"
+        # Subject one-liner from ai-review.sh's required template (mu-599y),
+        # handed down via env; literal default keeps any other caller unchanged.
+        proj = os.environ.get("_AI_REVIEW_PROJECT_DESC") or "mu (a Rust agent runtime)"
         hdr = (
-            f"This is convergence ROUND {rnd} of an antagonistic code-review panel for `mu` "
-            f"(a Rust agent runtime). You ({self_tag}) previously gave: {mine}.\n"
+            f"This is convergence ROUND {rnd} of an antagonistic code-review panel for {proj}. "
+            f"You ({self_tag}) previously gave: {mine}.\n"
             "The other reviewers' current positions:\n" + "\n".join(others) +
             "\n\nPress your STRONGEST objections to positions you disagree with, but CONCEDE "
             "points you now accept after seeing their reasoning, and move toward a SINGLE agreed "

@@ -26,7 +26,10 @@ for f in sorted(glob.glob(prefix + ".rank*.out")):
         verdicts[name] = v
         print(f"\n### {name}: {v} — {d.get('summary','')[:170]}")
         for x in d.get('findings', []):
-            print(f"   [{x.get('severity','?')}] {x.get('file','?')}:{x.get('line','?')} — {x.get('issue','')[:170]}")
+            if isinstance(x, dict):
+                print(f"   [{x.get('severity','?')}] {x.get('file','?')}:{x.get('line','?')} — {str(x.get('issue',''))[:170]}")
+            else:
+                print(f"   - {str(x)[:170]}")
         if not d.get('findings'):
             print("   (no findings)")
     except Exception as e:

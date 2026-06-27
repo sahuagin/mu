@@ -77,11 +77,14 @@ def main():
             "points you now accept after seeing their reasoning, and move toward a SINGLE agreed "
             "verdict. Re-read the code (Read/Grep) to settle disputes with evidence — do not just "
             "restate your prior view.\n\n"
-            "Respond with ONLY one JSON object (no prose, no fence):\n"
+            "Respond with ONLY one JSON object (no prose, no fence, nothing before or after it):\n"
             '{"verdict":"approve"|"needs-changes","summary":"<1-2 sentences>",'
             '"concede":["<point you now drop>"],"maintain":["<point you hold, + why>"],'
             '"findings":[{"file":"<path>","line":<int>,"severity":"high"|"medium"|"low",'
-            '"issue":"<desc>"}]}\n\n'
+            '"issue":"<desc>"}]}\n'
+            'Every element of "findings" MUST be a JSON object with exactly those four '
+            "keys (file, line, severity, issue), never a bare string and never null. "
+            "Use [] if there are no findings.\n\n"
             "Original PR diff under review:")
         with open(outf, 'w') as fh:
             fh.write(hdr + "\n```diff\n" + open(difff).read() + "\n```\n")

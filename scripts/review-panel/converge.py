@@ -59,9 +59,14 @@ def main():
         for tag, d in data.items():
             if tag == self_tag or not d:
                 continue
+            # Findings may come back as plain strings (some providers ignore the
+            # JSON-object shape and emit free text), so guard each one: only
+            # dicts get the structured format; everything else is stringified.
             fs = "; ".join(
-                f"[{x.get('severity', '?')}] {x.get('file', '?')}:{x.get('line', '?')} "
-                f"{x.get('issue', '')[:120]}" for x in d.get('findings', [])
+                (f"[{x.get('severity', '?')}] {x.get('file', '?')}:{x.get('line', '?')} "
+                 f"{str(x.get('issue', ''))[:120]}") if isinstance(x, dict)
+                else f"- {str(x)[:120]}"
+                for x in d.get('findings', [])
             ) or "(no findings)"
             others.append(f"- reviewer {tag}: verdict={d.get('verdict', '?')} :: {fs}")
         me = data.get(self_tag)

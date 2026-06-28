@@ -120,12 +120,16 @@ workers, a converger picks the best**]** → **REVIEW** (`ci-aipr`) → **ADJUDI
   re-grant a bypass to "work around" a rejected push; that guardrail is
   deliberate. The forward path is: a normal forward commit → PR → a human admin
   merges.
-- **Work is tracked in beads (`br`).** Canonical DB: `.beads/beads.db`;
-  `.beads/issues.jsonl` is the exported mirror, reconciled onto `main` by
-  `just beads-sync` (run from the backing repo after a merge wave). Claim a bead
-  before editing its code. The `mu-NNN` / `mu-<slug>` ids that pepper code
-  comments and spec filenames are the durable link from a line back to its
-  rationale.
+- **Work is tracked in beads.** The canonical store is the central **beadsd**
+  service (rmcp over HTTP), `mu → http://10.1.1.172:7771/mcp` (resolved from
+  `~/.config/beads/remotes.env`). Query and mutate it with the `beads --url <u>`
+  client, which relays the full `br` surface — `beads list / ready / show /
+  count / blocked / dep / …`, plus `claim` / `unclaim`. There is **no in-repo
+  `.beads/` mirror** any more (it was untracked + gitignored as stale legacy, and
+  `just beads-sync` retired); a bare `br` or a repo `.beads/` read is gone/stale —
+  do not rely on it. Claim a bead before editing its code. The `mu-NNN` /
+  `mu-<slug>` ids that pepper code comments and spec filenames are the durable
+  link from a line back to its rationale.
 - **Code search:** prefer semantic code-index recall (`code_recall`) for
   orientation and concept-location when it's configured; fall back to `rg` for
   literal / regex matches.

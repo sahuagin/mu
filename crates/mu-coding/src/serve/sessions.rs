@@ -19,7 +19,6 @@ use mu_core::event_log::SessionEventLog;
 use mu_core::protocol::{ApprovalDecision, OutstandingCall, WorkerStatus};
 use mu_core::session_status::SessionStatus;
 
-use super::dialogue_poller::DialoguePollerHandle;
 use super::mailbox::MailboxState;
 use super::mailbox::MailboxStateHandle;
 use super::provider_status::{ProviderCallState, ProviderStatusTracker};
@@ -82,14 +81,6 @@ struct SessionState {
     /// at each compaction check. `0` ⇒ unset (loop uses its config /
     /// default fallback). Wrapped so the daemon and loop share one cell.
     live_context_soft_limit: Arc<AtomicU64>,
-    /// mu-dialogue-inbound-wakeup: handle to this session's dialogue
-    /// poller, when one was spawned (only for sessions whose tool list
-    /// carries a `dialogue_poll` tool — i.e. the dialogue MCP server was
-    /// imported). `None` otherwise. [`Sessions::remove_with_teardown`]
-    /// takes it out and awaits the task so close is deterministic; the
-    /// poller also self-terminates if the loop's input receiver drops
-    /// first.
-    dialogue_poller: Option<DialoguePollerHandle>,
 }
 
 /// A session loaded from disk at daemon startup (mu-u1ld). The
@@ -210,13 +201,6 @@ pub struct NewSession {
     /// `SpawnArgs`. `session.set_config` writes it via
     /// [`Sessions::live_context_soft_limit`].
     pub live_context_soft_limit: Arc<AtomicU64>,
-    /// mu-dialogue-inbound-wakeup: handle to this session's dialogue poller
-    /// (`Some` only when a `dialogue_poll` tool was available to drive it).
-    /// Stored so [`Sessions::remove_with_teardown`] can signal + await it.
-    /// `pub(crate)` (not `pub`) because [`DialoguePollerHandle`] is a
-    /// crate-internal type — the registry is only constructed inside the
-    /// crate anyway.
-    pub(crate) dialogue_poller: Option<DialoguePollerHandle>,
 }
 
 impl Sessions {
@@ -281,7 +265,6 @@ impl Sessions {
                     mailbox: new.mailbox,
                     status_watch: new.status_watch,
                     live_context_soft_limit: new.live_context_soft_limit,
-                    dialogue_poller: new.dialogue_poller,
                 },
             );
         }
@@ -649,29 +632,15 @@ impl Sessions {
         live || worker || ghost
     }
 
-    /// Remove a session like [`remove`](Self::remove), but additionally
-    /// tear down its dialogue poller deterministically (mu-dialogue-inbound-
-    /// wakeup): signal cancellation and await the poller task. The lock is
-    /// released before the await — the poller handle is taken out under the
-    /// lock, the lock is dropped, and only then is the task joined, so no
-    /// session-registry lock is ever held across an `await` (the invariant
-    /// this module's other accessors keep too).
-    ///
-    /// `remove` (sync) drops the poller handle without joining it; the
-    /// poller then self-terminates when the agent loop's input receiver
-    /// closes. This variant gives the close path a deterministic join so a
-    /// closed session leaves no lingering poll in flight.
+    /// Remove a session and its worker / ghost entries, returning whether
+    /// anything was removed. Async + named `*_with_teardown` because it used
+    /// to also tear down a per-session dialogue poller; that poller was
+    /// removed in mu-rkhj (the inbound dialogue path is being rebuilt as a
+    /// server→daemon push), leaving this equivalent to [`remove`](Self::remove).
     pub async fn remove_with_teardown(&self, id: &str) -> bool {
-        // Phase 1 (locked, sync): remove the live entry and take its poller
-        // handle out. `live` records whether a live entry existed at all
-        // (independent of whether it carried a poller); the rest of the
-        // removed SessionState drops here, closing its input_tx.
-        let (live, poller) = match self.inner.lock() {
-            Ok(mut map) => match map.remove(id) {
-                Some(mut state) => (true, state.dialogue_poller.take()),
-                None => (false, None),
-            },
-            Err(_) => (false, None),
+        let live = match self.inner.lock() {
+            Ok(mut map) => map.remove(id).is_some(),
+            Err(_) => false,
         };
         let worker = match self.workers.lock() {
             Ok(mut map) => map.remove(id).is_some(),
@@ -681,11 +650,6 @@ impl Sessions {
             Ok(mut map) => map.remove(id).is_some(),
             Err(_) => false,
         };
-        // Phase 2 (unlocked): join the poller task. All registry locks above
-        // are dropped, so no lock is held across this await.
-        if let Some(poller) = poller {
-            poller.shutdown_and_join().await;
-        }
         live || worker || ghost
     }
 
@@ -764,7 +728,6 @@ mod tests {
                 mailbox: Arc::new(MailboxState::new()),
                 status_watch: None,
                 live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                dialogue_poller: None,
             },
         );
         assert!(sessions.input_sender(&id).is_some());
@@ -846,7 +809,6 @@ mod tests {
                 mailbox: Arc::new(MailboxState::new()),
                 status_watch: None,
                 live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                dialogue_poller: None,
             },
         );
 
@@ -899,7 +861,6 @@ mod tests {
                 mailbox: Arc::new(MailboxState::new()),
                 status_watch: None,
                 live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                dialogue_poller: None,
             },
         );
 
@@ -967,7 +928,6 @@ mod tests {
                 mailbox: Arc::new(MailboxState::new()),
                 status_watch: None,
                 live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                dialogue_poller: None,
             },
         );
         (log, tracker)

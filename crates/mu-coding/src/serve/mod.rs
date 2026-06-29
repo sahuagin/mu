@@ -11,7 +11,6 @@ use mu_core::event_log::SessionEventLog;
 
 pub mod auth;
 pub mod daemon_info;
-mod dialogue_poller;
 pub mod discovery;
 pub mod discovery_bootstrap;
 mod dispatch;

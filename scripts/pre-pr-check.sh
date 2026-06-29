@@ -110,4 +110,33 @@ verify_claims_step() {
 }
 run_step "verify-claims (main..@)" verify_claims_step
 
+# beads orphans nudge (mu-da27): surface beads referenced by main..@ that are
+# still OPEN in the CENTRAL store, so they get closed before merge instead of
+# left open. The old GitHub-CI check read the retired in-repo
+# .beads/issues.jsonl; this queries central beadsd via the `beads` client, so it
+# runs HERE (locally, where the service is reachable). Informational — never
+# blocks, and silent if beadsd is unreachable or `beads` isn't installed.
+orphans_nudge() {
+  local script="$REPO_ROOT/scripts/beads_orphans_prscope.py"
+  [ -f "$script" ] || return 0
+  local text=""
+  if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then
+    text=$(jj log -r 'main..@ ~ merges()' --no-graph -T 'description ++ "\n\n"' 2>/dev/null || true)
+  else
+    local base
+    if base=$(git merge-base main HEAD 2>/dev/null); then
+      text=$(git log --no-merges --format='%B%n%n' "$base..HEAD" 2>/dev/null || true)
+    fi
+  fi
+  [ -n "$text" ] || return 0
+  local out
+  out=$(printf '%s' "$text" | python3 "$script" 2>/dev/null || true)
+  if [ -n "$out" ]; then
+    printf "%s==> beads referenced by this branch are still open:%s\n" "$C_YELLOW" "$C_OFF"
+    printf "%s\n\n" "$out"
+  fi
+  return 0
+}
+orphans_nudge
+
 printf "%spre-pr-check: all checks green%s\n" "$C_GREEN" "$C_OFF"

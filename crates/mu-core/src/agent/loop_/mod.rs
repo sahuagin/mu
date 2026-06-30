@@ -227,14 +227,14 @@ pub enum AgentInput {
         summary: String,
     },
     /// mu-dialogue-inbound-wakeup: an inbound dialogue message addressed
-    /// to this session arrived on the mu-dialogue channel. Injected by
-    /// the per-session dialogue poller (a background task that long-polls
-    /// `dialogue_poll`) over the same input channel — the "wakeup
-    /// channel" — as `WatchCompleted` / `MailboxMessage`. The loop
-    /// synthesizes a User message carrying `from` + `content` INLINE and
-    /// queues InvokeLlm so the message lands directly as the woken turn's
-    /// motivation, whether the session was idle (parked on
-    /// `input_rx.recv`) or mid-run (queued behind the current work).
+    /// to this session arrived on a dialogue/mailbox receive path. This is
+    /// the transport-agnostic wake seam: v1 push delivery should feed this
+    /// over the same input channel — the "wakeup channel" — as
+    /// `WatchCompleted` / `MailboxMessage`. The loop synthesizes a User
+    /// message carrying `from` + `content` INLINE and queues InvokeLlm so
+    /// the message lands directly as the woken turn's motivation, whether
+    /// the session was idle (parked on `input_rx.recv`) or mid-run (queued
+    /// behind the current work).
     DialogueMessage {
         /// The peer id that sent the message (e.g. "cc:abcd").
         from: String,

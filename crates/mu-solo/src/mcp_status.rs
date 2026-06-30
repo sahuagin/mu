@@ -73,7 +73,7 @@ impl ClientHandler for StatusHandler {
     }
 }
 
-fn mcp_socket_path() -> std::path::PathBuf {
+pub(crate) fn mcp_socket_path() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("MU_STATE_DIR") {
         return std::path::PathBuf::from(dir).join("mcp.sock");
     }

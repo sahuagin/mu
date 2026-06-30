@@ -466,6 +466,60 @@ fn is_picker_command(cmd: &str) -> bool {
     matches!(cmd, "/effort" | "/provider" | "/model")
 }
 
+fn mcp_tools_summary(tools: Option<&[String]>) -> String {
+    match tools {
+        None => "all tools listed by server".to_string(),
+        Some([]) => "no tools (empty allowlist)".to_string(),
+        Some(list) => list.join(", "),
+    }
+}
+
+fn mcp_side_effects_summary(server: &mu_core::config::McpServerConfig) -> String {
+    let server_floor = server
+        .side_effects
+        .map(|s| format!("{s:?}"))
+        .unwrap_or_else(|| "unclassified → Execute/Ask fail-safe".to_string());
+    if server.tool_side_effects.is_empty() {
+        return server_floor;
+    }
+    let mut per_tool: Vec<String> = server
+        .tool_side_effects
+        .iter()
+        .map(|(name, side_effects)| format!("{name}={side_effects:?}"))
+        .collect();
+    per_tool.sort();
+    format!("{server_floor}; overrides: {}", per_tool.join(", "))
+}
+
+fn mcp_server_imports_dialogue_poll(server: &mu_core::config::McpServerConfig) -> bool {
+    match server.tools.as_ref() {
+        Some(tools) => tools.iter().any(|tool| tool == "dialogue_poll"),
+        None => server.name == "mu-dialogue",
+    }
+}
+
+fn mcp_server_status_lines(server: &mu_core::config::McpServerConfig) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(format!("    - {}", server.name)),
+        Line::from(format!("      url: {}", server.url)),
+        Line::from(format!(
+            "      tools: {}",
+            mcp_tools_summary(server.tools.as_deref())
+        )),
+        Line::from(format!(
+            "      side effects: {}",
+            mcp_side_effects_summary(server)
+        )),
+    ];
+    if mcp_server_imports_dialogue_poll(server) {
+        lines.push(Line::from(Span::styled(
+            "      ⚠ dialogue_poll is a compatibility long-poll tool; it is not the mu-native receive path".to_string(),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    lines
+}
+
 /// Session phase for the status line — a PROJECTION of current session
 /// state, re-derived on every event, never a sticky last-write (mu-d2hx:
 /// a done arm that didn't repaint left "⚙ tool (14.0s)" frozen for
@@ -1635,6 +1689,15 @@ impl App {
                         }
                         return Ok(false);
                     }
+                    "/mcp" if tail.is_empty() => {
+                        if self.fullscreen {
+                            let lines = self.build_mcp_lines();
+                            self.open_overlay("/mcp", lines);
+                        } else {
+                            self.emit_mcp_lines(vp)?;
+                        }
+                        return Ok(false);
+                    }
                     "/effort" => {
                         self.cmd_effort(vp, tail)?;
                         return Ok(false);
@@ -2345,6 +2408,72 @@ impl App {
 
     fn emit_status_lines(&self, vp: &mut DynamicViewport) -> Result<()> {
         let lines = self.build_status_lines();
+        let h = lines.len() as u16;
+        vp.insert_before(h, |buf| {
+            let p = Paragraph::new(lines);
+            ratatui::widgets::Widget::render(p, buf.area, buf);
+        })?;
+        Ok(())
+    }
+
+    /// /mcp — operator-visible status for the two MCP-ish surfaces that
+    /// matter in mu-solo today:
+    ///   1. the daemon's local MCP socket used for session-status push; and
+    ///   2. outbound `[[mcp.servers]]` tool imports configured for the daemon.
+    ///
+    /// This is deliberately honest about what it cannot yet know: import
+    /// success/failure and dialogue lease/push health are daemon-authoritative
+    /// facts that need a future RPC. Reading the same config the daemon loaded
+    /// is still useful terrain for finding long-poll footguns like
+    /// `dialogue_poll` without scraping logs.
+    fn build_mcp_lines(&self) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "── /mcp ───────────────────────────".to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        ];
+
+        let socket = mcp_status::mcp_socket_path();
+        let socket_state = if socket.exists() { "exists" } else { "missing" };
+        lines.push(Line::from(format!(
+            "  daemon socket: {} ({socket_state})",
+            socket.display()
+        )));
+        lines.push(Line::from(format!(
+            "  session-status push: {}",
+            if self.mcp_status.is_some() {
+                "receiving updates"
+            } else {
+                "no update received yet"
+            }
+        )));
+        lines.push(Line::from(""));
+
+        let config = mu_core::config::Config::load_default();
+        if config.mcp.servers.is_empty() {
+            lines.push(Line::from("  outbound MCP servers: none configured"));
+        } else {
+            lines.push(Line::from("  outbound MCP servers:"));
+            for server in &config.mcp.servers {
+                lines.extend(mcp_server_status_lines(server));
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  gaps: live import success/failure, imported tool names, dialogue lease, and push health need a daemon-authoritative status RPC".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+        lines
+    }
+
+    fn emit_mcp_lines(&self, vp: &mut DynamicViewport) -> Result<()> {
+        let lines = self.build_mcp_lines();
         let h = lines.len() as u16;
         vp.insert_before(h, |buf| {
             let p = Paragraph::new(lines);
@@ -3190,6 +3319,7 @@ impl App {
     fn build_slash_menu_items(&self) -> Vec<MenuItem> {
         let mut items = vec![
             MenuItem::new("/status", "Current provider / model / session / daemon"),
+            MenuItem::new("/mcp", "MCP and dialogue status / configured tool imports"),
             MenuItem::new("/help", "Show help for commands"),
             MenuItem::new("/effort ›", "Select effort level"),
             MenuItem::new("/focus", "Toggle focus mode (suppress streaming preview)"),
@@ -3231,6 +3361,7 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from("  /status            current provider / model / session / daemon"),
+            Line::from("  /mcp               MCP/dialogue config and status"),
             Line::from("  /help              show this list"),
             Line::from("  /effort [LEVEL]    show or set effort (configured per route)"),
             Line::from("  /focus [on|off]    toggle focus mode (suppress streaming preview)"),
@@ -4300,7 +4431,15 @@ mod tests {
         for c in ["/effort", "/provider", "/model"] {
             assert!(is_picker_command(c), "{c} should open a value picker");
         }
-        for c in ["/btw", "/config", "/help", "/status", "/focus", "/collapse"] {
+        for c in [
+            "/btw",
+            "/config",
+            "/help",
+            "/mcp",
+            "/status",
+            "/focus",
+            "/collapse",
+        ] {
             assert!(!is_picker_command(c), "{c} should not open a picker");
         }
     }
@@ -4323,6 +4462,41 @@ mod tests {
                 "no curated models for provider {p:?} (kind {kind:?})"
             );
         }
+    }
+
+    #[test]
+    fn mcp_status_flags_dialogue_poll_as_long_poll_compat() {
+        let server = mu_core::config::McpServerConfig {
+            name: "mu-dialogue".to_string(),
+            url: "http://127.0.0.1:7740/mcp".to_string(),
+            tools: Some(vec![
+                "dialogue_say".to_string(),
+                "dialogue_poll".to_string(),
+            ]),
+            prefix: None,
+            side_effects: Some(mu_core::agent::tool::SideEffects::ReadOnly),
+            tool_side_effects: std::collections::HashMap::new(),
+        };
+
+        assert!(mcp_server_imports_dialogue_poll(&server));
+        let rendered = mcp_server_status_lines(&server)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("dialogue_poll"));
+        assert!(rendered.contains("compatibility long-poll"));
+
+        let send_only = mu_core::config::McpServerConfig {
+            tools: Some(vec!["dialogue_say".to_string()]),
+            ..server
+        };
+        assert!(!mcp_server_imports_dialogue_poll(&send_only));
     }
 
     // ===== status-line state machine (mu-d2hx) =====

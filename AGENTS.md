@@ -13,9 +13,20 @@ model: **`mu serve` is the JSON-RPC core daemon; everything else is a frontend**
 to it — the TUIs, the one-shot `ask`, the web console. Sessions are
 event-sourced (see the architecture invariants below).
 
+## Current development map
+
+If you are here to continue mu development, especially the long-running goal of
+replacing Claude Code as the daily coding environment, read:
+
+- `specs/plans/mu-claude-code-replacement-current-state.md`
+
+That document is a repo-versioned operational snapshot: current terrain, stale
+beads to reconcile, and recommended next work. It is a map, not an invariant;
+verify against files, tests, `jj status`, and central beads before acting.
+
 ## Workspace layout
 
-Nine crates (`Cargo.toml` `[workspace]`):
+Twelve crates (`Cargo.toml` `[workspace]`):
 
 | crate | role |
 |---|---|
@@ -23,15 +34,18 @@ Nine crates (`Cargo.toml` `[workspace]`):
 | `mu-ai` | LLM provider abstraction |
 | `providers/mu-anthropic` | Anthropic Messages API wire protocol as typed Rust (standalone; no `mu-core` dep) |
 | `providers/mu-anthropic-py` | thin pyo3 binding over `mu-anthropic` |
+| `providers/mu-openai` | OpenAI Responses API wire protocol as typed Rust (standalone; no `mu-core` dep) |
+| `mu-events-py` | pyo3 helpers for mu event-log processing |
 | `mu-coding` | the coding agent; **owns the `mu` binary** (`src/bin/mu.rs`) |
 | `mu-tui` | terminal UI for `mu serve` |
 | `mu-solo` | standalone single-pane chat TUI for `mu serve` |
 | `mu-bridge` | Claude-code JSONL → mu event format (pyo3) |
 | `t4c` | tools4claude — capability/tool discovery |
+| `mu-dialogue` | inter-agent dialogue MCP service used by mu/cc workers |
 
 The `mu` CLI subcommands: `serve` (daemon), `ask` (one-shot), `resume`, `tui`,
 `orchestrate`, `console`, `login`/`logout`, `mark`, `list-sessions`,
-`analytics`, `capabilities`, `audit`, `versions`.
+`analytics`, `models`, `capabilities`, `audit`, `versions`.
 
 ## Build & test
 
@@ -71,11 +85,16 @@ workers, a converger picks the best**]** → **REVIEW** (`ci-aipr`) → **ADJUDI
 - **Run:** `scripts/orchestrator/orchestrate.sh <task-file> <repo-dir>`. Artifacts land in
   `RUN_DIR` (default `~/orchestrator-runs/run-<ts>/`): `summary.md`, per-stage `<stage>.out`,
   `worker.diff`, `provenance.jsonl`.
-- **Defaults:** gate seats + planner/adjudicator = `openai-codex/gpt-5.5`, worker =
-  `ollama/qwen3.6:27b` (one provider, no Anthropic dep). Knobs: `SEAT_`/`WORKER_`/`ARCHITECT_`/
-  `SPEC_CRITIC_`/`CONVERGER_` `PROVIDER`+`MODEL`; `CONVERGE_WORKERS` (1 = single worker);
-  `SPEC_GATE=0` / `ARCHITECT_GATE=0` to skip a gate; override a gate to
-  `claude-oauth/claude-opus-4-8` for opus's deeper skepticism.
+- **Defaults:** gate seats resolve from the `orchestrate_gate` role
+  (`agent-role orchestrate_gate`, with `openai-codex/gpt-5.5` as the
+  script fallback); worker seats resolve from the `coding` role
+  (`agent-role coding`, with `ollama/qwen3.6:27b` as the script fallback).
+  `agent-role` is ollama-lease-aware: if the shared ollama box is held by
+  another owner, ollama ranks sink below available non-ollama ranks. Knobs:
+  `SEAT_`/`WORKER_`/`ARCHITECT_`/`SPEC_CRITIC_`/`CONVERGER_` `PROVIDER`+`MODEL`;
+  `CONVERGE_WORKERS` (1 = single worker); `SPEC_GATE=0` / `ARCHITECT_GATE=0`
+  to skip a gate; override a gate through the same role/env machinery when you
+  need a deeper skeptic.
 - **The worker writes autonomously and merges nothing** — review `worker.diff`. The neutral
   per-stage role prompts sit beside `orchestrate.sh`
   (`{spec-critic,architect,conductor,worker,converge}-prompt.txt`); role→model ranks live in

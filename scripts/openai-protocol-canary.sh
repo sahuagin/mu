@@ -76,13 +76,13 @@ if [ "$live" = 1 ]; then
   fi
   if [ -n "${OPENAI_API_KEY:-}" ] && [ "${OPENAI_API_KEY}" != "null" ]; then
     run_check live_public_openai env MU_LIVE_OPENAI_API=1 \
-      cargo test --quiet -p mu-ai live_public_api
+      cargo test --quiet --manifest-path "$repo/Cargo.toml" -p mu-ai live_public_api
   else
     say "OPENAI_API_KEY unavailable; skipping public live checks"
   fi
   if [ -f "$HOME/.config/mu/auth/openai-codex.json" ]; then
     run_check live_codex env MU_LIVE_OPENAI_CODEX=1 \
-      cargo test --quiet -p mu-ai live_codex
+      cargo test --quiet --manifest-path "$repo/Cargo.toml" -p mu-ai live_codex
   else
     say "openai-codex token unavailable; skipping Codex live checks"
   fi

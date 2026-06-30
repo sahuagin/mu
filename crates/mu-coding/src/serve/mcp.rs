@@ -1096,10 +1096,22 @@ mod tests {
         _server: tokio::task::JoinHandle<()>,
     }
 
+    fn short_socket_tempdir() -> tempfile::TempDir {
+        // Unix-domain socket paths are capped by sockaddr_un.sun_path
+        // (104 bytes on FreeBSD). Long jj workspace names can leak into
+        // tempfile defaults on some runners, so force these MCP socket tests
+        // under a short parent when available.
+        tempfile::Builder::new()
+            .prefix("mu-mcp-")
+            .tempdir_in("/tmp")
+            .or_else(|_| tempfile::Builder::new().prefix("mu-mcp-").tempdir())
+            .expect("tempdir")
+    }
+
     /// Stand up the adapter stack (journal → control plane → MCP socket) and
     /// wait until the socket accepts. No client is connected.
     async fn spawn_server_socket(auth_registry: Arc<AuthRegistry>) -> ServerHandle {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = short_socket_tempdir();
         let journal_path = dir.path().join("daemon.jsonl");
         let journal = Arc::new(
             CommandJournal::open(&journal_path, "d-mcp-test", FsyncPolicy::Never)

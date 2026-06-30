@@ -1,12 +1,12 @@
 #!/bin/sh
 # mu-spawn — launch a non-POT worker agent.
 #
-# Current contract (mu-ktj0): POTs/jails are gone. This wrapper is the small,
-# boring dispatch surface used by mu's spawn_worker path and by humans who want
-# an ad-hoc child agent. It selects a provider/model through scripts/agent-role
-# (unless explicitly overridden), then runs either:
-#   - claude -p              for provider=claude-oauth
-#   - mu ask --bare          for all other providers
+# Current contract (mu-ktj0 / mu-lqa0): POTs/jails are gone. This wrapper is
+# the small, boring dispatch surface used by mu's spawn_worker path and by
+# humans who want an ad-hoc child agent. It selects a provider/model through
+# scripts/agent-role (unless explicitly overridden), then dispatches through
+# scripts/lib/agent-dispatch.sh so worker launches share the same ollama lease
+# and capability/tool-grant semantics as ai-review/orchestrator.
 #
 # Usage:
 #   mu-spawn [options] [prompt...]
@@ -22,6 +22,7 @@
 #   --reply-to ID       parent session id (default: env MU_REPLY_TO)
 #   --cwd DIR           working directory for the child (default: cwd)
 #   --timeout SECS      wall-clock timeout (default: env MU_SPAWN_TIMEOUT or 3600)
+#   --tools CSV         child tool grant (default: env MU_SPAWN_TOOLS or read,grep)
 #   --mcp-config FILE   claude MCP config file (default: env MU_SPAWN_MCP_CONFIG)
 #   --dry-run           print the resolved command and exit
 #   -h, --help          show this help
@@ -33,12 +34,13 @@
 # supplied.
 set -eu
 
-usage() { sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
 die() { printf 'mu-spawn: %s\n' "$1" >&2; exit 2; }
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\''/g")"; }
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 AGENT_ROLE=${AGENT_ROLE:-$SCRIPT_DIR/agent-role}
+AGENT_DISPATCH_LIB=${AGENT_DISPATCH_LIB:-$SCRIPT_DIR/lib/agent-dispatch.sh}
 ROLE=coding
 RANK=0
 PROVIDER=${MU_SPAWN_PROVIDER:-}
@@ -49,6 +51,11 @@ REPLY_TO=${MU_REPLY_TO:-}
 CWD=$(pwd)
 TIMEOUT_SECS=${MU_SPAWN_TIMEOUT:-3600}
 MCP_CONFIG=${MU_SPAWN_MCP_CONFIG:-}
+if [ "${MU_SPAWN_TOOLS+x}" ]; then
+  SPAWN_TOOLS=$MU_SPAWN_TOOLS
+else
+  SPAWN_TOOLS=read,grep
+fi
 MU_BIN=${MU:-mu}
 DRY_RUN=0
 
@@ -63,6 +70,7 @@ while [ "$#" -gt 0 ]; do
     --reply-to) REPLY_TO=${2:?--reply-to needs a value}; shift 2 ;;
     --cwd) CWD=${2:?--cwd needs a value}; shift 2 ;;
     --timeout) TIMEOUT_SECS=${2:?--timeout needs a value}; shift 2 ;;
+    --tools) SPAWN_TOOLS=${2:?--tools needs a value}; shift 2 ;;
     --mcp-config) MCP_CONFIG=${2:?--mcp-config needs a value}; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -75,10 +83,8 @@ done
 if [ -z "$PROVIDER" ] || [ -z "$MODEL" ]; then
   [ -x "$AGENT_ROLE" ] || die "agent-role not executable at $AGENT_ROLE"
   role_line=$($AGENT_ROLE "$ROLE" "$RANK") || exit $?
-  role_provider=$(printf '%s
-' "$role_line" | awk 'NR==1 {print $1}')
-  role_model=$(printf '%s
-' "$role_line" | awk 'NR==1 {$1=""; sub(/^ /, ""); print}')
+  role_provider=$(printf '%s\n' "$role_line" | awk 'NR==1 {print $1}')
+  role_model=$(printf '%s\n' "$role_line" | awk 'NR==1 {$1=""; sub(/^ /, ""); print}')
   [ -n "$role_provider" ] && [ -n "$role_model" ] || die "agent-role returned no provider/model for $ROLE rank $RANK"
   [ -n "$PROVIDER" ] || PROVIDER=$role_provider
   [ -n "$MODEL" ] || MODEL=$role_model
@@ -111,34 +117,29 @@ Worker identity:
 If mcp-dialogue tools are available, register presence before work by polling your own inbox once (dialogue_poll with a short timeout is enough). Use peer id '${PEER_ID:-unknown}'. For mu-native dialogue_say, the 'from' field is bound automatically by the runtime; do not spoof it. If you need to notify the parent and know its peer id, send a short result there as well as printing stdout. If dialogue tools are unavailable, stdout is the fallback result channel.
 EOF
 
-printf '[mu-spawn] provider=%s model=%s role=%s rank=%s session=%s peer=%s\n' \
-  "$PROVIDER" "$MODEL" "$ROLE" "$RANK" "${SESSION_ID:-unknown}" "${PEER_ID:-unknown}" >&2
+printf '[mu-spawn] provider=%s model=%s role=%s rank=%s tools=%s session=%s peer=%s\n' \
+  "$PROVIDER" "$MODEL" "$ROLE" "$RANK" "${SPAWN_TOOLS:-<none>}" "${SESSION_ID:-unknown}" "${PEER_ID:-unknown}" >&2
+
+[ -r "$AGENT_DISPATCH_LIB" ] || die "agent-dispatch.sh not readable at $AGENT_DISPATCH_LIB"
+# shellcheck source=scripts/lib/agent-dispatch.sh
+. "$AGENT_DISPATCH_LIB"
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  if [ "$PROVIDER" = claude-oauth ]; then
-    printf 'cd %s && timeout %s claude -p --model %s --append-system-prompt-file %s --output-format text < %s\n' \
-      "$(q "$CWD")" "$(q "$TIMEOUT_SECS")" "$(q "$MODEL")" "$(q "$SYS_FILE")" "$(q "$PROMPT_FILE")"
-  else
-    printf 'cd %s && timeout %s %s ask --bare --provider %s --model %s --append-system-prompt %s --prompt-file %s\n' \
-      "$(q "$CWD")" "$(q "$TIMEOUT_SECS")" "$(q "$MU_BIN")" "$(q "$PROVIDER")" "$(q "$MODEL")" "$(q "$SYS_FILE")" "$(q "$PROMPT_FILE")"
-  fi
+  printf 'cd %s && TOOLS=%s TIMEOUT=%s MAX_TURNS=%s MU=%s SYSPROMPT=%s MCP_CONFIG=%s agent_dispatch %s %s %s\n' \
+    "$(q "$CWD")" "$(q "$SPAWN_TOOLS")" "$(q "$TIMEOUT_SECS")" \
+    "$(q "${MU_SPAWN_MAX_TURNS:-40}")" "$(q "$MU_BIN")" "$(q "$SYS_FILE")" \
+    "$(q "$MCP_CONFIG")" "$(q "$PROVIDER")" "$(q "$MODEL")" "$(q "$PROMPT_FILE")"
   exit 0
 fi
 
 cd "$CWD"
 
-if [ "$PROVIDER" = claude-oauth ]; then
-  set -- claude -p --model "$MODEL" --append-system-prompt-file "$SYS_FILE" \
-    --output-format text --allowedTools Read,Grep,Glob,LS,Bash,Edit,Write \
-    --permission-mode bypassPermissions
-  [ -z "$MCP_CONFIG" ] || set -- "$@" --mcp-config "$MCP_CONFIG"
-  exec timeout "$TIMEOUT_SECS" "$@" < "$PROMPT_FILE"
-fi
-
-# For mu providers, keep the worker hermetic but useful. Dialogue tools come
-# from the operator's configured MCP servers; built-in tools are granted here.
-exec timeout "$TIMEOUT_SECS" "$MU_BIN" ask --bare \
-  --provider "$PROVIDER" --model "$MODEL" \
-  --append-system-prompt "$SYS_FILE" \
-  --tools read,write,edit,glob,grep,ls,bash --bash-yolo --max-turns 40 \
-  --prompt-file "$PROMPT_FILE"
+# Share the same dispatch/lease/capability path as ai-review/orchestrator.
+TOOLS=$SPAWN_TOOLS
+SYSPROMPT=$SYS_FILE
+TIMEOUT=$TIMEOUT_SECS
+MAX_TURNS=${MU_SPAWN_MAX_TURNS:-40}
+MU=$MU_BIN
+MCP_CONFIG=$MCP_CONFIG
+export TOOLS SYSPROMPT TIMEOUT MAX_TURNS MU MCP_CONFIG
+agent_dispatch "$PROVIDER" "$MODEL" "$PROMPT_FILE"

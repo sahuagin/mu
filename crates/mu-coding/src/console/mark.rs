@@ -18,6 +18,17 @@ use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 
 use super::time::now_rfc3339_utc;
 
+fn split_mark_session_ref(reference: &str) -> (Option<&str>, &str) {
+    let reference = reference.strip_prefix("mu:").unwrap_or(reference);
+    if let Some((daemon, session)) = reference.split_once('/') {
+        return (Some(daemon), session);
+    }
+    if let Some((daemon, session)) = reference.split_once(':') {
+        return (Some(daemon), session);
+    }
+    (None, reference)
+}
+
 /// What a successful mark did, for caller-side reporting.
 #[derive(Debug)]
 pub struct MarkOutcome {
@@ -28,10 +39,18 @@ pub struct MarkOutcome {
     pub rating: u8,
 }
 
-/// Sessions under `events_dir` whose session id starts with `prefix`.
-/// Returns `(daemon_id, session_id, jsonl path)` tuples; an exact id is
-/// just a prefix that matches once.
-pub fn resolve_sessions(events_dir: &Path, prefix: &str) -> Vec<(String, String, PathBuf)> {
+/// Sessions under `events_dir` whose session id starts with `reference`.
+///
+/// `reference` may be either the historical bare session id/prefix
+/// (`session-1`, `sess`) or a daemon-qualified ref copied from
+/// `mu list-sessions`: `<daemon>/<session>` (also accepts
+/// `mu:<daemon>/<session>` and `<daemon>:<session>` for symmetry with
+/// resume-style refs). Daemon and session components are prefix-matched;
+/// ambiguity is still refused by [`mark_session`].
+///
+/// Returns `(daemon_id, session_id, jsonl path)` tuples.
+pub fn resolve_sessions(events_dir: &Path, reference: &str) -> Vec<(String, String, PathBuf)> {
+    let (daemon_prefix, session_prefix) = split_mark_session_ref(reference);
     let mut matches = Vec::new();
     let Ok(daemons) = std::fs::read_dir(events_dir) else {
         return matches;
@@ -41,6 +60,12 @@ pub fn resolve_sessions(events_dir: &Path, prefix: &str) -> Vec<(String, String,
             continue;
         }
         let daemon_id = daemon.file_name().to_string_lossy().to_string();
+        if daemon_prefix
+            .map(|prefix| !daemon_id.starts_with(prefix))
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let Ok(files) = std::fs::read_dir(daemon.path()) else {
             continue;
         };
@@ -52,7 +77,7 @@ pub fn resolve_sessions(events_dir: &Path, prefix: &str) -> Vec<(String, String,
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if stem.starts_with(prefix) {
+            if stem.starts_with(session_prefix) {
                 matches.push((daemon_id.clone(), stem.to_string(), path));
             }
         }
@@ -61,25 +86,25 @@ pub fn resolve_sessions(events_dir: &Path, prefix: &str) -> Vec<(String, String,
 }
 
 /// Append an `OperatorMark` to the session uniquely identified by
-/// `session_prefix`. Refuses ambiguity rather than guessing, and
+/// `session_ref`. Refuses ambiguity rather than guessing, and
 /// verifies the line actually landed on disk before reporting success
 /// (the daemon-side append is deliberately best-effort; a marking tool
 /// that silently drops the mark would defeat its purpose).
 pub fn mark_session(
     events_dir: &Path,
-    session_prefix: &str,
+    session_ref: &str,
     rating: u8,
     note: Option<String>,
 ) -> Result<MarkOutcome> {
     if !(1..=5).contains(&rating) {
         bail!("rating must be 1-5, got {rating}");
     }
-    let mut matches = resolve_sessions(events_dir, session_prefix);
+    let mut matches = resolve_sessions(events_dir, session_ref);
     let (daemon_id, session_id, path) = match matches.len() {
         0 => bail!(
             "no session under {} matches '{}'",
             events_dir.display(),
-            session_prefix
+            session_ref
         ),
         1 => matches.remove(0),
         n => {
@@ -90,7 +115,7 @@ pub fn mark_session(
                 .collect();
             bail!(
                 "'{}' is ambiguous ({} matches):\n{}{}",
-                session_prefix,
+                session_ref,
                 n,
                 listing.join("\n"),
                 if n > 8 { "\n  …" } else { "" }
@@ -419,6 +444,36 @@ mod tests {
             })
             .collect();
         assert_eq!(marks, vec![(2, 2), (3, 4)]);
+    }
+
+    #[test]
+    fn mark_accepts_daemon_qualified_refs_from_list_sessions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_session(tmp.path(), "63d69fe6a408d77e", "session-1");
+        seed_session(tmp.path(), "dc5b7377666c1882", "session-1");
+
+        let outcome = mark_session(
+            tmp.path(),
+            "63d69fe6a408d77e/session-1",
+            5,
+            Some("enjoyable".into()),
+        )
+        .expect("daemon/session marks exact listed session");
+        assert_eq!(outcome.daemon_id, "63d69fe6a408d77e");
+        assert_eq!(outcome.session_id, "session-1");
+
+        let outcome = mark_session(tmp.path(), "mu:dc5b7377666c1882/session", 4, None)
+            .expect("mu:daemon/session also marks");
+        assert_eq!(outcome.daemon_id, "dc5b7377666c1882");
+        assert_eq!(outcome.session_id, "session-1");
+
+        let outcome = mark_session(tmp.path(), "63d69fe6a408d77e:session-1", 3, None)
+            .expect("daemon:session also marks");
+        assert_eq!(outcome.daemon_id, "63d69fe6a408d77e");
+        assert_eq!(outcome.session_id, "session-1");
+
+        let err = mark_session(tmp.path(), "session-1", 2, None).unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
     }
 
     #[test]

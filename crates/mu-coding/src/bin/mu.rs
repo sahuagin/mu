@@ -267,7 +267,9 @@ enum Command {
     /// mark is an ordinary event; projections (console header, the
     /// mu-stats session_marks view) take the latest. mu-operator-mark-5mwr.
     Mark {
-        /// Session id, or an unambiguous prefix of one.
+        /// Session id/prefix, or daemon-qualified ref (`daemon/session`,
+        /// `mu:daemon/session`, or `daemon:session`) copied from
+        /// `mu list-sessions`.
         session: String,
         /// Quality rating, 1 (unusable) to 5 (excellent).
         rating: u8,

@@ -15,12 +15,13 @@ use mu_core::agent::Tool;
 use mu_core::protocol::{
     AskSessionRequest, AuthInitiateRequest, AuthOfferRequest, CancelOutstandingRequest,
     CancelSessionRequest, CapabilitiesDiscoverRequest, CloseSessionRequest, CreateSessionRequest,
-    DaemonListRoutesRequest, DaemonOutstandingCallsRequest, DaemonStatsRequest,
-    DaemonUsageHistoryRequest, DelegateSessionRequest, GetConfigRequest, MailboxConsumeRequest,
-    MailboxListRequest, MailboxPostRequest, MailboxReadRequest, PeerHelloRequest, PingRequest,
-    Request, RespondToInputRequiredRequest, Response, ResumeSessionRequest, ScheduleWakeupRequest,
-    SessionEventsRequest, SessionListRequest, SessionStatsRequest, SetConfigRequest,
-    SetRouteRequest, SpawnWorkerRequest, StartAutonomousRequest, JSONRPC_VERSION,
+    DaemonListRoutesRequest, DaemonMcpStatusRequest, DaemonOutstandingCallsRequest,
+    DaemonStatsRequest, DaemonUsageHistoryRequest, DelegateSessionRequest, GetConfigRequest,
+    MailboxConsumeRequest, MailboxListRequest, MailboxPostRequest, MailboxReadRequest,
+    PeerHelloRequest, PingRequest, Request, RespondToInputRequiredRequest, Response,
+    ResumeSessionRequest, ScheduleWakeupRequest, SessionEventsRequest, SessionListRequest,
+    SessionStatsRequest, SetConfigRequest, SetRouteRequest, SpawnWorkerRequest,
+    StartAutonomousRequest, JSONRPC_VERSION,
 };
 use mu_core::skill::loader::LoadedSkill;
 use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
@@ -214,6 +215,7 @@ pub(crate) async fn dispatch_inner(
         SessionListRequest::METHOD => handle_session_list(request, discovery).await,
         SessionEventsRequest::METHOD => handle_session_events(request, sessions),
         DaemonStatsRequest::METHOD => handle_daemon_stats(request, sessions, daemon_info),
+        DaemonMcpStatusRequest::METHOD => handle_daemon_mcp_status(request, daemon_info),
         DaemonUsageHistoryRequest::METHOD => handle_daemon_usage_history(request, sessions),
         DaemonOutstandingCallsRequest::METHOD => handle_daemon_outstanding_calls(request, sessions),
         // mu-lho (mu-037 Phase 1): peer-discovery + mailbox.

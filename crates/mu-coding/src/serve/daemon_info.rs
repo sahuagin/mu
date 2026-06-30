@@ -6,11 +6,12 @@
 //! backend.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mu_core::config::Config;
 use mu_core::context::RecallProvider;
+use mu_core::protocol::McpServerStatus;
 use mu_core::route_catalog::RouteCatalog;
 
 use super::factory::BashSettings;
@@ -39,6 +40,10 @@ struct DaemonInfoInner {
     /// going back to disk. Tests pass `Config::default()` to avoid
     /// reading from the developer's `~/.config/mu/config.toml`.
     config: Arc<Config>,
+    /// Daemon-authoritative outbound MCP import snapshot. Populated once
+    /// after startup import attempts complete; queried by `daemon.mcp_status`
+    /// so frontends do not re-derive import truth from local config.
+    mcp_status: Arc<Mutex<Vec<McpServerStatus>>>,
     /// mu-phl v0 (mu-0bxv): session-start recall providers. The
     /// session handler iterates these on `create_session` /
     /// `session.delegate`, collects [`RecalledItem`]s, and bundles
@@ -74,6 +79,7 @@ impl DaemonInfo {
                     .unwrap_or(0),
                 events_dir: None,
                 config: Arc::new(Config::default()),
+                mcp_status: Arc::new(Mutex::new(Vec::new())),
                 recall_providers: Arc::new(Vec::new()),
                 route_catalog: Arc::new(RouteCatalog::from_env()),
                 bash_settings: BashSettings::default(),
@@ -171,6 +177,22 @@ impl DaemonInfo {
         &self.inner.config
     }
 
+    /// Daemon-authoritative snapshot of outbound MCP import attempts.
+    pub fn set_mcp_status(&self, status: Vec<McpServerStatus>) {
+        match self.inner.mcp_status.lock() {
+            Ok(mut guard) => *guard = status,
+            Err(poisoned) => *poisoned.into_inner() = status,
+        }
+    }
+
+    pub fn mcp_status_snapshot(&self) -> Vec<McpServerStatus> {
+        self.inner
+            .mcp_status
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
     /// mu-phl v0 (mu-0bxv): read access to the recall provider chain.
     /// The session handler iterates this on every `create_session` /
     /// `session.delegate` to build the new session's `ProjectContext`.
@@ -194,6 +216,7 @@ impl DaemonInfo {
                 started_at_unix_ms: 0,
                 events_dir: None,
                 config: Arc::new(Config::default()),
+                mcp_status: Arc::new(Mutex::new(Vec::new())),
                 recall_providers: Arc::new(Vec::new()),
                 route_catalog: Arc::new(RouteCatalog::from_env()),
                 bash_settings: BashSettings::default(),

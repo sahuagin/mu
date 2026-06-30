@@ -133,11 +133,11 @@ use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
     AskSessionRequest, AuthInitiateRequest, CancelOutstandingRequest, CancelSessionRequest,
     CapabilitiesDiscoverRequest, CloseSessionRequest, DaemonListRoutesRequest,
-    DaemonOutstandingCallsRequest, DaemonStatsRequest, DaemonUsageHistoryRequest, GetConfigRequest,
-    MailboxListRequest, MailboxPostRequest, MailboxReadRequest, PingRequest, Request,
-    RespondToInputRequiredRequest, Response, ScheduleWakeupRequest, SessionEventsRequest,
-    SessionListRequest, SessionStatsRequest, SetConfigRequest, SetRouteRequest, SpawnWorkerRequest,
-    StartAutonomousRequest,
+    DaemonMcpStatusRequest, DaemonOutstandingCallsRequest, DaemonStatsRequest,
+    DaemonUsageHistoryRequest, GetConfigRequest, MailboxListRequest, MailboxPostRequest,
+    MailboxReadRequest, PingRequest, Request, RespondToInputRequiredRequest, Response,
+    ScheduleWakeupRequest, SessionEventsRequest, SessionListRequest, SessionStatsRequest,
+    SetConfigRequest, SetRouteRequest, SpawnWorkerRequest, StartAutonomousRequest,
 };
 use mu_core::skill::loader::LoadedSkill;
 use mu_core::transport::{
@@ -291,6 +291,7 @@ fn method_meta(method: &str) -> MethodMeta {
         m if m == PingRequest::METHOD
             || m == SessionListRequest::METHOD
             || m == DaemonStatsRequest::METHOD
+            || m == DaemonMcpStatusRequest::METHOD
             || m == DaemonUsageHistoryRequest::METHOD
             || m == DaemonOutstandingCallsRequest::METHOD
             || m == DaemonListRoutesRequest::METHOD
@@ -1771,6 +1772,7 @@ mod tests {
             "session.events",
             "session.stats",
             "daemon.stats",
+            "daemon.mcp_status",
             "daemon.usage_history",
             "daemon.outstanding_calls",
             "daemon.list_routes",

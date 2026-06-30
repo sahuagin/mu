@@ -43,6 +43,18 @@ impl Drop for AbortOnDrop {
     }
 }
 
+fn mark_mcp_import_unregistered(
+    status: &mut [mu_core::protocol::McpServerStatus],
+    server_index: usize,
+    tool_index: usize,
+) {
+    if let Some(server) = status.get_mut(server_index) {
+        if let Some(tool_status) = server.imported_tools.get_mut(tool_index) {
+            tool_status.registered = false;
+        }
+    }
+}
+
 /// Default on-disk events directory used by the production binary
 /// (mu-upb). `None` means "don't write events to disk." Tests
 /// explicitly pass `None` to avoid polluting the developer's
@@ -388,18 +400,24 @@ where
     // Once registered they're base session tools, so the mu-onq8 `discover`
     // tool ranks them alongside everything else.
     let mut tools = tools;
-    let imported = mcp_client::import_remote_tools(&daemon_info.config().mcp.servers).await;
-    for tool in imported {
-        let name = tool.spec().name;
+    let mut imported = mcp_client::import_remote_tools(&daemon_info.config().mcp.servers).await;
+    for imported_tool in imported.tools {
+        let name = imported_tool.tool.spec().name;
         if tools.iter().any(|t| t.spec().name == name) {
             tracing::warn!(
                 tool = %name,
                 "MCP-imported tool collides with an existing tool; skipping"
             );
+            mark_mcp_import_unregistered(
+                &mut imported.status,
+                imported_tool.status_server_index,
+                imported_tool.status_tool_index,
+            );
         } else {
-            tools.push(tool);
+            tools.push(imported_tool.tool);
         }
     }
+    daemon_info.set_mcp_status(imported.status);
     let tools = Arc::new(tools);
     // mu-kex4.6.4: discover skills once at startup so `capabilities/discover`
     // can project them alongside tools (the daemon previously knew only tools;
@@ -610,6 +628,46 @@ fn build_recall_providers(
 mod tests {
     use super::*;
     use mu_core::config::{Config, SessionConfig};
+
+    #[test]
+    fn mark_mcp_import_unregistered_targets_one_import_not_same_named_tools() {
+        use mu_core::agent::{PermissionLevel, SideEffects};
+        use mu_core::protocol::{McpImportedToolStatus, McpServerConnectionState, McpServerStatus};
+
+        fn server(name: &str) -> McpServerStatus {
+            McpServerStatus {
+                name: name.to_string(),
+                url: format!("http://{name}/mcp"),
+                configured_tools: None,
+                prefix: None,
+                side_effects: Some(SideEffects::ReadOnly),
+                tool_side_effects: std::collections::HashMap::new(),
+                state: McpServerConnectionState::Connected,
+                imported_tools: vec![McpImportedToolStatus {
+                    remote_name: "same".to_string(),
+                    local_name: "same".to_string(),
+                    side_effects: SideEffects::ReadOnly,
+                    permission: PermissionLevel::Allow,
+                    classified: true,
+                    registered: true,
+                }],
+                last_error: None,
+                elapsed_ms: Some(1),
+            }
+        }
+
+        let mut status = vec![server("first"), server("second")];
+        mark_mcp_import_unregistered(&mut status, 1, 0);
+
+        assert!(
+            status[0].imported_tools[0].registered,
+            "same local_name on an earlier registered server must stay registered"
+        );
+        assert!(
+            !status[1].imported_tools[0].registered,
+            "only the colliding import that was skipped should be marked skipped"
+        );
+    }
 
     #[test]
     fn resolve_events_dir_returns_none_when_persist_disabled() {

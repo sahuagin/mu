@@ -19,8 +19,9 @@ pub use remote_tool::RemoteMcpTool;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use mu_core::agent::{SideEffects, Tool};
+use mu_core::agent::{PermissionLevel, SideEffects, Tool};
 use mu_core::config::McpServerConfig;
+use mu_core::protocol::{McpImportedToolStatus, McpServerConnectionState, McpServerStatus};
 use rmcp::model::{
     ClientCapabilities, ClientInfo, ClientRequest, CustomRequest, ExperimentalCapabilities,
     Implementation, ServerResult,
@@ -128,28 +129,59 @@ pub(crate) async fn fetch_ai_help(peer: &McpPeer, path: &[String]) -> anyhow::Re
     Ok(node)
 }
 
-/// Connect to every configured server and return the imported tools.
-/// Failures are per-server and non-fatal.
-pub async fn import_remote_tools(servers: &[McpServerConfig]) -> Vec<Arc<dyn Tool>> {
+pub struct ImportedMcpTool {
+    pub tool: Arc<dyn Tool>,
+    pub status_server_index: usize,
+    pub status_tool_index: usize,
+}
+
+pub struct ImportedMcpTools {
+    pub tools: Vec<ImportedMcpTool>,
+    pub status: Vec<McpServerStatus>,
+}
+
+/// Connect to every configured server and return the imported tools plus a
+/// daemon-authoritative import report. Failures are per-server and non-fatal.
+pub async fn import_remote_tools(servers: &[McpServerConfig]) -> ImportedMcpTools {
     /// Per-server budget for connect + initialize + tools/list. A hung or
     /// unresponsive server must degrade like an unreachable one — it cannot
     /// be allowed to stall daemon startup.
     const IMPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    let mut out: Vec<Arc<dyn Tool>> = Vec::new();
+    let mut out: Vec<ImportedMcpTool> = Vec::new();
+    let mut status: Vec<McpServerStatus> = Vec::new();
     for cfg in servers {
+        let started = std::time::Instant::now();
         let imported = tokio::time::timeout(IMPORT_TIMEOUT, import_from_server(cfg))
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {IMPORT_TIMEOUT:?}")));
+        let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         match imported {
-            Ok(tools) => {
+            Ok((tools, imported_tools)) => {
                 tracing::info!(
                     server = %cfg.name,
                     url = %cfg.url,
                     count = tools.len(),
                     "imported MCP tools"
                 );
-                out.extend(tools);
+                let server_index = status.len();
+                status.push(server_status(
+                    cfg,
+                    McpServerConnectionState::Connected,
+                    imported_tools,
+                    None,
+                    Some(elapsed_ms),
+                ));
+                out.extend(
+                    tools
+                        .into_iter()
+                        .enumerate()
+                        .map(|(status_tool_index, tool)| ImportedMcpTool {
+                            tool,
+                            status_server_index: server_index,
+                            status_tool_index,
+                        }),
+                );
             }
             Err(e) => {
                 tracing::warn!(
@@ -158,14 +190,51 @@ pub async fn import_remote_tools(servers: &[McpServerConfig]) -> Vec<Arc<dyn Too
                     error = %e,
                     "MCP server unreachable; no tools imported from it"
                 );
+                status.push(server_status(
+                    cfg,
+                    McpServerConnectionState::Unavailable,
+                    Vec::new(),
+                    Some(e.to_string()),
+                    Some(elapsed_ms),
+                ));
             }
         }
     }
-    out
+    ImportedMcpTools { tools: out, status }
+}
+
+fn server_status(
+    cfg: &McpServerConfig,
+    state: McpServerConnectionState,
+    imported_tools: Vec<McpImportedToolStatus>,
+    last_error: Option<String>,
+    elapsed_ms: Option<u64>,
+) -> McpServerStatus {
+    McpServerStatus {
+        name: cfg.name.clone(),
+        url: cfg.url.clone(),
+        configured_tools: cfg.tools.clone(),
+        prefix: cfg.prefix.clone().filter(|p| !p.is_empty()),
+        side_effects: cfg.side_effects,
+        tool_side_effects: cfg.tool_side_effects.clone(),
+        state,
+        imported_tools,
+        last_error,
+        elapsed_ms,
+    }
+}
+
+fn local_tool_name(prefix: Option<&str>, remote_name: &str) -> String {
+    match prefix {
+        Some(p) if !p.is_empty() => format!("{p}{remote_name}"),
+        _ => remote_name.to_string(),
+    }
 }
 
 /// Handshake with one server and wrap its (allowlisted) tools.
-async fn import_from_server(cfg: &McpServerConfig) -> anyhow::Result<Vec<Arc<dyn Tool>>> {
+async fn import_from_server(
+    cfg: &McpServerConfig,
+) -> anyhow::Result<(Vec<Arc<dyn Tool>>, Vec<McpImportedToolStatus>)> {
     let transport = StreamableHttpClientTransport::from_uri(cfg.url.as_str());
     // `initialize` handshake; the returned service owns the connection and
     // is shared (Arc) by every RemoteMcpTool imported from this server. The
@@ -174,13 +243,29 @@ async fn import_from_server(cfg: &McpServerConfig) -> anyhow::Result<Vec<Arc<dyn
     let peer: Arc<McpPeer> = Arc::new(MuMcpClient::default().serve(transport).await?);
     let remote = peer.list_all_tools().await?;
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+    let mut imported_tools: Vec<McpImportedToolStatus> = Vec::new();
     for def in remote {
         if let Some(allow) = &cfg.tools {
             if !allow.iter().any(|a| a == def.name.as_ref()) {
                 continue;
             }
         }
-        let (side_effects, classified) = resolve_side_effects(cfg, def.name.as_ref());
+        let remote_name = def.name.to_string();
+        let local_name = local_tool_name(cfg.prefix.as_deref(), &remote_name);
+        let (side_effects, classified) = resolve_side_effects(cfg, &remote_name);
+        let permission = if classified {
+            PermissionLevel::Allow
+        } else {
+            PermissionLevel::Ask
+        };
+        imported_tools.push(McpImportedToolStatus {
+            remote_name,
+            local_name,
+            side_effects,
+            permission,
+            classified,
+            registered: true,
+        });
         tools.push(Arc::new(RemoteMcpTool::new(
             &cfg.name,
             cfg.prefix.as_deref(),
@@ -190,7 +275,7 @@ async fn import_from_server(cfg: &McpServerConfig) -> anyhow::Result<Vec<Arc<dyn
             peer.clone(),
         )));
     }
-    Ok(tools)
+    Ok((tools, imported_tools))
 }
 
 #[cfg(test)]
@@ -270,5 +355,40 @@ mod tests {
             resolve_side_effects(&c, "other"),
             (SideEffects::Execute, false)
         );
+    }
+
+    #[test]
+    fn server_status_reports_configured_import_metadata() {
+        let mut c = cfg(
+            Some(SideEffects::ReadOnly),
+            &[("run", SideEffects::External)],
+        );
+        c.tools = Some(vec!["code_status".to_string()]);
+        c.prefix = Some("idx_".to_string());
+        let status = server_status(
+            &c,
+            McpServerConnectionState::Connected,
+            vec![McpImportedToolStatus {
+                remote_name: "code_status".to_string(),
+                local_name: local_tool_name(c.prefix.as_deref(), "code_status"),
+                side_effects: SideEffects::ReadOnly,
+                permission: PermissionLevel::Allow,
+                classified: true,
+                registered: true,
+            }],
+            None,
+            Some(12),
+        );
+
+        assert_eq!(status.name, "srv");
+        assert_eq!(
+            status.configured_tools,
+            Some(vec!["code_status".to_string()])
+        );
+        assert_eq!(status.prefix, Some("idx_".to_string()));
+        assert_eq!(status.state, McpServerConnectionState::Connected);
+        assert_eq!(status.elapsed_ms, Some(12));
+        assert_eq!(status.imported_tools[0].local_name, "idx_code_status");
+        assert_eq!(status.tool_side_effects["run"], SideEffects::External);
     }
 }

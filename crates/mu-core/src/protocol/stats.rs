@@ -9,6 +9,9 @@
 //! Extracted from `protocol.rs` per mu-6a8 phase 2 (2026-05-18); re-exported
 //! by `protocol::*` so external callers see no API change.
 
+use std::collections::HashMap;
+
+use crate::agent::{PermissionLevel, SideEffects};
 use serde::{Deserialize, Serialize};
 
 use super::ProviderStatusKind;
@@ -36,6 +39,68 @@ pub struct DaemonStatsResponse {
     /// Streaming, ToolExecuting}. Post-mu-035 this should be replaced
     /// by the live ProviderStatusTracker count.
     pub in_flight_calls_count: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DaemonMcpStatusRequest {}
+
+impl DaemonMcpStatusRequest {
+    pub const METHOD: &'static str = "daemon.mcp_status";
+}
+
+/// Daemon-authoritative snapshot of outbound MCP imports. Unlike the
+/// mu-solo fallback that rereads `~/.config/mu/config.toml`, this is the
+/// status of what the running daemon actually attempted at startup.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DaemonMcpStatusResponse {
+    pub snapshot_at_unix_ms: u64,
+    pub servers: Vec<McpServerStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpServerStatus {
+    pub name: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_effects: Option<SideEffects>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tool_side_effects: HashMap<String, SideEffects>,
+    pub state: McpServerConnectionState,
+    #[serde(default)]
+    pub imported_tools: Vec<McpImportedToolStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerConnectionState {
+    Connected,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpImportedToolStatus {
+    pub remote_name: String,
+    pub local_name: String,
+    pub side_effects: SideEffects,
+    pub permission: PermissionLevel,
+    pub classified: bool,
+    /// Whether this imported tool made it into the daemon's registered tool
+    /// set. A name collision can import successfully from MCP but still be
+    /// skipped before registration.
+    #[serde(default = "default_true")]
+    pub registered: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ===== mu-pex Phase 1: daemon.usage_history =====

@@ -188,7 +188,8 @@ impl Tool for SpawnWorkerTool {
                              session_id: {}\n\
                              worker_name: {}\n\n\
                              The task has been posted to the worker's mailbox. \
-                             Results will arrive in your mailbox when the worker finishes.",
+                             The daemon will wake this session with the worker result; \
+                             do not poll dialogue for it.",
                             r.session_id, r.pot_name,
                         ),
                         is_error: false,

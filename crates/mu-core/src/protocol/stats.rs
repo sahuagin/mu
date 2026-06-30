@@ -51,10 +51,25 @@ impl DaemonMcpStatusRequest {
 /// Daemon-authoritative snapshot of outbound MCP imports. Unlike the
 /// mu-solo fallback that rereads `~/.config/mu/config.toml`, this is the
 /// status of what the running daemon actually attempted at startup.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonMcpStatusResponse {
     pub snapshot_at_unix_ms: u64,
+    /// Effective daemon-side MCP switch after config and CLI overrides.
+    /// When false, no outbound MCP imports are attempted and the local
+    /// MCP socket/status surface is not started.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub servers: Vec<McpServerStatus>,
+}
+
+impl Default for DaemonMcpStatusResponse {
+    fn default() -> Self {
+        Self {
+            snapshot_at_unix_ms: 0,
+            enabled: true,
+            servers: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

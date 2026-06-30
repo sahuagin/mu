@@ -1496,6 +1496,7 @@ async fn mcp_tools_imported_from_config_mu_yc6() {
             tokens: vec![TEST_BEARER_TOKEN.to_string()],
         },
         mcp: McpConfig {
+            enabled: true,
             servers: vec![McpServerConfig {
                 name: "stub-code-index".into(),
                 url,
@@ -1605,6 +1606,7 @@ async fn mcp_unreachable_server_degrades_gracefully_mu_yc6() {
             tokens: vec![TEST_BEARER_TOKEN.to_string()],
         },
         mcp: McpConfig {
+            enabled: true,
             servers: vec![McpServerConfig {
                 name: "ghost".into(),
                 // Port 1 on loopback: nothing listens; connect fails fast.

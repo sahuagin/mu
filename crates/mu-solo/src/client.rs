@@ -119,6 +119,7 @@ impl Client {
         bash_yolo: bool,
         tools: &str,
         thinking: &str,
+        mcp_enabled: bool,
     ) -> Result<Self> {
         // Per-spawn bearer token, set via env. Daemon reads
         // `MU_BEARER_TOKEN`, requires every protected RPC to present
@@ -138,6 +139,11 @@ impl Client {
         // launch-time directive, so the serve-side provider default is unchanged.
         if !thinking.is_empty() {
             cmd.arg("--thinking").arg(thinking);
+        }
+        if mcp_enabled {
+            cmd.arg("--enable-mcp");
+        } else {
+            cmd.arg("--disable-mcp");
         }
         cmd.current_dir(cwd)
             .stdin(Stdio::piped())

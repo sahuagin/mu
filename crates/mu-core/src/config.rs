@@ -234,11 +234,25 @@ impl JournalConfig {
 /// side_effects = "read_only"              # operator trust floor for this server
 /// tool_side_effects = { code_recall = "read_only" }  # per-tool override
 /// ```
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpConfig {
+    /// Master MCP switch. When false, the daemon skips outbound MCP imports
+    /// AND the local MCP socket/status surface. Defaults true for long-lived
+    /// daemons (`mu serve`, `mu-solo`); one-shot frontends may override it off.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// Servers to connect to at daemon startup.
     pub servers: Vec<McpServerConfig>,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            servers: Vec::new(),
+        }
+    }
 }
 
 /// One outbound MCP server (`[[mcp.servers]]`).
@@ -980,7 +994,10 @@ mod tests {
 
     #[test]
     fn mcp_servers_default_empty_and_toml_can_configure() {
+        assert!(Config::default().mcp.enabled);
         assert!(Config::default().mcp.servers.is_empty());
+        let disabled: Config = toml::from_str("[mcp]\nenabled = false\n").expect("parse");
+        assert!(!disabled.mcp.enabled);
         let c: Config = toml::from_str(
             "[[mcp.servers]]\n\
              name = \"code-index\"\n\

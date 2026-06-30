@@ -182,6 +182,7 @@ async fn main() -> Result<()> {
         model: &cfg.session.model,
         bash_yolo: cfg.session.bash_yolo,
         tools: &cfg.session.tools,
+        mcp_enabled: cfg.session.mcp_enabled,
         thinking: &cfg.session.thinking,
         effort: &resolved_effort,
         effort_levels,

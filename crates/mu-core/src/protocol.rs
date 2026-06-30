@@ -170,6 +170,7 @@ mod tests {
     fn round_trip_daemon_mcp_status() -> Result<(), serde_json::Error> {
         let response = DaemonMcpStatusResponse {
             snapshot_at_unix_ms: 42,
+            enabled: true,
             servers: vec![McpServerStatus {
                 name: "code-index".to_string(),
                 url: "http://127.0.0.1:7622/mcp".to_string(),

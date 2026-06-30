@@ -12,7 +12,7 @@ use mu_core::agent::{Tool, ToolResult, ToolSpec};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
-use crate::serve::worker::{spawn_worker, SpawnWorkerConfig};
+use crate::serve::worker::{derive_child_tool_grant, spawn_worker, SpawnWorkerConfig};
 use crate::serve::DaemonInfo;
 use crate::serve::WeakSessions;
 
@@ -30,6 +30,8 @@ pub struct SpawnWorkerTool {
     /// "supervisor" alias (no live session), so this should be set to
     /// the calling session's id for results to reach the operator.
     parent_session_id: Option<String>,
+    /// Built-in tools from this session that may be delegated to the child.
+    parent_tool_grant: Vec<String>,
 }
 
 impl SpawnWorkerTool {
@@ -42,14 +44,24 @@ impl SpawnWorkerTool {
             sessions,
             daemon_info,
             parent_session_id,
+            parent_tool_grant: Vec::new(),
         }
+    }
+
+    pub fn with_parent_tool_grant(mut self, parent_tool_grant: Vec<String>) -> Self {
+        self.parent_tool_grant = parent_tool_grant;
+        self
     }
 
     /// Build the spawn config from the model's tool arguments, stamping
     /// in THIS tool's `parent_session_id` as the worker's reply_to so
     /// results route back to the calling session. Factored out of
     /// `execute` so the wiring is unit-testable without spawning a worker process.
-    fn build_config(&self, arguments: &Value) -> Result<SpawnWorkerConfig, String> {
+    fn build_config(
+        &self,
+        arguments: &Value,
+        parent_capability: Option<&mu_core::capability::Capability>,
+    ) -> Result<SpawnWorkerConfig, String> {
         let prompt = arguments
             .get("prompt")
             .and_then(Value::as_str)
@@ -73,6 +85,7 @@ impl SpawnWorkerTool {
             pot_name: None,
             timeout_secs: arguments.get("timeout_secs").and_then(Value::as_u64),
             parent_session_id: self.parent_session_id.clone(),
+            tools: derive_child_tool_grant(&self.parent_tool_grant, parent_capability),
         })
     }
 }
@@ -82,9 +95,10 @@ impl Tool for SpawnWorkerTool {
         ToolSpec::new(
             "spawn_worker",
             "Spawn a worker agent to perform a task autonomously. \
-             The worker is launched through mu-spawn using current non-POT runtimes \
-             (mu ask or claude -p). Results are posted back to your mailbox when \
-             done. Returns session_id and worker name.",
+             The worker is launched through the shared agent-dispatch path \
+             (mu ask or claude -p), with a child tool grant derived from and \
+             no wider than this session's tools. Results are posted back to \
+             your mailbox when done. Returns session_id and worker name.",
             json!({
                 "type": "object",
                 "properties": {
@@ -130,21 +144,10 @@ impl Tool for SpawnWorkerTool {
         'life0: 'async_trait,
         Self: 'async_trait,
     {
-        let config_result = self.build_config(&arguments);
         let weak_sessions = self.sessions.clone();
         let daemon_info = self.daemon_info.clone();
 
         Box::pin(async move {
-            let config = match config_result {
-                Ok(c) => c,
-                Err(e) => {
-                    return ToolResult {
-                        content: e,
-                        is_error: true,
-                    };
-                }
-            };
-
             // mu-qc08: upgrade the weak registry handle only now, at
             // point-of-use. `None` means the daemon is tearing down —
             // surface it as a clean tool error, never a panic.
@@ -155,6 +158,21 @@ impl Tool for SpawnWorkerTool {
                         content:
                             "spawn_worker: session registry unavailable (daemon shutting down)"
                                 .into(),
+                        is_error: true,
+                    };
+                }
+            };
+
+            let parent_capability = self
+                .parent_session_id
+                .as_deref()
+                .and_then(|id| sessions.capability(id))
+                .and_then(|cap| cap.lock().ok().map(|c| c.clone()));
+            let config = match self.build_config(&arguments, parent_capability.as_ref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    return ToolResult {
+                        content: e,
                         is_error: true,
                     };
                 }
@@ -212,24 +230,28 @@ mod tests {
     #[test]
     fn build_config_uses_caller_session_id_as_reply_to() {
         let cfg = tool(Some("session-7"))
-            .build_config(&json!({ "prompt": "do the thing" }))
+            .build_config(&json!({ "prompt": "do the thing" }), None)
             .expect("config builds");
         assert_eq!(cfg.parent_session_id.as_deref(), Some("session-7"));
         assert_eq!(cfg.prompt, "do the thing");
         assert!(cfg.provider.is_none());
         assert!(cfg.model.is_none());
         assert!(cfg.timeout_secs.is_none());
+        assert_eq!(cfg.tools, vec!["read", "grep"]);
     }
 
     #[test]
     fn build_config_parses_optional_model_and_timeout() {
         let cfg = tool(Some("session-1"))
-            .build_config(&json!({
-                "prompt": "p",
-                "provider": "openai-codex",
-                "model": "gpt-5.5",
-                "timeout_secs": 42
-            }))
+            .build_config(
+                &json!({
+                    "prompt": "p",
+                    "provider": "openai-codex",
+                    "model": "gpt-5.5",
+                    "timeout_secs": 42
+                }),
+                None,
+            )
             .expect("config builds");
         assert_eq!(cfg.provider.as_deref(), Some("openai-codex"));
         assert_eq!(cfg.model.as_deref(), Some("gpt-5.5"));
@@ -238,10 +260,13 @@ mod tests {
 
     #[test]
     fn build_config_rejects_model_without_provider() {
-        let result = tool(Some("session-1")).build_config(&json!({
-            "prompt": "p",
-            "model": "claude-opus-4-7"
-        }));
+        let result = tool(Some("session-1")).build_config(
+            &json!({
+                "prompt": "p",
+                "model": "claude-opus-4-7"
+            }),
+            None,
+        );
         let Err(err) = result else {
             panic!("model-only override must fail");
         };
@@ -250,7 +275,9 @@ mod tests {
 
     #[test]
     fn build_config_missing_prompt_is_error() {
-        assert!(tool(Some("session-1")).build_config(&json!({})).is_err());
+        assert!(tool(Some("session-1"))
+            .build_config(&json!({}), None)
+            .is_err());
     }
 
     #[test]
@@ -259,7 +286,7 @@ mod tests {
         // spawn_worker maps to the "supervisor" fallback. This is the
         // pre-fix behavior, kept only for the (non-session) edge case.
         let cfg = tool(None)
-            .build_config(&json!({ "prompt": "p" }))
+            .build_config(&json!({ "prompt": "p" }), None)
             .expect("config builds");
         assert!(cfg.parent_session_id.is_none());
     }

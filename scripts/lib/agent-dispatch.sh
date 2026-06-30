@@ -52,7 +52,7 @@ _ad_claude_tools() {  # $1=csv
 
 agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   local ad_prov ad_model ad_pf ad_tools ad_timeout ad_maxturns ad_thinking ad_mu ad_errlog
-  local ad_clsys ad_sysflags ad_cltools ad_perm ad_yolo ad_lease
+  local ad_clsys ad_sysflags ad_cltools ad_perm ad_yolo ad_lease ad_mcpflag
   ad_prov="$1"; ad_model="$2"
   ad_pf="${3:-${PROMPT_FILE:-}}"
   [ -n "$ad_pf" ] || { echo "agent_dispatch: no prompt file (arg 3 or \$PROMPT_FILE)" >&2; return 2; }
@@ -75,11 +75,17 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   if [ "$ad_prov" = "claude-oauth" ]; then
     ad_clsys=""
     [ -n "${SYSPROMPT:-}" ] && [ -r "$SYSPROMPT" ] && ad_clsys="--append-system-prompt-file $SYSPROMPT"
-    ad_cltools="$(_ad_claude_tools "$ad_tools")"; [ -n "$ad_cltools" ] || ad_cltools="Read Grep"
-    # shellcheck disable=SC2086 — $ad_clsys/$ad_perm/$ad_cltools intentionally word-split
-    timeout "$ad_timeout" claude -p --model "$ad_model" $ad_clsys $ad_perm \
+    ad_mcpflag=""
+    [ -n "${MCP_CONFIG:-}" ] && ad_mcpflag="--mcp-config $MCP_CONFIG"
+    ad_cltools=""
+    if [ -n "$ad_tools" ]; then
+      ad_cltools="$(_ad_claude_tools "$ad_tools")"
+      [ -n "$ad_cltools" ] && ad_cltools="--allowedTools $ad_cltools"
+    fi
+    # shellcheck disable=SC2086 — $ad_clsys/$ad_mcpflag/$ad_perm/$ad_cltools intentionally word-split
+    timeout "$ad_timeout" claude -p --model "$ad_model" $ad_clsys $ad_mcpflag $ad_perm \
       --exclude-dynamic-system-prompt-sections \
-      --allowedTools $ad_cltools --output-format text <"$ad_pf" 2>>"$ad_errlog"
+      $ad_cltools --output-format text <"$ad_pf" 2>>"$ad_errlog"
     return
   fi
 

@@ -465,13 +465,19 @@ fn session_spawn_tools(
         })
         .collect();
     if daemon_info.events_dir().is_some() {
-        tools.push(Arc::new(crate::tools::SpawnWorkerTool::new(
-            // mu-qc08: a WEAK handle — a strong clone here deadlocks
-            // shutdown (the tool lives in this session's own tool list).
-            sessions.downgrade(),
-            daemon_info.clone(),
-            Some(session_id.to_string()),
-        )));
+        let parent_tool_grant = crate::serve::worker::normalize_worker_tool_grant(
+            base.iter().map(|tool| tool.spec().name),
+        );
+        tools.push(Arc::new(
+            crate::tools::SpawnWorkerTool::new(
+                // mu-qc08: a WEAK handle — a strong clone here deadlocks
+                // shutdown (the tool lives in this session's own tool list).
+                sessions.downgrade(),
+                daemon_info.clone(),
+                Some(session_id.to_string()),
+            )
+            .with_parent_tool_grant(parent_tool_grant),
+        ));
         // mu-watch-tool-wakeup-o03p: the `watch` tool — spawn a command,
         // wake THIS session when it exits. Same WEAK-handle discipline as
         // spawn_worker (it lives in this session's own tool list), and
@@ -1682,6 +1688,11 @@ pub async fn handle_spawn_worker(
         "bad SpawnWorkerRequest"
     );
 
+    let parent_capability = req
+        .parent_session_id
+        .as_deref()
+        .and_then(|id| sessions.capability(id))
+        .and_then(|cap| cap.lock().ok().map(|c| c.clone()));
     let config = crate::serve::worker::SpawnWorkerConfig {
         prompt: req.prompt.clone(),
         provider: req.provider,
@@ -1689,6 +1700,9 @@ pub async fn handle_spawn_worker(
         pot_name: req.pot_name,
         timeout_secs: req.timeout_secs,
         parent_session_id: req.parent_session_id,
+        tools: crate::serve::worker::derive_child_tool_grant_from_capability(
+            parent_capability.as_ref(),
+        ),
     };
 
     match crate::serve::worker::spawn_worker(config, sessions, daemon_info).await {

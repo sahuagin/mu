@@ -5,12 +5,14 @@
 //! for exit/timeout/failure. POT/jail setup is deliberately gone; `mu-spawn`
 //! dispatches to current agent runtimes (`mu ask` or `claude -p`).
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::process::Command;
 
+use mu_core::capability::Capability;
 use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::WorkerStatus;
 
@@ -32,6 +34,74 @@ pub(crate) struct SpawnWorkerConfig {
     pub pot_name: Option<String>, // optional worker name (legacy field)
     pub timeout_secs: Option<u64>,
     pub parent_session_id: Option<String>,
+    /// Built-in mu tools the child may receive via `mu ask --tools` / agent_dispatch.
+    /// Always derived from the parent's session posture; never hardcoded to full power.
+    pub tools: Vec<String>,
+}
+
+/// Built-in tools that can honestly be passed through `mu ask --tools` and
+/// mapped to Claude's `--allowedTools` by scripts/lib/agent-dispatch.sh. Session
+/// control tools (spawn_worker/watch/discover/start_autonomous/...) are NOT
+/// delegable to a subprocess child by default; the child gets work tools only.
+const WORKER_TOOL_ORDER: &[&str] = &["read", "write", "edit", "glob", "grep", "ls", "bash"];
+
+/// Minimal no-inheritance fallback for non-session / direct RPC spawns. This is
+/// intentionally useful for inspection/review, but not write-capable.
+const DEFAULT_WORKER_TOOLS: &[&str] = &["read", "grep"];
+
+fn ordered_tool_intersection(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    let requested: HashSet<String> = names
+        .into_iter()
+        .filter(|name| WORKER_TOOL_ORDER.contains(&name.as_str()))
+        .collect();
+    WORKER_TOOL_ORDER
+        .iter()
+        .filter(|name| requested.iter().any(|requested| requested == *name))
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+/// Normalize a parent session's daemon/tool-list grant into the built-in tools
+/// that may be delegated to a subprocess worker.
+pub(crate) fn normalize_worker_tool_grant(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    ordered_tool_intersection(names)
+}
+
+/// Derive the child subprocess tool grant from a parent session's delegable tool
+/// grant and (when available) its live capability. This is the attenuation point:
+/// child tools are always a subset of the parent grant, further narrowed by
+/// `Capability.allowed_tools` when that axis is populated.
+pub(crate) fn derive_child_tool_grant(
+    parent_grant: &[String],
+    parent_capability: Option<&Capability>,
+) -> Vec<String> {
+    let base = if parent_grant.is_empty() {
+        DEFAULT_WORKER_TOOLS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>()
+    } else {
+        parent_grant.to_vec()
+    };
+    let Some(allowed) = parent_capability.and_then(|cap| cap.allowed_tools.as_ref()) else {
+        return ordered_tool_intersection(base);
+    };
+    ordered_tool_intersection(base.into_iter().filter(|name| allowed.contains(name)))
+}
+
+/// Direct RPC fallback: no per-session `SpawnWorkerTool` exists to carry the
+/// daemon's base grant, so derive from the parent capability when possible and
+/// otherwise use the minimal floor.
+pub(crate) fn derive_child_tool_grant_from_capability(
+    parent_capability: Option<&Capability>,
+) -> Vec<String> {
+    let Some(allowed) = parent_capability.and_then(|cap| cap.allowed_tools.as_ref()) else {
+        return DEFAULT_WORKER_TOOLS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+    };
+    ordered_tool_intersection(allowed.iter().cloned())
 }
 
 fn resolve_mu_spawn_binary() -> String {
@@ -180,6 +250,7 @@ pub(crate) async fn spawn_worker(
         .env("MU_DAEMON_ID", daemon_info.daemon_id())
         .env("MU_SESSION_ID", &session_id)
         .env("MU_REPLY_TO", &reply_to)
+        .env("MU_SPAWN_TOOLS", config.tools.join(","))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -469,14 +540,22 @@ mod tests {
             .await
     }
 
+    fn shell_escape(path: &std::path::Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+    }
+
     #[tokio::test]
     async fn spawn_worker_runs_mu_spawn_and_marks_done() {
         let _guard = env_lock().await;
         let tmp = tempfile::tempdir().expect("tempdir");
         let script = tmp.path().join("mu-spawn-test");
+        let env_file = tmp.path().join("tools.env");
         std::fs::write(
             &script,
-            "#!/bin/sh\ncat >/dev/null\necho hello-from-worker\n",
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nprintf '%s' \"$MU_SPAWN_TOOLS\" > {}\necho hello-from-worker\n",
+                shell_escape(&env_file),
+            ),
         )
         .expect("write script");
         #[cfg(unix)]
@@ -498,6 +577,7 @@ mod tests {
                 pot_name: None,
                 timeout_secs: Some(5),
                 parent_session_id: None,
+                tools: vec!["read".into(), "grep".into()],
             },
             sessions.clone(),
             daemon_info,
@@ -518,6 +598,64 @@ mod tests {
         assert!(
             matches!(status, Some(WorkerStatus::Done { exit_code: 0, .. })),
             "worker should finish cleanly, got {status:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(env_file).expect("tools env file"),
+            "read,grep",
+            "spawn_worker must pass the attenuated child tool grant to mu-spawn"
+        );
+    }
+
+    #[test]
+    fn child_tool_grant_is_parent_attenuated_and_ordered() {
+        let parent = normalize_worker_tool_grant(vec![
+            "grep".into(),
+            "read".into(),
+            "spawn_worker".into(),
+            "bash".into(),
+        ]);
+        assert_eq!(parent, vec!["read", "grep", "bash"]);
+
+        let cap = Capability {
+            allowed_tools: Some(HashSet::from([
+                "read".to_string(),
+                "grep".to_string(),
+                "spawn_worker".to_string(),
+            ])),
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_child_tool_grant(&parent, Some(&cap)),
+            vec!["read", "grep"]
+        );
+    }
+
+    #[test]
+    fn child_tool_grant_preserves_write_parent_bash_authority() {
+        let parent = normalize_worker_tool_grant(vec![
+            "read".into(),
+            "write".into(),
+            "edit".into(),
+            "glob".into(),
+            "grep".into(),
+            "ls".into(),
+            "bash".into(),
+        ]);
+        let cap = Capability {
+            allowed_tools: Some(parent.iter().cloned().collect()),
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_child_tool_grant(&parent, Some(&cap)),
+            vec!["read", "write", "edit", "glob", "grep", "ls", "bash"]
+        );
+    }
+
+    #[test]
+    fn direct_spawn_without_parent_uses_minimal_floor() {
+        assert_eq!(
+            derive_child_tool_grant_from_capability(None),
+            vec!["read".to_string(), "grep".to_string()]
         );
     }
 }

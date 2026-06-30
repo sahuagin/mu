@@ -3,8 +3,9 @@
 use serde_json::Value;
 
 use mu_core::protocol::{
-    DaemonOutstandingCallsResponse, DaemonStatsRequest, DaemonStatsResponse,
-    DaemonUsageHistoryRequest, DaemonUsageHistoryResponse, Request, Response, SessionStatusSummary,
+    DaemonMcpStatusRequest, DaemonMcpStatusResponse, DaemonOutstandingCallsResponse,
+    DaemonStatsRequest, DaemonStatsResponse, DaemonUsageHistoryRequest, DaemonUsageHistoryResponse,
+    Request, Response, SessionStatusSummary,
 };
 use mu_core::transport::{codes, err_response, ok_response};
 use mu_core::usage_history::{aggregate_into_rows, extract_per_session_metrics};
@@ -32,6 +33,28 @@ pub fn handle_outstanding_calls(request: Request<Value>, sessions: Sessions) -> 
 }
 
 pub use handle_outstanding_calls as handle_daemon_outstanding_calls;
+
+pub fn handle_daemon_mcp_status(
+    request: Request<Value>,
+    daemon_info: DaemonInfo,
+) -> Response<Value> {
+    let _params: DaemonMcpStatusRequest = match serde_json::from_value(request.params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("daemon.mcp_status: invalid params: {e}"),
+            );
+        }
+    };
+
+    let resp = DaemonMcpStatusResponse {
+        snapshot_at_unix_ms: discovery::now_unix_ms(),
+        servers: daemon_info.mcp_status_snapshot(),
+    };
+    ok_response(request.id, to_value_or_null(resp))
+}
 
 pub fn handle_daemon_stats(
     request: Request<Value>,

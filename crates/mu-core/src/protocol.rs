@@ -167,6 +167,38 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_daemon_mcp_status() -> Result<(), serde_json::Error> {
+        let response = DaemonMcpStatusResponse {
+            snapshot_at_unix_ms: 42,
+            servers: vec![McpServerStatus {
+                name: "code-index".to_string(),
+                url: "http://127.0.0.1:7622/mcp".to_string(),
+                configured_tools: Some(vec!["code_status".to_string()]),
+                prefix: None,
+                side_effects: Some(crate::agent::SideEffects::ReadOnly),
+                tool_side_effects: std::collections::HashMap::new(),
+                state: McpServerConnectionState::Connected,
+                imported_tools: vec![McpImportedToolStatus {
+                    remote_name: "code_status".to_string(),
+                    local_name: "code_status".to_string(),
+                    side_effects: crate::agent::SideEffects::ReadOnly,
+                    permission: crate::agent::PermissionLevel::Allow,
+                    classified: true,
+                    registered: true,
+                }],
+                last_error: None,
+                elapsed_ms: Some(7),
+            }],
+        };
+
+        let value = serde_json::to_value(&response)?;
+        let decoded: DaemonMcpStatusResponse = serde_json::from_value(value)?;
+
+        assert_eq!(decoded, response);
+        Ok(())
+    }
+
+    #[test]
     fn provider_selector_uses_tagged_snake_case_wire_format() -> Result<(), serde_json::Error> {
         let samples = [
             (

@@ -18,6 +18,9 @@ use crate::menu::{InlineMenu, MenuAction, MenuItem};
 use anyhow::{anyhow, Context, Result};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
+use mu_core::protocol::{
+    DaemonMcpStatusRequest, DaemonMcpStatusResponse, McpServerConnectionState, McpServerStatus,
+};
 use mu_core::session_status::SessionStatus;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -431,6 +434,11 @@ pub struct App {
     mcp_status_rx: Option<tokio::sync::mpsc::UnboundedReceiver<SessionStatus>>,
     /// Latest SessionStatus from the MCP subscription.
     mcp_status: Option<SessionStatus>,
+    /// Daemon-authoritative outbound MCP import snapshot (`daemon.mcp_status`).
+    /// Unlike the config fallback, this reports what the running daemon actually
+    /// attempted/imported at startup.
+    mcp_daemon_status: Option<DaemonMcpStatusResponse>,
+    mcp_daemon_status_error: Option<String>,
     /// mu-solo-scrollback-dup-recommit-8hva: write a renderer journal.
     renderer_journal: bool,
     /// mu-solo-osc-notify-mbmn: desktop notifications (OSC 99) on main-
@@ -498,6 +506,25 @@ fn mcp_server_imports_dialogue_poll(server: &mu_core::config::McpServerConfig) -
     }
 }
 
+fn mcp_status_imports_dialogue_poll(server: &McpServerStatus) -> bool {
+    match server.configured_tools.as_ref() {
+        Some(tools) => tools.iter().any(|tool| tool == "dialogue_poll"),
+        None => server.name == "mu-dialogue",
+    }
+}
+
+fn fetch_mcp_daemon_status(
+    client: &mut Client,
+) -> (Option<DaemonMcpStatusResponse>, Option<String>) {
+    match client.request(DaemonMcpStatusRequest::METHOD, serde_json::json!({})) {
+        Ok(v) => match serde_json::from_value::<DaemonMcpStatusResponse>(v) {
+            Ok(status) => (Some(status), None),
+            Err(e) => (None, Some(format!("daemon.mcp_status decode failed: {e}"))),
+        },
+        Err(e) => (None, Some(format!("daemon.mcp_status unavailable: {e}"))),
+    }
+}
+
 fn mcp_server_status_lines(server: &mu_core::config::McpServerConfig) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(format!("    - {}", server.name)),
@@ -512,6 +539,91 @@ fn mcp_server_status_lines(server: &mu_core::config::McpServerConfig) -> Vec<Lin
         )),
     ];
     if mcp_server_imports_dialogue_poll(server) {
+        lines.push(Line::from(Span::styled(
+            "      ⚠ dialogue_poll is a compatibility long-poll tool; it is not the mu-native receive path".to_string(),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    lines
+}
+
+fn daemon_mcp_side_effects_summary(server: &McpServerStatus) -> String {
+    let server_floor = server
+        .side_effects
+        .map(|s| format!("{s:?}"))
+        .unwrap_or_else(|| "unclassified → Execute/Ask fail-safe".to_string());
+    if server.tool_side_effects.is_empty() {
+        return server_floor;
+    }
+    let mut per_tool: Vec<String> = server
+        .tool_side_effects
+        .iter()
+        .map(|(name, side_effects)| format!("{name}={side_effects:?}"))
+        .collect();
+    per_tool.sort();
+    format!("{server_floor}; overrides: {}", per_tool.join(", "))
+}
+
+fn daemon_mcp_state_summary(server: &McpServerStatus) -> &'static str {
+    match server.state {
+        McpServerConnectionState::Connected => "connected",
+        McpServerConnectionState::Unavailable => "unavailable",
+    }
+}
+
+fn daemon_mcp_server_status_lines(server: &McpServerStatus) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(format!("    - {}", server.name)),
+        Line::from(format!("      url: {}", server.url)),
+        Line::from(format!("      state: {}", daemon_mcp_state_summary(server))),
+        Line::from(format!(
+            "      configured tools: {}",
+            mcp_tools_summary(server.configured_tools.as_deref())
+        )),
+        Line::from(format!(
+            "      side effects: {}",
+            daemon_mcp_side_effects_summary(server)
+        )),
+    ];
+    if let Some(elapsed_ms) = server.elapsed_ms {
+        lines.push(Line::from(format!("      import elapsed: {elapsed_ms} ms")));
+    }
+    if let Some(error) = &server.last_error {
+        lines.push(Line::from(Span::styled(
+            format!("      last error: {error}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    if server.imported_tools.is_empty() {
+        lines.push(Line::from("      imported tools: none"));
+    } else {
+        let mut imported: Vec<String> = server
+            .imported_tools
+            .iter()
+            .map(|tool| {
+                let registration = if tool.registered {
+                    "registered"
+                } else {
+                    "skipped"
+                };
+                let classified = if tool.classified {
+                    "classified"
+                } else {
+                    "unclassified"
+                };
+                format!(
+                    "{} (remote={}, {:?}, {:?}, {classified}, {registration})",
+                    tool.local_name, tool.remote_name, tool.side_effects, tool.permission
+                )
+            })
+            .collect();
+        imported.sort();
+        lines.push(Line::from(format!(
+            "      imported tools: {}",
+            imported.join(", ")
+        )));
+    }
+    if mcp_status_imports_dialogue_poll(server) {
         lines.push(Line::from(Span::styled(
             "      ⚠ dialogue_poll is a compatibility long-poll tool; it is not the mu-native receive path".to_string(),
             Style::default().fg(Color::Yellow),
@@ -811,6 +923,7 @@ impl App {
         });
 
         let mcp_status_rx = Some(mcp_status::spawn_status_subscriber(session_id.clone()));
+        let (mcp_daemon_status, mcp_daemon_status_error) = fetch_mcp_daemon_status(&mut client);
 
         Ok(Self {
             client,
@@ -858,6 +971,8 @@ impl App {
             ask_count: 0,
             mcp_status_rx,
             mcp_status: None,
+            mcp_daemon_status,
+            mcp_daemon_status_error,
             renderer_journal,
             notifications,
             terminal_focused: true,
@@ -1690,6 +1805,7 @@ impl App {
                         return Ok(false);
                     }
                     "/mcp" if tail.is_empty() => {
+                        self.refresh_mcp_daemon_status();
                         if self.fullscreen {
                             let lines = self.build_mcp_lines();
                             self.open_overlay("/mcp", lines);
@@ -2419,13 +2535,18 @@ impl App {
     /// /mcp — operator-visible status for the two MCP-ish surfaces that
     /// matter in mu-solo today:
     ///   1. the daemon's local MCP socket used for session-status push; and
-    ///   2. outbound `[[mcp.servers]]` tool imports configured for the daemon.
+    ///   2. outbound `[[mcp.servers]]` tool imports as reported by the daemon.
     ///
-    /// This is deliberately honest about what it cannot yet know: import
-    /// success/failure and dialogue lease/push health are daemon-authoritative
-    /// facts that need a future RPC. Reading the same config the daemon loaded
-    /// is still useful terrain for finding long-poll footguns like
-    /// `dialogue_poll` without scraping logs.
+    /// The daemon-authoritative `daemon.mcp_status` response is preferred:
+    /// it says what this running daemon actually attempted and imported. If
+    /// that RPC is unavailable (older daemon), fall back to reading local config
+    /// and clearly label that view as a fallback map.
+    fn refresh_mcp_daemon_status(&mut self) {
+        let (status, error) = fetch_mcp_daemon_status(&mut self.client);
+        self.mcp_daemon_status = status;
+        self.mcp_daemon_status_error = error;
+    }
+
     fn build_mcp_lines(&self) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = vec![
             Line::from(""),
@@ -2453,19 +2574,48 @@ impl App {
         )));
         lines.push(Line::from(""));
 
-        let config = mu_core::config::Config::load_default();
-        if config.mcp.servers.is_empty() {
-            lines.push(Line::from("  outbound MCP servers: none configured"));
-        } else {
-            lines.push(Line::from("  outbound MCP servers:"));
-            for server in &config.mcp.servers {
-                lines.extend(mcp_server_status_lines(server));
+        match &self.mcp_daemon_status {
+            Some(status) if status.servers.is_empty() => {
+                lines.push(Line::from(
+                    "  outbound MCP servers: none configured/imported by daemon",
+                ));
+                lines.push(Line::from(format!(
+                    "  daemon status snapshot: {}",
+                    status.snapshot_at_unix_ms
+                )));
+            }
+            Some(status) => {
+                lines.push(Line::from("  outbound MCP servers (daemon-authoritative):"));
+                lines.push(Line::from(format!(
+                    "  daemon status snapshot: {}",
+                    status.snapshot_at_unix_ms
+                )));
+                for server in &status.servers {
+                    lines.extend(daemon_mcp_server_status_lines(server));
+                }
+            }
+            None => {
+                if let Some(error) = &self.mcp_daemon_status_error {
+                    lines.push(Line::from(Span::styled(
+                        format!("  daemon.mcp_status: {error}"),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
+                let config = mu_core::config::Config::load_default();
+                if config.mcp.servers.is_empty() {
+                    lines.push(Line::from("  outbound MCP servers: none configured"));
+                } else {
+                    lines.push(Line::from("  outbound MCP servers (config fallback):"));
+                    for server in &config.mcp.servers {
+                        lines.extend(mcp_server_status_lines(server));
+                    }
+                }
             }
         }
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  gaps: live import success/failure, imported tool names, dialogue lease, and push health need a daemon-authoritative status RPC".to_string(),
+            "  gaps: dialogue lease and push health still need dialogue-native status; daemon.mcp_status covers outbound MCP import attempts".to_string(),
             Style::default().fg(Color::DarkGray),
         )));
         lines.push(Line::from(""));
@@ -4497,6 +4647,44 @@ mod tests {
             ..server
         };
         assert!(!mcp_server_imports_dialogue_poll(&send_only));
+    }
+
+    #[test]
+    fn daemon_mcp_status_lines_show_import_results() {
+        let server = McpServerStatus {
+            name: "code-index".to_string(),
+            url: "http://127.0.0.1:7622/mcp".to_string(),
+            configured_tools: Some(vec!["code_status".to_string()]),
+            prefix: None,
+            side_effects: Some(mu_core::agent::tool::SideEffects::ReadOnly),
+            tool_side_effects: std::collections::HashMap::new(),
+            state: McpServerConnectionState::Connected,
+            imported_tools: vec![mu_core::protocol::McpImportedToolStatus {
+                remote_name: "code_status".to_string(),
+                local_name: "code_status".to_string(),
+                side_effects: mu_core::agent::tool::SideEffects::ReadOnly,
+                permission: mu_core::agent::tool::PermissionLevel::Allow,
+                classified: true,
+                registered: true,
+            }],
+            last_error: None,
+            elapsed_ms: Some(7),
+        };
+
+        let rendered = daemon_mcp_server_status_lines(&server)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("state: connected"));
+        assert!(rendered.contains("configured tools: code_status"));
+        assert!(rendered.contains("imported tools: code_status"));
+        assert!(rendered.contains("registered"));
     }
 
     // ===== status-line state machine (mu-d2hx) =====

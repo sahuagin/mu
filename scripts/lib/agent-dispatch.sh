@@ -11,8 +11,11 @@
 # (+ $SYSPROMPT if set) — not a CLAUDE.md kernel that would make every model
 # self-identify as "claude".
 #
-# Tool grant is driven by $TOOLS (mu names: read,write,edit,glob,grep,ls,bash):
-#   - mu path passes `--tools $TOOLS`, and adds `--bash-yolo` when `bash` is granted.
+# Tool grant is driven by $TOOLS (mu names: read,write,edit,glob,grep,ls,bash;
+# MCP-imported names like code_recall/code_status opt mu into MCP but are not
+# passed through `--tools`, which only accepts built-ins):
+#   - mu path passes built-in names via `--tools`, adds `--enable-mcp` for
+#     MCP-imported names, and adds `--bash-yolo` when `bash` is granted.
 #   - claude path maps the names to `--allowedTools Read Write Edit Glob Grep LS Bash`,
 #     and adds `--permission-mode bypassPermissions` when a WRITE tool (write/edit/
 #     bash) is granted (a `-p` worker can't answer per-command prompts).
@@ -53,6 +56,7 @@ _ad_claude_tools() {  # $1=csv
 agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   local ad_prov ad_model ad_pf ad_tools ad_timeout ad_maxturns ad_thinking ad_mu ad_errlog
   local ad_clsys ad_sysflags ad_cltools ad_perm ad_yolo ad_lease ad_mcpflag
+  local ad_mu_tools ad_tool ad_old_ifs
   ad_prov="$1"; ad_model="$2"
   ad_pf="${3:-${PROMPT_FILE:-}}"
   [ -n "$ad_pf" ] || { echo "agent_dispatch: no prompt file (arg 3 or \$PROMPT_FILE)" >&2; return 2; }
@@ -92,8 +96,23 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   # mu providers (codex / ollama / openrouter / ...): hermetic --bare session.
   ad_sysflags=""
   [ -n "${SYSPROMPT:-}" ] && [ -r "$SYSPROMPT" ] && ad_sysflags="--append-system-prompt $SYSPROMPT"
-  ad_mcpflag=""
-  case ",$ad_tools," in *,code_recall,*|*,code_status,*) ad_mcpflag="--enable-mcp" ;; esac
+  # `mu ask --tools` accepts built-ins only. MCP-imported tools are granted by
+  # enabling MCP on the one-shot daemon, then letting MCP import them at startup.
+  ad_mcpflag=""; ad_mu_tools=""
+  if [ -n "$ad_tools" ]; then
+    ad_old_ifs=$IFS; IFS=,
+    for ad_tool in $ad_tools; do
+      IFS=$ad_old_ifs
+      ad_tool=$(printf '%s' "$ad_tool" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+      case "$ad_tool" in
+        "") ;;
+        code_recall|code_status) ad_mcpflag="--enable-mcp" ;;
+        *) ad_mu_tools="${ad_mu_tools:+$ad_mu_tools,}$ad_tool" ;;
+      esac
+      IFS=,
+    done
+    IFS=$ad_old_ifs
+  fi
 
   # LOTO acquire: when dispatching to the shared ollama box, hold the cooperative
   # lease for the run so concurrent ollama workers SERIALISE instead of evicting
@@ -119,9 +138,13 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   esac
 
   # shellcheck disable=SC2086 — $ad_lease/$ad_sysflags/$ad_yolo/$ad_mcpflag/tool flags intentionally word-split
-  if [ -n "$ad_tools" ]; then
+  if [ -n "$ad_tools" ] && [ -n "$ad_mu_tools" ]; then
     $ad_lease timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
-      --thinking "$ad_thinking" $ad_sysflags $ad_yolo $ad_mcpflag --max-turns "$ad_maxturns" --tools "$ad_tools" \
+      --thinking "$ad_thinking" $ad_sysflags $ad_yolo $ad_mcpflag --max-turns "$ad_maxturns" --tools "$ad_mu_tools" \
+      --prompt-file "$ad_pf" 2>>"$ad_errlog"
+  elif [ -n "$ad_tools" ]; then
+    $ad_lease timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
+      --thinking "$ad_thinking" $ad_sysflags $ad_yolo $ad_mcpflag --max-turns "$ad_maxturns" \
       --prompt-file "$ad_pf" 2>>"$ad_errlog"
   else
     $ad_lease timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \

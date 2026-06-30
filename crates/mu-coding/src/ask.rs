@@ -50,6 +50,9 @@ pub struct AskOptions {
     /// `Some(n)` → cap at `n` turns. `Some(0)` → disable entirely.
     /// Forwarded as `CreateSessionRequest.max_turns` to the daemon.
     pub max_turns: Option<u32>,
+    /// Whether to enable MCP on the spawned one-shot daemon. `mu ask`
+    /// defaults this false; callers opt in with `--enable-mcp`.
+    pub mcp_enabled: bool,
 }
 
 /// Run a single `mu ask` invocation. Flags (`provider`, `model`,
@@ -79,6 +82,7 @@ pub async fn run(opts: AskOptions) -> Result<()> {
         &opts.bash_allow,
         opts.bash_prompt,
         opts.bare,
+        opts.mcp_enabled,
         &bearer_token,
     )?;
     let mut stdin = child.stdin.take().context("child stdin not captured")?;
@@ -212,6 +216,7 @@ pub(crate) fn spawn_serve(
     bash_allow: &[String],
     bash_prompt: bool,
     bare: bool,
+    mcp_enabled: bool,
     bearer_token: &str,
 ) -> Result<tokio::process::Child> {
     // MU_BINARY env override allows integration tests to point at a
@@ -254,6 +259,11 @@ pub(crate) fn spawn_serve(
     }
     if bare {
         cmd.arg("--bare");
+    }
+    if mcp_enabled {
+        cmd.arg("--enable-mcp");
+    } else {
+        cmd.arg("--disable-mcp");
     }
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

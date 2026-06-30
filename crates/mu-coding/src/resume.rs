@@ -70,6 +70,7 @@ pub async fn run(opts: ResumeOptions) -> Result<()> {
         &opts.bash_allow,
         opts.bash_prompt,
         opts.bare,
+        true,
         &bearer_token,
     )?;
     let mut stdin = child.stdin.take().context("child stdin not captured")?;

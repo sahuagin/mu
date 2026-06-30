@@ -92,6 +92,8 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   # mu providers (codex / ollama / openrouter / ...): hermetic --bare session.
   ad_sysflags=""
   [ -n "${SYSPROMPT:-}" ] && [ -r "$SYSPROMPT" ] && ad_sysflags="--append-system-prompt $SYSPROMPT"
+  ad_mcpflag=""
+  case ",$ad_tools," in *,code_recall,*|*,code_status,*) ad_mcpflag="--enable-mcp" ;; esac
 
   # LOTO acquire: when dispatching to the shared ollama box, hold the cooperative
   # lease for the run so concurrent ollama workers SERIALISE instead of evicting
@@ -116,10 +118,10 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
       ;;
   esac
 
-  # shellcheck disable=SC2086 — $ad_lease/$ad_sysflags/$ad_yolo/tool flags intentionally word-split
+  # shellcheck disable=SC2086 — $ad_lease/$ad_sysflags/$ad_yolo/$ad_mcpflag/tool flags intentionally word-split
   if [ -n "$ad_tools" ]; then
     $ad_lease timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
-      --thinking "$ad_thinking" $ad_sysflags $ad_yolo --max-turns "$ad_maxturns" --tools "$ad_tools" \
+      --thinking "$ad_thinking" $ad_sysflags $ad_yolo $ad_mcpflag --max-turns "$ad_maxturns" --tools "$ad_tools" \
       --prompt-file "$ad_pf" 2>>"$ad_errlog"
   else
     $ad_lease timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \

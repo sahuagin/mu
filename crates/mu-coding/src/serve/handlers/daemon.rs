@@ -51,6 +51,7 @@ pub fn handle_daemon_mcp_status(
 
     let resp = DaemonMcpStatusResponse {
         snapshot_at_unix_ms: discovery::now_unix_ms(),
+        enabled: daemon_info.config().mcp.enabled,
         servers: daemon_info.mcp_status_snapshot(),
     };
     ok_response(request.id, to_value_or_null(resp))

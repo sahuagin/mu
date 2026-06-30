@@ -60,6 +60,13 @@ enum Command {
         /// command. Ignored when --bash-yolo is set.
         #[arg(long)]
         bash_prompt: bool,
+        /// Disable MCP for this daemon, overriding `[mcp].enabled`. Skips both
+        /// outbound tool imports and the local MCP socket/status surface.
+        #[arg(long, conflicts_with = "enable_mcp")]
+        disable_mcp: bool,
+        /// Enable MCP for this daemon, overriding `[mcp].enabled`.
+        #[arg(long, conflicts_with = "disable_mcp")]
+        enable_mcp: bool,
         /// Hermetic daemon: disable session-start recall injection
         /// (memory + project files) AND the discovery bootstrap, so
         /// sessions get no system content mu added on its own. For
@@ -134,6 +141,14 @@ enum Command {
         /// changing flags. Errors if FILE cannot be read (mu-x83o).
         #[arg(long = "append-system-prompt", value_name = "FILE")]
         append_system_prompt: Option<std::path::PathBuf>,
+        /// Enable MCP for this one-shot daemon. By default `mu ask` disables
+        /// MCP to avoid startup/teardown cost; opt in when requested tools
+        /// are imported from MCP (for example code_recall/code_status).
+        #[arg(long, conflicts_with = "disable_mcp")]
+        enable_mcp: bool,
+        /// Explicitly keep MCP disabled for this one-shot daemon. Alias: --no-mcp.
+        #[arg(long, alias = "no-mcp", conflicts_with = "enable_mcp")]
+        disable_mcp: bool,
         /// Hermetic session: forwarded as `--bare` to the spawned
         /// `mu serve` — no recall injection, no discovery bootstrap;
         /// the session's system prompt is exactly what (if anything)
@@ -467,6 +482,8 @@ async fn main() -> Result<()> {
             bash_yolo,
             bash_allow,
             bash_prompt,
+            disable_mcp,
+            enable_mcp,
             bare,
             max_turns,
         } => {
@@ -481,7 +498,18 @@ async fn main() -> Result<()> {
 
             // mu-qnag: hand the daemon its command policy so `watch` gates
             // through the SAME BashMode as `bash` (build_tools borrowed it).
-            mu_coding::serve::run(factory, tool_vec, bare, max_turns, bash_settings).await
+            let mcp_enabled_override = enable_mcp
+                .then_some(true)
+                .or_else(|| disable_mcp.then_some(false));
+            mu_coding::serve::run(
+                factory,
+                tool_vec,
+                bare,
+                max_turns,
+                mcp_enabled_override,
+                bash_settings,
+            )
+            .await
         }
         Command::Ask {
             prompt,
@@ -496,6 +524,8 @@ async fn main() -> Result<()> {
             bash_allow,
             bash_prompt,
             append_system_prompt,
+            enable_mcp,
+            disable_mcp: _,
             bare,
             max_turns,
         } => {
@@ -525,6 +555,7 @@ async fn main() -> Result<()> {
                 system_prompt,
                 bare,
                 max_turns,
+                mcp_enabled: enable_mcp,
             })
             .await
         }

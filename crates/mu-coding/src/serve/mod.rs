@@ -150,6 +150,7 @@ pub async fn run(
     tools: Vec<Arc<dyn Tool>>,
     bare: bool,
     max_turns: Option<u32>,
+    mcp_enabled_override: Option<bool>,
     bash_settings: BashSettings,
 ) -> anyhow::Result<()> {
     // spec mu-046 WP6: track config provenance — the file layers that
@@ -169,6 +170,14 @@ pub async fn run(
         config.recall.enabled = false;
         config.recall.bare = true;
         config_sources.push("cli:--bare".to_string());
+    }
+    if let Some(enabled) = mcp_enabled_override {
+        config.mcp.enabled = enabled;
+        config_sources.push(if enabled {
+            "cli:--enable-mcp".to_string()
+        } else {
+            "cli:--disable-mcp".to_string()
+        });
     }
     // mu-779s: if max_turns is Some, override the default. Note that
     // this is the daemon-wide default; per-session overrides still work
@@ -400,24 +409,29 @@ where
     // Once registered they're base session tools, so the mu-onq8 `discover`
     // tool ranks them alongside everything else.
     let mut tools = tools;
-    let mut imported = mcp_client::import_remote_tools(&daemon_info.config().mcp.servers).await;
-    for imported_tool in imported.tools {
-        let name = imported_tool.tool.spec().name;
-        if tools.iter().any(|t| t.spec().name == name) {
-            tracing::warn!(
-                tool = %name,
-                "MCP-imported tool collides with an existing tool; skipping"
-            );
-            mark_mcp_import_unregistered(
-                &mut imported.status,
-                imported_tool.status_server_index,
-                imported_tool.status_tool_index,
-            );
-        } else {
-            tools.push(imported_tool.tool);
+    if daemon_info.config().mcp.enabled {
+        let mut imported = mcp_client::import_remote_tools(&daemon_info.config().mcp.servers).await;
+        for imported_tool in imported.tools {
+            let name = imported_tool.tool.spec().name;
+            if tools.iter().any(|t| t.spec().name == name) {
+                tracing::warn!(
+                    tool = %name,
+                    "MCP-imported tool collides with an existing tool; skipping"
+                );
+                mark_mcp_import_unregistered(
+                    &mut imported.status,
+                    imported_tool.status_server_index,
+                    imported_tool.status_tool_index,
+                );
+            } else {
+                tools.push(imported_tool.tool);
+            }
         }
+        daemon_info.set_mcp_status(imported.status);
+    } else {
+        tracing::info!("MCP disabled; skipping outbound MCP imports");
+        daemon_info.set_mcp_status(Vec::new());
     }
-    daemon_info.set_mcp_status(imported.status);
     let tools = Arc::new(tools);
     // mu-kex4.6.4: discover skills once at startup so `capabilities/discover`
     // can project them alongside tools (the daemon previously knew only tools;
@@ -519,10 +533,11 @@ where
     let mcp_socket_path = std::env::var("MU_MCP_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(|_| mcp::default_mcp_socket_path());
-    let mcp_guard = if mcp_socket_path
-        .parent()
-        .map(|p| p.exists())
-        .unwrap_or(false)
+    let mcp_guard = if daemon_info.config().mcp.enabled
+        && mcp_socket_path
+            .parent()
+            .map(|p| p.exists())
+            .unwrap_or(false)
     {
         let mcp_sessions = sessions.clone();
         let mcp_daemon_info = daemon_info.clone();

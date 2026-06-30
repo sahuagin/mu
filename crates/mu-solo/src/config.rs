@@ -214,6 +214,10 @@ pub struct SessionConfig {
     /// convenience; never enable for sessions whose prompt source
     /// you don't fully trust.
     pub bash_yolo: bool,
+    /// Whether the spawned `mu serve` daemon should enable MCP. Solo defaults
+    /// on because interactive sessions benefit from MCP-imported tools; set
+    /// `[session] mcp_enabled = false` (or in a profile) to disable.
+    pub mcp_enabled: bool,
     /// Path to the `mu` daemon binary. Strictly a TUI-process
     /// concern (the daemon itself doesn't care), but grouped under
     /// session because it controls which binary the session runs
@@ -275,6 +279,7 @@ impl Default for SessionConfig {
             // unreachable mid-session.
             tools: "read,write,edit,glob,grep,memory_recall,bash".into(),
             bash_yolo: false,
+            mcp_enabled: true,
             mu_binary: "./target/release/mu".into(),
             cwd: None,
             cache_ttl: "1h".into(),

@@ -767,6 +767,7 @@ pub struct AppOptions<'a> {
     pub model: &'a str,
     pub bash_yolo: bool,
     pub tools: &'a str,
+    pub mcp_enabled: bool,
     /// mu-upk2: extended-thinking directive forwarded as `mu serve
     /// --thinking <v>`. Empty = no launch-time directive.
     pub thinking: &'a str,
@@ -807,6 +808,7 @@ impl App {
             model,
             bash_yolo,
             tools,
+            mcp_enabled,
             thinking,
             effort,
             effort_levels,
@@ -836,7 +838,7 @@ impl App {
                 valid_effort_levels.join("|")
             )
         })?;
-        let mut client = Client::spawn(mu_binary, cwd, bash_yolo, tools, thinking)?;
+        let mut client = Client::spawn(mu_binary, cwd, bash_yolo, tools, thinking, mcp_enabled)?;
 
         let search_dirs = skills::default_search_dirs(Some(cwd));
         let skills = skills::discover(&search_dirs);
@@ -922,8 +924,12 @@ impl App {
                 .join("session-1.jsonl")
         });
 
-        let mcp_status_rx = Some(mcp_status::spawn_status_subscriber(session_id.clone()));
         let (mcp_daemon_status, mcp_daemon_status_error) = fetch_mcp_daemon_status(&mut client);
+        let mcp_status_rx = if mcp_daemon_status.as_ref().is_some_and(|s| s.enabled) {
+            Some(mcp_status::spawn_status_subscriber(session_id.clone()))
+        } else {
+            None
+        };
 
         Ok(Self {
             client,
@@ -2575,6 +2581,16 @@ impl App {
         lines.push(Line::from(""));
 
         match &self.mcp_daemon_status {
+            Some(status) if !status.enabled => {
+                lines.push(Line::from(Span::styled(
+                    "  MCP disabled for this daemon",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(format!(
+                    "  daemon status snapshot: {}",
+                    status.snapshot_at_unix_ms
+                )));
+            }
             Some(status) if status.servers.is_empty() => {
                 lines.push(Line::from(
                     "  outbound MCP servers: none configured/imported by daemon",

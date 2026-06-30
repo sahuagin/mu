@@ -1,6 +1,6 @@
 //! Session-domain request handlers (session.*, autonomy-related).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -83,7 +83,8 @@ pub fn handle_create_session(
         cwd: params.cwd,                     // mu-phl v0 / mu-045
         parent_session_id: None,             // no parent — this is a root session
         branched_at_parent_event_id: None,
-        capability,                // root: unrestricted, autonomy per mu-7e21 grant above
+        capability, // root: unrestricted except launch tool grant applied below
+        root_launch_tool_capability: true,
         seed_messages: Vec::new(), // mu-mh4: fresh session starts empty
         seed_events: Vec::new(),   // mu-mh4: fresh session has no seed events
         cache_ttl: params.cache_ttl.unwrap_or_default(), // mu-f1a0
@@ -157,6 +158,7 @@ pub fn handle_delegate_session(
         parent_session_id: Some(params.parent_session_id.clone()),
         branched_at_parent_event_id: params.branched_at_parent_event_id,
         capability: child_capability,
+        root_launch_tool_capability: false,
         // mu-mh4: delegate sessions still start empty (the branch id is
         // recorded for audit). session.resume is the path that seeds a
         // continuation history; delegate-with-seed is future work.
@@ -339,6 +341,7 @@ pub fn handle_resume_session(
         parent_session_id: Some(parsed.session.clone()),
         branched_at_parent_event_id: continuation.fork_event_id,
         capability: resumed_capability,
+        root_launch_tool_capability: false,
         seed_messages: continuation.messages,
         seed_events: vec![head_attached],
         cache_ttl: CacheTtl::default(),
@@ -384,6 +387,13 @@ struct BuildSessionRequest<'a> {
     parent_session_id: Option<String>,
     branched_at_parent_event_id: Option<u64>,
     capability: Capability,
+    /// Root-session launch grants come from the daemon's concrete tool list
+    /// (`mu serve --tools`, plus imported MCP and per-session tools), not from
+    /// an agent-supplied attenuation request. When true, populate
+    /// `Capability.allowed_tools` from the final session tool vector after
+    /// per-session control/discovery tools are injected. Delegates/resumes keep
+    /// their already-attenuated predecessor capability and must not be widened.
+    root_launch_tool_capability: bool,
     /// mu-mh4: pre-seeded conversation history for a resumed/forked
     /// session (continuation projection of the predecessor's log).
     /// Empty for fresh and (current) delegate sessions.
@@ -512,6 +522,27 @@ fn session_spawn_tools(
     tools
 }
 
+fn session_tool_name_set(tools: &[Arc<dyn Tool>]) -> HashSet<String> {
+    tools.iter().map(|tool| tool.spec().name).collect()
+}
+
+fn apply_root_launch_tool_capability(
+    capability: &Arc<Mutex<Capability>>,
+    session_tools: &[Arc<dyn Tool>],
+) {
+    let allowed_tools = session_tool_name_set(session_tools);
+    match capability.lock() {
+        Ok(mut cap) => {
+            cap.allowed_tools = Some(allowed_tools);
+        }
+        Err(_) => {
+            tracing::warn!(
+                "session capability lock poisoned while applying launch tool grant;                  leaving allowed_tools unchanged"
+            );
+        }
+    }
+}
+
 /// Shared session-creation logic for both `create_session` (root) and
 /// `session.delegate` (child). Returns the new session_id on success
 /// or a human-readable error on provider-construction failure.
@@ -523,6 +554,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         parent_session_id,
         branched_at_parent_event_id,
         capability,
+        root_launch_tool_capability,
         seed_messages,
         seed_events,
         notif,
@@ -669,6 +701,14 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         // mu-kex4.6.3: semantic ranking is opt-in via [index].semantic_discover.
         daemon_info.config().index.semantic_discover,
     )));
+    if root_launch_tool_capability {
+        // mu-session-capability-allowed-tools-launch-grant-4hd8: a root
+        // session's capability now reflects the actual launch-time tool
+        // grant after daemon/imported/per-session tools are known. The set is
+        // exact for invocation authority; posture still narrows separately via
+        // max_side_effects / structured effects.
+        apply_root_launch_tool_capability(&capability_handle, &session_tools);
+    }
     let compaction_cfg = &daemon_info.config().compaction;
     let compaction_policy_override = resolve_compaction_policy(compaction_cfg);
     // mu-k011: discovery-bootstrap default. When session-start recall is
@@ -2276,6 +2316,47 @@ mod tests {
         assert!(
             ranking_entry_to_selector(&entry("magic-ai", "model")).is_none(),
             "unknown provider → None"
+        );
+    }
+
+    #[test]
+    fn root_launch_capability_names_final_session_tools() {
+        use crate::tools::{GrepTool, ReadTool};
+        use mu_core::capability::Capability;
+
+        let base: Vec<Arc<dyn Tool>> = vec![Arc::new(ReadTool::new()), Arc::new(GrepTool::new())];
+        let sessions = Sessions::new();
+        let di = DaemonInfo::new("test")
+            .with_events_dir(Some(std::path::PathBuf::from("/tmp/mu-test-events")));
+        let mut tools = session_spawn_tools(
+            &base,
+            &sessions,
+            &di,
+            "session-42",
+            &mu_core::capability::AutonomyCapability::Disallowed,
+        );
+        let capability = Arc::new(Mutex::new(Capability::root()));
+        let discover_siblings = Arc::new(tools.clone());
+        tools.push(Arc::new(crate::tools::DiscoverTool::new(
+            discover_siblings,
+            Arc::new(Vec::new()),
+            capability.clone(),
+            false,
+        )));
+
+        apply_root_launch_tool_capability(&capability, &tools);
+
+        let cap = capability.lock().expect("capability lock");
+        let allowed = cap.allowed_tools.as_ref().expect("allowed_tools set");
+        for expected in ["read", "grep", "spawn_worker", "watch", "discover"] {
+            assert!(
+                allowed.contains(expected),
+                "root launch capability should include {expected}; got {allowed:?}"
+            );
+        }
+        assert!(
+            !allowed.contains("write"),
+            "root launch capability must not invent tools absent from the session"
         );
     }
 

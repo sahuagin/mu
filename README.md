@@ -52,6 +52,22 @@ The protocol and event model are the contract. Frontends are hats.
   <img src="docs/assets/mu-logo-line.svg" alt="minimal mu cow logo" width="180">
 </p>
 
+## Finding your way
+
+| If you are looking for… | Start here |
+|---|---|
+| Current project state / next work | `specs/plans/mu-claude-code-replacement-current-state.md` |
+| Agent operating procedure | `AGENTS.md` |
+| Protocol/runtime contract | `specs/mu-001-protocol-types.md`, `specs/mu-046-ingest-pipeline.md` |
+| Event-sourced architecture | `specs/architecture/event-sourced-context.md` |
+| Provider wire crates | `crates/providers/mu-anthropic/`, `crates/providers/mu-openai/` |
+| Daily-driver TUI | `crates/mu-solo/` |
+| Orchestration scripts | `scripts/orchestrator/`, `scripts/lib/agent-dispatch.sh` |
+
+For agents: `AGENTS.md` is the operational front door. The current-state doc is
+a map to get oriented quickly, not a substitute for terrain-checking the repo,
+tests, and central beads.
+
 ## Status: self-hosting, pre-MVP
 
 `mu` is pre-release and not published to crates.io yet, but it is already used

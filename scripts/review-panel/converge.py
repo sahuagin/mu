@@ -27,11 +27,35 @@ def extract(s):
     return json.loads(s)
 
 
+def skipped_ollama_lease(done_text):
+    if not re.search(r'\bexit=75\b', done_text):
+        return False
+    # Round 1 writes:       exit=75 prov=ollama model=...
+    # Convergence writes:   exit=75 ollama/<model>
+    # Only those ollama-provider forms mean with-ollama-lease --skip-if-held.
+    return bool(
+        re.search(r'\bprov=ollama(?:\b|-)', done_text)
+        or re.search(r'\bexit=75\s+ollama(?:\b|/|-)', done_text)
+    )
+
+
 def load(prefix):
     base = os.path.basename(prefix)
     out = {}
     for f in sorted(glob.glob(prefix + ".rank*.out")):
         tag = os.path.basename(f)[len(base) + 1:-4]   # strip "<base>." and ".out"
+        done = f[:-4] + ".done"
+        try:
+            if os.path.exists(done):
+                with open(done) as fh:
+                    done_text = fh.read()
+                if skipped_ollama_lease(done_text):
+                    # with-ollama-lease --skip-if-held: this ollama reviewer
+                    # intentionally routed around an operator-held local box.
+                    # Omit it from quorum rather than counting it as unparsed.
+                    continue
+        except Exception:
+            pass
         try:
             out[tag] = extract(open(f).read())
         except Exception:

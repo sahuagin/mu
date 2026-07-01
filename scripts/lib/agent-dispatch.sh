@@ -39,6 +39,11 @@
 #   ERRLOG     stderr sink (appended)                           default /tmp/agent-dispatch.$$.err
 #   AGENT_DISPATCH_NO_LEASE  =1 skips the shared-ollama-box lease    default unset
 #              (see the LOTO-acquire note in the mu-providers branch)
+#   AGENT_DISPATCH_OLLAMA_SKIP_IF_HELD =1 makes ollama dispatch use
+#              `with-ollama-lease --skip-if-held`: exit 75 immediately when
+#              the shared box is already held instead of waiting in the fair
+#              queue. ci-aipr/review-panel enables this so a held local box
+#              drops the ollama reviewer and lets hosted reviewers proceed.
 #   AGENT_SESSION_OWNER/_TTL passed through to with-ollama-lease when it wraps an
 #              ollama dispatch (export one OWNER to let a multi-call run share the lease)
 
@@ -122,11 +127,18 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   # that still land on ollama (e.g. several resolved to it while the box was free).
   # Bare WAIT mode + with-ollama-lease's own fail-open mean an etcd outage runs
   # WITHOUT the lease rather than blocking. Opt out with AGENT_DISPATCH_NO_LEASE=1.
+  # ci-aipr/review-panel sets AGENT_DISPATCH_OLLAMA_SKIP_IF_HELD=1 so its ollama
+  # rank exits 75 immediately when an interactive operator already holds the box,
+  # rather than waiting in the fair queue and stalling the whole gate.
   ad_lease=""
   case "$ad_prov" in
     ollama|ollama-*)
       if [ -z "${AGENT_DISPATCH_NO_LEASE:-}" ] && command -v with-ollama-lease >/dev/null 2>&1; then
-        ad_lease="with-ollama-lease"
+        if [ "${AGENT_DISPATCH_OLLAMA_SKIP_IF_HELD:-}" = "1" ]; then
+          ad_lease="with-ollama-lease --skip-if-held"
+        else
+          ad_lease="with-ollama-lease"
+        fi
         # Ensure the lease outlives a long run (with-ollama-lease defaults TTL to
         # 1200s > the 900s reviewer cap; only override for a larger timeout, and
         # never clobber a caller-set TTL).

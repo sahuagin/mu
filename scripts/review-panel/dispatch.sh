@@ -31,6 +31,13 @@ OPENROUTER_API_KEY=$(tq -f "$HOME/.config/agent/config.toml" -r openrouter.api_k
 export OPENROUTER_API_KEY
 cd "$CWD" || exit 1
 
+# ci-aipr should not wait behind an operator's interactive ollama lease. When the
+# shared box is already held, the ollama rank exits 75 and converge.py ignores it,
+# allowing hosted reviewers to form the gate verdict. Set AI_REVIEW_OLLAMA_SKIP_IF_HELD=0
+# to restore the old fair-queue wait behavior for an explicit local-review run.
+AGENT_DISPATCH_OLLAMA_SKIP_IF_HELD="${AI_REVIEW_OLLAMA_SKIP_IF_HELD:-1}"
+export AGENT_DISPATCH_OLLAMA_SKIP_IF_HELD
+
 ranks_json=$("$TQ" -o json -f "$ROLES" code_review.ranked)
 N=$(printf '%s' "$ranks_json" | jq -r 'length')
 
@@ -38,8 +45,14 @@ N=$(printf '%s' "$ranks_json" | jq -r 'length')
 warmup() {  # $1=provider $2=model
   [ "$1" = "ollama" ] || return 0
   wf=$(mktemp); printf 'Reply with only: ok\n' > "$wf"
-  timeout 600 "$MU" ask --bare --provider "$1" --model "$2" --tools "" --prompt-file "$wf" >/dev/null 2>&1
+  if [ -z "${AGENT_DISPATCH_NO_LEASE:-}" ] && [ "${AGENT_DISPATCH_OLLAMA_SKIP_IF_HELD:-}" = "1" ] && command -v with-ollama-lease >/dev/null 2>&1; then
+    with-ollama-lease --skip-if-held timeout 600 "$MU" ask --bare --provider "$1" --model "$2" --tools "" --prompt-file "$wf" >/dev/null 2>&1
+  else
+    timeout 600 "$MU" ask --bare --provider "$1" --model "$2" --tools "" --prompt-file "$wf" >/dev/null 2>&1
+  fi
+  rc=$?
   rm -f "$wf"
+  return "$rc"
 }
 
 r=0

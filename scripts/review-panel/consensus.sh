@@ -23,6 +23,11 @@ MU="${MU_BIN:-mu}"; TQ="${TQ:-tq}"
 AGENT_DISPATCH_LIB="${AGENT_DISPATCH_LIB:-$HERE/../lib/agent-dispatch.sh}"
 [ -r "$AGENT_DISPATCH_LIB" ] || { echo "consensus.sh: missing dispatch lib: $AGENT_DISPATCH_LIB" >&2; exit 2; }
 . "$AGENT_DISPATCH_LIB"
+# ci-aipr/review-panel should route around an operator-held ollama box instead
+# of waiting behind the fair lock. dispatch.sh uses the same default for round 1;
+# keep it exported for convergence rounds that call agent_dispatch directly.
+AGENT_DISPATCH_OLLAMA_SKIP_IF_HELD="${AI_REVIEW_OLLAMA_SKIP_IF_HELD:-1}"
+export AGENT_DISPATCH_OLLAMA_SKIP_IF_HELD
 mkdir -p "$OUT"
 # the diff that convergence prompts quote = the content of the first ```diff fence.
 awk '/^```diff/{f=1;next} /^```/{if(f)exit} f' "$P1" > "$OUT/diff.txt"

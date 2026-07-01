@@ -206,6 +206,26 @@ pub struct CcMark {
     pub created_at: String,
 }
 
+/// Extract a Claude Code session id from CLI-facing refs accepted by
+/// `mu mark`: `cc:<session>`, `claude-code:<session>`,
+/// `cc:<project>/<session>`, or the console URL path
+/// `/cc/<project>/<session>` (leading slash optional). Returns `None`
+/// for native mu refs so callers can route those to [`mark_session`].
+pub fn cc_session_id_from_ref(reference: &str) -> Option<&str> {
+    let reference = reference.strip_prefix('/').unwrap_or(reference);
+    let rest = reference
+        .strip_prefix("cc:")
+        .or_else(|| reference.strip_prefix("claude-code:"))
+        .or_else(|| reference.strip_prefix("cc/"))
+        .or_else(|| reference.strip_prefix("claude-code/"))?;
+    let session = rest.rsplit('/').next().unwrap_or(rest);
+    (!session.is_empty()).then_some(session)
+}
+
+fn valid_cc_session_id(session_uuid: &str) -> bool {
+    !session_uuid.is_empty() && !session_uuid.contains(['/', '\\']) && !session_uuid.contains("..")
+}
+
 /// What a successful cc mark wrote, for caller-side reporting.
 #[derive(Debug)]
 pub struct CcMarkOutcome {
@@ -255,8 +275,8 @@ pub fn mark_cc_session(
     if !(1..=5).contains(&rating) {
         bail!("rating must be 1-5, got {rating}");
     }
-    if session_uuid.is_empty() {
-        bail!("cc session id is empty");
+    if !valid_cc_session_id(session_uuid) {
+        bail!("cc session id is empty or path-like");
     }
     if let Some(parent) = db_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -551,6 +571,25 @@ mod tests {
     }
 
     #[test]
+    fn cc_session_ref_parser_accepts_cli_and_console_forms() {
+        assert_eq!(cc_session_id_from_ref("cc:sess-aaa"), Some("sess-aaa"));
+        assert_eq!(
+            cc_session_id_from_ref("claude-code:cff69449-850a-4854-9268-b0cb113beb88"),
+            Some("cff69449-850a-4854-9268-b0cb113beb88")
+        );
+        assert_eq!(
+            cc_session_id_from_ref("cc:-home-tcovert-src-mu/sess-aaa"),
+            Some("sess-aaa")
+        );
+        assert_eq!(
+            cc_session_id_from_ref("/cc/-home-tcovert-src-mu/sess-aaa"),
+            Some("sess-aaa")
+        );
+        assert_eq!(cc_session_id_from_ref("session-1"), None);
+        assert_eq!(cc_session_id_from_ref("mu:daemon/session-1"), None);
+    }
+
+    #[test]
     fn cc_mark_rejects_bad_rating_and_empty_id() {
         let db = temp_db("reject");
         let err = mark_cc_session(&db, "abc", 0, None).unwrap_err();
@@ -559,6 +598,8 @@ mod tests {
         assert!(err.to_string().contains("rating must be 1-5"), "{err}");
         let err = mark_cc_session(&db, "", 3, None).unwrap_err();
         assert!(err.to_string().contains("empty"), "{err}");
+        let err = mark_cc_session(&db, "../abc", 3, None).unwrap_err();
+        assert!(err.to_string().contains("path-like"), "{err}");
     }
 
     #[test]

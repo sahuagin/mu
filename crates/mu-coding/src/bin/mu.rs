@@ -262,22 +262,29 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         dashboard_path: Option<std::path::PathBuf>,
     },
-    /// Append an operator quality mark (1-5) to a session's event log.
-    /// Quit-time capture for degraded (or excellent) sessions — the
-    /// mark is an ordinary event; projections (console header, the
-    /// mu-stats session_marks view) take the latest. mu-operator-mark-5mwr.
+    /// Append an operator quality mark (1-5) to a native mu or Claude Code session.
+    /// Native mu marks append an ordinary event to mu's event log; Claude Code
+    /// marks write the task_log sidecar and never modify Claude Code transcripts.
+    /// Projections (console header, the mu-stats session_marks view) take the latest.
+    /// mu-operator-mark-5mwr / mu-cc-sessions-console-lqqt.3.
     Mark {
-        /// Session id/prefix, or daemon-qualified ref (`daemon/session`,
-        /// `mu:daemon/session`, or `daemon:session`) copied from
-        /// `mu list-sessions`.
+        /// Native mu: session id/prefix, or daemon-qualified ref (`daemon/session`,
+        /// `mu:daemon/session`, or `daemon:session`) copied from `mu list-sessions`.
+        /// Claude Code: `cc:<session>`, `claude-code:<session>`, or a console path
+        /// like `/cc/<project>/<session>`.
         session: String,
         /// Quality rating, 1 (unusable) to 5 (excellent).
         rating: u8,
         /// Optional free-form note, e.g. "relitigated settled decisions".
         note: Option<String>,
         /// Path to the events directory. Default: ~/.local/share/mu/events/.
+        /// Used only for native mu session refs.
         #[arg(long, value_name = "PATH")]
         events_dir: Option<std::path::PathBuf>,
+        /// task_log sidecar DB for Claude Code session marks. Default:
+        /// ~/.local/share/task_log.sqlite.
+        #[arg(long, value_name = "PATH")]
+        cc_marks_db: Option<std::path::PathBuf>,
     },
     /// Print the version of each crate (smoke test for the workspace).
     Versions,
@@ -665,20 +672,38 @@ async fn main() -> Result<()> {
             rating,
             note,
             events_dir,
+            cc_marks_db,
         } => {
-            let events_dir = match events_dir {
-                Some(p) => p,
-                None => mu_coding::serve::default_events_dir().context(
-                    "could not resolve default events dir; pass --events-dir PATH explicitly",
-                )?,
-            };
-            let outcome =
-                mu_coding::console::mark::mark_session(&events_dir, &session, rating, note)?;
-            println!(
-                "marked {}/{} rating={} (event {})",
-                outcome.daemon_id, outcome.session_id, outcome.rating, outcome.event_id
-            );
-            Ok(())
+            if let Some(cc_session_id) = mu_coding::console::mark::cc_session_id_from_ref(&session)
+            {
+                let db = match cc_marks_db {
+                    Some(p) => p,
+                    None => mu_coding::console::mark::default_cc_marks_db().context(
+                        "could not resolve default task_log sidecar; pass --cc-marks-db PATH",
+                    )?,
+                };
+                let outcome =
+                    mu_coding::console::mark::mark_cc_session(&db, cc_session_id, rating, note)?;
+                println!(
+                    "marked {} rating={} (row {})",
+                    outcome.session_ref, outcome.rating, outcome.row_id
+                );
+                Ok(())
+            } else {
+                let events_dir = match events_dir {
+                    Some(p) => p,
+                    None => mu_coding::serve::default_events_dir().context(
+                        "could not resolve default events dir; pass --events-dir PATH explicitly",
+                    )?,
+                };
+                let outcome =
+                    mu_coding::console::mark::mark_session(&events_dir, &session, rating, note)?;
+                println!(
+                    "marked {}/{} rating={} (event {})",
+                    outcome.daemon_id, outcome.session_id, outcome.rating, outcome.event_id
+                );
+                Ok(())
+            }
         }
         Command::Analytics { cmd } => run_analytics(cmd),
         Command::Capabilities { cmd } => run_capabilities(cmd),

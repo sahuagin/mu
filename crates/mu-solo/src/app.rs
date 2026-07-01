@@ -151,6 +151,108 @@ impl TurnRoute {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelKeyIntent {
+    ClearPrompt,
+    CancelOutstanding,
+    Quit,
+}
+
+fn ctrl_c_intent(prompt_empty: bool, turn_in_flight: bool) -> CancelKeyIntent {
+    if !prompt_empty {
+        CancelKeyIntent::ClearPrompt
+    } else if turn_in_flight {
+        CancelKeyIntent::CancelOutstanding
+    } else {
+        CancelKeyIntent::Quit
+    }
+}
+
+fn esc_intent(
+    prompt_empty: bool,
+    turn_in_flight: bool,
+    selection_active: bool,
+) -> Option<CancelKeyIntent> {
+    if !prompt_empty {
+        Some(CancelKeyIntent::ClearPrompt)
+    } else if turn_in_flight {
+        Some(CancelKeyIntent::CancelOutstanding)
+    } else if selection_active {
+        Some(CancelKeyIntent::ClearPrompt)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CancelFeedback {
+    Canceled { session_id: String, was_in: String },
+    Idle { session_id: String, was_in: String },
+    Failed { session_id: String, error: String },
+}
+
+impl CancelFeedback {
+    fn flash(&self) -> String {
+        match self {
+            Self::Canceled { was_in, .. } => format!("cancel requested (was: {was_in})"),
+            Self::Idle { was_in, .. } => format!("nothing to cancel (state: {was_in})"),
+            Self::Failed { error, .. } => format!("cancel failed: {error}"),
+        }
+    }
+
+    fn lines(&self) -> Vec<Line<'static>> {
+        match self {
+            Self::Canceled { session_id, was_in } => vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "cancel — provider call aborted".to_string(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!("  session: {session_id}"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    format!("  was_in: {was_in}"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+            ],
+            Self::Idle { session_id, was_in } => vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "cancel — nothing in flight".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    format!("  session: {session_id}"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    format!("  was_in: {was_in}"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+            ],
+            Self::Failed { session_id, error } => vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "cancel — RPC failed".to_string(),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!("  session: {session_id}"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(format!("  {error}")),
+                Line::from(""),
+            ],
+        }
+    }
+}
+
 /// The in-flight assistant turn (mu-d04a Phase 1). Built incrementally by
 /// `handle_notification` from wire events and re-rendered from scratch each
 /// frame via `render::render_turn`; committed to scrollback (with closer)
@@ -1692,6 +1794,20 @@ impl App {
             (KeyModifiers::CONTROL, KeyCode::Char('s')) => {
                 self.open_in_editor(vp)?;
             }
+            (m, KeyCode::Char('c')) if m.contains(KeyModifiers::CONTROL) => {
+                match ctrl_c_intent(self.prompt.is_empty(), self.live_turn.is_some()) {
+                    CancelKeyIntent::ClearPrompt => {
+                        self.prompt.clear();
+                        self.selected_block = None;
+                        self.set_flash("prompt cleared");
+                    }
+                    CancelKeyIntent::CancelOutstanding => {
+                        self.selected_block = None;
+                        self.cmd_cancel_with_reason(vp, "user pressed Ctrl-C in mu-solo")?;
+                    }
+                    CancelKeyIntent::Quit => return Ok(true),
+                }
+            }
             (_, KeyCode::Char('c')) if self.prompt.is_empty() && self.selected_block.is_some() => {
                 self.apply_block_action(vp, BlockAction::Copy)?;
             }
@@ -1722,24 +1838,35 @@ impl App {
             (_, KeyCode::Enter) if self.prompt.is_empty() && self.selected_block.is_some() => {
                 self.emit_block_action_menu(vp)?;
             }
-            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-                if !self.prompt.is_empty() {
-                    self.prompt.clear();
-                } else if self.live_turn.is_some() {
-                    // Cancel in-flight turn
-                    self.cmd_cancel(vp)?;
-                } else {
-                    return Ok(true);
-                }
-            }
-            // Esc clears the prompt buffer (conventional "cancel
-            // typed input"). It is NOT an exit shortcut — zellij /
-            // tmux multiplexer scrollback exits also send Esc, and
-            // having Esc quit mu-solo turned that into an accidental
-            // session kill. Quit paths are now: /q, /quit, Ctrl-C.
+            // Esc is the non-destructive cancel key. With draft text it
+            // clears the prompt; with no draft and an in-flight turn it
+            // sends session.cancel_outstanding. It never exits the
+            // program — zellij/tmux scrollback exits also send Esc, so
+            // process exit remains explicit (/q or idle Ctrl-C).
             (_, KeyCode::Esc) => {
-                self.prompt.clear();
-                self.selected_block = None;
+                match esc_intent(
+                    self.prompt.is_empty(),
+                    self.live_turn.is_some(),
+                    self.selected_block.is_some(),
+                ) {
+                    Some(CancelKeyIntent::ClearPrompt) => {
+                        let had_prompt = !self.prompt.is_empty();
+                        self.prompt.clear();
+                        let cleared_selection = self.selected_block.take().is_some();
+                        self.set_flash(if had_prompt {
+                            "prompt cleared"
+                        } else if cleared_selection {
+                            "selection cleared"
+                        } else {
+                            "cleared"
+                        });
+                    }
+                    Some(CancelKeyIntent::CancelOutstanding) => {
+                        self.selected_block = None;
+                        self.cmd_cancel_with_reason(vp, "user pressed Esc in mu-solo")?;
+                    }
+                    Some(CancelKeyIntent::Quit) | None => {}
+                }
             }
             // Kill line (Ctrl-U) — clear entire prompt
             (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
@@ -3153,76 +3280,85 @@ impl App {
         Ok(())
     }
 
-    /// /cancel — abort the in-flight provider call without ending the
+    /// /cancel / Esc / Ctrl-C — abort the in-flight provider call without ending the
     /// session. Maps to `session.cancel_outstanding` (mu-035). Routes
     /// to whichever session owns the current streaming turn (main or
     /// /btw sidecar) so cancelling a side question doesn't kill the
     /// main turn or vice versa. Idempotent — if nothing is in flight,
     /// the daemon returns `canceled: false` and we say so.
-    fn cmd_cancel(&mut self, vp: &mut DynamicViewport) -> Result<()> {
-        // Pick the session whose turn is currently streaming. Fall
-        // back to the main session if nothing is in flight — the
-        // daemon will tell us it was idle.
-        let sid = match self.streaming_route {
-            Some(TurnRoute::Btw) => self
-                .sidecar_session_id
-                .clone()
-                .unwrap_or_else(|| self.session_id.clone()),
-            _ => self.session_id.clone(),
+    fn cancel_target_session_id_for(
+        main_session_id: &str,
+        sidecar_session_id: Option<&str>,
+        live_route: Option<TurnRoute>,
+        streaming_route: Option<TurnRoute>,
+    ) -> String {
+        match live_route.or(streaming_route) {
+            Some(TurnRoute::Btw) => sidecar_session_id.unwrap_or(main_session_id).to_string(),
+            Some(TurnRoute::Main) | None => main_session_id.to_string(),
+        }
+    }
+
+    fn cancel_target_session_id(&self) -> String {
+        Self::cancel_target_session_id_for(
+            &self.session_id,
+            self.sidecar_session_id.as_deref(),
+            self.live_turn.as_ref().map(|turn| turn.route),
+            self.streaming_route,
+        )
+    }
+
+    fn cmd_cancel_with_reason(&mut self, vp: &mut DynamicViewport, reason: &str) -> Result<()> {
+        let sid = self.cancel_target_session_id();
+        let feedback = match self.client.request(
+            "session.cancel_outstanding",
+            serde_json::json!({
+                "session_id": sid,
+                "reason": reason,
+            }),
+        ) {
+            Ok(resp) => {
+                let canceled = resp
+                    .get("canceled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let was_in = resp
+                    .get("was_in")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(unknown)")
+                    .to_string();
+                if canceled {
+                    CancelFeedback::Canceled {
+                        session_id: sid,
+                        was_in,
+                    }
+                } else {
+                    CancelFeedback::Idle {
+                        session_id: sid,
+                        was_in,
+                    }
+                }
+            }
+            Err(e) => CancelFeedback::Failed {
+                session_id: sid,
+                error: e.to_string(),
+            },
         };
-        let resp = self
-            .client
-            .request(
-                "session.cancel_outstanding",
-                serde_json::json!({
-                    "session_id": sid,
-                    "reason": "user pressed /cancel",
-                }),
-            )
-            .context("session.cancel_outstanding RPC failed")?;
-        let canceled = resp
-            .get("canceled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let was_in = resp
-            .get("was_in")
-            .and_then(|v| v.as_str())
-            .unwrap_or("(unknown)");
-        let lines: Vec<Line<'static>> = if canceled {
-            vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "/cancel — provider call aborted".to_string(),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    format!("  was_in: {was_in}"),
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(""),
-            ]
-        } else {
-            vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "/cancel — nothing in flight".to_string(),
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(Span::styled(
-                    format!("  was_in: {was_in}"),
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(""),
-            ]
-        };
-        let h = lines.len() as u16;
-        vp.insert_before(h, |buf| {
-            let p = Paragraph::new(lines);
-            ratatui::widgets::Widget::render(p, buf.area, buf);
-        })?;
+        self.set_flash(feedback.flash());
+        // Fullscreen paints over native scrollback, so the flash is the
+        // visible acknowledgement there. Inline keeps the richer panel.
+        if !self.fullscreen {
+            let lines = feedback.lines();
+            let h = lines.len() as u16;
+            vp.insert_before(h, |buf| {
+                let p = Paragraph::new(lines);
+                ratatui::widgets::Widget::render(p, buf.area, buf);
+            })?;
+        }
         Ok(())
+    }
+
+    fn cmd_cancel(&mut self, vp: &mut DynamicViewport) -> Result<()> {
+        self.cmd_cancel_with_reason(vp, "user ran /cancel in mu-solo")
     }
 
     /// /clear — clear the visible scrollback. Doesn't touch the
@@ -3546,8 +3682,12 @@ impl App {
             Line::from("  maximized block    ↑/↓ PgUp/PgDn scroll · c copy · p prompt · Esc close"),
             Line::from("  /q, /quit, /exit   leave the session"),
             Line::from(""),
-            Line::from("  Esc                clear the current prompt"),
-            Line::from("  Ctrl-C             leave the session"),
+            Line::from(
+                "  Esc                clear prompt; when empty + streaming, cancel response",
+            ),
+            Line::from(
+                "  Ctrl-C             clear prompt; when empty + streaming cancel; idle exits",
+            ),
         ];
 
         if !self.skills.is_empty() {
@@ -4564,6 +4704,88 @@ const MAX_VIEWPORT_HEIGHT: u16 = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancel_key_intents_are_non_destructive_until_idle() {
+        assert_eq!(
+            ctrl_c_intent(false, true),
+            CancelKeyIntent::ClearPrompt,
+            "Ctrl-C first clears draft text rather than hiding it with a cancel"
+        );
+        assert_eq!(
+            ctrl_c_intent(true, true),
+            CancelKeyIntent::CancelOutstanding,
+            "empty prompt + live turn cancels the response instead of exiting"
+        );
+        assert_eq!(
+            ctrl_c_intent(true, false),
+            CancelKeyIntent::Quit,
+            "idle Ctrl-C remains the explicit exit path"
+        );
+        assert_eq!(
+            esc_intent(false, true, false),
+            Some(CancelKeyIntent::ClearPrompt)
+        );
+        assert_eq!(
+            esc_intent(true, true, false),
+            Some(CancelKeyIntent::CancelOutstanding),
+            "Esc becomes the safe in-app cancel key during a stream"
+        );
+        assert_eq!(
+            esc_intent(true, false, true),
+            Some(CancelKeyIntent::ClearPrompt)
+        );
+        assert_eq!(esc_intent(true, false, false), None);
+    }
+
+    #[test]
+    fn cancel_target_prefers_live_turn_route_over_stale_streaming_route() {
+        assert_eq!(
+            App::cancel_target_session_id_for("main", Some("btw"), Some(TurnRoute::Btw), None),
+            "btw"
+        );
+        assert_eq!(
+            App::cancel_target_session_id_for(
+                "main",
+                Some("btw"),
+                Some(TurnRoute::Main),
+                Some(TurnRoute::Btw),
+            ),
+            "main",
+            "the structured live turn is authoritative when it exists"
+        );
+        assert_eq!(
+            App::cancel_target_session_id_for("main", None, Some(TurnRoute::Btw), None),
+            "main",
+            "missing sidecar id falls back to main rather than panicking"
+        );
+    }
+
+    #[test]
+    fn cancel_feedback_surfaces_flash_for_all_outcomes() {
+        assert_eq!(
+            CancelFeedback::Canceled {
+                session_id: "s".into(),
+                was_in: "streaming".into(),
+            }
+            .flash(),
+            "cancel requested (was: streaming)"
+        );
+        assert_eq!(
+            CancelFeedback::Idle {
+                session_id: "s".into(),
+                was_in: "idle".into(),
+            }
+            .flash(),
+            "nothing to cancel (state: idle)"
+        );
+        assert!(CancelFeedback::Failed {
+            session_id: "s".into(),
+            error: "boom".into(),
+        }
+        .flash()
+        .contains("cancel failed"));
+    }
 
     #[test]
     fn vcbm_effort_parses_against_configured_levels_and_aliases() {

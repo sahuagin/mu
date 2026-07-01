@@ -1322,6 +1322,7 @@ mod tests {
                 )),
                 mailbox: Arc::new(super::super::mailbox::MailboxState::new()),
                 status_watch: None,
+                autonomy_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
         );
@@ -1756,6 +1757,85 @@ mod tests {
             )),
             "accepted ask must not be receipted at handler completion: {:?}",
             log.snapshot()
+        );
+    }
+
+    /// An ask addressed to an active autonomous run is rejected before it
+    /// reaches the agent loop. Otherwise the loop consumes it as iteration
+    /// context but cannot receipt it until autonomous termination, creating
+    /// healthy `CommandReceived` orphans in long-running/sleeping runs.
+    #[tokio::test]
+    async fn autonomous_session_ask_is_rejected_with_receipt_not_queued() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("d.jsonl");
+        let journal = Arc::new(
+            CommandJournal::open(&journal_path, "d", FsyncPolicy::Never).expect("open journal"),
+        );
+        let ctx = test_ctx();
+        let sessions = ctx.sessions.clone();
+        let stream = Router::new();
+        let control = spawn_control_plane(journal, ctx, stream);
+
+        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(4);
+        let log = insert_session(&sessions, "s-auto", input_tx, Some(dir.path()));
+        assert!(
+            sessions.set_autonomy_active("s-auto", true),
+            "test session is live"
+        );
+
+        let req = request(
+            AskSessionRequest::METHOD,
+            json!({ "session_id": "s-auto", "user_message": "continue" }),
+        );
+        let auth = authed_state();
+        assert!(ingest(&control, req, test_origin(), &auth).is_none());
+
+        wait_for_log(&log, |events| {
+            events
+                .iter()
+                .any(|e| matches!(&e.payload, EventPayload::CommandRejected { .. }))
+        })
+        .await;
+
+        assert!(
+            matches!(
+                input_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "busy ask must not be queued into the autonomous loop"
+        );
+
+        let events = log.snapshot();
+        let received_id = events
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::CommandReceived { method, .. }
+                    if method == AskSessionRequest::METHOD =>
+                {
+                    Some(e.id)
+                }
+                _ => None,
+            })
+            .expect("CommandReceived in session log");
+        let (rejected_ref, message) = events
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::CommandRejected {
+                    command_event_id,
+                    message,
+                    ..
+                } => Some((*command_event_id, message.clone())),
+                _ => None,
+            })
+            .expect("CommandRejected receipt in session log");
+        assert_eq!(rejected_ref, received_id, "receipt pairs with command");
+        assert!(
+            message.contains("running autonomously"),
+            "busy rejection should explain autonomy state: {message}"
+        );
+        assert!(
+            daemon_journal_methods(&journal_path).is_empty(),
+            "session-slot command must not fall back to daemon journal"
         );
     }
 

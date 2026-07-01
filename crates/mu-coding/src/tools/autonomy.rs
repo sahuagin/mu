@@ -26,7 +26,7 @@ use mu_core::protocol::AutonomyOptions;
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
-use crate::serve::WeakSessions;
+use crate::serve::{AutonomyClaimError, WeakSessions};
 
 fn err(content: impl Into<String>) -> ToolResult {
     ToolResult {
@@ -45,10 +45,12 @@ fn ok(content: impl Into<String>) -> ToolResult {
 /// Tool: enter autonomous mode on THIS session with a goal.
 ///
 /// Sends `AgentInput::StartAutonomous` into the owning session's input
-/// channel — identical to what `handle_start_autonomous` does after
-/// its capability check. The input is consumed at the next iteration
-/// boundary, so a turn that calls this finishes normally and the loop
-/// transitions afterward.
+/// channel — the same loop input `handle_start_autonomous` sends after
+/// its capability check — while first claiming the live autonomy gate so
+/// external asks cannot slip in before the forwarder observes the first
+/// autonomy event. The input is consumed at the next iteration boundary,
+/// so a turn that calls this finishes normally and the loop transitions
+/// afterward.
 pub struct StartAutonomousTool {
     /// Weak for the same reason as SpawnWorkerTool (mu-qc08): this
     /// tool lives in its owning session's tool list; a strong handle
@@ -243,9 +245,6 @@ async fn send_to_own_loop(
     let Some(sessions) = sessions.upgrade() else {
         return err("daemon is shutting down");
     };
-    let Some(tx) = sessions.input_sender(session_id) else {
-        return err(format!("session not found: {session_id}"));
-    };
     let summary = match &input {
         AgentInput::StartAutonomous { goal, .. } => {
             format!("autonomous mode accepted; goal: {goal}")
@@ -257,12 +256,36 @@ async fn send_to_own_loop(
         }
         _ => "input queued".to_string(),
     };
+    let (tx, claimed_autonomy) = match &input {
+        AgentInput::StartAutonomous { .. } => match sessions.claim_autonomy_start(session_id) {
+            Ok(tx) => (tx, true),
+            Err(AutonomyClaimError::Missing) => {
+                return err(format!("session not found: {session_id}"));
+            }
+            Err(AutonomyClaimError::AlreadyActive) => {
+                return err(format!(
+                    "session {session_id} is already running autonomously"
+                ));
+            }
+        },
+        _ => {
+            let Some(tx) = sessions.input_sender(session_id) else {
+                return err(format!("session not found: {session_id}"));
+            };
+            (tx, false)
+        }
+    };
     match tx.send(input).await {
         Ok(()) => ok(format!(
             "{summary} — takes effect at the next iteration boundary \
              (the current turn finishes normally)."
         )),
-        Err(_) => err("session loop has terminated"),
+        Err(_) => {
+            if claimed_autonomy {
+                sessions.set_autonomy_active(session_id, false);
+            }
+            err("session loop has terminated")
+        }
     }
 }
 
@@ -292,6 +315,61 @@ mod tests {
             }
             other => panic!("wrong input: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn start_autonomous_tool_claims_gate_before_queuing() {
+        use std::sync::{Arc, Mutex};
+
+        use mu_core::capability::Capability;
+        use mu_core::context::CacheTtl;
+        use mu_core::event_log::SessionEventLog;
+
+        let sessions = crate::serve::Sessions::new();
+        let session_id = "self-start".to_string();
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<AgentInput>(4);
+        sessions.insert(
+            session_id.clone(),
+            crate::serve::NewSession {
+                input_tx,
+                forwarder: tokio::spawn(async {}),
+                agent: tokio::spawn(async {}),
+                event_log: Arc::new(SessionEventLog::new(session_id.clone())),
+                pending_approvals: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                parent_session_id: None,
+                capability: Arc::new(Mutex::new(Capability::root())),
+                cache_ttl: CacheTtl::default(),
+                provider_status: Arc::new(Mutex::new(crate::serve::ProviderStatusTracker::new())),
+                mailbox: Arc::new(crate::serve::MailboxState::new()),
+                status_watch: None,
+                autonomy_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                live_context_soft_limit: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+        );
+
+        let tool = StartAutonomousTool::new(sessions.downgrade(), session_id.clone());
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let result = tool.execute(json!({"goal": "ship it"}), cancel_rx).await;
+        assert!(!result.is_error, "unexpected tool error: {result:?}");
+        assert!(
+            sessions.autonomy_active(&session_id),
+            "tool path must claim the live gate before the loop forwards its first autonomy event"
+        );
+
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let second = tool.execute(json!({"goal": "again"}), cancel_rx).await;
+        assert!(second.is_error, "duplicate autonomous start should fail");
+        assert!(second.content.contains("already running autonomously"));
+
+        let queued = input_rx.recv().await.expect("first start queued");
+        match queued {
+            AgentInput::StartAutonomous { goal, .. } => assert_eq!(goal, "ship it"),
+            other => panic!("wrong input: {other:?}"),
+        }
+        assert!(matches!(
+            input_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]

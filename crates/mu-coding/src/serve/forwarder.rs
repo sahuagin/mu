@@ -37,6 +37,7 @@
 //! doesn't include them. We can amend mu-001 to add them when a
 //! frontend needs them.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -315,6 +316,29 @@ fn update_provider_status(event: &AgentEvent, tracker: &Arc<Mutex<ProviderStatus
     }
 }
 
+fn update_autonomy_active(event: &AgentEvent, active: &Arc<AtomicBool>) {
+    match event {
+        AgentEvent::AutonomousIterationStarted { .. }
+        | AgentEvent::AutonomousIterationCompleted { .. }
+        | AgentEvent::AutonomousScheduledWakeup { .. } => {
+            active.store(true, Ordering::Release);
+        }
+        AgentEvent::AutonomousTerminated { .. } => {
+            active.store(false, Ordering::Release);
+        }
+        _ => {}
+    }
+}
+
+/// Shared live projections maintained by the forwarder for dispatch-time
+/// queries/gates. Stored outside the event log so handlers can make cheap,
+/// race-closing decisions; the event log remains the audit source.
+#[derive(Clone)]
+pub struct ForwarderLiveState {
+    pub provider_status: Arc<Mutex<ProviderStatusTracker>>,
+    pub autonomy_active: Arc<AtomicBool>,
+}
+
 /// IO loop: read events from `events_rx`, append durable events to
 /// `event_log`, and emit wire notifications via `notif`. Exits when
 /// `events_rx` closes.
@@ -328,7 +352,7 @@ pub async fn forward_events(
     mut events_rx: mpsc::Receiver<AgentEvent>,
     notif: NotificationWriter,
     event_log: Arc<SessionEventLog>,
-    provider_status: Arc<Mutex<ProviderStatusTracker>>,
+    live_state: ForwarderLiveState,
     daemon_id: String,
     status_watch_tx: Option<tokio::sync::watch::Sender<Option<SessionStatus>>>,
 ) {
@@ -345,7 +369,8 @@ pub async fn forward_events(
         // daemon.outstanding_calls) see authoritative live state.
         // The lock is held only for the sync mutate; no `.await`
         // runs while it's held.
-        update_provider_status(&event, &provider_status);
+        update_provider_status(&event, &live_state.provider_status);
+        update_autonomy_active(&event, &live_state.autonomy_active);
 
         if let AgentEvent::Error { message } = &event {
             last_error_message = Some(message.clone());
@@ -428,7 +453,12 @@ pub async fn forward_events(
         // to watch subscribers on status-changing events.
         if recompute_status {
             if let Some(ref tx) = status_watch_tx {
-                let status = compute_status(&session_id, &daemon_id, &event_log, &provider_status);
+                let status = compute_status(
+                    &session_id,
+                    &daemon_id,
+                    &event_log,
+                    &live_state.provider_status,
+                );
                 let _ = tx.send(Some(status));
             }
         }
@@ -438,6 +468,12 @@ pub async fn forward_events(
             let _ = notif.emit(method, params).await;
         }
     }
+
+    // If the agent task dies after `session.start_autonomous` claimed the
+    // live gate but before it emits a normal AutonomousTerminated event,
+    // closing the event channel is our last chance to avoid wedging the
+    // session as permanently busy.
+    live_state.autonomy_active.store(false, Ordering::Release);
 }
 
 fn should_recompute_status(event: &AgentEvent) -> bool {

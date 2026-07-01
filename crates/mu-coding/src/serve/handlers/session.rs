@@ -1,7 +1,7 @@
 //! Session-domain request handlers (session.*, autonomy-related).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -31,8 +31,8 @@ use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
 use crate::serve::daemon_info::DaemonInfo;
 use crate::serve::discovery::SessionDiscovery;
 use crate::serve::factory::ProviderFactory;
-use crate::serve::forwarder::forward_events;
-use crate::serve::sessions::Sessions;
+use crate::serve::forwarder::{forward_events, ForwarderLiveState};
+use crate::serve::sessions::{AutonomyClaimError, Sessions};
 
 use super::{ok_or_respond, some_or_respond, to_value_or_null};
 
@@ -679,6 +679,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     let provider_status = Arc::new(Mutex::new(
         super::super::provider_status::ProviderStatusTracker::new(),
     ));
+    let autonomy_active = Arc::new(AtomicBool::new(false));
     let mailbox = Arc::new(super::super::mailbox::MailboxState::new());
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
     let mut session_tools = session_spawn_tools(
@@ -784,7 +785,10 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         events_rx,
         notif.clone(),
         event_log.clone(),
-        provider_status.clone(),
+        ForwarderLiveState {
+            provider_status: provider_status.clone(),
+            autonomy_active: autonomy_active.clone(),
+        },
         daemon_info.daemon_id().to_string(),
         Some(status_tx),
     ));
@@ -803,6 +807,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             provider_status,
             mailbox,
             status_watch: Some(status_rx),
+            autonomy_active,
             live_context_soft_limit,
         },
     );
@@ -885,6 +890,24 @@ pub async fn handle_ask_session(
         codes::INVALID_PARAMS,
         "ask_session: invalid params"
     );
+
+    // mu-autonomous-sleep-operability-f4ib.3: autonomous mode is a
+    // distinct non-interactive state. Letting a journaled `ask_session`
+    // enter the loop during autonomy makes its CommandTicket wait for
+    // the autonomous run's terminal Done; long-running/sleeping runs
+    // then leave healthy CommandReceived orphans. Reject busy here so
+    // the pipeline writes an immediate CommandRejected receipt.
+    if sessions.autonomy_active(&params.session_id) {
+        return err_response(
+            request.id,
+            codes::INVALID_PARAMS,
+            format!(
+                "ask_session: session {} is running autonomously; wait for \
+                 session.autonomous_terminated or cancel the outstanding run before asking again",
+                params.session_id
+            ),
+        );
+    }
 
     // Brief sync lock to clone the sender; lock dropped before the
     // await below.
@@ -1243,35 +1266,48 @@ pub async fn handle_start_autonomous(
                 .to_string(),
         );
     }
-
-    let sender = sessions.input_sender(&params.session_id);
-    match sender {
-        None => err_response(
-            request.id,
-            codes::INVALID_PARAMS,
-            format!(
-                "session.start_autonomous: session not found: {}",
-                params.session_id
-            ),
-        ),
-        Some(tx) => {
-            match tx
-                .send(AgentInput::StartAutonomous {
-                    goal: params.goal,
-                    options: params.options,
-                })
-                .await
-            {
-                Ok(_) => {
-                    let resp = StartAutonomousResponse { accepted: true };
-                    ok_response(request.id, to_value_or_null(resp))
-                }
-                Err(_) => err_response(
-                    request.id,
-                    codes::INTERNAL_ERROR,
-                    "session.start_autonomous: session loop has terminated",
+    let tx = match sessions.claim_autonomy_start(&params.session_id) {
+        Ok(tx) => tx,
+        Err(AutonomyClaimError::Missing) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!(
+                    "session.start_autonomous: session not found: {}",
+                    params.session_id
                 ),
-            }
+            );
+        }
+        Err(AutonomyClaimError::AlreadyActive) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!(
+                    "session.start_autonomous: session {} is already running autonomously",
+                    params.session_id
+                ),
+            );
+        }
+    };
+
+    match tx
+        .send(AgentInput::StartAutonomous {
+            goal: params.goal,
+            options: params.options,
+        })
+        .await
+    {
+        Ok(_) => {
+            let resp = StartAutonomousResponse { accepted: true };
+            ok_response(request.id, to_value_or_null(resp))
+        }
+        Err(_) => {
+            sessions.set_autonomy_active(&params.session_id, false);
+            err_response(
+                request.id,
+                codes::INTERNAL_ERROR,
+                "session.start_autonomous: session loop has terminated",
+            )
         }
     }
 }
@@ -2048,6 +2084,7 @@ mod tests {
                 )),
                 mailbox: Arc::new(crate::serve::mailbox::MailboxState::new()),
                 status_watch: None,
+                autonomy_active: Arc::new(AtomicBool::new(false)),
                 live_context_soft_limit: live.clone(),
             },
         );

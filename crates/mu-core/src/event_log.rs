@@ -1039,6 +1039,31 @@ impl SessionEventLog {
         self.len() == 0
     }
 
+    /// True while the latest autonomy marker says an autonomous run is in progress.
+    ///
+    /// mu-autonomous-sleep-operability-f4ib.3: `ask_session` is not a
+    /// defined intervention channel for an active autonomous/sleeping run. The
+    /// agent loop can consume such messages as iteration context, but it only
+    /// emits command receipts at the autonomous run's terminal `Done`, leaving
+    /// healthy long-running sessions with orphaned `CommandReceived` rows.
+    /// This durable projection mirrors the live ask gate and lets readers
+    /// diagnose whether a log was in autonomous mode at a point in time.
+    pub fn autonomous_run_active(&self) -> bool {
+        let Ok(events) = self.events.lock() else {
+            return false;
+        };
+        for ev in events.iter().rev() {
+            match &ev.payload {
+                EventPayload::AutonomousTerminated { .. } => return false,
+                EventPayload::AutonomousIterationStarted { .. }
+                | EventPayload::AutonomousIterationCompleted { .. }
+                | EventPayload::AutonomousScheduledWakeup { .. } => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// Sum usage across all `Done` events in the log. Returns None if
     /// no Done event ever reported usage (e.g. faux provider, or
     /// every ask hit an error before reporting).
@@ -1380,6 +1405,47 @@ mod tests {
         assert_eq!(a, 1);
         assert_eq!(b, 2);
         assert_eq!(log.len(), 2);
+    }
+
+    #[test]
+    fn autonomous_run_active_tracks_latest_autonomy_marker() {
+        let log = SessionEventLog::new("s1");
+        assert!(!log.autonomous_run_active());
+
+        log.append(
+            EventActor::Agent,
+            EventPayload::AutonomousIterationStarted {
+                iteration: 1,
+                motivation: "start".into(),
+            },
+        );
+        assert!(log.autonomous_run_active());
+
+        log.append(
+            EventActor::Agent,
+            EventPayload::AutonomousIterationCompleted {
+                iteration: 1,
+                outcome: crate::protocol::AutonomousIterationOutcome::Continue,
+            },
+        );
+        assert!(log.autonomous_run_active());
+
+        log.append(
+            EventActor::Agent,
+            EventPayload::AutonomousScheduledWakeup {
+                wake_at_unix_ms: 42,
+                reason: "sleep".into(),
+            },
+        );
+        assert!(log.autonomous_run_active());
+
+        log.append(
+            EventActor::Agent,
+            EventPayload::AutonomousTerminated {
+                reason: crate::protocol::AutonomousTerminationReason::Cancelled,
+            },
+        );
+        assert!(!log.autonomous_run_active());
     }
 
     #[test]

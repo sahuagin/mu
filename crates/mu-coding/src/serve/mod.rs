@@ -31,6 +31,13 @@ pub use factory::{
     build_provider_from_selector, build_tools, make_provider_factory, parse_tools_csv,
     resolve_launch_selection, selector_from_cli, BashSettings, ProviderFactory,
 };
+#[cfg(test)]
+pub(crate) use mailbox::MailboxState;
+#[cfg(test)]
+pub(crate) use provider_status::ProviderStatusTracker;
+pub(crate) use sessions::AutonomyClaimError;
+#[cfg(test)]
+pub(crate) use sessions::NewSession;
 pub use sessions::{Sessions, WeakSessions};
 
 struct AbortOnDrop(std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>);

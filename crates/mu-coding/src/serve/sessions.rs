@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::{mpsc, oneshot};
@@ -75,6 +75,12 @@ struct SessionState {
     /// updates. The forwarder sends on status-changing events; MCP
     /// subscribers clone this receiver and watch for changes.
     status_watch: Option<tokio::sync::watch::Receiver<Option<SessionStatus>>>,
+    /// Fast live gate for whether the session is in (or entering)
+    /// autonomous mode. The event log remains the durable source of
+    /// truth; this flag closes the start_autonomous → first event race
+    /// for handlers that must reject interactive asks before they enter
+    /// the loop.
+    autonomy_active: Arc<AtomicBool>,
     /// mu-context-limits-wire phase 2: the live context soft limit (=
     /// compaction trigger) in tokens, shared with the running agent loop.
     /// `session.set_config` stores the new value here; the loop reads it
@@ -196,11 +202,19 @@ pub struct NewSession {
     pub provider_status: Arc<Mutex<ProviderStatusTracker>>,
     pub mailbox: MailboxStateHandle,
     pub status_watch: Option<tokio::sync::watch::Receiver<Option<SessionStatus>>>,
+    /// Fast live autonomous-mode gate shared with the forwarder.
+    pub autonomy_active: Arc<AtomicBool>,
     /// mu-context-limits-wire phase 2: shared live context soft limit
     /// (= compaction trigger), the same `Arc` handed to the agent loop's
     /// `SpawnArgs`. `session.set_config` writes it via
     /// [`Sessions::live_context_soft_limit`].
     pub live_context_soft_limit: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutonomyClaimError {
+    Missing,
+    AlreadyActive,
 }
 
 impl Sessions {
@@ -264,6 +278,7 @@ impl Sessions {
                     provider_status: new.provider_status,
                     mailbox: new.mailbox,
                     status_watch: new.status_watch,
+                    autonomy_active: new.autonomy_active,
                     live_context_soft_limit: new.live_context_soft_limit,
                 },
             );
@@ -525,6 +540,59 @@ impl Sessions {
             .map(|s| s.mailbox.clone())
     }
 
+    /// Fast live check for autonomous/sleeping state. The durable event
+    /// log is the audit source; this flag is deliberately only a handler
+    /// gate so `ask_session` can reject before a CommandTicket enters an
+    /// autonomous loop and waits indefinitely for a terminal Done.
+    pub fn autonomy_active(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|map| {
+                map.get(id)
+                    .map(|s| s.autonomy_active.load(Ordering::Acquire))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Atomically claim the transition into autonomous mode and clone
+    /// the input sender while holding the registry lookup stable. This
+    /// closes the check-then-set race between concurrent
+    /// `session.start_autonomous` calls: only one caller can flip the
+    /// per-session flag from false to true.
+    pub fn claim_autonomy_start(
+        &self,
+        id: &str,
+    ) -> Result<mpsc::Sender<AgentInput>, AutonomyClaimError> {
+        let Ok(map) = self.inner.lock() else {
+            return Err(AutonomyClaimError::Missing);
+        };
+        let Some(state) = map.get(id) else {
+            return Err(AutonomyClaimError::Missing);
+        };
+        if state
+            .autonomy_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(AutonomyClaimError::AlreadyActive);
+        }
+        Ok(state.input_tx.clone())
+    }
+
+    /// Set the live autonomous gate for a session. Returns false when
+    /// the session is not live.
+    pub fn set_autonomy_active(&self, id: &str, active: bool) -> bool {
+        let Ok(map) = self.inner.lock() else {
+            return false;
+        };
+        let Some(state) = map.get(id) else {
+            return false;
+        };
+        state.autonomy_active.store(active, Ordering::Release);
+        true
+    }
+
     /// Snapshot the session's live provider-call state (mu-035 Phase
     /// D). `None` when the session doesn't exist OR when no provider
     /// call is currently in flight. Used by `session.cancel_outstanding`
@@ -727,6 +795,7 @@ mod tests {
                 provider_status: tracker,
                 mailbox: Arc::new(MailboxState::new()),
                 status_watch: None,
+                autonomy_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
         );
@@ -736,6 +805,56 @@ mod tests {
         assert!(sessions.input_sender(&id).is_none());
         assert!(sessions.event_log(&id).is_none());
         assert!(!sessions.remove(&id));
+    }
+
+    #[tokio::test]
+    async fn claim_autonomy_start_flips_gate_once_and_returns_sender() {
+        let sessions = Sessions::new();
+        let id = "auto-claim".to_string();
+        let (tx, mut rx) = mpsc::channel::<AgentInput>(2);
+        sessions.insert(
+            id.clone(),
+            NewSession {
+                input_tx: tx,
+                forwarder: tokio::spawn(async {}),
+                agent: tokio::spawn(async {}),
+                event_log: Arc::new(SessionEventLog::new(id.clone())),
+                pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+                parent_session_id: None,
+                capability: Arc::new(Mutex::new(Capability::root())),
+                cache_ttl: CacheTtl::default(),
+                provider_status: Arc::new(Mutex::new(ProviderStatusTracker::new())),
+                mailbox: Arc::new(MailboxState::new()),
+                status_watch: None,
+                autonomy_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+        );
+
+        let claimed = sessions
+            .claim_autonomy_start(&id)
+            .expect("first claim succeeds");
+        assert!(sessions.autonomy_active(&id));
+        assert!(
+            matches!(
+                sessions.claim_autonomy_start(&id),
+                Err(AutonomyClaimError::AlreadyActive)
+            ),
+            "second claim must not enqueue a duplicate autonomous start"
+        );
+
+        claimed
+            .send(AgentInput::Cancel)
+            .await
+            .expect("claimed sender is live");
+        assert!(matches!(rx.try_recv(), Ok(AgentInput::Cancel)));
+
+        assert!(sessions.set_autonomy_active(&id, false));
+        assert!(sessions.claim_autonomy_start(&id).is_ok());
+        assert!(matches!(
+            sessions.claim_autonomy_start("missing"),
+            Err(AutonomyClaimError::Missing)
+        ));
     }
 
     #[tokio::test]
@@ -808,6 +927,7 @@ mod tests {
                 provider_status: Arc::new(Mutex::new(ProviderStatusTracker::new())),
                 mailbox: Arc::new(MailboxState::new()),
                 status_watch: None,
+                autonomy_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
         );
@@ -860,6 +980,7 @@ mod tests {
                 provider_status: tracker,
                 mailbox: Arc::new(MailboxState::new()),
                 status_watch: None,
+                autonomy_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
         );
@@ -927,6 +1048,7 @@ mod tests {
                 provider_status: tracker.clone(),
                 mailbox: Arc::new(MailboxState::new()),
                 status_watch: None,
+                autonomy_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
         );

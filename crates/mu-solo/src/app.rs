@@ -158,10 +158,14 @@ enum CancelKeyIntent {
     Quit,
 }
 
-fn ctrl_c_intent(prompt_empty: bool, turn_in_flight: bool) -> CancelKeyIntent {
+fn ctrl_c_intent(
+    prompt_empty: bool,
+    turn_in_flight: bool,
+    main_session_busy: bool,
+) -> CancelKeyIntent {
     if !prompt_empty {
         CancelKeyIntent::ClearPrompt
-    } else if turn_in_flight {
+    } else if ctrl_c_should_cancel(prompt_empty, turn_in_flight, main_session_busy) {
         CancelKeyIntent::CancelOutstanding
     } else {
         CancelKeyIntent::Quit
@@ -170,12 +174,12 @@ fn ctrl_c_intent(prompt_empty: bool, turn_in_flight: bool) -> CancelKeyIntent {
 
 fn esc_intent(
     prompt_empty: bool,
-    turn_in_flight: bool,
+    cancel_available: bool,
     selection_active: bool,
 ) -> Option<CancelKeyIntent> {
     if !prompt_empty {
         Some(CancelKeyIntent::ClearPrompt)
-    } else if turn_in_flight {
+    } else if cancel_available {
         Some(CancelKeyIntent::CancelOutstanding)
     } else if selection_active {
         Some(CancelKeyIntent::ClearPrompt)
@@ -313,6 +317,171 @@ impl Turn {
             _ => true,
         })
     }
+}
+
+const PENDING_INTERJECTION_RESPONDING_LABEL: &str = "you · queued while assistant was responding";
+const PENDING_INTERJECTION_WAITING_LABEL: &str = "you · queued before next assistant response";
+const PENDING_INTERJECTION_MIXED_LABEL: &str = "you · queued before assistant could answer";
+const PENDING_INTERJECTION_PREVIEW_LIMIT: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingInterjectionTiming {
+    WhileResponding,
+    BeforeQueuedResponse,
+}
+
+impl PendingInterjectionTiming {
+    fn label(self) -> &'static str {
+        match self {
+            Self::WhileResponding => PENDING_INTERJECTION_RESPONDING_LABEL,
+            Self::BeforeQueuedResponse => PENDING_INTERJECTION_WAITING_LABEL,
+        }
+    }
+}
+
+/// A normal main-session prompt submitted while a previous main-session ask is
+/// still in flight or queued. The daemon still receives the ask immediately, so
+/// dispatch order stays honest; mu-solo holds the UI block until the response
+/// the operator could not yet account for is committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingInterjection {
+    request_id: i64,
+    body: String,
+    timing: PendingInterjectionTiming,
+}
+
+impl PendingInterjection {
+    fn new(request_id: i64, body: impl Into<String>, timing: PendingInterjectionTiming) -> Self {
+        Self {
+            request_id,
+            body: body.into(),
+            timing,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        self.timing.label()
+    }
+}
+
+fn main_session_busy_state(
+    live_turn_route: Option<TurnRoute>,
+    streaming_route: Option<TurnRoute>,
+    awaiting_queued_response: bool,
+    pending_interjection_count: usize,
+    queued_interjection_request_count: usize,
+    queued_interjection_response_count: usize,
+) -> bool {
+    live_turn_route == Some(TurnRoute::Main)
+        || streaming_route == Some(TurnRoute::Main)
+        || awaiting_queued_response
+        || pending_interjection_count > 0
+        || queued_interjection_request_count > 0
+        || queued_interjection_response_count > 0
+}
+
+fn queued_responses_after_terminal(
+    finished_main: bool,
+    queued_interjection_response_count: usize,
+) -> usize {
+    if finished_main {
+        queued_interjection_response_count.saturating_sub(1)
+    } else {
+        queued_interjection_response_count
+    }
+}
+
+fn should_await_queued_main(
+    finished_main: bool,
+    pending_interjection_count: usize,
+    queued_interjection_response_count: usize,
+) -> bool {
+    finished_main && (pending_interjection_count > 0 || queued_interjection_response_count > 0)
+}
+
+fn pending_interjection_timing_state(
+    live_turn_route: Option<TurnRoute>,
+) -> PendingInterjectionTiming {
+    match live_turn_route {
+        Some(TurnRoute::Main) => PendingInterjectionTiming::WhileResponding,
+        _ => PendingInterjectionTiming::BeforeQueuedResponse,
+    }
+}
+
+fn ctrl_c_should_cancel(
+    prompt_empty: bool,
+    live_turn_present: bool,
+    main_session_busy: bool,
+) -> bool {
+    prompt_empty && (live_turn_present || main_session_busy)
+}
+
+fn should_clear_queued_interjection_state_after_cancel(
+    canceled: bool,
+    target_is_main_session: bool,
+) -> bool {
+    canceled && target_is_main_session
+}
+
+fn pending_interjection_preview_label(pending: &[PendingInterjection]) -> &'static str {
+    match pending.first().map(|p| p.timing) {
+        Some(first) if pending.iter().all(|p| p.timing == first) => first.label(),
+        Some(_) => PENDING_INTERJECTION_MIXED_LABEL,
+        None => PENDING_INTERJECTION_MIXED_LABEL,
+    }
+}
+
+fn pending_interjection_preview_lines(
+    pending: &[PendingInterjection],
+    width: usize,
+) -> Vec<Line<'static>> {
+    if pending.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = vec![Line::from(Span::styled(
+        pending_interjection_preview_label(pending).to_string(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))];
+
+    let shown = pending.len().min(PENDING_INTERJECTION_PREVIEW_LIMIT);
+    for (idx, interjection) in pending.iter().take(shown).enumerate() {
+        let raw = interjection.body.lines().next().unwrap_or("").trim();
+        let prefix = if pending.len() == 1 {
+            "  ↳ ".to_string()
+        } else {
+            format!("  ↳ #{} ", idx + 1)
+        };
+        let available = width.saturating_sub(prefix.chars().count()).max(1);
+        lines.push(Line::from(vec![
+            Span::styled(prefix, Style::default().fg(Color::Cyan)),
+            Span::styled(
+                truncate_at_word(raw, available),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    if pending.len() > shown {
+        lines.push(Line::from(Span::styled(
+            format!("  ↳ +{} more queued", pending.len() - shown),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines
+}
+
+fn pending_interjection_commit_lines(
+    interjection: &PendingInterjection,
+    wrap_width: usize,
+) -> Vec<Line<'static>> {
+    render::block_lines(
+        interjection.label(),
+        Color::Cyan,
+        &interjection.body,
+        wrap_width,
+    )
 }
 
 /// Normalize a provider string to the daemon's wire enum
@@ -472,10 +641,11 @@ pub struct App {
     /// fires at most once per process to avoid spamming scrollback if
     /// the user keeps sending prompts to a faux session.
     renderer_mismatch_warned: bool,
-    /// Which session owns the currently-streaming turn. Set when an ask
-    /// is fired (Main on /send, Btw on /btw); kept in sync with
-    /// `live_turn.route` and used by `/cancel` to route to the right
-    /// session. None when no turn is in flight.
+    /// Which session owns the currently-streaming or immediately-awaited turn.
+    /// Set when an ask is fired (Main on /send, Btw on /btw); kept in sync with
+    /// `live_turn.route` once streaming starts and used by `/cancel` to route to
+    /// the right session. During queued main-session interjection gaps this can
+    /// be `Some(Main)` even while `live_turn` is temporarily None.
     streaming_route: Option<TurnRoute>,
     /// mu-d3v6: request ids of asks fired via `request_nowait`,
     /// awaiting their end-of-turn responses on the async channel.
@@ -483,6 +653,27 @@ pub struct App {
     /// Used to surface RPC-level ask errors; success responses are
     /// no-ops (session.done already drove the turn commit).
     pending_ask_ids: std::collections::HashSet<i64>,
+    /// Ask request ids that came from mid-stream same-session interjections.
+    /// They are still ordinary `ask_session`s at the daemon layer; this set
+    /// only keeps mu-solo from treating an RPC-level failure as if the current
+    /// live assistant turn failed.
+    queued_interjection_ask_ids: std::collections::HashSet<i64>,
+    /// A main-session queued interjection batch has been dispatched and the
+    /// preceding response has committed, but the queued batch has not produced
+    /// its own terminal done/error yet. This is the UI/session-busy bridge for
+    /// the gap where `live_turn` is None but the daemon is not actually idle.
+    awaiting_queued_interjection_response: bool,
+    /// Number of committed interjection prompts whose assistant responses have
+    /// not yet produced a terminal `session.done` / `session.error`. Kept
+    /// separately from JSON-RPC request ids because the terminal notification
+    /// and RPC response can arrive in either order.
+    queued_interjection_response_count: usize,
+    /// Main-session prompts submitted while a previous main-session ask is
+    /// still streaming or waiting for its queued response. Rendered as live
+    /// annotations and committed after that turn,
+    /// preserving both dispatch order and the fact that the operator had not
+    /// seen the response yet.
+    pending_interjections: Vec<PendingInterjection>,
     /// The in-flight assistant turn as a structured model (mu-d04a).
     /// Built by `handle_notification`, rendered live in the viewport each
     /// frame, committed to scrollback on done/error. None when idle.
@@ -859,6 +1050,19 @@ impl SessionPhase {
     }
 }
 
+fn phase_after_turn_end(
+    is_error: bool,
+    stop_reason: Option<&str>,
+    turn_count: Option<u32>,
+    will_await_queued_main: bool,
+) -> SessionPhase {
+    if will_await_queued_main && !is_error && stop_reason != Some("iteration_cap") {
+        SessionPhase::AwaitingFirstToken
+    } else {
+        SessionPhase::on_turn_end(is_error, stop_reason, turn_count)
+    }
+}
+
 /// Startup options for [`App::new`] — bundled so the constructor takes one
 /// borrowed struct instead of eight positional args. Borrows from the parsed
 /// config/CLI; no allocation at startup.
@@ -1051,6 +1255,10 @@ impl App {
             sidecar_session_id: None,
             streaming_route: None,
             pending_ask_ids: std::collections::HashSet::new(),
+            queued_interjection_ask_ids: std::collections::HashSet::new(),
+            awaiting_queued_interjection_response: false,
+            queued_interjection_response_count: 0,
+            pending_interjections: Vec::new(),
             live_turn: None,
             transcript: Transcript::new(),
             fullscreen: std::env::var_os("MU_SOLO_FULLSCREEN").is_some(),
@@ -1392,6 +1600,11 @@ impl App {
                 preview,
                 self.collapse_tools,
             ));
+            let pending = pending_interjection_preview_lines(&self.pending_interjections, bwrap);
+            if !pending.is_empty() {
+                tlines.push(Line::from(""));
+                tlines.extend(pending);
+            }
         }
 
         // Window: bottom-anchored, minus the scroll-up offset.
@@ -1429,6 +1642,12 @@ impl App {
         // tail-truncated so the prompt always stays visible; the full turn
         // lands in scrollback on commit (session.done/error). focus_mode
         // suppresses the preview — the model is still built and committed.
+        //
+        // mu-hsyt/R1-R4: same-session prompts submitted mid-stream are
+        // rendered as compact pending interjections BELOW the live assistant
+        // preview instead of replacing the preview or inserting a scrollback
+        // block immediately. They are ordinary queued ask_sessions at the
+        // daemon layer; this is only the temporal UI projection.
         let preview: Vec<Line<'static>> = match (self.focus_mode, self.live_turn.as_ref()) {
             (false, Some(turn)) => {
                 let tool_preview = if self.bash_yolo { 15 } else { 4 };
@@ -1445,7 +1664,21 @@ impl App {
                 // which guarantees ≥1 (up to 3) prompt rows stay visible.
                 let reserve = 4 + menu_rows + layout.lines.len().min(3);
                 let budget = (MAX_VIEWPORT_HEIGHT as usize).saturating_sub(reserve);
-                render::tail_truncate(full, budget)
+                let mut pending = pending_interjection_preview_lines(
+                    &self.pending_interjections,
+                    w.saturating_sub(2),
+                );
+                // Pending notes are useful only if the live assistant remains
+                // visible. If space is tight, compact/drop pending preview rows
+                // first; the full text is committed after the turn.
+                let max_pending = if budget >= 6 { budget - 3 } else { 0 };
+                if pending.len() > max_pending {
+                    pending = render::tail_truncate(pending, max_pending);
+                }
+                let assistant_budget = budget.saturating_sub(pending.len());
+                let mut rows = render::tail_truncate(full, assistant_budget);
+                rows.extend(pending);
+                rows
             }
             _ => Vec::new(),
         };
@@ -1638,22 +1871,71 @@ impl App {
                 // so surface the error and clear the streaming state
                 // the fire site set up.
                 if self.pending_ask_ids.remove(&id) {
+                    let was_interjection = self.queued_interjection_ask_ids.remove(&id);
                     if let Some(err) = error {
-                        self.streaming_route = None;
-                        self.live_turn = None;
-                        // Terminal repaint (mu-d2hx): no session.done will
-                        // come for this ask, so THIS arm must transition
-                        // the status projection or the spinner freezes.
-                        self.session_phase = SessionPhase::on_turn_end(true, None, None);
-                        self.phase_elapsed_ms = 0;
-                        let width = vp.area().width as usize;
-                        let wrap = width.saturating_sub(2);
-                        let lines = render::error_block(&format!("ask failed: {err}"), wrap);
-                        let h = lines.len() as u16;
-                        vp.insert_before(h, |buf| {
-                            let p = Paragraph::new(lines);
-                            ratatui::widgets::Widget::render(p, buf.area, buf);
-                        })?;
+                        if was_interjection {
+                            let before = self.pending_interjections.len();
+                            self.pending_interjections.retain(|p| p.request_id != id);
+                            let removed_pending = self.pending_interjections.len() != before;
+                            if !removed_pending {
+                                self.queued_interjection_response_count =
+                                    self.queued_interjection_response_count.saturating_sub(1);
+                            }
+                            self.set_flash("queued interjection failed".to_string());
+                            let width = vp.area().width as usize;
+                            let wrap = width.saturating_sub(2);
+                            let lines =
+                                render::error_block(&format!("queued ask failed: {err}"), wrap);
+                            let h = lines.len() as u16;
+                            vp.insert_before(h, |buf| {
+                                let p = Paragraph::new(lines);
+                                ratatui::widgets::Widget::render(p, buf.area, buf);
+                            })?;
+                        } else {
+                            let width = vp.area().width as usize;
+                            let wrap = width.saturating_sub(2);
+                            let has_queued_interjections = !self.pending_interjections.is_empty()
+                                || !self.queued_interjection_ask_ids.is_empty()
+                                || self.queued_interjection_response_count > 0;
+                            self.live_turn = None;
+                            if has_queued_interjections {
+                                // Later queued ask_session requests have already been sent to the
+                                // daemon. Do not drop their request ids or pending user blocks just
+                                // because the leading ask failed at RPC level: their own responses
+                                // may still arrive. Commit the queued user blocks now so any later
+                                // assistant turn does not land without the prompt that caused it.
+                                let newly_committed =
+                                    self.commit_pending_interjections(vp, wrap)?;
+                                self.queued_interjection_response_count += newly_committed;
+                                self.awaiting_queued_interjection_response =
+                                    self.queued_interjection_response_count > 0
+                                        || !self.queued_interjection_ask_ids.is_empty();
+                                self.streaming_route = if self.awaiting_queued_interjection_response
+                                {
+                                    Some(TurnRoute::Main)
+                                } else {
+                                    None
+                                };
+                            } else {
+                                self.streaming_route = None;
+                                self.awaiting_queued_interjection_response = false;
+                                self.queued_interjection_response_count = 0;
+                            }
+                            // Terminal repaint (mu-d2hx): no session.done will
+                            // come for this ask, so THIS arm must transition
+                            // the status projection or the spinner freezes.
+                            self.session_phase = SessionPhase::on_turn_end(true, None, None);
+                            self.phase_elapsed_ms = 0;
+                            let lines = render::error_block(&format!("ask failed: {err}"), wrap);
+                            let h = lines.len() as u16;
+                            vp.insert_before(h, |buf| {
+                                let p = Paragraph::new(lines);
+                                ratatui::widgets::Widget::render(p, buf.area, buf);
+                            })?;
+                        }
+                    }
+                    if was_interjection {
+                        self.clear_queued_interjection_bridge_if_idle();
                     }
                 }
                 // Unknown response ids: tolerate silently (defensive —
@@ -1795,7 +2077,11 @@ impl App {
                 self.open_in_editor(vp)?;
             }
             (m, KeyCode::Char('c')) if m.contains(KeyModifiers::CONTROL) => {
-                match ctrl_c_intent(self.prompt.is_empty(), self.live_turn.is_some()) {
+                match ctrl_c_intent(
+                    self.prompt.is_empty(),
+                    self.live_turn.is_some(),
+                    self.main_session_busy(),
+                ) {
                     CancelKeyIntent::ClearPrompt => {
                         self.prompt.clear();
                         self.selected_block = None;
@@ -1846,7 +2132,7 @@ impl App {
             (_, KeyCode::Esc) => {
                 match esc_intent(
                     self.prompt.is_empty(),
-                    self.live_turn.is_some(),
+                    self.live_turn.is_some() || self.main_session_busy(),
                     self.selected_block.is_some(),
                 ) {
                     Some(CancelKeyIntent::ClearPrompt) => {
@@ -2413,14 +2699,120 @@ impl App {
         Ok(())
     }
 
-    /// Send a user prompt: emit the "you" block to scrollback, then
-    /// fire `session.ask`.
+    fn main_session_busy(&self) -> bool {
+        main_session_busy_state(
+            self.live_turn.as_ref().map(|t| t.route),
+            self.streaming_route,
+            self.awaiting_queued_interjection_response,
+            self.pending_interjections.len(),
+            self.queued_interjection_ask_ids.len(),
+            self.queued_interjection_response_count,
+        )
+    }
+
+    fn clear_queued_interjection_bridge_if_idle(&mut self) {
+        let live_main = self
+            .live_turn
+            .as_ref()
+            .map(|t| t.route == TurnRoute::Main)
+            .unwrap_or(false);
+        if self.queued_interjection_ask_ids.is_empty()
+            && self.pending_interjections.is_empty()
+            && self.queued_interjection_response_count == 0
+            && !live_main
+        {
+            self.awaiting_queued_interjection_response = false;
+            if self.streaming_route == Some(TurnRoute::Main) {
+                self.streaming_route = None;
+            }
+            if self.session_phase == SessionPhase::AwaitingFirstToken {
+                self.session_phase = SessionPhase::Idle;
+            }
+        }
+    }
+
+    fn clear_queued_interjection_state_after_cancel(&mut self) {
+        for id in self.queued_interjection_ask_ids.drain() {
+            self.pending_ask_ids.remove(&id);
+        }
+        self.pending_interjections.clear();
+        self.queued_interjection_response_count = 0;
+        self.awaiting_queued_interjection_response = false;
+        if self.live_turn.is_none() && self.streaming_route == Some(TurnRoute::Main) {
+            self.streaming_route = None;
+        }
+        if self.live_turn.is_none() && self.session_phase == SessionPhase::AwaitingFirstToken {
+            self.session_phase = SessionPhase::Idle;
+        }
+    }
+
+    fn pending_interjection_timing(&self) -> PendingInterjectionTiming {
+        pending_interjection_timing_state(self.live_turn.as_ref().map(|t| t.route))
+    }
+
+    fn live_turn_for_route(&mut self, route: TurnRoute) -> &mut Turn {
+        if self.live_turn.is_none() {
+            self.streaming_route = Some(route);
+        }
+        self.live_turn.get_or_insert_with(|| Turn::new(route))
+    }
+
+    /// Send a user prompt. If the main session is idle, emit the ordinary
+    /// user block and start a live assistant turn. If the main assistant is
+    /// already streaming, queue the ask at the daemon layer but keep it as a
+    /// pending interjection in the UI until the response the operator had not
+    /// seen is committed.
     fn send_prompt(&mut self, vp: &mut DynamicViewport, text: &str) -> Result<()> {
         self.selected_block = None;
-        self.transcript
-            .push(TranscriptBlock::user(TurnRoute::Main, text.to_string()));
-        self.emit_you_block(vp, text)?;
-        self.fire_ask(vp, text)
+        if self.main_session_busy() {
+            self.queue_main_interjection(text)
+        } else {
+            self.transcript
+                .push(TranscriptBlock::user(TurnRoute::Main, text.to_string()));
+            self.emit_you_block(vp, text)?;
+            self.fire_ask(vp, text)
+        }
+    }
+
+    fn queue_main_interjection(&mut self, wire_text: &str) -> Result<()> {
+        let id = self.client.request_nowait(
+            "ask_session",
+            serde_json::json!({
+                "session_id": self.session_id,
+                "user_message": wire_text,
+                "effort": self.effort.clone(),
+            }),
+        )?;
+        self.pending_ask_ids.insert(id);
+        self.queued_interjection_ask_ids.insert(id);
+        let timing = self.pending_interjection_timing();
+        self.pending_interjections
+            .push(PendingInterjection::new(id, wire_text, timing));
+        self.set_flash(timing.label().to_string());
+        Ok(())
+    }
+
+    fn commit_pending_interjections(
+        &mut self,
+        vp: &mut DynamicViewport,
+        wrap_width: usize,
+    ) -> Result<usize> {
+        let pending = std::mem::take(&mut self.pending_interjections);
+        let committed = pending.len();
+        for interjection in pending {
+            let label = interjection.label();
+            let mut block =
+                TranscriptBlock::new(TranscriptKind::User, label, interjection.body.clone());
+            block.route = Some(TurnRoute::Main);
+            self.transcript.push(block);
+            let lines = pending_interjection_commit_lines(&interjection, wrap_width);
+            let h = lines.len() as u16;
+            vp.insert_before(h, |buf| {
+                let p = Paragraph::new(lines);
+                ratatui::widgets::Widget::render(p, buf.area, buf);
+            })?;
+        }
+        Ok(committed)
     }
 
     /// Show the "you" block in scrollback without sending anything.
@@ -2478,7 +2870,8 @@ impl App {
     /// coherently in the side conversation.
     ///
     /// v0 constraint: only one in-flight turn at a time across both
-    /// routes. If main is streaming, /btw refuses with a hint to wait.
+    /// routes. If any turn is live, or a queued main-session interjection is
+    /// waiting for its response, /btw refuses with a hint to wait.
     fn cmd_btw(&mut self, vp: &mut DynamicViewport, msg: &str) -> Result<()> {
         if msg.is_empty() {
             let lines: Vec<Line<'static>> = vec![
@@ -2500,11 +2893,11 @@ impl App {
             })?;
             return Ok(());
         }
-        if self.live_turn.is_some() {
+        if self.live_turn.is_some() || self.main_session_busy() {
             let lines: Vec<Line<'static>> = vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    "wait — main turn still streaming".to_string(),
+                    "wait — turn still in flight".to_string(),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -3326,6 +3719,13 @@ impl App {
                     .and_then(|v| v.as_str())
                     .unwrap_or("(unknown)")
                     .to_string();
+                let target_is_main_session = sid == self.session_id;
+                if should_clear_queued_interjection_state_after_cancel(
+                    canceled,
+                    target_is_main_session,
+                ) {
+                    self.clear_queued_interjection_state_after_cancel();
+                }
                 if canceled {
                     CancelFeedback::Canceled {
                         session_id: sid,
@@ -3524,7 +3924,7 @@ impl App {
     /// by prepending it to the user's message. If no message was
     /// provided, sends just the skill body with a brief preamble.
     fn cmd_skill(&mut self, vp: &mut DynamicViewport, skill_name: &str, tail: &str) -> Result<()> {
-        if self.live_turn.is_some() {
+        if self.live_turn.is_some() || self.main_session_busy() {
             let lines: Vec<Line<'static>> = vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -4009,9 +4409,7 @@ impl App {
                     return Ok(());
                 }
                 let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-                self.live_turn
-                    .get_or_insert_with(|| Turn::new(route))
-                    .push_text(delta);
+                self.live_turn_for_route(route).push_text(delta);
             }
             "session.assistant_text_finalized" => {
                 // Replace the current segment's streamed text with the
@@ -4023,7 +4421,7 @@ impl App {
                 let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 if !text.is_empty() {
                     let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-                    let turn = self.live_turn.get_or_insert_with(|| Turn::new(route));
+                    let turn = self.live_turn_for_route(route);
                     match turn.items.last_mut() {
                         Some(render::TurnItem::Text(s)) => *s = text.to_string(),
                         _ => turn.items.push(render::TurnItem::Text(text.to_string())),
@@ -4038,9 +4436,7 @@ impl App {
                     return Ok(());
                 }
                 let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-                self.live_turn
-                    .get_or_insert_with(|| Turn::new(route))
-                    .push_thinking(delta);
+                self.live_turn_for_route(route).push_thinking(delta);
             }
             "session.thinking_finalized" => {
                 // Mirror assistant_text_finalized: replace the streamed
@@ -4051,7 +4447,7 @@ impl App {
                 let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 if !text.is_empty() {
                     let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-                    let turn = self.live_turn.get_or_insert_with(|| Turn::new(route));
+                    let turn = self.live_turn_for_route(route);
                     match turn
                         .items
                         .iter_mut()
@@ -4078,7 +4474,7 @@ impl App {
                     return Ok(());
                 }
                 let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-                let turn = self.live_turn.get_or_insert_with(|| Turn::new(route));
+                let turn = self.live_turn_for_route(route);
                 if turn.tool_call_mut(id).is_none() {
                     turn.items.push(render::TurnItem::ToolCall {
                         tool_call_id: id.to_string(),
@@ -4126,7 +4522,7 @@ impl App {
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
                 let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-                let turn = self.live_turn.get_or_insert_with(|| Turn::new(route));
+                let turn = self.live_turn_for_route(route);
                 if turn.tool_call_mut(id).is_some() {
                     if let Some(render::TurnItem::ToolCall {
                         display_name: dn,
@@ -4172,8 +4568,7 @@ impl App {
                     _ => String::new(),
                 };
                 let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-                self.live_turn
-                    .get_or_insert_with(|| Turn::new(route))
+                self.live_turn_for_route(route)
                     .items
                     .push(render::TurnItem::ToolResult { kind, text });
             }
@@ -4209,7 +4604,23 @@ impl App {
                     .and_then(|v| v.as_u64())
                     .map(|n| n as u32);
                 let iteration_cap = !is_error && stop_reason == Some("iteration_cap");
-                self.session_phase = SessionPhase::on_turn_end(is_error, stop_reason, turn_count);
+                let finished_main = (sid.is_empty() || sid == self.session_id)
+                    && self
+                        .live_turn
+                        .as_ref()
+                        .map(|t| t.route == TurnRoute::Main)
+                        .unwrap_or(self.streaming_route == Some(TurnRoute::Main));
+                let queued_responses_after_current = queued_responses_after_terminal(
+                    finished_main,
+                    self.queued_interjection_response_count,
+                );
+                let will_await_queued_main = should_await_queued_main(
+                    finished_main,
+                    self.pending_interjections.len(),
+                    queued_responses_after_current,
+                );
+                self.session_phase =
+                    phase_after_turn_end(is_error, stop_reason, turn_count, will_await_queued_main);
                 self.phase_elapsed_ms = 0;
 
                 // mu-solo-osc-notify-mbmn: surface main-session turn
@@ -4235,12 +4646,12 @@ impl App {
                             self.model,
                             turn_budget_copy(turn_count)
                         ));
-                    } else if method == "session.done" {
+                    } else if method == "session.done" && !will_await_queued_main {
                         crate::notify::notify(&format!(
                             "mu ({}) is waiting for your input",
                             self.model
                         ));
-                    } else {
+                    } else if method == "session.error" {
                         crate::notify::notify(&format!(
                             "mu ({}): turn ended with an error",
                             self.model
@@ -4386,6 +4797,16 @@ impl App {
                         })?;
                     }
                 }
+                if finished_main {
+                    // R1/R2: a queued interjection did not feed the response
+                    // above, so commit it AFTER that response, but with a
+                    // label that preserves the concurrent authoring time.
+                    let newly_committed = self.commit_pending_interjections(vp, wrap_width)?;
+                    self.queued_interjection_response_count =
+                        queued_responses_after_current + newly_committed;
+                    self.awaiting_queued_interjection_response =
+                        self.queued_interjection_response_count > 0;
+                }
                 // mu-d2hx item b: an iteration-cap stop renders DISTINCTLY
                 // in the transcript (in addition to the status line) — the
                 // turn budget ran out; the session did not hang and did not
@@ -4411,7 +4832,11 @@ impl App {
                         ratatui::widgets::Widget::render(p, buf.area, buf);
                     })?;
                 }
-                self.streaming_route = None;
+                self.streaming_route = if will_await_queued_main {
+                    Some(TurnRoute::Main)
+                } else {
+                    None
+                };
             }
             _ => {} // ignore unhandled notifications for v0
         }
@@ -4705,20 +5130,240 @@ const MAX_VIEWPORT_HEIGHT: u16 = 20;
 mod tests {
     use super::*;
 
+    fn line_plain(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    fn lines_plain(lines: &[Line<'_>]) -> Vec<String> {
+        lines.iter().map(line_plain).collect()
+    }
+
+    #[test]
+    fn hsyt_queued_followup_keeps_phase_live_after_previous_done() {
+        assert_eq!(
+            phase_after_turn_end(false, None, None, true),
+            SessionPhase::AwaitingFirstToken
+        );
+        assert_eq!(
+            phase_after_turn_end(false, None, None, false),
+            SessionPhase::Idle
+        );
+        assert_eq!(
+            phase_after_turn_end(true, None, None, true),
+            SessionPhase::Errored
+        );
+        assert_eq!(
+            phase_after_turn_end(false, Some("iteration_cap"), Some(20), true),
+            SessionPhase::TurnBudgetExhausted {
+                turn_count: Some(20)
+            }
+        );
+    }
+
+    #[test]
+    fn hsyt_ctrl_c_cancels_queued_response_gap_instead_of_quitting() {
+        assert!(!ctrl_c_should_cancel(false, false, true));
+        assert!(ctrl_c_should_cancel(true, true, false));
+        assert!(ctrl_c_should_cancel(true, false, true));
+        assert!(!ctrl_c_should_cancel(true, false, false));
+    }
+
+    #[test]
+    fn hsyt_cancel_clears_queued_state_only_for_canceled_main_session() {
+        assert!(should_clear_queued_interjection_state_after_cancel(
+            true, true
+        ));
+        assert!(!should_clear_queued_interjection_state_after_cancel(
+            false, true
+        ));
+        assert!(!should_clear_queued_interjection_state_after_cancel(
+            true, false
+        ));
+    }
+
+    #[test]
+    fn hsyt_main_session_busy_includes_outstanding_queued_interjections() {
+        assert!(main_session_busy_state(None, None, true, 0, 0, 0));
+        assert!(main_session_busy_state(None, None, false, 1, 0, 0));
+        assert!(main_session_busy_state(None, None, false, 0, 1, 0));
+        assert!(main_session_busy_state(None, None, false, 0, 0, 1));
+        assert!(main_session_busy_state(
+            Some(TurnRoute::Main),
+            None,
+            false,
+            0,
+            0,
+            0
+        ));
+        assert!(main_session_busy_state(
+            None,
+            Some(TurnRoute::Main),
+            false,
+            0,
+            0,
+            0
+        ));
+        assert!(!main_session_busy_state(None, None, false, 0, 0, 0));
+        assert!(!main_session_busy_state(
+            Some(TurnRoute::Btw),
+            None,
+            false,
+            0,
+            0,
+            0
+        ));
+    }
+
+    #[test]
+    fn hsyt_interjection_timing_distinguishes_live_response_from_bridge_gap() {
+        assert_eq!(
+            pending_interjection_timing_state(Some(TurnRoute::Main)),
+            PendingInterjectionTiming::WhileResponding
+        );
+        assert_eq!(
+            pending_interjection_timing_state(None),
+            PendingInterjectionTiming::BeforeQueuedResponse
+        );
+        assert_eq!(
+            pending_interjection_timing_state(Some(TurnRoute::Btw)),
+            PendingInterjectionTiming::BeforeQueuedResponse
+        );
+    }
+
+    #[test]
+    fn hsyt_queued_response_count_drops_current_terminal_before_awaiting() {
+        assert_eq!(queued_responses_after_terminal(true, 0), 0);
+        assert_eq!(queued_responses_after_terminal(true, 1), 0);
+        assert_eq!(queued_responses_after_terminal(true, 2), 1);
+        assert_eq!(queued_responses_after_terminal(false, 2), 2);
+    }
+
+    #[test]
+    fn hsyt_awaits_remaining_queued_requests_after_committing_pending_text() {
+        assert!(should_await_queued_main(true, 0, 1));
+        assert!(should_await_queued_main(true, 1, 0));
+        assert!(!should_await_queued_main(true, 0, 0));
+        assert!(!should_await_queued_main(false, 1, 1));
+    }
+
+    #[test]
+    fn hsyt_pending_interjection_preview_preserves_order_and_compacts() {
+        let pending = vec![
+            PendingInterjection::new(
+                10,
+                "gorillas specifically",
+                PendingInterjectionTiming::WhileResponding,
+            ),
+            PendingInterjection::new(
+                11,
+                "also skip orangutans",
+                PendingInterjectionTiming::WhileResponding,
+            ),
+            PendingInterjection::new(
+                12,
+                "compare silverbacks",
+                PendingInterjectionTiming::WhileResponding,
+            ),
+            PendingInterjection::new(
+                13,
+                "note conservation status",
+                PendingInterjectionTiming::WhileResponding,
+            ),
+        ];
+
+        let plain = lines_plain(&pending_interjection_preview_lines(&pending, 80));
+
+        assert!(plain[0].contains(PENDING_INTERJECTION_RESPONDING_LABEL));
+        assert!(plain
+            .iter()
+            .any(|line| line.contains("#1 gorillas specifically")));
+        assert!(plain
+            .iter()
+            .any(|line| line.contains("#2 also skip orangutans")));
+        assert!(plain
+            .iter()
+            .any(|line| line.contains("#3 compare silverbacks")));
+        assert!(plain.iter().any(|line| line.contains("+1 more queued")));
+        assert!(
+            !plain
+                .iter()
+                .any(|line| line.contains("note conservation status")),
+            "fourth full body should be compacted behind the +N row"
+        );
+    }
+
+    #[test]
+    fn hsyt_pending_interjection_preview_uses_waiting_label_for_busy_gap() {
+        let pending = vec![PendingInterjection::new(
+            10,
+            "one more detail",
+            PendingInterjectionTiming::BeforeQueuedResponse,
+        )];
+
+        let plain = lines_plain(&pending_interjection_preview_lines(&pending, 80));
+
+        assert!(plain[0].contains(PENDING_INTERJECTION_WAITING_LABEL));
+        assert!(plain.iter().any(|line| line.contains("one more detail")));
+    }
+
+    #[test]
+    fn hsyt_pending_interjection_preview_uses_mixed_label_for_mixed_timings() {
+        let pending = vec![
+            PendingInterjection::new(
+                10,
+                "during response",
+                PendingInterjectionTiming::WhileResponding,
+            ),
+            PendingInterjection::new(
+                11,
+                "before queued response",
+                PendingInterjectionTiming::BeforeQueuedResponse,
+            ),
+        ];
+
+        let plain = lines_plain(&pending_interjection_preview_lines(&pending, 80));
+
+        assert!(plain[0].contains(PENDING_INTERJECTION_MIXED_LABEL));
+    }
+
+    #[test]
+    fn hsyt_pending_interjection_commit_uses_temporal_label() {
+        let interjection = PendingInterjection::new(
+            10,
+            "gorillas specifically",
+            PendingInterjectionTiming::WhileResponding,
+        );
+        let plain = lines_plain(&pending_interjection_commit_lines(&interjection, 80));
+
+        assert!(plain[0].contains(PENDING_INTERJECTION_RESPONDING_LABEL));
+        assert!(plain
+            .iter()
+            .any(|line| line.contains("gorillas specifically")));
+    }
+
     #[test]
     fn cancel_key_intents_are_non_destructive_until_idle() {
         assert_eq!(
-            ctrl_c_intent(false, true),
+            ctrl_c_intent(false, true, false),
             CancelKeyIntent::ClearPrompt,
             "Ctrl-C first clears draft text rather than hiding it with a cancel"
         );
         assert_eq!(
-            ctrl_c_intent(true, true),
+            ctrl_c_intent(true, true, false),
             CancelKeyIntent::CancelOutstanding,
             "empty prompt + live turn cancels the response instead of exiting"
         );
         assert_eq!(
-            ctrl_c_intent(true, false),
+            ctrl_c_intent(true, false, true),
+            CancelKeyIntent::CancelOutstanding,
+            "empty prompt + queued-response gap cancels instead of exiting"
+        );
+        assert_eq!(
+            ctrl_c_intent(true, false, false),
             CancelKeyIntent::Quit,
             "idle Ctrl-C remains the explicit exit path"
         );
@@ -4729,7 +5374,7 @@ mod tests {
         assert_eq!(
             esc_intent(true, true, false),
             Some(CancelKeyIntent::CancelOutstanding),
-            "Esc becomes the safe in-app cancel key during a stream"
+            "Esc becomes the safe in-app cancel key during a stream or queued gap"
         );
         assert_eq!(
             esc_intent(true, false, true),

@@ -1,112 +1,64 @@
 #!/bin/sh
-# with-ollama-lease — run a command while holding exclusive use of the shared
-# ollama box, coordinated through agent-slot's etcd session registry.
+# with-ollama-lease — coordinate exclusive use of the shared ollama box via
+# etcd's FAIR lock primitive (concurrency.Mutex, exposed by `etcdctl lock`)
+# instead of agent-slot's single-key CAS. WAIT callers get an ordered FIFO turn
+# (no race, no starvation); route-around + probe preserved; fail-open on outage.
 #
-# WHY: the box can't co-resident two large models; concurrent different-model
-# loads evict/reload-thrash each other (bead mu-0pqk). mu never sends num_ctx
-# (it talks ollama over the Anthropic wire), so the window is fixed at the
-# server and the ONLY lever against thrash is serialising who uses the box.
-# This is a COOPERATIVE lock: every consumer (the mu ask / claude -p launcher,
-# the review panel, mu-solo, benchmarks) must acquire it or route around it.
+# Modes (unchanged surface):
+#   with-ollama-lease <cmd...>              WAIT: block in the FIFO queue until it's
+#                                           our turn, acquire, run, release.
+#   with-ollama-lease --skip-if-held <cmd>  ROUTE-AROUND: if held by anyone, exit 75
+#                                           WITHOUT running (caller picks another model);
+#                                           else acquire, run, release.
+#   with-ollama-lease --held                PROBE (no run): exit 0 if held, else 1.
 #
-# Reuses agent-slot's session registry as a named mutex on "ollama-box":
-# `register` is atomic CAS that REFUSES a name held by a different owner, and
-# the etcd lease self-expires at TTL so a crashed holder never wedges the box.
-# The etcd endpoint comes from agent-slot's own default (AGENT_SLOT_ETCD).
+# vs v1: WAIT is now a fair queue (etcdctl lock), not a poll-race against in-loop
+# re-lockers. Crash-safety is the lock's --ttl lease (self-expires). Fail-open on
+# etcd outage is preserved (run WITHOUT the lease rather than block all inference).
 #
-# Deploy: tracked here; ~/.local/bin/with-ollama-lease is a symlink to this file
-# (callable bare by the review scripts and by the operator for `with-ollama-lease
-# mu-solo`). Source of truth is the repo, not the bin copy.
-#
-# Modes:
-#   with-ollama-lease <cmd...>              WAIT: poll until free, acquire, run, release.
-#   with-ollama-lease --skip-if-held <cmd>  ROUTE-AROUND: if another owner holds it,
-#                                           exit 75 (EX_TEMPFAIL) WITHOUT running so the
-#                                           caller can pick a non-ollama model; else
-#                                           acquire, run, release.
-#   with-ollama-lease --held                PROBE (no run): exit 0 if held by ANOTHER
-#                                           owner (caller should route around), else 1.
-#
-# Identity: the holder is $AGENT_SESSION_OWNER. A multi-call consumer (e.g. one
-# ai-review run) should export ONE owner so its own calls agree and OTHER runs
-# are excluded; defaults to a per-invocation id otherwise.
-#
-# Fail-open: an etcd outage makes the read-only probe report "not held" and the
-# acquire fail, so the command runs WITHOUT the lease rather than blocking all
-# local inference — a coordination outage must not halt work (it logs a warning).
-#
-# Tunables:
-#   OLLAMA_LEASE_NAME          mutex name        (default: ollama-box)
-#   AGENT_SESSION_OWNER        holder identity   (default: ollama-lease/<host>/<pid>)
-#   AGENT_SESSION_TTL          lease TTL seconds (default: 1200, > the 900s reviewer cap)
-#   OLLAMA_LEASE_WAIT_TIMEOUT  WAIT-mode cap     (default: 1800)
-#   OLLAMA_LEASE_POLL          WAIT poll seconds (default: 5)
-#   AGENT_SLOT_ETCD            etcd endpoints    (default: agent-slot's own default)
+# Tunables: OLLAMA_LEASE_NAME (default ollama-box), AGENT_SESSION_TTL (lease sec,
+# default 1200), AGENT_SLOT_ETCD (etcd endpoints).
 set -u
 
+EP="${AGENT_SLOT_ETCD:-http://10.1.1.172:2379}"
 NAME="${OLLAMA_LEASE_NAME:-ollama-box}"
-: "${AGENT_SESSION_OWNER:=ollama-lease/$(hostname -s)/$$}"
-export AGENT_SESSION_OWNER
-: "${AGENT_SESSION_TTL:=1200}"
-export AGENT_SESSION_TTL
-POLL="${OLLAMA_LEASE_POLL:-5}"
-WAIT_TIMEOUT="${OLLAMA_LEASE_WAIT_TIMEOUT:-1800}"
+LOCK="ollama-lock/${NAME}"                 # etcd lock prefix; holder key = ${LOCK}/<lease-hex>
+TTL="${AGENT_SESSION_TTL:-1200}"
+EC="etcdctl --endpoints=${EP}"
 
-# Read-only: is NAME registered by an owner OTHER than me? agent-slot sessions
-# prints "SESSION OWNER TTL" columns; match the name row and compare owner.
-held_by_other() {
-  agent-slot sessions 2>/dev/null | awk -v n="$NAME" -v me="$AGENT_SESSION_OWNER" '
-    $1==n && $2!=me { found=1 }
-    END { exit(found?0:1) }
-  '
+held() {   # is the lock currently held by anyone? holder key lives under ${LOCK}/
+  [ -n "$($EC get --prefix --keys-only "${LOCK}/" 2>/dev/null | head -1)" ]
 }
+etcd_up() { $EC --command-timeout=3s endpoint health >/dev/null 2>&1; }
 
-acquire() { agent-slot register "$NAME" >/dev/null 2>&1; }   # 0=ours now, !=0=held by other
-release() { agent-slot unregister "$NAME" >/dev/null 2>&1 || true; }
+run_locked() {   # fair WAIT-acquire, run "$@", release — or fail-open if etcd is down
+  if ! etcd_up; then
+    echo "with-ollama-lease: etcd unreachable; running WITHOUT lease (fail-open)" >&2
+    exec "$@"
+  fi
+  # command-timeout=0: don't bound the wrapped command; the lock's fair queue +
+  # the --ttl lease bound the wait (our turn comes, and a crashed holder expires).
+  exec $EC --command-timeout=0 lock --ttl "$TTL" "$LOCK" -- "$@"
+}
 
 case "${1:-}" in
   --held)
-    held_by_other && exit 0 || exit 1
+    held && exit 0 || exit 1
     ;;
   --skip-if-held)
     shift
     [ "$#" -gt 0 ] || { echo "with-ollama-lease: --skip-if-held needs a command" >&2; exit 2; }
-    # Route-around decision is the read-only probe, so an etcd OUTAGE (probe
-    # fails -> "not held") falls through to acquire-or-fail-open rather than
-    # being misread as "held".
-    if held_by_other; then
-      echo "with-ollama-lease: ollama box held by another owner; skipping (route around)" >&2
+    if etcd_up && held; then
+      echo "with-ollama-lease: ${NAME} held by another; routing around (exit 75)" >&2
       exit 75
     fi
-    if acquire; then
-      trap release EXIT INT TERM
-      "$@"
-    else
-      echo "with-ollama-lease: could not acquire lease (etcd unreachable or lost a race); proceeding WITHOUT lease (fail-open)" >&2
-      "$@"
-    fi
+    run_locked "$@"
     ;;
   "")
     echo "with-ollama-lease: needs a command (or --held / --skip-if-held)" >&2
     exit 2
     ;;
   *)
-    # WAIT: block while another owner holds it (read-only probe, so an etcd
-    # outage reads as "free" and falls through to acquire-or-fail-open).
-    waited=0
-    while held_by_other; do
-      if [ "$waited" -ge "$WAIT_TIMEOUT" ]; then
-        echo "with-ollama-lease: timed out after ${WAIT_TIMEOUT}s waiting; proceeding WITHOUT lease (fail-open)" >&2
-        break
-      fi
-      sleep "$POLL"; waited=$((waited + POLL))
-    done
-    if acquire; then
-      trap release EXIT INT TERM
-      "$@"
-    else
-      echo "with-ollama-lease: could not acquire lease (etcd unreachable or lost a race); proceeding WITHOUT lease (fail-open)" >&2
-      "$@"
-    fi
+    run_locked "$@"      # WAIT — fair FIFO queue
     ;;
 esac

@@ -2,13 +2,16 @@
 //! provider×model combinations and their properties.
 //!
 //! Built at daemon startup from environment probing (which API keys
-//! are set?) and hardcoded model lists. Queryable by front ends via
+//! are set?), hardcoded seed routes, `mu models sync` generated
+//! provider layers, and explicit operator favorites. Queryable by
+//! front ends via
 //! `daemon.list_routes` RPC or `mu://routes/available` MCP resource.
 //!
 //! Each entry carries a blake3 hash so clients can send `set_route`
 //! with the hash they selected from, and the daemon can reject stale
 //! picks if the catalog changed between query and submit.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -69,6 +72,53 @@ pub struct RouteEntry {
     pub hash: Arc<str>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ProviderAvailability {
+    anthropic_key: bool,
+    openai_key: bool,
+    openrouter_key: bool,
+    vllm_configured: bool,
+}
+
+impl ProviderAvailability {
+    fn from_env() -> Self {
+        Self {
+            anthropic_key: env_nonempty("ANTHROPIC_API_KEY"),
+            openai_key: env_nonempty("OPENAI_API_KEY"),
+            openrouter_key: env_nonempty("OPENROUTER_API_KEY"),
+            vllm_configured: env_nonempty("VLLM_API_BASE"),
+        }
+    }
+
+    #[cfg(test)]
+    fn all_configured() -> Self {
+        Self {
+            anthropic_key: true,
+            openai_key: true,
+            openrouter_key: true,
+            vllm_configured: true,
+        }
+    }
+
+    fn configured(self, provider_kind: &str) -> bool {
+        match provider_kind {
+            "anthropic_api" | "anthropic_oauth" => self.anthropic_key,
+            "openai_codex" | "openai_api" => self.openai_key,
+            "openrouter" => self.openrouter_key,
+            "vllm" => self.vllm_configured,
+            // Local providers have no credential bit. A generated ollama layer
+            // means the operator deliberately synced/selected those tags; live
+            // reachability is still checked by the provider when a turn runs.
+            "ollama" | "faux" => true,
+            _ => false,
+        }
+    }
+}
+
+fn env_nonempty(key: &str) -> bool {
+    std::env::var(key).ok().is_some_and(|s| !s.is_empty())
+}
+
 #[derive(Debug, Clone)]
 pub struct RouteCatalog {
     entries: Vec<RouteEntry>,
@@ -76,28 +126,32 @@ pub struct RouteCatalog {
 
 impl RouteCatalog {
     pub fn from_env() -> Self {
-        let anthropic_key = std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .is_some();
-        let openai_key = std::env::var("OPENAI_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .is_some();
-        let openrouter_key = std::env::var("OPENROUTER_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .is_some();
-        let vllm_configured = std::env::var("VLLM_API_BASE")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .is_some();
+        let availability = ProviderAvailability::from_env();
 
         // mu-nzxa: resolve the enrichment catalog ONCE and thread it into
         // build_entry, rather than each entry reaching for global(). The
         // public path passes the process-global catalog; tests pass a
         // controlled one so a user's models.toml can't change asserted values.
         let catalog = model_catalog::global();
+        let mut out = Self::from_catalog_with_availability(catalog, availability);
+
+        // mu-generated-model-routes-uc3n: `mu models sync` writes provider-
+        // scoped generated layers that `model_catalog::load()` already uses
+        // for enrichment. Route discovery must consume the same layers as
+        // route SOURCES too; otherwise the daemon/frontends know the limits for
+        // synced models but still cannot select them.
+        if let Some(p) = model_catalog::default_config_path() {
+            out = out
+                .with_generated_layers_for_config(catalog, &p, availability)
+                .with_favorite_routes(catalog, availability);
+        }
+        out
+    }
+
+    fn from_catalog_with_availability(
+        catalog: &model_catalog::ModelCatalogConfig,
+        availability: ProviderAvailability,
+    ) -> Self {
         let mut entries = Vec::new();
 
         for (model, soft, hard) in ANTHROPIC_MODELS {
@@ -105,7 +159,7 @@ impl RouteCatalog {
                 catalog,
                 "anthropic_api",
                 model,
-                anthropic_key,
+                availability.configured("anthropic_api"),
                 Some(*soft),
                 Some(*hard),
             ));
@@ -116,7 +170,7 @@ impl RouteCatalog {
                 catalog,
                 "openai_codex",
                 model,
-                openai_key,
+                availability.configured("openai_codex"),
                 Some(*soft),
                 Some(*hard),
             ));
@@ -127,7 +181,7 @@ impl RouteCatalog {
                 catalog,
                 "openrouter",
                 model,
-                openrouter_key,
+                availability.configured("openrouter"),
                 Some(*soft),
                 Some(*hard),
             ));
@@ -138,7 +192,7 @@ impl RouteCatalog {
                 catalog,
                 "vllm",
                 model,
-                vllm_configured,
+                availability.configured("vllm"),
                 Some(*soft),
                 Some(*hard),
             ));
@@ -191,7 +245,7 @@ impl RouteCatalog {
         S: AsRef<str>,
     {
         for m in models {
-            self.entries.push(build_entry(
+            self.upsert_entry(build_entry(
                 catalog,
                 "ollama",
                 m.as_ref(),
@@ -220,7 +274,7 @@ impl RouteCatalog {
     {
         let catalog = model_catalog::global();
         for m in models {
-            self.entries.push(build_entry(
+            self.upsert_entry(build_entry(
                 catalog,
                 "vllm",
                 m.as_ref(),
@@ -232,6 +286,89 @@ impl RouteCatalog {
             ));
         }
         self
+    }
+
+    fn with_generated_layers_for_config(
+        mut self,
+        catalog: &model_catalog::ModelCatalogConfig,
+        operator_config: &Path,
+        availability: ProviderAvailability,
+    ) -> Self {
+        for path in model_catalog::generated_layers_for(operator_config) {
+            let Some(provider_from_file) = generated_provider_from_path(&path) else {
+                continue;
+            };
+            let provider_kind = canonical_provider_kind(catalog, &provider_from_file);
+            let layer = model_catalog::load_operator_only(&path);
+            self.add_model_entries_for_provider(
+                catalog,
+                &provider_kind,
+                &layer.models,
+                availability,
+            );
+        }
+        self
+    }
+
+    fn with_favorite_routes(
+        mut self,
+        catalog: &model_catalog::ModelCatalogConfig,
+        availability: ProviderAvailability,
+    ) -> Self {
+        for fav in catalog.favorites.values() {
+            let provider_kind = canonical_provider_kind(catalog, &fav.provider);
+            let model = catalog.resolve_model_name(&fav.model);
+            if model.trim().is_empty() {
+                continue;
+            }
+            self.upsert_entry(build_entry(
+                catalog,
+                &provider_kind,
+                &model,
+                availability.configured(&provider_kind),
+                None,
+                None,
+            ));
+        }
+        self
+    }
+
+    fn add_model_entries_for_provider(
+        &mut self,
+        catalog: &model_catalog::ModelCatalogConfig,
+        provider_kind: &str,
+        models: &std::collections::BTreeMap<String, model_catalog::ModelCatalogEntry>,
+        availability: ProviderAvailability,
+    ) {
+        for (key, entry) in models {
+            let raw = entry.model.as_deref().unwrap_or(key.as_str());
+            let model = catalog.resolve_model_name(raw);
+            if model.trim().is_empty() {
+                continue;
+            }
+            self.upsert_entry(build_entry(
+                catalog,
+                provider_kind,
+                &model,
+                availability.configured(provider_kind),
+                None,
+                None,
+            ));
+        }
+    }
+
+    fn upsert_entry(&mut self, entry: RouteEntry) {
+        if let Some(existing) = self.entries.iter_mut().find(|e| {
+            e.provider_kind.as_ref() == entry.provider_kind.as_ref()
+                && e.model.as_ref() == entry.model.as_ref()
+        }) {
+            // A later source (generated layer / live discovery / favorite) can
+            // prove an already-known route is configured. Keep the original
+            // metadata, which was built against the same merged model catalog.
+            existing.configured |= entry.configured;
+            return;
+        }
+        self.entries.push(entry);
     }
 
     pub fn entries(&self) -> &[RouteEntry] {
@@ -326,6 +463,23 @@ fn provider_default_effort(provider_kind: &str, levels: &[Arc<str>]) -> Option<A
         .find(|l| l.as_ref() == preferred)
         .cloned()
         .or_else(|| levels.first().cloned())
+}
+
+fn generated_provider_from_path(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    Some(
+        name.strip_prefix("models.generated.")?
+            .strip_suffix(".toml")?
+            .to_string(),
+    )
+}
+
+fn canonical_provider_kind(catalog: &model_catalog::ModelCatalogConfig, provider: &str) -> String {
+    catalog
+        .provider(provider)
+        .and_then(|p| p.kind.as_deref())
+        .unwrap_or(provider)
+        .to_string()
 }
 
 fn build_entry(
@@ -530,8 +684,12 @@ mod tests {
         // Enrich against the deterministic built-in catalog, NOT the operator's
         // live models.toml — otherwise a user tuning their own qwen3.6
         // max_output_tokens breaks this test (bead mu-nzxa).
-        let catalog = RouteCatalog::from_env()
-            .with_ollama_models_using(&model_catalog::built_in(), ["qwen3.6:35b-a3b-q8_0"]);
+        let built_in = model_catalog::built_in();
+        let catalog = RouteCatalog::from_catalog_with_availability(
+            &built_in,
+            ProviderAvailability::all_configured(),
+        )
+        .with_ollama_models_using(&built_in, ["qwen3.6:35b-a3b-q8_0"]);
         let q = catalog
             .find("ollama", "qwen3.6:35b-a3b-q8_0")
             .expect("discovered qwen3.6 route should be present");
@@ -568,6 +726,167 @@ mod tests {
             Some(v) => std::env::set_var("VLLM_API_BASE", v),
             None => std::env::remove_var("VLLM_API_BASE"),
         }
+    }
+
+    #[test]
+    fn generated_layers_create_selectable_provider_routes() {
+        let dir = std::env::temp_dir().join(format!("mu-route-gen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let op = dir.join("models.toml");
+        std::fs::write(&op, "").unwrap();
+        let gen = model_catalog::generated_path_for_provider(&op, "anthropic_api");
+        std::fs::write(
+            &gen,
+            r#"
+[models.claude-fable-5]
+model = "claude-fable-5"
+context_hard_limit = 1000000
+max_output_tokens = 128000
+effort_levels = ["low", "medium", "high", "xhigh", "max"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = model_catalog::load(Some(&op));
+        let catalog = RouteCatalog::from_catalog_with_availability(
+            &cfg,
+            ProviderAvailability::all_configured(),
+        )
+        .with_generated_layers_for_config(
+            &cfg,
+            &op,
+            ProviderAvailability::all_configured(),
+        );
+        let fable = catalog
+            .find("anthropic_api", "claude-fable-5")
+            .expect("generated anthropic model should become a route");
+        assert!(fable.configured);
+        assert_eq!(fable.context_hard_limit, Some(1_000_000));
+        assert_eq!(fable.max_output_tokens, Some(128_000));
+        assert_eq!(
+            fable
+                .valid_effort_levels
+                .as_ref()
+                .map(|levels| levels.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+            Some(vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string(),
+                "max".to_string(),
+            ])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generated_layers_do_not_duplicate_seed_routes() {
+        let dir = std::env::temp_dir().join(format!("mu-route-dedupe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let op = dir.join("models.toml");
+        std::fs::write(&op, "").unwrap();
+        let gen = model_catalog::generated_path_for_provider(&op, "anthropic_api");
+        std::fs::write(
+            &gen,
+            r#"
+[models.claude-opus-4-8]
+model = "claude-opus-4-8"
+context_hard_limit = 1000000
+max_output_tokens = 128000
+"#,
+        )
+        .unwrap();
+
+        let cfg = model_catalog::load(Some(&op));
+        let catalog = RouteCatalog::from_catalog_with_availability(
+            &cfg,
+            ProviderAvailability::all_configured(),
+        )
+        .with_generated_layers_for_config(
+            &cfg,
+            &op,
+            ProviderAvailability::all_configured(),
+        );
+        let matches = catalog
+            .entries()
+            .iter()
+            .filter(|e| {
+                e.provider_kind.as_ref() == "anthropic_api" && e.model.as_ref() == "claude-opus-4-8"
+            })
+            .count();
+        assert_eq!(matches, 1, "generated layer should enrich, not duplicate");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn favorites_create_routes_for_operator_only_models() {
+        let mut cfg = model_catalog::built_in();
+        cfg.models.insert(
+            "glm".into(),
+            model_catalog::ModelCatalogEntry {
+                model: Some("z-ai/glm-5.2".into()),
+                context_hard_limit: Some(1_048_576),
+                max_output_tokens: Some(32_768),
+                ..Default::default()
+            },
+        );
+        cfg.favorites.insert(
+            "glm".into(),
+            model_catalog::FavoriteConfig {
+                provider: "openrouter".into(),
+                model: "glm".into(),
+                aliases: vec!["glm".into()],
+                ..Default::default()
+            },
+        );
+
+        let catalog = RouteCatalog::from_catalog_with_availability(
+            &cfg,
+            ProviderAvailability::all_configured(),
+        )
+        .with_favorite_routes(&cfg, ProviderAvailability::all_configured());
+        let route = catalog
+            .find("openrouter", "z-ai/glm-5.2")
+            .expect("favorite should create route for its provider/model pair");
+        assert!(route.configured);
+        assert_eq!(route.context_hard_limit, Some(1_048_576));
+        assert_eq!(route.max_output_tokens, Some(32_768));
+        assert!(route.favorites.iter().any(|f| f.name.as_ref() == "glm"));
+    }
+
+    #[test]
+    fn with_ollama_models_dedupes_generated_routes() {
+        let mut cfg = model_catalog::built_in();
+        cfg.models.insert(
+            "local".into(),
+            model_catalog::ModelCatalogEntry {
+                model: Some("qwen3.6:35b-a3b-q8_0".into()),
+                context_hard_limit: Some(262_144),
+                max_output_tokens: Some(32_768),
+                ..Default::default()
+            },
+        );
+        let mut base = RouteCatalog::from_catalog_with_availability(
+            &cfg,
+            ProviderAvailability::all_configured(),
+        );
+        base.add_model_entries_for_provider(
+            &cfg,
+            "ollama",
+            &cfg.models,
+            ProviderAvailability::all_configured(),
+        );
+        let catalog = base.with_ollama_models_using(&cfg, ["qwen3.6:35b-a3b-q8_0"]);
+        let matches = catalog
+            .entries()
+            .iter()
+            .filter(|e| {
+                e.provider_kind.as_ref() == "ollama" && e.model.as_ref() == "qwen3.6:35b-a3b-q8_0"
+            })
+            .count();
+        assert_eq!(matches, 1);
     }
 
     #[test]

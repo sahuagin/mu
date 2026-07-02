@@ -3,9 +3,9 @@
 | field | value |
 | --- | --- |
 | status | operational snapshot / roadmap map |
-| last terrain check | 2026-06-30 |
+| last terrain check | 2026-07-02 |
 | starting revision | `wuoxsolx` / git `6f476383` (`main`, `refactor(dialogue): rip the client-side inbound poller from mu sessions`) |
-| checks run | `jj status`, `just smoke`, `just ci`, targeted `mu-core` tests for `mu-rb4u` / `mu-4n8u` / `mu-kgpg`, targeted `mu-coding` spawn-worker tests, OpenAI canary replay/unit/spec checks, local `spawn_worker` dogfood with parent `openai-codex` and child `faux`, targeted file reads / `code_recall`, selected bead inspection |
+| checks run | `jj status`, `just smoke`, `just ci`, targeted `mu-core` tests for `mu-rb4u` / `mu-4n8u` / `mu-kgpg`, targeted `mu-coding` spawn-worker tests, OpenAI canary replay/unit/spec checks, local `spawn_worker` dogfood with parent `openai-codex` and child `faux`, targeted file reads / `code_recall`, selected bead inspection; 2026-07-02 follow-up: `just ci` over the metered-env scrub + kx prompt hints + parked-autonomy ask diagnostics stack |
 | tracker | central beadsd `mu` remote (`http://10.1.1.172:7771/mcp`) |
 
 This document is the fast map for agents continuing the long-term goal: make
@@ -110,23 +110,30 @@ substrate:
   read-only children and write/yolo parents keep their legitimate write/yolo
   worker path.
 
-Remaining capability work: normal root sessions still need their live
-`Capability.allowed_tools` populated from the launch-time `--tools` grant, rather
-than relying on the per-session `SpawnWorkerTool` to carry that grant for worker
-attenuation. That is the next sharper capability-hardening bead after the
-launcher path itself.
+- Normal root sessions now populate live `Capability.allowed_tools` from the
+  final launch-time session tool vector (base `--tools`, imported MCP tools,
+  plus per-session control/discovery tools). Worker attenuation and discovery
+  now see the same concrete parent authority instead of relying on a
+  spawn-worker-only side grant.
 
 ## mu-solo / frontend terrain
 
 - `mu-solo --profile/-p <name>` exists and selects `[profile.<name>]` from
   `~/.config/mu/solo.toml`, then resolves model aliases through the model
   catalog.
+- Route/model discoverability improved after `fix(routes): expose generated
+  model catalog entries`: `RouteCatalog::from_env()` imports
+  `models.generated.<provider>.toml` entries, and mu-solo's provider/model
+  picker consumes daemon `daemon.list_routes` metadata (provider/model labels,
+  context, max output, configured status) instead of relying only on curated
+  frontend lists.
 - The TUI is usable for daily work but still thin. The big live UX work remains:
   viewport streaming, fullscreen transcript mode, context inspection, rewind,
   multi-session visibility, and route/model discoverability.
-- Frontends should not be sources of provider truth. Known authority leaks:
-  mu-solo computes effort levels and model lists locally in places where the
-  daemon should resolve and send authoritative values.
+- Frontends should not be sources of provider truth. The model list picker now
+  leans on daemon route data; remaining known authority leak: mu-solo still
+  computes valid effort levels locally in places where the daemon should resolve
+  and send authoritative values.
 
 ## MCP / discovery / ai-help terrain
 
@@ -139,6 +146,16 @@ launcher path itself.
   `agent` both speak it.
 - The mu MCP surface implements negotiated `experimental.mu.aiHelp` and custom
   method `mu/aiHelp` to expose trimmed `--help-ai` nodes over MCP.
+- Operator config on 2026-07-02 imports the full current `agent-mcp` memory /
+  task / metrics / kx MCP surface (read and write tools with side-effect
+  classifications) and enables the direct `mu-dialogue` MCP server tools. A live
+  `mu serve --enable-mcp --bare` probe showed `dialogue_poll`,
+  `dialogue_history`, `dialogue_peers`, and `dialogue_say` in
+  `capabilities/discover`.
+- mu now has opt-in prompt-time kx document hints (`[recall].kx = true`): the
+  agent loop runs bounded `agent kx recall` for the current user intent and
+  injects compact doc pointers as a transient span. It is off by default because
+  it may call the configured embedder/API.
 
 Do not treat `t4c find` missing a mu builtin as evidence that mu lacks that
 builtin. Inside mu, prefer the native tool surface (`discover`, `code_recall`,
@@ -146,18 +163,21 @@ etc.); use `t4c` for Claude Code compatibility or host-side checks.
 
 ## Current high-leverage next sequence
 
-1. **Populate root session capabilities from launch grants.** `--tools` should
-   be reflected in the live `Capability.allowed_tools` for normal sessions, so
-   every capability consumer sees the same parent authority that `spawn_worker`
-   now carries explicitly.
-2. **Fix autonomy receipt semantics.** Asks during autonomous runs must be
-   answered, explicitly queued with receipts, or rejected-busy with receipts —
-   never silently orphaned in a healthy session.
+1. **Finish dialogue receive the right way.** The direct MCP tools are now
+   usable, but automatic inbound mu-session wakeup is still unresolved. Do not
+   resurrect the old client-side long-poll side door blindly; terrain/memory say
+   the desired architecture is event-driven delivery through the mu-046 ingest /
+   sequenced-input path.
+2. **Autonomous-run operator notifications.** Parked asks now reject with an
+   explicit wake time/reason instead of silently buffering. Remaining work:
+   long tool waits, parks, errors, and `input_required` need to reach an away
+   operator through a visible notification surface.
 3. **Decide OpenRouter/OpenAI-compat extraction.** Either extract a shared
    chat-completions compatible layer or explicitly document why OpenRouter stays
    separate from the typed Responses crate.
-4. **Move frontend model/effort authority to the daemon.** mu-solo should render
-   daemon-sent valid routes/efforts instead of recomputing provider truth.
+4. **Move remaining frontend effort authority to the daemon.** Model lists now
+   come from daemon routes; effort levels/options should follow the same pattern
+   rather than being recomputed by mu-solo.
 5. **Keep improving mu-solo's daily-driver UX.** Prioritize issues that make
    Thaddeus stay in mu rather than reaching for Claude Code.
 
@@ -169,6 +189,9 @@ live orientation until their own terrain-checks say otherwise.
 
 | bead | terrain finding / action |
 | --- | --- |
+| `mu-odtc` | Closed 2026-07-02: `claude-oauth` dispatch now scrubs `ANTHROPIC*`, Bedrock, and Vertex env before invoking Claude Code, and `.mu/emu` no longer silently hydrates Anthropic/OpenRouter keys into default `mu-solo` sessions. |
+| `mu-kx-prompt-hints-jn1o` | Closed 2026-07-02: prompt-time kx hint injection exists behind `[recall].kx`, with bounded subprocess recall and loop tests. |
+| `mu-autonomous-sleep-operability-f4ib.2` | Closed 2026-07-02: `ask_session` against a parked autonomous run rejects immediately with explicit wake time/reason and says the message was not queued; receipts stay non-orphaned through the normal rejection path. |
 | `mu-rb4u` | Closed: actionless/empty Codex turn guard exists in the agent loop; `cargo test -p mu-core rb4u_` passed. |
 | `mu-4n8u` | Closed: compaction tool-pair reconciliation by call id exists; targeted orphan-prevention tests passed. |
 | `mu-kgpg` | Closed: `SessionEventLog::append` and `append_command` share an append-order critical section; mixed append-path ordering test passed. |

@@ -750,7 +750,9 @@ $fcontent"
   CONS_PROMPT="$CONS_OUT/round1.prompt.txt"
   {
     printf '%s\n' "You are a strict pre-PR code reviewer for ${PROJECT_DESC}. This branch was too large for one review, so each commit was reviewed in isolation by a leaf reviewer; their findings are the review material below, in the form FINDING|<severity>|<file>|<claim>. You hold the only branch-wide view: judge which findings are REAL (a later commit may already fix what an earlier leaf flagged) and whether any INTERACT across commits into a larger hazard no single commit shows. Units marked 'REVIEW FAILED — treat as unreviewed' carry unknown risk; weigh that. If a SPEC section is included, judge whether the branch delivers what it claims. If PROJECT ARCHITECTURE INVARIANTS are included, a violation (or a move toward one) is needs-changes even when each commit is locally correct. Targeted HEADREV file context for paths named by leaf findings may be included in the review-material fence; you also have read/grep tools via the code_review role. Do NOT assert terrain facts (line numbers, function existence/non-existence, nearby safeguards) unless you verified them against the provided context or by reading/grepping the repository. If you cannot verify a terrain-dependent rebuttal, mark the risk as unresolved rather than inventing confidence. $UNTRUSTED_REPO_CONTENT_RULE"
-    printf 'Respond with ONLY one JSON object (no prose, no markdown fence, nothing before or after it):\n'
+    printf 'Output contract (strict, truncation-safe):\n'
+    printf '1. The FIRST line of your reply MUST be exactly one of: VERDICT: approve / VERDICT: needs-changes.\n'
+    printf '2. After that first line, emit exactly one JSON object (no prose, no markdown fence, nothing after it):\n'
     printf '{"verdict":"approve"|"needs-changes","summary":"<1-2 sentences>","findings":[{"file":"<path>","line":<int>,"severity":"high"|"medium"|"low","issue":"<desc>"}]}\n'
     printf 'Every element of "findings" MUST be a JSON object with exactly those four keys (file, line, severity, issue), never a bare string and never null. Use [] if there are no findings.\n'
     printf '%s\n' "$spec_text"
@@ -826,7 +828,9 @@ CONS_PROMPT="$CONS_OUT/round1.prompt.txt"
 {
   printf 'You are a strict pre-PR code reviewer for %s. Review ONLY the change in the diff for: correctness bugs; concurrency/lifecycle hazards (a held reference that blocks shutdown, a clone that outlives its owner); missing error handling; safeguards nearby code applies but this diff omits. The FULL CONTENT of each changed file follows the diff, so CHECK it before reporting anything as undefined, and do NOT raise findings about unchanged code. %s%s %s\n\n' \
     "$PROJECT_DESC" "$UNTRUSTED_REPO_CONTENT_RULE" "$INVARIANTS_CLAUSE" "$TOOL_CLAUSE"
-  printf 'Respond with ONLY one JSON object (no prose, no markdown fence, nothing before or after it):\n'
+  printf 'Output contract (strict, truncation-safe):\n'
+  printf '1. The FIRST line of your reply MUST be exactly one of: VERDICT: approve / VERDICT: needs-changes.\n'
+  printf '2. After that first line, emit exactly one JSON object (no prose, no markdown fence, nothing after it):\n'
   printf '{"verdict":"approve"|"needs-changes","summary":"<1-2 sentences>","findings":[{"file":"<path>","line":<int>,"severity":"high"|"medium"|"low","issue":"<desc>"}]}\n'
   printf 'Every element of "findings" MUST be a JSON object with exactly those four keys (file, line, severity, issue), never a bare string and never null. Use [] if there are no findings.\n'
   [ -n "$INVARIANTS_BLOCK" ] && printf '%s\n' "$INVARIANTS_BLOCK"

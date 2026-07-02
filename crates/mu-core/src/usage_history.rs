@@ -29,6 +29,11 @@ use crate::protocol::{PercentileStats, ProviderStatusKind, UsageHistoryRow};
 /// per-model-call, per-tool-call). Sum fields are session-cumulative.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PerSessionMetrics {
+    /// Canonical session id/ref that contributed this segment. A single
+    /// session may contribute multiple provider/model segments after
+    /// `session.set_route` / `ProviderSwitched`; aggregation counts unique
+    /// session ids per row rather than blindly counting segments.
+    pub session_id: String,
     pub provider_kind: String,
     pub model: String,
     /// Unix ms of the SessionCreated event.
@@ -59,23 +64,16 @@ pub struct PerSessionMetrics {
     pub error_count: u32,
 }
 
-/// Reduce a session's event log to a [`PerSessionMetrics`]. Returns
-/// `None` when there is no `SessionCreated` event (cannot identify
-/// the (provider, model) the session ran against).
-pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSessionMetrics> {
-    let (provider_kind, model, started_at_unix_ms) =
-        events.iter().find_map(|ev| match &ev.payload {
-            EventPayload::SessionCreated {
-                provider_kind,
-                model,
-                ..
-            } => Some((provider_kind.clone(), model.clone(), ev.timestamp_unix_ms)),
-            _ => None,
-        })?;
-
-    let mut m = PerSessionMetrics {
-        provider_kind,
-        model,
+fn new_metrics(
+    session_id: &str,
+    provider_kind: &str,
+    model: &str,
+    started_at_unix_ms: u64,
+) -> PerSessionMetrics {
+    PerSessionMetrics {
+        session_id: session_id.to_string(),
+        provider_kind: provider_kind.to_string(),
+        model: model.to_string(),
         started_at_unix_ms,
         wall_ms_samples: Vec::new(),
         model_call_latency_ms_samples: Vec::new(),
@@ -89,7 +87,54 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
         reasoning_tokens: 0,
         tool_call_count: 0,
         error_count: 0,
+    }
+}
+
+fn close_provider_status_period(
+    m: &mut PerSessionMetrics,
+    state: ProviderStatusKind,
+    started_at_unix_ms: u64,
+    ended_at_unix_ms: u64,
+) {
+    let duration = ended_at_unix_ms.saturating_sub(started_at_unix_ms);
+    match state {
+        ProviderStatusKind::AwaitingFirstToken => m.ttft_ms_samples.push(duration),
+        ProviderStatusKind::Streaming => m.streaming_ms_samples.push(duration),
+        _ => {}
+    }
+}
+
+/// Reduce a session's event log to provider/model metric segments. A plain
+/// session yields one segment. A session that records `ProviderSwitched` yields
+/// one segment per route epoch so post-switch tokens/timing aggregate under the
+/// provider/model actually in force.
+///
+/// Returns an empty vec when there is no `SessionCreated` event (cannot identify
+/// the initial route).
+pub fn extract_per_session_metric_segments(events: &[SessionEvent]) -> Vec<PerSessionMetrics> {
+    let Some((created_index, session_id, provider_kind, model, started_at_unix_ms)) = events
+        .iter()
+        .enumerate()
+        .find_map(|(idx, ev)| match &ev.payload {
+            EventPayload::SessionCreated {
+                provider_kind,
+                model,
+                ..
+            } => Some((
+                idx,
+                ev.session_id.clone(),
+                provider_kind.to_string(),
+                model.to_string(),
+                ev.timestamp_unix_ms,
+            )),
+            _ => None,
+        })
+    else {
+        return Vec::new();
     };
+
+    let mut segments: Vec<PerSessionMetrics> = Vec::new();
+    let mut m = new_metrics(&session_id, &provider_kind, &model, started_at_unix_ms);
 
     // Pair ToolCall with the ToolResult sharing its call_id.
     let mut open_tool_calls: std::collections::HashMap<&str, u64> =
@@ -117,7 +162,7 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
     // would leak into the inter-ask gap before the next AFT entry.
     let mut last_provider_status_transition: Option<(ProviderStatusKind, u64)> = None;
 
-    for ev in events {
+    for ev in events.iter().skip(created_index + 1) {
         match &ev.payload {
             EventPayload::ToolCall { call_id, .. } => {
                 open_tool_calls.insert(call_id.as_str(), ev.timestamp_unix_ms);
@@ -150,16 +195,12 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
                 if let Some((prev_state, prev_started_at)) =
                     last_provider_status_transition.take()
                 {
-                    let duration = ev.timestamp_unix_ms.saturating_sub(prev_started_at);
-                    match prev_state {
-                        ProviderStatusKind::AwaitingFirstToken => {
-                            m.ttft_ms_samples.push(duration);
-                        }
-                        ProviderStatusKind::Streaming => {
-                            m.streaming_ms_samples.push(duration);
-                        }
-                        _ => {}
-                    }
+                    close_provider_status_period(
+                        &mut m,
+                        prev_state,
+                        prev_started_at,
+                        ev.timestamp_unix_ms,
+                    );
                 }
                 if let Some(em) = elapsed_ms {
                     m.wall_ms_samples.push(*em);
@@ -187,34 +228,44 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
                 state,
                 started_at_unix_ms,
                 ..
-            } => {
-                match last_provider_status_transition {
-                    Some((_, prev_started_at))
-                        if *started_at_unix_ms == prev_started_at =>
-                    {
-                        // Same period — periodic tick. Skip.
-                    }
-                    Some((prev_state, prev_started_at)) => {
-                        // New period entered; close out the prior one.
-                        let duration = started_at_unix_ms.saturating_sub(prev_started_at);
-                        match prev_state {
-                            ProviderStatusKind::AwaitingFirstToken => {
-                                m.ttft_ms_samples.push(duration);
-                            }
-                            ProviderStatusKind::Streaming => {
-                                m.streaming_ms_samples.push(duration);
-                            }
-                            _ => {}
-                        }
-                        last_provider_status_transition =
-                            Some((*state, *started_at_unix_ms));
-                    }
-                    None => {
-                        // First-ever ProviderStatusUpdate for this session.
-                        last_provider_status_transition =
-                            Some((*state, *started_at_unix_ms));
-                    }
+            } => match last_provider_status_transition {
+                Some((_, prev_started_at)) if *started_at_unix_ms == prev_started_at => {
+                    // Same period — periodic tick. Skip.
                 }
+                Some((prev_state, prev_started_at)) => {
+                    // New period entered; close out the prior one.
+                    close_provider_status_period(
+                        &mut m,
+                        prev_state,
+                        prev_started_at,
+                        *started_at_unix_ms,
+                    );
+                    last_provider_status_transition = Some((*state, *started_at_unix_ms));
+                }
+                None => {
+                    // First-ever ProviderStatusUpdate for this segment.
+                    last_provider_status_transition = Some((*state, *started_at_unix_ms));
+                }
+            },
+            EventPayload::ProviderSwitched {
+                new_provider_kind,
+                new_model,
+                ..
+            } => {
+                // `session.set_route` changes the provider/model that future
+                // turns use. Close the current route epoch and start a fresh
+                // metrics segment at the switch event so subsequent Done usage,
+                // tool timings, and latency samples group under the new route.
+                segments.push(m);
+                open_tool_calls.clear();
+                pending_context_assembly_ts = None;
+                last_provider_status_transition = None;
+                m = new_metrics(
+                    &session_id,
+                    new_provider_kind.as_ref(),
+                    new_model.as_ref(),
+                    ev.timestamp_unix_ms,
+                );
             }
             // Variants that don't carry usage-history signal: skip.
             EventPayload::UserMessage { .. }
@@ -246,7 +297,6 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
             // mu-recall-provenance-audit-vnc9.1: recall provenance
             // refs are context-composition audit, not usage/timing.
             | EventPayload::RecallProvenance { .. }
-            | EventPayload::ProviderSwitched { .. }
             // mu-slat: worker lifecycle events are supervisor-side
             // bookkeeping, not per-call usage signals.
             | EventPayload::WorkerSpawned { .. }
@@ -274,7 +324,21 @@ pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSession
         }
     }
 
-    Some(m)
+    segments.push(m);
+    segments
+}
+
+/// Reduce a session's event log to a [`PerSessionMetrics`]. Returns
+/// `None` when there is no `SessionCreated` event (cannot identify
+/// the (provider, model) the session ran against).
+///
+/// Compatibility shim for older tests/callers: returns the first route segment.
+/// New usage-history callers should use [`extract_per_session_metric_segments`]
+/// so provider switches are attributed correctly.
+pub fn extract_per_session_metrics(events: &[SessionEvent]) -> Option<PerSessionMetrics> {
+    extract_per_session_metric_segments(events)
+        .into_iter()
+        .next()
 }
 
 /// Group session summaries by (provider, model, time-bucket) and
@@ -306,7 +370,11 @@ pub fn aggregate_into_rows(
     groups
         .into_iter()
         .map(|((provider_kind, model, bucket_start_unix_ms), members)| {
-            let session_count = members.len() as u32;
+            let session_count = members
+                .iter()
+                .map(|m| m.session_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len() as u32;
 
             // Pool distribution samples across all sessions in the
             // group. Each session contributes its own per-ask /
@@ -647,6 +715,78 @@ mod tests {
         assert_eq!(m.output_tokens, 70);
     }
 
+    #[test]
+    fn extraction_splits_metrics_at_provider_switch() {
+        let events = vec![
+            ev(
+                1,
+                100,
+                EventPayload::SessionCreated {
+                    provider_kind: "p1".into(),
+                    model: "m1".into(),
+                    parent_session_id: None,
+                    branched_at_parent_event_id: None,
+                    usage_semantics: None,
+                },
+            ),
+            ev(
+                2,
+                200,
+                EventPayload::Done {
+                    stop_reason: StopReason::EndTurn,
+                    turn_count: 1,
+                    usage: Some(usage(10, 1)),
+                    elapsed_ms: Some(100),
+                },
+            ),
+            ev(
+                3,
+                300,
+                EventPayload::ProviderSwitched {
+                    old_provider_kind: "p1".into(),
+                    old_model: "m1".into(),
+                    new_provider_kind: "p2".into(),
+                    new_model: "m2".into(),
+                    context_soft_limit: None,
+                    context_hard_limit: None,
+                    usage_semantics: None,
+                },
+            ),
+            ev(
+                4,
+                400,
+                EventPayload::Done {
+                    stop_reason: StopReason::EndTurn,
+                    turn_count: 2,
+                    usage: Some(usage(20, 2)),
+                    elapsed_ms: Some(200),
+                },
+            ),
+        ];
+
+        let segments = extract_per_session_metric_segments(&events);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].provider_kind, "p1");
+        assert_eq!(segments[0].model, "m1");
+        assert_eq!(segments[0].input_tokens, 10);
+        assert_eq!(segments[0].wall_ms_samples, vec![100]);
+        assert_eq!(segments[1].provider_kind, "p2");
+        assert_eq!(segments[1].model, "m2");
+        assert_eq!(segments[1].input_tokens, 20);
+        assert_eq!(segments[1].wall_ms_samples, vec![200]);
+
+        let rows = aggregate_into_rows(segments, None);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.session_count == 1));
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.provider_kind == "p2")
+                .unwrap()
+                .input_tokens_sum,
+            20
+        );
+    }
+
     // ===== mu-pex Phase 1.5: ProviderStatusUpdate-driven samples =====
 
     fn ps(
@@ -822,6 +962,7 @@ mod tests {
     #[test]
     fn aggregation_populates_ttft_and_streaming_in_row() {
         let mut m = PerSessionMetrics {
+            session_id: "s1".into(),
             provider_kind: "p".into(),
             model: "m".into(),
             started_at_unix_ms: 1_000,
@@ -900,6 +1041,7 @@ mod tests {
     #[test]
     fn aggregate_groups_by_provider_model_bucket() {
         let m1 = PerSessionMetrics {
+            session_id: "s1".into(),
             provider_kind: "anthropic_api".into(),
             model: "haiku".into(),
             started_at_unix_ms: 1_000,
@@ -917,6 +1059,7 @@ mod tests {
             error_count: 0,
         };
         let m2 = PerSessionMetrics {
+            session_id: "s2".into(),
             provider_kind: "anthropic_api".into(),
             model: "haiku".into(),
             started_at_unix_ms: 1_500,
@@ -934,6 +1077,7 @@ mod tests {
             error_count: 0,
         };
         let m3 = PerSessionMetrics {
+            session_id: "s3".into(),
             provider_kind: "openai_codex".into(),
             model: "gpt-x".into(),
             started_at_unix_ms: 1_200,
@@ -985,6 +1129,7 @@ mod tests {
         // bucket_ms = 1000 → started_at 500 → bucket 0; started_at
         // 1500 → bucket 1000; same (provider, model).
         let same_model = |started: u64| PerSessionMetrics {
+            session_id: format!("s-{started}"),
             provider_kind: "p".into(),
             model: "m".into(),
             started_at_unix_ms: started,

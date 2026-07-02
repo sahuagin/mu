@@ -525,7 +525,9 @@ fn pending_interjection_commit_lines(
 pub fn normalize_provider_kind(provider: &str) -> String {
     let lc = provider.to_lowercase();
     match lc.as_str() {
-        "anthropic" | "anthropic-api" | "anthropic_api" | "claude" => "anthropic_api".into(),
+        "anthropic" | "anthropic-api" | "anthropic_api" | "ant_api" | "claude" => {
+            "anthropic_api".into()
+        }
         "anthropic-oauth" | "anthropic_oauth" | "claude-oauth" => "anthropic_oauth".into(),
         "openai" | "openai-codex" | "openai_codex" | "codex" => "openai_codex".into(),
         // mu-zbmp: the public-key OpenAI path. Without this arm "openai-api"
@@ -672,6 +674,9 @@ pub struct App {
     /// pickers; the old curated lists are only a fallback for older daemons or
     /// decode failures.
     routes: Vec<RouteEntry>,
+    /// Operator-curated provider/model shortcuts shown at the top of `/model`.
+    /// Entries are parsed as `<provider>:<model>` on selection.
+    model_menu_aliases: Vec<String>,
     /// What the daemon *actually* picked for the renderer / cache /
     /// provider on this session, read from the first ContextAssembly
     /// event. None until the first session.done lets us peek. The
@@ -860,6 +865,65 @@ fn model_picker_strings_for(
     }
     items.extend(source);
     items
+}
+
+fn parse_model_menu_alias(alias: &str) -> Option<(String, String)> {
+    let (provider, model) = alias.split_once(':')?;
+    let provider = normalize_provider_kind(provider.trim());
+    let model = model.trim();
+    if provider.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some((provider, model.to_string()))
+}
+
+fn model_menu_alias_matches_current(alias: &str, provider: &str, model: &str) -> bool {
+    let Some((alias_provider, alias_model)) = parse_model_menu_alias(alias) else {
+        return false;
+    };
+    alias_provider == normalize_provider_kind(provider) && alias_model == model
+}
+
+fn model_picker_strings_with_aliases(
+    routes: &[RouteEntry],
+    provider: &str,
+    current_model: &str,
+    aliases: &[String],
+) -> Vec<String> {
+    let mut items: Vec<String> = aliases
+        .iter()
+        .filter(|a| parse_model_menu_alias(a).is_some())
+        .cloned()
+        .collect();
+    let covered_current = items
+        .iter()
+        .any(|a| model_menu_alias_matches_current(a, provider, current_model));
+    let mut models = model_picker_strings_for(routes, provider, current_model);
+    if covered_current {
+        models.retain(|m| m != current_model);
+    }
+    items.extend(models);
+    items
+}
+
+fn model_picker_item_description(
+    routes: &[RouteEntry],
+    provider: &str,
+    item: &str,
+    current_model: &str,
+    aliases: &[String],
+) -> String {
+    if aliases.iter().any(|a| a == item) {
+        if let Some((alias_provider, alias_model)) = parse_model_menu_alias(item) {
+            let mut parts = Vec::new();
+            if alias_provider == normalize_provider_kind(provider) && alias_model == current_model {
+                parts.push("current".to_string());
+            }
+            parts.push(format!("alias · {alias_provider}/{alias_model}"));
+            return parts.join(" · ");
+        }
+    }
+    model_picker_description(routes, provider, item, current_model)
 }
 
 fn compact_limit(n: u64) -> String {
@@ -1402,6 +1466,9 @@ pub struct AppOptions<'a> {
     /// mu-solo-osc-notify-mbmn: desktop notifications via OSC 99 on
     /// main-session turn done/error while the terminal is unfocused.
     pub notifications: bool,
+    /// mu-eeu5: `[model_menu].aliases` entries displayed at the top of
+    /// `/model` as provider/model shortcuts.
+    pub model_menu_aliases: &'a [String],
     /// mu-7e21: autonomy grant forwarded in create_session. None ⇒
     /// field omitted (INV-1 default: disallowed; no autonomy tools).
     pub autonomy: Option<mu_core::capability::AutonomyCapability>,
@@ -1436,6 +1503,7 @@ impl App {
             cache_ttl,
             renderer_journal,
             notifications,
+            model_menu_aliases,
             autonomy,
             max_side_effects,
         } = opts;
@@ -1584,6 +1652,7 @@ impl App {
             collapse_tools: true,
             events_file,
             routes,
+            model_menu_aliases: model_menu_aliases.to_vec(),
             actual_renderer: None,
             actual_cache_strategy: None,
             actual_provider_kind: None,
@@ -2337,7 +2406,7 @@ impl App {
                         }
                         MenuContext::Model => {
                             if let Some(m) = self.model_picker_strings().get(idx).cloned() {
-                                self.apply_model(vp, m)?;
+                                self.apply_model_menu_selection(vp, m)?;
                             }
                         }
                     }
@@ -3813,13 +3882,19 @@ impl App {
     /// Shared by the picker builder and its selection handler so the menu
     /// indices line up. (mu-zbmp)
     fn model_picker_strings(&self) -> Vec<String> {
-        model_picker_strings_for(&self.routes, &self.provider, &self.model)
+        model_picker_strings_with_aliases(
+            &self.routes,
+            &self.provider,
+            &self.model,
+            &self.model_menu_aliases,
+        )
     }
 
     fn cmd_model(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
         if arg.is_empty() {
             let kind = normalize_provider_kind(&self.provider);
-            let has_list = !self.route_models_for_provider(&kind).is_empty()
+            let has_list = !self.model_menu_aliases.is_empty()
+                || !self.route_models_for_provider(&kind).is_empty()
                 || !known_models_for(&kind).is_empty();
             if !has_list {
                 let lines: Vec<Line<'static>> = vec![
@@ -3847,13 +3922,25 @@ impl App {
             // provider/effort pickers (renders in fullscreen too).
             let strings = self.model_picker_strings();
             // mu-zbmp: open on the current model so a bare confirm keeps it.
-            let cursor = strings.iter().position(|m| m == &self.model).unwrap_or(0);
+            let cursor = strings
+                .iter()
+                .position(|m| {
+                    m == &self.model
+                        || model_menu_alias_matches_current(m, &self.provider, &self.model)
+                })
+                .unwrap_or(0);
             let items: Vec<MenuItem> = strings
                 .into_iter()
                 .map(|m| {
                     MenuItem::new(
                         m.clone(),
-                        model_picker_description(&self.routes, &self.provider, &m, &self.model),
+                        model_picker_item_description(
+                            &self.routes,
+                            &self.provider,
+                            &m,
+                            &self.model,
+                            &self.model_menu_aliases,
+                        ),
                     )
                 })
                 .collect();
@@ -3863,6 +3950,49 @@ impl App {
             return Ok(());
         }
         self.apply_model(vp, arg.to_string())
+    }
+
+    fn apply_model_menu_selection(&mut self, vp: &mut DynamicViewport, item: String) -> Result<()> {
+        if self.model_menu_aliases.iter().any(|a| a == &item) {
+            if let Some((provider, model)) = parse_model_menu_alias(&item) {
+                return self.apply_route(vp, provider, model, "alias");
+            }
+        }
+        self.apply_model(vp, item)
+    }
+
+    fn apply_route(
+        &mut self,
+        vp: &mut DynamicViewport,
+        provider_kind: String,
+        model: String,
+        source: &str,
+    ) -> Result<()> {
+        match self.send_set_route(vp, &provider_kind, &model) {
+            Ok(()) => {
+                self.provider = provider_kind.clone();
+                self.model = model.clone();
+                self.refresh_effort_for_route(&provider_kind, &model);
+                self.set_flash(format!("{source} → {} · {}", self.provider, self.model));
+            }
+            Err(e) => {
+                self.set_flash(format!("route switch failed: {e}"));
+                let lines = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("route switch failed: {e}"),
+                        Style::default().fg(Color::Red),
+                    )),
+                    Line::from(""),
+                ];
+                let h = lines.len() as u16;
+                vp.insert_before(h, |buf| {
+                    let p = Paragraph::new(lines);
+                    ratatui::widgets::Widget::render(p, buf.area, buf);
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// Apply a model switch: send `session.set_route` and update state.
@@ -5948,6 +6078,40 @@ mod tests {
             pricing_output_per_mtok: None,
             hash: std::sync::Arc::from("h"),
         }
+    }
+
+    #[test]
+    fn model_menu_aliases_prepend_and_parse_provider_model() {
+        let routes = vec![
+            route_for_test("anthropic_api", "claude-opus-4-8"),
+            route_for_test("ollama", "qwen3.6:35b-a3b"),
+        ];
+        let aliases = vec![
+            "ant_api:claude-opus-4-8".to_string(),
+            "ollama:qwen3.6:35b-a3b".to_string(),
+        ];
+        let strings = model_picker_strings_with_aliases(
+            &routes,
+            "anthropic_api",
+            "claude-opus-4-8",
+            &aliases,
+        );
+        assert_eq!(strings[0], "ant_api:claude-opus-4-8");
+        assert_eq!(strings[1], "ollama:qwen3.6:35b-a3b");
+        assert_eq!(
+            parse_model_menu_alias(&strings[1]),
+            Some(("ollama".to_string(), "qwen3.6:35b-a3b".to_string()))
+        );
+        assert_eq!(
+            model_picker_item_description(
+                &routes,
+                "anthropic_api",
+                &strings[0],
+                "claude-opus-4-8",
+                &aliases,
+            ),
+            "current · alias · anthropic_api/claude-opus-4-8"
+        );
     }
 
     #[test]

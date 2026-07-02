@@ -555,6 +555,16 @@ impl Sessions {
             .unwrap_or(false)
     }
 
+    /// Live parked-autonomy projection for handler diagnostics. This reads the
+    /// in-memory session log only: a dead rehydrated session is not "parked" in
+    /// the handler sense, even if an old log's last autonomy event was a wakeup.
+    pub fn autonomous_sleep_status(
+        &self,
+        id: &str,
+    ) -> Option<mu_core::event_log::AutonomousSleepStatus> {
+        self.event_log_in_memory(id)?.autonomous_sleep_status()
+    }
+
     /// Atomically claim the transition into autonomous mode and clone
     /// the input sender while holding the registry lookup stable. This
     /// closes the check-then-set race between concurrent

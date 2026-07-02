@@ -68,8 +68,18 @@ while [ "$r" -lt "$N" ]; do
     # output (-> .out), stderr -> $ERRLOG (per-rank .err). claude-oauth now routes
     # to `claude -p` instead of erroring. (Subshell-local assignments: no leakage.)
     TOOLS="$tools"; TIMEOUT="$TMO"; MAX_TURNS="$max_turns"; ERRLOG="${OUT}.${tag}.err"
-    agent_dispatch "$prov" "$model" "$PF" > "${OUT}.${tag}.out"
-    echo "exit=$? prov=$prov model=$model tools=[$tools]" > "${OUT}.${tag}.done"
+    _out="${OUT}.${tag}.out"
+    _retry=0
+    _max_retries="${MU_REVIEW_TIMEOUT_RETRIES:-${AI_REVIEW_TIMEOUT_RETRIES:-1}}"
+    agent_dispatch "$prov" "$model" "$PF" > "$_out"
+    _rc=$?
+    while [ "$_rc" -eq 124 ] && [ "$_retry" -lt "$_max_retries" ]; do
+      _retry=$((_retry + 1))
+      printf '%s\n' "reviewer timeout after ${TMO}s; retry ${_retry}/${_max_retries}" >> "$ERRLOG"
+      agent_dispatch "$prov" "$model" "$PF" > "$_out"
+      _rc=$?
+    done
+    echo "exit=$_rc retry=$_retry prov=$prov model=$model tools=[$tools]" > "${OUT}.${tag}.done"
   ) &
   r=$((r + 1))
 done

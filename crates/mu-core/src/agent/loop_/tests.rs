@@ -529,6 +529,59 @@ async fn s5h_done_propagates_end_turn_when_provider_reports_end_turn() {
     assert_eq!(done, StopReason::EndTurn);
 }
 
+/// mu-w8ap: ollama silently truncates prompts over num_ctx, so the loop
+/// refuses before provider.stream instead of letting the backend produce a
+/// misleading one-token length reply.
+#[tokio::test]
+async fn ollama_over_window_prompt_refused_before_provider_stream() {
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![]));
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let loop_ = loop_with(
+        provider,
+        Arc::from("ollama"),
+        Arc::from("tiny-window"),
+        vec![],
+        AgentConfig {
+            context_hard_limit: Some(1),
+            ..AgentConfig::default()
+        },
+        events_tx,
+        approvals,
+        capability,
+    );
+
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("this prompt is larger than the deliberately tiny test window"),
+            None,
+            None,
+        ))
+        .await
+        .expect("send user message");
+
+    let mut saw_refusal = false;
+    loop {
+        match timeout(Duration::from_secs(2), events_rx.recv()).await {
+            Ok(Some(AgentEvent::Error { message })) => {
+                saw_refusal =
+                    message.contains("Refusing instead of letting ollama silently truncate");
+            }
+            Ok(Some(AgentEvent::Done {
+                stop_reason: StopReason::Error,
+                ..
+            })) => break,
+            Ok(Some(_)) => {}
+            other => panic!("timed out or channel closed before Done(Error): {other:?}"),
+        }
+    }
+    assert!(saw_refusal, "expected over-window refusal error");
+
+    loop_.send(AgentInput::Cancel).await.expect("send cancel");
+    assert_eq!(loop_.join().await, Outcome::Cancelled);
+}
+
 /// B-6: provider error is recoverable — loop emits Error + Done(Error)
 /// and stays alive for the next ask_session.
 #[tokio::test]
@@ -2818,6 +2871,7 @@ async fn ub6q_switch_provider_updates_output_reservation() {
                 // 0 ⇒ keep the config threshold (12_000); this test
                 // isolates the output-reservation half of the switch.
                 context_soft_limit: 0,
+                context_hard_limit: 0,
             })
             .await
             .expect("send switch");
@@ -2896,6 +2950,7 @@ async fn ub6q_switch_provider_updates_soft_limit() {
                 model: Arc::from("faux"),
                 max_output_tokens: 0,
                 context_soft_limit: switch_soft,
+                context_hard_limit: 0,
             })
             .await
             .expect("send switch");

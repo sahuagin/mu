@@ -1290,9 +1290,41 @@ async fn run_inner(
             Action::External(AgentInput::CancelOutstanding { .. }) => {
                 continue;
             }
-            Action::External(AgentInput::SwitchProvider { .. }) => {
-                // Already handled in try_recv/recv above; should not
-                // reach the action queue. No-op if it somehow does.
+            Action::External(AgentInput::SwitchProvider {
+                provider: new,
+                provider_kind: new_kind,
+                model: new_model,
+                max_output_tokens: new_max_output,
+                context_soft_limit: new_soft,
+                context_hard_limit: new_hard,
+            }) => {
+                // mu-loop-buffered-switchprovider-drop-425f: a provider switch
+                // that arrives while a provider stream / tool dispatch is in
+                // progress is buffered as an Action::External. It still must be
+                // applied before the next queued user/wakeup turn runs; treating
+                // this arm as unreachable silently dropped mid-run switches.
+                let old_kind: Arc<str> = Arc::from(current_provider_kind.as_ref());
+                let old_model: Arc<str> = Arc::from(current_model.as_ref());
+                provider = new;
+                current_provider_kind = new_kind.clone();
+                current_model = new_model.clone();
+                current_max_output_tokens = new_max_output;
+                current_context_hard_limit = nonzero_usize(new_hard);
+                live_context_soft_limit.store(new_soft, Ordering::Relaxed);
+                // mu-wsgx: the old provider's actuals don't transfer (different
+                // tokenizer + accounting).
+                feedback_anchor = None;
+                let _ = events
+                    .send(AgentEvent::ProviderSwitched {
+                        old_provider_kind: old_kind,
+                        old_model,
+                        new_provider_kind: new_kind,
+                        new_model,
+                        // mu-rf9x: re-register the accounting convention for
+                        // the provider now in force.
+                        usage_semantics: provider.capabilities().usage_semantics,
+                    })
+                    .await;
             }
             Action::External(AgentInput::MailboxMessage {
                 from_session_id,

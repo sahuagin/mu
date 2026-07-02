@@ -96,6 +96,38 @@ fn predicted_prompt_total(anchor: Option<&FeedbackAnchor>, rope_estimate: usize)
         _ => rope_estimate + ESTIMATE_FALLBACK_OVERHEAD_TOKENS,
     }
 }
+
+fn nonzero_usize(value: u64) -> Option<usize> {
+    (value > 0).then_some(value as usize)
+}
+
+fn over_window_prompt_error(
+    provider_kind: &str,
+    model: &str,
+    predicted_input_tokens: usize,
+    output_reserve_tokens: usize,
+    context_hard_limit: Option<usize>,
+) -> Option<String> {
+    // mu-w8ap: ollama is the provider with known silent truncation behavior
+    // (num_ctx window exceeded -> clipped prompt + one-token "length" reply).
+    // Hosted APIs generally reject over-window requests themselves, and this
+    // tokenizer-free estimate is intentionally conservative rather than exact;
+    // fail closed only for the provider that otherwise fails open.
+    if !provider_kind.starts_with("ollama") {
+        return None;
+    }
+    let hard = context_hard_limit?;
+    let send_total = predicted_input_tokens.saturating_add(output_reserve_tokens);
+    if send_total <= hard {
+        return None;
+    }
+    Some(format!(
+        "prompt exceeds {provider_kind}/{model} context window before dispatch: \
+         estimated input {predicted_input_tokens} tokens + reserved output \
+         {output_reserve_tokens} tokens = {send_total}, hard window {hard}. \
+         Refusing instead of letting ollama silently truncate the prompt."
+    ))
+}
 use crate::protocol::{
     ApprovalDecision, AutonomousIterationOutcome, AutonomousTerminationReason, AutonomyOptions,
 };
@@ -196,6 +228,10 @@ pub enum AgentInput {
         /// limit. `0` ⇒ unset (loop falls back to config/default), as at
         /// creation.
         context_soft_limit: u64,
+        /// mu-w8ap: the new model's hard send window. `0` ⇒ unknown / do
+        /// not preflight. Used only for providers known to silently truncate
+        /// over-window prompts (ollama first).
+        context_hard_limit: u64,
     },
     /// mu-slat Phase 2: a mailbox message arrived for this session.
     /// Injected by the mailbox.post handler when the target is a live
@@ -665,6 +701,10 @@ pub struct AgentConfig {
     /// it on every `SwitchProvider`, so a mid-session model switch
     /// re-reserves the new model's output budget.
     pub max_output_tokens: usize,
+    /// mu-w8ap: model/provider hard context window used for pre-dispatch
+    /// over-window refusal on providers that silently truncate (ollama).
+    /// None ⇒ unknown / no preflight.
+    pub context_hard_limit: Option<usize>,
     /// mu-phl v0 (bead mu-vm81): pre-built recall context to inject at
     /// session start. Built by the daemon at create-session time
     /// (see `crates/mu-coding/src/serve/handlers/session.rs`) so the
@@ -750,6 +790,7 @@ impl Default for AgentConfig {
             system_prompt: None,
             compaction_threshold: None,
             max_output_tokens: 0,
+            context_hard_limit: None,
             project_context: None,
             compaction_policy_override: None,
             seed_messages: Vec::new(),
@@ -1079,6 +1120,10 @@ async fn run_inner(
     // updates its companion (the `live_context_soft_limit` atomic) in the
     // same step, so the two halves of the effective trigger never diverge.
     let mut current_max_output_tokens = config.max_output_tokens;
+    // mu-w8ap: hard model window for pre-dispatch refusal on silent-
+    // truncating providers (ollama). Updated alongside the soft limit and
+    // output reservation on provider switches.
+    let mut current_context_hard_limit = config.context_hard_limit;
     // mu-vcbm: the session's standing reasoning effort. Seeded from the
     // launch-time default, then updated stickily whenever a UserMessage
     // arrives carrying a `/effort` change. Passed to `Provider::stream`
@@ -1135,6 +1180,7 @@ async fn run_inner(
                     model: new_model,
                     max_output_tokens: new_max_output,
                     context_soft_limit: new_soft,
+                    context_hard_limit: new_hard,
                 } => {
                     let old_kind: Arc<str> = Arc::from(current_provider_kind.as_ref());
                     let old_model: Arc<str> = Arc::from(current_model.as_ref());
@@ -1142,6 +1188,7 @@ async fn run_inner(
                     current_provider_kind = new_kind.clone();
                     current_model = new_model.clone();
                     current_max_output_tokens = new_max_output;
+                    current_context_hard_limit = nonzero_usize(new_hard);
                     // mu-ub6q: store the new soft limit in the SAME handler
                     // that sets the reservation, so the effective trigger
                     // never pairs a new reservation with the old soft limit.
@@ -1186,6 +1233,7 @@ async fn run_inner(
                     model: new_model,
                     max_output_tokens: new_max_output,
                     context_soft_limit: new_soft,
+                    context_hard_limit: new_hard,
                 }) => {
                     let old_kind: Arc<str> = Arc::from(current_provider_kind.as_ref());
                     let old_model: Arc<str> = Arc::from(current_model.as_ref());
@@ -1193,6 +1241,7 @@ async fn run_inner(
                     current_provider_kind = new_kind.clone();
                     current_model = new_model.clone();
                     current_max_output_tokens = new_max_output;
+                    current_context_hard_limit = nonzero_usize(new_hard);
                     // mu-ub6q: store the new soft limit in the SAME handler
                     // that sets the reservation, so the effective trigger
                     // never pairs a new reservation with the old soft limit.
@@ -2042,6 +2091,53 @@ async fn run_inner(
                     &session_started_at,
                 );
 
+                let predicted_input_tokens =
+                    predicted_prompt_total(feedback_anchor.as_ref(), rope_estimate_sent);
+                if let Some(message) = over_window_prompt_error(
+                    current_provider_kind.as_ref(),
+                    current_model.as_ref(),
+                    predicted_input_tokens,
+                    current_max_output_tokens,
+                    current_context_hard_limit,
+                ) {
+                    let _ = events
+                        .send(AgentEvent::Callout {
+                            category: "warning".to_owned(),
+                            title: "prompt exceeds model context window".to_owned(),
+                            body: serde_json::json!({
+                                "provider": current_provider_kind.as_ref(),
+                                "model": current_model.as_ref(),
+                                "predicted_input_tokens": predicted_input_tokens,
+                                "context_hard_limit": current_context_hard_limit,
+                                "reason": "refusing before provider dispatch; ollama silently truncates over-window prompts",
+                            }),
+                            theme: Some("warning".to_owned()),
+                            context_refs: vec!["bead:mu-w8ap".to_owned()],
+                        })
+                        .await;
+                    let _ = events
+                        .send(AgentEvent::Error {
+                            message: message.clone(),
+                        })
+                        .await;
+                    let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
+                    let _ = events
+                        .send(AgentEvent::Done {
+                            stop_reason: StopReason::Error,
+                            turn_count,
+                            usage: aggregated_usage.take(),
+                            elapsed_ms,
+                            command_receipts: std::mem::take(pending_tickets),
+                        })
+                        .await;
+                    started_at = None;
+                    turn_count = 0;
+                    tool_history.clear();
+                    last_stop_reason = None;
+                    queue.clear();
+                    continue;
+                }
+
                 match handle_invoke_llm(
                     provider.as_ref(),
                     effective_system_prompt.as_deref(),
@@ -2299,6 +2395,7 @@ async fn run_inner(
                             model: new_model,
                             max_output_tokens: new_max_output,
                             context_soft_limit: new_soft,
+                            context_hard_limit: new_hard,
                         } => {
                             let old_kind: Arc<str> = Arc::from(current_provider_kind.as_ref());
                             let old_model: Arc<str> = Arc::from(current_model.as_ref());
@@ -2306,10 +2403,14 @@ async fn run_inner(
                             current_provider_kind = new_kind.clone();
                             current_model = new_model.clone();
                             current_max_output_tokens = new_max_output;
+                            current_context_hard_limit = nonzero_usize(new_hard);
                             // mu-ub6q: store the new soft limit in the
                             // same handler that sets the reservation (see
                             // the sibling switch paths above).
                             live_context_soft_limit.store(new_soft, Ordering::Relaxed);
+                            // mu-wsgx: the old provider's actuals don't
+                            // transfer (different tokenizer + accounting).
+                            feedback_anchor = None;
                             let _ = events
                                 .send(AgentEvent::ProviderSwitched {
                                     old_provider_kind: old_kind,

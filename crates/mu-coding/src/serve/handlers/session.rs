@@ -737,6 +737,16 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             limit: index_cfg.discover_injection_limit,
         }
     });
+    let recall_cfg = &daemon_info.config().recall;
+    let kx_hints = (recall_cfg.kx && !bare).then(|| {
+        let hints = match &recall_cfg.kx_binary {
+            Some(path) => mu_core::context::kx_hints::KxHints::new(path.clone()),
+            None => mu_core::context::kx_hints::KxHints::default_binary(),
+        };
+        hints
+            .with_limit(recall_cfg.kx_limit)
+            .with_min_score(recall_cfg.kx_min_score)
+    });
     // mu-context-limits-wire phase 2: shared live soft limit. Seeded with
     // the resolved soft limit (0 = unknown ⇒ loop uses its config/default
     // fallback). session.set_config writes this atomic and the loop reads
@@ -768,6 +778,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             // this session is a resume/fork-at-tail; empty otherwise.
             seed_messages,
             discover_hints,
+            kx_hints,
             // mu-vcbm: launch-time effort default → loop's standing effort.
             effort: effort.map(|e| Arc::from(e.as_str())),
         },

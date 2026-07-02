@@ -63,9 +63,12 @@ case "$name" in
         #
         # ( cd "$root" && cargo build --release --bin mu --bin mu-solo )
         TQ="${TQ:-$HOME/.cargo/bin/tq}"
-        unset ANTHROPIC_BASE_URL
         case "${MU_EMU_PROVIDER_KEYS:-}" in
             agent-config|1|true|yes)
+                for env_name in $(env | sed -n 's/^\(ANTHROPIC[A-Za-z0-9_]*\)=.*/\1/p'); do
+                    unset "$env_name"
+                done
+                unset OPENROUTER_API_KEY CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
                 ANTHROPIC_API_KEY=$("$TQ" -f "$HOME/.config/agent/config.toml" -r anthropic.api_key 2>/dev/null || true)
                 OPENROUTER_API_KEY=$("$TQ" -f "$HOME/.config/agent/config.toml" -r openrouter.api_key 2>/dev/null || true)
                 export ANTHROPIC_API_KEY OPENROUTER_API_KEY
@@ -73,7 +76,10 @@ case "$name" in
             env)
                 ;;
             *)
-                unset ANTHROPIC_API_KEY OPENROUTER_API_KEY
+                for env_name in $(env | sed -n 's/^\(ANTHROPIC[A-Za-z0-9_]*\)=.*/\1/p'); do
+                    unset "$env_name"
+                done
+                unset OPENROUTER_API_KEY CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
                 ;;
         esac
         exec "$target/mu-solo" \

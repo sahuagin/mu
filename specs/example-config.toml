@@ -173,6 +173,15 @@ memory = true
 # instead of relying on that hardcoded path.
 # memory_binary = "/usr/local/bin/agent"
 
+# Prompt-time kx document hints. When true, each user turn runs
+# `agent kx recall <prompt>` and injects a compact doc-pointer block after the
+# prompt, similar to Claude Code's UserPromptSubmit hook. Default false because
+# recall may call your configured embedder/API.
+kx = false
+# kx_binary = "/usr/local/bin/agent"  # unset = ~/.local/bin/agent
+kx_limit = 4
+kx_min_score = 0.60
+
 # First-position "this is startup orientation, not the task" preamble.
 # false (default) = no preamble. The MU_RECALL_BOOTLOADER=0/1 env var
 # overrides this per-session.

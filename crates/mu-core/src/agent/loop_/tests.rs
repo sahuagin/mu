@@ -51,6 +51,9 @@ fn loop_with(
 
 enum MockResponse {
     Events(Vec<ProviderEvent>),
+    /// Provider::stream fails before returning a stream. Used for retry
+    /// tests; mid-stream ProviderEvent::Error is a different boundary.
+    StartError(String),
     /// Events released only after the paired gate fires. Lets a test
     /// hold a stream open while it injects input (which lands in
     /// handle_invoke_llm's `buffered`), then complete the stream
@@ -75,6 +78,17 @@ impl MockProvider {
     fn pending() -> Self {
         let mut q = VecDeque::new();
         q.push_back(MockResponse::Pending);
+        Self {
+            responses: Mutex::new(q),
+        }
+    }
+
+    fn start_error_then(events: Vec<ProviderEvent>) -> Self {
+        let mut q = VecDeque::new();
+        q.push_back(MockResponse::StartError(
+            "anthropic request: error sending request for url (https://api.anthropic.com/v1/messages)".into(),
+        ));
+        q.push_back(MockResponse::Events(events));
         Self {
             responses: Mutex::new(q),
         }
@@ -128,6 +142,7 @@ impl Provider for MockProvider {
         let chunk = self.responses.lock().expect("mutex poisoned").pop_front();
         match chunk {
             Some(MockResponse::Events(events)) => Ok(Box::pin(stream::iter(events))),
+            Some(MockResponse::StartError(message)) => Err(ProviderError::Other(message)),
             Some(MockResponse::GatedEvents(events, gate)) => Ok(Box::pin(
                 stream::once(async move {
                     let _ = gate.await;
@@ -580,6 +595,37 @@ async fn ollama_over_window_prompt_refused_before_provider_stream() {
 
     loop_.send(AgentInput::Cancel).await.expect("send cancel");
     assert_eq!(loop_.join().await, Outcome::Cancelled);
+}
+
+/// mu-tds4: pre-first-token transport errors are retryable. A transient
+/// request-send failure should emit a visible retry callout, retry the same
+/// provider call, and recover without operator intervention.
+#[tokio::test]
+async fn transient_provider_start_error_retries_and_recovers() {
+    let provider = MockProvider::start_error_then(vec![
+        ProviderEvent::TextDelta("ok".into()),
+        ProviderEvent::Done(assistant_text("ok")),
+    ]);
+    let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Callout { title, context_refs, .. }
+            if title == "provider request retrying"
+                && context_refs.iter().any(|r| r == "bead:mu-tds4")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TextDelta { delta } if delta == "ok"
+    )));
 }
 
 /// B-6: provider error is recoverable — loop emits Error + Done(Error)

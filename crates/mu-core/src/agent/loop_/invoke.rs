@@ -1,6 +1,6 @@
 //! Provider invocation — stream handling + status emission.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -21,6 +21,55 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+const PROVIDER_START_MAX_ATTEMPTS: u32 = 3;
+const PROVIDER_START_BACKOFF_BASE_MS: u64 = 250;
+const PROVIDER_STATUS_TICK_MS: u64 = 1000;
+
+fn retryable_provider_start_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    // Transport/send failures: request never reached a durable response, so
+    // retrying is safe at this boundary (no stream has started yet).
+    if lower.contains("error sending request")
+        || lower.contains("connection reset")
+        || lower.contains("connection closed")
+        || lower.contains("connection refused")
+        || lower.contains("dns")
+        || lower.contains("tls")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+    {
+        return true;
+    }
+
+    // Provider overload/rate-limit classes. Status-specific auth, validation,
+    // spend, and context errors (4xx other than 429) are not retryable.
+    lower.contains("returned 429")
+        || lower.contains("returned 500")
+        || lower.contains("returned 502")
+        || lower.contains("returned 503")
+        || lower.contains("returned 504")
+        || lower.contains("returned 529")
+}
+
+fn provider_start_retry_delay_ms(attempt: u32) -> u64 {
+    let exp = attempt.saturating_sub(1).min(4);
+    let base = PROVIDER_START_BACKOFF_BASE_MS.saturating_mul(1_u64 << exp);
+    // Small deterministic jitter: enough to de-phase concurrent sessions,
+    // stable enough that tests don't flake or need RNG plumbing.
+    let jitter = now_unix_ms() % 125;
+    base.saturating_add(jitter)
+}
+
+fn retry_callout_body(error: &str, attempt: u32, delay_ms: u64) -> serde_json::Value {
+    serde_json::json!({
+        "attempt": attempt,
+        "max_attempts": PROVIDER_START_MAX_ATTEMPTS,
+        "delay_ms": delay_ms,
+        "error": error,
+        "boundary": "provider.stream returned before first token; mid-stream errors are not retried",
+    })
+}
+
 pub(crate) async fn handle_invoke_llm(
     provider: &dyn Provider,
     system_prompt: Option<&str>,
@@ -35,7 +84,6 @@ pub(crate) async fn handle_invoke_llm(
 ) -> Result<(AssistantMessage, Vec<AgentInput>), Outcome> {
     use crate::protocol::ProviderStatusKind;
 
-    const PROVIDER_STATUS_TICK_MS: u64 = 1000;
     let call_started_at = Instant::now();
     let call_started_unix_ms = now_unix_ms();
     let _ = events
@@ -48,24 +96,74 @@ pub(crate) async fn handle_invoke_llm(
         })
         .await;
 
-    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-    // mu-yqeq.8: the cache-annotated `ProviderMessages` projection is
-    // the canonical agent-loop → provider input. Per-provider
-    // adapters consume it via `MessageInput::Projected` and produce
-    // byte-equivalent wire JSON to the pre-cutover Legacy path (plus
-    // cache_control driven by the projection's cache_marker flags).
-    let mut stream = provider
-        .stream(
-            system_prompt,
-            effort,
-            MessageInput::Projected(projection),
-            tool_specs,
-            cancel_rx,
-        )
-        .await
-        .map_err(|e| Outcome::Error(e.to_string()))?;
-
     let mut buffered: Vec<AgentInput> = Vec::new();
+    let (cancel_tx, mut stream) = {
+        let mut attempt = 1;
+        loop {
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+            // mu-yqeq.8: the cache-annotated `ProviderMessages` projection is
+            // the canonical agent-loop → provider input. Per-provider
+            // adapters consume it via `MessageInput::Projected` and produce
+            // byte-equivalent wire JSON to the pre-cutover Legacy path (plus
+            // cache_control driven by the projection's cache_marker flags).
+            match provider
+                .stream(
+                    system_prompt,
+                    effort,
+                    MessageInput::Projected(projection),
+                    tool_specs,
+                    cancel_rx,
+                )
+                .await
+            {
+                Ok(stream) => break (cancel_tx, stream),
+                Err(e) => {
+                    let message = e.to_string();
+                    if attempt >= PROVIDER_START_MAX_ATTEMPTS
+                        || !retryable_provider_start_error(&message)
+                    {
+                        return Err(Outcome::Error(message));
+                    }
+                    let delay_ms = provider_start_retry_delay_ms(attempt);
+                    let _ = events
+                        .send(AgentEvent::Callout {
+                            category: "warning".to_owned(),
+                            title: "provider request retrying".to_owned(),
+                            body: retry_callout_body(&message, attempt, delay_ms),
+                            theme: Some("warning".to_owned()),
+                            context_refs: vec!["bead:mu-tds4".to_owned()],
+                        })
+                        .await;
+
+                    let mut slept = false;
+                    while !slept {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {
+                                slept = true;
+                            }
+                            input_opt = input_rx.recv() => match input_opt {
+                                Some(AgentInput::Cancel) => {
+                                    return Err(Outcome::Cancelled);
+                                }
+                                Some(AgentInput::CancelOutstanding { reason }) => {
+                                    return Err(Outcome::OutstandingCancelled { reason });
+                                }
+                                Some(input) => buffered.push(input),
+                                None => {
+                                    // Input side closed; still retry this provider call so
+                                    // daemon shutdown semantics stay compatible with the old
+                                    // path, which only noticed EOF while streaming.
+                                    slept = true;
+                                }
+                            }
+                        }
+                    }
+                    attempt += 1;
+                }
+            }
+        }
+    };
+
     let mut bytes_received: u64 = 0;
     let mut seen_first_token = false;
     let mut current_state = ProviderStatusKind::AwaitingFirstToken;
@@ -241,5 +339,33 @@ pub(crate) async fn handle_invoke_llm(
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retryable_provider_start_error;
+
+    #[test]
+    fn retryable_start_error_classification_is_narrow() {
+        assert!(retryable_provider_start_error(
+            "anthropic request: error sending request for url"
+        ));
+        assert!(retryable_provider_start_error(
+            "openrouter returned 529: overloaded"
+        ));
+        assert!(retryable_provider_start_error(
+            "openai returned 429: rate limit"
+        ));
+
+        assert!(!retryable_provider_start_error(
+            "anthropic returned 402: insufficient credits"
+        ));
+        assert!(!retryable_provider_start_error(
+            "codex returned 401: unauthorized"
+        ));
+        assert!(!retryable_provider_start_error(
+            "openrouter returned 400: bad request"
+        ));
     }
 }

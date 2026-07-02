@@ -29,7 +29,9 @@ AGENT_DISPATCH_LIB="${AGENT_DISPATCH_LIB:-$HERE/../lib/agent-dispatch.sh}"
 AGENT_DISPATCH_OLLAMA_SKIP_IF_HELD="${AI_REVIEW_OLLAMA_SKIP_IF_HELD:-1}"
 export AGENT_DISPATCH_OLLAMA_SKIP_IF_HELD
 mkdir -p "$OUT"
-# the diff that convergence prompts quote = the content of the first ```diff fence.
+# the review material that convergence prompts quote = content of the first
+# ```diff fence. In normal mode this is the PR diff; in chunked mode it is the
+# aggregated leaf findings plus targeted file context for cited paths.
 awk '/^```diff/{f=1;next} /^```/{if(f)exit} f' "$P1" > "$OUT/diff.txt"
 
 # round 1: whole panel, same prompt (config-driven dispatch + ollama warm-up).

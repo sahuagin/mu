@@ -1,25 +1,25 @@
 //! Model-aware `max_tokens` lookup shared by Anthropic and OpenAI-shaped
 //! provider request bodies.
 //!
-//! Anthropic's Messages API requires a `max_tokens` field on every
-//! request; OpenAI-shaped APIs accept one. Hardcoding a single value
-//! (mu's pre-mu-ql2 default was 4096) caps every response — including
-//! Opus 4.7, whose extended output ceiling is 128000 tokens — at the
-//! smallest-supported-model budget. This module returns a per-model
-//! cap so each request gets the right ceiling.
+//! Anthropic's Messages API requires a `max_tokens` field on every request;
+//! OpenAI-shaped APIs accept one. A single global value would cap every
+//! response — including Opus 4, whose extended-output ceiling is 128000 — at
+//! the smallest-supported-model budget, so mu resolves a per-model cap.
 //!
-//! The fallback is intentionally conservative: any unknown model name
-//! gets 4096 (the prior global default), so adding a new provider or
-//! model doesn't silently exceed its server-side maximum.
+//! The per-model and per-family caps are DATA, not code: they live in the model
+//! catalog (`models.default.toml` `[models.*]` / `[model_rules.*]`, overridable
+//! at runtime via `~/.config/mu/models.toml` — no recompile to add or retune a
+//! model). The only value hardcoded here is [`DEFAULT_MAX_OUTPUT_TOKENS`], the
+//! conservative floor for a model the catalog knows nothing about.
 
-/// Returns the `max_tokens` budget mu should send for the given
-/// provider model identifier.
-///
-/// Matching is by prefix on the *family* portion of the name, so
-/// version suffixes (date stamps, point releases) don't need
-/// case-by-case entries. Match-from-most-specific-to-least keeps
-/// `claude-haiku-4-5-...` from accidentally hitting a generic
-/// `claude-*` rule.
+/// Conservative floor for a model absent from the catalog (no `[models.*]`
+/// entry and no matching `[model_rules.*]`). Kept low on purpose: overshooting
+/// a server-side max errors, so an unknown model degrades to the smallest safe
+/// budget rather than guessing high. Every KNOWN cap belongs in the catalog.
+const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
+
+/// Returns the `max_tokens` budget mu should send for the given provider model
+/// identifier, resolved from the model catalog.
 pub fn max_tokens_for_model(model: &str) -> u32 {
     max_tokens_for_model_with_catalog(mu_core::model_catalog::global(), model)
 }
@@ -31,35 +31,19 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
 /// `~/.config/mu/models.toml` cannot change the asserted value. (A test that
 /// read `global()` broke the build the moment an operator tuned their own
 /// per-model `max_output_tokens`. bead mu-nzxa.)
+///
+/// Resolution is the catalog's: an exact `[models.*]` entry wins, else the
+/// most-specific matching `[model_rules.*]` prefix (so date-stamped and
+/// point-release ids inherit their family cap), else the floor. No family
+/// values are duplicated here — they're all in the catalog.
 pub fn max_tokens_for_model_with_catalog(
     catalog: &mu_core::model_catalog::ModelCatalogConfig,
     model: &str,
 ) -> u32 {
-    if let Some(v) = catalog.resolve_model(model).max_output_tokens {
-        return v;
-    }
-    let m = model.to_ascii_lowercase();
-    if m.starts_with("claude-opus-4") {
-        // Catalog-less safety net only (the built-in catalog carries the real
-        // opus-4 ceiling, 128000). If we ever reach here the catalog was
-        // bypassed, so stay conservative — overshooting a server max errors.
-        16384
-    } else if m.starts_with("claude-sonnet-4") || m.starts_with("claude-haiku-4") {
-        8192
-    } else if m.starts_with("gpt-5") || m.starts_with("o4") || m.starts_with("o3") {
-        16384
-    } else if m.starts_with("gpt-oss") || m.starts_with("deepseek-r1") || m.starts_with("qwen3.6:")
-    {
-        // ollama-served reasoning models: thinking arrives on the
-        // reasoning channel and counts against max_tokens. Measured
-        // 2026-06-05: gpt-oss:20b reviewing a ~500-line diff burned all
-        // 4096 tokens reasoning (finish=length, content EMPTY); at 16384
-        // the same prompt finished with room to spare. A 4k cap starves
-        // these models of any visible output on non-trivial prompts.
-        16384
-    } else {
-        4096
-    }
+    catalog
+        .resolve_model(model)
+        .max_output_tokens
+        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
 }
 
 #[cfg(test)]
@@ -120,5 +104,22 @@ mod tests {
         assert_eq!(mt("qwen3.6:35b-a3b-q8_0"), 16384);
         // Non-reasoning local models keep the conservative default.
         assert_eq!(mt("qwen3-coder:30b"), 4096);
+    }
+
+    #[test]
+    fn empty_catalog_falls_back_to_floor() {
+        // Caps are data: with no catalog at all, even a known family drops to
+        // the floor (there is no family knowledge in code to fall back on).
+        // Not a real path — the built-in catalog is mandatory — but this pins
+        // the contract so nobody reintroduces a hardcoded per-family ladder.
+        let empty = mu_core::model_catalog::ModelCatalogConfig::default();
+        assert_eq!(
+            max_tokens_for_model_with_catalog(&empty, "claude-opus-4-7"),
+            DEFAULT_MAX_OUTPUT_TOKENS
+        );
+        assert_eq!(
+            max_tokens_for_model_with_catalog(&empty, "gpt-5"),
+            DEFAULT_MAX_OUTPUT_TOKENS
+        );
     }
 }

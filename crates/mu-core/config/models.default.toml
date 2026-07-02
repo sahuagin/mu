@@ -97,6 +97,11 @@ max_output_tokens = 8192
 prefixes = ["gpt-5", "o4", "o3"]
 max_output_tokens = 16384
 
+# ollama-served reasoning models: thinking arrives on the reasoning channel and
+# counts against max_tokens. Measured 2026-06-05: gpt-oss:20b reviewing a
+# ~500-line diff burned all 4096 tokens reasoning (finish=length, content EMPTY);
+# at 16384 the same prompt finished with room to spare. A 4k cap starves these
+# models of any visible output on non-trivial prompts.
 [model_rules.ollama_reasoning]
 prefixes = ["gpt-oss", "deepseek-r1", "qwen3.6:"]
 max_output_tokens = 16384

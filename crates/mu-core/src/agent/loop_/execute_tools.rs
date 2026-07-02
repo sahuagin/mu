@@ -118,6 +118,137 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+pub(crate) enum ExecuteToolsExit {
+    Completed {
+        tool_messages: Vec<AgentMessage>,
+        buffered: Vec<AgentInput>,
+    },
+    /// The current ask was narrow-cancelled while one or more assistant
+    /// tool calls were outstanding. `tool_messages` contains synthetic
+    /// is_error ToolResult messages for every unanswered call, so the
+    /// durable log and in-memory history never retain a dangling function
+    /// call (OpenAI/Codex rejects that shape on the next turn).
+    OutstandingCancelled {
+        reason: String,
+        tool_messages: Vec<AgentMessage>,
+    },
+    /// The whole session was cancelled while tool calls were outstanding.
+    /// We still return synthetic tool results for log/history hygiene before
+    /// the outer loop terminates.
+    Cancelled { tool_messages: Vec<AgentMessage> },
+}
+
+async fn emit_tool_call_started(events: &mpsc::Sender<AgentEvent>, call: &ToolCall) {
+    let _ = events
+        .send(AgentEvent::ToolCallStarted {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            arguments: call.arguments.clone().into(),
+        })
+        .await;
+}
+
+async fn finish_tool_call(
+    events: &mpsc::Sender<AgentEvent>,
+    history: &mut ToolHistory,
+    tool_messages: &mut Vec<AgentMessage>,
+    call: ToolCall,
+    result: ToolResult,
+    verbatim: bool,
+) {
+    history.record(
+        call.name.clone(),
+        call.arguments.clone().into(),
+        result.is_error,
+    );
+
+    // mu-2e0h tier 1: deterministic ingestion hygiene (ANSI strip,
+    // repeat collapse, line cap, dump truncation) applied ONCE,
+    // here — so the provider context, the durable event log, and
+    // the wire all carry the same content. Event-log-decides
+    // depends on the log being the truth of what the model saw;
+    // filtering only the context entry would silently diverge
+    // them. Clean content passes through borrowed (no copy).
+    // Tools that declare `verbatim_result` (read-like tools whose
+    // output must stay byte-identical to disk for exact-match
+    // editing) bypass the filter entirely.
+    let content = if verbatim {
+        result.content
+    } else {
+        match super::super::tool_result_filter::filter_tool_result(&result.content) {
+            std::borrow::Cow::Borrowed(_) => result.content,
+            std::borrow::Cow::Owned(filtered) => filtered,
+        }
+    };
+
+    let _ = events
+        .send(AgentEvent::ToolCallCompleted {
+            tool_call_id: call.id.clone(),
+            content: content.clone(),
+            is_error: result.is_error,
+        })
+        .await;
+
+    tool_messages.push(AgentMessage::ToolResult {
+        call_id: call.id,
+        content,
+        is_error: result.is_error,
+    });
+}
+
+fn cancelled_tool_result(
+    call: &ToolCall,
+    reason: &str,
+    source: &str,
+    already_running: bool,
+) -> ToolResult {
+    let state = if already_running {
+        "cancelled before completion"
+    } else {
+        "not executed because the ask was cancelled"
+    };
+    ToolResult {
+        content: format!("tool call `{}` {state} by {source}: {reason}", call.name),
+        is_error: true,
+    }
+}
+
+async fn cancel_current_and_remaining(
+    events: &mpsc::Sender<AgentEvent>,
+    history: &mut ToolHistory,
+    tool_messages: &mut Vec<AgentMessage>,
+    current: ToolCall,
+    remaining: Vec<ToolCall>,
+    reason: &str,
+    source: &str,
+) {
+    finish_tool_call(
+        events,
+        history,
+        tool_messages,
+        current.clone(),
+        cancelled_tool_result(&current, reason, source, true),
+        false,
+    )
+    .await;
+
+    for call in remaining {
+        // The assistant message already contains this tool_call block; emit
+        // a started+completed tombstone pair so live clients and the durable
+        // log see an answered call rather than a silent gap.
+        emit_tool_call_started(events, &call).await;
+        finish_tool_call(
+            events,
+            history,
+            tool_messages,
+            call.clone(),
+            cancelled_tool_result(&call, reason, source, false),
+            false,
+        )
+        .await;
+    }
+}
+
 pub(crate) async fn handle_execute_tools(
     tools: &[Arc<dyn Tool>],
     calls: Vec<ToolCall>,
@@ -126,11 +257,12 @@ pub(crate) async fn handle_execute_tools(
     history: &mut ToolHistory,
     pending_approvals: &PendingApprovals,
     capability: &SessionCapability,
-) -> Result<(Vec<AgentMessage>, Vec<AgentInput>), Outcome> {
+) -> Result<ExecuteToolsExit, Outcome> {
     let mut buffered: Vec<AgentInput> = Vec::new();
     let mut tool_messages: Vec<AgentMessage> = Vec::new();
+    let mut calls: VecDeque<ToolCall> = calls.into_iter().collect();
 
-    for call in calls {
+    while let Some(call) = calls.pop_front() {
         let _ = events
             .send(AgentEvent::ProviderStatus {
                 state: crate::protocol::ProviderStatusKind::ToolExecuting,
@@ -140,13 +272,7 @@ pub(crate) async fn handle_execute_tools(
                 tool_call_id: Some(call.id.clone()),
             })
             .await;
-        let _ = events
-            .send(AgentEvent::ToolCallStarted {
-                tool_call_id: call.id.clone(),
-                tool_name: call.name.clone(),
-                arguments: call.arguments.clone().into(),
-            })
-            .await;
+        emit_tool_call_started(events, &call).await;
 
         let tool = tools.iter().find(|t| t.spec().name == call.name);
 
@@ -297,13 +423,39 @@ pub(crate) async fn handle_execute_tools(
                                 if let Ok(mut pending) = pending_approvals.lock() {
                                     pending.remove(&request_id);
                                 }
-                                return Err(Outcome::Cancelled);
+                                let reason = "session cancelled while awaiting tool approval";
+                                let remaining = calls.drain(..).collect();
+                                cancel_current_and_remaining(
+                                    events,
+                                    history,
+                                    &mut tool_messages,
+                                    call.clone(),
+                                    remaining,
+                                    reason,
+                                    "session.cancel",
+                                )
+                                .await;
+                                return Ok(ExecuteToolsExit::Cancelled { tool_messages });
                             }
                             Some(AgentInput::CancelOutstanding { reason }) => {
                                 if let Ok(mut pending) = pending_approvals.lock() {
                                     pending.remove(&request_id);
                                 }
-                                return Err(Outcome::OutstandingCancelled { reason });
+                                let remaining = calls.drain(..).collect();
+                                cancel_current_and_remaining(
+                                    events,
+                                    history,
+                                    &mut tool_messages,
+                                    call.clone(),
+                                    remaining,
+                                    &reason,
+                                    "session.cancel_outstanding",
+                                )
+                                .await;
+                                return Ok(ExecuteToolsExit::OutstandingCancelled {
+                                    reason,
+                                    tool_messages,
+                                });
                             }
                             Some(AgentInput::UserMessage(..))
                             | Some(AgentInput::StartAutonomous { .. })
@@ -315,13 +467,37 @@ pub(crate) async fn handle_execute_tools(
                                 if let Ok(mut pending) = pending_approvals.lock() {
                                     pending.remove(&request_id);
                                 }
-                                return Err(Outcome::Cancelled);
+                                let reason = "tool approval interrupted by another session input";
+                                let remaining = calls.drain(..).collect();
+                                cancel_current_and_remaining(
+                                    events,
+                                    history,
+                                    &mut tool_messages,
+                                    call.clone(),
+                                    remaining,
+                                    reason,
+                                    "agent loop",
+                                )
+                                .await;
+                                return Ok(ExecuteToolsExit::Cancelled { tool_messages });
                             }
                             None => {
                                 if let Ok(mut pending) = pending_approvals.lock() {
                                     pending.remove(&request_id);
                                 }
-                                return Err(Outcome::Cancelled);
+                                let reason = "input channel closed while awaiting tool approval";
+                                let remaining = calls.drain(..).collect();
+                                cancel_current_and_remaining(
+                                    events,
+                                    history,
+                                    &mut tool_messages,
+                                    call.clone(),
+                                    remaining,
+                                    reason,
+                                    "session shutdown",
+                                )
+                                .await;
+                                return Ok(ExecuteToolsExit::Cancelled { tool_messages });
                             }
                         },
                     };
@@ -464,11 +640,37 @@ pub(crate) async fn handle_execute_tools(
                             } => match input_opt {
                                 Some(AgentInput::Cancel) => {
                                     let _ = cancel_tx.send(());
-                                    return Err(Outcome::Cancelled);
+                                    let reason = "session cancelled while tool was executing";
+                                    let remaining = calls.drain(..).collect();
+                                    cancel_current_and_remaining(
+                                        events,
+                                        history,
+                                        &mut tool_messages,
+                                        call.clone(),
+                                        remaining,
+                                        reason,
+                                        "session.cancel",
+                                    )
+                                    .await;
+                                    return Ok(ExecuteToolsExit::Cancelled { tool_messages });
                                 }
                                 Some(AgentInput::CancelOutstanding { reason }) => {
                                     let _ = cancel_tx.send(());
-                                    return Err(Outcome::OutstandingCancelled { reason });
+                                    let remaining = calls.drain(..).collect();
+                                    cancel_current_and_remaining(
+                                        events,
+                                        history,
+                                        &mut tool_messages,
+                                        call.clone(),
+                                        remaining,
+                                        &reason,
+                                        "session.cancel_outstanding",
+                                    )
+                                    .await;
+                                    return Ok(ExecuteToolsExit::OutstandingCancelled {
+                                        reason,
+                                        tool_messages,
+                                    });
                                 }
                                 Some(input @ AgentInput::UserMessage(..))
                                 | Some(input @ AgentInput::StartAutonomous { .. })
@@ -519,46 +721,12 @@ pub(crate) async fn handle_execute_tools(
             }
         };
 
-        history.record(
-            call.name.clone(),
-            call.arguments.clone().into(),
-            result.is_error,
-        );
-
-        // mu-2e0h tier 1: deterministic ingestion hygiene (ANSI strip,
-        // repeat collapse, line cap, dump truncation) applied ONCE,
-        // here — so the provider context, the durable event log, and
-        // the wire all carry the same content. Event-log-decides
-        // depends on the log being the truth of what the model saw;
-        // filtering only the context entry would silently diverge
-        // them. Clean content passes through borrowed (no copy).
-        // Tools that declare `verbatim_result` (read-like tools whose
-        // output must stay byte-identical to disk for exact-match
-        // editing) bypass the filter entirely.
         let verbatim = tool.map(|t| t.spec().verbatim_result).unwrap_or(false);
-        let content = if verbatim {
-            result.content
-        } else {
-            match super::super::tool_result_filter::filter_tool_result(&result.content) {
-                std::borrow::Cow::Borrowed(_) => result.content,
-                std::borrow::Cow::Owned(filtered) => filtered,
-            }
-        };
-
-        let _ = events
-            .send(AgentEvent::ToolCallCompleted {
-                tool_call_id: call.id.clone(),
-                content: content.clone(),
-                is_error: result.is_error,
-            })
-            .await;
-
-        tool_messages.push(AgentMessage::ToolResult {
-            call_id: call.id,
-            content,
-            is_error: result.is_error,
-        });
+        finish_tool_call(events, history, &mut tool_messages, call, result, verbatim).await;
     }
 
-    Ok((tool_messages, buffered))
+    Ok(ExecuteToolsExit::Completed {
+        tool_messages,
+        buffered,
+    })
 }

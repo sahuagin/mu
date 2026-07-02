@@ -79,9 +79,21 @@ fn build_request_body_max_tokens_is_model_aware() {
     let messages = vec![AgentMessage::User {
         content: "hi".into(),
     }];
-    let opus = build_request_body("claude-opus-4-7", None, &messages, &[]);
+    let opus = build_request_body_with_catalog(
+        &mu_core::model_catalog::built_in(),
+        "claude-opus-4-7",
+        None,
+        &messages,
+        &[],
+    );
     assert_eq!(opus["max_tokens"], 16384);
-    let haiku = build_request_body("claude-haiku-4-5", None, &messages, &[]);
+    let haiku = build_request_body_with_catalog(
+        &mu_core::model_catalog::built_in(),
+        "claude-haiku-4-5",
+        None,
+        &messages,
+        &[],
+    );
     assert_eq!(haiku["max_tokens"], 8192);
 }
 

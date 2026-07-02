@@ -516,12 +516,41 @@ pub(crate) fn build_request_body(
     messages: &[AgentMessage],
     tools: &[ToolSpec],
 ) -> Value {
-    let mut req = MessagesRequest::new(
+    build_request_body_with_max_tokens(
         model,
+        system_prompt,
+        messages,
+        tools,
         super::output_limits::max_tokens_for_model(model),
-        map_agent_messages(messages),
     )
-    .with_stream(true);
+}
+
+#[cfg(test)]
+pub(crate) fn build_request_body_with_catalog(
+    catalog: &mu_core::model_catalog::ModelCatalogConfig,
+    model: &str,
+    system_prompt: Option<&str>,
+    messages: &[AgentMessage],
+    tools: &[ToolSpec],
+) -> Value {
+    build_request_body_with_max_tokens(
+        model,
+        system_prompt,
+        messages,
+        tools,
+        super::output_limits::max_tokens_for_model_with_catalog(catalog, model),
+    )
+}
+
+fn build_request_body_with_max_tokens(
+    model: &str,
+    system_prompt: Option<&str>,
+    messages: &[AgentMessage],
+    tools: &[ToolSpec],
+    max_tokens: u32,
+) -> Value {
+    let mut req =
+        MessagesRequest::new(model, max_tokens, map_agent_messages(messages)).with_stream(true);
     if let Some(s) = system_prompt {
         if !s.is_empty() {
             // Legacy path emits no cache_control (mu-yqeq.8).

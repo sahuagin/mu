@@ -107,7 +107,7 @@ use super::types::{AgentMessage, AssistantMessage, ContentBlock, StopReason, Too
 
 // Use these types from submodules internally
 use compaction_integration::CompactionBaseline;
-use execute_tools::handle_execute_tools;
+use execute_tools::{handle_execute_tools, ExecuteToolsExit};
 use invoke::handle_invoke_llm;
 
 /// Map of outstanding `session.input_required` prompts, keyed by
@@ -2149,16 +2149,19 @@ async fn run_inner(
                 )
                 .await
                 {
-                    Ok((tool_results, buffered)) => {
+                    Ok(ExecuteToolsExit::Completed {
+                        tool_messages,
+                        buffered,
+                    }) => {
                         if let RunMode::Autonomous {
                             tool_calls_consumed,
                             ..
                         } = &mut mode
                         {
                             *tool_calls_consumed =
-                                tool_calls_consumed.saturating_add(tool_results.len() as u32);
+                                tool_calls_consumed.saturating_add(tool_messages.len() as u32);
                         }
-                        for r in tool_results {
+                        for r in tool_messages {
                             messages.push(r);
                         }
                         let _ = events.send(AgentEvent::TurnEnd).await;
@@ -2166,7 +2169,18 @@ async fn run_inner(
                             queue.push_back(action);
                         }
                     }
-                    Err(Outcome::OutstandingCancelled { reason }) => {
+                    Ok(ExecuteToolsExit::OutstandingCancelled {
+                        reason,
+                        tool_messages,
+                    }) => {
+                        // Even though the ask is aborted, keep the conversation
+                        // history structurally complete: every assistant
+                        // tool_call now has a synthetic is_error ToolResult.
+                        // Otherwise the next OpenAI/Codex request is an invalid
+                        // continuation ("No tool output found for function call").
+                        for r in tool_messages {
+                            messages.push(r);
+                        }
                         let _ = events
                             .send(AgentEvent::Callout {
                                 category: "info".into(),
@@ -2192,6 +2206,12 @@ async fn run_inner(
                         last_stop_reason = None;
                         queue.clear();
                         continue;
+                    }
+                    Ok(ExecuteToolsExit::Cancelled { tool_messages }) => {
+                        for r in tool_messages {
+                            messages.push(r);
+                        }
+                        return Outcome::Cancelled;
                     }
                     Err(outcome) => {
                         if let Outcome::Error(ref m) = outcome {

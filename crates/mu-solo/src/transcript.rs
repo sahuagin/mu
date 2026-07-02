@@ -52,9 +52,17 @@ impl TranscriptBlock {
     }
 
     pub fn assistant(route: TurnRoute, items: &[TurnItem]) -> Self {
+        Self::assistant_with_label(route, route.header_label(), items)
+    }
+
+    pub fn assistant_with_label(
+        route: TurnRoute,
+        label: impl Into<String>,
+        items: &[TurnItem],
+    ) -> Self {
         let mut b = Self::new(
             TranscriptKind::Assistant,
-            route.header_label(),
+            label,
             render_turn_items_plain(items),
         );
         b.items = Some(items.to_vec());

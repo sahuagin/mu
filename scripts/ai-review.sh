@@ -554,14 +554,23 @@ review_leaf() { # $1=commit $2=short-id $3=unit-label ("" = whole commit) $4=mes
     printf '%s\n' "$d"
     printf '%s\n' "END UNTRUSTED REPO CONTENT: UNIT DIFF"
   } > "$LEAF_FILE"
-  local out rc f
+  local out rc f retry=0 max_timeout_retries
+  max_timeout_retries="${MU_REVIEW_TIMEOUT_RETRIES:-${AI_REVIEW_TIMEOUT_RETRIES:-1}}"
   out="$(run_review "$PROVIDER" "$MODEL" "$LEAF_FILE")"; rc=$?
+  if [ "$rc" -eq 124 ] && [ "$max_timeout_retries" -gt 0 ]; then
+    retry=1
+    echo "${C_YEL}  → leaf timed out after ${TIMEOUT}s; retrying once${C_OFF}"
+    out="$(run_review "$PROVIDER" "$MODEL" "$LEAF_FILE")"; rc=$?
+  fi
   f="$(printf '%s' "$out" | leaf_findings)"
   if [ "$rc" -eq 124 ] || [ -z "$f" ]; then
     # mu ask's exit code is not load-bearing (mu-qc08) — only timeout's 124 is
     # trusted; otherwise "failed" means the output carried no contract lines.
     local reason="no contract output"
-    [ "$rc" -eq 124 ] && reason="timeout after ${TIMEOUT}s"
+    if [ "$rc" -eq 124 ]; then
+      reason="timeout after ${TIMEOUT}s"
+      [ "$retry" -gt 0 ] && reason="$reason after retry"
+    fi
     failed=$((failed + 1))
     log_leaf_error "$c" "$unit" "$reason"
     echo "${C_YEL}  → leaf FAILED ($reason) — recorded as unreviewed. stderr: $ERRLOG${C_OFF}"

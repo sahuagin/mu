@@ -773,6 +773,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             // only once the input alone reaches the window. None route ⇒
             // 0 ⇒ no reservation (unchanged behavior).
             max_output_tokens: max_output_tokens.unwrap_or(0) as usize,
+            context_hard_limit: context_hard_limit.map(|h| h as usize),
             compaction_policy_override,
             // mu-mh4: seed the loop with the continuation history when
             // this session is a resume/fork-at-tail; empty otherwise.
@@ -1516,6 +1517,7 @@ pub async fn handle_set_route(
         model: Arc::from(model_str.as_str()),
         max_output_tokens: max_output_tokens.unwrap_or(0) as usize,
         context_soft_limit: context_soft_limit.unwrap_or(0),
+        context_hard_limit: context_hard_limit.unwrap_or(0),
     };
 
     if input_tx.send(input).await.is_err() {

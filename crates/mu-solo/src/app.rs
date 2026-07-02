@@ -734,6 +734,12 @@ pub struct App {
     /// no native scrollback. Opt-in via `MU_SOLO_FULLSCREEN` while it's built
     /// as a parallel mode alongside the inline path.
     fullscreen: bool,
+    /// Transcript block count at the moment fullscreen was last entered (0
+    /// when the session started in fullscreen via `MU_SOLO_FULLSCREEN`). The
+    /// inline flip replays only blocks past this watermark: earlier blocks
+    /// were already emitted to native scrollback by the inline commit path,
+    /// and replaying them would duplicate scrollback on every toggle.
+    fullscreen_entry_blocks: usize,
     /// Lines scrolled UP from the bottom of the transcript in fullscreen mode
     /// (0 = stuck to the latest). Ignored in inline mode.
     transcript_scroll: usize,
@@ -1751,6 +1757,7 @@ impl App {
             live_turn: None,
             transcript: Transcript::new(),
             fullscreen: std::env::var_os("MU_SOLO_FULLSCREEN").is_some(),
+            fullscreen_entry_blocks: 0,
             transcript_scroll: 0,
             selected_block: None,
             maximized_block: None,
@@ -2376,15 +2383,20 @@ impl App {
                                     self.queued_interjection_response_count.saturating_sub(1);
                             }
                             self.set_flash("queued interjection failed".to_string());
-                            let width = vp.area().width as usize;
-                            let wrap = width.saturating_sub(2);
-                            let lines =
-                                render::error_block(&format!("queued ask failed: {err}"), wrap);
-                            let h = lines.len() as u16;
-                            vp.insert_before(h, |buf| {
-                                let p = Paragraph::new(lines);
-                                ratatui::widgets::Widget::render(p, buf.area, buf);
-                            })?;
+                            // Record in the transcript (fullscreen render +
+                            // inline replay); insert_before is inline-only.
+                            let err_msg = format!("queued ask failed: {err}");
+                            self.transcript.push(TranscriptBlock::error(&err_msg));
+                            if !self.fullscreen {
+                                let width = vp.area().width as usize;
+                                let wrap = width.saturating_sub(2);
+                                let lines = render::error_block(&err_msg, wrap);
+                                let h = lines.len() as u16;
+                                vp.insert_before(h, |buf| {
+                                    let p = Paragraph::new(lines);
+                                    ratatui::widgets::Widget::render(p, buf.area, buf);
+                                })?;
+                            }
                         } else {
                             let width = vp.area().width as usize;
                             let wrap = width.saturating_sub(2);
@@ -2420,12 +2432,18 @@ impl App {
                             // the status projection or the spinner freezes.
                             self.session_phase = SessionPhase::on_turn_end(true, None, None);
                             self.phase_elapsed_ms = 0;
-                            let lines = render::error_block(&format!("ask failed: {err}"), wrap);
-                            let h = lines.len() as u16;
-                            vp.insert_before(h, |buf| {
-                                let p = Paragraph::new(lines);
-                                ratatui::widgets::Widget::render(p, buf.area, buf);
-                            })?;
+                            // Record in the transcript (fullscreen render +
+                            // inline replay); insert_before is inline-only.
+                            let err_msg = format!("ask failed: {err}");
+                            self.transcript.push(TranscriptBlock::error(&err_msg));
+                            if !self.fullscreen {
+                                let lines = render::error_block(&err_msg, wrap);
+                                let h = lines.len() as u16;
+                                vp.insert_before(h, |buf| {
+                                    let p = Paragraph::new(lines);
+                                    ratatui::widgets::Widget::render(p, buf.area, buf);
+                                })?;
+                            }
                         }
                     }
                     if was_interjection {
@@ -2744,6 +2762,18 @@ impl App {
                     }
                     "/collapse" => {
                         self.cmd_collapse(vp, tail)?;
+                        return Ok(false);
+                    }
+                    "/fullscreen" => {
+                        self.cmd_fullscreen(vp, tail)?;
+                        return Ok(false);
+                    }
+                    "/inline" => {
+                        if tail.is_empty() {
+                            self.cmd_fullscreen(vp, "off")?;
+                        } else {
+                            self.set_flash(format!("/inline takes no arguments (got {tail:?})"));
+                        }
                         return Ok(false);
                     }
                     "/btw" => {
@@ -3413,18 +3443,27 @@ impl App {
                 TranscriptBlock::new(TranscriptKind::User, label, interjection.body.clone());
             block.route = Some(TurnRoute::Main);
             self.transcript.push(block);
-            let lines = pending_interjection_commit_lines(&interjection, wrap_width);
-            let h = lines.len() as u16;
-            vp.insert_before(h, |buf| {
-                let p = Paragraph::new(lines);
-                ratatui::widgets::Widget::render(p, buf.area, buf);
-            })?;
+            // Fullscreen renders the transcript block; the inline flip
+            // replays it.
+            if !self.fullscreen {
+                let lines = pending_interjection_commit_lines(&interjection, wrap_width);
+                let h = lines.len() as u16;
+                vp.insert_before(h, |buf| {
+                    let p = Paragraph::new(lines);
+                    ratatui::widgets::Widget::render(p, buf.area, buf);
+                })?;
+            }
         }
         Ok(committed)
     }
 
     /// Show the "you" block in scrollback without sending anything.
+    /// No-op in fullscreen: the owned-buffer render shows the transcript
+    /// block, and the inline flip replays it to scrollback.
     fn emit_you_block(&self, vp: &mut DynamicViewport, display_text: &str) -> Result<()> {
+        if self.fullscreen {
+            return Ok(());
+        }
         vp.clear_viewport()?;
         let width = vp.area().width as usize;
         let wrap_width = width.saturating_sub(2);
@@ -3563,12 +3602,15 @@ impl App {
         let route = TurnRoute::Btw;
         self.transcript
             .push(TranscriptBlock::user(route, msg.to_string()));
-        let lines = render::block_lines(route.you_label(), route.you_color(), msg, wrap_width);
-        let h = lines.len() as u16;
-        vp.insert_before(h, |buf| {
-            let p = Paragraph::new(lines);
-            ratatui::widgets::Widget::render(p, buf.area, buf);
-        })?;
+        // Fullscreen renders the transcript block; the inline flip replays it.
+        if !self.fullscreen {
+            let lines = render::block_lines(route.you_label(), route.you_color(), msg, wrap_width);
+            let h = lines.len() as u16;
+            vp.insert_before(h, |buf| {
+                let p = Paragraph::new(lines);
+                ratatui::widgets::Widget::render(p, buf.area, buf);
+            })?;
+        }
 
         // Route this turn to the sidecar and start a fresh live turn.
         self.streaming_route = Some(route);
@@ -3887,6 +3929,94 @@ impl App {
             let p = Paragraph::new(lines);
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
+        Ok(())
+    }
+
+    /// /fullscreen [on|off|toggle] — switch between the owned-buffer
+    /// fullscreen render and the inline/native-scrollback render. While
+    /// fullscreen, transcript commits do NOT write native scrollback (the
+    /// owned buffer is the display); on the fullscreen→inline edge, the
+    /// blocks committed during the fullscreen period are replayed into
+    /// `insert_before` so scrollback becomes whole again (mu-vi6n).
+    fn cmd_fullscreen(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
+        let target = match fullscreen_target(arg, self.fullscreen) {
+            Ok(target) => target,
+            Err(msg) => {
+                self.set_flash(msg.clone());
+                if !self.fullscreen {
+                    let lines: Vec<Line<'static>> = vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            msg,
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from("  usage:    /fullscreen [on|off|toggle]"),
+                        Line::from(""),
+                    ];
+                    let h = lines.len() as u16;
+                    vp.insert_before(h, |buf| {
+                        let p = Paragraph::new(lines);
+                        ratatui::widgets::Widget::render(p, buf.area, buf);
+                    })?;
+                }
+                return Ok(());
+            }
+        };
+
+        match (self.fullscreen, target) {
+            (true, false) => {
+                self.fullscreen = false;
+                self.overlay = None;
+                self.transcript_scroll = 0;
+                self.selected_block = None;
+                self.maximized_block = None;
+                vp.set_height(VIEWPORT_HEIGHT)?;
+                let wrap_width = (vp.area().width as usize).saturating_sub(2);
+                let preview = if self.bash_yolo { 15 } else { 4 };
+                // Replay only the fullscreen-period delta; blocks before the
+                // watermark were emitted to scrollback by the inline commit
+                // path already. (/clear resets the watermark; min() is only
+                // out-of-bounds defense.)
+                let skip = self.fullscreen_entry_blocks.min(self.transcript.len());
+                let lines = render_transcript_lines_for_inline_dump(
+                    &self.transcript,
+                    skip,
+                    wrap_width,
+                    preview,
+                );
+                // Emit in bounded slices: a long fullscreen session's delta in
+                // one insert_before would silently truncate at the `as u16`
+                // cast past 65535 lines and spike the terminal in one burst.
+                const DUMP_CHUNK_LINES: usize = 500;
+                for chunk in lines.chunks(DUMP_CHUNK_LINES) {
+                    let chunk: Vec<Line<'static>> = chunk.to_vec();
+                    let h = chunk.len() as u16;
+                    vp.insert_before(h, |buf| {
+                        let p = Paragraph::new(chunk);
+                        ratatui::widgets::Widget::render(p, buf.area, buf);
+                    })?;
+                }
+                self.set_flash(
+                    "fullscreen → off; fullscreen-period transcript replayed to scrollback"
+                        .to_string(),
+                );
+            }
+            (false, true) => {
+                self.fullscreen = true;
+                self.overlay = None;
+                self.transcript_scroll = 0;
+                self.selected_block = None;
+                self.maximized_block = None;
+                self.fullscreen_entry_blocks = self.transcript.len();
+                self.set_flash("fullscreen → on".to_string());
+            }
+            (_, _) => {
+                self.set_flash(format!(
+                    "fullscreen already {}",
+                    if self.fullscreen { "on" } else { "off" }
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -4460,6 +4590,12 @@ impl App {
         self.transcript.clear();
         self.transcript_scroll = 0;
         self.selected_block = None;
+        // Reset the replay watermark: after a clear, everything committed
+        // from here on is post-watermark by definition. A stale watermark
+        // above the new (shorter) transcript length would make the
+        // fullscreen→inline replay skip post-clear blocks entirely —
+        // silently dropping them from native scrollback (panel finding).
+        self.fullscreen_entry_blocks = 0;
         if !self.fullscreen {
             vp.clear_viewport()?;
         }
@@ -4641,28 +4777,36 @@ impl App {
             }
         };
 
-        // Activation banner — the only visual feedback.
-        let banner_lines: Vec<Line<'static>> = vec![
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    format!("  /{skill_name}"),
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" — {}", skill.description),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]),
-            Line::from(""),
-        ];
-        let bh = banner_lines.len() as u16;
-        vp.insert_before(bh, |buf| {
-            let p = Paragraph::new(banner_lines);
-            ratatui::widgets::Widget::render(p, buf.area, buf);
-        })?;
+        // Activation notice — the record: visible in the fullscreen render
+        // and in the fullscreen→inline replay. The styled banner below is
+        // inline-only chrome (invisible under the owned-buffer render).
+        self.transcript.push(TranscriptBlock::notice(
+            format!("/{skill_name}"),
+            format!("/{skill_name} — {}", skill.description),
+        ));
+        if !self.fullscreen {
+            let banner_lines: Vec<Line<'static>> = vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(
+                        format!("  /{skill_name}"),
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" — {}", skill.description),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]),
+                Line::from(""),
+            ];
+            let bh = banner_lines.len() as u16;
+            vp.insert_before(bh, |buf| {
+                let p = Paragraph::new(banner_lines);
+                ratatui::widgets::Widget::render(p, buf.area, buf);
+            })?;
+        }
 
         // Build the wire message: skill body is invisible context,
         // only the user's message (if any) shows in scrollback.
@@ -4677,6 +4821,11 @@ impl App {
         };
 
         if !tail.is_empty() {
+            // Record the user's tail in the transcript (fullscreen render +
+            // inline replay); emit_you_block is the inline scrollback path
+            // and no-ops in fullscreen.
+            self.transcript
+                .push(TranscriptBlock::user(TurnRoute::Main, tail.to_string()));
             self.emit_you_block(vp, tail)?;
         }
         self.fire_ask(vp, &wire_msg)?;
@@ -4713,6 +4862,11 @@ impl App {
             MenuItem::new("/effort ›", "Select effort level"),
             MenuItem::new("/focus", "Toggle focus mode (suppress streaming preview)"),
             MenuItem::new("/collapse", "Fold tool call+result blocks to one-liners"),
+            MenuItem::new("/fullscreen", "Toggle fullscreen owned-buffer render"),
+            MenuItem::new(
+                "/inline",
+                "Leave fullscreen and replay transcript to scrollback",
+            ),
             MenuItem::new("/provider ›", "Select provider"),
             MenuItem::new("/model ›", "Select model"),
             MenuItem::new(
@@ -4757,6 +4911,8 @@ impl App {
             Line::from(
                 "  /collapse [on|off] fold completed tool blocks to one-liners (fullscreen)",
             ),
+            Line::from("  /fullscreen [on|off] toggle fullscreen owned-buffer render"),
+            Line::from("  /inline            leave fullscreen; replay transcript to scrollback"),
             Line::from("  /provider [name]   list-picker (bare) or set directly"),
             Line::from("  /model [name]      list-picker (bare) or set directly"),
             Line::from("  /btw <message>     side question via sidecar (main history unaffected)"),
@@ -5440,54 +5596,63 @@ impl App {
                         if let Some(msg) = error_msg.as_deref() {
                             t.items.push(render::TurnItem::Error(msg.to_string()));
                         }
-                        // Finalize-mismatch check: compare committed
-                        // history lines against the rendered line count
-                        // that's about to be inserted. A mismatch here
-                        // means the live preview and the final commit
-                        // diverged — log to the journal and warn.
-                        let history_before = vp.history_len();
                         let label = t.header_label();
                         self.transcript.push(TranscriptBlock::assistant_with_label(
                             t.route,
                             label.clone(),
                             &t.items,
                         ));
-                        let mut lines = render::render_turn(
-                            &label,
-                            t.route.color(),
-                            &t.items,
-                            wrap_width,
-                            preview_lines,
-                            false, // inline scrollback commit keeps full results (mu-5h9m)
-                        );
-                        lines.extend(render::turn_closer(t.route.color()));
-                        let h = lines.len() as u16;
-                        // Compute committed text length for the mismatch check.
-                        let committed_text_len: usize = t
-                            .items
-                            .iter()
-                            .map(|item| {
-                                if let render::TurnItem::Text(s) = item {
-                                    s.len()
-                                } else {
-                                    0
-                                }
-                            })
-                            .sum();
-                        vp.insert_before(h, |buf| {
-                            let p = Paragraph::new(lines);
-                            ratatui::widgets::Widget::render(p, buf.area, buf);
-                        })?;
-                        // Post-insert mismatch check: history should have
-                        // grown to exactly min(before + h, MAX_HISTORY) —
-                        // the cap-aware form, so a MAX_HISTORY drain does
-                        // not false-alarm (8hva judge finding).
-                        let history_after = vp.history_len();
-                        let expected_after =
-                            (history_before + h as usize).min(crate::viewport::MAX_HISTORY);
-                        if history_after != expected_after {
-                            let actually_committed = history_after.saturating_sub(history_before);
-                            vp.journal_finalize_mismatch(actually_committed, committed_text_len);
+                        // Fullscreen owns the display: the transcript push above
+                        // is the record, and the inline flip replays it to
+                        // scrollback. Emitting here too would duplicate it.
+                        if !self.fullscreen {
+                            // Finalize-mismatch check: compare committed
+                            // history lines against the rendered line count
+                            // that's about to be inserted. A mismatch here
+                            // means the live preview and the final commit
+                            // diverged — log to the journal and warn.
+                            let history_before = vp.history_len();
+                            let mut lines = render::render_turn(
+                                &label,
+                                t.route.color(),
+                                &t.items,
+                                wrap_width,
+                                preview_lines,
+                                false, // inline scrollback commit keeps full results (mu-5h9m)
+                            );
+                            lines.extend(render::turn_closer(t.route.color()));
+                            let h = lines.len() as u16;
+                            // Compute committed text length for the mismatch check.
+                            let committed_text_len: usize = t
+                                .items
+                                .iter()
+                                .map(|item| {
+                                    if let render::TurnItem::Text(s) = item {
+                                        s.len()
+                                    } else {
+                                        0
+                                    }
+                                })
+                                .sum();
+                            vp.insert_before(h, |buf| {
+                                let p = Paragraph::new(lines);
+                                ratatui::widgets::Widget::render(p, buf.area, buf);
+                            })?;
+                            // Post-insert mismatch check: history should have
+                            // grown to exactly min(before + h, MAX_HISTORY) —
+                            // the cap-aware form, so a MAX_HISTORY drain does
+                            // not false-alarm (8hva judge finding).
+                            let history_after = vp.history_len();
+                            let expected_after =
+                                (history_before + h as usize).min(crate::viewport::MAX_HISTORY);
+                            if history_after != expected_after {
+                                let actually_committed =
+                                    history_after.saturating_sub(history_before);
+                                vp.journal_finalize_mismatch(
+                                    actually_committed,
+                                    committed_text_len,
+                                );
+                            }
                         }
                     }
                     _ => {
@@ -5513,11 +5678,16 @@ impl App {
                                 Line::from(""),
                             ]
                         };
-                        let h = lines.len() as u16;
-                        vp.insert_before(h, |buf| {
-                            let p = Paragraph::new(lines);
-                            ratatui::widgets::Widget::render(p, buf.area, buf);
-                        })?;
+                        // Fullscreen: the error is in the transcript (replayed
+                        // on the inline flip); the no-output hint is inline-only
+                        // chrome. Either way, don't write scrollback here.
+                        if !self.fullscreen {
+                            let h = lines.len() as u16;
+                            vp.insert_before(h, |buf| {
+                                let p = Paragraph::new(lines);
+                                ratatui::widgets::Widget::render(p, buf.area, buf);
+                            })?;
+                        }
                     }
                 }
                 if finished_main {
@@ -5549,11 +5719,15 @@ impl App {
                         )));
                     }
                     nlines.push(Line::from(""));
-                    let h = nlines.len() as u16;
-                    vp.insert_before(h, |buf| {
-                        let p = Paragraph::new(nlines);
-                        ratatui::widgets::Widget::render(p, buf.area, buf);
-                    })?;
+                    // Transcript block above is the record (fullscreen render
+                    // + inline replay); scrollback write is inline-only.
+                    if !self.fullscreen {
+                        let h = nlines.len() as u16;
+                        vp.insert_before(h, |buf| {
+                            let p = Paragraph::new(nlines);
+                            ratatui::widgets::Widget::render(p, buf.area, buf);
+                        })?;
+                    }
                 }
                 self.streaming_route = if will_await_queued_main {
                     Some(TurnRoute::Main)
@@ -5839,6 +6013,93 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
+fn fullscreen_target(arg: &str, current: bool) -> Result<bool, String> {
+    match arg.trim().to_ascii_lowercase().as_str() {
+        "" | "toggle" => Ok(!current),
+        "on" | "true" | "1" | "yes" | "full" | "fullscreen" => Ok(true),
+        "off" | "false" | "0" | "no" | "inline" => Ok(false),
+        other => Err(format!(
+            "unknown fullscreen arg {other:?} — use on|off|toggle"
+        )),
+    }
+}
+
+/// Render transcript blocks `skip..` for the fullscreen→inline scrollback
+/// replay. `skip` is the watermark recorded at fullscreen entry — earlier
+/// blocks are already in native scrollback from the inline commit path.
+///
+/// Deliberately excludes the in-flight `live_turn`: a turn streaming across
+/// the flip stays visible in the inline preview and is committed to
+/// scrollback in full by the normal completion path when it finishes;
+/// dumping its partial content here would duplicate it then.
+fn render_transcript_lines_for_inline_dump(
+    transcript: &Transcript,
+    skip: usize,
+    wrap_width: usize,
+    tool_preview_lines: usize,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "── fullscreen transcript replay ─────────────────".to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+
+    let delta = &transcript.blocks()[skip.min(transcript.len())..];
+    if delta.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no transcript blocks committed during this fullscreen session)".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+        return lines;
+    }
+
+    for block in delta {
+        lines.push(Line::from(""));
+        match (block.kind, block.items.as_ref()) {
+            (TranscriptKind::User, _) => {
+                let color = block
+                    .route
+                    .map(|r| r.you_color())
+                    .unwrap_or(ratatui::style::Color::Cyan);
+                lines.extend(render::block_lines(
+                    &block.label,
+                    color,
+                    &block.body,
+                    wrap_width,
+                ));
+            }
+            (TranscriptKind::Assistant, Some(items)) => {
+                let color = block
+                    .route
+                    .map(|r| r.color())
+                    .unwrap_or(ratatui::style::Color::White);
+                lines.extend(render::render_turn(
+                    &block.label,
+                    color,
+                    items,
+                    wrap_width,
+                    tool_preview_lines,
+                    false,
+                ));
+                lines.extend(render::turn_closer(color));
+            }
+            (TranscriptKind::Assistant, None) | (TranscriptKind::Notice, _) => {
+                lines.extend(render::assistant_block(&block.body, wrap_width))
+            }
+            (TranscriptKind::Error, _) => {
+                lines.extend(render::error_block(&block.body, wrap_width))
+            }
+        }
+    }
+    lines.push(Line::from(""));
+    lines
+}
+
 /// Minimum viewport height (separator + 1 prompt row + separator + status + info).
 const VIEWPORT_HEIGHT: u16 = 5;
 /// Keep a few prompt rows allocated so crossing a visual-line boundary while
@@ -5951,6 +6212,92 @@ mod tests {
 
     fn lines_plain(lines: &[Line<'_>]) -> Vec<String> {
         lines.iter().map(line_plain).collect()
+    }
+
+    #[test]
+    fn fullscreen_target_parses_toggle_on_off_and_inline_alias() {
+        assert!(fullscreen_target("", false).unwrap());
+        assert!(!fullscreen_target("", true).unwrap());
+        assert!(fullscreen_target("on", false).unwrap());
+        assert!(!fullscreen_target("off", true).unwrap());
+        assert!(!fullscreen_target("inline", true).unwrap());
+        assert!(fullscreen_target("force", true).is_err());
+    }
+
+    #[test]
+    fn fullscreen_to_inline_dump_replays_transcript_blocks() {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptBlock::user(
+            TurnRoute::Main,
+            "hello from fullscreen",
+        ));
+        transcript.push(TranscriptBlock::new(
+            TranscriptKind::Assistant,
+            "assistant ⋅ faux/faux",
+            "answer only lived in owned buffer",
+        ));
+
+        let rendered = lines_plain(&render_transcript_lines_for_inline_dump(
+            &transcript,
+            0,
+            80,
+            4,
+        ))
+        .join("\n");
+        assert!(rendered.contains("fullscreen transcript replay"));
+        assert!(rendered.contains("hello from fullscreen"));
+        assert!(rendered.contains("answer only lived in owned buffer"));
+    }
+
+    #[test]
+    fn fullscreen_to_inline_dump_replays_only_past_the_watermark() {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptBlock::user(
+            TurnRoute::Main,
+            "committed inline before fullscreen",
+        ));
+        transcript.push(TranscriptBlock::new(
+            TranscriptKind::Assistant,
+            "assistant ⋅ faux/faux",
+            "committed during fullscreen",
+        ));
+
+        // Watermark 1: only the fullscreen-period block replays.
+        let rendered = lines_plain(&render_transcript_lines_for_inline_dump(
+            &transcript,
+            1,
+            80,
+            4,
+        ))
+        .join("\n");
+        assert!(!rendered.contains("committed inline before fullscreen"));
+        assert!(rendered.contains("committed during fullscreen"));
+
+        // Watermark at (or defensively past) the end: nothing to replay,
+        // placeholder only. (/clear resets the app-level watermark to 0, so
+        // past-the-end only arises from the min() clamp.)
+        for skip in [2, 5] {
+            let rendered = lines_plain(&render_transcript_lines_for_inline_dump(
+                &transcript,
+                skip,
+                80,
+                4,
+            ))
+            .join("\n");
+            assert!(rendered.contains("no transcript blocks committed during this fullscreen"));
+        }
+    }
+
+    #[test]
+    fn fullscreen_to_inline_dump_handles_empty_transcript() {
+        let rendered = lines_plain(&render_transcript_lines_for_inline_dump(
+            &Transcript::new(),
+            0,
+            80,
+            4,
+        ))
+        .join("\n");
+        assert!(rendered.contains("no transcript blocks committed during this fullscreen"));
     }
 
     #[test]

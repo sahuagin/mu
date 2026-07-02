@@ -683,6 +683,43 @@ $content"
 [spec context truncated at 60000 bytes]"
   fi
 
+  # mu-aipr-synthesis-fabricates-terrain-uepk: chunked synthesis previously
+  # saw only leaf FINDING lines + diffstat, then confidently rebutted findings
+  # with fake terrain ("function does not exist", bogus line claims). Give the
+  # synthesis/convergence panel bounded HEADREV file content for every path named
+  # in a leaf finding, and keep it inside the first ```diff fence below so later
+  # convergence rounds retain the same terrain material. The panel also has
+  # read/grep tools via the code_review role, but context here makes the safe path
+  # cheap and deterministic.
+  local synth_context="" synth_context_max="${MU_REVIEW_SYNTH_CONTEXT_MAX_BYTES:-100000}"
+  local finding_files ff fcontent
+  finding_files="$(printf '%s\n' "$SYNTH_FINDINGS" | awk -F'|' '$1 == "FINDING" && $3 != "" { print $3 }' | sort -u || true)"
+  while IFS= read -r ff; do
+    [ -n "$ff" ] || continue
+    case "$ff" in /dev/null) continue ;; esac
+    if [ -n "$IS_JJ" ]; then
+      fcontent="$(jj file show -r "$HEADREV" -- "$ff" 2>/dev/null || true)"
+    else
+      fcontent="$(git show "$HEADREV:$ff" 2>/dev/null || true)"
+    fi
+    if [ -z "$fcontent" ]; then
+      fcontent="[file unavailable at $HEADREV; possibly deleted, generated, or the leaf cited a non-existent path]"
+    else
+      # Avoid accidentally closing the markdown fence that consensus.sh extracts
+      # for later convergence prompts.
+      fcontent="$(printf '%s' "$fcontent" | sed 's/```/` ` `/g')"
+    fi
+    synth_context="$synth_context
+
+===== TARGETED FILE CONTEXT: $ff =====
+$fcontent"
+    if [ "${#synth_context}" -gt "$synth_context_max" ]; then
+      synth_context="$(printf '%s' "$synth_context" | head -c "$synth_context_max")
+[targeted synthesis context truncated at ${synth_context_max} bytes]"
+      break
+    fi
+  done <<<"$finding_files"
+
   echo "${C_DIM}── synthesis: CONSENSUS panel (code_review role, <=${MU_REVIEW_MAX_ROUNDS:-4} rounds) over $leaves leaf unit(s) ──${C_OFF}"
   # mu-feur follow-up: chunked now converges the SAME antagonistic panel the
   # single-shot path uses, over the aggregated leaf FINDINGS — which are compact
@@ -693,7 +730,7 @@ $content"
   CONS_OUT="$(mktemp -d "${TMPDIR:-/tmp}/ai-review-chunked-consensus.XXXXXX")"
   CONS_PROMPT="$CONS_OUT/round1.prompt.txt"
   {
-    printf '%s\n' "You are a strict pre-PR code reviewer for ${PROJECT_DESC}. This branch was too large for one review, so each commit was reviewed in isolation by a leaf reviewer; their findings are the review material below, in the form FINDING|<severity>|<file>|<claim>. You hold the only branch-wide view: judge which findings are REAL (a later commit may already fix what an earlier leaf flagged) and whether any INTERACT across commits into a larger hazard no single commit shows. Units marked 'REVIEW FAILED — treat as unreviewed' carry unknown risk; weigh that. If a SPEC section is included, judge whether the branch delivers what it claims. If PROJECT ARCHITECTURE INVARIANTS are included, a violation (or a move toward one) is needs-changes even when each commit is locally correct. Do NOT raise findings about code not represented here."
+    printf '%s\n' "You are a strict pre-PR code reviewer for ${PROJECT_DESC}. This branch was too large for one review, so each commit was reviewed in isolation by a leaf reviewer; their findings are the review material below, in the form FINDING|<severity>|<file>|<claim>. You hold the only branch-wide view: judge which findings are REAL (a later commit may already fix what an earlier leaf flagged) and whether any INTERACT across commits into a larger hazard no single commit shows. Units marked 'REVIEW FAILED — treat as unreviewed' carry unknown risk; weigh that. If a SPEC section is included, judge whether the branch delivers what it claims. If PROJECT ARCHITECTURE INVARIANTS are included, a violation (or a move toward one) is needs-changes even when each commit is locally correct. Targeted HEADREV file context for paths named by leaf findings may be included in the review-material fence; you also have read/grep tools via the code_review role. Do NOT assert terrain facts (line numbers, function existence/non-existence, nearby safeguards) unless you verified them against the provided context or by reading/grepping the repository. If you cannot verify a terrain-dependent rebuttal, mark the risk as unresolved rather than inventing confidence."
     printf 'Respond with ONLY one JSON object (no prose, no markdown fence, nothing before or after it):\n'
     printf '{"verdict":"approve"|"needs-changes","summary":"<1-2 sentences>","findings":[{"file":"<path>","line":<int>,"severity":"high"|"medium"|"low","issue":"<desc>"}]}\n'
     printf 'Every element of "findings" MUST be a JSON object with exactly those four keys (file, line, severity, issue), never a bare string and never null. Use [] if there are no findings.\n'
@@ -704,8 +741,8 @@ $content"
     # consensus.sh carries the FIRST ```diff fence into each convergence round as
     # the shared artifact; here that fence holds the aggregated leaf findings (not
     # a raw diff), and the prose above tells the panel exactly that.
-    printf '\nAGGREGATED LEAF FINDINGS (%s unit(s), %s unreviewed) — the review material:\n```diff\n%s\n```\n' \
-      "$leaves" "$failed" "$SYNTH_FINDINGS"
+    printf '\nREVIEW MATERIAL (%s unit(s), %s unreviewed). This is what convergence rounds will re-read: aggregated leaf findings plus bounded HEADREV file context for cited paths.\n```diff\nAGGREGATED LEAF FINDINGS:\n%s\n\nTARGETED FILE CONTEXT FOR CITED PATHS:%s\n```\n' \
+      "$leaves" "$failed" "$SYNTH_FINDINGS" "${synth_context:-\n[none: no file paths were cited by leaf findings]}"
   } > "$CONS_PROMPT"
 
   # log_panel_chunked records $SYNTH_PROVIDER/$SYNTH_MODEL as the synth lane; that

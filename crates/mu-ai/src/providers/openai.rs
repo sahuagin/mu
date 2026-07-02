@@ -188,15 +188,24 @@ impl OpenaiProvider {
 
     // ---- Public (API key) constructors ----
 
-    /// Direct API-key provider against `api.openai.com`.
+    /// Direct API-key provider against `api.openai.com`. When
+    /// `OPENAI_BASE_URL` is set (and non-empty), the Responses endpoint
+    /// becomes `{OPENAI_BASE_URL}/v1/responses` instead — e.g. a LAN ollama
+    /// box that serves the Responses API. Mirrors `providers/anthropic.rs`'s
+    /// `ANTHROPIC_BASE_URL` handling.
     pub fn from_api_key(model: String, api_key: String) -> Self {
+        let endpoint = std::env::var("OPENAI_BASE_URL")
+            .ok()
+            .filter(|b| !b.trim().is_empty())
+            .map(|b| format!("{}/v1/responses", b.trim_end_matches('/')))
+            .unwrap_or_else(|| PUBLIC_ENDPOINT.into());
         Self {
             model,
             thinking: DEFAULT_THINKING.into(),
             instructions: DEFAULT_INSTRUCTIONS.into(),
             mode: AuthMode::Public { api_key },
             http: reqwest::Client::new(),
-            endpoint: PUBLIC_ENDPOINT.into(),
+            endpoint,
         }
     }
 

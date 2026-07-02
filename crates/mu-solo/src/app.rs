@@ -19,8 +19,10 @@ use anyhow::{anyhow, Context, Result};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use mu_core::protocol::{
-    DaemonMcpStatusRequest, DaemonMcpStatusResponse, McpServerConnectionState, McpServerStatus,
+    DaemonListRoutesRequest, DaemonListRoutesResponse, DaemonMcpStatusRequest,
+    DaemonMcpStatusResponse, McpServerConnectionState, McpServerStatus,
 };
+use mu_core::route_catalog::RouteEntry;
 use mu_core::session_status::SessionStatus;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -73,10 +75,12 @@ const KNOWN_PROVIDERS: &[&str] = &[
     "faux",
 ];
 
-/// Known models per provider for the `/model` picker. Returns an
-/// empty slice for providers we don't have curated lists for; the
-/// caller falls back to free-form entry. Strings live as `&'static str`
-/// so we can hand them to the picker without allocating.
+/// Curated fallback models per provider for the `/model` picker. The real
+/// picker uses daemon.list_routes when available; this table exists only for
+/// older daemons / decode failures. Returns an empty slice for providers we
+/// don't have curated fallbacks for; the caller falls back to free-form entry.
+/// Strings live as `&'static str` so we can hand them to the picker without
+/// allocating.
 fn known_models_for(provider: &str) -> &'static [&'static str] {
     match normalize_provider_kind(provider).as_str() {
         "anthropic_api" | "anthropic_oauth" => &[
@@ -87,13 +91,10 @@ fn known_models_for(provider: &str) -> &'static [&'static str] {
         ],
         "openai_codex" => &["gpt-5.5"],
         "openai_api" => &["gpt-4o", "gpt-4-turbo"],
-        // OpenRouter model IDs drift faster than mu releases; this is
-        // a curated *small* set of currently-valid entries (verified
-        // against openrouter.ai/api/v1/models as of 2026-05-23). For
-        // the long tail, use `/model <full-id>` to set directly —
-        // free-form entry skips the picker. A future commit can
-        // populate this list dynamically by querying OpenRouter's
-        // /api/v1/models on first /model invocation.
+        // Fallback only. OpenRouter model IDs drift faster than mu releases;
+        // normal sessions should receive generated/current entries through
+        // daemon.list_routes. For anything absent here, `/model <full-id>`
+        // still sets directly if the daemon route catalog knows it.
         "openrouter" => &[
             "anthropic/claude-opus-4.7",
             "anthropic/claude-haiku-4-5",
@@ -629,6 +630,10 @@ pub struct App {
     /// them off disk to detect a silent faux-fallback. None when we
     /// can't resolve the data dir on this platform/user.
     events_file: Option<std::path::PathBuf>,
+    /// Daemon-advertised route catalog. Preferred source for provider/model
+    /// pickers; the old curated lists are only a fallback for older daemons or
+    /// decode failures.
+    routes: Vec<RouteEntry>,
     /// What the daemon *actually* picked for the renderer / cache /
     /// provider on this session, read from the first ContextAssembly
     /// event. None until the first session.done lets us peek. The
@@ -767,6 +772,138 @@ fn is_picker_command(cmd: &str) -> bool {
     matches!(cmd, "/effort" | "/provider" | "/model")
 }
 
+fn provider_picker_strings_for(routes: &[RouteEntry], current_provider: &str) -> Vec<String> {
+    let mut providers: Vec<String> = KNOWN_PROVIDERS.iter().map(|p| (*p).to_string()).collect();
+    for route in routes {
+        let provider = route.provider_kind.to_string();
+        let kind = normalize_provider_kind(&provider);
+        if !providers.iter().any(|p| normalize_provider_kind(p) == kind) {
+            providers.push(provider);
+        }
+    }
+    let current = normalize_provider_kind(current_provider);
+    if !providers
+        .iter()
+        .any(|p| normalize_provider_kind(p) == current)
+    {
+        providers.insert(0, current);
+    }
+    providers
+}
+
+fn route_models_for_provider_from(routes: &[RouteEntry], provider_kind: &str) -> Vec<String> {
+    let kind = normalize_provider_kind(provider_kind);
+    let mut models: Vec<String> = routes
+        .iter()
+        .filter(|r| r.provider_kind.as_ref() == kind)
+        .map(|r| r.model.to_string())
+        .collect();
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn model_picker_strings_for(
+    routes: &[RouteEntry],
+    provider: &str,
+    current_model: &str,
+) -> Vec<String> {
+    let kind = normalize_provider_kind(provider);
+    let routed = route_models_for_provider_from(routes, &kind);
+    let known = known_models_for(&kind);
+    let source: Vec<String> = if routed.is_empty() {
+        known.iter().map(|s| (*s).to_string()).collect()
+    } else {
+        routed
+    };
+    let mut items: Vec<String> = Vec::with_capacity(source.len() + 1);
+    if !source.iter().any(|m| m == current_model) {
+        items.push(current_model.to_string());
+    }
+    items.extend(source);
+    items
+}
+
+fn compact_limit(n: u64) -> String {
+    if n >= 1_000_000 && n.is_multiple_of(1_000_000) {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000 && n.is_multiple_of(1_000) {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
+}
+
+fn provider_picker_description(
+    routes: &[RouteEntry],
+    provider: &str,
+    current_provider: &str,
+) -> String {
+    let kind = normalize_provider_kind(provider);
+    let mut parts = Vec::new();
+    if normalize_provider_kind(current_provider) == kind {
+        parts.push("current".to_string());
+    }
+    if let Some(label) = routes
+        .iter()
+        .find(|r| r.provider_kind.as_ref() == kind)
+        .and_then(|r| r.provider_label.as_ref())
+    {
+        parts.push(label.to_string());
+    } else {
+        parts.push("provider".to_string());
+    }
+    parts.join(" · ")
+}
+
+fn model_picker_description(
+    routes: &[RouteEntry],
+    provider: &str,
+    model: &str,
+    current_model: &str,
+) -> String {
+    let kind = normalize_provider_kind(provider);
+    let Some(route) = routes
+        .iter()
+        .find(|r| r.provider_kind.as_ref() == kind && r.model.as_ref() == model)
+    else {
+        return if model == current_model {
+            "model (current)".to_string()
+        } else {
+            "model".to_string()
+        };
+    };
+
+    let mut parts = Vec::new();
+    if model == current_model {
+        parts.push("current".to_string());
+    }
+    if let Some(label) = route.label.as_ref() {
+        parts.push(label.to_string());
+    } else if let Some(fav) = route.favorites.first() {
+        parts.push(
+            fav.label
+                .as_ref()
+                .map(|l| l.to_string())
+                .unwrap_or_else(|| format!("favorite {}", fav.name)),
+        );
+    }
+    if let Some(ctx) = route.context_hard_limit {
+        parts.push(format!("ctx {}", compact_limit(ctx)));
+    }
+    if let Some(out) = route.max_output_tokens {
+        parts.push(format!("out {}", compact_limit(out as u64)));
+    }
+    if !route.configured {
+        parts.push("not configured".to_string());
+    }
+    if parts.is_empty() {
+        "model".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
 fn mcp_tools_summary(tools: Option<&[String]>) -> String {
     match tools {
         None => "all tools listed by server".to_string(),
@@ -803,6 +940,22 @@ fn mcp_status_imports_dialogue_poll(server: &McpServerStatus) -> bool {
     match server.configured_tools.as_ref() {
         Some(tools) => tools.iter().any(|tool| tool == "dialogue_poll"),
         None => server.name == "mu-dialogue",
+    }
+}
+
+fn fetch_routes(client: &mut Client) -> Vec<RouteEntry> {
+    match client.request(DaemonListRoutesRequest::METHOD, serde_json::json!({})) {
+        Ok(v) => match serde_json::from_value::<DaemonListRoutesResponse>(v) {
+            Ok(resp) => resp.routes,
+            Err(e) => {
+                tracing::warn!(error = %e, "daemon.list_routes decode failed; using curated fallback");
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "daemon.list_routes unavailable; using curated fallback");
+            Vec::new()
+        }
     }
 }
 
@@ -1218,6 +1371,7 @@ impl App {
             .and_then(|v| v.as_str())
             .unwrap_or("(unknown)")
             .to_string();
+        let routes = fetch_routes(&mut client);
 
         // Construct the events log path before moving daemon_id into
         // the struct. dirs::data_dir() returns None only on
@@ -1269,6 +1423,7 @@ impl App {
             flash: None,
             collapse_tools: true,
             events_file,
+            routes,
             actual_renderer: None,
             actual_cache_strategy: None,
             actual_provider_kind: None,
@@ -2014,8 +2169,8 @@ impl App {
                             }
                         }
                         MenuContext::Provider => {
-                            if let Some(p) = KNOWN_PROVIDERS.get(idx) {
-                                self.apply_provider(vp, (*p).to_string())?;
+                            if let Some(p) = self.route_provider_strings().get(idx).cloned() {
+                                self.apply_provider(vp, p)?;
                             }
                         }
                         MenuContext::Model => {
@@ -3356,33 +3511,49 @@ impl App {
         }
     }
 
+    fn route_provider_strings(&self) -> Vec<String> {
+        provider_picker_strings_for(&self.routes, &self.provider)
+    }
+
+    fn route_models_for_provider(&self, provider_kind: &str) -> Vec<String> {
+        route_models_for_provider_from(&self.routes, provider_kind)
+    }
+
+    fn default_model_for_provider(&self, provider_kind: &str) -> String {
+        let kind = normalize_provider_kind(provider_kind);
+        self.route_models_for_provider(&kind)
+            .into_iter()
+            .next()
+            .or_else(|| known_models_for(&kind).first().map(|s| (*s).to_string()))
+            .unwrap_or_else(|| self.model.clone())
+    }
+
     /// /provider [name] — switch the session's provider. Bare
     /// `/provider` opens a modal picker; `/provider <name>` sets
     /// directly. Sends `session.set_route` to the daemon; the switch
     /// takes effect on the next turn.
     fn cmd_provider(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
         if arg.is_empty() {
-            // mu-zbmp: inline picker over the known providers — reuses the
-            // inline-menu widget (renders in both inline and fullscreen
-            // modes, unlike the old alt-screen modal) so the values are
-            // actually visible. Selection applies via the
-            // MenuContext::Provider arm -> apply_provider.
-            let items: Vec<MenuItem> = KNOWN_PROVIDERS
+            // mu-generated-model-routes-uc3n: prefer the daemon route catalog
+            // over this file's stale curated provider/model lists. The curated
+            // list remains only as a fallback when an older daemon lacks
+            // daemon.list_routes.
+            let providers = self.route_provider_strings();
+            let items: Vec<MenuItem> = providers
                 .iter()
                 .map(|p| {
-                    let current = if *p == self.provider {
-                        " (current)"
-                    } else {
-                        ""
-                    };
-                    MenuItem::new(*p, format!("provider{current}"))
+                    MenuItem::new(
+                        p.clone(),
+                        provider_picker_description(&self.routes, p, &self.provider),
+                    )
                 })
                 .collect();
             // mu-zbmp: open on the current provider so a bare confirm keeps
             // it (the old modal passed `current`; cursor-0 would switch).
-            let cursor = KNOWN_PROVIDERS
+            let current_kind = normalize_provider_kind(&self.provider);
+            let cursor = providers
                 .iter()
-                .position(|p| *p == self.provider)
+                .position(|p| normalize_provider_kind(p) == current_kind)
                 .unwrap_or(0);
             let max_visible = vp.area().height.saturating_sub(3) as usize;
             self.inline_menu = Some(InlineMenu::with_cursor(items, max_visible.max(5), cursor));
@@ -3397,11 +3568,7 @@ impl App {
     /// and the inline provider picker. (mu-zbmp)
     fn apply_provider(&mut self, vp: &mut DynamicViewport, new_provider: String) -> Result<()> {
         let kind = normalize_provider_kind(&new_provider);
-        let models = known_models_for(&kind);
-        let default_model = models
-            .first()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| self.model.clone());
+        let default_model = self.default_model_for_provider(&kind);
 
         match self.send_set_route(vp, &kind, &default_model) {
             Ok(()) => {
@@ -3434,29 +3601,28 @@ impl App {
     /// /model [name] — switch the session's model. Bare `/model` opens
     /// a picker scoped to the current provider; `/model <name>` sets
     /// directly. Sends `session.set_route` to the daemon.
-    /// The model picker's value list for the current provider: the curated
-    /// models, with the current model prepended if it isn't among them.
+    /// The model picker's value list for the current provider: daemon routes
+    /// when available, otherwise the curated fallback models, with the current
+    /// model prepended if it isn't among them.
     /// Shared by the picker builder and its selection handler so the menu
     /// indices line up. (mu-zbmp)
     fn model_picker_strings(&self) -> Vec<String> {
-        let kind = normalize_provider_kind(&self.provider);
-        let known = known_models_for(&kind);
-        let mut items: Vec<String> = Vec::with_capacity(known.len() + 1);
-        if !known.iter().any(|m| *m == self.model) {
-            items.push(self.model.clone());
-        }
-        items.extend(known.iter().map(|s| (*s).to_string()));
-        items
+        model_picker_strings_for(&self.routes, &self.provider, &self.model)
     }
 
     fn cmd_model(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
         if arg.is_empty() {
             let kind = normalize_provider_kind(&self.provider);
-            if known_models_for(&kind).is_empty() {
+            let has_list = !self.route_models_for_provider(&kind).is_empty()
+                || !known_models_for(&kind).is_empty();
+            if !has_list {
                 let lines: Vec<Line<'static>> = vec![
                     Line::from(""),
                     Line::from(Span::styled(
-                        format!("no curated model list for provider {:?}", self.provider),
+                        format!(
+                            "no daemon/curated model list for provider {:?}",
+                            self.provider
+                        ),
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
@@ -3471,7 +3637,7 @@ impl App {
                 })?;
                 return Ok(());
             }
-            // mu-zbmp: inline picker over the curated models — mirrors the
+            // mu-zbmp: inline picker over the routed/curated models — mirrors the
             // provider/effort pickers (renders in fullscreen too).
             let strings = self.model_picker_strings();
             // mu-zbmp: open on the current model so a bare confirm keeps it.
@@ -3479,8 +3645,10 @@ impl App {
             let items: Vec<MenuItem> = strings
                 .into_iter()
                 .map(|m| {
-                    let current = if m == self.model { " (current)" } else { "" };
-                    MenuItem::new(m, format!("model{current}"))
+                    MenuItem::new(
+                        m.clone(),
+                        model_picker_description(&self.routes, &self.provider, &m, &self.model),
+                    )
                 })
                 .collect();
             let max_visible = vp.area().height.saturating_sub(3) as usize;
@@ -5495,6 +5663,82 @@ mod tests {
                 "no curated models for provider {p:?} (kind {kind:?})"
             );
         }
+    }
+
+    fn route_for_test(provider: &str, model: &str) -> RouteEntry {
+        RouteEntry {
+            provider_kind: std::sync::Arc::from(provider),
+            model: std::sync::Arc::from(model),
+            configured: true,
+            provider_label: None,
+            provider_aliases: Vec::new(),
+            provider_quirks: Vec::new(),
+            label: None,
+            aliases: Vec::new(),
+            quirks: Vec::new(),
+            max_output_tokens: None,
+            favorites: Vec::new(),
+            context_soft_limit: None,
+            context_hard_limit: None,
+            valid_effort_levels: None,
+            default_effort: None,
+            pricing_input_per_mtok: None,
+            pricing_output_per_mtok: None,
+            hash: std::sync::Arc::from("h"),
+        }
+    }
+
+    #[test]
+    fn generated_route_catalog_feeds_model_picker() {
+        let mut fable = route_for_test("anthropic_api", "claude-fable-5");
+        fable.provider_label = Some(std::sync::Arc::from("Anthropic API"));
+        fable.label = Some(std::sync::Arc::from("Claude Fable 5"));
+        fable.context_hard_limit = Some(1_000_000);
+        fable.max_output_tokens = Some(128_000);
+        let routes = vec![
+            fable,
+            route_for_test("anthropic_api", "claude-sonnet-5"),
+            route_for_test("openrouter", "z-ai/glm-5.2"),
+        ];
+
+        let providers = provider_picker_strings_for(&routes, "anthropic");
+        assert!(providers
+            .iter()
+            .any(|p| normalize_provider_kind(p) == "anthropic_api"));
+        assert!(providers
+            .iter()
+            .any(|p| normalize_provider_kind(p) == "openrouter"));
+        assert_eq!(
+            provider_picker_description(&routes, "anthropic", "anthropic"),
+            "current · Anthropic API"
+        );
+
+        let models = model_picker_strings_for(&routes, "anthropic", "claude-fable-5");
+        assert_eq!(
+            models,
+            vec!["claude-fable-5".to_string(), "claude-sonnet-5".to_string()]
+        );
+        assert_eq!(
+            model_picker_description(&routes, "anthropic", "claude-fable-5", "claude-fable-5"),
+            "current · Claude Fable 5 · ctx 1M · out 128k"
+        );
+
+        let models = model_picker_strings_for(&routes, "openrouter", "old/current");
+        assert_eq!(
+            models,
+            vec!["old/current".to_string(), "z-ai/glm-5.2".to_string()]
+        );
+    }
+
+    #[test]
+    fn route_picker_falls_back_to_curated_models_without_daemon_routes() {
+        let providers = provider_picker_strings_for(&[], "anthropic");
+        assert!(providers.iter().any(|p| p == "anthropic"));
+        assert!(providers.iter().any(|p| p == "openrouter"));
+
+        let models = model_picker_strings_for(&[], "ollama", "custom-local");
+        assert_eq!(models[0], "custom-local");
+        assert!(models.iter().any(|m| m == "qwen3-coder:30b"));
     }
 
     #[test]

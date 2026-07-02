@@ -1122,6 +1122,126 @@ fn turn_budget_copy(turn_count: Option<u32>) -> String {
     }
 }
 
+fn autonomy_notification_body(model: &str, method: &str, params: &Value) -> Option<String> {
+    let prefix = format!("mu ({model})");
+    match method {
+        "session.input_required" => {
+            let tool = params
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tool");
+            let summary = params
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("approval required");
+            Some(format!("{prefix} needs approval for {tool}: {summary}"))
+        }
+        "session.autonomous_scheduled_wakeup" => {
+            let wake_at = params
+                .get("wake_at_unix_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let reason = params
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("scheduled wakeup");
+            Some(format!(
+                "{prefix} parked until unix_ms {wake_at}: {}",
+                compact_notification_text(reason)
+            ))
+        }
+        "session.autonomous_iteration_started" => {
+            let iteration = params
+                .get("iteration")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if iteration <= 1 {
+                return None;
+            }
+            let motivation = params
+                .get("motivation")
+                .and_then(|v| v.as_str())
+                .unwrap_or("resuming autonomous run");
+            Some(format!(
+                "{prefix} woke for autonomous iteration {iteration}: {}",
+                compact_notification_text(motivation)
+            ))
+        }
+        "session.autonomous_iteration_completed" => {
+            let outcome = params.get("outcome")?;
+            let tag = outcome.get("tag").and_then(|v| v.as_str()).unwrap_or("");
+            match tag {
+                "escalating_to_human" => Some(format!(
+                    "{prefix} autonomous run is waiting for human input"
+                )),
+                "iteration_error" => {
+                    let msg = outcome
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("iteration error");
+                    Some(format!(
+                        "{prefix} autonomous iteration errored: {}",
+                        compact_notification_text(msg)
+                    ))
+                }
+                "goal_met" => {
+                    let detail = outcome
+                        .get("detail")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("goal met");
+                    Some(format!(
+                        "{prefix} autonomous goal met: {}",
+                        compact_notification_text(detail)
+                    ))
+                }
+                _ => None,
+            }
+        }
+        "session.autonomous_terminated" => {
+            let reason = params.get("reason")?;
+            let tag = reason
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ended");
+            let detail = reason
+                .get("detail")
+                .or_else(|| reason.get("message"))
+                .and_then(|v| v.as_str());
+            match detail {
+                Some(d) if !d.is_empty() => Some(format!(
+                    "{prefix} autonomous run ended ({tag}): {}",
+                    compact_notification_text(d)
+                )),
+                _ => Some(format!("{prefix} autonomous run ended: {tag}")),
+            }
+        }
+        _ => None,
+    }
+}
+
+fn compact_notification_text(s: &str) -> String {
+    const MAX: usize = 120;
+    let normalized = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= MAX {
+        return normalized;
+    }
+    let mut out: String = normalized.chars().take(MAX.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+const LONG_TOOL_NOTIFY_MS: u64 = 8_000;
+
+fn long_tool_notification_body(model: &str, elapsed_ms: u64, outcome_kind: &str) -> Option<String> {
+    if elapsed_ms < LONG_TOOL_NOTIFY_MS {
+        return None;
+    }
+    let secs = (elapsed_ms as f64) / 1000.0;
+    Some(format!(
+        "mu ({model}): long tool call finished after {secs:.1}s ({outcome_kind})"
+    ))
+}
+
 impl SessionPhase {
     fn icon(self) -> &'static str {
         match self {
@@ -4567,6 +4687,13 @@ impl App {
         }
         let width = vp.area().width as usize;
         let wrap_width = width.saturating_sub(2);
+        if sid == self.session_id
+            && crate::notify::should_notify(self.notifications, self.terminal_focused)
+        {
+            if let Some(body) = autonomy_notification_body(&self.model, method, params) {
+                crate::notify::notify(&body);
+            }
+        }
         match method {
             "session.text_delta" => {
                 // Build the model only; the live preview is painted by
@@ -4735,6 +4862,16 @@ impl App {
                         .to_string(),
                     _ => String::new(),
                 };
+                if sid == self.session_id
+                    && crate::notify::should_notify(self.notifications, self.terminal_focused)
+                    && self.session_phase == SessionPhase::ToolExecuting
+                {
+                    if let Some(body) =
+                        long_tool_notification_body(&self.model, self.phase_elapsed_ms, &kind)
+                    {
+                        crate::notify::notify(&body);
+                    }
+                }
                 let route = self.streaming_route.unwrap_or(TurnRoute::Main);
                 self.live_turn_for_route(route)
                     .items
@@ -5297,6 +5434,7 @@ const MAX_VIEWPORT_HEIGHT: u16 = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn line_plain(line: &Line<'_>) -> String {
         line.spans
@@ -5855,6 +5993,62 @@ mod tests {
         assert_eq!(
             turn_budget_copy(Some(7)),
             "turn budget exhausted (7) — say continue, or raise the cap"
+        );
+    }
+
+    #[test]
+    fn autonomy_notification_copy_covers_park_input_and_terminal() {
+        assert_eq!(
+            autonomy_notification_body(
+                "test-model",
+                "session.input_required",
+                &json!({"tool_name": "write", "summary": "approve file edit"}),
+            )
+            .as_deref(),
+            Some("mu (test-model) needs approval for write: approve file edit")
+        );
+        assert_eq!(
+            autonomy_notification_body(
+                "test-model",
+                "session.autonomous_scheduled_wakeup",
+                &json!({"wake_at_unix_ms": 1777000000000_u64, "reason": "waiting for CI"}),
+            )
+            .as_deref(),
+            Some("mu (test-model) parked until unix_ms 1777000000000: waiting for CI")
+        );
+        assert_eq!(
+            autonomy_notification_body(
+                "test-model",
+                "session.autonomous_terminated",
+                &json!({"reason": {"tag": "errored", "message": "provider 402"}}),
+            )
+            .as_deref(),
+            Some("mu (test-model) autonomous run ended (errored): provider 402")
+        );
+    }
+
+    #[test]
+    fn autonomy_notification_copy_skips_noisy_events() {
+        assert!(autonomy_notification_body(
+            "test-model",
+            "session.autonomous_iteration_started",
+            &json!({"iteration": 1, "motivation": "goal"}),
+        )
+        .is_none());
+        assert!(autonomy_notification_body(
+            "test-model",
+            "session.autonomous_iteration_completed",
+            &json!({"iteration": 2, "outcome": {"tag": "continue"}}),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn long_tool_notification_copy_is_thresholded() {
+        assert!(long_tool_notification_body("test-model", 7_999, "ok").is_none());
+        assert_eq!(
+            long_tool_notification_body("test-model", 8_000, "ok").as_deref(),
+            Some("mu (test-model): long tool call finished after 8.0s (ok)")
         );
     }
 

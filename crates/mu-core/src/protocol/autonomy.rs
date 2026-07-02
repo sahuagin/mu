@@ -173,6 +173,22 @@ impl AutonomousIterationCompletedEvent {
     pub const METHOD: &'static str = "session.autonomous_iteration_completed";
 }
 
+/// `session.autonomous_scheduled_wakeup` notification. Emitted when an
+/// autonomous run parks itself with `session.schedule_wakeup`. The event is
+/// also durable (`EventPayload::AutonomousScheduledWakeup`); the wire form
+/// exists so frontends can notify an away operator immediately instead of
+/// waiting for the eventual wake iteration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutonomousScheduledWakeupEvent {
+    pub session_id: String,
+    pub wake_at_unix_ms: u64,
+    pub reason: String,
+}
+
+impl AutonomousScheduledWakeupEvent {
+    pub const METHOD: &'static str = "session.autonomous_scheduled_wakeup";
+}
+
 /// `session.autonomous_terminated` notification (mu-036). Always the
 /// final autonomy event for a run (INV-7). Session returns to
 /// RunMode::Idle and is addressable via ask_session again.

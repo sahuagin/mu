@@ -62,6 +62,12 @@ pub enum EventActor {
     System,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutonomousSleepStatus {
+    pub wake_at_unix_ms: u64,
+    pub reason: String,
+}
+
 /// Typed event payload. Common envelope, different shapes per kind.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1064,6 +1070,34 @@ impl SessionEventLog {
         false
     }
 
+    /// Latest live sleeping projection, if the current autonomy run is parked.
+    ///
+    /// This is intentionally derived from the durable event log rather than
+    /// the agent loop's private `RunMode`: once `AutonomousScheduledWakeup`
+    /// has been appended and no later `AutonomousIterationStarted` or
+    /// `AutonomousTerminated` has superseded it, readers can explain the live
+    /// state to callers (notably `ask_session`) without joining the loop.
+    pub fn autonomous_sleep_status(&self) -> Option<AutonomousSleepStatus> {
+        let events = self.events.lock().ok()?;
+        for ev in events.iter().rev() {
+            match &ev.payload {
+                EventPayload::AutonomousTerminated { .. }
+                | EventPayload::AutonomousIterationStarted { .. } => return None,
+                EventPayload::AutonomousScheduledWakeup {
+                    wake_at_unix_ms,
+                    reason,
+                } => {
+                    return Some(AutonomousSleepStatus {
+                        wake_at_unix_ms: *wake_at_unix_ms,
+                        reason: reason.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// Sum usage across all `Done` events in the log. Returns None if
     /// no Done event ever reported usage (e.g. faux provider, or
     /// every ask hit an error before reporting).
@@ -1438,6 +1472,23 @@ mod tests {
             },
         );
         assert!(log.autonomous_run_active());
+        assert_eq!(
+            log.autonomous_sleep_status(),
+            Some(AutonomousSleepStatus {
+                wake_at_unix_ms: 42,
+                reason: "sleep".into(),
+            })
+        );
+
+        log.append(
+            EventActor::Agent,
+            EventPayload::AutonomousIterationStarted {
+                iteration: 2,
+                motivation: "wake".into(),
+            },
+        );
+        assert!(log.autonomous_run_active());
+        assert_eq!(log.autonomous_sleep_status(), None);
 
         log.append(
             EventActor::Agent,

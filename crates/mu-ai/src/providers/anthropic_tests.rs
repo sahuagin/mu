@@ -74,8 +74,9 @@ fn build_request_body_basics() {
 
 #[test]
 fn build_request_body_max_tokens_is_model_aware() {
-    // mu-ql2: real-model identifiers get their per-family ceiling so
-    // longer responses don't get prematurely truncated.
+    // mu-ql2: real-model identifiers get their catalog max_output so longer
+    // responses aren't prematurely truncated. opus-4-7 = 128000 (Anthropic's
+    // queried extended-output ceiling, set in models.default.toml).
     let messages = vec![AgentMessage::User {
         content: "hi".into(),
     }];
@@ -86,7 +87,7 @@ fn build_request_body_max_tokens_is_model_aware() {
         &messages,
         &[],
     );
-    assert_eq!(opus["max_tokens"], 16384);
+    assert_eq!(opus["max_tokens"], 128000);
     let haiku = build_request_body_with_catalog(
         &mu_core::model_catalog::built_in(),
         "claude-haiku-4-5",

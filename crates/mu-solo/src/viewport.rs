@@ -705,6 +705,35 @@ impl DynamicViewport {
         let _ = f.write_all(line.as_bytes());
     }
 
+    fn journal_notify_line(ts_ms: u128, occasion: &str, body_len: usize) -> String {
+        serde_json::json!({
+            "ts_ms": ts_ms,
+            "kind": "notify",
+            "trigger": "notify",
+            "occasion": occasion,
+            "body_len": body_len,
+        })
+        .to_string()
+            + "\n"
+    }
+
+    /// Record an OSC-notification emission in the renderer journal. This is a
+    /// projection flight-recorder line, not semantic history: when an operator
+    /// says "no popup", it distinguishes "mu never emitted" from terminal /
+    /// multiplexer suppression. The body itself is intentionally NOT logged.
+    pub fn journal_notify(&mut self, occasion: &str, body: &str) {
+        let Some(ref mut f) = self.journal else {
+            return;
+        };
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let body_len = body.chars().count();
+        let line = Self::journal_notify_line(ts_ms, occasion, body_len);
+        let _ = f.write_all(line.as_bytes());
+    }
+
     /// Return the current history line count.  Used by callers that
     /// want to record pre-commit and post-commit offsets for the journal.
     pub fn history_len(&self) -> usize {
@@ -1149,6 +1178,22 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn notify_journal_entry_is_valid_json_without_body() {
+        let line = super::DynamicViewport::journal_notify_line(42, "session.done", 37);
+        let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap_or_else(|e| {
+            panic!("notify journal line not valid JSON: {e}\n  line: {line:?}")
+        });
+        assert_eq!(v["kind"], "notify");
+        assert_eq!(v["trigger"], "notify");
+        assert_eq!(v["occasion"], "session.done");
+        assert_eq!(v["body_len"], 37);
+        assert!(
+            v.get("body").is_none(),
+            "journal should record notification metadata, not popup text"
+        );
     }
 
     fn tempfile_for_test() -> std::path::PathBuf {

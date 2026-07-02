@@ -114,7 +114,7 @@ def main():
             'Every element of "findings" MUST be a JSON object with exactly those four '
             "keys (file, line, severity, issue), never a bare string and never null. "
             "Use [] if there are no findings.\n\n"
-            "Original PR diff under review:")
+            "Original review material under review (PR diff, or chunked leaf findings + targeted file context):")
         with open(outf, 'w') as fh:
             fh.write(hdr + "\n```diff\n" + open(difff).read() + "\n```\n")
         print(f"wrote {outf}")

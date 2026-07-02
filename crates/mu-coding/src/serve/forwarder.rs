@@ -48,10 +48,10 @@ use mu_core::command_journal::CommandTicket;
 use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
     AssistantTextFinalizedEvent, AutonomousIterationCompletedEvent,
-    AutonomousIterationStartedEvent, AutonomousTerminatedEvent, CalloutBody, CalloutEvent,
-    DoneEvent, ErrorEvent, InputRequiredEvent, ProviderStatusEvent, TextDeltaEvent,
-    ThinkingDeltaEvent, ThinkingFinalizedEvent, ToolCallCompletedEvent, ToolCallDeltaEvent,
-    ToolCallStartedEvent, ToolOutcome,
+    AutonomousIterationStartedEvent, AutonomousScheduledWakeupEvent, AutonomousTerminatedEvent,
+    CalloutBody, CalloutEvent, DoneEvent, ErrorEvent, InputRequiredEvent, ProviderStatusEvent,
+    TextDeltaEvent, ThinkingDeltaEvent, ThinkingFinalizedEvent, ToolCallCompletedEvent,
+    ToolCallDeltaEvent, ToolCallStartedEvent, ToolOutcome,
 };
 use mu_core::session_status::SessionStatus;
 use mu_core::transport::codes;
@@ -250,6 +250,17 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
                 outcome,
             },
         ),
+        AgentEvent::AutonomousScheduledWakeup {
+            wake_at_unix_ms,
+            reason,
+        } => to_pair(
+            AutonomousScheduledWakeupEvent::METHOD,
+            AutonomousScheduledWakeupEvent {
+                session_id: session_id.to_string(),
+                wake_at_unix_ms,
+                reason,
+            },
+        ),
         AgentEvent::AutonomousTerminated { reason } => to_pair(
             AutonomousTerminatedEvent::METHOD,
             AutonomousTerminatedEvent {
@@ -262,12 +273,7 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
         // durable event log (mu-032 v1 / mu-za92 — see to_log_event);
         // wire-level exposure is a future TUI/web-ui feature when
         // there's a consumer.
-        // mu-036 Phase C: schedule_wakeup parking lands durably (see
-        // to_log_event) but has no wire-notification method in mu-036's
-        // surface — the next AutonomousIterationStarted on wake carries
-        // the wake reason as its motivation, which clients observe.
-        AgentEvent::AutonomousScheduledWakeup { .. }
-        | AgentEvent::AgentStart
+        AgentEvent::AgentStart
         | AgentEvent::TurnStart
         | AgentEvent::TurnEnd
         | AgentEvent::MessageStart { .. }
@@ -1042,6 +1048,22 @@ mod tests {
         .expect("expected Some");
         assert_eq!(params["outcome"]["kind"], "err");
         assert_eq!(params["outcome"]["message"], "boom");
+    }
+
+    #[test]
+    fn translate_autonomous_scheduled_wakeup() {
+        let (method, params) = translate_event(
+            "s-auto",
+            AgentEvent::AutonomousScheduledWakeup {
+                wake_at_unix_ms: 1_777_000_000_000,
+                reason: "wait for CI".into(),
+            },
+        )
+        .expect("scheduled wakeup now has a wire notification");
+        assert_eq!(method, "session.autonomous_scheduled_wakeup");
+        assert_eq!(params["session_id"], "s-auto");
+        assert_eq!(params["wake_at_unix_ms"], 1_777_000_000_000_u64);
+        assert_eq!(params["reason"], "wait for CI");
     }
 
     #[test]

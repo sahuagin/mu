@@ -4,7 +4,7 @@
 //! Anthropic's Messages API requires a `max_tokens` field on every
 //! request; OpenAI-shaped APIs accept one. Hardcoding a single value
 //! (mu's pre-mu-ql2 default was 4096) caps every response — including
-//! Opus 4.7, which natively supports 32768 output tokens — at the
+//! Opus 4.7, whose extended output ceiling is 128000 tokens — at the
 //! smallest-supported-model budget. This module returns a per-model
 //! cap so each request gets the right ceiling.
 //!
@@ -40,6 +40,9 @@ pub fn max_tokens_for_model_with_catalog(
     }
     let m = model.to_ascii_lowercase();
     if m.starts_with("claude-opus-4") {
+        // Catalog-less safety net only (the built-in catalog carries the real
+        // opus-4 ceiling, 128000). If we ever reach here the catalog was
+        // bypassed, so stay conservative — overshooting a server max errors.
         16384
     } else if m.starts_with("claude-sonnet-4") || m.starts_with("claude-haiku-4") {
         8192
@@ -71,9 +74,12 @@ mod tests {
     }
 
     #[test]
-    fn opus_4_7_gets_16k() {
-        assert_eq!(mt("claude-opus-4-7"), 16384);
-        assert_eq!(mt("claude-opus-4-7-20260301"), 16384);
+    fn opus_4_7_gets_128k() {
+        // opus-4 family ceiling = 128000 (Anthropic-queried). The exact
+        // [models.claude_opus_4_7] entry and the [model_rules.claude_opus_4]
+        // family fallback both carry it, so the date-stamped variant matches too.
+        assert_eq!(mt("claude-opus-4-7"), 128000);
+        assert_eq!(mt("claude-opus-4-7-20260301"), 128000);
     }
 
     #[test]
@@ -96,7 +102,7 @@ mod tests {
 
     #[test]
     fn case_insensitive() {
-        assert_eq!(mt("Claude-Opus-4-7"), 16384);
+        assert_eq!(mt("Claude-Opus-4-7"), 128000);
         assert_eq!(mt("CLAUDE-HAIKU-4-5"), 8192);
     }
 

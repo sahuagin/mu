@@ -40,7 +40,7 @@ family = "claude-opus-4"
 label = "Claude Opus 4.7"
 context_soft_limit = 200000
 context_hard_limit = 1000000
-max_output_tokens = 16384
+max_output_tokens = 128000
 
 [models.claude_opus_4_8]
 model = "claude-opus-4-8"
@@ -48,7 +48,7 @@ family = "claude-opus-4"
 label = "Claude Opus 4.8"
 context_soft_limit = 200000
 context_hard_limit = 1000000
-max_output_tokens = 16384
+max_output_tokens = 128000
 
 [models.claude_sonnet_4_6]
 model = "claude-sonnet-4-6"
@@ -74,9 +74,12 @@ context_soft_limit = 1000000
 context_hard_limit = 1000000
 max_output_tokens = 16384
 
+# Opus-4 family fallback: the Anthropic-queried extended-output ceiling (128000),
+# so date-stamped / not-yet-cataloged opus-4 ids inherit the family value instead
+# of an older, smaller cap. Exact [models.*] entries still override per model.
 [model_rules.claude_opus_4]
 prefix = "claude-opus-4"
-max_output_tokens = 16384
+max_output_tokens = 128000
 
 [model_rules.claude_sonnet_haiku_4]
 prefixes = ["claude-sonnet-4", "claude-haiku-4"]

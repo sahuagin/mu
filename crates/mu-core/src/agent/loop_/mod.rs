@@ -703,6 +703,11 @@ pub struct AgentConfig {
     /// discipline. `None` (the default) ⇒ feature off; wired by the
     /// daemon from `[index].discover_injection` at session creation.
     pub discover_hints: Option<crate::context::capability_hints::DiscoverHints>,
+    /// Prompt-time kx document-index hints. When `Some`, each turn the loop
+    /// runs the last user message through `agent kx recall` and injects a small
+    /// transient doc-pointer block after that user span. `None` (default) keeps
+    /// pre-kx behavior and avoids any embedder/API cost.
+    pub kx_hints: Option<crate::context::kx_hints::KxHints>,
     /// mu-vcbm: the session's launch-time reasoning-effort default
     /// (`CreateSessionRequest.effort`). Seeds the loop's standing effort
     /// at session start; subsequent `/effort` changes ride in on
@@ -723,6 +728,7 @@ impl std::fmt::Debug for AgentConfig {
                 &self.compaction_policy_override.is_some(),
             )
             .field("discover_hints", &self.discover_hints.is_some())
+            .field("kx_hints", &self.kx_hints.is_some())
             .field("effort", &self.effort)
             .finish()
     }
@@ -739,6 +745,7 @@ impl Default for AgentConfig {
             compaction_policy_override: None,
             seed_messages: Vec::new(),
             discover_hints: None,
+            kx_hints: None,
             effort: None,
         }
     }
@@ -1096,6 +1103,10 @@ async fn run_inner(
     // so the hint content (and rope position) is byte-stable within an
     // ask and the cacheable prefix is never disturbed.
     let mut capability_hint_memo: Option<(String, Option<String>)> = None;
+    // Prompt-time kx recall is also memoized once per ask/autonomous
+    // iteration so tool rounds don't re-run the embedder or mutate the
+    // provider prompt.
+    let mut kx_hint_memo: Option<(String, Option<String>)> = None;
     // mu-wsgx: feedback anchor for the compaction-trigger measure.
     // None until the first provider-reported usage; reset on provider
     // switch (different tokenizer + accounting convention).
@@ -1776,6 +1787,41 @@ async fn run_inner(
                                 {
                                     Some(hint) => {
                                         crate::context::capability_hints::with_hint_after_last_user(
+                                            &rope, hint,
+                                        )
+                                    }
+                                    None => rope,
+                                }
+                            }
+                            None => rope,
+                        }
+                    }
+                    None => rope,
+                };
+
+                // Prompt-time kx document recall: same transient-span pattern as
+                // capability hints, but backed by `agent kx recall` so relevant
+                // experiment/spec/markdown pointers show up without the operator
+                // remembering to ask for them. Memoized per intent; disabled by
+                // default because it may call the configured embedder.
+                let rope: RetainedRope = match &config.kx_hints {
+                    Some(kx) => {
+                        let intent = messages.iter().rev().find_map(|m| match m {
+                            AgentMessage::User { content } => Some(content.as_str()),
+                            _ => None,
+                        });
+                        match intent {
+                            Some(intent) => {
+                                let stale = kx_hint_memo
+                                    .as_ref()
+                                    .is_none_or(|(memo_intent, _)| memo_intent != intent);
+                                if stale {
+                                    let hint = kx.render_for_intent(intent);
+                                    kx_hint_memo = Some((intent.to_owned(), hint));
+                                }
+                                match kx_hint_memo.as_ref().and_then(|(_, h)| h.as_deref()) {
+                                    Some(hint) => {
+                                        crate::context::kx_hints::with_kx_hint_after_last_user(
                                             &rope, hint,
                                         )
                                     }

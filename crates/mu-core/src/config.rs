@@ -362,6 +362,22 @@ pub struct RecallConfig {
     /// different binary rather than relying on the hardcoded operator path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_binary: Option<PathBuf>,
+    /// Prompt-time kx document hints. When true, each user turn runs
+    /// `agent kx recall <prompt>` and injects a compact doc-pointer block after
+    /// the prompt. Default false because kx recall may call the configured
+    /// embedder/API; opt in only for interactive sessions where that latency/cost
+    /// is intended.
+    #[serde(default)]
+    pub kx: bool,
+    /// Path to the agent CLI used for kx recall. None => ~/.local/bin/agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kx_binary: Option<PathBuf>,
+    /// Hit cap for prompt-time kx injection.
+    #[serde(default = "default_kx_limit")]
+    pub kx_limit: usize,
+    /// Cosine floor passed to `agent kx recall --min-score`.
+    #[serde(default = "default_kx_min_score")]
+    pub kx_min_score: f32,
 }
 
 /// serde default helper: `true`. A bare `#[serde(default)]` on a `bool`
@@ -370,6 +386,14 @@ pub struct RecallConfig {
 /// default.
 fn default_true() -> bool {
     true
+}
+
+fn default_kx_limit() -> usize {
+    4
+}
+
+fn default_kx_min_score() -> f32 {
+    0.60
 }
 
 impl Default for RecallConfig {
@@ -382,6 +406,10 @@ impl Default for RecallConfig {
             bootloader_text: None,
             memory: true,
             memory_binary: None,
+            kx: false,
+            kx_binary: None,
+            kx_limit: default_kx_limit(),
+            kx_min_score: default_kx_min_score(),
         }
     }
 }

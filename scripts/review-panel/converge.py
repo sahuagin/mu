@@ -66,12 +66,13 @@ def extract(s):
 def skipped_ollama_lease(done_text):
     if not re.search(r'\bexit=75\b', done_text):
         return False
-    # Round 1 writes:       exit=75 prov=ollama model=...
-    # Convergence writes:   exit=75 ollama/<model>
+    # Round 1 writes:       exit=75 retry=N prov=ollama model=...
+    # Convergence writes:   exit=75 retry=N ollama/<model>
+    # (retry=N absent in pre-retry .done lines; keep it optional.)
     # Only those ollama-provider forms mean with-ollama-lease --skip-if-held.
     return bool(
         re.search(r'\bprov=ollama(?:\b|-)', done_text)
-        or re.search(r'\bexit=75\s+ollama(?:\b|/|-)', done_text)
+        or re.search(r'\bexit=75\b(?:\s+retry=\d+)?\s+ollama(?:\b|/|-)', done_text)
     )
 
 
@@ -90,6 +91,20 @@ def load(prefix):
                     # intentionally routed around an operator-held local box.
                     # Omit it from quorum rather than counting it as unparsed.
                     continue
+                if re.search(r'\bexit=124\b', done_text):
+                    out[tag] = {
+                        "verdict": "timeout",
+                        "summary": "reviewer timed out before producing a parseable verdict",
+                        "findings": [
+                            {
+                                "file": "<reviewer>",
+                                "line": 0,
+                                "severity": "medium",
+                                "issue": "reviewer timed out (exit 124); treat this seat as inconclusive rather than empty output",
+                            }
+                        ],
+                    }
+                    continue
         except Exception:
             pass
         try:
@@ -105,7 +120,7 @@ def main():
         data = load(sys.argv[2])
         verdicts = {t: (d.get('verdict', '?').lower() if d else 'unparsed')
                     for t, d in data.items()}
-        real = [v for v in verdicts.values() if v not in ('unparsed', '?')]
+        real = [v for v in verdicts.values() if v in ('approve', 'needs-changes')]
         if data and len(set(real)) == 1 and len(real) == len(verdicts):
             print("AGREE " + real[0])
             return 0

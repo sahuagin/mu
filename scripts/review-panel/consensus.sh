@@ -61,9 +61,18 @@ while [ "$round" -lt "$MAXR" ]; do
       # agent_dispatch reads TOOLS/TIMEOUT/MU/ERRLOG from scope; stdout -> .out,
       # stderr -> $ERRLOG. claude-oauth now routes to `claude -p` instead of erroring.
       TOOLS="$tools"; TIMEOUT=900; MAX_TURNS="$max_turns"; ERRLOG="$OUT/r${round}.${tag}.err"
-      agent_dispatch "$prov" "$model" "$OUT/r${round}.${tag}.prompt" \
-        > "$OUT/r${round}.${tag}.out"
-      echo "exit=$? $prov/$model" > "$OUT/r${round}.${tag}.done"
+      _out="$OUT/r${round}.${tag}.out"
+      _retry=0
+      _max_retries="${MU_REVIEW_TIMEOUT_RETRIES:-${AI_REVIEW_TIMEOUT_RETRIES:-1}}"
+      agent_dispatch "$prov" "$model" "$OUT/r${round}.${tag}.prompt" > "$_out"
+      _rc=$?
+      while [ "$_rc" -eq 124 ] && [ "$_retry" -lt "$_max_retries" ]; do
+        _retry=$((_retry + 1))
+        printf '%s\n' "reviewer timeout after ${TIMEOUT}s; retry ${_retry}/${_max_retries}" >> "$ERRLOG"
+        agent_dispatch "$prov" "$model" "$OUT/r${round}.${tag}.prompt" > "$_out"
+        _rc=$?
+      done
+      echo "exit=$_rc retry=$_retry $prov/$model" > "$OUT/r${round}.${tag}.done"
     ) &
     r=$((r + 1))
   done

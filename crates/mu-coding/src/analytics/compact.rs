@@ -61,7 +61,14 @@ pub fn compact_dir(
                 continue;
             }
             summary.files_scanned += 1;
-            compact_file(conn, &path, min_ended_at_unix_ms, &mut summary)?;
+            let daemon_id = daemon_entry.file_name().to_string_lossy().into_owned();
+            compact_file_scoped(
+                conn,
+                &path,
+                min_ended_at_unix_ms,
+                &mut summary,
+                Some(daemon_id.as_str()),
+            )?;
         }
     }
 
@@ -88,6 +95,16 @@ pub fn compact_file(
     min_ended_at_unix_ms: Option<u64>,
     summary: &mut CompactSummary,
 ) -> Result<()> {
+    compact_file_scoped(conn, path, min_ended_at_unix_ms, summary, None)
+}
+
+fn compact_file_scoped(
+    conn: &Connection,
+    path: &Path,
+    min_ended_at_unix_ms: Option<u64>,
+    summary: &mut CompactSummary,
+    session_scope: Option<&str>,
+) -> Result<()> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading event log {}", path.display()))?;
     let mut running_tool_calls: u32 = 0;
@@ -109,7 +126,10 @@ pub fn compact_file(
             running_tool_calls = running_tool_calls.saturating_add(1);
             continue;
         }
-        if let Some(row) = project_event(&event, min_ended_at_unix_ms, running_tool_calls) {
+        if let Some(mut row) = project_event(&event, min_ended_at_unix_ms, running_tool_calls) {
+            if let Some(scope) = session_scope {
+                row.session_id = qualified_session_id(scope, &row.session_id);
+            }
             upsert_task(conn, &row)?;
             summary.tasks_upserted += 1;
             running_tool_calls = 0;
@@ -121,6 +141,15 @@ pub fn compact_file(
         }
     }
     Ok(())
+}
+
+fn qualified_session_id(scope: &str, session_id: &str) -> String {
+    let scope = scope.trim();
+    if scope.is_empty() || session_id.contains('/') || session_id.starts_with("mu:") {
+        session_id.to_string()
+    } else {
+        format!("{scope}/{session_id}")
+    }
 }
 
 /// Project a single SessionEvent into a TaskRow, or None if this event
@@ -402,6 +431,79 @@ mod tests {
 
         drop(conn);
         let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&dbpath);
+    }
+
+    #[test]
+    fn compact_dir_qualifies_session_ids_by_daemon_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "mu_jhcj_events_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let dbpath = std::env::temp_dir().join(format!(
+            "mu_jhcj_compact_{}.sqlite",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&dbpath);
+        std::fs::create_dir_all(root.join("daemon-a")).unwrap();
+        std::fs::create_dir_all(root.join("daemon-b")).unwrap();
+
+        let mut a = telemetry_event();
+        if let EventPayload::TaskTelemetry {
+            ref mut task_id, ..
+        } = a.payload
+        {
+            *task_id = "task-daemon-a".to_owned();
+        }
+        let mut b = telemetry_event();
+        if let EventPayload::TaskTelemetry {
+            ref mut task_id, ..
+        } = b.payload
+        {
+            *task_id = "task-daemon-b".to_owned();
+        }
+        // Both logs use the normal local session id. The analytics sink must
+        // not collapse them to one logical session: every daemon has its own
+        // session-1, session-2, ... namespace.
+        std::fs::write(
+            root.join("daemon-a").join("session-1.jsonl"),
+            serde_json::to_string(&a).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("daemon-b").join("session-1.jsonl"),
+            serde_json::to_string(&b).unwrap(),
+        )
+        .unwrap();
+
+        let conn = super::super::sink::open(&dbpath).unwrap();
+        let summary = compact_dir(&conn, &root, None).unwrap();
+        assert_eq!(summary.tasks_upserted, 2);
+        let mut sessions: Vec<String> = conn
+            .prepare("SELECT session_id FROM tasks ORDER BY session_id")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        sessions.sort();
+        assert_eq!(
+            sessions,
+            vec![
+                "daemon-a/session-abc".to_string(),
+                "daemon-b/session-abc".to_string(),
+            ]
+        );
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&dbpath);
     }
 

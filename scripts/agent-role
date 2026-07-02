@@ -8,13 +8,18 @@
 # Usage:
 #   agent-role <role>              every rank, one per line: "<provider> <model>"
 #   agent-role <role> <rank>       one rank (0-based):       "<provider> <model>"
+#   agent-role --max-turns <role> [<rank>]
+#                                 resolved turn budget(s), one per rank;
+#                                 blank/omitted = let mu use provider defaults,
+#                                 0 = explicitly uncapped
 #   agent-role --cmd <role> [<rank>]   a ready-to-run dispatch command:
 #                                        claude-oauth  → `claude -p --model <m>`   (Max sub, ToS-clean)
 #                                        otherwise     → `mu ask --bare --provider <p> --model <m>`
 #
 # Resolution: `tq -o json <role>.ranked` emits the ranked array as JSON; `jq`
 # indexes it. Per-model params come from ~/.config/mu/models.toml via mu's
-# id-match at dispatch — not from here.
+# id-match at dispatch — not from here. Role dispatch params such as `max_turns`
+# live here because they describe seat behavior, not model capability.
 set -eu
 
 ROLES="${AGENT_ROLES:-$HOME/.config/mu/agent_roles.toml}"
@@ -24,7 +29,17 @@ command -v "$TQ" >/dev/null 2>&1 || TQ=tq
 die() { printf 'agent-role: %s\n' "$1" >&2; exit 1; }
 
 CMD=0
-[ "${1:-}" = "--cmd" ] && { CMD=1; shift; }
+MAX_TURNS_MODE=0
+while [ "${1:-}" ]; do
+    case "$1" in
+        --cmd) CMD=1; shift ;;
+        --max-turns) MAX_TURNS_MODE=1; shift ;;
+        --) shift; break ;;
+        -*) die "unknown option: $1" ;;
+        *) break ;;
+    esac
+done
+[ "$CMD" -eq 1 ] && [ "$MAX_TURNS_MODE" -eq 1 ] && die "--cmd and --max-turns are mutually exclusive"
 ROLE="${1:-}"; RANK="${2:-}"
 
 emit() {  # $1=provider $2=model
@@ -45,7 +60,13 @@ emit() {  # $1=provider $2=model
 # through emit() so the dispatch-path map (claude-oauth -> claude -p) and future
 # per-model params apply. Role/rank args are ignored when pinned. Inference covers
 # the common cases; pass the explicit two-token form for anything it guesses wrong.
+# For --max-turns with a pin, AGENT_ROLE_PIN_MAX_TURNS is the only source; blank
+# means "no explicit turn budget".
 if [ -n "${AGENT_ROLE_PIN:-}" ]; then
+    if [ "$MAX_TURNS_MODE" -eq 1 ]; then
+        [ -n "${AGENT_ROLE_PIN_MAX_TURNS:-}" ] && printf '%s\n' "$AGENT_ROLE_PIN_MAX_TURNS"
+        exit 0
+    fi
     # shellcheck disable=SC2086
     set -- $AGENT_ROLE_PIN
     if [ "$#" -ge 2 ]; then
@@ -63,11 +84,13 @@ if [ -n "${AGENT_ROLE_PIN:-}" ]; then
     exit 0
 fi
 
-[ -n "$ROLE" ] || die "usage: agent-role [--cmd] <role> [<rank>]"
+[ -n "$ROLE" ] || die "usage: agent-role [--cmd|--max-turns] <role> [<rank>]"
 [ -f "$ROLES" ] || die "no roles file: $ROLES (set AGENT_ROLES to override)"
 
 json=$("$TQ" -o json -f "$ROLES" "$ROLE.ranked" 2>/dev/null) \
     || die "role '$ROLE' not found in $ROLES"
+role_max_turns=$("$TQ" -o json -f "$ROLES" "$ROLE.max_turns" 2>/dev/null || printf 'null')
+case "$role_max_turns" in ''|null) role_max_turns=null ;; esac
 
 # Lease-aware (LOTO): if this role has a provider=ollama target and the shared
 # ollama box is held by ANOTHER owner, sink ollama targets to the bottom of the
@@ -81,18 +104,30 @@ if [ -z "${AGENT_ROLE_NO_LEASE:-}" ] \
     json=$(printf '%s' "$json" | jq 'to_entries|sort_by([(.value.provider=="ollama"),.key])|map(.value)')
 fi
 
+emit_max_turns() {  # $1=rank
+    printf '%s' "$json" | jq -r --argjson role_max "$role_max_turns" ".[$1].max_turns // \$role_max // \"\""
+}
+
 if [ -n "$RANK" ]; then
     p=$(printf '%s' "$json" | jq -r ".[$RANK].provider // empty")
     m=$(printf '%s' "$json" | jq -r ".[$RANK].model // empty")
     [ -n "$p" ] && [ -n "$m" ] || die "role '$ROLE' has no rank $RANK"
-    emit "$p" "$m"
+    if [ "$MAX_TURNS_MODE" -eq 1 ]; then
+        emit_max_turns "$RANK"
+    else
+        emit "$p" "$m"
+    fi
 else
     n=$(printf '%s' "$json" | jq -r 'length')
     i=0
     while [ "$i" -lt "$n" ]; do
-        p=$(printf '%s' "$json" | jq -r ".[$i].provider")
-        m=$(printf '%s' "$json" | jq -r ".[$i].model")
-        emit "$p" "$m"
+        if [ "$MAX_TURNS_MODE" -eq 1 ]; then
+            emit_max_turns "$i"
+        else
+            p=$(printf '%s' "$json" | jq -r ".[$i].provider")
+            m=$(printf '%s' "$json" | jq -r ".[$i].model")
+            emit "$p" "$m"
+        fi
         i=$((i + 1))
     done
 fi

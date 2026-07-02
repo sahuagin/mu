@@ -279,32 +279,65 @@ export _AI_REVIEW_PROJECT_DESC="$PROJECT_DESC"
 # Skipped when MU_REVIEW_HEAD is set: the on-disk files belong to the working
 # copy, not the pinned head — appending them would hand reviewers the WRONG
 # definitions (worse than none).
+# Context includes only bounded, text-like files. The old global "append then
+# head -c" shape let a single Cargo.lock / SVG / generated fixture consume the
+# whole reviewer window, silently truncating away the output contract for local
+# ollama reviewers (mu-ai-review-context-overflow-fg4j).
+review_context_skip_file() { # $1=repo-relative path
+  case "$1" in
+    Cargo.lock|*/Cargo.lock|*.lock|package-lock.json|*/package-lock.json|pnpm-lock.yaml|*/pnpm-lock.yaml|yarn.lock|*/yarn.lock|bun.lockb|*/bun.lockb|go.sum|*/go.sum)
+      return 0 ;;
+    *.svg|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.ico|*.pdf|*.zip|*.gz|*.xz|*.bz2|*.zst|*.br|*.tar|*.tgz|*.wasm|*.mp3|*.mp4|*.mov|*.bin)
+      return 0 ;;
+  esac
+  return 1
+}
+
+append_review_context() { # $1=chunk; updates CONTEXT/_context_used
+  local _chunk="$1" _remaining
+  [ "$_context_used" -lt "$_context_max" ] || return 1
+  _remaining=$((_context_max - _context_used))
+  if [ "${#_chunk}" -gt "$_remaining" ]; then
+    _chunk="$(printf '%s' "$_chunk" | head -c "$_remaining")
+... [changed-file context truncated at ${_context_max} bytes — review the diff above and use read/grep for omitted files]"
+    CONTEXT="$CONTEXT$_chunk"
+    _context_used=$_context_max
+    return 1
+  fi
+  CONTEXT="$CONTEXT$_chunk"
+  _context_used=$((_context_used + ${#_chunk}))
+  return 0
+}
+
 CONTEXT=""
 if [ "${MU_REVIEW_FULL_FILES:-1}" = "1" ] && [ -z "${MU_REVIEW_HEAD:-}" ]; then
+  _context_max="${MU_REVIEW_CONTEXT_MAX_BYTES:-100000}"
+  _context_per_file_max="${MU_REVIEW_CONTEXT_PER_FILE_MAX_BYTES:-20000}"
+  _context_used=0
   while IFS= read -r _f; do
     case "$_f" in ""|/dev/null) continue ;; esac   # skip blanks + pure deletions
     [ -f "$_f" ] || continue
-    CONTEXT="$CONTEXT
+    if review_context_skip_file "$_f"; then
+      append_review_context "
+
+===== FULL CONTENT SKIPPED: $_f =====
+[skipped lock/generated/binary-style file from reviewer prompt context; inspect with read/grep only if this diff makes it relevant]" || break
+      continue
+    fi
+    _bytes="$(wc -c < "$_f" | tr -d '[:space:]')"
+    if [ "${_bytes:-0}" -gt "$_context_per_file_max" ]; then
+      _content="$(head -c "$_context_per_file_max" "$_f")
+... [full content for $_f truncated at ${_context_per_file_max}/${_bytes} bytes — use read/grep for omitted regions]"
+    else
+      _content="$(cat "$_f")"
+    fi
+    append_review_context "
 
 ===== FULL CONTENT: $_f =====
-$(cat "$_f")"
+$_content" || break
   done <<EOF_CTX
 $(printf '%s\n' "$DIFF" | sed -n 's#^+++ b/##p')
 EOF_CTX
-  # Default sized to the reviewer models' context window, NOT to "as much
-  # as possible": the panel models run at num_ctx=32768 (~100-130KB of
-  # text), and ollama SILENTLY truncates an oversized prompt down to the
-  # window — when the truncated prompt fills it, generation gets ~1 token
-  # of budget and the reviewer emits a single word ("Based"/"Looking"),
-  # finish_reason=length, exit 0. The old 200000 default did exactly that
-  # to every FULL_FILES review on 2026-06-06: both reviewers UNCLEAR →
-  # every PR escalated. 100000 bytes ≈ 25-30k tokens of context leaves
-  # room for the diff + prompt + a real generated review. (mu-1mvq)
-  _max="${MU_REVIEW_CONTEXT_MAX_BYTES:-100000}"
-  if [ "${#CONTEXT}" -gt "$_max" ]; then
-    CONTEXT="$(printf '%s' "$CONTEXT" | head -c "$_max")
-... [changed-file context truncated at ${_max} bytes — review the diff above]"
-  fi
 fi
 
 # --- reviewer client = freshly-built mu, never the (possibly stale) installed one

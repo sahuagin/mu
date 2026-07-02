@@ -1272,6 +1272,67 @@ async fn wf5w_buffered_um_does_not_suppress_done() {
     );
 }
 
+/// mu-loop-buffered-switchprovider-drop-425f: a provider switch sent while an
+/// LLM stream is in progress is buffered by handle_invoke_llm. It must still be
+/// applied after the current ask terminates, before a buffered follow-up ask
+/// invokes the model. Pre-fix, the queued Action::External(SwitchProvider) arm
+/// was a no-op, so the follow-up ran against the old provider (or errored if the
+/// old mock had no scripted response).
+#[tokio::test]
+async fn switch_provider_buffered_during_stream_applies_before_next_ask() {
+    let (initial_provider, gate) = MockProvider::gated_first(
+        vec![
+            ProviderEvent::TextDelta("first".into()),
+            ProviderEvent::Done(assistant_text("first")),
+        ],
+        vec![],
+    );
+    let switched_provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![vec![
+        ProviderEvent::TextDelta("second-from-switched".into()),
+        ProviderEvent::Done(assistant_text("second-from-switched")),
+    ]]));
+    let (loop_, events_rx) = spawn_loop(initial_provider, vec![], AgentConfig::default());
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("ask one"), None, None))
+        .await
+        .expect("send first ask");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    loop_
+        .send(AgentInput::SwitchProvider {
+            provider: switched_provider,
+            provider_kind: Arc::from("switched"),
+            model: Arc::from("switched-model"),
+            max_output_tokens: 0,
+            context_soft_limit: 0,
+            context_hard_limit: 0,
+        })
+        .await
+        .expect("send switch while stream is active");
+    loop_
+        .send(AgentInput::UserMessage(user_msg("ask two"), None, None))
+        .await
+        .expect("send second ask");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = gate.send(());
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ProviderSwitched { new_provider_kind, new_model, .. }
+            if new_provider_kind.as_ref() == "switched"
+                && new_model.as_ref() == "switched-model"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TextDelta { delta } if delta == "second-from-switched"
+    )));
+}
+
 /// mu-2e0h: tool results pass through the tier-1 ingestion filter at
 /// the execute_tools seam — the SAME filtered content reaches the
 /// ToolCallCompleted event (log + wire) and the ToolResult message

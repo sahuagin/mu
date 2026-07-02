@@ -4135,6 +4135,99 @@ async fn uz0n_hint_span_follows_user_and_is_stable_across_rounds() {
     );
 }
 
+/// Prompt-time kx hint injection mirrors the Claude Code hook at the agent-loop
+/// layer: `agent kx recall` runs once for the user intent, the transient span is
+/// present on every provider round in the ask, and it stays out of history.
+#[tokio::test]
+async fn kx_hint_span_follows_user_and_is_stable_across_rounds() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("mu-kx-loop-test-{pid}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("agent");
+    let log = dir.join("calls.log");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {log}
+printf '%s\n' '{{"results":[{{"name":"doc","description":"desc","score":0.91,"path":"/tmp/doc.md","tags":"topic:test","date":"2026-07-02"}}]}}'
+"#,
+            log = shell_escape_path(&log)
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (provider, records) = RecordingProvider::new(vec![
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "t1",
+            "echo",
+            json!({}),
+        ))],
+        vec![ProviderEvent::Done(assistant_text("done"))],
+    ]);
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool::ok("echo", "ok"))];
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let config = AgentConfig {
+        kx_hints: Some(crate::context::kx_hints::KxHints::new(&script)),
+        ..AgentConfig::default()
+    };
+    let loop_ = loop_with(
+        provider,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        tools,
+        config,
+        events_tx,
+        approvals,
+        capability,
+    );
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("find the design note"),
+            None,
+            None,
+        ))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let _ = events_handle.await.expect("drain");
+
+    let records = records.lock().expect("records").clone();
+    assert_eq!(records.len(), 2, "tool round-trip = two provider calls");
+    let mut hint_positions = Vec::new();
+    for (i, rec) in records.iter().enumerate() {
+        let user_pos = rec
+            .first_span_ids
+            .iter()
+            .position(|id| id == "msg-0-user")
+            .unwrap_or_else(|| panic!("call {i}: user span missing: {:?}", rec.first_span_ids));
+        let hint_pos = rec
+            .first_span_ids
+            .iter()
+            .position(|id| id == crate::context::kx_hints::KX_HINT_SPAN_ID)
+            .unwrap_or_else(|| panic!("call {i}: kx hint span missing: {:?}", rec.first_span_ids));
+        assert_eq!(hint_pos, user_pos + 1, "call {i}: hint follows user");
+        hint_positions.push(hint_pos);
+    }
+    assert_eq!(hint_positions[0], hint_positions[1]);
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls.lines().count(),
+        1,
+        "kx recall must be memoized across tool rounds"
+    );
+}
+
+fn shell_escape_path(path: &std::path::Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
 /// Off by default: `AgentConfig::default()` (discover_hints: None)
 /// produces no hint span — pre-mu-uz0n ropes are byte-identical.
 #[tokio::test]

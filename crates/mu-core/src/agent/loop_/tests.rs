@@ -913,6 +913,174 @@ async fn b7_user_message_during_tool_pushes_to_back() {
     );
 }
 
+/// Cancelling while an assistant tool call is in flight must leave the
+/// conversation structurally valid for the next provider call: every tool_call
+/// in the assistant message needs a matching ToolResult, even if that result is
+/// a runtime-generated cancellation tombstone. This is the shape OpenAI/Codex
+/// enforces with "No tool output found for function call ...".
+#[tokio::test]
+async fn cancel_outstanding_during_tool_tombstones_call_for_next_turn() {
+    let (provider, records) = RecordingProvider::new(vec![
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "t1",
+            "slow",
+            json!({}),
+        ))],
+        vec![
+            ProviderEvent::TextDelta("after cancel".into()),
+            ProviderEvent::Done(assistant_text("after cancel")),
+        ],
+    ]);
+    let tools_arc: Vec<Arc<dyn Tool>> = vec![MockTool::delayed(
+        "slow",
+        "tool result that should not land",
+        Duration::from_secs(5),
+    )]
+    .into_iter()
+    .map(|t| Arc::new(t) as Arc<dyn Tool>)
+    .collect();
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let loop_ = loop_with(
+        provider as Arc<dyn Provider>,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        tools_arc,
+        AgentConfig::default(),
+        events_tx,
+        approvals,
+        capability,
+    );
+
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("start slow tool"),
+            None,
+            None,
+        ))
+        .await
+        .expect("send first ask");
+
+    let mut events = Vec::new();
+    loop {
+        let event = timeout(Duration::from_millis(500), events_rx.recv())
+            .await
+            .expect("timed out waiting for tool start")
+            .expect("event channel closed before tool start");
+        let saw_tool_start = matches!(
+            &event,
+            AgentEvent::ToolCallStarted { tool_call_id, .. } if tool_call_id == "t1"
+        );
+        events.push(event);
+        if saw_tool_start {
+            break;
+        }
+    }
+
+    loop_
+        .send(AgentInput::CancelOutstanding {
+            reason: "operator changed direction".into(),
+        })
+        .await
+        .expect("send cancel_outstanding");
+
+    loop {
+        let event = timeout(Duration::from_millis(500), events_rx.recv())
+            .await
+            .expect("timed out waiting for aborted done")
+            .expect("event channel closed before aborted done");
+        let saw_aborted_done = matches!(
+            &event,
+            AgentEvent::Done {
+                stop_reason: StopReason::Aborted,
+                ..
+            }
+        );
+        events.push(event);
+        if saw_aborted_done {
+            break;
+        }
+    }
+
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("continue after cancel"),
+            None,
+            None,
+        ))
+        .await
+        .expect("send follow-up ask");
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    events.extend(events_handle.await.expect("events drain"));
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+
+    let tool_completed_idx = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::ToolCallCompleted {
+                    tool_call_id,
+                    content,
+                    is_error: true,
+                } if tool_call_id == "t1"
+                    && content.contains("session.cancel_outstanding")
+                    && content.contains("operator changed direction")
+            )
+        })
+        .expect("cancelled tool call should be completed with an error tombstone");
+    let aborted_done_idx = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::Done {
+                    stop_reason: StopReason::Aborted,
+                    ..
+                }
+            )
+        })
+        .expect("missing aborted Done");
+    assert!(
+        tool_completed_idx < aborted_done_idx,
+        "tool cancellation tombstone must land before the aborted Done"
+    );
+
+    let dones: Vec<StopReason> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Done { stop_reason, .. } => Some(*stop_reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dones, vec![StopReason::Aborted, StopReason::EndTurn]);
+
+    let records = records.lock().expect("records mutex").clone();
+    assert_eq!(
+        records.len(),
+        2,
+        "cancel should not auto-continue the aborted ask"
+    );
+    assert_eq!(
+        records[1].message_count, 5,
+        "follow-up provider call must include user + assistant(tool_call) + cancelled tool_result + next user"
+    );
+    assert_eq!(
+        records[1].first_span_ids,
+        vec![
+            "tool-schema:slow",
+            "msg-0-user",
+            "msg-1-assistant",
+            "msg-2-tool-result:t1",
+            "msg-3-user",
+        ],
+    );
+}
+
 // ============================================================================
 // Pure-planner tests
 // ============================================================================

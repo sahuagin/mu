@@ -909,6 +909,16 @@ pub async fn handle_ask_session(
     // then leave healthy CommandReceived orphans. Reject busy here so
     // the pipeline writes an immediate CommandRejected receipt.
     if sessions.autonomy_active(&params.session_id) {
+        if let Some(sleep) = sessions.autonomous_sleep_status(&params.session_id) {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!(
+                    "ask_session: session {} is parked until unix_ms {} ({:?}); message was not queued. Wait for wakeup, cancel the autonomous run, or use an explicit wake/cancel control surface.",
+                    params.session_id, sleep.wake_at_unix_ms, sleep.reason
+                ),
+            );
+        }
         return err_response(
             request.id,
             codes::INVALID_PARAMS,
@@ -2109,6 +2119,37 @@ mod tests {
             method: method.into(),
             params,
         }
+    }
+
+    #[tokio::test]
+    async fn ask_session_against_parked_autonomy_reports_wakeup_state() {
+        let sessions = Sessions::new();
+        let (log, _live) = insert_live_session(&sessions, "s-sleep", Capability::root());
+        assert!(sessions.set_autonomy_active("s-sleep", true));
+        log.append(
+            EventActor::Agent,
+            EventPayload::AutonomousScheduledWakeup {
+                wake_at_unix_ms: 1_777_000_000_000,
+                reason: "overnight CI".into(),
+            },
+        );
+
+        let resp = handle_ask_session(
+            cfg_req(
+                AskSessionRequest::METHOD,
+                json!({"session_id": "s-sleep", "user_message": "are you awake?"}),
+            ),
+            sessions,
+            None,
+        )
+        .await;
+
+        let Response::Err { error, .. } = resp else {
+            panic!("expected parked ask rejection, got {resp:?}");
+        };
+        assert!(error.message.contains("parked until unix_ms 1777000000000"));
+        assert!(error.message.contains("overnight CI"));
+        assert!(error.message.contains("message was not queued"));
     }
 
     #[tokio::test]

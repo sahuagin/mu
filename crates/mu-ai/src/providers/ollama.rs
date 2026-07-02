@@ -33,13 +33,19 @@
 //! no wire to the ollama endpoint at all.
 //!
 //! Env overrides: `OLLAMA_API_BASE` (base URL), `OLLAMA_API_KEY`
-//! (optional; defaults empty). The request path is fixed at
+//! (optional; defaults empty), `MU_OLLAMA_LEASE=off` to disable the
+//! automatic shared-box lease (`force` enables it for non-default bases),
+//! `MU_OLLAMA_LEASE_CMD` to choose the helper command, and
+//! `MU_OLLAMA_LEASE_ACQUIRE_TIMEOUT_MS` to bound fair-queue wait. The request
+//! path is fixed at
 //! `/v1/messages` by `AnthropicProvider`, so the legacy
 //! `OLLAMA_API_PATH` override (an OpenAI-compat-era knob) no longer
 //! applies.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
@@ -68,6 +74,8 @@ pub fn base_from_env() -> String {
 
 pub struct OllamaProvider {
     inner: AnthropicProvider,
+    base: String,
+    lease: Mutex<Option<OllamaLeaseGuard>>,
 }
 
 impl OllamaProvider {
@@ -86,9 +94,13 @@ impl OllamaProvider {
             .filter(|s| !s.is_empty())
             .unwrap_or_default();
         let inner = AnthropicProvider::new(key, model)
-            .with_api_base(base)
+            .with_api_base(base.clone())
             .with_ollama_thinking_flag("");
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            base,
+            lease: Mutex::new(None),
+        })
     }
 
     /// Configure ollama's Anthropic-compat thinking switch. Ollama treats
@@ -97,6 +109,52 @@ impl OllamaProvider {
     pub fn with_thinking_flag(mut self, flag: &str) -> Self {
         self.inner = self.inner.with_ollama_thinking_flag(flag);
         self
+    }
+
+    async fn ensure_shared_box_lease(&self) -> Result<(), ProviderError> {
+        if !should_auto_lease_ollama_base(&self.base) {
+            return Ok(());
+        }
+        if self
+            .lease
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        let command = ollama_lease_command();
+        let mut guard = match OllamaLeaseGuard::spawn(&command) {
+            Ok(guard) => guard,
+            Err(e) => {
+                // Fail-open for environments that have ollama but not the
+                // cooperative lease helper installed. The operator's normal
+                // mu environment ships `with-ollama-lease`; ad-hoc dev boxes
+                // should not lose ollama entirely because the helper is absent.
+                tracing::warn!(
+                    command = %command,
+                    error = %e,
+                    "ollama lease helper unavailable; continuing without shared-box lease"
+                );
+                return Ok(());
+            }
+        };
+        if let Err(e) = guard.wait_ready(ollama_lease_acquire_timeout()).await {
+            return Err(ProviderError::Other(format!(
+                "ollama shared-box lease acquisition failed: {e}"
+            )));
+        }
+
+        let mut slot = self
+            .lease
+            .lock()
+            .map_err(|_| ProviderError::Other("ollama lease guard mutex poisoned".to_string()))?;
+        if slot.is_none() {
+            *slot = Some(guard);
+            tracing::info!(base = %self.base, "ollama shared-box lease acquired");
+        }
+        Ok(())
     }
 
     /// Query the ollama server for its locally-available models via the
@@ -161,6 +219,100 @@ fn relabel_inner_error(msg: String) -> String {
     msg.replace("anthropic", "ollama")
 }
 
+fn should_auto_lease_ollama_base_with_setting(base: &str, setting: Option<&str>) -> bool {
+    match setting.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(ref v) if matches!(v.as_str(), "0" | "false" | "off" | "no") => return false,
+        Some(ref v) if matches!(v.as_str(), "1" | "true" | "on" | "yes" | "force") => {
+            return true;
+        }
+        _ => {}
+    }
+    let trimmed = base.trim_end_matches('/');
+    trimmed == OLLAMA_API_BASE || trimmed.contains("://10.1.1.143:11434")
+}
+
+fn should_auto_lease_ollama_base(base: &str) -> bool {
+    should_auto_lease_ollama_base_with_setting(
+        base,
+        std::env::var("MU_OLLAMA_LEASE").ok().as_deref(),
+    )
+}
+
+fn ollama_lease_command() -> String {
+    std::env::var("MU_OLLAMA_LEASE_CMD")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "with-ollama-lease".to_string())
+}
+
+fn ollama_lease_acquire_timeout() -> Duration {
+    std::env::var("MU_OLLAMA_LEASE_ACQUIRE_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(300))
+}
+
+struct OllamaLeaseGuard {
+    child: Child,
+    ready_path: PathBuf,
+}
+
+impl OllamaLeaseGuard {
+    fn spawn(command: &str) -> Result<Self, std::io::Error> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let ready_path = std::env::temp_dir().join(format!(
+            "mu-ollama-lease-{}-{unique}.ready",
+            std::process::id()
+        ));
+        let child = Command::new(command)
+            .arg("sh")
+            .arg("-c")
+            .arg("printf ready > \"$MU_OLLAMA_LEASE_READY\"; exec sleep \"${MU_OLLAMA_LEASE_SLEEP_SECS:-86400}\"")
+            .env("MU_OLLAMA_LEASE_READY", &ready_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        Ok(Self { child, ready_path })
+    }
+
+    async fn wait_ready(&mut self, timeout: Duration) -> Result<(), String> {
+        let started = tokio::time::Instant::now();
+        loop {
+            if self.ready_path.exists() {
+                return Ok(());
+            }
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    return Err(format!("lease helper exited before acquisition: {status}"));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(format!("lease helper status check failed: {e}")),
+            }
+            if started.elapsed() >= timeout {
+                return Err(format!(
+                    "timed out after {}ms waiting for ollama lease",
+                    timeout.as_millis()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+impl Drop for OllamaLeaseGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.ready_path);
+    }
+}
+
 #[async_trait]
 impl Provider for OllamaProvider {
     async fn stream(
@@ -171,6 +323,12 @@ impl Provider for OllamaProvider {
         tools: &[ToolSpec],
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+        // The default ollama endpoint is the shared LAN box. Acquire the
+        // cooperative etcd lease lazily on first real model call so *every*
+        // mu path (solo, ask, ai-review, workers) protects the resident model
+        // without requiring the operator to remember `with-ollama-lease`.
+        self.ensure_shared_box_lease().await?;
+
         // Identical wire protocol to Anthropic; delegate wholesale —
         // but relabel any inner error so it never leaks "anthropic"
         // (see `relabel_inner_error` and bead mu-eb98). This `await?`
@@ -289,6 +447,38 @@ mod tests {
         if std::env::var("OLLAMA_API_BASE").is_err() {
             assert_eq!(base_from_env(), OLLAMA_API_BASE);
         }
+    }
+
+    #[test]
+    fn shared_box_base_auto_leases_unless_disabled() {
+        assert!(should_auto_lease_ollama_base_with_setting(
+            "http://10.1.1.143:11434",
+            None
+        ));
+        assert!(should_auto_lease_ollama_base_with_setting(
+            "http://10.1.1.143:11434/",
+            None
+        ));
+        assert!(!should_auto_lease_ollama_base_with_setting(
+            "http://10.1.1.143:11434",
+            Some("off")
+        ));
+    }
+
+    #[test]
+    fn non_shared_ollama_base_does_not_auto_lease() {
+        assert!(!should_auto_lease_ollama_base_with_setting(
+            "http://127.0.0.1:11434",
+            None
+        ));
+        assert!(!should_auto_lease_ollama_base_with_setting(
+            "http://localhost:11434",
+            None
+        ));
+        assert!(should_auto_lease_ollama_base_with_setting(
+            "http://127.0.0.1:11434",
+            Some("force")
+        ));
     }
 
     #[test]

@@ -61,7 +61,7 @@ _ad_claude_tools() {  # $1=csv
 agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   local ad_prov ad_model ad_pf ad_tools ad_timeout ad_maxturns ad_thinking ad_mu ad_errlog
   local ad_clsys ad_sysflags ad_cltools ad_perm ad_yolo ad_lease ad_mcpflag
-  local ad_mu_tools ad_tool ad_old_ifs
+  local ad_mu_tools ad_tool ad_old_ifs ad_env
   ad_prov="$1"; ad_model="$2"
   ad_pf="${3:-${PROMPT_FILE:-}}"
   [ -n "$ad_pf" ] || { echo "agent_dispatch: no prompt file (arg 3 or \$PROMPT_FILE)" >&2; return 2; }
@@ -80,7 +80,10 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
 
   # claude-oauth: reach the $0 Max subscription via the approved client. Prompt on
   # STDIN, not argv (a ~1MB prompt overflows ARG_MAX, mu-b6tl). --exclude-dynamic-
-  # system-prompt-sections strips claude's agent scaffolding.
+  # system-prompt-sections strips claude's agent scaffolding. Because this lane's
+  # contract is OAuth/subscription billing, scrub Anthropic API/Bedrock/Vertex env
+  # before invoking `claude`: the CLI can otherwise prefer API-key / credit-pool
+  # mode when ANTHROPIC_API_KEY leaks in from the operator shell (mu-odtc).
   if [ "$ad_prov" = "claude-oauth" ]; then
     ad_clsys=""
     [ -n "${SYSPROMPT:-}" ] && [ -r "$SYSPROMPT" ] && ad_clsys="--append-system-prompt-file $SYSPROMPT"
@@ -92,9 +95,18 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
       [ -n "$ad_cltools" ] && ad_cltools="--allowedTools $ad_cltools"
     fi
     # shellcheck disable=SC2086 — $ad_clsys/$ad_mcpflag/$ad_perm/$ad_cltools intentionally word-split
-    timeout "$ad_timeout" claude -p --model "$ad_model" $ad_clsys $ad_mcpflag $ad_perm \
-      --exclude-dynamic-system-prompt-sections \
-      $ad_cltools --output-format text <"$ad_pf" 2>>"$ad_errlog"
+    (
+      # Force Claude Code's OAuth/subscription path. Preserve CLAUDE_* OAuth
+      # state (e.g. CLAUDE_CODE_OAUTH_TOKEN), but remove Anthropic API/provider
+      # selectors that could reroute the approved client to metered API billing.
+      for ad_env in $(env | sed -n 's/^\(ANTHROPIC[A-Za-z0-9_]*\)=.*/\1/p'); do
+        unset "$ad_env"
+      done
+      unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
+      timeout "$ad_timeout" claude -p --model "$ad_model" $ad_clsys $ad_mcpflag $ad_perm \
+        --exclude-dynamic-system-prompt-sections \
+        $ad_cltools --output-format text <"$ad_pf" 2>>"$ad_errlog"
+    )
     return
   fi
 

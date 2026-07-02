@@ -49,17 +49,33 @@ fi
 # build the tool's own --bin and exec it, forwarding args verbatim.
 case "$name" in
     mu-solo)
-        # Standalone TUI: needs `mu` built alongside, the claude-proxy
-        # ANTHROPIC_BASE_URL cleared, and API keys pulled from the agent config
-        # via tq. Provider/model are NOT injected here — they come from
-        # solo.toml ([session] or `-p <profile>`). Forcing them here only
-        # clobbered the config; MU_SOLO_PROVIDER/MODEL existed solely to work
-        # around that and are gone now.
+        # Standalone TUI: needs `mu` built alongside. Provider/model are NOT
+        # injected here — they come from solo.toml ([session] or `-p <profile>`).
+        #
+        # Billing/auth posture (mu-odtc): do NOT silently hydrate provider API
+        # keys into every solo session. Most profiles use subscription/local
+        # providers; ambient Anthropic/OpenRouter keys leaked through here into
+        # child mu daemons and downstream dispatch. Default = scrub metered API
+        # env. Opt in explicitly when doing live API work:
+        #
+        #   MU_EMU_PROVIDER_KEYS=agent-config mu-solo -p opus   # load from ~/.config/agent/config.toml
+        #   MU_EMU_PROVIDER_KEYS=env          mu-solo -p opus   # preserve caller env
+        #
         # ( cd "$root" && cargo build --release --bin mu --bin mu-solo )
         TQ="${TQ:-$HOME/.cargo/bin/tq}"
         unset ANTHROPIC_BASE_URL
-        ANTHROPIC_API_KEY=$("$TQ" -f "$HOME/.config/agent/config.toml" -r anthropic.api_key 2>/dev/null || true) \
-        OPENROUTER_API_KEY=$("$TQ" -f "$HOME/.config/agent/config.toml" -r openrouter.api_key 2>/dev/null || true) \
+        case "${MU_EMU_PROVIDER_KEYS:-}" in
+            agent-config|1|true|yes)
+                ANTHROPIC_API_KEY=$("$TQ" -f "$HOME/.config/agent/config.toml" -r anthropic.api_key 2>/dev/null || true)
+                OPENROUTER_API_KEY=$("$TQ" -f "$HOME/.config/agent/config.toml" -r openrouter.api_key 2>/dev/null || true)
+                export ANTHROPIC_API_KEY OPENROUTER_API_KEY
+                ;;
+            env)
+                ;;
+            *)
+                unset ANTHROPIC_API_KEY OPENROUTER_API_KEY
+                ;;
+        esac
         exec "$target/mu-solo" \
             --mu-binary "$target/mu" \
             "$@" ;;

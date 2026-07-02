@@ -4,6 +4,7 @@
 # Single source of truth = ~/.config/mu/agent_roles.toml (`[[code_review.ranked]]`):
 #   provider+model  -> resolved via `agent-role code_review <rank>`
 #   tools           -> per-rank `tools` field (default "read,grep"; "" => zero tools)
+#   max_turns       -> per-rank or role-level turn budget; omitted = provider default
 # Nothing model-specific is hardcoded here — change models/tools in the TOML, not this script.
 #
 # Behavior:
@@ -59,13 +60,14 @@ r=0
 while [ "$r" -lt "$N" ]; do
   set -- $(agent-role code_review "$r"); prov="$1"; model="$2"
   tools=$(printf '%s' "$ranks_json" | jq -r ".[$r].tools // \"read,grep\"")
+  max_turns=$(agent-role --max-turns code_review "$r" 2>/dev/null || true)
   tag="rank${r}.$(printf '%s' "$model" | tr '/:' '__')"
   (
     warmup "$prov" "$model"
     # agent_dispatch reads TOOLS/TIMEOUT/MU/ERRLOG from scope; stdout = the model's
     # output (-> .out), stderr -> $ERRLOG (per-rank .err). claude-oauth now routes
     # to `claude -p` instead of erroring. (Subshell-local assignments: no leakage.)
-    TOOLS="$tools"; TIMEOUT="$TMO"; ERRLOG="${OUT}.${tag}.err"
+    TOOLS="$tools"; TIMEOUT="$TMO"; MAX_TURNS="$max_turns"; ERRLOG="${OUT}.${tag}.err"
     agent_dispatch "$prov" "$model" "$PF" > "${OUT}.${tag}.out"
     echo "exit=$? prov=$prov model=$model tools=[$tools]" > "${OUT}.${tag}.done"
   ) &

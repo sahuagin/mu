@@ -50,6 +50,7 @@ while [ "$round" -lt "$MAXR" ]; do
   while [ "$r" -lt "$N" ]; do
     set -- $(agent-role code_review "$r"); prov="$1"; model="$2"
     tools=$(printf '%s' "$ranks_json" | jq -r ".[$r].tools // \"read,grep\"")
+    max_turns=$(agent-role --max-turns code_review "$r" 2>/dev/null || true)
     tag="rank${r}.$(printf '%s' "$model" | tr '/:' '__')"
     python3 "$HERE/converge.py" prompt "$OUT/r$prev" "$round" "$OUT/diff.txt" "$tag" \
       "$OUT/r${round}.${tag}.prompt" >/dev/null
@@ -57,7 +58,7 @@ while [ "$round" -lt "$MAXR" ]; do
       cd "$CWD" || exit 1
       # agent_dispatch reads TOOLS/TIMEOUT/MU/ERRLOG from scope; stdout -> .out,
       # stderr -> $ERRLOG. claude-oauth now routes to `claude -p` instead of erroring.
-      TOOLS="$tools"; TIMEOUT=900; ERRLOG="$OUT/r${round}.${tag}.err"
+      TOOLS="$tools"; TIMEOUT=900; MAX_TURNS="$max_turns"; ERRLOG="$OUT/r${round}.${tag}.err"
       agent_dispatch "$prov" "$model" "$OUT/r${round}.${tag}.prompt" \
         > "$OUT/r${round}.${tag}.out"
       echo "exit=$? $prov/$model" > "$OUT/r${round}.${tag}.done"

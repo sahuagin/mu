@@ -110,9 +110,10 @@ set -o pipefail
 # last-ditch default, so the gate still runs on a host without agent-role/tq/jq
 # (this script deliberately degrades when jq is absent — see json_escape).
 # Bench provenance: ~/src/public_github/code-review-bench/reports/NOTES.md.
-_leaf_prov=""; _leaf_model=""; _leaf_fb_prov=""; _leaf_fb_model=""
+_leaf_prov=""; _leaf_model=""; _leaf_fb_prov=""; _leaf_fb_model=""; _leaf_max_turns=""
 read -r _leaf_prov    _leaf_model    < <(agent-role code_review_leaf 0 2>/dev/null) || true
 read -r _leaf_fb_prov _leaf_fb_model < <(agent-role code_review_leaf 1 2>/dev/null) || true
+_leaf_max_turns="$(agent-role --max-turns code_review_leaf 0 2>/dev/null || true)"
 PROVIDER="${MU_REVIEW_PROVIDER:-${_leaf_prov:-ollama}}"
 MODEL="${MU_REVIEW_MODEL:-${_leaf_model:-qwen3.6:35b-a3b-q8_0}}"
 PROVIDER2="${MU_REVIEW_PROVIDER_2:-openrouter}"
@@ -137,8 +138,9 @@ FALLBACK_MODEL="${MU_REVIEW_FALLBACK_MODEL:-${_leaf_fb_model:-gpt-5.5}}"
 TOOLS="${MU_REVIEW_TOOLS:-read,grep}"
 # Turn cap is an anti-FLAIL backstop (stop a model looping forever), NOT a
 # throttle — set generous so it never truncates a legitimate investigation;
-# TIMEOUT is the wall-clock backstop. Forwarded to `mu ask --max-turns`.
-MAX_TURNS="${MU_REVIEW_MAX_TURNS:-15}"
+# TIMEOUT is the wall-clock backstop. Forwarded to `mu ask --max-turns` only
+# when role/env config sets an explicit budget; omitted = provider default.
+MAX_TURNS="${MU_REVIEW_MAX_TURNS-${_leaf_max_turns}}"
 BASE="${MU_REVIEW_BASE:-main}"
 # Chunked-mode knobs (v2). Synthesis defaults to primary 2: the strong/cheap
 # frontier lane is the right place for the one cross-commit judgement call.

@@ -35,16 +35,17 @@ REPO_DIR="${2:?usage: orchestrate.sh <task-file> <repo-dir>}"
 # is the fallback if agent-role or the role is absent. (No ollama rank in that
 # role — gate judgment is local models' weak lane, and the gates must not depend
 # on the shared ollama lease.)
-GATE_PROVIDER=""; GATE_MODEL=""
+GATE_PROVIDER=""; GATE_MODEL=""; GATE_MAX_TURNS=""
 if command -v agent-role >/dev/null 2>&1; then
   # shellcheck disable=SC2046
   set -- $(agent-role orchestrate_gate 0 2>/dev/null)
   GATE_PROVIDER="${1:-}"; GATE_MODEL="${2:-}"
+  GATE_MAX_TURNS="$(agent-role --max-turns orchestrate_gate 0 2>/dev/null || true)"
 fi
 GATE_PROVIDER="${GATE_PROVIDER:-openai-codex}"; GATE_MODEL="${GATE_MODEL:-gpt-5.5}"
-SPEC_CRITIC_PROVIDER="${SPEC_CRITIC_PROVIDER:-$GATE_PROVIDER}"; SPEC_CRITIC_MODEL="${SPEC_CRITIC_MODEL:-$GATE_MODEL}"  # spec-critic gate (forks before code)
-ARCHITECT_PROVIDER="${ARCHITECT_PROVIDER:-$GATE_PROVIDER}"; ARCHITECT_MODEL="${ARCHITECT_MODEL:-$GATE_MODEL}"  # invariant-guardian veto gate
-SEAT_PROVIDER="${SEAT_PROVIDER:-$GATE_PROVIDER}"; SEAT_MODEL="${SEAT_MODEL:-$GATE_MODEL}"  # the conductor under test
+SPEC_CRITIC_PROVIDER="${SPEC_CRITIC_PROVIDER:-$GATE_PROVIDER}"; SPEC_CRITIC_MODEL="${SPEC_CRITIC_MODEL:-$GATE_MODEL}"; SPEC_CRITIC_MAX_TURNS="${SPEC_CRITIC_MAX_TURNS-$GATE_MAX_TURNS}"  # spec-critic gate (forks before code)
+ARCHITECT_PROVIDER="${ARCHITECT_PROVIDER:-$GATE_PROVIDER}"; ARCHITECT_MODEL="${ARCHITECT_MODEL:-$GATE_MODEL}"; ARCHITECT_MAX_TURNS="${ARCHITECT_MAX_TURNS-$GATE_MAX_TURNS}"  # invariant-guardian veto gate
+SEAT_PROVIDER="${SEAT_PROVIDER:-$GATE_PROVIDER}"; SEAT_MODEL="${SEAT_MODEL:-$GATE_MODEL}"; SEAT_MAX_TURNS="${SEAT_MAX_TURNS-$GATE_MAX_TURNS}"  # the conductor under test
 # Worker seat: resolve from the lock-aware role registry (`agent-role coding`)
 # so a HELD ollama box demotes to a non-ollama coding rank automatically (the
 # #383 LOTO demote/sink) instead of hammering a box another session owns. An
@@ -53,10 +54,12 @@ SEAT_PROVIDER="${SEAT_PROVIDER:-$GATE_PROVIDER}"; SEAT_MODEL="${SEAT_MODEL:-$GAT
 # here — it lands in the shared scripts/lib/agent-dispatch.sh so orchestrate +
 # ai-review inherit it at the dispatch layer; coordinated split, mu-dialogue
 # 2026-06-23.)
+WORKER_ROLE_MAX_TURNS=""
 if [ -z "${WORKER_PROVIDER:-}" ] && command -v agent-role >/dev/null 2>&1; then
   # shellcheck disable=SC2046
   set -- $(agent-role coding 0 2>/dev/null)
   WORKER_PROVIDER="${1:-}"; WORKER_MODEL="${2:-}"
+  WORKER_ROLE_MAX_TURNS="$(agent-role --max-turns coding 0 2>/dev/null || true)"
 fi
 WORKER_PROVIDER="${WORKER_PROVIDER:-ollama}"; WORKER_MODEL="${WORKER_MODEL:-qwen3.6:27b}"  # fallback if agent-role is absent
 AIREVIEW="${AIREVIEW:-$REPO_DIR/scripts/ai-review.sh}"
@@ -71,7 +74,7 @@ CONVERGE_ROSTER="${CONVERGE_ROSTER:-ollama:qwen3.6:27b,claude-oauth:claude-sonne
 # The converger is a skeptical SELECTION gate (antagonistic, citation-gated). It
 # shares the orchestrate_gate role with the other gates (gpt-5.5 first, opus
 # fallback); per-seat CONVERGER_PROVIDER/MODEL still overrides.
-CONVERGER_PROVIDER="${CONVERGER_PROVIDER:-$GATE_PROVIDER}"; CONVERGER_MODEL="${CONVERGER_MODEL:-$GATE_MODEL}"
+CONVERGER_PROVIDER="${CONVERGER_PROVIDER:-$GATE_PROVIDER}"; CONVERGER_MODEL="${CONVERGER_MODEL:-$GATE_MODEL}"; CONVERGER_MAX_TURNS="${CONVERGER_MAX_TURNS-$GATE_MAX_TURNS}"
 # Fixed, neutral system prompts (role + minimal tool-orientation) kept CONSTANT
 # across seat arms so identity/recall don't confound the A/B (--bare strips the rest).
 CONDUCTOR_PROMPT="${CONDUCTOR_PROMPT:-$(dirname "$0")/conductor-prompt.txt}"
@@ -119,7 +122,7 @@ forks and verdict in the required shape.
 REQUEST:
 $TASK
 EOF
-  SYSPROMPT="$SPEC_CRITIC_PROMPT"
+  SYSPROMPT="$SPEC_CRITIC_PROMPT"; MAX_TURNS="$SPEC_CRITIC_MAX_TURNS"
   ( cd "$REPO_DIR" && dispatch spec-critic "$SPEC_CRITIC_PROVIDER" "$SPEC_CRITIC_MODEL" "read,grep,ls" "$RUN_DIR/spec-critic.prompt" )
   SPEC_VERDICT="$(grep -m1 '^VERDICT:' "$RUN_DIR/spec-critic.out" 2>/dev/null || echo 'VERDICT: (none parsed)')"
   log "spec-critic -> $SPEC_VERDICT"
@@ -152,7 +155,7 @@ invariant brief and verdict in the required shape.
 TASK:
 $TASK
 EOF
-  SYSPROMPT="$ARCHITECT_PROMPT"
+  SYSPROMPT="$ARCHITECT_PROMPT"; MAX_TURNS="$ARCHITECT_MAX_TURNS"
   ( cd "$REPO_DIR" && dispatch architect "$ARCHITECT_PROVIDER" "$ARCHITECT_MODEL" "read,grep,ls" "$RUN_DIR/architect.prompt" )
   ARCH_VERDICT="$(grep -m1 '^VERDICT:' "$RUN_DIR/architect.out" 2>/dev/null || echo 'VERDICT: (none parsed)')"
   log "architect -> $ARCH_VERDICT"
@@ -192,11 +195,11 @@ TASK:
 $TASK
 EOF
 SYSPROMPT="$CONDUCTOR_PROMPT"
-# The planner must investigate across the codebase before it can conclude; the dispatch default
-# (15) is a GATE-sized budget and starves a thorough seat — mu-uvuo run #5: deepseek-v4-pro spent
-# all 15 turns reading and was cancelled ONE turn before emitting the plan, so plan.md captured
-# only its trailing "let me verify a few more details" line. Give the planner the worker's budget.
-MAX_TURNS="${PLAN_MAX_TURNS:-40}"
+# The planner must investigate across the codebase before it can conclude; its
+# turn budget comes from the role config (PLAN_MAX_TURNS still overrides).
+# Omitted role budget means "let mu apply provider-aware defaults"; no hardcoded
+# dispatch cap shadows the operator's config.
+MAX_TURNS="${PLAN_MAX_TURNS-$SEAT_MAX_TURNS}"
 ( cd "$REPO_DIR" && dispatch plan "$SEAT_PROVIDER" "$SEAT_MODEL" "read,grep,ls" "$RUN_DIR/plan.prompt" )
 cp "$RUN_DIR/plan.out" "$RUN_DIR/plan.md"
 log "plan -> $RUN_DIR/plan.md"
@@ -220,7 +223,7 @@ run_worker(){  # $1=slot $2=provider $3=model
   rw_ws="$( cd "$REPO_DIR" && sprint-start --no-bead "orch-$(date -u +%H%M%S)-$rw_slot" 2>/dev/null | sed -n 's/^cd //p' )"
   rw_ws="${rw_ws:-$REPO_DIR}"
   printf '%s\n' "$rw_ws" > "$RUN_DIR/worker.$rw_slot.ws"
-  MAX_TURNS="${WORKER_MAX_TURNS:-40}"; SYSPROMPT="$WORKER_PROMPT"  # WORKER_MAX_TURNS=0 ⇒ uncapped (safe for a free local worker; pair with a raised TIMEOUT)
+  MAX_TURNS="${WORKER_MAX_TURNS-$WORKER_ROLE_MAX_TURNS}"; SYSPROMPT="$WORKER_PROMPT"
   ( cd "$rw_ws" && dispatch "implement-$rw_slot" "$rw_prov" "$rw_model" \
       "read,write,edit,glob,grep,ls,bash" "$RUN_DIR/impl.prompt" )
   ( cd "$rw_ws" && jj diff --git > "$RUN_DIR/worker.$rw_slot.diff" 2>/dev/null )
@@ -251,7 +254,7 @@ else
     done
     echo; echo "Select the candidate that best satisfies the plan. End with 'WINNER: <n>' (or 'WINNER: none | <why>')."
   } > "$RUN_DIR/converge.prompt"
-  SYSPROMPT="$CONVERGE_PROMPT"
+  SYSPROMPT="$CONVERGE_PROMPT"; MAX_TURNS="$CONVERGER_MAX_TURNS"
   ( cd "$REPO_DIR" && dispatch converge "$CONVERGER_PROVIDER" "$CONVERGER_MODEL" "read,grep" "$RUN_DIR/converge.prompt" )
   WINNER="$(grep -m1 '^WINNER:' "$RUN_DIR/converge.out" 2>/dev/null | sed -E 's/^WINNER:[[:space:]]*([0-9]+).*/\1/')"
   case "$WINNER" in ''|*[!0-9]*) log "converge: WINNER unparsed or 'none' — defaulting to candidate 1 (review gate is the backstop); see converge.out"; WINNER=1 ;; esac

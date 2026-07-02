@@ -30,10 +30,12 @@
 #
 # Tunables (read from the CALLER's scope; defaults applied when unset):
 #   TOOLS      mu tool CSV                                      default "read,grep"
-#              ("" => zero tools: omits --tools/--max-turns/--allowedTools)
+#              ("" => zero tools: omits --tools/--allowedTools; MAX_TURNS still
+#              applies on the mu path when explicitly set)
 #   SYSPROMPT  system-prompt file (optional; overrides daemon)  default unset
 #   TIMEOUT    wall-clock backstop, seconds                     default 900
-#   MAX_TURNS  mu --max-turns (mu path, when TOOLS non-empty)   default 15
+#   MAX_TURNS  mu --max-turns (mu path); unset/empty = provider default,
+#              0 = explicitly uncapped
 #   THINKING   mu/claude thinking level                         default low
 #   MU         mu binary                                        default `command -v mu`
 #   ERRLOG     stderr sink (appended)                           default /tmp/agent-dispatch.$$.err
@@ -60,23 +62,24 @@ _ad_claude_tools() {  # $1=csv
 
 agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   local ad_prov ad_model ad_pf ad_tools ad_timeout ad_maxturns ad_thinking ad_mu ad_errlog
-  local ad_clsys ad_sysflags ad_cltools ad_perm ad_yolo ad_lease ad_mcpflag
+  local ad_clsys ad_sysflags ad_cltools ad_perm ad_yolo ad_lease ad_mcpflag ad_turnflag
   local ad_mu_tools ad_tool ad_old_ifs
   ad_prov="$1"; ad_model="$2"
   ad_pf="${3:-${PROMPT_FILE:-}}"
   [ -n "$ad_pf" ] || { echo "agent_dispatch: no prompt file (arg 3 or \$PROMPT_FILE)" >&2; return 2; }
   ad_tools="${TOOLS-read,grep}"            # '-' not ':-': honour an explicit empty TOOLS
   ad_timeout="${TIMEOUT:-900}"
-  ad_maxturns="${MAX_TURNS:-15}"
+  ad_maxturns="${MAX_TURNS-}"
   ad_thinking="${THINKING:-low}"
   ad_mu="${MU:-$(command -v mu || true)}"
   ad_errlog="${ERRLOG:-${TMPDIR:-/tmp}/agent-dispatch.$$.err}"
 
   # Write tools (write/edit/bash) need extra flags so a non-interactive worker
   # doesn't deadlock (claude) and can run a shell (mu). Read-only sets stay clean.
-  ad_perm=""; ad_yolo=""
+  ad_perm=""; ad_yolo=""; ad_turnflag=""
   case ",$ad_tools," in *,write,*|*,edit,*|*,bash,*) ad_perm="--permission-mode bypassPermissions" ;; esac
   case ",$ad_tools," in *,bash,*) ad_yolo="--bash-yolo" ;; esac
+  [ -n "$ad_maxturns" ] && ad_turnflag="--max-turns $ad_maxturns"
 
   # claude-oauth: reach the $0 Max subscription via the approved client. Prompt on
   # STDIN, not argv (a ~1MB prompt overflows ARG_MAX, mu-b6tl). --exclude-dynamic-
@@ -164,17 +167,17 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
       ;;
   esac
 
-  # shellcheck disable=SC2086 — $ad_lease/$ad_sysflags/$ad_yolo/$ad_mcpflag/tool flags intentionally word-split
+  # shellcheck disable=SC2086 — $ad_lease/$ad_sysflags/$ad_yolo/$ad_mcpflag/$ad_turnflag/tool flags intentionally word-split
   if [ -n "$ad_tools" ] && [ -n "$ad_mu_tools" ]; then
     $ad_lease timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
-      --thinking "$ad_thinking" $ad_sysflags $ad_yolo $ad_mcpflag --max-turns "$ad_maxturns" --tools "$ad_mu_tools" \
+      --thinking "$ad_thinking" $ad_sysflags $ad_yolo $ad_mcpflag $ad_turnflag --tools "$ad_mu_tools" \
       --prompt-file "$ad_pf" 2>>"$ad_errlog"
   elif [ -n "$ad_tools" ]; then
     $ad_lease timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
-      --thinking "$ad_thinking" $ad_sysflags $ad_yolo $ad_mcpflag --max-turns "$ad_maxturns" \
+      --thinking "$ad_thinking" $ad_sysflags $ad_yolo $ad_mcpflag $ad_turnflag \
       --prompt-file "$ad_pf" 2>>"$ad_errlog"
   else
     $ad_lease timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
-      --thinking "$ad_thinking" $ad_sysflags --prompt-file "$ad_pf" 2>>"$ad_errlog"
+      --thinking "$ad_thinking" $ad_sysflags $ad_turnflag --prompt-file "$ad_pf" 2>>"$ad_errlog"
   fi
 }

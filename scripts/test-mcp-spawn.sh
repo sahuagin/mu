@@ -5,6 +5,17 @@
 # This uses -p (headless, credit pool) for testing. Production would
 # use pty-bridge for subscription billing.
 
+# ── DISABLED 2026-07-06 ──────────────────────────────────────────────────────
+# This script spawned Claude Code via `claude -p`, which runs on credit-pool /
+# metered API billing AND registers the client as "sdk-cli", not "cli". The real
+# goal was to launch claude-code in a controlled-stdio process that KEEPS its
+# interactive "cli" designation (pty-bridge) — this `-p` shortcut never achieved
+# that, and it does not scrub ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL, so running
+# it with a key in the environment silently bills per-token. Refusing to run.
+# (Body preserved below for a future controlled-stdio rewrite.)
+echo "test-mcp-spawn.sh is DISABLED: it spawned 'claude -p' (metered, registers as sdk-cli) and never met its goal of a controlled-stdio 'cli' launch. See the header comment for the rewrite path (pty-bridge)." >&2
+exit 1
+
 SOCK="${MU_MCP_SOCKET:-$HOME/.local/share/mu/mcp.sock}"
 MCP_CONFIG="$HOME/.local/share/mu/mcp-config.json"
 

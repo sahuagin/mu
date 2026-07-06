@@ -1465,13 +1465,21 @@ mod live_tests {
         std::env::var("MU_LIVE_OPENAI_CODEX").ok().as_deref() == Some("1")
     }
 
+    /// The Codex backend retires model ids out from under us: on 2026-07-06 it
+    /// started rejecting `gpt-5-codex` for ChatGPT-account Codex with a 400
+    /// (bead mu-openai-protocol-canary-drift-c4hw). Default to the model the
+    /// production openai-codex lane runs; override when that drifts too.
+    fn live_codex_model() -> String {
+        std::env::var("MU_LIVE_OPENAI_CODEX_MODEL").unwrap_or_else(|_| "gpt-5.5".into())
+    }
+
     #[tokio::test]
     async fn live_codex_text_smoke() {
         if !live_enabled() {
             eprintln!("skipping live_codex_text_smoke (set MU_LIVE_OPENAI_CODEX=1)");
             return;
         }
-        let provider = OpenaiProvider::from_store("gpt-5-codex".into())
+        let provider = OpenaiProvider::from_store(live_codex_model())
             .expect("must be logged in via `mu login --provider openai-codex`");
         let messages = vec![AgentMessage::User {
             content: "Reply with the single word 'hello' and nothing else.".into(),
@@ -1508,7 +1516,7 @@ mod live_tests {
             eprintln!("skipping live_codex_tool_call (set MU_LIVE_OPENAI_CODEX=1)");
             return;
         }
-        let provider = OpenaiProvider::from_store("gpt-5-codex".into()).expect("must be logged in");
+        let provider = OpenaiProvider::from_store(live_codex_model()).expect("must be logged in");
         let echo_tool = ToolSpec {
             name: "echo".into(),
             description: "Echo a string.".into(),

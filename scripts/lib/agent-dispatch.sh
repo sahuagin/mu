@@ -92,7 +92,11 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
       [ -n "$ad_cltools" ] && ad_cltools="--allowedTools $ad_cltools"
     fi
     # shellcheck disable=SC2086 — $ad_clsys/$ad_mcpflag/$ad_perm/$ad_cltools intentionally word-split
-    timeout "$ad_timeout" claude -p --model "$ad_model" $ad_clsys $ad_mcpflag $ad_perm \
+    # OAuth/subscription lane: scrub the metered-API selectors before `claude` —
+    # if ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL leak in from the operator shell,
+    # the CLI silently switches to per-token API billing (the mu-odtc trap).
+    timeout "$ad_timeout" env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL \
+      claude -p --model "$ad_model" $ad_clsys $ad_mcpflag $ad_perm \
       --exclude-dynamic-system-prompt-sections \
       $ad_cltools --output-format text <"$ad_pf" 2>>"$ad_errlog"
     return

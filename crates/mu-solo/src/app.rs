@@ -622,11 +622,13 @@ fn effort_fields_from_response(resp: &serde_json::Value) -> (Option<Vec<String>>
 /// mu-uvuo: apply a daemon-sent effort vocabulary to the dial state. The
 /// daemon owns the model catalog, so the frontend renders what it is
 /// handed and never recomputes levels locally (a remote frontend has no
-/// catalog at all). `None`/empty daemon levels keep the current set — an
-/// older daemon degrades to the launch-time levels rather than to a
-/// recompute. An operator `effort_levels` config override always wins.
-/// If the current effort falls outside the new set, snap to the daemon
-/// default, then the operator default, then the first level.
+/// catalog at all). `None` (field absent ⇒ older daemon) keeps the
+/// current set; `Some` but empty is the daemon's authoritative "no
+/// effort dial for this route" and resets to the generic set instead of
+/// carrying the previous route's vocabulary forward. An operator
+/// `effort_levels` config override always wins. If the current effort
+/// falls outside the new set, snap to the daemon default, then the
+/// operator default, then the first level.
 fn apply_daemon_effort_config(
     valid_levels: &mut Vec<String>,
     effort: &mut String,
@@ -636,14 +638,22 @@ fn apply_daemon_effort_config(
     daemon_default: Option<&str>,
 ) {
     if !levels_override {
-        let normalized: Vec<String> = daemon_levels
-            .unwrap_or_default()
-            .iter()
-            .map(|s| normalize_effort(s))
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !normalized.is_empty() {
-            *valid_levels = normalized;
+        if let Some(levels) = daemon_levels {
+            let normalized: Vec<String> = levels
+                .iter()
+                .map(|s| normalize_effort(s))
+                .filter(|s| !s.is_empty())
+                .collect();
+            // Sent-but-empty is the daemon's authoritative "this route has
+            // no effort dial": reset to the generic set (the pre-daemon-
+            // authority behavior for such routes) rather than carrying the
+            // previous route's vocabulary forward. Only an ABSENT field
+            // (older daemon) keeps the current levels.
+            *valid_levels = if normalized.is_empty() {
+                generic_effort_levels()
+            } else {
+                normalized
+            };
         }
     }
     if !valid_levels.iter().any(|e| e == effort) {
@@ -6106,6 +6116,26 @@ mod tests {
         // ...and the snap lands inside the operator set (daemon default
         // "medium" is not in it), via the operator default.
         assert_eq!(effort, "max");
+    }
+
+    #[test]
+    fn uvuo_authoritative_empty_levels_reset_to_generic() {
+        // Panel finding on the original diff: switching from an
+        // effort-enabled route to an effort-less one (daemon sends
+        // Some([])) must not carry the old route's vocabulary forward.
+        let mut levels = vec!["off".to_string(), "on".to_string()];
+        let mut effort = "on".to_string();
+        apply_daemon_effort_config(
+            &mut levels,
+            &mut effort,
+            false,
+            None,
+            Some(Vec::new()),
+            None,
+        );
+        assert_eq!(levels, generic_effort_levels());
+        // "on" is not in the generic set — snapped to its first level.
+        assert_eq!(effort, "low");
     }
 
     #[test]

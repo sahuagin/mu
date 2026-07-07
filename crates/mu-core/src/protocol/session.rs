@@ -85,8 +85,9 @@ pub struct CreateSessionResponse {
     /// session's route. The daemon owns the model catalog, so it — not the
     /// frontend — resolves which effort levels a provider/model accepts;
     /// frontends render this set instead of recomputing it locally (a
-    /// remote frontend has no catalog at all). `None` ⇒ older daemon or a
-    /// route with no effort dial.
+    /// remote frontend has no catalog at all). Daemons that implement
+    /// mu-uvuo always send this field: an empty list is the authoritative
+    /// "this route has no effort dial". `None` (absent) ⇒ older daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_effort_levels: Option<Vec<String>>,
     /// mu-uvuo: daemon-resolved default effort for the route, when the

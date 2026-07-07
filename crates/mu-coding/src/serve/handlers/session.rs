@@ -878,24 +878,35 @@ fn build_project_context(
     }
 }
 
-/// Pull a (kind, model) pair out of a `ProviderSelector` for logging
-/// purposes. The protocol-level enum is already snake_case on the
-/// wire; we just want a flat (string, string) for the event payload.
 /// mu-uvuo: daemon-side effort resolution for a route, as owned wire
 /// strings. The route catalog (models.toml + generated layers) lives with
 /// the daemon; frontends render this instead of consulting a catalog they
 /// may not have (a remote frontend has none).
+///
+/// Always `Some` on this daemon: an empty vec is the authoritative "this
+/// route has no effort dial" answer (e.g. an openrouter model with no
+/// catalog entry or provider fallback), so an ABSENT field can only mean
+/// an older daemon. Without that distinction a frontend switching from an
+/// effort-enabled route to an effort-less one would keep rendering the
+/// stale dial (ci-aipr panel finding on the original mu-uvuo diff).
 fn effort_config_strings(
     provider_kind: &str,
     model: &str,
 ) -> (Option<Vec<String>>, Option<String>) {
     let (levels, default) = mu_core::route_catalog::effort_config_for(provider_kind, model);
     (
-        levels.map(|l| l.iter().map(|s| s.to_string()).collect()),
+        Some(
+            levels
+                .map(|l| l.iter().map(|s| s.to_string()).collect())
+                .unwrap_or_default(),
+        ),
         default.map(|s| s.to_string()),
     )
 }
 
+/// Pull a (kind, model) pair out of a `ProviderSelector` for logging
+/// purposes. The protocol-level enum is already snake_case on the
+/// wire; we just want a flat (string, string) for the event payload.
 fn describe_selector(selector: &ProviderSelector) -> (String, String) {
     match selector {
         ProviderSelector::AnthropicApi { model } => ("anthropic_api".into(), model.clone()),

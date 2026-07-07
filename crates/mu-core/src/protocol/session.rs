@@ -81,6 +81,19 @@ impl CreateSessionRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateSessionResponse {
     pub session_id: String,
+    /// mu-uvuo: the daemon-resolved reasoning-effort vocabulary for the
+    /// session's route. The daemon owns the model catalog, so it — not the
+    /// frontend — resolves which effort levels a provider/model accepts;
+    /// frontends render this set instead of recomputing it locally (a
+    /// remote frontend has no catalog at all). `None` ⇒ older daemon or a
+    /// route with no effort dial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_effort_levels: Option<Vec<String>>,
+    /// mu-uvuo: daemon-resolved default effort for the route, when the
+    /// catalog declares one. Frontends snap to this when their current
+    /// effort is not in `valid_effort_levels`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
 }
 
 /// Provider selection at session-create time. Tagged enum so the wire
@@ -583,6 +596,15 @@ impl SetRouteRequest {
 pub struct SetRouteResponse {
     pub provider_kind: String,
     pub model: String,
+    /// mu-uvuo: daemon-resolved effort vocabulary for the NEW route (see
+    /// [`CreateSessionResponse::valid_effort_levels`]). Sent on every
+    /// switch so the frontend's effort dial tracks the route without a
+    /// local catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_effort_levels: Option<Vec<String>>,
+    /// mu-uvuo: daemon-resolved default effort for the new route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
 }
 
 // ── generic config-plane message (mu-context-limits-wire phase 2) ────

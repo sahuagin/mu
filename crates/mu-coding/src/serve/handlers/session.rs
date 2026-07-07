@@ -77,6 +77,13 @@ pub fn handle_create_session(
         capability.max_side_effects = Some(max_side_effects);
     }
 
+    // mu-uvuo: resolve the effort vocabulary for the requested route up
+    // front — the daemon owns the catalog, so the create response carries
+    // the authoritative set for the frontend to render instead of
+    // recomputing it locally.
+    let (route_kind, route_model) = describe_selector(&params.provider);
+    let (valid_effort_levels, default_effort) = effort_config_strings(&route_kind, &route_model);
+
     match build_and_register_session(BuildSessionRequest {
         selector: &params.provider,
         system_prompt: params.system_prompt, // mu-n48
@@ -98,7 +105,11 @@ pub fn handle_create_session(
         daemon_info: &daemon_info,
     }) {
         Ok(session_id) => {
-            let resp = CreateSessionResponse { session_id };
+            let resp = CreateSessionResponse {
+                session_id,
+                valid_effort_levels,
+                default_effort,
+            };
             ok_response(request.id, to_value_or_null(resp))
         }
         Err(e) => err_response(
@@ -867,6 +878,32 @@ fn build_project_context(
     }
 }
 
+/// mu-uvuo: daemon-side effort resolution for a route, as owned wire
+/// strings. The route catalog (models.toml + generated layers) lives with
+/// the daemon; frontends render this instead of consulting a catalog they
+/// may not have (a remote frontend has none).
+///
+/// Always `Some` on this daemon: an empty vec is the authoritative "this
+/// route has no effort dial" answer (e.g. an openrouter model with no
+/// catalog entry or provider fallback), so an ABSENT field can only mean
+/// an older daemon. Without that distinction a frontend switching from an
+/// effort-enabled route to an effort-less one would keep rendering the
+/// stale dial (ci-aipr panel finding on the original mu-uvuo diff).
+fn effort_config_strings(
+    provider_kind: &str,
+    model: &str,
+) -> (Option<Vec<String>>, Option<String>) {
+    let (levels, default) = mu_core::route_catalog::effort_config_for(provider_kind, model);
+    (
+        Some(
+            levels
+                .map(|l| l.iter().map(|s| s.to_string()).collect())
+                .unwrap_or_default(),
+        ),
+        default.map(|s| s.to_string()),
+    )
+}
+
 /// Pull a (kind, model) pair out of a `ProviderSelector` for logging
 /// purposes. The protocol-level enum is already snake_case on the
 /// wire; we just want a flat (string, string) for the event payload.
@@ -1570,11 +1607,16 @@ pub async fn handle_set_route(
     // can't observe a half-updated pair. (set_config still updates the
     // atomic daemon-side; this is the switch path.)
 
+    // mu-uvuo: send the new route's effort vocabulary with the switch so
+    // the frontend's effort dial tracks the route without a local catalog.
+    let (valid_effort_levels, default_effort) = effort_config_strings(&kind_str, &model_str);
     ok_response(
         request.id,
         serde_json::to_value(SetRouteResponse {
             provider_kind: kind_str,
             model: model_str,
+            valid_effort_levels,
+            default_effort,
         })
         .unwrap_or_default(),
     )

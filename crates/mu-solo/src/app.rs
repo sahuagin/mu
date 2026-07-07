@@ -600,19 +600,68 @@ fn generic_effort_levels() -> Vec<String> {
         .collect()
 }
 
-fn route_effort_config(provider_kind: &str, model: &str) -> (Vec<String>, Option<String>) {
-    let (levels, default) = mu_core::route_catalog::effort_config_for(provider_kind, model);
-    let levels: Vec<String> = levels
-        .unwrap_or_default()
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect();
-    let levels = if levels.is_empty() {
-        generic_effort_levels()
-    } else {
-        levels
-    };
-    (levels, default.map(|s| s.to_string()))
+/// mu-uvuo: pull the daemon-resolved effort vocabulary out of a
+/// `create_session` / `session.set_route` response. `None` levels ⇒ an
+/// older daemon (fields absent) or an effort-less route.
+fn effort_fields_from_response(resp: &serde_json::Value) -> (Option<Vec<String>>, Option<String>) {
+    let levels = resp
+        .get("valid_effort_levels")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect::<Vec<String>>()
+        });
+    let default = resp
+        .get("default_effort")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    (levels, default)
+}
+
+/// mu-uvuo: apply a daemon-sent effort vocabulary to the dial state. The
+/// daemon owns the model catalog, so the frontend renders what it is
+/// handed and never recomputes levels locally (a remote frontend has no
+/// catalog at all). `None` (field absent ⇒ older daemon) keeps the
+/// current set; `Some` but empty is the daemon's authoritative "no
+/// effort dial for this route" and resets to the generic set instead of
+/// carrying the previous route's vocabulary forward. An operator
+/// `effort_levels` config override always wins. If the current effort
+/// falls outside the new set, snap to the daemon default, then the
+/// operator default, then the first level.
+fn apply_daemon_effort_config(
+    valid_levels: &mut Vec<String>,
+    effort: &mut String,
+    levels_override: bool,
+    default_effort_override: Option<&str>,
+    daemon_levels: Option<Vec<String>>,
+    daemon_default: Option<&str>,
+) {
+    if !levels_override {
+        if let Some(levels) = daemon_levels {
+            let normalized: Vec<String> = levels
+                .iter()
+                .map(|s| normalize_effort(s))
+                .filter(|s| !s.is_empty())
+                .collect();
+            // Sent-but-empty is the daemon's authoritative "this route has
+            // no effort dial": reset to the generic set (the pre-daemon-
+            // authority behavior for such routes) rather than carrying the
+            // previous route's vocabulary forward. Only an ABSENT field
+            // (older daemon) keeps the current levels.
+            *valid_levels = if normalized.is_empty() {
+                generic_effort_levels()
+            } else {
+                normalized
+            };
+        }
+    }
+    if !valid_levels.iter().any(|e| e == effort) {
+        *effort = daemon_default
+            .and_then(|d| parse_effort_against(d, valid_levels))
+            .or_else(|| default_effort_override.and_then(|d| parse_effort_against(d, valid_levels)))
+            .unwrap_or_else(|| valid_levels[0].clone());
+    }
 }
 
 /// User-visible app state. Held across the run loop.
@@ -1580,6 +1629,22 @@ impl App {
             .and_then(|v| v.as_str())
             .context("session.create response missing session_id")?
             .to_string();
+
+        // mu-uvuo: adopt the daemon-resolved effort vocabulary for the
+        // route. The pre-create validation above only guards against the
+        // config/generic set; the daemon's catalog is authoritative and
+        // may narrow it (e.g. xhigh invalid on this model).
+        let (daemon_levels, daemon_default) = effort_fields_from_response(&resp);
+        let mut valid_effort_levels = valid_effort_levels;
+        let mut effort = effort;
+        apply_daemon_effort_config(
+            &mut valid_effort_levels,
+            &mut effort,
+            effort_levels_override,
+            default_effort_override.as_deref(),
+            daemon_levels,
+            daemon_default.as_deref(),
+        );
 
         // daemon.stats — query once at startup for the daemon_id /
         // version so /status can surface them. Non-fatal if missing
@@ -3767,23 +3832,22 @@ impl App {
         Ok(())
     }
 
-    fn refresh_effort_for_route(&mut self, provider_kind: &str, model: &str) {
-        if !self.effort_levels_override {
-            let (levels, default) = route_effort_config(provider_kind, model);
-            self.valid_effort_levels = levels;
-            if !self.valid_effort_levels.iter().any(|e| e == &self.effort) {
-                self.effort = default
-                    .or_else(|| self.default_effort_override.clone())
-                    .and_then(|d| parse_effort_against(&d, &self.valid_effort_levels))
-                    .unwrap_or_else(|| self.valid_effort_levels[0].clone());
-            }
-        } else if !self.valid_effort_levels.iter().any(|e| e == &self.effort) {
-            self.effort = self
-                .default_effort_override
-                .as_deref()
-                .and_then(|d| parse_effort_against(d, &self.valid_effort_levels))
-                .unwrap_or_else(|| self.valid_effort_levels[0].clone());
-        }
+    /// mu-uvuo: track a route switch's effort vocabulary from the daemon's
+    /// `session.set_route` response — no local catalog recompute.
+    fn refresh_effort_for_route(
+        &mut self,
+        daemon_levels: Option<Vec<String>>,
+        daemon_default: Option<String>,
+    ) {
+        let default_override = self.default_effort_override.clone();
+        apply_daemon_effort_config(
+            &mut self.valid_effort_levels,
+            &mut self.effort,
+            self.effort_levels_override,
+            default_override.as_deref(),
+            daemon_levels,
+            daemon_default.as_deref(),
+        );
     }
 
     fn route_provider_strings(&self) -> Vec<String> {
@@ -3846,11 +3910,10 @@ impl App {
         let default_model = self.default_model_for_provider(&kind);
 
         match self.send_set_route(vp, &kind, &default_model) {
-            Ok(()) => {
+            Ok((daemon_levels, daemon_default)) => {
                 self.provider = new_provider;
                 self.model = default_model;
-                let model = self.model.clone();
-                self.refresh_effort_for_route(&kind, &model);
+                self.refresh_effort_for_route(daemon_levels, daemon_default);
                 self.set_flash(format!("provider → {} · {}", self.provider, self.model));
             }
             Err(e) => {
@@ -3969,10 +4032,10 @@ impl App {
         source: &str,
     ) -> Result<()> {
         match self.send_set_route(vp, &provider_kind, &model) {
-            Ok(()) => {
+            Ok((daemon_levels, daemon_default)) => {
                 self.provider = provider_kind.clone();
                 self.model = model.clone();
-                self.refresh_effort_for_route(&provider_kind, &model);
+                self.refresh_effort_for_route(daemon_levels, daemon_default);
                 self.set_flash(format!("{source} → {} · {}", self.provider, self.model));
             }
             Err(e) => {
@@ -4000,10 +4063,9 @@ impl App {
     fn apply_model(&mut self, vp: &mut DynamicViewport, new_model: String) -> Result<()> {
         let kind = normalize_provider_kind(&self.provider);
         match self.send_set_route(vp, &kind, &new_model) {
-            Ok(()) => {
+            Ok((daemon_levels, daemon_default)) => {
                 self.model = new_model;
-                let model = self.model.clone();
-                self.refresh_effort_for_route(&kind, &model);
+                self.refresh_effort_for_route(daemon_levels, daemon_default);
                 self.set_flash(format!("model → {}", self.model));
             }
             Err(e) => {
@@ -4027,13 +4089,16 @@ impl App {
     }
 
     /// Send `session.set_route` to the daemon and emit a success banner
-    /// on success. Returns Err with the error message on failure.
+    /// on success. Returns the daemon-resolved effort vocabulary for the
+    /// new route (mu-uvuo) so the caller can refresh the dial; Err carries
+    /// the error message on failure.
+    #[allow(clippy::type_complexity)]
     fn send_set_route(
         &mut self,
         vp: &mut DynamicViewport,
         provider_kind: &str,
         model: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(Option<Vec<String>>, Option<String>), String> {
         let selector = serde_json::json!({
             "kind": provider_kind,
             "model": model,
@@ -4043,7 +4108,7 @@ impl App {
             "provider": selector,
         });
         match self.client.request("session.set_route", params) {
-            Ok(_resp) => {
+            Ok(resp) => {
                 let lines = vec![
                     Line::from(""),
                     Line::from(Span::styled(
@@ -4059,7 +4124,7 @@ impl App {
                     let p = Paragraph::new(lines);
                     ratatui::widgets::Widget::render(p, buf.area, buf);
                 });
-                Ok(())
+                Ok(effort_fields_from_response(&resp))
             }
             Err(e) => Err(format!("{e}")),
         }
@@ -6001,10 +6066,107 @@ mod tests {
     }
 
     #[test]
-    fn vcbm_generic_effort_fallback_preserves_non_effort_providers() {
-        let (levels, default) = route_effort_config("openrouter", "some/model");
-        assert_eq!(levels, vec!["low", "medium", "high", "xhigh", "max"]);
-        assert_eq!(default, None);
+    fn uvuo_daemon_levels_replace_local_and_keep_valid_effort() {
+        let mut levels = generic_effort_levels();
+        let mut effort = "high".to_string();
+        apply_daemon_effort_config(
+            &mut levels,
+            &mut effort,
+            false,
+            None,
+            Some(vec!["Low".into(), "medium".into(), "high".into()]),
+            Some("medium"),
+        );
+        assert_eq!(levels, vec!["low", "medium", "high"]);
+        // Still-valid effort is never snapped away.
+        assert_eq!(effort, "high");
+    }
+
+    #[test]
+    fn uvuo_snaps_effort_to_daemon_default_when_narrowed() {
+        // The live mu-uvuo bug shape: sonnet offered xhigh locally, daemon
+        // says the model only accepts low/medium/high with default high.
+        let mut levels = generic_effort_levels();
+        let mut effort = "xhigh".to_string();
+        apply_daemon_effort_config(
+            &mut levels,
+            &mut effort,
+            false,
+            None,
+            Some(vec!["low".into(), "medium".into(), "high".into()]),
+            Some("high"),
+        );
+        assert_eq!(effort, "high");
+    }
+
+    #[test]
+    fn uvuo_operator_level_override_wins_but_effort_still_snaps() {
+        let mut levels = vec!["low".to_string(), "max".to_string()];
+        let mut effort = "medium".to_string();
+        apply_daemon_effort_config(
+            &mut levels,
+            &mut effort,
+            true,
+            Some("max"),
+            Some(vec!["low".into(), "medium".into(), "high".into()]),
+            Some("medium"),
+        );
+        // Operator's explicit level set is not clobbered by the daemon...
+        assert_eq!(levels, vec!["low", "max"]);
+        // ...and the snap lands inside the operator set (daemon default
+        // "medium" is not in it), via the operator default.
+        assert_eq!(effort, "max");
+    }
+
+    #[test]
+    fn uvuo_authoritative_empty_levels_reset_to_generic() {
+        // Panel finding on the original diff: switching from an
+        // effort-enabled route to an effort-less one (daemon sends
+        // Some([])) must not carry the old route's vocabulary forward.
+        let mut levels = vec!["off".to_string(), "on".to_string()];
+        let mut effort = "on".to_string();
+        apply_daemon_effort_config(
+            &mut levels,
+            &mut effort,
+            false,
+            None,
+            Some(Vec::new()),
+            None,
+        );
+        assert_eq!(levels, generic_effort_levels());
+        // "on" is not in the generic set — snapped to its first level.
+        assert_eq!(effort, "low");
+    }
+
+    #[test]
+    fn uvuo_missing_daemon_fields_keep_current_levels() {
+        // Older daemon (fields absent): keep launch levels, no recompute.
+        let mut levels = vec!["low".to_string(), "high".to_string()];
+        let mut effort = "high".to_string();
+        apply_daemon_effort_config(&mut levels, &mut effort, false, None, None, None);
+        assert_eq!(levels, vec!["low", "high"]);
+        assert_eq!(effort, "high");
+    }
+
+    #[test]
+    fn uvuo_effort_fields_parse_from_response_json() {
+        let resp = serde_json::json!({
+            "session_id": "s-1",
+            "valid_effort_levels": ["low", "high"],
+            "default_effort": "high",
+        });
+        let (levels, default) = effort_fields_from_response(&resp);
+        assert_eq!(
+            levels.as_deref(),
+            Some(&["low".to_string(), "high".to_string()][..])
+        );
+        assert_eq!(default.as_deref(), Some("high"));
+
+        // Older daemon: both fields absent → None, not empty.
+        let (levels, default) =
+            effort_fields_from_response(&serde_json::json!({"session_id": "s-1"}));
+        assert!(levels.is_none());
+        assert!(default.is_none());
     }
 
     #[test]

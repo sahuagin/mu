@@ -140,6 +140,17 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
       if [ -z "${AGENT_DISPATCH_NO_LEASE:-}" ] && command -v with-ollama-lease >/dev/null 2>&1; then
         if [ "${AGENT_DISPATCH_OLLAMA_SKIP_IF_HELD:-}" = "1" ]; then
           ad_lease="with-ollama-lease --skip-if-held"
+          # A down/unreachable box is functionally the same as a held one: skip
+          # fast (exit 75) so a hosted rank forms the verdict, instead of acquiring
+          # the (free) lock and then hanging on the dead box for the whole timeout.
+          # Probe the base mu itself dials; short cap; a missing curl just skips
+          # the probe (old behaviour, no regression).
+          local _ad_ob="${OLLAMA_API_BASE:-http://10.1.1.143:11434}"
+          if command -v curl >/dev/null 2>&1 &&
+             ! curl -fsS -m "${AGENT_DISPATCH_OLLAMA_HEALTH_TIMEOUT:-3}" "${_ad_ob%/}/api/version" >/dev/null 2>&1; then
+            printf 'agent-dispatch: ollama box %s unreachable; skipping rank (exit 75, same as held)\n' "$_ad_ob" >>"${ad_errlog:-/dev/stderr}"
+            return 75
+          fi
         else
           ad_lease="with-ollama-lease"
         fi

@@ -29,7 +29,6 @@ pub mod context_attribution;
 pub mod context_renderer;
 pub mod event_log;
 pub mod forensics;
-pub mod hooks; // mu-bb2v: operator-declared lifecycle hook subprocesses
 pub mod model_catalog;
 pub mod pricing;
 pub mod protocol;

@@ -5,6 +5,12 @@
 //! reports the count. Errors when `old_string` is not found, is
 //! ambiguous (multiple matches and `replace_all` is false), is empty,
 //! or equals `new_string`. See spec mu-022.
+//!
+//! Matching is staged (bead mu-t731): exact substring first, then two
+//! line-granularity fallbacks — trailing-whitespace-insensitive, then
+//! uniform-indent-shift with `new_string` re-indented to the file. The
+//! matched stage is reported in the tool output; fuzzier stages never
+//! engage when a stricter one matched. See `edit_matcher`.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -16,6 +22,7 @@ use mu_core::agent::{
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
+use crate::tools::edit_matcher::{self, MatchStage};
 use crate::tools::path::expand_leading_tilde;
 
 pub struct EditTool;
@@ -38,8 +45,10 @@ impl Tool for EditTool {
             "edit",
             "Edit a file by replacing a unique occurrence of `old_string` with `new_string`. \
              When `old_string` appears multiple times, the call fails unless `replace_all` is true. \
-             The match is exact (no whitespace normalization) — include enough surrounding context \
-             for the match to be unique.",
+             Matching prefers an exact match; when none exists it falls back to whole-line matching \
+             that tolerates trailing-whitespace drift, then a uniform indentation shift (the \
+             replacement is re-indented to the file). Include enough surrounding context for the \
+             match to be unique.",
             json!({
                 "type": "object",
                 "properties": {
@@ -146,37 +155,46 @@ impl Tool for EditTool {
                 }
             };
 
-            let occurrences = contents.matches(&old_string).count();
-            if occurrences == 0 {
-                return ToolResult {
-                    content: format!("edit: `old_string` not found in {}", path.display()),
-                    is_error: true,
+            let matched =
+                match edit_matcher::find_staged_matches(&contents, &old_string, &new_string) {
+                    Some(m) => m,
+                    None => {
+                        let hint = edit_matcher::closest_line_hint(&contents, &old_string)
+                            .map(|h| format!("; {h}"))
+                            .unwrap_or_default();
+                        return ToolResult {
+                            content: format!(
+                                "edit: `old_string` not found in {} (tried exact, \
+                                 whitespace-tolerant, and indent-shift matching){hint}",
+                                path.display()
+                            ),
+                            is_error: true,
+                        };
+                    }
                 };
-            }
+            let occurrences = matched.spans.len();
             if occurrences > 1 && !replace_all {
                 return ToolResult {
                     content: format!(
-                        "edit: `old_string` appears {occurrences} times in {}; \
-                         include more surrounding context to make the match unique, \
-                         or set replace_all=true",
-                        path.display()
+                        "edit: `old_string` appears {occurrences} times in {} \
+                         ({} match); include more surrounding context to make \
+                         the match unique, or set replace_all=true",
+                        path.display(),
+                        matched.stage.label()
                     ),
                     is_error: true,
                 };
             }
 
-            let new_contents = if replace_all {
-                contents.replace(&old_string, &new_string)
-            } else {
-                // Exactly one occurrence — replace by find+splice for clarity.
-                let idx = contents.find(&old_string).expect("checked count > 0");
-                let mut s =
-                    String::with_capacity(contents.len() - old_string.len() + new_string.len());
-                s.push_str(&contents[..idx]);
-                s.push_str(&new_string);
-                s.push_str(&contents[idx + old_string.len()..]);
-                s
+            let stage_note = match matched.stage {
+                MatchStage::Exact => String::new(),
+                MatchStage::TrailingWs => " via whitespace-tolerant match".to_owned(),
+                MatchStage::IndentShift => match &matched.indent_note {
+                    Some(d) => format!(" via indent-shift match (indentation shifted {d})"),
+                    None => " via indent-shift match".to_owned(),
+                },
             };
+            let new_contents = edit_matcher::apply_spans(&contents, &matched.spans);
 
             let write_handle = tokio::task::spawn_blocking(move || {
                 std::fs::write(&path_owned, new_contents.as_bytes()).map(|_| new_contents.len())
@@ -184,15 +202,15 @@ impl Tool for EditTool {
 
             match write_handle.await {
                 Ok(Ok(bytes_written)) => ToolResult {
-                    content: if replace_all {
+                    content: if occurrences > 1 {
                         format!(
-                            "edited {} ({} replacements, {bytes_written} bytes written)",
+                            "edited {} ({} replacements{stage_note}, {bytes_written} bytes written)",
                             path.display(),
                             occurrences
                         )
                     } else {
                         format!(
-                            "edited {} (1 replacement, {bytes_written} bytes written)",
+                            "edited {} (1 replacement{stage_note}, {bytes_written} bytes written)",
                             path.display()
                         )
                     },
@@ -456,6 +474,54 @@ mod tests {
 
         assert!(!result.is_error);
         assert_eq!(after, "beforeafter");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn b10_trailing_ws_fallback_reports_stage() -> Result<(), Box<dyn Error>> {
+        let path = temp_path("b10")?;
+        fs::write(&path, "foo   \nbar\t\nrest\n")?;
+
+        let result = execute_edit(&path, "foo\nbar", "merged", false).await;
+        let after = fs::read_to_string(&path)?;
+        let _ = fs::remove_file(&path);
+
+        assert!(!result.is_error, "got: {}", result.content);
+        assert_eq!(after, "merged\nrest\n");
+        assert!(result.content.contains("whitespace-tolerant"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn b11_indent_shift_fallback_reindents() -> Result<(), Box<dyn Error>> {
+        let path = temp_path("b11")?;
+        fs::write(&path, "    if x {\n        y();\n    }\n")?;
+
+        let result = execute_edit(&path, "if x {\n    y();\n}", "if z {\n    y();\n}", false).await;
+        let after = fs::read_to_string(&path)?;
+        let _ = fs::remove_file(&path);
+
+        assert!(!result.is_error, "got: {}", result.content);
+        assert_eq!(after, "    if z {\n        y();\n    }\n");
+        assert!(result.content.contains("indent-shift"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn b12_not_found_reports_stages_and_hint() -> Result<(), Box<dyn Error>> {
+        let path = temp_path("b12")?;
+        fs::write(&path, "fn alpha() {\n    body();\n}\n")?;
+
+        let result = execute_edit(&path, "fn alpha() {\n    wrong();\n}", "x", false).await;
+        let after = fs::read_to_string(&path)?;
+        let _ = fs::remove_file(&path);
+
+        assert!(result.is_error);
+        assert!(result.content.contains("not found"));
+        assert!(result.content.contains("indent-shift matching"));
+        assert!(result.content.contains("line 1"), "got: {}", result.content);
+        // File unchanged.
+        assert_eq!(after, "fn alpha() {\n    body();\n}\n");
         Ok(())
     }
 

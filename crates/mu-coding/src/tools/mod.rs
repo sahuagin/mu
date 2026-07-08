@@ -5,6 +5,7 @@ pub mod bash;
 pub mod dialogue;
 pub mod discover;
 pub mod edit;
+pub mod edit_matcher;
 pub mod glob;
 pub mod grep;
 pub mod ls;

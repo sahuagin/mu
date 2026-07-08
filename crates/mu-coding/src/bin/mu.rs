@@ -388,7 +388,7 @@ enum CapabilitiesCmd {
         #[arg(long, default_value = "10")]
         limit: usize,
         /// Comma-separated tools to include in the manifest.
-        #[arg(long, default_value = "read,write,ls,edit,grep,glob,bash")]
+        #[arg(long, default_value = "read,write,ls,edit,grep,glob,todo,bash")]
         tools: String,
     },
 }

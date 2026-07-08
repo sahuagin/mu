@@ -12,6 +12,7 @@ pub mod memory_recall;
 pub mod path;
 pub mod read;
 pub mod spawn_worker;
+pub mod todo;
 pub mod watch;
 pub mod write;
 
@@ -27,6 +28,7 @@ pub use ls::LsTool;
 pub use memory_recall::MemoryRecallTool;
 pub use read::ReadTool;
 pub use spawn_worker::SpawnWorkerTool;
+pub use todo::TodoTool;
 pub use watch::WatchTool;
 pub use write::WriteTool;
 
@@ -62,6 +64,10 @@ mod policy_invariants {
                  args — the model cannot make it run arbitrary work",
             ),
             "discover" => Some("ranks the session's own tools; read-only projection"),
+            "todo" => Some(
+                "mutates only this session's own in-memory task list — no fs, \
+                 no exec, no network (mu-z1ce)",
+            ),
             "start_autonomous" | "schedule_wakeup" => Some(
                 "affects only this session's own control flow, not world state; \
                  gated by AutonomyCapability at tool-presence + the loop input \
@@ -105,6 +111,7 @@ mod policy_invariants {
             Arc::new(GrepTool::new()),
             Arc::new(GlobTool::new()),
             Arc::new(MemoryRecallTool::new()),
+            Arc::new(TodoTool::new()),
             Arc::new(BashTool::new(BashMode::Yolo)),
             Arc::new(WatchTool::new(
                 sessions.downgrade(),

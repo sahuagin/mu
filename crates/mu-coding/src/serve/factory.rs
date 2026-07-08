@@ -19,7 +19,7 @@ use mu_core::protocol::ProviderSelector;
 
 use crate::tools::{
     AwsReconTool, BashMode, BashTool, EditTool, GlobTool, GrepTool, LsTool, MemoryRecallTool,
-    ReadTool, WriteTool,
+    ReadTool, TodoTool, WriteTool,
 };
 
 /// Settings that parameterize how the `bash` tool is built.
@@ -271,6 +271,8 @@ pub fn build_tools(names: &[String], bash: &BashSettings) -> Result<Vec<Arc<dyn 
             // store — the discoverable tail that the small-kernel
             // injection (mu-zk2i) demotes everything into.
             "memory_recall" => Ok(Arc::new(MemoryRecallTool::new()) as Arc<dyn Tool>),
+            // mu-z1ce: session-scoped task list for multi-step steering.
+            "todo" => Ok(Arc::new(TodoTool::new()) as Arc<dyn Tool>),
             "aws_recon" => Ok(
                 Arc::new(AwsReconTool::from_env().map_err(|e| anyhow::anyhow!(e))?)
                     as Arc<dyn Tool>,
@@ -292,7 +294,7 @@ pub fn build_tools(names: &[String], bash: &BashSettings) -> Result<Vec<Arc<dyn 
             }
             other => anyhow::bail!(
                 "unknown tool: {other} (expected: read, write, ls, edit, grep, glob, \
-                 memory_recall, aws_recon, bash)"
+                 memory_recall, todo, aws_recon, bash)"
             ),
         })
         .collect()

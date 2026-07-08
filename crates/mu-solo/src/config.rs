@@ -277,7 +277,7 @@ impl Default for SessionConfig {
             // injection (mu-zk2i) demotes everything but the identity
             // kernel to recall-only; without this tool that tail is
             // unreachable mid-session.
-            tools: "read,write,edit,glob,grep,memory_recall,bash".into(),
+            tools: "read,write,edit,glob,grep,memory_recall,todo,bash".into(),
             bash_yolo: false,
             mcp_enabled: true,
             mu_binary: "./target/release/mu".into(),
@@ -573,7 +573,10 @@ mod tests {
         assert_eq!(work.model, "architect"); // a label; resolved at launch
         assert_eq!(work.provider, "openai-codex");
         // omitted fields fall through to SessionConfig defaults
-        assert_eq!(work.tools, "read,write,edit,glob,grep,memory_recall,bash");
+        assert_eq!(
+            work.tools,
+            "read,write,edit,glob,grep,memory_recall,todo,bash"
+        );
         assert!(!work.bash_yolo);
 
         let review = c.select_profile("review").expect("review profile exists");

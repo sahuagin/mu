@@ -85,6 +85,9 @@ pub struct Config {
     pub journal: JournalConfig,
     /// `[routes]` — provider route-catalog discovery knobs.
     pub routes: RoutesConfig,
+    /// `[hooks]` — operator-declared lifecycle hook subprocesses
+    /// (mu-bb2v).
+    pub hooks: HooksConfig,
 }
 
 /// `[routes]` section. Startup route-catalog discovery (mu-818c).
@@ -618,6 +621,62 @@ impl Default for TuiConfig {
 pub struct BudgetConfig {
     pub api_key_daily_warn_usd: Option<f64>,
     pub api_key_weekly_warn_usd: Option<f64>,
+}
+
+/// `[hooks]` section — operator-declared lifecycle hook subprocesses
+/// (mu-bb2v). Each entry attaches one shell command to one agent-loop
+/// event; see [`crate::hooks`] for the dispatch contract (stdin JSON
+/// payload, PreToolUse deny protocol, fail-open invariant).
+///
+/// ```toml
+/// [hooks]
+/// enabled = true
+///
+/// [[hooks.entries]]
+/// event = "PreToolUse"
+/// matcher = "bash"
+/// command = "~/.config/mu/hooks/bash-guard"
+/// timeout_ms = 10000
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HooksConfig {
+    /// Master switch. `false` ⇒ no hook subprocess ever runs,
+    /// regardless of entries.
+    pub enabled: bool,
+    /// The hook declarations, dispatched in declaration order.
+    pub entries: Vec<HookEntryConfig>,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            entries: Vec::new(),
+        }
+    }
+}
+
+/// One `[[hooks.entries]]` row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookEntryConfig {
+    /// Lifecycle event name: `SessionStart`, `PreToolUse`,
+    /// `PostToolUse`, or `Stop`. Unknown names are skipped with a
+    /// warning at engine construction — they never fail the config.
+    pub event: String,
+    /// Tool-name filter for the tool events. `None` matches every
+    /// tool; `"name"` matches exactly; a trailing `*` matches by
+    /// prefix (`"mcp_*"`). Ignored for `SessionStart` / `Stop`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
+    /// Shell command, run via `/bin/sh -c` with the event payload on
+    /// stdin. A leading `~/` expands to `$HOME`.
+    pub command: String,
+    /// Per-hook wall-clock budget in milliseconds. `None` ⇒ the
+    /// engine default (30s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 /// `[auth]` section — connect-time SASL-shaped handshake configuration

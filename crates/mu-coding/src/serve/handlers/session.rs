@@ -752,6 +752,19 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     // fallback). session.set_config writes this atomic and the loop reads
     // it at each compaction check — no restart needed.
     let live_context_soft_limit = Arc::new(AtomicU64::new(context_soft_limit.unwrap_or(0)));
+    // mu-bb2v: build the lifecycle hook engine once per session from the
+    // daemon's `[hooks]` config. SessionStart fires here (fire-and-forget);
+    // the PreToolUse gate rides AgentConfig into the loop; PostToolUse and
+    // Stop are observed by the event forwarder below.
+    let hook_engine = mu_core::hooks::HookEngine::from_config(&daemon_info.config().hooks);
+    if let Some(h) = &hook_engine {
+        h.observe_session_start(
+            &session_id,
+            &cwd.as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        );
+    }
     let agent = AgentLoop::spawn(SpawnArgs {
         provider,
         provider_kind: kind_arc,
@@ -781,6 +794,8 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             kx_hints,
             // mu-vcbm: launch-time effort default → loop's standing effort.
             effort: effort.map(|e| Arc::from(e.as_str())),
+            // mu-bb2v: PreToolUse gate; None when no hooks configured.
+            hooks: hook_engine.clone(),
         },
         events: events_tx,
         pending_approvals: pending_approvals.clone(),
@@ -802,6 +817,9 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         },
         daemon_info.daemon_id().to_string(),
         Some(status_tx),
+        // mu-bb2v: observational hooks (PostToolUse/Stop) dispatch from
+        // the forwarder's ordered event stream.
+        hook_engine,
     ));
 
     sessions.insert(

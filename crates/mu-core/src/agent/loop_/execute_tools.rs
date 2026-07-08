@@ -249,7 +249,6 @@ async fn cancel_current_and_remaining(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_execute_tools(
     tools: &[Arc<dyn Tool>],
     calls: Vec<ToolCall>,
@@ -258,7 +257,6 @@ pub(crate) async fn handle_execute_tools(
     history: &mut ToolHistory,
     pending_approvals: &PendingApprovals,
     capability: &SessionCapability,
-    hooks: Option<&crate::hooks::HookEngine>,
 ) -> Result<ExecuteToolsExit, Outcome> {
     let mut buffered: Vec<AgentInput> = Vec::new();
     let mut tool_messages: Vec<AgentMessage> = Vec::new();
@@ -368,34 +366,12 @@ pub(crate) async fn handle_execute_tools(
                 None
             };
 
-        // mu-bb2v: operator PreToolUse hook gate. Runs after the
-        // runtime's own gates (capability/retry/validate) and BEFORE the
-        // PermissionLevel::Ask modal — a human is never asked to approve
-        // a call an operator hook will deny anyway. Only an explicit
-        // deny blocks; hook errors and timeouts fail open (see
-        // `crate::hooks`).
-        let hook_refusal_reason: Option<String> = if capability_refusal_reason.is_none()
-            && retry_refusal_reason.is_none()
-            && validate_refusal_reason.is_none()
-        {
-            match hooks {
-                Some(h) => {
-                    h.gate_pre_tool_use(&call.name, call.arguments.as_value())
-                        .await
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-
         // mu-8stm.1: a no-approver / dropped-channel timeout produces a
         // refusal distinct from a human denial, so the model doesn't read
         // "fail-closed, no approver" as "the user said no".
         let mut permission_refusal_reason: Option<String> = None;
         let permission_decision = if retry_refusal_reason.is_none()
             && validate_refusal_reason.is_none()
-            && hook_refusal_reason.is_none()
         {
             match tool.as_ref().map(|t| t.spec().policy.permission) {
                 Some(PermissionLevel::Ask) | Some(PermissionLevel::AskOnce) => {
@@ -591,30 +567,6 @@ pub(crate) async fn handle_execute_tools(
             // already user-facing (e.g. bash's allowlist message).
             ToolResult {
                 content: reason,
-                is_error: true,
-            }
-        } else if let Some(reason) = hook_refusal_reason {
-            // mu-bb2v: an operator PreToolUse hook denied this call.
-            let _ = events
-                .send(AgentEvent::Callout {
-                    category: "warning".to_owned(),
-                    title: format!("hook denied {}", call.name),
-                    body: serde_json::json!({
-                        "tool": call.name,
-                        "reason": reason,
-                    }),
-                    theme: Some("warning".to_owned()),
-                    context_refs: vec!["spec:hooks".to_owned()],
-                })
-                .await;
-            ToolResult {
-                content: format!(
-                    "runtime refused: tool `{}` denied by an operator PreToolUse \
-                     hook: {reason}. Do not retry the same call unchanged; adjust \
-                     the approach to satisfy the operator's policy or report the \
-                     obstacle.",
-                    call.name
-                ),
                 is_error: true,
             }
         } else if let Some(reason) = permission_refusal_reason {

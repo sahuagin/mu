@@ -347,7 +347,6 @@ pub struct ForwarderLiveState {
 /// (event log) are derived from the same `AgentEvent` source. They
 /// don't share rows — the wire wants per-delta granularity; the log
 /// wants per-significant-event granularity.
-#[allow(clippy::too_many_arguments)]
 pub async fn forward_events(
     session_id: String,
     mut events_rx: mpsc::Receiver<AgentEvent>,
@@ -356,7 +355,6 @@ pub async fn forward_events(
     live_state: ForwarderLiveState,
     daemon_id: String,
     status_watch_tx: Option<tokio::sync::watch::Sender<Option<SessionStatus>>>,
-    hooks: Option<Arc<mu_core::hooks::HookEngine>>,
 ) {
     // spec mu-046 WP4: the most recent AgentEvent::Error message. The
     // loop emits Error then its terminal Done(Error) on the same
@@ -365,13 +363,6 @@ pub async fn forward_events(
     // generic one. Local to this one ordered stream — not a side
     // table; correlation still comes from the ticket.
     let mut last_error_message: Option<String> = None;
-    // mu-bb2v: tool_call_id → (tool_name, arguments), populated from
-    // ToolCallStarted so the PostToolUse hook payload can carry the
-    // tool's identity (ToolCallCompleted has only the id). Entries are
-    // removed at Completed; the loop synthesizes Completed tombstones
-    // for cancelled calls, so the map drains rather than leaks.
-    let mut hook_tool_index: std::collections::HashMap<String, (String, Value)> =
-        std::collections::HashMap::new();
     while let Some(event) = events_rx.recv().await {
         // mu-035 Phase D: mirror provider-call lifecycle into the
         // shared tracker so dispatch handlers (cancel_outstanding,
@@ -380,49 +371,6 @@ pub async fn forward_events(
         // runs while it's held.
         update_provider_status(&event, &live_state.provider_status);
         update_autonomy_active(&event, &live_state.autonomy_active);
-
-        // mu-bb2v: observational lifecycle hooks ride the forwarder —
-        // the one ordered stream that already sees every AgentEvent —
-        // so the agent loop stays hook-free except for its PreToolUse
-        // gate. Dispatch is fire-and-forget inside the engine; nothing
-        // here blocks on a hook subprocess.
-        if let Some(h) = &hooks {
-            match &event {
-                AgentEvent::ToolCallStarted {
-                    tool_call_id,
-                    tool_name,
-                    arguments,
-                } => {
-                    if h.listens(mu_core::hooks::HookEventKind::PostToolUse) {
-                        hook_tool_index
-                            .insert(tool_call_id.clone(), (tool_name.clone(), arguments.clone()));
-                    }
-                }
-                AgentEvent::ToolCallCompleted {
-                    tool_call_id,
-                    content,
-                    is_error,
-                } => {
-                    if let Some((tool_name, tool_input)) = hook_tool_index.remove(tool_call_id) {
-                        h.observe_post_tool_use(&tool_name, Some(&tool_input), content, *is_error);
-                    }
-                }
-                AgentEvent::Done {
-                    stop_reason,
-                    turn_count,
-                    ..
-                } => {
-                    // snake_case wire form ("end_turn"), falling back to
-                    // Debug if serialization ever fails.
-                    let reason = serde_json::to_value(stop_reason)
-                        .ok()
-                        .and_then(|v| v.as_str().map(str::to_owned))
-                        .unwrap_or_else(|| format!("{stop_reason:?}"));
-                    h.observe_stop(&reason, *turn_count);
-                }
-                _ => {}
-            }
-        }
 
         if let AgentEvent::Error { message } = &event {
             last_error_message = Some(message.clone());

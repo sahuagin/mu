@@ -714,14 +714,6 @@ pub struct AgentConfig {
     /// `AgentInput::UserMessage` and override it. `None` ⇒ the provider's
     /// own construction-time default (its `--thinking` value, if any).
     pub effort: Option<Arc<str>>,
-    /// mu-bb2v: lifecycle hook engine. The loop consults it for the
-    /// PreToolUse gate (a hook can deny a tool call before the
-    /// permission gate ever asks a human); observational events
-    /// (SessionStart/PostToolUse/Stop) are dispatched outside the loop
-    /// by the daemon's event forwarder. `None` (default) ⇒ no hooks,
-    /// zero overhead — wired by the daemon from `[hooks]` at session
-    /// creation.
-    pub hooks: Option<Arc<crate::hooks::HookEngine>>,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -738,7 +730,6 @@ impl std::fmt::Debug for AgentConfig {
             .field("discover_hints", &self.discover_hints.is_some())
             .field("kx_hints", &self.kx_hints.is_some())
             .field("effort", &self.effort)
-            .field("hooks", &self.hooks.is_some())
             .finish()
     }
 }
@@ -756,7 +747,6 @@ impl Default for AgentConfig {
             discover_hints: None,
             kx_hints: None,
             effort: None,
-            hooks: None,
         }
     }
 }
@@ -2212,7 +2202,6 @@ async fn run_inner(
                     &mut tool_history,
                     &pending_approvals,
                     &capability,
-                    config.hooks.as_deref(),
                 )
                 .await
                 {

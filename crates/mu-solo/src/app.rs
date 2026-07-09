@@ -221,7 +221,7 @@ pub enum TurnRoute {
 }
 
 impl TurnRoute {
-    /// Header label + body-prefix color for streaming output.
+    /// Base assistant label before provider/model provenance is attached.
     pub fn header_label(self) -> &'static str {
         match self {
             Self::Main => "assistant",
@@ -249,6 +249,31 @@ impl TurnRoute {
         match self {
             Self::Main => Color::Cyan,
             Self::Btw => Color::Magenta,
+        }
+    }
+}
+
+fn assistant_label_with_provenance(route: TurnRoute, provider_kind: &str, model: &str) -> String {
+    let provider_kind = provider_kind.trim();
+    let model = model.trim();
+    if provider_kind.is_empty() || model.is_empty() {
+        route.header_label().to_string()
+    } else {
+        format!("{} ⋅ {provider_kind}/{model}", route.header_label())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnProvenance {
+    provider_kind: String,
+    model: String,
+}
+
+impl TurnProvenance {
+    fn new(provider_kind: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider_kind: provider_kind.into(),
+            model: model.into(),
         }
     }
 }
@@ -368,15 +393,23 @@ impl CancelFeedback {
 #[derive(Debug, Clone)]
 pub struct Turn {
     pub route: TurnRoute,
+    pub provider_kind: String,
+    pub model: String,
     pub items: Vec<render::TurnItem>,
 }
 
 impl Turn {
-    fn new(route: TurnRoute) -> Self {
+    fn new(route: TurnRoute, provenance: TurnProvenance) -> Self {
         Self {
             route,
+            provider_kind: provenance.provider_kind,
+            model: provenance.model,
             items: Vec::new(),
         }
+    }
+
+    fn header_label(&self) -> String {
+        assistant_label_with_provenance(self.route, &self.provider_kind, &self.model)
     }
 
     /// Append a text delta: extend the trailing `Text` item if the last
@@ -725,6 +758,11 @@ pub struct App {
     /// /btw calls so follow-ups stay coherent; main session history
     /// is unaffected.
     sidecar_session_id: Option<String>,
+    /// Provider/model frozen for the sidecar at creation time. `/btw` sessions
+    /// do not automatically follow later main-session `/provider` or `/model`
+    /// switches, so turn headers need this separate provenance to stay honest.
+    sidecar_provider_kind: Option<String>,
+    sidecar_model: Option<String>,
     /// Absolute path to the durable event log for the main session.
     /// Used by the renderer-mismatch diagnostic: ContextAssembly
     /// events aren't on the wire (per forwarder.rs:209), so we read
@@ -1634,6 +1672,8 @@ impl App {
             focus_mode,
             clipboard_command: clipboard_command.map(<[String]>::to_vec),
             sidecar_session_id: None,
+            sidecar_provider_kind: None,
+            sidecar_model: None,
             streaming_route: None,
             pending_ask_ids: std::collections::HashSet::new(),
             queued_interjection_ask_ids: std::collections::HashSet::new(),
@@ -1975,8 +2015,9 @@ impl App {
             if !tlines.is_empty() {
                 tlines.push(Line::from(""));
             }
+            let label = turn.header_label();
             tlines.extend(render::render_turn(
-                turn.route.header_label(),
+                &label,
                 turn.route.color(),
                 &turn.items,
                 bwrap,
@@ -2034,8 +2075,9 @@ impl App {
         let preview: Vec<Line<'static>> = match (self.focus_mode, self.live_turn.as_ref()) {
             (false, Some(turn)) => {
                 let tool_preview = if self.bash_yolo { 15 } else { 4 };
+                let label = turn.header_label();
                 let full = render::render_turn(
-                    turn.route.header_label(),
+                    &label,
                     turn.route.color(),
                     &turn.items,
                     w.saturating_sub(2),
@@ -3208,11 +3250,50 @@ impl App {
         pending_interjection_timing_state(self.live_turn.as_ref().map(|t| t.route))
     }
 
+    fn turn_provenance_for(&self, route: TurnRoute) -> TurnProvenance {
+        match route {
+            TurnRoute::Main => {
+                // Header truthfulness: normally show the operator-selected route
+                // (so a pending /model switch is reflected immediately). If we
+                // already detected a faux fallback, prefer the daemon-resolved
+                // provider/model so the header doesn't keep claiming the model
+                // the daemon is NOT actually using.
+                let provider = if self.is_renderer_mismatch() {
+                    self.actual_provider_kind
+                        .clone()
+                        .unwrap_or_else(|| normalize_provider_kind(&self.provider))
+                } else {
+                    normalize_provider_kind(&self.provider)
+                };
+                let model = if self.is_renderer_mismatch() {
+                    self.actual_model
+                        .clone()
+                        .unwrap_or_else(|| self.model.clone())
+                } else {
+                    self.model.clone()
+                };
+                TurnProvenance::new(provider, model)
+            }
+            TurnRoute::Btw => TurnProvenance::new(
+                self.sidecar_provider_kind
+                    .clone()
+                    .unwrap_or_else(|| normalize_provider_kind(&self.provider)),
+                self.sidecar_model
+                    .clone()
+                    .unwrap_or_else(|| self.model.clone()),
+            ),
+        }
+    }
+
     fn live_turn_for_route(&mut self, route: TurnRoute) -> &mut Turn {
         if self.live_turn.is_none() {
             self.streaming_route = Some(route);
+            let provenance = self.turn_provenance_for(route);
+            self.live_turn = Some(Turn::new(route, provenance));
         }
-        self.live_turn.get_or_insert_with(|| Turn::new(route))
+        self.live_turn
+            .as_mut()
+            .expect("live_turn initialized above")
     }
 
     /// Send a user prompt. If the main session is idle, emit the ordinary
@@ -3291,7 +3372,10 @@ impl App {
     fn fire_ask(&mut self, vp: &mut DynamicViewport, wire_text: &str) -> Result<()> {
         vp.snap_to_bottom()?;
         self.streaming_route = Some(TurnRoute::Main);
-        self.live_turn = Some(Turn::new(TurnRoute::Main));
+        self.live_turn = Some(Turn::new(
+            TurnRoute::Main,
+            self.turn_provenance_for(TurnRoute::Main),
+        ));
         // Repaint the status projection IMMEDIATELY (mu-d2hx sighting ii:
         // after an error + manual retry the indicators stayed stale until
         // the first provider_status arrived — if it ever did). Firing an
@@ -3394,6 +3478,8 @@ impl App {
                 .context("session.delegate response missing child_session_id")?
                 .to_string();
             self.sidecar_session_id = Some(child_id);
+            self.sidecar_provider_kind = Some(kind);
+            self.sidecar_model = Some(self.model.clone());
         }
         let sid = self
             .sidecar_session_id
@@ -3417,7 +3503,7 @@ impl App {
 
         // Route this turn to the sidecar and start a fresh live turn.
         self.streaming_route = Some(route);
-        self.live_turn = Some(Turn::new(route));
+        self.live_turn = Some(Turn::new(route, self.turn_provenance_for(route)));
         // Same status-projection repaint as fire_ask (mu-d2hx): a /btw
         // turn is in flight now; the status must say so immediately.
         self.session_phase = SessionPhase::AwaitingFirstToken;
@@ -5230,10 +5316,14 @@ impl App {
                         // means the live preview and the final commit
                         // diverged — log to the journal and warn.
                         let history_before = vp.history_len();
-                        self.transcript
-                            .push(TranscriptBlock::assistant(t.route, &t.items));
+                        let label = t.header_label();
+                        self.transcript.push(TranscriptBlock::assistant_with_label(
+                            t.route,
+                            label.clone(),
+                            &t.items,
+                        ));
                         let mut lines = render::render_turn(
-                            t.route.header_label(),
+                            &label,
                             t.route.color(),
                             &t.items,
                             wrap_width,
@@ -5731,6 +5821,42 @@ mod tests {
 
     fn lines_plain(lines: &[Line<'_>]) -> Vec<String> {
         lines.iter().map(line_plain).collect()
+    }
+
+    #[test]
+    fn assistant_headers_include_provider_model_provenance() {
+        assert_eq!(
+            assistant_label_with_provenance(TurnRoute::Main, "anthropic_api", "claude-opus-4-8"),
+            "assistant ⋅ anthropic_api/claude-opus-4-8"
+        );
+        assert_eq!(
+            assistant_label_with_provenance(TurnRoute::Btw, "ollama", "qwen3.6:35b-a3b"),
+            "assistant ⋅ btw ⋅ ollama/qwen3.6:35b-a3b"
+        );
+    }
+
+    #[test]
+    fn assistant_header_falls_back_to_route_label_when_provenance_missing() {
+        assert_eq!(
+            assistant_label_with_provenance(TurnRoute::Main, "", "claude-opus-4-8"),
+            "assistant"
+        );
+        assert_eq!(
+            assistant_label_with_provenance(TurnRoute::Btw, "ollama", ""),
+            "assistant ⋅ btw"
+        );
+    }
+
+    #[test]
+    fn turn_carries_creation_time_provenance() {
+        let t = Turn::new(
+            TurnRoute::Btw,
+            TurnProvenance::new("openrouter", "anthropic/claude-haiku-4-5"),
+        );
+        assert_eq!(
+            t.header_label(),
+            "assistant ⋅ btw ⋅ openrouter/anthropic/claude-haiku-4-5"
+        );
     }
 
     #[test]

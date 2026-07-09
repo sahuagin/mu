@@ -4845,6 +4845,11 @@ impl App {
     }
 
     /// Dispatch a single notification.
+    fn emit_notification(&mut self, vp: &mut DynamicViewport, occasion: &str, body: &str) {
+        vp.journal_notify(occasion, body);
+        crate::notify::notify(body);
+    }
+
     fn handle_notification(
         &mut self,
         vp: &mut DynamicViewport,
@@ -4874,7 +4879,7 @@ impl App {
             && crate::notify::should_notify(self.notifications, self.terminal_focused)
         {
             if let Some(body) = autonomy_notification_body(&self.model, method, params) {
-                crate::notify::notify(&body);
+                self.emit_notification(vp, method, &body);
             }
         }
         match method {
@@ -5052,7 +5057,7 @@ impl App {
                     if let Some(body) =
                         long_tool_notification_body(&self.model, self.phase_elapsed_ms, &kind)
                     {
-                        crate::notify::notify(&body);
+                        self.emit_notification(vp, "session.tool_call_completed.long", &body);
                     }
                 }
                 let route = self.streaming_route.unwrap_or(TurnRoute::Main);
@@ -5146,21 +5151,14 @@ impl App {
                         // mu-d2hx item c: an iteration-cap stop is a
                         // terminal state reached while the operator is
                         // away — say WHY, not just "waiting for input".
-                        crate::notify::notify(&format!(
-                            "mu ({}): {}",
-                            self.model,
-                            turn_budget_copy(turn_count)
-                        ));
+                        let body = format!("mu ({}): {}", self.model, turn_budget_copy(turn_count));
+                        self.emit_notification(vp, "session.done.iteration_cap", &body);
                     } else if method == "session.done" && !will_await_queued_main {
-                        crate::notify::notify(&format!(
-                            "mu ({}) is waiting for your input",
-                            self.model
-                        ));
+                        let body = format!("mu ({}) is waiting for your input", self.model);
+                        self.emit_notification(vp, "session.done", &body);
                     } else if method == "session.error" {
-                        crate::notify::notify(&format!(
-                            "mu ({}): turn ended with an error",
-                            self.model
-                        ));
+                        let body = format!("mu ({}): turn ended with an error", self.model);
+                        self.emit_notification(vp, "session.error", &body);
                     }
                 }
 

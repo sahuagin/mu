@@ -159,7 +159,7 @@ pub(crate) async fn spawn_worker(
     });
     let pot_name = config
         .pot_name
-        .unwrap_or_else(|| format!("mu-worker-{}", &session_id));
+        .unwrap_or_else(|| format!("mu-worker-{}", session_id));
     let timeout_secs = config.timeout_secs.unwrap_or(3600);
 
     let event_log = Arc::new(SessionEventLog::new(session_id.clone()));

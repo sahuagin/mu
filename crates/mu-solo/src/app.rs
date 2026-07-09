@@ -60,6 +60,107 @@ struct Overlay {
     title: String,
     lines: Vec<Line<'static>>,
     scroll: usize,
+    /// Optional footer override (mu-solo interactive approval). When set,
+    /// replaces the default "c copy · Esc close" hint — an approval panel
+    /// shows its own "y/a approve · n/d deny" keys instead. `None` for the
+    /// ordinary read-only overlays (/help, /status).
+    footer: Option<String>,
+}
+
+/// A pending tool-approval prompt (Track A: interactive approval). Built
+/// from a `session.input_required` notification; resolved by the operator
+/// into a `session.respond_to_input_required` RPC. The backend already
+/// emits the event and answers the RPC (mu-029 / PendingApprovals) — this
+/// is the mu-solo surface that was previously a no-op notification arm.
+#[derive(Debug, Clone)]
+struct PendingApproval {
+    session_id: String,
+    request_id: String,
+    tool_name: String,
+    summary: String,
+    /// Pretty-printed tool arguments, for display in the modal.
+    arguments_pretty: String,
+}
+
+/// The operator's keypress intent while an approval modal is up. Explicit
+/// only: there is deliberately NO Enter default (a permission gate must not
+/// be satisfiable by an accidental Enter), and Esc is `Ignore`, not deny —
+/// consistent with the app's Esc-is-never-destructive convention. The
+/// daemon's own approval-gate timeout is the backstop if the operator walks
+/// away.
+enum ApprovalKey {
+    Approve,
+    Deny,
+    Quit,
+    Ignore,
+}
+
+fn approval_key(key: KeyEvent) -> ApprovalKey {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if let KeyCode::Char('c') = key.code {
+            return ApprovalKey::Quit;
+        }
+    }
+    match key.code {
+        KeyCode::Char(c) => match c.to_ascii_lowercase() {
+            'y' | 'a' => ApprovalKey::Approve,
+            'n' | 'd' => ApprovalKey::Deny,
+            _ => ApprovalKey::Ignore,
+        },
+        _ => ApprovalKey::Ignore,
+    }
+}
+
+/// Parse a `session.input_required` notification's params into a
+/// `PendingApproval`. Returns `None` when the identifying fields are
+/// absent (a malformed event can't be answered, so it can't be shown).
+fn parse_input_required(params: &Value) -> Option<PendingApproval> {
+    let get = |k: &str| params.get(k).and_then(|v| v.as_str());
+    let session_id = get("session_id")?.to_string();
+    let request_id = get("request_id")?.to_string();
+    let tool_name = get("tool_name").unwrap_or("(tool)").to_string();
+    let summary = get("summary").unwrap_or("").to_string();
+    let arguments_pretty = params
+        .get("arguments")
+        .map(|a| serde_json::to_string_pretty(a).unwrap_or_else(|_| a.to_string()))
+        .unwrap_or_default();
+    Some(PendingApproval {
+        session_id,
+        request_id,
+        tool_name,
+        summary,
+        arguments_pretty,
+    })
+}
+
+/// Build the styled body lines for an approval modal. `render_overlay`
+/// wraps each in the box edge, so these are content-only.
+fn approval_overlay_lines(pa: &PendingApproval) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("Tool: {}", pa.tool_name),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if !pa.summary.is_empty() {
+        lines.push(Line::from(Span::styled(
+            pa.summary.clone(),
+            Style::default().fg(Color::White),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "arguments:".to_string(),
+        Style::default().fg(Color::DarkGray),
+    )));
+    for l in pa.arguments_pretty.lines() {
+        lines.push(Line::from(Span::styled(
+            l.to_string(),
+            Style::default().fg(Color::Gray),
+        )));
+    }
+    lines
 }
 
 /// Known providers offered by the `/provider` picker. Free-form
@@ -714,6 +815,12 @@ pub struct App {
     /// What the inline menu is being used for — determines what
     /// happens on selection.
     menu_context: MenuContext,
+    /// Pending tool-approval prompts from `session.input_required`
+    /// (Track A). The daemon's permission gate is sequential per session,
+    /// so this is normally 0 or 1 deep; a queue tolerates a main + `/btw`
+    /// overlap. The front is the one currently shown (as an overlay), and
+    /// keys route to `handle_approval_key` while it's non-empty.
+    pending_approvals: std::collections::VecDeque<PendingApproval>,
     /// Provider-status-driven session phase for the status line.
     session_phase: SessionPhase,
     /// Elapsed ms in the current provider-status phase. Updated by
@@ -1553,6 +1660,7 @@ impl App {
             skills,
             inline_menu: None,
             menu_context: MenuContext::default(),
+            pending_approvals: std::collections::VecDeque::new(),
             session_phase: SessionPhase::default(),
             phase_elapsed_ms: 0,
             cumulative_input_tokens: 0,
@@ -2226,6 +2334,13 @@ impl App {
         // flash does so later in this same call, so the new flash survives
         // until the *following* key (vim-style transient ack, mu-5h9m).
         self.flash = None;
+        // A pending tool approval is the most urgent modal — the turn is
+        // blocked on it — so it takes keys before any other overlay. It
+        // reuses the overlay renderer for display, but its own key handler
+        // (approve/deny) instead of the overlay's scroll/close keys.
+        if !self.pending_approvals.is_empty() {
+            return self.handle_approval_key(vp, key);
+        }
         if self.maximized_block.is_some() {
             return self.handle_maximized_key(vp, key);
         }
@@ -2768,6 +2883,7 @@ impl App {
             title: title.into(),
             lines,
             scroll: 0,
+            footer: None,
         });
     }
 
@@ -2831,6 +2947,13 @@ impl App {
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             )
+        } else if let Some(f) = overlay.footer.clone() {
+            (
+                format!(" {f} "),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else if max_scroll > 0 {
             (
                 format!(
@@ -2857,6 +2980,66 @@ impl App {
         vp.render(Paragraph::new(lines));
         vp.flush()?;
         Ok(())
+    }
+
+    /// Show the front pending approval by building an overlay for it (the
+    /// overlay renderer paints it in both inline and fullscreen). No-op if
+    /// the queue is empty.
+    fn show_front_approval(&mut self) {
+        if let Some(pa) = self.pending_approvals.front().cloned() {
+            self.overlay = Some(Overlay {
+                title: "Approve tool call?".to_string(),
+                lines: approval_overlay_lines(&pa),
+                scroll: 0,
+                footer: Some("y/a approve · n/d deny · Ctrl-C quit".to_string()),
+            });
+        }
+    }
+
+    /// Keys while an approval modal is up: y/a approve, n/d deny, Ctrl-C
+    /// quit; everything else ignored (no accidental-Enter approval, and Esc
+    /// is a deliberate no-op — the daemon gate timeout is the backstop).
+    fn handle_approval_key(&mut self, _vp: &mut DynamicViewport, key: KeyEvent) -> Result<bool> {
+        match approval_key(key) {
+            ApprovalKey::Quit => Ok(true),
+            ApprovalKey::Ignore => Ok(false),
+            ApprovalKey::Approve => {
+                self.resolve_front_approval(true);
+                Ok(false)
+            }
+            ApprovalKey::Deny => {
+                self.resolve_front_approval(false);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Answer the front approval: send `session.respond_to_input_required`
+    /// with the decision, then show the next queued prompt or close the
+    /// modal. A stale request_id (the daemon already timed out and denied)
+    /// errors harmlessly — surfaced via flash, not treated as fatal.
+    fn resolve_front_approval(&mut self, approve: bool) {
+        let Some(pa) = self.pending_approvals.pop_front() else {
+            return;
+        };
+        let decision = if approve { "approve" } else { "deny" };
+        let verb = if approve { "approved" } else { "denied" };
+        match self.client.request(
+            "session.respond_to_input_required",
+            serde_json::json!({
+                "session_id": pa.session_id,
+                "request_id": pa.request_id,
+                "decision": decision,
+            }),
+        ) {
+            Ok(_) => self.set_flash(format!("{verb} {}", pa.tool_name)),
+            Err(e) => self.set_flash(format!("approval response: {e}")),
+        }
+        if self.pending_approvals.is_empty() {
+            self.overlay = None;
+        } else {
+            self.show_front_approval();
+        }
     }
 
     /// Key handling while a modal overlay is open: scroll or dismiss. Mirrors
@@ -4896,7 +5079,24 @@ impl App {
                         .unwrap_or(0);
                 }
             }
+            "session.input_required" => {
+                // Track A: surface the daemon's permission prompt as an
+                // interactive modal. Previously this fell through to the
+                // no-op catch-all, so a non-yolo session had no inline
+                // approve/deny path.
+                if let Some(pa) = parse_input_required(params) {
+                    self.pending_approvals.push_back(pa);
+                    self.show_front_approval();
+                }
+            }
             "session.done" | "session.error" => {
+                // If a turn terminates while an approval is still up (e.g.
+                // the daemon's gate timed out and denied), the modal is
+                // stale — clear it and the overlay it borrowed for display.
+                if !self.pending_approvals.is_empty() {
+                    self.pending_approvals.clear();
+                    self.overlay = None;
+                }
                 let is_error = method == "session.error";
                 // Terminal repaint (mu-d2hx): EVERY done/error transitions
                 // the phase projection — leaving the last live phase in
@@ -5435,6 +5635,93 @@ const MAX_VIEWPORT_HEIGHT: u16 = 20;
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parse_input_required_extracts_fields() {
+        let params = serde_json::json!({
+            "session_id": "s1",
+            "request_id": "r1",
+            "tool_name": "bash",
+            "summary": "run ls -la",
+            "arguments": {"command": "ls -la"},
+        });
+        let pa = parse_input_required(&params).expect("parsed");
+        assert_eq!(pa.session_id, "s1");
+        assert_eq!(pa.request_id, "r1");
+        assert_eq!(pa.tool_name, "bash");
+        assert_eq!(pa.summary, "run ls -la");
+        assert!(pa.arguments_pretty.contains("ls -la"));
+    }
+
+    #[test]
+    fn parse_input_required_needs_session_and_request_ids() {
+        // Missing request_id → unanswerable → None.
+        assert!(parse_input_required(&serde_json::json!({
+            "session_id": "s1", "tool_name": "bash"
+        }))
+        .is_none());
+        // Missing session_id → None.
+        assert!(parse_input_required(&serde_json::json!({
+            "request_id": "r1", "tool_name": "bash"
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn parse_input_required_tolerates_missing_optional_fields() {
+        let pa = parse_input_required(&serde_json::json!({
+            "session_id": "s1", "request_id": "r1"
+        }))
+        .expect("parsed");
+        assert_eq!(pa.tool_name, "(tool)");
+        assert_eq!(pa.summary, "");
+        assert_eq!(pa.arguments_pretty, "");
+    }
+
+    #[test]
+    fn approval_key_maps_intents() {
+        let ch = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        assert!(matches!(approval_key(ch('y')), ApprovalKey::Approve));
+        assert!(matches!(approval_key(ch('a')), ApprovalKey::Approve));
+        assert!(matches!(approval_key(ch('Y')), ApprovalKey::Approve));
+        assert!(matches!(approval_key(ch('A')), ApprovalKey::Approve));
+        assert!(matches!(approval_key(ch('n')), ApprovalKey::Deny));
+        assert!(matches!(approval_key(ch('d')), ApprovalKey::Deny));
+        assert!(matches!(approval_key(ch('N')), ApprovalKey::Deny));
+        assert!(matches!(approval_key(ch('x')), ApprovalKey::Ignore));
+        assert!(matches!(
+            approval_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ApprovalKey::Ignore
+        ));
+        assert!(matches!(
+            approval_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            ApprovalKey::Ignore
+        ));
+        assert!(matches!(
+            approval_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            ApprovalKey::Quit
+        ));
+    }
+
+    #[test]
+    fn approval_overlay_lines_show_tool_and_args() {
+        let pa = PendingApproval {
+            session_id: "s".into(),
+            request_id: "r".into(),
+            tool_name: "bash".into(),
+            summary: "run it".into(),
+            arguments_pretty: "{\n  \"command\": \"ls\"\n}".into(),
+        };
+        let lines = approval_overlay_lines(&pa);
+        let flat: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(flat.contains("Tool: bash"));
+        assert!(flat.contains("run it"));
+        assert!(flat.contains("command"));
+    }
 
     fn line_plain(line: &Line<'_>) -> String {
         line.spans

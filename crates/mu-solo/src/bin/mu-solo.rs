@@ -193,6 +193,7 @@ async fn main() -> Result<()> {
         clipboard_command: cfg.tui.clipboard_command.as_deref(),
         renderer_journal: cfg.tui.renderer_journal,
         notifications: cfg.tui.notifications,
+        model_menu_aliases: &cfg.model_menu.aliases,
         // mu-7e21: [autonomy] in solo.toml → create_session grant.
         autonomy: cfg.autonomy.to_capability(),
         // mu-n25a: [session] max_side_effects → create_session ceiling.

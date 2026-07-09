@@ -45,6 +45,16 @@ pub struct SoloConfig {
     pub session: SessionConfig,
     #[serde(default)]
     pub autonomy: AutonomyConfig,
+    /// Operator-curated fast route aliases for the `/model` picker. These are
+    /// TUI-local affordances: selecting one sends `session.set_route` with the
+    /// embedded provider/model pair. Example:
+    ///
+    /// ```toml
+    /// [model_menu]
+    /// aliases = ["anthropic_api:claude-opus-4-8", "ollama:qwen3.6:35b-a3b"]
+    /// ```
+    #[serde(default)]
+    pub model_menu: ModelMenuConfig,
     /// mu-f7f6: named session presets — the user's reusable "plates".
     /// `mu-solo -p <name>` uses `[profile.<name>]` as the session config
     /// instead of `[session]`. Each profile is a (partial) [`SessionConfig`]:
@@ -79,6 +89,15 @@ impl SoloConfig {
             )
         })
     }
+}
+
+/// Operator-curated provider/model shortcuts for the `/model` picker.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ModelMenuConfig {
+    /// Entries are `<provider>:<model>`, splitting on the FIRST colon so ollama
+    /// tags like `qwen3.6:35b-a3b` remain valid model ids.
+    pub aliases: Vec<String>,
 }
 
 /// mu-7e21: autonomy grant for the solo session, forwarded as
@@ -539,6 +558,25 @@ mod tests {
         assert_eq!(c.session.thinking, "high");
         // Untouched fields keep their defaults.
         assert_eq!(c.session.model, "gpt-5.5");
+    }
+
+    #[test]
+    fn model_menu_aliases_parse_from_toml() {
+        let toml = r#"
+            [model_menu]
+            aliases = [
+              "ant_api:claude-opus-4-8",
+              "ollama:qwen3.6:35b-a3b",
+            ]
+        "#;
+        let c: SoloConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(
+            c.model_menu.aliases,
+            vec![
+                "ant_api:claude-opus-4-8".to_string(),
+                "ollama:qwen3.6:35b-a3b".to_string(),
+            ]
+        );
     }
 
     #[test]

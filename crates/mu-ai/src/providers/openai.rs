@@ -1588,6 +1588,8 @@ impl Provider for OpenaiProvider {
             max_tools: None,
             context_window_tokens: None,
             usage_semantics: UsageSemantics::openai_style(),
+            // Hosted API: rejects over-window requests itself; no silent truncation.
+            truncates_over_window_prompts: false,
         }
     }
 }

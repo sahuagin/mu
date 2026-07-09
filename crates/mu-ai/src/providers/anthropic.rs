@@ -268,6 +268,8 @@ impl Provider for AnthropicProvider {
             // Messages API: input/cache_read/cache_creation are
             // disjoint buckets; thinking bills inside output_tokens.
             usage_semantics: UsageSemantics::anthropic_style(),
+            // Hosted API: rejects over-window requests itself; no silent truncation.
+            truncates_over_window_prompts: false,
         }
     }
 }

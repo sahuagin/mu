@@ -8,7 +8,7 @@ use mu_core::protocol::{
     Request, Response, SessionStatusSummary,
 };
 use mu_core::transport::{codes, err_response, ok_response};
-use mu_core::usage_history::{aggregate_into_rows, extract_per_session_metrics};
+use mu_core::usage_history::{aggregate_into_rows, extract_per_session_metric_segments};
 
 use crate::serve::daemon_info::DaemonInfo;
 use crate::serve::discovery;
@@ -148,21 +148,24 @@ pub fn handle_daemon_usage_history(request: Request<Value>, sessions: Sessions) 
     let mut considered: u32 = 0;
     for (_sid, log, _parent) in snapshot.iter() {
         let events = log.snapshot();
-        let Some(metrics) = extract_per_session_metrics(&events) else {
+        let segments = extract_per_session_metric_segments(&events);
+        if segments.is_empty() {
             continue;
-        };
+        }
         considered = considered.saturating_add(1);
-        if let Some(since) = params.since_unix_ms {
-            if metrics.started_at_unix_ms < since {
-                continue;
+        for metrics in segments {
+            if let Some(since) = params.since_unix_ms {
+                if metrics.started_at_unix_ms < since {
+                    continue;
+                }
             }
-        }
-        if let Some(until) = params.until_unix_ms {
-            if metrics.started_at_unix_ms >= until {
-                continue;
+            if let Some(until) = params.until_unix_ms {
+                if metrics.started_at_unix_ms >= until {
+                    continue;
+                }
             }
+            per_session.push(metrics);
         }
-        per_session.push(metrics);
     }
 
     let rows = aggregate_into_rows(per_session, params.time_bucket_ms);

@@ -66,13 +66,24 @@ enum MockResponse {
 
 struct MockProvider {
     responses: Mutex<VecDeque<MockResponse>>,
+    /// mu-z0jb: advertise ProviderCapabilities::truncates_over_window_prompts
+    /// so tests can exercise the capability-driven pre-dispatch refusal.
+    truncates_over_window: bool,
 }
 
 impl MockProvider {
     fn new(responses: Vec<Vec<ProviderEvent>>) -> Self {
         Self {
             responses: Mutex::new(responses.into_iter().map(MockResponse::Events).collect()),
+            truncates_over_window: false,
         }
+    }
+
+    /// mu-z0jb: mark this mock as a fail-open (silently truncating)
+    /// provider so the loop's over-window refusal fires for it.
+    fn truncating_over_window(mut self) -> Self {
+        self.truncates_over_window = true;
+        self
     }
 
     fn pending() -> Self {
@@ -80,6 +91,7 @@ impl MockProvider {
         q.push_back(MockResponse::Pending);
         Self {
             responses: Mutex::new(q),
+            truncates_over_window: false,
         }
     }
 
@@ -91,6 +103,7 @@ impl MockProvider {
         q.push_back(MockResponse::Events(events));
         Self {
             responses: Mutex::new(q),
+            truncates_over_window: false,
         }
     }
 
@@ -110,6 +123,7 @@ impl MockProvider {
         (
             Self {
                 responses: Mutex::new(q),
+                truncates_over_window: false,
             },
             gate_tx,
         )
@@ -125,12 +139,20 @@ impl MockProvider {
         }
         Self {
             responses: Mutex::new(q),
+            truncates_over_window: false,
         }
     }
 }
 
 #[async_trait]
 impl Provider for MockProvider {
+    fn capabilities(&self) -> crate::agent::capabilities::ProviderCapabilities {
+        crate::agent::capabilities::ProviderCapabilities {
+            truncates_over_window_prompts: self.truncates_over_window,
+            ..Default::default()
+        }
+    }
+
     async fn stream(
         &self,
         _system_prompt: Option<&str>,
@@ -550,7 +572,7 @@ async fn s5h_done_propagates_end_turn_when_provider_reports_end_turn() {
 #[tokio::test]
 async fn ollama_over_window_prompt_refused_before_provider_stream() {
     let (events_tx, mut events_rx) = mpsc::channel(64);
-    let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![]));
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![]).truncating_over_window());
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
     let loop_ = loop_with(
@@ -595,6 +617,63 @@ async fn ollama_over_window_prompt_refused_before_provider_stream() {
 
     loop_.send(AgentInput::Cancel).await.expect("send cancel");
     assert_eq!(loop_.join().await, Outcome::Cancelled);
+}
+
+/// mu-z0jb: the over-window refusal is CAPABILITY-driven, not keyed on the
+/// provider-kind string. A provider that does NOT advertise
+/// `truncates_over_window_prompts` (hosted APIs reject over-window requests
+/// themselves) sails past the pre-dispatch check even with a tiny hard
+/// window — the request reaches the provider stream and completes.
+#[tokio::test]
+async fn non_truncating_provider_not_refused_over_window() {
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![vec![
+        ProviderEvent::TextDelta("hi".into()),
+        ProviderEvent::Done(assistant_text("hi")),
+    ]]));
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let loop_ = loop_with(
+        provider,
+        Arc::from("openrouter"),
+        Arc::from("tiny-window"),
+        vec![],
+        AgentConfig {
+            context_hard_limit: Some(1),
+            ..AgentConfig::default()
+        },
+        events_tx,
+        approvals,
+        capability,
+    );
+
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("this prompt is larger than the deliberately tiny test window"),
+            None,
+            None,
+        ))
+        .await
+        .expect("send user message");
+
+    let mut saw_refusal = false;
+    loop {
+        match timeout(Duration::from_secs(2), events_rx.recv()).await {
+            Ok(Some(AgentEvent::Error { message })) => {
+                saw_refusal = message.contains("silently truncate");
+            }
+            Ok(Some(AgentEvent::Done { .. })) => break,
+            Ok(Some(_)) => {}
+            other => panic!("timed out or channel closed before Done: {other:?}"),
+        }
+    }
+    assert!(
+        !saw_refusal,
+        "non-truncating provider must not trip the over-window refusal"
+    );
+
+    loop_.send(AgentInput::Cancel).await.expect("send cancel");
+    let _ = loop_.join().await;
 }
 
 /// mu-tds4: pre-first-token transport errors are retryable. A transient
@@ -1652,6 +1731,7 @@ fn mock_provider_one_tool_call(tool_name: &str, args: Value) -> MockProvider {
     q.push_back(MockResponse::Events(second_turn));
     MockProvider {
         responses: Mutex::new(q),
+        truncates_over_window: false,
     }
 }
 

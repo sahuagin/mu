@@ -71,6 +71,16 @@ pub struct ProviderCapabilities {
     /// `input_tokens` includes cache reads; Anthropic's buckets are
     /// disjoint) that consumers kept re-deriving wrong.
     pub usage_semantics: UsageSemantics,
+
+    /// mu-z0jb: provider silently TRUNCATES prompts that exceed the
+    /// model's context window instead of rejecting them (ollama clips
+    /// to `num_ctx` and returns a one-token "length" reply;
+    /// llama-server/vLLM context-shift similarly fail open). The agent
+    /// loop uses this to refuse over-window prompts BEFORE dispatch
+    /// (mu-w8ap) — previously keyed on `provider_kind == "ollama"`,
+    /// which left every other fail-open lane unprotected. Hosted APIs
+    /// that reject over-window requests keep the default `false`.
+    pub truncates_over_window_prompts: bool,
 }
 
 /// mu-rf9x: a provider's token-usage accounting convention.
@@ -232,6 +242,7 @@ impl Default for ProviderCapabilities {
             max_tools: None,
             context_window_tokens: None,
             usage_semantics: UsageSemantics::default(),
+            truncates_over_window_prompts: false,
         }
     }
 }

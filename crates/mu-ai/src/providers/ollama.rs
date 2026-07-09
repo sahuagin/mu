@@ -229,6 +229,10 @@ impl Provider for OllamaProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         let mut caps = self.inner.capabilities();
         caps.supports_prompt_caching = false;
+        // ollama clips over-window prompts to num_ctx and returns a
+        // one-token "length" reply instead of erroring (mu-w8ap) — the
+        // agent loop refuses over-window prompts pre-dispatch on this flag.
+        caps.truncates_over_window_prompts = true;
         caps
     }
 

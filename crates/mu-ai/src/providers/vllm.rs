@@ -103,7 +103,14 @@ impl Provider for VllmProvider {
     }
 
     fn capabilities(&self) -> mu_core::agent::capabilities::ProviderCapabilities {
-        self.inner.capabilities()
+        let mut caps = self.inner.capabilities();
+        // vLLM and llama-server (this lane also fronts llama.cpp's
+        // OpenAI-compatible server) default to context-shift/truncation
+        // when the prompt exceeds the serving window — same fail-open
+        // behavior as ollama, so the agent loop must refuse over-window
+        // prompts pre-dispatch here too (mu-z0jb).
+        caps.truncates_over_window_prompts = true;
+        caps
     }
 
     fn renderer(&self) -> Arc<dyn ProviderRenderer> {

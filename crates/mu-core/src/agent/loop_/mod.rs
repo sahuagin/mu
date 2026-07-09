@@ -102,18 +102,23 @@ fn nonzero_usize(value: u64) -> Option<usize> {
 }
 
 fn over_window_prompt_error(
+    truncates_over_window: bool,
     provider_kind: &str,
     model: &str,
     predicted_input_tokens: usize,
     output_reserve_tokens: usize,
     context_hard_limit: Option<usize>,
 ) -> Option<String> {
-    // mu-w8ap: ollama is the provider with known silent truncation behavior
-    // (num_ctx window exceeded -> clipped prompt + one-token "length" reply).
-    // Hosted APIs generally reject over-window requests themselves, and this
-    // tokenizer-free estimate is intentionally conservative rather than exact;
-    // fail closed only for the provider that otherwise fails open.
-    if !provider_kind.starts_with("ollama") {
+    // mu-w8ap: some providers silently truncate over-window prompts instead
+    // of rejecting them (ollama clips to num_ctx and returns a one-token
+    // "length" reply; llama-server/vLLM context-shift similarly). Hosted
+    // APIs generally reject over-window requests themselves, and this
+    // tokenizer-free estimate is intentionally conservative rather than
+    // exact; fail closed only for providers that otherwise fail open —
+    // advertised via `ProviderCapabilities::truncates_over_window_prompts`
+    // (mu-z0jb; previously a `provider_kind.starts_with("ollama")` match,
+    // which left other fail-open lanes like vllm/llama-server unprotected).
+    if !truncates_over_window {
         return None;
     }
     let hard = context_hard_limit?;
@@ -125,7 +130,7 @@ fn over_window_prompt_error(
         "prompt exceeds {provider_kind}/{model} context window before dispatch: \
          estimated input {predicted_input_tokens} tokens + reserved output \
          {output_reserve_tokens} tokens = {send_total}, hard window {hard}. \
-         Refusing instead of letting ollama silently truncate the prompt."
+         Refusing instead of letting {provider_kind} silently truncate the prompt."
     ))
 }
 use crate::protocol::{
@@ -2126,6 +2131,7 @@ async fn run_inner(
                 let predicted_input_tokens =
                     predicted_prompt_total(feedback_anchor.as_ref(), rope_estimate_sent);
                 if let Some(message) = over_window_prompt_error(
+                    provider.capabilities().truncates_over_window_prompts,
                     current_provider_kind.as_ref(),
                     current_model.as_ref(),
                     predicted_input_tokens,
@@ -2141,7 +2147,7 @@ async fn run_inner(
                                 "model": current_model.as_ref(),
                                 "predicted_input_tokens": predicted_input_tokens,
                                 "context_hard_limit": current_context_hard_limit,
-                                "reason": "refusing before provider dispatch; ollama silently truncates over-window prompts",
+                                "reason": "refusing before provider dispatch; this provider silently truncates over-window prompts",
                             }),
                             theme: Some("warning".to_owned()),
                             context_refs: vec!["bead:mu-w8ap".to_owned()],

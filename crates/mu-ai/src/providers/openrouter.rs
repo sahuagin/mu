@@ -205,6 +205,8 @@ impl Provider for OpenRouterProvider {
             // the total (prompt_tokens_details.cached_tokens subset).
             // Ollama inherits this via its inner provider.
             usage_semantics: UsageSemantics::openai_style(),
+            // Hosted API: rejects over-window requests itself; no silent truncation.
+            truncates_over_window_prompts: false,
         }
     }
 }

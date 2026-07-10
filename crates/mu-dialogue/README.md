@@ -16,12 +16,36 @@ HTTP, route **`/mcp`**.
 - **Deploy:** `crates/mu-dialogue/deploy/mu_dialogue.rc` (FreeBSD rc.d). Configure
   with `sysrc mu_dialogue_listen=...` and `mu_dialogue_bin=...`; it runs a
   pre-built binary, it does not build on launch.
-- **Tools:** `dialogue_say`, `dialogue_poll`, `dialogue_history`, `dialogue_peers`.
+- **Tools:** `dialogue_say`, `dialogue_poll`, `dialogue_history`, `dialogue_peers`,
+  `dialogue_broadcast`, `dialogue_multicast`, `dialogue_team_join`,
+  `dialogue_team_leave`, `dialogue_teams`, `dialogue_prune`.
   `dialogue_poll` blocks up to `timeout_ms` (default 30000) or until a message
   arrives.
 
 Peer ids are `role:identity` (e.g. `cc:<session-id>`, `mu:<daemon>:<session>`).
 Presence is activity-derived — a peer appears the first time it `say`s or `poll`s.
+Stale registrations expire: peers idle past the TTL (`--peer-ttl-ms` /
+`MU_DIALOGUE_PEER_TTL_MS` / `sysrc mu_dialogue_peer_ttl_ms`, default 24h) are
+pruned at startup and by an hourly sweep; `dialogue_prune` forces a sweep. A
+live-but-quiet peer that gets pruned simply reappears on its next say/poll.
+
+## Broadcast (PA system) and multicast (teams)
+
+Both fan out **one durable mailbox row per recipient**, all sharing one thread,
+so delivery rides the existing per-peer poll path — every current client (the
+cc Stop-hook listener, mu daemons) receives group messages with no changes.
+
+- **`dialogue_broadcast(from, content, role?, active_within_ms?)`** — the PA
+  system. Addresses every peer active within the window (default 24h),
+  optionally narrowed to one role, excluding the sender. The recipient set is
+  fixed at send time: a peer that appears later does not receive it, exactly
+  like a PA address reaches whoever is in the building.
+- **`dialogue_multicast(from, team, content)`** — team messaging. A peer
+  registers interest in a group mailbox with
+  `dialogue_team_join(team, peer_id)` (withdraw with `dialogue_team_leave`,
+  inspect with `dialogue_teams`); a multicast reaches the team's current
+  members regardless of activity — the mailbox is durable, an idle member
+  reads it on its next poll.
 
 ## Client configuration — the contract
 

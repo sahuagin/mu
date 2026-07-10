@@ -49,6 +49,18 @@ use ulid::Ulid;
 const SERVER_NAME: &str = "mu-dialogue";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_POLL_TIMEOUT_MS: u64 = 30_000;
+/// Peer registrations whose `last_seen` is older than this are stale and get
+/// pruned (startup + a periodic sweep). Presence here is activity-derived
+/// compatibility behavior — the lease-backed etcd registry from
+/// `specs/plans/mu-dialogue-push-mailbox-v1.md` §1 is the real fix; until it
+/// lands, a TTL keeps dead session ids from accumulating forever. Override
+/// with `--peer-ttl-ms` / `MU_DIALOGUE_PEER_TTL_MS`.
+const DEFAULT_PEER_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+/// How often the background sweep prunes stale peers.
+const PRUNE_INTERVAL_SECS: u64 = 3600;
+/// Default recency window for `dialogue_broadcast` recipients: the PA system
+/// addresses peers present "in the building", not every id ever seen.
+const DEFAULT_BROADCAST_WINDOW_MS: i64 = DEFAULT_PEER_TTL_MS;
 /// Cap on how long a single `notified()` wait blocks before re-checking the
 /// store. The wake is notify-driven (not busy-wait); this only bounds the
 /// worst-case latency to observe a message inserted by a *different* process
@@ -61,6 +73,9 @@ const POLL_RECHECK_INTERVAL_MS: u64 = 1_000;
 struct Store {
     db: Arc<Mutex<Connection>>,
     notify: Arc<Notify>,
+    /// Stale-peer cutoff: registrations idle longer than this are pruned
+    /// (startup, the periodic sweep, and dialogue_prune's default).
+    peer_ttl_ms: i64,
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -95,6 +110,19 @@ fn migrate(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_peers_role_seen
             ON peers(role, last_seen);
+
+        -- Team membership: a peer registers interest in a named group mailbox
+        -- (the multicast model from the push-mailbox spec's roadmap). A
+        -- multicast to <team> fans out one durable mailbox row per current
+        -- member, so delivery rides the existing per-peer poll path unchanged.
+        CREATE TABLE IF NOT EXISTS team_members (
+            team       TEXT NOT NULL,
+            peer_id    TEXT NOT NULL,
+            joined_at  INTEGER NOT NULL,
+            PRIMARY KEY (team, peer_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_team_members_peer
+            ON team_members(peer_id);
         "#,
     )?;
     Ok(())
@@ -243,6 +271,141 @@ impl Store {
         Ok(())
     }
 
+    /// Deliver one message to many mailboxes: one durable `dialogue` row per
+    /// recipient (a group mailbox is an expansion list), all sharing one
+    /// thread, inserted in a single transaction, with a single wake. Delivery
+    /// then rides the existing per-peer poll path unchanged — every current
+    /// client (cc Stop-hook listener, mu daemon) receives group messages with
+    /// zero client changes. Returns the thread id and timestamp.
+    async fn fan_out(
+        &self,
+        from: &str,
+        recipients: &[String],
+        content: &str,
+        session_thread: Option<&str>,
+    ) -> Result<(String, i64)> {
+        let ts = now_ms();
+        // The fan-out mints ONE id up front: it is the thread every recipient's
+        // copy carries, so dialogue_history replays the announcement and every
+        // reply to it as one conversation.
+        let thread = session_thread
+            .map(String::from)
+            .unwrap_or_else(|| Ulid::new().to_string());
+        if !recipients.is_empty() {
+            let mut conn = self.db.lock().await;
+            let tx = conn.transaction()?;
+            for to in recipients {
+                let id = Ulid::new().to_string();
+                tx.execute(
+                    "INSERT INTO dialogue (id, from_peer, to_peer, session_thread, content, ts)
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                    params![id, from, to, thread, content, ts],
+                )?;
+            }
+            tx.commit()?;
+            self.notify.notify_waiters();
+        }
+        Ok((thread, ts))
+    }
+
+    /// Peer ids active since the cutoff, optionally filtered by role,
+    /// most-recently-active first. The broadcast recipient set.
+    async fn active_peer_ids(
+        &self,
+        role: Option<&str>,
+        active_since_ms: i64,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .list_peers(role, active_since_ms)
+            .await?
+            .into_iter()
+            .map(|p| p.peer_id)
+            .collect())
+    }
+
+    /// Register a peer's interest in a team (group mailbox). Idempotent.
+    /// Returns the team's member count after the join.
+    async fn team_join(&self, team: &str, peer_id: &str, ts: i64) -> Result<i64> {
+        let conn = self.db.lock().await;
+        conn.execute(
+            "INSERT INTO team_members (team, peer_id, joined_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(team, peer_id) DO NOTHING",
+            params![team, peer_id, ts],
+        )?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM team_members WHERE team = ?1",
+            params![team],
+            |r| r.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Withdraw a peer's interest in a team. Returns whether a row was removed.
+    async fn team_leave(&self, team: &str, peer_id: &str) -> Result<bool> {
+        let conn = self.db.lock().await;
+        let n = conn.execute(
+            "DELETE FROM team_members WHERE team = ?1 AND peer_id = ?2",
+            params![team, peer_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Members of one team, oldest joiner first.
+    async fn team_members_of(&self, team: &str) -> Result<Vec<(String, i64)>> {
+        let conn = self.db.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT peer_id, joined_at FROM team_members WHERE team = ?1 ORDER BY joined_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![team], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Every team and its member count; `peer_id` narrows to the teams that
+    /// peer belongs to.
+    async fn teams_overview(&self, peer_id: Option<&str>) -> Result<Vec<(String, i64)>> {
+        let conn = self.db.lock().await;
+        let rows = match peer_id {
+            Some(p) => {
+                let mut stmt = conn.prepare(
+                    "SELECT t.team, COUNT(*) FROM team_members t
+                      WHERE t.team IN (SELECT team FROM team_members WHERE peer_id = ?1)
+                      GROUP BY t.team ORDER BY t.team",
+                )?;
+                let rows = stmt
+                    .query_map(params![p], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT team, COUNT(*) FROM team_members GROUP BY team ORDER BY team",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            }
+        };
+        Ok(rows)
+    }
+
+    /// Remove peer registrations not seen since `cutoff_ms`, and those peers'
+    /// team memberships with them. Returns (peers_removed, memberships_removed).
+    /// Pruning is cosmetic, not authoritative: a pruned-but-alive peer
+    /// re-registers on its next say/poll (touch_peer).
+    async fn prune_peers(&self, cutoff_ms: i64) -> Result<(usize, usize)> {
+        let conn = self.db.lock().await;
+        let memberships = conn.execute(
+            "DELETE FROM team_members WHERE peer_id IN
+                 (SELECT peer_id FROM peers WHERE last_seen < ?1)",
+            params![cutoff_ms],
+        )?;
+        let peers = conn.execute("DELETE FROM peers WHERE last_seen < ?1", params![cutoff_ms])?;
+        Ok((peers, memberships))
+    }
+
     /// List known peers, most-recently-active first. `role` filters by kind
     /// (e.g. "cc", "mu"); `active_since_ms` drops anyone whose last_seen is
     /// older than the cutoff (0 = no recency filter).
@@ -342,6 +505,60 @@ struct PeersArgs {
     active_within_ms: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct BroadcastArgs {
+    from: String,
+    content: String,
+    /// Narrow the announcement to one kind of peer ("cc", "mu", …).
+    #[serde(default)]
+    role: Option<String>,
+    /// Recency window for recipients (ms). Peers whose last_seen is older are
+    /// not addressed. Default DEFAULT_BROADCAST_WINDOW_MS.
+    #[serde(default)]
+    active_within_ms: Option<i64>,
+    #[serde(default)]
+    session_thread: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MulticastArgs {
+    from: String,
+    team: String,
+    content: String,
+    #[serde(default)]
+    session_thread: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TeamJoinArgs {
+    team: String,
+    peer_id: String,
+}
+
+#[derive(Deserialize)]
+struct TeamLeaveArgs {
+    team: String,
+    peer_id: String,
+}
+
+#[derive(Deserialize)]
+struct TeamsArgs {
+    /// List the members of this team. Omit for the all-teams overview.
+    #[serde(default)]
+    team: Option<String>,
+    /// Overview mode: narrow to the teams this peer belongs to.
+    #[serde(default)]
+    peer_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PruneArgs {
+    /// Remove peers whose last_seen is older than this many ms. Omit for the
+    /// server's configured peer TTL.
+    #[serde(default)]
+    max_age_ms: Option<i64>,
+}
+
 async fn handle_say(store: &Store, args: SayArgs) -> Result<Value> {
     let (id, ts) = store
         .say(
@@ -400,6 +617,127 @@ async fn handle_peers(store: &Store, args: PeersArgs) -> Result<Value> {
         .unwrap_or(0);
     let peers = store.list_peers(args.role.as_deref(), active_since).await?;
     Ok(json!({ "peers": peers, "now": now }))
+}
+
+/// PA system: deliver one announcement to every peer active within the window
+/// (optionally one role), excluding the sender. The recipient set is fixed at
+/// send time — a peer that appears later does not receive it, exactly like a
+/// PA address reaches whoever is in the building.
+async fn handle_broadcast(store: &Store, args: BroadcastArgs) -> Result<Value> {
+    if args.from.is_empty() {
+        anyhow::bail!("broadcast requires a non-empty 'from'");
+    }
+    let now = now_ms();
+    let window = args
+        .active_within_ms
+        .filter(|w| *w > 0)
+        .unwrap_or(DEFAULT_BROADCAST_WINDOW_MS);
+    let recipients: Vec<String> = store
+        .active_peer_ids(args.role.as_deref(), now - window)
+        .await?
+        .into_iter()
+        .filter(|p| p != &args.from)
+        .collect();
+    let (thread, ts) = store
+        .fan_out(
+            &args.from,
+            &recipients,
+            &args.content,
+            args.session_thread.as_deref(),
+        )
+        .await?;
+    // Announcing proves the announcer is live.
+    store.touch_peer(&args.from, ts).await?;
+    Ok(json!({
+        "id": thread, "ts": ts,
+        "count": recipients.len(), "recipients": recipients,
+    }))
+}
+
+/// Team multicast: deliver to the current members of a group mailbox
+/// (registered interest via dialogue_team_join), excluding the sender.
+/// Members are addressed regardless of activity — the mailbox is durable, an
+/// idle member reads it on its next poll.
+async fn handle_multicast(store: &Store, args: MulticastArgs) -> Result<Value> {
+    if args.from.is_empty() {
+        anyhow::bail!("multicast requires a non-empty 'from'");
+    }
+    if args.team.is_empty() {
+        anyhow::bail!("multicast requires a non-empty 'team'");
+    }
+    let recipients: Vec<String> = store
+        .team_members_of(&args.team)
+        .await?
+        .into_iter()
+        .map(|(peer, _joined)| peer)
+        .filter(|p| p != &args.from)
+        .collect();
+    let (thread, ts) = store
+        .fan_out(
+            &args.from,
+            &recipients,
+            &args.content,
+            args.session_thread.as_deref(),
+        )
+        .await?;
+    store.touch_peer(&args.from, ts).await?;
+    Ok(json!({
+        "id": thread, "ts": ts, "team": args.team,
+        "count": recipients.len(), "recipients": recipients,
+    }))
+}
+
+async fn handle_team_join(store: &Store, args: TeamJoinArgs) -> Result<Value> {
+    if args.team.is_empty() || args.peer_id.is_empty() {
+        anyhow::bail!("team_join requires non-empty 'team' and 'peer_id'");
+    }
+    let ts = now_ms();
+    let members = store.team_join(&args.team, &args.peer_id, ts).await?;
+    // Joining proves the joiner is live.
+    store.touch_peer(&args.peer_id, ts).await?;
+    Ok(json!({ "team": args.team, "peer_id": args.peer_id, "members": members }))
+}
+
+async fn handle_team_leave(store: &Store, args: TeamLeaveArgs) -> Result<Value> {
+    let removed = store.team_leave(&args.team, &args.peer_id).await?;
+    Ok(json!({ "team": args.team, "peer_id": args.peer_id, "removed": removed }))
+}
+
+async fn handle_teams(store: &Store, args: TeamsArgs) -> Result<Value> {
+    match args.team {
+        Some(team) => {
+            let members: Vec<Value> = store
+                .team_members_of(&team)
+                .await?
+                .into_iter()
+                .map(|(peer_id, joined_at)| json!({ "peer_id": peer_id, "joined_at": joined_at }))
+                .collect();
+            Ok(json!({ "team": team, "members": members }))
+        }
+        None => {
+            let teams: Vec<Value> = store
+                .teams_overview(args.peer_id.as_deref())
+                .await?
+                .into_iter()
+                .map(|(team, members)| json!({ "team": team, "members": members }))
+                .collect();
+            Ok(json!({ "teams": teams }))
+        }
+    }
+}
+
+async fn handle_prune(store: &Store, args: PruneArgs) -> Result<Value> {
+    let max_age = args
+        .max_age_ms
+        .filter(|a| *a > 0)
+        .unwrap_or(store.peer_ttl_ms);
+    let cutoff = now_ms() - max_age;
+    let (peers, memberships) = store.prune_peers(cutoff).await?;
+    Ok(json!({
+        "removed_peers": peers,
+        "removed_memberships": memberships,
+        "cutoff": cutoff,
+    }))
 }
 
 // ─────────────────────────── rmcp ServerHandler ─────────────────────────────
@@ -478,6 +816,94 @@ fn tools_list() -> Vec<Tool> {
                 }
             })),
         ),
+        Tool::new(
+            "dialogue_broadcast",
+            "PA system: send one announcement to every peer active within the \
+             recency window (optionally one role), excluding yourself. Each \
+             recipient gets a durable mailbox copy on one shared thread; the \
+             recipient set is fixed at send time. Returns {id, ts, count, \
+             recipients}.",
+            schema(json!({
+                "type": "object",
+                "properties": {
+                    "from":             {"type": "string", "description": "Sender peer id"},
+                    "content":          {"type": "string", "description": "Announcement body"},
+                    "role":             {"type": "string", "description": "Only address one kind of peer ('cc', 'mu', …). Omit for all."},
+                    "active_within_ms": {"type": "number", "description": "Recency window for recipients (ms). Default 24h."},
+                    "session_thread":   {"type": "string", "description": "Optional thread id; minted if omitted"}
+                },
+                "required": ["from", "content"]
+            })),
+        ),
+        Tool::new(
+            "dialogue_multicast",
+            "Team multicast: send to the current members of a team (group \
+             mailbox), excluding yourself. Members register interest with \
+             dialogue_team_join; delivery is a durable mailbox copy per member \
+             on one shared thread, regardless of member activity. Returns \
+             {id, ts, team, count, recipients}.",
+            schema(json!({
+                "type": "object",
+                "properties": {
+                    "from":           {"type": "string", "description": "Sender peer id"},
+                    "team":           {"type": "string", "description": "Team (group mailbox) name"},
+                    "content":        {"type": "string", "description": "Message body"},
+                    "session_thread": {"type": "string", "description": "Optional thread id; minted if omitted"}
+                },
+                "required": ["from", "team", "content"]
+            })),
+        ),
+        Tool::new(
+            "dialogue_team_join",
+            "Register a peer's interest in a team (group mailbox) so it \
+             receives dialogue_multicast messages sent to that team. \
+             Idempotent. Returns {team, peer_id, members}.",
+            schema(json!({
+                "type": "object",
+                "properties": {
+                    "team":    {"type": "string", "description": "Team name"},
+                    "peer_id": {"type": "string", "description": "Peer joining the team"}
+                },
+                "required": ["team", "peer_id"]
+            })),
+        ),
+        Tool::new(
+            "dialogue_team_leave",
+            "Withdraw a peer's interest in a team. Returns {team, peer_id, removed}.",
+            schema(json!({
+                "type": "object",
+                "properties": {
+                    "team":    {"type": "string", "description": "Team name"},
+                    "peer_id": {"type": "string", "description": "Peer leaving the team"}
+                },
+                "required": ["team", "peer_id"]
+            })),
+        ),
+        Tool::new(
+            "dialogue_teams",
+            "List teams. With 'team': that team's members. Without: every team \
+             and its member count ('peer_id' narrows to teams that peer belongs to).",
+            schema(json!({
+                "type": "object",
+                "properties": {
+                    "team":    {"type": "string", "description": "List this team's members"},
+                    "peer_id": {"type": "string", "description": "Overview mode: only teams this peer belongs to"}
+                }
+            })),
+        ),
+        Tool::new(
+            "dialogue_prune",
+            "Remove stale peer registrations (and their team memberships): \
+             peers whose last_seen is older than max_age_ms (default: the \
+             server's peer TTL). Pruning is cosmetic — a live peer re-registers \
+             on its next say/poll. Returns {removed_peers, removed_memberships, cutoff}.",
+            schema(json!({
+                "type": "object",
+                "properties": {
+                    "max_age_ms": {"type": "number", "description": "Staleness cutoff in ms (default: server peer TTL, 24h unless overridden)"}
+                }
+            })),
+        ),
     ]
 }
 
@@ -514,6 +940,48 @@ impl DialogueHandler {
                     .await
                     .map_err(|e| format!("dialogue_peers failed: {e:#}"))
             }
+            "dialogue_broadcast" => {
+                let args: BroadcastArgs = serde_json::from_value(arguments)
+                    .map_err(|e| format!("dialogue_broadcast bad args: {e}"))?;
+                handle_broadcast(&self.store, args)
+                    .await
+                    .map_err(|e| format!("dialogue_broadcast failed: {e:#}"))
+            }
+            "dialogue_multicast" => {
+                let args: MulticastArgs = serde_json::from_value(arguments)
+                    .map_err(|e| format!("dialogue_multicast bad args: {e}"))?;
+                handle_multicast(&self.store, args)
+                    .await
+                    .map_err(|e| format!("dialogue_multicast failed: {e:#}"))
+            }
+            "dialogue_team_join" => {
+                let args: TeamJoinArgs = serde_json::from_value(arguments)
+                    .map_err(|e| format!("dialogue_team_join bad args: {e}"))?;
+                handle_team_join(&self.store, args)
+                    .await
+                    .map_err(|e| format!("dialogue_team_join failed: {e:#}"))
+            }
+            "dialogue_team_leave" => {
+                let args: TeamLeaveArgs = serde_json::from_value(arguments)
+                    .map_err(|e| format!("dialogue_team_leave bad args: {e}"))?;
+                handle_team_leave(&self.store, args)
+                    .await
+                    .map_err(|e| format!("dialogue_team_leave failed: {e:#}"))
+            }
+            "dialogue_teams" => {
+                let args: TeamsArgs = serde_json::from_value(arguments)
+                    .map_err(|e| format!("dialogue_teams bad args: {e}"))?;
+                handle_teams(&self.store, args)
+                    .await
+                    .map_err(|e| format!("dialogue_teams failed: {e:#}"))
+            }
+            "dialogue_prune" => {
+                let args: PruneArgs = serde_json::from_value(arguments)
+                    .map_err(|e| format!("dialogue_prune bad args: {e}"))?;
+                handle_prune(&self.store, args)
+                    .await
+                    .map_err(|e| format!("dialogue_prune failed: {e:#}"))
+            }
             other => Err(format!("unknown tool: {other}")),
         }
     }
@@ -527,6 +995,9 @@ impl ServerHandler for DialogueHandler {
                 "Multi-peer inter-agent dialogue channel (the email/inbox-over-MCP model). \
                  dialogue_say to send, dialogue_poll to long-poll an inbox, dialogue_history \
                  to replay a thread, dialogue_peers to discover who is on the channel. \
+                 dialogue_broadcast is the PA system (announce to every active peer); \
+                 dialogue_multicast sends to a team's members (register interest with \
+                 dialogue_team_join / dialogue_team_leave, inspect with dialogue_teams). \
                  Peers: cc, mu, warden subagents, orchestrators.\n\
                  \n\
                  Peer ids are 'role:identity'. Identify yourself consistently in the \
@@ -534,7 +1005,8 @@ impl ServerHandler for DialogueHandler {
                  CLAUDE_CODE_SESSION_ID (e.g. 'cc:2257560e-...'); an mu session uses \
                  'mu:<daemon_id>:<session_id>'. The 'role:' prefix is what dialogue_peers \
                  groups on. Presence is activity-derived — you appear to others the first \
-                 time you say or poll, not at connect.",
+                 time you say or poll, not at connect. Stale registrations expire: peers \
+                 idle past the server TTL are pruned (dialogue_prune forces a sweep).",
             )
     }
 
@@ -624,9 +1096,29 @@ fn parse_allowed_hosts(args: &[String]) -> Vec<String> {
     hosts
 }
 
-fn open_store() -> Result<Store> {
+/// `--peer-ttl-ms <ms>` / `--peer-ttl-ms=<ms>`, falling back to
+/// `MU_DIALOGUE_PEER_TTL_MS`, else DEFAULT_PEER_TTL_MS.
+fn parse_peer_ttl_ms(args: &[String]) -> i64 {
+    let mut it = args.iter();
+    let mut from_args = None;
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--peer-ttl-ms=") {
+            from_args = Some(v.to_string());
+        } else if a == "--peer-ttl-ms" {
+            from_args = it.next().cloned();
+        }
+    }
+    from_args
+        .or_else(|| env::var("MU_DIALOGUE_PEER_TTL_MS").ok())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|ttl| *ttl > 0)
+        .unwrap_or(DEFAULT_PEER_TTL_MS)
+}
+
+fn open_store(peer_ttl_ms: i64) -> Result<Store> {
     let db_path = default_db_path();
-    info!(version = VERSION, db = %db_path.display(), "mu-dialogue starting");
+    info!(version = VERSION, db = %db_path.display(), peer_ttl_ms, "mu-dialogue starting");
     let conn =
         Connection::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
     conn.execute_batch("PRAGMA journal_mode = WAL;")?;
@@ -634,6 +1126,7 @@ fn open_store() -> Result<Store> {
     Ok(Store {
         db: Arc::new(Mutex::new(conn)),
         notify: Arc::new(Notify::new()),
+        peer_ttl_ms,
     })
 }
 
@@ -656,7 +1149,38 @@ async fn main() -> Result<()> {
         .or_else(|| env::var("MU_DIALOGUE_ADDR").ok())
         .filter(|s| !s.is_empty());
     let allowed_hosts = parse_allowed_hosts(&args);
-    let store = open_store()?;
+    let store = open_store(parse_peer_ttl_ms(&args))?;
+
+    // Stale-registration hygiene: prune once at startup, then sweep hourly.
+    // TTL-based expiry is compatibility behavior until the lease-backed etcd
+    // presence registry (push-mailbox spec §1) replaces touch_peer presence.
+    match store.prune_peers(now_ms() - store.peer_ttl_ms).await {
+        Ok((peers, memberships)) if peers > 0 || memberships > 0 => {
+            info!(
+                peers,
+                memberships, "pruned stale peer registrations at startup"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => warn!("startup peer prune failed: {e:#}"),
+    }
+    {
+        let store = store.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(PRUNE_INTERVAL_SECS));
+            tick.tick().await; // the immediate first tick — startup already pruned
+            loop {
+                tick.tick().await;
+                match store.prune_peers(now_ms() - store.peer_ttl_ms).await {
+                    Ok((peers, memberships)) if peers > 0 || memberships > 0 => {
+                        info!(peers, memberships, "pruned stale peer registrations");
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!("periodic peer prune failed: {e:#}"),
+                }
+            }
+        });
+    }
 
     match listen {
         Some(addr) => serve_http(&addr, store, allowed_hosts).await,
@@ -716,6 +1240,7 @@ mod tests {
         Store {
             db: Arc::new(Mutex::new(conn)),
             notify: Arc::new(Notify::new()),
+            peer_ttl_ms: DEFAULT_PEER_TTL_MS,
         }
     }
 
@@ -877,7 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn advertises_four_tools() {
+    fn advertises_all_tools() {
         let names: Vec<_> = tools_list().iter().map(|t| t.name.to_string()).collect();
         assert_eq!(
             names,
@@ -885,9 +1410,279 @@ mod tests {
                 "dialogue_say",
                 "dialogue_poll",
                 "dialogue_history",
-                "dialogue_peers"
+                "dialogue_peers",
+                "dialogue_broadcast",
+                "dialogue_multicast",
+                "dialogue_team_join",
+                "dialogue_team_leave",
+                "dialogue_teams",
+                "dialogue_prune",
             ]
         );
+    }
+
+    /// Broadcast reaches every active peer except the sender; every copy
+    /// shares one thread; each recipient's poll delivers exactly its own copy.
+    #[tokio::test]
+    async fn broadcast_fans_out_to_active_peers_except_sender() {
+        let h = DialogueHandler {
+            store: test_store().await,
+        };
+        // Three peers become known through activity.
+        for p in ["cc:a", "cc:b", "mu:d1:s1"] {
+            h.dispatch(
+                "dialogue_poll",
+                json!({"to": p, "since": 0, "timeout_ms": 0}),
+            )
+            .await
+            .unwrap();
+        }
+        let out = h
+            .dispatch(
+                "dialogue_broadcast",
+                json!({"from": "cc:a", "content": "all hands"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["count"], 2);
+        let recipients: Vec<_> = out["recipients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(recipients.contains(&"cc:b".to_string()));
+        assert!(recipients.contains(&"mu:d1:s1".to_string()));
+        assert!(!recipients.contains(&"cc:a".to_string()), "sender excluded");
+
+        // Each recipient's inbox has exactly one copy, on the shared thread.
+        let thread = out["id"].as_str().unwrap();
+        for p in ["cc:b", "mu:d1:s1"] {
+            let polled = h
+                .dispatch(
+                    "dialogue_poll",
+                    json!({"to": p, "since": 0, "timeout_ms": 0}),
+                )
+                .await
+                .unwrap();
+            let msgs = polled["messages"].as_array().unwrap();
+            assert_eq!(msgs.len(), 1, "{p} gets exactly one copy");
+            assert_eq!(msgs[0]["content"], "all hands");
+            assert_eq!(msgs[0]["session_thread"].as_str().unwrap(), thread);
+        }
+        // The sender's inbox got nothing.
+        let own = h
+            .dispatch(
+                "dialogue_poll",
+                json!({"to": "cc:a", "since": 0, "timeout_ms": 0}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(own["messages"].as_array().unwrap().len(), 0);
+        // history replays the announcement (one row per recipient).
+        let hist = h
+            .dispatch("dialogue_history", json!({"session_thread": thread}))
+            .await
+            .unwrap();
+        assert_eq!(hist["messages"].as_array().unwrap().len(), 2);
+    }
+
+    /// The role filter and the recency window narrow the broadcast set.
+    #[tokio::test]
+    async fn broadcast_respects_role_and_recency() {
+        let store = test_store().await;
+        // A stale cc peer (last_seen far in the past) and a fresh mu peer.
+        store.touch_peer("cc:old", 1000).await.unwrap();
+        store.touch_peer("mu:d1:s1", now_ms()).await.unwrap();
+        store.touch_peer("cc:fresh", now_ms()).await.unwrap();
+        let h = DialogueHandler { store };
+
+        // Default window: the stale peer is not addressed.
+        let out = h
+            .dispatch(
+                "dialogue_broadcast",
+                json!({"from": "mu:d1:s1", "content": "x"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["recipients"][0], "cc:fresh");
+
+        // Role filter: address only mu peers (sender excluded → zero).
+        let out = h
+            .dispatch(
+                "dialogue_broadcast",
+                json!({"from": "mu:d1:s1", "content": "x", "role": "mu"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["count"], 0);
+    }
+
+    /// Multicast reaches current team members only, excluding the sender;
+    /// join/leave change the set.
+    #[tokio::test]
+    async fn multicast_delivers_to_team_members() {
+        let h = DialogueHandler {
+            store: test_store().await,
+        };
+        for p in ["cc:a", "cc:b", "cc:c"] {
+            h.dispatch(
+                "dialogue_team_join",
+                json!({"team": "search", "peer_id": p}),
+            )
+            .await
+            .unwrap();
+        }
+        // A non-member never sees team traffic.
+        h.dispatch(
+            "dialogue_poll",
+            json!({"to": "cc:outsider", "since": 0, "timeout_ms": 0}),
+        )
+        .await
+        .unwrap();
+
+        let out = h
+            .dispatch(
+                "dialogue_multicast",
+                json!({"from": "cc:a", "team": "search", "content": "regroup"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["count"], 2);
+        assert_eq!(out["team"], "search");
+
+        for p in ["cc:b", "cc:c"] {
+            let polled = h
+                .dispatch(
+                    "dialogue_poll",
+                    json!({"to": p, "since": 0, "timeout_ms": 0}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(polled["messages"].as_array().unwrap().len(), 1);
+        }
+        let outsider = h
+            .dispatch(
+                "dialogue_poll",
+                json!({"to": "cc:outsider", "since": 0, "timeout_ms": 0}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outsider["messages"].as_array().unwrap().len(), 0);
+
+        // cc:b leaves; the next multicast reaches only cc:c.
+        let left = h
+            .dispatch(
+                "dialogue_team_leave",
+                json!({"team": "search", "peer_id": "cc:b"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(left["removed"], true);
+        let out = h
+            .dispatch(
+                "dialogue_multicast",
+                json!({"from": "cc:a", "team": "search", "content": "again"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["recipients"][0], "cc:c");
+
+        // Unknown team → zero recipients, not an error.
+        let out = h
+            .dispatch(
+                "dialogue_multicast",
+                json!({"from": "cc:a", "team": "ghosts", "content": "hello?"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn teams_listing_and_membership_views() {
+        let h = DialogueHandler {
+            store: test_store().await,
+        };
+        h.dispatch(
+            "dialogue_team_join",
+            json!({"team": "alpha", "peer_id": "cc:a"}),
+        )
+        .await
+        .unwrap();
+        h.dispatch(
+            "dialogue_team_join",
+            json!({"team": "alpha", "peer_id": "cc:b"}),
+        )
+        .await
+        .unwrap();
+        h.dispatch(
+            "dialogue_team_join",
+            json!({"team": "beta", "peer_id": "cc:b"}),
+        )
+        .await
+        .unwrap();
+        // join is idempotent
+        let again = h
+            .dispatch(
+                "dialogue_team_join",
+                json!({"team": "alpha", "peer_id": "cc:a"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again["members"], 2);
+
+        let all = h.dispatch("dialogue_teams", json!({})).await.unwrap();
+        let teams = all["teams"].as_array().unwrap();
+        assert_eq!(teams.len(), 2);
+
+        let alpha = h
+            .dispatch("dialogue_teams", json!({"team": "alpha"}))
+            .await
+            .unwrap();
+        assert_eq!(alpha["members"].as_array().unwrap().len(), 2);
+
+        let of_a = h
+            .dispatch("dialogue_teams", json!({"peer_id": "cc:a"}))
+            .await
+            .unwrap();
+        let of_a_teams = of_a["teams"].as_array().unwrap();
+        assert_eq!(of_a_teams.len(), 1);
+        assert_eq!(of_a_teams[0]["team"], "alpha");
+    }
+
+    /// Prune removes idle registrations and their team memberships; fresh
+    /// peers and their memberships survive.
+    #[tokio::test]
+    async fn prune_removes_stale_peers_and_memberships() {
+        let store = test_store().await;
+        store.touch_peer("cc:stale", 1000).await.unwrap();
+        store.touch_peer("cc:fresh", now_ms()).await.unwrap();
+        store.team_join("t", "cc:stale", 1000).await.unwrap();
+        store.team_join("t", "cc:fresh", now_ms()).await.unwrap();
+        let h = DialogueHandler { store };
+
+        let out = h.dispatch("dialogue_prune", json!({})).await.unwrap();
+        assert_eq!(out["removed_peers"], 1);
+        assert_eq!(out["removed_memberships"], 1);
+
+        let peers = h.dispatch("dialogue_peers", json!({})).await.unwrap();
+        let ids: Vec<_> = peers["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["peer_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["cc:fresh"]);
+        let team = h
+            .dispatch("dialogue_teams", json!({"team": "t"}))
+            .await
+            .unwrap();
+        let members = team["members"].as_array().unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0]["peer_id"], "cc:fresh");
     }
 
     #[tokio::test]

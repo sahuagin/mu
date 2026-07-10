@@ -30,6 +30,9 @@
 #   db            — sqlite path. Default ~/.local/share/agent.sqlite.
 #   allowed_hosts — comma-separated Host allow-list. Default empty = allow any
 #                   (trusted-network default; lock a public bind down here).
+#   peer_ttl_ms   — stale-peer registration TTL in ms; peers idle longer are
+#                   pruned (startup + hourly sweep). Default empty = binary
+#                   default (24h).
 #   bin           — path to the PRE-BUILT mu-dialogue binary the service execs.
 #                   Default <home>/src/public_github/mu/target/release/mu-dialogue;
 #                   sysrc it to whichever workspace you build/deploy from.
@@ -51,6 +54,7 @@ load_rc_config "$name"
 : ${mu_dialogue_listen:="0.0.0.0:7740"}
 : ${mu_dialogue_db:=""}
 : ${mu_dialogue_allowed_hosts:=""}
+: ${mu_dialogue_peer_ttl_ms:=""}
 : ${mu_dialogue_logfile:="/var/log/${name}.log"}
 
 # Resolve the run-user's home for HOME and chdir.
@@ -76,6 +80,7 @@ command_args="-r -t ${name} -P ${pidfile} -o ${mu_dialogue_logfile} \
     /usr/bin/env HOME=${mu_dialogue_home} \
     LISTEN=${mu_dialogue_listen} DATABASE_PATH=${mu_dialogue_db} \
     MU_DIALOGUE_ALLOWED_HOSTS=${mu_dialogue_allowed_hosts} \
+    MU_DIALOGUE_PEER_TTL_MS=${mu_dialogue_peer_ttl_ms} \
     ${mu_dialogue_bin}"
 required_files="${mu_dialogue_bin}"
 

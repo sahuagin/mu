@@ -91,6 +91,18 @@ impl OllamaProvider {
         Ok(Self { inner })
     }
 
+    /// Construct against an explicit base URL + key, bypassing env resolution
+    /// (mu-v8ye — the config-defined-provider path passes already-resolved
+    /// values). Same credential isolation as `from_env`: the key is whatever
+    /// the caller resolved (empty for auth-less ollama), never
+    /// `ANTHROPIC_API_KEY`.
+    pub fn with_endpoint(base_url: String, api_key: String, model: String) -> Self {
+        let inner = AnthropicProvider::new(api_key, model)
+            .with_api_base(base_url)
+            .with_ollama_thinking_flag("");
+        Self { inner }
+    }
+
     /// Configure ollama's Anthropic-compat thinking switch. Ollama treats
     /// thinking as on/off: explicit off forms disable reasoning; any other
     /// non-empty value enables summarized thinking.

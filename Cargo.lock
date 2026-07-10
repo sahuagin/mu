@@ -1804,6 +1804,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mu-openai-chat"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "mu-solo"
 version = "0.0.1"
 dependencies = [

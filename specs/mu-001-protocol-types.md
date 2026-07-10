@@ -155,8 +155,20 @@ pub enum ProviderSelector {
     OpenaiApi      { model: String },
     OpenaiOauth    { model: String },   // wraps `codex` CLI
     Openrouter     { model: String },
-    Vllm           { model: String },   // local vLLM (OpenAI-compatible); wire kind "vllm", VLLM_API_BASE
-    Ollama         { model: String },   // local ollama (OpenAI-compatible); wire kind "ollama", OLLAMA_API_BASE — bead mu-818c
+    Vllm           { model: String },   // DEPRECATED (mu-v8ye): openai-chat wire; prefer a Configured endpoint. wire kind "vllm", VLLM_API_BASE
+    Ollama         { model: String },   // local ollama (Anthropic Messages wire, mu-fmas); wire kind "ollama", OLLAMA_API_BASE — bead mu-818c
+    // Config-defined provider (mu-v8ye): a `[[providers.endpoints]]` entry
+    // resolved to (protocol, base_url, api_key) at selection time and carried
+    // self-contained on the wire. `protocol` ∈ {openai-chat, anthropic-messages,
+    // openai-responses}; endpoint override via `<NAME>_BASE_URL`. wire kind "configured".
+    Configured {
+        name:     String,
+        protocol: String,
+        base_url: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        api_key:  String,
+        model:    String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -312,7 +324,7 @@ impl ErrorEvent {
    `id = json!("a-uuid")` both round-trip. (Test both shapes.)
 5. **B-5 (provider tagged enum wire format)**: Encoding
    `ProviderSelector::AnthropicApi { model: "x" }` produces JSON
-   `{"kind":"anthropic_api","model":"x"}`. Test all 7 variants.
+   `{"kind":"anthropic_api","model":"x"}`. Test all 8 variants (incl. Configured — mu-v8ye).
 6. **B-6 (error response with optional data)**: `Response::Err` with
    `error.data = None` does NOT include a `"data"` key in the encoded
    form; with `error.data = Some(...)` it does. Verifies the

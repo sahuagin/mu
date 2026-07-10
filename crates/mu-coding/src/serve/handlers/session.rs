@@ -879,6 +879,9 @@ fn describe_selector(selector: &ProviderSelector) -> (String, String) {
         ProviderSelector::Openrouter { model } => ("openrouter".into(), model.clone()),
         ProviderSelector::Vllm { model } => ("vllm".into(), model.clone()),
         ProviderSelector::Ollama { model } => ("ollama".into(), model.clone()),
+        // mu-v8ye: label a config-defined provider by its configured name so
+        // event payloads distinguish e.g. card1 from card2.
+        ProviderSelector::Configured { name, model, .. } => (name.clone(), model.clone()),
     }
 }
 

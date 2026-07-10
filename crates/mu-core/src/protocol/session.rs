@@ -112,13 +112,42 @@ pub enum ProviderSelector {
     /// Local vLLM/OpenAI-compatible server. Wire kind `"vllm"`.
     /// Endpoint defaults to `http://127.0.0.1:8000`, overridable via
     /// `VLLM_API_BASE`; path overridable via `VLLM_API_PATH`.
+    ///
+    /// DEPRECATED (mu-v8ye): "vllm" conflated the openai-chat *wire* with a
+    /// provider *name*. Prefer a `[[providers.endpoints]]` entry with
+    /// `protocol = "openai-chat"`, selected via [`Configured`]. Retained as a
+    /// built-in so existing configs/CLI keep working.
     Vllm {
         model: String,
     },
-    /// Local ollama server (OpenAI-compatible). Wire kind `"ollama"`.
-    /// Endpoint defaults to the LAN box (`http://10.1.1.143:11434`),
-    /// overridable via `OLLAMA_API_BASE`. (bead mu-818c)
+    /// Local ollama server. Wire kind `"ollama"`. Speaks the Anthropic
+    /// Messages wire (ollama ≥ v0.14); endpoint defaults to the LAN box
+    /// (`http://10.1.1.143:11434`), overridable via `OLLAMA_API_BASE`.
+    /// (beads mu-818c, mu-fmas)
     Ollama {
+        model: String,
+    },
+    /// A config-defined provider (`[[providers.endpoints]]`, mu-v8ye). The
+    /// name resolves to a `(protocol, base_url, api_key_env)` triple at
+    /// selection time; the daemon carries the resolved parts on the wire so
+    /// the provider factory needs no config access. Wire kind `"configured"`.
+    Configured {
+        /// The config entry's `name` (for diagnostics/labels).
+        name: String,
+        /// Resolved wire protocol (kebab-case: `openai-chat`,
+        /// `anthropic-messages`, `openai-responses`).
+        protocol: String,
+        /// Resolved base URL (after any `<NAME>_BASE_URL` override).
+        base_url: String,
+        /// Resolved API key (already read from `api_key_env`, if any). Empty
+        /// for auth-less local servers.
+        ///
+        /// SECRET-BEARING: when non-empty this travels selection→daemon over
+        /// the JSON-RPC channel (trusted local IPC). Never log this variant
+        /// verbatim — redact `api_key` in any diagnostic that serializes a
+        /// `ProviderSelector`.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        api_key: String,
         model: String,
     },
 }

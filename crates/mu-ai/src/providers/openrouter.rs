@@ -37,6 +37,11 @@ pub struct OpenRouterProvider {
     model: String,
     api_base: String,
     api_path: String,
+    /// Provider label for diagnostics/event provenance. Defaults to
+    /// `"openrouter"`; a config-defined openai-chat endpoint (mu-v8ye) reuses
+    /// this provider but overrides the label with its configured name so the
+    /// trait-path label matches the event-path label (`with_label`).
+    label: &'static str,
 }
 
 impl OpenRouterProvider {
@@ -47,6 +52,7 @@ impl OpenRouterProvider {
             model,
             api_base: OPENROUTER_API_BASE.to_string(),
             api_path: OPENROUTER_API_PATH.to_string(),
+            label: "openrouter",
         }
     }
 
@@ -87,6 +93,7 @@ impl OpenRouterProvider {
             model,
             api_base,
             api_path,
+            label: "openrouter",
         })
     }
 
@@ -99,6 +106,18 @@ impl OpenRouterProvider {
     /// Override the chat-completions path (default `/api/v1/chat/completions`).
     pub fn with_api_path(mut self, path: String) -> Self {
         self.api_path = path;
+        self
+    }
+
+    /// Override the provider label (mu-v8ye). A config-defined openai-chat
+    /// endpoint reuses this provider but should report its configured name
+    /// (e.g. `"card1"`) rather than the default `"openrouter"` so the
+    /// trait-path label agrees with the event-path label. The name is leaked
+    /// to `&'static str` — providers are long-lived (one per session) and few,
+    /// so the bounded, one-time leak is acceptable and keeps the trait's
+    /// `-> &'static str` contract.
+    pub fn with_label(mut self, label: &str) -> Self {
+        self.label = Box::leak(label.to_string().into_boxed_str());
         self
     }
 }
@@ -175,11 +194,12 @@ impl Provider for OpenRouterProvider {
         Ok(apply_dialect_rescue(events_stream(bytes, cancel_rx), tools))
     }
 
-    /// Identify as `"openrouter"` so ContextAssembly events and
+    /// Identify as `"openrouter"` (or the configured name for a mu-v8ye
+    /// config-defined openai-chat endpoint) so ContextAssembly events and
     /// downstream diagnostics don't see the default `"faux"` label.
     /// Matches the snake_case wire `provider_kind` enum.
     fn provider_label(&self) -> &'static str {
-        "openrouter"
+        self.label
     }
 
     /// OpenRouter proxies to many backing models with OpenAI-style

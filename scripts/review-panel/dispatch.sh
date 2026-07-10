@@ -27,6 +27,8 @@ HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 AGENT_DISPATCH_LIB="${AGENT_DISPATCH_LIB:-$HERE/../lib/agent-dispatch.sh}"
 [ -r "$AGENT_DISPATCH_LIB" ] || { echo "dispatch.sh: missing dispatch lib: $AGENT_DISPATCH_LIB" >&2; exit 2; }
 . "$AGENT_DISPATCH_LIB"
+# mu-0htd: constrained verdict re-ask when a reviewer answers in prose.
+. "$HERE/verdict-retry.sh"
 # OpenRouter key for the metered rank — exported silently, never printed.
 OPENROUTER_API_KEY=$(tq -f "$HOME/.config/agent/config.toml" -r openrouter.api_key)
 export OPENROUTER_API_KEY
@@ -61,8 +63,22 @@ while [ "$r" -lt "$N" ]; do
   set -- $(agent-role code_review "$r"); prov="$1"; model="$2"
   tools=$(printf '%s' "$ranks_json" | jq -r ".[$r].tools // \"read,grep\"")
   max_turns=$(agent-role --max-turns code_review "$r" 2>/dev/null || true)
+  # Per-rank endpoint/lease (mu-vneb): a config-defined per-card rank pins its
+  # server + lock via agent_roles.toml `endpoint`/`lease` keys, emitted by
+  # `agent-role --env` as OLLAMA_API_BASE / OLLAMA_LEASE_NAME (or VLLM_API_BASE).
+  # Without this every ollama rank dialed the DEFAULT box (:11434) — the daily
+  # driver's card — evicting it and serialising reviewers on one lock. Empty for
+  # ranks without the keys, so unpinned rosters are unchanged. Requires
+  # agent-role with `--env` (mu#478). A stale agent-role lacking it must NOT fail
+  # silently (a reviewer flagged the swallowed error) — warn once, then degrade
+  # to the default endpoint rather than break the run.
+  rank_env=$(agent-role --env code_review "$r" 2>/dev/null) || {
+    [ -n "${_env_warned:-}" ] || { echo "dispatch.sh: 'agent-role --env' failed — per-rank endpoints DISABLED (reviewers use the default box). Update agent-role (mu#478)." >&2; _env_warned=1; }
+    rank_env=""
+  }
   tag="rank${r}.$(printf '%s' "$model" | tr '/:' '__')"
   (
+    [ -n "$rank_env" ] && eval "export $rank_env"
     warmup "$prov" "$model"
     # agent_dispatch reads TOOLS/TIMEOUT/MU/ERRLOG from scope; stdout = the model's
     # output (-> .out), stderr -> $ERRLOG (per-rank .err). claude-oauth now routes
@@ -79,6 +95,7 @@ while [ "$r" -lt "$N" ]; do
       agent_dispatch "$prov" "$model" "$PF" > "$_out"
       _rc=$?
     done
+    reask_if_unparsed "$prov" "$model" "$_out"
     echo "exit=$_rc retry=$_retry prov=$prov model=$model tools=[$tools]" > "${OUT}.${tag}.done"
   ) &
   r=$((r + 1))

@@ -16,6 +16,40 @@ def extract(s):
             s = s[a:b+1]
     return json.loads(s)
 
+
+def has_verdict(s):
+    """True if `s` yields a usable verdict. Used by --check so the dispatch
+    harness can decide whether a reviewer needs a constrained re-ask (mu-0htd):
+    local models sometimes answer in prose without any verdict, which
+    consensus can't score.
+
+    Acceptance MUST match converge.py's `parse()` exactly, or --check triggers
+    a re-ask for output converge.py would have scored fine (a reviewer flagged
+    this drift). converge.py accepts EITHER a leading `VERDICT: <x>` line (even
+    with the JSON body absent/truncated — verdict_prefix) OR a parseable JSON
+    object; mirror both here."""
+    # Leading-VERDICT-line acceptance (converge.py::verdict_prefix).
+    first = s.lstrip().splitlines()[0] if s.strip() else ""
+    if re.match(r'(?i)^VERDICT\s*:\s*(APPROVE|NEEDS[-_ ]CHANGES|REJECT)\b', first.strip()):
+        return True
+    # JSON-object acceptance.
+    try:
+        d = extract(s)
+        return isinstance(d, dict) and str(d.get('verdict', '')).lower() in (
+            'approve', 'needs-changes', 'reject')
+    except Exception:
+        return False
+
+
+# --check <file>: exit 0 if the file holds a parseable verdict, 1 otherwise.
+# No stdout — a pure predicate for shell `if`.
+if len(sys.argv) >= 3 and sys.argv[1] == '--check':
+    try:
+        ok = has_verdict(open(sys.argv[2]).read())
+    except Exception:
+        ok = False
+    sys.exit(0 if ok else 1)
+
 prefix = sys.argv[1]
 verdicts = {}
 for f in sorted(glob.glob(prefix + ".rank*.out")):

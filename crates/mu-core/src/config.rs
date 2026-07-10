@@ -530,6 +530,64 @@ pub struct ProvidersConfig {
     pub codex_auth_ranking: Vec<String>,
     /// Optional proxy used for some providers.
     pub proxy: ProxyConfig,
+    /// `[[providers.endpoints]]` — config-defined providers (mu-v8ye). Each
+    /// entry names a WHERE (`base_url`) + a WIRE (`protocol`), decoupling the
+    /// two so a local card running `llama-server` (openai-chat) vs `ollama`
+    /// (anthropic-messages) is a config choice, not a code choice. The roster's
+    /// `provider` field can then name one of these entries. Empty by default —
+    /// the built-in provider names (ollama/openrouter/…) keep working.
+    pub endpoints: Vec<ProviderEndpoint>,
+}
+
+/// One `[[providers.endpoints]]` entry: a named provider defined by its wire
+/// protocol and endpoint rather than a hardcoded Rust module (mu-v8ye).
+///
+/// ```toml
+/// [[providers.endpoints]]
+/// name       = "card1"                       # what the roster's `provider` names
+/// protocol   = "openai-chat"                 # wire: openai-chat | anthropic-messages | openai-responses
+/// base_url   = "http://10.1.1.143:11435"     # scheme://host:port (path is per-protocol default)
+/// # api_key_env = "CARD1_API_KEY"            # optional; omit for auth-less local servers
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderEndpoint {
+    /// The provider name callers select with `--provider <name>` / the roster
+    /// `provider` field. Must not collide with a built-in name.
+    pub name: String,
+    /// Wire protocol this endpoint speaks.
+    pub protocol: ProtocolKind,
+    /// Base URL (`scheme://host:port`); the request path is the protocol's
+    /// default. `<NAME>_BASE_URL` (upper-cased `name`) overrides at runtime.
+    pub base_url: String,
+    /// Optional environment variable holding the API key. Omit for local
+    /// servers that ignore auth (ollama, llama-server, vLLM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+}
+
+/// The wire protocol a provider speaks — the axis mu-v8ye splits out from the
+/// provider *name*. Three implementations exist; a config entry selects one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProtocolKind {
+    /// Anthropic Messages wire (`/v1/messages`). ollama ≥ v0.14 serves it with
+    /// full fidelity — native tool_use, thinking blocks, top-level system.
+    AnthropicMessages,
+    /// OpenAI Chat Completions wire (`/v1/chat/completions`). The primary wire
+    /// for local inference servers: llama.cpp `llama-server`, vLLM, LM Studio,
+    /// and OpenRouter. (Replaces the old `vllm` provider name — mu-v8ye.)
+    OpenaiChat,
+    /// OpenAI Responses wire (`/v1/responses`). OpenAI-hosted only (server-side
+    /// state, built-in tools); not something a local server offers.
+    OpenaiResponses,
+}
+
+impl ProvidersConfig {
+    /// Look up a config-defined endpoint by the name a caller selected.
+    pub fn endpoint(&self, name: &str) -> Option<&ProviderEndpoint> {
+        self.endpoints.iter().find(|e| e.name == name)
+    }
 }
 
 /// `[providers.proxy]` section. When `url` is set, the listed

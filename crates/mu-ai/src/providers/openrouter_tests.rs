@@ -11,6 +11,18 @@ use mu_core::agent::{
 use serde_json::json;
 
 #[test]
+fn provider_label_defaults_and_overrides() {
+    use mu_core::agent::Provider;
+    // Default label is "openrouter" (unchanged for the existing provider path).
+    let p = OpenRouterProvider::new(String::new(), "m".into());
+    assert_eq!(p.provider_label(), "openrouter");
+    // mu-v8ye: a config-defined openai-chat endpoint overrides the label with
+    // its configured name so the trait-path label matches the event-path label.
+    let p = OpenRouterProvider::new(String::new(), "m".into()).with_label("card1");
+    assert_eq!(p.provider_label(), "card1");
+}
+
+#[test]
 fn b1_translate_user_message() {
     let m = AgentMessage::User {
         content: "hi".into(),

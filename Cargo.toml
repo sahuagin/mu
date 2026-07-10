@@ -6,6 +6,7 @@ members = [
     "crates/providers/mu-anthropic",
     "crates/providers/mu-anthropic-py",
     "crates/providers/mu-openai",
+    "crates/providers/mu-openai-chat",
     "crates/mu-events-py",
     "crates/mu-coding",
     "crates/mu-tui",

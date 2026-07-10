@@ -156,6 +156,48 @@ pub fn build_provider_from_selector(
             }
             Ok(Arc::new(provider))
         }
+        // Config-defined provider (mu-v8ye): the selector already carries the
+        // resolved (protocol, base_url, api_key), so build the matching wire
+        // impl pointed at the endpoint — no env round-trip, no config access.
+        ProviderSelector::Configured {
+            name,
+            protocol,
+            base_url,
+            api_key,
+            model,
+        } => match protocol.as_str() {
+            "openai-chat" => {
+                log_thinking_ignored(name, thinking);
+                let provider = OpenRouterProvider::new(api_key.clone(), model.clone())
+                    .with_api_base(base_url.clone())
+                    .with_api_path("/v1/chat/completions".to_string())
+                    // mu-v8ye: label by the configured name so the trait-path
+                    // label agrees with the event-path label in session.rs.
+                    .with_label(name);
+                Ok(Arc::new(provider))
+            }
+            "anthropic-messages" => {
+                let mut provider =
+                    OllamaProvider::with_endpoint(base_url.clone(), api_key.clone(), model.clone());
+                if let Some(t) = thinking {
+                    if !t.is_empty() {
+                        provider = provider.with_thinking_flag(t);
+                    }
+                }
+                Ok(Arc::new(provider))
+            }
+            "openai-responses" => {
+                anyhow::bail!(
+                    "provider '{name}': protocol 'openai-responses' is OpenAI-hosted \
+                     (server-side state / built-in tools) and not yet supported as a \
+                     config-defined endpoint; use openai-codex / openai-api"
+                )
+            }
+            other => anyhow::bail!(
+                "provider '{name}': unknown protocol '{other}' \
+                 (expected: openai-chat, anthropic-messages, openai-responses)"
+            ),
+        },
     }
 }
 
@@ -191,10 +233,86 @@ pub fn selector_from_cli(name: &str, model: Option<&str>) -> Result<ProviderSele
         "ollama" => Ok(ProviderSelector::Ollama {
             model: model.unwrap_or("qwen3-coder:30b").to_string(),
         }),
-        other => anyhow::bail!(
-            "unknown provider: {other} (expected: faux, anthropic-api, openai-codex, openai, openrouter, vllm, ollama)"
-        ),
+        // Not a built-in name: try a config-defined `[[providers.endpoints]]`
+        // entry (mu-v8ye). Resolves protocol/base_url/api_key here (selection
+        // time) so the wire selector is self-contained and the daemon factory
+        // needs no config access.
+        other => {
+            let cfg = mu_core::config::Config::load_default();
+            resolve_configured_selector(&cfg.providers, other, model)
+        }
     }
+}
+
+/// Resolve a config-defined provider name to a self-contained
+/// [`ProviderSelector::Configured`] (mu-v8ye): look up the
+/// `[[providers.endpoints]]` entry, apply a `<NAME>_BASE_URL` runtime
+/// override, and read the API key from `api_key_env` (if any) — so the wire
+/// selector carries everything the factory needs.
+pub fn resolve_configured_selector(
+    providers: &mu_core::config::ProvidersConfig,
+    name: &str,
+    model: Option<&str>,
+) -> Result<ProviderSelector> {
+    let Some(ep) = providers.endpoint(name) else {
+        let known: Vec<&str> = providers
+            .endpoints
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        anyhow::bail!(
+            "unknown provider: {name} (built-ins: faux, anthropic-api, openai-codex, \
+             openai, openrouter, vllm, ollama; config-defined: {})",
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
+        );
+    };
+    let model = model.map(str::to_string).ok_or_else(|| {
+        anyhow::anyhow!(
+            "config-defined provider '{name}' requires an explicit --model (no built-in default)"
+        )
+    })?;
+    // Runtime endpoint override: <NAME>_BASE_URL (upper-cased, non-alnum → '_').
+    let env_key = format!("{}_BASE_URL", to_env_prefix(name));
+    let base_url = std::env::var(&env_key)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ep.base_url.clone());
+    let api_key = ep
+        .api_key_env
+        .as_ref()
+        .and_then(|k| std::env::var(k).ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    let protocol = match ep.protocol {
+        mu_core::config::ProtocolKind::AnthropicMessages => "anthropic-messages",
+        mu_core::config::ProtocolKind::OpenaiChat => "openai-chat",
+        mu_core::config::ProtocolKind::OpenaiResponses => "openai-responses",
+    };
+    Ok(ProviderSelector::Configured {
+        name: name.to_string(),
+        protocol: protocol.to_string(),
+        base_url,
+        api_key,
+        model,
+    })
+}
+
+/// Upper-case a provider name into an env-var prefix, mapping any non
+/// alphanumeric character to `_` (so `card-1` → `CARD_1`).
+fn to_env_prefix(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Resolve a possible SELECTION alias before `(provider, model)` reach
@@ -454,6 +572,71 @@ mod tests {
             Ok(_) => panic!("expected error"),
             Err(e) => assert!(e.to_string().contains("unknown provider")),
         }
+    }
+
+    #[test]
+    fn configured_selector_resolves_protocol_and_base() {
+        use mu_core::config::{ProtocolKind, ProviderEndpoint, ProvidersConfig};
+        let providers = ProvidersConfig {
+            endpoints: vec![ProviderEndpoint {
+                name: "card1".into(),
+                protocol: ProtocolKind::OpenaiChat,
+                base_url: "http://10.1.1.143:11435".into(),
+                api_key_env: None,
+            }],
+            ..Default::default()
+        };
+        let s = resolve_configured_selector(&providers, "card1", Some("ornith-q4-r0")).unwrap();
+        assert_eq!(
+            s,
+            ProviderSelector::Configured {
+                name: "card1".into(),
+                protocol: "openai-chat".into(),
+                base_url: "http://10.1.1.143:11435".into(),
+                api_key: String::new(),
+                model: "ornith-q4-r0".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn configured_selector_requires_model() {
+        use mu_core::config::{ProtocolKind, ProviderEndpoint, ProvidersConfig};
+        let providers = ProvidersConfig {
+            endpoints: vec![ProviderEndpoint {
+                name: "card1".into(),
+                protocol: ProtocolKind::OpenaiChat,
+                base_url: "http://x".into(),
+                api_key_env: None,
+            }],
+            ..Default::default()
+        };
+        assert!(resolve_configured_selector(&providers, "card1", None).is_err());
+    }
+
+    #[test]
+    fn configured_selector_unknown_name_lists_known() {
+        use mu_core::config::{ProtocolKind, ProviderEndpoint, ProvidersConfig};
+        let providers = ProvidersConfig {
+            endpoints: vec![ProviderEndpoint {
+                name: "card1".into(),
+                protocol: ProtocolKind::AnthropicMessages,
+                base_url: "http://x".into(),
+                api_key_env: None,
+            }],
+            ..Default::default()
+        };
+        let err = resolve_configured_selector(&providers, "nope", Some("m"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("config-defined: card1"), "got: {err}");
+    }
+
+    #[test]
+    fn env_prefix_maps_nonalnum_to_underscore() {
+        assert_eq!(to_env_prefix("card1"), "CARD1");
+        assert_eq!(to_env_prefix("card-1"), "CARD_1");
+        assert_eq!(to_env_prefix("ornith.review"), "ORNITH_REVIEW");
     }
 
     #[test]

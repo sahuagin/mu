@@ -12,6 +12,7 @@ rust-version.workspace = true
 mu-core = { path = "../mu-core" }
 mu-anthropic = { path = "../providers/mu-anthropic" }
 mu-openai = { path = "../providers/mu-openai" }
+mu-openai-chat = { path = "../providers/mu-openai-chat" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 # mu-sqn: anchors the workspace rustls-webpki security floor (see root

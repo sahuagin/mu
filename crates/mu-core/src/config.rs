@@ -1308,6 +1308,21 @@ mod tests {
     }
 
     #[test]
+    fn load_still_rejects_a_dialogue_typo() {
+        // The passthrough is targeted to exactly `dialogue` — a near-miss typo
+        // like [dialoge] is still an unknown field and must STILL reject the
+        // config (deny_unknown_fields typo-safety preserved for everything but
+        // the one section mu-core deliberately tolerates).
+        let dir = std::env::temp_dir().join(format!("mu-dialogue-typo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[dialoge.presence]\nenabled = true\n").unwrap();
+        // Rejected → degrades to defaults (same as any unknown section).
+        assert_eq!(Config::load(&[&path]), Config::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn load_layers_overlay_in_order() {
         let dir = std::env::temp_dir().join(format!("mu-l1z-layered-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

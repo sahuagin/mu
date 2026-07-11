@@ -85,6 +85,12 @@ pub struct Config {
     pub journal: JournalConfig,
     /// `[routes]` — provider route-catalog discovery knobs.
     pub routes: RoutesConfig,
+    /// `[dialogue]` — owned by the mu-dialogue server (etcd-lease presence,
+    /// crates/mu-dialogue/src/presence.rs), which reads the SAME config file.
+    /// mu-core tolerates the section without interpreting it — otherwise
+    /// `deny_unknown_fields` rejects the whole shared config and every
+    /// mu-core consumer silently falls back to built-in defaults.
+    pub dialogue: Option<toml::Value>,
 }
 
 /// `[routes]` section. Startup route-catalog discovery (mu-818c).
@@ -1007,6 +1013,34 @@ mod tests {
     fn empty_toml_parses_to_default() {
         let c: Config = toml::from_str("").expect("empty TOML must parse");
         assert_eq!(c, Config::default());
+    }
+
+    /// Regression (2026-07-10 live incident): the shared ~/.config/mu/config.toml
+    /// gained a `[dialogue.presence]` section owned by mu-dialogue; mu-core's
+    /// `deny_unknown_fields` rejected the ENTIRE file, so every consumer
+    /// (mu ask, daemon, orchestrate) silently ran on built-in defaults. The
+    /// `[dialogue]` section must parse as tolerated-and-ignored, and the rest
+    /// of the file must still populate normally.
+    #[test]
+    fn dialogue_section_is_tolerated_not_fatal() {
+        let c: Config = toml::from_str(
+            r#"
+            [session]
+            default_max_turns = 7
+
+            [dialogue.presence]
+            enabled = true
+            etcd = ["http://10.0.0.1:2379"]
+            "#,
+        )
+        .expect("config with [dialogue] section must parse");
+        // The co-resident sections still load — no silent default fallback.
+        assert_eq!(c.session.default_max_turns, Some(7));
+        // The section is carried opaquely, not interpreted.
+        assert!(c.dialogue.is_some());
+        // A genuinely unknown top-level section is still a hard error
+        // (deny_unknown_fields keeps catching real typos).
+        assert!(toml::from_str::<Config>("[dialoge]\nx = 1\n").is_err());
     }
 
     #[test]

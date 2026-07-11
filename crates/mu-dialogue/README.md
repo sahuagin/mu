@@ -29,6 +29,31 @@ Stale registrations expire: peers idle past the TTL (`--peer-ttl-ms` /
 pruned at startup and by an hourly sweep; `dialogue_prune` forces a sweep. A
 live-but-quiet peer that gets pruned simply reappears on its next say/poll.
 
+## Optional etcd-lease presence
+
+Real liveness (push-mailbox spec §1) is **opt-in** so a bare mu install needs
+no etcd. Enable it in the mu config:
+
+```toml
+# ~/.config/mu/config.toml  (or $MU_CONFIG)
+[dialogue.presence]
+enabled = true
+etcd    = ["http://<etcd-host>:2379"]   # endpoints, tried in order
+# prefix = "/mu/dialogue/v1/peers/"     # default
+```
+
+A consumer registers **its own mailbox**: a key `"<prefix><peer_id>"` (value:
+`{"peer_id","role","registered_at_unix_ms"}`) held by an etcd **lease** the
+client keeps alive. The lease IS the liveness proof — it expires on death, so
+a listed key means live *right now*. With presence enabled the server reads
+that keyspace (etcd v3 JSON gateway, no gRPC dependency): `dialogue_peers`
+reports lease-live peers with `"presence":"lease"` (activity-derived rows are
+marked `"activity"`), and `dialogue_broadcast` addresses lease-live peers even
+if they have never said/polled. etcd unreachable → **fail-open** to
+activity-derived behavior for that call; section absent or `enabled = false` →
+exactly the pre-etcd behavior (activity presence + the TTL sweep), no network
+touched.
+
 ## Broadcast (PA system) and multicast (teams)
 
 Both fan out **one durable mailbox row per recipient**, all sharing one thread,

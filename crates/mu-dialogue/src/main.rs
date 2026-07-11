@@ -46,6 +46,8 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 use ulid::Ulid;
 
+mod presence;
+
 const SERVER_NAME: &str = "mu-dialogue";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_POLL_TIMEOUT_MS: u64 = 30_000;
@@ -76,6 +78,31 @@ struct Store {
     /// Stale-peer cutoff: registrations idle longer than this are pruned
     /// (startup, the periodic sweep, and dialogue_prune's default).
     peer_ttl_ms: i64,
+    /// Optional etcd-lease presence (config-gated; see src/presence.rs).
+    /// None = the section is absent/disabled and no network is ever touched.
+    presence: Option<Presence>,
+}
+
+#[derive(Clone)]
+struct Presence {
+    cfg: presence::PresenceConfig,
+    http: reqwest::Client,
+}
+
+impl Store {
+    /// Lease-live peers from etcd, or None when presence is disabled OR etcd
+    /// is unreachable (fail-open: a presence outage degrades to
+    /// activity-derived behavior, it never blocks messaging).
+    async fn lease_live(&self) -> Option<Vec<presence::LeasePeer>> {
+        let p = self.presence.as_ref()?;
+        match presence::lease_peers(&p.http, &p.cfg).await {
+            Ok(peers) => Some(peers),
+            Err(e) => {
+                warn!("etcd presence unavailable, falling back to activity-derived: {e:#}");
+                None
+            }
+        }
+    }
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -616,7 +643,50 @@ async fn handle_peers(store: &Store, args: PeersArgs) -> Result<Value> {
         .map(|w| now - w)
         .unwrap_or(0);
     let peers = store.list_peers(args.role.as_deref(), active_since).await?;
-    Ok(json!({ "peers": peers, "now": now }))
+    let lease = store.lease_live().await;
+    let Some(lease) = lease else {
+        // Presence disabled (or etcd down, fail-open): the original shape.
+        return Ok(json!({ "peers": peers, "now": now }));
+    };
+
+    // Merge: lease-live peers are authoritative (live RIGHT NOW by lease
+    // expiry, so they bypass the recency filter); activity-derived rows are
+    // compatibility presence, each marked so callers can tell them apart.
+    let lease_ids: std::collections::HashSet<&str> =
+        lease.iter().map(|p| p.peer_id.as_str()).collect();
+    let mut out: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in &peers {
+        let src = if lease_ids.contains(p.peer_id.as_str()) {
+            "lease"
+        } else {
+            "activity"
+        };
+        seen.insert(p.peer_id.clone());
+        out.push(json!({
+            "peer_id": p.peer_id, "role": p.role,
+            "first_seen": p.first_seen, "last_seen": p.last_seen,
+            "presence": src,
+        }));
+    }
+    for lp in &lease {
+        if seen.contains(&lp.peer_id) {
+            continue;
+        }
+        if let Some(role) = &args.role {
+            if role != &lp.role {
+                continue;
+            }
+        }
+        // Never said/polled (pure lease registration): live now, no activity
+        // timestamps to report beyond its registration time.
+        out.push(json!({
+            "peer_id": lp.peer_id, "role": lp.role,
+            "first_seen": lp.registered_at, "last_seen": Value::Null,
+            "presence": "lease",
+        }));
+    }
+    Ok(json!({ "peers": out, "now": now, "presence_backend": "etcd" }))
 }
 
 /// PA system: deliver one announcement to every peer active within the window
@@ -632,12 +702,23 @@ async fn handle_broadcast(store: &Store, args: BroadcastArgs) -> Result<Value> {
         .active_within_ms
         .filter(|w| *w > 0)
         .unwrap_or(DEFAULT_BROADCAST_WINDOW_MS);
-    let recipients: Vec<String> = store
+    let mut recipients: Vec<String> = store
         .active_peer_ids(args.role.as_deref(), now - window)
         .await?
         .into_iter()
         .filter(|p| p != &args.from)
         .collect();
+    // Lease-live peers are in the building by definition — address them even
+    // if they've never said/polled (pure lease registration).
+    if let Some(lease) = store.lease_live().await {
+        let have: std::collections::HashSet<String> = recipients.iter().cloned().collect();
+        for lp in lease {
+            let role_ok = args.role.as_deref().is_none_or(|r| r == lp.role);
+            if role_ok && lp.peer_id != args.from && !have.contains(&lp.peer_id) {
+                recipients.push(lp.peer_id);
+            }
+        }
+    }
     let (thread, ts) = store
         .fan_out(
             &args.from,
@@ -1123,10 +1204,32 @@ fn open_store(peer_ttl_ms: i64) -> Result<Store> {
         Connection::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
     conn.execute_batch("PRAGMA journal_mode = WAL;")?;
     migrate(&conn).context("schema migration")?;
+    // Optional etcd-lease presence: enabled only by [dialogue.presence]
+    // enabled=true in the mu config — a bare install runs without etcd.
+    let cfg_path = presence::default_config_path();
+    let presence = match presence::load(&cfg_path) {
+        Some(cfg) => {
+            info!(etcd = ?cfg.etcd, prefix = %cfg.prefix,
+                  "etcd-lease presence ENABLED ({})", cfg_path.display());
+            Some(Presence {
+                cfg,
+                http: reqwest::Client::new(),
+            })
+        }
+        None => {
+            info!(
+                "etcd-lease presence disabled (no [dialogue.presence] enabled=true in {}); \
+                 using activity-derived presence + TTL sweep",
+                cfg_path.display()
+            );
+            None
+        }
+    };
     Ok(Store {
         db: Arc::new(Mutex::new(conn)),
         notify: Arc::new(Notify::new()),
         peer_ttl_ms,
+        presence,
     })
 }
 
@@ -1241,6 +1344,7 @@ mod tests {
             db: Arc::new(Mutex::new(conn)),
             notify: Arc::new(Notify::new()),
             peer_ttl_ms: DEFAULT_PEER_TTL_MS,
+            presence: None,
         }
     }
 

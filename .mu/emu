@@ -86,6 +86,16 @@ case "$name" in
             --mu-binary "$target/mu" \
             "$@" ;;
     *)
-        ( cd "$root" && cargo build --release --bin "$name" )
+        # Auto-build DISABLED (operator, 2026-07-10): exec the prebuilt binary,
+        # do NOT rebuild on launch. The checkout is shared by concurrent sessions
+        # that routinely have uncommitted WIP in the working copy, so a
+        # build-on-launch could silently compile an unintended tree. Rebuild
+        # deliberately on a repo update instead:
+        #   cargo build --release --all-features --all-targets
+        # (mu-solo already skipped its build for the same reason.)
+        if [ ! -x "$target/$name" ]; then
+            echo "emu: $target/$name is not built — run 'cargo build --release --bin $name' (or --all-targets) from $root" >&2
+            exit 1
+        fi
         exec "$target/$name" "$@" ;;
 esac

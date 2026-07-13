@@ -348,6 +348,26 @@ impl Sessions {
         self.inner.lock().ok()?.get(id).map(|s| s.input_tx.clone())
     }
 
+    /// Ids of sessions that are actually LIVE on this daemon — the `inner`
+    /// registry plus spawned `workers`. Rehydrated entries are read-only
+    /// ghosts loaded from disk and deliberately excluded: presence
+    /// registration (serve/presence.rs) must never claim liveness for them.
+    /// Same lock-then-clone-then-drop pattern as the other accessors.
+    pub fn live_session_ids(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if let Ok(map) = self.inner.lock() {
+            out.extend(map.keys().cloned());
+        }
+        if let Ok(map) = self.workers.lock() {
+            for sid in map.keys() {
+                if !out.contains(sid) {
+                    out.push(sid.clone());
+                }
+            }
+        }
+        out
+    }
+
     /// Snapshot of every session for the discovery layer. Returns
     /// `(session_id, event_log, parent_session_id)` triples. The
     /// caller derives `SessionInfo` from these. Includes both live and

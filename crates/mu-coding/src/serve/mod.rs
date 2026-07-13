@@ -21,6 +21,7 @@ mod mailbox;
 pub mod mcp;
 pub mod mcp_client;
 mod pipeline;
+mod presence;
 mod provider_status;
 mod sessions;
 pub(crate) mod worker;
@@ -384,6 +385,18 @@ where
         }
         sessions.insert_rehydrated(sup_id, sup_log, None);
         tracing::info!(daemon_id = %daemon_info.daemon_id(), "registered supervisor mailbox");
+    }
+    // Optional etcd-lease presence (push-mailbox spec, mu-daemon slice):
+    // register this daemon + its live sessions on the dialogue channel under
+    // one lease. Production-only (events_dir set - same hermeticity posture
+    // as the supervisor mailbox above) AND config-gated: without
+    // [dialogue.presence] enabled=true this spawns nothing and touches no
+    // network, so a bare mu install needs no etcd.
+    if daemon_info.events_dir().is_some() {
+        if let Some(pcfg) = presence::from_config(daemon_info.config().dialogue.as_ref()) {
+            tracing::info!(etcd = ?pcfg.etcd, "dialogue presence: enabled (etcd lease)");
+            presence::spawn(pcfg, daemon_info.daemon_id().to_string(), sessions.clone());
+        }
     }
     // mu-935: when events_dir is configured (mu-upb's on-disk JSONL
     // path), wrap the local backend with FileBackend so session.list

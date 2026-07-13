@@ -30,6 +30,12 @@ tracing-subscriber = { workspace = true }
 rusqlite = { workspace = true }
 shlex = { workspace = true }
 sha2 = { workspace = true }
+# serve/presence.rs: optional etcd-lease session presence over the v3 JSON
+# gateway. reqwest is already in the tree via rmcp's reqwest transport and
+# base64 is a workspace dep, so this is opt-in at runtime with ~zero compile
+# cost (hence no cargo feature).
+reqwest = { workspace = true }
+base64 = { workspace = true }
 # mu-7rk (mu-yox): constant-time BEARER digest compare in serve::auth.
 subtle = { workspace = true }
 # mu-038: pluggable session discovery (async trait + random daemon_id)

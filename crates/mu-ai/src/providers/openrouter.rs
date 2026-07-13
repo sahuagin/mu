@@ -11,7 +11,6 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{BoxStream, Stream, StreamExt};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
@@ -697,108 +696,36 @@ pub(crate) fn build_request_body_from_projection(
 // Response side: SSE → ProviderEvent
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct OpenAiChunk {
-    #[serde(default)]
-    choices: Vec<OpenAiChoice>,
-    /// Usage may arrive in a separate chunk after choices stop
-    /// streaming. With `stream_options.include_usage = true`, the
-    /// backend emits one final chunk with `choices: []` and `usage`
-    /// populated. We capture it whenever present (defensive — some
-    /// providers attach it to the last content chunk instead).
-    #[serde(default)]
-    usage: Option<OpenAiUsage>,
-}
+// Chat-completions streaming chunk types come from the standalone
+// `mu-openai-chat` wire crate (mu-14a4) rather than being redefined here: the
+// crate's `ChatCompletionChunk`/`ChatChoice`/`ChatDelta`/`ToolCallDelta`/
+// `FunctionDelta`/`Usage` are byte-matched to this same wire (promoted from
+// these exact structs) and unit-tested there. This makes the crate a real
+// consumer (was dead code) and removes the duplicate definitions. The
+// mu↔wire translation (below) stays here — the consumer owns translation.
+use mu_openai_chat::{ChatCompletionChunk, Usage as WireUsage};
 
-#[derive(Debug, Deserialize, Default)]
-#[allow(dead_code)]
-struct OpenAiUsage {
-    #[serde(default)]
-    prompt_tokens: Option<u64>,
-    #[serde(default)]
-    completion_tokens: Option<u64>,
-    #[serde(default)]
-    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
-    #[serde(default)]
-    completion_tokens_details: Option<OpenAiCompletionTokensDetails>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[allow(dead_code)]
-struct OpenAiPromptTokensDetails {
-    #[serde(default)]
-    cached_tokens: Option<u64>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[allow(dead_code)]
-struct OpenAiCompletionTokensDetails {
-    #[serde(default)]
-    reasoning_tokens: Option<u64>,
-}
-
-impl OpenAiUsage {
-    fn to_usage(&self) -> Usage {
-        Usage {
-            input_tokens: self.prompt_tokens.unwrap_or(0),
-            output_tokens: self.completion_tokens.unwrap_or(0),
-            cache_read_input_tokens: self
-                .prompt_tokens_details
-                .as_ref()
-                .and_then(|d| d.cached_tokens),
-            cache_creation_input_tokens: None,
-            cache_creation_5m_input_tokens: None,
-            cache_creation_1h_input_tokens: None,
-            reasoning_tokens: self
-                .completion_tokens_details
-                .as_ref()
-                .and_then(|d| d.reasoning_tokens),
-        }
+/// Convert the wire crate's `Usage` into mu's accounting `Usage`. (Was
+/// `OpenAiUsage::to_usage`; the crate type is pure wire data, so the mu-side
+/// mapping lives here.) `prompt_tokens` is the TOTAL prompt; `cached_tokens`
+/// is a subset reported as a cache read. Anthropic-style cache-creation
+/// fields have no chat-completions equivalent.
+fn wire_usage_to_mu(u: &WireUsage) -> Usage {
+    Usage {
+        input_tokens: u.prompt_tokens.unwrap_or(0),
+        output_tokens: u.completion_tokens.unwrap_or(0),
+        cache_read_input_tokens: u
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens),
+        cache_creation_input_tokens: None,
+        cache_creation_5m_input_tokens: None,
+        cache_creation_1h_input_tokens: None,
+        reasoning_tokens: u
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens),
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct OpenAiChoice {
-    #[serde(default)]
-    delta: OpenAiDelta,
-    #[serde(default)]
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[allow(dead_code)]
-struct OpenAiDelta {
-    #[serde(default)]
-    content: Option<String>,
-    /// Thinking-model reasoning channel. ollama's OpenAI-compat endpoint
-    /// streams reasoning here (some servers spell it `reasoning_content`).
-    /// Without this field serde silently drops it — turns end text_len=0
-    /// while output_tokens shows the model reasoned (mu-mdds).
-    #[serde(default, alias = "reasoning_content")]
-    reasoning: Option<String>,
-    #[serde(default)]
-    tool_calls: Option<Vec<OpenAiToolCallDelta>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct OpenAiToolCallDelta {
-    index: u32,
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default, rename = "function")]
-    function: Option<OpenAiFunctionDelta>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct OpenAiFunctionDelta {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    arguments: Option<String>,
 }
 
 fn map_finish_reason(s: Option<&str>) -> StopReason {
@@ -921,7 +848,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
             ));
         }
 
-        let chunk: OpenAiChunk = match serde_json::from_str(&sse_event.data) {
+        let chunk: ChatCompletionChunk = match serde_json::from_str(&sse_event.data) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %e, data = %sse_event.data, "failed to parse openrouter chunk");
@@ -934,7 +861,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
         // populated usage; without it, some backends embed usage on
         // the last content chunk. Either way, latest non-None wins.
         if let Some(u) = chunk.usage.as_ref() {
-            state.usage = Some(u.to_usage());
+            state.usage = Some(wire_usage_to_mu(u));
         }
 
         // Process every choice (typically just one, choices[0]).

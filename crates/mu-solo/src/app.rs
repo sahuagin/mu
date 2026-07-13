@@ -539,6 +539,19 @@ fn done_receipt_ask_ids(params: &Value) -> Vec<i64> {
         .unwrap_or_default()
 }
 
+/// mu-z9ol: may a RECEIPTLESS finished-main terminal settle the oldest
+/// awaited interjection? Only on a daemon that has never minted a receipt
+/// (persist_events_to_disk = false — nothing would ever settle by id there).
+/// Once any receipt has been seen, the daemon tickets every ask, so a
+/// receiptless done is a wakeup/autonomous turn, not an ask response.
+fn should_blind_settle_receiptless_terminal(
+    receipts_seen: bool,
+    finished_main: bool,
+    awaiting_count: usize,
+) -> bool {
+    !receipts_seen && finished_main && awaiting_count > 0
+}
+
 fn should_await_queued_main(
     finished_main: bool,
     pending_interjection_count: usize,
@@ -851,6 +864,13 @@ pub struct App {
     /// `queued_interjection_ask_ids` because the terminal notification and
     /// RPC response can arrive in either order. Ordered oldest-first.
     queued_interjection_awaiting_done_ids: Vec<i64>,
+    /// mu-z9ol: latched true the first time any main-session terminal carries
+    /// `command_receipts`. A daemon that has demonstrably minted one ticket
+    /// mints them for every ask (WP4 disk-backed path), so once set, the
+    /// receiptless-terminal settle fallback is disabled — a receiptless done
+    /// on such a daemon is a wakeup/autonomous turn, not an ask response, and
+    /// must not settle an awaited interjection (panel reviewer finding).
+    done_receipts_seen: bool,
     /// Main-session prompts submitted while a previous main-session ask is
     /// still streaming or waiting for its queued response. Rendered as live
     /// annotations and committed after that turn,
@@ -1781,6 +1801,7 @@ impl App {
             queued_interjection_ask_ids: std::collections::HashSet::new(),
             awaiting_queued_interjection_response: false,
             queued_interjection_awaiting_done_ids: Vec::new(),
+            done_receipts_seen: false,
             pending_interjections: Vec::new(),
             live_turn: None,
             transcript: Transcript::new(),
@@ -5576,6 +5597,7 @@ impl App {
                 if sid.is_empty() || sid == self.session_id {
                     let receipt_ids = done_receipt_ask_ids(params);
                     if !receipt_ids.is_empty() {
+                        self.done_receipts_seen = true;
                         self.queued_interjection_awaiting_done_ids
                             .retain(|awaited| !receipt_ids.contains(awaited));
                         for p in &mut self.pending_interjections {
@@ -5583,19 +5605,21 @@ impl App {
                                 p.settled = true;
                             }
                         }
-                    } else if finished_main
-                        && !self.queued_interjection_awaiting_done_ids.is_empty()
-                    {
-                        // No receipts on a finished main terminal: a daemon
-                        // running without disk-backed session logs
-                        // (persist_events_to_disk = false) never mints
-                        // tickets, so nothing would EVER settle by id. Keep
-                        // the pre-receipt semantics there — one finished
-                        // main turn settles the oldest awaited response. On
-                        // the default (persisted) path every ask-done
-                        // carries receipts, so this arm only sees wakeup/
-                        // autonomous dones, which the old heuristic
-                        // miscounted the same way.
+                    } else if should_blind_settle_receiptless_terminal(
+                        self.done_receipts_seen,
+                        finished_main,
+                        self.queued_interjection_awaiting_done_ids.len(),
+                    ) {
+                        // No receipts on a finished main terminal, and this
+                        // daemon has never minted one: it is running without
+                        // disk-backed session logs (persist_events_to_disk =
+                        // false), where nothing would EVER settle by id. Keep
+                        // the pre-receipt semantics there — one finished main
+                        // turn settles the oldest awaited response. Once any
+                        // receipt has been seen (done_receipts_seen), the
+                        // daemon demonstrably tickets every ask, so a
+                        // receiptless done is a wakeup/autonomous turn and
+                        // must NOT settle an awaited interjection.
                         self.queued_interjection_awaiting_done_ids.remove(0);
                     }
                 }
@@ -6582,6 +6606,22 @@ mod tests {
         assert_eq!(still_owed, vec![14]);
         // and with everything settled, nothing awaits → no busy bridge
         assert!(!should_await_queued_main(true, 0, still_owed.len() - 1));
+    }
+
+    /// mu-z9ol hardening (panel finding): once the daemon has minted any
+    /// receipt, a receiptless done (wakeup/autonomous) must never settle an
+    /// awaited interjection; blind settling is only for never-receipted
+    /// daemons (persist_events_to_disk = false).
+    #[test]
+    fn z9ol_receiptless_terminal_settles_only_on_never_receipted_daemon() {
+        // legacy daemon: no receipt ever seen → old semantics preserved
+        assert!(should_blind_settle_receiptless_terminal(false, true, 1));
+        // persisted daemon: receipts seen → wakeup dones settle nothing
+        assert!(!should_blind_settle_receiptless_terminal(true, true, 1));
+        // nothing awaited → nothing to settle either way
+        assert!(!should_blind_settle_receiptless_terminal(false, true, 0));
+        // not a finished main terminal → out of scope
+        assert!(!should_blind_settle_receiptless_terminal(false, false, 1));
     }
 
     #[test]

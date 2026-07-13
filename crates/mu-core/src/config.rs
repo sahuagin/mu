@@ -85,6 +85,14 @@ pub struct Config {
     pub journal: JournalConfig,
     /// `[routes]` — provider route-catalog discovery knobs.
     pub routes: RoutesConfig,
+    /// `[dialogue]` — NOT consumed by mu-core; owned by the mu-dialogue binary
+    /// (etcd-lease presence etc., mu#482). The operator config is SHARED by both
+    /// mu-core (`mu ask`/daemon) and mu-dialogue, so mu-core must TOLERATE the
+    /// section it does not own — otherwise `deny_unknown_fields` rejects the
+    /// ENTIRE config and silently drops back to defaults (no MCP servers, no
+    /// providers). Accepted-and-ignored here as opaque passthrough.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialogue: Option<toml::Value>,
 }
 
 /// `[routes]` section. Startup route-catalog discovery (mu-818c).
@@ -1274,6 +1282,43 @@ mod tests {
         std::fs::write(&path, "[session]\nno_such_field_xyz = 1\n").unwrap();
         let c = Config::load(&[&path]);
         assert_eq!(c, Config::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_tolerates_dialogue_section_owned_by_mu_dialogue() {
+        // The operator config is SHARED with the mu-dialogue binary (mu#482).
+        // mu-core must accept-and-ignore its [dialogue] section, NOT reject the
+        // whole config — otherwise a real [providers]/[[mcp.servers]] config is
+        // silently dropped to defaults. Regression for the mu#482 config-break.
+        let dir = std::env::temp_dir().join(format!("mu-dialogue-tol-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[dialogue.presence]\nenabled = true\netcd = [\"http://10.1.1.172:2379\"]\n\n[session]\ndefault_max_turns = 7\n",
+        )
+        .unwrap();
+        let c = Config::load(&[&path]);
+        // Config loaded (NOT dropped to defaults): the [session] value survived.
+        assert_eq!(c.session.default_max_turns, Some(7));
+        // The unowned [dialogue] section was retained as opaque passthrough.
+        assert!(c.dialogue.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_still_rejects_a_dialogue_typo() {
+        // The passthrough is targeted to exactly `dialogue` — a near-miss typo
+        // like [dialoge] is still an unknown field and must STILL reject the
+        // config (deny_unknown_fields typo-safety preserved for everything but
+        // the one section mu-core deliberately tolerates).
+        let dir = std::env::temp_dir().join(format!("mu-dialogue-typo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[dialoge.presence]\nenabled = true\n").unwrap();
+        // Rejected → degrades to defaults (same as any unknown section).
+        assert_eq!(Config::load(&[&path]), Config::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

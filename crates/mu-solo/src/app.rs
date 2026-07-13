@@ -483,6 +483,11 @@ struct PendingInterjection {
     request_id: i64,
     body: String,
     timing: PendingInterjectionTiming,
+    /// mu-z9ol: a terminal Done named this ask in its receipts before
+    /// the block was committed — the ask was absorbed into an earlier
+    /// turn (or closed out by a synthetic terminal Done), so once
+    /// committed it must NOT be awaited as a separate response.
+    settled: bool,
 }
 
 impl PendingInterjection {
@@ -491,6 +496,7 @@ impl PendingInterjection {
             request_id,
             body: body.into(),
             timing,
+            settled: false,
         }
     }
 
@@ -515,15 +521,22 @@ fn main_session_busy_state(
         || queued_interjection_response_count > 0
 }
 
-fn queued_responses_after_terminal(
-    finished_main: bool,
-    queued_interjection_response_count: usize,
-) -> usize {
-    if finished_main {
-        queued_interjection_response_count.saturating_sub(1)
-    } else {
-        queued_interjection_response_count
-    }
+/// mu-z9ol: request ids named in a terminal event's `command_receipts`.
+/// A Done's receipts are the exact set of asks it satisfied — several
+/// asks can share one Done when a mid-ask user message is absorbed into
+/// the running ask (spec mu-046 WP4). Only i64 ids are kept: that is
+/// the id space this client issues (`MuClient::request_nowait`), and
+/// receipts from other connections' commands must not match ours.
+fn done_receipt_ask_ids(params: &Value) -> Vec<i64> {
+    params
+        .get("command_receipts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| r.get("request_id").and_then(|id| id.as_i64()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn should_await_queued_main(
@@ -556,6 +569,20 @@ fn should_clear_queued_interjection_state_after_cancel(
     target_is_main_session: bool,
 ) -> bool {
     canceled && target_is_main_session
+}
+
+/// mu-z9ol escape hatch: cancel came back `canceled=false` — the daemon
+/// has nothing in flight for this session — while the client still holds
+/// queued-interjection state. That projection is stale by definition
+/// (every accepted ask's ticket rides out on exactly one Done, so a
+/// truly outstanding ask means a non-idle daemon); recover instead of
+/// leaving the session wedged with no in-band escape.
+fn should_recover_stale_queued_interjection_state(
+    canceled: bool,
+    target_is_main_session: bool,
+    queued_state_armed: bool,
+) -> bool {
+    !canceled && target_is_main_session && queued_state_armed
 }
 
 fn pending_interjection_preview_label(pending: &[PendingInterjection]) -> &'static str {
@@ -818,11 +845,12 @@ pub struct App {
     /// its own terminal done/error yet. This is the UI/session-busy bridge for
     /// the gap where `live_turn` is None but the daemon is not actually idle.
     awaiting_queued_interjection_response: bool,
-    /// Number of committed interjection prompts whose assistant responses have
-    /// not yet produced a terminal `session.done` / `session.error`. Kept
-    /// separately from JSON-RPC request ids because the terminal notification
-    /// and RPC response can arrive in either order.
-    queued_interjection_response_count: usize,
+    /// Ask request ids of committed interjection prompts whose responses have
+    /// not yet been settled by a terminal `session.done` / `session.error`
+    /// naming them in its `command_receipts` (mu-z9ol). Kept separately from
+    /// `queued_interjection_ask_ids` because the terminal notification and
+    /// RPC response can arrive in either order. Ordered oldest-first.
+    queued_interjection_awaiting_done_ids: Vec<i64>,
     /// Main-session prompts submitted while a previous main-session ask is
     /// still streaming or waiting for its queued response. Rendered as live
     /// annotations and committed after that turn,
@@ -1752,7 +1780,7 @@ impl App {
             pending_ask_ids: std::collections::HashSet::new(),
             queued_interjection_ask_ids: std::collections::HashSet::new(),
             awaiting_queued_interjection_response: false,
-            queued_interjection_response_count: 0,
+            queued_interjection_awaiting_done_ids: Vec::new(),
             pending_interjections: Vec::new(),
             live_turn: None,
             transcript: Transcript::new(),
@@ -2379,8 +2407,8 @@ impl App {
                             self.pending_interjections.retain(|p| p.request_id != id);
                             let removed_pending = self.pending_interjections.len() != before;
                             if !removed_pending {
-                                self.queued_interjection_response_count =
-                                    self.queued_interjection_response_count.saturating_sub(1);
+                                self.queued_interjection_awaiting_done_ids
+                                    .retain(|awaited| *awaited != id);
                             }
                             self.set_flash("queued interjection failed".to_string());
                             // Record in the transcript (fullscreen render +
@@ -2402,7 +2430,7 @@ impl App {
                             let wrap = width.saturating_sub(2);
                             let has_queued_interjections = !self.pending_interjections.is_empty()
                                 || !self.queued_interjection_ask_ids.is_empty()
-                                || self.queued_interjection_response_count > 0;
+                                || !self.queued_interjection_awaiting_done_ids.is_empty();
                             self.live_turn = None;
                             if has_queued_interjections {
                                 // Later queued ask_session requests have already been sent to the
@@ -2410,11 +2438,11 @@ impl App {
                                 // because the leading ask failed at RPC level: their own responses
                                 // may still arrive. Commit the queued user blocks now so any later
                                 // assistant turn does not land without the prompt that caused it.
-                                let newly_committed =
-                                    self.commit_pending_interjections(vp, wrap)?;
-                                self.queued_interjection_response_count += newly_committed;
+                                let newly_awaited = self.commit_pending_interjections(vp, wrap)?;
+                                self.queued_interjection_awaiting_done_ids
+                                    .extend(newly_awaited);
                                 self.awaiting_queued_interjection_response =
-                                    self.queued_interjection_response_count > 0
+                                    !self.queued_interjection_awaiting_done_ids.is_empty()
                                         || !self.queued_interjection_ask_ids.is_empty();
                                 self.streaming_route = if self.awaiting_queued_interjection_response
                                 {
@@ -2425,7 +2453,7 @@ impl App {
                             } else {
                                 self.streaming_route = None;
                                 self.awaiting_queued_interjection_response = false;
-                                self.queued_interjection_response_count = 0;
+                                self.queued_interjection_awaiting_done_ids.clear();
                             }
                             // Terminal repaint (mu-d2hx): no session.done will
                             // come for this ask, so THIS arm must transition
@@ -3305,8 +3333,17 @@ impl App {
             self.awaiting_queued_interjection_response,
             self.pending_interjections.len(),
             self.queued_interjection_ask_ids.len(),
-            self.queued_interjection_response_count,
+            self.queued_interjection_awaiting_done_ids.len(),
         )
+    }
+
+    /// Any queued-interjection bookkeeping still armed — pending blocks,
+    /// outstanding ask ids, awaited dones, or the busy-bridge flag.
+    fn queued_interjection_state_armed(&self) -> bool {
+        self.awaiting_queued_interjection_response
+            || !self.pending_interjections.is_empty()
+            || !self.queued_interjection_ask_ids.is_empty()
+            || !self.queued_interjection_awaiting_done_ids.is_empty()
     }
 
     fn clear_queued_interjection_bridge_if_idle(&mut self) {
@@ -3317,7 +3354,7 @@ impl App {
             .unwrap_or(false);
         if self.queued_interjection_ask_ids.is_empty()
             && self.pending_interjections.is_empty()
-            && self.queued_interjection_response_count == 0
+            && self.queued_interjection_awaiting_done_ids.is_empty()
             && !live_main
         {
             self.awaiting_queued_interjection_response = false;
@@ -3335,7 +3372,7 @@ impl App {
             self.pending_ask_ids.remove(&id);
         }
         self.pending_interjections.clear();
-        self.queued_interjection_response_count = 0;
+        self.queued_interjection_awaiting_done_ids.clear();
         self.awaiting_queued_interjection_response = false;
         if self.live_turn.is_none() && self.streaming_route == Some(TurnRoute::Main) {
             self.streaming_route = None;
@@ -3430,14 +3467,23 @@ impl App {
         Ok(())
     }
 
+    /// Commit every pending interjection block to the transcript (and
+    /// inline scrollback), returning the request ids of the ones that
+    /// still owe a response — i.e. the UNSETTLED ones (mu-z9ol). A
+    /// settled interjection was already named in a terminal Done's
+    /// receipts: its response is the turn that just committed, so it
+    /// must not be awaited again.
     fn commit_pending_interjections(
         &mut self,
         vp: &mut DynamicViewport,
         wrap_width: usize,
-    ) -> Result<usize> {
+    ) -> Result<Vec<i64>> {
         let pending = std::mem::take(&mut self.pending_interjections);
-        let committed = pending.len();
+        let mut still_owed = Vec::new();
         for interjection in pending {
+            if !interjection.settled {
+                still_owed.push(interjection.request_id);
+            }
             let label = interjection.label();
             let mut block =
                 TranscriptBlock::new(TranscriptKind::User, label, interjection.body.clone());
@@ -3454,7 +3500,7 @@ impl App {
                 })?;
             }
         }
-        Ok(committed)
+        Ok(still_owed)
     }
 
     /// Show the "you" block in scrollback without sending anything.
@@ -4519,6 +4565,7 @@ impl App {
 
     fn cmd_cancel_with_reason(&mut self, vp: &mut DynamicViewport, reason: &str) -> Result<()> {
         let sid = self.cancel_target_session_id();
+        let mut recovered_stale_queued_state = false;
         let feedback = match self.client.request(
             "session.cancel_outstanding",
             serde_json::json!({
@@ -4542,6 +4589,23 @@ impl App {
                     target_is_main_session,
                 ) {
                     self.clear_queued_interjection_state_after_cancel();
+                } else if should_recover_stale_queued_interjection_state(
+                    canceled,
+                    target_is_main_session,
+                    self.queued_interjection_state_armed(),
+                ) {
+                    // mu-z9ol escape hatch: the daemon reports nothing in
+                    // flight, so any client-side queued/awaiting projection
+                    // is stale by definition. Commit queued prompt text
+                    // first (never drop operator input), then reset the
+                    // bridge so dispatch returns to the idle path. Without
+                    // this, a desynced session stays wedged with no in-band
+                    // recovery — Esc was the natural escape and it refused.
+                    let width = vp.area().width as usize;
+                    let wrap = width.saturating_sub(2);
+                    let _ = self.commit_pending_interjections(vp, wrap)?;
+                    self.clear_queued_interjection_state_after_cancel();
+                    recovered_stale_queued_state = true;
                 }
                 if canceled {
                     CancelFeedback::Canceled {
@@ -4560,7 +4624,13 @@ impl App {
                 error: e.to_string(),
             },
         };
-        self.set_flash(feedback.flash());
+        if recovered_stale_queued_state {
+            // The recovery is the headline — "nothing in flight" alone
+            // would read as Esc having done nothing (again).
+            self.set_flash("cleared stale queued-prompt state (daemon idle)".to_string());
+        } else {
+            self.set_flash(feedback.flash());
+        }
         // Fullscreen paints over native scrollback, so the flash is the
         // visible acknowledgement there. Inline keeps the richer panel.
         if !self.fullscreen {
@@ -5492,14 +5562,50 @@ impl App {
                         .as_ref()
                         .map(|t| t.route == TurnRoute::Main)
                         .unwrap_or(self.streaming_route == Some(TurnRoute::Main));
-                let queued_responses_after_current = queued_responses_after_terminal(
-                    finished_main,
-                    self.queued_interjection_response_count,
-                );
+                // mu-z9ol: settle queued interjections by receipt instead
+                // of the old one-per-terminal decrement. A terminal Done's
+                // command_receipts name the EXACT asks it satisfied —
+                // several asks share one Done when a mid-ask prompt is
+                // absorbed into the running ask (spec mu-046 WP4), and the
+                // old heuristic wedged the session on exactly that case
+                // (awaiting a second done that never comes, then permanently
+                // attributing every response to the previous prompt).
+                // Settlement keys on the session id alone: receipt
+                // correlation does not depend on whether this client
+                // projected a live main turn.
+                if sid.is_empty() || sid == self.session_id {
+                    let receipt_ids = done_receipt_ask_ids(params);
+                    if !receipt_ids.is_empty() {
+                        self.queued_interjection_awaiting_done_ids
+                            .retain(|awaited| !receipt_ids.contains(awaited));
+                        for p in &mut self.pending_interjections {
+                            if receipt_ids.contains(&p.request_id) {
+                                p.settled = true;
+                            }
+                        }
+                    } else if finished_main
+                        && !self.queued_interjection_awaiting_done_ids.is_empty()
+                    {
+                        // No receipts on a finished main terminal: a daemon
+                        // running without disk-backed session logs
+                        // (persist_events_to_disk = false) never mints
+                        // tickets, so nothing would EVER settle by id. Keep
+                        // the pre-receipt semantics there — one finished
+                        // main turn settles the oldest awaited response. On
+                        // the default (persisted) path every ask-done
+                        // carries receipts, so this arm only sees wakeup/
+                        // autonomous dones, which the old heuristic
+                        // miscounted the same way.
+                        self.queued_interjection_awaiting_done_ids.remove(0);
+                    }
+                }
                 let will_await_queued_main = should_await_queued_main(
                     finished_main,
-                    self.pending_interjections.len(),
-                    queued_responses_after_current,
+                    self.pending_interjections
+                        .iter()
+                        .filter(|p| !p.settled)
+                        .count(),
+                    self.queued_interjection_awaiting_done_ids.len(),
                 );
                 self.session_phase =
                     phase_after_turn_end(is_error, stop_reason, turn_count, will_await_queued_main);
@@ -5694,11 +5800,14 @@ impl App {
                     // R1/R2: a queued interjection did not feed the response
                     // above, so commit it AFTER that response, but with a
                     // label that preserves the concurrent authoring time.
-                    let newly_committed = self.commit_pending_interjections(vp, wrap_width)?;
-                    self.queued_interjection_response_count =
-                        queued_responses_after_current + newly_committed;
+                    // mu-z9ol: only the UNSETTLED ones still owe a response —
+                    // an interjection named in this done's receipts was
+                    // absorbed into the turn that just committed.
+                    let newly_awaited = self.commit_pending_interjections(vp, wrap_width)?;
+                    self.queued_interjection_awaiting_done_ids
+                        .extend(newly_awaited);
                     self.awaiting_queued_interjection_response =
-                        self.queued_interjection_response_count > 0;
+                        !self.queued_interjection_awaiting_done_ids.is_empty();
                 }
                 // mu-d2hx item b: an iteration-cap stop renders DISTINCTLY
                 // in the transcript (in addition to the status line) — the
@@ -6429,11 +6538,70 @@ mod tests {
     }
 
     #[test]
-    fn hsyt_queued_response_count_drops_current_terminal_before_awaiting() {
-        assert_eq!(queued_responses_after_terminal(true, 0), 0);
-        assert_eq!(queued_responses_after_terminal(true, 1), 0);
-        assert_eq!(queued_responses_after_terminal(true, 2), 1);
-        assert_eq!(queued_responses_after_terminal(false, 2), 2);
+    fn z9ol_done_receipt_ask_ids_extracts_only_i64_request_ids() {
+        let params = serde_json::json!({
+            "session_id": "session-1",
+            "stop_reason": "end_turn",
+            "command_receipts": [
+                { "command_event_id": 7, "request_id": 12, "method": "ask_session" },
+                { "command_event_id": 9, "request_id": 13, "method": "ask_session" },
+                // another connection's string id must not match ours
+                { "command_event_id": 11, "request_id": "mcp-4", "method": "ask_session" },
+            ],
+        });
+        assert_eq!(done_receipt_ask_ids(&params), vec![12, 13]);
+        // absent field (older daemon / non-ask done) → no settlement
+        assert_eq!(
+            done_receipt_ask_ids(&serde_json::json!({"stop_reason": "end_turn"})),
+            Vec::<i64>::new()
+        );
+    }
+
+    /// mu-z9ol regression: the shared-Done absorption case. An
+    /// interjection named in the terminating done's receipts is settled
+    /// pre-commit, so committing it must NOT leave a response owed —
+    /// the old count heuristic did, wedging the session permanently.
+    #[test]
+    fn z9ol_settled_interjection_owes_no_response_after_commit() {
+        let mut absorbed = PendingInterjection::new(
+            13,
+            "right. ollama is a different machine.",
+            PendingInterjectionTiming::WhileResponding,
+        );
+        absorbed.settled = true;
+        let deferred = PendingInterjection::new(
+            14,
+            "nothing blocking the third card",
+            PendingInterjectionTiming::BeforeQueuedResponse,
+        );
+        let still_owed: Vec<i64> = [absorbed, deferred]
+            .iter()
+            .filter(|p| !p.settled)
+            .map(|p| p.request_id)
+            .collect();
+        assert_eq!(still_owed, vec![14]);
+        // and with everything settled, nothing awaits → no busy bridge
+        assert!(!should_await_queued_main(true, 0, still_owed.len() - 1));
+    }
+
+    #[test]
+    fn z9ol_stale_queued_state_recovers_only_on_idle_main_cancel() {
+        // daemon idle + main target + armed state → recover
+        assert!(should_recover_stale_queued_interjection_state(
+            false, true, true
+        ));
+        // a real cancel takes the clear path, not the recovery path
+        assert!(!should_recover_stale_queued_interjection_state(
+            true, true, true
+        ));
+        // nothing armed → nothing to recover
+        assert!(!should_recover_stale_queued_interjection_state(
+            false, true, false
+        ));
+        // sidecar cancels never touch main-session bookkeeping
+        assert!(!should_recover_stale_queued_interjection_state(
+            false, false, true
+        ));
     }
 
     #[test]

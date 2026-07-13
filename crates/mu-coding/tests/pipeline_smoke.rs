@@ -702,6 +702,64 @@ async fn ask_receipt_lands_in_session_log_at_done_wp4() {
     let _ = std::fs::remove_dir_all(&events_dir);
 }
 
+/// mu-z9ol: the wire `session.done` names the ask(s) it satisfied via
+/// `command_receipts`, end to end — journaled ticket → agent loop →
+/// forwarder → wire — and the receipt's `command_event_id` pairs with
+/// the session-log `CommandReceived`. Clients (mu-solo queued
+/// interjections) reconcile queued prompts against these instead of
+/// awaiting a per-ask done that a shared/absorbed Done never sends.
+#[tokio::test]
+async fn z9ol_wire_done_names_the_ask_it_satisfies() {
+    let journal_dir = unique_journal_dir();
+    let events_dir = unique_events_dir();
+    std::fs::create_dir_all(&events_dir).expect("create events dir");
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) =
+        spawn_server_with_events(provider, journal_dir.clone(), Some(events_dir.clone()));
+    authenticate(&mut client).await;
+
+    let session_id = create_session(&mut client, 1).await;
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 7, "method": "ask_session",
+        "params": { "session_id": session_id, "user_message": "hello" }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write ask");
+
+    let done = await_notification(&mut client, "session.done").await;
+    let receipts = done["params"]["command_receipts"]
+        .as_array()
+        .expect("session.done carries command_receipts for the ask");
+    assert_eq!(receipts.len(), 1, "one ask → one receipt: {done}");
+    assert_eq!(receipts[0]["request_id"], 7);
+    assert_eq!(receipts[0]["method"], "ask_session");
+    // The full original params must NOT be echoed on the wire.
+    assert!(receipts[0].get("params").is_none());
+
+    // The wire receipt pairs with the session-log CommandReceived.
+    let events = session_log_events(&events_dir, &session_id);
+    let received_id = events
+        .iter()
+        .find_map(|e| match &e.payload {
+            EventPayload::CommandReceived { method, .. } if method == "ask_session" => Some(e.id),
+            _ => None,
+        })
+        .expect("CommandReceived in session log");
+    assert_eq!(
+        receipts[0]["command_event_id"].as_u64(),
+        Some(received_id),
+        "wire receipt pairs with the session-log command"
+    );
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+    let _ = std::fs::remove_dir_all(&journal_dir);
+    let _ = std::fs::remove_dir_all(&events_dir);
+}
+
 /// A provider whose stream never yields: the ask wedges in-flight so
 /// the test can cancel it mid-turn. The agent loop's cancel path does
 /// not need provider cooperation — it selects on its input channel.

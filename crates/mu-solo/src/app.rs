@@ -396,6 +396,14 @@ pub struct Turn {
     pub provider_kind: String,
     pub model: String,
     pub items: Vec<render::TurnItem>,
+    /// Index of this invocation's in-flight streamed `Text` item
+    /// (mu-b20l). Set when a delta opens the item, cleared when
+    /// `finalize_text` swaps in the canonical text — so the finalize
+    /// targets the right item even when its own ToolCall was pushed
+    /// after the stream (the wire's normal order).
+    streaming_text_ix: Option<usize>,
+    /// Mirror of `streaming_text_ix` for the reasoning channel.
+    streaming_thinking_ix: Option<usize>,
 }
 
 impl Turn {
@@ -405,6 +413,8 @@ impl Turn {
             provider_kind: provenance.provider_kind,
             model: provenance.model,
             items: Vec::new(),
+            streaming_text_ix: None,
+            streaming_thinking_ix: None,
         }
     }
 
@@ -412,25 +422,69 @@ impl Turn {
         assistant_label_with_provenance(self.route, &self.provider_kind, &self.model)
     }
 
-    /// Append a text delta: extend the trailing `Text` item if the last
-    /// item is text, else push a new one. This is what makes streamed
-    /// prose accumulate in place instead of committing per-newline.
+    /// Append a text delta: extend this invocation's in-flight `Text`
+    /// item (tracked by index, mu-b20l — robust to items pushed in
+    /// between), else open a new one and start tracking it. This is what
+    /// makes streamed prose accumulate in place instead of committing
+    /// per-newline; `finalize_text` swaps the tracked item for the
+    /// canonical text and ends tracking.
     fn push_text(&mut self, delta: &str) {
-        match self.items.last_mut() {
-            Some(render::TurnItem::Text(s)) => s.push_str(delta),
-            _ => self.items.push(render::TurnItem::Text(delta.to_string())),
+        if let Some(ix) = self.streaming_text_ix {
+            if let Some(render::TurnItem::Text(s)) = self.items.get_mut(ix) {
+                s.push_str(delta);
+                return;
+            }
         }
+        self.items.push(render::TurnItem::Text(delta.to_string()));
+        self.streaming_text_ix = Some(self.items.len() - 1);
     }
 
     /// Append a reasoning delta, mirroring [`push_text`](Self::push_text):
-    /// extend the trailing `Thinking` item or open a new one. (mu-upk2)
+    /// extend this invocation's tracked `Thinking` item or open a new
+    /// one. (mu-upk2, tracked per mu-b20l)
     fn push_thinking(&mut self, delta: &str) {
-        match self.items.last_mut() {
-            Some(render::TurnItem::Thinking(s)) => s.push_str(delta),
-            _ => self
-                .items
-                .push(render::TurnItem::Thinking(delta.to_string())),
+        if let Some(ix) = self.streaming_thinking_ix {
+            if let Some(render::TurnItem::Thinking(s)) = self.items.get_mut(ix) {
+                s.push_str(delta);
+                return;
+            }
         }
+        self.items
+            .push(render::TurnItem::Thinking(delta.to_string()));
+        self.streaming_thinking_ix = Some(self.items.len() - 1);
+    }
+
+    /// Replace the in-flight streamed text with the canonical finalized
+    /// text (mu-wk2 swap), or push it if this invocation streamed none.
+    /// Targets the TRACKED streaming item (mu-b20l), not the trailing
+    /// item: the wire orders text_delta… → tool_call_started →
+    /// assistant_text_finalized, so at finalize time the trailing item is
+    /// often the ToolCall — a last-item-only check appended a duplicate
+    /// text below the tool marker (the operator's "stutter"). Tracking by
+    /// index also keeps a no-delta invocation's finalize from clobbering
+    /// an earlier invocation's already-canonical item, whatever sits
+    /// between them.
+    fn finalize_text(&mut self, text: &str) {
+        if let Some(ix) = self.streaming_text_ix.take() {
+            if let Some(render::TurnItem::Text(s)) = self.items.get_mut(ix) {
+                *s = text.to_string();
+                return;
+            }
+        }
+        self.items.push(render::TurnItem::Text(text.to_string()));
+    }
+
+    /// Mirror of [`finalize_text`](Self::finalize_text) for the reasoning
+    /// channel (mu-b20l): same tracked-index replace-or-push.
+    fn finalize_thinking(&mut self, text: &str) {
+        if let Some(ix) = self.streaming_thinking_ix.take() {
+            if let Some(render::TurnItem::Thinking(s)) = self.items.get_mut(ix) {
+                *s = text.to_string();
+                return;
+            }
+        }
+        self.items
+            .push(render::TurnItem::Thinking(text.to_string()));
     }
 
     /// The most recent in-flight `ToolCall` item with this id, if any. Used to
@@ -5363,15 +5417,14 @@ impl App {
                 // `text` is what the AssistantMessage commits). In agent
                 // loops this fires once per invocation; each segment is a
                 // distinct Text item, separated by any intervening tool
-                // calls, all inside the one live turn.
+                // calls, all inside the one live turn. Segment-bounded
+                // replace (mu-b20l): the finalize often lands AFTER the
+                // segment's tool_call_started, so a last-item-only check
+                // duplicated the text below the tool marker.
                 let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 if !text.is_empty() {
                     let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-                    let turn = self.live_turn_for_route(route);
-                    match turn.items.last_mut() {
-                        Some(render::TurnItem::Text(s)) => *s = text.to_string(),
-                        _ => turn.items.push(render::TurnItem::Text(text.to_string())),
-                    }
+                    self.live_turn_for_route(route).finalize_text(text);
                 }
             }
             "session.thinking_delta" => {
@@ -5387,24 +5440,13 @@ impl App {
             "session.thinking_finalized" => {
                 // Mirror assistant_text_finalized: replace the streamed
                 // reasoning with the canonical text from the assistant
-                // message's Thinking blocks. The reasoning item precedes the
-                // answer text in the turn, so target the most recent Thinking
-                // item rather than the trailing item.
+                // message's Thinking blocks. Segment-bounded (mu-b20l) so a
+                // no-delta segment's finalize can't clobber an earlier
+                // segment's already-canonical reasoning.
                 let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 if !text.is_empty() {
                     let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-                    let turn = self.live_turn_for_route(route);
-                    match turn
-                        .items
-                        .iter_mut()
-                        .rev()
-                        .find(|it| matches!(it, render::TurnItem::Thinking(_)))
-                    {
-                        Some(render::TurnItem::Thinking(s)) => *s = text.to_string(),
-                        _ => turn
-                            .items
-                            .push(render::TurnItem::Thinking(text.to_string())),
-                    }
+                    self.live_turn_for_route(route).finalize_thinking(text);
                 }
             }
             "session.tool_call_delta" => {
@@ -6466,6 +6508,91 @@ mod tests {
         assert_eq!(
             t.header_label(),
             "assistant ⋅ btw ⋅ openrouter/anthropic/claude-haiku-4-5"
+        );
+    }
+
+    /// Bare ToolCall item for segment-boundary tests (mu-b20l).
+    fn test_tool_call(id: &str) -> render::TurnItem {
+        render::TurnItem::ToolCall {
+            tool_call_id: id.into(),
+            display_name: "bash".into(),
+            primary_arg: String::new(),
+            arguments: serde_json::Value::Null,
+            partial_args: String::new(),
+        }
+    }
+
+    /// mu-b20l: finalize must REPLACE the segment's streamed text even when
+    /// a ToolCall trails it (the wire orders deltas → tool_call_started →
+    /// finalize). The old last-item-only check appended a duplicate below
+    /// the tool marker — the operator's "stutter."
+    #[test]
+    fn b20l_finalize_replaces_streamed_text_across_trailing_tool_call() {
+        let mut t = Turn::new(TurnRoute::Main, TurnProvenance::new("ollama", "m"));
+        t.push_thinking("hmm");
+        t.push_text("Let me check");
+        t.items.push(test_tool_call("c1"));
+        t.finalize_text("Let me check the config.");
+        let texts: Vec<&str> = t
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                render::TurnItem::Text(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["Let me check the config."],
+            "one canonical text, no duplicate after the tool call: {:?}",
+            t.items
+        );
+    }
+
+    /// mu-b20l guard: a finalize for a segment that streamed no deltas must
+    /// PUSH, not clobber the previous segment's already-canonical item.
+    #[test]
+    fn b20l_no_delta_segment_finalize_does_not_clobber_previous_segment() {
+        let mut t = Turn::new(TurnRoute::Main, TurnProvenance::new("ollama", "m"));
+        t.push_text("segment one");
+        t.finalize_text("segment one, canonical");
+        t.items.push(test_tool_call("c1"));
+        // second segment streams nothing; finalize arrives anyway
+        t.finalize_text("segment two, canonical");
+        let texts: Vec<&str> = t
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                render::TurnItem::Text(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["segment one, canonical", "segment two, canonical"],
+            "earlier segment survives: {:?}",
+            t.items
+        );
+        // thinking mirrors both behaviors: a streamed item is replaced
+        // across its trailing tool call; a stream-less finalize pushes.
+        let mut t2 = Turn::new(TurnRoute::Main, TurnProvenance::new("ollama", "m"));
+        t2.push_thinking("raw");
+        t2.items.push(test_tool_call("c2"));
+        t2.finalize_thinking("canonical reasoning");
+        t2.finalize_thinking("second invocation reasoning");
+        let thinks: Vec<&str> = t2
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                render::TurnItem::Thinking(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thinks,
+            vec!["canonical reasoning", "second invocation reasoning"],
+            "replace tracked, push untracked: {:?}",
+            t2.items
         );
     }
 

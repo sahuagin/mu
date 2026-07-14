@@ -1891,3 +1891,259 @@ async fn mh4_resume_bad_ref_rejected() {
     drop(client);
     let _ = timeout(Duration::from_millis(500), server_handle).await;
 }
+
+/// mu-rkhj: the event-driven dialogue receive path, end to end. A stub
+/// dialogue server exposes `dialogue_subscribe`; the daemon registers on
+/// import (capability sniff — note the empty tools allowlist: subscribe
+/// fires off the UNfiltered surface). The test then pushes one
+/// `notifications/dialogue.message` over the captured subscription and
+/// asserts the addressed session WAKES and runs a turn whose motivation
+/// carries the message plus its correlation handles. No polling anywhere.
+#[tokio::test]
+async fn z_rkhj_dialogue_push_wakes_session_no_polling() {
+    use rmcp::model::{
+        CallToolRequestParams, CallToolResult, Content, CustomNotification, ListToolsResult,
+        PaginatedRequestParams, ServerCapabilities, ServerInfo, ServerNotification,
+    };
+    use rmcp::service::{Peer, RequestContext, RoleServer};
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, tower::StreamableHttpService,
+    };
+    use rmcp::{ErrorData as McpError, ServerHandler};
+    use std::sync::Mutex as StdMutex;
+
+    type SubSlot = Arc<StdMutex<Option<(String, Peer<RoleServer>)>>>;
+    type AckSlot = Arc<StdMutex<Vec<String>>>;
+
+    #[derive(Clone)]
+    struct StubDialogueServer {
+        sub: SubSlot,
+        acks: AckSlot,
+    }
+
+    impl ServerHandler for StubDialogueServer {
+        fn get_info(&self) -> ServerInfo {
+            // mu-rkhj discovery: the handshake capability, not tools/list.
+            let mut mu = serde_json::Map::new();
+            mu.insert("dialoguePush".to_string(), Value::Bool(true));
+            let mut experimental = rmcp::model::ExperimentalCapabilities::new();
+            experimental.insert("mu".to_string(), mu);
+            ServerInfo::new(
+                ServerCapabilities::builder()
+                    .enable_tools()
+                    .enable_experimental_with(experimental)
+                    .build(),
+            )
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_
+        {
+            async move {
+                // Plumbing is deliberately unlisted (mu-rkhj): the daemon
+                // must subscribe off the handshake capability alone.
+                Ok(ListToolsResult {
+                    tools: vec![],
+                    ..Default::default()
+                })
+            }
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_
+        {
+            let sub = self.sub.clone();
+            let acks = self.acks.clone();
+            async move {
+                match request.name.as_ref() {
+                    "dialogue_subscribe" => {
+                        let daemon_id = request
+                            .arguments
+                            .as_ref()
+                            .and_then(|a| a.get("daemon_id"))
+                            .and_then(|v| v.as_str())
+                            .expect("daemon_id arg")
+                            .to_string();
+                        *sub.lock().unwrap() = Some((daemon_id.clone(), context.peer.clone()));
+                        Ok(CallToolResult::success(vec![Content::text(
+                            json!({"subscribed": daemon_id, "replayed": 0}).to_string(),
+                        )]))
+                    }
+                    "dialogue_ack" => {
+                        let id = request
+                            .arguments
+                            .as_ref()
+                            .and_then(|a| a.get("id"))
+                            .and_then(|v| v.as_str())
+                            .expect("ack id arg")
+                            .to_string();
+                        acks.lock().unwrap().push(id.clone());
+                        Ok(CallToolResult::success(vec![Content::text(
+                            json!({"acked": true, "id": id}).to_string(),
+                        )]))
+                    }
+                    other => panic!("unexpected tool call: {other}"),
+                }
+            }
+        }
+    }
+
+    let sub: SubSlot = Arc::new(StdMutex::new(None));
+    let acks: AckSlot = Arc::new(StdMutex::new(Vec::new()));
+    let service: StreamableHttpService<StubDialogueServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            {
+                let sub = sub.clone();
+                let acks = acks.clone();
+                move || {
+                    Ok(StubDialogueServer {
+                        sub: sub.clone(),
+                        acks: acks.clone(),
+                    })
+                }
+            },
+            Default::default(),
+            Default::default(),
+        );
+    let app = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub dialogue mcp");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let config = Config {
+        auth: AuthConfig::Bearer {
+            tokens: vec![TEST_BEARER_TOKEN.to_string()],
+        },
+        mcp: McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                name: "stub-dialogue".into(),
+                url: format!("http://{addr}/mcp"),
+                // Empty allowlist: no tools imported — the subscribe must
+                // still fire (it sniffs the unfiltered surface). Receiving
+                // needs NO model-visible tool at all.
+                tools: Some(vec![]),
+                prefix: None,
+                side_effects: Some(mu_core::agent::SideEffects::ReadOnly),
+                tool_side_effects: Default::default(),
+            }],
+        },
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
+        // Hint injection would become the newest user-role span, and
+        // FauxProvider::echo echoes only the MOST RECENT user message —
+        // the assertion below needs the dialogue wake message itself.
+        index: mu_core::config::IndexConfig {
+            discover_injection: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (mut client, server_handle) = spawn_server_with_config(provider, Vec::new(), config).await;
+
+    // The daemon subscribes during startup import.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let (daemon_id, peer) = loop {
+        if let Some(s) = sub.lock().unwrap().clone() {
+            break s;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon never called dialogue_subscribe"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    // Create the session that will receive the push.
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "create_session",
+        "params": { "provider": { "kind": "anthropic_api", "model": "irrelevant" } }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write");
+    let resp = read_line(&mut client).await;
+    let session_id = resp["result"]["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    // PUSH one message — no ask, no poll. The session must wake on it.
+    let note = CustomNotification::new(
+        "notifications/dialogue.message",
+        Some(json!({
+            "id": "01RKHJTESTMSG",
+            "from": "cc:test-peer",
+            "to": format!("mu:{daemon_id}:{session_id}"),
+            "session_thread": "01RKHJTESTTHREAD",
+            "content": "are you awake? reply on this thread.",
+            "ts": 1_784_000_000_000_i64,
+        })),
+    );
+    peer.send_notification(ServerNotification::CustomNotification(note))
+        .await
+        .expect("push notification");
+
+    // The woken turn's motivation (echoed back by FauxProvider::echo)
+    // carries the message AND its correlation handles.
+    let mut echoed = String::new();
+    let done = loop {
+        let line = read_line(&mut client).await;
+        if line["method"] == "session.text_delta" {
+            echoed.push_str(line["params"]["delta"].as_str().unwrap_or(""));
+        }
+        if line["method"] == "session.done" {
+            break line;
+        }
+    };
+    assert!(
+        echoed.contains("cc:test-peer") && echoed.contains("are you awake? reply on this thread."),
+        "woken turn must carry sender + content: {echoed}"
+    );
+    assert!(
+        echoed.contains("01RKHJTESTMSG") && echoed.contains("session_thread=01RKHJTESTTHREAD"),
+        "woken turn must carry the correlation handles: {echoed}"
+    );
+    assert_eq!(done["params"]["session_id"], session_id.as_str());
+    // A wakeup turn answers no ask — its done carries no command receipts.
+    assert!(
+        done["params"].get("command_receipts").is_none(),
+        "wakeup done must not claim an ask receipt: {done}"
+    );
+
+    // mu-rkhj acked delivery: the daemon acks the message id once it
+    // reached the session's input channel — only that makes the row
+    // non-replayable server-side.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if acks.lock().unwrap().iter().any(|id| id == "01RKHJTESTMSG") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon never acked the pushed message: {:?}",
+            acks.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+}

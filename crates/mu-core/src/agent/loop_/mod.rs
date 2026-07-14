@@ -281,6 +281,14 @@ pub enum AgentInput {
         from: String,
         /// The message body.
         content: String,
+        /// The message's unique id on the channel (mu-rkhj). Replies
+        /// correlate by IDENTIFIER, not adjacency — a response pairs
+        /// with its request no matter when it arrives.
+        message_id: Option<String>,
+        /// The dialogue thread (dialogue_say's `session_thread`,
+        /// mu-rkhj). Passing it back on a reply keeps the exchange
+        /// joinable across any interleaving.
+        thread: Option<String>,
     },
 }
 
@@ -1380,18 +1388,35 @@ async fn run_inner(
                     queue.push_back(Action::InvokeLlm);
                 }
             }
-            Action::External(AgentInput::DialogueMessage { from, content }) => {
+            Action::External(AgentInput::DialogueMessage {
+                from,
+                content,
+                message_id,
+                thread,
+            }) => {
                 // mu-dialogue-inbound-wakeup: an inbound dialogue message
                 // arrived for this session. Inject it as a User message and
                 // run the LLM — same "external attention wakes a session"
                 // shape as WatchCompleted, carried INLINE so the message
                 // lands directly as the woken turn's motivation. The model
-                // sees who spoke and what they said, plus a nudge that it
-                // may reply on the same channel.
-                let notification = format!(
-                    "[Dialogue] {from}: {content}\n\n\
-                     You may reply with dialogue_say if appropriate."
-                );
+                // sees who spoke and what they said, plus the correlation
+                // handles (mu-rkhj): replies pair by thread id, never by
+                // adjacency, so it can answer whenever it likes.
+                let correlation = match (&message_id, &thread) {
+                    (Some(id), Some(t)) => format!(" (msg {id}, thread {t})"),
+                    (Some(id), None) => format!(" (msg {id})"),
+                    (None, Some(t)) => format!(" (thread {t})"),
+                    (None, None) => String::new(),
+                };
+                let reply_hint = match &thread {
+                    Some(t) => format!(
+                        "You may reply with dialogue_say (set session_thread={t} so the \
+                         reply pairs with this message)."
+                    ),
+                    None => "You may reply with dialogue_say if appropriate.".to_string(),
+                };
+                let notification =
+                    format!("[Dialogue]{correlation} {from}: {content}\n\n{reply_hint}");
                 let msg = AgentMessage::User {
                     content: notification,
                 };

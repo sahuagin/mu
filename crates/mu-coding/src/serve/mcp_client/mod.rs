@@ -23,9 +23,10 @@ use mu_core::agent::{PermissionLevel, SideEffects, Tool};
 use mu_core::config::McpServerConfig;
 use mu_core::protocol::{McpImportedToolStatus, McpServerConnectionState, McpServerStatus};
 use rmcp::model::{
-    ClientCapabilities, ClientInfo, ClientRequest, CustomRequest, ExperimentalCapabilities,
-    Implementation, ServerResult,
+    CallToolRequestParams, ClientCapabilities, ClientInfo, ClientRequest, CustomNotification,
+    CustomRequest, ExperimentalCapabilities, Implementation, ServerResult,
 };
+use rmcp::service::NotificationContext;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::ServiceExt;
 use serde_json::Value;
@@ -67,8 +68,44 @@ fn resolve_side_effects(cfg: &McpServerConfig, remote_name: &str) -> (SideEffect
 /// elicitation), but it advertises `experimental.mu.aiHelp` so a mu-aware peer
 /// offers its negotiated `mu/aiHelp` surface, and it carries a per-connection
 /// cache for the scoped help nodes fetched lazily from that peer.
+/// mu-rkhj: one inbound dialogue message pushed by the dialogue server
+/// over the daemon's outbound MCP connection (`notifications/dialogue.message`).
+#[derive(Debug)]
+pub struct InboundDialogue {
+    /// Target session id (the `<session>` segment of `mu:<daemon>:<session>`).
+    pub to_session: String,
+    /// Sending peer id.
+    pub from: String,
+    pub content: String,
+    /// Channel message id — the reply-correlation handle (mu-rkhj:
+    /// responses pair by identifier, never by adjacency).
+    pub message_id: Option<String>,
+    /// Dialogue thread id (`session_thread`).
+    pub thread: Option<String>,
+    /// mu-rkhj acked delivery: the connection to ack on once the message
+    /// reaches the session's input channel. The server marks a row
+    /// delivered ONLY on dialogue_ack — a notification send is
+    /// unacknowledged, so without the ack the row replays on the next
+    /// subscribe (at-least-once; the router dedups by message id).
+    pub ack_peer: rmcp::service::Peer<rmcp::service::RoleClient>,
+}
+
+/// mu-rkhj: dialogue push wiring, threaded from serve into the outbound
+/// client. `daemon_id` is announced to the dialogue server via
+/// `dialogue_subscribe`; pushed messages arrive on `inbound_tx`.
+#[derive(Clone)]
+pub struct DialoguePush {
+    pub daemon_id: String,
+    pub inbound_tx: tokio::sync::mpsc::UnboundedSender<InboundDialogue>,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct MuMcpClient {
+    /// mu-rkhj: when set, `notifications/dialogue.message` notifications
+    /// from the server are parsed and forwarded here. None on connections
+    /// to servers that never push (the default), where any custom
+    /// notification is silently dropped as before.
+    dialogue: Option<DialoguePush>,
     /// Scoped AI-help nodes fetched on demand from the peer, keyed by their
     /// scope path. PARTIAL at rest: only the paths a caller actually asked for
     /// are materialized — the tree is never fetched whole, and nothing is
@@ -80,6 +117,48 @@ pub(crate) struct MuMcpClient {
 }
 
 impl rmcp::ClientHandler for MuMcpClient {
+    fn on_custom_notification(
+        &self,
+        notification: CustomNotification,
+        context: NotificationContext<rmcp::service::RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        // mu-rkhj: the event-driven dialogue receive path. The server
+        // pushes one notification per message addressed to
+        // `mu:<daemon>:<session>`; parse and forward to serve's router,
+        // which injects AgentInput::DialogueMessage into the session.
+        let inbound = (notification.method == "notifications/dialogue.message")
+            .then(|| self.dialogue.clone())
+            .flatten()
+            .and_then(|wiring| {
+                let p = notification.params.as_ref()?;
+                let to = p.get("to")?.as_str()?;
+                let (daemon, session) = to.strip_prefix("mu:")?.split_once(':')?;
+                if daemon != wiring.daemon_id || session.is_empty() {
+                    tracing::warn!(%to, our_daemon = %wiring.daemon_id,
+                        "dialogue push addressed to a different daemon; dropping");
+                    return None;
+                }
+                Some((
+                    wiring,
+                    InboundDialogue {
+                        to_session: session.to_string(),
+                        from: p.get("from")?.as_str()?.to_string(),
+                        content: p.get("content")?.as_str()?.to_string(),
+                        message_id: p.get("id").and_then(|v| v.as_str()).map(String::from),
+                        thread: p
+                            .get("session_thread")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        ack_peer: context.peer.clone(),
+                    },
+                ))
+            });
+        if let Some((wiring, msg)) = inbound {
+            let _ = wiring.inbound_tx.send(msg);
+        }
+        std::future::ready(())
+    }
+
     fn get_info(&self) -> ClientInfo {
         // Advertise the experimental feature flag the mu server negotiates on:
         // `experimental.mu.aiHelp: true`. A non-mu server simply ignores an
@@ -138,11 +217,21 @@ pub struct ImportedMcpTool {
 pub struct ImportedMcpTools {
     pub tools: Vec<ImportedMcpTool>,
     pub status: Vec<McpServerStatus>,
+    /// mu-rkhj: connections holding a live dialogue push subscription.
+    /// Normally every imported RemoteMcpTool Arc-shares its connection, but
+    /// a dialogue server whose tools are all filtered out would otherwise
+    /// drop its connection at end of import — killing the subscription.
+    /// serve keeps these alive for the daemon's lifetime (and drops them at
+    /// shutdown, closing the connections).
+    pub(crate) dialogue_connections: Vec<Arc<McpPeer>>,
 }
 
 /// Connect to every configured server and return the imported tools plus a
 /// daemon-authoritative import report. Failures are per-server and non-fatal.
-pub async fn import_remote_tools(servers: &[McpServerConfig]) -> ImportedMcpTools {
+pub async fn import_remote_tools(
+    servers: &[McpServerConfig],
+    dialogue: Option<&DialoguePush>,
+) -> ImportedMcpTools {
     /// Per-server budget for connect + initialize + tools/list. A hung or
     /// unresponsive server must degrade like an unreachable one — it cannot
     /// be allowed to stall daemon startup.
@@ -150,14 +239,16 @@ pub async fn import_remote_tools(servers: &[McpServerConfig]) -> ImportedMcpTool
 
     let mut out: Vec<ImportedMcpTool> = Vec::new();
     let mut status: Vec<McpServerStatus> = Vec::new();
+    let mut dialogue_connections: Vec<Arc<McpPeer>> = Vec::new();
     for cfg in servers {
         let started = std::time::Instant::now();
-        let imported = tokio::time::timeout(IMPORT_TIMEOUT, import_from_server(cfg))
+        let imported = tokio::time::timeout(IMPORT_TIMEOUT, import_from_server(cfg, dialogue))
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {IMPORT_TIMEOUT:?}")));
         let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         match imported {
-            Ok((tools, imported_tools)) => {
+            Ok((tools, imported_tools, subscribed)) => {
+                dialogue_connections.extend(subscribed);
                 tracing::info!(
                     server = %cfg.name,
                     url = %cfg.url,
@@ -200,7 +291,11 @@ pub async fn import_remote_tools(servers: &[McpServerConfig]) -> ImportedMcpTool
             }
         }
     }
-    ImportedMcpTools { tools: out, status }
+    ImportedMcpTools {
+        tools: out,
+        status,
+        dialogue_connections,
+    }
 }
 
 fn server_status(
@@ -234,14 +329,68 @@ fn local_tool_name(prefix: Option<&str>, remote_name: &str) -> String {
 /// Handshake with one server and wrap its (allowlisted) tools.
 async fn import_from_server(
     cfg: &McpServerConfig,
-) -> anyhow::Result<(Vec<Arc<dyn Tool>>, Vec<McpImportedToolStatus>)> {
+    dialogue: Option<&DialoguePush>,
+) -> anyhow::Result<(
+    Vec<Arc<dyn Tool>>,
+    Vec<McpImportedToolStatus>,
+    Option<Arc<McpPeer>>,
+)> {
     let transport = StreamableHttpClientTransport::from_uri(cfg.url.as_str());
     // `initialize` handshake; the returned service owns the connection and
     // is shared (Arc) by every RemoteMcpTool imported from this server. The
     // handshake advertises `experimental.mu.aiHelp` but does NOT fetch any
     // help — scoped help is pulled lazily later via [`fetch_ai_help`].
-    let peer: Arc<McpPeer> = Arc::new(MuMcpClient::default().serve(transport).await?);
+    // mu-rkhj: every connection carries the dialogue wiring; only a server
+    // that actually pushes `notifications/dialogue.message` (mu-dialogue)
+    // ever exercises it.
+    let handler = MuMcpClient {
+        dialogue: dialogue.cloned(),
+        ..MuMcpClient::default()
+    };
+    let peer: Arc<McpPeer> = Arc::new(handler.serve(transport).await?);
     let remote = peer.list_all_tools().await?;
+    // mu-rkhj: a server advertising the experimental mu.dialoguePush
+    // handshake capability is the dialogue channel — register this daemon
+    // for push delivery. The server replays anything unacked. Failure is
+    // non-fatal, same posture as the rest of the import: messages wait in
+    // the store until a later subscribe succeeds.
+    let mut subscribed: Option<Arc<McpPeer>> = None;
+    if let Some(wiring) = dialogue {
+        // Discovery = the handshake's experimental mu.dialoguePush
+        // capability (mu-rkhj) — the plumbing tools are deliberately
+        // absent from tools/list so model/tool surfaces never see them.
+        let has_dialogue_push = peer
+            .peer_info()
+            .and_then(|info| info.capabilities.experimental.as_ref())
+            .and_then(|e| e.get("mu"))
+            .and_then(|m| m.get("dialoguePush"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if has_dialogue_push {
+            let mut args = serde_json::Map::new();
+            args.insert(
+                "daemon_id".to_string(),
+                Value::String(wiring.daemon_id.clone()),
+            );
+            let call = peer
+                .call_tool(CallToolRequestParams::new("dialogue_subscribe").with_arguments(args));
+            match tokio::time::timeout(std::time::Duration::from_secs(3), call).await {
+                Ok(Ok(_)) => {
+                    tracing::info!(server = %cfg.name, daemon_id = %wiring.daemon_id,
+                        "dialogue push subscription registered");
+                    subscribed = Some(peer.clone());
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(server = %cfg.name, error = %e,
+                        "dialogue_subscribe failed; inbound dialogue will wait for a reconnect");
+                }
+                Err(_) => {
+                    tracing::warn!(server = %cfg.name,
+                        "dialogue_subscribe timed out; inbound dialogue will wait for a reconnect");
+                }
+            }
+        }
+    }
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     let mut imported_tools: Vec<McpImportedToolStatus> = Vec::new();
     for def in remote {
@@ -275,7 +424,7 @@ async fn import_from_server(
             peer.clone(),
         )));
     }
-    Ok((tools, imported_tools))
+    Ok((tools, imported_tools, subscribed))
 }
 
 #[cfg(test)]

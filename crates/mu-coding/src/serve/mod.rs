@@ -439,8 +439,97 @@ where
     // Once registered they're base session tools, so the mu-onq8 `discover`
     // tool ranks them alongside everything else.
     let mut tools = tools;
+    // mu-rkhj: event-driven dialogue receive. The outbound MCP client
+    // registers this daemon with the dialogue server (dialogue_subscribe);
+    // pushed messages arrive as notifications, land on this channel, and
+    // the router below injects them into the addressed session as
+    // AgentInput::DialogueMessage — the model never polls to receive.
+    let (dialogue_inbound_tx, mut dialogue_inbound_rx) =
+        tokio::sync::mpsc::unbounded_channel::<mcp_client::InboundDialogue>();
+    #[allow(unused_assignments)]
+    let mut dialogue_connections: Vec<Arc<mcp_client::McpPeer>> = Vec::new();
+    let dialogue_router_guard = {
+        let sessions = sessions.clone();
+        let handle = tokio::spawn(async move {
+            // mu-rkhj acked delivery: at-least-once with dedup. The server
+            // replays anything unacked on subscribe, and a push can race
+            // its own replay, so remember recent message ids; a duplicate
+            // is acked again (the server evidently missed the first ack)
+            // but never re-injected.
+            const DEDUP_CAP: usize = 256;
+            let mut seen: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+            while let Some(msg) = dialogue_inbound_rx.recv().await {
+                let dup = msg.message_id.as_ref().is_some_and(|id| seen.contains(id));
+                if !dup {
+                    let Some(tx) = sessions.input_sender(&msg.to_session) else {
+                        // No ack: the row stays undelivered server-side and
+                        // replays on this daemon's next subscribe (e.g. the
+                        // session gets created/rehydrated after a restart).
+                        tracing::warn!(session = %msg.to_session, from = %msg.from,
+                            "inbound dialogue for unknown session; unacked — replays on next subscribe");
+                        continue;
+                    };
+                    let input = mu_core::agent::AgentInput::DialogueMessage {
+                        from: msg.from.clone(),
+                        content: msg.content,
+                        message_id: msg.message_id.clone(),
+                        thread: msg.thread,
+                    };
+                    if tx.send(input).await.is_err() {
+                        tracing::warn!(session = %msg.to_session,
+                            "inbound dialogue: session input channel closed; unacked — replays on next subscribe");
+                        continue;
+                    }
+                    if let Some(id) = &msg.message_id {
+                        seen.push_back(id.clone());
+                        if seen.len() > DEDUP_CAP {
+                            seen.pop_front();
+                        }
+                    }
+                }
+                // Ack only after the message reached the session's input
+                // channel (or was recognized as an already-delivered dup).
+                if let Some(id) = msg.message_id {
+                    let ack_peer = msg.ack_peer;
+                    tokio::spawn(async move {
+                        let mut args = serde_json::Map::new();
+                        args.insert("id".to_string(), serde_json::Value::String(id.clone()));
+                        let call = ack_peer.call_tool(
+                            rmcp::model::CallToolRequestParams::new("dialogue_ack")
+                                .with_arguments(args),
+                        );
+                        match tokio::time::timeout(std::time::Duration::from_secs(3), call).await {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => tracing::warn!(%id, error = %e,
+                                "dialogue_ack failed; message may replay (deduped)"),
+                            Err(_) => tracing::warn!(%id,
+                                "dialogue_ack timed out; message may replay (deduped)"),
+                        }
+                    });
+                }
+            }
+        });
+        // Same lifetime contract as mcp_guard/presence (mu-ad5x lesson):
+        // this task holds a Sessions clone, so it MUST die with the
+        // transport handler or the shutdown cascade wedges.
+        AbortOnDrop(std::sync::Mutex::new(Some(handle)))
+    };
     if daemon_info.config().mcp.enabled {
-        let mut imported = mcp_client::import_remote_tools(&daemon_info.config().mcp.servers).await;
+        let dialogue_push = mcp_client::DialoguePush {
+            daemon_id: daemon_info.daemon_id().to_string(),
+            inbound_tx: dialogue_inbound_tx,
+        };
+        let mut imported = mcp_client::import_remote_tools(
+            &daemon_info.config().mcp.servers,
+            Some(&dialogue_push),
+        )
+        .await;
+        // mu-rkhj: keep dialogue-subscribed connections alive for the
+        // daemon's lifetime — with every tool filtered out nothing else
+        // holds them, and a dropped connection kills the subscription.
+        // The Vec rides the transport closure like the guards below and
+        // drops (closing the connections) at shutdown.
+        dialogue_connections = imported.dialogue_connections;
         for imported_tool in imported.tools {
             let name = imported_tool.tool.spec().name;
             if tools.iter().any(|t| t.spec().name == name) {
@@ -608,6 +697,10 @@ where
         // mu-ad5x: same lifetime contract as mcp_guard — dropping the
         // handler aborts the presence task, releasing its Sessions clone.
         let _ = &presence_guard;
+        // mu-rkhj: ditto for the dialogue inbound router, and the
+        // subscribed connections it feeds from.
+        let _ = &dialogue_router_guard;
+        let _ = &dialogue_connections;
         let control = control.clone();
         let auth_state = auth_state.clone();
         async move { pipeline::ingest(&control, req, origin, &auth_state) }

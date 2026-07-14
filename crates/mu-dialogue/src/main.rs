@@ -28,6 +28,7 @@
 #![allow(clippy::manual_async_fn)]
 
 use std::{
+    collections::HashMap,
     env,
     path::PathBuf,
     sync::Arc,
@@ -36,7 +37,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use rmcp::model::*;
-use rmcp::service::{RequestContext, RoleServer};
+use rmcp::service::{Peer, RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,10 @@ const DEFAULT_BROADCAST_WINDOW_MS: i64 = DEFAULT_PEER_TTL_MS;
 /// worst-case latency to observe a message inserted by a *different* process
 /// (cross-process writers don't fire this process's in-memory `Notify`).
 const POLL_RECHECK_INTERVAL_MS: u64 = 1_000;
+/// mu-rkhj: server-initiated MCP notification method carrying one inbound
+/// dialogue message to a subscribed daemon. Event-driven receive — the
+/// wire counterpart of the daemon's `AgentInput::DialogueMessage` seam.
+const DIALOGUE_PUSH_METHOD: &str = "notifications/dialogue.message";
 
 // ───────────────────────────── Storage ──────────────────────────────────────
 
@@ -81,6 +86,13 @@ struct Store {
     /// Optional etcd-lease presence (config-gated; see src/presence.rs).
     /// None = the section is absent/disabled and no network is ever touched.
     presence: Option<Presence>,
+    /// mu-rkhj: live push subscriptions — daemon_id → that daemon's MCP
+    /// connection peer (registered via `dialogue_subscribe`). A message to
+    /// `mu:<daemon>:<session>` is PUSHED over the subscription and marked
+    /// delivered; without one it stays undelivered in the store and
+    /// replays when the daemon subscribes. Send failure drops the entry
+    /// (dead connection) — the daemon re-subscribes on reconnect.
+    subs: Arc<Mutex<HashMap<String, Peer<RoleServer>>>>,
 }
 
 #[derive(Clone)]
@@ -152,6 +164,16 @@ fn migrate(conn: &Connection) -> Result<()> {
             ON team_members(peer_id);
         "#,
     )?;
+    // mu-rkhj: delivered_at marks a row as PUSHED to a live daemon
+    // subscription (NULL = not yet pushed; poll-consumed rows are never
+    // marked — delivery there is the poller's cursor). Additive column on
+    // an existing table, so it can't ride CREATE TABLE IF NOT EXISTS.
+    let has_delivered = conn
+        .prepare("SELECT 1 FROM pragma_table_info('dialogue') WHERE name = 'delivered_at'")?
+        .exists([])?;
+    if !has_delivered {
+        conn.execute("ALTER TABLE dialogue ADD COLUMN delivered_at INTEGER", [])?;
+    }
     Ok(())
 }
 
@@ -203,6 +225,10 @@ impl Store {
         }
         // Wake any in-process long-pollers; each re-checks its own filter.
         self.notify.notify_waiters();
+        // mu-rkhj: event-driven delivery — push to the target's daemon if
+        // it holds a live subscription; otherwise the row waits in the
+        // store and replays on subscribe.
+        self.push_message(&id, from, to, &thread, content, ts).await;
         Ok((id, ts))
     }
 
@@ -319,18 +345,29 @@ impl Store {
             .map(String::from)
             .unwrap_or_else(|| Ulid::new().to_string());
         if !recipients.is_empty() {
-            let mut conn = self.db.lock().await;
-            let tx = conn.transaction()?;
-            for to in recipients {
-                let id = Ulid::new().to_string();
-                tx.execute(
-                    "INSERT INTO dialogue (id, from_peer, to_peer, session_thread, content, ts)
-                     VALUES (?, ?, ?, ?, ?, ?)",
-                    params![id, from, to, thread, content, ts],
-                )?;
+            let mut inserted: Vec<(String, String)> = Vec::with_capacity(recipients.len());
+            {
+                let mut conn = self.db.lock().await;
+                let tx = conn.transaction()?;
+                for to in recipients {
+                    let id = Ulid::new().to_string();
+                    tx.execute(
+                        "INSERT INTO dialogue (id, from_peer, to_peer, session_thread, content, ts)
+                         VALUES (?, ?, ?, ?, ?, ?)",
+                        params![id, from, to, thread, content, ts],
+                    )?;
+                    inserted.push((id, to.clone()));
+                }
+                tx.commit()?;
             }
-            tx.commit()?;
             self.notify.notify_waiters();
+            // mu-rkhj: the broadcast/multicast itself is fire-and-return —
+            // the caller gets the thread id as its correlation handle and
+            // never waits. Each recipient copy is pushed to its daemon's
+            // subscription when one is live.
+            for (id, to) in &inserted {
+                self.push_message(id, from, to, &thread, content, ts).await;
+            }
         }
         Ok((thread, ts))
     }
@@ -456,6 +493,140 @@ impl Store {
         };
         Ok(rows)
     }
+    /// mu-rkhj: parse the daemon segment of a mu peer id
+    /// (`mu:<daemon>:<session>`). None for non-mu peers (cc etc. receive by
+    /// poll, never by push).
+    fn daemon_of(peer_id: &str) -> Option<&str> {
+        let rest = peer_id.strip_prefix("mu:")?;
+        let daemon = rest.split(':').next()?;
+        if daemon.is_empty() {
+            None
+        } else {
+            Some(daemon)
+        }
+    }
+
+    /// mu-rkhj: push one message to its target daemon's live subscription,
+    /// if any. Fire-and-forget from the sender's perspective: success marks
+    /// the row delivered; a send failure drops the dead subscription and
+    /// leaves the row undelivered for replay on the daemon's re-subscribe.
+    async fn push_message(
+        &self,
+        id: &str,
+        from: &str,
+        to: &str,
+        thread: &str,
+        content: &str,
+        ts: i64,
+    ) {
+        let Some(daemon) = Self::daemon_of(to) else {
+            return;
+        };
+        let peer = { self.subs.lock().await.get(daemon).cloned() };
+        let Some(peer) = peer else { return };
+        let note = CustomNotification::new(
+            DIALOGUE_PUSH_METHOD,
+            Some(json!({
+                "id": id,
+                "from": from,
+                "to": to,
+                "session_thread": thread,
+                "content": content,
+                "ts": ts,
+            })),
+        );
+        match peer
+            .send_notification(ServerNotification::CustomNotification(note))
+            .await
+        {
+            Ok(()) => {
+                // Deliberately NOT marked delivered here (panel finding): a
+                // notification send is unacknowledged fire-and-forget — Ok
+                // proves the write left, not that the daemon routed it into
+                // the session. delivered_at is set only by the daemon's
+                // dialogue_ack, so an unrouted message replays on the next
+                // subscribe. The daemon dedups the at-least-once window by
+                // message id.
+            }
+            Err(e) => {
+                warn!("push to daemon {daemon} failed ({e:#}); dropping its subscription");
+                self.subs.lock().await.remove(daemon);
+            }
+        }
+    }
+
+    /// mu-rkhj: acknowledged delivery — the daemon confirms a pushed
+    /// message reached its session's input channel; only then is the row
+    /// non-replayable. Returns whether a row was newly marked.
+    async fn ack_message(&self, id: &str) -> Result<bool> {
+        let conn = self.db.lock().await;
+        let n = conn.execute(
+            "UPDATE dialogue SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL",
+            params![now_ms(), id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// mu-rkhj: register a daemon's connection for push delivery, then
+    /// replay every message addressed to its sessions that was never
+    /// pushed. Returns the number of replayed messages. Store order =
+    /// arrival order (append-only rowid), no cursor.
+    async fn subscribe_daemon(&self, daemon_id: &str, peer: Peer<RoleServer>) -> Result<usize> {
+        // Open-trust posture, stated loudly (panel finding): the channel
+        // has no caller authentication anywhere (dialogue_say takes any
+        // `from`; dialogue_poll reads any inbox), and subscribe is the
+        // same trust level. A replacement is legitimate (daemon restart /
+        // reconnect) but is ALWAYS logged so a diverted subscription is
+        // visible in the server log, never silent. Real authn (peer
+        // handles / capability tokens, mu-037 lineage) is follow-up work
+        // recorded on the bead.
+        if self
+            .subs
+            .lock()
+            .await
+            .insert(daemon_id.to_string(), peer)
+            .is_some()
+        {
+            warn!(
+                "dialogue_subscribe: REPLACED existing subscription for daemon {daemon_id} \
+                 (legitimate on daemon restart; investigate if unexpected)"
+            );
+        }
+        let rows: Vec<DialogueRow> = {
+            let conn = self.db.lock().await;
+            let mut stmt = conn.prepare(
+                "SELECT rowid AS seq, id, from_peer, to_peer, session_thread, content, ts
+                 FROM dialogue
+                 WHERE to_peer LIKE ?1 AND delivered_at IS NULL
+                 ORDER BY rowid ASC",
+            )?;
+            let it = stmt.query_map(params![format!("mu:{daemon_id}:%")], dialogue_row)?;
+            it.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let n = rows.len();
+        for r in rows {
+            self.push_message(
+                &r.id,
+                &r.from,
+                &r.to,
+                r.session_thread.as_deref().unwrap_or(&r.id),
+                &r.content,
+                r.ts,
+            )
+            .await;
+        }
+        Ok(n)
+    }
+
+    /// mu-rkhj: does this (mu) peer's daemon hold a live subscription?
+    /// Subscribed daemons receive by PUSH, so their polls drain instead of
+    /// waiting (operator standard: no model-visible blocking receive).
+    async fn daemon_subscribed(&self, peer_id: &str) -> bool {
+        match Self::daemon_of(peer_id) {
+            Some(d) => self.subs.lock().await.contains_key(d),
+            None => false,
+        }
+    }
 }
 
 fn dialogue_row(row: &rusqlite::Row) -> rusqlite::Result<DialogueRow> {
@@ -579,6 +750,13 @@ struct TeamsArgs {
 }
 
 #[derive(Deserialize)]
+struct SubscribeArgs {
+    /// The subscribing daemon's id — the `<daemon>` segment of its
+    /// sessions' peer ids (`mu:<daemon>:<session>`).
+    daemon_id: String,
+}
+
+#[derive(Deserialize)]
 struct PruneArgs {
     /// Remove peers whose last_seen is older than this many ms. Omit for the
     /// server's configured peer TTL.
@@ -602,7 +780,14 @@ async fn handle_say(store: &Store, args: SayArgs) -> Result<Value> {
 
 async fn handle_poll(store: &Store, args: PollArgs) -> Result<Value> {
     let limit = args.limit.unwrap_or(25).clamp(1, 200);
-    let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_POLL_TIMEOUT_MS);
+    let mut timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_POLL_TIMEOUT_MS);
+    // mu-rkhj: a daemon with a live push subscription receives by PUSH —
+    // waiting here is meaningless (anything new arrives as a notification),
+    // so its poll degenerates to an immediate drain. Unsubscribed peers
+    // (cc's out-of-band watcher) keep the long-poll unchanged.
+    if store.daemon_subscribed(&args.to).await {
+        timeout_ms = 0;
+    }
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
     // Polling its own inbox proves the poller (`to`) is live.
@@ -837,6 +1022,11 @@ fn schema(v: Value) -> Arc<JsonMap<String, Value>> {
 
 fn tools_list() -> Vec<Tool> {
     vec![
+        // mu-rkhj: dialogue_subscribe and dialogue_ack are deliberately NOT
+        // listed — they are daemon plumbing dispatched by name (the
+        // handshake's experimental mu.dialoguePush capability is the
+        // discovery signal). Keeping them out of tools/list keeps them off
+        // every model/tool surface that builds from the listing.
         Tool::new(
             "dialogue_say",
             "Send a message to another peer through the dialogue channel. \
@@ -991,8 +1181,51 @@ fn tools_list() -> Vec<Tool> {
 impl DialogueHandler {
     /// Dispatch one tool call to its handler, returning the JSON payload or a
     /// human-readable error string (surfaced as an MCP tool error).
+    /// mu-rkhj: register a daemon's push subscription. Lives OUTSIDE
+    /// [`dispatch`] because it needs the calling connection's peer handle
+    /// (`RequestContext::peer`), which only `call_tool` has. Daemon
+    /// plumbing, not a model surface: a mu daemon calls it once after the
+    /// MCP handshake; the server then PUSHES every message addressed to
+    /// `mu:<daemon_id>:*` and replays what accumulated while it was away.
+    async fn subscribe(
+        &self,
+        arguments: Value,
+        peer: &Peer<RoleServer>,
+    ) -> std::result::Result<Value, String> {
+        let args: SubscribeArgs = serde_json::from_value(arguments)
+            .map_err(|e| format!("dialogue_subscribe bad args: {e}"))?;
+        let replayed = self
+            .store
+            .subscribe_daemon(&args.daemon_id, peer.clone())
+            .await
+            .map_err(|e| format!("dialogue_subscribe failed: {e:#}"))?;
+        info!(
+            daemon_id = %args.daemon_id,
+            replayed,
+            "dialogue push subscription registered"
+        );
+        Ok(json!({ "subscribed": args.daemon_id, "replayed": replayed }))
+    }
+
     async fn dispatch(&self, name: &str, arguments: Value) -> std::result::Result<Value, String> {
         match name {
+            "dialogue_ack" => {
+                // mu-rkhj: daemon plumbing — confirms a PUSHED message
+                // reached its session's input channel. Only this marks a
+                // row delivered/non-replayable (a notification send is
+                // unacknowledged, so the push itself proves nothing).
+                let id = arguments
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "dialogue_ack bad args: missing id".to_string())?
+                    .to_string();
+                let acked = self
+                    .store
+                    .ack_message(&id)
+                    .await
+                    .map_err(|e| format!("dialogue_ack failed: {e:#}"))?;
+                Ok(json!({ "acked": acked, "id": id }))
+            }
             "dialogue_say" => {
                 let args: SayArgs = serde_json::from_value(arguments)
                     .map_err(|e| format!("dialogue_say bad args: {e}"))?;
@@ -1070,10 +1303,23 @@ impl DialogueHandler {
 
 impl ServerHandler for DialogueHandler {
     fn get_info(&self) -> InitializeResult {
-        InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(SERVER_NAME, VERSION))
-            .with_instructions(
-                "Multi-peer inter-agent dialogue channel (the email/inbox-over-MCP model). \
+        // mu-rkhj: the push capability is announced in the HANDSHAKE, not
+        // in tools/list — dialogue_subscribe/dialogue_ack are daemon
+        // plumbing reachable by name only (panel finding: advertising
+        // them as ordinary tools invited model/tool-surface callers).
+        let mut mu = JsonMap::new();
+        mu.insert("dialoguePush".to_string(), Value::Bool(true));
+        let mut experimental = ExperimentalCapabilities::new();
+        experimental.insert("mu".to_string(), mu);
+        InitializeResult::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_experimental_with(experimental)
+                .build(),
+        )
+        .with_server_info(Implementation::new(SERVER_NAME, VERSION))
+        .with_instructions(
+            "Multi-peer inter-agent dialogue channel (the email/inbox-over-MCP model). \
                  dialogue_say to send, dialogue_poll to long-poll an inbox, dialogue_history \
                  to replay a thread, dialogue_peers to discover who is on the channel. \
                  dialogue_broadcast is the PA system (announce to every active peer); \
@@ -1088,7 +1334,7 @@ impl ServerHandler for DialogueHandler {
                  groups on. Presence is activity-derived — you appear to others the first \
                  time you say or poll, not at connect. Stale registrations expire: peers \
                  idle past the server TTL are pruned (dialogue_prune forces a sweep).",
-            )
+        )
     }
 
     fn list_tools(
@@ -1107,11 +1353,16 @@ impl ServerHandler for DialogueHandler {
     fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
         async move {
             let arguments = Value::Object(request.arguments.unwrap_or_default());
-            match self.dispatch(&request.name, arguments).await {
+            let outcome = if request.name.as_ref() == "dialogue_subscribe" {
+                self.subscribe(arguments, &context.peer).await
+            } else {
+                self.dispatch(&request.name, arguments).await
+            };
+            match outcome {
                 Ok(v) => Ok(CallToolResult::success(vec![Content::new(
                     RawContent::text(v.to_string()),
                     None,
@@ -1230,6 +1481,7 @@ fn open_store(peer_ttl_ms: i64) -> Result<Store> {
         notify: Arc::new(Notify::new()),
         peer_ttl_ms,
         presence,
+        subs: Arc::new(Mutex::new(HashMap::new())),
     })
 }
 
@@ -1345,6 +1597,7 @@ mod tests {
             notify: Arc::new(Notify::new()),
             peer_ttl_ms: DEFAULT_PEER_TTL_MS,
             presence: None,
+            subs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1523,6 +1776,71 @@ mod tests {
                 "dialogue_prune",
             ]
         );
+    }
+
+    /// mu-rkhj: only mu peers have a daemon segment — cc and friends
+    /// receive by poll, never push.
+    #[test]
+    fn daemon_of_parses_mu_peer_ids_only() {
+        assert_eq!(Store::daemon_of("mu:abc123:session-1"), Some("abc123"));
+        assert_eq!(Store::daemon_of("cc:some-uuid"), None);
+        assert_eq!(Store::daemon_of("mu:"), None);
+        assert_eq!(Store::daemon_of("warden:x:y"), None);
+    }
+
+    /// mu-rkhj: rows start undelivered; the migration adds the column to
+    /// pre-existing databases (idempotent).
+    #[tokio::test]
+    async fn undelivered_rows_await_replay_and_migration_is_idempotent() {
+        let store = test_store().await;
+        // migrate twice — the guarded ALTER must not error
+        {
+            let conn = store.db.lock().await;
+            migrate(&conn).unwrap();
+        }
+        store
+            .say("cc:peer", "mu:d1:session-1", "hello", None)
+            .await
+            .unwrap();
+        let undelivered: i64 = {
+            let conn = store.db.lock().await;
+            conn.query_row(
+                "SELECT COUNT(*) FROM dialogue WHERE to_peer LIKE 'mu:d1:%' AND delivered_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(undelivered, 1, "no subscription -> stays undelivered");
+        // and an unsubscribed daemon's poll still long-polls (flag false)
+        assert!(!store.daemon_subscribed("mu:d1:session-1").await);
+        assert!(!store.daemon_subscribed("cc:peer").await);
+    }
+
+    /// mu-rkhj acked delivery: only dialogue_ack marks a row delivered;
+    /// a second ack for the same id is a no-op (dedup on the daemon side).
+    #[tokio::test]
+    async fn ack_marks_delivered_exactly_once() {
+        let store = test_store().await;
+        let (id, _ts) = store
+            .say("cc:peer", "mu:d1:session-1", "hello", None)
+            .await
+            .unwrap();
+        assert!(store.ack_message(&id).await.unwrap(), "first ack marks");
+        assert!(
+            !store.ack_message(&id).await.unwrap(),
+            "second ack is a no-op"
+        );
+        let undelivered: i64 = {
+            let conn = store.db.lock().await;
+            conn.query_row(
+                "SELECT COUNT(*) FROM dialogue WHERE delivered_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(undelivered, 0, "acked row is non-replayable");
     }
 
     /// Broadcast reaches every active peer except the sender; every copy

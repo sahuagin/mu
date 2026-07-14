@@ -4176,6 +4176,8 @@ async fn d1_dialogue_message_wakes_idle_session_with_inline_content() {
         .send(AgentInput::DialogueMessage {
             from: "cc:peer-7".to_owned(),
             content: "can you take a look at PR 99?".to_owned(),
+            message_id: Some("01TESTMSG".to_owned()),
+            thread: Some("01TESTTHREAD".to_owned()),
         })
         .await
         .expect("send dialogue-message");
@@ -4197,6 +4199,19 @@ async fn d1_dialogue_message_wakes_idle_session_with_inline_content() {
         woke_with_content,
         "dialogue message must be injected inline as a user message; kinds={:?}",
         events.iter().map(kind).collect::<Vec<_>>()
+    );
+
+    // mu-rkhj: the correlation handles reach the model — replies pair by
+    // thread id, never by adjacency.
+    let woke_with_correlation = events.iter().any(|e| match e {
+        AgentEvent::MessageStart {
+            message: AgentMessage::User { content },
+        } => content.contains("01TESTMSG") && content.contains("session_thread=01TESTTHREAD"),
+        _ => false,
+    });
+    assert!(
+        woke_with_correlation,
+        "wake message must carry the message id and thread reply hint"
     );
 
     // The wake drove exactly one provider turn.

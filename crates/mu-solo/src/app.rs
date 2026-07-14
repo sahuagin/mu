@@ -396,6 +396,14 @@ pub struct Turn {
     pub provider_kind: String,
     pub model: String,
     pub items: Vec<render::TurnItem>,
+    /// Index of this invocation's in-flight streamed `Text` item
+    /// (mu-b20l). Set when a delta opens the item, cleared when
+    /// `finalize_text` swaps in the canonical text — so the finalize
+    /// targets the right item even when its own ToolCall was pushed
+    /// after the stream (the wire's normal order).
+    streaming_text_ix: Option<usize>,
+    /// Mirror of `streaming_text_ix` for the reasoning channel.
+    streaming_thinking_ix: Option<usize>,
 }
 
 impl Turn {
@@ -405,6 +413,8 @@ impl Turn {
             provider_kind: provenance.provider_kind,
             model: provenance.model,
             items: Vec::new(),
+            streaming_text_ix: None,
+            streaming_thinking_ix: None,
         }
     }
 
@@ -412,25 +422,69 @@ impl Turn {
         assistant_label_with_provenance(self.route, &self.provider_kind, &self.model)
     }
 
-    /// Append a text delta: extend the trailing `Text` item if the last
-    /// item is text, else push a new one. This is what makes streamed
-    /// prose accumulate in place instead of committing per-newline.
+    /// Append a text delta: extend this invocation's in-flight `Text`
+    /// item (tracked by index, mu-b20l — robust to items pushed in
+    /// between), else open a new one and start tracking it. This is what
+    /// makes streamed prose accumulate in place instead of committing
+    /// per-newline; `finalize_text` swaps the tracked item for the
+    /// canonical text and ends tracking.
     fn push_text(&mut self, delta: &str) {
-        match self.items.last_mut() {
-            Some(render::TurnItem::Text(s)) => s.push_str(delta),
-            _ => self.items.push(render::TurnItem::Text(delta.to_string())),
+        if let Some(ix) = self.streaming_text_ix {
+            if let Some(render::TurnItem::Text(s)) = self.items.get_mut(ix) {
+                s.push_str(delta);
+                return;
+            }
         }
+        self.items.push(render::TurnItem::Text(delta.to_string()));
+        self.streaming_text_ix = Some(self.items.len() - 1);
     }
 
     /// Append a reasoning delta, mirroring [`push_text`](Self::push_text):
-    /// extend the trailing `Thinking` item or open a new one. (mu-upk2)
+    /// extend this invocation's tracked `Thinking` item or open a new
+    /// one. (mu-upk2, tracked per mu-b20l)
     fn push_thinking(&mut self, delta: &str) {
-        match self.items.last_mut() {
-            Some(render::TurnItem::Thinking(s)) => s.push_str(delta),
-            _ => self
-                .items
-                .push(render::TurnItem::Thinking(delta.to_string())),
+        if let Some(ix) = self.streaming_thinking_ix {
+            if let Some(render::TurnItem::Thinking(s)) = self.items.get_mut(ix) {
+                s.push_str(delta);
+                return;
+            }
         }
+        self.items
+            .push(render::TurnItem::Thinking(delta.to_string()));
+        self.streaming_thinking_ix = Some(self.items.len() - 1);
+    }
+
+    /// Replace the in-flight streamed text with the canonical finalized
+    /// text (mu-wk2 swap), or push it if this invocation streamed none.
+    /// Targets the TRACKED streaming item (mu-b20l), not the trailing
+    /// item: the wire orders text_delta… → tool_call_started →
+    /// assistant_text_finalized, so at finalize time the trailing item is
+    /// often the ToolCall — a last-item-only check appended a duplicate
+    /// text below the tool marker (the operator's "stutter"). Tracking by
+    /// index also keeps a no-delta invocation's finalize from clobbering
+    /// an earlier invocation's already-canonical item, whatever sits
+    /// between them.
+    fn finalize_text(&mut self, text: &str) {
+        if let Some(ix) = self.streaming_text_ix.take() {
+            if let Some(render::TurnItem::Text(s)) = self.items.get_mut(ix) {
+                *s = text.to_string();
+                return;
+            }
+        }
+        self.items.push(render::TurnItem::Text(text.to_string()));
+    }
+
+    /// Mirror of [`finalize_text`](Self::finalize_text) for the reasoning
+    /// channel (mu-b20l): same tracked-index replace-or-push.
+    fn finalize_thinking(&mut self, text: &str) {
+        if let Some(ix) = self.streaming_thinking_ix.take() {
+            if let Some(render::TurnItem::Thinking(s)) = self.items.get_mut(ix) {
+                *s = text.to_string();
+                return;
+            }
+        }
+        self.items
+            .push(render::TurnItem::Thinking(text.to_string()));
     }
 
     /// The most recent in-flight `ToolCall` item with this id, if any. Used to
@@ -488,6 +542,14 @@ struct PendingInterjection {
     /// turn (or closed out by a synthetic terminal Done), so once
     /// committed it must NOT be awaited as a separate response.
     settled: bool,
+    /// mu-9bri: the live main turn's item count at the moment this
+    /// prompt was queued. On commit the turn is split here so the
+    /// prompt lands in CHRONOLOGICAL position — everything streamed
+    /// before it above, the part that answered it below — instead of
+    /// the whole answer rendering above the question. None when no
+    /// main turn was live at queue time (bridge gap): those commit
+    /// after the turn, as before.
+    splice_at: Option<usize>,
 }
 
 impl PendingInterjection {
@@ -497,12 +559,57 @@ impl PendingInterjection {
             body: body.into(),
             timing,
             settled: false,
+            splice_at: None,
         }
     }
 
     fn label(&self) -> &'static str {
         self.timing.label()
     }
+}
+
+/// One step of a chronological turn commit (mu-9bri): either a
+/// contiguous run of the finished turn's items, or one queued
+/// interjection (by index into the drained pending list).
+#[derive(Debug, PartialEq, Eq)]
+enum SpliceStep {
+    Segment(std::ops::Range<usize>),
+    Interjection(usize),
+}
+
+/// mu-9bri: plan the interleaved commit of a finished turn's items and
+/// its pending interjections. `splices[i]` is pending interjection i's
+/// captured splice point. Pending arrive in submission order and mid-turn
+/// splice points are nondecreasing (the turn only grows); points are
+/// clamped to the item count and empty segments are skipped. A None
+/// (bridge-gap prompt, queued with no live turn) has no intrinsic
+/// position: it resolves to the NEXT spliced prompt's position when one
+/// follows — a later prompt's splice must not be dragged past the end by
+/// an earlier positionless one — and to after-the-whole-turn otherwise
+/// (the legacy placement). Submission order is preserved in every case.
+/// With no interjections this degenerates to [Segment(0..n)] — the
+/// pre-mu-9bri order.
+fn plan_splice_commit(item_count: usize, splices: &[Option<usize>]) -> Vec<SpliceStep> {
+    // Resolve None entries against the next concrete splice (right-to-left).
+    let mut resolved = vec![0usize; splices.len()];
+    let mut next_pos = item_count;
+    for i in (0..splices.len()).rev() {
+        next_pos = splices[i].unwrap_or(next_pos).min(item_count);
+        resolved[i] = next_pos;
+    }
+    let mut steps = Vec::new();
+    let mut cursor = 0usize;
+    for (i, pos) in resolved.into_iter().enumerate() {
+        if pos > cursor {
+            steps.push(SpliceStep::Segment(cursor..pos));
+            cursor = pos;
+        }
+        steps.push(SpliceStep::Interjection(i));
+    }
+    if cursor < item_count {
+        steps.push(SpliceStep::Segment(cursor..item_count));
+    }
+    steps
 }
 
 fn main_session_busy_state(
@@ -3482,8 +3589,24 @@ impl App {
         self.pending_ask_ids.insert(id);
         self.queued_interjection_ask_ids.insert(id);
         let timing = self.pending_interjection_timing();
-        self.pending_interjections
-            .push(PendingInterjection::new(id, wire_text, timing));
+        let mut interjection = PendingInterjection::new(id, wire_text, timing);
+        // mu-9bri: remember where the live main turn stood when this
+        // prompt was queued, so the commit can split the turn there and
+        // keep question-before-answer chronology. The ITEM boundary is
+        // the deliberate granularity, not an approximation: deltas still
+        // streaming into the in-flight item come from a provider call
+        // that never saw this prompt (absorption injects it at the NEXT
+        // InvokeLlm), so that item's tail is pre-prompt content by
+        // authorship and the answer necessarily begins in a later item.
+        // Splitting mid-item would also cut across the canonical text
+        // that finalize swaps in, which need not align byte-for-byte
+        // with the streamed accumulation.
+        interjection.splice_at = self
+            .live_turn
+            .as_ref()
+            .filter(|t| t.route == TurnRoute::Main)
+            .map(|t| t.items.len());
+        self.pending_interjections.push(interjection);
         self.set_flash(timing.label().to_string());
         Ok(())
     }
@@ -3505,23 +3628,117 @@ impl App {
             if !interjection.settled {
                 still_owed.push(interjection.request_id);
             }
-            let label = interjection.label();
-            let mut block =
-                TranscriptBlock::new(TranscriptKind::User, label, interjection.body.clone());
-            block.route = Some(TurnRoute::Main);
-            self.transcript.push(block);
-            // Fullscreen renders the transcript block; the inline flip
-            // replays it.
-            if !self.fullscreen {
-                let lines = pending_interjection_commit_lines(&interjection, wrap_width);
-                let h = lines.len() as u16;
-                vp.insert_before(h, |buf| {
-                    let p = Paragraph::new(lines);
-                    ratatui::widgets::Widget::render(p, buf.area, buf);
-                })?;
+            self.commit_one_interjection(vp, wrap_width, &interjection)?;
+        }
+        Ok(still_owed)
+    }
+
+    /// Commit one queued-prompt block to the transcript (and inline
+    /// scrollback). Shared by the drain-all path above and the
+    /// chronological interleave (mu-9bri).
+    fn commit_one_interjection(
+        &mut self,
+        vp: &mut DynamicViewport,
+        wrap_width: usize,
+        interjection: &PendingInterjection,
+    ) -> Result<()> {
+        let label = interjection.label();
+        let mut block =
+            TranscriptBlock::new(TranscriptKind::User, label, interjection.body.clone());
+        block.route = Some(TurnRoute::Main);
+        self.transcript.push(block);
+        // Fullscreen renders the transcript block; the inline flip
+        // replays it.
+        if !self.fullscreen {
+            let lines = pending_interjection_commit_lines(interjection, wrap_width);
+            let h = lines.len() as u16;
+            vp.insert_before(h, |buf| {
+                let p = Paragraph::new(lines);
+                ratatui::widgets::Widget::render(p, buf.area, buf);
+            })?;
+        }
+        Ok(())
+    }
+
+    /// mu-9bri: commit a finished main turn INTERLEAVED with its queued
+    /// prompts, in chronological order — each prompt lands where the
+    /// stream stood when it was typed, so the part of the turn that
+    /// answered it renders BELOW it. Returns the request ids that still
+    /// owe a response (unsettled, same contract as
+    /// [`commit_pending_interjections`]).
+    fn commit_turn_interleaved(
+        &mut self,
+        vp: &mut DynamicViewport,
+        wrap_width: usize,
+        preview_lines: usize,
+        t: &Turn,
+        label: &str,
+    ) -> Result<Vec<i64>> {
+        let pending = std::mem::take(&mut self.pending_interjections);
+        let splices: Vec<Option<usize>> = pending.iter().map(|p| p.splice_at).collect();
+        let mut still_owed = Vec::new();
+        for step in plan_splice_commit(t.items.len(), &splices) {
+            match step {
+                SpliceStep::Segment(range) => {
+                    self.commit_assistant_segment(
+                        vp,
+                        wrap_width,
+                        preview_lines,
+                        t.route,
+                        label,
+                        &t.items[range],
+                    )?;
+                }
+                SpliceStep::Interjection(i) => {
+                    let interjection = &pending[i];
+                    if !interjection.settled {
+                        still_owed.push(interjection.request_id);
+                    }
+                    self.commit_one_interjection(vp, wrap_width, interjection)?;
+                }
             }
         }
         Ok(still_owed)
+    }
+
+    /// Commit a run of turn items as one assistant block (transcript +
+    /// inline scrollback). Extracted from the done handler for the
+    /// mu-9bri interleave; the single-block path there keeps its
+    /// finalize-mismatch diagnostic, which doesn't apply per-segment.
+    fn commit_assistant_segment(
+        &mut self,
+        vp: &mut DynamicViewport,
+        wrap_width: usize,
+        preview_lines: usize,
+        route: TurnRoute,
+        label: &str,
+        items: &[render::TurnItem],
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        self.transcript.push(TranscriptBlock::assistant_with_label(
+            route,
+            label.to_string(),
+            items,
+        ));
+        if !self.fullscreen {
+            let mut lines = render::render_turn(
+                label,
+                route.color(),
+                items,
+                wrap_width,
+                preview_lines,
+                false,
+            );
+            lines.extend(render::turn_closer(route.color()));
+            let h = lines.len() as u16;
+            vp.insert_before(h, |buf| {
+                let p = Paragraph::new(lines);
+                ratatui::widgets::Widget::render(p, buf.area, buf);
+            })?;
+        }
+        Ok(())
     }
 
     /// Show the "you" block in scrollback without sending anything.
@@ -5363,15 +5580,14 @@ impl App {
                 // `text` is what the AssistantMessage commits). In agent
                 // loops this fires once per invocation; each segment is a
                 // distinct Text item, separated by any intervening tool
-                // calls, all inside the one live turn.
+                // calls, all inside the one live turn. Segment-bounded
+                // replace (mu-b20l): the finalize often lands AFTER the
+                // segment's tool_call_started, so a last-item-only check
+                // duplicated the text below the tool marker.
                 let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 if !text.is_empty() {
                     let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-                    let turn = self.live_turn_for_route(route);
-                    match turn.items.last_mut() {
-                        Some(render::TurnItem::Text(s)) => *s = text.to_string(),
-                        _ => turn.items.push(render::TurnItem::Text(text.to_string())),
-                    }
+                    self.live_turn_for_route(route).finalize_text(text);
                 }
             }
             "session.thinking_delta" => {
@@ -5387,24 +5603,13 @@ impl App {
             "session.thinking_finalized" => {
                 // Mirror assistant_text_finalized: replace the streamed
                 // reasoning with the canonical text from the assistant
-                // message's Thinking blocks. The reasoning item precedes the
-                // answer text in the turn, so target the most recent Thinking
-                // item rather than the trailing item.
+                // message's Thinking blocks. Segment-bounded (mu-b20l) so a
+                // no-delta segment's finalize can't clobber an earlier
+                // segment's already-canonical reasoning.
                 let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 if !text.is_empty() {
                     let route = self.streaming_route.unwrap_or(TurnRoute::Main);
-                    let turn = self.live_turn_for_route(route);
-                    match turn
-                        .items
-                        .iter_mut()
-                        .rev()
-                        .find(|it| matches!(it, render::TurnItem::Thinking(_)))
-                    {
-                        Some(render::TurnItem::Thinking(s)) => *s = text.to_string(),
-                        _ => turn
-                            .items
-                            .push(render::TurnItem::Thinking(text.to_string())),
-                    }
+                    self.live_turn_for_route(route).finalize_thinking(text);
                 }
             }
             "session.tool_call_delta" => {
@@ -5721,67 +5926,92 @@ impl App {
                 // `session.error` message attaches as a trailing inline
                 // Error item so it reads as part of the turn it killed.
                 let preview_lines = if self.bash_yolo { 15 } else { 4 };
+                let mut interleaved_commit_done = false;
                 match self.live_turn.take() {
                     Some(mut t) if t.has_output() || error_msg.is_some() => {
                         if let Some(msg) = error_msg.as_deref() {
                             t.items.push(render::TurnItem::Error(msg.to_string()));
                         }
                         let label = t.header_label();
-                        self.transcript.push(TranscriptBlock::assistant_with_label(
-                            t.route,
-                            label.clone(),
-                            &t.items,
-                        ));
-                        // Fullscreen owns the display: the transcript push above
-                        // is the record, and the inline flip replays it to
-                        // scrollback. Emitting here too would duplicate it.
-                        if !self.fullscreen {
-                            // Finalize-mismatch check: compare committed
-                            // history lines against the rendered line count
-                            // that's about to be inserted. A mismatch here
-                            // means the live preview and the final commit
-                            // diverged — log to the journal and warn.
-                            let history_before = vp.history_len();
-                            let mut lines = render::render_turn(
-                                &label,
-                                t.route.color(),
-                                &t.items,
+                        // mu-9bri: prompts queued WHILE this turn streamed
+                        // commit in chronological position — split the turn
+                        // at each prompt's captured splice point so the part
+                        // that answered it renders below it, not above.
+                        if finished_main
+                            && self
+                                .pending_interjections
+                                .iter()
+                                .any(|p| p.splice_at.is_some())
+                        {
+                            let newly_awaited = self.commit_turn_interleaved(
+                                vp,
                                 wrap_width,
                                 preview_lines,
-                                false, // inline scrollback commit keeps full results (mu-5h9m)
-                            );
-                            lines.extend(render::turn_closer(t.route.color()));
-                            let h = lines.len() as u16;
-                            // Compute committed text length for the mismatch check.
-                            let committed_text_len: usize = t
-                                .items
-                                .iter()
-                                .map(|item| {
-                                    if let render::TurnItem::Text(s) = item {
-                                        s.len()
-                                    } else {
-                                        0
-                                    }
-                                })
-                                .sum();
-                            vp.insert_before(h, |buf| {
-                                let p = Paragraph::new(lines);
-                                ratatui::widgets::Widget::render(p, buf.area, buf);
-                            })?;
-                            // Post-insert mismatch check: history should have
-                            // grown to exactly min(before + h, MAX_HISTORY) —
-                            // the cap-aware form, so a MAX_HISTORY drain does
-                            // not false-alarm (8hva judge finding).
-                            let history_after = vp.history_len();
-                            let expected_after =
-                                (history_before + h as usize).min(crate::viewport::MAX_HISTORY);
-                            if history_after != expected_after {
-                                let actually_committed =
-                                    history_after.saturating_sub(history_before);
-                                vp.journal_finalize_mismatch(
-                                    actually_committed,
-                                    committed_text_len,
+                                &t,
+                                &label,
+                            )?;
+                            self.queued_interjection_awaiting_done_ids
+                                .extend(newly_awaited);
+                            self.awaiting_queued_interjection_response =
+                                !self.queued_interjection_awaiting_done_ids.is_empty();
+                            interleaved_commit_done = true;
+                        } else {
+                            self.transcript.push(TranscriptBlock::assistant_with_label(
+                                t.route,
+                                label.clone(),
+                                &t.items,
+                            ));
+                            // Fullscreen owns the display: the transcript push above
+                            // is the record, and the inline flip replays it to
+                            // scrollback. Emitting here too would duplicate it.
+                            if !self.fullscreen {
+                                // Finalize-mismatch check: compare committed
+                                // history lines against the rendered line count
+                                // that's about to be inserted. A mismatch here
+                                // means the live preview and the final commit
+                                // diverged — log to the journal and warn.
+                                let history_before = vp.history_len();
+                                let mut lines = render::render_turn(
+                                    &label,
+                                    t.route.color(),
+                                    &t.items,
+                                    wrap_width,
+                                    preview_lines,
+                                    false, // inline scrollback commit keeps full results (mu-5h9m)
                                 );
+                                lines.extend(render::turn_closer(t.route.color()));
+                                let h = lines.len() as u16;
+                                // Compute committed text length for the mismatch check.
+                                let committed_text_len: usize = t
+                                    .items
+                                    .iter()
+                                    .map(|item| {
+                                        if let render::TurnItem::Text(s) = item {
+                                            s.len()
+                                        } else {
+                                            0
+                                        }
+                                    })
+                                    .sum();
+                                vp.insert_before(h, |buf| {
+                                    let p = Paragraph::new(lines);
+                                    ratatui::widgets::Widget::render(p, buf.area, buf);
+                                })?;
+                                // Post-insert mismatch check: history should have
+                                // grown to exactly min(before + h, MAX_HISTORY) —
+                                // the cap-aware form, so a MAX_HISTORY drain does
+                                // not false-alarm (8hva judge finding).
+                                let history_after = vp.history_len();
+                                let expected_after =
+                                    (history_before + h as usize).min(crate::viewport::MAX_HISTORY);
+                                if history_after != expected_after {
+                                    let actually_committed =
+                                        history_after.saturating_sub(history_before);
+                                    vp.journal_finalize_mismatch(
+                                        actually_committed,
+                                        committed_text_len,
+                                    );
+                                }
                             }
                         }
                     }
@@ -5820,13 +6050,15 @@ impl App {
                         }
                     }
                 }
-                if finished_main {
+                if finished_main && !interleaved_commit_done {
                     // R1/R2: a queued interjection did not feed the response
                     // above, so commit it AFTER that response, but with a
                     // label that preserves the concurrent authoring time.
                     // mu-z9ol: only the UNSETTLED ones still owe a response —
                     // an interjection named in this done's receipts was
                     // absorbed into the turn that just committed.
+                    // (mu-9bri: splice-tagged interjections took the
+                    // interleaved path inside the turn commit above.)
                     let newly_awaited = self.commit_pending_interjections(vp, wrap_width)?;
                     self.queued_interjection_awaiting_done_ids
                         .extend(newly_awaited);
@@ -6466,6 +6698,166 @@ mod tests {
         assert_eq!(
             t.header_label(),
             "assistant ⋅ btw ⋅ openrouter/anthropic/claude-haiku-4-5"
+        );
+    }
+
+    /// mu-9bri: the observed bug — a prompt queued mid-turn (splice at
+    /// item 3 of 5) must land BETWEEN the items that preceded it and the
+    /// items that answered it, not below the whole turn.
+    #[test]
+    fn z9bri_splice_plan_puts_question_before_its_answer() {
+        assert_eq!(
+            plan_splice_commit(5, &[Some(3)]),
+            vec![
+                SpliceStep::Segment(0..3),
+                SpliceStep::Interjection(0),
+                SpliceStep::Segment(3..5),
+            ]
+        );
+        // bridge-gap prompt (no live turn at queue time) keeps the
+        // legacy after-the-turn position
+        assert_eq!(
+            plan_splice_commit(5, &[None]),
+            vec![SpliceStep::Segment(0..5), SpliceStep::Interjection(0)]
+        );
+        // no interjections → one segment, the pre-mu-9bri shape
+        assert_eq!(plan_splice_commit(4, &[]), vec![SpliceStep::Segment(0..4)]);
+    }
+
+    #[test]
+    fn z9bri_splice_plan_edges() {
+        // queued before anything streamed → prompt first
+        assert_eq!(
+            plan_splice_commit(3, &[Some(0)]),
+            vec![SpliceStep::Interjection(0), SpliceStep::Segment(0..3)]
+        );
+        // splice past the end (turn shrank / clamped) → after the turn
+        assert_eq!(
+            plan_splice_commit(3, &[Some(9)]),
+            vec![SpliceStep::Segment(0..3), SpliceStep::Interjection(0)]
+        );
+        // two prompts at the same point → no empty segment between them
+        assert_eq!(
+            plan_splice_commit(4, &[Some(2), Some(2)]),
+            vec![
+                SpliceStep::Segment(0..2),
+                SpliceStep::Interjection(0),
+                SpliceStep::Interjection(1),
+                SpliceStep::Segment(2..4),
+            ]
+        );
+        // mixed: mid-turn prompt then a bridge prompt
+        assert_eq!(
+            plan_splice_commit(4, &[Some(1), None]),
+            vec![
+                SpliceStep::Segment(0..1),
+                SpliceStep::Interjection(0),
+                SpliceStep::Segment(1..4),
+                SpliceStep::Interjection(1),
+            ]
+        );
+        // mixed the other way (panel finding): a bridge prompt must not
+        // drag a LATER mid-turn prompt past the end — it resolves to the
+        // next concrete splice, preserving submission order AND the
+        // later prompt's position.
+        assert_eq!(
+            plan_splice_commit(4, &[None, Some(2)]),
+            vec![
+                SpliceStep::Segment(0..2),
+                SpliceStep::Interjection(0),
+                SpliceStep::Interjection(1),
+                SpliceStep::Segment(2..4),
+            ]
+        );
+        // empty turn (error-only done) → prompts only
+        assert_eq!(
+            plan_splice_commit(0, &[Some(0)]),
+            vec![SpliceStep::Interjection(0)]
+        );
+    }
+
+    /// Bare ToolCall item for segment-boundary tests (mu-b20l).
+    fn test_tool_call(id: &str) -> render::TurnItem {
+        render::TurnItem::ToolCall {
+            tool_call_id: id.into(),
+            display_name: "bash".into(),
+            primary_arg: String::new(),
+            arguments: serde_json::Value::Null,
+            partial_args: String::new(),
+        }
+    }
+
+    /// mu-b20l: finalize must REPLACE the segment's streamed text even when
+    /// a ToolCall trails it (the wire orders deltas → tool_call_started →
+    /// finalize). The old last-item-only check appended a duplicate below
+    /// the tool marker — the operator's "stutter."
+    #[test]
+    fn b20l_finalize_replaces_streamed_text_across_trailing_tool_call() {
+        let mut t = Turn::new(TurnRoute::Main, TurnProvenance::new("ollama", "m"));
+        t.push_thinking("hmm");
+        t.push_text("Let me check");
+        t.items.push(test_tool_call("c1"));
+        t.finalize_text("Let me check the config.");
+        let texts: Vec<&str> = t
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                render::TurnItem::Text(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["Let me check the config."],
+            "one canonical text, no duplicate after the tool call: {:?}",
+            t.items
+        );
+    }
+
+    /// mu-b20l guard: a finalize for a segment that streamed no deltas must
+    /// PUSH, not clobber the previous segment's already-canonical item.
+    #[test]
+    fn b20l_no_delta_segment_finalize_does_not_clobber_previous_segment() {
+        let mut t = Turn::new(TurnRoute::Main, TurnProvenance::new("ollama", "m"));
+        t.push_text("segment one");
+        t.finalize_text("segment one, canonical");
+        t.items.push(test_tool_call("c1"));
+        // second segment streams nothing; finalize arrives anyway
+        t.finalize_text("segment two, canonical");
+        let texts: Vec<&str> = t
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                render::TurnItem::Text(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["segment one, canonical", "segment two, canonical"],
+            "earlier segment survives: {:?}",
+            t.items
+        );
+        // thinking mirrors both behaviors: a streamed item is replaced
+        // across its trailing tool call; a stream-less finalize pushes.
+        let mut t2 = Turn::new(TurnRoute::Main, TurnProvenance::new("ollama", "m"));
+        t2.push_thinking("raw");
+        t2.items.push(test_tool_call("c2"));
+        t2.finalize_thinking("canonical reasoning");
+        t2.finalize_thinking("second invocation reasoning");
+        let thinks: Vec<&str> = t2
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                render::TurnItem::Thinking(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thinks,
+            vec!["canonical reasoning", "second invocation reasoning"],
+            "replace tracked, push untracked: {:?}",
+            t2.items
         );
     }
 

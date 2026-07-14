@@ -204,7 +204,20 @@ async fn delete_peer(client: &reqwest::Client, cfg: &PresenceConfig, peer_id: &s
 
 /// Spawn the daemon's presence reconciliation task. Never fails, never
 /// blocks the caller; all etcd trouble is retried on the next tick.
-pub fn spawn(cfg: PresenceConfig, daemon_id: String, sessions: Sessions) {
+///
+/// Returns the task's `JoinHandle` — the caller MUST tie it to daemon
+/// shutdown (serve wraps it in `AbortOnDrop`, same as the MCP listener).
+/// The task loops forever and holds a `Sessions` clone; left running it
+/// wedges the reference-driven shutdown cascade and `mu serve` never
+/// exits after stdin closes (mu-ad5x). Aborting is crash-equivalent and
+/// safe by design: the etcd lease expires at TTL and the peer keys
+/// vanish with it — the same cleanup path a daemon crash takes.
+#[must_use = "tie this handle to shutdown (AbortOnDrop) or serve never exits (mu-ad5x)"]
+pub fn spawn(
+    cfg: PresenceConfig,
+    daemon_id: String,
+    sessions: Sessions,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         let tick = Duration::from_secs((cfg.ttl_s / 3).max(2));
@@ -251,7 +264,7 @@ pub fn spawn(cfg: PresenceConfig, daemon_id: String, sessions: Sessions) {
             }
             tokio::time::sleep(tick).await;
         }
-    });
+    })
 }
 
 #[cfg(test)]

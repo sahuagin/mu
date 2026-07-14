@@ -392,12 +392,22 @@ where
     // as the supervisor mailbox above) AND config-gated: without
     // [dialogue.presence] enabled=true this spawns nothing and touches no
     // network, so a bare mu install needs no etcd.
-    if daemon_info.events_dir().is_some() {
-        if let Some(pcfg) = presence::from_config(daemon_info.config().dialogue.as_ref()) {
+    // mu-ad5x: the presence task loops forever and holds a Sessions clone,
+    // so like the MCP listener below it MUST die with the transport handler
+    // (AbortOnDrop captured by the closure) or the shutdown cascade wedges
+    // and `mu serve` never exits after stdin closes. The abort is
+    // crash-equivalent: the etcd lease expires at TTL and the peer keys
+    // vanish with it.
+    let presence_guard = if daemon_info.events_dir().is_some() {
+        presence::from_config(daemon_info.config().dialogue.as_ref()).map(|pcfg| {
             tracing::info!(etcd = ?pcfg.etcd, "dialogue presence: enabled (etcd lease)");
-            presence::spawn(pcfg, daemon_info.daemon_id().to_string(), sessions.clone());
-        }
-    }
+            let handle =
+                presence::spawn(pcfg, daemon_info.daemon_id().to_string(), sessions.clone());
+            AbortOnDrop(std::sync::Mutex::new(Some(handle)))
+        })
+    } else {
+        None
+    };
     // mu-935: when events_dir is configured (mu-upb's on-disk JSONL
     // path), wrap the local backend with FileBackend so session.list
     // with include_remote=true picks up peer daemons' sessions from
@@ -595,6 +605,9 @@ where
     // sends; `None` = the pipeline owns the response.
     mu_core::transport::serve_with_ingest(reader, writer, outbound, move |req, _notif, origin| {
         let _ = &mcp_guard;
+        // mu-ad5x: same lifetime contract as mcp_guard — dropping the
+        // handler aborts the presence task, releasing its Sessions clone.
+        let _ = &presence_guard;
         let control = control.clone();
         let auth_state = auth_state.clone();
         async move { pipeline::ingest(&control, req, origin, &auth_state) }

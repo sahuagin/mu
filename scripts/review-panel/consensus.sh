@@ -8,6 +8,11 @@
 # orchestrator escalates an unresolved split. Models can't talk directly, so this
 # script mediates the rounds (mu-dialogue peer-convergence is a future swap-in).
 #
+# Round 1 seats may carry a per-rank `focus` (mu-3ajg, applied by dispatch.sh):
+# parallel seats then review different topics instead of duplicating one review.
+# Convergence rounds (2+) are deliberately UNfocused — they reconcile the pooled
+# findings, and a seat pressing only its own lens there would fight convergence.
+#
 # usage: consensus.sh <round1-prompt-file> <out-dir> [review-cwd] [max-rounds]
 # exit:  0 consensus reached (verdict on stdout: "CONSENSUS <verdict>")
 #        3 no consensus after max-rounds (ESCALATE)

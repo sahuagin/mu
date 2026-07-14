@@ -196,6 +196,29 @@ pub struct DoneEvent {
     /// milliseconds. None for clean-shutdown Dones where no turns ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u64>,
+    /// mu-z9ol: one entry per ask this Done satisfies. Several asks can
+    /// share one Done — a user message that arrives mid-ask is absorbed
+    /// into the running ask (spec mu-046 WP4), and the loop's synthetic
+    /// terminal Done closes out every still-pending ticket. Clients use
+    /// these to reconcile queued prompts against the responses that
+    /// actually covered them instead of awaiting dones that never come.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_receipts: Vec<DoneCommandReceipt>,
+}
+
+/// Wire projection of one `CommandTicket` carried by a terminal Done
+/// (mu-z9ol). Deliberately minimal: enough for a client to match the
+/// receipt to a request it issued, without echoing the full params.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DoneCommandReceipt {
+    /// Session-log event id of the `CommandReceived` this receipt
+    /// answers — globally unique within the session log.
+    pub command_event_id: u64,
+    /// JSON-RPC id of the originating command. Client-chosen and unique
+    /// only per connection: match it against ids YOU issued.
+    pub request_id: Value,
+    /// The original command's method (e.g. `ask_session`).
+    pub method: String,
 }
 
 impl DoneEvent {

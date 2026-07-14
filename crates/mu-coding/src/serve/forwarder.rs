@@ -49,9 +49,9 @@ use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 use mu_core::protocol::{
     AssistantTextFinalizedEvent, AutonomousIterationCompletedEvent,
     AutonomousIterationStartedEvent, AutonomousScheduledWakeupEvent, AutonomousTerminatedEvent,
-    CalloutBody, CalloutEvent, DoneEvent, ErrorEvent, InputRequiredEvent, ProviderStatusEvent,
-    TextDeltaEvent, ThinkingDeltaEvent, ThinkingFinalizedEvent, ToolCallCompletedEvent,
-    ToolCallDeltaEvent, ToolCallStartedEvent, ToolOutcome,
+    CalloutBody, CalloutEvent, DoneCommandReceipt, DoneEvent, ErrorEvent, InputRequiredEvent,
+    ProviderStatusEvent, TextDeltaEvent, ThinkingDeltaEvent, ThinkingFinalizedEvent,
+    ToolCallCompletedEvent, ToolCallDeltaEvent, ToolCallStartedEvent, ToolOutcome,
 };
 use mu_core::session_status::SessionStatus;
 use mu_core::transport::codes;
@@ -151,7 +151,8 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
             stop_reason,
             usage,
             elapsed_ms,
-            ..
+            turn_count: _,
+            command_receipts,
         } => to_pair(
             DoneEvent::METHOD,
             DoneEvent {
@@ -159,6 +160,19 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
                 stop_reason,
                 usage,
                 elapsed_ms,
+                // mu-z9ol: surface the satisfied-ask correlation on the
+                // wire. Several asks can share one Done (mid-ask
+                // absorption, spec mu-046 WP4); without this, clients
+                // that queued a prompt cannot tell an absorbed ask from
+                // one whose own done is still coming.
+                command_receipts: command_receipts
+                    .into_iter()
+                    .map(|t| DoneCommandReceipt {
+                        command_event_id: t.command_event_id,
+                        request_id: t.echo.request_id,
+                        method: t.echo.method,
+                    })
+                    .collect(),
             },
         ),
         AgentEvent::Error { message } => to_pair(
@@ -1048,6 +1062,61 @@ mod tests {
         .expect("expected Some");
         assert_eq!(params["outcome"]["kind"], "err");
         assert_eq!(params["outcome"]["message"], "boom");
+    }
+
+    /// mu-z9ol: the wire Done must carry one receipt per satisfied ask —
+    /// clients reconcile queued prompts against them. Several asks share
+    /// one Done when a mid-ask user message is absorbed (spec mu-046 WP4).
+    #[test]
+    fn translate_done_carries_command_receipts() {
+        use mu_core::command_journal::CommandEcho;
+
+        let ticket = |event_id: u64, req_id: i64| CommandTicket {
+            command_event_id: event_id,
+            echo: CommandEcho {
+                request_id: serde_json::json!(req_id),
+                method: "ask_session".into(),
+                params: serde_json::json!({"user_message": "hi"}),
+            },
+            received_at_unix_ms: 1_777_000_000_000,
+        };
+        let (method, params) = translate_event(
+            "s1",
+            AgentEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: None,
+                elapsed_ms: Some(10),
+                command_receipts: vec![ticket(5, 12), ticket(9, 13)],
+            },
+        )
+        .expect("Done has a wire notification");
+        assert_eq!(method, "session.done");
+        let receipts = params["command_receipts"]
+            .as_array()
+            .expect("receipts on the wire");
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0]["command_event_id"], 5);
+        assert_eq!(receipts[0]["request_id"], 12);
+        assert_eq!(receipts[0]["method"], "ask_session");
+        assert_eq!(receipts[1]["request_id"], 13);
+        // the full original params must NOT be echoed on the wire
+        assert!(receipts[0].get("params").is_none());
+
+        // a receiptless Done (wakeup/autonomous turn) omits the field
+        // entirely — old clients and strict parsers see no change.
+        let (_, params) = translate_event(
+            "s1",
+            AgentEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: None,
+                elapsed_ms: None,
+                command_receipts: Vec::new(),
+            },
+        )
+        .expect("Done has a wire notification");
+        assert!(params.get("command_receipts").is_none());
     }
 
     #[test]

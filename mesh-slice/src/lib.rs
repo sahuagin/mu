@@ -29,14 +29,17 @@ mod tests {
     use crate::proxy::CodeIndexProxy;
     use crate::service;
 
-    const NATS_BIN: &str = "/home/claude/.local/bin/nats-server";
+    /// nats-server binary: `$NATS_BIN` if set, else `nats-server` on `PATH`.
+    fn nats_bin() -> String {
+        std::env::var("NATS_BIN").unwrap_or_else(|_| "nats-server".to_string())
+    }
 
     /// Spawn a throwaway nats-server (JetStream on, store under target/) and
     /// return the child + its client URL. Panics if the binary is missing.
     async fn spawn_nats(port: u16) -> (std::process::Child, String) {
         let store = format!("target/nats-js-{port}");
         let _ = std::fs::remove_dir_all(&store);
-        let child = std::process::Command::new(NATS_BIN)
+        let child = std::process::Command::new(nats_bin())
             .args([
                 "-p",
                 &port.to_string(),
@@ -49,7 +52,7 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("spawn nats-server (is it installed at NATS_BIN?)");
+            .expect("spawn nats-server (set NATS_BIN or add nats-server to PATH)");
         // Wait for the port to accept connections.
         let url = format!("127.0.0.1:{port}");
         for _ in 0..100 {

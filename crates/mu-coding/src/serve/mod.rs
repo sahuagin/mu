@@ -20,6 +20,7 @@ mod handlers;
 mod mailbox;
 pub mod mcp;
 pub mod mcp_client;
+mod mesh;
 mod pipeline;
 mod presence;
 mod provider_status;
@@ -541,6 +542,68 @@ where
                 )
             })?;
     }
+    // mu-wxc4: NATS mesh adapter (adapter #3, INV-7). Config-gated: with
+    // `[mesh] enabled=true` the daemon also serves its JSON-RPC surface over
+    // the mesh via serve/mesh.rs — inbound crosses `ingest` (journaled),
+    // outbound rides an outbound Router lane. Spawned AFTER the control plane
+    // and outbound Router exist, like the MCP adapter below. The returned
+    // handle aborts its tasks on drop, so capturing it in the transport
+    // closure ties it to daemon shutdown (mu-ad5x lifetime contract).
+    let mesh_guard = {
+        let mesh_cfg = &daemon_info.config().mesh;
+        // FAIL CLOSED (mu-iqo8): the mesh adapter serves ONE auth state for all
+        // peers multiplexed on its subject, so per-connection auth cannot
+        // isolate them — once any peer authenticates, every peer on the subject
+        // is authorized. Rather than ship that bypass behind a doc, refuse to
+        // expose the mesh when a peer-auth handshake is configured. The mesh's
+        // real multi-peer auth is per-request biscuit capabilities (mesh-slice)
+        // and lands with mu-iqo8; until then it runs ONLY where the daemon is
+        // already pre-authenticated (no auth mechanism enforcing — e.g. a
+        // single-operator / trusted-network deployment).
+        let auth_required = matches!(
+            auth::initial_connection_state(&auth_registry),
+            auth::AuthState::Unauthenticated
+        );
+        if mesh_cfg.enabled && auth_required {
+            tracing::error!(
+                "[mesh].enabled but an auth mechanism requires a per-connection handshake; \
+                 the mesh multiplexes peers on one subject and cannot yet isolate their auth \
+                 (mu-iqo8) — refusing to expose protected commands over the mesh. Disable \
+                 [mesh] or [auth], or wait for per-request capabilities."
+            );
+            None
+        } else if mesh_cfg.enabled {
+            let subject = if mesh_cfg.subject.is_empty() {
+                format!("mu.daemon.{}.rpc", daemon_info.daemon_id())
+            } else {
+                mesh_cfg.subject.clone()
+            };
+            // Pre-authenticated (no enforcing mechanism): the mesh gets its own
+            // connection auth state via `initial_connection_state`, the same
+            // per-connection posture the MCP adapter applies (mu-046 WP5).
+            let mesh_auth_state: auth::AuthStateHandle = Arc::new(std::sync::Mutex::new(
+                auth::initial_connection_state(&auth_registry),
+            ));
+            match mesh::spawn_mesh_adapter(
+                &mesh_cfg.nats_url,
+                &subject,
+                control.clone(),
+                mesh_auth_state,
+                outbound.clone(),
+            )
+            .await
+            {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    tracing::warn!(error = %e,
+                        "mesh adapter failed to start; daemon serves without the mesh");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
     // mu-mb02: start MCP server on a unix socket if MU_MCP_SOCKET is
     // set or if the default socket path's parent exists. The MCP surface
     // shares Sessions + DaemonInfo with the primary JSON-RPC loop so
@@ -608,6 +671,9 @@ where
         // mu-ad5x: same lifetime contract as mcp_guard — dropping the
         // handler aborts the presence task, releasing its Sessions clone.
         let _ = &presence_guard;
+        // mu-wxc4: same lifetime contract — dropping the handler aborts the
+        // mesh adapter tasks, releasing their ControlPlane/Router clones.
+        let _ = &mesh_guard;
         let control = control.clone();
         let auth_state = auth_state.clone();
         async move { pipeline::ingest(&control, req, origin, &auth_state) }

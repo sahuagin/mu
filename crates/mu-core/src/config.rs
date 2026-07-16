@@ -93,6 +93,34 @@ pub struct Config {
     /// providers). Accepted-and-ignored here as opaque passthrough.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialogue: Option<toml::Value>,
+    /// `[mesh]` — NATS service-mesh transport (mu-wxc4): when enabled, the
+    /// daemon connects to NATS and serves its JSON-RPC surface over the mesh
+    /// (via `serve/mesh.rs`), in addition to stdio. Default disabled, so a
+    /// bare install touches no NATS.
+    pub mesh: MeshConfig,
+}
+
+/// `[mesh]` section (mu-wxc4). Off by default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MeshConfig {
+    /// Serve the daemon over the NATS mesh when true.
+    pub enabled: bool,
+    /// NATS server URL (e.g. `127.0.0.1:4222`).
+    pub nats_url: String,
+    /// Inbound request subject the daemon subscribes to. Defaults to a
+    /// per-daemon subject at startup when left empty.
+    pub subject: String,
+}
+
+impl Default for MeshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            nats_url: "127.0.0.1:4222".to_string(),
+            subject: String::new(),
+        }
+    }
 }
 
 /// `[routes]` section. Startup route-catalog discovery (mu-818c).

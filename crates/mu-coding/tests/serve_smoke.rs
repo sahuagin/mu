@@ -125,6 +125,39 @@ async fn spawn_server_full(
     (client, handle)
 }
 
+/// Like [`spawn_server_full`] but WITHOUT the bearer handshake — for configs
+/// whose auth is non-enforcing (empty BEARER allowlist), where the daemon runs
+/// pre-authenticated (mu-ddua) and a token handshake would be *denied* against
+/// the empty allowlist. Returns the (unauthenticated-but-pre-authed) client +
+/// handle. Used by the mesh test, which exercises the mesh transport rather
+/// than stdio auth.
+async fn spawn_server_no_handshake(
+    provider: Arc<dyn Provider>,
+    config: Config,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (server_read, server_write) = tokio::io::split(server);
+    let server_buf = BufReader::new(server_read);
+    let mut config = config;
+    if config.journal.dir.is_none() {
+        config.journal.dir = Some(unique_test_dir("journal"));
+    }
+    let factory: serve::ProviderFactory =
+        std::sync::Arc::new(move |_selector, _cache_ttl| Ok(provider.clone()));
+    let handle = tokio::spawn(serve::serve_with_io_with_config(
+        server_buf,
+        server_write,
+        factory,
+        Vec::new(),
+        None,
+        config,
+    ));
+    (client, handle)
+}
+
 /// Perform the BEARER handshake on `client` so subsequent RPCs pass
 /// the mu-fnn enforcement gate. Panics on any non-success — the
 /// happy-path here is contract, not the test under verification.
@@ -1890,4 +1923,200 @@ async fn mh4_resume_bad_ref_rejected() {
 
     drop(client);
     let _ = timeout(Duration::from_millis(500), server_handle).await;
+}
+
+// ---------------------------------------------------------------------------
+// mu-wxc4: the mesh transport, live. Proves the daemon actually serves its
+// JSON-RPC surface over NATS through the wired adapter (serve/mesh.rs,
+// spawned from serve/mod.rs when [mesh].enabled) — not just the in-memory
+// unit proof. A real nats-server, a real request/reply round-trip.
+// ---------------------------------------------------------------------------
+
+/// Spawn a throwaway nats-server (JetStream on, store under target/) and wait
+/// for its port to accept connections. The binary is resolved from `$NATS_BIN`
+/// if set, otherwise `nats-server` on `PATH` — so this runs on any host with
+/// nats-server installed, not just one hardcoded location. Skips the test
+/// (returns None) if the binary cannot be spawned, so the suite still passes on
+/// hosts without NATS installed.
+///
+/// The child is returned to the caller, which kills + waits it. clippy's
+/// zombie_processes lint can't see that cross-function ownership (and the
+/// timeout-panic path aborts the test process regardless), so allow it here.
+#[allow(clippy::zombie_processes)]
+async fn spawn_nats(port: u16) -> Option<(std::process::Child, String)> {
+    let bin = std::env::var("NATS_BIN").unwrap_or_else(|_| "nats-server".to_string());
+    let store = format!("target/nats-js-{port}");
+    let _ = std::fs::remove_dir_all(&store);
+    let child = match std::process::Command::new(&bin)
+        .args([
+            "-p",
+            &port.to_string(),
+            "-js",
+            "-sd",
+            &store,
+            "-a",
+            "127.0.0.1",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("skipping mesh test: cannot spawn nats-server ({bin}): {e} — set NATS_BIN or add nats-server to PATH");
+            return None;
+        }
+    };
+    let url = format!("127.0.0.1:{port}");
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(&url).await.is_ok() {
+            return Some((child, url));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("nats-server on {url} never accepted connections");
+}
+
+/// The daemon, mesh-enabled, over a live NATS: a mesh client requests the
+/// daemon's subject and gets the JSON-RPC reply back over the bus. This is
+/// the full wired path — `spawn_mesh_adapter` (serve/mod.rs startup) →
+/// subscription → `ingest` → Router lane → NATS reply — with only the client
+/// standing in for a peer service.
+#[tokio::test]
+async fn mesh_daemon_serves_jsonrpc_over_live_nats() {
+    let Some((mut nats, url)) = spawn_nats(14520).await else {
+        return; // no nats-server on this host; nothing to prove
+    };
+
+    const SUBJECT: &str = "mu.smoke.daemon.rpc";
+    // Default auth (BEARER with an empty allowlist) is non-enforcing, so the
+    // daemon runs pre-authenticated (mu-ddua) and the mesh is exposed. With an
+    // *enforcing* mechanism the mesh fails closed instead — see
+    // `mesh_refuses_when_auth_is_enforcing_over_live_nats`.
+    let config = Config {
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
+        mesh: mu_core::config::MeshConfig {
+            enabled: true,
+            nats_url: url.clone(),
+            subject: SUBJECT.to_string(),
+        },
+        ..Default::default()
+    };
+
+    // Keep `client` alive (unused beyond keeping the daemon serving). No
+    // handshake: the empty-allowlist config is non-enforcing, so the daemon is
+    // pre-authenticated and the mesh is exposed.
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (client, server_handle) = spawn_server_no_handshake(provider, config).await;
+
+    // A peer on the bus. Retry the request/reply until the daemon's mesh
+    // subscription is up (no stdio handshake barrier gates that here), then
+    // exercise the full wired path: subject → ingest → Router lane → NATS reply.
+    let bus = async_nats::connect(&url).await.expect("connect nats");
+    let req = json!({ "jsonrpc": "2.0", "id": 99, "method": "ping", "params": null });
+    let payload = serde_json::to_vec(&req).expect("encode request");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let reply = loop {
+        match timeout(
+            Duration::from_secs(2),
+            bus.request(SUBJECT, payload.clone().into()),
+        )
+        .await
+        {
+            Ok(Ok(reply)) => break reply,
+            _ if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            other => panic!("mesh never responded before deadline: {other:?}"),
+        }
+    };
+    let resp: Value = serde_json::from_slice(&reply.payload).expect("decode mesh reply");
+
+    assert_eq!(resp["jsonrpc"], "2.0", "reply is JSON-RPC: {resp}");
+    assert_eq!(
+        resp["id"], 99,
+        "reply restores the client's own JSON-RPC id (not the internal correlation id): {resp}"
+    );
+    assert_eq!(
+        resp["result"]["pong"], true,
+        "daemon answered ping over the mesh: {resp}"
+    );
+    assert!(
+        resp["result"]["server_version"].is_string(),
+        "ping result carries server_version: {resp}"
+    );
+
+    // An unparseable request that carries a reply subject gets a JSON-RPC
+    // error back (id=null, -32700), like stdio's parse_request_line — not a
+    // silent drop that leaves the peer waiting out its timeout.
+    let bad = timeout(
+        Duration::from_secs(5),
+        bus.request(SUBJECT, b"}{ not json".to_vec().into()),
+    )
+    .await
+    .expect("parse-error reply timed out")
+    .expect("parse-error reply failed");
+    let err: Value = serde_json::from_slice(&bad.payload).expect("decode error reply");
+    assert_eq!(err["jsonrpc"], "2.0", "error reply is JSON-RPC: {err}");
+    assert!(err["id"].is_null(), "unparseable request → id null: {err}");
+    assert_eq!(err["error"]["code"], -32700, "parse error code: {err}");
+
+    drop(client); // stdin-EOF → daemon shutdown cascade (drops the mesh guard)
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+    nats.kill().ok();
+    nats.wait().ok();
+}
+
+/// mu-iqo8 fail-closed: with an *enforcing* auth mechanism configured, the mesh
+/// adapter must NOT expose the daemon — it multiplexes peers on one subject and
+/// cannot isolate their auth yet, so exposing protected commands would be a
+/// cross-peer bypass. The daemon refuses to subscribe; a bus peer requesting
+/// the subject gets "no responders", not a reply.
+#[tokio::test]
+async fn mesh_refuses_when_auth_is_enforcing_over_live_nats() {
+    let Some((mut nats, url)) = spawn_nats(14521).await else {
+        return; // no nats-server on this host; nothing to prove
+    };
+
+    const SUBJECT: &str = "mu.smoke.daemon.refused";
+    // A non-empty BEARER allowlist IS enforcing → auth required → mesh refuses.
+    let config = Config {
+        auth: AuthConfig::Bearer {
+            tokens: vec![TEST_BEARER_TOKEN.to_string()],
+        },
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
+        mesh: mu_core::config::MeshConfig {
+            enabled: true,
+            nats_url: url.clone(),
+            subject: SUBJECT.to_string(),
+        },
+        ..Default::default()
+    };
+
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (client, server_handle) = spawn_server_with_config(provider, Vec::new(), config).await;
+
+    let bus = async_nats::connect(&url).await.expect("connect nats");
+    let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping", "params": null });
+    let payload = serde_json::to_vec(&req).expect("encode request");
+    // No subscriber on the subject: the mesh refused to come up. That surfaces
+    // either as a NoResponders request error or (if the client isn't tracking
+    // responders) as no reply at all — both are correct. Only an actual reply
+    // means the mesh wrongly exposed the daemon under enforcing auth.
+    let outcome = timeout(Duration::from_secs(2), bus.request(SUBJECT, payload.into())).await;
+    if let Ok(Ok(reply)) = outcome {
+        panic!(
+            "mesh must refuse under enforcing auth, but a peer got a reply: {:?}",
+            String::from_utf8_lossy(&reply.payload)
+        );
+    }
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+    nats.kill().ok();
+    nats.wait().ok();
 }

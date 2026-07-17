@@ -62,7 +62,7 @@ async fn bridge_binary_serves_code_recall_over_stdio() {
     let issuer_hex = root.private().to_bytes_hex();
 
     let svc_client = async_nats::connect(&url).await.expect("connect nats");
-    let _service = service::start(svc_client, root.public())
+    let _service = service::start(svc_client, root.public(), service::Backend::Stub)
         .await
         .expect("start code_index service");
 

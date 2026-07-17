@@ -15,6 +15,7 @@
 pub mod adapter;
 pub mod agent;
 pub mod capability;
+pub mod config;
 pub mod contract;
 pub mod proxy;
 pub mod service;
@@ -78,7 +79,7 @@ mod tests {
         let root = Arc::new(KeyPair::new());
         // Hold the service handle for the test's lifetime — dropping it stops
         // the service.
-        let _service = service::start(client.clone(), root.public())
+        let _service = service::start(client.clone(), root.public(), service::Backend::Stub)
             .await
             .expect("start code_index service");
 
@@ -134,7 +135,7 @@ mod tests {
         let (mut nats, url) = spawn_nats(14323).await;
         let client = async_nats::connect(&url).await.expect("connect nats");
         let root = Arc::new(KeyPair::new());
-        let _service = service::start(client.clone(), root.public())
+        let _service = service::start(client.clone(), root.public(), service::Backend::Stub)
             .await
             .expect("start service");
         let proxy = Arc::new(CodeIndexProxy::new(client.clone(), root.clone()));
@@ -180,6 +181,64 @@ mod tests {
         assert!(hits[0].symbol.contains("where_are_sessions_built"));
 
         cc.cancel().await.ok();
+        nats.kill().ok();
+        nats.wait().ok();
+    }
+
+    /// The protocol adapter, live: the mesh `code_index` service forwards to
+    /// the ACTUAL running code_index MCP server and relays REAL hits (not the
+    /// stub fixture). The endpoint comes from config — env
+    /// `MU_MESH_CODE_INDEX_URL` or `[mesh] code_index_url` in
+    /// `~/.config/agent/config.toml`; nothing is baked into the code. Skips
+    /// if unconfigured or unreachable.
+    #[tokio::test]
+    async fn code_index_service_forwards_to_real_backend() {
+        let Some(cx_url) = crate::config::setting("MU_MESH_CODE_INDEX_URL", "code_index_url")
+        else {
+            eprintln!(
+                "skipping: no code_index endpoint (set MU_MESH_CODE_INDEX_URL or \
+                 [mesh] code_index_url in ~/.config/agent/config.toml)"
+            );
+            return;
+        };
+        let (mut nats, url) = spawn_nats(14327).await;
+        let client = async_nats::connect(&url).await.expect("connect nats");
+        let root = Arc::new(KeyPair::new());
+
+        let started = service::start(
+            client.clone(),
+            root.public(),
+            service::Backend::CodeIndexMcp {
+                url: cx_url.clone(),
+            },
+        )
+        .await;
+        let Ok(_service) = started else {
+            eprintln!("skipping: code_index MCP unreachable at {cx_url}");
+            nats.kill().ok();
+            nats.wait().ok();
+            return;
+        };
+
+        let proxy = CodeIndexProxy::new(client.clone(), root.clone());
+        let hits = proxy
+            .recall("where are sessions built", Some(3))
+            .await
+            .expect("recall");
+        assert!(!hits.is_empty(), "real backend returned hits");
+        // Real repo source paths — NOT the stub's fabricated `src/stub_N.rs`.
+        assert!(
+            hits.iter().any(|h| h.path.contains(".rs")),
+            "hits carry real source paths: {hits:?}"
+        );
+        assert!(
+            hits.iter().all(|h| h.path != "src/stub_0.rs"),
+            "must be real results, not the stub: {hits:?}"
+        );
+
+        let status = proxy.status().await.expect("status");
+        assert!(status.healthy, "real backend reports healthy");
+
         nats.kill().ok();
         nats.wait().ok();
     }

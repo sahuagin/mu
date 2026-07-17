@@ -48,7 +48,12 @@ reinventing. NATS provides, off the shelf:
    it means "directed 1-1 to the memory service, relay the reply".
 
 5. **MCP only at the foreign edge.** CC speaks MCP 1.0; an MCP↔NATS adapter is
-   the ONLY MCP-speaking hop. The fleet never speaks MCP internally.
+   the ONLY MCP-speaking hop. The fleet never speaks MCP internally. The
+   deployable form is **`mu-mesh-bridge`** (`mesh-slice/src/bin/bridge.rs`): a
+   stdio MCP server CC launches as a subprocess (`.mcp.json` `command=`), which
+   relays `code_recall`/`code_status` to the mesh via the proxy — retiring the
+   hardcoded `code-index` `ip:port`. Proven by `tests/bridge_smoke.rs` launching
+   the real binary as CC would. Next services behind it: memory, kx, beadsd.
 
 ## Command & control (agents as first-class peers)
 

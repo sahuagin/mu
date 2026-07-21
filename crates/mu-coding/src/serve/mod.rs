@@ -21,6 +21,7 @@ mod mailbox;
 pub mod mcp;
 pub mod mcp_client;
 mod mesh;
+mod mesh_consume;
 mod pipeline;
 mod presence;
 mod provider_status;
@@ -440,6 +441,27 @@ where
     // Once registered they're base session tools, so the mu-onq8 `discover`
     // tool ranks them alongside everything else.
     let mut tools = tools;
+    // mu-a0l6: mesh-consumed code_index tools register FIRST — enabling
+    // consumption is an explicit operator choice, so it wins name collisions;
+    // the MCP import below then warns+skips its duplicates. Best-effort like
+    // the import: failure degrades to "no mesh tools", never a boot failure.
+    if daemon_info.config().mesh.consume_code_index {
+        match mesh_consume::mesh_code_index_tools(&daemon_info.config().mesh).await {
+            Ok(mesh_tools) => {
+                for tool in mesh_tools {
+                    let name = tool.spec().name;
+                    if tools.iter().any(|t| t.spec().name == name) {
+                        tracing::warn!(tool = %name,
+                            "mesh-consumed tool collides with an existing tool; skipping");
+                    } else {
+                        tools.push(tool);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e,
+                "mesh code_index consumption failed to start; continuing without it"),
+        }
+    }
     if daemon_info.config().mcp.enabled {
         let mut imported = mcp_client::import_remote_tools(&daemon_info.config().mcp.servers).await;
         for imported_tool in imported.tools {

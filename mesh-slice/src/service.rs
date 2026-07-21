@@ -98,7 +98,11 @@ pub async fn start(
         tokio::spawn(async move {
             while let Some(req) = endpoint.next().await {
                 let reply = serve(&req.message.payload, &issuer, &backend).await;
-                let _ = req.respond(Ok(reply)).await;
+                // A reply that cannot be sent leaves the caller waiting out
+                // its timeout — make that observable, never silent.
+                if let Err(e) = req.respond(Ok(reply)).await {
+                    eprintln!("code_index service: failed to send reply: {e}");
+                }
             }
         });
     }
@@ -177,6 +181,27 @@ fn stub_command(command: &Command) -> CommandResult {
     }
 }
 
+/// Bound on one backend (code_index MCP) round-trip. Without it a stalled
+/// backend hangs the handler task; NATS peers time out but server tasks
+/// accumulate (review 2026-07-21). Generous: covers cold-embedder reloads.
+const BACKEND_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Await `fut` under [`BACKEND_CALL_TIMEOUT`], turning a timeout into a typed
+/// error instead of an indefinite hang.
+async fn bounded<T, E: std::fmt::Display>(
+    what: &str,
+    fut: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> Result<T> {
+    match tokio::time::timeout(BACKEND_CALL_TIMEOUT, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(anyhow::anyhow!("{what}: {e}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "{what}: backend timed out after {}s",
+            BACKEND_CALL_TIMEOUT.as_secs()
+        )),
+    }
+}
+
 /// Protocol adapter: forward the command to the real code_index MCP server and
 /// map its answer into the typed contract.
 async fn code_index_command(
@@ -190,10 +215,11 @@ async fn code_index_command(
             if let Some(l) = limit {
                 args.insert("limit".into(), json!(l));
             }
-            let res = cx
-                .call_tool(CallToolRequestParams::new("code_recall").with_arguments(args))
-                .await
-                .map_err(|e| anyhow::anyhow!("code_recall call: {e}"))?;
+            let res = bounded(
+                "code_recall call",
+                cx.call_tool(CallToolRequestParams::new("code_recall").with_arguments(args)),
+            )
+            .await?;
             let text = res
                 .content
                 .iter()
@@ -212,10 +238,11 @@ async fn code_index_command(
             Ok(CommandResult::CodeRecall(hits_from_markdown(&text)?))
         }
         Command::CodeStatus => {
-            let res = cx
-                .call_tool(CallToolRequestParams::new("code_status"))
-                .await
-                .map_err(|e| anyhow::anyhow!("code_status call: {e}"))?;
+            let res = bounded(
+                "code_status call",
+                cx.call_tool(CallToolRequestParams::new("code_status")),
+            )
+            .await?;
             let healthy = !res.is_error.unwrap_or(false);
             // `indexed_repos` is 1/0 for the ONE index this service fronts —
             // the contract has no richer field and stays unchanged for this

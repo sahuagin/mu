@@ -88,6 +88,22 @@ pub struct Agent {
     /// event stream.
     inbox_tx: mpsc::UnboundedSender<InboundEvent>,
     inbox_rx: mpsc::UnboundedReceiver<InboundEvent>,
+    /// Teams already subscribed — makes [`Agent::join_team`] idempotent
+    /// (re-joining must NOT add a second subscriber, which would double
+    /// every team delivery; review 2026-07-21).
+    joined_teams: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Forwarder tasks (DM inbox + one per joined team), aborted on drop so
+    /// a dropped Agent releases its subscriptions promptly instead of
+    /// lingering until the next message fails to send (review 2026-07-21).
+    forwarders: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        for h in self.forwarders.lock().expect("forwarders").drain(..) {
+            h.abort();
+        }
+    }
 }
 
 impl Agent {
@@ -125,7 +141,7 @@ impl Agent {
             .flush()
             .await
             .map_err(|e| anyhow!("flush after join: {e}"))?;
-        spawn_forwarder(dm_sub, issuer, inbox_tx.clone());
+        let dm_forwarder = spawn_forwarder(dm_sub, issuer, inbox_tx.clone());
 
         Ok(Self {
             id: id.to_string(),
@@ -135,6 +151,8 @@ impl Agent {
             _presence: presence,
             inbox_tx,
             inbox_rx,
+            joined_teams: std::sync::Mutex::new(std::collections::HashSet::new()),
+            forwarders: std::sync::Mutex::new(vec![dm_forwarder]),
         })
     }
 
@@ -187,19 +205,39 @@ impl Agent {
     }
 
     /// Launch/join a team (use 3): subscribe to the team's channel so this
-    /// agent receives its multicasts as [`InboundEvent::Team`]. Idempotent
-    /// at the messaging layer — joining twice just adds another subscriber.
+    /// agent receives its multicasts as [`InboundEvent::Team`]. Idempotent:
+    /// re-joining a team this agent already subscribed is a no-op (a second
+    /// subscription would double every delivery).
     pub async fn join_team(&self, team: &str) -> Result<()> {
-        let sub = self
-            .client
-            .subscribe(team_subject(team))
-            .await
-            .map_err(|e| anyhow!("team subscribe: {e}"))?;
-        self.client
-            .flush()
-            .await
-            .map_err(|e| anyhow!("flush after team join: {e}"))?;
-        spawn_forwarder(sub, self.issuer, self.inbox_tx.clone());
+        // Claim membership atomically BEFORE subscribing: a concurrent
+        // re-join sees the claim and returns instead of double-subscribing.
+        // On subscribe failure the claim is RELEASED, so a transient error
+        // does not poison future re-joins. (Closes both the sequential
+        // error-poisoning and the concurrent double-join review findings.)
+        if !self
+            .joined_teams
+            .lock()
+            .expect("joined_teams")
+            .insert(team.to_string())
+        {
+            return Ok(()); // already a member (or join in flight)
+        }
+        let sub = match self.client.subscribe(team_subject(team)).await {
+            Ok(sub) => sub,
+            Err(e) => {
+                self.joined_teams.lock().expect("joined_teams").remove(team);
+                return Err(anyhow!("team subscribe: {e}"));
+            }
+        };
+        if let Err(e) = self.client.flush().await {
+            // Release the claim on ANY post-claim failure — a kept claim
+            // makes every future re-join a silent no-op (`sub` drops here,
+            // unsubscribing client-side).
+            self.joined_teams.lock().expect("joined_teams").remove(team);
+            return Err(anyhow!("flush after team join: {e}"));
+        }
+        let handle = spawn_forwarder(sub, self.issuer, self.inbox_tx.clone());
+        self.forwarders.lock().expect("forwarders").push(handle);
         Ok(())
     }
 
@@ -251,7 +289,7 @@ fn spawn_forwarder(
     mut sub: async_nats::Subscriber,
     issuer: PublicKey,
     tx: mpsc::UnboundedSender<InboundEvent>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(msg) = sub.next().await {
             let Ok(env) = serde_json::from_slice::<Envelope<AgentCommand>>(&msg.payload) else {
@@ -270,5 +308,5 @@ fn spawn_forwarder(
                 break; // agent dropped
             }
         }
-    });
+    })
 }

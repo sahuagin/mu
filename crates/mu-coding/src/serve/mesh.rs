@@ -129,7 +129,7 @@ pub(crate) async fn serve_mesh<E: MeshEgress>(
     control: Arc<ControlPlane>,
     auth_state: AuthStateHandle,
     router: Router,
-    mut inbound: mpsc::UnboundedReceiver<MeshInbound>,
+    mut inbound: mpsc::Receiver<MeshInbound>,
     egress: Arc<E>,
 ) {
     let origin = Origin {
@@ -235,11 +235,19 @@ pub(crate) async fn serve_mesh<E: MeshEgress>(
                         command_seq: None,
                         item: Outbound(value),
                     }),
-                    // Unlike stdio (which can only drop it), name the loss.
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "mesh: immediate reject was unserializable — no reply sent"
-                    ),
+                    // Unlike stdio (which can only drop it), name the loss —
+                    // and reclaim the pending-reply entry, which would
+                    // otherwise sit until CAP eviction (review 2026-07-21 #5).
+                    Err(e) => {
+                        replies
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .take(&corr);
+                        tracing::warn!(
+                            error = %e,
+                            "mesh: immediate reject was unserializable — no reply sent"
+                        );
+                    }
                 }
             }
         }
@@ -309,19 +317,36 @@ pub(crate) async fn spawn_mesh_adapter(
 ) -> anyhow::Result<MeshAdapterHandle> {
     use futures::StreamExt;
 
-    let client = async_nats::connect(nats_url)
-        .await
-        .map_err(|e| anyhow::anyhow!("mesh: connect NATS at {nats_url}: {e}"))?;
-    let mut sub = client
-        .subscribe(subject.to_string())
-        .await
-        .map_err(|e| anyhow::anyhow!("mesh: subscribe {subject}: {e}"))?;
-    client
-        .flush()
-        .await
-        .map_err(|e| anyhow::anyhow!("mesh: flush: {e}"))?;
+    // Bounded setup: these awaits sit on the DAEMON STARTUP path (serve/mod.rs
+    // calls this inline), so a black-holing or stalled broker must fail fast
+    // into the non-fatal "serve without the mesh" branch, not stall boot. ONE
+    // timeout covers the whole connect+subscribe+flush sequence — a broker
+    // that accepts the TCP connect but stalls the handshake/flush is the same
+    // failure (review 2026-07-21: bounding only the connect defeated this).
+    let (client, sub) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let client = async_nats::connect(nats_url)
+            .await
+            .map_err(|e| anyhow::anyhow!("mesh: connect NATS at {nats_url}: {e}"))?;
+        let sub = client
+            .subscribe(subject.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!("mesh: subscribe {subject}: {e}"))?;
+        client
+            .flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("mesh: flush: {e}"))?;
+        Ok::<_, anyhow::Error>((client, sub))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("mesh: NATS setup at {nats_url} timed out after 5s"))??;
+    let mut sub = sub;
 
-    let (tx, rx) = mpsc::unbounded_channel::<MeshInbound>();
+    // BOUNDED inbound queue (review 2026-07-21, all seats): with an unbounded
+    // channel a peer publishing faster than the pipeline ingests grows daemon
+    // memory without limit. Bounded + awaited send pushes backpressure onto
+    // the NATS subscription consumption instead (the client's own slow-
+    // consumer accounting then applies).
+    let (tx, rx) = mpsc::channel::<MeshInbound>(1024);
 
     // Inbound: each NATS request (which carries a reply subject) becomes a
     // MeshInbound. A message with no reply subject is a publish (not a
@@ -366,6 +391,7 @@ pub(crate) async fn spawn_mesh_adapter(
                     request,
                     reply_to: reply.to_string(),
                 })
+                .await
                 .is_err()
             {
                 break; // adapter gone
@@ -452,7 +478,7 @@ mod tests {
         // route back to that lane.
         let control = Arc::new(spawn_control_plane(journal, test_ctx(), router.clone()));
 
-        let (tx, rx) = mpsc::unbounded_channel::<MeshInbound>();
+        let (tx, rx) = mpsc::channel::<MeshInbound>(1024);
         let egress = Arc::new(SinkEgress::default());
         {
             let control = control;
@@ -475,6 +501,7 @@ mod tests {
             },
             reply_to: reply_subject.to_string(),
         })
+        .await
         .expect("send inbound");
 
         // Outbound must arrive on the egress sink, routed to the reply
@@ -527,7 +554,7 @@ mod tests {
         let router = Router::new();
         let control = Arc::new(spawn_control_plane(journal, test_ctx(), router.clone()));
 
-        let (tx, rx) = mpsc::unbounded_channel::<MeshInbound>();
+        let (tx, rx) = mpsc::channel::<MeshInbound>(1024);
         let egress = Arc::new(SinkEgress::default());
         {
             let router = router.clone();
@@ -548,6 +575,7 @@ mod tests {
                 },
                 reply_to: subject.to_string(),
             })
+            .await
             .expect("send inbound");
         }
 

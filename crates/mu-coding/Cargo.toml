@@ -20,6 +20,9 @@ mu-ai = { path = "../mu-ai" }
 # HelpAiProbeSource and reuses its HelpAiDoc superset model.
 t4c = { path = "../t4c" }
 tokio = { workspace = true }
+# mu-wxc4: NATS mesh transport for the mesh adapter (serve/mesh.rs).
+async-nats = { workspace = true }
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
@@ -57,6 +60,9 @@ axum = "0.8"
 
 [dev-dependencies]
 futures = { workspace = true }
+# mu-wxc4: the mesh daemon smoke test drives the live NATS transport
+# (spawns nats-server, requests the daemon's subject, asserts the reply).
+async-nats = { workspace = true }
 # mu-yc6 smoke tests: stub MCP server over Streamable HTTP (mirrors how
 # code-index-mcp serves; axum hosts rmcp's tower StreamableHttpService)
 rmcp = { workspace = true, features = ["transport-streamable-http-server"] }

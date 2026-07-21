@@ -1,0 +1,28 @@
+# Cargo project config.
+#
+# Sets TMPDIR for all cargo subprocesses (rustc, build scripts, doctest
+# scratch, etc.) to <project>/target.
+#
+# Three benefits:
+#  - FreeBSD /tmp is mounted noexec by hardening policy; cargo's default
+#    env::temp_dir() lookup falls back to /tmp when TMPDIR is unset,
+#    which then fails for any build script that wants to exec.
+#    Pointing TMPDIR inside target/ avoids that.
+#  - target/ is created by cargo as its first action, before any build
+#    script runs — so TMPDIR always points at a directory that exists
+#    by the time the first cc/rustc subprocess needs it. (Previous
+#    iteration used target/tmp, which cargo doesn't auto-create; first
+#    build after `cargo clean` failed with cc errors like
+#    "unable to make temporary file: No such file or directory".)
+#  - target/ lives under target/, so `cargo clean` wipes any leftover
+#    scratch automatically — no separate GC dance.
+#
+# Trade-off: cargo subprocesses' temp files (typically cc/ld scratch
+# .o.tmp files, doctest dirs) land alongside cargo's own build outputs
+# in target/. Harmless mechanically; very slight visual clutter for
+# anyone browsing target/.
+#
+# relative=true → resolved against this config file's directory (= project root).
+# force=true   → overrides any shell-set TMPDIR so the project convention wins.
+[env]
+TMPDIR = { value = "target", relative = true, force = true }

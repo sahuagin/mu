@@ -111,6 +111,18 @@ pub struct MeshConfig {
     /// Inbound request subject the daemon subscribes to. Defaults to a
     /// per-daemon subject at startup when left empty.
     pub subject: String,
+    /// mu-a0l6: CONSUME the mesh `code_index` service — register
+    /// `code_recall`/`code_status` as session tools backed by NATS
+    /// request/reply (subject-addressed) instead of the `[[mcp.servers]]`
+    /// HTTP import. When both are enabled the mesh tools register first and
+    /// the MCP import skips the colliding names.
+    pub consume_code_index: bool,
+    /// Hex Ed25519 private key the daemon mints per-request mesh
+    /// capabilities with; the mesh services must trust its public half.
+    /// Required when `consume_code_index` is set (there is no anonymous
+    /// access to mesh services). Same key the fleet's `[mesh] issuer_key`
+    /// config carries.
+    pub issuer_key: String,
 }
 
 impl Default for MeshConfig {
@@ -119,6 +131,8 @@ impl Default for MeshConfig {
             enabled: false,
             nats_url: "127.0.0.1:4222".to_string(),
             subject: String::new(),
+            consume_code_index: false,
+            issuer_key: String::new(),
         }
     }
 }

@@ -2001,6 +2001,7 @@ async fn mesh_daemon_serves_jsonrpc_over_live_nats() {
             enabled: true,
             nats_url: url.clone(),
             subject: SUBJECT.to_string(),
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -2093,6 +2094,7 @@ async fn mesh_refuses_when_auth_is_enforcing_over_live_nats() {
             enabled: true,
             nats_url: url.clone(),
             subject: SUBJECT.to_string(),
+            ..Default::default()
         },
         ..Default::default()
     };

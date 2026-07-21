@@ -22,6 +22,8 @@ t4c = { path = "../t4c" }
 tokio = { workspace = true }
 # mu-wxc4: NATS mesh transport for the mesh adapter (serve/mesh.rs).
 async-nats = { workspace = true }
+ulid = { workspace = true }
+biscuit-auth = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

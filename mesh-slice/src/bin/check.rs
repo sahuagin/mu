@@ -51,7 +51,13 @@ async fn main() -> Result<()> {
     let query = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "where are sessions built".into());
-    let hits = proxy.recall(&query, Some(3)).await?;
+    // Optional second arg: target index (serving-side name or absolute
+    // path) — exercises the contract's `db` targeting end to end.
+    let db = std::env::args().nth(2);
+    if let Some(db) = &db {
+        println!("db       : {db}");
+    }
+    let hits = proxy.recall_in(&query, Some(3), db).await?;
     println!("recall   : {} hit(s) for {query:?}", hits.len());
     for h in &hits {
         println!("  {:>6.3}  {}  ({})", h.score, h.symbol, h.path);

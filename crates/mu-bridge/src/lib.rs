@@ -50,7 +50,10 @@ fn py_convert_session(lines: Vec<String>, session_id: &str) -> PyResult<Vec<PyMu
 
 // ─── Python-visible event wrapper ────────────────────────────────────
 
-#[pyclass]
+// skip_from_py_object: pyo3 0.29 makes the Clone-derived FromPyObject
+// opt-in; PyMuEvent is output-only (returned to Python, never extracted
+// from Python arguments), so the extraction impl was never used.
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 struct PyMuEvent(MuEvent);
 

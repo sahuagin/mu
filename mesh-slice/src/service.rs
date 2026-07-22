@@ -163,7 +163,7 @@ async fn run_command(command: &Command, backend: &BackendState) -> CommandResult
 /// Deterministic fixture backend (tests).
 fn stub_command(command: &Command) -> CommandResult {
     match command {
-        Command::CodeRecall { query, limit } => {
+        Command::CodeRecall { query, limit, .. } => {
             let n = limit.unwrap_or(3).min(3) as usize;
             let hits = (0..n)
                 .map(|i| Hit {
@@ -209,11 +209,14 @@ async fn code_index_command(
     cx: &RunningService<RoleClient, ()>,
 ) -> Result<CommandResult> {
     match command {
-        Command::CodeRecall { query, limit } => {
+        Command::CodeRecall { query, limit, db } => {
             let mut args = serde_json::Map::new();
             args.insert("query".into(), json!(query));
             if let Some(l) = limit {
                 args.insert("limit".into(), json!(l));
+            }
+            if let Some(db) = db {
+                args.insert("db".into(), json!(db));
             }
             let res = bounded(
                 "code_recall call",
@@ -258,15 +261,20 @@ async fn code_index_command(
 /// Parse code_index's markdown recall output into typed [`Hit`]s. Each result
 /// is a header line: `## <symbol> (<score>) <kind> — <path>:<lines>`.
 ///
-/// Drift guard: semantic recall always returns nearest neighbors, so a
-/// NON-empty body that parses to zero hits means the output format drifted —
-/// that is a typed error (with a preview), never a silent empty result. A
-/// genuinely empty/whitespace body is the only legitimate zero-hit shape.
+/// Drift guard: semantic recall over an indexed corpus always returns nearest
+/// neighbors, so a NON-empty body that parses to zero hits is surfaced as a
+/// typed error, never a silent empty result. The backend's own prose (e.g.
+/// "No results found. Has the repository been indexed?" for an empty/missing
+/// `db` target) passes through VERBATIM — it is the useful message; calling it
+/// "format drift" was misdiagnosis (review warned this was brittle; terrain
+/// confirmed it on a `db` targeting an unindexed name, 2026-07-21).
 fn hits_from_markdown(markdown: &str) -> anyhow::Result<Vec<Hit>> {
     let hits: Vec<Hit> = markdown.lines().filter_map(parse_hit_line).collect();
     if hits.is_empty() && !markdown.trim().is_empty() {
         let preview: String = markdown.chars().take(200).collect();
-        anyhow::bail!("code_recall output did not match the expected format (drift?): {preview}");
+        // No prefix: the enclosing layers already attribute (run_command adds
+        // "code_index backend:"), and the backend prose stands on its own.
+        anyhow::bail!("{preview}");
     }
     Ok(hits)
 }
@@ -330,6 +338,6 @@ mod tests {
     fn format_drift_is_an_error_not_silent_empty() {
         let err = hits_from_markdown("Results:\n* TranscriptBlock at transcript.rs (0.03)\n")
             .expect_err("drifted format must error");
-        assert!(err.to_string().contains("drift"), "{err}");
+        assert!(err.to_string().contains("TranscriptBlock at"), "{err}");
     }
 }

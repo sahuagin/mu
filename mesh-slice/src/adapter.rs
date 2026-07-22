@@ -57,7 +57,8 @@ impl ServerHandler for McpNatsAdapter {
                             "type": "object",
                             "properties": {
                                 "query": {"type": "string"},
-                                "limit": {"type": "number"}
+                                "limit": {"type": "number"},
+                                "db": {"type": "string", "description": "Target index: a repo name (resolves to ~/.cache/code_index/<name>.db serving-side) or absolute path. Omit for the default index."}
                             },
                             "required": ["query"]
                         })),
@@ -92,7 +93,11 @@ impl ServerHandler for McpNatsAdapter {
                         .and_then(Value::as_str)
                         .unwrap_or_default();
                     let limit = args.get("limit").and_then(Value::as_u64).map(|n| n as u32);
-                    match proxy.recall(query, limit).await {
+                    let db = args
+                        .get("db")
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_string());
+                    match proxy.recall_in(query, limit, db).await {
                         Ok(hits) => Ok(ok_json(&hits)),
                         Err(e) => Ok(err_text(e.to_string())),
                     }

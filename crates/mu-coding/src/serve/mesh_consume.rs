@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
-use mu_core::agent::{SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec};
+use mu_core::agent::{Tool, ToolPolicy, ToolResult, ToolSpec};
 use mu_core::config::MeshConfig;
 
 /// Subject root the mesh `code_index` service listens on (endpoints:
@@ -47,7 +47,15 @@ struct Envelope<'a> {
 
 #[derive(Serialize)]
 enum Command<'a> {
-    CodeRecall { query: &'a str, limit: Option<u32> },
+    CodeRecall {
+        query: &'a str,
+        limit: Option<u32>,
+        /// Target index: serving-side name or absolute path; None = the
+        /// service's default. Restores the repo-targeting the direct MCP
+        /// tool always had (operator regression report, 2026-07-21).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        db: Option<&'a str>,
+    },
     CodeStatus,
 }
 
@@ -167,7 +175,10 @@ impl Tool for MeshCodeIndexTool {
                     // Saturate rather than wrap: a limit beyond u32::MAX is
                     // absurd input, but wrapping would silently shrink it.
                     .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
-                self.proxy.call(Command::CodeRecall { query, limit }).await
+                let db = arguments.get("db").and_then(Value::as_str);
+                self.proxy
+                    .call(Command::CodeRecall { query, limit, db })
+                    .await
             } else {
                 self.proxy.call(Command::CodeStatus).await
             };
@@ -224,10 +235,11 @@ fn render_hits(hits: &[Hit]) -> String {
 }
 
 fn read_only(spec: ToolSpec) -> ToolSpec {
-    spec.with_policy(ToolPolicy {
-        side_effects: SideEffects::ReadOnly,
-        ..ToolPolicy::default()
-    })
+    // The CANONICAL read-only policy (ReadOnly + Allow). Spreading
+    // `..ToolPolicy::default()` here inherited the fail-closed default's
+    // `Ask` and prompted the operator on EVERY recall (caught live,
+    // 2026-07-21) — exactly the omission the default is designed to punish.
+    spec.with_policy(ToolPolicy::read_only())
 }
 
 /// Build the mesh-backed `code_recall` + `code_status` session tools:
@@ -271,7 +283,8 @@ pub(crate) async fn mesh_code_index_tools(mesh: &MeshConfig) -> Result<Vec<Arc<d
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Natural language query or symbol name"},
-                "limit": {"type": "number", "description": "Max results (default service-side)"}
+                "limit": {"type": "number", "description": "Max results (default service-side)"},
+                "db": {"type": "string", "description": "Target index: a repo name (e.g. \"mu\") or absolute path. Omit for the default index."}
             },
             "required": ["query"]
         }),
@@ -316,6 +329,7 @@ mod tests {
             command: Command::CodeRecall {
                 query: "where are sessions built",
                 limit: Some(2),
+                db: None,
             },
         };
         let v = serde_json::to_value(&env).expect("serialize");
@@ -324,8 +338,19 @@ mod tests {
             json!({
                 "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 "capability": "AAEC",
+                // `db` absent when None — old services never see the field.
                 "command": {"CodeRecall": {"query": "where are sessions built", "limit": 2}}
             })
+        );
+        let with_db = serde_json::to_value(Command::CodeRecall {
+            query: "q",
+            limit: None,
+            db: Some("mu"),
+        })
+        .expect("serialize");
+        assert_eq!(
+            with_db,
+            json!({"CodeRecall": {"query": "q", "limit": null, "db": "mu"}})
         );
         let status = serde_json::to_value(Command::CodeStatus).expect("serialize");
         assert_eq!(status, json!("CodeStatus"));

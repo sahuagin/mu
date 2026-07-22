@@ -48,10 +48,22 @@ impl CodeIndexProxy {
 
     /// `code_recall` — same call shape as today; returns typed hits.
     pub async fn recall(&self, query: &str, limit: Option<u32>) -> Result<Vec<Hit>> {
+        self.recall_in(query, limit, None).await
+    }
+
+    /// `recall` targeting a specific index (`db`: serving-side name or
+    /// absolute path); `None` = the service default.
+    pub async fn recall_in(
+        &self,
+        query: &str,
+        limit: Option<u32>,
+        db: Option<String>,
+    ) -> Result<Vec<Hit>> {
         match self
             .call(Command::CodeRecall {
                 query: query.to_string(),
                 limit,
+                db,
             })
             .await?
         {

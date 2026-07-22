@@ -49,8 +49,17 @@ pub struct Reply<R> {
 /// `code_recall`, `code_status`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Command {
-    /// Hybrid symbol/concept recall.
-    CodeRecall { query: String, limit: Option<u32> },
+    /// Hybrid symbol/concept recall. `db` targets a specific index (a name
+    /// resolving to `~/.cache/code_index/<name>.db` on the serving side, or
+    /// an absolute path); `None` = the service's default index. Restores the
+    /// repo-targeting the direct MCP tool always had — dropping it made the
+    /// mesh hardcode one repo (operator regression report, 2026-07-21).
+    CodeRecall {
+        query: String,
+        limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        db: Option<String>,
+    },
     /// Index health.
     CodeStatus,
 }

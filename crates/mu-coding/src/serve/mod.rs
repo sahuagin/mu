@@ -22,6 +22,7 @@ pub mod mcp;
 pub mod mcp_client;
 mod mesh;
 mod mesh_consume;
+mod mesh_dialogue;
 mod pipeline;
 mod presence;
 mod provider_status;
@@ -462,6 +463,40 @@ where
                 "mesh code_index consumption failed to start; continuing without it"),
         }
     }
+    // spec mu-046: the outbound Router is constructed early so mesh dialogue
+    // (below) can broadcast mailbox notifications through it; consumers
+    // (control plane, adapters, stdio lanes) attach later as before.
+    let outbound = mu_core::transport::Router::new();
+    // mu-z0zc: join the mesh as an agent (presence + DM inbox -> durable
+    // mailbox) and register the dm/who tools. Best-effort like the rest of
+    // the mesh surface; the returned guard is captured by the transport
+    // closure below so dialogue leaves the mesh when the daemon exits.
+    let mut mesh_dialogue_guard = None;
+    if daemon_info.config().mesh.dialogue {
+        match mesh_dialogue::spawn_mesh_dialogue(
+            &daemon_info.config().mesh,
+            daemon_info.daemon_id(),
+            sessions.clone(),
+            outbound.clone(),
+        )
+        .await
+        {
+            Ok((guard, dialogue_tools)) => {
+                mesh_dialogue_guard = Some(guard);
+                for tool in dialogue_tools {
+                    let name = tool.spec().name;
+                    if tools.iter().any(|t| t.spec().name == name) {
+                        tracing::warn!(tool = %name,
+                            "mesh dialogue tool collides with an existing tool; skipping");
+                    } else {
+                        tools.push(tool);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e,
+                "mesh dialogue failed to start; continuing without it"),
+        }
+    }
     if daemon_info.config().mcp.enabled {
         let mut imported = mcp_client::import_remote_tools(&daemon_info.config().mcp.servers).await;
         for imported_tool in imported.tools {
@@ -525,7 +560,6 @@ where
     // envelopes route to their origin's lane, broadcasts to all. The
     // pipeline consumer holds a producer clone and drops it on
     // shutdown, closing the lanes.
-    let outbound = mu_core::transport::Router::new();
     // spec mu-046 INV-3/INV-7 (WP3): the single-writer control-plane
     // consumer. It owns the daemon's session map et al. and exits —
     // releasing them, continuing the shutdown cascade — when the last
@@ -696,6 +730,9 @@ where
         // mu-wxc4: same lifetime contract — dropping the handler aborts the
         // mesh adapter tasks, releasing their ControlPlane/Router clones.
         let _ = &mesh_guard;
+        // mu-z0zc: same contract — dropping the handler deregisters mesh
+        // dialogue (presence + DM subscription).
+        let _ = &mesh_dialogue_guard;
         let control = control.clone();
         let auth_state = auth_state.clone();
         async move { pipeline::ingest(&control, req, origin, &auth_state) }

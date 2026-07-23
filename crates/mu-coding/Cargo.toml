@@ -23,6 +23,7 @@ tokio = { workspace = true }
 # mu-wxc4: NATS mesh transport for the mesh adapter (serve/mesh.rs).
 async-nats = { workspace = true }
 ulid = { workspace = true }
+bytes = { workspace = true }
 biscuit-auth = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }

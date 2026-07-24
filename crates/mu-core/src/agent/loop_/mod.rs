@@ -1337,9 +1337,19 @@ async fn run_inner(
                 subject,
                 seq,
             }) => {
+                // mu-07g0 + the mailbox design doc (mu-dialogue-push-mailbox
+                // v1): "push is a wake HINT, not the only copy" — the wake
+                // carries the sender-authored SUBJECT only; the receiving
+                // model decides whether the body is worth its context and
+                // retrieves it with the session `mailbox` tool. (The old
+                // text referenced `mu_mailbox_read`, a daemon MCP-surface
+                // tool sessions don't have; the first live drive cost 9
+                // turns of phantom-tool archaeology.)
                 let notification = format!(
-                    "[Mailbox] New {message_kind} message (seq {seq}) from session {from_session_id}: {subject}\n\
-                     Read it with mu_mailbox_read, then act on it."
+                    "[Mailbox] New {message_kind} message (seq {seq}) from \
+                     {from_session_id}: {subject}\n\
+                     Stored durably in your mailbox. To read the full \
+                     message: mailbox tool, action=read, seq={seq}."
                 );
                 let msg = AgentMessage::User {
                     content: notification,

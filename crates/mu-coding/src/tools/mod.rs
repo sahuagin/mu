@@ -9,6 +9,7 @@ pub mod edit_matcher;
 pub mod glob;
 pub mod grep;
 pub mod ls;
+pub mod mailbox;
 pub mod memory_recall;
 pub mod path;
 pub mod read;

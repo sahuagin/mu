@@ -69,6 +69,12 @@ enum AgentCommand {
         /// peers neither send nor need it; serde ignores unknowns).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<String>,
+        /// Sender-authored envelope line — the ONLY body-derived content the
+        /// receiver's wake carries (design doc: push is a wake hint; the
+        /// receiving model decides whether to retrieve the body). Absent ⇒
+        /// receiver renders a generic "mesh dm from <agent>".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<String>,
     },
 }
 
@@ -85,6 +91,7 @@ async fn deliver_dm(
     router: &Router,
     target: &str,
     from_agent: &str,
+    subject: Option<&str>,
     body: &str,
 ) -> Result<()> {
     let mailbox = sessions
@@ -94,7 +101,9 @@ async fn deliver_dm(
         .event_log(target)
         .ok_or_else(|| anyhow!("target session has no event log: {target}"))?;
 
-    let subject = format!("mesh dm from {from_agent}");
+    let subject = subject
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("mesh dm from {from_agent}"));
     let seq = mailbox.allocate_seq();
     let posted_event_id = log.append(
         EventActor::System,
@@ -235,8 +244,12 @@ impl Tool for DmTool {
             .get("session")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let subject = arguments
+            .get("subject")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let run = async {
-            match send_dm(&self.shared, to, body, session).await {
+            match send_dm(&self.shared, to, body, session, subject).await {
                 Ok(()) => ToolResult {
                     content: format!("dm sent to {to}"),
                     is_error: false,
@@ -292,6 +305,7 @@ async fn send_dm(
     to: &str,
     body: &str,
     session: Option<String>,
+    subject: Option<String>,
 ) -> Result<()> {
     let token = biscuit!(r#"right({r});"#, r = DM_RIGHT)
         .build(&shared.root)
@@ -305,6 +319,7 @@ async fn send_dm(
             from: shared.agent_id.clone(),
             body: body.to_string(),
             session,
+            subject,
         },
     };
     let payload = serde_json::to_vec(&env)?;
@@ -413,9 +428,19 @@ pub(crate) async fn spawn_mesh_dialogue(
                 from,
                 body,
                 session,
+                subject,
             } = env.command;
             let target = session.as_deref().unwrap_or("supervisor");
-            match deliver_dm(&inbound_sessions, &inbound_router, target, &from, &body).await {
+            match deliver_dm(
+                &inbound_sessions,
+                &inbound_router,
+                target,
+                &from,
+                subject.as_deref(),
+                &body,
+            )
+            .await
+            {
                 Ok(()) => tracing::info!(%from, %target, "mesh dialogue: dm delivered"),
                 Err(e) => tracing::warn!(%from, %target, error = %e,
                     "mesh dialogue: dm delivery failed"),
@@ -448,7 +473,8 @@ pub(crate) async fn spawn_mesh_dialogue(
             "properties": {
                 "to": {"type": "string", "description": "Peer agent id (a `who` entry)"},
                 "body": {"type": "string", "description": "Message body"},
-                "session": {"type": "string", "description": "Target session on the peer daemon (default: its supervisor session)"}
+                "session": {"type": "string", "description": "Target session on the peer daemon (default: its supervisor session)"},
+                "subject": {"type": "string", "description": "One-line summary shown in the receiver's wake — write it so the receiver can decide whether to read the body"}
             },
             "required": ["to", "body"]
         }),
@@ -502,6 +528,7 @@ mod tests {
                 from: "alice".to_string(),
                 body: "review PR 42?".to_string(),
                 session: None,
+                subject: None,
             },
         };
         let v = serde_json::to_value(&env).expect("serialize");

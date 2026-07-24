@@ -16,7 +16,7 @@ pub mod discovery_bootstrap;
 mod dispatch;
 pub mod factory;
 mod forwarder;
-mod handlers;
+pub(crate) mod handlers;
 mod mailbox;
 pub mod mcp;
 pub mod mcp_client;

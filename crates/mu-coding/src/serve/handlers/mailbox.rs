@@ -298,7 +298,7 @@ pub fn handle_mailbox_consume(request: Request<Value>, sessions: Sessions) -> Re
 /// set, then composes the final `MailboxMessageView` list filtering
 /// per `since_seq` and `include_consumed`. Order is by `seq` ascending
 /// (which equals event-log append order since `seq` is monotonic).
-fn project_mailbox(
+pub(crate) fn project_mailbox(
     log: &SessionEventLog,
     since_seq: Option<u64>,
     include_consumed: bool,

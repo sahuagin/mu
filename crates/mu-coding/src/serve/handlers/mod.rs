@@ -7,6 +7,7 @@ pub mod auth;
 pub mod capabilities;
 pub mod daemon;
 pub mod mailbox;
+pub(crate) use mailbox::project_mailbox;
 pub mod session;
 
 use serde_json::Value;

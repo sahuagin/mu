@@ -492,6 +492,14 @@ fn session_spawn_tools(
         // wake THIS session when it exits. Same WEAK-handle discipline as
         // spawn_worker (it lives in this session's own tool list), and
         // scoped to this session_id so the wakeup routes back here.
+        // mu-07g0: the session-side mailbox READ affordance — every session
+        // can list/read its own durable mailbox (the wake inlines small
+        // bodies; this covers truncated bodies and history). Weak handle:
+        // mu-qc08 shutdown rule.
+        tools.push(crate::tools::mailbox::mailbox_tool(
+            sessions.downgrade(),
+            session_id,
+        ));
         tools.push(Arc::new(crate::tools::WatchTool::new(
             sessions.downgrade(),
             session_id.to_string(),

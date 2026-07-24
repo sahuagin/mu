@@ -85,6 +85,16 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   # STDIN, not argv (a ~1MB prompt overflows ARG_MAX, mu-b6tl). --exclude-dynamic-
   # system-prompt-sections strips claude's agent scaffolding.
   if [ "$ad_prov" = "claude-oauth" ]; then
+    # Nested-cc guard: `claude -p` hangs when run inside a claude-code session
+    # (CLAUDECODE=1) — the child does its work but never returns. Fail loud
+    # instead of freezing the caller. claude -p is correct for mu's standalone
+    # external launch (CLAUDECODE unset); a cc session must use the harness's
+    # native Agent tool for a claude worker, not this seat. Mirrors the guard
+    # in spline-review-dispatch.
+    if [ -n "${CLAUDECODE:-}" ]; then
+      echo "agent-dispatch: claude-oauth ('claude -p') cannot run nested in a claude-code session (CLAUDECODE=1) — it hangs. Use a non-claude seat, or the harness Agent tool." >&2
+      return 1
+    fi
     ad_clsys=""
     [ -n "${SYSPROMPT:-}" ] && [ -r "$SYSPROMPT" ] && ad_clsys="--append-system-prompt-file $SYSPROMPT"
     ad_mcpflag=""

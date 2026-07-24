@@ -2040,6 +2040,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "biscuit-auth",
+ "bytes",
  "clap",
  "dirs",
  "futures",

@@ -123,6 +123,12 @@ pub struct MeshConfig {
     /// access to mesh services). Same key the fleet's `[mesh] issuer_key`
     /// config carries.
     pub issuer_key: String,
+    /// mu-z0zc: join the mesh as an AGENT — presence registration plus a
+    /// DM inbox (`mu.agent.<daemon_id>.dm`) whose verified messages land
+    /// in the durable mailbox, and `dm`/`who` session tools. Requires
+    /// `issuer_key`. Safe under enforcing auth: every DM carries its own
+    /// per-message capability.
+    pub dialogue: bool,
 }
 
 impl Default for MeshConfig {
@@ -133,6 +139,7 @@ impl Default for MeshConfig {
             subject: String::new(),
             consume_code_index: false,
             issuer_key: String::new(),
+            dialogue: false,
         }
     }
 }

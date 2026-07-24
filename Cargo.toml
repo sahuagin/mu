@@ -33,6 +33,7 @@ async-nats = "0.49"
 # contract; biscuit-auth = per-request capability minting (the mesh's native
 # grant model; reconciliation with mu's Capability is mu-iqo8/mu-kc9v).
 ulid = "3"
+bytes = "1"
 biscuit-auth = "6"
 # runtime + I/O
 tokio = { version = "1", features = ["full"] }

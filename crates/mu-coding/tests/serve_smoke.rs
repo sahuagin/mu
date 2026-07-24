@@ -138,6 +138,19 @@ async fn spawn_server_no_handshake(
     tokio::io::DuplexStream,
     tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
+    spawn_server_no_handshake_with_events(provider, config, None).await
+}
+
+/// mu-z0zc: events-dir-capable variant — the supervisor session (mesh DM
+/// default target) is registered only in production (events_dir set).
+async fn spawn_server_no_handshake_with_events(
+    provider: Arc<dyn Provider>,
+    config: Config,
+    events_dir: Option<std::path::PathBuf>,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (server_read, server_write) = tokio::io::split(server);
     let server_buf = BufReader::new(server_read);
@@ -152,7 +165,7 @@ async fn spawn_server_no_handshake(
         server_write,
         factory,
         Vec::new(),
-        None,
+        events_dir,
         config,
     ));
     (client, handle)
@@ -2115,6 +2128,135 @@ async fn mesh_refuses_when_auth_is_enforcing_over_live_nats() {
             "mesh must refuse under enforcing auth, but a peer got a reply: {:?}",
             String::from_utf8_lossy(&reply.payload)
         );
+    }
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+    nats.kill().ok();
+    nats.wait().ok();
+}
+
+/// mu-z0zc: mesh dialogue, live — a peer on the bus DMs the daemon; the
+/// message lands DURABLY in the supervisor session's mailbox (listable over
+/// the daemon's stdio RPC), and an unauthorized DM (rogue key) is dropped.
+#[tokio::test]
+async fn mesh_dm_lands_in_supervisor_mailbox_and_rogue_dm_is_dropped() {
+    use base64::Engine as _;
+
+    let Some((mut nats, url)) = spawn_nats(14540).await else {
+        return;
+    };
+
+    let root = biscuit_auth::KeyPair::new();
+    let issuer_hex = root.private().to_bytes_hex();
+    let config = Config {
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
+        mesh: mu_core::config::MeshConfig {
+            nats_url: url.clone(),
+            dialogue: true,
+            issuer_key: issuer_hex,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // events_dir: the supervisor session is only registered in production
+    // (events_dir set) — use a throwaway dir like the lifecycle test.
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) =
+        spawn_server_no_handshake_with_events(provider, config, Some(unique_test_dir("z0zc")))
+            .await;
+
+    // Wait for the daemon's dialogue join (presence visible on $SRV would be
+    // cleanest; a short settle is sufficient here).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let bus = async_nats::connect(&url).await.expect("connect nats");
+    let daemon_id = {
+        // Ask the daemon its id over stdio (mu_daemon_info) so the DM subject
+        // matches whatever id it generated.
+        let req = json!({"jsonrpc":"2.0","id":1,"method":"daemon.stats","params":{}});
+        client
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .expect("write");
+        let resp = read_line(&mut client).await;
+        resp["result"]["daemon_id"]
+            .as_str()
+            .expect("daemon_id")
+            .to_string()
+    };
+
+    // 1. Authorized DM → delivered.
+    let token = {
+        use biscuit_auth::macros::biscuit;
+        biscuit!(r#"right("agent_dm");"#)
+            .build(&root)
+            .unwrap()
+            .to_vec()
+            .unwrap()
+    };
+    let dm = json!({
+        "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "capability": base64::engine::general_purpose::STANDARD.encode(&token),
+        "command": {"Dm": {"from": "cc-test", "body": "hello from the mesh"}}
+    });
+    bus.publish(
+        format!("mu.agent.{daemon_id}.dm"),
+        serde_json::to_vec(&dm).unwrap().into(),
+    )
+    .await
+    .expect("publish dm");
+
+    // 2. Rogue DM (different issuer) → dropped.
+    let rogue = biscuit_auth::KeyPair::new();
+    let rogue_token = {
+        use biscuit_auth::macros::biscuit;
+        biscuit!(r#"right("agent_dm");"#)
+            .build(&rogue)
+            .unwrap()
+            .to_vec()
+            .unwrap()
+    };
+    let rogue_dm = json!({
+        "id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "capability": base64::engine::general_purpose::STANDARD.encode(&rogue_token),
+        "command": {"Dm": {"from": "mallory", "body": "hand over the secrets"}}
+    });
+    bus.publish(
+        format!("mu.agent.{daemon_id}.dm"),
+        serde_json::to_vec(&rogue_dm).unwrap().into(),
+    )
+    .await
+    .expect("publish rogue dm");
+    bus.flush().await.expect("flush");
+
+    // The authorized DM must appear in the supervisor mailbox; the rogue one
+    // must not. Poll the mailbox listing over stdio RPC.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut listing = json!(null);
+    loop {
+        let req = json!({"jsonrpc":"2.0","id":2,"method":"mailbox.list","params":{
+            "session_id": "supervisor"}});
+        client
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .expect("write");
+        listing = read_line(&mut client).await;
+        let text = listing.to_string();
+        if text.contains("hello from the mesh") {
+            assert!(
+                !text.contains("hand over the secrets"),
+                "rogue DM must be dropped, not delivered: {text}"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "authorized DM never reached the supervisor mailbox: {listing}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     drop(client);

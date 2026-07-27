@@ -326,6 +326,39 @@ pub fn discover_view_semantic(
     )
 }
 
+/// [`discover_view_semantic`] restricted to a LOCAL embedding endpoint
+/// (mu-0x5i). Identical ranking, but refuses to embed when the resolved
+/// endpoint is not loopback / private-network — see
+/// [`ConfigEmbedder::endpoint_is_local`].
+///
+/// This exists for the per-turn capability-hint injection.
+/// [`discover_view_semantic`] is right for the `discover` TOOL — a rare,
+/// operator-initiated orientation call where a paid embed is proportionate —
+/// but injection runs on EVERY turn, so the same call against the default
+/// OpenRouter endpoint would quietly convert an occasional cost into a
+/// per-turn one. Refusing here means the worst case of enabling
+/// injection-semantic without a local embedder is "hints stay lexical", never
+/// "the operator gets billed per turn".
+///
+/// **Blocking** (synchronous HTTP embed call) — async callers must wrap it in
+/// `spawn_blocking`. Returns `Err` when no embedder is configured, the endpoint
+/// is remote, or embedding fails; callers fall back to the lexical floor.
+pub fn discover_view_semantic_local(
+    tree: &Tree,
+    intent: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<CapabilityView>> {
+    let embedder = ConfigEmbedder::from_config()?;
+    anyhow::ensure!(
+        ConfigEmbedder::endpoint_is_local(embedder.endpoint()),
+        "refusing per-turn embed against non-local endpoint {} \
+         (point T4C_EMBED_ENDPOINT at a loopback/private-network embedder, \
+         or leave [index].discover_injection_semantic off)",
+        embedder.endpoint(),
+    );
+    discover_view_semantic_with(tree, intent, limit, embedder, "mu-discover")
+}
+
 /// Build one capability under `<source>.<name>`. Returns `None` when `name`
 /// can't form a valid path (empty / too deep) — best-effort projection: skip a
 /// pathological entry rather than fail the whole source.

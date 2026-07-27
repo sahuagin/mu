@@ -257,6 +257,10 @@ pub(crate) async fn handle_execute_tools(
     history: &mut ToolHistory,
     pending_approvals: &PendingApprovals,
     capability: &SessionCapability,
+    // mu-0x5i: `[index].discover_injection`. Gates the unknown-tool
+    // near-miss suggestion below, which used to run unconditionally — so
+    // an operator who turned the feature off still got half of it.
+    discover_hints_enabled: bool,
 ) -> Result<ExecuteToolsExit, Outcome> {
     let mut buffered: Vec<AgentInput> = Vec::new();
     let mut tool_messages: Vec<AgentMessage> = Vec::new();
@@ -704,11 +708,17 @@ pub(crate) async fn handle_execute_tools(
                 // mu-uz0n layer 2: the moment the model invents a tool
                 // name is the one moment it's receptive to discovery —
                 // rank the bad name against the real surface and name
-                // the near-misses in the error itself.
+                // the near-misses in the error itself. mu-0x5i: gated on
+                // the same flag as layer 1, so "off" means off.
                 None => ToolResult {
-                    content: match crate::context::capability_hints::suggest_for_unknown_tool(
-                        tools, &call.name,
-                    ) {
+                    content: match discover_hints_enabled
+                        .then(|| {
+                            crate::context::capability_hints::suggest_for_unknown_tool(
+                                tools, &call.name,
+                            )
+                        })
+                        .flatten()
+                    {
                         Some(near) => format!(
                             "tool not found: {}. closest available: {near} — \
                              call `discover` with your intent for the full ranked list",

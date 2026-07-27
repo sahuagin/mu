@@ -4325,6 +4325,10 @@ async fn uz0n_hint_span_follows_user_and_is_stable_across_rounds() {
         discover_hints: Some(crate::context::capability_hints::DiscoverHints {
             skills: Arc::new(Vec::new()),
             limit: 3,
+            // 0.0 keeps this test about POSITION, not relevance — the
+            // ratio floor is unit-tested in `context::capability_hints`.
+            min_score_ratio: 0.0,
+            semantic: false,
         }),
         ..AgentConfig::default()
     };
@@ -4362,7 +4366,7 @@ async fn uz0n_hint_span_follows_user_and_is_stable_across_rounds() {
         let hint_pos = rec
             .first_span_ids
             .iter()
-            .position(|id| id == crate::context::capability_hints::HINT_SPAN_ID)
+            .position(|id| *id == crate::context::capability_hints::hint_span_id(0))
             .unwrap_or_else(|| panic!("call {i}: hint span missing: {:?}", rec.first_span_ids));
         assert_eq!(
             hint_pos,
@@ -4488,7 +4492,7 @@ async fn uz0n_no_hint_without_config() {
     assert!(records.iter().all(|r| !r
         .first_span_ids
         .iter()
-        .any(|id| id == crate::context::capability_hints::HINT_SPAN_ID)));
+        .any(|id| id.starts_with(crate::context::capability_hints::HINT_SPAN_PREFIX))));
 }
 
 /// mu-uz0n layer 2: an invented tool name comes back with ranked
@@ -4503,6 +4507,62 @@ async fn uz0n_unknown_tool_error_suggests_near_misses() {
     assert_eq!(
         crate::context::capability_hints::suggest_for_unknown_tool(&tools, "zzqy"),
         None
+    );
+}
+
+/// mu-0x5i: layer 2 obeys the SAME flag as layer 1. This is the half of
+/// the feature that ignored `[index].discover_injection` entirely — the
+/// operator turned injection off and still got "closest available:" on
+/// every invented tool name.
+#[tokio::test]
+async fn ox5i_unknown_tool_error_is_bare_when_injection_is_off() {
+    let (provider, _records) = RecordingProvider::new(vec![
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "t1",
+            "frobnicate",
+            json!({}),
+        ))],
+        vec![ProviderEvent::Done(assistant_text("done"))],
+    ]);
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool::ok("frobnicate_widget", "ok"))];
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let loop_ = loop_with(
+        provider,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        tools,
+        // discover_hints: None — the feature is OFF.
+        AgentConfig::default(),
+        events_tx,
+        approvals,
+        capability,
+    );
+    loop_
+        .send(AgentInput::UserMessage(user_msg("go"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("drain");
+
+    let errors: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCallCompleted {
+                content, is_error, ..
+            } if *is_error => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        errors.iter().any(|c| c.contains("tool not found: frobnicate")),
+        "expected a tool-not-found error, got {errors:?}"
+    );
+    assert!(
+        errors.iter().all(|c| !c.contains("closest available")),
+        "injection is off — the error must not carry discovery hints: {errors:?}"
     );
 }
 

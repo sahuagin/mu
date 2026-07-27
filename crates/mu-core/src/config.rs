@@ -182,20 +182,55 @@ pub struct IndexConfig {
     pub semantic_discover: bool,
     /// mu-uz0n: implicit capability discovery. Each turn the daemon ranks
     /// the last user message / iteration motivation through the same
-    /// (lexical) ranking the `discover` tool uses and injects the top-N as
-    /// a compact transient hint span — always-AVAILABLE discovery is not
-    /// always-USED (observed: sessions working ON t4c never called
-    /// discover), so the hints arrive in-band, no opt-in tool call needed.
-    /// Default `true` (the injection IS the fix); suppressed by `--bare`.
+    /// ranking the `discover` tool uses and injects the top-N as a hint
+    /// span — always-AVAILABLE discovery is not always-USED (observed:
+    /// sessions working ON t4c never called discover), so the hints
+    /// arrive in-band, no opt-in tool call needed.
+    ///
+    /// mu-0x5i: default flipped to `false` (OPT-IN). Shipped-on ranking was
+    /// lexical-only and cut at `score > 0.0`, which surfaced near-irrelevant
+    /// hits every turn; the operator's verdict was "not worth trying to use".
+    /// It stays off until an operator opts in with a tuned
+    /// `discover_injection_min_score_ratio`. Also suppressed by `--bare`.
+    /// This flag gates BOTH halves of the feature: per-turn hints AND the
+    /// unknown-tool "closest available" suggestion (which ignored it before).
     /// Sizing: machine-view one-liners, hard-capped at ~700 bytes — see
     /// [`crate::context::capability_hints::HINT_MAX_BYTES`].
-    #[serde(default = "default_true")]
     pub discover_injection: bool,
     /// mu-uz0n: top-N entries per injected hint. Keep small — the hint is
     /// a pointer surface, not documentation; the `discover` tool remains
     /// the full-list path.
     #[serde(default = "default_discover_injection_limit")]
     pub discover_injection_limit: usize,
+    /// mu-0x5i: relevance floor for an injected entry, as a FRACTION OF THE
+    /// BEST-SCORING HIT of that same turn (`0.0..=1.0`). `0.5` ⇒ keep only
+    /// entries scoring at least half the top hit.
+    ///
+    /// Deliberately relative, not absolute: ranker scores are unnormalized
+    /// (`tool.read` measured at `2.0`, not `0..1`) and the scale differs
+    /// between the lexical floor and the semantic ranker, so an absolute
+    /// threshold would silently mean something different after either
+    /// changes. A ratio is scale-free and survives both.
+    ///
+    /// `0.0` restores the old "anything above zero" behavior. Values outside
+    /// `0.0..=1.0` are clamped at use, never rejected — a bad number degrades
+    /// the hint, it must not fail the turn.
+    #[serde(default = "default_discover_injection_min_score_ratio")]
+    pub discover_injection_min_score_ratio: f64,
+    /// mu-0x5i: rank the INJECTED hints semantically rather than lexically.
+    ///
+    /// Separate from [`Self::semantic_discover`] on purpose: that one governs
+    /// the `discover` TOOL, a rare operator-initiated orientation call where a
+    /// paid embed is fine. Injection runs on EVERY turn, so sharing the knob
+    /// would silently convert an occasional cost into a per-turn one.
+    ///
+    /// Enforced local-only: the embed is attempted only when the resolved
+    /// endpoint is loopback or RFC-1918 (see
+    /// [`crate::t4c_source::discover_view_semantic_local`]). A remote/paid
+    /// endpoint — including the default OpenRouter one — falls back to the
+    /// lexical floor instead of billing per turn.
+    #[serde(default)]
+    pub discover_injection_semantic: bool,
 }
 
 /// serde default helper for [`IndexConfig::discover_injection_limit`].
@@ -203,12 +238,25 @@ fn default_discover_injection_limit() -> usize {
     3
 }
 
+/// serde default helper for [`IndexConfig::discover_injection_min_score_ratio`].
+///
+/// `0.5` — an entry must score at least half the turn's best hit. Chosen as
+/// the conservative end of "obviously related": on the measured lexical
+/// scale a direct name/keyword hit lands far above a merely co-occurring
+/// term, so half-of-top admits genuine near-misses and drops the filler that
+/// made the shipped default noisy.
+fn default_discover_injection_min_score_ratio() -> f64 {
+    0.5
+}
+
 impl Default for IndexConfig {
     fn default() -> Self {
         Self {
             semantic_discover: false,
-            discover_injection: true,
+            discover_injection: false,
             discover_injection_limit: default_discover_injection_limit(),
+            discover_injection_min_score_ratio: default_discover_injection_min_score_ratio(),
+            discover_injection_semantic: false,
         }
     }
 }
@@ -1133,6 +1181,50 @@ mod tests {
         assert!(!Config::default().index.semantic_discover);
         let c: Config = toml::from_str("[index]\nsemantic_discover = true\n").expect("parse");
         assert!(c.index.semantic_discover);
+    }
+
+    #[test]
+    fn discover_injection_defaults_off_and_toml_can_enable() {
+        // mu-0x5i: the operator's verdict on always-on was "not worth
+        // trying to use", so the feature is opt-in.
+        assert!(!Config::default().index.discover_injection);
+        let c: Config = toml::from_str("[index]\ndiscover_injection = true\n").expect("parse");
+        assert!(c.index.discover_injection);
+    }
+
+    #[test]
+    fn discover_injection_false_survives_a_partial_index_section() {
+        // The reported symptom was "`discover_injection = false` does not
+        // disable the feature". The config layer was never the cause, and
+        // this pins that: an [index] section that sets the flag OFF while
+        // omitting its siblings must keep it off and still default the rest.
+        let c: Config = toml::from_str("[index]\ndiscover_injection = false\n").expect("parse");
+        assert!(!c.index.discover_injection);
+        assert_eq!(c.index.discover_injection_limit, 3);
+        assert_eq!(c.index.discover_injection_min_score_ratio, 0.5);
+    }
+
+    #[test]
+    fn discover_injection_min_score_ratio_defaults_and_toml_can_set() {
+        assert_eq!(
+            Config::default().index.discover_injection_min_score_ratio,
+            0.5
+        );
+        let c: Config = toml::from_str("[index]\ndiscover_injection_min_score_ratio = 0.8\n")
+            .expect("parse");
+        assert_eq!(c.index.discover_injection_min_score_ratio, 0.8);
+    }
+
+    #[test]
+    fn discover_injection_semantic_is_independent_of_semantic_discover() {
+        // Sharing one knob would turn a rare paid embed (the `discover`
+        // TOOL) into a per-turn one (injection). They must not be coupled.
+        let c: Config = toml::from_str("[index]\nsemantic_discover = true\n").expect("parse");
+        assert!(c.index.semantic_discover);
+        assert!(
+            !c.index.discover_injection_semantic,
+            "enabling the tool's semantic ranking must not enable per-turn embedding"
+        );
     }
 
     #[test]

@@ -736,13 +736,18 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         bare,
     );
     // mu-uz0n: implicit capability discovery — per-turn hint injection,
-    // ranked by the same lexical engine as the `discover` tool. Bare
-    // sessions stay hermetic (no injection mu didn't get told to make).
+    // ranked by the same engine as the `discover` tool. Bare sessions
+    // stay hermetic (no injection mu didn't get told to make).
+    // mu-0x5i: opt-in now (`discover_injection` defaults false), and the
+    // resulting `Option` gates BOTH halves of the feature — the per-turn
+    // hints here and the unknown-tool suggestion in `execute_tools`.
     let index_cfg = &daemon_info.config().index;
     let discover_hints = (index_cfg.discover_injection && !bare).then(|| {
         mu_core::context::capability_hints::DiscoverHints {
             skills: skills.clone(),
             limit: index_cfg.discover_injection_limit,
+            min_score_ratio: index_cfg.discover_injection_min_score_ratio,
+            semantic: index_cfg.discover_injection_semantic,
         }
     });
     let recall_cfg = &daemon_info.config().recall;

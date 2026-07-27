@@ -1147,12 +1147,18 @@ async fn run_inner(
     let mut bg_compaction =
         crate::context::BackgroundCompactionState::new(crate::context::CompactionQuota::default());
     let mut compaction_baseline: Option<CompactionBaseline> = None;
-    // mu-uz0n: memoized capability hint for the current intent (the
-    // last user-role message). Re-ranked only when the intent changes
-    // — i.e. once per ask / autonomous iteration, not per tool round —
-    // so the hint content (and rope position) is byte-stable within an
-    // ask and the cacheable prefix is never disturbed.
-    let mut capability_hint_memo: Option<(String, Option<String>)> = None;
+    // mu-0x5i: every capability hint injected in this session, each
+    // anchored to the user message it was ranked for. This is the whole
+    // dedup + cache story — see `context::capability_hints`:
+    //   * a hint stays at its anchor, so the prefix through it is
+    //     byte-stable for the rest of the session;
+    //   * a capability named by any LIVE record is never named again;
+    //   * a record whose anchor compaction dropped is pruned, which
+    //     re-arms its capabilities (they left the context, so
+    //     "already in context" stopped being true).
+    // Records with `text: None` memoize "this turn ranked to nothing",
+    // so tool rounds don't re-rank (or re-embed) the same intent.
+    let mut capability_hints: Vec<crate::context::capability_hints::InjectedHint> = Vec::new();
     // Prompt-time kx recall is also memoized once per ask/autonomous
     // iteration so tool rounds don't re-run the embedder or mutate the
     // provider prompt.
@@ -1848,49 +1854,94 @@ async fn run_inner(
                     ),
                 };
 
-                // mu-uz0n: implicit capability discovery — rank the
-                // current intent against the session's capability
-                // surface and inject the top-N as a compact transient
-                // span after the last user span. Memoized per intent
-                // (see `capability_hint_memo`); covers both assembly
+                // mu-uz0n / mu-0x5i: implicit capability discovery — rank
+                // this turn's intent against the session's capability
+                // surface and anchor the qualifying hits to the user
+                // message they were ranked for. Covers both assembly
                 // paths above since it post-processes the rope.
                 let rope: RetainedRope = match &config.discover_hints {
                     Some(hints) => {
-                        let intent = messages.iter().rev().find_map(|m| match m {
-                            AgentMessage::User { content } => Some(content.as_str()),
-                            _ => None,
-                        });
-                        match intent {
-                            Some(intent) => {
-                                let stale = capability_hint_memo
-                                    .as_ref()
-                                    .is_none_or(|(memo_intent, _)| memo_intent != intent);
-                                if stale {
-                                    let snapshot =
-                                        capability.lock().map(|c| c.clone()).unwrap_or_default();
-                                    let hint = crate::context::capability_hints::rank_hint(
+                        use crate::context::capability_hints as caphints;
+                        // Prune first: a record whose anchoring user span
+                        // compaction dropped is no longer in context, so it
+                        // must stop suppressing its own capabilities.
+                        capability_hints.retain(|h| caphints::rope_has_anchor(&rope, h.anchor_msg_idx));
+                        // This turn's anchor is the LAST user message; its
+                        // index is what the rope's `msg-{idx}-user` span id
+                        // is built from.
+                        let anchor = messages
+                            .iter()
+                            .rposition(|m| matches!(m, AgentMessage::User { .. }));
+                        if let Some(idx) = anchor {
+                            // Already ranked for this anchor (including a
+                            // recorded "nothing to say") ⇒ don't rank again
+                            // on every tool round of the same ask.
+                            let ranked = capability_hints.iter().any(|h| h.anchor_msg_idx == idx);
+                            if !ranked {
+                                let intent = match &messages[idx] {
+                                    AgentMessage::User { content } => content.to_string(),
+                                    // rposition matched User; unreachable in
+                                    // practice, and an empty intent ranks to
+                                    // None rather than misbehaving.
+                                    _ => String::new(),
+                                };
+                                let already: std::collections::HashSet<String> = capability_hints
+                                    .iter()
+                                    .flat_map(|h| h.paths.iter().cloned())
+                                    .collect();
+                                let snapshot =
+                                    capability.lock().map(|c| c.clone()).unwrap_or_default();
+                                let ranked = if hints.semantic {
+                                    // Semantic ranking makes a blocking HTTP
+                                    // embed call; keep it off the tokio
+                                    // worker (same posture as kx recall
+                                    // below).
+                                    let tools = tools.clone();
+                                    let skills = hints.skills.clone();
+                                    let limit = hints.limit;
+                                    let min_score_ratio = hints.min_score_ratio;
+                                    tokio::task::spawn_blocking(move || {
+                                        caphints::rank_hint(
+                                            &tools,
+                                            &snapshot,
+                                            &skills,
+                                            &intent,
+                                            &caphints::RankOptions {
+                                                limit,
+                                                min_score_ratio,
+                                                already: &already,
+                                                semantic: true,
+                                            },
+                                        )
+                                    })
+                                    .await
+                                    .unwrap_or(None)
+                                } else {
+                                    caphints::rank_hint(
                                         &tools,
                                         &snapshot,
                                         &hints.skills,
-                                        intent,
-                                        hints.limit,
-                                    );
-                                    capability_hint_memo = Some((intent.to_owned(), hint));
-                                }
-                                match capability_hint_memo
-                                    .as_ref()
-                                    .and_then(|(_, h)| h.as_deref())
-                                {
-                                    Some(hint) => {
-                                        crate::context::capability_hints::with_hint_after_last_user(
-                                            &rope, hint,
-                                        )
-                                    }
-                                    None => rope,
-                                }
+                                        &intent,
+                                        &caphints::RankOptions {
+                                            limit: hints.limit,
+                                            min_score_ratio: hints.min_score_ratio,
+                                            already: &already,
+                                            semantic: false,
+                                        },
+                                    )
+                                };
+                                let (text, paths) = match ranked {
+                                    Some((text, paths)) => (Some(text), paths),
+                                    None => (None, Vec::new()),
+                                };
+                                capability_hints.push(caphints::InjectedHint {
+                                    anchor_msg_idx: idx,
+                                    text,
+                                    paths,
+                                });
                             }
-                            None => rope,
                         }
+                        caphints::with_hints(&rope, &capability_hints)
                     }
                     None => rope,
                 };
@@ -2346,6 +2397,7 @@ async fn run_inner(
                     &mut tool_history,
                     &pending_approvals,
                     &capability,
+                    config.discover_hints.is_some(),
                 )
                 .await
                 {

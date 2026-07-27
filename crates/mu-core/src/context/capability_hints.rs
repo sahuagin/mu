@@ -1,4 +1,4 @@
-//! Implicit capability discovery — mu-uz0n layer 1.
+//! Implicit capability discovery — mu-uz0n layer 1, reworked by mu-0x5i.
 //!
 //! Discovery loses the tool-choice auction when it's opt-in: the model
 //! already believes it knows its tools, grep/bash have massive training
@@ -9,8 +9,44 @@
 //! So the daemon stops waiting to be asked: each turn, the user's
 //! message (or the autonomous iteration motivation — whatever the last
 //! user-role message is) is run through the same ranking the `discover`
-//! tool uses, and the top-N hits are INJECTED as a compact hint span —
-//! the same push-not-pull posture as session-start recall providers.
+//! tool uses, and the qualifying hits are INJECTED as a compact hint
+//! span — the same push-not-pull posture as session-start recall.
+//!
+//! ## What mu-0x5i changed, and why
+//!
+//! Shipped-on, the feature was judged not worth using. Three causes:
+//!
+//! 1. **Everything above zero counted.** The cut was `score > 0.0`, but
+//!    ranker scores are UNNORMALIZED (`tool.read` measured at `2.0`), so
+//!    "top 3 above zero" routinely meant three barely-related entries.
+//!    The cut is now a fraction of the turn's BEST hit
+//!    ([`RankOptions::min_score_ratio`]) — scale-free, so it survives the
+//!    lexical→semantic switch that an absolute floor would not.
+//!
+//! 2. **The memo was on the wrong axis.** It keyed on intent text and
+//!    only skipped re-RANKING within one ask. The span itself was
+//!    transient, so identical capabilities were re-injected every turn
+//!    while the previous turn's hint vanished — repeat noise AND cache
+//!    churn at every turn boundary. Now a hint is ANCHORED to the user
+//!    message it accompanied ([`InjectedHint`]) and persists in the rope
+//!    at that position, and a capability already present in context is
+//!    never re-injected ([`RankOptions::already`]).
+//!
+//! 3. **Half the feature ignored its own flag.** [`suggest_for_unknown_tool`]
+//!    (layer 2) ran unconditionally; `[index].discover_injection = false`
+//!    never silenced it. Both halves are gated on the flag now.
+//!
+//! ## Cache discipline
+//!
+//! Anchoring is what makes this cacheable. A hint sits immediately after
+//! the `msg-{idx}-user` span it was ranked for and never moves, so once
+//! written the prefix through it is byte-stable across every later turn —
+//! strictly better than the old transient span, which mutated the tail of
+//! the prefix on each ask. New turns append; they don't rewrite.
+//!
+//! When compaction drops the anchoring user span, the hint goes with it
+//! (nothing to anchor to) and its capabilities become eligible again —
+//! which is exactly right: "already in context" stopped being true.
 //!
 //! ## Injection sizing (the 21k-wall gate)
 //!
@@ -18,19 +54,10 @@
 //! truncated summary — and hard-capped at [`HINT_MAX_BYTES`]. Top-3
 //! default is ~300-400 bytes ≈ ~100 tokens. Compare the measured 15.9K
 //! token full-memory wall (config.rs, session c76f6949) this repo
-//! already walked back once.
-//!
-//! ## Cache discipline
-//!
-//! The hint span is inserted immediately AFTER the last `User` span
-//! (not at the rope tail): within an ask, tool rounds append assistant/
-//! tool-result spans after it, so its position — and everything before
-//! it — is byte-stable across rounds and the cacheable prefix is
-//! untouched. Across asks the previous hint vanishes (it is transient,
-//! never part of [`super::super::agent::AgentMessage`] history), which
-//! invalidates at most the previous turn boundary — the bounded price
-//! of not accumulating stale hints forever.
+//! already walked back once. Dedup bounds the accumulation: each
+//! capability is named at most once per compaction epoch.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::agent::Tool;
@@ -39,14 +66,15 @@ use crate::context::rope::{RetainedRope, RetentionClass, Span, SpanKind};
 use crate::skill::loader::LoadedSkill;
 use crate::t4c_source::{self, CapabilityView};
 
-/// Stable rope span id for the injected hint. One id, content replaced
-/// per turn — `ContextAssembly::prefix_span_hashes` then names the
-/// mutation if it ever needs diagnosing.
-pub const HINT_SPAN_ID: &str = "capability-hint";
+/// Prefix for injected hint span ids; the anchoring message index is
+/// appended (see [`hint_span_id`]). One span per anchoring user message,
+/// so `ContextAssembly::prefix_span_hashes` can name any of them if it
+/// ever needs diagnosing.
+pub const HINT_SPAN_PREFIX: &str = "capability-hint";
 
-/// Hard byte ceiling on the rendered hint. The formatter drops entries
-/// rather than exceed it — injection must never become the wall it
-/// exists to replace.
+/// Hard byte ceiling on a single rendered hint. The formatter drops
+/// entries rather than exceed it — injection must never become the wall
+/// it exists to replace.
 pub const HINT_MAX_BYTES: usize = 700;
 
 /// Per-entry summary truncation (chars).
@@ -54,8 +82,8 @@ const SUMMARY_MAX_CHARS: usize = 90;
 
 /// Per-session wiring for implicit discovery, carried on
 /// `AgentConfig::discover_hints`. `None` there ⇒ feature off (the
-/// default; tests and pre-mu-uz0n behavior). The daemon wires `Some`
-/// from `[index].discover_injection` at session creation.
+/// default since mu-0x5i; also what `--bare` forces). The daemon wires
+/// `Some` from `[index].discover_injection` at session creation.
 #[derive(Clone)]
 pub struct DiscoverHints {
     /// Daemon-discovered skills — same set the `discover` tool ranks.
@@ -63,6 +91,13 @@ pub struct DiscoverHints {
     pub skills: Arc<Vec<LoadedSkill>>,
     /// Top-N entries to inject. Keep small; see module doc.
     pub limit: usize,
+    /// Relevance floor as a fraction of the turn's best hit. See
+    /// [`RankOptions::min_score_ratio`].
+    pub min_score_ratio: f64,
+    /// Rank semantically instead of lexically. Local-embedder-only and
+    /// falls back to lexical — see
+    /// [`crate::t4c_source::discover_view_semantic_local`].
+    pub semantic: bool,
 }
 
 impl std::fmt::Debug for DiscoverHints {
@@ -70,26 +105,88 @@ impl std::fmt::Debug for DiscoverHints {
         f.debug_struct("DiscoverHints")
             .field("skills", &self.skills.len())
             .field("limit", &self.limit)
+            .field("min_score_ratio", &self.min_score_ratio)
+            .field("semantic", &self.semantic)
             .finish()
     }
 }
 
+/// One hint that has been injected into this session's context, anchored
+/// to the user message it was ranked for.
+///
+/// `text: None` records a turn that ranked to NOTHING (everything was
+/// below the floor, or already in context). Keeping the negative result
+/// is what stops the loop re-ranking — and, when semantic is on,
+/// re-embedding — on every tool round of the same ask.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InjectedHint {
+    /// Index into the agent's `messages` of the anchoring user message.
+    /// Matches the `msg-{idx}-user` span id the rope assembler emits.
+    pub anchor_msg_idx: usize,
+    /// Rendered hint, or `None` for "this turn had nothing new to say".
+    pub text: Option<String>,
+    /// Capability paths named by this hint — the dedup key set.
+    pub paths: Vec<String>,
+}
+
+/// Span id of the user message a hint anchors to. Mirrors
+/// [`crate::context::assembly`]'s `msg-{idx}-user` scheme; the two must
+/// agree or hints silently stop being placed (pinned by
+/// `hint_anchors_match_assembled_rope_ids`).
+pub fn anchor_span_id(msg_idx: usize) -> String {
+    format!("msg-{msg_idx}-user")
+}
+
+/// Span id of the injected hint for the message at `msg_idx`.
+pub fn hint_span_id(msg_idx: usize) -> String {
+    format!("{HINT_SPAN_PREFIX}-{msg_idx}")
+}
+
+/// Whether the rope still contains the user span a hint anchors to.
+/// `false` ⇒ compaction dropped it, so the hint is no longer in context.
+pub fn rope_has_anchor(rope: &RetainedRope, msg_idx: usize) -> bool {
+    let anchor = anchor_span_id(msg_idx);
+    rope.spans().iter().any(|s| s.id.as_ref() == anchor)
+}
+
+/// Knobs for one ranking pass.
+pub struct RankOptions<'a> {
+    /// Max entries in the rendered hint.
+    pub limit: usize,
+    /// Relevance floor as a FRACTION of the best-scoring hit this turn
+    /// (`0.0..=1.0`, clamped). `0.5` ⇒ keep only entries scoring at
+    /// least half the top hit; `0.0` ⇒ the old "anything above zero".
+    ///
+    /// Relative rather than absolute because ranker scores are
+    /// unnormalized and the lexical and semantic rankers do not share a
+    /// scale — an absolute floor would mean something different after
+    /// either changed.
+    pub min_score_ratio: f64,
+    /// Capability paths already present in this session's context. Never
+    /// re-injected; see the module doc.
+    pub already: &'a HashSet<String>,
+    /// Rank semantically (local embedder only) rather than lexically.
+    pub semantic: bool,
+}
+
 /// Rank `intent` against the session's capability surface (same
 /// manifest the `discover` tool builds: tools + skills + host catalog,
-/// permission-attenuated) and render the compact hint. `None` when the
-/// intent is empty or nothing scores above zero — no match means no
-/// injection, never noise.
+/// permission-attenuated) and render the compact hint, with the
+/// qualifying capability paths.
 ///
-/// Lexical ranking only: per-turn cost must stay micro. Semantic
-/// ranking remains the `discover` tool's opt-in path
-/// (`[index].semantic_discover`).
+/// `None` when the intent is empty, the manifest can't be built, or
+/// nothing clears the floor / everything is already in context — no
+/// match means no injection, never noise.
+///
+/// **May block** when `opts.semantic` is set (synchronous HTTP embed);
+/// async callers must wrap it in `spawn_blocking`.
 pub fn rank_hint(
     tools: &[Arc<dyn Tool>],
     capability: &Capability,
     skills: &[LoadedSkill],
     intent: &str,
-    limit: usize,
-) -> Option<String> {
+    opts: &RankOptions<'_>,
+) -> Option<(String, Vec<String>)> {
     if intent.trim().is_empty() {
         return None;
     }
@@ -97,22 +194,57 @@ pub fn rank_hint(
     // Manifest-build failure ⇒ no hint, never an error: the injection
     // is best-effort sugar on the turn, not load-bearing.
     let tree = registry.build().ok()?;
-    let views = t4c_source::discover_view(&tree, intent, limit.max(1));
-    format_hint(&views, limit)
+    // Rank deeper than `limit`: dedup and the score floor both remove
+    // candidates, and asking for exactly `limit` would leave the hint
+    // short whenever the top hits are already in context.
+    let depth = opts.limit.max(1).saturating_mul(4).max(8);
+    let views = if opts.semantic {
+        // Local-only, and lexical is a correct answer — never fail the
+        // turn because an embedder was unreachable.
+        t4c_source::discover_view_semantic_local(&tree, intent, depth).unwrap_or_else(|e| {
+            tracing::debug!(
+                error = %e,
+                "capability hints: semantic rank unavailable, using lexical"
+            );
+            t4c_source::discover_view(&tree, intent, depth)
+        })
+    } else {
+        t4c_source::discover_view(&tree, intent, depth)
+    };
+    format_hint(&views, opts)
 }
 
-/// Render ranked views as the compact machine-view hint. Public for
-/// tests; production goes through [`rank_hint`].
-pub fn format_hint(views: &[CapabilityView], limit: usize) -> Option<String> {
+/// Render ranked views as the compact machine-view hint, returning the
+/// text and the capability paths it names. Public for tests; production
+/// goes through [`rank_hint`].
+pub fn format_hint(
+    views: &[CapabilityView],
+    opts: &RankOptions<'_>,
+) -> Option<(String, Vec<String>)> {
+    // The floor is a fraction of the best ALLOWED hit of this turn,
+    // computed BEFORE dedup: if the top hit is already in context, the
+    // remaining entries still have to clear the same bar. Otherwise
+    // dropping the leader would promote whatever weak entry came next.
+    let top = views
+        .iter()
+        .filter(|v| v.allowed_by_session && v.score > 0.0)
+        .map(|v| v.score)
+        .fold(0.0_f64, f64::max);
+    if top <= 0.0 {
+        return None;
+    }
+    let floor = top * opts.min_score_ratio.clamp(0.0, 1.0);
+
     let mut out = String::from(
         "[capability hints — auto-ranked against this turn; \
          call `discover` with your intent for the full list]",
     );
-    let mut entries = 0usize;
+    let mut paths = Vec::new();
     for v in views
         .iter()
-        .filter(|v| v.score > 0.0 && v.allowed_by_session)
-        .take(limit)
+        .filter(|v| v.allowed_by_session && v.score > 0.0 && v.score >= floor)
+        .filter(|v| !opts.already.contains(&v.path))
+        .take(opts.limit)
     {
         let summary: String = v.summary.chars().take(SUMMARY_MAX_CHARS).collect();
         let line = format!("\n• {} — {}", v.path, summary.trim());
@@ -120,28 +252,38 @@ pub fn format_hint(views: &[CapabilityView], limit: usize) -> Option<String> {
             break;
         }
         out.push_str(&line);
-        entries += 1;
+        paths.push(v.path.clone());
     }
-    (entries > 0).then_some(out)
+    (!paths.is_empty()).then_some((out, paths))
 }
 
-/// Return a rope with the hint span inserted immediately after the
-/// LAST `User` span (see module doc for why that position). A rope
-/// with no user span comes back unchanged — there is no turn to hint.
-pub fn with_hint_after_last_user(rope: &RetainedRope, hint: &str) -> RetainedRope {
-    let spans = rope.spans();
-    let Some(pos) = spans.iter().rposition(|s| matches!(s.kind, SpanKind::User)) else {
+/// Return a rope with each hint span inserted immediately after the user
+/// span it anchors to. Hints whose anchor is absent (compacted away) are
+/// skipped; the caller prunes them via [`rope_has_anchor`].
+pub fn with_hints(rope: &RetainedRope, hints: &[InjectedHint]) -> RetainedRope {
+    if hints.iter().all(|h| h.text.is_none()) {
         return rope.clone();
-    };
-    let mut out: Vec<Span> = Vec::with_capacity(spans.len() + 1);
-    out.extend_from_slice(&spans[..=pos]);
-    out.push(Span::new(
-        HINT_SPAN_ID,
-        SpanKind::User,
-        hint,
-        RetentionClass::Hot,
-    ));
-    out.extend_from_slice(&spans[pos + 1..]);
+    }
+    let spans = rope.spans();
+    let mut out: Vec<Span> = Vec::with_capacity(spans.len() + hints.len());
+    for span in spans {
+        let anchored = if span.kind == SpanKind::User {
+            hints
+                .iter()
+                .find(|h| h.text.is_some() && anchor_span_id(h.anchor_msg_idx) == *span.id)
+        } else {
+            None
+        };
+        out.push(span.clone());
+        if let Some(h) = anchored {
+            out.push(Span::new(
+                hint_span_id(h.anchor_msg_idx),
+                SpanKind::User,
+                h.text.as_deref().unwrap_or_default(),
+                RetentionClass::Hot,
+            ));
+        }
+    }
     RetainedRope::from_spans(out)
 }
 
@@ -150,6 +292,10 @@ pub fn with_hint_after_last_user(rope: &RetainedRope, hint: &str) -> RetainedRop
 /// is receptive: rank the bad name against the real surface and name
 /// the near-misses. Returns `None` when nothing scores (the bare
 /// "tool not found" stands alone).
+///
+/// mu-0x5i: the CALLER gates this on `[index].discover_injection`. It
+/// used to run unconditionally, which is why turning the feature off
+/// appeared not to work.
 pub fn suggest_for_unknown_tool(tools: &[Arc<dyn Tool>], name: &str) -> Option<String> {
     let tree = t4c_source::build_manifest(tools, &[]).build().ok()?;
     let views = t4c_source::discover_view(&tree, name, 3);
@@ -165,6 +311,7 @@ pub fn suggest_for_unknown_tool(tools: &[Arc<dyn Tool>], name: &str) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::AgentMessage;
 
     fn view(path: &str, summary: &str, score: f64) -> CapabilityView {
         CapabilityView {
@@ -179,78 +326,254 @@ mod tests {
         }
     }
 
+    fn opts(limit: usize, ratio: f64, already: &HashSet<String>) -> RankOptions<'_> {
+        RankOptions {
+            limit,
+            min_score_ratio: ratio,
+            already,
+            semantic: false,
+        }
+    }
+
+    fn none() -> HashSet<String> {
+        HashSet::new()
+    }
+
     #[test]
     fn format_hint_is_compact_and_limited() {
+        let seen = none();
         let views = vec![
             view("tool.read", "Read file contents", 0.9),
-            view("skill.code-index", "semantic + lexical code recall", 0.7),
-            view("bash.rg", "ripgrep", 0.5),
-            view("tool.write", "should be cut by limit", 0.4),
+            view("skill.code-index", "semantic + lexical code recall", 0.85),
+            view("bash.rg", "ripgrep", 0.8),
+            view("tool.write", "should be cut by limit", 0.75),
         ];
-        let hint = format_hint(&views, 3).expect("hint");
+        let (hint, paths) = format_hint(&views, &opts(3, 0.5, &seen)).expect("hint");
         assert!(hint.starts_with("[capability hints"));
         assert!(hint.contains("• tool.read — Read file contents"));
         assert!(hint.contains("• skill.code-index"));
         assert!(hint.contains("• bash.rg"));
         assert!(!hint.contains("tool.write"), "limit must cap entries");
+        assert_eq!(paths, vec!["tool.read", "skill.code-index", "bash.rg"]);
         assert!(hint.len() <= HINT_MAX_BYTES, "hint exceeded byte cap");
     }
 
     #[test]
     fn format_hint_skips_zero_scores_and_disallowed() {
+        let seen = none();
         let mut blocked = view("tool.spawn", "spawn workers", 0.9);
         blocked.allowed_by_session = false;
         let views = vec![blocked, view("tool.noise", "no match", 0.0)];
         assert_eq!(
-            format_hint(&views, 3),
+            format_hint(&views, &opts(3, 0.5, &seen)),
             None,
             "no qualifying entries ⇒ no hint"
         );
     }
 
     #[test]
+    fn min_score_ratio_cuts_relative_to_the_turns_best_hit() {
+        // The shipped bug: `score > 0.0` admitted anything. Scores are
+        // unnormalized (2.0 here), so the cut has to be relative.
+        let seen = none();
+        let views = vec![
+            view("tool.read", "the actual answer", 2.0),
+            view("tool.middling", "half as good", 1.0),
+            view("bash.tangential", "barely related", 0.2),
+        ];
+        let (hint, paths) = format_hint(&views, &opts(5, 0.5, &seen)).expect("hint");
+        assert!(hint.contains("tool.read"));
+        assert!(hint.contains("tool.middling"), "exactly at the floor stays");
+        assert!(
+            !hint.contains("bash.tangential"),
+            "0.2 is below 50% of 2.0 and must be cut"
+        );
+        assert_eq!(paths, vec!["tool.read", "tool.middling"]);
+    }
+
+    #[test]
+    fn min_score_ratio_zero_restores_above_zero_behavior() {
+        let seen = none();
+        let views = vec![
+            view("tool.read", "top", 2.0),
+            view("bash.tangential", "barely related", 0.2),
+        ];
+        let (_, paths) = format_hint(&views, &opts(5, 0.0, &seen)).expect("hint");
+        assert_eq!(paths, vec!["tool.read", "bash.tangential"]);
+    }
+
+    #[test]
+    fn ratio_is_computed_before_dedup_so_leftovers_still_clear_the_bar() {
+        // tool.read is already in context. tool.weak must NOT be promoted
+        // into the hint just because the leader was filtered out.
+        let seen: HashSet<String> = ["tool.read".to_string()].into_iter().collect();
+        let views = vec![
+            view("tool.read", "top hit, already injected", 2.0),
+            view("tool.weak", "well below half of 2.0", 0.3),
+        ];
+        assert_eq!(
+            format_hint(&views, &opts(5, 0.5, &seen)),
+            None,
+            "dedup must not lower the bar for what remains"
+        );
+    }
+
+    #[test]
+    fn already_injected_capabilities_are_not_repeated() {
+        let seen: HashSet<String> = ["tool.read".to_string()].into_iter().collect();
+        let views = vec![
+            view("tool.read", "already in context", 2.0),
+            view("skill.code-index", "still relevant and new", 1.8),
+        ];
+        let (hint, paths) = format_hint(&views, &opts(3, 0.5, &seen)).expect("hint");
+        assert!(!hint.contains("tool.read"), "must not repeat");
+        assert_eq!(paths, vec!["skill.code-index"]);
+    }
+
+    #[test]
     fn format_hint_enforces_byte_cap() {
+        let seen = none();
         let views: Vec<CapabilityView> = (0..50)
             .map(|i| view(&format!("tool.t{i}"), &"x".repeat(SUMMARY_MAX_CHARS), 1.0))
             .collect();
-        let hint = format_hint(&views, 50).expect("hint");
+        let (hint, _) = format_hint(&views, &opts(50, 0.5, &seen)).expect("hint");
         assert!(
             hint.len() <= HINT_MAX_BYTES,
             "byte cap must hold at any limit"
         );
     }
 
-    #[test]
-    fn hint_span_lands_after_last_user_span() {
-        let rope = RetainedRope::from_spans(vec![
+    fn rope() -> RetainedRope {
+        RetainedRope::from_spans(vec![
             Span::new(
                 "sys",
                 SpanKind::System,
                 "you are mu",
                 RetentionClass::Startup,
             ),
-            Span::new("u1", SpanKind::User, "first", RetentionClass::Hot),
-            Span::new("a1", SpanKind::Assistant, "reply", RetentionClass::Hot),
-            Span::new("u2", SpanKind::User, "second", RetentionClass::Hot),
-            Span::new("a2", SpanKind::Assistant, "working", RetentionClass::Hot),
-            Span::new("t1", SpanKind::ToolResult, "{}", RetentionClass::Hot),
-        ]);
-        let out = with_hint_after_last_user(&rope, "[capability hints] • tool.read");
-        let ids: Vec<&str> = out.spans().iter().map(|s| s.id.as_ref()).collect();
-        assert_eq!(ids, vec!["sys", "u1", "a1", "u2", HINT_SPAN_ID, "a2", "t1"]);
-        let hint = &out.spans()[4];
-        assert!(matches!(hint.kind, SpanKind::User), "must render user-role");
+            Span::new("msg-0-user", SpanKind::User, "first", RetentionClass::Hot),
+            Span::new(
+                "msg-1-assistant",
+                SpanKind::Assistant,
+                "reply",
+                RetentionClass::Hot,
+            ),
+            Span::new("msg-2-user", SpanKind::User, "second", RetentionClass::Hot),
+            Span::new(
+                "msg-3-assistant",
+                SpanKind::Assistant,
+                "working",
+                RetentionClass::Hot,
+            ),
+        ])
     }
 
     #[test]
-    fn rope_without_user_span_is_unchanged() {
-        let rope = RetainedRope::from_spans(vec![Span::new(
-            "sys",
-            SpanKind::System,
-            "you are mu",
-            RetentionClass::Startup,
-        )]);
-        let out = with_hint_after_last_user(&rope, "hint");
-        assert_eq!(out.spans(), rope.spans());
+    fn hints_land_after_the_user_span_they_anchor_to() {
+        let hints = vec![
+            InjectedHint {
+                anchor_msg_idx: 0,
+                text: Some("[capability hints] • tool.read".to_string()),
+                paths: vec!["tool.read".to_string()],
+            },
+            InjectedHint {
+                anchor_msg_idx: 2,
+                text: Some("[capability hints] • skill.code-index".to_string()),
+                paths: vec!["skill.code-index".to_string()],
+            },
+        ];
+        let out = with_hints(&rope(), &hints);
+        let ids: Vec<&str> = out.spans().iter().map(|s| s.id.as_ref()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "sys",
+                "msg-0-user",
+                "capability-hint-0",
+                "msg-1-assistant",
+                "msg-2-user",
+                "capability-hint-2",
+                "msg-3-assistant",
+            ],
+            "each hint sits immediately after its own anchor"
+        );
+    }
+
+    #[test]
+    fn earlier_hints_are_byte_stable_when_a_later_one_is_added() {
+        // The cache property: adding turn N's hint must not disturb any
+        // span before it. This is what the old transient span broke.
+        let first = vec![InjectedHint {
+            anchor_msg_idx: 0,
+            text: Some("[capability hints] • tool.read".to_string()),
+            paths: vec!["tool.read".to_string()],
+        }];
+        let mut second = first.clone();
+        second.push(InjectedHint {
+            anchor_msg_idx: 2,
+            text: Some("[capability hints] • skill.code-index".to_string()),
+            paths: vec!["skill.code-index".to_string()],
+        });
+        let before = with_hints(&rope(), &first);
+        let after = with_hints(&rope(), &second);
+        let prefix_len = before
+            .spans()
+            .iter()
+            .position(|s| s.id.as_ref() == "msg-2-user")
+            .expect("anchor present")
+            + 1;
+        assert_eq!(
+            before.spans()[..prefix_len],
+            after.spans()[..prefix_len],
+            "prefix through the new anchor must be untouched"
+        );
+    }
+
+    #[test]
+    fn hint_with_missing_anchor_is_not_placed() {
+        // Compaction dropped the anchoring user span; the hint has
+        // nowhere to go, and its capabilities become eligible again.
+        let hints = vec![InjectedHint {
+            anchor_msg_idx: 99,
+            text: Some("orphan".to_string()),
+            paths: vec!["tool.read".to_string()],
+        }];
+        let out = with_hints(&rope(), &hints);
+        assert_eq!(out.spans(), rope().spans());
+        assert!(!rope_has_anchor(&rope(), 99));
+        assert!(rope_has_anchor(&rope(), 2));
+    }
+
+    #[test]
+    fn negative_result_injects_nothing() {
+        let hints = vec![InjectedHint {
+            anchor_msg_idx: 0,
+            text: None,
+            paths: Vec::new(),
+        }];
+        assert_eq!(with_hints(&rope(), &hints).spans(), rope().spans());
+    }
+
+    #[test]
+    fn hint_anchors_match_assembled_rope_ids() {
+        // Pins the coupling to `context::assembly`'s `msg-{idx}-user`
+        // scheme. If assembly renames its spans, hints would silently
+        // stop being placed rather than fail loudly — so assert it here.
+        let messages = vec![
+            AgentMessage::User {
+                content: "first".into(),
+            },
+            AgentMessage::User {
+                content: "second".into(),
+            },
+        ];
+        let assembled = crate::context::assemble_rope(None, &messages, &[]);
+        for idx in 0..messages.len() {
+            assert!(
+                rope_has_anchor(&assembled, idx),
+                "assembly must emit {} for message {idx}",
+                anchor_span_id(idx)
+            );
+        }
     }
 }

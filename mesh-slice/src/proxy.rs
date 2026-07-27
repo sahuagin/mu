@@ -17,7 +17,7 @@ use ulid::Ulid;
 
 use crate::capability;
 use crate::contract::MeshCommand;
-use crate::contract::{Command, CommandResult, Hit, Request, Response, StatusInfo};
+use crate::contract::{Command, CommandResult, Hit, Request, Response, SourceInfo, StatusInfo};
 use crate::service::{SERVICE_NAME, SERVICE_SUBJECT};
 
 /// mu's handle to the code_index service. Holds only a NATS connection and
@@ -82,6 +82,16 @@ impl CodeIndexProxy {
         }
     }
 
+    /// Which indexes the service can serve, and what to pass as `db`. The
+    /// caller never has to guess a repo name.
+    pub async fn sources(&self) -> Result<Vec<SourceInfo>> {
+        match self.call(Command::CodeSources).await? {
+            CommandResult::CodeSources(s) => Ok(s),
+            CommandResult::Error(e) => Err(anyhow!("code_sources refused: {e}")),
+            other => Err(anyhow!("unexpected result for sources: {other:?}")),
+        }
+    }
+
     /// The interpretation step: mint the capability the command needs, build
     /// the typed envelope, address the service by subject (never host:port),
     /// do the request/reply, decode the typed response. This is what the
@@ -118,5 +128,6 @@ fn endpoint_of(command: &Command) -> &'static str {
     match command {
         Command::CodeRecall { .. } => "recall",
         Command::CodeStatus => "status",
+        Command::CodeSources => "sources",
     }
 }

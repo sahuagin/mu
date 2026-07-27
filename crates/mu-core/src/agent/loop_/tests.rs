@@ -4322,10 +4322,15 @@ async fn uz0n_hint_span_follows_user_and_is_stable_across_rounds() {
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
     let config = AgentConfig {
-        discover_hints: Some(crate::context::capability_hints::DiscoverHints {
-            skills: Arc::new(Vec::new()),
-            limit: 3,
-        }),
+        discover_hints: Some(crate::context::capability_hints::DiscoverHints::fixed(
+            Arc::new(Vec::new()),
+            true,
+            3,
+            // 0.0 keeps this test about POSITION, not relevance — the
+            // ratio floor is unit-tested in `context::capability_hints`.
+            0.0,
+            false,
+        )),
         ..AgentConfig::default()
     };
     let loop_ = loop_with(
@@ -4362,7 +4367,7 @@ async fn uz0n_hint_span_follows_user_and_is_stable_across_rounds() {
         let hint_pos = rec
             .first_span_ids
             .iter()
-            .position(|id| id == crate::context::capability_hints::HINT_SPAN_ID)
+            .position(|id| *id == crate::context::capability_hints::hint_span_id(0))
             .unwrap_or_else(|| panic!("call {i}: hint span missing: {:?}", rec.first_span_ids));
         assert_eq!(
             hint_pos,
@@ -4488,7 +4493,7 @@ async fn uz0n_no_hint_without_config() {
     assert!(records.iter().all(|r| !r
         .first_span_ids
         .iter()
-        .any(|id| id == crate::context::capability_hints::HINT_SPAN_ID)));
+        .any(|id| id.starts_with(crate::context::capability_hints::HINT_SPAN_PREFIX))));
 }
 
 /// mu-uz0n layer 2: an invented tool name comes back with ranked
@@ -4503,6 +4508,151 @@ async fn uz0n_unknown_tool_error_suggests_near_misses() {
     assert_eq!(
         crate::context::capability_hints::suggest_for_unknown_tool(&tools, "zzqy"),
         None
+    );
+}
+
+/// mu-0x5i: the memoization fix, end-to-end. Two asks with the SAME
+/// intent must produce ONE hint, not two: the capability is already in
+/// context after ask 1, and naming it again is the repeat-noise the
+/// operator reported. The old per-intent memo could not do this — it
+/// re-injected a fresh transient span every ask.
+///
+/// It also pins the cache property: ask 1's hint keeps its anchor and
+/// position in ask 2's rope, so the prefix through it never moves.
+#[tokio::test]
+async fn ox5i_capabilities_already_in_context_are_not_reinjected() {
+    let (provider, records) = RecordingProvider::new(vec![
+        vec![ProviderEvent::Done(assistant_text("one"))],
+        vec![ProviderEvent::Done(assistant_text("two"))],
+    ]);
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool::ok("frobnicate_widget", "ok"))];
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let config = AgentConfig {
+        discover_hints: Some(crate::context::capability_hints::DiscoverHints::fixed(
+            Arc::new(Vec::new()),
+            true,
+            3,
+            0.0,
+            false,
+        )),
+        ..AgentConfig::default()
+    };
+    let loop_ = loop_with(
+        provider,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        tools,
+        config,
+        events_tx,
+        approvals,
+        capability,
+    );
+    // Drain to Done between sends — back-to-back sends coalesce into one
+    // turn, and this test is specifically about the SECOND ask.
+    for _ in 0..2 {
+        loop_
+            .send(AgentInput::UserMessage(
+                user_msg("frobnicate the widget"),
+                None,
+                None,
+            ))
+            .await
+            .expect("send");
+        drain_until_done(&mut events_rx).await;
+    }
+    let _ = loop_.join().await;
+
+    let records = records.lock().expect("records").clone();
+    assert_eq!(records.len(), 2, "two asks = two provider calls");
+    let hint_ids = |ids: &[String]| -> Vec<String> {
+        ids.iter()
+            .filter(|id| id.starts_with(crate::context::capability_hints::HINT_SPAN_PREFIX))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        hint_ids(&records[0].first_span_ids),
+        vec![crate::context::capability_hints::hint_span_id(0)],
+        "ask 1 injects a hint anchored to its user message"
+    );
+    assert_eq!(
+        hint_ids(&records[1].first_span_ids),
+        vec![crate::context::capability_hints::hint_span_id(0)],
+        "ask 2 must NOT add a second hint — the capability is already in \
+         context — and ask 1's hint must still be there, at its anchor"
+    );
+    // Cache property: everything up to and including ask 1's hint is
+    // byte-identical between the two calls.
+    let first = &records[0].first_span_ids;
+    let cut = first
+        .iter()
+        .position(|id| *id == crate::context::capability_hints::hint_span_id(0))
+        .expect("hint present")
+        + 1;
+    assert_eq!(
+        first[..cut],
+        records[1].first_span_ids[..cut],
+        "the prefix through ask 1's hint must be untouched by ask 2"
+    );
+}
+
+/// mu-0x5i: layer 2 obeys the SAME flag as layer 1. This is the half of
+/// the feature that ignored `[index].discover_injection` entirely — the
+/// operator turned injection off and still got "closest available:" on
+/// every invented tool name.
+#[tokio::test]
+async fn ox5i_unknown_tool_error_is_bare_when_injection_is_off() {
+    let (provider, _records) = RecordingProvider::new(vec![
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "t1",
+            "frobnicate",
+            json!({}),
+        ))],
+        vec![ProviderEvent::Done(assistant_text("done"))],
+    ]);
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool::ok("frobnicate_widget", "ok"))];
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let loop_ = loop_with(
+        provider,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        tools,
+        // discover_hints: None — the feature is OFF.
+        AgentConfig::default(),
+        events_tx,
+        approvals,
+        capability,
+    );
+    loop_
+        .send(AgentInput::UserMessage(user_msg("go"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("drain");
+
+    let errors: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCallCompleted {
+                content, is_error, ..
+            } if *is_error => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        errors
+            .iter()
+            .any(|c| c.contains("tool not found: frobnicate")),
+        "expected a tool-not-found error, got {errors:?}"
+    );
+    assert!(
+        errors.iter().all(|c| !c.contains("closest available")),
+        "injection is off — the error must not carry discovery hints: {errors:?}"
     );
 }
 

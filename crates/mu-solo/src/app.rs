@@ -4665,79 +4665,62 @@ impl App {
     /// /config — read or write session config over the generic
     /// capability-gated config message (mu-context-limits-wire phase 2).
     ///
-    ///   /config [get] [key...]      read keys (default: context.soft_limit;
-    ///                               `*` for the whole readable config)
-    ///   /config set <key> <value>   write one key, e.g.
-    ///                               `/config set context.soft_limit 120000`
+    ///   /config [get] [key...]      read keys (default: context.soft_limit)
+    ///   /config get all             read EVERYTHING addressable (`*` works too)
+    ///   /config <key>=<value>       write one key, e.g.
+    ///                               `/config index.discover_injection=false`
+    ///   /config set <key> <value>   the same write, spelled out
     ///
-    /// The set takes effect live: the daemon updates the running loop's
-    /// compaction trigger AND records the change so the context meter
-    /// reflects it on the next status tick.
+    /// mu-0x5i: keys are named `<toml section>.<toml key>`, so what you
+    /// type here is what you'd put in config.toml — one vocabulary. The
+    /// command stays GENERIC on purpose: the daemon owns the key registry,
+    /// so new knobs become addressable without a new slash command.
+    ///
+    /// Writes take effect live on the running loop — `context.soft_limit`
+    /// moves the compaction trigger (and records the change so the meter
+    /// reflects it), and the `index.*` knobs retune capability hints from
+    /// the next turn. Nothing here edits config.toml: these are
+    /// session-scoped overrides, so a restart returns to the file.
     fn cmd_config(&mut self, vp: &mut DynamicViewport, arg: &str) -> Result<()> {
         let mut parts = arg.split_whitespace();
         let first = parts.next().unwrap_or("get");
         let mut lines: Vec<Line> = vec![Line::from("")];
+        let inline_assignment = parse_config_assignment(first);
         match first {
+            _ if inline_assignment.is_some() => {
+                let (key, raw) = inline_assignment.expect("checked by the guard");
+                self.config_set(&mut lines, key, &raw);
+            }
             "set" => {
                 let key = match parts.next() {
                     Some(k) => k.to_string(),
                     None => {
-                        self.set_flash("usage: /config set <key> <value>");
+                        self.set_flash(
+                            "usage: /config set <key> <value>  (or /config <key>=<value>)",
+                        );
                         return Ok(());
                     }
                 };
-                let raw = parts.next().unwrap_or("");
-                // Integers parse as JSON numbers (what context.soft_limit
-                // wants); anything else is sent as a string and the daemon
-                // validates per key.
-                let value: serde_json::Value = raw
-                    .parse::<u64>()
-                    .map(serde_json::Value::from)
-                    .unwrap_or_else(|_| serde_json::Value::from(raw));
-                let params = serde_json::json!({
-                    "session_id": self.session_id,
-                    "entries": [{ "key": key, "value": value }],
-                });
-                match self.client.request("session.set_config", params) {
-                    Ok(v) => {
-                        let applied = v
-                            .get("applied")
-                            .and_then(|a| a.as_array())
-                            .map(|a| !a.is_empty())
-                            .unwrap_or(false);
-                        if applied {
-                            lines.push(Line::from(Span::styled(
-                                format!("config set: {key} = {value}"),
-                                Style::default().fg(Color::Green),
-                            )));
-                            self.set_flash(format!("config set {key}"));
-                        }
-                        if let Some(rej) = v.get("rejected").and_then(|r| r.as_array()) {
-                            for r in rej {
-                                let k = r.get("key").and_then(|x| x.as_str()).unwrap_or("?");
-                                let reason =
-                                    r.get("reason").and_then(|x| x.as_str()).unwrap_or("?");
-                                lines.push(Line::from(Span::styled(
-                                    format!("rejected {k}: {reason}"),
-                                    Style::default().fg(Color::Red),
-                                )));
-                            }
-                        }
-                    }
-                    Err(e) => lines.push(Line::from(Span::styled(
-                        format!("set_config failed: {e}"),
-                        Style::default().fg(Color::Red),
-                    ))),
-                }
+                // `set key=value` reads naturally too; take the value from
+                // whichever side of the split it turned up on.
+                let (key, raw) = match key.split_once('=') {
+                    Some((k, v)) => (k.to_string(), v.to_string()),
+                    None => (key, parts.next().unwrap_or("").to_string()),
+                };
+                self.config_set(&mut lines, key, &raw);
             }
             sub => {
-                // "get" (explicit) or bare keys; default to the soft limit.
+                // "get" (explicit) or bare keys; `all` (like the daemon's
+                // `"*"`) dumps the whole addressable config.
                 let mut keys: Vec<String> = parts.map(|s| s.to_string()).collect();
                 if sub != "get" {
                     keys.insert(0, sub.to_string());
                 }
                 if keys.is_empty() {
                     keys.push("context.soft_limit".to_string());
+                }
+                if keys.iter().any(|k| k == "all" || k == "*") {
+                    keys = vec!["*".to_string()];
                 }
                 let params = serde_json::json!({
                     "session_id": self.session_id,
@@ -4772,6 +4755,46 @@ impl App {
             ratatui::widgets::Widget::render(p, buf.area, buf);
         })?;
         Ok(())
+    }
+
+    /// Send one `session.set_config` assignment and report the outcome.
+    /// Shared by `/config set <k> <v>` and `/config <k>=<v>`.
+    fn config_set(&mut self, lines: &mut Vec<Line<'static>>, key: String, raw: &str) {
+        let value = config_value_from_str(raw);
+        let params = serde_json::json!({
+            "session_id": self.session_id,
+            "entries": [{ "key": key, "value": value }],
+        });
+        match self.client.request("session.set_config", params) {
+            Ok(v) => {
+                let applied = v
+                    .get("applied")
+                    .and_then(|a| a.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false);
+                if applied {
+                    lines.push(Line::from(Span::styled(
+                        format!("config set: {key} = {value}"),
+                        Style::default().fg(Color::Green),
+                    )));
+                    self.set_flash(format!("config set {key}"));
+                }
+                if let Some(rej) = v.get("rejected").and_then(|r| r.as_array()) {
+                    for r in rej {
+                        let k = r.get("key").and_then(|x| x.as_str()).unwrap_or("?");
+                        let reason = r.get("reason").and_then(|x| x.as_str()).unwrap_or("?");
+                        lines.push(Line::from(Span::styled(
+                            format!("rejected {k}: {reason}"),
+                            Style::default().fg(Color::Red),
+                        )));
+                    }
+                }
+            }
+            Err(e) => lines.push(Line::from(Span::styled(
+                format!("set_config failed: {e}"),
+                Style::default().fg(Color::Red),
+            ))),
+        }
     }
 
     /// /cancel / Esc / Ctrl-C — abort the in-flight provider call without ending the
@@ -5179,7 +5202,7 @@ impl App {
             MenuItem::new("/model ›", "Select model"),
             MenuItem::new(
                 "/config",
-                "Read/set session config (e.g. context.soft_limit)",
+                "Read/set session config (/config get all, /config key=value)",
             ),
             MenuItem::new(
                 "/btw",
@@ -5223,6 +5246,8 @@ impl App {
             Line::from("  /inline            leave fullscreen; replay transcript to scrollback"),
             Line::from("  /provider [name]   list-picker (bare) or set directly"),
             Line::from("  /model [name]      list-picker (bare) or set directly"),
+            Line::from("  /config get all    show every addressable session config key"),
+            Line::from("  /config k=v        set one, e.g. index.discover_injection=false"),
             Line::from("  /btw <message>     side question via sidecar (main history unaffected)"),
             Line::from("  /cancel            abort the in-flight provider call"),
             Line::from("  /clear             clear the visible scrollback"),
@@ -6366,6 +6391,35 @@ fn titlecase_tool(name: &str) -> String {
 }
 
 /// Format token count compactly: 0, 500, 1.2k, 200k, 1.0M
+/// mu-0x5i: recognise `/config <section>.<key>=<value>` — the generic
+/// write form. The daemon's key registry is already generic, so the UI
+/// must not grow a bespoke command per knob: one syntax reaches every
+/// addressable key, present and future.
+///
+/// `get`/`set` keep their meaning as subcommands, so a hypothetical key
+/// literally named `set` can still be written the long way.
+fn parse_config_assignment(first: &str) -> Option<(String, String)> {
+    if first == "set" || first == "get" {
+        return None;
+    }
+    let (k, v) = first.split_once('=')?;
+    (!k.is_empty()).then(|| (k.to_string(), v.to_string()))
+}
+
+/// Coerce a typed-in config value to its natural JSON type.
+///
+/// Bool and float matter now that the `index.*` knobs are addressable: an
+/// unquoted `false` arriving as the STRING `"false"` is exactly the kind
+/// of thing that reads as "it silently ignored me". The daemon coerces
+/// liberally too, so this is belt and braces, not the only defence.
+fn config_value_from_str(raw: &str) -> Value {
+    raw.parse::<bool>()
+        .map(Value::from)
+        .or_else(|_| raw.parse::<u64>().map(Value::from))
+        .or_else(|_| raw.parse::<f64>().map(Value::from))
+        .unwrap_or_else(|_| Value::from(raw))
+}
+
 fn format_tokens(n: u64) -> String {
     if n < 1_000 {
         format!("{n}")
@@ -6495,6 +6549,47 @@ mod tests {
         assert_eq!(pa.tool_name, "bash");
         assert_eq!(pa.summary, "run ls -la");
         assert!(pa.arguments_pretty.contains("ls -la"));
+    }
+
+    #[test]
+    fn config_assignment_form_is_recognised() {
+        assert_eq!(
+            parse_config_assignment("index.discover_injection=false"),
+            Some(("index.discover_injection".to_string(), "false".to_string()))
+        );
+        // A ratio keeps its dots and decimals intact.
+        assert_eq!(
+            parse_config_assignment("index.discover_injection_min_score_ratio=0.75"),
+            Some((
+                "index.discover_injection_min_score_ratio".to_string(),
+                "0.75".to_string()
+            ))
+        );
+        // Subcommands are not assignments.
+        assert_eq!(parse_config_assignment("get"), None);
+        assert_eq!(parse_config_assignment("set"), None);
+        // A bare key is a READ, not a write to empty.
+        assert_eq!(parse_config_assignment("context.soft_limit"), None);
+        // A leading `=` names no key.
+        assert_eq!(parse_config_assignment("=5"), None);
+        // Empty value is allowed through — the daemon rejects it per key,
+        // with a reason, rather than the UI guessing.
+        assert_eq!(
+            parse_config_assignment("some.key="),
+            Some(("some.key".to_string(), String::new()))
+        );
+    }
+
+    #[test]
+    fn config_values_are_sent_as_their_natural_json_type() {
+        // The bug this prevents: `false` arriving as the string "false"
+        // and the knob appearing to ignore the operator.
+        assert_eq!(config_value_from_str("false"), serde_json::json!(false));
+        assert_eq!(config_value_from_str("true"), serde_json::json!(true));
+        assert_eq!(config_value_from_str("120000"), serde_json::json!(120000));
+        assert_eq!(config_value_from_str("0.75"), serde_json::json!(0.75));
+        // Anything else stays a string; the daemon validates per key.
+        assert_eq!(config_value_from_str("full"), serde_json::json!("full"));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use mu_core::agent::{AgentConfig, AgentInput, AgentLoop, AgentMessage, SpawnArgs, Tool};
 use mu_core::capability::Capability;
+use mu_core::context::capability_hints::LiveHintConfig;
 use mu_core::context::rope::SpanText;
 use mu_core::context::CacheTtl;
 use mu_core::context::{ProjectContext, RecalledItem};
@@ -736,15 +737,33 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         bare,
     );
     // mu-uz0n: implicit capability discovery — per-turn hint injection,
-    // ranked by the same lexical engine as the `discover` tool. Bare
-    // sessions stay hermetic (no injection mu didn't get told to make).
+    // ranked by the same engine as the `discover` tool. Bare sessions
+    // stay hermetic (no injection mu didn't get told to make), so they
+    // get `None` and can't opt in at runtime either.
+    //
+    // mu-0x5i: a NON-bare session is always WIRED (skills aboard) even
+    // when the feature is off, and the on/off decision lives in the
+    // shared `LiveHintConfig` seeded from `[index].discover_injection`.
+    // That split is what makes `/config index.discover_injection=true`
+    // work mid-session — flipping a bool can't conjure the skill list.
+    // The live `enabled` gates BOTH halves: the per-turn hints here and
+    // the unknown-tool suggestion in `execute_tools`.
     let index_cfg = &daemon_info.config().index;
-    let discover_hints = (index_cfg.discover_injection && !bare).then(|| {
-        mu_core::context::capability_hints::DiscoverHints {
-            skills: skills.clone(),
-            limit: index_cfg.discover_injection_limit,
-        }
+    let live_hints = (!bare).then(|| {
+        Arc::new(mu_core::context::capability_hints::LiveHintConfig::new(
+            index_cfg.discover_injection,
+            index_cfg.discover_injection_limit,
+            index_cfg.discover_injection_min_score_ratio,
+            index_cfg.discover_injection_semantic,
+        ))
     });
+    let discover_hints =
+        live_hints
+            .clone()
+            .map(|live| mu_core::context::capability_hints::DiscoverHints {
+                skills: skills.clone(),
+                live,
+            });
     let recall_cfg = &daemon_info.config().recall;
     let kx_hints = (recall_cfg.kx && !bare).then(|| {
         let hints = match &recall_cfg.kx_binary {
@@ -829,6 +848,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
             status_watch: Some(status_rx),
             autonomy_active,
             live_context_soft_limit,
+            live_discover_hints: live_hints,
         },
     );
 
@@ -1611,14 +1631,80 @@ mod config_keys {
     pub const HARD_LIMIT: &str = "context.hard_limit";
     /// Current context fill (last call's input tokens). Read-only.
     pub const USED_TOKENS: &str = "context.used_tokens";
+
+    // mu-0x5i: the `[index]` capability-hint tunables, live per session.
+    // Keys are `<toml section>.<toml key>` so what an operator types at
+    // `/config` is the same name they'd put in config.toml — one
+    // vocabulary, not two.
+    /// Whether per-turn capability hints (and the unknown-tool
+    /// suggestion) are on. Read/write.
+    pub const DISCOVER_INJECTION: &str = "index.discover_injection";
+    /// Top-N entries per injected hint. Read/write.
+    pub const DISCOVER_INJECTION_LIMIT: &str = "index.discover_injection_limit";
+    /// Relevance floor as a fraction of the turn's best hit. Read/write.
+    pub const DISCOVER_INJECTION_MIN_SCORE_RATIO: &str = "index.discover_injection_min_score_ratio";
+    /// Rank injected hints semantically (local embedder only). Read/write.
+    pub const DISCOVER_INJECTION_SEMANTIC: &str = "index.discover_injection_semantic";
+
     /// Every key returned for the explicit `"*"` whole-config request.
-    pub const ALL_READABLE: &[&str] = &[SOFT_LIMIT, HARD_LIMIT, USED_TOKENS];
+    pub const ALL_READABLE: &[&str] = &[
+        SOFT_LIMIT,
+        HARD_LIMIT,
+        USED_TOKENS,
+        DISCOVER_INJECTION,
+        DISCOVER_INJECTION_LIMIT,
+        DISCOVER_INJECTION_MIN_SCORE_RATIO,
+        DISCOVER_INJECTION_SEMANTIC,
+    ];
+}
+
+// Liberal scalar coercion for `session.set_config` values (mu-0x5i).
+// A `/config` line is typed by a human and arrives through whatever the
+// frontend guessed, so `true`, `"true"`, and `1` all mean true. The
+// daemon owns the type, not the transport — being strict here would
+// just push identical parsing into every frontend.
+
+fn as_bool(v: &Value) -> Option<bool> {
+    match v {
+        Value::Bool(b) => Some(*b),
+        Value::Number(n) => n.as_u64().and_then(|n| match n {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }),
+        Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "on" | "1" => Some(true),
+            "false" | "no" | "off" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn as_u64(v: &Value) -> Option<u64> {
+    match v {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
 }
 
 /// Read one key's current value. `None` ⇒ unknown key (omitted from the
 /// response — the daemon never volunteers a value that wasn't asked for).
 /// `Some(Value::Null)` ⇒ a known key with no value yet.
-fn read_config_key(log: &SessionEventLog, key: &str) -> Option<Value> {
+fn read_config_key(
+    log: &SessionEventLog,
+    hints: Option<&LiveHintConfig>,
+    key: &str,
+) -> Option<Value> {
     let (soft, hard) = log
         .context_limits()
         .map_or((None, None), |(s, h, _max_output)| (Some(s), h));
@@ -1626,6 +1712,21 @@ fn read_config_key(log: &SessionEventLog, key: &str) -> Option<Value> {
         config_keys::SOFT_LIMIT => Some(soft.map_or(Value::Null, Value::from)),
         config_keys::HARD_LIMIT => Some(hard.map_or(Value::Null, Value::from)),
         config_keys::USED_TOKENS => Some(log.live_usage().1.map_or(Value::Null, Value::from)),
+        // A `--bare` session is not wired for injection, so these read
+        // Null rather than being omitted: "asked, and the answer is
+        // nothing" is a different fact from "no such key".
+        config_keys::DISCOVER_INJECTION => {
+            Some(hints.map_or(Value::Null, |h| Value::from(h.enabled())))
+        }
+        config_keys::DISCOVER_INJECTION_LIMIT => {
+            Some(hints.map_or(Value::Null, |h| Value::from(h.limit())))
+        }
+        config_keys::DISCOVER_INJECTION_MIN_SCORE_RATIO => {
+            Some(hints.map_or(Value::Null, |h| Value::from(h.min_score_ratio())))
+        }
+        config_keys::DISCOVER_INJECTION_SEMANTIC => {
+            Some(hints.map_or(Value::Null, |h| Value::from(h.semantic())))
+        }
         _ => None,
     }
 }
@@ -1675,9 +1776,10 @@ pub async fn handle_get_config(request: Request<Value>, sessions: Sessions) -> R
     } else {
         params.keys.clone()
     };
+    let hints = sessions.live_discover_hints(&params.session_id);
     let mut values = std::collections::BTreeMap::new();
     for key in keys {
-        if let Some(v) = read_config_key(&log, &key) {
+        if let Some(v) = read_config_key(&log, hints.as_deref(), &key) {
             values.insert(key, v);
         }
         // Unknown keys are silently omitted: never return more than asked.
@@ -1735,6 +1837,7 @@ pub async fn handle_set_config(request: Request<Value>, sessions: Sessions) -> R
         )
     );
 
+    let hints = sessions.live_discover_hints(&params.session_id);
     let mut applied = Vec::new();
     let mut rejected = Vec::new();
     for entry in params.entries {
@@ -1771,6 +1874,64 @@ pub async fn handle_set_config(request: Request<Value>, sessions: Sessions) -> R
                 _ => Err("context.soft_limit expects a positive integer token count".to_string()),
             },
             config_keys::HARD_LIMIT | config_keys::USED_TOKENS => Err("read-only key".to_string()),
+            // mu-0x5i: capability-hint tunables. Writes land in the cell
+            // the running loop reads, so they apply from the next turn —
+            // which is the point: finding a usable `min_score_ratio`
+            // shouldn't cost a daemon restart per attempt.
+            config_keys::DISCOVER_INJECTION
+            | config_keys::DISCOVER_INJECTION_LIMIT
+            | config_keys::DISCOVER_INJECTION_MIN_SCORE_RATIO
+            | config_keys::DISCOVER_INJECTION_SEMANTIC => match hints.as_deref() {
+                None => Err("capability hints are not wired for this session (--bare); \
+                     nothing to set"
+                    .to_string()),
+                Some(h) => match key.as_str() {
+                    config_keys::DISCOVER_INJECTION => match as_bool(&value) {
+                        Some(b) => {
+                            h.set_enabled(b);
+                            Ok(Value::from(b))
+                        }
+                        None => Err(format!(
+                            "{} expects a boolean",
+                            config_keys::DISCOVER_INJECTION
+                        )),
+                    },
+                    config_keys::DISCOVER_INJECTION_SEMANTIC => match as_bool(&value) {
+                        Some(b) => {
+                            h.set_semantic(b);
+                            Ok(Value::from(b))
+                        }
+                        None => Err(format!(
+                            "{} expects a boolean",
+                            config_keys::DISCOVER_INJECTION_SEMANTIC
+                        )),
+                    },
+                    config_keys::DISCOVER_INJECTION_LIMIT => match as_u64(&value) {
+                        Some(n) if n > 0 => {
+                            h.set_limit(n as usize);
+                            Ok(Value::from(n))
+                        }
+                        _ => Err(format!(
+                            "{} expects a positive integer",
+                            config_keys::DISCOVER_INJECTION_LIMIT
+                        )),
+                    },
+                    _ => match as_f64(&value) {
+                        // Rejected rather than clamped: a typed-in 50
+                        // meaning "50%" must not silently become 1.0 and
+                        // look like it worked.
+                        Some(r) if (0.0..=1.0).contains(&r) => {
+                            h.set_min_score_ratio(r);
+                            Ok(Value::from(r))
+                        }
+                        _ => Err(format!(
+                            "{} expects a fraction between 0.0 and 1.0 \
+                             (it is a ratio of the turn's best hit, not a percent)",
+                            config_keys::DISCOVER_INJECTION_MIN_SCORE_RATIO
+                        )),
+                    },
+                },
+            },
             _ => Err("unknown config key".to_string()),
         };
         match result {
@@ -2099,6 +2260,23 @@ mod tests {
         id: &str,
         cap: Capability,
     ) -> (Arc<SessionEventLog>, Arc<AtomicU64>) {
+        let (log, live, _) = insert_live_session_with_hints(sessions, id, cap, None);
+        (log, live)
+    }
+
+    /// mu-0x5i: like [`insert_live_session`], but wires the live
+    /// capability-hint cell so the `index.*` config keys are addressable.
+    /// `None` models a `--bare` session (never wired).
+    fn insert_live_session_with_hints(
+        sessions: &Sessions,
+        id: &str,
+        cap: Capability,
+        hints: Option<Arc<LiveHintConfig>>,
+    ) -> (
+        Arc<SessionEventLog>,
+        Arc<AtomicU64>,
+        Option<Arc<LiveHintConfig>>,
+    ) {
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel(8);
         let log = Arc::new(SessionEventLog::new(id.to_string()));
         let live = Arc::new(AtomicU64::new(0));
@@ -2120,9 +2298,10 @@ mod tests {
                 status_watch: None,
                 autonomy_active: Arc::new(AtomicBool::new(false)),
                 live_context_soft_limit: live.clone(),
+                live_discover_hints: hints.clone(),
             },
         );
-        (log, live)
+        (log, live, hints)
     }
 
     fn cfg_req(method: &str, params: Value) -> Request<Value> {
@@ -2273,6 +2452,131 @@ mod tests {
         .await;
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["result"]["values"]["context.soft_limit"], json!(120_000));
+    }
+
+    /// mu-0x5i: the `index.*` capability-hint knobs are addressable
+    /// through the SAME generic key→value messages as `context.*` — the
+    /// operator's requirement was one `/config <key>=<value>` surface,
+    /// not a bespoke command per knob. Writes must reach the cell the
+    /// running agent loop reads, so tuning costs no restart.
+    #[tokio::test]
+    async fn set_config_tunes_capability_hints_live() {
+        let sessions = Sessions::new();
+        let hints = Arc::new(LiveHintConfig::new(false, 3, 0.5, false));
+        let _ = insert_live_session_with_hints(
+            &sessions,
+            "s1",
+            Capability::root(),
+            Some(hints.clone()),
+        );
+
+        // Enable + retune in one request, mixing types (and a string
+        // "true", which is what a naive frontend sends).
+        let resp = handle_set_config(
+            cfg_req(
+                SetConfigRequest::METHOD,
+                json!({"session_id": "s1", "entries": [
+                    {"key": "index.discover_injection", "value": "true"},
+                    {"key": "index.discover_injection_limit", "value": 5},
+                    {"key": "index.discover_injection_min_score_ratio", "value": 0.75}
+                ]}),
+            ),
+            sessions.clone(),
+        )
+        .await;
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["result"]["applied"].as_array().unwrap().len(), 3);
+        assert!(v["result"]["rejected"].as_array().unwrap().is_empty());
+        // The live cell the loop reads — not a copy.
+        assert!(hints.enabled());
+        assert_eq!(hints.limit(), 5);
+        assert_eq!(hints.min_score_ratio(), 0.75);
+
+        // A ratio outside 0..=1 is REJECTED, not clamped: "50" meaning
+        // "50%" must not silently become 1.0 and look like it worked.
+        let resp = handle_set_config(
+            cfg_req(
+                SetConfigRequest::METHOD,
+                json!({"session_id": "s1", "entries": [
+                    {"key": "index.discover_injection_min_score_ratio", "value": 50}
+                ]}),
+            ),
+            sessions.clone(),
+        )
+        .await;
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["result"]["rejected"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            hints.min_score_ratio(),
+            0.75,
+            "a rejected write must not move the live value"
+        );
+
+        // `"*"` reports the index keys alongside the context ones, so
+        // `/config get all` can actually interrogate the whole surface.
+        let resp = handle_get_config(
+            cfg_req(
+                GetConfigRequest::METHOD,
+                json!({"session_id": "s1", "keys": ["*"]}),
+            ),
+            sessions.clone(),
+        )
+        .await;
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            v["result"]["values"]["index.discover_injection"],
+            json!(true)
+        );
+        assert_eq!(
+            v["result"]["values"]["index.discover_injection_limit"],
+            json!(5)
+        );
+        assert_eq!(
+            v["result"]["values"]["index.discover_injection_min_score_ratio"],
+            json!(0.75)
+        );
+        assert_eq!(
+            v["result"]["values"]["index.discover_injection_semantic"],
+            json!(false)
+        );
+    }
+
+    /// A `--bare` session is never wired for injection, so the keys read
+    /// Null and writing them is rejected with a reason rather than
+    /// silently pretending to work.
+    #[tokio::test]
+    async fn capability_hint_keys_are_inert_on_a_bare_session() {
+        let sessions = Sessions::new();
+        let _ = insert_live_session_with_hints(&sessions, "s1", Capability::root(), None);
+
+        let resp = handle_get_config(
+            cfg_req(
+                GetConfigRequest::METHOD,
+                json!({"session_id": "s1", "keys": ["index.discover_injection"]}),
+            ),
+            sessions.clone(),
+        )
+        .await;
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            v["result"]["values"]["index.discover_injection"],
+            json!(null),
+            "asked-and-nothing is a different fact from no-such-key"
+        );
+
+        let resp = handle_set_config(
+            cfg_req(
+                SetConfigRequest::METHOD,
+                json!({"session_id": "s1", "entries": [
+                    {"key": "index.discover_injection", "value": true}
+                ]}),
+            ),
+            sessions.clone(),
+        )
+        .await;
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["result"]["rejected"].as_array().unwrap().len(), 1);
+        assert!(v["result"]["applied"].as_array().unwrap().is_empty());
     }
 
     // mu-8bkf: compaction policy resolution from config.  Pins that

@@ -1210,8 +1210,8 @@ mod tests {
             Config::default().index.discover_injection_min_score_ratio,
             0.5
         );
-        let c: Config = toml::from_str("[index]\ndiscover_injection_min_score_ratio = 0.8\n")
-            .expect("parse");
+        let c: Config =
+            toml::from_str("[index]\ndiscover_injection_min_score_ratio = 0.8\n").expect("parse");
         assert_eq!(c.index.discover_injection_min_score_ratio, 0.8);
     }
 

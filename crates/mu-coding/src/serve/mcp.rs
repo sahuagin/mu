@@ -1228,6 +1228,7 @@ mod tests {
                 status_watch: None,
                 autonomy_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                live_discover_hints: None,
             },
         );
         log

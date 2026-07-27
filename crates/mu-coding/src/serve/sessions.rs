@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 
 use mu_core::agent::AgentInput;
 use mu_core::capability::Capability;
+use mu_core::context::capability_hints::LiveHintConfig;
 use mu_core::context::CacheTtl;
 use mu_core::event_log::SessionEventLog;
 use mu_core::protocol::{ApprovalDecision, OutstandingCall, WorkerStatus};
@@ -87,6 +88,12 @@ struct SessionState {
     /// at each compaction check. `0` ⇒ unset (loop uses its config /
     /// default fallback). Wrapped so the daemon and loop share one cell.
     live_context_soft_limit: Arc<AtomicU64>,
+    /// mu-0x5i: live capability-hint tunables, shared with the running
+    /// agent loop. `session.get_config`/`set_config` read and write here,
+    /// so `/config index.discover_injection=true` applies from the next
+    /// turn without a daemon restart. `None` for a `--bare` session,
+    /// which is never wired for injection at all.
+    live_discover_hints: Option<Arc<LiveHintConfig>>,
 }
 
 /// A session loaded from disk at daemon startup (mu-u1ld). The
@@ -209,6 +216,20 @@ pub struct NewSession {
     /// `SpawnArgs`. `session.set_config` writes it via
     /// [`Sessions::live_context_soft_limit`].
     pub live_context_soft_limit: Arc<AtomicU64>,
+    /// mu-0x5i: the same `Arc<LiveHintConfig>` handed to the agent loop's
+    /// `DiscoverHints`. `None` for `--bare` sessions (never wired).
+    /// Defaults to `None` via [`NewSession::default_live_discover_hints`]
+    /// for constructors that don't care.
+    pub live_discover_hints: Option<Arc<LiveHintConfig>>,
+}
+
+impl NewSession {
+    /// What a caller with no opinion on capability hints should pass.
+    /// Spelled out so test constructors read as a deliberate "not wired"
+    /// rather than an oversight.
+    pub fn default_live_discover_hints() -> Option<Arc<LiveHintConfig>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,6 +301,7 @@ impl Sessions {
                     status_watch: new.status_watch,
                     autonomy_active: new.autonomy_active,
                     live_context_soft_limit: new.live_context_soft_limit,
+                    live_discover_hints: new.live_discover_hints,
                 },
             );
         }
@@ -659,6 +681,14 @@ impl Sessions {
             .map(|s| s.live_context_soft_limit.clone())
     }
 
+    /// mu-0x5i: the shared capability-hint tunables for a session, so
+    /// `session.get_config`/`set_config` can read and update what the
+    /// running loop uses. `None` if no such live session exists OR the
+    /// session is `--bare` (never wired for injection).
+    pub fn live_discover_hints(&self, id: &str) -> Option<Arc<LiveHintConfig>> {
+        self.inner.lock().ok()?.get(id)?.live_discover_hints.clone()
+    }
+
     /// Snapshot every outstanding provider call across all sessions
     /// (mu-035 Phase D). Returns one [`OutstandingCall`] per session
     /// currently in a non-idle state. Sessions that are between asks
@@ -827,6 +857,7 @@ mod tests {
                 status_watch: None,
                 autonomy_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                live_discover_hints: None,
             },
         );
         assert!(sessions.input_sender(&id).is_some());
@@ -858,6 +889,7 @@ mod tests {
                 status_watch: None,
                 autonomy_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                live_discover_hints: None,
             },
         );
 
@@ -959,6 +991,7 @@ mod tests {
                 status_watch: None,
                 autonomy_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                live_discover_hints: None,
             },
         );
 
@@ -1012,6 +1045,7 @@ mod tests {
                 status_watch: None,
                 autonomy_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                live_discover_hints: None,
             },
         );
 
@@ -1080,6 +1114,7 @@ mod tests {
                 status_watch: None,
                 autonomy_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                live_discover_hints: None,
             },
         );
         (log, tracker)

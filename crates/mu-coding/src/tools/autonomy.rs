@@ -344,6 +344,7 @@ mod tests {
                 status_watch: None,
                 autonomy_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 live_context_soft_limit: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                live_discover_hints: None,
             },
         );
 

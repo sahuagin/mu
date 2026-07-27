@@ -249,6 +249,9 @@ async fn cancel_current_and_remaining(
     }
 }
 
+// One dispatch call needs the whole per-round context; bundling it into a
+// struct would just move the same fields behind another name.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_execute_tools(
     tools: &[Arc<dyn Tool>],
     calls: Vec<ToolCall>,

@@ -155,9 +155,7 @@ impl ConfigEmbedder {
         let host = if let Some(inner) = authority.strip_prefix('[') {
             inner.split_once(']').map_or(inner, |(h, _port)| h)
         } else {
-            authority
-                .rsplit_once(':')
-                .map_or(authority, |(h, _port)| h)
+            authority.rsplit_once(':').map_or(authority, |(h, _port)| h)
         };
         let host = host.trim().to_ascii_lowercase();
 
@@ -250,7 +248,7 @@ mod tests {
         for e in [
             ConfigEmbedder::DEFAULT_ENDPOINT,
             "https://api.openai.com/v1/embeddings",
-            "https://11.0.0.1/v1/embeddings",   // adjacent to 10/8, not private
+            "https://11.0.0.1/v1/embeddings", // adjacent to 10/8, not private
             "https://172.32.0.1/v1/embeddings", // just past 172.16/12
             "https://localhost.evil.com/v1/embeddings",
             "",

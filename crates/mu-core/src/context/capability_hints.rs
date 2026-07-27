@@ -80,33 +80,120 @@ pub const HINT_MAX_BYTES: usize = 700;
 /// Per-entry summary truncation (chars).
 const SUMMARY_MAX_CHARS: usize = 90;
 
+/// The tunables, in a cell the daemon and the running agent loop SHARE
+/// (mu-0x5i). `session.set_config` writes here; the loop reads at the
+/// top of each turn, so `/config index.discover_injection=true` takes
+/// effect on the next turn with no restart.
+///
+/// Atomics rather than a lock because the loop reads these on its hot
+/// path and a config write must never be able to block a turn.
+///
+/// Enabling mid-session starts injecting from the NEXT turn; disabling
+/// stops adding hints but deliberately LEAVES the ones already in
+/// context. Retracting them would rewrite the prefix and throw away the
+/// cache — a strictly worse trade than a few stale pointer lines.
+#[derive(Debug)]
+pub struct LiveHintConfig {
+    enabled: std::sync::atomic::AtomicBool,
+    limit: std::sync::atomic::AtomicUsize,
+    /// `f64` bits — `AtomicF64` doesn't exist.
+    min_score_ratio_bits: std::sync::atomic::AtomicU64,
+    semantic: std::sync::atomic::AtomicBool,
+}
+
+impl LiveHintConfig {
+    pub fn new(enabled: bool, limit: usize, min_score_ratio: f64, semantic: bool) -> Self {
+        use std::sync::atomic::*;
+        Self {
+            enabled: AtomicBool::new(enabled),
+            limit: AtomicUsize::new(limit),
+            min_score_ratio_bits: AtomicU64::new(min_score_ratio.to_bits()),
+            semantic: AtomicBool::new(semantic),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn set_enabled(&self, v: bool) {
+        self.enabled.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn limit(&self) -> usize {
+        self.limit.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn set_limit(&self, v: usize) {
+        self.limit.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn min_score_ratio(&self) -> f64 {
+        f64::from_bits(
+            self.min_score_ratio_bits
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+    pub fn set_min_score_ratio(&self, v: f64) {
+        self.min_score_ratio_bits
+            .store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn semantic(&self) -> bool {
+        self.semantic.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn set_semantic(&self, v: bool) {
+        self.semantic.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Default for LiveHintConfig {
+    fn default() -> Self {
+        Self::new(false, 3, 0.5, false)
+    }
+}
+
 /// Per-session wiring for implicit discovery, carried on
-/// `AgentConfig::discover_hints`. `None` there ⇒ feature off (the
-/// default since mu-0x5i; also what `--bare` forces). The daemon wires
-/// `Some` from `[index].discover_injection` at session creation.
+/// `AgentConfig::discover_hints`. `None` there ⇒ the feature is not
+/// wired at all, which is what `--bare` forces and what every default
+/// `AgentConfig` (tests, embedders) gets.
+///
+/// `Some` does NOT mean "on": the daemon wires `Some` for any non-bare
+/// session and puts the on/off decision in [`LiveHintConfig::enabled`],
+/// seeded from `[index].discover_injection`. That split is what lets an
+/// operator flip the feature on mid-session — the skills the ranker
+/// needs are already aboard.
 #[derive(Clone)]
 pub struct DiscoverHints {
     /// Daemon-discovered skills — same set the `discover` tool ranks.
     /// The agent loop doesn't otherwise hold skills, so they ride in.
     pub skills: Arc<Vec<LoadedSkill>>,
-    /// Top-N entries to inject. Keep small; see module doc.
-    pub limit: usize,
-    /// Relevance floor as a fraction of the turn's best hit. See
-    /// [`RankOptions::min_score_ratio`].
-    pub min_score_ratio: f64,
-    /// Rank semantically instead of lexically. Local-embedder-only and
-    /// falls back to lexical — see
-    /// [`crate::t4c_source::discover_view_semantic_local`].
-    pub semantic: bool,
+    /// Live tunables, shared with the daemon's `session.set_config`.
+    pub live: Arc<LiveHintConfig>,
+}
+
+impl DiscoverHints {
+    /// Wire with a fixed configuration — the convenient path for tests
+    /// and any caller that doesn't need live updates.
+    pub fn fixed(
+        skills: Arc<Vec<LoadedSkill>>,
+        enabled: bool,
+        limit: usize,
+        min_score_ratio: f64,
+        semantic: bool,
+    ) -> Self {
+        Self {
+            skills,
+            live: Arc::new(LiveHintConfig::new(
+                enabled,
+                limit,
+                min_score_ratio,
+                semantic,
+            )),
+        }
+    }
 }
 
 impl std::fmt::Debug for DiscoverHints {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiscoverHints")
             .field("skills", &self.skills.len())
-            .field("limit", &self.limit)
-            .field("min_score_ratio", &self.min_score_ratio)
-            .field("semantic", &self.semantic)
+            .field("live", &self.live)
             .finish()
     }
 }
@@ -150,6 +237,7 @@ pub fn rope_has_anchor(rope: &RetainedRope, msg_idx: usize) -> bool {
 }
 
 /// Knobs for one ranking pass.
+#[derive(Debug)]
 pub struct RankOptions<'a> {
     /// Max entries in the rendered hint.
     pub limit: usize,

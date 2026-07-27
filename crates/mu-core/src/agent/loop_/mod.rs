@@ -1865,13 +1865,25 @@ async fn run_inner(
                         // Prune first: a record whose anchoring user span
                         // compaction dropped is no longer in context, so it
                         // must stop suppressing its own capabilities.
-                        capability_hints.retain(|h| caphints::rope_has_anchor(&rope, h.anchor_msg_idx));
+                        capability_hints
+                            .retain(|h| caphints::rope_has_anchor(&rope, h.anchor_msg_idx));
                         // This turn's anchor is the LAST user message; its
                         // index is what the rope's `msg-{idx}-user` span id
                         // is built from.
-                        let anchor = messages
-                            .iter()
-                            .rposition(|m| matches!(m, AgentMessage::User { .. }));
+                        // `enabled` is read LIVE (session.set_config writes
+                        // it), so a mid-session `/config` flip takes effect
+                        // on the next turn. Turning it off stops NEW hints;
+                        // hints already anchored stay put rather than
+                        // rewriting the prefix and dropping the cache.
+                        let anchor = hints
+                            .live
+                            .enabled()
+                            .then(|| {
+                                messages
+                                    .iter()
+                                    .rposition(|m| matches!(m, AgentMessage::User { .. }))
+                            })
+                            .flatten();
                         if let Some(idx) = anchor {
                             // Already ranked for this anchor (including a
                             // recorded "nothing to say") ⇒ don't rank again
@@ -1891,15 +1903,18 @@ async fn run_inner(
                                     .collect();
                                 let snapshot =
                                     capability.lock().map(|c| c.clone()).unwrap_or_default();
-                                let ranked = if hints.semantic {
+                                // Read the tunables once per rank, not per
+                                // use, so one turn can't straddle a
+                                // concurrent `session.set_config` write.
+                                let limit = hints.live.limit();
+                                let min_score_ratio = hints.live.min_score_ratio();
+                                let ranked = if hints.live.semantic() {
                                     // Semantic ranking makes a blocking HTTP
                                     // embed call; keep it off the tokio
                                     // worker (same posture as kx recall
                                     // below).
                                     let tools = tools.clone();
                                     let skills = hints.skills.clone();
-                                    let limit = hints.limit;
-                                    let min_score_ratio = hints.min_score_ratio;
                                     tokio::task::spawn_blocking(move || {
                                         caphints::rank_hint(
                                             &tools,
@@ -1923,8 +1938,8 @@ async fn run_inner(
                                         &hints.skills,
                                         &intent,
                                         &caphints::RankOptions {
-                                            limit: hints.limit,
-                                            min_score_ratio: hints.min_score_ratio,
+                                            limit,
+                                            min_score_ratio,
                                             already: &already,
                                             semantic: false,
                                         },
@@ -2397,7 +2412,10 @@ async fn run_inner(
                     &mut tool_history,
                     &pending_approvals,
                     &capability,
-                    config.discover_hints.is_some(),
+                    config
+                        .discover_hints
+                        .as_ref()
+                        .is_some_and(|h| h.live.enabled()),
                 )
                 .await
                 {

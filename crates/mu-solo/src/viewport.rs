@@ -617,6 +617,25 @@ impl DynamicViewport {
     /// (mu-solo-scrollback-dup-recommit-8hva).  We therefore clamp
     /// `start` to `scrollback_committed` so that only the screen-resident
     /// tail of history is repainted.
+    ///
+    /// ## Clear only what we redraw (mu-8oqp)
+    ///
+    /// The clamp above means we sometimes have FEWER history lines to
+    /// draw (`rows_to_draw`) than there are rows above the viewport
+    /// (`visible_rows`), leaving the top `top = visible_rows -
+    /// rows_to_draw` rows outside the repaint span. Those rows hold
+    /// content the terminal scrolled up there; we are not entitled to
+    /// blank them, because nothing will put it back.
+    ///
+    /// Clearing `0..viewport.y` unconditionally is exactly how the
+    /// blank band got produced: `scrollback_committed` exceeds
+    /// `naive_start` precisely when the viewport has moved DOWN since
+    /// the last `insert_before`, which is what the shrink branch of
+    /// `set_height` does when the live preview collapses at turn
+    /// commit. The band came out the height the viewport shrank by.
+    /// So the clear starts at `top`, not at 0. The caller has already
+    /// cleared the vacated OLD viewport rows, which is the only region
+    /// above the new viewport that legitimately needs erasing.
     fn repaint_history_tail<W: Write>(&self, stdout: &mut W) -> io::Result<()> {
         let visible_rows = self.viewport.y as usize;
         // Never start before scrollback_committed: those lines live in
@@ -626,8 +645,8 @@ impl DynamicViewport {
         let rows_to_draw = self.history.len().saturating_sub(start);
         let top = visible_rows.saturating_sub(rows_to_draw);
 
-        for row in 0..self.viewport.y {
-            queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+        for row in top..visible_rows {
+            queue!(stdout, MoveTo(0, row as u16), Clear(ClearType::CurrentLine))?;
         }
 
         for (i, hline) in self.history[start..].iter().enumerate() {
@@ -1042,6 +1061,94 @@ mod tests {
     fn scrollback_committed_one_over_fit() {
         // One line past the viewport top → one line in scrollback.
         assert_eq!(scrollback_committed_after_insert(21, 20), 1);
+    }
+
+    /// The row span `repaint_history_tail` CLEARS, as `(start, end)`
+    /// exclusive. Mirrors the fixed implementation (mu-8oqp).
+    fn repaint_clear_span(
+        history_len: usize,
+        visible_rows: usize,
+        scrollback_committed: usize,
+    ) -> (usize, usize) {
+        let start = repaint_start(history_len, visible_rows, scrollback_committed);
+        let rows_to_draw = history_len.saturating_sub(start);
+        let top = visible_rows.saturating_sub(rows_to_draw);
+        (top, visible_rows)
+    }
+
+    /// The row span that actually RECEIVES a history line.
+    fn repaint_draw_span(
+        history_len: usize,
+        visible_rows: usize,
+        scrollback_committed: usize,
+    ) -> (usize, usize) {
+        let start = repaint_start(history_len, visible_rows, scrollback_committed);
+        let rows_to_draw = history_len.saturating_sub(start);
+        let top = visible_rows.saturating_sub(rows_to_draw);
+        (top, top + rows_to_draw)
+    }
+
+    // ── mu-8oqp: never blank a row we will not repaint ────────────────────────
+
+    /// THE REGRESSION. `scrollback_committed > naive_start` exactly when
+    /// the viewport moved DOWN since the last `insert_before` — which is
+    /// what `set_height`'s shrink branch does when the live preview
+    /// collapses at turn commit. The old code cleared `0..visible_rows`
+    /// but only redrew the bottom `rows_to_draw`, blanking the top rows
+    /// permanently: a band the height the viewport shrank by.
+    #[test]
+    fn clear_span_never_exceeds_draw_span_after_viewport_moves_down() {
+        // 100 history lines; 30 of them were screen-resident when last
+        // committed (scrollback_committed = 70). The viewport then shrank
+        // and moved down, so there are now 40 rows above it.
+        let (clear_lo, clear_hi) = repaint_clear_span(100, 40, 70);
+        let (draw_lo, draw_hi) = repaint_draw_span(100, 40, 70);
+
+        // A gap exists — this is the shrink case, not the trivial one.
+        assert_eq!(
+            draw_lo, 10,
+            "30 drawable lines into 40 rows leaves a 10-row top gap"
+        );
+
+        assert_eq!(
+            (clear_lo, clear_hi),
+            (draw_lo, draw_hi),
+            "cleared rows must be exactly the redrawn rows; rows 0..{draw_lo} hold \
+             terminal-scrolled content that nothing will put back"
+        );
+    }
+
+    /// The ordinary case (viewport hasn't moved) must be unaffected:
+    /// everything above the viewport is redrawn, so everything is cleared.
+    #[test]
+    fn clear_span_still_covers_everything_when_nothing_is_scrollback_clamped() {
+        let (clear_lo, clear_hi) = repaint_clear_span(50, 20, 30);
+        let (draw_lo, draw_hi) = repaint_draw_span(50, 20, 30);
+        assert_eq!(
+            (clear_lo, clear_hi),
+            (0, 20),
+            "no clamp ⇒ full-region clear"
+        );
+        assert_eq!((draw_lo, draw_hi), (0, 20));
+    }
+
+    /// The draw span can never spill past the top of the viewport, in
+    /// either regime — otherwise the repaint would paint over live chrome.
+    #[test]
+    fn draw_span_never_overruns_the_viewport_top() {
+        for (hist, rows, committed) in [
+            (100usize, 40usize, 70usize),
+            (50, 20, 30),
+            (5, 20, 0),
+            (0, 10, 0),
+        ] {
+            let (_, draw_hi) = repaint_draw_span(hist, rows, committed);
+            assert!(
+                draw_hi <= rows,
+                "draw span {draw_hi} overran viewport top {rows} for \
+                 (history={hist}, rows={rows}, committed={committed})"
+            );
+        }
     }
 
     // ── repaint_start offset logic ────────────────────────────────────────────

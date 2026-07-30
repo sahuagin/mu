@@ -28,7 +28,7 @@ use ulid::Ulid;
 
 use crate::capability;
 use crate::contract::MeshCommand;
-use crate::contract::{Command, CommandResult, Hit, Request, Response, StatusInfo};
+use crate::contract::{Command, CommandResult, Hit, Request, Response, SourceInfo, StatusInfo};
 
 /// The service's addressable name/subject root. Consumers reach it by THIS,
 /// never by host:port. Endpoints hang off it: `<SUBJECT>.recall`, `.status`.
@@ -90,9 +90,13 @@ pub async fn start(
         .endpoint("status")
         .await
         .map_err(|e| anyhow::anyhow!("status endpoint: {e}"))?;
+    let sources = group
+        .endpoint("sources")
+        .await
+        .map_err(|e| anyhow::anyhow!("sources endpoint: {e}"))?;
 
     let issuer = Arc::new(issuer);
-    for mut endpoint in [recall, status] {
+    for mut endpoint in [recall, status, sources] {
         let issuer = issuer.clone();
         let backend = backend_state.clone();
         tokio::spawn(async move {
@@ -178,6 +182,20 @@ fn stub_command(command: &Command) -> CommandResult {
             indexed_repos: 42,
             healthy: true,
         }),
+        Command::CodeSources => CommandResult::CodeSources(vec![
+            SourceInfo {
+                name: "stub_repo".into(),
+                managed: true,
+                path: "/stub/src/stub_repo".into(),
+                detail: "3 files, 3 chunks, indexed 0h ago".into(),
+            },
+            SourceInfo {
+                name: "stub_legacy".into(),
+                managed: false,
+                path: "/stub/.cache/code_index/stub_legacy.db".into(),
+                detail: "1 files, 1 chunks, indexed 9h ago".into(),
+            },
+        ]),
     }
 }
 
@@ -255,7 +273,62 @@ async fn code_index_command(
                 healthy,
             }))
         }
+        Command::CodeSources => {
+            let mut args = serde_json::Map::new();
+            // Ask for the STABLE machine format, never the human rendering:
+            // the prose layout is free to change, the TAB rows are a contract.
+            args.insert("porcelain".into(), json!(true));
+            let res = bounded(
+                "code_sources call",
+                cx.call_tool(CallToolRequestParams::new("code_sources").with_arguments(args)),
+            )
+            .await?;
+            let text = res
+                .content
+                .iter()
+                .find_map(|c| c.as_text().map(|t| t.text.clone()));
+            if res.is_error.unwrap_or(false) {
+                anyhow::bail!(
+                    "code_sources backend error: {}",
+                    text.as_deref().unwrap_or("(no error text)")
+                );
+            }
+            // No text at all is an empty index set, not a failure: a service
+            // fronting a cache dir with nothing in it has nothing to list.
+            Ok(CommandResult::CodeSources(sources_from_porcelain(
+                text.as_deref().unwrap_or(""),
+            )))
+        }
     }
+}
+
+/// Parse `code_sources --porcelain` rows:
+/// `name<TAB>managed|unmanaged<TAB>path<TAB>detail`.
+///
+/// Malformed rows are skipped rather than failing the whole listing — a
+/// discovery call that returns most of the truth beats one that returns
+/// nothing because a future column was added.
+fn sources_from_porcelain(text: &str) -> Vec<SourceInfo> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let mut cols = line.split('\t');
+            let name = cols.next()?.trim();
+            let managed = cols.next()?.trim();
+            let path = cols.next()?.trim();
+            // `detail` may itself contain no tabs; take the remainder.
+            let detail = cols.next().unwrap_or("").trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some(SourceInfo {
+                name: name.to_string(),
+                managed: managed == "managed",
+                path: path.to_string(),
+                detail: detail.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Parse code_index's markdown recall output into typed [`Hit`]s. Each result
@@ -314,7 +387,39 @@ fn encode_err(id: Ulid, msg: String) -> Bytes {
 
 #[cfg(test)]
 mod tests {
-    use super::hits_from_markdown;
+    use super::{hits_from_markdown, sources_from_porcelain};
+
+    #[test]
+    fn parses_porcelain_source_rows() {
+        let text = "mu\tmanaged\t/srv/repos/mu\t247 files, 5547 chunks, indexed 3h ago\n\
+                    codex\tunmanaged\t/srv/cache/code_index/codex.db\t9000 files, 700000 chunks, indexed 60d ago\n";
+        let got = sources_from_porcelain(text);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].name, "mu");
+        assert!(got[0].managed);
+        assert_eq!(got[0].path, "/srv/repos/mu");
+        assert!(got[0].detail.contains("5547 chunks"));
+        assert_eq!(got[1].name, "codex");
+        assert!(!got[1].managed);
+    }
+
+    #[test]
+    fn porcelain_skips_malformed_rows_instead_of_failing_the_listing() {
+        // A truncated row and a blank line must not cost us the good ones:
+        // partial discovery beats none.
+        let text = "mu\tmanaged\t/src/mu\t247 files\ngarbage-with-no-tabs\n\n\
+                    other\tunmanaged\t/cache/other.db\t1 files\n";
+        let got = sources_from_porcelain(text);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].name, "mu");
+        assert_eq!(got[1].name, "other");
+    }
+
+    #[test]
+    fn empty_porcelain_is_an_empty_set_not_an_error() {
+        assert!(sources_from_porcelain("").is_empty());
+        assert!(sources_from_porcelain("\n  \n").is_empty());
+    }
 
     #[test]
     fn parses_real_recall_header_lines() {

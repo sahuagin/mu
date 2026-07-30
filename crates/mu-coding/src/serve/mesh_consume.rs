@@ -45,6 +45,11 @@ struct Envelope<'a> {
     command: Command<'a>,
 }
 
+// The `Code` prefix is the WIRE format, not a naming habit: these variant
+// names serialize verbatim into the mesh envelope and must match
+// `mesh-slice/src/contract.rs`. Renaming to satisfy the lint would either
+// break every deployed peer or bury the real names under serde(rename).
+#[allow(clippy::enum_variant_names)]
 #[derive(Serialize)]
 enum Command<'a> {
     CodeRecall {
@@ -57,6 +62,9 @@ enum Command<'a> {
         db: Option<&'a str>,
     },
     CodeStatus,
+    /// Which repositories are indexed and what to pass as `db` — so the model
+    /// can look the name up instead of guessing it.
+    CodeSources,
 }
 
 impl Command<'_> {
@@ -64,12 +72,14 @@ impl Command<'_> {
         match self {
             Command::CodeRecall { .. } => "code_recall",
             Command::CodeStatus => "code_status",
+            Command::CodeSources => "code_sources",
         }
     }
     fn endpoint(&self) -> &'static str {
         match self {
             Command::CodeRecall { .. } => "recall",
             Command::CodeStatus => "status",
+            Command::CodeSources => "sources",
         }
     }
 }
@@ -80,10 +90,13 @@ struct Reply {
     result: CommandResult,
 }
 
+// Same wire-format constraint as `Command` above.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Deserialize)]
 enum CommandResult {
     CodeRecall(Vec<Hit>),
     CodeStatus(StatusInfo),
+    CodeSources(Vec<SourceInfo>),
     Error(String),
 }
 
@@ -98,6 +111,14 @@ struct Hit {
 struct StatusInfo {
     indexed_repos: u32,
     healthy: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceInfo {
+    name: String,
+    managed: bool,
+    path: String,
+    detail: String,
 }
 
 // ── proxy ─────────────────────────────────────────────────────────────────
@@ -146,11 +167,19 @@ impl CodeIndexProxy {
 
 // ── session tools ─────────────────────────────────────────────────────────
 
-/// One mesh-backed session tool (`code_recall` or `code_status`).
+/// Which operation a [`MeshCodeIndexTool`] instance performs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MeshOp {
+    Recall,
+    Status,
+    Sources,
+}
+
+/// One mesh-backed session tool (`code_recall`, `code_status`, `code_sources`).
 struct MeshCodeIndexTool {
     proxy: Arc<CodeIndexProxy>,
     spec: ToolSpec,
-    recall: bool,
+    op: MeshOp,
 }
 
 #[async_trait]
@@ -161,26 +190,28 @@ impl Tool for MeshCodeIndexTool {
 
     async fn execute(&self, arguments: Value, mut cancel_rx: oneshot::Receiver<()>) -> ToolResult {
         let call = async {
-            let result = if self.recall {
-                let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
-                if query.is_empty() {
-                    return ToolResult {
-                        content: "code_recall requires a non-empty `query`".to_string(),
-                        is_error: true,
-                    };
+            let result = match self.op {
+                MeshOp::Recall => {
+                    let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
+                    if query.is_empty() {
+                        return ToolResult {
+                            content: "code_recall requires a non-empty `query`".to_string(),
+                            is_error: true,
+                        };
+                    }
+                    let limit = arguments
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        // Saturate rather than wrap: a limit beyond u32::MAX is
+                        // absurd input, but wrapping would silently shrink it.
+                        .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+                    let db = arguments.get("db").and_then(Value::as_str);
+                    self.proxy
+                        .call(Command::CodeRecall { query, limit, db })
+                        .await
                 }
-                let limit = arguments
-                    .get("limit")
-                    .and_then(Value::as_u64)
-                    // Saturate rather than wrap: a limit beyond u32::MAX is
-                    // absurd input, but wrapping would silently shrink it.
-                    .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
-                let db = arguments.get("db").and_then(Value::as_str);
-                self.proxy
-                    .call(Command::CodeRecall { query, limit, db })
-                    .await
-            } else {
-                self.proxy.call(Command::CodeStatus).await
+                MeshOp::Status => self.proxy.call(Command::CodeStatus).await,
+                MeshOp::Sources => self.proxy.call(Command::CodeSources).await,
             };
             match result {
                 Ok(CommandResult::CodeRecall(hits)) => ToolResult {
@@ -189,6 +220,10 @@ impl Tool for MeshCodeIndexTool {
                 },
                 Ok(CommandResult::CodeStatus(s)) => ToolResult {
                     content: format!("healthy={} indexed_repos={}", s.healthy, s.indexed_repos),
+                    is_error: false,
+                },
+                Ok(CommandResult::CodeSources(sources)) => ToolResult {
+                    content: render_sources(&sources),
                     is_error: false,
                 },
                 Ok(CommandResult::Error(e)) => ToolResult {
@@ -230,6 +265,27 @@ fn render_hits(hits: &[Hit]) -> String {
     }
     hits.iter()
         .map(|h| format!("{:.3}  {}  ({})", h.score, h.symbol, h.path))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Model-facing rendering of the servable index set. Leads with the `db`
+/// value to pass, because looking that up is the entire reason to call this.
+fn render_sources(sources: &[SourceInfo]) -> String {
+    if sources.is_empty() {
+        return "no indexes are configured or present on the code_index service".to_string();
+    }
+    sources
+        .iter()
+        .map(|s| {
+            format!(
+                "db={:<18} {:<10} {}  [{}]",
+                s.name,
+                if s.managed { "managed" } else { "unmanaged" },
+                s.path,
+                s.detail
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -284,7 +340,7 @@ pub(crate) async fn mesh_code_index_tools(mesh: &MeshConfig) -> Result<Vec<Arc<d
             "properties": {
                 "query": {"type": "string", "description": "Natural language query or symbol name"},
                 "limit": {"type": "number", "description": "Max results (default service-side)"},
-                "db": {"type": "string", "description": "Target index: a repo name (e.g. \"mu\") or absolute path. Omit for the default index."}
+                "db": {"type": "string", "description": "Target index: a repo name (e.g. \"mu\") or absolute path. Omit for the default index. Call code_sources for the valid names — do not guess."}
             },
             "required": ["query"]
         }),
@@ -298,16 +354,31 @@ pub(crate) async fn mesh_code_index_tools(mesh: &MeshConfig) -> Result<Vec<Arc<d
         input_schema: json!({"type": "object", "properties": {}}),
         ..ToolSpec::default()
     });
+    let sources_spec = read_only(ToolSpec {
+        name: "code_sources".to_string(),
+        description: "List the code indexes available to code_recall: the name to \
+                      pass as `db`, the repository behind it, and how fresh it is. \
+                      Call this before targeting a repo other than the default \
+                      instead of guessing a name."
+            .to_string(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        ..ToolSpec::default()
+    });
     Ok(vec![
         Arc::new(MeshCodeIndexTool {
             proxy: proxy.clone(),
             spec: recall_spec,
-            recall: true,
+            op: MeshOp::Recall,
+        }),
+        Arc::new(MeshCodeIndexTool {
+            proxy: proxy.clone(),
+            spec: status_spec,
+            op: MeshOp::Status,
         }),
         Arc::new(MeshCodeIndexTool {
             proxy,
-            spec: status_spec,
-            recall: false,
+            spec: sources_spec,
+            op: MeshOp::Sources,
         }),
     ])
 }
@@ -354,6 +425,44 @@ mod tests {
         );
         let status = serde_json::to_value(Command::CodeStatus).expect("serialize");
         assert_eq!(status, json!("CodeStatus"));
+        // Unit variants serialize as bare strings — a service too old to know
+        // this one replies Error rather than misparsing a struct.
+        let sources = serde_json::to_value(Command::CodeSources).expect("serialize");
+        assert_eq!(sources, json!("CodeSources"));
+    }
+
+    /// GOLDEN: the discovery reply decodes and renders `db=` first, because
+    /// looking that value up is the only reason to call it.
+    #[test]
+    fn sources_reply_decodes_and_renders_the_db_name() {
+        let reply: Reply = serde_json::from_value(json!({
+            "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "result": {"CodeSources": [
+                {"name": "mu", "managed": true,
+                 "path": "/srv/repos/mu",
+                 "detail": "247 files, 5547 chunks, indexed 3h ago"},
+                {"name": "codex", "managed": false,
+                 "path": "/srv/cache/code_index/codex.db",
+                 "detail": "9k files, 700k chunks, indexed 60d ago"}
+            ]}
+        }))
+        .expect("decode sources reply");
+        let CommandResult::CodeSources(sources) = reply.result else {
+            panic!("wrong variant");
+        };
+        assert_eq!(sources.len(), 2);
+        assert!(sources[0].managed);
+        assert!(!sources[1].managed);
+
+        let rendered = render_sources(&sources);
+        assert!(rendered.starts_with("db=mu"), "got: {rendered}");
+        assert!(rendered.contains("unmanaged"));
+        assert!(rendered.contains("247 files"));
+    }
+
+    #[test]
+    fn empty_source_list_says_so_rather_than_rendering_nothing() {
+        assert!(render_sources(&[]).contains("no indexes"));
     }
 
     /// GOLDEN, reply direction: the service's typed results decode.

@@ -47,6 +47,9 @@ pub struct Reply<R> {
 
 /// The typed operations of the `code_index` service (its current surface:
 /// `code_recall`, `code_status`).
+// The `Code` prefix is the WIRE format: these names serialize verbatim into
+// the envelope, so renaming to satisfy the lint would break deployed peers.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Command {
     /// Hybrid symbol/concept recall. `db` targets a specific index (a name
@@ -62,6 +65,12 @@ pub enum Command {
     },
     /// Index health.
     CodeStatus,
+    /// Which repositories are indexed, and what to pass as `db`. The
+    /// discovery verb: without it a mesh peer has to GUESS a repo name, which
+    /// is the folkloric-capability failure mode that made the mu-07g0
+    /// phantom-tool hunt expensive. Additive — a peer that never sends it is
+    /// unaffected, and a service too old to answer replies `Error`.
+    CodeSources,
 }
 
 impl MeshCommand for Command {
@@ -69,6 +78,7 @@ impl MeshCommand for Command {
         match self {
             Command::CodeRecall { .. } => "code_recall",
             Command::CodeStatus => "code_status",
+            Command::CodeSources => "code_sources",
         }
     }
 }
@@ -77,10 +87,13 @@ impl MeshCommand for Command {
 pub type Request = Envelope<Command>;
 pub type Response = Reply<CommandResult>;
 
+// Same wire-format constraint as `Command` above.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum CommandResult {
     CodeRecall(Vec<Hit>),
     CodeStatus(StatusInfo),
+    CodeSources(Vec<SourceInfo>),
     /// The service refused or failed — carries a human-readable reason. An
     /// unauthorized request (bad/missing capability) surfaces here.
     Error(String),
@@ -97,6 +110,23 @@ pub struct Hit {
 pub struct StatusInfo {
     pub indexed_repos: u32,
     pub healthy: bool,
+}
+
+/// One index the service can serve, as reported by `CodeSources`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceInfo {
+    /// The key to pass as `CodeRecall`'s `db`.
+    pub name: String,
+    /// `true` when the source is configured (`[[code_index.sources]]`), so
+    /// the reindex cron keeps it fresh. `false` = servable but unmaintained.
+    pub managed: bool,
+    /// The repository root for a managed source; the db file for an
+    /// unmanaged one, which has no configured root to name.
+    pub path: String,
+    /// Human-readable contents/freshness, e.g. "247 files, 5547 chunks,
+    /// indexed 3h ago" or "MISSING". Opaque to the contract on purpose: it is
+    /// for a model or an operator to read, not to compute on.
+    pub detail: String,
 }
 
 /// Base64 for the capability bytes so the envelope is clean JSON on the wire

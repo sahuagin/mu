@@ -68,6 +68,13 @@ impl ServerHandler for McpNatsAdapter {
                         "code_index health (bridged to the mesh code_index service).",
                         schema(json!({"type": "object", "properties": {}})),
                     ),
+                    Tool::new(
+                        "code_sources",
+                        "List the indexes code_recall can target: the name to pass as `db`, \
+                         the repository behind it, and how fresh it is. Call this instead of \
+                         guessing a repo name.",
+                        schema(json!({"type": "object", "properties": {}})),
+                    ),
                 ],
                 ..Default::default()
             })
@@ -103,6 +110,10 @@ impl ServerHandler for McpNatsAdapter {
                     }
                 }
                 "code_status" => match proxy.status().await {
+                    Ok(s) => Ok(ok_json(&s)),
+                    Err(e) => Ok(err_text(e.to_string())),
+                },
+                "code_sources" => match proxy.sources().await {
                     Ok(s) => Ok(ok_json(&s)),
                     Err(e) => Ok(err_text(e.to_string())),
                 },

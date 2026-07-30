@@ -4716,6 +4716,9 @@ fn main() -> Result<()> {
     // alt-screen takeover behavior from pre-mu-o1y7.
     let mut app = App::new(mu, (default_provider, default_model));
     let mut mode = ViewportMode::Fullscreen;
+    // Armed before entering: enter_terminal_mode enables raw mode before it
+    // can return Err, so a partial failure would otherwise strand the terminal.
+    let restore_guard = TerminalRestoreGuard::new(mode);
     let mut terminal = enter_terminal_mode(mode)?;
 
     let res = loop {
@@ -4732,6 +4735,7 @@ fn main() -> Result<()> {
                     Err(e) => break Err(e.into()),
                 };
                 mode = new_mode;
+                restore_guard.set_mode(new_mode);
                 app.current_mode = new_mode;
             }
             Err(e) => break Err(e),
@@ -4847,6 +4851,44 @@ fn leave_terminal_mode(
     }
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// Restores the terminal on every exit path, including a panic unwind
+/// (mu-solo has the same guard in `bin/mu-solo.rs`). Writes to stdout
+/// rather than the ratatui backend since it can't hold the `Terminal`.
+/// `Cell` because mu-tui rebuilds the terminal on a mode swap, and a
+/// stale mode would skip `LeaveAlternateScreen`. Needs a panic hook
+/// instead if the profile ever becomes `panic = "abort"`.
+struct TerminalRestoreGuard {
+    mode: std::cell::Cell<ViewportMode>,
+}
+
+impl TerminalRestoreGuard {
+    fn new(mode: ViewportMode) -> Self {
+        Self {
+            mode: std::cell::Cell::new(mode),
+        }
+    }
+
+    /// Point the guard at the mode now on screen, after a swap.
+    fn set_mode(&self, mode: ViewportMode) {
+        self.mode.set(mode);
+    }
+}
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        // Same order as `leave_terminal_mode`: pop the keyboard
+        // protocol before leaving raw mode, and only undo the
+        // alt-screen/mouse takeover that `Fullscreen` actually did.
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+        let _ = disable_raw_mode();
+        if matches!(self.mode.get(), ViewportMode::Fullscreen) {
+            let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+        }
+        let _ = execute!(stdout, SetTitle(""), crossterm::cursor::Show);
+    }
 }
 
 /// mu-1jq: build the terminal title string, e.g. `μ - tcovert`. Set
@@ -5186,6 +5228,29 @@ fn compute_needed_inline_height(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guard holding its construction-time mode would skip
+    /// LeaveAlternateScreen after Inline → Fullscreen, stranding a
+    /// panicking session in the alternate screen.
+    #[test]
+    fn restore_guard_tracks_the_live_viewport_mode() {
+        let guard = TerminalRestoreGuard::new(ViewportMode::Fullscreen);
+        assert_eq!(guard.mode.get(), ViewportMode::Fullscreen);
+
+        guard.set_mode(ViewportMode::Inline(12));
+        assert_eq!(
+            guard.mode.get(),
+            ViewportMode::Inline(12),
+            "a mode swap must be visible to the guard"
+        );
+
+        guard.set_mode(ViewportMode::Fullscreen);
+        assert_eq!(
+            guard.mode.get(),
+            ViewportMode::Fullscreen,
+            "swapping back must re-arm the alt-screen teardown"
+        );
+    }
 
     /// mu-2zs: short lines should not wrap (returned as a single row).
     #[test]

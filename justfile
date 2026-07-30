@@ -2,9 +2,9 @@
 #
 # `just --list` shows what this project supports without reading scripts/ or README.
 # Recipes are thin wrappers around the underlying scripts and cargo commands —
-# they're the front door, not the enforcement. The PR-promotion gate stays in
-# scripts/gh-wrapper (intercepts `gh pr create` and `gh pr ready`), so e.g.
-# bypassing `just check` before `gh pr create` still trips the wrapper.
+# they're the front door AND the enforcement: nothing gates PR promotion
+# automatically — no PR-open hook, no `gh` shim. Run `just ci-aipr` yourself
+# before opening a PR.
 #
 # bead: mu-7s3x
 
@@ -126,9 +126,8 @@ solo-debugrelease *args:
 
 # ── PR flow (jj-aware) ────────────────────────────────────────────────────
 
-# scripts/gh-wrapper auto-runs pre-pr-check.sh at `gh pr create`, so don't
-# pre-run `just check` — that'd just double the work. Use MU_SKIP_PR_CHECK=1
-# to bypass (escape hatch in the wrapper).
+# Run `just ci-aipr` (check + review panel) before opening a PR — this recipe
+# does not, and nothing else will.
 
 # Push current jj @ as <bookmark> and open a PR. Extra args forward to gh pr create.
 # [positional-arguments] preserves shell quoting on the forwarded args so titles

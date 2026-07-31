@@ -59,12 +59,14 @@ The `mu` CLI subcommands: `serve` (daemon), `ask` (one-shot), `resume`, `tui`,
   - `cargo test --workspace --all-features --no-fail-fast` — plain `cargo test`,
     not nextest
 - `just check` runs the superset `scripts/pre-pr-check.sh` (the `just ci` checks
-  plus `verify-claims`). `scripts/gh-wrapper` runs it automatically at
-  `gh pr create` / `gh pr ready`, so the gate holds even if you skip the manual
-  run.
+  plus `verify-claims`). **Nothing runs it for you** — there is no PR-open hook
+  or `gh` shim. Run it yourself.
 - `just check-quick` — fmt + clippy only (fast inner loop).
-- `just ci-aipr` — local-only cross-provider AI review of the diff
-  (`scripts/ai-review.sh`); not a CI step.
+- **`just ci-aipr` is required before opening a PR** — it runs `just check` then
+  the cross-provider review panel (`scripts/ai-review.sh`). Local-only, not a CI
+  step, so nothing else will run it for you. Reviewer seats come from
+  `agent-role code_review`; probe `/api/ps` before using an ollama seat so a
+  panel run can't evict a model someone is holding.
 
 ## Running it
 

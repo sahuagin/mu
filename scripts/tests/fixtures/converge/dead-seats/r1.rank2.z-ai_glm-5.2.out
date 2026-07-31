@@ -1,0 +1,2 @@
+VERDICT: approve
+{"verdict":"approve","summary":"The fix correctly narrows the clear span in repaint_history_tail from 0..viewport.y to top..visible_rows so it exactly matches the redraw span, eliminating the blank-band regression when the viewport moves down on shrink. The as u16 cast is safe (row < visible_rows = viewport.y as usize ≤ u16::MAX), all I/O uses ? for error propagation consistent with surrounding code, and the new tests faithfully mirror the implementation's arithmetic. No architecture invariants are implicated (pure terminal-rendering change).","findings":[]}

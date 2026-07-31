@@ -1,0 +1,1 @@
+exit=1 retry=0 prov=ollama-card1 model=ornith-q4-r0 tools=[read,grep] focus=[correctness bugs and concurrency/lifecycle hazards — races, cancellation and shutdown paths, held locks or references that outlive their owner]

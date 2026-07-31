@@ -1,0 +1,2 @@
+VERDICT: approve
+{"verdict":"approve","summary":"The fix correctly narrows repaint_history_tail's clear span to [top, visible_rows) so it exactly matches the redraw span, and the math shows rows_to_draw <= visible_rows always, so the test's clear==draw equality is exact and reachable. rank2's two findings accurately describe the code but demonstrate no actual defect or failure mode.","findings":[]}

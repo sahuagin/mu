@@ -1,0 +1,2 @@
+VERDICT: approve
+{"verdict":"approve","summary":"The diff narrows repaint clearing to the rows that are actually redrawn, matching the existing scrollback-committed invariant and avoiding the blank-band regression without introducing lifecycle, error-handling, or architecture-invariant issues.","findings":[]}

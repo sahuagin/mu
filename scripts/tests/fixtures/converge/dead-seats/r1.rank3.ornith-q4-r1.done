@@ -1,0 +1,1 @@
+exit=1 retry=0 prov=ollama-card2 model=ornith-q4-r1 tools=[read,grep] focus=[architecture invariants and contract drift — event-log/journal durability invariants, wire/API compatibility, and adherence to the specs the diff touches]

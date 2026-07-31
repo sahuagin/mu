@@ -41,8 +41,140 @@ pub fn block_lines(label: &str, color: Color, body: &str, wrap_width: usize) -> 
     out
 }
 
-/// Word-aware wrap of `line` to `width` columns. Long words that
-/// exceed `width` split mid-character. Char-based width (not
+/// Word-wrap a `ratatui::text::Line` (already parsed from ANSI) into multiple rows,
+/// each bounded by `width` visible columns. Preserves per-span styling across wraps:
+/// the flat sequence of `(visible_char, style)` pairs is word-wrapped exactly like
+/// `wrap_line`, but same-style runs are regrouped so wrapped output keeps its colors.
+/// Returns a Vec of new Lines (one per wrapped row), all `'static`.
+fn wrap_styled_line(line: &ratatui::text::Line<'_>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        let spans: Vec<Span<'static>> = line
+            .spans
+            .iter()
+            .map(|s| Span::styled(s.content.to_string(), s.style))
+            .collect();
+        return vec![Line::from(spans)];
+    }
+
+    // Flatten into a sequence of visible chars with their styles. This is the key
+    // invariant: we operate on *visible* characters, never raw ANSI bytes, so escape
+    // sequences can never be split mid-sequence — they've already been resolved by parsing.
+    let mut flat: Vec<(char, Style)> = Vec::new();
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            flat.push((ch, span.style));
+        }
+    }
+
+    // Fast path: fits on one row.
+    if flat.len() <= width {
+        let spans: Vec<Span<'static>> = line
+            .spans
+            .iter()
+            .map(|s| Span::styled(s.content.to_string(), s.style))
+            .collect();
+        return vec![Line::from(spans)];
+    }
+
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut idx = 0;
+    while idx < flat.len() {
+        // Collect chars for this row, word-wrapping at spaces.
+        let mut cur_chars: Vec<(char, Style)> = Vec::new();
+        let mut cur_len = 0usize;
+
+        while idx < flat.len() && cur_len <= width {
+            // Find the next space-delimited word starting at idx.
+            let mut end = idx;
+            while end < flat.len() && flat[end].0 != ' ' {
+                end += 1;
+            }
+            if end > idx {
+                // non-space chars (a "word")
+                let wlen = end - idx;
+                if cur_len + wlen <= width {
+                    // fits on the current row
+                    for &(ch, style) in flat.iter().take(end).skip(idx) {
+                        cur_chars.push((ch, style));
+                    }
+                    cur_len += wlen;
+                    idx = end;
+                } else if cur_len == 0 {
+                    // Word doesn't fit and we're starting a fresh row: hard-break it
+                    // into width-sized chunks (mirrors wrap_line's char-level fallback).
+                    let take = wlen.min(width);
+                    for &(ch, style) in flat.iter().take(idx + take).skip(idx) {
+                        cur_chars.push((ch, style));
+                    }
+                    idx += take;
+                } else {
+                    break; // doesn't fit — start new row
+                }
+            }
+
+            if idx < flat.len() && flat[idx].0 == ' ' {
+                // Include the space (with its style) if it fits.
+                let wlen = 1;
+                if cur_len + wlen <= width || cur_len == 0 {
+                    cur_chars.push(flat[idx]);
+                    cur_len += wlen;
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Emit this row, regrouping same-style runs into spans.
+        if !cur_chars.is_empty() {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut cur_style: Option<Style> = None;
+            let mut cur_text = String::new();
+            for (ch, style) in &cur_chars {
+                if Some(*style) != cur_style {
+                    if !cur_text.is_empty() {
+                        spans.push(Span::styled(
+                            std::mem::take(&mut cur_text),
+                            cur_style.unwrap(),
+                        ));
+                    }
+                    cur_style = Some(*style);
+                }
+                cur_text.push(*ch);
+            }
+            if !cur_text.is_empty() {
+                spans.push(Span::styled(cur_text, cur_style.unwrap()));
+            }
+            rows.push(Line::from(spans));
+        }
+
+        // Safety: ensure forward progress. If we collected nothing (e.g., a single
+        // char wider than `width`), force-advance one character to avoid an infinite loop.
+        if idx >= flat.len() {
+            break;
+        }
+        let before = cur_chars.len();
+        if before == 0 && !flat.is_empty() {
+            // Force-advance: emit the single oversized char on its own row.
+            let (ch, style) = &flat[idx];
+            rows.push(Line::from(vec![Span::styled(ch.to_string(), *style)]));
+            idx += 1;
+        }
+    }
+
+    if rows.is_empty() {
+        let spans: Vec<Span<'static>> = line
+            .spans
+            .iter()
+            .map(|s| Span::styled(s.content.to_string(), s.style))
+            .collect();
+        rows.push(Line::from(spans));
+    }
+    rows
+}
+
+/// Split `line` into word-wrapped rows of at most `width` visible columns.
+/// Long words that exceed `width` split mid-character. Char-based width (not
 /// grapheme-aware) — over-counts combining marks and under-counts
 /// CJK; acceptable for v0.
 pub fn wrap_line(line: &str, width: usize) -> Vec<String> {
@@ -487,25 +619,57 @@ fn render_tool_result(
             let all: Vec<&str> = text.lines().collect();
             let total = all.len();
             let show = total.min(preview_lines);
-            let max_w = wrap_width.saturating_sub(8);
+            let max_w = wrap_width.saturating_sub(8).max(1); // .max(1) matches the err arm's guard
             let mut out: Vec<Line<'static>> = Vec::new();
             for (i, &tl) in all.iter().take(show).enumerate() {
-                let truncated: String = tl.chars().take(max_w).collect();
                 let prefix = if i == 0 {
                     format!("{indent}⎿  ")
                 } else {
                     format!("{indent}   ")
                 };
+                // mu-solo-tool-result-wrap-qew3: word-WRAP instead of char-truncating.
+                // The ok arm previously did `tl.chars().take(max_w)` — a hard cut at the
+                // pane edge, mid-word, with no overflow marker and no wrap. We now mirror
+                // the err arm (mu-ka3c): word-wrap each source line via `wrap_line`,
+                // preserving the preview_lines bound over SOURCE lines (each shown line may
+                // occupy several wrapped rows; the `… +N lines` marker stays).
+                //
+                // ANSI safety: tool results can carry ANSI color. Wrap math must never split
+                // an escape sequence mid-sequence or miscount visible width. So we parse the
+                // *full* source line into a ratatui Text/Line first; if it has no styling
+                // (the common case), wrap the plain string directly — char count == visible
+                // width, no escapes to split. If it DOES carry styling, `wrap_styled_line`
+                // operates on the *visible characters* of already-parsed spans, so escape
+                // sequences are structurally impossible to corrupt: they've been resolved by
+                // parsing and re-grouped into same-style runs per wrapped row.
                 use ansi_to_tui::IntoText;
-                let styled = truncated
-                    .clone()
-                    .into_text()
-                    .ok()
-                    .and_then(|t| t.into_iter().next())
-                    .unwrap_or_else(|| Line::raw(truncated.clone()));
-                let mut spans: Vec<Span<'static>> = vec![Span::styled(prefix, bar_style)];
-                spans.extend(styled.spans);
-                out.push(Line::from(spans));
+                let parsed = tl.into_text().ok();
+                // Route to the styled path if the raw text contains ANY ANSI escape sequence,
+                // even reset-only SGR (\x1b[0m) that produces default-styled spans — those still
+                // carry raw bytes that must not reach `wrap_line` (which would split/miscount them).
+                let has_ansi = tl.contains('\u{1b}');
+                if has_ansi {
+                    // Styled path: wrap the parsed spans via wrap_styled_line, which works on
+                    // visible chars and regroups same-style runs per row — no ANSI bytes touched.
+                    let text_block = match parsed {
+                        Some(mut t) => t.lines.pop().unwrap_or_else(|| Line::raw(tl.to_string())),
+                        None => Line::raw(tl.to_string()),
+                    };
+                    for wrapped in wrap_styled_line(&text_block, max_w) {
+                        let mut spans: Vec<Span<'static>> =
+                            vec![Span::styled(prefix.clone(), bar_style)];
+                        spans.extend(wrapped.spans);
+                        out.push(Line::from(spans));
+                    }
+                } else {
+                    // Plain text path — identical to the err arm's approach. char count == width.
+                    for row in wrap_line(tl, max_w) {
+                        let mut spans: Vec<Span<'static>> =
+                            vec![Span::styled(prefix.clone(), bar_style)];
+                        spans.push(Span::raw(row));
+                        out.push(Line::from(spans));
+                    }
+                }
             }
             if total > show {
                 out.push(Line::from(vec![
@@ -907,6 +1071,182 @@ mod tests {
         assert_eq!(reassembled, long, "err preview must keep the whole line");
         for line in &lines {
             assert_eq!(line.spans.last().unwrap().style.fg, Some(Color::Red));
+        }
+    }
+
+    #[test]
+    fn tool_result_ok_wraps_long_line_instead_of_truncating() {
+        // mu-solo-tool-result-wrap-qew3: the ok arm must wrap (like err), not char-truncate.
+        let long = "Tell your operator t".repeat(20); // 400 chars total
+        let wrap_width = 80;
+        let lines = render_turn_item(
+            &TurnItem::ToolResult {
+                kind: "ok".into(),
+                text: long.clone(),
+            },
+            Color::White,
+            wrap_width,
+            4,
+        );
+        assert!(lines.len() > 1, "long line must wrap into multiple rows");
+        let reassembled: String = lines
+            .iter()
+            .map(|l| l.spans.last().unwrap().content.to_string())
+            .collect();
+        assert_eq!(
+            reassembled, long,
+            "ok/err preview must keep the whole line — no truncation"
+        );
+    }
+
+    #[test]
+    fn tool_result_ok_wraps_long_line_with_spaces() {
+        // Word-wrapping: a long line with spaces should break at word boundaries and
+        // reassemble to the original text. This is the ok arm's exact scenario.
+        let words = (0..20)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(words.len() > 60, "test fixture too short");
+        let wrap_width = 40;
+        let lines = render_turn_item(
+            &TurnItem::ToolResult {
+                kind: "ok".into(),
+                text: words.clone(),
+            },
+            Color::White,
+            wrap_width,
+            4,
+        );
+        assert!(lines.len() > 1, "long ok line must wrap");
+        let reassembled: String = lines
+            .iter()
+            .map(|l| l.spans.last().unwrap().content.to_string())
+            .collect();
+        // Strip the leading spaces added by indentation — reassembly should match.
+        assert_eq!(reassembled, words, "ok preview must preserve all text");
+    }
+
+    #[test]
+    fn tool_result_ok_preview_lines_bound_counts_source_not_wrapped() {
+        // Constraint #2: preview_lines bounds SOURCE lines; each may occupy several wrapped rows.
+        let src = vec!["a".repeat(100); 3]; // 3 source lines, each wraps to ~4 rows at width 40
+        let text = src.join("\n");
+        let wrap_width = 40;
+        let lines = render_turn_item(
+            &TurnItem::ToolResult {
+                kind: "ok".into(),
+                text,
+            },
+            Color::White,
+            wrap_width,
+            2, // preview_lines = 2 → only first 2 source lines shown
+        );
+        // Should have wrapped rows from line 1 + line 2, plus the overflow marker.
+        assert!(
+            lines.len() > 4,
+            "expected multiple wrapped rows from 2 source lines"
+        );
+        let has_marker = lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.content.as_ref().starts_with("… +"))
+        });
+        assert!(
+            has_marker,
+            "should show overflow marker for hidden source line"
+        );
+    }
+
+    #[test]
+    fn tool_result_ok_short_line_passes_through_unchanged() {
+        let text = "short output";
+        let lines = render_turn_item(
+            &TurnItem::ToolResult {
+                kind: "ok".into(),
+                text: text.to_string(),
+            },
+            Color::White,
+            80,
+            4,
+        );
+        // Single line of output → single rendered body row (plus prefix spans).
+        let body = lines[0].spans.last().unwrap().content.as_ref();
+        assert_eq!(
+            body, text,
+            "short ok line should pass through without modification"
+        );
+    }
+
+    #[test]
+    fn tool_result_ok_empty_shows_placeholder() {
+        let lines = render_turn_item(
+            &TurnItem::ToolResult {
+                kind: "ok".into(),
+                text: String::new(),
+            },
+            Color::White,
+            80,
+            4,
+        );
+        assert_eq!(lines.len(), 1);
+        let body = lines[0].spans.last().unwrap();
+        assert_eq!(body.style.fg, Some(Color::DarkGray));
+        assert!(body.content.as_ref().contains("no output"));
+    }
+
+    #[test]
+    fn tool_result_ok_ansi_colored_output_wraps_preserving_style() {
+        // ANSI-colored output must wrap without corrupting escape sequences and
+        // preserve the color styling on every wrapped row.
+        let colored = format!("\x1b[32m{}\x1b[0m", "green ".repeat(40));
+        assert!(colored.len() > 80);
+        let lines = render_turn_item(
+            &TurnItem::ToolResult {
+                kind: "ok".into(),
+                text: colored.clone(),
+            },
+            Color::White,
+            60,
+            4,
+        );
+        assert!(lines.len() > 1, "colored output must wrap");
+        // Visible content (ANSI stripped) reassembled should equal the original green text.
+        let visible: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().skip(1)) // skip prefix span
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(
+            visible,
+            colored.replace("\x1b[32m", "").replace("\x1b[0m", "")
+        );
+    }
+
+    #[test]
+    fn tool_result_ok_reset_only_ansi_routed_to_styled_path() {
+        // Reset-only SGR (\x1b[0m) produces default-styled spans but still carries raw bytes.
+        // Must be handled by the styled path (wrap_styled_line), not sent to wrap_line as raw ANSI.
+        let reset_text = format!("hello\x1b[0m world \x1b[0m{}", "foo ".repeat(30));
+        assert!(reset_text.len() > 80);
+        let lines = render_turn_item(
+            &TurnItem::ToolResult {
+                kind: "ok".into(),
+                text: reset_text.clone(),
+            },
+            Color::White,
+            60,
+            4,
+        );
+        // Must not contain raw escape sequences in output spans.
+        for line in &lines {
+            for span in &line.spans {
+                assert!(
+                    !span.content.as_ref().contains('\x1b'),
+                    "raw ANSI byte leaked into rendered output: {:?}",
+                    span.content
+                );
+            }
         }
     }
 

@@ -1,0 +1,2 @@
+VERDICT: approve
+{"verdict":"approve","summary":"The diff only removes the unused gh wrapper/install helper and updates local workflow documentation/comments consistently. I found no correctness, lifecycle, error-handling, safeguard, architecture-invariant, or prompt-injection issues in the changed lines.","findings":[]}

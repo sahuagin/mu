@@ -1,0 +1,1 @@
+exit=0 retry=0 prov=openrouter model=z-ai/glm-5.2 tools=[read,grep] focus=[error handling and missing safeguards — unhandled failure paths, silent fallbacks, and validations that nearby code applies but this diff omits]

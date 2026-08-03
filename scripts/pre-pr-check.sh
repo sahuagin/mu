@@ -73,6 +73,15 @@ else
   run_step "cargo test --workspace" cargo test --workspace --all-features --no-fail-fast
 fi
 
+# Review-gate self-test (mu-mhzo). Fixtures are captured panel runs, so this
+# costs no model spend.
+converge_audit_step() {
+  local t="$REPO_ROOT/scripts/tests/converge-audit-test.sh"
+  [ -f "$t" ] || { printf "%s    converge-audit-test.sh missing — skipping%s\n\n" "$C_DIM" "$C_OFF"; return 0; }
+  sh "$t"
+}
+run_step "review-panel converge audit" converge_audit_step
+
 # verify-claims gate (mu-b5kl): iterate every non-merge commit in main..@ (jj)
 # or main..HEAD (git) and run scripts/verify-claims.sh on each. Opt-in
 # strictness: commits without a `## Files` block exit 0 with a skip note.

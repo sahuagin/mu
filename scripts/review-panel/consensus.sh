@@ -2,11 +2,15 @@
 # consensus.sh — goal-protocol consensus code review.
 #
 # The code_review panel (agent_roles.toml) reviews a diff, then converges over
-# ANTAGONISTIC rounds toward one agreed verdict: each round, every reviewer sees
-# the others' positions and is told to press objections, concede, and move toward
-# agreement. Stops when the panel agrees OR after <max-rounds> (default 4); the
-# orchestrator escalates an unresolved split. Models can't talk directly, so this
-# script mediates the rounds (mu-dialogue peer-convergence is a future swap-in).
+# ANTAGONISTIC rounds: each round every reviewer sees the others' positions and
+# presses or concedes on evidence. Stops when the panel agrees OR after
+# <max-rounds> (default 4); an unresolved split escalates. Models can't talk
+# directly, so this script mediates the rounds (mu-dialogue peer-convergence is
+# a future swap-in).
+#
+# Reviewers seek the CORRECT verdict, not an agreed one: agreement-seeking is
+# what let convergence erase correct dissent (mu-mhzo). A sustained split is a
+# legitimate outcome; converge.py's ledger + `audit` enforce that structurally.
 #
 # Round 1 seats may carry a per-rank `focus` (mu-3ajg, applied by dispatch.sh):
 # parallel seats then review different topics instead of duplicating one review.
@@ -15,7 +19,10 @@
 #
 # usage: consensus.sh <round1-prompt-file> <out-dir> [review-cwd] [max-rounds]
 # exit:  0 consensus reached (verdict on stdout: "CONSENSUS <verdict>")
-#        3 no consensus after max-rounds (ESCALATE)
+#        3 no consensus after max-rounds, OR a convergence-round approve that
+#          erased an unrefuted finding >= medium (both ESCALATE)
+# env:   MU_REVIEW_AUDIT=0        skip the erasure audit (approve on verdicts alone)
+#        MU_REVIEW_AUDIT_FLOOR    severity bar for the audit (default medium)
 set -u
 P1="$1"; OUT="$2"; CWD="${3:-$PWD}"; MAXR="${4:-4}"
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -116,7 +123,22 @@ while [ "$round" -lt "$MAXR" ]; do
   done
   wait
   res=$(python3 "$HERE/converge.py" agree "$OUT/r${round}"); echo "round $round: $res"
-  case "$res" in AGREE\ *) echo "CONSENSUS ${res#AGREE }"; exit 0;; esac
+  case "$res" in
+    "AGREE approve")
+      # A finding >= medium that vanished without an evidenced refutation was
+      # erased, not resolved, and must not be spent as a PASS (mu-mhzo). Not
+      # called for a round-1 agreement: nothing can have vanished yet.
+      if [ "${MU_REVIEW_AUDIT:-1}" = "1" ]; then
+        audit=$(python3 "$HERE/converge.py" audit "$OUT" "$round"); arc=$?
+        if [ "$arc" -ne 0 ]; then
+          echo "audit: $audit"
+          echo "NO CONSENSUS after $round rounds — ESCALATE (converged by erasure: finding(s) dropped without an evidenced refutation). Final positions: $res"
+          exit 3
+        fi
+      fi
+      echo "CONSENSUS approve"; exit 0;;
+    AGREE\ *) echo "CONSENSUS ${res#AGREE }"; exit 0;;
+  esac
 done
 echo "NO CONSENSUS after $MAXR rounds — ESCALATE. Final positions: $res"
 exit 3

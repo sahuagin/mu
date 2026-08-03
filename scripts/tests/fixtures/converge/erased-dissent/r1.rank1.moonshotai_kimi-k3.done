@@ -1,0 +1,1 @@
+exit=0 retry=0 prov=openrouter model=moonshotai/kimi-k3 tools=[read,grep] focus=[correctness bugs and concurrency/lifecycle hazards — races, cancellation and shutdown paths, held locks or references that outlive their owner]

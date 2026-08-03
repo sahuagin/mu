@@ -126,17 +126,9 @@ json=$("$TQ" -o json -f "$ROLES" "$ROLE.ranked" 2>/dev/null) \
 role_max_turns=$("$TQ" -o json -f "$ROLES" "$ROLE.max_turns" 2>/dev/null || printf 'null')
 case "$role_max_turns" in ''|null) role_max_turns=null ;; esac
 
-# Lease-aware (LOTO): if this role has a provider=ollama target and the shared
-# ollama box is held by ANOTHER owner, sink ollama targets to the bottom of the
-# ranked list so rank-0 becomes a usable non-ollama fallback. Probes only when an
-# ollama target exists; fail-open (etcd down -> --held non-zero -> no reorder);
-# opt out with AGENT_ROLE_NO_LEASE=1.
-if [ -z "${AGENT_ROLE_NO_LEASE:-}" ] \
-    && printf '%s' "$json" | jq -e 'any(.[]; .provider=="ollama")' >/dev/null 2>&1 \
-    && command -v with-ollama-lease >/dev/null 2>&1 \
-    && with-ollama-lease --held >/dev/null 2>&1; then
-    json=$(printf '%s' "$json" | jq 'to_entries|sort_by([(.value.provider=="ollama"),.key])|map(.value)')
-fi
+# No held-box demotion here: routing does not probe leases. Held-box fallback
+# lives at the dispatch layer (agent-dispatch.sh AGENT_DISPATCH_OLLAMA_SKIP_IF_HELD);
+# a rank's `lease` key still flows through as OLLAMA_LEASE_NAME for it. (mu-5ypj)
 
 emit_max_turns() {  # $1=rank
     printf '%s' "$json" | jq -r --argjson role_max "$role_max_turns" ".[$1].max_turns // \$role_max // \"\""

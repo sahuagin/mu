@@ -47,3 +47,16 @@ ansi-to-tui = "8"
 serde_yaml = { workspace = true }
 toml = { workspace = true }
 arboard = { version = "3.6.1", default-features = false }
+
+# Deterministic viewport scenario driver for the pty screen-scrape test
+# (mu-8oqp) — a miniature in-repo mu-vt-probe. Normal deps only.
+[[bin]]
+name = "vt-scenario"
+path = "src/bin/vt-scenario.rs"
+
+[dev-dependencies]
+# Screen-scrape validation (mu-8oqp): an INDEPENDENT terminal model. Two
+# prior fixes in this bug family were green on their own bookkeeping tests
+# and wrong on the real screen; asserting through vt100 breaks that loop.
+vt100 = "0.15"
+nix = { version = "0.29.0", features = ["term", "poll"] }

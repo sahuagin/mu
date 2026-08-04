@@ -15,16 +15,21 @@
 //! scrollback and are no longer addressable as screen rows.
 //!
 //! `scrollback_committed` tracks the exact count of history entries
-//! that have been pushed into native scrollback and therefore **must
-//! not be redrawn** by `repaint_history_tail`.  The invariant is:
+//! that have been pushed into native scrollback and are therefore no
+//! longer screen-addressable.  The invariant is:
 //!
-//!   `scrollback_committed = max(0, history.len() − viewport.y)`
+//!   `scrollback_committed = max(0, history.len() − (viewport.y − gap_rows))`
 //!
-//! after every `insert_before` call.  `repaint_history_tail` starts
-//! from `max(scrollback_committed, history.len() − visible_rows)` so
-//! that it never touches lines already in native scrollback — those
-//! would appear twice (once in scrollback, once on-screen) when the
-//! user scrolls up.
+//! after every `insert_before` call (`gap_rows` — blank rows a
+//! chrome-pinned shrink left between transcript and viewport — hold no
+//! content); `set_height`'s grow path advances it when its region push
+//! feeds resident rows into scrollback.
+//!
+//! Nothing ever redraws lines above the viewport (mu-8oqp): scrollback
+//! lines are unreachable, so any redraw scheme must choose between a
+//! blank band, a duplicated band, or an on-screen copy of scrollback
+//! content — all three shipped as bugs at some point.  Content above
+//! the viewport moves only UP, into scrollback, via the CRLF pattern.
 //!
 //! ## Emission strategies (mu-solo-zellij-blank-band-ptvm)
 //!
@@ -70,7 +75,10 @@ use ratatui::widgets::Widget;
 type RenderCell = (String, Color, Color, Modifier);
 
 /// A stored line of history content (what insert_before rendered).
-/// Kept so we can replay on viewport shrink.
+/// Only the line COUNT is load-bearing now (journal offsets, drain and
+/// scrollback-committed accounting); nothing redraws the cells since the
+/// shrink repaint was removed (mu-8oqp). Slimming this to a counter is a
+/// possible follow-up.
 #[derive(Clone)]
 struct HistoryLine {
     cells: Vec<RenderCell>,
@@ -163,12 +171,17 @@ pub struct DynamicViewport {
     history: Vec<HistoryLine>,
     /// Number of history entries that have been committed to native
     /// terminal scrollback (and are therefore no longer addressable
-    /// as screen rows).  Maintained by insert_before; read by
-    /// repaint_history_tail to prevent drawing lines that already
-    /// live in native scrollback — the double-draw is the root cause
-    /// of the mid-message span duplication bug
+    /// as screen rows).  Maintained by insert_before and by
+    /// set_height's grow-path region push.  Drawing a committed line
+    /// to a screen row would double it in the scroll-up view — the
+    /// root cause of the mid-message span duplication bug
     /// (mu-solo-scrollback-dup-recommit-8hva).
     scrollback_committed: usize,
+    /// Blank rows between the transcript tail and the viewport top, left
+    /// by a chrome-pinned shrink (mu-8oqp). The next inserts PAINT into the
+    /// gap top-down instead of scrolling; grow expands the viewport up over
+    /// it. Always 0 when the transcript is flush against the viewport.
+    gap_rows: u16,
     /// Optional renderer journal — appended by the commit paths.
     /// None when journalling is disabled (config knob renderer_journal).
     journal: Option<std::fs::File>,
@@ -236,6 +249,7 @@ impl DynamicViewport {
             screen_size: (cols, rows),
             history: Vec::new(),
             scrollback_committed: 0,
+            gap_rows: 0,
             journal,
             strategy,
         };
@@ -257,9 +271,26 @@ impl DynamicViewport {
         self.set_height(rows.saturating_sub(1).max(1))
     }
 
-    /// Resize the viewport to a new height. If growing, scrolls the
-    /// content above the viewport up to make room. If shrinking,
-    /// clears the freed lines.
+    /// Resize the viewport to a new height.
+    ///
+    /// The chrome stays pinned to the screen bottom in BOTH directions —
+    /// a prompt that rides up mid-session was tried before and rejected by
+    /// the operator (it makes reading hard to follow).
+    ///
+    /// Shrinking keeps the transcript exactly where it is: the vacated rows
+    /// become a tracked GAP between the transcript tail and the viewport
+    /// (`gap_rows`), cleared but never repainted. Every scheme that
+    /// repainted that area had to source rows from history that exists only
+    /// in native scrollback, which is unreachable — the options were a
+    /// blank band (the shipped bug), a duplicated band (closed PR #502), or
+    /// an on-screen copy of scrollback lines (the 8hva regression). Content
+    /// above the viewport must only ever move UP. The gap is consumed by
+    /// `insert_before` painting new lines directly into it, and by the grow
+    /// branch expanding up over it.
+    ///
+    /// Growing consumes the gap first (no terminal motion at all); only the
+    /// remainder scrolls the history region up, through the
+    /// scrollback-feeding CRLF pattern so exiting rows are preserved.
     pub fn set_height(&mut self, new_height: u16) -> io::Result<()> {
         let (cols, rows) = terminal::size()?;
         self.screen_size = (cols, rows);
@@ -279,37 +310,51 @@ impl DynamicViewport {
         let old_height = self.viewport.height;
 
         if new_height > old_height {
-            // Growing: scroll content above the viewport up to make room.
+            // Growing: expand up over the gap first (blank rows, no terminal
+            // motion), then down over any free rows below (pre-snap edge
+            // case), then a scrollback-feeding push for the remainder.
             let growth = new_height - old_height;
-            let viewport_top = self.viewport.y;
+            let (from_gap, after_gap) = grow_split(growth, self.gap_rows);
+            self.gap_rows -= from_gap;
+            self.viewport.y -= from_gap;
+            let viewport_bottom = self.viewport.y + old_height + from_gap;
+            let free_below = rows.saturating_sub(viewport_bottom);
+            let (_take_below, push_needed) = grow_split(after_gap, free_below);
 
-            if viewport_top >= growth {
-                scroll_region_up(0, viewport_top.saturating_sub(1), growth)?;
-                self.viewport.y -= growth;
-            } else {
-                let available = viewport_top;
-                if available > 0 {
-                    scroll_region_up(0, viewport_top.saturating_sub(1), available)?;
+            if push_needed > 0 {
+                let viewport_top = self.viewport.y;
+                let push = push_needed.min(viewport_top);
+                if push > 0 {
+                    let mut stdout = io::stdout();
+                    match self.strategy {
+                        EmissionStrategy::Fast => {
+                            emit_region_push_up_fast(&mut stdout, viewport_top, push)?
+                        }
+                        EmissionStrategy::Conservative => {
+                            emit_region_push_up_conservative(&mut stdout, viewport_top, push)?
+                        }
+                    }
+                    // The exiting top rows entered native scrollback; count
+                    // how many of them were resident history lines.
+                    let resident = self.history.len().saturating_sub(self.scrollback_committed);
+                    self.scrollback_committed +=
+                        committed_delta_for_push(push as usize, viewport_top as usize, resident);
+                    self.viewport.y -= push;
                 }
-                self.viewport.y = 0;
             }
             self.viewport.height = new_height;
         } else {
-            // Shrinking: keep the viewport bottom anchored to the bottom of the
-            // terminal. The live assistant preview grows upward while a turn is
-            // streaming; when it collapses after commit, leaving `viewport.y`
-            // unchanged strands the prompt/status mid-screen with blank space
-            // below and the next refresh visibly jumps. Tail-follow mode should
-            // behave like a chat client: the input chrome stays at the bottom.
+            // Shrinking: chrome stays at the bottom; the transcript stays
+            // put; the vacated rows in between become gap (see method docs).
             let old_y = self.viewport.y;
             let new_y = rows.saturating_sub(new_height);
             let mut stdout = io::stdout();
-            for row in old_y..(old_y + old_height) {
+            for row in old_y..new_y {
                 queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
             }
+            self.gap_rows = self.gap_rows.saturating_add(new_y.saturating_sub(old_y));
             self.viewport.y = new_y;
             self.viewport.height = new_height;
-            self.repaint_history_tail(&mut stdout)?;
             stdout.flush()?;
         }
 
@@ -339,10 +384,16 @@ impl DynamicViewport {
         stdout.flush()
     }
 
-    /// Move the viewport to the bottom of the screen. Used after sending
-    /// a prompt so that streaming insert_before calls don't trigger
-    /// push-downs (which create blank line gaps).
+    /// Move the viewport to the bottom of the screen and forget any tracked
+    /// gap. Only for moments when nothing resident sits above (startup,
+    /// maximize/fullscreen exits — their entry paths pushed the transcript
+    /// to scrollback): the rows skipped over are genuinely blank, and the
+    /// gap reset makes subsequent inserts scroll normally instead of
+    /// painting into dead rows. Do NOT call this mid-conversation — the
+    /// chrome-pinned shrink + gap-paint in insert_before own that case
+    /// (mu-8oqp).
     pub fn snap_to_bottom(&mut self) -> io::Result<()> {
+        self.gap_rows = 0;
         let (_, screen_rows) = terminal::size()?;
         let target_y = screen_rows.saturating_sub(self.viewport.height);
         if self.viewport.y < target_y {
@@ -458,10 +509,17 @@ impl DynamicViewport {
         let width = self.viewport.width;
         let mut stdout = io::stdout();
 
-        // If the viewport isn't at the bottom of the screen (blank space
-        // below from Pi-style shrink), push it DOWN first to make room above.
+        // If the viewport isn't at the bottom of the screen (free rows left
+        // by an in-place shrink, mu-8oqp), push it DOWN first to make room
+        // above. The rows this vacates sit DIRECTLY below the transcript —
+        // exactly where the first `push_down` new lines belong — so those
+        // lines are later painted straight into them (`painted_direct`)
+        // instead of being scrolled in at the region bottom. Scrolling the
+        // full payload here would sweep the vacated blank rows up into the
+        // middle of the transcript and prematurely commit resident lines to
+        // scrollback — the band artifact, reintroduced through the side door.
         let viewport_bottom = self.viewport.y + self.viewport.height;
-        if viewport_bottom < screen_rows {
+        let push_down = if viewport_bottom < screen_rows {
             let push_down = height.min(screen_rows - viewport_bottom);
             match self.strategy {
                 EmissionStrategy::Fast => {
@@ -473,13 +531,12 @@ impl DynamicViewport {
                     // zellij may blank-fill a margined reverse scroll
                     // (DECSTBM + CSI T) instead of moving the viewport
                     // image. We don't need the terminal to move anything:
-                    // the viewport is invalidated below, and the history
-                    // emission that follows paints >= push_down fresh rows
-                    // at the bottom of the new history region — exactly
-                    // the rows the old viewport top vacates. So just clear
-                    // the old viewport rows (prevents stale viewport
-                    // pixels from scrolling up into history/scrollback)
-                    // and relocate the viewport logically.
+                    // the vacated rows are painted directly below, and the
+                    // viewport is invalidated so the next flush repaints its
+                    // new position. Just clear the old viewport rows
+                    // (prevents stale viewport pixels from scrolling up into
+                    // history/scrollback) and relocate the viewport
+                    // logically.
                     emit_push_down_conservative(
                         &mut stdout,
                         self.viewport.y,
@@ -493,7 +550,21 @@ impl DynamicViewport {
             // Force full redraw since viewport moved
             self.buffers[1 - self.current].reset();
             self.invalidate_screen_cache();
-        }
+            push_down
+        } else {
+            0
+        };
+
+        // Gap-paint (mu-8oqp): rows between the transcript tail and the
+        // viewport (left by a chrome-pinned shrink) receive the first
+        // payload rows by direct paint — no scroll, nothing committed to
+        // scrollback for them. Mutually exclusive with push_down: a gap
+        // exists only when the viewport is already bottom-anchored.
+        let gap_take = if push_down == 0 {
+            self.gap_rows.min(height)
+        } else {
+            0
+        };
 
         let viewport_top = self.viewport.y;
         if viewport_top == 0 {
@@ -523,21 +594,46 @@ impl DynamicViewport {
         let mut buf = Buffer::empty(draw_area);
         draw_fn(&mut buf);
 
-        match self.strategy {
-            EmissionStrategy::Fast => emit_insert_fast(
-                &mut stdout,
-                &buf,
-                viewport_top,
-                self.viewport.x,
-                self.viewport.y,
-            )?,
-            EmissionStrategy::Conservative => emit_insert_conservative(
-                &mut stdout,
-                &buf,
-                viewport_top,
-                self.viewport.x,
-                self.viewport.y,
-            )?,
+        // Direct-paint rows: either the rows the viewport just vacated by
+        // push-down, or the top of the gap (directly under the transcript
+        // tail). Plain paints — no scrolling, nothing enters scrollback.
+        // Only the remainder scrolls through the region.
+        let painted_direct = (push_down.min(height)).max(gap_take);
+        if painted_direct > 0 {
+            let paint_top = if gap_take > 0 {
+                // Top of the gap: directly under the transcript tail.
+                let top = viewport_top - self.gap_rows;
+                self.gap_rows -= gap_take;
+                top
+            } else {
+                viewport_top - painted_direct
+            };
+            for i in 0..painted_direct {
+                queue!(stdout, MoveTo(0, paint_top + i))?;
+                write_buffer_row(&mut stdout, &buf, i)?;
+            }
+            stdout.flush()?;
+        }
+
+        if painted_direct < height {
+            match self.strategy {
+                EmissionStrategy::Fast => emit_insert_fast(
+                    &mut stdout,
+                    &buf,
+                    painted_direct,
+                    viewport_top,
+                    self.viewport.x,
+                    self.viewport.y,
+                )?,
+                EmissionStrategy::Conservative => emit_insert_conservative(
+                    &mut stdout,
+                    &buf,
+                    painted_direct,
+                    viewport_top,
+                    self.viewport.x,
+                    self.viewport.y,
+                )?,
+            }
         }
         self.buffers[1 - self.current].reset();
         self.invalidate_screen_cache();
@@ -560,11 +656,20 @@ impl DynamicViewport {
         // Update scrollback_committed: lines that overflowed past
         // viewport_top went into native scrollback and must not be
         // redrawn.  The invariant after every insert_before is:
-        //   scrollback_committed = max(0, history.len() − viewport.y)
-        // Re-derive from the new history length so accumulated rounding
-        // from multiple small inserts never drifts.
-        let vp_top = self.viewport.y as usize;
-        self.scrollback_committed = self.history.len().saturating_sub(vp_top);
+        //   scrollback_committed = max(0, history.len() − (viewport.y − gap_rows))
+        // (gap rows sit inside the region but hold no content — counting
+        // them as resident would undercount committed). Re-derive from the
+        // new history length so accumulated rounding never drifts.
+        // Monotonic: native scrollback is append-only, so committed can never
+        // decrease. The naive re-derive undercounts when the region is not
+        // full of content (e.g. the first small insert after a maximize/
+        // fullscreen exit snapped the viewport under a blank region) — and a
+        // committed undercount is the seed of the historic duplication class
+        // (panel finding, 2026-08-03).
+        let content_rows = (self.viewport.y - self.gap_rows) as usize;
+        self.scrollback_committed = self
+            .scrollback_committed
+            .max(self.history.len().saturating_sub(content_rows));
 
         // Cap history to prevent unbounded growth (keep last MAX_HISTORY lines)
         if self.history.len() > MAX_HISTORY {
@@ -601,41 +706,6 @@ impl DynamicViewport {
     fn invalidate_screen_cache(&mut self) {
         let expected = self.viewport.width as usize * self.viewport.height as usize;
         self.screen_cache = vec![None; expected];
-    }
-
-    /// Repaint the visible history tail above the viewport from the in-memory
-    /// rendered-line cache. Used after moving the viewport down on shrink: the
-    /// terminal rows exposed between the old and new viewport positions are
-    /// blank unless we redraw the committed transcript tail into them.
-    ///
-    /// ## Scrollback-committed guard
-    ///
-    /// Lines in `history[..scrollback_committed]` are in native terminal
-    /// scrollback — they are no longer screen-addressable.  Drawing them
-    /// here would create a second copy that appears when the user scrolls
-    /// up, producing the "span twice" duplication
-    /// (mu-solo-scrollback-dup-recommit-8hva).  We therefore clamp
-    /// `start` to `scrollback_committed` so that only the screen-resident
-    /// tail of history is repainted.
-    fn repaint_history_tail<W: Write>(&self, stdout: &mut W) -> io::Result<()> {
-        let visible_rows = self.viewport.y as usize;
-        // Never start before scrollback_committed: those lines live in
-        // native scrollback and must not be drawn to screen rows.
-        let naive_start = self.history.len().saturating_sub(visible_rows);
-        let start = naive_start.max(self.scrollback_committed);
-        let rows_to_draw = self.history.len().saturating_sub(start);
-        let top = visible_rows.saturating_sub(rows_to_draw);
-
-        for row in 0..self.viewport.y {
-            queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
-        }
-
-        for (i, hline) in self.history[start..].iter().enumerate() {
-            let y = (top + i) as u16;
-            queue!(stdout, MoveTo(0, y), Clear(ClearType::CurrentLine))?;
-            write_history_line(stdout, hline)?;
-        }
-        Ok(())
     }
 
     /// Append one JSONL entry to the renderer journal (if open).
@@ -741,33 +811,6 @@ impl DynamicViewport {
     }
 }
 
-fn write_history_line<W: Write>(stdout: &mut W, line: &HistoryLine) -> io::Result<()> {
-    for (symbol, fg, bg, modifier) in &line.cells {
-        queue!(
-            stdout,
-            SetForegroundColor(to_crossterm_color(*fg)),
-            SetBackgroundColor(to_crossterm_color(*bg))
-        )?;
-        if modifier.contains(Modifier::BOLD) {
-            queue!(stdout, SetAttribute(Attribute::Bold))?;
-        }
-        if modifier.contains(Modifier::DIM) {
-            queue!(stdout, SetAttribute(Attribute::Dim))?;
-        }
-        if modifier.contains(Modifier::ITALIC) {
-            queue!(stdout, SetAttribute(Attribute::Italic))?;
-        }
-        if modifier.contains(Modifier::UNDERLINED) {
-            queue!(stdout, SetAttribute(Attribute::Underlined))?;
-        }
-        if modifier.contains(Modifier::REVERSED) {
-            queue!(stdout, SetAttribute(Attribute::Reverse))?;
-        }
-        queue!(stdout, Print(symbol), SetAttribute(Attribute::Reset))?;
-    }
-    Ok(())
-}
-
 /// Render one row of an off-screen `Buffer` at the cursor's current position,
 /// preserving fg/bg/modifiers. Used by `insert_before` to emit history rows
 /// into the DECSTBM scroll region (CRLF advances; this paints the new row).
@@ -851,6 +894,7 @@ fn emit_push_down_conservative<W: Write>(
 fn emit_insert_fast<W: Write>(
     out: &mut W,
     buf: &Buffer,
+    from_row: u16,
     viewport_top: u16,
     viewport_x: u16,
     viewport_y: u16,
@@ -864,7 +908,7 @@ fn emit_insert_fast<W: Write>(
     write!(out, "\x1b[1;{}r", viewport_top)?;
     queue!(out, MoveTo(0, viewport_top - 1))?;
 
-    for y in 0..buf.area.height {
+    for y in from_row..buf.area.height {
         queue!(out, Print("\r\n"))?;
         write_buffer_row(out, buf, y)?;
     }
@@ -900,6 +944,7 @@ fn emit_insert_fast<W: Write>(
 fn emit_insert_conservative<W: Write>(
     out: &mut W,
     buf: &Buffer,
+    from_row: u16,
     viewport_top: u16,
     viewport_x: u16,
     viewport_y: u16,
@@ -908,7 +953,7 @@ fn emit_insert_conservative<W: Write>(
     // single-row history region still makes progress.
     let chunk_rows = viewport_top.saturating_sub(1).max(1);
     let total = buf.area.height;
-    let mut y = 0u16;
+    let mut y = from_row;
     while y < total {
         let end = (y + chunk_rows).min(total);
         write!(out, "\x1b[1;{}r", viewport_top)?;
@@ -927,23 +972,77 @@ fn emit_insert_conservative<W: Write>(
     out.flush()
 }
 
-/// Scroll a region of the terminal up using DECSTBM.
-fn scroll_region_up(first_row: u16, last_row: u16, amount: u16) -> io::Result<()> {
-    if amount == 0 {
+/// Pure math for `set_height`'s grow: how much of `growth` comes from free
+/// rows below the viewport vs pushing the history region up. Split out for
+/// unit tests.
+fn grow_split(growth: u16, free_below: u16) -> (u16, u16) {
+    let take_below = growth.min(free_below);
+    (take_below, growth - take_below)
+}
+
+/// Pure math: of `pushed` rows that just entered native scrollback from the
+/// top of a `region_rows`-tall history region holding `resident` history
+/// lines at its bottom, how many were history lines. Rows above the resident
+/// tail are pre-session terminal content and don't advance
+/// `scrollback_committed`.
+fn committed_delta_for_push(pushed: usize, region_rows: usize, resident: usize) -> usize {
+    let non_history = region_rows.saturating_sub(resident);
+    pushed.saturating_sub(non_history)
+}
+
+/// FAST region push: scroll the history region (rows 0..viewport_top) up by
+/// `amount` via the top-margin CRLF pattern, so the exiting top rows enter
+/// native scrollback and `amount` blank rows open at the region's bottom for
+/// the growing viewport to claim. This is `emit_insert_fast` with no payload:
+/// the CRLF-at-region-bottom scroll is the only primitive that feeds
+/// scrollback — DECSTBM+`CSI S` discards exiting rows, which is how the old
+/// grow ate the top of the transcript and why the old shrink needed a repair
+/// repaint (mu-8oqp).
+fn emit_region_push_up_fast<W: Write>(
+    out: &mut W,
+    viewport_top: u16,
+    amount: u16,
+) -> io::Result<()> {
+    if amount == 0 || viewport_top == 0 {
         return Ok(());
     }
-    let mut stdout = io::stdout();
-    // CSI first+1 ; last+1 r  → set scroll region
-    // CSI amount S             → scroll up
-    // CSI r                    → reset scroll region
-    write!(
-        stdout,
-        "\x1b[{};{}r\x1b[{}S\x1b[r",
-        first_row + 1,
-        last_row + 1,
-        amount
-    )?;
-    stdout.flush()
+    write!(out, "\x1b[?2026h")?;
+    write!(out, "\x1b[1;{}r", viewport_top)?;
+    queue!(out, MoveTo(0, viewport_top - 1))?;
+    for _ in 0..amount {
+        queue!(out, Print("\r\n"))?;
+    }
+    write!(out, "\x1b[r")?;
+    write!(out, "\x1b[?2026l")?;
+    out.flush()
+}
+
+/// CONSERVATIVE region push: same scroll as the fast variant but framed like
+/// `emit_insert_conservative` — chunks strictly smaller than the region,
+/// margins reset and stream flushed between chunks, no `?2026` brackets
+/// (mu-solo-zellij-blank-band-ptvm hypotheses a–c).
+fn emit_region_push_up_conservative<W: Write>(
+    out: &mut W,
+    viewport_top: u16,
+    amount: u16,
+) -> io::Result<()> {
+    if amount == 0 || viewport_top == 0 {
+        return Ok(());
+    }
+    let chunk_rows = viewport_top.saturating_sub(1).max(1);
+    let mut done = 0u16;
+    while done < amount {
+        let n = chunk_rows.min(amount - done);
+        write!(out, "\x1b[1;{}r", viewport_top)?;
+        queue!(out, MoveTo(0, viewport_top - 1))?;
+        for _ in 0..n {
+            queue!(out, Print("\r\n"))?;
+        }
+        write!(out, "\x1b[r")?;
+        out.flush()?;
+        done += n;
+    }
+    Ok(())
 }
 
 /// Convert ratatui Color to crossterm Color.
@@ -984,11 +1083,11 @@ impl Drop for DynamicViewport {
 
 // ─── pure-logic unit tests (no terminal I/O) ─────────────────────────────────
 //
-// These tests exercise the scrollback_committed invariant computation and the
-// repaint_history_tail offset selection — the two arithmetic paths at the heart
-// of mu-solo-scrollback-dup-recommit-8hva.  We cannot instantiate a real
-// DynamicViewport in CI (no TTY), so we test the pure helper functions that
-// encode the invariant logic directly.
+// These tests exercise the scrollback_committed invariant, the grow-split /
+// committed-delta arithmetic, and the region-push emission byte streams
+// (mu-8oqp).  We cannot instantiate a real DynamicViewport here (no TTY), so
+// we test the pure helpers directly; the on-screen behavior is validated by
+// tests/pty_scrape.rs under a real pty.
 
 #[cfg(test)]
 mod tests {
@@ -996,134 +1095,186 @@ mod tests {
     /// when history has `history_len` entries and the viewport top is at
     /// `viewport_top` screen rows.  Mirrors the post-insert update in
     /// `insert_before`.
-    fn scrollback_committed_after_insert(history_len: usize, viewport_top: usize) -> usize {
-        history_len.saturating_sub(viewport_top)
+    fn scrollback_committed_after_insert(
+        history_len: usize,
+        viewport_top: usize,
+        gap_rows: usize,
+    ) -> usize {
+        history_len.saturating_sub(viewport_top - gap_rows)
     }
 
-    /// Compute the `start` index into `history` that `repaint_history_tail`
-    /// should use.  `visible_rows` is `viewport.y` (rows above the viewport).
-    /// Mirrors the fixed `repaint_history_tail` implementation.
-    fn repaint_start(
-        history_len: usize,
-        visible_rows: usize,
-        scrollback_committed: usize,
-    ) -> usize {
-        let naive_start = history_len.saturating_sub(visible_rows);
-        naive_start.max(scrollback_committed)
-    }
+    use super::{
+        committed_delta_for_push, emit_region_push_up_conservative, emit_region_push_up_fast,
+        grow_split,
+    };
 
     // ── scrollback_committed invariant ───────────────────────────────────────
 
     #[test]
     fn scrollback_committed_zero_when_history_fits_in_viewport() {
         // 5 history lines, 20-row viewport region → nothing overflows.
-        assert_eq!(scrollback_committed_after_insert(5, 20), 0);
+        assert_eq!(scrollback_committed_after_insert(5, 20, 0), 0);
     }
 
     #[test]
     fn scrollback_committed_counts_overflow() {
         // 50 lines inserted into a 20-row region → 30 lines to scrollback.
-        assert_eq!(scrollback_committed_after_insert(50, 20), 30);
+        assert_eq!(scrollback_committed_after_insert(50, 20, 0), 30);
     }
 
     #[test]
     fn scrollback_committed_saturates_at_zero_for_small_history() {
         // viewport is larger than history — no overflow.
-        assert_eq!(scrollback_committed_after_insert(3, 20), 0);
+        assert_eq!(scrollback_committed_after_insert(3, 20, 0), 0);
     }
 
     #[test]
     fn scrollback_committed_exact_fit() {
         // Exactly viewport_top lines — boundary: no overflow.
-        assert_eq!(scrollback_committed_after_insert(20, 20), 0);
+        assert_eq!(scrollback_committed_after_insert(20, 20, 0), 0);
     }
 
     #[test]
     fn scrollback_committed_one_over_fit() {
         // One line past the viewport top → one line in scrollback.
-        assert_eq!(scrollback_committed_after_insert(21, 20), 1);
+        assert_eq!(scrollback_committed_after_insert(21, 20, 0), 1);
     }
 
-    // ── repaint_start offset logic ────────────────────────────────────────────
+    // ── committed monotonicity (mu-8oqp panel finding) ───────────────────────
 
     #[test]
-    fn repaint_start_no_scrollback_overflow_normal_case() {
-        // 10 history lines, all fit in 20-row visible region,
-        // nothing committed to scrollback.
-        let start = repaint_start(10, 20, 0);
-        // Should start at 0 (history.len() - visible_rows saturates to 0).
-        assert_eq!(start, 0);
+    fn committed_never_decreases_after_snap_and_small_insert() {
+        // Maximize exit: everything committed (len 50, committed 50), snap
+        // under a blank region (y 19, gap 0). A 3-line insert's naive
+        // re-derive would claim committed = 53 − 19 = 34 — resurrecting 16
+        // scrollback lines as "resident". The monotonic clamp keeps 50.
+        let committed_before = 50usize;
+        let naive = scrollback_committed_after_insert(53, 19, 0);
+        assert_eq!(naive, 34);
+        assert_eq!(committed_before.max(naive), 50);
     }
 
-    #[test]
-    fn repaint_start_clamps_to_scrollback_committed() {
-        // The bug scenario:
-        // history has 50 lines; viewport_top was 20 → scrollback_committed=30.
-        // Viewport shrinks to new top=35 → repaint wants last 35 lines but
-        // must not touch the first 30 (in native scrollback).
-        let start = repaint_start(50, 35, 30);
-        // naive_start = 50 - 35 = 15; clamped to 30 by scrollback_committed.
-        assert_eq!(start, 30);
-        // Lines to draw = 50 - 30 = 20 (not 35).  This is the fix: 15 lines
-        // that would have caused duplication are no longer drawn on-screen.
-    }
+    // ── grow arithmetic (mu-8oqp) ────────────────────────────────────────────
 
     #[test]
-    fn repaint_start_no_clamp_when_history_all_on_screen() {
-        // Small history, no overflow: clamp has no effect.
-        let start = repaint_start(5, 35, 0);
-        // naive_start = 0 (5 lines fit in 35 rows), scrollback_committed=0.
-        assert_eq!(start, 0);
+    fn grow_split_all_from_free_space() {
+        // Post-shrink state: plenty of free rows below — no push needed.
+        assert_eq!(grow_split(5, 12), (5, 0));
     }
 
     #[test]
-    fn repaint_start_identical_naive_and_committed() {
-        // If naive_start == scrollback_committed there's no duplicate risk.
-        let start = repaint_start(50, 20, 30);
-        // naive_start = 50 - 20 = 30; clamp(30, 30) = 30.
-        assert_eq!(start, 30);
+    fn grow_split_partial_push() {
+        // 3 free rows below, need 8 → 3 below + 5 pushed.
+        assert_eq!(grow_split(8, 3), (3, 5));
     }
 
     #[test]
-    fn repaint_start_naive_exceeds_committed() {
-        // Shrink to very small visible area: naive_start > committed.
-        // Use the naive_start (it's safe because it's already past scrollback).
-        let start = repaint_start(50, 5, 30);
-        // naive_start = 45; committed = 30; max(45, 30) = 45.
-        assert_eq!(start, 45);
+    fn grow_split_no_free_space() {
+        // Bottom-anchored viewport: everything comes from the push.
+        assert_eq!(grow_split(6, 0), (0, 6));
     }
 
-    // ── duplication shape verification ───────────────────────────────────────
-    //
-    // Verifies the exact "before once / span twice / tail once" pattern is
-    // eliminated.  Uses symbolic history indices rather than real terminal
-    // cells — the arithmetic is what matters.
+    #[test]
+    fn committed_delta_full_region_resident() {
+        // Region full of history: every pushed row was a history line.
+        assert_eq!(committed_delta_for_push(5, 20, 20), 5);
+    }
 
     #[test]
-    fn no_duplication_after_large_insert_and_shrink() {
-        // Simulate the real session:
-        // - viewport_top = 20, insert 50 lines → scrollback_committed = 30
-        // - viewport shrinks to top = 35
-        // - repaint must only draw lines [30..50] (20 lines), NOT [15..50].
+    fn committed_delta_absorbed_by_pre_session_rows() {
+        // 20-row region, 12 resident history lines → 8 pre-session rows on
+        // top. Pushing 5 exits only pre-session content.
+        assert_eq!(committed_delta_for_push(5, 20, 12), 0);
+    }
 
-        let history_len = 50usize;
-        let viewport_top_before = 20usize;
-        let viewport_top_after = 35usize;
+    #[test]
+    fn committed_delta_straddles_boundary() {
+        // 8 pre-session rows, push 11 → 3 history lines enter scrollback.
+        assert_eq!(committed_delta_for_push(11, 20, 12), 3);
+    }
 
-        let committed = scrollback_committed_after_insert(history_len, viewport_top_before);
-        // 30 lines in native scrollback.
-        assert_eq!(committed, 30);
+    // ── region-push emission byte streams ────────────────────────────────────
 
-        let start = repaint_start(history_len, viewport_top_after, committed);
-        // Must NOT start before committed.
-        assert!(
-            start >= committed,
-            "repaint started at {start} which is before scrollback boundary {committed} — would duplicate"
+    #[test]
+    fn push_up_fast_exact_bytes() {
+        let mut out: Vec<u8> = Vec::new();
+        emit_region_push_up_fast(&mut out, 20, 3).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        // Sync bracket, DECSTBM over the history region, park at region
+        // bottom, one CRLF per pushed row, reset margins, close bracket.
+        assert_eq!(
+            s,
+            "\x1b[?2026h\x1b[1;20r\x1b[20;1H\r\n\r\n\r\n\x1b[r\x1b[?2026l"
         );
-        // Should draw history[30..50] — lines not in scrollback.
-        assert_eq!(start, 30);
-        let rows_drawn = history_len.saturating_sub(start);
-        assert_eq!(rows_drawn, 20);
+    }
+
+    #[test]
+    fn push_up_fast_zero_amount_is_noop() {
+        let mut out: Vec<u8> = Vec::new();
+        emit_region_push_up_fast(&mut out, 20, 0).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn push_up_conservative_single_chunk_no_sync_brackets() {
+        let mut out: Vec<u8> = Vec::new();
+        emit_region_push_up_conservative(&mut out, 20, 3).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(s, "\x1b[1;20r\x1b[20;1H\r\n\r\n\r\n\x1b[r");
+        assert!(
+            !s.contains("\x1b[?2026"),
+            "conservative path must not use sync brackets"
+        );
+        assert!(
+            !s.contains('T'),
+            "conservative path must not reverse-scroll"
+        );
+    }
+
+    #[test]
+    fn push_up_conservative_chunks_stay_smaller_than_region() {
+        // Region of 4 rows → chunk cap 3. Pushing 7 must burst as 3+3+1 with
+        // margins reset between bursts (ptvm hypothesis b).
+        let mut out: Vec<u8> = Vec::new();
+        emit_region_push_up_conservative(&mut out, 4, 7).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(
+            s.matches("\x1b[1;4r").count(),
+            3,
+            "expected 3 margin-set bursts"
+        );
+        assert_eq!(
+            s.matches("\x1b[r").count(),
+            3,
+            "each burst must reset margins"
+        );
+        assert_eq!(s.matches("\r\n").count(), 7, "all 7 rows must scroll");
+    }
+
+    // ── shrink/grow round trip keeps the committed invariant ─────────────────
+
+    #[test]
+    fn collapse_then_grow_accounting_round_trip() {
+        // New model (chrome pinned): viewport_top 20, 50 lines inserted →
+        // committed 30, resident 20. Preview collapse moves the viewport to
+        // the bottom and records the vacated rows as GAP — committed and
+        // resident are untouched (nothing above moved).
+        let committed = scrollback_committed_after_insert(50, 20, 0);
+        assert_eq!(committed, 30);
+        // Collapse: y 20 → 34, gap 14. Invariant with the gap counted:
+        // committed = 50 − (34 − 14) = 30 — unchanged, as it must be.
+        assert_eq!(scrollback_committed_after_insert(50, 34, 14), committed);
+        // A 3-line insert gap-paints (no scroll): len 53, gap 11.
+        // committed = 53 − (34 − 11) = 30 — still unchanged.
+        assert_eq!(scrollback_committed_after_insert(53, 34, 11), committed);
+        // Next preview grow by 5 consumes gap only: y 29, gap 6.
+        // committed = 53 − (29 − 6) = 30. No push, no commit.
+        assert_eq!(scrollback_committed_after_insert(53, 29, 6), committed);
+        // Grow past the gap pushes the region: 6 more rows than gap →
+        // committed advances by exactly the pushed resident rows.
+        let resident = 53 - committed;
+        let after_push = committed + committed_delta_for_push(6, 23, resident);
+        assert_eq!(after_push, 36);
     }
 
     // ── journal mismatch detection ────────────────────────────────────────────
@@ -1327,7 +1478,7 @@ mod tests {
         let buf = payload(12, 35);
 
         let mut fast: Vec<u8> = Vec::new();
-        emit_insert_fast(&mut fast, &buf, viewport_top, vx, vy).unwrap();
+        emit_insert_fast(&mut fast, &buf, 0, viewport_top, vx, vy).unwrap();
 
         // Verbatim copy of the pre-split insert_before emission lines
         // (history bookkeeping removed — it never wrote to the stream).
@@ -1365,7 +1516,7 @@ mod tests {
     fn fast_path_uses_sync_brackets() {
         let buf = payload(12, 35);
         let mut fast: Vec<u8> = Vec::new();
-        emit_insert_fast(&mut fast, &buf, 20, 0, 20).unwrap();
+        emit_insert_fast(&mut fast, &buf, 0, 20, 0, 20).unwrap();
         let s = String::from_utf8_lossy(&fast);
         assert!(s.contains("\x1b[?2026h") && s.contains("\x1b[?2026l"));
     }
@@ -1379,7 +1530,7 @@ mod tests {
         // in miniature).
         let buf = payload(12, 100);
         let mut out: Vec<u8> = Vec::new();
-        emit_insert_conservative(&mut out, &buf, viewport_top, 0, viewport_top).unwrap();
+        emit_insert_conservative(&mut out, &buf, 0, viewport_top, 0, viewport_top).unwrap();
 
         for (params, fin) in parse_csi(&out) {
             assert_ne!(
@@ -1417,7 +1568,7 @@ mod tests {
         let viewport_top: u16 = 20;
         let buf = payload(12, 100);
         let mut out: Vec<u8> = Vec::new();
-        emit_insert_conservative(&mut out, &buf, viewport_top, 0, viewport_top).unwrap();
+        emit_insert_conservative(&mut out, &buf, 0, viewport_top, 0, viewport_top).unwrap();
 
         // Each chunk opens with DECSTBM on the history region. Between
         // consecutive openings, the number of scrolled rows (CRLFs) must be
@@ -1454,9 +1605,9 @@ mod tests {
         let buf = payload(12, 100);
 
         let mut fast: Vec<u8> = Vec::new();
-        emit_insert_fast(&mut fast, &buf, viewport_top, 0, viewport_top).unwrap();
+        emit_insert_fast(&mut fast, &buf, 0, viewport_top, 0, viewport_top).unwrap();
         let mut cons: Vec<u8> = Vec::new();
-        emit_insert_conservative(&mut cons, &buf, viewport_top, 0, viewport_top).unwrap();
+        emit_insert_conservative(&mut cons, &buf, 0, viewport_top, 0, viewport_top).unwrap();
 
         // With escape framing stripped, both paths must print exactly the
         // same characters in the same order — the strategies may only differ

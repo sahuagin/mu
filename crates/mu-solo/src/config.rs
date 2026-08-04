@@ -196,6 +196,14 @@ pub struct TuiConfig {
     /// enclosing terminal (kitty/wezterm/iTerm2) raises the popup.
     /// Default: true (on). Set to `false` in `[tui]` to disable.
     pub notifications: bool,
+    /// Start in fullscreen (alternate-screen) mode. `[tui] fullscreen =
+    /// true` in solo.toml (profile-able) is the front door; the
+    /// `MU_SOLO_TUI__FULLSCREEN` env override rides the standard figment
+    /// layering. Replaces the ad-hoc `MU_SOLO_FULLSCREEN` variable the
+    /// operator had to export to avoid starting in the (since-fixed but
+    /// unwanted) inline mode. Default: false. `/fullscreen` still toggles
+    /// at runtime either way.
+    pub fullscreen: bool,
 }
 
 impl Default for TuiConfig {
@@ -206,6 +214,7 @@ impl Default for TuiConfig {
             clipboard_command: None,
             renderer_journal: true,
             notifications: true,
+            fullscreen: false,
         }
     }
 }

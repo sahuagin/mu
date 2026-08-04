@@ -1738,6 +1738,9 @@ pub struct AppOptions<'a> {
     /// mu-solo-osc-notify-mbmn: desktop notifications via OSC 99 on
     /// main-session turn done/error while the terminal is unfocused.
     pub notifications: bool,
+    /// Start in fullscreen (alternate-screen) mode — from `[tui] fullscreen`
+    /// or the legacy `MU_SOLO_FULLSCREEN` export (mu-d04a slice 3).
+    pub fullscreen: bool,
     /// mu-eeu5: `[model_menu].aliases` entries displayed at the top of
     /// `/model` as provider/model shortcuts.
     pub model_menu_aliases: &'a [String],
@@ -1775,6 +1778,8 @@ impl App {
             cache_ttl,
             renderer_journal,
             notifications,
+            fullscreen,
+
             model_menu_aliases,
             autonomy,
             max_side_effects,
@@ -1918,7 +1923,21 @@ impl App {
             live_turn: None,
             wal,
             transcript: Transcript::new(),
-            fullscreen: std::env::var_os("MU_SOLO_FULLSCREEN").is_some(),
+            // Startup fullscreen must take the alt screen exactly like the
+            // /fullscreen flip does — a fullscreen app on the main screen is
+            // the pre-slice-3 bug (panel finding, 2026-08-04). Config-driven
+            // ([tui] fullscreen, profile-able); the legacy ad-hoc
+            // MU_SOLO_FULLSCREEN export still works so existing launchers
+            // don't silently regress to inline.
+            fullscreen: {
+                if fullscreen {
+                    let _ = crossterm::execute!(
+                        std::io::stdout(),
+                        crossterm::terminal::EnterAlternateScreen
+                    );
+                }
+                fullscreen
+            },
             fullscreen_entry_blocks: 0,
             transcript_scroll: 0,
             selected_block: None,
@@ -2757,7 +2776,10 @@ impl App {
             // transcript-expand vocabulary). While it runs, daemon messages
             // queue in the client channel and drain on close; the main
             // screen is restored by the terminal, untouched.
-            (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
+            // Suppressed in fullscreen: that mode already displays the
+            // transcript, and nesting alt-screen enters would strand the
+            // mode on the pager's close (mu-d04a slice 3).
+            (KeyModifiers::CONTROL, KeyCode::Char('o')) if !self.fullscreen => {
                 let transcript = &self.transcript;
                 let live = self.live_turn.as_ref();
                 crate::log_window::run(|wrap| {
@@ -4299,6 +4321,11 @@ impl App {
 
         match (self.fullscreen, target) {
             (true, false) => {
+                // Leave the alt screen FIRST: the terminal restores the main
+                // screen exactly as it was, so the viewport restore and the
+                // watermark replay below are ordinary artifact-free inserts
+                // (the main screen was never written during fullscreen).
+                crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
                 self.fullscreen = false;
                 self.overlay = None;
                 self.transcript_scroll = 0;
@@ -4337,6 +4364,12 @@ impl App {
                 );
             }
             (false, true) => {
+                // mu-d04a slice 3 / 8km0: fullscreen lives on the ALTERNATE
+                // screen — redraws there are genuinely free (no scrollback
+                // interaction exists), and leaving restores the main screen
+                // untouched by terminal contract, which is the redraw-at-will
+                // deal fullscreen was always supposed to be.
+                crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
                 self.fullscreen = true;
                 self.overlay = None;
                 self.transcript_scroll = 0;

@@ -1046,7 +1046,7 @@ fn emit_region_push_up_conservative<W: Write>(
 }
 
 /// Convert ratatui Color to crossterm Color.
-fn to_crossterm_color(color: Color) -> CtColor {
+pub(crate) fn to_crossterm_color(color: Color) -> CtColor {
     match color {
         Color::Reset => CtColor::Reset,
         Color::Black => CtColor::Black,

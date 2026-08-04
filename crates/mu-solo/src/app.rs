@@ -2746,6 +2746,17 @@ impl App {
             (KeyModifiers::NONE, KeyCode::PageDown) if self.fullscreen => {
                 self.transcript_scroll = self.transcript_scroll.saturating_sub(10);
             }
+            // ctrl+o: the LOG WINDOW (mu-d04a.2) — alt-screen pager over
+            // every committed turn, openable mid-turn (claude-code's
+            // transcript-expand vocabulary). While it runs, daemon messages
+            // queue in the client channel and drain on close; the main
+            // screen is restored by the terminal, untouched.
+            (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
+                let transcript = &self.transcript;
+                crate::log_window::run(|wrap| {
+                    render_transcript_blocks(transcript, 0, wrap, LOG_WINDOW_TOOL_LINES)
+                })?;
+            }
             // ctrl+s: dump the record into $EDITOR (hx) — keyboard copy-out
             // that works in fullscreen (mu-5h9m), like the zellij `ctrl+s e`.
             (KeyModifiers::CONTROL, KeyCode::Char('s')) => {
@@ -5265,6 +5276,9 @@ impl App {
             Line::from("  /copy [WHAT]       copy last|assistant|user|all semantically"),
             Line::from("  Alt-Up/Down or Alt-k/j select previous/next semantic block"),
             Line::from("  c / p / m          copy / copy into prompt / maximize selection"),
+            Line::from(
+                "  Ctrl-O             log window: scroll every committed turn (works mid-turn)",
+            ),
             Line::from("  maximized block    ↑/↓ PgUp/PgDn scroll · c copy · p prompt · Esc close"),
             Line::from("  /q, /quit, /exit   leave the session"),
             Line::from(""),
@@ -6487,7 +6501,28 @@ fn render_transcript_lines_for_inline_dump(
         return lines;
     }
 
-    for block in delta {
+    lines.extend(render_transcript_blocks(
+        transcript,
+        skip,
+        wrap_width,
+        tool_preview_lines,
+    ));
+    lines.push(Line::from(""));
+    lines
+}
+
+/// Render transcript blocks `skip..` as formatted lines — the shared
+/// projection used by the fullscreen→inline replay AND the ctrl-o log
+/// window (mu-d04a.2). Pure over its inputs; each caller passes its own
+/// wrap width (projection principle: render at view time).
+fn render_transcript_blocks(
+    transcript: &Transcript,
+    skip: usize,
+    wrap_width: usize,
+    tool_preview_lines: usize,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for block in &transcript.blocks()[skip.min(transcript.len())..] {
         lines.push(Line::from(""));
         match (block.kind, block.items.as_ref()) {
             (TranscriptKind::User, _) => {
@@ -6525,9 +6560,13 @@ fn render_transcript_lines_for_inline_dump(
             }
         }
     }
-    lines.push(Line::from(""));
     lines
 }
+
+/// Tool-result line budget in the ctrl-o log window: effectively unbounded —
+/// the pager scrolls, so truncation there would recreate the very readback
+/// pain the window exists to fix (mu-d04a.2).
+const LOG_WINDOW_TOOL_LINES: usize = 10_000;
 
 /// Minimum viewport height (separator + 1 prompt row + separator + status + info).
 const VIEWPORT_HEIGHT: u16 = 5;

@@ -47,6 +47,9 @@ ansi-to-tui = "8"
 serde_yaml = { workspace = true }
 toml = { workspace = true }
 arboard = { version = "3.6.1", default-features = false }
+# Display-width-aware clipping in the log window (already transitive via
+# ratatui; same version).
+unicode-width = "0.2"
 
 # Deterministic viewport scenario driver for the pty screen-scrape test
 # (mu-8oqp) — a miniature in-repo mu-vt-probe. Normal deps only.

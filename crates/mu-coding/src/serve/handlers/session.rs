@@ -472,6 +472,19 @@ fn session_spawn_tools(
                 "to",
                 crate::tools::DialogueBind::Default,
             )) as Arc<dyn Tool>,
+            // at-uws: same idiom for the MESH dm tool. The envelope names the
+            // sending daemon but had no way to name the sending SESSION, so a
+            // reply landed on the daemon's supervisor rather than whoever
+            // wrote — the message arrived and the conversation then died. The
+            // BARE session id (not the `mu:daemon:session` dialogue identity),
+            // because the receiver already knows the daemon from `from` and
+            // reassembles the pair itself.
+            "dm" => Arc::new(crate::tools::SessionDialogueTool::new(
+                t.clone(),
+                session_id.to_string(),
+                "from_session",
+                crate::tools::DialogueBind::Force,
+            )) as Arc<dyn Tool>,
             _ => t.clone(),
         })
         .collect();

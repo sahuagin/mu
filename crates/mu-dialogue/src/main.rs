@@ -16,11 +16,25 @@
 //!
 //! Peers: cc, mu, warden subagents, orchestrators. Prime use case is cc↔mu.
 //!
+//! **Mesh gateway (at-uws).** With `[dialogue.mesh] enabled = true`, this
+//! server also speaks the NATS agent mesh on behalf of the peers connected to
+//! it: a `dialogue_say` to a `mu:` peer is additionally published as a
+//! capability-signed DM, and verified inbound DMs are written into the same
+//! `dialogue` table as ordinary rows. cc and the CLI are unchanged — the
+//! long-poll, the keyset cursor and the `role:identity` peer ids all keep
+//! working because nothing about the read path moves. See [`mesh`]. Disabled
+//! by default: without the config section no NATS connection is opened.
+//!
 //! Config (env / CLI, mirroring the agent-mcp service tier — no hardcoded
 //! endpoints):
 //!   --listen <host:port> | LISTEN | MU_DIALOGUE_ADDR   → HTTP bind (else stdio)
 //!   --allow-host <h> (repeatable) | MU_DIALOGUE_ALLOWED_HOSTS (comma-sep)
 //!   DATABASE_PATH                                       → sqlite path
+//!   --peer-ttl-ms <ms> | MU_DIALOGUE_PEER_TTL_MS        → stale-peer cutoff
+//!
+//! and, from `~/.config/mu/config.toml` (`$MU_CONFIG`):
+//!   [dialogue.presence] enabled  → etcd-lease presence  (src/presence.rs)
+//!   [dialogue.mesh]     enabled  → the mesh gateway     (src/mesh.rs)
 
 // rmcp's ServerHandler trait returns `impl Future + Send + '_` in several
 // methods, so these can't become plain `async fn` without fighting the SDK
@@ -46,18 +60,31 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 use ulid::Ulid;
 
+mod mesh;
 mod presence;
 
 const SERVER_NAME: &str = "mu-dialogue";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_POLL_TIMEOUT_MS: u64 = 30_000;
 /// Peer registrations whose `last_seen` is older than this are stale and get
-/// pruned (startup + a periodic sweep). Presence here is activity-derived
-/// compatibility behavior — the lease-backed etcd registry from
-/// `specs/plans/mu-dialogue-push-mailbox-v1.md` §1 is the real fix; until it
-/// lands, a TTL keeps dead session ids from accumulating forever. Override
-/// with `--peer-ttl-ms` / `MU_DIALOGUE_PEER_TTL_MS`.
-const DEFAULT_PEER_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+/// pruned (startup + a periodic sweep), and it is also how recently a peer must
+/// have been heard from to count as present. Override with `--peer-ttl-ms` /
+/// `MU_DIALOGUE_PEER_TTL_MS`.
+///
+/// This was 24h, justified in a comment as a stopgap "until the lease-backed
+/// etcd registry lands". It landed: `[dialogue.presence]` is live, and `$SRV`
+/// discovery joined it (at-uws). With two real liveness signals in place, a
+/// day-long activity memory is no longer a fallback but noise — the peers are
+/// overwhelmingly short-lived spawns whose ids are never reused. Measured on
+/// the live server: 102 peers, of which 74 of the 83 activity-derived rows were
+/// already stale by an hour, while the 19 lease-backed entries were the ones
+/// actually tracking liveness.
+///
+/// An hour is generous for the thing it now answers — is this peer here NOW.
+/// A live cc session's Stop-hook long-poll touches far more often than hourly,
+/// and pruning is not authoritative anyway: a pruned-but-alive peer
+/// re-registers on its next say or poll (`touch_peer`).
+const DEFAULT_PEER_TTL_MS: i64 = 60 * 60 * 1000;
 /// How often the background sweep prunes stale peers.
 const PRUNE_INTERVAL_SECS: u64 = 3600;
 /// Default recency window for `dialogue_broadcast` recipients: the PA system
@@ -81,6 +108,10 @@ struct Store {
     /// Optional etcd-lease presence (config-gated; see src/presence.rs).
     /// None = the section is absent/disabled and no network is ever touched.
     presence: Option<Presence>,
+    /// Optional mesh gateway (config-gated; see src/mesh.rs). None = the
+    /// section is absent/disabled and no NATS connection is ever opened, so
+    /// the server behaves exactly as it did before at-uws.
+    mesh: Option<Arc<mesh::Gateway>>,
 }
 
 #[derive(Clone)]
@@ -103,6 +134,30 @@ impl Store {
             }
         }
     }
+
+    /// Peers reachable over the mesh right now, as dialogue peer ids, from
+    /// `$SRV` discovery — liveness-derived, so an entry means "up this
+    /// instant". None when the gateway is disabled OR NATS is unreachable
+    /// (fail-open, same rule as `lease_live`).
+    ///
+    /// This ADDS a presence source rather than replacing the etcd one: `$SRV`
+    /// knows daemons, while the etcd leases carry `mu:<daemon>:<session>`
+    /// granularity that `$SRV` has no way to express.
+    async fn mesh_live(&self) -> Option<std::collections::HashSet<String>> {
+        let gw = self.mesh.as_ref()?;
+        match gw.srv_agents().await {
+            Ok(agents) => Some(
+                agents
+                    .iter()
+                    .map(|a| mesh::srv_agent_to_peer_id(a))
+                    .collect(),
+            ),
+            Err(e) => {
+                warn!("mesh $SRV discovery unavailable, presence unaffected: {e:#}");
+                None
+            }
+        }
+    }
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -118,7 +173,15 @@ fn migrate(conn: &Connection) -> Result<()> {
             -- Sender-authored one-line summary, rendered in the receiver's wake.
             -- Nullable: pre-existing rows and fan-outs carry none, and the
             -- receiver falls back to a generic line.
-            subject         TEXT
+            subject         TEXT,
+            -- Which path actually DELIVERED this message. NULL = this store
+            -- (the peer reads it via dialogue_poll). 'mesh' = it went out over
+            -- the NATS mesh and the recipient has already had it pushed into
+            -- its mailbox, so polling must NOT hand it over a second time
+            -- (at-uws: the mesh takes priority over MCP whenever both are
+            -- available). The row is still written, because history, threading
+            -- and audit all read this table.
+            route           TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_dialogue_to_ts
             ON dialogue(to_peer, ts);
@@ -164,8 +227,20 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_subject {
         conn.execute_batch("ALTER TABLE dialogue ADD COLUMN subject TEXT;")?;
     }
+    // Same story for `route` (at-uws). Existing rows get NULL, which is
+    // exactly right: everything written before the gateway existed was
+    // delivered by polling this store.
+    let has_route = conn
+        .prepare("SELECT 1 FROM pragma_table_info('dialogue') WHERE name = 'route'")?
+        .exists([])?;
+    if !has_route {
+        conn.execute_batch("ALTER TABLE dialogue ADD COLUMN route TEXT;")?;
+    }
     Ok(())
 }
+
+/// `route` value for a message the gateway delivered over the mesh.
+const ROUTE_MESH: &str = "mesh";
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -191,6 +266,12 @@ struct DialogueRow {
     ts: i64,
     /// Sender-authored summary line; `None` for fan-outs and pre-`subject` rows.
     subject: Option<String>,
+    /// Delivery path, when it was not this store — see the `route` column.
+    /// Omitted from the wire for ordinary rows, so existing clients see no
+    /// change; a mesh-routed row never reaches a poller anyway, and this is
+    /// what makes it legible in `dialogue_history`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route: Option<String>,
 }
 
 impl Store {
@@ -201,6 +282,7 @@ impl Store {
         content: &str,
         session_thread: Option<&str>,
         subject: Option<&str>,
+        route: Option<&str>,
     ) -> Result<(String, i64)> {
         let id = Ulid::new().to_string();
         let ts = now_ms();
@@ -211,9 +293,9 @@ impl Store {
         {
             let conn = self.db.lock().await;
             conn.execute(
-                "INSERT INTO dialogue (id, from_peer, to_peer, session_thread, content, ts, subject)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![id, from, to, thread, content, ts, subject],
+                "INSERT INTO dialogue (id, from_peer, to_peer, session_thread, content, ts, subject, route)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![id, from, to, thread, content, ts, subject, route],
             )?;
         }
         // Wake any in-process long-pollers; each re-checks its own filter.
@@ -249,9 +331,9 @@ impl Store {
         match after_seq {
             Some(after_seq) => {
                 let mut stmt = conn.prepare(
-                    "SELECT rowid AS seq, id, from_peer, to_peer, session_thread, content, ts, subject
+                    "SELECT rowid AS seq, id, from_peer, to_peer, session_thread, content, ts, subject, route
                        FROM dialogue
-                      WHERE to_peer = ?1 AND rowid > ?2
+                      WHERE to_peer = ?1 AND rowid > ?2 AND route IS NULL
                       ORDER BY rowid ASC
                       LIMIT ?3",
                 )?;
@@ -262,9 +344,9 @@ impl Store {
             }
             None => {
                 let mut stmt = conn.prepare(
-                    "SELECT rowid AS seq, id, from_peer, to_peer, session_thread, content, ts, subject
+                    "SELECT rowid AS seq, id, from_peer, to_peer, session_thread, content, ts, subject, route
                        FROM dialogue
-                      WHERE to_peer = ?1 AND ts > ?2
+                      WHERE to_peer = ?1 AND ts > ?2 AND route IS NULL
                       ORDER BY rowid ASC
                       LIMIT ?3",
                 )?;
@@ -276,10 +358,25 @@ impl Store {
         }
     }
 
+    /// Undo a mesh route mark, returning the message to the poll path. Called
+    /// only when a publish failed after the row was already marked.
+    async fn clear_route(&self, id: &str) -> Result<()> {
+        {
+            let conn = self.db.lock().await;
+            conn.execute(
+                "UPDATE dialogue SET route = NULL WHERE id = ?1",
+                params![id],
+            )?;
+        }
+        // The row is pollable now, so wake anyone already waiting on it.
+        self.notify.notify_waiters();
+        Ok(())
+    }
+
     async fn history(&self, session_thread: &str, limit: i64) -> Result<Vec<DialogueRow>> {
         let conn = self.db.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT rowid AS seq, id, from_peer, to_peer, session_thread, content, ts, subject
+            "SELECT rowid AS seq, id, from_peer, to_peer, session_thread, content, ts, subject, route
                FROM dialogue
               WHERE session_thread = ?
               ORDER BY rowid ASC
@@ -301,15 +398,31 @@ impl Store {
             return Ok(());
         }
         let role = peer_id.split(':').next().unwrap_or(peer_id);
-        let conn = self.db.lock().await;
-        conn.execute(
-            "INSERT INTO peers (peer_id, role, first_seen, last_seen)
-             VALUES (?1, ?2, ?3, ?3)
-             ON CONFLICT(peer_id) DO UPDATE SET
-                 last_seen = excluded.last_seen,
-                 role      = excluded.role",
-            params![peer_id, role, ts],
-        )?;
+        {
+            let conn = self.db.lock().await;
+            conn.execute(
+                "INSERT INTO peers (peer_id, role, first_seen, last_seen)
+                 VALUES (?1, ?2, ?3, ?3)
+                 ON CONFLICT(peer_id) DO UPDATE SET
+                     last_seen = excluded.last_seen,
+                     role      = excluded.role",
+                params![peer_id, role, ts],
+            )?;
+        }
+        // The same act that proves a peer is live here is what earns it a mesh
+        // inbox: the gateway fronts it so DMs arriving between its polls are
+        // buffered into this store instead of dropped. Only peers this server
+        // actually serves — a `mu:` id belongs to a daemon that speaks the mesh
+        // itself, and fronting it would steal its subject. Idempotent, so all
+        // but the first touch is a map lookup. Never fatal: a NATS hiccup must
+        // not take down messaging (same fail-open rule as etcd presence).
+        if let Some(gw) = &self.mesh {
+            if mesh::resolve_target(peer_id).is_none() {
+                if let Err(e) = gw.front_peer(peer_id).await {
+                    warn!("gateway: fronting {peer_id} failed, mesh inbox absent: {e:#}");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -433,19 +546,21 @@ impl Store {
         Ok(rows)
     }
 
-    /// Remove peer registrations not seen since `cutoff_ms`, and those peers'
-    /// team memberships with them. Returns (peers_removed, memberships_removed).
-    /// Pruning is cosmetic, not authoritative: a pruned-but-alive peer
+    /// Remove peer registrations not seen since `cutoff_ms`. Returns the number
+    /// removed. Pruning is cosmetic, not authoritative: a pruned-but-alive peer
     /// re-registers on its next say/poll (touch_peer).
-    async fn prune_peers(&self, cutoff_ms: i64) -> Result<(usize, usize)> {
+    ///
+    /// Team memberships are deliberately NOT removed with the peer. Joining a
+    /// team is an explicit act and leaving it is `dialogue_team_leave`; going
+    /// quiet is neither. That coupling was harmless while the TTL was a day,
+    /// but presence is now an hour (see [`DEFAULT_PEER_TTL_MS`]) and it would
+    /// have silently unsubscribed every team member hourly. Delivery stays sane
+    /// because `dialogue_multicast` addresses the members who are actually
+    /// present rather than every id that ever joined.
+    async fn prune_peers(&self, cutoff_ms: i64) -> Result<usize> {
         let conn = self.db.lock().await;
-        let memberships = conn.execute(
-            "DELETE FROM team_members WHERE peer_id IN
-                 (SELECT peer_id FROM peers WHERE last_seen < ?1)",
-            params![cutoff_ms],
-        )?;
         let peers = conn.execute("DELETE FROM peers WHERE last_seen < ?1", params![cutoff_ms])?;
-        Ok((peers, memberships))
+        Ok(peers)
     }
 
     /// List known peers, most-recently-active first. `role` filters by kind
@@ -483,6 +598,7 @@ fn dialogue_row(row: &rusqlite::Row) -> rusqlite::Result<DialogueRow> {
         content: row.get(5)?,
         ts: row.get(6)?,
         subject: row.get(7)?,
+        route: row.get(8)?,
     })
 }
 
@@ -608,6 +724,15 @@ struct PruneArgs {
 }
 
 async fn handle_say(store: &Store, args: SayArgs) -> Result<Value> {
+    // ONE path delivers, never both: if the target is on the mesh right now,
+    // the mesh carries it and the row is marked so `dialogue_poll` will not
+    // hand the same message over a second time. A peer not on the mesh is
+    // served from the store exactly as before. Decided BEFORE the insert so
+    // the row is never briefly pollable and then retracted.
+    let route = match (&store.mesh, mesh::resolve_target(&args.to)) {
+        (Some(gw), Some(target)) if gw.is_agent_live(&target.agent).await => Some((gw, target)),
+        _ => None,
+    };
     let (id, ts) = store
         .say(
             &args.from,
@@ -615,11 +740,45 @@ async fn handle_say(store: &Store, args: SayArgs) -> Result<Value> {
             &args.content,
             args.session_thread.as_deref(),
             args.subject.as_deref(),
+            route.as_ref().map(|_| ROUTE_MESH),
         )
         .await?;
     // Sending proves the sender is live — register/refresh its presence.
     store.touch_peer(&args.from, ts).await?;
-    Ok(json!({ "id": id, "ts": ts }))
+
+    let mut out = json!({ "id": id, "ts": ts });
+    if let Some((gw, target)) = route {
+        match gw
+            .publish_dm(&args.from, &target, &args.content, args.subject.as_deref())
+            .await
+        {
+            Ok(envelope_id) => {
+                out["mesh"] = json!({
+                    "published": true,
+                    "agent": target.agent,
+                    "session": target.session,
+                    "envelope_id": envelope_id,
+                });
+            }
+            Err(e) => {
+                // The row was marked mesh-routed on the strength of a liveness
+                // check that has now been contradicted. Clear the mark so the
+                // message falls back to the poll path instead of being stranded
+                // between the two — a duplicate is recoverable, a lost message
+                // is not.
+                warn!(to = %args.to, "gateway: mesh publish failed, falling back to the store: {e:#}");
+                if let Err(e) = store.clear_route(&id).await {
+                    warn!(%id, "gateway: clearing the route mark failed: {e:#}");
+                }
+                out["mesh"] = json!({
+                    "published": false,
+                    "error": e.to_string(),
+                    "delivered_by": "store",
+                });
+            }
+        }
+    }
+    Ok(out)
 }
 
 async fn handle_poll(store: &Store, args: PollArgs) -> Result<Value> {
@@ -666,16 +825,28 @@ async fn handle_peers(store: &Store, args: PeersArgs) -> Result<Value> {
         .unwrap_or(0);
     let peers = store.list_peers(args.role.as_deref(), active_since).await?;
     let lease = store.lease_live().await;
-    let Some(lease) = lease else {
-        // Presence disabled (or etcd down, fail-open): the original shape.
+    let mesh_live = store.mesh_live().await;
+    if lease.is_none() && mesh_live.is_none() {
+        // Both live backends disabled (or down, fail-open): the original shape.
         return Ok(json!({ "peers": peers, "now": now }));
-    };
+    }
+    let lease = lease.unwrap_or_default();
+    let mesh_live = mesh_live.unwrap_or_default();
 
-    // Merge: lease-live peers are authoritative (live RIGHT NOW by lease
-    // expiry, so they bypass the recency filter); activity-derived rows are
-    // compatibility presence, each marked so callers can tell them apart.
+    // Merge three sources. `presence` keeps its original meaning — "lease" for
+    // an etcd-lease-live peer, "activity" for a say/poll-derived row — and
+    // `mesh` is a separate flag for mesh reachability, so an existing caller
+    // reading `presence` sees nothing new.
     let lease_ids: std::collections::HashSet<&str> =
         lease.iter().map(|p| p.peer_id.as_str()).collect();
+    // A fronted `cc:` peer registers its own $SRV name; its daemon-level id is
+    // what a `mu:<daemon>:<session>` peer is reachable BY, so a session id
+    // counts as mesh-live when its daemon answers.
+    let mesh_reachable = |peer_id: &str| -> bool {
+        mesh_live.contains(peer_id)
+            || mesh::resolve_target(peer_id)
+                .is_some_and(|t| mesh_live.contains(&mesh::inbound_peer_id(&t.agent)))
+    };
     let mut out: Vec<Value> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for p in &peers {
@@ -688,7 +859,7 @@ async fn handle_peers(store: &Store, args: PeersArgs) -> Result<Value> {
         out.push(json!({
             "peer_id": p.peer_id, "role": p.role,
             "first_seen": p.first_seen, "last_seen": p.last_seen,
-            "presence": src,
+            "presence": src, "mesh": mesh_reachable(&p.peer_id),
         }));
     }
     for lp in &lease {
@@ -700,15 +871,42 @@ async fn handle_peers(store: &Store, args: PeersArgs) -> Result<Value> {
                 continue;
             }
         }
+        seen.insert(lp.peer_id.clone());
         // Never said/polled (pure lease registration): live now, no activity
         // timestamps to report beyond its registration time.
         out.push(json!({
             "peer_id": lp.peer_id, "role": lp.role,
             "first_seen": lp.registered_at, "last_seen": Value::Null,
-            "presence": "lease",
+            "presence": "lease", "mesh": mesh_reachable(&lp.peer_id),
         }));
     }
-    Ok(json!({ "peers": out, "now": now, "presence_backend": "etcd" }))
+    // Mesh-only: on the mesh right now but unknown to both the store and etcd
+    // — a daemon that has never spoken to this server. Without this, the
+    // gateway could publish to a peer that `dialogue_peers` never listed.
+    for peer_id in &mesh_live {
+        if seen.contains(peer_id) {
+            continue;
+        }
+        let role = peer_id.split(':').next().unwrap_or(peer_id).to_string();
+        if let Some(want) = &args.role {
+            if want != &role {
+                continue;
+            }
+        }
+        out.push(json!({
+            "peer_id": peer_id, "role": role,
+            "first_seen": Value::Null, "last_seen": Value::Null,
+            "presence": "mesh", "mesh": true,
+        }));
+    }
+
+    let backend = match (store.presence.is_some(), store.mesh.is_some()) {
+        (true, true) => "etcd+mesh",
+        (true, false) => "etcd",
+        (false, true) => "mesh",
+        (false, false) => "none",
+    };
+    Ok(json!({ "peers": out, "now": now, "presence_backend": backend }))
 }
 
 /// PA system: deliver one announcement to every peer active within the window
@@ -768,13 +966,27 @@ async fn handle_multicast(store: &Store, args: MulticastArgs) -> Result<Value> {
     if args.team.is_empty() {
         anyhow::bail!("multicast requires a non-empty 'team'");
     }
-    let recipients: Vec<String> = store
+    // Address the members who are HERE, not every id that ever joined.
+    // Membership is durable (a quiet peer stays a member and starts receiving
+    // again on its next poll); presence decides who a given multicast reaches.
+    let members: Vec<String> = store
         .team_members_of(&args.team)
         .await?
         .into_iter()
         .map(|(peer, _joined)| peer)
         .filter(|p| p != &args.from)
         .collect();
+    let present: std::collections::HashSet<String> = store
+        .active_peer_ids(None, now_ms() - store.peer_ttl_ms)
+        .await?
+        .into_iter()
+        .collect();
+    let recipients: Vec<String> = members
+        .iter()
+        .filter(|p| present.contains(p.as_str()))
+        .cloned()
+        .collect();
+    let absent = members.len() - recipients.len();
     let (thread, ts) = store
         .fan_out(
             &args.from,
@@ -787,6 +999,9 @@ async fn handle_multicast(store: &Store, args: MulticastArgs) -> Result<Value> {
     Ok(json!({
         "id": thread, "ts": ts, "team": args.team,
         "count": recipients.len(), "recipients": recipients,
+        // Members who are still subscribed but not currently present, so a
+        // short delivery list is legible instead of looking like lost mail.
+        "absent_members": absent,
     }))
 }
 
@@ -835,10 +1050,12 @@ async fn handle_prune(store: &Store, args: PruneArgs) -> Result<Value> {
         .filter(|a| *a > 0)
         .unwrap_or(store.peer_ttl_ms);
     let cutoff = now_ms() - max_age;
-    let (peers, memberships) = store.prune_peers(cutoff).await?;
+    let peers = store.prune_peers(cutoff).await?;
     Ok(json!({
         "removed_peers": peers,
-        "removed_memberships": memberships,
+        // Team memberships survive a presence sweep by design — see
+        // Store::prune_peers. Reported as 0 so the field keeps its shape.
+        "removed_memberships": 0,
         "cutoff": cutoff,
     }))
 }
@@ -1253,7 +1470,132 @@ fn open_store(peer_ttl_ms: i64) -> Result<Store> {
         notify: Arc::new(Notify::new()),
         peer_ttl_ms,
         presence,
+        // Attached in main(): connecting is async, and a mesh that is down
+        // must degrade to store-only rather than stop the server booting.
+        mesh: None,
     })
+}
+
+/// Connect the mesh gateway and start draining verified inbound DMs into the
+/// store, or leave the server exactly as it was when the gateway is disabled
+/// or NATS is unreachable. Returns whether the gateway came up.
+///
+/// Inbound DMs become ordinary `dialogue` rows, which is the whole trick: the
+/// long-poll, the rowid cursor and every existing client keep working with no
+/// changes, and the store that was already a durable buffer goes on being one.
+async fn attach_mesh(store: &mut Store) -> bool {
+    let cfg_path = presence::default_config_path();
+    let Some(cfg) = mesh::load(&cfg_path) else {
+        info!(
+            "mesh gateway disabled (no [dialogue.mesh] enabled=true in {}); \
+             dialogue is store-only",
+            cfg_path.display()
+        );
+        return false;
+    };
+    let (gateway, mut inbound_rx) = match mesh::connect(&cfg).await {
+        Ok(v) => v,
+        Err(e) => {
+            // Fail-open: the mesh is an additional delivery path, not a
+            // prerequisite for the MCP surface every cc session wakes on.
+            warn!("mesh gateway unavailable, running store-only: {e:#}");
+            return false;
+        }
+    };
+    store.mesh = Some(Arc::new(gateway));
+
+    let writer = store.clone();
+    tokio::spawn(async move {
+        while let Some(dm) = inbound_rx.recv().await {
+            match writer
+                .say(
+                    &dm.from_peer,
+                    &dm.to_peer,
+                    &dm.body,
+                    None,
+                    dm.subject.as_deref(),
+                    // An INBOUND mesh DM becomes an ordinary pollable row:
+                    // the mesh delivered it to the gateway, and the cc peer
+                    // it is addressed to reads it the only way it can — by
+                    // polling. `route` marks messages the mesh delivered to
+                    // the RECIPIENT, which is not the case here.
+                    None,
+                )
+                .await
+            {
+                Ok((id, ts)) => {
+                    // The sender is demonstrably live — record it so it shows
+                    // up in dialogue_peers and can be replied to.
+                    if let Err(e) = writer.touch_peer(&dm.from_peer, ts).await {
+                        warn!("gateway: touch_peer for inbound sender failed: {e:#}");
+                    }
+                    info!(from = %dm.from_peer, to = %dm.to_peer, %id,
+                          "mesh gateway: inbound dm stored");
+                }
+                Err(e) => warn!(from = %dm.from_peer, to = %dm.to_peer,
+                                "gateway: storing inbound dm failed: {e:#}"),
+            }
+        }
+    });
+    true
+}
+
+/// Front every recently-active peer this server serves, so a cc session that
+/// was live before a gateway restart keeps its mesh inbox without having to
+/// poll first. Bounded by the peer TTL — the gateway fronts exactly the peers
+/// presence counts as here, so mu's `who` and `dialogue_peers` agree.
+async fn front_known_peers(store: &Store) {
+    let Some(gw) = store.mesh.clone() else {
+        return;
+    };
+    let cutoff = now_ms() - store.peer_ttl_ms;
+    let peers = match store.list_peers(None, cutoff).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("gateway: listing peers to front failed: {e:#}");
+            return;
+        }
+    };
+    let mut fronted = 0usize;
+    for p in &peers {
+        if mesh::resolve_target(&p.peer_id).is_some() {
+            continue; // a mu daemon fronts itself
+        }
+        match gw.front_peer(&p.peer_id).await {
+            Ok(true) => fronted += 1,
+            Ok(false) => {}
+            Err(e) => warn!("gateway: fronting {} failed: {e:#}", p.peer_id),
+        }
+    }
+    info!(fronted, "mesh gateway: fronted known peers at startup");
+}
+
+/// Release mesh registrations for peers that have gone quiet. Without this, a
+/// gateway that has been up for days holds presence for every cc session that
+/// ever polled it, and mu's `who` fills with the dead. A peer that is merely
+/// between polls re-fronts on its next one.
+async fn reconcile_fronted(store: &Store) {
+    let Some(gw) = store.mesh.clone() else {
+        return;
+    };
+    let cutoff = now_ms() - store.peer_ttl_ms;
+    let live: std::collections::HashSet<String> = match store.list_peers(None, cutoff).await {
+        Ok(p) => p.into_iter().map(|p| p.peer_id).collect(),
+        Err(e) => {
+            warn!("gateway: listing peers to reconcile failed: {e:#}");
+            return;
+        }
+    };
+    let mut released = 0usize;
+    for peer_id in gw.fronted_peers().await {
+        if !live.contains(&peer_id) {
+            gw.release_peer(&peer_id).await;
+            released += 1;
+        }
+    }
+    if released > 0 {
+        info!(released, "mesh gateway: released stale peer registrations");
+    }
 }
 
 // ─────────────────────────────── Entry ──────────────────────────────────────
@@ -1275,20 +1617,24 @@ async fn main() -> Result<()> {
         .or_else(|| env::var("MU_DIALOGUE_ADDR").ok())
         .filter(|s| !s.is_empty());
     let allowed_hosts = parse_allowed_hosts(&args);
-    let store = open_store(parse_peer_ttl_ms(&args))?;
+    let mut store = open_store(parse_peer_ttl_ms(&args))?;
+    let mesh_up = attach_mesh(&mut store).await;
+    let store = store;
 
     // Stale-registration hygiene: prune once at startup, then sweep hourly.
     // TTL-based expiry is compatibility behavior until the lease-backed etcd
     // presence registry (push-mailbox spec §1) replaces touch_peer presence.
     match store.prune_peers(now_ms() - store.peer_ttl_ms).await {
-        Ok((peers, memberships)) if peers > 0 || memberships > 0 => {
-            info!(
-                peers,
-                memberships, "pruned stale peer registrations at startup"
-            );
+        Ok(peers) if peers > 0 => {
+            info!(peers, "pruned stale peer registrations at startup");
         }
         Ok(_) => {}
         Err(e) => warn!("startup peer prune failed: {e:#}"),
+    }
+    // After the prune, so a restart does not hand mesh presence back to peers
+    // that just aged out.
+    if mesh_up {
+        front_known_peers(&store).await;
     }
     {
         let store = store.clone();
@@ -1298,12 +1644,13 @@ async fn main() -> Result<()> {
             loop {
                 tick.tick().await;
                 match store.prune_peers(now_ms() - store.peer_ttl_ms).await {
-                    Ok((peers, memberships)) if peers > 0 || memberships > 0 => {
-                        info!(peers, memberships, "pruned stale peer registrations");
+                    Ok(peers) if peers > 0 => {
+                        info!(peers, "pruned stale peer registrations");
                     }
                     Ok(_) => {}
                     Err(e) => warn!("periodic peer prune failed: {e:#}"),
                 }
+                reconcile_fronted(&store).await;
             }
         });
     }
@@ -1368,6 +1715,7 @@ mod tests {
             notify: Arc::new(Notify::new()),
             peer_ttl_ms: DEFAULT_PEER_TTL_MS,
             presence: None,
+            mesh: None,
         }
     }
 
@@ -1426,6 +1774,110 @@ mod tests {
         );
         // Idempotent: a second run must not fail on a duplicate column.
         migrate(&conn).unwrap();
+        // `route` (at-uws) rides the same guarded-ALTER path.
+        assert!(
+            conn.prepare("SELECT 1 FROM pragma_table_info('dialogue') WHERE name = 'route'")
+                .unwrap()
+                .exists([])
+                .unwrap(),
+            "migrate() must add route to an existing dialogue table"
+        );
+    }
+
+    /// The operator's rule: one path delivers, never both. A message the mesh
+    /// carried must not ALSO come back out of a poll, or a mu daemon running
+    /// both transports reads everything twice. It stays in `history`, because
+    /// that is the audit trail and the thread.
+    #[tokio::test]
+    async fn a_mesh_routed_message_is_invisible_to_poll_but_kept_in_history() {
+        let store = test_store().await;
+        let (mesh_id, _) = store
+            .say(
+                "cc:a",
+                "mu:d:s1",
+                "went over the mesh",
+                None,
+                None,
+                Some(ROUTE_MESH),
+            )
+            .await
+            .unwrap();
+        let (local_id, _) = store
+            .say("cc:a", "mu:d:s1", "stayed in the store", None, None, None)
+            .await
+            .unwrap();
+
+        // Poll sees only the store-delivered one.
+        let polled = store.fetch_for("mu:d:s1", 0, None, 25).await.unwrap();
+        assert_eq!(polled.len(), 1, "a mesh-routed row must not be polled");
+        assert_eq!(polled[0].id, local_id);
+
+        // The keyset cursor must skip it too, not stall on it: a client that
+        // pages from before the mesh row still reaches the one after it.
+        let after = store.fetch_for("mu:d:s1", 0, Some(0), 25).await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, local_id);
+
+        // History keeps both, and says which path each took.
+        let thread = store.history(&mesh_id, 50).await.unwrap();
+        assert_eq!(thread.len(), 1);
+        assert_eq!(thread[0].route.as_deref(), Some(ROUTE_MESH));
+    }
+
+    /// A publish that fails after the row was marked must not strand the
+    /// message: clearing the mark returns it to the poll path.
+    #[tokio::test]
+    async fn a_failed_publish_returns_the_message_to_the_poll_path() {
+        let store = test_store().await;
+        let (id, _) = store
+            .say(
+                "cc:a",
+                "mu:d:s1",
+                "publish will fail",
+                None,
+                None,
+                Some(ROUTE_MESH),
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .fetch_for("mu:d:s1", 0, None, 25)
+            .await
+            .unwrap()
+            .is_empty());
+
+        store.clear_route(&id).await.unwrap();
+        let polled = store.fetch_for("mu:d:s1", 0, None, 25).await.unwrap();
+        assert_eq!(polled.len(), 1, "the message must fall back to polling");
+        assert_eq!(polled[0].id, id);
+        assert!(polled[0].route.is_none());
+    }
+
+    /// With no gateway configured nothing is ever marked, so every message
+    /// stays pollable — the pre-at-uws behaviour, unchanged.
+    #[tokio::test]
+    async fn without_a_gateway_every_message_stays_on_the_poll_path() {
+        let h = DialogueHandler {
+            store: test_store().await,
+        };
+        h.dispatch(
+            "dialogue_say",
+            json!({"from": "cc:a", "to": "mu:d:s1", "content": "hello"}),
+        )
+        .await
+        .unwrap();
+        let polled = h
+            .dispatch(
+                "dialogue_poll",
+                json!({"to": "mu:d:s1", "since": 0, "timeout_ms": 0}),
+            )
+            .await
+            .unwrap();
+        let msgs = polled["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        // `route` is omitted entirely for ordinary rows, so existing clients
+        // see byte-identical output to before.
+        assert!(msgs[0].get("route").is_none());
     }
 
     #[tokio::test]
@@ -1840,7 +2292,7 @@ mod tests {
     /// Prune removes idle registrations and their team memberships; fresh
     /// peers and their memberships survive.
     #[tokio::test]
-    async fn prune_removes_stale_peers_and_memberships() {
+    async fn prune_removes_stale_peers_but_never_their_team_membership() {
         let store = test_store().await;
         store.touch_peer("cc:stale", 1000).await.unwrap();
         store.touch_peer("cc:fresh", now_ms()).await.unwrap();
@@ -1850,7 +2302,6 @@ mod tests {
 
         let out = h.dispatch("dialogue_prune", json!({})).await.unwrap();
         assert_eq!(out["removed_peers"], 1);
-        assert_eq!(out["removed_memberships"], 1);
 
         let peers = h.dispatch("dialogue_peers", json!({})).await.unwrap();
         let ids: Vec<_> = peers["peers"]
@@ -1860,13 +2311,48 @@ mod tests {
             .map(|p| p["peer_id"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(ids, vec!["cc:fresh"]);
+
+        // Membership SURVIVES: joining is explicit and leaving is
+        // dialogue_team_leave. Going quiet is neither — and with an hour-long
+        // presence TTL, unsubscribing on silence would empty every team hourly.
         let team = h
             .dispatch("dialogue_teams", json!({"team": "t"}))
             .await
             .unwrap();
         let members = team["members"].as_array().unwrap();
-        assert_eq!(members.len(), 1);
-        assert_eq!(members[0]["peer_id"], "cc:fresh");
+        assert_eq!(members.len(), 2, "a quiet peer must stay a team member");
+    }
+
+    /// Membership is durable but delivery follows presence: a multicast
+    /// addresses the members who are here, and says how many it skipped so a
+    /// short recipient list does not look like lost mail.
+    #[tokio::test]
+    async fn multicast_addresses_present_members_and_reports_the_absent() {
+        let store = test_store().await;
+        store.touch_peer("cc:here", now_ms()).await.unwrap();
+        store.team_join("t", "cc:here", now_ms()).await.unwrap();
+        // A member that joined and then went quiet long enough to be pruned.
+        store.team_join("t", "cc:gone", 1000).await.unwrap();
+        let h = DialogueHandler { store };
+
+        let out = h
+            .dispatch(
+                "dialogue_multicast",
+                json!({"from": "cc:sender", "team": "t", "content": "standup"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["recipients"][0], "cc:here");
+        assert_eq!(out["absent_members"], 1);
+
+        // The absent member kept its membership, so it receives again once it
+        // comes back — no rejoin needed.
+        let team = h
+            .dispatch("dialogue_teams", json!({"team": "t"}))
+            .await
+            .unwrap();
+        assert_eq!(team["members"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]

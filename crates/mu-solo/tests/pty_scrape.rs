@@ -23,11 +23,13 @@
 
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::pty::{openpty, Winsize};
+use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg};
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
@@ -42,10 +44,18 @@ fn scrape(scenario: &str, force_conservative: bool) -> Vec<String> {
     };
     let pty = openpty(Some(&ws), None).expect("openpty");
     let slave = pty.slave;
+    // Make the pty slave byte-transparent before spawning. The harness feeds
+    // the child's escape stream into an independent vt100 parser, so inheriting
+    // host-specific cooked output processing would make the test environment,
+    // rather than mu-solo, rewrite the bytes under test.
+    let mut tio = tcgetattr(&slave).expect("tcgetattr slave");
+    cfmakeraw(&mut tio);
+    tcsetattr(&slave, SetArg::TCSANOW, &tio).expect("tcsetattr raw slave");
     let mut master = std::fs::File::from(pty.master);
 
     let exe = env!("CARGO_BIN_EXE_vt-scenario");
-    let mut child = Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .arg(scenario)
         .stdin(Stdio::from(slave.try_clone().expect("clone slave")))
         .stdout(Stdio::from(slave.try_clone().expect("clone slave")))
@@ -54,9 +64,26 @@ fn scrape(scenario: &str, force_conservative: bool) -> Vec<String> {
         .env(
             "MU_SOLO_FORCE_CONSERVATIVE_RENDER",
             if force_conservative { "1" } else { "0" },
-        )
-        .spawn()
-        .expect("spawn vt-scenario");
+        );
+    // `crossterm::terminal::size()` otherwise consults the developer's outer
+    // controlling TTY (zellij/tmux) instead of the 80x24 pty above. Headless
+    // CI has no controlling TTY and therefore falls back to stdio. Detach the
+    // child into a new session to make local execution follow that same path.
+    // SAFETY: between fork and exec the closure calls only `setsid` (which is
+    // async-signal-safe) and captures errno on failure; it touches no shared
+    // Rust state.
+    unsafe {
+        command.pre_exec(|| {
+            if nix::libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("spawn vt-scenario");
+    // `Command::spawn` borrows its reusable builder. Drop the builder now so
+    // the parent's Stdio-owned slave descriptors cannot suppress master EOF.
+    drop(command);
 
     let mut parser = vt100::Parser::new(ROWS, COLS, 0);
     let deadline = Instant::now() + Duration::from_secs(30);

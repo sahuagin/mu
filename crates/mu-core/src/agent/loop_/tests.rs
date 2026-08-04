@@ -1091,6 +1091,155 @@ async fn b7_user_message_during_tool_pushes_to_back() {
     );
 }
 
+#[tokio::test]
+async fn start_autonomous_buffered_by_tools_cannot_overtake_nested_tool_continuation() {
+    let (provider, records) = RecordingProvider::new(vec![
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "t1",
+            "slow",
+            json!({}),
+        ))],
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "t2",
+            "echo",
+            json!({}),
+        ))],
+        vec![ProviderEvent::Done(assistant_text("nested tool completed"))],
+        vec![ProviderEvent::Done(assistant_text("autonomous turn"))],
+    ]);
+    let tools_arc: Vec<Arc<dyn Tool>> = vec![
+        MockTool::delayed("slow", "slow result", Duration::from_millis(50)),
+        MockTool::ok("echo", "echo result"),
+    ]
+    .into_iter()
+    .map(|t| Arc::new(t) as Arc<dyn Tool>)
+    .collect();
+    let (events_tx, mut events_rx) = mpsc::channel(128);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let mut cap = crate::capability::Capability::root();
+    cap.autonomy = autonomy_allowed(10);
+    let capability: SessionCapability = Arc::new(Mutex::new(cap));
+    let loop_ = loop_with(
+        provider as Arc<dyn Provider>,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        tools_arc,
+        AgentConfig::default(),
+        events_tx,
+        approvals,
+        capability,
+    );
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("start"), None, None))
+        .await
+        .expect("send first ask");
+
+    let mut observed = Vec::new();
+    loop {
+        let event = timeout(Duration::from_millis(500), events_rx.recv())
+            .await
+            .expect("timed out waiting for slow tool start")
+            .expect("event channel closed before slow tool start");
+        let slow_started = matches!(
+            event,
+            AgentEvent::ToolCallStarted {
+                ref tool_call_id,
+                ..
+            } if tool_call_id == "t1"
+        );
+        observed.push(event);
+        if slow_started {
+            break;
+        }
+    }
+
+    loop_
+        .send(AgentInput::StartAutonomous {
+            goal: "autonomous goal".into(),
+            options: AutonomyOptions::default(),
+        })
+        .await
+        .expect("send start_autonomous while tools run");
+
+    let mut nested_completed_idx = None;
+    loop {
+        let event = timeout(Duration::from_millis(1000), events_rx.recv())
+            .await
+            .expect("timed out waiting for autonomous transition")
+            .expect("event channel closed");
+        let nested_completed = matches!(
+            event,
+            AgentEvent::MessageEnd {
+                message: AgentMessage::Assistant(ref msg)
+            } if msg.content.iter().any(|c| matches!(
+                c,
+                ContentBlock::Text { text } if text.as_ref() == "nested tool completed"
+            ))
+        );
+        let autonomy_started = matches!(event, AgentEvent::AutonomousIterationStarted { .. });
+        observed.push(event);
+        if nested_completed {
+            nested_completed_idx = Some(observed.len() - 1);
+        }
+        if autonomy_started {
+            break;
+        }
+    }
+
+    let autonomy_started_idx = observed
+        .iter()
+        .position(|event| matches!(event, AgentEvent::AutonomousIterationStarted { .. }))
+        .expect("autonomous iteration did not start");
+    assert!(
+        nested_completed_idx.expect("nested tool continuation did not complete")
+            < autonomy_started_idx,
+        "autonomy started before the active tool chain completed"
+    );
+
+    loop_.send(AgentInput::Cancel).await.expect("cancel loop");
+    let _ = loop_.join().await;
+
+    let records = records.lock().expect("records mutex").clone();
+    assert!(
+        records.len() >= 3,
+        "expected at least three provider calls, got {records:?}"
+    );
+    assert!(
+        records[1].messages.iter().any(|m| matches!(
+            m,
+            AgentMessage::ToolResult { call_id, is_error: false, .. } if call_id == "t1"
+        )) || records[1]
+            .all_span_ids
+            .iter()
+            .any(|id| id == "msg-2-tool-result:t1"),
+        "second provider invocation must include ToolResult for assistant call t1: {:?}",
+        records[1]
+    );
+    assert!(
+        records[2].messages.iter().any(|m| matches!(
+            m,
+            AgentMessage::ToolResult { call_id, is_error: false, .. } if call_id == "t2"
+        )) || records[2]
+            .all_span_ids
+            .iter()
+            .any(|id| id == "msg-4-tool-result:t2"),
+        "third provider invocation must include ToolResult for nested assistant call t2 before autonomous work can invoke provider: {:?}",
+        records[2]
+    );
+    assert!(
+        !records[2].messages.iter().any(|m| matches!(
+            m,
+            AgentMessage::User { content } if content.contains("autonomous goal")
+        )) && !records[2]
+            .provider_contents
+            .iter()
+            .any(|content| content.contains("autonomous goal")),
+        "start_autonomous goal must not overtake nested tool continuation: {:?}",
+        records[2]
+    );
+}
+
 /// Cancelling while an assistant tool call is in flight must leave the
 /// conversation structurally valid for the next provider call: every tool_call
 /// in the assistant message needs a matching ToolResult, even if that result is
@@ -1562,14 +1711,15 @@ fn plan_post_execute_tools_basic() {
 }
 
 #[test]
-fn plan_post_execute_tools_with_buffered_orders_inputs_first() {
+fn plan_post_execute_tools_preserves_buffered_fifo_before_continuation() {
     let buffered = vec![
         AgentInput::UserMessage(user_msg("first"), None, None),
         AgentInput::UserMessage(user_msg("second"), None, None),
     ];
     let actions = plan_post_execute_tools(buffered);
-    // External(first), External(second), InvokeLlm — buffered go
-    // first so their context is available when the LLM runs.
+    // Buffered inputs keep their baseline FIFO position so their context and
+    // command tickets land before the continuation. StartAutonomous has its
+    // own turn-boundary deferral guard and cannot add a duplicate invocation.
     assert_eq!(actions.len(), 3);
     assert!(matches!(
         actions[0],
@@ -2534,6 +2684,112 @@ async fn a1_iteration_cap_terminates_at_capability_bound() {
     );
 }
 
+#[tokio::test]
+async fn autonomous_terminal_provider_error_completes_iteration_and_later_ask_runs() {
+    let provider = MockProvider::new(vec![
+        vec![ProviderEvent::Error("terminal provider failure".to_owned())],
+        vec![ProviderEvent::Done(assistant_text("later ask accepted"))],
+    ]);
+    let (loop_, mut events_rx) = spawn_loop_with_autonomy(
+        provider,
+        vec![],
+        AgentConfig::default(),
+        autonomy_allowed(10),
+    );
+
+    loop_
+        .send(AgentInput::StartAutonomous {
+            goal: "hit provider error".to_owned(),
+            options: crate::protocol::AutonomyOptions::default(),
+        })
+        .await
+        .expect("send autonomous start");
+
+    let mut events = Vec::new();
+    loop {
+        let event = timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("timed out waiting for autonomous error termination")
+            .expect("event channel closed before autonomous error termination");
+        let terminated = matches!(event, AgentEvent::AutonomousTerminated { .. });
+        events.push(event);
+        if terminated {
+            break;
+        }
+    }
+
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("are you idle now?"),
+            None,
+            None,
+        ))
+        .await
+        .expect("later ask should be accepted by the live loop");
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    events.extend(events_handle.await.expect("events drain"));
+
+    let terminates: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::AutonomousTerminated { .. }))
+        .collect();
+    assert_eq!(terminates.len(), 1, "expected one autonomous termination");
+    match terminates[0] {
+        AgentEvent::AutonomousTerminated { reason } => assert!(
+            matches!(reason, AutonomousTerminationReason::Errored { .. }),
+            "expected provider error termination, got {reason:?}"
+        ),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let completed_idx = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::AutonomousIterationCompleted {
+                    outcome: AutonomousIterationOutcome::IterationError { .. },
+                    ..
+                }
+            )
+        })
+        .expect("provider error did not complete the in-flight iteration");
+    let terminate_idx = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::AutonomousTerminated { .. }))
+        .expect("terminate index");
+    assert!(
+        completed_idx < terminate_idx,
+        "INV-6/7: iteration completion must precede autonomous termination"
+    );
+
+    let later_answered = events.iter().any(|e| match e {
+        AgentEvent::MessageEnd {
+            message: AgentMessage::Assistant(msg),
+        } => msg.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::Text { text } if text.contains("later ask accepted")
+            )
+        }),
+        _ => false,
+    });
+    assert!(
+        later_answered,
+        "later idle ask did not receive provider response"
+    );
+
+    let later_autonomy = events[terminate_idx + 1..]
+        .iter()
+        .any(|e| matches!(e, AgentEvent::AutonomousIterationStarted { .. }));
+    assert!(
+        !later_autonomy,
+        "stale autonomous mode restarted after error"
+    );
+}
+
 /// A-2: SelfReport goal_status:satisfied early termination.
 ///
 /// Iteration 1: provider yields a plain message (no marker → Continue).
@@ -3406,9 +3662,16 @@ struct InputRecord {
     variant: InputVariant,
     /// Number of messages in the projection (or legacy slice).
     message_count: usize,
+    /// Full legacy snapshot when available; tests that assert provider protocol
+    /// validity use default legacy routing.
+    messages: Vec<AgentMessage>,
+    provider_contents: Vec<String>,
     /// First five source span ids in the projection — a structural
     /// fingerprint that catches reshape regressions.
     first_span_ids: Vec<String>,
+    /// All source span ids for protocol-ordering assertions whose target may
+    /// legitimately fall beyond the structural fingerprint above.
+    all_span_ids: Vec<String>,
     /// mu-vcbm: the per-call effort the loop passed to `stream()`.
     effort: Option<String>,
 }
@@ -3439,17 +3702,31 @@ impl Provider for RecordingProvider {
             MessageInput::Legacy(msgs) => InputRecord {
                 variant: InputVariant::Legacy,
                 message_count: msgs.len(),
+                messages: msgs.to_vec(),
+                provider_contents: Vec::new(),
                 first_span_ids: Vec::new(),
+                all_span_ids: Vec::new(),
                 effort,
             },
             MessageInput::Projected(pmsgs) => InputRecord {
                 variant: InputVariant::Projected,
                 message_count: pmsgs.messages.len(),
+                messages: Vec::new(),
+                provider_contents: pmsgs
+                    .messages
+                    .iter()
+                    .map(|m| m.content().to_owned())
+                    .collect(),
                 first_span_ids: pmsgs
                     .messages
                     .iter()
                     .take(5)
                     .filter_map(|m| m.source_span_ids().first().map(|s| s.as_ref().to_string()))
+                    .collect(),
+                all_span_ids: pmsgs
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.source_span_ids().iter().map(|s| s.as_ref().to_string()))
                     .collect(),
                 effort,
             },

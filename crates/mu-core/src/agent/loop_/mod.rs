@@ -947,8 +947,10 @@ fn plan_post_invoke_llm(
 }
 
 /// Decide what to enqueue after `ExecuteTools` completes. Pure.
-/// Buffered UMs come first so they land in `messages` before the
-/// next InvokeLlm runs.
+/// Buffered inputs keep their baseline FIFO position before the next
+/// `InvokeLlm`; `StartAutonomous` itself defers when that continuation is
+/// already queued, so it cannot interpose an autonomous model turn between an
+/// assistant tool call and its tool results.
 fn plan_post_execute_tools(buffered: Vec<AgentInput>) -> Vec<Action> {
     let mut actions = Vec::with_capacity(buffered.len() + 1);
     for input in buffered {
@@ -963,6 +965,40 @@ fn plan_post_execute_tools(buffered: Vec<AgentInput>) -> Vec<Action> {
 /// share one LLM call).
 fn should_push_invoke_llm(queue: &VecDeque<Action>) -> bool {
     !queue.iter().any(|a| matches!(a, Action::InvokeLlm))
+}
+
+fn has_queued_turn_chain_action(queue: &VecDeque<Action>) -> bool {
+    queue.iter().any(|a| {
+        matches!(
+            a,
+            Action::InvokeLlm | Action::ExecuteTools(_) | Action::MaybeFinish
+        )
+    })
+}
+
+async fn terminate_autonomous_error_if_active(
+    events: &mpsc::Sender<AgentEvent>,
+    mode: &mut RunMode,
+    message: String,
+) {
+    let iteration = match mode {
+        RunMode::Autonomous { iteration, .. } => *iteration,
+        _ => return,
+    };
+    let _ = events
+        .send(AgentEvent::AutonomousIterationCompleted {
+            iteration,
+            outcome: AutonomousIterationOutcome::IterationError {
+                message: message.clone(),
+            },
+        })
+        .await;
+    let _ = events
+        .send(AgentEvent::AutonomousTerminated {
+            reason: AutonomousTerminationReason::Errored { message },
+        })
+        .await;
+    *mode = RunMode::Idle;
 }
 
 /// Handle to a running agent loop.
@@ -1455,6 +1491,14 @@ async fn run_inner(
                             continue;
                         }
                     };
+
+                if has_queued_turn_chain_action(&queue) {
+                    queue.push_back(Action::External(AgentInput::StartAutonomous {
+                        goal,
+                        options,
+                    }));
+                    continue;
+                }
 
                 let effective_max_iterations = options
                     .max_iterations
@@ -2224,6 +2268,7 @@ async fn run_inner(
                             message: message.clone(),
                         })
                         .await;
+                    terminate_autonomous_error_if_active(&events, &mut mode, message.clone()).await;
                     let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
                     let _ = events
                         .send(AgentEvent::Done {
@@ -2380,7 +2425,8 @@ async fn run_inner(
                         continue;
                     }
                     Err(Outcome::Error(m)) => {
-                        let _ = events.send(AgentEvent::Error { message: m }).await;
+                        let _ = events.send(AgentEvent::Error { message: m.clone() }).await;
+                        terminate_autonomous_error_if_active(&events, &mut mode, m.clone()).await;
                         let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
                         let _ = events
                             .send(AgentEvent::Done {
@@ -2486,6 +2532,8 @@ async fn run_inner(
                     Err(outcome) => {
                         if let Outcome::Error(ref m) = outcome {
                             let _ = events.send(AgentEvent::Error { message: m.clone() }).await;
+                            terminate_autonomous_error_if_active(&events, &mut mode, m.clone())
+                                .await;
                         }
                         return outcome;
                     }

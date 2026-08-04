@@ -988,6 +988,10 @@ pub struct App {
     /// Built by `handle_notification`, rendered live in the viewport each
     /// frame, committed to scrollback on done/error. None when idle.
     live_turn: Option<Turn>,
+    /// Live-turn write-ahead log (mu-d04a slice 2): deltas append as they
+    /// arrive, truncated when the turn commits. Crash readback + the
+    /// two-append-only-logs read model.
+    wal: crate::wal::TurnWal,
     /// Semantic transcript independent of rendered terminal cells. Copy /
     /// export commands read this, not ratatui scrollback.
     transcript: Transcript,
@@ -1848,6 +1852,7 @@ impl App {
             .and_then(|v| v.as_str())
             .context("session.create response missing session_id")?
             .to_string();
+        let wal = crate::wal::TurnWal::open(&session_id);
 
         // daemon.stats — query once at startup for the daemon_id /
         // version so /status can surface them. Non-fatal if missing
@@ -1911,6 +1916,7 @@ impl App {
             done_receipts_seen: false,
             pending_interjections: Vec::new(),
             live_turn: None,
+            wal,
             transcript: Transcript::new(),
             fullscreen: std::env::var_os("MU_SOLO_FULLSCREEN").is_some(),
             fullscreen_entry_blocks: 0,
@@ -2753,8 +2759,32 @@ impl App {
             // screen is restored by the terminal, untouched.
             (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
                 let transcript = &self.transcript;
+                let live = self.live_turn.as_ref();
                 crate::log_window::run(|wrap| {
-                    render_transcript_blocks(transcript, 0, wrap, LOG_WINDOW_TOOL_LINES)
+                    let mut lines =
+                        render_transcript_blocks(transcript, 0, wrap, LOG_WINDOW_TOOL_LINES);
+                    // In-flight section (mu-d04a slice 2): the mid-run
+                    // reader sees the current turn too, full detail, under
+                    // a marked separator. Content-equivalent to the WAL.
+                    if let Some(turn) = live {
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(Span::styled(
+                            "── in flight ───────────────────────".to_string(),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                        lines.push(Line::from(""));
+                        lines.extend(render::render_turn(
+                            &turn.header_label(),
+                            turn.route.color(),
+                            &turn.items,
+                            wrap,
+                            LOG_WINDOW_TOOL_LINES,
+                            false,
+                        ));
+                    }
+                    lines
                 })?;
             }
             // ctrl+s: dump the record into $EDITOR (hx) — keyboard copy-out
@@ -5602,6 +5632,11 @@ impl App {
                 return Ok(());
             }
         }
+        // The live-turn WAL is keyed by the MAIN session (per-session WALs
+        // ride mu-d04a Phase 2): only main-session events may append to or
+        // truncate it. Without this gate a finishing /btw sidecar would
+        // wipe the main turn's WAL mid-flight (panel finding, 2026-08-04).
+        let wal_owner = sid.is_empty() || sid == self.session_id;
         let width = vp.area().width as usize;
         let wrap_width = width.saturating_sub(2);
         if sid == self.session_id
@@ -5622,6 +5657,9 @@ impl App {
                 }
                 let route = self.streaming_route.unwrap_or(TurnRoute::Main);
                 self.live_turn_for_route(route).push_text(delta);
+                if wal_owner {
+                    self.wal.append("text", delta);
+                }
             }
             "session.assistant_text_finalized" => {
                 // Replace the current segment's streamed text with the
@@ -5637,6 +5675,9 @@ impl App {
                 if !text.is_empty() {
                     let route = self.streaming_route.unwrap_or(TurnRoute::Main);
                     self.live_turn_for_route(route).finalize_text(text);
+                    if wal_owner {
+                        self.wal.append("text_final", text);
+                    }
                 }
             }
             "session.thinking_delta" => {
@@ -5648,6 +5689,9 @@ impl App {
                 }
                 let route = self.streaming_route.unwrap_or(TurnRoute::Main);
                 self.live_turn_for_route(route).push_thinking(delta);
+                if wal_owner {
+                    self.wal.append("thinking", delta);
+                }
             }
             "session.thinking_finalized" => {
                 // Mirror assistant_text_finalized: replace the streamed
@@ -5659,6 +5703,9 @@ impl App {
                 if !text.is_empty() {
                     let route = self.streaming_route.unwrap_or(TurnRoute::Main);
                     self.live_turn_for_route(route).finalize_thinking(text);
+                    if wal_owner {
+                        self.wal.append("thinking_final", text);
+                    }
                 }
             }
             "session.tool_call_delta" => {
@@ -5711,6 +5758,9 @@ impl App {
                     .get("tool_name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("?");
+                if wal_owner {
+                    self.wal.append("tool", name);
+                }
                 let id = params
                     .get("tool_call_id")
                     .and_then(|v| v.as_str())
@@ -5749,6 +5799,15 @@ impl App {
             }
             "session.tool_call_completed" => {
                 let outcome = params.get("outcome");
+                if wal_owner {
+                    self.wal.append(
+                        "tool_result",
+                        outcome
+                            .and_then(|o| o.get("kind"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?"),
+                    );
+                }
                 let kind = outcome
                     .and_then(|o| o.get("kind"))
                     .and_then(|v| v.as_str())
@@ -5812,6 +5871,13 @@ impl App {
                 }
             }
             "session.done" | "session.error" => {
+                // The turn's content now reaches the event log through the
+                // commit path — the WAL's job is done (mu-d04a slice 2).
+                // Owner-gated: a sidecar's done must not wipe the main
+                // turn's WAL (panel finding, 2026-08-04).
+                if wal_owner {
+                    self.wal.truncate();
+                }
                 // If a turn terminates while an approval is still up (e.g.
                 // the daemon's gate timed out and denied), the modal is
                 // stale — clear it and the overlay it borrowed for display.

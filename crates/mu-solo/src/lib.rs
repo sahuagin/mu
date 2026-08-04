@@ -72,3 +72,4 @@ pub mod render;
 pub mod skills;
 pub mod transcript;
 pub mod viewport;
+pub mod wal;

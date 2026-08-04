@@ -3123,6 +3123,7 @@ impl App {
             (_, KeyCode::Esc) | (_, KeyCode::Char('q')) => {
                 self.maximized_block = None;
                 vp.set_height(VIEWPORT_HEIGHT)?;
+                vp.snap_to_bottom()?;
             }
             (_, KeyCode::Up) | (KeyModifiers::ALT, KeyCode::Char('k')) => {
                 state.scroll = state.scroll.saturating_sub(1);
@@ -3154,6 +3155,7 @@ impl App {
                         copy_to_clipboard_or_file(&block.body, self.clipboard_command.as_deref())?;
                     self.maximized_block = None;
                     vp.set_height(VIEWPORT_HEIGHT)?;
+                    vp.snap_to_bottom()?;
                     self.emit_block_notice(vp, "copied selected block".to_string(), outcome)?;
                 }
             }
@@ -3166,6 +3168,7 @@ impl App {
                 }
                 self.maximized_block = None;
                 vp.set_height(VIEWPORT_HEIGHT)?;
+                vp.snap_to_bottom()?;
             }
             _ => {}
         }
@@ -3354,6 +3357,7 @@ impl App {
                 // Overlay already taken (stays closed).
                 if !self.fullscreen {
                     vp.set_height(VIEWPORT_HEIGHT)?;
+                    vp.snap_to_bottom()?;
                 }
                 return Ok(false);
             }
@@ -3573,7 +3577,7 @@ impl App {
             self.transcript
                 .push(TranscriptBlock::user(TurnRoute::Main, text.to_string()));
             self.emit_you_block(vp, text)?;
-            self.fire_ask(vp, text)
+            self.fire_ask(text)
         }
     }
 
@@ -3760,9 +3764,14 @@ impl App {
         Ok(())
     }
 
-    /// Reset streaming state, snap viewport, and fire `ask_session`.
-    fn fire_ask(&mut self, vp: &mut DynamicViewport, wire_text: &str) -> Result<()> {
-        vp.snap_to_bottom()?;
+    /// Reset streaming state and fire `ask_session`.
+    ///
+    /// Deliberately does NOT snap the viewport (mu-8oqp): the viewport is
+    /// already bottom-anchored, and snap_to_bottom would RESET the tracked
+    /// gap left by the preview collapse — the next insert would then scroll
+    /// instead of gap-painting, sweeping the blank rows into the transcript
+    /// permanently.
+    fn fire_ask(&mut self, wire_text: &str) -> Result<()> {
         self.streaming_route = Some(TurnRoute::Main);
         self.live_turn = Some(Turn::new(
             TurnRoute::Main,
@@ -4255,6 +4264,7 @@ impl App {
                 self.selected_block = None;
                 self.maximized_block = None;
                 vp.set_height(VIEWPORT_HEIGHT)?;
+                vp.snap_to_bottom()?;
                 let wrap_width = (vp.area().width as usize).saturating_sub(2);
                 let preview = if self.bash_yolo { 15 } else { 4 };
                 // Replay only the fullscreen-period delta; blocks before the
@@ -5159,7 +5169,7 @@ impl App {
                 .push(TranscriptBlock::user(TurnRoute::Main, tail.to_string()));
             self.emit_you_block(vp, tail)?;
         }
-        self.fire_ask(vp, &wire_msg)?;
+        self.fire_ask(&wire_msg)?;
         Ok(())
     }
 

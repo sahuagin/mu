@@ -114,7 +114,11 @@ fn migrate(conn: &Connection) -> Result<()> {
             to_peer         TEXT NOT NULL,
             session_thread  TEXT,
             content         TEXT NOT NULL,
-            ts              INTEGER NOT NULL
+            ts              INTEGER NOT NULL,
+            -- Sender-authored one-line summary, rendered in the receiver's wake.
+            -- Nullable: pre-existing rows and fan-outs carry none, and the
+            -- receiver falls back to a generic line.
+            subject         TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_dialogue_to_ts
             ON dialogue(to_peer, ts);
@@ -152,6 +156,14 @@ fn migrate(conn: &Connection) -> Result<()> {
             ON team_members(peer_id);
         "#,
     )?;
+    // `subject` shipped after the table did, so existing DBs need it added.
+    // SQLite has no ADD COLUMN IF NOT EXISTS; ask the pragma instead.
+    let has_subject = conn
+        .prepare("SELECT 1 FROM pragma_table_info('dialogue') WHERE name = 'subject'")?
+        .exists([])?;
+    if !has_subject {
+        conn.execute_batch("ALTER TABLE dialogue ADD COLUMN subject TEXT;")?;
+    }
     Ok(())
 }
 
@@ -177,6 +189,8 @@ struct DialogueRow {
     session_thread: Option<String>,
     content: String,
     ts: i64,
+    /// Sender-authored summary line; `None` for fan-outs and pre-`subject` rows.
+    subject: Option<String>,
 }
 
 impl Store {
@@ -186,6 +200,7 @@ impl Store {
         to: &str,
         content: &str,
         session_thread: Option<&str>,
+        subject: Option<&str>,
     ) -> Result<(String, i64)> {
         let id = Ulid::new().to_string();
         let ts = now_ms();
@@ -196,9 +211,9 @@ impl Store {
         {
             let conn = self.db.lock().await;
             conn.execute(
-                "INSERT INTO dialogue (id, from_peer, to_peer, session_thread, content, ts)
-                 VALUES (?, ?, ?, ?, ?, ?)",
-                params![id, from, to, thread, content, ts],
+                "INSERT INTO dialogue (id, from_peer, to_peer, session_thread, content, ts, subject)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![id, from, to, thread, content, ts, subject],
             )?;
         }
         // Wake any in-process long-pollers; each re-checks its own filter.
@@ -234,7 +249,7 @@ impl Store {
         match after_seq {
             Some(after_seq) => {
                 let mut stmt = conn.prepare(
-                    "SELECT rowid AS seq, id, from_peer, to_peer, session_thread, content, ts
+                    "SELECT rowid AS seq, id, from_peer, to_peer, session_thread, content, ts, subject
                        FROM dialogue
                       WHERE to_peer = ?1 AND rowid > ?2
                       ORDER BY rowid ASC
@@ -247,7 +262,7 @@ impl Store {
             }
             None => {
                 let mut stmt = conn.prepare(
-                    "SELECT rowid AS seq, id, from_peer, to_peer, session_thread, content, ts
+                    "SELECT rowid AS seq, id, from_peer, to_peer, session_thread, content, ts, subject
                        FROM dialogue
                       WHERE to_peer = ?1 AND ts > ?2
                       ORDER BY rowid ASC
@@ -264,7 +279,7 @@ impl Store {
     async fn history(&self, session_thread: &str, limit: i64) -> Result<Vec<DialogueRow>> {
         let conn = self.db.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT rowid AS seq, id, from_peer, to_peer, session_thread, content, ts
+            "SELECT rowid AS seq, id, from_peer, to_peer, session_thread, content, ts, subject
                FROM dialogue
               WHERE session_thread = ?
               ORDER BY rowid ASC
@@ -467,6 +482,7 @@ fn dialogue_row(row: &rusqlite::Row) -> rusqlite::Result<DialogueRow> {
         session_thread: row.get(4)?,
         content: row.get(5)?,
         ts: row.get(6)?,
+        subject: row.get(7)?,
     })
 }
 
@@ -495,6 +511,11 @@ struct SayArgs {
     to: String,
     content: String,
     session_thread: Option<String>,
+    /// One-line summary shown in the receiver's wake. Mirrors the mesh DM
+    /// contract's `subject`, which is why it is sender-authored rather than
+    /// derived from the body.
+    #[serde(default)]
+    subject: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -593,6 +614,7 @@ async fn handle_say(store: &Store, args: SayArgs) -> Result<Value> {
             &args.to,
             &args.content,
             args.session_thread.as_deref(),
+            args.subject.as_deref(),
         )
         .await?;
     // Sending proves the sender is live — register/refresh its presence.
@@ -848,7 +870,8 @@ fn tools_list() -> Vec<Tool> {
                     "from":           {"type": "string", "description": "Sender peer id (e.g. 'cc', 'mu')"},
                     "to":             {"type": "string", "description": "Recipient peer id"},
                     "content":        {"type": "string", "description": "Message body"},
-                    "session_thread": {"type": "string", "description": "Optional thread id; minted from the message id if omitted"}
+                    "session_thread": {"type": "string", "description": "Optional thread id; minted from the message id if omitted"},
+                    "subject":        {"type": "string", "description": "One-line summary shown in the receiver's wake — write it so the receiver can decide whether to read the body"}
                 },
                 "required": ["from", "to", "content"]
             })),
@@ -1346,6 +1369,63 @@ mod tests {
             peer_ttl_ms: DEFAULT_PEER_TTL_MS,
             presence: None,
         }
+    }
+
+    #[tokio::test]
+    async fn subject_round_trips_and_is_absent_when_unsent() {
+        let h = DialogueHandler {
+            store: test_store().await,
+        };
+        h.dispatch(
+            "dialogue_say",
+            json!({"from": "cc", "to": "mu", "content": "body", "subject": "gateway is up"}),
+        )
+        .await
+        .unwrap();
+        // A sender that omits it leaves the field null rather than inventing one;
+        // the receiver's generic fallback is the mesh contract's behaviour.
+        h.dispatch(
+            "dialogue_say",
+            json!({"from": "cc", "to": "mu", "content": "no subject here"}),
+        )
+        .await
+        .unwrap();
+
+        let polled = h
+            .dispatch(
+                "dialogue_poll",
+                json!({"to": "mu", "since": 0, "timeout_ms": 0}),
+            )
+            .await
+            .unwrap();
+        let msgs = polled["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["subject"], "gateway is up");
+        assert!(msgs[1]["subject"].is_null());
+    }
+
+    #[tokio::test]
+    async fn migrate_adds_subject_to_a_pre_subject_database() {
+        // A DB created before `subject` existed: the CREATE TABLE IF NOT EXISTS
+        // in migrate() is a no-op against it, so only the ALTER can save it.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"CREATE TABLE dialogue (
+                   id TEXT PRIMARY KEY, from_peer TEXT NOT NULL, to_peer TEXT NOT NULL,
+                   session_thread TEXT, content TEXT NOT NULL, ts INTEGER NOT NULL
+               );"#,
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert!(
+            conn.prepare("SELECT 1 FROM pragma_table_info('dialogue') WHERE name = 'subject'")
+                .unwrap()
+                .exists([])
+                .unwrap(),
+            "migrate() must add subject to an existing dialogue table"
+        );
+        // Idempotent: a second run must not fail on a duplicate column.
+        migrate(&conn).unwrap();
     }
 
     #[tokio::test]

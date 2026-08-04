@@ -193,6 +193,10 @@ async fn main() -> Result<()> {
         clipboard_command: cfg.tui.clipboard_command.as_deref(),
         renderer_journal: cfg.tui.renderer_journal,
         notifications: cfg.tui.notifications,
+        // [tui] fullscreen (profile-able) is the front door; the legacy
+        // ad-hoc MU_SOLO_FULLSCREEN export keeps working so existing
+        // launchers don't silently regress to inline (mu-d04a slice 3).
+        fullscreen: cfg.tui.fullscreen || std::env::var_os("MU_SOLO_FULLSCREEN").is_some(),
         model_menu_aliases: &cfg.model_menu.aliases,
         // mu-7e21: [autonomy] in solo.toml → create_session grant.
         autonomy: cfg.autonomy.to_capability(),
@@ -288,6 +292,10 @@ struct TerminalRestoreGuard;
 
 impl Drop for TerminalRestoreGuard {
     fn drop(&mut self) {
+        // Unconditional: a panic/exit inside F3 fullscreen (alt screen,
+        // mu-d04a slice 3) must not strand the terminal in the alt buffer.
+        // A no-op when the alt screen is not active.
+        let _ = execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         let _ = execute!(std::io::stdout(), DisableFocusChange);
         let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
         let _ = execute!(std::io::stdout(), DisableBracketedPaste);

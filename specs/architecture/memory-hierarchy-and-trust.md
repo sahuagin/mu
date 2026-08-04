@@ -91,6 +91,155 @@ own assessment: "irrelevant wallowing."
   content stays pinned at the prefix; volatile content lives at the tail;
   compaction drops from the tail region only (see mu-tlri).
 
+## Working-set prefetch: context planning, not inject-everything
+
+Reviewing [TencentDB Agent Memory's v1 task
+canvas](https://github.com/TencentCloud/TencentDB-Agent-Memory/tree/v1.0.1) in
+2026-08 produced an independent convergence and one useful refinement. Its
+short-term subsystem does not retrieve tool history through SQLite similarity
+search. It continuously folds tool-call/result pairs into a small,
+model-authored task graph; each graph node maps back through JSONL entries to
+the full raw result. The representation is Mermaid, but the durable property is
+**a compact task-state map with a resolvable road back to evidence**. (Its edges
+are inferred workflow relations, not a formal DAG or a substitute for event
+causality.)
+
+Mu already has the stronger substrate for this: the event log retains the full
+history, context is a projection, and compaction removes spans from the working
+rope without deleting their source events. The refinement is to treat context
+assembly as **working-set management with recoverable misses**:
+
+- the active prompt is the hot working set;
+- compact task/project maps are the page table;
+- source events and evicted spans are backing storage;
+- rehydrating an evidence ID is a context page fault;
+- a cheap local model may speculatively prefetch likely-needed cold evidence for
+  an expensive model.
+
+This does **not** replace mu's continuous background compaction. The current
+online policy — retain recent causal continuity, demote lower-value spans before
+the hard limit, and keep the session moving — remains the normal path. Prefetch
+and evidence rehydration make demotion reversible when an older dependency
+becomes relevant again. They avoid both extremes: hoarding all history until a
+cliff compaction and rebuilding the entire prompt on every turn.
+
+### Two retrieval problems, not one
+
+Keep these separate because they have different keys and failure modes:
+
+1. **Active-task cold history.** Session/task identity and event lineage already
+   define the search domain. Build a compact projection of goal, established
+   findings, failed paths, unresolved questions, recent changes, and evidence
+   IDs. No semantic search is required to decide which task the evidence belongs
+   to; model judgment is only needed to compress or infer relations. Known causal
+   edges from the event log must remain distinguishable from inferred edges.
+2. **Cross-session durable memory.** This still requires lexical/semantic recall
+   and a relevance decision. Giving the whole current user turn to FTS/vector
+   search and injecting the top hits every turn merely recreates the failed
+   inject-everything experiment at a smaller scale. Giving the model a memory
+   tool also does not help when the model treats it as a write-only sink and
+   never queries it.
+
+The circularity is real: the best query depends on understanding the task, while
+understanding the task may depend on the missing evidence. The proposed escape
+is coarse-to-fine planning, not pretending the circle is solved. A cheap local
+planner reads the identity kernel plus compact task/project maps, identifies
+entities, operations, constraints, and unresolved questions, retrieves candidate
+evidence summaries, and emits a bounded context capsule. Its token ceiling is
+explicit rather than qualitative:
+
+```text
+capsule_budget = min(configured_capsule_max,
+                     soft_limit - stable_prefix_estimate - frontier_reserve)
+```
+
+`frontier_reserve` must be positive, and prefetch is disabled when the remainder
+is non-positive. The experiment chooses `configured_capsule_max`; no result may
+exceed the computed budget. The planner need not solve the main task; like a
+prefetcher or database query planner, it predicts the expensive model's likely
+working set. False negatives remain recoverable through evidence IDs. False
+positives consume attention and therefore remain measurable failures, not
+harmless extras.
+
+### Context epochs and prompt caching
+
+Reassembling a provider request from projections does not itself invalidate a
+prompt cache; changed bytes or ordering do. Organize frontier work into context
+epochs:
+
+```text
+stable identity / project instructions / tool schemas   (long-lived prefix)
+epoch-initialization task capsule                        (frozen this epoch)
+frontier conversation and tool loop                     (append-only tail)
+```
+
+An epoch capsule is not a Warm recall injection into an existing conversation.
+It initializes a new context projection, is immutable for that epoch, and is
+replaced exactly once when the next epoch begins. Its implementation requires an
+explicit epoch-scoped stable retention class (`EpochPinned`, or equivalent),
+with `cacheable = true`: protected from ordinary within-epoch compaction, but
+retired when its `epoch_id` is replaced. Do not overload Warm (which would break
+the contiguous cacheable prefix) or unscoped Pinned (which has no retirement
+lifecycle). Exactly one capsule may exist in an epoch.
+
+The prior frontier tail remains in the event log but is not carried verbatim
+after replacement; the new capsule must preserve whatever task state the next
+epoch needs. A new epoch therefore intentionally forfeits the old
+capsule-and-tail cache while retaining any cache hit through the stable prefix.
+This is a boundary cost to amortize across the following tool loop, not a claim
+of zero invalidation. Context pressure is also an epoch-boundary signal: if
+ordinary tail compaction cannot get below the soft limit while preserving the
+capsule and positive frontier reserve, retire the epoch and rebuild a smaller
+capsule under the budget formula rather than accumulating capsules or crossing
+the hard limit.
+
+The earlier tail-injection rule still governs recall during an epoch: newly
+rehydrated evidence lands as a Warm span at the append-only tail, gets recency
+attention, and remains eviction-by-construction. A material miss may either be
+served by that ordinary tail injection or, when it changes the task's working
+set enough to justify paying the boundary cost, end the epoch and build a new
+capsule. Do not rewrite a capsule in place, append multiple capsules, or prepend
+a different recall block on every turn.
+
+### Experimental integration surface
+
+The first experiment should be a new selectable `CompactionPolicy`, not a
+replacement for the effective heuristic default. A `working-set` policy can run
+at the existing soft-limit trigger, use a cheap/local asynchronous judge to
+produce the task capsule and evidence handles from the current `RetainedRope`,
+and return the ordinary `CompactionResult` audit/metrics. Configuration can then
+compare `heuristic`, `hash-and-summary`, `working-set`, and `no-compaction` on the
+same sessions and thresholds (mu-working-set-compaction-policy-9dpq).
+
+Do not force the whole design through that trait. `CompactionPolicy::compact`
+currently receives only `&RetainedRope` and a token target; it neither queries
+cold event history nor runs at task boundaries when the rope is below pressure.
+Keep a separate `ContextPlanner`/evidence-resolver surface over `EventLogView`
+and the mu-or85 rehydration handles. The compaction policy may consume that
+surface later, but v1 can test whether a task capsule preserves continuity using
+only the hot rope. This separates a measurable compaction algorithm from the
+still-unsolved general recall trigger.
+
+### The unresolved part is the trigger
+
+This refinement supplies a substrate and recovery path, not a general relevance
+oracle. Narrow decision-point triggers such as mu-8puo work because the tool name
+and action classify the need mechanically. General memory recall has no trigger
+of comparable quality yet.
+
+Candidate signals to test include task/epoch transitions, references to an
+entity whose spans are cold, unresolved evidence IDs, explicit model requests,
+repeated reads/questions, and compaction demotion of spans linked from the active
+task map. None should become standing auto-injection without measurement. Track
+which prefetched evidence the expensive model actually reads or cites, which
+page faults follow a miss, token/cache cost, latency, and task outcome. The
+trigger/query experiment is successful only if it improves the expensive
+model's effective context, not merely recall cosine scores.
+
+Privacy is also architectural here: the planner sees broad history precisely so
+it can minimize the frontier model's capsule. It should default to a local model;
+sending raw history to a cloud model for memory extraction defeats that boundary.
+
 ## Recall scoring
 
 `score = f(semantic, recency, verified_at, tier_depth, orphan_penalty)`
@@ -130,28 +279,37 @@ prove the assertion/retraction/as-of model works — but they version
 not a timestamp). Their lesson, minus their JVMs: never delete, only
 mask; always answer "as of when, said by whom."
 
-## Implementation slices (ordered)
+## Implementation state and experiment sequence
 
-1. **agent.sqlite schema + CLI** (one session, agent_tools): columns
-   `verified_at`, `orphaned`, `source_ref`; table
-   `memory_supersedes(old_id, new_id, reason, created_at)`; `agent memory
-   search` self-labels every hit and never shows a masked fact without
-   its successor; `agent memory correct OLD --with NEW` writes the edge.
-   Fixes the store where the incidents happened, this week.
-2. **Retention auditor** (cron or session-start hook): resolve
-   provenance refs; mark orphans. Cheap, mechanical.
-3. **mu L0–L3 + consolidator** (mu-jsde → mu-5xbp): EventLogView range
-   queries, then the continuous consolidator with fact-identity
-   resolution and tombstone writing. The model-in-the-loop part.
-4. **Injection rework** (mu-42x8 experiment): identity tier extraction,
-   tail-injection via triggered recall (mu-8puo), measured by the
-   per-section token breakdowns shipped in PR #161.
+1. **Shipped trust substrate** (agent_tools): `verified_at`, `orphaned`,
+   `source_ref`, supersession edges, labeled recall, and explicit correction.
+2. **Shipped measurement and narrow-trigger groundwork**: per-section injection
+   measurements in PR #161 and action-time tail recall (mu-8puo) in PR #173.
+   The broader offline tiering experiment mu-42x8 remains open; narrow mechanical
+   triggers are evidence, not a solved general relevance oracle.
+3. **Open retention auditor**: resolve provenance refs and mark orphans. Cheap,
+   mechanical, and independent of model-planned context.
+4. **Open event-query and consolidation substrate** (mu-jsde → mu-5xbp):
+   `EventLogView` range queries, then continuous consolidation with fact-identity
+   resolution and tombstone writing.
+5. **Open reversible evidence path** (mu-or85 / mu-or85.2): elide cold spans to
+   evidence handles and append verbatim source content on `context_recall`.
+   Mu-68u5 remains the separately scoped passive `context.list()` introspection
+   experiment; it is not the task-state-map implementation.
+6. **Proposed working-set policy experiment**
+   (mu-working-set-compaction-policy-9dpq, design refinement
+   mu-context-working-set-prefetch-8632): first compare a task capsule built from
+   the current rope against existing policies, then compose EventLogView and the
+   reversible evidence path for cold-history misses and non-pressure triggers.
 
 ## Cross-references
 
 - Beads: mu-5xbp (consolidator), mu-jsde (EventLogView), mu-42x8
-  (tiering experiment), mu-8puo (triggered recall), mu-68u5
-  (context.list/rehydrate), mu-tlri (pin stable prefix), mu-wsgx
+  (tiering experiment), mu-8puo (triggered recall), mu-68u5 (passive
+  `context.list()`), mu-or85 / mu-or85.2 (elision + verbatim rehydration),
+  mu-working-set-compaction-policy-9dpq (selectable policy experiment),
+  mu-context-working-set-prefetch-8632 (this refinement), mu-tlri (pin stable
+  prefix), mu-wsgx
   (trigger calibration — the feedback-predictor pattern is the same
   trust-the-terrain discipline applied to token counts).
 - Memory: `36a2866b` (recall-is-testimony), `42577731` (usage-accounting

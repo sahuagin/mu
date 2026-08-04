@@ -64,6 +64,7 @@ pub mod app;
 pub mod client;
 pub mod config;
 pub mod input;
+pub mod log_window;
 pub mod mcp_status;
 pub mod menu;
 pub mod notify;

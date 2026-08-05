@@ -49,6 +49,45 @@ fn dm_subject(agent: &str) -> String {
     format!("mu.agent.{agent}.dm")
 }
 
+/// Metadata key carrying a peer's identity, unmangled.
+const META_PEER_ID: &str = "peer_id";
+/// Metadata key carrying the exact subject to publish to, so a sender never
+/// re-derives the naming rule.
+const META_DM_SUBJECT: &str = "dm_subject";
+
+/// A dialogue peer id as its DM subject: each `:` level becomes a NATS subject
+/// token, so routing is the transport's own hierarchy — dispatch on the daemon
+/// token, then the session token. A daemon catches all of its sessions with
+/// `mu.agent.mu.<daemon>.*.dm` (mu-b1lq).
+fn peer_dm_subject(peer_id: &str) -> String {
+    format!("mu.agent.{}.dm", peer_id.replace(':', "."))
+}
+
+/// A Micro service name for a peer. Micro allows only `[A-Za-z0-9_-]`, but this
+/// is a registration KEY, not an identity — that travels in metadata — so it
+/// only has to be legal and unique. Nothing parses it.
+fn micro_name(peer_id: &str) -> String {
+    let safe: String = peer_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{PRESENCE_PREFIX}{safe}")
+}
+
+/// Metadata advertising who a registration is and where to reach it.
+fn peer_metadata(peer_id: &str, subject: &str) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([
+        (META_PEER_ID.to_string(), peer_id.to_string()),
+        (META_DM_SUBJECT.to_string(), subject.to_string()),
+    ])
+}
+
 // ── wire types (mirror of mesh-slice/src/agent.rs AgentCommand) ───────────
 
 #[derive(Serialize, Deserialize)]
@@ -303,9 +342,20 @@ async fn who(client: &async_nats::Client) -> Result<Vec<String>> {
     let deadline = tokio::time::Instant::now() + WHO_WINDOW;
     while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, sub.next()).await {
         if let Ok(v) = serde_json::from_slice::<Value>(&msg.payload) {
-            if let Some(name) = v.get("name").and_then(Value::as_str) {
-                if let Some(agent) = name.strip_prefix(PRESENCE_PREFIX) {
-                    agents.push(agent.to_string());
+            // Identity is advertised unmangled in metadata; a peer that
+            // publishes none is named by its service name, as before.
+            let from_meta = v
+                .get("metadata")
+                .and_then(|m| m.get(META_PEER_ID))
+                .and_then(Value::as_str);
+            match from_meta {
+                Some(peer_id) => agents.push(peer_id.to_string()),
+                None => {
+                    if let Some(name) = v.get("name").and_then(Value::as_str) {
+                        if let Some(agent) = name.strip_prefix(PRESENCE_PREFIX) {
+                            agents.push(agent.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -336,7 +386,7 @@ async fn send_dm(
             // address the receiver can reply to directly. Only a send with no
             // session behind it (the daemon itself) falls back to the daemon id.
             from: match from_session.as_deref() {
-                Some(s) if !s.is_empty() => session_agent_id(&shared.agent_id, s),
+                Some(s) if !s.is_empty() => session_peer_id(&shared.agent_id, s),
                 _ => shared.agent_id.clone(),
             },
             body: body.to_string(),
@@ -346,9 +396,16 @@ async fn send_dm(
         },
     };
     let payload = serde_json::to_vec(&env)?;
+    // A `role:identity` peer id routes by subject hierarchy; a bare agent id
+    // is the legacy daemon form and keeps its flat subject.
+    let subject = if to.contains(':') {
+        peer_dm_subject(to)
+    } else {
+        dm_subject(to)
+    };
     shared
         .client
-        .publish(dm_subject(to), payload.into())
+        .publish(subject, payload.into())
         .await
         .map_err(|e| anyhow!("publish: {e}"))?;
     shared
@@ -361,18 +418,9 @@ async fn send_dm(
 
 // ── startup ───────────────────────────────────────────────────────────────
 
-/// Separator standing in for the `:` of a dialogue peer id on the wire. NATS
-/// Micro validates service names against `[A-Za-z0-9_-]` and rejects a colon
-/// (verified against a live server, at-uws). A DOUBLED underscore, because
-/// single ones occur inside real identities — `warden:sub_agent_3` — and
-/// splitting on those would corrupt them.
-pub(crate) const MESH_ID_SEP: &str = "__";
-
-/// A session's mesh agent id: its dialogue peer id `mu:<daemon>:<session>`
-/// with the colons encoded. One rule for every participant — a mesh agent name
-/// is just a dialogue peer id that can survive NATS Micro's charset.
-pub(crate) fn session_agent_id(daemon_id: &str, session_id: &str) -> String {
-    format!("mu{MESH_ID_SEP}{daemon_id}{MESH_ID_SEP}{session_id}")
+/// A session's dialogue peer id.
+pub(crate) fn session_peer_id(daemon_id: &str, session_id: &str) -> String {
+    format!("mu:{daemon_id}:{session_id}")
 }
 
 /// Per-session mesh registration (mu-6s7s): each session gets its own `$SRV`
@@ -448,21 +496,23 @@ impl MeshSessions {
         {
             return Ok(());
         }
-        let agent = session_agent_id(&self.inner.daemon_id, session_id);
+        let peer_id = session_peer_id(&self.inner.daemon_id, session_id);
+        let subject = peer_dm_subject(&peer_id);
         let presence = self
             .inner
             .client
             .service_builder()
             .description("mu session (mesh dialogue presence)")
-            .start(agent.clone(), "0.1.0")
+            .metadata(peer_metadata(&peer_id, &subject))
+            .start(micro_name(&peer_id), "0.1.0")
             .await
-            .map_err(|e| anyhow!("session presence register {agent}: {e}"))?;
+            .map_err(|e| anyhow!("session presence register {peer_id}: {e}"))?;
         let sub = self
             .inner
             .client
-            .subscribe(dm_subject(&agent))
+            .subscribe(subject.clone())
             .await
-            .map_err(|e| anyhow!("session dm subscribe {agent}: {e}"))?;
+            .map_err(|e| anyhow!("session dm subscribe {peer_id}: {e}"))?;
         self.inner
             .client
             .flush()
@@ -490,7 +540,8 @@ impl MeshSessions {
                 _presence: presence,
             },
         );
-        tracing::info!(session = %session_id, %agent, "mesh dialogue: session joined the mesh");
+        tracing::info!(session = %session_id, %peer_id, %subject,
+            "mesh dialogue: session joined the mesh");
         Ok(())
     }
 }
@@ -590,35 +641,46 @@ pub(crate) async fn spawn_mesh_dialogue(
     );
     let issuer = root.public();
 
-    let (client, presence, sub) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let client = async_nats::connect(&mesh.nats_url)
-            .await
-            .map_err(|e| anyhow!("dialogue: connect NATS at {}: {e}", mesh.nats_url))?;
-        let presence = client
-            .service_builder()
-            .description("mu daemon (mesh dialogue presence)")
-            .start(format!("{PRESENCE_PREFIX}{daemon_id}"), "0.1.0")
-            .await
-            .map_err(|e| anyhow!("dialogue: presence register: {e}"))?;
-        let sub = client
-            .subscribe(dm_subject(daemon_id))
-            .await
-            .map_err(|e| anyhow!("dialogue: dm subscribe: {e}"))?;
-        client
-            .flush()
-            .await
-            .map_err(|e| anyhow!("dialogue: flush: {e}"))?;
-        Ok::<_, anyhow::Error>((client, presence, sub))
-    })
-    .await
-    .map_err(|_| {
-        anyhow!(
-            "dialogue: NATS setup at {} timed out after 5s",
-            mesh.nats_url
-        )
-    })??;
+    let (client, presence, sub, sub_hier) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let client = async_nats::connect(&mesh.nats_url)
+                .await
+                .map_err(|e| anyhow!("dialogue: connect NATS at {}: {e}", mesh.nats_url))?;
+            let daemon_peer_id = format!("mu:{daemon_id}");
+            let presence = client
+                .service_builder()
+                .description("mu daemon (mesh dialogue presence)")
+                .metadata(peer_metadata(&daemon_peer_id, &dm_subject(daemon_id)))
+                .start(format!("{PRESENCE_PREFIX}{daemon_id}"), "0.1.0")
+                .await
+                .map_err(|e| anyhow!("dialogue: presence register: {e}"))?;
+            let sub = client
+                .subscribe(dm_subject(daemon_id))
+                .await
+                .map_err(|e| anyhow!("dialogue: dm subscribe: {e}"))?;
+            // Also answer on the hierarchical form of the daemon's own peer id, so
+            // a sender using one uniform rule reaches daemons and sessions alike.
+            // The legacy flat subject above stays for peers that predate mu-b1lq.
+            let sub_hier = client
+                .subscribe(peer_dm_subject(&daemon_peer_id))
+                .await
+                .map_err(|e| anyhow!("dialogue: hierarchical dm subscribe: {e}"))?;
+            client
+                .flush()
+                .await
+                .map_err(|e| anyhow!("dialogue: flush: {e}"))?;
+            Ok::<_, anyhow::Error>((client, presence, sub, sub_hier))
+        })
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "dialogue: NATS setup at {} timed out after 5s",
+                mesh.nats_url
+            )
+        })??;
 
     let inbound_task = spawn_inbound(sub, issuer, sessions.clone(), router.clone(), None);
+    let inbound_hier = spawn_inbound(sub_hier, issuer, sessions.clone(), router.clone(), None);
 
     let mesh_sessions = MeshSessions {
         inner: Arc::new(MeshSessionsInner {
@@ -688,7 +750,7 @@ pub(crate) async fn spawn_mesh_dialogue(
         "mesh dialogue: joined (presence + dm inbox)");
     Ok((
         MeshDialogueHandle {
-            tasks: vec![inbound_task],
+            tasks: vec![inbound_task, inbound_hier],
             _presence: presence,
         },
         tools,

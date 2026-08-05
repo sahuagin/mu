@@ -75,12 +75,9 @@ enum AgentCommand {
         /// receiver renders a generic "mesh dm from <agent>".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subject: Option<String>,
-        /// The SENDER's session on `from`'s daemon (at-uws). Without it a DM
-        /// is attributed to the daemon alone, so a reply lands on that
-        /// daemon's supervisor session instead of the session that wrote —
-        /// the first message arrives and the conversation cannot continue.
-        /// Bound at the tool layer, not supplied by the model. Additive and
-        /// optional: older peers neither send nor need it.
+        /// The SENDER's session, so a reply reaches whoever wrote rather than
+        /// the daemon's supervisor (at-uws). Bound at the tool layer, not by
+        /// the model. Additive: older peers neither send nor need it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_session: Option<String>,
     },
@@ -378,13 +375,10 @@ pub(crate) fn session_agent_id(daemon_id: &str, session_id: &str) -> String {
     format!("mu{MESH_ID_SEP}{daemon_id}{MESH_ID_SEP}{session_id}")
 }
 
-/// Per-session mesh registration (mu-6s7s): a session is a first-class mesh
-/// participant with its own `$SRV` presence and its own DM inbox, so peers
-/// address the session that is actually conversing rather than its daemon.
-///
-/// The daemon keeps its own `agent_<daemon_id>` registration alongside these —
-/// that is its service/cluster identity, and it is what an older peer, or one
-/// addressing "whoever is supervising", still talks to.
+/// Per-session mesh registration (mu-6s7s): each session gets its own `$SRV`
+/// presence and DM inbox, so peers address the session that is conversing. The
+/// daemon keeps `agent_<daemon_id>` as its service/cluster identity, which is
+/// what older peers and daemon-level addressing still use.
 #[derive(Clone)]
 pub(crate) struct MeshSessions {
     inner: Arc<MeshSessionsInner>,
@@ -411,14 +405,10 @@ struct MeshSessionsInner {
     joined: std::sync::Mutex<std::collections::HashMap<String, JoinedSession>>,
 }
 
-/// One session's mesh footprint. Dropping it aborts the inbound task (ending
-/// the subscription) and drops the Micro `Service` (deregistering presence).
-///
-/// Today that only happens at daemon exit: mu has no session teardown —
-/// `Sessions::remove` is test-only and there is no `session.close` handler, so
-/// a session lives as long as its daemon and so does its mesh registration.
-/// When a teardown path lands, removing the entry from `joined` is the whole
-/// of what it needs to do.
+/// One session's mesh footprint. Dropping it ends the subscription and
+/// deregisters presence — today only at daemon exit, since mu has no session
+/// teardown (`Sessions::remove` is test-only, no `session.close` handler). A
+/// future teardown path need only drop the entry from `joined`. See mu-6s7s.
 struct JoinedSession {
     task: tokio::task::JoinHandle<()>,
     _presence: async_nats::service::Service,
@@ -508,12 +498,9 @@ impl MeshSessions {
 /// Drain a DM subscription: verify each envelope, deliver accepted ones to a
 /// session's durable mailbox. Unauthorized or malformed messages are dropped.
 ///
-/// `fixed_target` is what makes a per-session inbox work (mu-6s7s). On the
-/// DAEMON's queue it is None, so the target comes from the envelope's `session`
-/// field and defaults to `supervisor`. On a SESSION's own queue it is that
-/// session — the daemon knows who a message is for from the queue it arrived
-/// on, which is why sessions having their own inboxes makes the field
-/// redundant rather than merely convenient.
+/// `fixed_target` is the session owning this queue (mu-6s7s), so the queue
+/// itself is the addressing. None on the daemon's own queue, where the target
+/// comes from the envelope's `session` field and defaults to `supervisor`.
 fn spawn_inbound(
     mut sub: async_nats::Subscriber,
     issuer: PublicKey,

@@ -66,24 +66,10 @@ mod presence;
 const SERVER_NAME: &str = "mu-dialogue";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_POLL_TIMEOUT_MS: u64 = 30_000;
-/// Peer registrations whose `last_seen` is older than this are stale and get
-/// pruned (startup + a periodic sweep), and it is also how recently a peer must
-/// have been heard from to count as present. Override with `--peer-ttl-ms` /
-/// `MU_DIALOGUE_PEER_TTL_MS`.
-///
-/// This was 24h, justified in a comment as a stopgap "until the lease-backed
-/// etcd registry lands". It landed: `[dialogue.presence]` is live, and `$SRV`
-/// discovery joined it (at-uws). With two real liveness signals in place, a
-/// day-long activity memory is no longer a fallback but noise — the peers are
-/// overwhelmingly short-lived spawns whose ids are never reused. Measured on
-/// the live server: 102 peers, of which 74 of the 83 activity-derived rows were
-/// already stale by an hour, while the 19 lease-backed entries were the ones
-/// actually tracking liveness.
-///
-/// An hour is generous for the thing it now answers — is this peer here NOW.
-/// A live cc session's Stop-hook long-poll touches far more often than hourly,
-/// and pruning is not authoritative anyway: a pruned-but-alive peer
-/// re-registers on its next say or poll (`touch_peer`).
+/// How recently a peer must have said or polled to count as present; older
+/// registrations are pruned. Keeps transient sessions from reporting as active.
+/// Override with `--peer-ttl-ms` / `MU_DIALOGUE_PEER_TTL_MS`. Rationale for the
+/// 24h -> 1h change: at-uws.
 const DEFAULT_PEER_TTL_MS: i64 = 60 * 60 * 1000;
 /// How often the background sweep prunes stale peers.
 const PRUNE_INTERVAL_SECS: u64 = 3600;
@@ -546,17 +532,13 @@ impl Store {
         Ok(rows)
     }
 
-    /// Remove peer registrations not seen since `cutoff_ms`. Returns the number
-    /// removed. Pruning is cosmetic, not authoritative: a pruned-but-alive peer
-    /// re-registers on its next say/poll (touch_peer).
+    /// Remove peer registrations not seen since `cutoff_ms`. Cosmetic, not
+    /// authoritative: a pruned-but-alive peer re-registers on its next
+    /// say/poll.
     ///
-    /// Team memberships are deliberately NOT removed with the peer. Joining a
-    /// team is an explicit act and leaving it is `dialogue_team_leave`; going
-    /// quiet is neither. That coupling was harmless while the TTL was a day,
-    /// but presence is now an hour (see [`DEFAULT_PEER_TTL_MS`]) and it would
-    /// have silently unsubscribed every team member hourly. Delivery stays sane
-    /// because `dialogue_multicast` addresses the members who are actually
-    /// present rather than every id that ever joined.
+    /// Team memberships deliberately survive — joining is explicit and leaving
+    /// is `dialogue_team_leave`, so silence must not unsubscribe. Multicast
+    /// filters recipients by presence instead. Background: at-uws.
     async fn prune_peers(&self, cutoff_ms: i64) -> Result<usize> {
         let conn = self.db.lock().await;
         let peers = conn.execute("DELETE FROM peers WHERE last_seen < ?1", params![cutoff_ms])?;
@@ -724,11 +706,9 @@ struct PruneArgs {
 }
 
 async fn handle_say(store: &Store, args: SayArgs) -> Result<Value> {
-    // ONE path delivers, never both: if the target is on the mesh right now,
-    // the mesh carries it and the row is marked so `dialogue_poll` will not
-    // hand the same message over a second time. A peer not on the mesh is
-    // served from the store exactly as before. Decided BEFORE the insert so
-    // the row is never briefly pollable and then retracted.
+    // One path delivers, never both: a target on the mesh gets it over the
+    // mesh and the row is marked so `dialogue_poll` skips it. Decided before
+    // the insert, so the row is never briefly pollable and then retracted.
     let route = match &store.mesh {
         Some(gw) => gw.address(&args.to).await.map(|target| (gw, target)),
         None => None,

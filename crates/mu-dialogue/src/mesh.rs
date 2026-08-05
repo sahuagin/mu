@@ -1,52 +1,21 @@
-//! Mesh gateway (at-uws): mu-dialogue speaks the NATS agent mesh **on behalf
-//! of** the MCP peers connected to it.
+//! Mesh gateway (at-uws): mu-dialogue speaks the NATS agent mesh on behalf of
+//! the MCP peers connected to it, so cc and `agent dialogue` stay unchanged.
 //!
-//! ```text
-//! cc -> agent dialogue (CLI, unchanged) -> mu-dialogue :7740 -> NATS mesh
-//! ```
+//! The gateway holds its subscriptions continuously — core NATS has no replay,
+//! and a CLI that subscribes only for the length of one `poll` would drop
+//! anything sent between polls. Verified inbound DMs become ordinary `dialogue`
+//! rows, so the long-poll, the rowid cursor and `role:identity` peer ids are
+//! untouched. The store is the buffer; there is no second one.
 //!
-//! The point of putting the mesh client HERE rather than in the CLI: core NATS
-//! is fire-and-forget with no replay, and a CLI subscribes only for the
-//! duration of one `poll`. Anything published between polls would be dropped.
-//! The gateway holds its subscriptions continuously, and every verified
-//! inbound DM is written into the existing `dialogue` table as an ORDINARY
-//! row — so the long-poll, the rowid keyset cursor and the `role:identity`
-//! peer ids all keep working untouched. The store is the buffer; there is no
-//! second one.
+//! Routing: one path delivers, never both. If `$SRV` says the target is on the
+//! mesh, the DM goes over the mesh and the row is marked `route = 'mesh'` so
+//! `dialogue_poll` will not serve it again. The check fails CLOSED and a failed
+//! publish clears the mark, so the failure mode is a duplicate, not a loss.
 //!
-//! **Strictly opt-in.** The gateway is enabled only by
-//!
-//! ```toml
-//! # ~/.config/mu/config.toml
-//! [dialogue.mesh]
-//! enabled = true
-//! # nats_url / issuer_key default to the fleet-wide [mesh] section
-//! ```
-//!
-//! With the section absent or `enabled = false`, mu-dialogue behaves exactly
-//! as before and never opens a NATS connection — same convention as
-//! [`crate::presence`].
-//!
-//! **One path delivers, never both.** The mesh takes priority over MCP
-//! whenever both are available: `dialogue_say` asks `$SRV` whether the target
-//! is on the mesh right now, and if it is, the DM goes over the mesh and the
-//! stored row is marked `route = 'mesh'` so `dialogue_poll` will not serve the
-//! same message a second time. A daemon running both transports therefore
-//! reads each message once, not twice. A target that is NOT on the mesh is
-//! served from the store exactly as before.
-//!
-//! The row is written either way, because `dialogue_history`, threading and
-//! audit all read that table — what changes is only whether a poller may take
-//! it. The liveness check fails CLOSED: if `$SRV` cannot be reached the message
-//! stays pollable rather than being committed to a path we could not verify,
-//! and a publish that fails after the mark clears it again. The failure mode
-//! is a duplicate, never a lost message.
-//!
-//! Wire shape is fixed by the mesh contract (`mesh-slice/src/agent.rs`) and
-//! mirrors mu's richer version in `crates/mu-coding/src/serve/mesh_dialogue.rs`
-//! (which adds the additive optional `session` and `subject` fields). Inbound
-//! DMs are per-message capability-verified; an unauthorized envelope is
-//! dropped, never delivered (the contract's no-fail-open rule).
+//! Opt-in via `[dialogue.mesh] enabled = true`; with it absent no NATS
+//! connection is opened. Wire shape mirrors `mesh-slice/src/agent.rs` and
+//! `mu-coding/src/serve/mesh_dialogue.rs`. Inbound DMs are capability-verified
+//! per message; unauthorized envelopes are dropped, never delivered.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -231,22 +200,14 @@ pub fn inbound_peer_id_with_session(from: &str, from_session: Option<&str>) -> S
 
 /// A dialogue peer id as a mesh agent id.
 ///
-/// Separator standing in for the `:` of a dialogue peer id on the wire. NATS
-/// Micro validates service names against `[A-Za-z0-9_-]` and REJECTS a colon
-/// (verified against a live server, not assumed).
-///
-/// DOUBLED, because single underscores occur inside real identities —
-/// `warden:sub_agent_3` — and a single-underscore separator could not tell
-/// those apart from a session-level id once mu sessions took mesh names of
-/// their own (mu-6s7s). Must match `mu-coding`'s `MESH_ID_SEP`.
+/// Stands in for the `:` of a dialogue peer id: NATS Micro service names allow
+/// only `[A-Za-z0-9_-]`. Doubled so it cannot be confused with the single
+/// underscores that occur inside identities (`warden:sub_agent_3`). Must match
+/// `mu-coding`'s `MESH_ID_SEP`. Background: at-uws, mu-6s7s.
 pub const MESH_ID_SEP: &str = "__";
 
-/// A dialogue peer id as a mesh agent id: one rule for every participant, a
-/// mesh agent name is just a peer id that can survive Micro's charset.
-///
-/// The same encoding names the DM subject, which is what keeps peers in sync:
-/// a daemon reads an id from `who` and publishes to `mu.agent.<that>.dm`, so
-/// the gateway must listen on precisely the name it advertised.
+/// A dialogue peer id as a mesh agent id. The same encoding names the DM
+/// subject, so a peer can derive the subject from what `who` returned.
 pub fn mesh_name(peer_id: &str) -> String {
     peer_id.replace(':', MESH_ID_SEP)
 }
@@ -458,15 +419,10 @@ impl Gateway {
         live
     }
 
-    /// Where to actually send a DM for `peer_id`, or None if it is not
-    /// reachable on the mesh at all.
-    ///
-    /// Prefers the SESSION's own inbox (mu-6s7s): a session that is a mesh
-    /// participant in its own right is addressed directly, and the envelope
-    /// needs no `session` field because the queue is the addressing. A daemon
-    /// that has not adopted per-session inboxes still answers on its own
-    /// subject, so the fall-back keeps naming the session in the envelope and
-    /// nothing breaks mid-migration.
+    /// Where to send a DM for `peer_id`, or None if it is not on the mesh.
+    /// Prefers the session's own inbox (mu-6s7s), where the subject is the
+    /// address and no `session` field is needed; falls back to the daemon
+    /// subject plus that field for daemons without per-session inboxes.
     pub async fn address(&self, peer_id: &str) -> Option<MeshTarget> {
         let target = resolve_target(peer_id)?;
         if target.session.is_some() {
@@ -859,16 +815,12 @@ mod tests {
     }
 }
 
-/// End-to-end tests against a REAL NATS server. `#[ignore]`d, so `cargo test`
-/// stays hermetic; run them where NATS is reachable with
+/// End-to-end tests against a REAL NATS server, `#[ignore]`d so `cargo test`
+/// stays hermetic:
+/// `MU_DIALOGUE_TEST_NATS=127.0.0.1:4222 cargo test -p mu-dialogue -- --ignored`
 ///
-/// ```sh
-/// MU_DIALOGUE_TEST_NATS=127.0.0.1:4222 cargo test -p mu-dialogue -- --ignored
-/// ```
-///
-/// Each test mints its OWN issuer keypair and addresses only subjects unique
-/// to the test process, so nothing here can reach a live daemon's mailbox or
-/// depend on the fleet issuer key.
+/// Each mints its own issuer keypair and uses process-unique subjects, so none
+/// can reach a live daemon's mailbox or depend on the fleet issuer key.
 #[cfg(test)]
 mod live_tests {
     use super::*;

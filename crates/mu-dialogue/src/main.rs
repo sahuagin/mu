@@ -729,9 +729,9 @@ async fn handle_say(store: &Store, args: SayArgs) -> Result<Value> {
     // hand the same message over a second time. A peer not on the mesh is
     // served from the store exactly as before. Decided BEFORE the insert so
     // the row is never briefly pollable and then retracted.
-    let route = match (&store.mesh, mesh::resolve_target(&args.to)) {
-        (Some(gw), Some(target)) if gw.is_agent_live(&target.agent).await => Some((gw, target)),
-        _ => None,
+    let route = match &store.mesh {
+        Some(gw) => gw.address(&args.to).await.map(|target| (gw, target)),
+        None => None,
     };
     let (id, ts) = store
         .say(

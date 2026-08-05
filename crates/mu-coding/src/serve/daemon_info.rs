@@ -60,6 +60,11 @@ struct DaemonInfoInner {
     /// couldn't. Default = strict, no extras (the safe floor) for tests
     /// and a bare `new`.
     bash_settings: BashSettings,
+    /// mu-6s7s: per-session mesh registration, populated once after
+    /// `spawn_mesh_dialogue` succeeds at startup (same "filled in after boot"
+    /// shape as `mcp_status`). `None` when mesh dialogue is off or failed to
+    /// start, in which case sessions simply never join the mesh.
+    mesh_sessions: Arc<Mutex<Option<crate::serve::mesh_dialogue::MeshSessions>>>,
 }
 
 impl DaemonInfo {
@@ -80,6 +85,7 @@ impl DaemonInfo {
                 events_dir: None,
                 config: Arc::new(Config::default()),
                 mcp_status: Arc::new(Mutex::new(Vec::new())),
+                mesh_sessions: Arc::new(Mutex::new(None)),
                 recall_providers: Arc::new(Vec::new()),
                 route_catalog: Arc::new(RouteCatalog::from_env()),
                 bash_settings: BashSettings::default(),
@@ -185,6 +191,24 @@ impl DaemonInfo {
         }
     }
 
+    /// mu-6s7s: hand the daemon its per-session mesh registry once mesh
+    /// dialogue is up. Called once from `serve::run`.
+    pub(crate) fn set_mesh_sessions(&self, mesh: crate::serve::mesh_dialogue::MeshSessions) {
+        match self.inner.mesh_sessions.lock() {
+            Ok(mut guard) => *guard = Some(mesh),
+            Err(poisoned) => *poisoned.into_inner() = Some(mesh),
+        }
+    }
+
+    /// The per-session mesh registry, or None when mesh dialogue is off.
+    pub(crate) fn mesh_sessions(&self) -> Option<crate::serve::mesh_dialogue::MeshSessions> {
+        self.inner
+            .mesh_sessions
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
     pub fn mcp_status_snapshot(&self) -> Vec<McpServerStatus> {
         self.inner
             .mcp_status
@@ -217,6 +241,7 @@ impl DaemonInfo {
                 events_dir: None,
                 config: Arc::new(Config::default()),
                 mcp_status: Arc::new(Mutex::new(Vec::new())),
+                mesh_sessions: Arc::new(Mutex::new(None)),
                 recall_providers: Arc::new(Vec::new()),
                 route_catalog: Arc::new(RouteCatalog::from_env()),
                 bash_settings: BashSettings::default(),

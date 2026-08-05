@@ -335,7 +335,13 @@ async fn send_dm(
         id: ulid::Ulid::generate().to_string(),
         capability: base64::engine::general_purpose::STANDARD.encode(token),
         command: AgentCommand::Dm {
-            from: shared.agent_id.clone(),
+            // mu-6s7s: a session sends under its OWN mesh id, so `from` is an
+            // address the receiver can reply to directly. Only a send with no
+            // session behind it (the daemon itself) falls back to the daemon id.
+            from: match from_session.as_deref() {
+                Some(s) if !s.is_empty() => session_agent_id(&shared.agent_id, s),
+                _ => shared.agent_id.clone(),
+            },
             body: body.to_string(),
             session,
             subject,
@@ -357,6 +363,204 @@ async fn send_dm(
 }
 
 // ── startup ───────────────────────────────────────────────────────────────
+
+/// Separator standing in for the `:` of a dialogue peer id on the wire. NATS
+/// Micro validates service names against `[A-Za-z0-9_-]` and rejects a colon
+/// (verified against a live server, at-uws). A DOUBLED underscore, because
+/// single ones occur inside real identities — `warden:sub_agent_3` — and
+/// splitting on those would corrupt them.
+pub(crate) const MESH_ID_SEP: &str = "__";
+
+/// A session's mesh agent id: its dialogue peer id `mu:<daemon>:<session>`
+/// with the colons encoded. One rule for every participant — a mesh agent name
+/// is just a dialogue peer id that can survive NATS Micro's charset.
+pub(crate) fn session_agent_id(daemon_id: &str, session_id: &str) -> String {
+    format!("mu{MESH_ID_SEP}{daemon_id}{MESH_ID_SEP}{session_id}")
+}
+
+/// Per-session mesh registration (mu-6s7s): a session is a first-class mesh
+/// participant with its own `$SRV` presence and its own DM inbox, so peers
+/// address the session that is actually conversing rather than its daemon.
+///
+/// The daemon keeps its own `agent_<daemon_id>` registration alongside these —
+/// that is its service/cluster identity, and it is what an older peer, or one
+/// addressing "whoever is supervising", still talks to.
+#[derive(Clone)]
+pub(crate) struct MeshSessions {
+    inner: Arc<MeshSessionsInner>,
+}
+
+impl std::fmt::Debug for MeshSessions {
+    /// `DaemonInfo` derives Debug; the NATS client and live registrations
+    /// have none, so report the shape rather than the contents.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let joined = self.inner.joined.lock().map(|j| j.len()).unwrap_or(0);
+        f.debug_struct("MeshSessions")
+            .field("daemon_id", &self.inner.daemon_id)
+            .field("joined", &joined)
+            .finish_non_exhaustive()
+    }
+}
+
+struct MeshSessionsInner {
+    client: async_nats::Client,
+    issuer: PublicKey,
+    daemon_id: String,
+    sessions: Sessions,
+    router: Router,
+    joined: std::sync::Mutex<std::collections::HashMap<String, JoinedSession>>,
+}
+
+/// One session's mesh footprint. Dropping it aborts the inbound task (ending
+/// the subscription) and drops the Micro `Service` (deregistering presence).
+///
+/// Today that only happens at daemon exit: mu has no session teardown —
+/// `Sessions::remove` is test-only and there is no `session.close` handler, so
+/// a session lives as long as its daemon and so does its mesh registration.
+/// When a teardown path lands, removing the entry from `joined` is the whole
+/// of what it needs to do.
+struct JoinedSession {
+    task: tokio::task::JoinHandle<()>,
+    _presence: async_nats::service::Service,
+}
+
+impl Drop for JoinedSession {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl MeshSessions {
+    /// Put `session_id` on the mesh. Detached and best-effort: session creation
+    /// is a synchronous path and must not block on, or fail for, the mesh —
+    /// same posture as the rest of the mesh surface.
+    pub(crate) fn join_detached(&self, session_id: &str) {
+        let this = self.clone();
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = this.join(&session_id).await {
+                tracing::warn!(session = %session_id, error = %e,
+                    "mesh dialogue: session could not join the mesh");
+            }
+        });
+    }
+
+    async fn join(&self, session_id: &str) -> Result<()> {
+        use async_nats::service::ServiceExt as _;
+        // Claim-check before the awaits; a second join must not double-subscribe
+        // (which would double every delivery).
+        if self
+            .inner
+            .joined
+            .lock()
+            .expect("mesh sessions")
+            .contains_key(session_id)
+        {
+            return Ok(());
+        }
+        let agent = session_agent_id(&self.inner.daemon_id, session_id);
+        let presence = self
+            .inner
+            .client
+            .service_builder()
+            .description("mu session (mesh dialogue presence)")
+            .start(agent.clone(), "0.1.0")
+            .await
+            .map_err(|e| anyhow!("session presence register {agent}: {e}"))?;
+        let sub = self
+            .inner
+            .client
+            .subscribe(dm_subject(&agent))
+            .await
+            .map_err(|e| anyhow!("session dm subscribe {agent}: {e}"))?;
+        self.inner
+            .client
+            .flush()
+            .await
+            .map_err(|e| anyhow!("flush after session join: {e}"))?;
+
+        // The queue IS the addressing: everything arriving here is for this
+        // session, so no envelope field decides the target.
+        let task = spawn_inbound(
+            sub,
+            self.inner.issuer,
+            self.inner.sessions.clone(),
+            self.inner.router.clone(),
+            Some(session_id.to_string()),
+        );
+        let mut joined = self.inner.joined.lock().expect("mesh sessions");
+        if joined.contains_key(session_id) {
+            task.abort(); // lost a race; ours drops, releasing both
+            return Ok(());
+        }
+        joined.insert(
+            session_id.to_string(),
+            JoinedSession {
+                task,
+                _presence: presence,
+            },
+        );
+        tracing::info!(session = %session_id, %agent, "mesh dialogue: session joined the mesh");
+        Ok(())
+    }
+}
+
+/// Drain a DM subscription: verify each envelope, deliver accepted ones to a
+/// session's durable mailbox. Unauthorized or malformed messages are dropped.
+///
+/// `fixed_target` is what makes a per-session inbox work (mu-6s7s). On the
+/// DAEMON's queue it is None, so the target comes from the envelope's `session`
+/// field and defaults to `supervisor`. On a SESSION's own queue it is that
+/// session — the daemon knows who a message is for from the queue it arrived
+/// on, which is why sessions having their own inboxes makes the field
+/// redundant rather than merely convenient.
+fn spawn_inbound(
+    mut sub: async_nats::Subscriber,
+    issuer: PublicKey,
+    sessions: Sessions,
+    router: Router,
+    fixed_target: Option<String>,
+) -> tokio::task::JoinHandle<()> {
+    use futures::StreamExt;
+    tokio::spawn(async move {
+        while let Some(msg) = sub.next().await {
+            let Ok(env) = serde_json::from_slice::<DmEnvelope>(&msg.payload) else {
+                tracing::debug!("mesh dialogue: dropping malformed dm envelope");
+                continue;
+            };
+            if !dm_authorized(&env.capability, issuer) {
+                tracing::warn!("mesh dialogue: dropping unauthorized dm");
+                continue;
+            }
+            let AgentCommand::Dm {
+                from,
+                body,
+                session,
+                subject,
+                from_session,
+            } = env.command;
+            let target = fixed_target
+                .as_deref()
+                .or(session.as_deref())
+                .unwrap_or("supervisor");
+            match deliver_dm(
+                &sessions,
+                &router,
+                target,
+                &from,
+                from_session.as_deref(),
+                subject.as_deref(),
+                &body,
+            )
+            .await
+            {
+                Ok(()) => tracing::info!(%from, %target, "mesh dialogue: dm delivered"),
+                Err(e) => tracing::warn!(%from, %target, error = %e,
+                    "mesh dialogue: dm delivery failed"),
+            }
+        }
+    })
+}
 
 /// Everything mesh-dialogue: aborting the tasks on drop releases the DM
 /// subscription and presence registration (dropping the Micro `Service`
@@ -383,9 +587,8 @@ pub(crate) async fn spawn_mesh_dialogue(
     daemon_id: &str,
     sessions: Sessions,
     router: Router,
-) -> Result<(MeshDialogueHandle, Vec<Arc<dyn Tool>>)> {
+) -> Result<(MeshDialogueHandle, Vec<Arc<dyn Tool>>, MeshSessions)> {
     use async_nats::service::ServiceExt as _;
-    use futures::StreamExt;
 
     if mesh.issuer_key.is_empty() {
         return Err(anyhow!(
@@ -428,48 +631,18 @@ pub(crate) async fn spawn_mesh_dialogue(
         )
     })??;
 
-    // Inbound DM loop: decode → verify capability → deliver to the mailbox.
-    // Unauthorized or malformed messages are dropped (logged, never
-    // delivered) — the mesh contract's no-fail-open rule.
-    let inbound_sessions = sessions;
-    let inbound_router = router;
-    let mut sub = sub;
-    let inbound_task = tokio::spawn(async move {
-        while let Some(msg) = sub.next().await {
-            let Ok(env) = serde_json::from_slice::<DmEnvelope>(&msg.payload) else {
-                tracing::debug!("mesh dialogue: dropping malformed dm envelope");
-                continue;
-            };
-            if !dm_authorized(&env.capability, issuer) {
-                tracing::warn!("mesh dialogue: dropping unauthorized dm");
-                continue;
-            }
-            let AgentCommand::Dm {
-                from,
-                body,
-                session,
-                subject,
-                from_session,
-            } = env.command;
-            let target = session.as_deref().unwrap_or("supervisor");
-            match deliver_dm(
-                &inbound_sessions,
-                &inbound_router,
-                target,
-                &from,
-                from_session.as_deref(),
-                subject.as_deref(),
-                &body,
-            )
-            .await
-            {
-                Ok(()) => tracing::info!(%from, %target, "mesh dialogue: dm delivered"),
-                Err(e) => tracing::warn!(%from, %target, error = %e,
-                    "mesh dialogue: dm delivery failed"),
-            }
-        }
-    });
+    let inbound_task = spawn_inbound(sub, issuer, sessions.clone(), router.clone(), None);
 
+    let mesh_sessions = MeshSessions {
+        inner: Arc::new(MeshSessionsInner {
+            client: client.clone(),
+            issuer,
+            daemon_id: daemon_id.to_string(),
+            sessions,
+            router,
+            joined: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }),
+    };
     let shared = Arc::new(MeshDialogueTools {
         client,
         root,
@@ -532,6 +705,7 @@ pub(crate) async fn spawn_mesh_dialogue(
             _presence: presence,
         },
         tools,
+        mesh_sessions,
     ))
 }
 

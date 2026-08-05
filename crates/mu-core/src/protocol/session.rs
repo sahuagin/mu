@@ -453,14 +453,21 @@ pub struct DelegateSessionResponse {
 
 // ── mu-mh4: session resume (fork-at-tail) ────────────────────────────
 
-/// A parsed reference to a session, addressing it by daemon + session.
+/// An OPERATOR-facing reference to a session, addressing it by daemon +
+/// session. This is what a person types at `session.resume`, which is why
+/// either part may be a PREFIX — resolution against the events directory
+/// disambiguates, and refuses ambiguity rather than guessing.
 ///
 /// Two textual forms are accepted (PR #206 contract):
-///   - `daemon:session`               — the operator-friendly short form
-///   - `mu:<daemon>/<session>`        — the canonical fleet-wide form
+///   - `daemon:session`               — the short form
+///   - `mu:<daemon>/<session>`        — the long form
 ///
-/// Either part MAY be a prefix; resolution against the events directory
-/// disambiguates (and refuses ambiguity rather than guessing).
+/// NOT the fleet-wide identity: that is [`mu_peer::PeerId`], spelled
+/// `mu:<daemon>:<session>`, and it is what the dialogue channel and the agent
+/// mesh address peers by. The two disagreed silently for a while (mu-uto4) —
+/// this type's long form uses a SLASH and would reject a `PeerId`. Convert
+/// rather than reparsing: `PeerId::from(&session_ref)` and
+/// `SessionRef::try_from(&peer_id)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRef {
     pub daemon: String,
@@ -506,7 +513,9 @@ impl SessionRef {
         })
     }
 
-    /// Render in canonical `mu:<daemon>/<session>` form.
+    /// Render in this type's long `mu:<daemon>/<session>` form. For the
+    /// fleet-wide identity of the same session, go through
+    /// [`mu_peer::PeerId`] instead.
     pub fn to_canonical(&self) -> String {
         format!("mu:{}/{}", self.daemon, self.session)
     }
@@ -515,6 +524,71 @@ impl SessionRef {
 impl std::fmt::Display for SessionRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.to_canonical())
+    }
+}
+
+impl From<&SessionRef> for mu_peer::PeerId {
+    /// An operator's reference as the fleet-wide identity. Lossless: both name
+    /// a daemon and a session.
+    fn from(r: &SessionRef) -> Self {
+        mu_peer::PeerId::mu_session(&r.daemon, &r.session)
+    }
+}
+
+impl TryFrom<&mu_peer::PeerId> for SessionRef {
+    type Error = String;
+
+    /// A fleet identity as an operator reference. Fails for anything that does
+    /// not name a session on a mu daemon — a `cc:` peer has no daemon, and
+    /// `mu:<daemon>` alone has no session, so neither is a `SessionRef`.
+    /// Before mu-uto4 the short-form parser accepted `cc:<uuid>` as
+    /// daemon=`cc`, which produced a confusing "session not found" much later.
+    fn try_from(p: &mu_peer::PeerId) -> Result<Self, Self::Error> {
+        let mu = p
+            .as_mu()
+            .ok_or_else(|| format!("`{p}` is not a mu peer, so it names no session"))?;
+        let session = mu
+            .session
+            .ok_or_else(|| format!("`{p}` names a daemon but no session on it"))?;
+        Ok(SessionRef {
+            daemon: mu.daemon.to_string(),
+            session: session.to_string(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod session_ref_peer_id_tests {
+    use super::*;
+    use mu_peer::PeerId;
+
+    /// The two spellings now interoperate by conversion instead of by hoping
+    /// a parser accepts the other's output (mu-uto4).
+    #[test]
+    fn session_refs_and_peer_ids_convert_both_ways() {
+        let r = SessionRef::parse("mu:100c058851c356a5/session-2").expect("parse");
+        let p = PeerId::from(&r);
+        assert_eq!(p.to_string(), "mu:100c058851c356a5:session-2");
+        assert_eq!(SessionRef::try_from(&p).unwrap(), r);
+    }
+
+    /// A peer id this type cannot represent is refused up front, rather than
+    /// parsing into nonsense that fails later at lookup.
+    #[test]
+    fn peer_ids_that_name_no_session_are_refused() {
+        for s in [
+            "cc:17302f24-836a-4f82-a988-cb711338e6e7",
+            "mu:100c058851c356a5",
+        ] {
+            assert!(SessionRef::try_from(&PeerId::parse(s)).is_err(), "{s}");
+        }
+    }
+
+    /// The long form still uses a slash, and a peer id is still not one — the
+    /// point is that conversion exists, not that the parsers merged.
+    #[test]
+    fn a_peer_id_is_still_not_parseable_as_a_session_ref_long_form() {
+        assert!(SessionRef::parse("mu:100c058851c356a5:session-2").is_err());
     }
 }
 

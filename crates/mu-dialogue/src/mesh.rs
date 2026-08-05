@@ -27,6 +27,7 @@ use biscuit_auth::macros::{authorizer, biscuit};
 use biscuit_auth::{Biscuit, KeyPair, PrivateKey, PublicKey};
 use bytes::Bytes;
 use futures::StreamExt;
+use mu_peer::{PeerId, META_DM_SUBJECT, META_PEER_ID};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
@@ -153,96 +154,24 @@ pub struct MeshTarget {
     pub session: Option<String>,
 }
 
-/// `mu:<daemon>` → that daemon's supervisor session;
-/// `mu:<daemon>:<session>` → that session.
+/// A mesh `from` as a dialogue peer id.
 ///
-/// Everything else — `cc:*` above all — is None: those peers are served by
-/// this gateway's own store, and publishing them to the mesh would round-trip
-/// straight back into it as a duplicate.
-pub fn resolve_target(peer_id: &str) -> Option<MuPeer> {
-    let rest = peer_id.strip_prefix("mu:")?;
-    match rest.split_once(':') {
-        Some((daemon, session)) if !daemon.is_empty() && !session.is_empty() => Some(MuPeer {
-            daemon: daemon.to_string(),
-            session: Some(session.to_string()),
-        }),
-        // `mu:` alone, `mu::x`, `mu:d:` — malformed, not addressable.
-        Some(_) => None,
-        None if !rest.is_empty() => Some(MuPeer {
-            daemon: rest.to_string(),
-            session: None,
-        }),
-        None => None,
+/// Three shapes arrive, because the mesh has been through two migrations:
+/// a full peer id (`mu:<daemon>:<session>`, what a current mu session sends),
+/// a bare daemon id (a peer predating mu-b1lq), and either of those alongside
+/// a separate `from_session` (at-uws, before sessions had their own ids).
+pub fn inbound_peer_id(from: &str, from_session: Option<&str>) -> PeerId {
+    // No separator means a bare daemon id; anything else already names itself.
+    let base = if from.contains(':') {
+        PeerId::parse(from)
+    } else {
+        PeerId::mu_daemon(from)
+    };
+    match from_session.filter(|s| !s.is_empty()) {
+        // Only fills a gap — a sender that named its own session wins.
+        Some(session) if base.sub().is_none() => PeerId::mu_session(base.id(), session),
+        _ => base,
     }
-}
-
-/// A `mu:` peer id parsed into the daemon that hosts it and, when present, the
-/// session on it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MuPeer {
-    pub daemon: String,
-    pub session: Option<String>,
-}
-
-/// A mesh `from` (a bare daemon id) as a dialogue peer id.
-///
-/// The mesh contract carries no SENDER session — `AgentCommand::Dm.session`
-/// names the target — so an inbound DM is attributed to the daemon. A reply
-/// therefore lands on that daemon's supervisor session rather than the session
-/// that wrote it. That is a gap in the contract, not in this translation.
-pub fn inbound_peer_id(from: &str) -> String {
-    format!("mu:{from}")
-}
-
-/// A mesh `from` plus the sender's session as a dialogue peer id.
-///
-/// With `from_session` the result is `mu:<daemon>:<session>`, which
-/// [`resolve_target`] turns straight back into a DM addressed at that same
-/// session — so a reply reaches whoever wrote. Without it the attribution
-/// falls back to the daemon, which is where peers predating the field land.
-pub fn inbound_peer_id_with_session(from: &str, from_session: Option<&str>) -> String {
-    match from_session {
-        Some(s) if !s.is_empty() => format!("mu:{from}:{s}"),
-        _ => inbound_peer_id(from),
-    }
-}
-
-/// A dialogue peer id as a mesh agent id.
-///
-/// Metadata key carrying a peer's identity, unmangled.
-const META_PEER_ID: &str = "peer_id";
-/// Metadata key carrying the exact subject to publish to.
-const META_DM_SUBJECT: &str = "dm_subject";
-
-/// A dialogue peer id as its DM subject: each `:` level becomes a NATS subject
-/// token, so routing is the transport's own hierarchy (mu-b1lq). Must match
-/// `mu-coding`'s `peer_dm_subject`.
-pub fn peer_dm_subject(peer_id: &str) -> String {
-    format!("mu.agent.{}.dm", peer_id.replace(':', "."))
-}
-
-/// A Micro service name for a peer. Micro allows only `[A-Za-z0-9_-]`, but this
-/// is a registration KEY, not an identity — that travels in metadata — so it
-/// only has to be legal and unique. Nothing parses it.
-pub fn micro_name(peer_id: &str) -> String {
-    peer_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// A `$SRV` agent id as a dialogue peer id — the inverse of [`mesh_name`].
-///
-/// A `$SRV` responder's name as a dialogue peer id, for peers that advertise no
-/// metadata. Those are daemons registering their bare id, so the role is `mu`.
-pub fn srv_agent_to_peer_id(agent: &str) -> String {
-    inbound_peer_id(agent)
 }
 
 /// One verified inbound DM, handed to the store writer.
@@ -410,8 +339,8 @@ impl Gateway {
             };
             match meta(META_PEER_ID) {
                 Some(peer_id) => {
-                    let subject =
-                        meta(META_DM_SUBJECT).unwrap_or_else(|| peer_dm_subject(&peer_id));
+                    let subject = meta(META_DM_SUBJECT)
+                        .unwrap_or_else(|| PeerId::parse(&peer_id).dm_subject());
                     agents.insert(peer_id, subject);
                 }
                 // No metadata: a daemon predating mu-b1lq, reachable only on
@@ -423,7 +352,7 @@ impl Gateway {
                         .and_then(Value::as_str)
                         .and_then(|n| n.strip_prefix(PRESENCE_PREFIX))
                     {
-                        agents.insert(srv_agent_to_peer_id(agent), dm_subject(agent));
+                        agents.insert(PeerId::mu_daemon(agent).to_string(), dm_subject(agent));
                     }
                 }
             }
@@ -465,7 +394,8 @@ impl Gateway {
     /// address and no `session` field is needed; falls back to the daemon
     /// subject plus that field for daemons without per-session inboxes.
     pub async fn address(&self, peer_id: &str) -> Option<MeshTarget> {
-        let target = resolve_target(peer_id)?;
+        let peer = PeerId::parse(peer_id);
+        let target = peer.as_mu()?;
         // The session itself on the mesh → its own subject identifies it, so
         // the envelope needs no `session` field.
         if target.session.is_some() {
@@ -479,11 +409,11 @@ impl Gateway {
         // Otherwise its daemon, which still needs the session named. Use the
         // subject the daemon advertises, so one predating mu-b1lq is reached
         // on the flat subject it actually listens to.
-        self.live_subject(&inbound_peer_id(&target.daemon))
+        self.live_subject(&PeerId::mu_daemon(target.daemon).to_string())
             .await
             .map(|subject| MeshTarget {
                 subject,
-                session: target.session.clone(),
+                session: target.session.map(str::to_string),
             })
     }
 
@@ -508,16 +438,16 @@ impl Gateway {
         }
         // One encoded name for both the presence registration and the inbox,
         // so the subject a daemon derives from `who` is the one we listen on.
-        let subject = peer_dm_subject(peer_id);
+        let subject = PeerId::parse(peer_id).dm_subject();
         let presence = self
             .client
             .service_builder()
             .description("mu-dialogue gateway (fronting an MCP peer)")
-            .metadata(std::collections::HashMap::from([
-                (META_PEER_ID.to_string(), peer_id.to_string()),
-                (META_DM_SUBJECT.to_string(), subject.clone()),
-            ]))
-            .start(format!("{PRESENCE_PREFIX}{}", micro_name(peer_id)), "0.1.0")
+            .metadata(PeerId::parse(peer_id).mesh_metadata())
+            .start(
+                format!("{PRESENCE_PREFIX}{}", PeerId::parse(peer_id).micro_name()),
+                "0.1.0",
+            )
             .await
             .map_err(|e| anyhow!("gateway: presence register {peer_id}: {e}"))?;
         let mut sub = self
@@ -553,7 +483,7 @@ impl Gateway {
                 if tx
                     .send(InboundDm {
                         to_peer: to_peer.clone(),
-                        from_peer: inbound_peer_id_with_session(&from, from_session.as_deref()),
+                        from_peer: inbound_peer_id(&from, from_session.as_deref()).to_string(),
                         body,
                         subject,
                     })
@@ -700,119 +630,26 @@ mod tests {
         assert!(!dm_authorized("", root.public()));
     }
 
-    /// The translation the bead names: dialogue's `role:identity` ids onto the
-    /// mesh's subject + optional session field.
+    /// A mesh `from` becomes a peer id a reply can be addressed to — the
+    /// sending session when the envelope names one, its daemon otherwise.
     #[test]
-    fn peer_ids_translate_to_mesh_targets() {
-        // Daemon-level id → supervisor session (no `session` field).
+    fn inbound_from_is_attributed_so_a_reply_can_reach_it() {
+        // Bare daemon id (a peer predating mu-b1lq).
+        let p = inbound_peer_id("bb073ae9893a123a", None);
+        assert_eq!(p.to_string(), "mu:bb073ae9893a123a");
+        assert!(p.as_mu().is_some(), "a reply must be addressable");
+        // Separate from_session (at-uws era).
+        let p = inbound_peer_id("bb073ae9893a123a", Some("session-3"));
+        assert_eq!(p.to_string(), "mu:bb073ae9893a123a:session-3");
+        assert_eq!(p.as_mu().unwrap().session, Some("session-3"));
+        // A sender that names itself fully wins over from_session.
+        let p = inbound_peer_id("mu:bb073ae9893a123a:session-9", Some("session-3"));
+        assert_eq!(p.to_string(), "mu:bb073ae9893a123a:session-9");
+        // Empty from_session is no session at all.
         assert_eq!(
-            resolve_target("mu:100c058851c356a5"),
-            Some(MuPeer {
-                daemon: "100c058851c356a5".to_string(),
-                session: None
-            })
+            inbound_peer_id("bb073ae9893a123a", Some("")).to_string(),
+            "mu:bb073ae9893a123a"
         );
-        // Session-level id → subject is the DAEMON, session rides the envelope.
-        assert_eq!(
-            resolve_target("mu:100c058851c356a5:session-2"),
-            Some(MuPeer {
-                daemon: "100c058851c356a5".to_string(),
-                session: Some("session-2".to_string())
-            })
-        );
-        // cc peers are served by this gateway's own store. Publishing one to
-        // the mesh would round-trip back into that store as a duplicate.
-        assert_eq!(
-            resolve_target("cc:17302f24-836a-4f82-a988-cb711338e6e7"),
-            None
-        );
-        // Malformed / non-mesh ids address nothing.
-        assert_eq!(resolve_target("mu:"), None);
-        assert_eq!(resolve_target("mu::session-1"), None);
-        assert_eq!(resolve_target("mu:daemon:"), None);
-        assert_eq!(resolve_target("warden:x"), None);
-        assert_eq!(resolve_target(""), None);
-    }
-
-    #[test]
-    fn inbound_from_is_attributed_to_the_sending_daemon() {
-        assert_eq!(inbound_peer_id("bb073ae9893a123a"), "mu:bb073ae9893a123a");
-        // Round-trips: the id an inbound DM is attributed to is one a reply
-        // can be addressed to.
-        assert!(resolve_target(&inbound_peer_id("bb073ae9893a123a")).is_some());
-    }
-
-    /// The reply path. A DM carrying the sender's session must be attributed
-    /// to THAT session, and addressing the attribution back must resolve to
-    /// the same daemon and session — otherwise a reply reaches the daemon's
-    /// supervisor and the session that wrote never hears back.
-    #[test]
-    fn a_reply_addresses_the_session_that_wrote_not_the_supervisor() {
-        let peer = inbound_peer_id_with_session("bb073ae9893a123a", Some("session-3"));
-        assert_eq!(peer, "mu:bb073ae9893a123a:session-3");
-        assert_eq!(
-            resolve_target(&peer),
-            Some(MuPeer {
-                daemon: "bb073ae9893a123a".to_string(),
-                session: Some("session-3".to_string()),
-            }),
-            "a reply must come back to the sending session"
-        );
-        // A peer predating the field still resolves — to the daemon, which is
-        // the old behaviour rather than a broken id.
-        for absent in [None, Some("")] {
-            let peer = inbound_peer_id_with_session("bb073ae9893a123a", absent);
-            assert_eq!(peer, "mu:bb073ae9893a123a");
-            assert_eq!(
-                resolve_target(&peer).unwrap().session,
-                None,
-                "without from_session a reply falls back to the supervisor"
-            );
-        }
-    }
-
-    #[test]
-    fn dm_subject_matches_the_contract() {
-        assert_eq!(dm_subject("abc"), "mu.agent.abc.dm");
-        assert_eq!(peer_dm_subject("cc:uuid"), "mu.agent.cc.uuid.dm");
-    }
-
-    /// A peer id's levels become subject tokens, so NATS itself routes:
-    /// dispatch on the daemon token, then the session token (mu-b1lq).
-    #[test]
-    fn peer_ids_become_hierarchical_subjects() {
-        assert_eq!(
-            peer_dm_subject("mu:100c058851c356a5:session-2"),
-            "mu.agent.mu.100c058851c356a5.session-2.dm"
-        );
-        assert_eq!(
-            peer_dm_subject("mu:100c058851c356a5"),
-            "mu.agent.mu.100c058851c356a5.dm"
-        );
-        assert_eq!(
-            peer_dm_subject("cc:deploy-test"),
-            "mu.agent.cc.deploy-test.dm"
-        );
-        // A daemon's wildcard for all of its sessions is a prefix of these.
-        assert!(peer_dm_subject("mu:d:s1").starts_with("mu.agent.mu.d."));
-    }
-
-    /// The Micro service name is a registration KEY, not an identity — Micro
-    /// allows only [A-Za-z0-9_-], and identity travels in metadata instead.
-    #[test]
-    fn micro_names_are_legal_for_every_peer_id() {
-        for peer in [
-            "cc:17302f24-836a-4f82-a988-cb711338e6e7",
-            "warden:sub_agent_3",
-            "mu:100c058851c356a5:session-2",
-        ] {
-            let n = micro_name(peer);
-            assert!(
-                n.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
-                "{n} is not a legal Micro service name"
-            );
-        }
     }
 
     fn write_cfg(name: &str, body: &str) -> std::path::PathBuf {
@@ -973,7 +810,7 @@ mod live_tests {
         };
         client
             .publish(
-                peer_dm_subject(&peer),
+                PeerId::parse(&peer).dm_subject(),
                 serde_json::to_vec(&env).unwrap().into(),
             )
             .await
@@ -989,9 +826,7 @@ mod live_tests {
         // reaches the session that wrote rather than the daemon's supervisor.
         assert_eq!(dm.from_peer, "mu:bb073ae9893a123a:session-7");
         assert_eq!(
-            resolve_target(&dm.from_peer)
-                .and_then(|t| t.session)
-                .as_deref(),
+            PeerId::parse(&dm.from_peer).as_mu().and_then(|t| t.session),
             Some("session-7"),
         );
         assert_eq!(dm.body, "the gateway works");
@@ -1027,7 +862,7 @@ mod live_tests {
         let rogue = KeyPair::new();
         client
             .publish(
-                peer_dm_subject(&peer),
+                PeerId::parse(&peer).dm_subject(),
                 send(mint(&rogue, DM_RIGHT), "rogue").into(),
             )
             .await
@@ -1035,14 +870,17 @@ mod live_tests {
         // Correct issuer, wrong right.
         client
             .publish(
-                peer_dm_subject(&peer),
+                PeerId::parse(&peer).dm_subject(),
                 send(mint(&root, "code_recall"), "wrong right").into(),
             )
             .await
             .unwrap();
         // Not even an envelope.
         client
-            .publish(peer_dm_subject(&peer), Bytes::from_static(b"{garbage"))
+            .publish(
+                PeerId::parse(&peer).dm_subject(),
+                Bytes::from_static(b"{garbage"),
+            )
             .await
             .unwrap();
         client.flush().await.unwrap();
@@ -1050,7 +888,7 @@ mod live_tests {
         // Then a good one: if it arrives first, the three above were dropped.
         client
             .publish(
-                peer_dm_subject(&peer),
+                PeerId::parse(&peer).dm_subject(),
                 send(mint(&root, DM_RIGHT), "legitimate").into(),
             )
             .await
@@ -1086,24 +924,21 @@ mod live_tests {
         let sess_peer = format!("mu:{modern}:session-4");
 
         let client = async_nats::connect(&nats_url()).await.expect("raw client");
-        let meta = |peer: &str| {
-            std::collections::HashMap::from([
-                (META_PEER_ID.to_string(), peer.to_string()),
-                (META_DM_SUBJECT.to_string(), peer_dm_subject(peer)),
-            ])
-        };
         // A daemon that advertises itself, plus one of its sessions.
         let _d1 = client
             .service_builder()
-            .metadata(meta(&format!("mu:{modern}")))
+            .metadata(PeerId::parse(&format!("mu:{modern}")).mesh_metadata())
             .start(format!("{PRESENCE_PREFIX}{modern}"), "0.1.0")
             .await
             .expect("modern daemon presence");
         let _s1 = client
             .service_builder()
-            .metadata(meta(&sess_peer))
+            .metadata(PeerId::parse(&sess_peer).mesh_metadata())
             .start(
-                format!("{PRESENCE_PREFIX}{}", micro_name(&sess_peer)),
+                format!(
+                    "{PRESENCE_PREFIX}{}",
+                    PeerId::parse(&sess_peer).micro_name()
+                ),
                 "0.1.0",
             )
             .await
@@ -1160,11 +995,12 @@ mod live_tests {
         let mut sub = client.subscribe(dm_subject(&daemon)).await.expect("sub");
         client.flush().await.unwrap();
 
-        let parsed = resolve_target(&format!("mu:{daemon}:session-2")).expect("resolves");
+        let parsed_owner = PeerId::parse(&format!("mu:{daemon}:session-2"));
+        let parsed = parsed_owner.as_mu().expect("resolves");
         assert_eq!(parsed.daemon, daemon);
         let target = MeshTarget {
             subject: dm_subject(&daemon),
-            session: parsed.session.clone(),
+            session: parsed.session.map(str::to_string),
         };
         let sent_id = gw
             .publish_dm("cc:sender", &target, "body text", Some("a subject"))

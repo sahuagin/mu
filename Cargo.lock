@@ -2046,6 +2046,7 @@ dependencies = [
  "futures",
  "mu-ai",
  "mu-core",
+ "mu-peer",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rmcp",
@@ -2075,6 +2076,7 @@ dependencies = [
  "dirs",
  "figment",
  "futures",
+ "mu-peer",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2098,6 +2100,7 @@ dependencies = [
  "biscuit-auth",
  "bytes",
  "futures",
+ "mu-peer",
  "reqwest 0.12.28",
  "rmcp",
  "rusqlite",
@@ -2137,6 +2140,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "mu-peer"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

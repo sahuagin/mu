@@ -128,13 +128,7 @@ fn parse_kv(prefix: &str, kv: &Value) -> Option<LeasePeer> {
         .and_then(|p| p.get("role"))
         .and_then(Value::as_str)
         .map(String::from)
-        .unwrap_or_else(|| {
-            peer_id
-                .split(':')
-                .next()
-                .unwrap_or(peer_id.as_str())
-                .to_string()
-        });
+        .unwrap_or_else(|| mu_peer::PeerId::parse(&peer_id).role().to_string());
     let registered_at = payload
         .as_ref()
         .and_then(|p| p.get("registered_at_unix_ms"))

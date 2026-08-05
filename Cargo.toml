@@ -14,6 +14,7 @@ members = [
     "crates/mu-bridge",
     "crates/t4c",
     "crates/mu-dialogue",
+    "crates/mu-peer",
 ]
 
 [workspace.package]
@@ -27,6 +28,9 @@ authors = ["Thaddeus Covert <tcovert@sahuagin.net>"]
 rust-version = "1.91"
 
 [workspace.dependencies]
+# mu-uto4: the peer identity type, a leaf crate so dependency-light binaries
+# (mu-dialogue) can share it without pulling in mu-core.
+mu-peer = { path = "crates/mu-peer" }
 # mu-wxc4: NATS service-mesh transport (adopt-not-reinvent messaging bus).
 async-nats = "0.49"
 # mu-a0l6 mesh consumption: ulid = request correlation ids matching the mesh

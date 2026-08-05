@@ -456,7 +456,8 @@ fn session_spawn_tools(
     // to this session's id; dialogue_poll.to defaults to it (so polling your
     // own inbox needs no argument). Tools the daemon didn't import (dialogue
     // server absent/unreachable) simply aren't present and pass through.
-    let dialogue_identity = format!("mu:{}:{}", daemon_info.daemon_id(), session_id);
+    let dialogue_identity =
+        mu_peer::PeerId::mu_session(daemon_info.daemon_id(), session_id).to_string();
     let mut tools: Vec<Arc<dyn Tool>> = base
         .iter()
         .map(|t| match t.spec().name.as_str() {

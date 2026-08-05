@@ -22,7 +22,7 @@ pub mod mcp;
 pub mod mcp_client;
 mod mesh;
 mod mesh_consume;
-mod mesh_dialogue;
+pub(crate) mod mesh_dialogue;
 mod pipeline;
 mod presence;
 mod provider_status;
@@ -481,8 +481,11 @@ where
         )
         .await
         {
-            Ok((guard, dialogue_tools)) => {
+            Ok((guard, dialogue_tools, mesh_sessions)) => {
                 mesh_dialogue_guard = Some(guard);
+                // mu-6s7s: sessions become first-class mesh participants —
+                // handlers/session.rs joins each one as it is created.
+                daemon_info.set_mesh_sessions(mesh_sessions);
                 for tool in dialogue_tools {
                     let name = tool.spec().name;
                     if tools.iter().any(|t| t.spec().name == name) {

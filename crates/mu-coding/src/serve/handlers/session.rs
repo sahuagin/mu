@@ -865,6 +865,20 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         },
     );
 
+    // mu-6s7s: the session becomes a mesh participant in its own right — its
+    // own `$SRV` presence and its own DM inbox — so peers address whoever is
+    // actually conversing rather than the daemon that hosts them. AFTER the
+    // registry insert, so a DM arriving immediately finds a deliverable
+    // session. Detached and best-effort: this path is synchronous and the mesh
+    // must never be able to fail session creation.
+    //
+    // There is no matching `leave` here because production never removes a
+    // session (`Sessions::remove` is test-only); a session's mesh footprint is
+    // released when the daemon exits and the registrations drop with it.
+    if let Some(mesh) = daemon_info.mesh_sessions() {
+        mesh.join_detached(&session_id);
+    }
+
     Ok(session_id)
 }
 

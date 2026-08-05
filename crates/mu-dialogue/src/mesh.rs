@@ -231,28 +231,35 @@ pub fn inbound_peer_id_with_session(from: &str, from_session: Option<&str>) -> S
 
 /// A dialogue peer id as a mesh agent id.
 ///
-/// NATS Micro validates service names against `[A-Za-z0-9_-]` and REJECTS the
-/// colon in `role:identity` (verified against a live server, not assumed), so
-/// a fronted peer cannot register under its own id. `_` is the substitute: no
-/// role in use contains one, so splitting at the FIRST `_` recovers the id
-/// exactly, and any underscore inside an identity survives untouched.
+/// Separator standing in for the `:` of a dialogue peer id on the wire. NATS
+/// Micro validates service names against `[A-Za-z0-9_-]` and REJECTS a colon
+/// (verified against a live server, not assumed).
 ///
-/// The same encoding names the DM subject, which is what keeps mu unchanged: a
-/// daemon reads an id from `who` and publishes to `mu.agent.<that>.dm`, so the
-/// gateway must listen on precisely the name it advertised.
+/// DOUBLED, because single underscores occur inside real identities —
+/// `warden:sub_agent_3` — and a single-underscore separator could not tell
+/// those apart from a session-level id once mu sessions took mesh names of
+/// their own (mu-6s7s). Must match `mu-coding`'s `MESH_ID_SEP`.
+pub const MESH_ID_SEP: &str = "__";
+
+/// A dialogue peer id as a mesh agent id: one rule for every participant, a
+/// mesh agent name is just a peer id that can survive Micro's charset.
+///
+/// The same encoding names the DM subject, which is what keeps peers in sync:
+/// a daemon reads an id from `who` and publishes to `mu.agent.<that>.dm`, so
+/// the gateway must listen on precisely the name it advertised.
 pub fn mesh_name(peer_id: &str) -> String {
-    peer_id.replacen(':', "_", 1)
+    peer_id.replace(':', MESH_ID_SEP)
 }
 
 /// A `$SRV` agent id as a dialogue peer id — the inverse of [`mesh_name`].
 ///
-/// Two kinds answer a `$SRV.PING`: mu daemons, which register their bare
-/// daemon id, and the peers a gateway fronts, which register an encoded
-/// `role_identity`. The underscore is what tells them apart — a daemon id is
-/// bare hex.
+/// Three kinds answer a `$SRV.PING`: mu daemons, which register their bare
+/// daemon id; mu SESSIONS, which register `mu__<daemon>__<session>` (mu-6s7s);
+/// and the peers a gateway fronts, `cc__<uuid>` and friends. The separator is
+/// what tells an encoded peer id from a bare daemon id.
 pub fn srv_agent_to_peer_id(agent: &str) -> String {
-    if agent.contains('_') {
-        agent.replacen('_', ":", 1)
+    if agent.contains(MESH_ID_SEP) {
+        agent.replace(MESH_ID_SEP, ":")
     } else {
         inbound_peer_id(agent)
     }
@@ -449,6 +456,29 @@ impl Gateway {
         let live = agents.contains(agent);
         *self.live_cache.lock().await = Some((tokio::time::Instant::now(), agents));
         live
+    }
+
+    /// Where to actually send a DM for `peer_id`, or None if it is not
+    /// reachable on the mesh at all.
+    ///
+    /// Prefers the SESSION's own inbox (mu-6s7s): a session that is a mesh
+    /// participant in its own right is addressed directly, and the envelope
+    /// needs no `session` field because the queue is the addressing. A daemon
+    /// that has not adopted per-session inboxes still answers on its own
+    /// subject, so the fall-back keeps naming the session in the envelope and
+    /// nothing breaks mid-migration.
+    pub async fn address(&self, peer_id: &str) -> Option<MeshTarget> {
+        let target = resolve_target(peer_id)?;
+        if target.session.is_some() {
+            let direct = mesh_name(peer_id);
+            if self.is_agent_live(&direct).await {
+                return Some(MeshTarget {
+                    agent: direct,
+                    session: None,
+                });
+            }
+        }
+        self.is_agent_live(&target.agent).await.then_some(target)
     }
 
     /// Start fronting `peer_id` on the mesh: register its presence so mu's
@@ -734,7 +764,7 @@ mod tests {
     #[test]
     fn dm_subject_matches_the_contract() {
         assert_eq!(dm_subject("abc"), "mu.agent.abc.dm");
-        assert_eq!(dm_subject(&mesh_name("cc:uuid")), "mu.agent.cc_uuid.dm");
+        assert_eq!(dm_subject(&mesh_name("cc:uuid")), "mu.agent.cc__uuid.dm");
     }
 
     /// A peer id must survive the trip onto the mesh and back, or a daemon
@@ -747,6 +777,10 @@ mod tests {
             "cc:deploy-test",
             "warden:sub_agent_3",
             "cc:has_underscores_inside",
+            // mu-6s7s: mu sessions now take mesh names too, and a
+            // single-underscore separator could not tell `warden:sub_agent_3`
+            // from a session-level id. The doubled one can.
+            "mu:100c058851c356a5:session-2",
         ] {
             let wire = mesh_name(peer);
             assert!(
@@ -1024,6 +1058,84 @@ mod live_tests {
             dm.body, "legitimate",
             "an unauthorized dm was delivered ahead of the legitimate one"
         );
+    }
+
+    /// mu-6s7s: a session that is on the mesh in its own right is addressed
+    /// DIRECTLY — the subject is the session, so the envelope needs no
+    /// `session` field. A daemon that has not adopted per-session inboxes is
+    /// still reached the old way, which is what makes the migration safe.
+    ///
+    /// Both cases are asserted off ONE `$SRV` sweep: the liveness cache is
+    /// keyed by time, not by agent, so registering everything up front keeps
+    /// the test off a five-second wait.
+    #[tokio::test]
+    #[ignore = "requires a live NATS server"]
+    async fn a_live_session_is_addressed_directly_and_an_older_daemon_is_not() {
+        use async_nats::service::ServiceExt as _;
+        let (gw, _rx, _root) = live_gateway().await;
+        let pid = std::process::id();
+        let modern = format!("gwmodern{pid}");
+        let legacy = format!("gwlegacy{pid}");
+
+        let client = async_nats::connect(&nats_url()).await.expect("raw client");
+        // A daemon that registers per-session inboxes, plus its own.
+        let _d1 = client
+            .service_builder()
+            .start(format!("{PRESENCE_PREFIX}{modern}"), "0.1.0")
+            .await
+            .expect("modern daemon presence");
+        let _s1 = client
+            .service_builder()
+            .start(
+                format!(
+                    "{PRESENCE_PREFIX}{}",
+                    mesh_name(&format!("mu:{modern}:session-4"))
+                ),
+                "0.1.0",
+            )
+            .await
+            .expect("session presence");
+        // A daemon on an older build: only its own registration.
+        let _d2 = client
+            .service_builder()
+            .start(format!("{PRESENCE_PREFIX}{legacy}"), "0.1.0")
+            .await
+            .expect("legacy daemon presence");
+        client.flush().await.unwrap();
+
+        // Session is present → addressed directly, no envelope field.
+        let t = gw
+            .address(&format!("mu:{modern}:session-4"))
+            .await
+            .expect("modern session is reachable");
+        assert_eq!(t.agent, format!("mu__{modern}__session-4"));
+        assert_eq!(
+            t.session, None,
+            "the queue is the addressing; no `session` field should be needed"
+        );
+
+        // Same daemon, a session that never joined → fall back to the daemon.
+        let t = gw
+            .address(&format!("mu:{modern}:session-99"))
+            .await
+            .expect("falls back to the daemon");
+        assert_eq!(t.agent, modern);
+        assert_eq!(t.session.as_deref(), Some("session-99"));
+
+        // Older daemon → always the daemon subject plus the field.
+        let t = gw
+            .address(&format!("mu:{legacy}:session-1"))
+            .await
+            .expect("legacy daemon is reachable");
+        assert_eq!(t.agent, legacy);
+        assert_eq!(t.session.as_deref(), Some("session-1"));
+
+        // Nothing registered at all → not reachable, so the message stays in
+        // the store rather than being published into the void.
+        assert!(gw
+            .address(&format!("mu:gwabsent{pid}:session-1"))
+            .await
+            .is_none());
     }
 
     /// Outbound: what `dialogue_say` puts on the wire is an envelope a mu

@@ -132,12 +132,7 @@ impl Store {
     async fn mesh_live(&self) -> Option<std::collections::HashSet<String>> {
         let gw = self.mesh.as_ref()?;
         match gw.srv_agents().await {
-            Ok(agents) => Some(
-                agents
-                    .iter()
-                    .map(|a| mesh::srv_agent_to_peer_id(a))
-                    .collect(),
-            ),
+            Ok(agents) => Some(agents.into_keys().collect()),
             Err(e) => {
                 warn!("mesh $SRV discovery unavailable, presence unaffected: {e:#}");
                 None
@@ -735,7 +730,7 @@ async fn handle_say(store: &Store, args: SayArgs) -> Result<Value> {
             Ok(envelope_id) => {
                 out["mesh"] = json!({
                     "published": true,
-                    "agent": target.agent,
+                    "subject": target.subject,
                     "session": target.session,
                     "envelope_id": envelope_id,
                 });
@@ -825,7 +820,7 @@ async fn handle_peers(store: &Store, args: PeersArgs) -> Result<Value> {
     let mesh_reachable = |peer_id: &str| -> bool {
         mesh_live.contains(peer_id)
             || mesh::resolve_target(peer_id)
-                .is_some_and(|t| mesh_live.contains(&mesh::inbound_peer_id(&t.agent)))
+                .is_some_and(|t| mesh_live.contains(&mesh::inbound_peer_id(&t.daemon)))
     };
     let mut out: Vec<Value> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();

@@ -35,3 +35,12 @@ ulid = "1"
 reqwest = { workspace = true }
 toml = { workspace = true }
 base64 = { workspace = true }
+# at-uws: the mesh gateway (src/mesh.rs) — a NATS client speaking the agent
+# mesh on behalf of the MCP peers connected here, with per-message biscuit
+# capabilities exactly as the mesh contract requires. All workspace deps
+# already used by mu-coding's mesh dialogue; a config with the gateway
+# disabled never opens a connection.
+async-nats = { workspace = true }
+biscuit-auth = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }

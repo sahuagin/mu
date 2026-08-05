@@ -2092,8 +2092,12 @@ name = "mu-dialogue"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-nats",
  "axum",
  "base64 0.22.1",
+ "biscuit-auth",
+ "bytes",
+ "futures",
  "reqwest 0.12.28",
  "rmcp",
  "rusqlite",

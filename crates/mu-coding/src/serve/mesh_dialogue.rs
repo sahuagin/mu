@@ -75,6 +75,14 @@ enum AgentCommand {
         /// receiver renders a generic "mesh dm from <agent>".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subject: Option<String>,
+        /// The SENDER's session on `from`'s daemon (at-uws). Without it a DM
+        /// is attributed to the daemon alone, so a reply lands on that
+        /// daemon's supervisor session instead of the session that wrote —
+        /// the first message arrives and the conversation cannot continue.
+        /// Bound at the tool layer, not supplied by the model. Additive and
+        /// optional: older peers neither send nor need it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_session: Option<String>,
     },
 }
 
@@ -91,6 +99,7 @@ async fn deliver_dm(
     router: &Router,
     target: &str,
     from_agent: &str,
+    from_session: Option<&str>,
     subject: Option<&str>,
     body: &str,
 ) -> Result<()> {
@@ -104,13 +113,17 @@ async fn deliver_dm(
     let subject = subject
         .map(str::to_string)
         .unwrap_or_else(|| format!("mesh dm from {from_agent}"));
+    // at-uws: attribute to the sending SESSION when the envelope names one.
+    // "mesh" remains the fallback for peers that do not send `from_session`,
+    // so nothing about the older wire shape changes.
+    let from_session_id = from_session.unwrap_or("mesh").to_string();
     let seq = mailbox.allocate_seq();
     let posted_event_id = log.append(
         EventActor::System,
         EventPayload::MailboxMessagePosted {
             seq,
             from_daemon_id: from_agent.to_string(),
-            from_session_id: "mesh".to_string(),
+            from_session_id: from_session_id.clone(),
             message_kind: DM_KIND.to_string(),
             subject: subject.clone(),
             body: Value::String(body.to_string()),
@@ -133,7 +146,7 @@ async fn deliver_dm(
                 session_id: target.to_string(),
                 seq,
                 from_daemon_id: from_agent.to_string(),
-                from_session_id: "mesh".to_string(),
+                from_session_id: from_session_id.clone(),
                 kind: DM_KIND.to_string(),
                 subject: subject.clone(),
                 body: Value::String(body.to_string()),
@@ -147,7 +160,7 @@ async fn deliver_dm(
     // UserMessage from the mailbox entry (looked up by seq) and runs.
     if let Some(tx) = sessions.input_sender(target) {
         let _ = tx.try_send(AgentInput::MailboxMessage {
-            from_session_id: "mesh".to_string(),
+            from_session_id,
             message_kind: DM_KIND.to_string(),
             subject,
             seq,
@@ -248,8 +261,13 @@ impl Tool for DmTool {
             .get("subject")
             .and_then(Value::as_str)
             .map(str::to_string);
+        // Bound by SessionDialogueTool, not by the model (see the schema note).
+        let from_session = arguments
+            .get("from_session")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let run = async {
-            match send_dm(&self.shared, to, body, session, subject).await {
+            match send_dm(&self.shared, to, body, session, subject, from_session).await {
                 Ok(()) => ToolResult {
                     content: format!("dm sent to {to}"),
                     is_error: false,
@@ -306,6 +324,7 @@ async fn send_dm(
     body: &str,
     session: Option<String>,
     subject: Option<String>,
+    from_session: Option<String>,
 ) -> Result<()> {
     let token = biscuit!(r#"right({r});"#, r = DM_RIGHT)
         .build(&shared.root)
@@ -320,6 +339,7 @@ async fn send_dm(
             body: body.to_string(),
             session,
             subject,
+            from_session,
         },
     };
     let payload = serde_json::to_vec(&env)?;
@@ -429,6 +449,7 @@ pub(crate) async fn spawn_mesh_dialogue(
                 body,
                 session,
                 subject,
+                from_session,
             } = env.command;
             let target = session.as_deref().unwrap_or("supervisor");
             match deliver_dm(
@@ -436,6 +457,7 @@ pub(crate) async fn spawn_mesh_dialogue(
                 &inbound_router,
                 target,
                 &from,
+                from_session.as_deref(),
                 subject.as_deref(),
                 &body,
             )
@@ -474,7 +496,8 @@ pub(crate) async fn spawn_mesh_dialogue(
                 "to": {"type": "string", "description": "Peer agent id (a `who` entry)"},
                 "body": {"type": "string", "description": "Message body"},
                 "session": {"type": "string", "description": "Target session on the peer daemon (default: its supervisor session)"},
-                "subject": {"type": "string", "description": "One-line summary shown in the receiver's wake — write it so the receiver can decide whether to read the body"}
+                "subject": {"type": "string", "description": "One-line summary shown in the receiver's wake — write it so the receiver can decide whether to read the body"},
+                "from_session": {"type": "string", "description": "Bound to this session by the daemon so replies come back here; not for the model to set"}
             },
             "required": ["to", "body"]
         }),
@@ -529,6 +552,7 @@ mod tests {
                 body: "review PR 42?".to_string(),
                 session: None,
                 subject: None,
+                from_session: None,
             },
         };
         let v = serde_json::to_value(&env).expect("serialize");
@@ -547,9 +571,37 @@ mod tests {
             "command": {"Dm": {"from": "bob", "body": "hi"}}
         }))
         .expect("decode slice-shaped dm");
-        let AgentCommand::Dm { from, session, .. } = inbound.command;
+        let AgentCommand::Dm {
+            from,
+            session,
+            from_session,
+            ..
+        } = inbound.command;
         assert_eq!(from, "bob");
         assert!(session.is_none());
+        assert!(from_session.is_none());
+    }
+
+    /// at-uws: `from_session` names the SENDER's session so a reply can come
+    /// back to it. Additive like `session` — absent from the wire when unset,
+    /// so a peer that predates it is unaffected.
+    #[test]
+    fn from_session_is_additive_and_carries_the_senders_session() {
+        let env = DmEnvelope {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+            capability: "AAEC".to_string(),
+            command: AgentCommand::Dm {
+                from: "alice".to_string(),
+                body: "hi".to_string(),
+                session: None,
+                subject: None,
+                from_session: Some("session-3".to_string()),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&env).expect("serialize")["command"]["Dm"],
+            json!({"from": "alice", "body": "hi", "from_session": "session-3"})
+        );
     }
 
     /// Capability gate: mint→verify round-trips; a rogue key or wrong right

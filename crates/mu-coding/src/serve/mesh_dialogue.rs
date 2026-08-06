@@ -31,6 +31,7 @@ use mu_core::agent::{AgentInput, SideEffects, Tool, ToolPolicy, ToolResult, Tool
 use mu_core::config::MeshConfig;
 use mu_core::event_log::{EventActor, EventPayload};
 use mu_core::transport::Router;
+use mu_peer::{PeerId, META_PEER_ID};
 
 use super::sessions::Sessions;
 
@@ -47,45 +48,6 @@ const WHO_WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
 
 fn dm_subject(agent: &str) -> String {
     format!("mu.agent.{agent}.dm")
-}
-
-/// Metadata key carrying a peer's identity, unmangled.
-const META_PEER_ID: &str = "peer_id";
-/// Metadata key carrying the exact subject to publish to, so a sender never
-/// re-derives the naming rule.
-const META_DM_SUBJECT: &str = "dm_subject";
-
-/// A dialogue peer id as its DM subject: each `:` level becomes a NATS subject
-/// token, so routing is the transport's own hierarchy — dispatch on the daemon
-/// token, then the session token. A daemon catches all of its sessions with
-/// `mu.agent.mu.<daemon>.*.dm` (mu-b1lq).
-fn peer_dm_subject(peer_id: &str) -> String {
-    format!("mu.agent.{}.dm", peer_id.replace(':', "."))
-}
-
-/// A Micro service name for a peer. Micro allows only `[A-Za-z0-9_-]`, but this
-/// is a registration KEY, not an identity — that travels in metadata — so it
-/// only has to be legal and unique. Nothing parses it.
-fn micro_name(peer_id: &str) -> String {
-    let safe: String = peer_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("{PRESENCE_PREFIX}{safe}")
-}
-
-/// Metadata advertising who a registration is and where to reach it.
-fn peer_metadata(peer_id: &str, subject: &str) -> std::collections::HashMap<String, String> {
-    std::collections::HashMap::from([
-        (META_PEER_ID.to_string(), peer_id.to_string()),
-        (META_DM_SUBJECT.to_string(), subject.to_string()),
-    ])
 }
 
 // ── wire types (mirror of mesh-slice/src/agent.rs AgentCommand) ───────────
@@ -399,7 +361,7 @@ async fn send_dm(
     // A `role:identity` peer id routes by subject hierarchy; a bare agent id
     // is the legacy daemon form and keeps its flat subject.
     let subject = if to.contains(':') {
-        peer_dm_subject(to)
+        PeerId::parse(to).dm_subject()
     } else {
         dm_subject(to)
     };
@@ -420,7 +382,7 @@ async fn send_dm(
 
 /// A session's dialogue peer id.
 pub(crate) fn session_peer_id(daemon_id: &str, session_id: &str) -> String {
-    format!("mu:{daemon_id}:{session_id}")
+    PeerId::mu_session(daemon_id, session_id).to_string()
 }
 
 /// Per-session mesh registration (mu-6s7s): each session gets its own `$SRV`
@@ -496,15 +458,16 @@ impl MeshSessions {
         {
             return Ok(());
         }
-        let peer_id = session_peer_id(&self.inner.daemon_id, session_id);
-        let subject = peer_dm_subject(&peer_id);
+        let peer = PeerId::mu_session(&self.inner.daemon_id, session_id);
+        let peer_id = peer.to_string();
+        let subject = peer.dm_subject();
         let presence = self
             .inner
             .client
             .service_builder()
             .description("mu session (mesh dialogue presence)")
-            .metadata(peer_metadata(&peer_id, &subject))
-            .start(micro_name(&peer_id), "0.1.0")
+            .metadata(peer.mesh_metadata())
+            .start(format!("{PRESENCE_PREFIX}{}", peer.micro_name()), "0.1.0")
             .await
             .map_err(|e| anyhow!("session presence register {peer_id}: {e}"))?;
         let sub = self
@@ -646,11 +609,11 @@ pub(crate) async fn spawn_mesh_dialogue(
             let client = async_nats::connect(&mesh.nats_url)
                 .await
                 .map_err(|e| anyhow!("dialogue: connect NATS at {}: {e}", mesh.nats_url))?;
-            let daemon_peer_id = format!("mu:{daemon_id}");
+            let daemon_peer = PeerId::mu_daemon(daemon_id);
             let presence = client
                 .service_builder()
                 .description("mu daemon (mesh dialogue presence)")
-                .metadata(peer_metadata(&daemon_peer_id, &dm_subject(daemon_id)))
+                .metadata(daemon_peer.mesh_metadata())
                 .start(format!("{PRESENCE_PREFIX}{daemon_id}"), "0.1.0")
                 .await
                 .map_err(|e| anyhow!("dialogue: presence register: {e}"))?;
@@ -662,7 +625,7 @@ pub(crate) async fn spawn_mesh_dialogue(
             // a sender using one uniform rule reaches daemons and sessions alike.
             // The legacy flat subject above stays for peers that predate mu-b1lq.
             let sub_hier = client
-                .subscribe(peer_dm_subject(&daemon_peer_id))
+                .subscribe(daemon_peer.dm_subject())
                 .await
                 .map_err(|e| anyhow!("dialogue: hierarchical dm subscribe: {e}"))?;
             client

@@ -9,6 +9,9 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# mu-uto4: the peer identity type, so SessionRef and PeerId interoperate
+# instead of being two disagreeing spellings of daemon+session.
+mu-peer = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }

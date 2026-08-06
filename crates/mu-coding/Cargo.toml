@@ -13,6 +13,8 @@ name = "mu"
 path = "src/bin/mu.rs"
 
 [dependencies]
+# mu-uto4: one type for peer identity, shared with mu-dialogue.
+mu-peer = { workspace = true }
 mu-core = { path = "../mu-core" }
 mu-ai = { path = "../mu-ai" }
 # mu -> t4c (the allowed direction; t4c is a leaf crate, never depends back).

@@ -49,6 +49,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use mu_peer::PeerId;
 use rmcp::model::*;
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
@@ -378,7 +379,7 @@ impl Store {
         if peer_id.is_empty() {
             return Ok(());
         }
-        let role = peer_id.split(':').next().unwrap_or(peer_id);
+        let role = PeerId::parse(peer_id).role().to_string();
         {
             let conn = self.db.lock().await;
             conn.execute(
@@ -398,7 +399,7 @@ impl Store {
         // but the first touch is a map lookup. Never fatal: a NATS hiccup must
         // not take down messaging (same fail-open rule as etcd presence).
         if let Some(gw) = &self.mesh {
-            if mesh::resolve_target(peer_id).is_none() {
+            if PeerId::parse(peer_id).as_mu().is_none() {
                 if let Err(e) = gw.front_peer(peer_id).await {
                     warn!("gateway: fronting {peer_id} failed, mesh inbox absent: {e:#}");
                 }
@@ -819,8 +820,9 @@ async fn handle_peers(store: &Store, args: PeersArgs) -> Result<Value> {
     // counts as mesh-live when its daemon answers.
     let mesh_reachable = |peer_id: &str| -> bool {
         mesh_live.contains(peer_id)
-            || mesh::resolve_target(peer_id)
-                .is_some_and(|t| mesh_live.contains(&mesh::inbound_peer_id(&t.daemon)))
+            || PeerId::parse(peer_id)
+                .as_mu()
+                .is_some_and(|t| mesh_live.contains(&PeerId::mu_daemon(t.daemon).to_string()))
     };
     let mut out: Vec<Value> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -862,7 +864,7 @@ async fn handle_peers(store: &Store, args: PeersArgs) -> Result<Value> {
         if seen.contains(peer_id) {
             continue;
         }
-        let role = peer_id.split(':').next().unwrap_or(peer_id).to_string();
+        let role = PeerId::parse(peer_id).role().to_string();
         if let Some(want) = &args.role {
             if want != &role {
                 continue;
@@ -1533,7 +1535,7 @@ async fn front_known_peers(store: &Store) {
     };
     let mut fronted = 0usize;
     for p in &peers {
-        if mesh::resolve_target(&p.peer_id).is_some() {
+        if PeerId::parse(&p.peer_id).as_mu().is_some() {
             continue; // a mu daemon fronts itself
         }
         match gw.front_peer(&p.peer_id).await {

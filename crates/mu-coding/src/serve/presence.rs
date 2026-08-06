@@ -96,9 +96,9 @@ pub fn from_config(dialogue: Option<&toml::Value>) -> Option<PresenceConfig> {
 fn desired_peer_ids(daemon_id: &str, live_session_ids: &[String]) -> HashSet<String> {
     let mut set: HashSet<String> = live_session_ids
         .iter()
-        .map(|sid| format!("mu:{daemon_id}:{sid}"))
+        .map(|sid| mu_peer::PeerId::mu_session(daemon_id, sid).to_string())
         .collect();
-    set.insert(format!("mu:{daemon_id}"));
+    set.insert(mu_peer::PeerId::mu_daemon(daemon_id).to_string());
     set
 }
 

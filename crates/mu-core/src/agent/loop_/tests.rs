@@ -3285,6 +3285,105 @@ async fn autonomous_buffered_user_after_end_turn_still_emits_lifecycle_before_fo
     );
 }
 
+/// Historical trace regression for daemon `abbeda352f5b553c`, session 1:
+/// event 783 finalized the autonomous assistant response, event 784 posted a
+/// mailbox wake, and the log then ended without iteration completion or Done.
+/// Reproduce that causal shape without committing the private raw JSONL.
+#[tokio::test]
+async fn autonomous_buffered_mailbox_after_end_turn_closes_before_mailbox_turn() {
+    let (provider, gate) = MockProvider::gated_first(
+        vec![ProviderEvent::Done(assistant_text(
+            "finished goal_status:satisfied",
+        ))],
+        vec![vec![ProviderEvent::Done(assistant_text(
+            "mailbox follow-up answered",
+        ))]],
+    );
+    let (loop_, events_rx) = spawn_loop_with_autonomy(
+        provider,
+        vec![],
+        AgentConfig::default(),
+        autonomy_allowed(10),
+    );
+
+    loop_
+        .send(AgentInput::StartAutonomous {
+            goal: "finish while mailbox wake is queued".to_owned(),
+            options: crate::protocol::AutonomyOptions::default(),
+        })
+        .await
+        .expect("send autonomous start");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    loop_
+        .send(AgentInput::MailboxMessage {
+            from_session_id: "session-worker".to_owned(),
+            message_kind: "worker_status".to_owned(),
+            subject: "worker completed".to_owned(),
+            seq: 784,
+        })
+        .await
+        .expect("send buffered mailbox wake");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = gate.send(());
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    let completed = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::AutonomousIterationCompleted { .. }))
+        .expect("mailbox wake must not suppress iteration completion");
+    let terminated = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::AutonomousTerminated { .. }))
+        .expect("mailbox wake must not suppress autonomous termination");
+    let first_done = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Done { .. }))
+        .expect("autonomous run must emit Done");
+    let mailbox_start = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::MessageStart {
+                    message: AgentMessage::User { content }
+                } if content.contains("[Mailbox]") && content.contains("worker completed")
+            )
+        })
+        .expect("mailbox wake must become a user message");
+    let mailbox_answer = events
+        .iter()
+        .position(|event| match event {
+            AgentEvent::MessageEnd {
+                message: AgentMessage::Assistant(msg),
+            } => msg.content.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text } if text.contains("mailbox follow-up answered"))
+            }),
+            _ => false,
+        })
+        .expect("mailbox turn must receive its provider answer");
+    let done_count = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::Done { .. }))
+        .count();
+
+    assert!(
+        completed < terminated
+            && terminated < first_done
+            && first_done < mailbox_start
+            && mailbox_start < mailbox_answer,
+        "autonomous lifecycle must close before the queued mailbox turn; kinds={:?}",
+        events.iter().map(kind).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        done_count, 2,
+        "autonomous and mailbox turns need distinct Done events"
+    );
+}
+
+/// A-3: defensive Disallowed callout.
 ///
 /// Dispatch already gates start_autonomous on AutonomyCapability::Allowed;
 /// the loop-side defensive check ensures that if a capability is

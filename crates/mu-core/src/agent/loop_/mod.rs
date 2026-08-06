@@ -2709,31 +2709,6 @@ async fn run_inner(
                         })
                         .await;
 
-                    // A queued schedule_wakeup owns a non-terminal
-                    // iteration's completion and the N -> N+1 transition:
-                    // its handler emits Completed, parks, re-checks bounds,
-                    // and starts the resumed iteration. GoalMet still wins —
-                    // an already-satisfied run must terminate rather than
-                    // sleeping and reviving solely because a wake request was
-                    // buffered near the end of its final provider stream.
-                    if !satisfied && queued_schedule_wakeup(&queue) {
-                        continue;
-                    }
-
-                    let outcome = if satisfied {
-                        AutonomousIterationOutcome::GoalMet {
-                            detail: reason.clone(),
-                        }
-                    } else {
-                        AutonomousIterationOutcome::Continue
-                    };
-                    let _ = events
-                        .send(AgentEvent::AutonomousIterationCompleted {
-                            iteration: current_iteration,
-                            outcome: outcome.clone(),
-                        })
-                        .await;
-
                     let (cap_max_iter, cap_max_wall, cap_max_tools) = {
                         let cap = capability.lock().ok();
                         match cap.as_ref().map(|c| c.autonomy.clone()) {
@@ -2770,6 +2745,32 @@ async fn run_inner(
                     } else {
                         None
                     };
+
+                    // A queued schedule_wakeup owns a non-terminal
+                    // iteration's completion and the N -> N+1 transition:
+                    // its handler emits Completed, parks, re-checks bounds,
+                    // and starts the resumed iteration. Any terminal reason
+                    // wins — a run whose goal is met or whose bounds are
+                    // exhausted must terminate now rather than sleeping and
+                    // reviving solely because a wake request was buffered near
+                    // the end of its final provider stream.
+                    if terminal_reason.is_none() && queued_schedule_wakeup(&queue) {
+                        continue;
+                    }
+
+                    let outcome = if satisfied {
+                        AutonomousIterationOutcome::GoalMet {
+                            detail: reason.clone(),
+                        }
+                    } else {
+                        AutonomousIterationOutcome::Continue
+                    };
+                    let _ = events
+                        .send(AgentEvent::AutonomousIterationCompleted {
+                            iteration: current_iteration,
+                            outcome: outcome.clone(),
+                        })
+                        .await;
 
                     if let Some(reason_term) = terminal_reason {
                         let _ = events

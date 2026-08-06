@@ -3100,6 +3100,72 @@ async fn satisfied_autonomous_turn_ignores_buffered_schedule_wakeup() {
 }
 
 #[tokio::test]
+async fn exhausted_autonomous_bound_ignores_buffered_schedule_wakeup() {
+    let (provider, gate) = MockProvider::gated_first(
+        vec![ProviderEvent::Done(assistant_text(
+            "not finished goal_status:continue",
+        ))],
+        vec![],
+    );
+    let (loop_, events_rx) = spawn_loop_with_autonomy(
+        provider,
+        vec![],
+        AgentConfig::default(),
+        autonomy_allowed_wakeup(1, 60_000),
+    );
+
+    loop_
+        .send(AgentInput::StartAutonomous {
+            goal: "stop at the iteration cap instead of sleeping".to_owned(),
+            options: crate::protocol::AutonomyOptions::default(),
+        })
+        .await
+        .expect("send autonomous start");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    loop_
+        .send(AgentInput::ScheduleWakeup {
+            wake_at_unix_ms: now_unix_ms() + 60_000,
+            reason: "this wake must not defer the exhausted bound".to_owned(),
+        })
+        .await
+        .expect("send buffered wakeup");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = gate.send(());
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::AutonomousIterationCompleted {
+            iteration: 1,
+            outcome: AutonomousIterationOutcome::Continue,
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::AutonomousTerminated {
+            reason: AutonomousTerminationReason::IterationCap,
+        }
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AutonomousScheduledWakeup { .. })),
+        "an exhausted run must terminate without parking"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::AutonomousIterationStarted { .. }))
+            .count(),
+        1,
+        "the ignored wakeup must not start another iteration"
+    );
+}
+
+#[tokio::test]
 async fn autonomous_buffered_user_after_end_turn_still_emits_lifecycle_before_followup() {
     let (provider, gate) = MockProvider::gated_first(
         vec![ProviderEvent::Done(assistant_text(

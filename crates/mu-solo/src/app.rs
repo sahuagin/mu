@@ -33,7 +33,7 @@ use crate::client::{Client, Message};
 use crate::input::InputBuffer;
 use crate::render;
 use crate::skills::{self, DiscoveredSkill};
-use crate::transcript::{Transcript, TranscriptBlock, TranscriptKind};
+use crate::transcript::{render_turn_items_plain, Transcript, TranscriptBlock, TranscriptKind};
 use crate::viewport::DynamicViewport;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5017,6 +5017,14 @@ impl App {
         Ok(())
     }
 
+    fn export_transcript_plain(&self) -> String {
+        render_transcript_export_plain(
+            &self.transcript,
+            self.live_turn.as_ref(),
+            &self.pending_interjections,
+        )
+    }
+
     /// /transcript [PATH] — write the semantic transcript projection to a file.
     /// Bare command writes to a temp file and prints the path. This reads the
     /// in-memory semantic record, not rendered terminal cells.
@@ -5030,7 +5038,7 @@ impl App {
             std::process::id(),
             self.ask_count
         ));
-        std::fs::write(&path, self.transcript.render_all_plain())
+        std::fs::write(&path, self.export_transcript_plain())
             .with_context(|| format!("write transcript to {path:?}"))?;
         let editor = std::env::var("VISUAL")
             .or_else(|_| std::env::var("EDITOR"))
@@ -5078,7 +5086,7 @@ impl App {
         } else {
             std::path::PathBuf::from(arg)
         };
-        let text = self.transcript.render_all_plain();
+        let text = self.export_transcript_plain();
         std::fs::write(&path, text).with_context(|| format!("write transcript to {path:?}"))?;
         self.set_flash(format!("✓ transcript → {}", path.display()));
         let lines: Vec<Line<'static>> = vec![
@@ -5113,7 +5121,7 @@ impl App {
                 .transcript
                 .last_matching(TranscriptKind::User)
                 .map(|b| b.body.clone()),
-            "all" => Some(self.transcript.render_all_plain()),
+            "all" => Some(self.export_transcript_plain()),
             _ => None,
         };
         let Some(text) = text else {
@@ -6566,6 +6574,78 @@ fn fullscreen_target(arg: &str, current: bool) -> Result<bool, String> {
     }
 }
 
+/// Plain semantic export projection shared by Ctrl-S, `/transcript`, and
+/// `/copy all`. Unlike the committed-only `Transcript::render_all_plain`, this
+/// includes the current in-memory turn and queued operator interjections. For a
+/// live main turn it uses the same splice plan as terminal commit, so prompts
+/// typed mid-stream retain their chronological position instead of vanishing
+/// from an export. A sidecar turn is never interleaved with main-session
+/// prompts, matching the route guard on the normal commit path.
+fn render_transcript_export_plain(
+    transcript: &Transcript,
+    live_turn: Option<&Turn>,
+    pending: &[PendingInterjection],
+) -> String {
+    fn append_block(out: &mut String, label: &str, body: &str) {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        let _ = std::fmt::Write::write_fmt(out, format_args!("## {label}\n"));
+        if !body.is_empty() {
+            out.push_str(body.trim_end());
+            out.push('\n');
+        }
+    }
+
+    let mut out = transcript.render_all_plain();
+    let item_count = live_turn.map_or(0, |turn| turn.items.len());
+    let splice_main_interjections = live_turn.is_none_or(|turn| turn.route == TurnRoute::Main);
+    let splices: Vec<Option<usize>> = pending
+        .iter()
+        .map(|p| {
+            if splice_main_interjections {
+                p.splice_at
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for step in plan_splice_commit(item_count, &splices) {
+        match step {
+            SpliceStep::Segment(range) => {
+                let Some(turn) = live_turn else {
+                    continue;
+                };
+                let body = render_turn_items_plain(&turn.items[range]);
+                if !body.is_empty() {
+                    append_block(
+                        &mut out,
+                        &format!("{} (live/incomplete)", turn.header_label()),
+                        &body,
+                    );
+                }
+            }
+            SpliceStep::Interjection(i) => {
+                let interjection = &pending[i];
+                append_block(
+                    &mut out,
+                    &format!("{} (queued/uncommitted)", interjection.label()),
+                    &interjection.body,
+                );
+            }
+        }
+    }
+
+    if !out.is_empty() && !out.ends_with("\n\n") {
+        out.push('\n');
+    }
+    out
+}
+
 /// Render transcript blocks `skip..` for the fullscreen→inline scrollback
 /// replay. `skip` is the watermark recorded at fullscreen entry — earlier
 /// blocks are already in native scrollback from the inline commit path.
@@ -6681,6 +6761,122 @@ const MAX_VIEWPORT_HEIGHT: u16 = 20;
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn export_plain_includes_finalized_live_turn_before_done() {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptBlock::user(
+            TurnRoute::Main,
+            "question".to_string(),
+        ));
+        transcript.push(TranscriptBlock::assistant_with_label(
+            TurnRoute::Main,
+            "mu (test): committed".to_string(),
+            &[render::TurnItem::Text("old answer".to_string())],
+        ));
+
+        let mut live = Turn::new(
+            TurnRoute::Main,
+            TurnProvenance::new("test-provider".to_string(), "test-model".to_string()),
+        );
+        // Simulates a completed assistant_message_event / text finalization
+        // whose terminal Done has not arrived yet, so the turn is still live.
+        live.finalize_text("canonical answer before done");
+
+        let plain = render_transcript_export_plain(&transcript, Some(&live), &[]);
+        assert!(plain.contains("## mu (test): committed\nold answer"));
+        assert!(plain.contains("## assistant ⋅ test-provider/test-model (live/incomplete)"));
+        assert!(plain.contains("canonical answer before done"));
+        assert_eq!(plain.matches("canonical answer before done").count(), 1);
+    }
+
+    #[test]
+    fn export_plain_marks_partial_streaming_live_turn_incomplete() {
+        let transcript = Transcript::new();
+        let mut live = Turn::new(
+            TurnRoute::Main,
+            TurnProvenance::new("test-provider".to_string(), "test-model".to_string()),
+        );
+        live.push_thinking("still weighing");
+        live.push_text("partial ans");
+
+        let plain = render_transcript_export_plain(&transcript, Some(&live), &[]);
+        assert!(plain.starts_with("## assistant ⋅ test-provider/test-model (live/incomplete)\n"));
+        assert!(plain.contains("[thinking]\nstill weighing"));
+        assert!(plain.contains("partial ans"));
+        assert_eq!(plain.matches("live/incomplete").count(), 1);
+    }
+
+    #[test]
+    fn export_plain_splices_pending_interjection_chronologically() {
+        let transcript = Transcript::new();
+        let mut live = Turn::new(
+            TurnRoute::Main,
+            TurnProvenance::new("test-provider".to_string(), "test-model".to_string()),
+        );
+        live.push_text("before prompt");
+        live.push_thinking("after prompt");
+
+        let mut pending = PendingInterjection::new(
+            7,
+            "operator correction",
+            PendingInterjectionTiming::WhileResponding,
+        );
+        pending.splice_at = Some(1);
+
+        let plain = render_transcript_export_plain(&transcript, Some(&live), &[pending]);
+        let before = plain.find("before prompt").expect("pre-prompt segment");
+        let prompt = plain.find("operator correction").expect("queued prompt");
+        let after = plain.find("after prompt").expect("post-prompt segment");
+        assert!(before < prompt && prompt < after, "export={plain}");
+        assert!(plain.contains("(queued/uncommitted)"));
+        assert_eq!(plain.matches("operator correction").count(), 1);
+    }
+
+    #[test]
+    fn export_plain_does_not_splice_main_prompt_into_btw_turn() {
+        let transcript = Transcript::new();
+        let mut live = Turn::new(
+            TurnRoute::Btw,
+            TurnProvenance::new("test-provider".to_string(), "test-model".to_string()),
+        );
+        live.push_text("btw before");
+        live.push_thinking("btw after");
+
+        // This state is prevented by cmd_btw's busy gate, but the export
+        // projection remains defensive: a stale main-session splice point
+        // must never split a sidecar turn.
+        let mut pending = PendingInterjection::new(
+            8,
+            "main-session prompt",
+            PendingInterjectionTiming::WhileResponding,
+        );
+        pending.splice_at = Some(1);
+
+        let plain = render_transcript_export_plain(&transcript, Some(&live), &[pending]);
+        let before = plain.find("btw before").expect("first btw segment");
+        let after = plain.find("btw after").expect("second btw segment");
+        let prompt = plain.find("main-session prompt").expect("main prompt");
+        assert!(before < after && after < prompt, "export={plain}");
+    }
+
+    #[test]
+    fn export_plain_omits_empty_live_turn() {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptBlock::user(
+            TurnRoute::Main,
+            "question".to_string(),
+        ));
+        let live = Turn::new(
+            TurnRoute::Main,
+            TurnProvenance::new("test-provider".to_string(), "test-model".to_string()),
+        );
+
+        assert_eq!(
+            render_transcript_export_plain(&transcript, Some(&live), &[]),
+            transcript.render_all_plain()
+        );
+    }
 
     #[test]
     fn parse_input_required_extracts_fields() {

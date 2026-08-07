@@ -2855,6 +2855,534 @@ async fn a2_self_report_goal_met_early_termination() {
     );
 }
 
+#[tokio::test]
+async fn autonomous_buffered_user_after_nonterminal_turn_drives_next_iteration_without_synthetic() {
+    let (provider, gate) = MockProvider::gated_first(
+        vec![ProviderEvent::Done(assistant_text(
+            "not done goal_status:continue",
+        ))],
+        vec![vec![ProviderEvent::Done(assistant_text(
+            "now finished goal_status:satisfied",
+        ))]],
+    );
+    let (loop_, events_rx) = spawn_loop_with_autonomy(
+        provider,
+        vec![],
+        AgentConfig::default(),
+        autonomy_allowed(10),
+    );
+
+    loop_
+        .send(AgentInput::StartAutonomous {
+            goal: "continue after buffered input".to_owned(),
+            options: crate::protocol::AutonomyOptions::default(),
+        })
+        .await
+        .expect("send autonomous start");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("external motivation for iteration two"),
+            None,
+            None,
+        ))
+        .await
+        .expect("send buffered follow-up");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = gate.send(());
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    let completed_idx = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::AutonomousIterationCompleted { iteration: 1, .. }
+            )
+        })
+        .expect("iteration 1 completion");
+    let followup_user_start = events[completed_idx + 1..]
+        .iter()
+        .position(|event| match event {
+            AgentEvent::MessageStart {
+                message: AgentMessage::User { content },
+            } => content.contains("external motivation for iteration two"),
+            _ => false,
+        })
+        .map(|i| i + completed_idx + 1)
+        .expect("buffered external user start");
+    let iter2_started_idx = events[completed_idx + 1..]
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::AutonomousIterationStarted { iteration: 2, .. }
+            )
+        })
+        .map(|i| i + completed_idx + 1)
+        .expect("iteration 2 start");
+    let second_turn_start = events[iter2_started_idx + 1..]
+        .iter()
+        .position(|event| matches!(event, AgentEvent::TurnStart))
+        .map(|i| i + iter2_started_idx + 1)
+        .expect("second provider turn");
+
+    assert!(
+        completed_idx < followup_user_start
+            && followup_user_start < iter2_started_idx
+            && iter2_started_idx < second_turn_start,
+        "external input must precede the next autonomous iteration start/model call; kinds={:?}",
+        events.iter().map(kind).collect::<Vec<_>>()
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::MessageStart {
+                message: AgentMessage::User { content },
+            } if content.contains("iteration 2: continue toward the goal")
+        )),
+        "queued external input must suppress the synthetic continuation message"
+    );
+}
+
+#[tokio::test]
+async fn buffered_schedule_wakeup_owns_next_autonomous_iteration() {
+    let (provider, gate) = MockProvider::gated_first(
+        vec![ProviderEvent::Done(assistant_text(
+            "not done goal_status:continue",
+        ))],
+        vec![vec![ProviderEvent::Done(assistant_text(
+            "now finished goal_status:satisfied",
+        ))]],
+    );
+    let (loop_, mut events_rx) = spawn_loop_with_autonomy(
+        provider,
+        vec![],
+        AgentConfig::default(),
+        autonomy_allowed_wakeup(3, 60_000),
+    );
+
+    loop_
+        .send(AgentInput::StartAutonomous {
+            goal: "sleep after this turn".to_owned(),
+            options: crate::protocol::AutonomyOptions::default(),
+        })
+        .await
+        .expect("send autonomous start");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let wake_reason = "resume after the buffered wake".to_owned();
+    loop_
+        .send(AgentInput::ScheduleWakeup {
+            wake_at_unix_ms: now_unix_ms() + 50,
+            reason: wake_reason.clone(),
+        })
+        .await
+        .expect("send buffered wakeup");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = gate.send(());
+
+    let events = timeout(
+        Duration::from_secs(5),
+        collect_until_terminated(&mut events_rx),
+    )
+    .await
+    .expect("autonomous run terminated within timeout");
+    drop(loop_);
+
+    let starts: Vec<(u32, &str)> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::AutonomousIterationStarted {
+                iteration,
+                motivation,
+            } => Some((*iteration, motivation.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        starts,
+        vec![
+            (1, "Autonomous goal: sleep after this turn"),
+            (2, wake_reason.as_str())
+        ],
+        "the wakeup must be the sole owner of iteration 2; kinds={:?}",
+        events.iter().map(kind).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentEvent::AutonomousIterationCompleted { iteration: 1, .. }
+            ))
+            .count(),
+        1,
+        "iteration 1 must be completed exactly once by the wakeup path"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::MessageStart {
+                message: AgentMessage::User { content },
+            } if content.contains("iteration 2: continue toward the goal")
+        )),
+        "no stale synthetic continuation may survive across sleep"
+    );
+}
+
+#[tokio::test]
+async fn satisfied_autonomous_turn_ignores_buffered_schedule_wakeup() {
+    let (provider, gate) = MockProvider::gated_first(
+        vec![ProviderEvent::Done(assistant_text(
+            "finished goal_status:satisfied",
+        ))],
+        vec![],
+    );
+    let (loop_, events_rx) = spawn_loop_with_autonomy(
+        provider,
+        vec![],
+        AgentConfig::default(),
+        autonomy_allowed_wakeup(3, 60_000),
+    );
+
+    loop_
+        .send(AgentInput::StartAutonomous {
+            goal: "finish instead of sleeping".to_owned(),
+            options: crate::protocol::AutonomyOptions::default(),
+        })
+        .await
+        .expect("send autonomous start");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    loop_
+        .send(AgentInput::ScheduleWakeup {
+            wake_at_unix_ms: now_unix_ms() + 60_000,
+            reason: "this wake must be ignored".to_owned(),
+        })
+        .await
+        .expect("send buffered wakeup");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = gate.send(());
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::AutonomousIterationCompleted {
+            iteration: 1,
+            outcome: AutonomousIterationOutcome::GoalMet { .. },
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::AutonomousTerminated {
+            reason: AutonomousTerminationReason::GoalMet { .. },
+        }
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AutonomousScheduledWakeup { .. })),
+        "a satisfied run must terminate without parking"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::AutonomousIterationStarted { .. }))
+            .count(),
+        1,
+        "the ignored wakeup must not start another iteration"
+    );
+}
+
+#[tokio::test]
+async fn exhausted_autonomous_bound_ignores_buffered_schedule_wakeup() {
+    let (provider, gate) = MockProvider::gated_first(
+        vec![ProviderEvent::Done(assistant_text(
+            "not finished goal_status:continue",
+        ))],
+        vec![],
+    );
+    let (loop_, events_rx) = spawn_loop_with_autonomy(
+        provider,
+        vec![],
+        AgentConfig::default(),
+        autonomy_allowed_wakeup(1, 60_000),
+    );
+
+    loop_
+        .send(AgentInput::StartAutonomous {
+            goal: "stop at the iteration cap instead of sleeping".to_owned(),
+            options: crate::protocol::AutonomyOptions::default(),
+        })
+        .await
+        .expect("send autonomous start");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    loop_
+        .send(AgentInput::ScheduleWakeup {
+            wake_at_unix_ms: now_unix_ms() + 60_000,
+            reason: "this wake must not defer the exhausted bound".to_owned(),
+        })
+        .await
+        .expect("send buffered wakeup");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = gate.send(());
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::AutonomousIterationCompleted {
+            iteration: 1,
+            outcome: AutonomousIterationOutcome::Continue,
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::AutonomousTerminated {
+            reason: AutonomousTerminationReason::IterationCap,
+        }
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AutonomousScheduledWakeup { .. })),
+        "an exhausted run must terminate without parking"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::AutonomousIterationStarted { .. }))
+            .count(),
+        1,
+        "the ignored wakeup must not start another iteration"
+    );
+}
+
+#[tokio::test]
+async fn autonomous_buffered_user_after_end_turn_still_emits_lifecycle_before_followup() {
+    let (provider, gate) = MockProvider::gated_first(
+        vec![ProviderEvent::Done(assistant_text(
+            "finished goal_status:satisfied",
+        ))],
+        vec![vec![ProviderEvent::Done(assistant_text(
+            "follow-up answered",
+        ))]],
+    );
+    let (loop_, events_rx) = spawn_loop_with_autonomy(
+        provider,
+        vec![],
+        AgentConfig::default(),
+        autonomy_allowed(10),
+    );
+
+    loop_
+        .send(AgentInput::StartAutonomous {
+            goal: "finish while follow-up is queued".to_owned(),
+            options: crate::protocol::AutonomyOptions::default(),
+        })
+        .await
+        .expect("send autonomous start");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("follow-up after autonomous answer"),
+            None,
+            None,
+        ))
+        .await
+        .expect("send buffered follow-up");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = gate.send(());
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    let autonomous_assistant_end = events
+        .iter()
+        .position(|event| match event {
+            AgentEvent::MessageEnd {
+                message: AgentMessage::Assistant(msg),
+            } => msg.content.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text } if text.contains("finished goal_status:satisfied"))
+            }),
+            _ => false,
+        })
+        .expect("autonomous assistant MessageEnd");
+    let completed_idx = events[autonomous_assistant_end + 1..]
+        .iter()
+        .position(|event| matches!(event, AgentEvent::AutonomousIterationCompleted { .. }))
+        .map(|i| i + autonomous_assistant_end + 1)
+        .expect("buffered follow-up must not suppress iteration completion");
+    let terminated_idx = events[autonomous_assistant_end + 1..]
+        .iter()
+        .position(|event| matches!(event, AgentEvent::AutonomousTerminated { .. }))
+        .map(|i| i + autonomous_assistant_end + 1)
+        .expect("buffered follow-up must not suppress autonomous termination");
+    let done_idx = events[autonomous_assistant_end + 1..]
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Done { .. }))
+        .map(|i| i + autonomous_assistant_end + 1)
+        .expect("terminal autonomous run must emit Done before follow-up");
+    let followup_user_start = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            matches!(
+                event,
+                AgentEvent::MessageStart {
+                    message: AgentMessage::User { .. }
+                }
+            )
+        })
+        .nth(1)
+        .map(|(i, _)| i)
+        .expect("follow-up user MessageStart");
+    let followup_assistant_end = events[followup_user_start + 1..]
+        .iter()
+        .position(|event| {
+            match event {
+            AgentEvent::MessageEnd {
+                message: AgentMessage::Assistant(msg),
+            } => msg.content.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text } if text.contains("follow-up answered"))
+            }),
+            _ => false,
+        }
+        })
+        .map(|i| i + followup_user_start + 1)
+        .expect("queued follow-up must receive its own provider answer");
+    let followup_done = events[followup_assistant_end + 1..]
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Done { .. }))
+        .map(|i| i + followup_assistant_end + 1)
+        .expect("queued follow-up must receive its own Done");
+
+    assert!(
+        autonomous_assistant_end < completed_idx
+            && completed_idx < terminated_idx
+            && terminated_idx < done_idx
+            && done_idx < followup_user_start
+            && followup_user_start < followup_assistant_end
+            && followup_assistant_end < followup_done,
+        "lifecycle must close the autonomous turn before queued follow-up runs as a fresh ask; kinds={:?}",
+        events.iter().map(kind).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        2,
+        "autonomous run and queued follow-up must have distinct Done termini"
+    );
+}
+
+/// Historical trace regression for daemon `abbeda352f5b553c`, session 1:
+/// event 783 finalized the autonomous assistant response, event 784 posted a
+/// mailbox wake, and the log then ended without iteration completion or Done.
+/// Reproduce that causal shape without committing the private raw JSONL.
+#[tokio::test]
+async fn autonomous_buffered_mailbox_after_end_turn_closes_before_mailbox_turn() {
+    let (provider, gate) = MockProvider::gated_first(
+        vec![ProviderEvent::Done(assistant_text(
+            "finished goal_status:satisfied",
+        ))],
+        vec![vec![ProviderEvent::Done(assistant_text(
+            "mailbox follow-up answered",
+        ))]],
+    );
+    let (loop_, events_rx) = spawn_loop_with_autonomy(
+        provider,
+        vec![],
+        AgentConfig::default(),
+        autonomy_allowed(10),
+    );
+
+    loop_
+        .send(AgentInput::StartAutonomous {
+            goal: "finish while mailbox wake is queued".to_owned(),
+            options: crate::protocol::AutonomyOptions::default(),
+        })
+        .await
+        .expect("send autonomous start");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    loop_
+        .send(AgentInput::MailboxMessage {
+            from_session_id: "session-worker".to_owned(),
+            message_kind: "worker_status".to_owned(),
+            subject: "worker completed".to_owned(),
+            seq: 784,
+        })
+        .await
+        .expect("send buffered mailbox wake");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = gate.send(());
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    let completed = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::AutonomousIterationCompleted { .. }))
+        .expect("mailbox wake must not suppress iteration completion");
+    let terminated = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::AutonomousTerminated { .. }))
+        .expect("mailbox wake must not suppress autonomous termination");
+    let first_done = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Done { .. }))
+        .expect("autonomous run must emit Done");
+    let mailbox_start = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::MessageStart {
+                    message: AgentMessage::User { content }
+                } if content.contains("[Mailbox]") && content.contains("worker completed")
+            )
+        })
+        .expect("mailbox wake must become a user message");
+    let mailbox_answer = events
+        .iter()
+        .position(|event| match event {
+            AgentEvent::MessageEnd {
+                message: AgentMessage::Assistant(msg),
+            } => msg.content.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text } if text.contains("mailbox follow-up answered"))
+            }),
+            _ => false,
+        })
+        .expect("mailbox turn must receive its provider answer");
+    let done_count = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::Done { .. }))
+        .count();
+
+    assert!(
+        completed < terminated
+            && terminated < first_done
+            && first_done < mailbox_start
+            && mailbox_start < mailbox_answer,
+        "autonomous lifecycle must close before the queued mailbox turn; kinds={:?}",
+        events.iter().map(kind).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        done_count, 2,
+        "autonomous and mailbox turns need distinct Done events"
+    );
+}
+
 /// A-3: defensive Disallowed callout.
 ///
 /// Dispatch already gates start_autonomous on AutonomyCapability::Allowed;

@@ -846,6 +846,11 @@ enum Action {
     InvokeLlm,
     ExecuteTools(Vec<ToolCall>),
     MaybeFinish,
+    StartAutonomousIteration {
+        iteration: u32,
+        motivation: String,
+        inject_message: bool,
+    },
 }
 
 // ============================================================================
@@ -971,9 +976,32 @@ fn has_queued_turn_chain_action(queue: &VecDeque<Action>) -> bool {
     queue.iter().any(|a| {
         matches!(
             a,
-            Action::InvokeLlm | Action::ExecuteTools(_) | Action::MaybeFinish
+            Action::InvokeLlm
+                | Action::ExecuteTools(_)
+                | Action::MaybeFinish
+                | Action::StartAutonomousIteration { .. }
         )
     })
+}
+
+fn queued_external_drives_model(queue: &VecDeque<Action>) -> bool {
+    queue.iter().any(|a| {
+        matches!(
+            a,
+            Action::External(
+                AgentInput::UserMessage(..)
+                    | AgentInput::WatchCompleted { .. }
+                    | AgentInput::DialogueMessage { .. }
+                    | AgentInput::MailboxMessage { .. }
+            )
+        )
+    })
+}
+
+fn queued_schedule_wakeup(queue: &VecDeque<Action>) -> bool {
+    queue
+        .iter()
+        .any(|a| matches!(a, Action::External(AgentInput::ScheduleWakeup { .. })))
 }
 
 async fn terminate_autonomous_error_if_active(
@@ -1305,6 +1333,33 @@ async fn run_inner(
         };
 
         match action {
+            Action::StartAutonomousIteration {
+                iteration,
+                motivation,
+                inject_message,
+            } => {
+                let _ = events
+                    .send(AgentEvent::AutonomousIterationStarted {
+                        iteration,
+                        motivation: motivation.clone(),
+                    })
+                    .await;
+                if inject_message {
+                    let msg = AgentMessage::User {
+                        content: motivation,
+                    };
+                    let _ = events
+                        .send(AgentEvent::MessageStart {
+                            message: msg.clone(),
+                        })
+                        .await;
+                    messages.push(msg.clone());
+                    let _ = events.send(AgentEvent::MessageEnd { message: msg }).await;
+                }
+                if should_push_invoke_llm(&queue) {
+                    queue.push_back(Action::InvokeLlm);
+                }
+            }
             Action::External(AgentInput::UserMessage(msg, ticket, effort)) => {
                 // spec mu-046 WP4: a journaled ask's ticket joins the
                 // current ask's pending set; it is drained into the
@@ -1762,7 +1817,9 @@ async fn run_inner(
                 let _ = events
                     .send(AgentEvent::MessageEnd { message: wake_msg })
                     .await;
-                queue.push_back(Action::InvokeLlm);
+                if should_push_invoke_llm(&queue) {
+                    queue.push_back(Action::InvokeLlm);
+                }
             }
             Action::InvokeLlm => {
                 // mu-779s: iteration cap check with progressive warnings
@@ -2590,14 +2647,13 @@ async fn run_inner(
                 }
 
                 if let RunMode::Autonomous { .. } = &mode {
-                    // Autonomous mode owns its own continuation /
-                    // termination semantics: queued input defers the
-                    // goal-check to the next MaybeFinish, exactly as
-                    // before (a per-iteration continuation must NOT
-                    // emit Done).
-                    if !queue.is_empty() {
-                        continue;
-                    }
+                    // Autonomous lifecycle belongs to the just-finished
+                    // provider turn, not to the absence of queued input. A
+                    // follow-up UserMessage/WatchCompleted/etc. may be
+                    // buffered while the stream is in flight; it must not
+                    // hide the iteration completion (and possible terminal
+                    // Done/receipt) from observers. Process the lifecycle
+                    // first, then let any queued external input run.
                     let (
                         current_iteration,
                         current_options,
@@ -2653,20 +2709,6 @@ async fn run_inner(
                         })
                         .await;
 
-                    let outcome = if satisfied {
-                        AutonomousIterationOutcome::GoalMet {
-                            detail: reason.clone(),
-                        }
-                    } else {
-                        AutonomousIterationOutcome::Continue
-                    };
-                    let _ = events
-                        .send(AgentEvent::AutonomousIterationCompleted {
-                            iteration: current_iteration,
-                            outcome: outcome.clone(),
-                        })
-                        .await;
-
                     let (cap_max_iter, cap_max_wall, cap_max_tools) = {
                         let cap = capability.lock().ok();
                         match cap.as_ref().map(|c| c.autonomy.clone()) {
@@ -2704,6 +2746,32 @@ async fn run_inner(
                         None
                     };
 
+                    // A queued schedule_wakeup owns a non-terminal
+                    // iteration's completion and the N -> N+1 transition:
+                    // its handler emits Completed, parks, re-checks bounds,
+                    // and starts the resumed iteration. Any terminal reason
+                    // wins — a run whose goal is met or whose bounds are
+                    // exhausted must terminate now rather than sleeping and
+                    // reviving solely because a wake request was buffered near
+                    // the end of its final provider stream.
+                    if terminal_reason.is_none() && queued_schedule_wakeup(&queue) {
+                        continue;
+                    }
+
+                    let outcome = if satisfied {
+                        AutonomousIterationOutcome::GoalMet {
+                            detail: reason.clone(),
+                        }
+                    } else {
+                        AutonomousIterationOutcome::Continue
+                    };
+                    let _ = events
+                        .send(AgentEvent::AutonomousIterationCompleted {
+                            iteration: current_iteration,
+                            outcome: outcome.clone(),
+                        })
+                        .await;
+
                     if let Some(reason_term) = terminal_reason {
                         let _ = events
                             .send(AgentEvent::AutonomousTerminated {
@@ -2732,28 +2800,22 @@ async fn run_inner(
                     if let RunMode::Autonomous { iteration, .. } = &mut mode {
                         *iteration = next_iter;
                     }
-                    let motivation = format!("iteration {next_iter}: continue toward the goal");
-                    let _ = events
-                        .send(AgentEvent::AutonomousIterationStarted {
+
+                    if queued_external_drives_model(&queue) {
+                        queue.push_back(Action::StartAutonomousIteration {
                             iteration: next_iter,
-                            motivation: motivation.clone(),
-                        })
-                        .await;
-                    let continuation_msg = AgentMessage::User {
-                        content: motivation,
-                    };
-                    let _ = events
-                        .send(AgentEvent::MessageStart {
-                            message: continuation_msg.clone(),
-                        })
-                        .await;
-                    messages.push(continuation_msg.clone());
-                    let _ = events
-                        .send(AgentEvent::MessageEnd {
-                            message: continuation_msg,
-                        })
-                        .await;
-                    queue.push_back(Action::InvokeLlm);
+                            motivation: "external input".to_owned(),
+                            inject_message: false,
+                        });
+                        continue;
+                    }
+
+                    let motivation = format!("iteration {next_iter}: continue toward the goal");
+                    queue.push_back(Action::StartAutonomousIteration {
+                        iteration: next_iter,
+                        motivation,
+                        inject_message: true,
+                    });
                     continue;
                 }
 

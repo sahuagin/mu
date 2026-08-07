@@ -38,6 +38,23 @@ ci: fmt-check clippy test
 ci-aipr: check
     scripts/ai-review.sh
 
+# ── build ─────────────────────────────────────────────────────────────────
+
+# One canonical invocation on purpose. Cargo fingerprints the command, so an
+# ad-hoc `--all-targets` build and a `--bin` build rebuild the whole tree each
+# time they alternate (`--all-targets` pulls dev-dependencies in, which unifies
+# features differently). agent_tools' `just build` is the same idea; deploy-local
+# calls this rather than carrying its own copy of the flags.
+#
+# --bins covers every binary target (6 today) with no list to keep in sync.
+# --all-features is deliberately NOT used: only the two *-py crates define any
+# features, and enabling their extension-module builds is not what a tool build
+# wants.
+
+# Release build of every binary — what ~/.local/bin's tools are, via .mu/emu.
+build:
+    cargo build --release --bins
+
 # ── individual cargo steps ────────────────────────────────────────────────
 
 # Format every crate in place.

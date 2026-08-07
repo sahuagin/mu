@@ -2018,34 +2018,55 @@ pub async fn handle_spawn_worker(
 /// agent loop as compaction headroom (mu-ub6q). See
 /// [`mu_core::session_status`] for what soft/hard mean.
 ///
-/// - **hard**: the model's `context_hard_limit` from the route catalog
-///   (`None` when the catalog has none — informational only).
+/// - **hard**: the model's `context_hard_limit` from the exact provider
+///   route when present, otherwise from the model catalog. The fallback matters
+///   for direct provider/model sessions: a model can be configured in
+///   `models.toml` without being a selectable route source.
 /// - **soft** precedence (no magic constant): the global override
 ///   `[compaction] context_soft_limit` if set, else the model's per-model
 ///   `context_soft_limit`, else — as a last resort when a model declares
-///   no soft budget — its `context_hard_limit`. `None` only for a route
-///   the catalog doesn't know at all (e.g. a hand-built test log); then
-///   there is no meter denominator and no compaction trigger, which is
-///   the honest answer rather than a guessed number.
+///   no soft budget — its `context_hard_limit`. `None` only when neither
+///   the provider route nor the model catalog knows a limit; then there is no
+///   meter denominator and no compaction trigger, which is the honest answer
+///   rather than a guessed number.
 fn resolve_context_limits(
     daemon_info: &DaemonInfo,
     provider_kind: &str,
     model: &str,
 ) -> (Option<u64>, Option<u64>, Option<u32>) {
-    let route = daemon_info.route_catalog().find(provider_kind, model);
-    let model_soft = route.and_then(|r| r.context_soft_limit);
-    let hard = route.and_then(|r| r.context_hard_limit);
-    // mu-ub6q: the model's output budget, reserved as compaction
-    // headroom by the agent loop (AgentConfig::max_output_tokens) so a
-    // soft limit set at the window still leaves room for the output.
-    let max_output = route.and_then(|r| r.max_output_tokens);
-    let soft = daemon_info
-        .config()
-        .compaction
-        .context_soft_limit
-        .map(|v| v as u64)
-        .or(model_soft)
-        .or(hard);
+    let route_catalog = daemon_info.route_catalog();
+    let route = route_catalog.find(provider_kind, model);
+    let model_settings = route_catalog.resolve_model_metadata(model);
+    resolve_context_limits_from_metadata(
+        daemon_info.config().compaction.context_soft_limit,
+        route.map(|r| {
+            (
+                r.context_soft_limit,
+                r.context_hard_limit,
+                r.max_output_tokens,
+            )
+        }),
+        &model_settings,
+    )
+}
+
+/// Combine provider-aware route metadata with provider-independent model
+/// metadata. An exact route wins field-by-field; the model catalog fills only
+/// missing fields. This lets direct known models such as `gpt-5.6-sol` expose
+/// truthful status/compaction limits without adding model-name conditionals
+/// (mu-solo-direct-model-context-xgwt). Keeping this separate makes the
+/// fallback testable without reading the operator's process-global
+/// `models.toml`.
+fn resolve_context_limits_from_metadata(
+    soft_override: Option<usize>,
+    route: Option<(Option<u64>, Option<u64>, Option<u32>)>,
+    model: &mu_core::model_catalog::ResolvedModelSettings,
+) -> (Option<u64>, Option<u64>, Option<u32>) {
+    let (route_soft, route_hard, route_output) = route.unwrap_or((None, None, None));
+    let model_soft = route_soft.or(model.context_soft_limit);
+    let hard = route_hard.or(model.context_hard_limit);
+    let max_output = route_output.or(model.max_output_tokens);
+    let soft = soft_override.map(|v| v as u64).or(model_soft).or(hard);
     (soft, hard, max_output)
 }
 
@@ -2334,6 +2355,53 @@ mod tests {
             method: method.into(),
             params,
         }
+    }
+
+    #[test]
+    fn direct_session_uses_known_model_metadata_without_a_route() {
+        let model = mu_core::model_catalog::ResolvedModelSettings {
+            context_soft_limit: Some(272_000),
+            context_hard_limit: Some(1_000_000),
+            max_output_tokens: Some(128_000),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_context_limits_from_metadata(None, None, &model),
+            (Some(272_000), Some(1_000_000), Some(128_000))
+        );
+    }
+
+    #[test]
+    fn exact_route_wins_and_model_metadata_fills_missing_fields() {
+        let model = mu_core::model_catalog::ResolvedModelSettings {
+            context_soft_limit: Some(272_000),
+            context_hard_limit: Some(1_000_000),
+            max_output_tokens: Some(128_000),
+            ..Default::default()
+        };
+        let route = Some((Some(200_000), Some(900_000), None));
+
+        assert_eq!(
+            resolve_context_limits_from_metadata(None, route, &model),
+            (Some(200_000), Some(900_000), Some(128_000))
+        );
+        assert_eq!(
+            resolve_context_limits_from_metadata(Some(150_000), route, &model),
+            (Some(150_000), Some(900_000), Some(128_000))
+        );
+    }
+
+    #[test]
+    fn unknown_direct_session_does_not_fabricate_context_limits() {
+        assert_eq!(
+            resolve_context_limits_from_metadata(
+                None,
+                None,
+                &mu_core::model_catalog::ResolvedModelSettings::default(),
+            ),
+            (None, None, None)
+        );
     }
 
     #[tokio::test]

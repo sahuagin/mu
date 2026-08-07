@@ -122,6 +122,10 @@ fn env_nonempty(key: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct RouteCatalog {
     entries: Vec<RouteEntry>,
+    /// The model metadata snapshot used to enrich this catalog. Retained so a
+    /// direct provider/model session can resolve known limits even when that
+    /// pair was not contributed by a route-discovery source.
+    model_catalog: Arc<model_catalog::ModelCatalogConfig>,
 }
 
 impl RouteCatalog {
@@ -207,7 +211,10 @@ impl RouteCatalog {
             Some(128_000),
         ));
 
-        Self { entries }
+        Self {
+            entries,
+            model_catalog: Arc::new(catalog.clone()),
+        }
     }
 
     /// Merge dynamically-discovered ollama models into the catalog.
@@ -383,6 +390,13 @@ impl RouteCatalog {
         self.entries
             .iter()
             .find(|e| e.provider_kind.as_ref() == provider_kind && e.model.as_ref() == model)
+    }
+
+    /// Resolve provider-independent metadata from the same catalog snapshot
+    /// that enriched the route entries. Unlike [`find`](Self::find), this does
+    /// not require the model to have been contributed by a route source.
+    pub fn resolve_model_metadata(&self, model: &str) -> model_catalog::ResolvedModelSettings {
+        self.model_catalog.resolve_model(model)
     }
 
     pub fn configured_entries(&self) -> impl Iterator<Item = &RouteEntry> {
@@ -643,6 +657,33 @@ mod tests {
         let entry = catalog.find("faux", "faux").unwrap();
         let found = catalog.find_by_hash(&entry.hash).unwrap();
         assert_eq!(found.model, entry.model);
+    }
+
+    #[test]
+    fn retains_metadata_for_models_without_a_route_source() {
+        let mut model_catalog = model_catalog::built_in();
+        model_catalog.models.insert(
+            "direct-only".into(),
+            model_catalog::ModelCatalogEntry {
+                model: Some("provider/direct-only".into()),
+                context_soft_limit: Some(272_000),
+                context_hard_limit: Some(1_000_000),
+                max_output_tokens: Some(128_000),
+                ..Default::default()
+            },
+        );
+        let routes = RouteCatalog::from_catalog_with_availability(
+            &model_catalog,
+            ProviderAvailability::all_configured(),
+        );
+
+        assert!(routes
+            .find("openai_codex", "provider/direct-only")
+            .is_none());
+        let settings = routes.resolve_model_metadata("provider/direct-only");
+        assert_eq!(settings.context_soft_limit, Some(272_000));
+        assert_eq!(settings.context_hard_limit, Some(1_000_000));
+        assert_eq!(settings.max_output_tokens, Some(128_000));
     }
 
     #[test]

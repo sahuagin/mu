@@ -110,6 +110,13 @@ crossterm = "0.28"
 # MCP (used for built-in MCP servers and client; later)
 rmcp = { version = "1", default-features = false }
 
+# biscuit-quote 0.3.0 depends on archived proc-macro-error2 2.0.1, whose
+# never-type fallback will be rejected by a future Rust. Upstream replaced it
+# with manyhow after 0.3.0; pin that source until a fixed release is published.
+# Bead: mu-proc-macro-error2-future-incompat-7lbq.
+[patch.crates-io]
+biscuit-quote = { git = "https://github.com/biscuit-auth/biscuit-rust.git", rev = "037cbf4e7e97938662d67365c1c6b3de928cb143" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

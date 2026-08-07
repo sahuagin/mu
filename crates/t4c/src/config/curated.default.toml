@@ -134,7 +134,7 @@ ai = false
 
 [[capability]]
 path = "bash.sprint-start"
-summary = "claim a bead (issue) and enter a unique jj workspace, atomically — the correct-by-construction way to start work on a bead. Pairs with sprint-end. Claims in the CURRENT repo's tracker (per remotes.env); if the bead lives in ANOTHER repo's tracker (e.g. an `at-*`/agent_tools bead while you're in the mu repo → fails ISSUE_NOT_FOUND), claim it there with `beads --url <that-remote> claim <bead> --actor <a>` and use `sprint-start --no-bead <label>` for the isolated workspace."
+summary = "claim a bead (issue) and enter a unique jj workspace, atomically — the correct-by-construction way to start work on a bead. Finish with `sprint-end --close` (bare sprint-end only unclaims, leaving the bead open). Claims in the CURRENT repo's tracker (per remotes.env); if the bead lives in ANOTHER repo's tracker (e.g. an `at-*`/agent_tools bead while you're in the mu repo → fails ISSUE_NOT_FOUND), claim it there with `beads --url <that-remote> claim <bead> --actor <a>` and use `sprint-start --no-bead <label>` for the isolated workspace."
 keywords = [
     "bead", "claim", "issue", "ticket", "workspace", "sprint", "start", "work", "task", "begin",
     "not found", "issue_not_found", "remote", "wrong tracker",
@@ -151,9 +151,10 @@ ai = false
 
 [[capability]]
 path = "bash.sprint-end"
-summary = "release a claimed bead and tear down its sprint-start workspace (`--close` to close the bead). Bare sprint-end unclaims back to open — close first, or use sprint-end --close."
+summary = "release a claimed bead and tear down its sprint-start workspace. Finished work: `sprint-end --close` — one step, releases AND closes. Bare `sprint-end` UNCLAIMS instead (status -> open), which is for parking unfinished work. Do not close the bead separately and then run bare sprint-end; the unclaim used to undo the close (at-bes now leaves an already-closed bead alone). Tear down from the repo root, not from inside the workspace."
 keywords = [
     "bead", "release", "unclaim", "close", "finish", "issue", "workspace", "sprint", "end", "teardown",
+    "reopen", "reopened", "still open", "already closed", "done",
 ]
 invoke = ["sprint-end", "BEAD-ID"]
 requires = []

@@ -73,13 +73,60 @@ pub fn load(path: &std::path::Path) -> Option<PresenceConfig> {
     Some(cfg)
 }
 
-/// Default config path: `$MU_CONFIG` or `~/.config/mu/config.toml`.
-pub fn default_config_path() -> std::path::PathBuf {
+fn home_config(rel: &str) -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    std::path::PathBuf::from(home).join(rel)
+}
+
+/// Does this file define the nested table named by `keys`?
+fn defines(path: &std::path::Path, keys: &[&str]) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(root) = text.parse::<toml::Value>() else {
+        return false;
+    };
+    let mut node = &root;
+    for k in keys {
+        match node.get(k) {
+            Some(next) => node = next,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Where to read a top-level section from, same rules as
+/// [`config_path_for`]. `[mesh]` is genuinely mu-specific, so it normally
+/// stays in the mu config even when `[dialogue.mesh]` has moved — which is why
+/// the two are resolved separately rather than assumed to share a file.
+pub fn config_path_for_key(keys: &[&str]) -> std::path::PathBuf {
     if let Ok(p) = std::env::var("MU_CONFIG") {
         return std::path::PathBuf::from(p);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    std::path::PathBuf::from(home).join(".config/mu/config.toml")
+    let agent = home_config(".config/agent/config.toml");
+    if defines(&agent, keys) {
+        return agent;
+    }
+    home_config(".config/mu/config.toml")
+}
+
+/// Where to read `[dialogue.<section>]` from (mu-htit).
+///
+/// `~/.config/agent/config.toml` first — mu-dialogue is a tool several clients
+/// use, so its config belongs with the shared agent config, not under the
+/// mu-specific tree. Falls back to `~/.config/mu/config.toml`, which is where
+/// these sections have lived until now.
+///
+/// The fallback is per SECTION, not per file, and that distinction matters: a
+/// whole-file preference would silently disable presence on any host whose
+/// agent config exists but carries no `[dialogue.presence]`, turning a config
+/// move into an outage. This way an existing deployment keeps working untouched
+/// and a section takes effect wherever it is put.
+///
+/// `$MU_CONFIG` still wins outright, so an explicit override overrides.
+pub fn config_path_for(section: &str) -> std::path::PathBuf {
+    config_path_for_key(&["dialogue", section])
 }
 
 /// One lease-live peer, parsed from its etcd key/value. The key suffix (after
@@ -228,6 +275,58 @@ mod tests {
         let cfg = load(&p).unwrap();
         assert_eq!(cfg.etcd, vec!["http://10.0.0.1:2379"]);
         assert_eq!(cfg.prefix, DEFAULT_PREFIX);
+    }
+
+    /// mu-htit: the agent config wins for a section it defines, and the mu
+    /// config still serves the ones it does not — per SECTION, so moving one
+    /// does not disable the other.
+    #[test]
+    fn sections_resolve_from_the_agent_config_first_then_fall_back() {
+        let dir = std::env::temp_dir().join(format!("mu-dlg-cfgres-{}", std::process::id()));
+        let agent = dir.join(".config/agent");
+        let mu = dir.join(".config/mu");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&mu).unwrap();
+        // The shared agent config carries only `mesh`; presence still lives
+        // in the mu config, as on a host mid-migration.
+        std::fs::write(
+            agent.join("config.toml"),
+            "[dialogue.mesh]\nenabled = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            mu.join("config.toml"),
+            "[dialogue.presence]\nenabled = true\netcd = [\"http://x:2379\"]\n",
+        )
+        .unwrap();
+
+        // Isolate HOME; $MU_CONFIG must not leak in from the caller's env.
+        let prev_home = std::env::var("HOME").ok();
+        let prev_cfg = std::env::var("MU_CONFIG").ok();
+        std::env::set_var("HOME", &dir);
+        std::env::remove_var("MU_CONFIG");
+
+        assert_eq!(config_path_for("mesh"), agent.join("config.toml"));
+        assert_eq!(config_path_for("presence"), mu.join("config.toml"));
+        // A section defined nowhere resolves to the mu config, where `load`
+        // finds nothing and the feature stays off — the pre-mu-htit behaviour.
+        assert_eq!(config_path_for("nosuch"), mu.join("config.toml"));
+
+        // An explicit override still beats both.
+        std::env::set_var("MU_CONFIG", "/explicit/path.toml");
+        assert_eq!(
+            config_path_for("mesh"),
+            std::path::PathBuf::from("/explicit/path.toml")
+        );
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_cfg {
+            Some(c) => std::env::set_var("MU_CONFIG", c),
+            None => std::env::remove_var("MU_CONFIG"),
+        }
     }
 
     #[test]

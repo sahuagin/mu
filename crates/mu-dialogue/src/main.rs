@@ -1423,7 +1423,7 @@ fn open_store(peer_ttl_ms: i64) -> Result<Store> {
     migrate(&conn).context("schema migration")?;
     // Optional etcd-lease presence: enabled only by [dialogue.presence]
     // enabled=true in the mu config — a bare install runs without etcd.
-    let cfg_path = presence::default_config_path();
+    let cfg_path = presence::config_path_for("presence");
     let presence = match presence::load(&cfg_path) {
         Some(cfg) => {
             info!(etcd = ?cfg.etcd, prefix = %cfg.prefix,
@@ -1461,8 +1461,9 @@ fn open_store(peer_ttl_ms: i64) -> Result<Store> {
 /// long-poll, the rowid cursor and every existing client keep working with no
 /// changes, and the store that was already a durable buffer goes on being one.
 async fn attach_mesh(store: &mut Store) -> bool {
-    let cfg_path = presence::default_config_path();
-    let Some(cfg) = mesh::load(&cfg_path) else {
+    let cfg_path = presence::config_path_for("mesh");
+    let fleet_path = presence::config_path_for_key(&["mesh"]);
+    let Some(cfg) = mesh::load(&cfg_path, &fleet_path) else {
         info!(
             "mesh gateway disabled (no [dialogue.mesh] enabled=true in {}); \
              dialogue is store-only",

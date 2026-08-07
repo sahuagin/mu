@@ -69,16 +69,29 @@ pub struct MeshConfig {
 /// section, or `enabled = true` is missing, or when no NATS url / issuer key
 /// can be resolved — every "not configured" shape means "run exactly as
 /// before".
-pub fn load(path: &Path) -> Option<MeshConfig> {
+/// `path` holds `[dialogue.mesh]`; `fleet_path` holds the top-level `[mesh]`
+/// the unset fields inherit from. They are usually DIFFERENT files — the
+/// dialogue section belongs with the shared agent config, `[mesh]` is
+/// mu-specific — so inheritance has to cross files or the gateway silently
+/// stays off with an empty nats_url (mu-htit).
+pub fn load(path: &Path, fleet_path: &Path) -> Option<MeshConfig> {
     let text = std::fs::read_to_string(path).ok()?;
     let root: toml::Value = text.parse().ok()?;
     let mut cfg: MeshConfig = root.get("dialogue")?.get("mesh")?.clone().try_into().ok()?;
     if !cfg.enabled {
         return None;
     }
+    let fleet: Option<toml::Value> = if fleet_path == path {
+        None
+    } else {
+        std::fs::read_to_string(fleet_path)
+            .ok()
+            .and_then(|t| t.parse().ok())
+    };
     let inherit = |field: &str| -> String {
         root.get("mesh")
             .and_then(|m| m.get(field))
+            .or_else(|| fleet.as_ref()?.get("mesh")?.get(field))
             .and_then(toml::Value::as_str)
             .unwrap_or_default()
             .to_string()
@@ -652,6 +665,12 @@ mod tests {
         );
     }
 
+    /// Most config tests keep `[dialogue.mesh]` and `[mesh]` in one file; the
+    /// cross-file case has its own test.
+    fn load1(p: &std::path::Path) -> Option<MeshConfig> {
+        load(p, p)
+    }
+
     fn write_cfg(name: &str, body: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("mu-dlg-mesh-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -664,36 +683,57 @@ mod tests {
     fn config_absent_or_disabled_means_none() {
         let dir = std::env::temp_dir().join(format!("mu-dlg-mesh-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(load(&dir.join("missing.toml")).is_none());
-        assert!(load(&write_cfg("nosection.toml", "[other]\nx = 1\n")).is_none());
+        assert!(load1(&dir.join("missing.toml")).is_none());
+        assert!(load1(&write_cfg("nosection.toml", "[other]\nx = 1\n")).is_none());
         // A [mesh] section alone must NOT switch the gateway on — the daemon
         // has had one for a while and enabling it here is a separate decision.
-        assert!(load(&write_cfg(
+        assert!(load1(&write_cfg(
             "meshonly.toml",
             "[mesh]\nenabled = true\nnats_url = \"127.0.0.1:4222\"\nissuer_key = \"ab\"\n"
         ))
         .is_none());
-        assert!(load(&write_cfg(
+        assert!(load1(&write_cfg(
             "off.toml",
             "[dialogue.mesh]\nenabled = false\n[mesh]\nnats_url = \"x\"\nissuer_key = \"ab\"\n"
         ))
         .is_none());
         // Enabled but nothing to connect to / sign with → still disabled.
-        assert!(load(&write_cfg(
+        assert!(load1(&write_cfg(
             "nourl.toml",
             "[dialogue.mesh]\nenabled = true\n"
         ))
         .is_none());
-        assert!(load(&write_cfg(
+        assert!(load1(&write_cfg(
             "nokey.toml",
             "[dialogue.mesh]\nenabled = true\n[mesh]\nnats_url = \"127.0.0.1:4222\"\n"
         ))
         .is_none());
     }
 
+    /// mu-htit: `[dialogue.mesh]` moves to the shared agent config while
+    /// `[mesh]` stays mu-specific, so inheritance must cross files. Getting
+    /// this wrong leaves nats_url empty and the gateway silently off.
+    #[test]
+    fn the_fleet_section_is_inherited_across_files() {
+        let dialogue = write_cfg(
+            "split-dialogue.toml",
+            "[dialogue]\nurl = \"http://10.1.1.172:7740/mcp\"\n\n[dialogue.mesh]\nenabled = true\n",
+        );
+        let fleet = write_cfg(
+            "split-fleet.toml",
+            "[mesh]\nnats_url = \"127.0.0.1:4222\"\nissuer_key = \"beef\"\n",
+        );
+        let cfg = load(&dialogue, &fleet).expect("enabled, inheriting across files");
+        assert_eq!(cfg.nats_url, "127.0.0.1:4222");
+        assert_eq!(cfg.issuer_key, "beef");
+        // Without the fleet file there is nothing to connect to, so it stays off
+        // rather than half-configured.
+        assert!(load(&dialogue, &dialogue).is_none());
+    }
+
     #[test]
     fn config_inherits_from_the_fleet_mesh_section_and_can_override() {
-        let cfg = load(&write_cfg(
+        let cfg = load1(&write_cfg(
             "inherit.toml",
             "[dialogue.mesh]\nenabled = true\n\
              [mesh]\nnats_url = \"127.0.0.1:4222\"\nissuer_key = \"beef\"\n",
@@ -702,7 +742,7 @@ mod tests {
         assert_eq!(cfg.nats_url, "127.0.0.1:4222");
         assert_eq!(cfg.issuer_key, "beef");
 
-        let cfg = load(&write_cfg(
+        let cfg = load1(&write_cfg(
             "override.toml",
             "[dialogue.mesh]\nenabled = true\nnats_url = \"10.0.0.9:4222\"\n\
              [mesh]\nnats_url = \"127.0.0.1:4222\"\nissuer_key = \"beef\"\n",

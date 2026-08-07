@@ -18,6 +18,18 @@ use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
 
 use super::time::now_rfc3339_utc;
 
+/// Split an operator's `mu mark` reference into (daemon prefix, session prefix).
+///
+/// mu-nldm: this is deliberately NOT `SessionRef::parse` or `mu_peer::PeerId`.
+/// Those name one exact thing; this is a LOOKUP over the events dir where both
+/// halves are PREFIXES and the daemon is optional — `sess` is a valid
+/// reference. Routing it through either would reject the bare form, which is
+/// the historical and most-used shape. Ambiguity is refused by `mark_session`,
+/// so being permissive here costs nothing.
+///
+/// It accepts every rendering the other two produce, so anything pasted from
+/// `mu list-sessions`, `dialogue_peers`, mesh `who` or a resume ref resolves.
+/// Keep it that way; the tests pin each shape.
 fn split_mark_session_ref(reference: &str) -> (Option<&str>, &str) {
     let reference = reference.strip_prefix("mu:").unwrap_or(reference);
     if let Some((daemon, session)) = reference.split_once('/') {
@@ -41,12 +53,13 @@ pub struct MarkOutcome {
 
 /// Sessions under `events_dir` whose session id starts with `reference`.
 ///
-/// `reference` may be either the historical bare session id/prefix
-/// (`session-1`, `sess`) or a daemon-qualified ref copied from
-/// `mu list-sessions`: `<daemon>/<session>` (also accepts
-/// `mu:<daemon>/<session>` and `<daemon>:<session>` for symmetry with
-/// resume-style refs). Daemon and session components are prefix-matched;
-/// ambiguity is still refused by [`mark_session`].
+/// `reference` may be the historical bare session id/prefix (`session-1`,
+/// `sess`), or any qualified form: `<daemon>/<session>` from
+/// `mu list-sessions`, `mu:<daemon>/<session>` (a `SessionRef`),
+/// `<daemon>:<session>`, or `mu:<daemon>:<session>` (a `mu_peer::PeerId`, what
+/// `dialogue_peers` and mesh `who` print). Both components are prefix-matched;
+/// ambiguity is refused by [`mark_session`]. See [`split_mark_session_ref`] for
+/// why this grammar is its own.
 ///
 /// Returns `(daemon_id, session_id, jsonl path)` tuples.
 pub fn resolve_sessions(events_dir: &Path, reference: &str) -> Vec<(String, String, PathBuf)> {
@@ -494,6 +507,21 @@ mod tests {
 
         let err = mark_session(tmp.path(), "session-1", 2, None).unwrap_err();
         assert!(err.to_string().contains("ambiguous"), "{err}");
+    }
+
+    /// mu-nldm: the fleet identity rendering, `mu:<daemon>:<session>`, is what
+    /// `dialogue_peers` and mesh `who` emit — so it is what someone pastes at
+    /// `mu mark`. It has to resolve like the other qualified forms.
+    #[test]
+    fn mark_accepts_the_peer_id_rendering() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_session(tmp.path(), "63d69fe6a408d77e", "session-1");
+        seed_session(tmp.path(), "dc5b7377666c1882", "session-1");
+
+        let outcome = mark_session(tmp.path(), "mu:63d69fe6a408d77e:session-1", 5, None)
+            .expect("mu:<daemon>:<session> marks the exact session");
+        assert_eq!(outcome.daemon_id, "63d69fe6a408d77e");
+        assert_eq!(outcome.session_id, "session-1");
     }
 
     #[test]

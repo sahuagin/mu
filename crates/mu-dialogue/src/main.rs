@@ -1463,13 +1463,12 @@ fn open_store(peer_ttl_ms: i64) -> Result<Store> {
 async fn attach_mesh(store: &mut Store) -> bool {
     let cfg_path = presence::config_path_for("mesh");
     let fleet_path = presence::config_path_for_key(&["mesh"]);
-    let Some(cfg) = mesh::load(&cfg_path, &fleet_path) else {
-        info!(
-            "mesh gateway disabled (no [dialogue.mesh] enabled=true in {}); \
-             dialogue is store-only",
-            cfg_path.display()
-        );
-        return false;
+    let cfg = match mesh::load(&cfg_path, &fleet_path) {
+        Ok(cfg) => cfg,
+        Err(why) => {
+            info!("mesh gateway off — {why}; dialogue is store-only");
+            return false;
+        }
     };
     let (gateway, mut inbound_rx) = match mesh::connect(&cfg).await {
         Ok(v) => v,

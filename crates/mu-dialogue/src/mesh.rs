@@ -74,12 +74,25 @@ pub struct MeshConfig {
 /// dialogue section belongs with the shared agent config, `[mesh]` is
 /// mu-specific — so inheritance has to cross files or the gateway silently
 /// stays off with an empty nats_url (mu-htit).
-pub fn load(path: &Path, fleet_path: &Path) -> Option<MeshConfig> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let root: toml::Value = text.parse().ok()?;
-    let mut cfg: MeshConfig = root.get("dialogue")?.get("mesh")?.clone().try_into().ok()?;
+pub fn load(path: &Path, fleet_path: &Path) -> Result<MeshConfig, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("no [dialogue.mesh]: cannot read {}: {e}", path.display()))?;
+    let root: toml::Value = text
+        .parse()
+        .map_err(|e| format!("{} is not valid TOML: {e}", path.display()))?;
+    let section = root
+        .get("dialogue")
+        .and_then(|d| d.get("mesh"))
+        .ok_or_else(|| format!("no [dialogue.mesh] section in {}", path.display()))?;
+    let mut cfg: MeshConfig = section
+        .clone()
+        .try_into()
+        .map_err(|e| format!("[dialogue.mesh] in {} is malformed: {e}", path.display()))?;
     if !cfg.enabled {
-        return None;
+        return Err(format!(
+            "[dialogue.mesh] in {} has enabled = false",
+            path.display()
+        ));
     }
     let fleet: Option<toml::Value> = if fleet_path == path {
         None
@@ -102,10 +115,20 @@ pub fn load(path: &Path, fleet_path: &Path) -> Option<MeshConfig> {
     if cfg.issuer_key.is_empty() {
         cfg.issuer_key = inherit("issuer_key");
     }
-    if cfg.nats_url.is_empty() || cfg.issuer_key.is_empty() {
-        return None;
+    // Name the field AND both files searched. "enabled = true but nothing to
+    // connect to" used to report the same line as "no section at all", which
+    // sent at least one debugging session down the wrong path entirely.
+    for (field, value) in [("nats_url", &cfg.nats_url), ("issuer_key", &cfg.issuer_key)] {
+        if value.is_empty() {
+            return Err(format!(
+                "[dialogue.mesh] is enabled in {} but {field} is unset — put it there, \
+                 or in a [mesh] section of {} (checked both)",
+                path.display(),
+                fleet_path.display()
+            ));
+        }
     }
-    Some(cfg)
+    Ok(cfg)
 }
 
 // ──────────────────────── Wire types (mesh contract) ────────────────────────
@@ -667,7 +690,7 @@ mod tests {
 
     /// Most config tests keep `[dialogue.mesh]` and `[mesh]` in one file; the
     /// cross-file case has its own test.
-    fn load1(p: &std::path::Path) -> Option<MeshConfig> {
+    fn load1(p: &std::path::Path) -> Result<MeshConfig, String> {
         load(p, p)
     }
 
@@ -683,31 +706,31 @@ mod tests {
     fn config_absent_or_disabled_means_none() {
         let dir = std::env::temp_dir().join(format!("mu-dlg-mesh-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(load1(&dir.join("missing.toml")).is_none());
-        assert!(load1(&write_cfg("nosection.toml", "[other]\nx = 1\n")).is_none());
+        assert!(load1(&dir.join("missing.toml")).is_err());
+        assert!(load1(&write_cfg("nosection.toml", "[other]\nx = 1\n")).is_err());
         // A [mesh] section alone must NOT switch the gateway on — the daemon
         // has had one for a while and enabling it here is a separate decision.
         assert!(load1(&write_cfg(
             "meshonly.toml",
             "[mesh]\nenabled = true\nnats_url = \"127.0.0.1:4222\"\nissuer_key = \"ab\"\n"
         ))
-        .is_none());
+        .is_err());
         assert!(load1(&write_cfg(
             "off.toml",
             "[dialogue.mesh]\nenabled = false\n[mesh]\nnats_url = \"x\"\nissuer_key = \"ab\"\n"
         ))
-        .is_none());
+        .is_err());
         // Enabled but nothing to connect to / sign with → still disabled.
         assert!(load1(&write_cfg(
             "nourl.toml",
             "[dialogue.mesh]\nenabled = true\n"
         ))
-        .is_none());
+        .is_err());
         assert!(load1(&write_cfg(
             "nokey.toml",
             "[dialogue.mesh]\nenabled = true\n[mesh]\nnats_url = \"127.0.0.1:4222\"\n"
         ))
-        .is_none());
+        .is_err());
     }
 
     /// mu-htit: `[dialogue.mesh]` moves to the shared agent config while
@@ -728,7 +751,7 @@ mod tests {
         assert_eq!(cfg.issuer_key, "beef");
         // Without the fleet file there is nothing to connect to, so it stays off
         // rather than half-configured.
-        assert!(load(&dialogue, &dialogue).is_none());
+        assert!(load(&dialogue, &dialogue).is_err());
     }
 
     #[test]

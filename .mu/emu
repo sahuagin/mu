@@ -1,9 +1,9 @@
 #!/bin/sh
-# emu — "execute mu": a multi-call auto-build launcher.
+# emu — "execute mu": a multi-call launcher.
 #
 # Symlink this script (from the checkout it lives in) into ~/.local/bin under a
-# tool's name; invoking that name rebuilds the tool from THIS workspace and
-# execs it. Everything is derived from $0 — no hardcoded paths, no per-tool
+# tool's name; invoking that name execs that tool's PREBUILT binary from THIS
+# workspace. Everything is derived from $0 — no hardcoded paths, no per-tool
 # wrapper scripts:
 #
 #   basename "$0"      -> WHICH tool   (the invoked symlink name)
@@ -14,10 +14,16 @@
 # which checkout they `emu install` from.
 #
 #   emu install t4c mu-solo    # run from a checkout: create the ~/.local/bin links
-#   t4c <args>                 # (via the symlink) build t4c from this workspace, exec it
+#   t4c <args>                 # (via the symlink) exec t4c built from this workspace
 #
-# cargo build writes to stderr, so stdout stays clean for the tool's own output.
-# A build failure aborts (set -e) instead of exec'ing a stale binary.
+# It does NOT build. Auto-build was removed 2026-07-10 because the checkout is
+# shared by concurrent sessions with uncommitted WIP, so building on launch could
+# silently compile an unintended tree (see the `*)` arm). Rebuild deliberately
+# after updating the checkout — `deploy-local` does this, or by hand:
+#     cargo build --release --bin <tool>        # or --all-features --all-targets
+# A tool whose binary is missing errors out rather than running something stale.
+# (at-dk1: this header used to claim auto-build long after it was gone, and
+# deploy-local was written against the claim instead of the behaviour.)
 set -eu
 
 self=$(readlink -f "$0")

@@ -55,6 +55,25 @@ fn origins(cfg: &Path, fleet: &Path, field: &str) -> Vec<Origin> {
     found
 }
 
+/// A section defined in a file the loader will NOT consult, because an
+/// earlier candidate defined it too. Same failure class as a shadowed field —
+/// the ignored copy looks authoritative when you read it (mu-qqv0).
+fn report_section_shadowing(keys: &[&str]) -> bool {
+    let winner = presence::config_path_for_key(keys);
+    let mut any = false;
+    for cand in presence::config_candidates() {
+        if cand != winner && presence::file_defines(&cand, keys) {
+            println!(
+                "      SHADOWED: [{}] is ALSO defined in {} — that copy is IGNORED",
+                keys.join("."),
+                cand.display()
+            );
+            any = true;
+        }
+    }
+    any
+}
+
 fn redact(field: &str, value: &str) -> String {
     if field.contains("key") && value.len() > 12 {
         format!(
@@ -168,6 +187,7 @@ pub fn run(args: &[String]) -> i32 {
         }
         None => println!("      disabled (absent, enabled = false, or no endpoints)"),
     }
+    report_section_shadowing(&["dialogue", "presence"]);
     println!();
 
     // ── mesh gateway ─────────────────────────────────────────────────────
@@ -177,6 +197,8 @@ pub fn run(args: &[String]) -> i32 {
     if f_path != m_path {
         println!("      inherits [mesh] from {}", f_path.display());
     }
+    report_section_shadowing(&["dialogue", "mesh"]);
+    report_section_shadowing(&["mesh"]);
     match mesh::load(&m_path, &f_path) {
         Ok(cfg) => {
             println!("      enabled     = true");
@@ -310,6 +332,48 @@ mod tests {
         assert!(shown.contains("64 chars"));
         // Non-secret fields are shown verbatim.
         assert_eq!(redact("nats_url", "10.1.1.172:4222"), "10.1.1.172:4222");
+    }
+
+    /// A whole SECTION present in a file the loader will not consult is the
+    /// same failure class as a shadowed field, and was missed by the first cut
+    /// of this command: presence in both files, agent winning, the mu copy
+    /// silently ignored while reading as authoritative.
+    #[test]
+    fn a_section_defined_in_both_files_is_reported_as_shadowed() {
+        let d = tmp("sect");
+        std::fs::create_dir_all(d.join(".config/agent")).unwrap();
+        std::fs::create_dir_all(d.join(".config/mu")).unwrap();
+        std::fs::write(
+            d.join(".config/agent/config.toml"),
+            "[dialogue.presence]\nenabled = true\netcd = [\"http://wrong:2379\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join(".config/mu/config.toml"),
+            "[dialogue.presence]\nenabled = true\netcd = [\"http://right:2379\"]\n",
+        )
+        .unwrap();
+
+        let prev = std::env::var("HOME").ok();
+        let prev_cfg = std::env::var("MU_CONFIG").ok();
+        std::env::set_var("HOME", &d);
+        std::env::remove_var("MU_CONFIG");
+
+        let cands = presence::config_candidates();
+        assert_eq!(cands.len(), 2, "agent then mu");
+        let winner = presence::config_path_for_key(&["dialogue", "presence"]);
+        assert!(winner.ends_with(".config/agent/config.toml"), "agent wins");
+        // The loser defines it too — that is what must be reported.
+        let loser = cands.iter().find(|c| **c != winner).unwrap();
+        assert!(presence::file_defines(loser, &["dialogue", "presence"]));
+
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        if let Some(c) = prev_cfg {
+            std::env::set_var("MU_CONFIG", c)
+        }
     }
 
     #[test]

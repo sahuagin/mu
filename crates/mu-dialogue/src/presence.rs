@@ -101,14 +101,36 @@ fn defines(path: &std::path::Path, keys: &[&str]) -> bool {
 /// stays in the mu config even when `[dialogue.mesh]` has moved — which is why
 /// the two are resolved separately rather than assumed to share a file.
 pub fn config_path_for_key(keys: &[&str]) -> std::path::PathBuf {
+    let cands = config_candidates();
+    for c in &cands {
+        if defines(c, keys) {
+            return c.clone();
+        }
+    }
+    // Nothing defines it: report the last candidate, which is where the loader
+    // will look and (truthfully) find nothing.
+    cands
+        .last()
+        .cloned()
+        .unwrap_or_else(|| home_config(".config/mu/config.toml"))
+}
+
+/// Every file consulted, in precedence order. `$MU_CONFIG` collapses this to a
+/// single entry — it overrides both, for every section.
+pub fn config_candidates() -> Vec<std::path::PathBuf> {
     if let Ok(p) = std::env::var("MU_CONFIG") {
-        return std::path::PathBuf::from(p);
+        return vec![std::path::PathBuf::from(p)];
     }
-    let agent = home_config(".config/agent/config.toml");
-    if defines(&agent, keys) {
-        return agent;
-    }
-    home_config(".config/mu/config.toml")
+    vec![
+        home_config(".config/agent/config.toml"),
+        home_config(".config/mu/config.toml"),
+    ]
+}
+
+/// Does `path` define the nested table named by `keys`? Public so
+/// `--check-config` can report a section that is present but NOT consulted.
+pub fn file_defines(path: &std::path::Path, keys: &[&str]) -> bool {
+    defines(path, keys)
 }
 
 /// Where to read `[dialogue.<section>]` from (mu-htit).

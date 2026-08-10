@@ -45,7 +45,7 @@ if [ "$name" = "emu" ]; then
             done
             exit 0 ;;
         *)
-            echo "emu — multi-call auto-build launcher (workspace: $root)" >&2
+            echo "emu — multi-call launcher for prebuilt tools (workspace: $root)" >&2
             echo "usage: emu install <tool>...   then invoke each tool by name" >&2
             exit 0 ;;
     esac

@@ -294,6 +294,15 @@ pub struct SessionConfig {
     /// An unrecognized value is a hard config error (so a typo doesn't
     /// silently fall through to unrestricted).
     pub max_side_effects: String,
+    /// mu-sftz: path to a file whose contents become the session's
+    /// system prompt (`CreateSessionRequest.system_prompt`) — the
+    /// mu-solo/profile counterpart of `mu ask --append-system-prompt`.
+    /// A leading `~/` expands to $HOME. Empty string (the DEFAULT) =
+    /// no override; the daemon default prompt applies. A configured
+    /// but unreadable file is a hard startup error (matching mu-x83o's
+    /// fail-fast posture) — a seat whose behavioral contract silently
+    /// failed to load must not come up looking normal.
+    pub system_prompt_file: String,
 }
 
 impl Default for SessionConfig {
@@ -318,6 +327,8 @@ impl Default for SessionConfig {
             // mu-n25a: unrestricted by default — opt-in posture, so
             // existing solo configs are unaffected.
             max_side_effects: String::new(),
+            // mu-sftz: no system-prompt override by default.
+            system_prompt_file: String::new(),
         }
     }
 }
@@ -349,6 +360,36 @@ impl SessionConfig {
             }
         };
         Ok(Some(parsed))
+    }
+
+    /// mu-sftz: read the configured `system_prompt_file` into the string
+    /// sent as `CreateSessionRequest.system_prompt`. `Ok(None)` = no
+    /// override (empty path ⇒ the field is omitted from create_session,
+    /// so the daemon default prompt applies). A configured-but-unreadable
+    /// file is a hard error: a profile whose behavioral contract failed
+    /// to load must not start looking normal.
+    pub fn system_prompt(&self) -> Result<Option<String>> {
+        let raw = self.system_prompt_file.trim();
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let path = if let Some(rest) = raw.strip_prefix("~/") {
+            match dirs::home_dir() {
+                Some(home) => home.join(rest),
+                None => anyhow::bail!(
+                    "[session] system_prompt_file {raw:?} uses `~/` but no home directory could be determined"
+                ),
+            }
+        } else {
+            PathBuf::from(raw)
+        };
+        let text = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "[session] system_prompt_file: cannot read {}",
+                path.display()
+            )
+        })?;
+        Ok(Some(text))
     }
 }
 
@@ -454,6 +495,51 @@ mod tests {
         let c = SoloConfig::default();
         assert!(!c.autonomy.enabled);
         assert_eq!(c.autonomy.to_capability(), None);
+    }
+
+    // ── mu-sftz: system_prompt_file ─────────────────────────────
+
+    #[test]
+    fn system_prompt_none_by_default() {
+        let c = SoloConfig::default();
+        assert_eq!(c.session.system_prompt_file, "");
+        assert_eq!(
+            c.session.system_prompt().expect("ok"),
+            None,
+            "empty config → no override sent; daemon default prompt applies"
+        );
+    }
+
+    #[test]
+    fn system_prompt_file_contents_are_read() {
+        let dir = std::env::temp_dir().join(format!("mu-sftz-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let f = dir.join("router-sys.md");
+        std::fs::write(&f, "DISPOSITION contract v1\n").expect("write");
+        let toml = format!(
+            "[session]\nsystem_prompt_file = {:?}\n",
+            f.to_str().expect("utf8 path")
+        );
+        let c: SoloConfig = toml::from_str(&toml).expect("parse");
+        assert_eq!(
+            c.session.system_prompt().expect("ok").as_deref(),
+            Some("DISPOSITION contract v1\n")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn system_prompt_missing_file_is_a_hard_error() {
+        let toml = r#"
+            [session]
+            system_prompt_file = "/nonexistent/mu-sftz/router-sys.md"
+        "#;
+        let c: SoloConfig = toml::from_str(toml).expect("parse");
+        let err = c.session.system_prompt().expect_err("must fail");
+        assert!(
+            err.to_string().contains("system_prompt_file"),
+            "error names the offending key: {err}"
+        );
     }
 
     // ── mu-n25a: max_side_effects ───────────────────────────────

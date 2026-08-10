@@ -61,6 +61,7 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 use ulid::Ulid;
 
+mod check;
 mod mesh;
 mod presence;
 
@@ -1589,6 +1590,12 @@ async fn main() -> Result<()> {
         .init();
 
     let args: Vec<String> = env::args().skip(1).collect();
+    // Answer "what would you use, and from where?" without starting anything.
+    // Deliberately before the store opens and the port binds, so it is safe to
+    // run against a host whose service is already up (mu-qqv0).
+    if args.iter().any(|a| a == "--check-config") {
+        std::process::exit(check::run(&args));
+    }
     let listen = parse_listen(&args)
         .or_else(|| env::var("LISTEN").ok())
         .or_else(|| env::var("MU_DIALOGUE_ADDR").ok())

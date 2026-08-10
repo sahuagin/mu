@@ -42,6 +42,43 @@ const DM_RIGHT: &str = "agent_dm";
 const WHO_WINDOW: Duration = Duration::from_millis(300);
 /// Bound on connect + subscribe at startup.
 const NATS_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound on any post-connect NATS operation (mu-10fa).
+///
+/// async-nats' `flush()` waits for a server ack, so on a disconnected client it
+/// blocks until reconnect. Unbounded, that turns a dead broker into a HUNG
+/// `dialogue_peers`/`say`/`poll` — the MCP surface every cc session's wake
+/// depends on. The mesh is an optional transport: when it cannot answer
+/// promptly it must degrade to "no mesh", never block the store path.
+const NATS_OP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Await `fut` under [`NATS_OP_TIMEOUT`], flattening tokio's nested Result.
+///
+/// `tokio::time::timeout` returns `Result<Result<T, E>, Elapsed>` — the outer
+/// error is "the deadline passed", the inner is the operation's own failure.
+/// Chaining `.map_err(..)?.map_err(..)?` handles both but reads like a
+/// duplicate, and the two messages end up near-identical in a log. This names
+/// the two cases separately so a failure says which one it was.
+async fn bounded_in<T, E: std::fmt::Display>(
+    limit: Duration,
+    what: &str,
+    fut: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T> {
+    match tokio::time::timeout(limit, fut).await {
+        Err(_elapsed) => Err(anyhow!(
+            "{what}: timed out after {limit:?} (broker unreachable?)"
+        )),
+        Ok(Err(e)) => Err(anyhow!("{what}: {e}")),
+        Ok(Ok(v)) => Ok(v),
+    }
+}
+
+/// [`bounded_in`] at the standard post-connect bound.
+async fn bounded<T, E: std::fmt::Display>(
+    what: &str,
+    fut: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T> {
+    bounded_in(NATS_OP_TIMEOUT, what, fut).await
+}
 
 /// A mesh agent's DM inbox subject.
 pub fn dm_subject(agent: &str) -> String {
@@ -267,7 +304,7 @@ pub async fn connect(cfg: &MeshConfig) -> Result<(Gateway, mpsc::UnboundedReceiv
             .map_err(|e| anyhow!("[mesh].issuer_key is not a valid hex Ed25519 key: {e}"))?,
     );
     let issuer = root.public();
-    let client = tokio::time::timeout(NATS_SETUP_TIMEOUT, async {
+    let client = bounded_in(NATS_SETUP_TIMEOUT, "gateway: NATS setup", async {
         let client = async_nats::connect(&cfg.nats_url)
             .await
             .map_err(|e| anyhow!("gateway: connect NATS at {}: {e}", cfg.nats_url))?;
@@ -277,8 +314,7 @@ pub async fn connect(cfg: &MeshConfig) -> Result<(Gateway, mpsc::UnboundedReceiv
             .map_err(|e| anyhow!("gateway: flush: {e}"))?;
         Ok::<_, anyhow::Error>(client)
     })
-    .await
-    .map_err(|_| anyhow!("gateway: NATS setup at {} timed out", cfg.nats_url))??;
+    .await?;
 
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
     info!(nats = %cfg.nats_url, "mesh gateway: connected");
@@ -329,14 +365,14 @@ impl Gateway {
             },
         };
         let payload = serde_json::to_vec(&env)?;
-        self.client
-            .publish(target.subject.clone(), payload.into())
-            .await
-            .map_err(|e| anyhow!("publish: {e}"))?;
-        self.client
-            .flush()
-            .await
-            .map_err(|e| anyhow!("flush: {e}"))?;
+        bounded("publish dm", async {
+            self.client
+                .publish(target.subject.clone(), payload.into())
+                .await
+                .map_err(|e| anyhow!("publish: {e}"))?;
+            self.client.flush().await.map_err(|e| anyhow!("flush: {e}"))
+        })
+        .await?;
         Ok(id)
     }
 
@@ -346,20 +382,19 @@ impl Gateway {
     /// one the peer ADVERTISES, so this never re-derives a naming rule; a peer
     /// publishing no metadata is a daemon on the legacy flat subject.
     pub async fn srv_agents(&self) -> Result<HashMap<String, String>> {
+        // Bounded as a whole: the collection loop below already had a deadline,
+        // but subscribe/publish/flush did not, and flush is the one that blocks
+        // forever on a dead broker (mu-10fa).
         let inbox = self.client.new_inbox();
-        let mut sub = self
-            .client
-            .subscribe(inbox.clone())
-            .await
-            .map_err(|e| anyhow!("srv inbox: {e}"))?;
-        self.client
-            .publish_with_reply("$SRV.PING".to_string(), inbox, Bytes::new())
-            .await
-            .map_err(|e| anyhow!("srv ping: {e}"))?;
-        self.client
-            .flush()
-            .await
-            .map_err(|e| anyhow!("srv flush: {e}"))?;
+        let mut sub = bounded("srv inbox", self.client.subscribe(inbox.clone())).await?;
+        bounded("srv ping/flush", async {
+            self.client
+                .publish_with_reply("$SRV.PING".to_string(), inbox, Bytes::new())
+                .await
+                .map_err(|e| anyhow!("ping: {e}"))?;
+            self.client.flush().await.map_err(|e| anyhow!("flush: {e}"))
+        })
+        .await?;
 
         let mut agents = HashMap::new();
         let deadline = tokio::time::Instant::now() + WHO_WINDOW;
@@ -416,7 +451,12 @@ impl Gateway {
                 // Fail CLOSED for routing: if we cannot confirm the peer is on
                 // the mesh, keep the message in the store where its MCP poll
                 // will find it. Never strand it on a path we cannot verify.
+                //
+                // Cache the FAILURE too, or a down broker costs a fresh timeout
+                // on every lookup — a single `say` does three, and every cc
+                // poll pays one. Recovery is delayed by at most LIVENESS_TTL.
                 warn!("gateway: $SRV liveness check failed, routing to the store: {e:#}");
+                *self.live_cache.lock().await = Some((tokio::time::Instant::now(), HashMap::new()));
                 return None;
             }
         };
@@ -475,26 +515,32 @@ impl Gateway {
         // One encoded name for both the presence registration and the inbox,
         // so the subject a daemon derives from `who` is the one we listen on.
         let subject = PeerId::parse(peer_id).dm_subject();
-        let presence = self
-            .client
-            .service_builder()
-            .description("mu-dialogue gateway (fronting an MCP peer)")
-            .metadata(PeerId::parse(peer_id).mesh_metadata())
-            .start(
-                format!("{PRESENCE_PREFIX}{}", PeerId::parse(peer_id).micro_name()),
-                "0.1.0",
-            )
-            .await
-            .map_err(|e| anyhow!("gateway: presence register {peer_id}: {e}"))?;
-        let mut sub = self
-            .client
-            .subscribe(subject.clone())
-            .await
-            .map_err(|e| anyhow!("gateway: dm subscribe {peer_id}: {e}"))?;
-        self.client
-            .flush()
-            .await
-            .map_err(|e| anyhow!("gateway: flush: {e}"))?;
+        // Bounded: front_peer runs from touch_peer, i.e. on EVERY say and poll
+        // by a peer not yet fronted. An unreachable broker must not hang that.
+        let (presence, mut sub) = bounded(&format!("fronting {peer_id}"), async {
+            let presence = self
+                .client
+                .service_builder()
+                .description("mu-dialogue gateway (fronting an MCP peer)")
+                .metadata(PeerId::parse(peer_id).mesh_metadata())
+                .start(
+                    format!("{PRESENCE_PREFIX}{}", PeerId::parse(peer_id).micro_name()),
+                    "0.1.0",
+                )
+                .await
+                .map_err(|e| anyhow!("gateway: presence register {peer_id}: {e}"))?;
+            let sub = self
+                .client
+                .subscribe(subject.clone())
+                .await
+                .map_err(|e| anyhow!("gateway: dm subscribe {peer_id}: {e}"))?;
+            self.client
+                .flush()
+                .await
+                .map_err(|e| anyhow!("gateway: flush: {e}"))?;
+            Ok::<_, anyhow::Error>((presence, sub))
+        })
+        .await?;
 
         let issuer = self.issuer;
         let tx = self.inbound_tx.clone();

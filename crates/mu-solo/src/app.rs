@@ -1750,6 +1750,10 @@ pub struct AppOptions<'a> {
     /// mu-n25a: side-effects ceiling forwarded in create_session. None ⇒
     /// field omitted (root default: unrestricted, no posture restriction).
     pub max_side_effects: Option<mu_core::agent::tool::SideEffects>,
+    /// mu-sftz: session system prompt (already read from
+    /// `[session] system_prompt_file` by the caller). None ⇒ field
+    /// omitted from create_session; daemon default prompt applies.
+    pub system_prompt: Option<String>,
 }
 
 impl App {
@@ -1783,6 +1787,7 @@ impl App {
             model_menu_aliases,
             autonomy,
             max_side_effects,
+            system_prompt,
         } = opts;
         let valid_effort_levels: Vec<String> = effort_levels
             .into_iter()
@@ -1835,6 +1840,14 @@ impl App {
                     tracing::warn!(error = %e, "could not serialize autonomy grant; omitting");
                 }
             }
+        }
+        // mu-sftz: forward the profile system prompt when configured.
+        // Omitted when None (same posture as autonomy/max_side_effects)
+        // so the daemon default prompt applies and older daemons are
+        // unaffected. Wire field matches `mu ask --append-system-prompt`
+        // -> CreateSessionRequest.system_prompt (mu-x83o plumbing).
+        if let Some(sp) = &system_prompt {
+            create_params["system_prompt"] = serde_json::json!(sp);
         }
         // mu-n25a: forward the side-effects ceiling when configured. Like
         // autonomy, omit the field entirely when None so an older daemon

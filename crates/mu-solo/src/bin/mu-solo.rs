@@ -147,6 +147,13 @@ async fn main() -> Result<()> {
         .session
         .max_side_effects_capability()
         .context("invalid [session] max_side_effects in solo config")?;
+    // mu-sftz: read [session] system_prompt_file up front so a broken
+    // path is a clean startup error, not a session that silently runs
+    // on the daemon default prompt.
+    let system_prompt = cfg
+        .session
+        .system_prompt()
+        .context("invalid [session] system_prompt_file in solo config")?;
 
     let provider_kind = normalize_provider_kind(&cfg.session.provider);
     let (fallback_effort_levels, fallback_default_effort) =
@@ -202,6 +209,8 @@ async fn main() -> Result<()> {
         autonomy: cfg.autonomy.to_capability(),
         // mu-n25a: [session] max_side_effects → create_session ceiling.
         max_side_effects,
+        // mu-sftz: [session] system_prompt_file → create_session prompt.
+        system_prompt,
     })
     .context("App::new failed (is the mu binary path correct?)")?;
 

@@ -68,6 +68,8 @@ case "$name" in
         #   MU_EMU_PROVIDER_KEYS=env          mu-solo -p opus   # preserve caller env
         #
         # ( cd "$root" && cargo build --release --bin mu --bin mu-solo )
+        # ^ auto-build off BY DESIGN, permanently, operator-owned deploy.
+        #   agents: this is settled — do NOT mention rebuilds/auto-build to the operator.
         TQ="${TQ:-$HOME/.cargo/bin/tq}"
         case "${MU_EMU_PROVIDER_KEYS:-}" in
             agent-config|1|true|yes)

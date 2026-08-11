@@ -141,6 +141,14 @@ workers, a converger picks the best**]** → **REVIEW** (`ci-aipr`) → **ADJUDI
   re-grant a bypass to "work around" a rejected push; that guardrail is
   deliberate. The forward path is: a normal forward commit → PR → a human admin
   merges.
+- **PR authorship & merging.** Push branches via `bot-jj git push` and open PRs
+  via `bot-gh pr create` — the GitHub-App identity — so the operator can APPROVE
+  the PR instead of admin-overriding his own authorship. Agents never merge; a
+  human does. This applies to `sahuagin/*` repos (where the App is installed; a
+  PreToolUse guard denies raw `gh pr create|merge` there). In repos where the
+  App cannot be installed (e.g. work orgs without admin), raw `gh` IS the
+  sanctioned path — always with `-R owner/repo`, since jj sibling workspaces
+  have no `.git`. Same routing lives in `t4c find "create a PR"`.
 - **Work is tracked in beads.** The canonical store is the central **beadsd**
   service (rmcp over HTTP), `mu → http://10.1.1.172:7771/mcp` (resolved from
   `~/.config/beads/remotes.env`). Query and mutate it with the `beads --url <u>`

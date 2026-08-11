@@ -74,10 +74,10 @@ ai = false
 
 [[capability]]
 path = "bash.gh.pr"
-summary = "GitHub CLI for PRs/issues. In jj sibling workspaces there is no .git: always pass `-R owner/repo` (e.g. `gh pr create -R sahuagin/mu ...`). Avoid `gh pr merge -d`; merge, then `jj git fetch`."
+summary = "PR/issue CLI. PREFER `bot-gh` when installed (same flags after the subcommand; App-authored so the operator can APPROVE — required for sahuagin/* repos, where a guard denies raw `gh pr create|merge`; never self-merge). Repos without the App (work orgs): raw `gh` is the path. In jj sibling workspaces there is no .git: always pass `-R owner/repo`. Avoid `gh pr merge -d`; merge, then `jj git fetch`."
 keywords = [
-    "github", "gh", "pr", "pull-request", "review", "merge", "issue", "jj",
-    "workspace", "not-a-git-repository", "repository",
+    "github", "gh", "bot-gh", "pr", "pull-request", "review", "merge", "issue", "jj",
+    "workspace", "not-a-git-repository", "repository", "author", "approve",
 ]
 invoke = ["gh", "pr", "create", "-R", "OWNER/REPO", "--base", "main", "--head", "BRANCH"]
 requires = []
@@ -209,6 +209,15 @@ summary = "search file contents for a pattern or regex"
 keywords = ["search", "grep", "regex", "pattern", "string", "text"]
 # rg/grep both auto-disable color when stdout isn't a tty, so no mandatory flag.
 impls = ["rg", "grep"]
+
+[[chain]]
+slot = "bash.pr-author"
+summary = "author a GitHub PR: bot-gh preferred when installed (App identity — the operator can APPROVE; sahuagin/* repos require it and never self-merge), raw gh as the fallback where the App cannot be installed (work orgs). Always -R owner/repo from jj workspaces."
+keywords = ["pr", "pull-request", "author", "create", "bot-gh", "github", "approve"]
+impls = [
+    { cmd = "bot-gh", flags = [] },
+    { cmd = "gh", flags = [] },
+]
 
 [[chain]]
 slot = "bash.find-files"

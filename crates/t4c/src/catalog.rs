@@ -101,7 +101,7 @@ mod tests {
         let caps = curated();
         let chains = default_chains();
         assert_eq!(caps.len(), 14, "expected 14 [[capability]] entries");
-        assert_eq!(chains.len(), 4, "expected 4 [[chain]] entries");
+        assert_eq!(chains.len(), 5, "expected 5 [[chain]] entries");
         // chains carry their per-impl mandatory flags through the TOML round-trip
         let find = chains
             .iter()
@@ -121,6 +121,10 @@ mod tests {
         assert!(gh.summary.contains("-R owner/repo"));
         assert!(gh.summary.contains("jj sibling workspaces"));
         assert!(gh.summary.contains("Avoid `gh pr merge -d`"));
+        // Invoke stays `gh` (universal — liveness must not key on bot-gh,
+        // absent on work machines); the bot-gh PREFERENCE is carried by the
+        // summary and by the bash.pr-author chain (bot-gh -> gh).
+        assert!(gh.summary.contains("bot-gh"));
         assert_eq!(gh.invoke[..4], ["gh", "pr", "create", "-R"]);
     }
 

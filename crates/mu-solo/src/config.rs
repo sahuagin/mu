@@ -89,6 +89,14 @@ impl SoloConfig {
             )
         })
     }
+
+    /// mu-yopt: the autonomy block in effect for the CURRENT session
+    /// config — the session/profile-level override when present, else
+    /// the top-level `[autonomy]`. Call AFTER any profile swap so a
+    /// profile's override is seen.
+    pub fn effective_autonomy(&self) -> &AutonomyConfig {
+        self.session.autonomy.as_ref().unwrap_or(&self.autonomy)
+    }
 }
 
 /// Operator-curated provider/model shortcuts for the `/model` picker.
@@ -303,6 +311,14 @@ pub struct SessionConfig {
     /// fail-fast posture) — a seat whose behavioral contract silently
     /// failed to load must not come up looking normal.
     pub system_prompt_file: String,
+    /// mu-yopt: per-session/profile autonomy override. `None` (the
+    /// DEFAULT) falls back to the top-level `[autonomy]` block, so
+    /// existing configs behave exactly as before. Set
+    /// `[profile.<name>.autonomy] enabled = false` to strip the
+    /// autonomy tools from one profile (e.g. a router seat that must
+    /// never launch into work) while other profiles keep the global
+    /// grant — or grant profile-specific bounds the same way.
+    pub autonomy: Option<AutonomyConfig>,
 }
 
 impl Default for SessionConfig {
@@ -329,6 +345,8 @@ impl Default for SessionConfig {
             max_side_effects: String::new(),
             // mu-sftz: no system-prompt override by default.
             system_prompt_file: String::new(),
+            // mu-yopt: inherit the top-level [autonomy] by default.
+            autonomy: None,
         }
     }
 }
@@ -495,6 +513,64 @@ mod tests {
         let c = SoloConfig::default();
         assert!(!c.autonomy.enabled);
         assert_eq!(c.autonomy.to_capability(), None);
+    }
+
+    // ── mu-yopt: per-profile autonomy ───────────────────────────
+
+    #[test]
+    fn autonomy_falls_back_to_global_by_default() {
+        let toml = r#"
+            [autonomy]
+            enabled = true
+            max_iterations = 7
+        "#;
+        let c: SoloConfig = toml::from_str(toml).expect("parse");
+        assert!(c.session.autonomy.is_none(), "no session-level override");
+        let eff = c.effective_autonomy();
+        assert!(eff.enabled);
+        assert_eq!(eff.max_iterations, 7);
+    }
+
+    #[test]
+    fn profile_autonomy_override_strips_global_grant() {
+        let toml = r#"
+            [autonomy]
+            enabled = true
+
+            [profile.router]
+            provider = "ollama"
+            model = "some-model"
+
+            [profile.router.autonomy]
+            enabled = false
+        "#;
+        let mut c: SoloConfig = toml::from_str(toml).expect("parse");
+        c.session = c.select_profile("router").expect("profile");
+        let eff = c.effective_autonomy();
+        assert!(
+            !eff.enabled,
+            "profile override wins over global enabled=true"
+        );
+        assert!(eff.to_capability().is_none(), "no grant sent");
+    }
+
+    #[test]
+    fn profile_autonomy_can_grant_when_global_disabled() {
+        let toml = r#"
+            [profile.goal]
+            provider = "ollama"
+            model = "some-model"
+
+            [profile.goal.autonomy]
+            enabled = true
+            max_iterations = 3
+        "#;
+        let mut c: SoloConfig = toml::from_str(toml).expect("parse");
+        c.session = c.select_profile("goal").expect("profile");
+        assert!(!c.autonomy.enabled, "global default stays disabled");
+        let eff = c.effective_autonomy();
+        assert!(eff.enabled);
+        assert_eq!(eff.max_iterations, 3);
     }
 
     // ── mu-sftz: system_prompt_file ─────────────────────────────

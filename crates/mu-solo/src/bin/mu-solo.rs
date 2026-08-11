@@ -206,7 +206,8 @@ async fn main() -> Result<()> {
         fullscreen: cfg.tui.fullscreen || std::env::var_os("MU_SOLO_FULLSCREEN").is_some(),
         model_menu_aliases: &cfg.model_menu.aliases,
         // mu-7e21: [autonomy] in solo.toml → create_session grant.
-        autonomy: cfg.autonomy.to_capability(),
+        // mu-yopt: a session/profile-level [*.autonomy] block wins.
+        autonomy: cfg.effective_autonomy().to_capability(),
         // mu-n25a: [session] max_side_effects → create_session ceiling.
         max_side_effects,
         // mu-sftz: [session] system_prompt_file → create_session prompt.

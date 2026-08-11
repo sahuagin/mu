@@ -155,10 +155,14 @@ where
             ResponseStreamEvent::ResponseError { message, .. } => {
                 return Err(AccumulateError::StreamError(message));
             }
-            ResponseStreamEvent::Error { message, code, .. } => {
-                let msg = message
-                    .or(code)
-                    .unwrap_or_else(|| "openai stream error".into());
+            ResponseStreamEvent::Error {
+                message,
+                code,
+                status,
+                error,
+                ..
+            } => {
+                let msg = crate::stream_error_message(message, code, status, error);
                 return Err(AccumulateError::StreamError(msg));
             }
             // Everything else (content_part, reasoning deltas, refusal, unknown)
@@ -273,6 +277,23 @@ mod tests {
         )];
         let err = accumulate(stream::iter(events)).await.unwrap_err();
         assert_eq!(err, AccumulateError::StreamError("boom".into()));
+    }
+
+    #[tokio::test]
+    async fn wrapped_error_event_surfaces_nested_detail() {
+        let events = vec![ev(json!({
+            "type": "error",
+            "status": 429,
+            "error": {"type": "usage_limit_reached",
+                      "message": "The usage limit has been reached"}
+        }))];
+        let err = accumulate(stream::iter(events)).await.unwrap_err();
+        assert_eq!(
+            err,
+            AccumulateError::StreamError(
+                "usage_limit_reached: The usage limit has been reached (http 429)".into()
+            )
+        );
     }
 
     #[tokio::test]

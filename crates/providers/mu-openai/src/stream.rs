@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{JsonValue, OutputContent, OutputItem, Response};
+use crate::{JsonValue, OutputContent, OutputItem, Response, ResponseError};
 
 /// One decoded streaming event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,12 +195,20 @@ pub enum ResponseStreamEvent {
         message: String,
         sequence_number: u64,
     },
+    /// The codex backend wraps the detail in a nested `error` body
+    /// (`{"type":"error","status":429,"error":{"type":"usage_limit_reached",
+    /// "message":...,"plan_type":...,"resets_at":...}}`); the public API uses
+    /// flat top-level `message`/`code`. Both shapes land here.
     #[serde(rename = "error")]
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ResponseError>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sequence_number: Option<u64>,
     },
@@ -210,6 +218,35 @@ pub enum ResponseStreamEvent {
     /// land here; they're out of scope for agent/text.)
     #[serde(untagged)]
     Unknown(JsonValue),
+}
+
+/// Render an `Error` stream event's fields as one displayable message,
+/// whichever shape (flat or nested) carried the detail.
+pub fn stream_error_message(
+    message: Option<String>,
+    code: Option<String>,
+    status: Option<u16>,
+    error: Option<ResponseError>,
+) -> String {
+    let e = error.unwrap_or_default();
+    let text = message.or(e.message);
+    let code = code.or(e.code).or(e.kind);
+    let mut msg = match (code, text) {
+        (Some(c), Some(t)) => format!("{c}: {t}"),
+        (Some(c), None) => c,
+        (None, Some(t)) => t,
+        (None, None) => "openai stream error".into(),
+    };
+    if let Some(s) = status {
+        msg.push_str(&format!(" (http {s})"));
+    }
+    if let Some(p) = e.plan_type {
+        msg.push_str(&format!(" [plan {p}]"));
+    }
+    if let Some(r) = e.resets_at {
+        msg.push_str(&format!(" [resets_at {r}]"));
+    }
+    msg
 }
 
 #[cfg(test)]
@@ -278,6 +315,78 @@ mod tests {
                          "message": "slow", "sequence_number": 5})),
             ResponseStreamEvent::ResponseError { .. }
         ));
+    }
+
+    #[test]
+    fn wrapped_error_event_parses_and_renders_detail() {
+        // The codex backend's shape: detail nested under `error`, flat
+        // top-level message/code absent.
+        let ev = parse(json!({
+            "type": "error",
+            "status": 429,
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+                "plan_type": "pro",
+                "resets_at": 1738888888
+            }
+        }));
+        let (message, code, status, error) = match ev {
+            ResponseStreamEvent::Error {
+                message,
+                code,
+                status,
+                error,
+                ..
+            } => (message, code, status, error),
+            other => panic!("expected Error event, got {other:?}"),
+        };
+        assert_eq!(status, Some(429));
+        let msg = stream_error_message(message, code, status, error);
+        assert_eq!(
+            msg,
+            "usage_limit_reached: The usage limit has been reached \
+             (http 429) [plan pro] [resets_at 1738888888]"
+        );
+    }
+
+    #[test]
+    fn flat_error_event_still_renders_message() {
+        let ev = parse(json!({"type": "error", "code": "rate_limit_exceeded",
+                              "message": "slow down", "sequence_number": 2}));
+        let (message, code, status, error) = match ev {
+            ResponseStreamEvent::Error {
+                message,
+                code,
+                status,
+                error,
+                ..
+            } => (message, code, status, error),
+            other => panic!("expected Error event, got {other:?}"),
+        };
+        assert_eq!(
+            stream_error_message(message, code, status, error),
+            "rate_limit_exceeded: slow down"
+        );
+    }
+
+    #[test]
+    fn empty_error_event_keeps_generic_message() {
+        let ev = parse(json!({"type": "error"}));
+        let (message, code, status, error) = match ev {
+            ResponseStreamEvent::Error {
+                message,
+                code,
+                status,
+                error,
+                ..
+            } => (message, code, status, error),
+            other => panic!("expected Error event, got {other:?}"),
+        };
+        assert_eq!(
+            stream_error_message(message, code, status, error),
+            "openai stream error"
+        );
     }
 
     #[test]

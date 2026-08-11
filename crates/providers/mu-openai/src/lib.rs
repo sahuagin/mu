@@ -30,4 +30,4 @@ pub use response::{
     IncompleteDetails, OutputContent, OutputItem, Response, ResponseError, ResponseStatus, Usage,
     UsageInputDetails, UsageOutputDetails,
 };
-pub use stream::ResponseStreamEvent;
+pub use stream::{stream_error_message, ResponseStreamEvent};

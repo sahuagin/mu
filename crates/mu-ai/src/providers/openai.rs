@@ -1458,11 +1458,10 @@ fn fold_frame(state: &mut StreamState, frame: ResponseStreamEvent) -> Option<Pro
             Some(done_event(state, stop))
         }
         ResponseStreamEvent::Failed { response, .. } => {
-            let err_msg = response
-                .error
-                .as_ref()
-                .and_then(|e| e.message.clone())
-                .unwrap_or_else(|| "openai response failed".into());
+            let err_msg = match response.error {
+                Some(e) => mu_openai::stream_error_message(None, None, None, Some(e)),
+                None => "openai response failed".into(),
+            };
             state.error_message = Some(err_msg.clone());
             state.finished = true;
             state.emitted_done = true;
@@ -1474,10 +1473,14 @@ fn fold_frame(state: &mut StreamState, frame: ResponseStreamEvent) -> Option<Pro
             state.emitted_done = true;
             Some(ProviderEvent::Error(message))
         }
-        ResponseStreamEvent::Error { message, code, .. } => {
-            let msg = message
-                .or(code)
-                .unwrap_or_else(|| "openai stream error".into());
+        ResponseStreamEvent::Error {
+            message,
+            code,
+            status,
+            error,
+            ..
+        } => {
+            let msg = mu_openai::stream_error_message(message, code, status, error);
             state.error_message = Some(msg.clone());
             state.finished = true;
             state.emitted_done = true;

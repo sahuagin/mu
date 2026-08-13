@@ -52,9 +52,10 @@ pub mod codes {
     /// The connection's `AuthState` is terminally `Denied` — including
     /// re-attempts of pre-auth methods are rejected until reconnect.
     pub const AUTH_DENIED: i32 = -32002;
-    /// spec mu-046 INV-2 (fail closed): the command could not be made
-    /// durable — the journal append errored — so it was rejected and
-    /// never processed.
+    /// Fail-closed durability error: a load-bearing command journal or
+    /// resume-bootstrap append could not be made durable, so the operation was
+    /// rejected before processing/session registration (spec mu-046 INV-2 and
+    /// the resume-bootstrap durability carve-out).
     pub const JOURNAL_UNAVAILABLE: i32 = -32003;
 }
 

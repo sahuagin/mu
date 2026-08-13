@@ -428,6 +428,21 @@ impl Sessions {
             .collect()
     }
 
+    /// Look up only a currently active local session/worker. This deliberately
+    /// excludes the bare-id rehydrated cache, whose entries may originate from
+    /// another daemon directory.
+    pub fn active_event_log(&self, id: &str) -> Option<Arc<SessionEventLog>> {
+        if let Ok(map) = self.inner.lock() {
+            if let Some(session) = map.get(id) {
+                return Some(session.event_log.clone());
+            }
+        }
+        self.workers
+            .lock()
+            .ok()
+            .and_then(|map| map.get(id).map(|session| session.event_log.clone()))
+    }
+
     /// Look up a session's event log in memory only — live wins on ID
     /// collision, then workers, then already-cached rehydrated entries.
     /// Does NOT touch disk. Mutating callers that must not resurrect a
@@ -465,6 +480,39 @@ impl Sessions {
     pub fn event_log(&self, id: &str) -> Option<Arc<SessionEventLog>> {
         self.event_log_in_memory(id)
             .or_else(|| self.lazy_load_from_disk(id))
+    }
+
+    /// Resolve an event log by the exact daemon/session pair. Unlike
+    /// [`event_log`](Self::event_log), this never guesses across daemon
+    /// directories and never lets an unrelated live bare-id collision win.
+    pub fn event_log_for_daemon(
+        &self,
+        daemon_id: &str,
+        session_id: &str,
+    ) -> Option<Arc<SessionEventLog>> {
+        let events_dir = self.events_dir.as_ref()?;
+        if std::path::Path::new(daemon_id).file_name() != Some(std::ffi::OsStr::new(daemon_id))
+            || std::path::Path::new(session_id).file_name()
+                != Some(std::ffi::OsStr::new(session_id))
+        {
+            return None;
+        }
+        let path = events_dir
+            .join(daemon_id)
+            .join(format!("{session_id}.jsonl"));
+        if !path.is_file() {
+            return None;
+        }
+        let (log, malformed) = SessionEventLog::from_jsonl(&path).ok()?;
+        if malformed > 0 {
+            tracing::warn!(
+                daemon_id,
+                session_id,
+                malformed,
+                "daemon-qualified session load skipped malformed line(s)"
+            );
+        }
+        Some(Arc::new(log))
     }
 
     /// Find a past session's `<daemon>/<id>.jsonl` on disk, parse it once,

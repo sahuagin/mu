@@ -453,10 +453,12 @@ pub struct DelegateSessionResponse {
 
 // ── mu-mh4: session resume (fork-at-tail) ────────────────────────────
 
-/// An OPERATOR-facing reference to a session, addressing it by daemon +
-/// session. This is what a person types at `session.resume`, which is why
-/// either part may be a PREFIX — resolution against the events directory
-/// disambiguates, and refuses ambiguity rather than guessing.
+/// An OPERATOR-facing reference to a session, syntactically carrying daemon +
+/// session components. Both components currently require exact, non-empty text;
+/// prefix resolution is not implemented.
+///
+/// Current runtime behavior: `session.resume` resolves this exact pair against
+/// `<events_dir>/<daemon>/<session>.jsonl`; it does not perform prefix matching.
 ///
 /// Two textual forms are accepted (PR #206 contract):
 ///   - `daemon:session`               — the short form
@@ -597,8 +599,8 @@ mod session_ref_peer_id_tests {
 /// ([`crate::agent::continuation::project_strict`]), and — only if the
 /// log is clean — births a fresh live session parented on the dead one,
 /// seeded with the continuation history. A ragged log is REFUSED with a
-/// precise diagnosis (which record, what's missing) and a `mu --recover`
-/// hint; it does NOT silently truncate (that's `session.recover`'s job).
+/// precise diagnosis (which record, what's missing). It does not silently
+/// truncate; automated repair is not implemented yet.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResumeSessionRequest {
     /// The predecessor session, as `daemon:session` or

@@ -164,9 +164,9 @@ enum Command {
     },
     /// Resume a dead session by forking a fresh live head at its last
     /// clean boundary (mu-mh4). STRICT: refuses a ragged log (incomplete
-    /// records / unanswered tool calls) with a precise diagnosis and a
-    /// `mu recover` hint — it never silently truncates. Accepts the
-    /// alias `--resume` too: `mu --resume daemon:session`.
+    /// records / unanswered tool calls) with a precise diagnosis; automated
+    /// repair is not implemented. Accepts the alias `--resume` too:
+    /// `mu --resume daemon:session`.
     #[command(alias = "--resume")]
     Resume {
         /// Predecessor session: `daemon:session` or the canonical
@@ -320,7 +320,7 @@ enum Command {
         log: std::path::PathBuf,
     },
     /// List past sessions, newest-first — the discovery surface for
-    /// `mu resume` / `mu --recover` (which take an id). Offline; no daemon.
+    /// `mu resume` (which takes an id). Offline; no daemon.
     ///
     /// Cheap by design (mu-lazy-session-rehydration-bh4f): the recency
     /// sort uses file mtime only, and just the most-recent `--last` logs

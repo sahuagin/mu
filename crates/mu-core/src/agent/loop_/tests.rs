@@ -960,6 +960,114 @@ async fn mu_779s_iteration_cap_done_event_uses_iteration_cap_stop_reason() {
     assert_eq!(done.1, 2, "turn_count in Done event should equal max_turns");
 }
 
+/// bead mu-autonomy-turn-budget-wedge-6tnp: the per-ask max_turns cap
+/// tripping INSIDE an autonomous run must terminate the run —
+/// AutonomousTerminated is what clears the daemon-side autonomy_active
+/// gate. Without it the session wedges: the TUI says "say continue"
+/// while ask_session is refused. Observed live on daemon
+/// 258fee87b0ce912c (2026-08-12).
+#[tokio::test]
+async fn turn_budget_inside_autonomy_terminates_run_and_later_ask_runs() {
+    let tool_turn = || {
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "t1",
+            "echo",
+            json!({}),
+        ))]
+    };
+    let provider = MockProvider::new(vec![
+        tool_turn(), // autonomous iteration, turn 1
+        tool_turn(), // turn 2 — next turn-start trips the cap
+        vec![ProviderEvent::Done(assistant_text("later ask accepted"))],
+    ]);
+    let tools = vec![MockTool::always_ok("echo", "ok")];
+    let config = AgentConfig {
+        max_turns: Some(2),
+        ..AgentConfig::default()
+    };
+    let (loop_, mut events_rx) =
+        spawn_loop_with_autonomy(provider, tools, config, autonomy_allowed(10));
+
+    loop_
+        .send(AgentInput::StartAutonomous {
+            goal: "burn the turn budget".to_owned(),
+            options: crate::protocol::AutonomyOptions::default(),
+        })
+        .await
+        .expect("send autonomous start");
+
+    let mut events = Vec::new();
+    loop {
+        let event = timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("timed out waiting for budget termination")
+            .expect("event channel closed before budget termination");
+        let done = matches!(
+            event,
+            AgentEvent::Done {
+                stop_reason: StopReason::IterationCap,
+                ..
+            }
+        );
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+
+    // The wedge fix: termination precedes the cap Done, with the budget
+    // reason — not IterationCap (the autonomous iteration bound).
+    let terminate_idx = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::AutonomousTerminated { .. }))
+        .expect("cap inside autonomy must emit AutonomousTerminated");
+    match &events[terminate_idx] {
+        AgentEvent::AutonomousTerminated { reason } => assert!(
+            matches!(reason, AutonomousTerminationReason::TurnBudgetExhausted),
+            "expected TurnBudgetExhausted, got {reason:?}"
+        ),
+        other => panic!("unexpected: {other:?}"),
+    }
+    assert_eq!(
+        terminate_idx,
+        events.len() - 2,
+        "AutonomousTerminated must immediately precede the cap Done"
+    );
+
+    // The session is interactive again: a later ask must be accepted
+    // and answered (pre-fix, serve would refuse it on autonomy_active).
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("are you idle now?"),
+            None,
+            None,
+        ))
+        .await
+        .expect("later ask should be accepted by the live loop");
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    events.extend(events_handle.await.expect("events drain"));
+
+    let later_answered = events.iter().any(|e| match e {
+        AgentEvent::MessageEnd {
+            message: AgentMessage::Assistant(msg),
+        } => msg.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::Text { text } if text.contains("later ask accepted")
+            )
+        }),
+        _ => false,
+    });
+    assert!(later_answered, "later ask did not run to completion");
+    let terminates = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::AutonomousTerminated { .. }))
+        .count();
+    assert_eq!(terminates, 1, "exactly one termination for the run");
+}
+
 /// mu-779s: per-provider max_turns defaults. Anthropic stays at 20;
 /// OpenAI bumps to 35 because in practice OpenAI models dispatch
 /// noticeably more tool calls per task than Anthropic; openrouter

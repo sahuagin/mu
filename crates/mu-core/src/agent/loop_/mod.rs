@@ -1878,6 +1878,21 @@ async fn run_inner(
                 if config.max_turns.is_some_and(|n| n > 0)
                     && turn_count >= config.max_turns.unwrap_or(0)
                 {
+                    // A cap trip during an autonomous (or parked) run must
+                    // ALSO terminate the run — AutonomousTerminated is what
+                    // clears the daemon-side autonomy_active gate. Without
+                    // it the session wedges: the TUI says "say continue"
+                    // while ask_session is refused (bead
+                    // mu-autonomy-turn-budget-wedge-6tnp). Terminated first,
+                    // Done second, matching the autonomous terminal path.
+                    if !matches!(mode, RunMode::Idle | RunMode::Asking) {
+                        let _ = events
+                            .send(AgentEvent::AutonomousTerminated {
+                                reason: AutonomousTerminationReason::TurnBudgetExhausted,
+                            })
+                            .await;
+                        mode = RunMode::Idle;
+                    }
                     // mu-779s: distinguish iteration-cap exit from natural
                     // end_turn so downstream consumers (TUI, transcript,
                     // telemetry) can surface "turn budget exhausted" rather

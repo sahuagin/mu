@@ -193,16 +193,15 @@ pub fn handle_delegate_session(
 
 /// mu-mh4: `session.resume` — STRICT fork-at-tail resume.
 ///
-/// Resolves the predecessor session's event log (`Sessions::event_log`
-/// lazily find-by-ids and parses the one matching on-disk log on demand —
-/// across daemon dirs — so a cross-daemon predecessor is addressable here
-/// without the old startup bulk-rehydration; mu-lazy-session-rehydration-bh4f),
-/// projects it to its last clean boundary via
+/// Resolves the predecessor by its exact daemon/session pair. A local daemon
+/// may satisfy the lookup from memory; otherwise the handler reads exactly
+/// `<events_dir>/<daemon>/<session>.jsonl`, never the collision-prone bare-id
+/// lookup. It then projects the log to its last clean boundary via
 /// [`mu_core::agent::continuation::project_strict`], and — only if the
 /// log is CLEAN — births a fresh live session parented on the dead one,
 /// seeded with the continuation history. A ragged log is REFUSED with a
-/// precise diagnosis and a `mu --recover` hint (git-style); it is never
-/// silently truncated.
+/// precise diagnosis and preserved for a future explicit recovery path; it is
+/// never silently truncated.
 ///
 /// The resumed session's capability is the predecessor's ∩ any requested
 /// attenuations (intersection-only — resume can only narrow). When the
@@ -238,11 +237,22 @@ pub fn handle_resume_session(
         "session.resume"
     );
 
-    // Resolve the predecessor's event log from the Sessions map (the
-    // session id is the addressable key; rehydration loaded all daemons'
-    // logs at startup).
+    // Resolve the exact daemon/session pair. Resume must not use the generic
+    // bare-id lookup: session-N values collide across daemon generations.
     let predecessor_log = some_or_respond!(
-        sessions.event_log(&parsed.session),
+        if parsed.daemon == daemon_info.daemon_id() {
+            sessions.active_event_log(&parsed.session).or_else(|| {
+                if daemon_info.events_dir().is_none() {
+                    // Explicitly ephemeral daemons have no cross-daemon disk
+                    // cache; allow their in-memory rehydrated test fixtures.
+                    sessions.event_log_in_memory(&parsed.session)
+                } else {
+                    sessions.event_log_for_daemon(&parsed.daemon, &parsed.session)
+                }
+            })
+        } else {
+            sessions.event_log_for_daemon(&parsed.daemon, &parsed.session)
+        },
         request.id,
         codes::INVALID_PARAMS,
         format!(
@@ -254,20 +264,24 @@ pub fn handle_resume_session(
     );
 
     // STRICT continuation projection. A ragged log is refused with a
-    // diagnosis naming the damage + a --recover hint.
+    // diagnosis naming the damage; automated repair is tracked separately.
     let events = predecessor_log.snapshot();
     let continuation = match mu_core::agent::continuation::project_strict(&events) {
         Ok(c) => c,
         Err(e) => {
+            let recovery = match &e {
+                mu_core::agent::continuation::ContinuationError::MissingContinuationSeed {
+                    ..
+                } => "This legacy/incomplete head cannot prove inherited history. Resume the named predecessor directly to preserve its history; this head's child-local turns remain available only in its log until recovery tooling exists.",
+                mu_core::agent::continuation::ContinuationError::RaggedTail { .. } => "Automated recovery is not implemented yet; the ragged tail remains preserved in the event log.",
+                mu_core::agent::continuation::ContinuationError::Empty => "The selected log contains no resumable events.",
+                mu_core::agent::continuation::ContinuationError::NoCleanBoundary { .. } => "No provider-sendable boundary exists in the selected log; it was not modified.",
+                mu_core::agent::continuation::ContinuationError::InvalidContinuationSeed { .. } => "The inherited-history record is malformed or misplaced; the selected log was not modified.",
+            };
             return err_response(
                 request.id,
                 codes::INVALID_PARAMS,
-                format!(
-                    "session.resume refused: {e}. \
-                     The log is not cleanly resumable; run `mu --recover {}` to \
-                     tombstone the broken record(s) and resume from the last prompt.",
-                    params.session_ref
-                ),
+                format!("session.resume refused: {e}. {recovery}"),
             );
         }
     };
@@ -289,10 +303,14 @@ pub fn handle_resume_session(
     // The operator's `attenuations` can only narrow further from this
     // floor, never widen past it; explicit re-grants are out of scope
     // until capability persistence (mu-nqn5) lands.
-    let base_cap = sessions
-        .capability(&parsed.session)
-        .and_then(|h| h.lock().ok().map(|c| c.clone()))
-        .unwrap_or_else(Capability::read_only);
+    let base_cap = if parsed.daemon == daemon_info.daemon_id() {
+        sessions
+            .capability(&parsed.session)
+            .and_then(|h| h.lock().ok().map(|c| c.clone()))
+            .unwrap_or_else(Capability::read_only)
+    } else {
+        Capability::read_only()
+    };
     let resumed_capability = match &params.attenuations {
         Some(attn) => base_cap.attenuate(attn),
         None => base_cap,
@@ -333,6 +351,12 @@ pub fn handle_resume_session(
         branched_at_event_id: continuation.fork_event_id,
     };
 
+    let continuation_seeded = EventPayload::ContinuationSeeded {
+        predecessor_session_id: parsed.session.clone(),
+        branched_at_event_id: continuation.fork_event_id,
+        messages: continuation.messages.clone(),
+    };
+
     let new_session_id = build_and_register_session(BuildSessionRequest {
         selector: &params.provider,
         system_prompt: None,
@@ -344,7 +368,7 @@ pub fn handle_resume_session(
         capability: resumed_capability,
         root_launch_tool_capability: false,
         seed_messages: continuation.messages,
-        seed_events: vec![head_attached],
+        seed_events: vec![continuation_seeded, head_attached],
         cache_ttl: CacheTtl::default(),
         max_turns: None, // resume sessions inherit the cap from the predecessor
         effort: None,    // mu-vcbm: resumed sessions use the provider default
@@ -355,12 +379,23 @@ pub fn handle_resume_session(
         skills,
         daemon_info: &daemon_info,
     });
-    let new_session_id = ok_or_respond!(
-        new_session_id,
-        request.id,
-        codes::INVALID_PARAMS,
-        "session.resume"
-    );
+    let new_session_id = match new_session_id {
+        Ok(id) => id,
+        Err(BuildSessionError::BootstrapDurability(error)) => {
+            return err_response(
+                request.id,
+                codes::JOURNAL_UNAVAILABLE,
+                format!("session.resume: persisting resume bootstrap: {error}"),
+            );
+        }
+        Err(BuildSessionError::Invalid(error)) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("session.resume: {error}"),
+            );
+        }
+    };
 
     let resp = ResumeSessionResponse {
         session_id: new_session_id,
@@ -369,6 +404,36 @@ pub fn handle_resume_session(
         seeded_message_count,
     };
     ok_response(request.id, to_value_or_null(resp))
+}
+
+struct PendingBootstrap {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for PendingBootstrap {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[derive(Debug)]
+enum BuildSessionError {
+    Invalid(String),
+    BootstrapDurability(std::io::Error),
+}
+
+impl std::fmt::Display for BuildSessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) => f.write_str(message),
+            Self::BootstrapDurability(error) => {
+                write!(f, "persisting resume bootstrap: {error}")
+            }
+        }
+    }
 }
 
 /// Input bundle for [`build_and_register_session`]. Groups the
@@ -569,7 +634,7 @@ fn apply_root_launch_tool_capability(
 /// Shared session-creation logic for both `create_session` (root) and
 /// `session.delegate` (child). Returns the new session_id on success
 /// or a human-readable error on provider-construction failure.
-fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, String> {
+fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, BuildSessionError> {
     let BuildSessionRequest {
         selector,
         system_prompt,
@@ -590,29 +655,55 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
         max_turns,
         effort,
     } = req;
-    let provider =
-        factory(selector, cache_ttl).map_err(|e| format!("could not build provider: {e}"))?;
+    let provider = factory(selector, cache_ttl)
+        .map_err(|e| BuildSessionError::Invalid(format!("could not build provider: {e}")))?;
 
     let session_id = Sessions::next_id();
     let event_log = Arc::new(SessionEventLog::new(session_id.clone()));
 
-    // mu-upb: attach a per-session JSONL writer at
-    // <events_dir>/<daemon_id>/<session_id>.jsonl.
-    // Best-effort — failures are logged but don't block session
-    // creation. When daemon_info.events_dir() is None (tests),
-    // skip entirely — no disk write happens. Production sets
-    // events_dir to ~/.local/share/mu/events.
+    // Attach a per-session JSONL writer at
+    // <events_dir>/<daemon_id>/<session_id>.jsonl. Ordinary fresh/delegated
+    // sessions retain best-effort attachment. Resume bootstrap (`seed_events`
+    // non-empty) is recovery-critical: a configured writer that cannot attach
+    // fails construction before the head can become observable.
+    let mut bootstrap_paths: Option<(PendingBootstrap, PathBuf)> = None;
     if let Some(events_dir) = daemon_info.events_dir() {
-        let path = events_dir
+        let final_path = events_dir
             .join(daemon_info.daemon_id())
             .join(format!("{}.jsonl", session_id));
-        if let Err(e) = event_log.attach_disk_writer(&path) {
+        let path = if seed_events.is_empty() {
+            final_path.clone()
+        } else {
+            let pending = final_path.with_extension("jsonl.pending");
+            bootstrap_paths = Some((
+                PendingBootstrap {
+                    path: pending.clone(),
+                    armed: false,
+                },
+                final_path,
+            ));
+            pending
+        };
+        let attach = if seed_events.is_empty() {
+            event_log.attach_disk_writer(&path)
+        } else {
+            event_log.attach_disk_writer_durable(&path)
+        };
+        if let Err(error) = attach {
+            if !seed_events.is_empty() {
+                return Err(BuildSessionError::BootstrapDurability(std::io::Error::new(
+                    error.kind(),
+                    format!("attaching {}: {error}", path.display()),
+                )));
+            }
             tracing::warn!(
                 session_id = %session_id,
                 path = %path.display(),
-                error = %e,
+                error = %error,
                 "could not attach disk writer; continuing in-memory only",
             );
+        } else if let Some((pending, _)) = bootstrap_paths.as_mut() {
+            pending.armed = true;
         }
     }
 
@@ -635,44 +726,80 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, St
     // soft-limit / hard-limit / fill vocabulary.
     let (context_soft_limit, context_hard_limit, max_output_tokens) =
         resolve_context_limits(daemon_info, &kind_str, &model_str);
-    event_log.append(
-        EventActor::System,
-        EventPayload::SessionCreated {
-            provider_kind: kind_str,
-            model: model_str,
-            parent_session_id: parent_session_id.clone(),
-            branched_at_parent_event_id,
-            // mu-rf9x: register the provider's token-accounting
-            // convention so log readers can interpret every usage
-            // record in this session without provider arithmetic.
-            usage_semantics: Some(provider.capabilities().usage_semantics),
-        },
-    );
-    // Only record a snapshot when we actually have a soft limit — a route
-    // the catalog doesn't know yields no limits, and a missing event is
-    // truer than a fabricated number (the meter simply stays blank).
-    if let Some(soft) = context_soft_limit {
-        event_log.append(
-            EventActor::System,
-            EventPayload::SessionConfigResolved {
-                context_soft_limit: soft,
-                context_hard_limit,
-                // mu-a79g: record the output budget the compaction
-                // trigger reserves against, so the effective compaction
-                // point is reconstructable from the event stream alone.
-                max_output_tokens,
-            },
-        );
+    let session_created = EventPayload::SessionCreated {
+        provider_kind: kind_str,
+        model: model_str,
+        parent_session_id: parent_session_id.clone(),
+        branched_at_parent_event_id,
+        // mu-rf9x: register the provider's token-accounting convention so log
+        // readers can interpret every usage record without provider arithmetic.
+        usage_semantics: Some(provider.capabilities().usage_semantics),
+    };
+    let config_resolved = context_soft_limit.map(|soft| EventPayload::SessionConfigResolved {
+        context_soft_limit: soft,
+        context_hard_limit,
+        max_output_tokens,
+    });
+    let resume_bootstrap = !seed_events.is_empty();
+    let append_bootstrap = |payload| -> Result<(), BuildSessionError> {
+        if resume_bootstrap && event_log.has_disk_writer() {
+            event_log
+                .append_durable(EventActor::System, payload)
+                .map_err(BuildSessionError::BootstrapDurability)?;
+        } else {
+            event_log.append(EventActor::System, payload);
+        }
+        Ok(())
+    };
+    append_bootstrap(session_created)?;
+    if let Some(payload) = config_resolved {
+        append_bootstrap(payload)?;
     }
 
-    // mu-mh4 (panel finding 4): append any seed events (e.g. resume's
-    // HeadAttached) AFTER SessionCreated but BEFORE the session is
-    // registered below. This closes the audit-continuity race: the
-    // session only becomes observable in the Sessions map once these
-    // events are already durable on the log, so no reader can see the
-    // session without also seeing them.
+    // Resume birth metadata, inherited context, and lineage are one load-bearing
+    // bootstrap sequence. Disk-backed construction durably appends all of them
+    // before registration; ephemeral in-memory sessions preserve ordering.
     for payload in seed_events {
-        event_log.append(EventActor::System, payload);
+        append_bootstrap(payload)?;
+    }
+    if let Some((mut pending, final_path)) = bootstrap_paths {
+        // Refuse publication over an existing canonical log. Session ids are
+        // process-local counters, so this is the final defense against restart
+        // collisions destroying earlier data.
+        if final_path.exists() {
+            return Err(BuildSessionError::BootstrapDurability(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("refusing to replace existing {}", final_path.display()),
+            )));
+        }
+        std::fs::rename(&pending.path, &final_path)
+            .map_err(BuildSessionError::BootstrapDurability)?;
+        if let Some(parent) = final_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Err(error) = std::fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+                // Publication was not proven durable. Move the coherent file
+                // back out of the discovery namespace before refusing. If the
+                // rollback itself fails, preserve that fact in the returned IO
+                // error rather than claiming only the sync failed.
+                if let Err(rollback) = std::fs::rename(&final_path, &pending.path) {
+                    // The coherent final file is already visible. Leave it in
+                    // place and report both failures; do not let the pending
+                    // guard pretend it can hide or delete that final path.
+                    pending.armed = false;
+                    return Err(BuildSessionError::BootstrapDurability(
+                        std::io::Error::new(
+                            error.kind(),
+                            format!(
+                                "syncing published bootstrap failed: {error}; rollback to {} failed: {rollback}",
+                                pending.path.display()
+                            ),
+                        ),
+                    ));
+                }
+                let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+                return Err(BuildSessionError::BootstrapDurability(error));
+            }
+        }
+        pending.armed = false;
     }
 
     let pending_approvals = Arc::new(Mutex::new(HashMap::new()));
@@ -3113,13 +3240,14 @@ mod tests {
         let factory = crate::serve::factory::make_provider_factory(false, None);
         let tools: Arc<Vec<Arc<dyn Tool>>> = Arc::new(Vec::new());
         let di = DaemonInfo::new("test-daemon"); // no events_dir — in-memory only
+        let daemon_id = di.daemon_id().to_string();
 
         let req = Request {
             jsonrpc: JSONRPC_VERSION.into(),
             id: json!(1),
             method: "session.resume".into(),
             params: json!({
-                "session_ref": format!("test-daemon:{predecessor_id}"),
+                "session_ref": format!("{daemon_id}:{predecessor_id}"),
                 "provider": { "kind": "anthropic_api", "model": "faux" },
             }),
         };

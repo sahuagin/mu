@@ -1827,17 +1827,35 @@ async fn create_and_ask_to_done(
 #[tokio::test]
 async fn mh4_resume_forks_clean_session_at_tail() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (mut client, server_handle) = spawn_server(provider).await;
+    let events_dir = unique_test_dir("mh4-resume-disk");
+    let config = Config {
+        auth: AuthConfig::Bearer {
+            tokens: vec![TEST_BEARER_TOKEN.to_string()],
+        },
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
+        ..Default::default()
+    };
+    let (mut client, server_handle) =
+        spawn_server_full(provider, Vec::new(), config, Some(events_dir.clone())).await;
 
     // Predecessor: one completed exchange → clean boundary.
     let predecessor = create_and_ask_to_done(&mut client, 1, "first question").await;
+    let daemon_id = std::fs::read_dir(&events_dir)
+        .expect("events dir")
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().is_dir())
+        .expect("daemon events directory")
+        .file_name()
+        .to_string_lossy()
+        .into_owned();
 
-    // Resume it. daemon_id is unknown to the test, but the handler
-    // resolves by session id, so any daemon part parses fine.
+    // Resume it by its exact daemon/session identity.
     let req = json!({
         "jsonrpc": "2.0", "id": 100, "method": "session.resume",
         "params": {
-            "session_ref": format!("anydaemon:{predecessor}"),
+            "session_ref": format!("{daemon_id}:{predecessor}"),
             "provider": { "kind": "anthropic_api", "model": "x" }
         }
     });
@@ -1859,7 +1877,8 @@ async fn mh4_resume_forks_clean_session_at_tail() {
     );
     let new_session = resp["result"]["session_id"]
         .as_str()
-        .expect("new session id");
+        .expect("new session id")
+        .to_string();
     assert_ne!(new_session, predecessor, "resume births a NEW session");
     assert_eq!(
         resp["result"]["predecessor_session_id"], predecessor,
@@ -1875,8 +1894,59 @@ async fn mh4_resume_forks_clean_session_at_tail() {
         "forked at a concrete boundary event: {resp}"
     );
 
+    // Resume the resumed head before it receives any child-local messages.
+    // The second fork must inherit the original exchange transitively; a
+    // process-local seed alone would make this response report zero messages.
+    let req = json!({
+        "jsonrpc": "2.0", "id": 101, "method": "session.resume",
+        "params": {
+            "session_ref": format!("{daemon_id}:{new_session}"),
+            "provider": { "kind": "anthropic_api", "model": "x" }
+        }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write second resume");
+    let second = loop {
+        let line = read_line(&mut client).await;
+        if line["id"] == 101 {
+            break line;
+        }
+    };
+    assert!(
+        second.get("error").is_none(),
+        "resumed head should itself be resumable: {second}"
+    );
+    assert_eq!(
+        second["result"]["predecessor_session_id"], new_session,
+        "second head attaches to the first resumed head"
+    );
+    assert_eq!(
+        second["result"]["seeded_message_count"], 2,
+        "inherited history survives repeated resume: {second}"
+    );
+
     drop(client);
     let _ = timeout(Duration::from_millis(500), server_handle).await;
+
+    let new_log = std::fs::read_dir(&events_dir)
+        .expect("events dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join(format!("{new_session}.jsonl")))
+        .find(|path| path.is_file())
+        .expect("disk-backed resumed head log");
+    let persisted = std::fs::read_to_string(&new_log).expect("read resumed head log");
+    assert!(persisted.contains("\"kind\":\"continuation_seeded\""));
+    assert!(persisted.contains("\"kind\":\"head_attached\""));
+    assert!(!std::fs::read_dir(&events_dir)
+        .expect("events dir")
+        .filter_map(Result::ok)
+        .filter_map(|daemon| std::fs::read_dir(daemon.path()).ok())
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "pending")));
+    let _ = std::fs::remove_dir_all(&events_dir);
 }
 
 /// mu-mh4: session.resume REFUSES an unknown predecessor with a clear

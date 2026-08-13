@@ -119,9 +119,14 @@ workers, a converger picks the best**]** → **REVIEW** (`ci-aipr`) → **ADJUDI
 2. **Durability is two-tier (spec mu-046).** The command journal is the
    fail-closed write-ahead path — an inbound command is journaled before
    processing, and a failed append *rejects* the command
-   (`JOURNAL_UNAVAILABLE = -32003`). Session-log gateway events (tool results,
-   assistant messages) are best-effort disk-before-memory appends: IO errors are
-   logged and ignored, not fatal.
+   (`JOURNAL_UNAVAILABLE = -32003`). In disk-backed daemons,
+   resume-bootstrap events are likewise fail-closed because the new head needs
+   a durable copy of inherited context. Explicitly ephemeral daemons
+   (`events_dir = None`, primarily tests) preserve bootstrap ordering in memory
+   but make no persistence claim.
+   Ordinary session-log gateway events (tool results, assistant messages) are
+   best-effort disk-before-memory appends: IO errors are logged and ignored, not
+   fatal.
 3. **Rehydration is lazy and request-driven**
    (`mu-lazy-session-rehydration-bh4f`). `mu serve` parses nothing on cold start;
    a past session is loaded by id the first time it's addressed. Enumeration is

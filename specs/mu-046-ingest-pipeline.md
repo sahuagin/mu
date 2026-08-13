@@ -44,9 +44,12 @@ out-of-band off the logs.
 - Not capability/biscuit gating — the extremities stay open (MVP). The
   adapter/route seam carries an `AuthSnapshot` and a gate hook so gating can
   land later without re-architecting.
-- Not a session-log durability overhaul — only *command* appends get the
-  strict fsync path. Gateway-result events (tool results, assistant messages)
-  keep best-effort appends.
+- Not a general session-log durability overhaul — commands and the complete
+  resume-bootstrap sequence (`SessionCreated`, optional `SessionConfigResolved`,
+  `ContinuationSeeded`, `HeadAttached`) are the narrow strict paths.
+  Gateway-result events (tool results, assistant messages) keep best-effort
+  appends. A disk-backed head is not registered unless its entire bootstrap
+  writes, syncs, and publishes durably; failure returns `JOURNAL_UNAVAILABLE`.
 - Not log compaction or retention — logs stay append-only and unbounded;
   tombstones (mu-mh4) remain the only repair mechanism.
 
@@ -172,7 +175,8 @@ bytes outward.
 ### Wire surface
 
 One addition: error code `JOURNAL_UNAVAILABLE = -32003`, returned when a
-command cannot be made durable. New `[journal]` config section:
+load-bearing command journal or resume-bootstrap sequence cannot be made
+durable. New `[journal]` config section:
 
 ```toml
 [journal]
@@ -187,9 +191,10 @@ journal_queries = true    # default true: read-only queries are journaled too
   pipeline's journal — fsync'd per policy — before it enters that pipeline's
   queue. No handler, no state machine, no side effect sees a command that is
   not on disk.
-- **INV-2 (fail closed).** If the journal append errors, the command is
-  rejected with `JOURNAL_UNAVAILABLE` and is never processed. A daemon that
-  cannot open its journal at boot does not serve.
+- **INV-2 (fail closed).** If a command-journal append or disk-backed
+  resume-bootstrap append errors, the operation is rejected with
+  `JOURNAL_UNAVAILABLE` before command processing or session registration. A
+  daemon that cannot open its command journal at boot does not serve.
 - **INV-3 (seq is the sequencer).** Within a pipeline, journal order == queue
   order == processing order, maintained by a single writer per pipeline.
   Per-session replay is deterministic: re-feed the journal, get the same
@@ -392,4 +397,6 @@ Order: WP1 → WP2 → WP3 → {WP4 ∥ WP5} → WP6 → WP7.
 - Journaling pre-parse wire garbage (transport-level parse failures) — noted
   follow-up.
 - `CapabilityAmended` events — reserved here, lands under mu-nqn5.
-- fsync for non-command session events — best-effort append stays.
+- fsync for other non-command session events — gateway-result append stays
+  best-effort; resume-bootstrap events are the explicit exception described
+  above.

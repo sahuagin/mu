@@ -16,17 +16,17 @@
 //! stays in the log untouched (the log is the noun) but is excluded
 //! from the head we hand the new session.
 //!
-//! Two entry points fall out of the operator's `--resume` / `--recover`
-//! split (bead mu-mh4, CLI-contract comment 2026-06-07):
+//! Two projection modes support strict resume now and an explicit repairing
+//! command later (bead mu-mh4, CLI-contract comment 2026-06-07):
 //!
 //!   - [`project_strict`] — `mu --resume`. Refuses a ragged log,
 //!     returning a [`ContinuationError`] that names the *exact* damage
 //!     (which event id, what's missing) so the caller can print a
-//!     git-style hint pointing at `mu --recover`.
+//!     precise refusal and preserve the damaged tail for a repairing path.
 //!   - [`project_to_clean_boundary`] — the repairing path's projection.
 //!     Truncates to the last clean boundary and returns the messages
-//!     plus the id of the event it forked at. `mu --recover` lays
-//!     tombstones over the excluded tail and resumes from here.
+//!     plus the id of the event it forked at. a future recovery command can lay tombstones over the excluded tail and
+//!     resume from here.
 //!
 //! Both honor the tombstone rule: an event whose id appears in a
 //! `Tombstone`'s `target_event_id` is skipped entirely (mu-mh4 tier 3
@@ -38,8 +38,8 @@ use crate::agent::types::{AgentMessage, ContentBlock};
 use crate::event_log::{tombstoned_ids, EventPayload, SessionEvent};
 
 /// Why a strict continuation projection refused. Each variant names
-/// the precise damage so `mu --resume`'s refusal can point at the
-/// exact record and suggest the `mu --recover` remediation.
+/// the precise damage so `mu --resume`'s refusal can identify the exact
+/// record without claiming an unavailable repair command exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContinuationError {
     /// The log has no clean boundary at all — there is nothing
@@ -51,16 +51,24 @@ pub enum ContinuationError {
     },
     /// The tail past the last clean boundary is ragged: there ARE
     /// events after the boundary that a strict resume cannot send.
-    /// `--recover` is the authorized path to tombstone them.
+    /// An explicit repairing path may tombstone them.
     RaggedTail {
         /// Event id of the last clean boundary (the fork point a
-        /// `--recover` would use).
+        /// repairing projection would use).
         clean_boundary_event_id: u64,
         /// Event id of the first ragged event past the boundary.
         first_ragged_event_id: u64,
         /// What's wrong with the tail.
         detail: String,
     },
+    /// The log declares itself as a resumed head, but its durable inherited
+    /// history is absent. Continuing would silently truncate the conversation.
+    MissingContinuationSeed {
+        /// Parent named by `HeadAttached`.
+        predecessor_session_id: String,
+    },
+    /// A persisted inherited-history seed is not provider-sendable.
+    InvalidContinuationSeed { detail: String },
     /// The log is empty (no events) — nothing to resume.
     Empty,
 }
@@ -71,6 +79,15 @@ impl std::fmt::Display for ContinuationError {
             ContinuationError::Empty => write!(f, "session log is empty; nothing to resume"),
             ContinuationError::NoCleanBoundary { detail } => {
                 write!(f, "no clean boundary to resume from: {detail}")
+            }
+            ContinuationError::MissingContinuationSeed {
+                predecessor_session_id,
+            } => write!(
+                f,
+                "resumed head names predecessor `{predecessor_session_id}` but its inherited-history seed is missing"
+            ),
+            ContinuationError::InvalidContinuationSeed { detail } => {
+                write!(f, "inherited-history seed is not provider-sendable: {detail}")
             }
             ContinuationError::RaggedTail {
                 clean_boundary_event_id,
@@ -99,12 +116,12 @@ pub struct Continuation {
     /// `None` only when the boundary is the empty conversation.
     pub fork_event_id: Option<u64>,
     /// True when there were events past the fork point that a strict
-    /// resume could not include (the ragged tail). `mu --recover`
-    /// tombstones these; `mu --resume` would have refused.
+    /// resume could not include (the ragged tail). A repairing caller can
+    /// tombstone these; strict resume refuses them.
     pub had_ragged_tail: bool,
     /// The id of the first ragged event past the boundary, when
-    /// `had_ragged_tail`. Used by `--recover` to know where to start
-    /// laying tombstones.
+    /// `had_ragged_tail`. Used by a repairing caller to know where to
+    /// start laying tombstones.
     pub first_ragged_event_id: Option<u64>,
 }
 
@@ -113,6 +130,35 @@ pub struct Continuation {
 struct Boundary {
     messages: Vec<AgentMessage>,
     event_id: u64,
+}
+
+fn validate_seed_messages(messages: &[AgentMessage]) -> Result<(), String> {
+    let mut pending = BTreeSet::new();
+    for message in messages {
+        match message {
+            AgentMessage::Assistant(assistant) => {
+                for block in &assistant.content {
+                    if let ContentBlock::ToolCall(call) = block {
+                        pending.insert(call.id.clone());
+                    }
+                }
+            }
+            AgentMessage::ToolResult { call_id, .. } => {
+                if !pending.remove(call_id) {
+                    return Err(format!(
+                        "seeded tool result for call `{call_id}` has no matching tool call"
+                    ));
+                }
+            }
+            AgentMessage::User { .. } => {}
+        }
+    }
+    if let Some(call_id) = pending.into_iter().next() {
+        return Err(format!(
+            "seeded tool call `{call_id}` has no matching tool result"
+        ));
+    }
+    Ok(())
 }
 
 /// Walk the (tombstone-filtered) log and project it into messages,
@@ -136,6 +182,8 @@ fn project_internal(events: &[SessionEvent]) -> Result<Continuation, Continuatio
     // never-answered call — not at whatever event happened to come next.
     let mut messages: Vec<AgentMessage> = Vec::new();
     let mut pending_tool_calls: Vec<(String, u64)> = Vec::new();
+    let mut saw_conversational_event = false;
+    let mut saw_continuation_seed = false;
 
     // The last coherent snapshot we could resume from.
     let mut last_clean: Option<Boundary> = None;
@@ -160,6 +208,7 @@ fn project_internal(events: &[SessionEvent]) -> Result<Continuation, Continuatio
 
         match &ev.payload {
             EventPayload::UserMessage { content } => {
+                saw_conversational_event = true;
                 messages.push(AgentMessage::User {
                     content: content.clone(),
                 });
@@ -167,7 +216,33 @@ fn project_internal(events: &[SessionEvent]) -> Result<Continuation, Continuatio
                     capture(&messages, ev.id, &mut last_clean);
                 }
             }
+            EventPayload::ContinuationSeeded {
+                messages: inherited,
+                ..
+            } => {
+                if saw_conversational_event || saw_continuation_seed {
+                    return Err(ContinuationError::InvalidContinuationSeed {
+                        detail:
+                            "seed must precede all conversational events and appear exactly once"
+                                .into(),
+                    });
+                }
+                if let Err(detail) = validate_seed_messages(inherited) {
+                    return Err(ContinuationError::InvalidContinuationSeed { detail });
+                }
+                // A resumed head stores its inherited provider-sendable
+                // history as one seed event. Replace (rather than append
+                // to) the running projection: this event is emitted before
+                // any child-local conversational events and is the exact
+                // base the live loop received. Older logs simply lack it.
+                messages = inherited.clone();
+                saw_continuation_seed = true;
+                pending_tool_calls.clear();
+                first_ragged = None;
+                capture(&messages, ev.id, &mut last_clean);
+            }
             EventPayload::AssistantMessageEvent { message } => {
+                saw_conversational_event = true;
                 for block in &message.content {
                     if let ContentBlock::ToolCall(tc) = block {
                         pending_tool_calls.push((tc.id.clone(), ev.id));
@@ -181,6 +256,7 @@ fn project_internal(events: &[SessionEvent]) -> Result<Continuation, Continuatio
                 }
             }
             EventPayload::ToolCall { call_id, .. } => {
+                saw_conversational_event = true;
                 // A bare ToolCall event (not already inside an assistant
                 // block) still registers as pending. Dedup against calls
                 // the assistant block already introduced.
@@ -193,6 +269,7 @@ fn project_internal(events: &[SessionEvent]) -> Result<Continuation, Continuatio
                 content,
                 is_error,
             } => {
+                saw_conversational_event = true;
                 let before = pending_tool_calls.len();
                 pending_tool_calls.retain(|(c, _)| c != call_id);
                 let removed = pending_tool_calls.len() != before;
@@ -311,8 +388,87 @@ fn project_internal(events: &[SessionEvent]) -> Result<Continuation, Continuatio
 /// `mu --resume` (STRICT). Project the log for continuation, but
 /// REFUSE if the tail past the last clean boundary is ragged. The
 /// returned [`ContinuationError`] names the exact damage so the caller
-/// can print a precise diagnosis and a `mu --recover` hint.
+/// can print a precise diagnosis without silently truncating.
 pub fn project_strict(events: &[SessionEvent]) -> Result<Continuation, ContinuationError> {
+    let dead = tombstoned_ids(events);
+    let required_seed = events.iter().find_map(|event| {
+        if dead.contains(&event.id) {
+            return None;
+        }
+        match &event.payload {
+            EventPayload::ContinuationSeeded {
+                predecessor_session_id,
+                branched_at_event_id,
+                ..
+            } => Some((
+                event.id,
+                predecessor_session_id.as_str(),
+                *branched_at_event_id,
+            )),
+            _ => None,
+        }
+    });
+    if let Some((seed_event_id, seeded_predecessor, seeded_branch_event_id)) = required_seed {
+        let matching_head = events.iter().any(|event| {
+            event.id > seed_event_id
+                && !dead.contains(&event.id)
+                && matches!(
+                    &event.payload,
+                    EventPayload::HeadAttached {
+                        predecessor_session_id,
+                        branched_at_event_id,
+                        ..
+                    } if predecessor_session_id == seeded_predecessor
+                        && branched_at_event_id == &seeded_branch_event_id
+                )
+        });
+        if !matching_head {
+            return Err(ContinuationError::InvalidContinuationSeed {
+                detail: "seed has no matching later HeadAttached lineage marker".into(),
+            });
+        }
+    }
+
+    let attached_predecessor = events.iter().find_map(|event| {
+        if dead.contains(&event.id) {
+            return None;
+        }
+        match &event.payload {
+            EventPayload::HeadAttached {
+                predecessor_session_id,
+                branched_at_event_id,
+                ..
+            } => Some((
+                event.id,
+                predecessor_session_id.as_str(),
+                *branched_at_event_id,
+            )),
+            _ => None,
+        }
+    });
+    if let Some((head_attached_event_id, predecessor_session_id, attached_branch_event_id)) =
+        attached_predecessor
+    {
+        let matching_seed = events.iter().any(|event| {
+            event.id < head_attached_event_id
+                && !dead.contains(&event.id)
+                && matches!(
+                    &event.payload,
+                    EventPayload::ContinuationSeeded {
+                        predecessor_session_id: seeded_predecessor,
+                        branched_at_event_id: seeded_branch_event_id,
+                        ..
+                    } if seeded_predecessor == predecessor_session_id
+                        && seeded_branch_event_id == &attached_branch_event_id
+                )
+        });
+        if !matching_seed {
+            return Err(ContinuationError::MissingContinuationSeed {
+                predecessor_session_id: predecessor_session_id.to_string(),
+            });
+        }
+    }
+
     let cont = project_internal(events)?;
     if cont.had_ragged_tail {
         // Re-derive the precise damage detail for the error.
@@ -326,10 +482,12 @@ pub fn project_strict(events: &[SessionEvent]) -> Result<Continuation, Continuat
     Ok(cont)
 }
 
-/// The repairing path's projection (`mu --recover`). Truncates to the
-/// last clean boundary and returns the messages plus fork point.
-/// Tolerates a ragged tail (the caller tombstones it); only fails when
-/// there is no clean boundary at all.
+/// The repairing path's projection (CLI wiring is tracked separately).
+/// Truncates to the last clean boundary and returns the messages plus fork
+/// point. It tolerates an ordinary ragged tail, but still refuses an invalid
+/// inherited-history seed because projecting past one would fabricate context.
+/// The future recovery command must decide explicitly whether to tombstone such
+/// a seed, follow predecessor lineage, or stop for operator input.
 pub fn project_to_clean_boundary(
     events: &[SessionEvent],
 ) -> Result<Continuation, ContinuationError> {
@@ -339,7 +497,7 @@ pub fn project_to_clean_boundary(
 /// Re-derive a precise, human-readable description of what's wrong in
 /// the ragged tail starting at `first_ragged_event_id`. Used to enrich
 /// the strict refusal so `mu --resume` can name the exact damage and
-/// point at `mu --recover`.
+/// support a future explicit recovery command.
 fn ragged_detail(events: &[SessionEvent], first_ragged_event_id: Option<u64>) -> String {
     let Some(start) = first_ragged_event_id else {
         return "ragged tail past the last clean boundary".to_string();
@@ -392,7 +550,7 @@ fn ragged_detail(events: &[SessionEvent], first_ragged_event_id: Option<u64>) ->
 }
 
 /// Convenience: the terminal error event (if any) in a log — the
-/// record `mu --recover`'s cause-of-death preflight would match
+/// record a future recovery preflight could match
 /// against a known-signatures table. Returns the message of the last
 /// `Error` / `ErrorInvalidMessage` event. (The preflight table itself
 /// is filed as follow-up work; this is the hook it reads.)
@@ -499,6 +657,33 @@ mod tests {
         )
     }
 
+    fn continuation_seeded(
+        id: u64,
+        predecessor: &str,
+        messages: Vec<AgentMessage>,
+    ) -> SessionEvent {
+        ev(
+            id,
+            EventPayload::ContinuationSeeded {
+                predecessor_session_id: predecessor.into(),
+                branched_at_event_id: Some(42),
+                messages,
+            },
+        )
+    }
+
+    fn head_attached(id: u64, predecessor: &str) -> SessionEvent {
+        ev(
+            id,
+            EventPayload::HeadAttached {
+                daemon_id: "d1".into(),
+                claimed_actor: "operator".into(),
+                predecessor_session_id: predecessor.into(),
+                branched_at_event_id: Some(42),
+            },
+        )
+    }
+
     #[test]
     fn empty_log_refuses() {
         let err = project_strict(&[]).unwrap_err();
@@ -519,6 +704,175 @@ mod tests {
         assert!(!cont.had_ragged_tail);
         assert_eq!(cont.fork_event_id, Some(4)); // the Done is the boundary
         assert!(matches!(&cont.messages[0], AgentMessage::User { content } if content == "hi"));
+    }
+
+    #[test]
+    fn legacy_resumed_head_without_seed_fails_closed() {
+        let log = vec![
+            session_created(1),
+            head_attached(2, "predecessor"),
+            user(3, "child-local question"),
+            assistant_text(4, "child-local answer"),
+            done(5),
+        ];
+
+        let err = project_strict(&log).expect_err("legacy head cannot prove inherited history");
+        assert_eq!(
+            err,
+            ContinuationError::MissingContinuationSeed {
+                predecessor_session_id: "predecessor".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn resumed_head_with_seed_after_attachment_fails_closed() {
+        let log = vec![
+            session_created(1),
+            head_attached(2, "predecessor"),
+            continuation_seeded(3, "predecessor", vec![]),
+            user(4, "child-local question"),
+            assistant_text(5, "child-local answer"),
+            done(6),
+        ];
+
+        let err = project_strict(&log).expect_err("late inherited history must refuse");
+        assert!(matches!(
+            err,
+            ContinuationError::InvalidContinuationSeed { .. }
+        ));
+    }
+
+    #[test]
+    fn resumed_head_with_mismatched_seed_fails_closed() {
+        let log = vec![
+            session_created(1),
+            continuation_seeded(2, "wrong-predecessor", vec![]),
+            head_attached(3, "predecessor"),
+            done(4),
+        ];
+
+        let err = project_strict(&log).expect_err("mismatched inherited history must refuse");
+        assert!(matches!(
+            err,
+            ContinuationError::InvalidContinuationSeed { .. }
+        ));
+    }
+
+    #[test]
+    fn repair_projection_can_inspect_seed_required_head_without_seed() {
+        let log = vec![
+            session_created(1),
+            head_attached(2, "predecessor"),
+            user(3, "child-local question"),
+            assistant_text(4, "child-local answer"),
+            done(5),
+        ];
+
+        let cont = project_to_clean_boundary(&log)
+            .expect("repair projection can inspect a partial seed-required head");
+        assert_eq!(cont.messages.len(), 2);
+        assert_eq!(cont.fork_event_id, Some(5));
+    }
+
+    #[test]
+    fn orphan_continuation_seed_refuses_strict_projection() {
+        let log = vec![
+            session_created(1),
+            continuation_seeded(2, "predecessor", vec![]),
+            done(3),
+        ];
+        let err = project_strict(&log).expect_err("orphan seed must not establish lineage");
+        assert!(matches!(
+            err,
+            ContinuationError::InvalidContinuationSeed { .. }
+        ));
+    }
+
+    #[test]
+    fn continuation_seed_after_conversation_refuses() {
+        let log = vec![
+            session_created(1),
+            user(2, "local-before-seed"),
+            continuation_seeded(3, "predecessor", vec![]),
+        ];
+        let err = project_strict(&log).expect_err("late seed must not rewrite history");
+        assert!(matches!(
+            err,
+            ContinuationError::InvalidContinuationSeed { .. }
+        ));
+    }
+
+    #[test]
+    fn continuation_seed_with_dangling_tool_call_refuses() {
+        let inherited = vec![AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: "dangling".into(),
+                name: "read".into(),
+                arguments: ToolArgs::new(json!({})).expect("valid args"),
+            })],
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        })];
+        let log = vec![
+            session_created(1),
+            continuation_seeded(2, "predecessor", inherited),
+            head_attached(3, "predecessor"),
+        ];
+
+        let err = project_strict(&log).expect_err("ragged seed must refuse");
+        assert!(matches!(
+            err,
+            ContinuationError::InvalidContinuationSeed { .. }
+        ));
+    }
+
+    #[test]
+    fn resumed_head_persists_inherited_history_for_transitive_resume() {
+        let inherited = vec![
+            AgentMessage::User {
+                content: "first question".into(),
+            },
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![ContentBlock::Text {
+                    text: "first answer".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            }),
+        ];
+        let log = vec![
+            session_created(1),
+            continuation_seeded(2, "predecessor", inherited.clone()),
+            head_attached(3, "predecessor"),
+            user(4, "second question"),
+            assistant_text(5, "second answer"),
+            done(6),
+        ];
+
+        let cont = project_strict(&log).expect("resumed head can itself resume");
+        assert_eq!(cont.messages.len(), 4);
+        assert_eq!(&cont.messages[..2], inherited.as_slice());
+        assert_eq!(cont.fork_event_id, Some(6));
+    }
+
+    #[test]
+    fn continuation_seed_after_local_projection_refuses() {
+        let inherited = vec![AgentMessage::User {
+            content: "inherited".into(),
+        }];
+        let log = vec![
+            session_created(1),
+            user(2, "must not be discarded"),
+            continuation_seeded(3, "predecessor", inherited),
+            done(4),
+        ];
+
+        let err = project_strict(&log).expect_err("late seed cannot replace local history");
+        assert!(matches!(
+            err,
+            ContinuationError::InvalidContinuationSeed { .. }
+        ));
     }
 
     #[test]
@@ -629,7 +983,7 @@ mod tests {
 
     #[test]
     fn tombstoned_ragged_tail_projects_clean() {
-        // After --recover lays a tombstone over the dangling tool call,
+        // After a repairing caller lays a tombstone over the dangling tool call,
         // a strict projection of the SAME log should now succeed: the
         // tombstoned event is skipped, leaving a clean boundary at the
         // Done.

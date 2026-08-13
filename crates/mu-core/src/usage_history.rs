@@ -311,6 +311,7 @@ pub fn extract_per_session_metric_segments(events: &[SessionEvent]) -> Vec<PerSe
             // signal.
             | EventPayload::Tombstone { .. }
             | EventPayload::HeadAttached { .. }
+            | EventPayload::ContinuationSeeded { .. }
             // spec mu-046: command/receipt journal records are border
             // bookkeeping; their token/timing signal already arrives
             // via the Done/AssistantMessage events they wrap.

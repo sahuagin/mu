@@ -110,14 +110,30 @@ pub fn load_session_rope(path: &Path) -> std::io::Result<(String, RetainedRope, 
 /// the projection in isolation.
 pub fn events_to_messages(events: &[SessionEvent]) -> Vec<AgentMessage> {
     let mut out: Vec<AgentMessage> = Vec::with_capacity(events.len());
+    let mut saw_conversation = false;
+    let mut saw_seed = false;
     for ev in events {
         match &ev.payload {
+            EventPayload::ContinuationSeeded {
+                messages: inherited,
+                ..
+            } if !saw_conversation && !saw_seed => {
+                out = inherited.clone();
+                saw_seed = true;
+            }
+            EventPayload::ContinuationSeeded { .. } => {
+                // The live projector refuses malformed ordering. This infallible
+                // offline helper cannot express that error, so it preserves the
+                // already-projected prefix rather than silently rebasing it.
+            }
             EventPayload::UserMessage { content } => {
+                saw_conversation = true;
                 out.push(AgentMessage::User {
                     content: content.clone(),
                 });
             }
             EventPayload::AssistantMessageEvent { message } => {
+                saw_conversation = true;
                 out.push(AgentMessage::Assistant(message.clone()));
             }
             EventPayload::ToolResult {
@@ -125,6 +141,7 @@ pub fn events_to_messages(events: &[SessionEvent]) -> Vec<AgentMessage> {
                 content,
                 is_error,
             } => {
+                saw_conversation = true;
                 out.push(AgentMessage::ToolResult {
                     call_id: call_id.clone(),
                     content: content.clone(),
@@ -348,6 +365,60 @@ mod tests {
             actor: EventActor::User,
             payload,
         }
+    }
+
+    #[test]
+    fn events_to_messages_folds_continuation_seed_as_base() {
+        let inherited = vec![AgentMessage::User {
+            content: "inherited".into(),
+        }];
+        let events = vec![
+            ev(
+                1,
+                "s1",
+                EventPayload::ContinuationSeeded {
+                    predecessor_session_id: "parent".into(),
+                    branched_at_event_id: Some(42),
+                    messages: inherited.clone(),
+                },
+            ),
+            ev(
+                2,
+                "s1",
+                EventPayload::UserMessage {
+                    content: "local".into(),
+                },
+            ),
+        ];
+        let messages = events_to_messages(&events);
+        assert_eq!(&messages[..1], inherited.as_slice());
+        assert!(matches!(&messages[1], AgentMessage::User { content } if content == "local"));
+    }
+
+    #[test]
+    fn events_to_messages_does_not_rebase_on_late_seed() {
+        let events = vec![
+            ev(
+                1,
+                "s1",
+                EventPayload::UserMessage {
+                    content: "local".into(),
+                },
+            ),
+            ev(
+                2,
+                "s1",
+                EventPayload::ContinuationSeeded {
+                    predecessor_session_id: "parent".into(),
+                    branched_at_event_id: Some(42),
+                    messages: vec![AgentMessage::User {
+                        content: "late inherited".into(),
+                    }],
+                },
+            ),
+        ];
+        let messages = events_to_messages(&events);
+        assert!(matches!(&messages[..], [AgentMessage::User { content }] if content == "local"));
     }
 
     #[test]

@@ -556,13 +556,26 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         branched_at_event_id: Option<u64>,
     },
+    /// The provider-sendable history inherited by a resumed live head.
+    ///
+    /// `AgentConfig::seed_messages` alone is process-local: without this
+    /// event, resuming the resumed session after another daemon restart
+    /// projects only the child's new messages and silently loses all
+    /// inherited history. Persist the exact seed before registration so
+    /// continuation replay remains transitive across any number of heads.
+    ContinuationSeeded {
+        predecessor_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branched_at_event_id: Option<u64>,
+        messages: Vec<crate::agent::types::AgentMessage>,
+    },
     /// mu-mh4: an append-only compensating event that marks an earlier
     /// record as poisoned (broken / incomplete / malformed). The log
     /// is NEVER edited; a Tombstone is laid OVER the bad record so
     /// every projection can skip it via one rule (skip tombstoned
-    /// event ids). Born for `mu --recover` (lay tombstones over the
-    /// ragged tail of a session that died mid-iteration, then resume
-    /// from the last clean prompt), but the kind generalizes to ANY
+    /// event ids). Born for an explicit recovery path that can lay
+    /// tombstones over a ragged tail, then resume
+    /// from the last clean prompt, but the kind generalizes to ANY
     /// poisoned record: degraded_eof partials, malformed tool results,
     /// etc. Attributed and reasoned so the scar is legible in every
     /// consumer (the console renders tombstoned spans as scar tissue).
@@ -658,6 +671,7 @@ impl EventPayload {
             Self::WorkerTimeout { .. } => "worker_timeout",
             Self::OperatorMark { .. } => "operator_mark",
             Self::HeadAttached { .. } => "head_attached",
+            Self::ContinuationSeeded { .. } => "continuation_seeded",
             Self::Tombstone { .. } => "tombstone",
             Self::CommandReceived { .. } => "command_received",
             Self::CommandSucceeded { .. } => "command_succeeded",
@@ -851,35 +865,78 @@ impl SessionEventLog {
     }
 
     /// Attach an on-disk JSONL writer (mu-upb). Creates the parent
-    /// directories if needed and opens the file in append mode.
-    ///
-    /// Returns the path that was opened on success (useful for
-    /// logging "events going to /path/to/file.jsonl"). On error,
-    /// the writer stays None and append() continues in-memory only.
+    /// directories, opens the file in append mode, and syncs the parent
+    /// directory entry before publishing the writer. Callers that need
+    /// best-effort behavior may log and ignore the returned error; recovery-
+    /// critical callers propagate it.
     pub fn attach_disk_writer(&self, path: &std::path::Path) -> std::io::Result<PathBuf> {
+        self.attach_disk_writer_inner(path, false)
+    }
+
+    /// Attach a writer and require the newly-created directory entry to be
+    /// durable before publishing it. Used by recovery-critical bootstrap paths.
+    pub fn attach_disk_writer_durable(&self, path: &std::path::Path) -> std::io::Result<PathBuf> {
+        self.attach_disk_writer_inner(path, true)
+    }
+
+    fn attach_disk_writer_inner(
+        &self,
+        path: &std::path::Path,
+        require_dir_sync: bool,
+    ) -> std::io::Result<PathBuf> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        // Fsync the parent directory so the just-created file's dirent
-        // survives a crash (the file's own writes don't persist it).
-        // BEST-EFFORT, matching this log's posture (append() swallows
-        // IO errors; persistence here is not load-bearing) — contrast
-        // `CommandJournal::open`, where the same sync propagates.
+        let file = if require_dir_sync {
+            OpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .open(path)?
+        } else {
+            OpenOptions::new().create(true).append(true).open(path)?
+        };
+        // Resume bootstrap makes the dirent load-bearing; ordinary session
+        // logs retain their historical best-effort posture on filesystems that
+        // reject directory fsync.
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            if let Err(e) = std::fs::File::open(parent).and_then(|d| d.sync_all()) {
+            if let Err(error) = std::fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+                if require_dir_sync {
+                    drop(file);
+                    let _ = std::fs::remove_file(path);
+                    return Err(error);
+                }
                 tracing::warn!(
                     session_id = %self.session_id,
                     path = %parent.display(),
-                    error = %e,
-                    "parent-directory fsync failed after attaching disk writer; continuing"
+                    error = %error,
+                    "parent-directory fsync failed after attaching best-effort writer"
                 );
             }
+            // create_dir_all may have created the daemon directory itself. Its
+            // entry lives in events_dir (the grandparent), so strict attachment
+            // must sync that directory too before claiming the path is durable.
+            if require_dir_sync {
+                if let Some(events_dir) = parent.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    if let Err(error) =
+                        std::fs::File::open(events_dir).and_then(|dir| dir.sync_all())
+                    {
+                        drop(file);
+                        let _ = std::fs::remove_file(path);
+                        return Err(error);
+                    }
+                }
+            }
         }
-        let mut guard = self
-            .disk_writer
-            .lock()
-            .map_err(|_| std::io::Error::other("disk_writer mutex poisoned"))?;
+        let mut guard = match self.disk_writer.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                drop(file);
+                if require_dir_sync {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(std::io::Error::other("disk_writer mutex poisoned"));
+            }
+        };
         *guard = Some(file);
         Ok(path.to_path_buf())
     }
@@ -960,22 +1017,19 @@ impl SessionEventLog {
         id
     }
 
-    /// spec mu-046: like [`append`](Self::append), but for commands —
-    /// the strict path. Writes the JSONL line, `sync_data()`s, THEN
-    /// pushes to memory; IO errors propagate so the caller can fail
-    /// closed (reject with `JOURNAL_UNAVAILABLE`, never process —
-    /// INV-2). The inverse of `append`'s swallow-and-continue:
-    /// command durability is load-bearing, gateway-event durability
-    /// is best-effort.
-    ///
-    /// Errors `Unsupported` when no disk writer is attached — an
-    /// in-memory-only session cannot make a command durable, and
-    /// silently succeeding would forge the write-ahead guarantee.
-    pub fn append_command(&self, actor: EventActor, payload: EventPayload) -> std::io::Result<u64> {
-        // Hold the append-order lock across assign-id → write → fsync
-        // → memory push so disk order, event id order, and snapshot
-        // order stay aligned against both command and non-command
-        // appends.
+    /// Append an event durably: write + `sync_data()` before making it visible
+    /// in memory. Unlike [`append`](Self::append), errors propagate. Requires
+    /// an attached disk writer.
+    pub fn append_durable(&self, actor: EventActor, payload: EventPayload) -> std::io::Result<u64> {
+        self.append_durable_with_context(actor, payload, "durable append requires a disk writer")
+    }
+
+    fn append_durable_with_context(
+        &self,
+        actor: EventActor,
+        payload: EventPayload,
+        no_writer: &str,
+    ) -> std::io::Result<u64> {
         let mut guard = self
             .disk_writer
             .lock()
@@ -983,7 +1037,7 @@ impl SessionEventLog {
         let Some(file) = guard.as_mut() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "append_command requires a disk writer: commands must be durable before processing (spec mu-046 INV-1)",
+                no_writer,
             ));
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -998,19 +1052,23 @@ impl SessionEventLog {
         let line = serde_json::to_string(&event).map_err(std::io::Error::other)?;
         writeln!(file, "{line}")?;
         file.sync_data()?;
-        // Disk first, memory second: by the time the event is visible
-        // in any projection it is already durable. A poisoned events
-        // mutex after a durable write surfaces as an error — the
-        // on-disk record then reads as an orphan, which is the legible
-        // outcome (INV-4). Keep the append-order lock held until the
-        // memory push completes so a best-effort append cannot overtake
-        // a strict command append in snapshots.
         let mut events = self
             .events
             .lock()
             .map_err(|_| std::io::Error::other("event log mutex poisoned after durable write"))?;
         events.push(event);
         Ok(id)
+    }
+
+    /// spec mu-046: strict command append. Writes and syncs before exposing the
+    /// command in memory; IO errors propagate so ingress can reject with
+    /// `JOURNAL_UNAVAILABLE` rather than process an unjournaled command.
+    pub fn append_command(&self, actor: EventActor, payload: EventPayload) -> std::io::Result<u64> {
+        self.append_durable_with_context(
+            actor,
+            payload,
+            "append_command requires a disk writer: commands must be durable before processing (spec mu-046 INV-1)",
+        )
     }
 
     /// spec mu-046 WP4: does this log have an on-disk JSONL writer
@@ -1871,6 +1929,61 @@ mod tests {
                 items: vec![sample_redacted_memory_entry()],
             },
         );
+        let (recovered, malformed) = SessionEventLog::from_jsonl(&path).expect("from_jsonl");
+        assert_eq!(malformed, 0);
+        assert_eq!(recovered.snapshot(), log.snapshot());
+    }
+
+    #[test]
+    fn durable_attach_refuses_existing_pending_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s1.jsonl.pending");
+        std::fs::write(&path, "stale").expect("seed stale pending");
+        let log = SessionEventLog::new("s1");
+        let err = log
+            .attach_disk_writer_durable(&path)
+            .expect_err("durable bootstrap must not append to stale state");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(path).expect("read stale"), "stale");
+    }
+
+    #[test]
+    fn append_durable_round_trips_before_returning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s1.jsonl");
+        let log = SessionEventLog::new("s1");
+        log.attach_disk_writer(&path).expect("attach");
+        let payload = EventPayload::ContinuationSeeded {
+            predecessor_session_id: "predecessor".into(),
+            branched_at_event_id: Some(42),
+            messages: vec![crate::agent::AgentMessage::User {
+                content: "inherited question".into(),
+            }],
+        };
+        log.append_durable(EventActor::System, payload)
+            .expect("durable append");
+        let (recovered, malformed) = SessionEventLog::from_jsonl(&path).expect("from_jsonl");
+        assert_eq!(malformed, 0);
+        assert_eq!(recovered.snapshot(), log.snapshot());
+    }
+
+    #[test]
+    fn continuation_seeded_rehydrates_from_jsonl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s1.jsonl");
+        let log = SessionEventLog::new("s1");
+        log.attach_disk_writer(&path).expect("attach");
+        log.append(
+            EventActor::System,
+            EventPayload::ContinuationSeeded {
+                predecessor_session_id: "predecessor".into(),
+                branched_at_event_id: Some(42),
+                messages: vec![crate::agent::AgentMessage::User {
+                    content: "inherited question".into(),
+                }],
+            },
+        );
+
         let (recovered, malformed) = SessionEventLog::from_jsonl(&path).expect("from_jsonl");
         assert_eq!(malformed, 0);
         assert_eq!(recovered.snapshot(), log.snapshot());

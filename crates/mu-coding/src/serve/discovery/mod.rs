@@ -197,6 +197,7 @@ pub fn derive_status_from_events(
             // session-status-driving.
             | EventPayload::Tombstone { .. }
             | EventPayload::HeadAttached { .. }
+            | EventPayload::ContinuationSeeded { .. }
             // spec mu-046: command/receipt records are border
             // bookkeeping, not session-status-driving.
             | EventPayload::CommandReceived { .. }

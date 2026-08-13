@@ -8,8 +8,8 @@
 //! the predecessor's one log on demand when `session.resume` resolves it. The
 //! daemon projects the predecessor's log to its last clean boundary and
 //! births a fresh live session seeded with that history — or REFUSES
-//! with a precise diagnosis if the log is ragged (and the CLI prints the
-//! `mu --recover` hint the daemon supplies).
+//! with a precise diagnosis if the log is ragged. Automated repair is not
+//! implemented yet; the source event log remains untouched.
 //!
 //! On success the resumed session id is printed. When a `prompt` is
 //! given, the resumed session is immediately asked it (the new head
@@ -195,8 +195,8 @@ async fn resume_session(
             let line = read_line(stdout).await?;
             if line.get("id") == Some(&Value::from(id)) {
                 if let Some(error) = line.get("error") {
-                    // The daemon's refusal message already carries the
-                    // precise diagnosis + the `mu --recover` hint.
+                    // The daemon's refusal message carries the precise
+                    // diagnosis and honestly reports that repair is unavailable.
                     let msg = error
                         .get("message")
                         .and_then(|m| m.as_str())

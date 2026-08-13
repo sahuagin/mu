@@ -509,6 +509,18 @@ fn render_transcript(events: &[SessionEvent]) -> String {
     );
     for ev in events {
         match &ev.payload {
+            EventPayload::ContinuationSeeded { messages, .. } => {
+                let text = serde_json::to_string_pretty(messages)
+                    .unwrap_or_else(|_| format!("{messages:#?}"));
+                transcript_block(
+                    &mut out,
+                    ev.id,
+                    ev.timestamp_unix_ms,
+                    "inherited",
+                    &text,
+                    false,
+                );
+            }
             EventPayload::UserMessage { content } => {
                 transcript_block(
                     &mut out,

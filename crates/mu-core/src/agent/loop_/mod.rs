@@ -734,10 +734,9 @@ pub struct AgentConfig {
     /// log to its last clean boundary
     /// ([`crate::agent::continuation::project_strict`]) and hands the
     /// resulting [`AgentMessage`] history here, so the resumed loop
-    /// starts mid-conversation rather than empty. These messages are NOT
-    /// re-logged as events in the new session's log — they live in the
-    /// predecessor's log, which the new `SessionCreated` event points
-    /// back to via `branched_at_parent_event_id`.
+    /// starts mid-conversation rather than empty. The resume handler also
+    /// persists the same provider-sendable base as `ContinuationSeeded` in the
+    /// new head's log, making repeated resume independent of process memory.
     pub seed_messages: Vec<AgentMessage>,
     /// mu-uz0n: implicit capability discovery. When `Some`, each turn
     /// the loop ranks the last user-role message (operator ask or

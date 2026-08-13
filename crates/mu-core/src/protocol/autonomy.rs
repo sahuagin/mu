@@ -106,6 +106,13 @@ pub enum AutonomousTerminationReason {
     IterationCap,
     WallClockExpired,
     ToolCallCapExhausted,
+    /// The per-ask `max_turns` budget tripped mid-run. Distinct from
+    /// `IterationCap` (the autonomous iteration bound): this is the
+    /// interactive turn cap firing inside autonomy, which must still
+    /// terminate the run — otherwise the session wedges with
+    /// autonomy_active set and ask_session refused (bead
+    /// mu-autonomy-turn-budget-wedge-6tnp).
+    TurnBudgetExhausted,
     EscalationTimedOut,
     GraderRejected {
         detail: String,
@@ -117,6 +124,12 @@ pub enum AutonomousTerminationReason {
     Errored {
         message: String,
     },
+    /// A reason tag this binary doesn't know — written by a newer
+    /// daemon. Replay must keep the terminated event rather than drop
+    /// the line as malformed: losing it leaves the log's
+    /// autonomous_run_active projection permanently true.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Request to park the session for `sleep_for_ms` (or until
@@ -200,4 +213,24 @@ pub struct AutonomousTerminatedEvent {
 
 impl AutonomousTerminatedEvent {
     pub const METHOD: &'static str = "session.autonomous_terminated";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn termination_reason_round_trips_and_tolerates_unknown_tags() {
+        let json = serde_json::to_string(&AutonomousTerminationReason::TurnBudgetExhausted)
+            .expect("serialize");
+        assert_eq!(json, r#"{"tag":"turn_budget_exhausted"}"#);
+        let back: AutonomousTerminationReason = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, AutonomousTerminationReason::TurnBudgetExhausted);
+
+        // A tag from a newer binary lands on Unknown instead of failing
+        // the whole event line during replay.
+        let future: AutonomousTerminationReason =
+            serde_json::from_str(r#"{"tag":"quantum_decoherence"}"#).expect("unknown tag");
+        assert_eq!(future, AutonomousTerminationReason::Unknown);
+    }
 }

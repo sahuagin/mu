@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Parse a panel's per-rank .out files into verdicts/findings.
 usage: parse_panel.py <prefix>   # e.g. .../pr282.r1  -> reads <prefix>.rank*.out
-Robust to ```json fences and [thinking] lines."""
+Robust to ```json fences, [thinking] lines, and inline <think> blocks."""
 import json, re, glob, sys, os
 
 def extract(s):
     s = s.strip()
+    s = re.sub(r'(?is)<think>.*?</think>', '', s)
     s = re.sub(r'^\s*\[thinking\].*?$', '', s, flags=re.M)
     m = re.search(r'```(?:json)?\s*(\{.*\})\s*```', s, re.S)
     if m:

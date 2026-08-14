@@ -5701,6 +5701,29 @@ impl App {
             }
         }
         match method {
+            // Synthesized by the client's stderr drain (not a daemon
+            // JSON-RPC notification): the daemon's operator-facing
+            // CONFIG ERROR banner, which the alt-screen TUI otherwise
+            // swallows — the operator then runs indefinitely on
+            // built-in defaults without knowing (bead
+            // mu-tui-surface-daemon-config-error-tx6r).
+            "daemon.config_error" => {
+                let text = params
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("daemon reported a config error");
+                self.transcript.push(TranscriptBlock::error(text));
+                if !self.fullscreen {
+                    let lines = render::error_block(text, wrap_width);
+                    let h = lines.len() as u16;
+                    vp.insert_before(h, |buf| {
+                        let p = Paragraph::new(lines);
+                        ratatui::widgets::Widget::render(p, buf.area, buf);
+                    })?;
+                }
+                self.set_flash("daemon CONFIG ERROR — running on built-in defaults".to_string());
+                return Ok(());
+            }
             "session.text_delta" => {
                 // Build the model only; the live preview is painted by
                 // render_viewport each tick (focus_mode suppresses the

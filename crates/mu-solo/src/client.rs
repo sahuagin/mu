@@ -43,6 +43,43 @@ pub enum Message {
     ReaderError(String),
 }
 
+/// Collects the daemon's multi-line `mu: CONFIG ERROR` stderr banner
+/// (marker line + detail lines, terminated by a blank line). `feed`
+/// returns the completed banner text when one closes; `finish` flushes
+/// a banner cut off by EOF. Capped so a runaway stream can't buffer
+/// unboundedly.
+#[derive(Default)]
+struct BannerScanner {
+    lines: Vec<String>,
+}
+
+impl BannerScanner {
+    const MAX_LINES: usize = 16;
+
+    fn feed(&mut self, line: &str) -> Option<String> {
+        if line.starts_with("mu: CONFIG ERROR") {
+            let prior = self.finish();
+            self.lines.push(line.to_string());
+            return prior;
+        }
+        if self.lines.is_empty() {
+            return None;
+        }
+        if line.is_empty() || self.lines.len() >= Self::MAX_LINES {
+            return self.finish();
+        }
+        self.lines.push(line.to_string());
+        None
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        if self.lines.is_empty() {
+            return None;
+        }
+        Some(std::mem::take(&mut self.lines).join("\n"))
+    }
+}
+
 pub struct Client {
     child: Child,
     /// `None` after [`Client::shutdown`] closed it to signal EOF.
@@ -168,6 +205,9 @@ impl Client {
         //     pipe stays drained.
         let log_path: Option<std::path::PathBuf> =
             std::env::var_os("MU_SOLO_DAEMON_LOG").map(std::path::PathBuf::from);
+        let (tx, rx) = mpsc::channel::<Message>();
+        let (notif_tx, notif_rx) = tokio_mpsc::unbounded_channel();
+        let stderr_notif_tx = notif_tx.clone();
         thread::Builder::new()
             .name("mu-solo-daemon-stderr".into())
             .spawn(move || {
@@ -179,25 +219,46 @@ impl Client {
                         .open(&p)
                         .ok()
                 });
+                // The daemon's operator-facing CONFIG ERROR banner
+                // (config.rs loud_config_drop) lands on stderr, which
+                // the alt-screen TUI hides — forward it into the
+                // notification stream so the app can render it.
+                let mut banner = BannerScanner::default();
+                let send = |text: String| {
+                    let _ = stderr_notif_tx.send(Message::Notification {
+                        method: "daemon.config_error".into(),
+                        params: serde_json::json!({ "text": text }),
+                    });
+                };
                 let mut reader = BufReader::new(stderr);
                 let mut buf = String::new();
                 loop {
                     buf.clear();
                     match reader.read_line(&mut buf) {
-                        Ok(0) => return, // EOF
+                        Ok(0) => {
+                            if let Some(text) = banner.finish() {
+                                send(text);
+                            }
+                            return; // EOF
+                        }
                         Ok(_) => {
                             if let Some(f) = sink.as_mut() {
                                 let _ = f.write_all(buf.as_bytes());
                             }
+                            if let Some(text) = banner.feed(buf.trim_end()) {
+                                send(text);
+                            }
                         }
-                        Err(_) => return,
+                        Err(_) => {
+                            if let Some(text) = banner.finish() {
+                                send(text);
+                            }
+                            return;
+                        }
                     }
                 }
             })
             .context("spawning daemon-stderr drain thread")?;
-
-        let (tx, rx) = mpsc::channel::<Message>();
-        let (notif_tx, notif_rx) = tokio_mpsc::unbounded_channel();
 
         // Stdout reader thread. Parses each line as a JSON-RPC message
         // and routes it: notifications to the async channel, responses
@@ -675,5 +736,48 @@ mod tests {
         );
         let status = child.try_wait().expect("try_wait").expect("reaped");
         assert!(!status.success(), "sleep must have been killed: {status:?}");
+    }
+
+    #[test]
+    fn banner_scanner_collects_config_error_and_ignores_noise() {
+        let mut b = BannerScanner::default();
+        // Ordinary tracing noise is ignored.
+        assert!(b
+            .feed("2026-08-13T12:18:49 ERROR mu_core::config: ...")
+            .is_none());
+        assert!(b.feed("").is_none());
+        // Banner: marker + indented detail, closed by the blank line.
+        assert!(b
+            .feed("mu: CONFIG ERROR — mu config failed to load — your ENTIRE config was IGNORED")
+            .is_none());
+        assert!(b.feed("    unknown field `base_url`").is_none());
+        assert!(b.feed("    -> the entire config was ignored").is_none());
+        let text = b.feed("").expect("blank line closes the banner");
+        assert!(text.starts_with("mu: CONFIG ERROR"));
+        assert!(text.contains("unknown field `base_url`"));
+        assert_eq!(text.lines().count(), 3);
+        // Post-banner lines are noise again.
+        assert!(b.feed("more tracing").is_none());
+
+        // EOF mid-banner still flushes.
+        assert!(b.feed("mu: CONFIG ERROR — again").is_none());
+        let cut = b.finish().expect("eof flush");
+        assert!(cut.contains("again"));
+        assert!(b.finish().is_none());
+    }
+
+    #[test]
+    fn banner_scanner_caps_runaway_banners() {
+        let mut b = BannerScanner::default();
+        assert!(b.feed("mu: CONFIG ERROR — big").is_none());
+        let mut flushed = None;
+        for i in 0..40 {
+            if let Some(t) = b.feed(&format!("    line {i}")) {
+                flushed = Some(t);
+                break;
+            }
+        }
+        let t = flushed.expect("cap must flush");
+        assert!(t.lines().count() <= BannerScanner::MAX_LINES + 1);
     }
 }

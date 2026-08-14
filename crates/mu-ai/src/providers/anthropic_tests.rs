@@ -805,10 +805,11 @@ fn test_events_stream(
     bytes: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     cancel_rx: oneshot::Receiver<()>,
 ) -> BoxStream<'static, ProviderEvent> {
-    let bytes: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = Box::pin(bytes);
+    let bytes: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> =
+        Box::pin(bytes.map(|r| r.map_err(|e| e.to_string())));
     let sse = SseStream::new(bytes);
     let state = StreamState {
-        sse: Box::pin(sse),
+        sse,
         blocks: HashMap::new(),
         block_order: Vec::new(),
         stop_reason: None,

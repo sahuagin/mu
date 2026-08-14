@@ -960,6 +960,122 @@ async fn mu_779s_iteration_cap_done_event_uses_iteration_cap_stop_reason() {
     assert_eq!(done.1, 2, "turn_count in Done event should equal max_turns");
 }
 
+/// bead mu-openai-stream-retry-y0dw: a retryable error event arriving on
+/// the stream BEFORE any output token re-runs the provider call (same
+/// attempt budget as start-error retry) instead of failing the ask.
+#[tokio::test]
+async fn stream_error_before_first_token_retries_and_succeeds() {
+    let provider = MockProvider::new(vec![
+        vec![ProviderEvent::Error(
+            "rate_limit_exceeded: Rate limit reached. Please try again in 0.05s. (http 429)"
+                .to_owned(),
+        )],
+        vec![ProviderEvent::Done(assistant_text(
+            "second attempt answered",
+        ))],
+    ]);
+    let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    let retried = events.iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::Callout { title, .. } if title == "provider stream retrying"
+        )
+    });
+    assert!(retried, "expected a stream-retry callout");
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "retryable pre-token stream error must not fail the ask"
+    );
+    let answered = events.iter().any(|e| {
+        match e {
+        AgentEvent::MessageEnd {
+            message: AgentMessage::Assistant(msg),
+        } => msg.content.iter().any(|b| {
+            matches!(b, ContentBlock::Text { text } if text.contains("second attempt answered"))
+        }),
+        _ => false,
+    }
+    });
+    assert!(answered, "second attempt should answer the ask");
+}
+
+/// Once output has streamed, an error fails the ask — re-running would
+/// duplicate already-emitted deltas.
+#[tokio::test]
+async fn stream_error_after_first_token_fails_the_ask() {
+    let provider = MockProvider::new(vec![
+        vec![
+            ProviderEvent::TextDelta("partial ".to_owned()),
+            ProviderEvent::Error("server_is_overloaded (http 503)".to_owned()),
+        ],
+        vec![ProviderEvent::Done(assistant_text("must not be reached"))],
+    ]);
+    let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "post-token stream error must fail the ask"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Callout { title, .. } if title == "provider stream retrying"
+        )),
+        "post-token stream error must not retry"
+    );
+}
+
+/// Quota-window errors are not transient; they surface immediately.
+#[tokio::test]
+async fn non_retryable_stream_error_fails_immediately() {
+    let provider = MockProvider::new(vec![
+        vec![ProviderEvent::Error(
+            "usage_limit_reached: The usage limit has been reached (http 429)".to_owned(),
+        )],
+        vec![ProviderEvent::Done(assistant_text("must not be reached"))],
+    ]);
+    let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { message } if message.contains("usage_limit_reached"))),
+        "non-retryable error must surface"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Callout { title, .. } if title == "provider stream retrying"
+        )),
+        "non-retryable error must not retry"
+    );
+}
+
 /// bead mu-autonomy-turn-budget-wedge-6tnp: the per-ask max_turns cap
 /// tripping INSIDE an autonomous run must terminate the run —
 /// AutonomousTerminated is what clears the daemon-side autonomy_active

@@ -33,7 +33,7 @@ use mu_core::context::{
 
 use crate::context::{AnthropicCacheStrategy, AnthropicProviderRenderer};
 
-use super::sse::{SseEvent, SseStream};
+use super::sse::{ByteSse, SseStream};
 
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -844,10 +844,11 @@ fn events_stream(
 ) -> BoxStream<'static, ProviderEvent> {
     // Box::pin the input to satisfy SseStream's `S: Unpin` bound;
     // reqwest::Response::bytes_stream() returns a !Unpin type.
-    let bytes: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> = Box::pin(bytes);
+    let bytes: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> =
+        Box::pin(bytes.map(|r| r.map_err(|e| e.to_string())));
     let sse = SseStream::new(bytes);
     let state = StreamState {
-        sse: Box::pin(sse),
+        sse,
         blocks: HashMap::new(),
         block_order: Vec::new(),
         stop_reason: None,
@@ -880,7 +881,7 @@ enum BlockBuilder {
 }
 
 struct StreamState {
-    sse: Pin<Box<dyn Stream<Item = SseEvent> + Send>>,
+    sse: ByteSse,
     /// Open content blocks indexed by Anthropic's block index. Built
     /// up as start/delta/stop events arrive; finalized into
     /// `AssistantMessage::content` at `message_stop`.
@@ -937,6 +938,15 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 state.finished = true;
                 if !state.emitted_done {
                     state.emitted_done = true;
+                    // A dropped connection is not a clean close: surface it
+                    // as an error instead of a complete-looking truncated
+                    // turn (bead mu-openai-stream-retry-y0dw).
+                    if let Some(e) = state.sse.take_transport_error() {
+                        return Some((
+                            ProviderEvent::Error(format!("anthropic stream transport error: {e}")),
+                            state,
+                        ));
+                    }
                     let usage = anthropic_usage_to_mu(&state.usage);
                     return Some((
                         ProviderEvent::Done(AssistantMessage {

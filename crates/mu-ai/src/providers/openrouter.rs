@@ -22,7 +22,7 @@ use mu_core::context::{
     extract_call_id_from_span_id, ProviderMessage, ProviderMessages, ProviderRole,
 };
 
-use super::sse::{SseEvent, SseStream};
+use super::sse::{ByteSse, SseStream};
 
 const OPENROUTER_API_BASE: &str = "https://openrouter.ai";
 /// Default chat-completions path. OpenRouter nests under `/api/v1`; the
@@ -749,7 +749,7 @@ struct ToolCallBuilder {
 }
 
 struct StreamState {
-    sse: Pin<Box<dyn Stream<Item = SseEvent> + Send>>,
+    sse: ByteSse,
     accumulated_text: String,
     accumulated_thinking: String,
     tool_calls: HashMap<u32, ToolCallBuilder>,
@@ -767,10 +767,11 @@ fn events_stream(
     bytes: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
     cancel_rx: oneshot::Receiver<()>,
 ) -> BoxStream<'static, ProviderEvent> {
-    let bytes: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> = Box::pin(bytes);
+    let bytes: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> =
+        Box::pin(bytes.map(|r| r.map_err(|e| e.to_string())));
     let sse = SseStream::new(bytes);
     let state = StreamState {
-        sse: Box::pin(sse),
+        sse,
         accumulated_text: String::new(),
         accumulated_thinking: String::new(),
         tool_calls: HashMap::new(),
@@ -819,6 +820,15 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 state.finished = true;
                 if !state.emitted_done {
                     state.emitted_done = true;
+                    // A dropped connection is not a clean close: surface it
+                    // as an error instead of a complete-looking truncated
+                    // turn (bead mu-openai-stream-retry-y0dw).
+                    if let Some(e) = state.sse.take_transport_error() {
+                        return Some((
+                            ProviderEvent::Error(format!("openrouter stream transport error: {e}")),
+                            state,
+                        ));
+                    }
                     let stop = map_finish_reason(state.finish_reason.as_deref());
                     return Some((
                         ProviderEvent::Done(AssistantMessage {

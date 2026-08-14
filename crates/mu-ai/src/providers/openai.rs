@@ -71,7 +71,7 @@ use mu_core::context::{
 
 use crate::auth::{self, FileSystemTokenStore, OAuthToken, TokenStore};
 
-use super::sse::{SseEvent, SseStream};
+use super::sse::{ByteSse, SseStream};
 
 // ============================================================================
 // Constants
@@ -801,7 +801,7 @@ struct ToolCallBuilder {
 }
 
 struct StreamState {
-    sse: Pin<Box<dyn Stream<Item = SseEvent> + Send>>,
+    sse: ByteSse,
     accumulated_text: String,
     /// Tool-call builders keyed by `output_index`.
     tool_calls: HashMap<u32, ToolCallBuilder>,
@@ -839,16 +839,14 @@ fn events_stream(
     bytes: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
     cancel_rx: oneshot::Receiver<()>,
 ) -> BoxStream<'static, ProviderEvent> {
-    let bytes: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> = Box::pin(bytes);
+    let bytes: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> =
+        Box::pin(bytes.map(|r| r.map_err(|e| e.to_string())));
     let sse = SseStream::new(bytes);
-    let state = new_stream_state(Box::pin(sse), cancel_rx);
+    let state = new_stream_state(sse, cancel_rx);
     Box::pin(futures::stream::unfold(state, next_event))
 }
 
-fn new_stream_state(
-    sse: Pin<Box<dyn Stream<Item = SseEvent> + Send>>,
-    cancel_rx: oneshot::Receiver<()>,
-) -> StreamState {
+fn new_stream_state(sse: ByteSse, cancel_rx: oneshot::Receiver<()>) -> StreamState {
     StreamState {
         sse,
         accumulated_text: String::new(),
@@ -1240,6 +1238,16 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                             "openai stream ended with error: {msg}"
                         );
                         return Some((ProviderEvent::Error(msg), state));
+                    }
+                    // A dropped connection is not a clean close: without
+                    // this, a mid-stream transport failure produced a
+                    // complete-looking truncated turn (bead
+                    // mu-openai-stream-retry-y0dw).
+                    if let Some(e) = state.sse.take_transport_error() {
+                        return Some((
+                            ProviderEvent::Error(format!("openai stream transport error: {e}")),
+                            state,
+                        ));
                     }
                     let stop = map_stop(&state);
                     debug!(

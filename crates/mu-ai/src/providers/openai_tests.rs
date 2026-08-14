@@ -48,9 +48,10 @@ fn test_events_stream(
     bytes: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     cancel_rx: oneshot::Receiver<()>,
 ) -> BoxStream<'static, ProviderEvent> {
-    let bytes: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = Box::pin(bytes);
+    let bytes: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> =
+        Box::pin(bytes.map(|r| r.map_err(|e| e.to_string())));
     let sse = SseStream::new(bytes);
-    let state = new_stream_state(Box::pin(sse), cancel_rx);
+    let state = new_stream_state(sse, cancel_rx);
     Box::pin(futures::stream::unfold(state, next_event))
 }
 
@@ -832,7 +833,10 @@ async fn cancel_mid_stream_yields_aborted() {
 #[test]
 fn stop_reason_max_tokens_from_incomplete_details() {
     let (_tx, rx) = tokio::sync::oneshot::channel();
-    let mut state = new_stream_state(Box::pin(futures::stream::empty()), rx);
+    let mut state = new_stream_state(
+        SseStream::new(Box::pin(futures::stream::empty::<Result<Bytes, String>>())),
+        rx,
+    );
     state.accumulated_text = "partial".into();
     state.final_status = Some(ResponseStatus::Incomplete);
     state.incomplete_reason = Some("max_output_tokens".into());

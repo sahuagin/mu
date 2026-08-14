@@ -23,15 +23,25 @@ pub struct SseEvent {
     pub data: String,
 }
 
+/// The concrete SSE stream both providers hold: byte source boxed with
+/// its error pre-rendered to String, the SseStream itself left concrete
+/// so [`SseStream::take_transport_error`] stays reachable after EOF
+/// (boxing the outer stream erases it).
+pub type ByteSse = SseStream<Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>>;
+
 /// Wrap a stream of `Bytes` (e.g., reqwest's `bytes_stream()`) into a
 /// stream of parsed `SseEvent`s. Errors from the underlying stream
 /// terminate the SSE stream.
 pub struct SseStream<S> {
     inner: S,
     buffer: String,
+    /// Trailing bytes of an incomplete UTF-8 code point split across
+    /// chunk boundaries, carried into the next chunk.
+    pending_bytes: Vec<u8>,
     pending_event: Option<String>,
     pending_data: Vec<String>,
     done: bool,
+    transport_error: Option<String>,
 }
 
 impl<S> SseStream<S> {
@@ -39,10 +49,20 @@ impl<S> SseStream<S> {
         Self {
             inner,
             buffer: String::new(),
+            pending_bytes: Vec::new(),
             pending_event: None,
             pending_data: Vec::new(),
             done: false,
+            transport_error: None,
         }
+    }
+
+    /// A transport error terminates the SSE stream like EOF (the Item
+    /// type carries no error channel), but the consumer must be able to
+    /// tell a dropped connection from a clean close — a mid-stream drop
+    /// otherwise masquerades as a complete-looking truncated turn.
+    pub fn take_transport_error(&mut self) -> Option<String> {
+        self.transport_error.take()
     }
 
     /// Parse complete events from the buffer; returns the next ready
@@ -83,6 +103,7 @@ impl<S> SseStream<S> {
 impl<S, E> Stream for SseStream<S>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
 {
     type Item = SseEvent;
 
@@ -98,20 +119,44 @@ where
             // Pull more bytes.
             match Pin::new(&mut self.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
-                    if let Ok(s) = std::str::from_utf8(&bytes) {
-                        self.buffer.push_str(s);
-                    } else {
-                        // Non-UTF-8 in an SSE stream is fatal.
-                        self.done = true;
-                        return Poll::Ready(None);
+                    // Chunks can split a multi-byte UTF-8 code point, so
+                    // decode over carried + new bytes and keep any
+                    // incomplete trailing code point for the next chunk.
+                    self.pending_bytes.extend_from_slice(&bytes);
+                    let pending = std::mem::take(&mut self.pending_bytes);
+                    match std::str::from_utf8(&pending) {
+                        Ok(s) => {
+                            self.buffer.push_str(s);
+                        }
+                        Err(e) if e.error_len().is_none() => {
+                            let valid = e.valid_up_to();
+                            let s = std::str::from_utf8(&pending[..valid])
+                                .expect("valid_up_to prefix is valid");
+                            self.buffer.push_str(s);
+                            self.pending_bytes = pending[valid..].to_vec();
+                        }
+                        Err(_) => {
+                            // Genuinely invalid bytes are fatal — and must
+                            // read as a transport failure, not a clean close.
+                            self.transport_error = Some("invalid UTF-8 in SSE stream".to_string());
+                            self.done = true;
+                            return Poll::Ready(None);
+                        }
                     }
                 }
-                Poll::Ready(Some(Err(_))) => {
+                Poll::Ready(Some(Err(e))) => {
+                    self.transport_error = Some(e.to_string());
                     self.done = true;
                     return Poll::Ready(None);
                 }
                 Poll::Ready(None) => {
                     self.done = true;
+                    if !self.pending_bytes.is_empty() {
+                        // EOF mid-code-point: the stream was cut, not closed.
+                        self.transport_error =
+                            Some("stream ended mid-UTF-8 code point".to_string());
+                        return Poll::Ready(None);
+                    }
                     // Flush any trailing event without a blank-line terminator.
                     if !self.pending_data.is_empty() || self.pending_event.is_some() {
                         let event = SseEvent {
@@ -136,6 +181,51 @@ mod tests {
 
     fn ok(b: &str) -> Result<Bytes, std::io::Error> {
         Ok(Bytes::copy_from_slice(b.as_bytes()))
+    }
+
+    #[tokio::test]
+    async fn transport_error_terminates_and_is_retrievable() {
+        let bytes = stream::iter(vec![
+            ok("event: foo\ndata: x\n\n"),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            )),
+        ]);
+        let mut sse = SseStream::new(Box::pin(bytes));
+        assert!(sse.next().await.is_some(), "buffered event still yielded");
+        assert!(sse.next().await.is_none(), "transport error ends stream");
+        let err = sse.take_transport_error().expect("error recorded");
+        assert!(err.contains("connection reset"));
+        assert!(sse.take_transport_error().is_none(), "take drains");
+    }
+
+    #[tokio::test]
+    async fn non_utf8_reads_as_transport_error_not_clean_eof() {
+        let bytes = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(&[
+            0xff, 0xfe, 0xfd,
+        ]))]);
+        let mut sse = SseStream::new(Box::pin(bytes));
+        assert!(sse.next().await.is_none());
+        let err = sse
+            .take_transport_error()
+            .expect("recorded as transport error");
+        assert!(err.contains("invalid UTF-8"));
+    }
+
+    #[tokio::test]
+    async fn multibyte_code_point_split_across_chunks_decodes() {
+        // "é" (0xC3 0xA9) split across two chunks must decode, not
+        // misread as invalid UTF-8.
+        let bytes = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"data: caf\xc3")),
+            Ok(Bytes::from_static(b"\xa9\n\n")),
+        ]);
+        let mut sse = SseStream::new(Box::pin(bytes));
+        let ev = sse.next().await.expect("event decodes");
+        assert_eq!(ev.data, "café");
+        assert!(sse.next().await.is_none());
+        assert!(sse.take_transport_error().is_none(), "no spurious error");
     }
 
     #[tokio::test]

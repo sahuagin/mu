@@ -244,76 +244,9 @@ pub fn selector_from_cli(name: &str, model: Option<&str>) -> Result<ProviderSele
     }
 }
 
-/// Resolve a config-defined provider name to a self-contained
-/// [`ProviderSelector::Configured`] (mu-v8ye): look up the
-/// `[[providers.endpoints]]` entry, apply a `<NAME>_BASE_URL` runtime
-/// override, and read the API key from `api_key_env` (if any) — so the wire
-/// selector carries everything the factory needs.
-pub fn resolve_configured_selector(
-    providers: &mu_core::config::ProvidersConfig,
-    name: &str,
-    model: Option<&str>,
-) -> Result<ProviderSelector> {
-    let Some(ep) = providers.endpoint(name) else {
-        let known: Vec<&str> = providers
-            .endpoints
-            .iter()
-            .map(|e| e.name.as_str())
-            .collect();
-        anyhow::bail!(
-            "unknown provider: {name} (built-ins: faux, anthropic-api, openai-codex, \
-             openai, openrouter, vllm, ollama; config-defined: {})",
-            if known.is_empty() {
-                "none".to_string()
-            } else {
-                known.join(", ")
-            }
-        );
-    };
-    let model = model.map(str::to_string).ok_or_else(|| {
-        anyhow::anyhow!(
-            "config-defined provider '{name}' requires an explicit --model (no built-in default)"
-        )
-    })?;
-    // Runtime endpoint override: <NAME>_BASE_URL (upper-cased, non-alnum → '_').
-    let env_key = format!("{}_BASE_URL", to_env_prefix(name));
-    let base_url = std::env::var(&env_key)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| ep.base_url.clone());
-    let api_key = ep
-        .api_key_env
-        .as_ref()
-        .and_then(|k| std::env::var(k).ok())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_default();
-    let protocol = match ep.protocol {
-        mu_core::config::ProtocolKind::AnthropicMessages => "anthropic-messages",
-        mu_core::config::ProtocolKind::OpenaiChat => "openai-chat",
-        mu_core::config::ProtocolKind::OpenaiResponses => "openai-responses",
-    };
-    Ok(ProviderSelector::Configured {
-        name: name.to_string(),
-        protocol: protocol.to_string(),
-        base_url,
-        api_key,
-        model,
-    })
-}
-
-/// Upper-case a provider name into an env-var prefix, mapping any non
-/// alphanumeric character to `_` (so `card-1` → `CARD_1`).
-fn to_env_prefix(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
+/// Resolution of config-defined provider names moved to mu-core (mu-9128) so
+/// mu-solo can share it; re-exported here for existing daemon-side callers.
+pub use mu_core::config::resolve_configured_selector;
 
 /// Resolve a possible SELECTION alias before `(provider, model)` reach
 /// [`selector_from_cli`]. If `model` names a favorite — its
@@ -630,13 +563,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("config-defined: card1"), "got: {err}");
-    }
-
-    #[test]
-    fn env_prefix_maps_nonalnum_to_underscore() {
-        assert_eq!(to_env_prefix("card1"), "CARD1");
-        assert_eq!(to_env_prefix("card-1"), "CARD_1");
-        assert_eq!(to_env_prefix("ornith.review"), "ORNITH_REVIEW");
     }
 
     #[test]

@@ -791,6 +791,43 @@ pub fn normalize_provider_kind(provider: &str) -> String {
     }
 }
 
+/// Build the wire `provider` value for `create_session` /
+/// `session.delegate` / `session.set_route`. A built-in kind ships as
+/// `{kind, model}`; any other string names a `[[providers.endpoints]]`
+/// entry (mu-v8ye) and is resolved — protocol, base_url, api_key — into a
+/// self-contained `configured` selector, matching how `mu ask` resolves
+/// the same names. Without this, an endpoint name in a profile reached the
+/// daemon raw and was rejected as an unknown enum variant. (mu-9128)
+pub fn provider_selector_value(provider: &str, model: &str) -> Result<serde_json::Value> {
+    selector_value_with(
+        &mu_core::config::Config::load_default().providers,
+        provider,
+        model,
+    )
+}
+
+fn selector_value_with(
+    providers: &mu_core::config::ProvidersConfig,
+    provider: &str,
+    model: &str,
+) -> Result<serde_json::Value> {
+    let kind = normalize_provider_kind(provider);
+    match kind.as_str() {
+        "anthropic_api" | "anthropic_oauth" | "openai_api" | "openai_codex" | "openrouter"
+        | "vllm" | "ollama" | "faux" => Ok(serde_json::json!({ "kind": kind, "model": model })),
+        // Endpoint names are matched as configured (case-sensitive), so pass
+        // the raw string — mirrors selector_from_cli on the daemon side.
+        _ => {
+            let selector = mu_core::config::resolve_configured_selector(
+                providers,
+                provider.trim(),
+                Some(model),
+            )?;
+            Ok(serde_json::to_value(selector)?)
+        }
+    }
+}
+
 fn truncate_at_word(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_owned();
@@ -1813,16 +1850,18 @@ impl App {
             tracing::info!(count = skills.len(), "discovered skills");
         }
 
-        // Normalize provider input → daemon's snake_case wire enum
-        // (mirrors mu-tui's accept-anything mapping in create_session).
-        let kind = normalize_provider_kind(provider);
+        // Provider input → wire selector: built-in kinds normalize to the
+        // daemon's snake_case enum; a [[providers.endpoints]] name resolves
+        // to a full `configured` selector (mu-9128).
+        let provider_value = provider_selector_value(provider, model)
+            .with_context(|| format!("could not resolve provider '{provider}'"))?;
 
         // mu-f1a0: forward the configured cache TTL tier. Omit the
         // field entirely when it isn't one of the wire values so an
         // older daemon (or a typo) degrades to the 5m default rather
         // than failing session creation.
         let mut create_params = serde_json::json!({
-            "provider": { "kind": kind, "model": model },
+            "provider": provider_value,
             "effort": effort.clone(),
         });
         if matches!(cache_ttl, "5m" | "1h") {
@@ -3939,13 +3978,15 @@ impl App {
         // become an arg later.
         if self.sidecar_session_id.is_none() {
             let kind = normalize_provider_kind(&self.provider);
+            let provider_value = provider_selector_value(&self.provider, &self.model)
+                .context("could not resolve sidecar provider")?;
             let resp = self
                 .client
                 .request(
                     "session.delegate",
                     serde_json::json!({
                         "parent_session_id": self.session_id,
-                        "provider": { "kind": kind, "model": self.model },
+                        "provider": provider_value,
                     }),
                 )
                 .context("session.delegate failed (sidecar creation)")?;
@@ -4728,10 +4769,8 @@ impl App {
         provider_kind: &str,
         model: &str,
     ) -> Result<(), String> {
-        let selector = serde_json::json!({
-            "kind": provider_kind,
-            "model": model,
-        });
+        let selector = provider_selector_value(provider_kind, model)
+            .map_err(|e| format!("could not resolve provider '{provider_kind}': {e}"))?;
         let params = serde_json::json!({
             "session_id": self.session_id,
             "provider": selector,
@@ -7714,6 +7753,54 @@ mod tests {
         let (levels, default) = route_effort_config("openrouter", "some/model");
         assert_eq!(levels, vec!["low", "medium", "high", "xhigh", "max"]);
         assert_eq!(default, None);
+    }
+
+    #[test]
+    fn selector_value_builtin_kind_ships_kind_model() {
+        let providers = mu_core::config::ProvidersConfig::default();
+        let v = selector_value_with(&providers, "vllm", "qwen3.8-27b-nvfp4").unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "kind": "vllm", "model": "qwen3.8-27b-nvfp4" })
+        );
+    }
+
+    #[test]
+    fn selector_value_endpoint_name_resolves_configured() {
+        use mu_core::config::{ProtocolKind, ProviderEndpoint, ProvidersConfig};
+        let providers = ProvidersConfig {
+            endpoints: vec![ProviderEndpoint {
+                name: "vllm143".into(),
+                protocol: ProtocolKind::OpenaiChat,
+                base_url: "http://10.1.1.143:11435".into(),
+                api_key_env: None,
+            }],
+            ..Default::default()
+        };
+        let v = selector_value_with(&providers, "vllm143", "qwen3.8-27b-nvfp4").unwrap();
+        assert_eq!(v["kind"], "configured");
+        assert_eq!(v["name"], "vllm143");
+        assert_eq!(v["protocol"], "openai-chat");
+        assert_eq!(v["base_url"], "http://10.1.1.143:11435");
+        assert_eq!(v["model"], "qwen3.8-27b-nvfp4");
+    }
+
+    #[test]
+    fn selector_value_unknown_name_errors_with_known_list() {
+        use mu_core::config::{ProtocolKind, ProviderEndpoint, ProvidersConfig};
+        let providers = ProvidersConfig {
+            endpoints: vec![ProviderEndpoint {
+                name: "vllm143".into(),
+                protocol: ProtocolKind::OpenaiChat,
+                base_url: "http://x".into(),
+                api_key_env: None,
+            }],
+            ..Default::default()
+        };
+        let err = selector_value_with(&providers, "nope", "m")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("config-defined: vllm143"), "got: {err}");
     }
 
     #[test]

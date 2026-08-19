@@ -103,8 +103,13 @@ enum Command {
         /// Model id (forwarded to the spawned `mu serve`).
         #[arg(long)]
         model: Option<String>,
-        /// Comma-separated list of tools (forwarded).
-        #[arg(long, default_value = "")]
+        /// Comma-separated list of tools (forwarded). Defaults to the
+        /// read-only set — a bare ask can inspect the world but not
+        /// change it (mu-spk7: the old empty default launched ZERO base
+        /// tools, so the model's read/grep calls were refused and it
+        /// resorted to abusing infrastructure tools). Pass --tools ""
+        /// explicitly for a pure-chat session.
+        #[arg(long, default_value = "read,grep,glob,memory_recall")]
         tools: String,
         /// Forwarded as `--ephemeral` to `mu serve`. See `mu serve --help`.
         #[arg(long)]

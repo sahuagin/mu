@@ -568,10 +568,6 @@ fn session_spawn_tools(
             )
             .with_parent_tool_grant(parent_tool_grant),
         ));
-        // mu-watch-tool-wakeup-o03p: the `watch` tool — spawn a command,
-        // wake THIS session when it exits. Same WEAK-handle discipline as
-        // spawn_worker (it lives in this session's own tool list), and
-        // scoped to this session_id so the wakeup routes back here.
         // mu-07g0: the session-side mailbox READ affordance — every session
         // can list/read its own durable mailbox (the wake inlines small
         // bodies; this covers truncated bodies and history). Weak handle:
@@ -580,16 +576,26 @@ fn session_spawn_tools(
             sessions.downgrade(),
             session_id,
         ));
-        tools.push(Arc::new(crate::tools::WatchTool::new(
-            sessions.downgrade(),
-            session_id.to_string(),
-            // mu-qnag: watch gates every command through the daemon's bash
-            // policy. A session with no `--bash-*` flags resolves to strict
-            // (read-only allowlist), so a read-only reviewer's
-            // watch("cargo test") is rejected by the SAME gate bash uses;
-            // a `--bash-yolo` worker keeps watch("cargo build") unchanged.
-            daemon_info.bash_settings().resolve_mode(),
-        )));
+        // mu-watch-tool-wakeup-o03p: the `watch` tool — spawn a command,
+        // wake THIS session when it exits. Same WEAK-handle discipline as
+        // spawn_worker (it lives in this session's own tool list), and
+        // scoped to this session_id so the wakeup routes back here.
+        //
+        // mu-spk7: injected only when the launch grant includes `bash`.
+        // watch IS command execution — a session launched without bash
+        // could still run allowlisted commands through it (observed: a
+        // bare `mu ask` session reading files via watch("cat ...")), so
+        // watch rides bash's grant. Within a granted session, mu-qnag
+        // still gates every watched command through the daemon's bash
+        // policy: a strict session's watch("cargo test") is rejected by
+        // the SAME allowlist bash uses; `--bash-yolo` runs anything.
+        if base.iter().any(|t| t.spec().name == "bash") {
+            tools.push(Arc::new(crate::tools::WatchTool::new(
+                sessions.downgrade(),
+                session_id.to_string(),
+                daemon_info.bash_settings().resolve_mode(),
+            )));
+        }
     }
     if let AutonomyCapability::Allowed {
         allow_schedule_wakeup,
@@ -2948,7 +2954,15 @@ mod tests {
         use crate::tools::{GrepTool, ReadTool};
         use mu_core::capability::Capability;
 
-        let base: Vec<Arc<dyn Tool>> = vec![Arc::new(ReadTool::new()), Arc::new(GrepTool::new())];
+        let base: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(ReadTool::new()),
+            Arc::new(GrepTool::new()),
+            // mu-spk7: watch rides bash's grant — bash must be in the base
+            // set for watch to appear in the launch capability.
+            Arc::new(crate::tools::BashTool::new(
+                crate::tools::BashMode::strict_with_extras(&[], false),
+            )),
+        ];
         let sessions = Sessions::new();
         let di = DaemonInfo::new("test")
             .with_events_dir(Some(std::path::PathBuf::from("/tmp/mu-test-events")));
@@ -2972,7 +2986,7 @@ mod tests {
 
         let cap = capability.lock().expect("capability lock");
         let allowed = cap.allowed_tools.as_ref().expect("allowed_tools set");
-        for expected in ["read", "grep", "spawn_worker", "watch", "discover"] {
+        for expected in ["read", "grep", "bash", "spawn_worker", "watch", "discover"] {
             assert!(
                 allowed.contains(expected),
                 "root launch capability should include {expected}; got {allowed:?}"
@@ -3012,7 +3026,11 @@ mod tests {
     // so a finished watch wakes the caller.
     #[test]
     fn session_spawn_tools_injects_watch_in_production() {
-        let base: Vec<Arc<dyn Tool>> = vec![];
+        // mu-spk7: watch rides bash's grant — the base set must include
+        // bash for watch to be injected.
+        let base: Vec<Arc<dyn Tool>> = vec![Arc::new(crate::tools::BashTool::new(
+            crate::tools::BashMode::strict_with_extras(&[], false),
+        ))];
         let sessions = Sessions::new();
         let di = DaemonInfo::new("test")
             .with_events_dir(Some(std::path::PathBuf::from("/tmp/mu-test-events")));
@@ -3025,7 +3043,31 @@ mod tests {
         );
         assert!(
             tools.iter().any(|t| t.spec().name == "watch"),
-            "production session should get a watch tool",
+            "production session with bash granted should get a watch tool",
+        );
+    }
+
+    #[test]
+    fn session_spawn_tools_omits_watch_without_bash_grant() {
+        // mu-spk7 (operator ruling): watch is command execution, so a
+        // session launched WITHOUT bash gets no watch either — otherwise
+        // allowlisted commands remain reachable through the back door
+        // (observed: a bare `mu ask` session reading files via
+        // watch("cat ...") after its read/bash calls were refused).
+        let base: Vec<Arc<dyn Tool>> = vec![];
+        let sessions = Sessions::new();
+        let di = DaemonInfo::new("test")
+            .with_events_dir(Some(std::path::PathBuf::from("/tmp/mu-test-events")));
+        let tools = session_spawn_tools(
+            &base,
+            &sessions,
+            &di,
+            "session-42",
+            &mu_core::capability::AutonomyCapability::Disallowed,
+        );
+        assert!(
+            !tools.iter().any(|t| t.spec().name == "watch"),
+            "no bash in the launch grant => no watch tool",
         );
     }
 

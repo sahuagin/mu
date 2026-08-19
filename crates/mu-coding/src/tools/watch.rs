@@ -67,11 +67,20 @@ const DEFAULT_TIMEOUT_SECS: u64 = 3600;
 /// finer tier-1 filtering (mu-2e0h) is a follow-up, tracked separately.
 const OUTPUT_TAIL_BYTES: usize = 4000;
 
+/// One live watch: the background task's handle plus the registration
+/// identity (`command` + `note`) used for duplicate detection (mu-spk7).
+struct LiveWatch {
+    handle: AbortHandle,
+    command: String,
+    note: String,
+}
+
 /// Per-session registry of live watch tasks. Holds each background task's
-/// [`AbortHandle`] so the tool can (a) enforce the concurrency cap and
+/// [`AbortHandle`] so the tool can (a) enforce the concurrency cap,
 /// (b) abort every live watch on session teardown — which drops each
-/// task's `kill_on_drop` `Child` and kills the process.
-type WatchRegistry = Arc<Mutex<Vec<AbortHandle>>>;
+/// task's `kill_on_drop` `Child` and kills the process — and (c) refuse
+/// duplicate registrations while the original is still running.
+type WatchRegistry = Arc<Mutex<Vec<LiveWatch>>>;
 
 pub struct WatchTool {
     /// Non-owning handle to the registry (mu-qc08): a strong clone would
@@ -102,23 +111,39 @@ impl WatchTool {
     }
 
     /// Atomically prune finished watches, enforce the concurrency cap,
-    /// and register `handle` if there's room. Returns `Err` (without
+    /// and register `entry` if there's room. Returns `Err` (without
     /// registering) when the cap is reached — the caller then aborts the
     /// just-spawned task so its child is killed rather than orphaned.
-    fn reserve_slot(&self, handle: AbortHandle) -> Result<(), String> {
+    fn reserve_slot(&self, entry: LiveWatch) -> Result<(), String> {
         let mut live = self
             .registry
             .lock()
             .map_err(|_| "watch: registry lock poisoned".to_string())?;
-        live.retain(|h| !h.is_finished());
+        live.retain(|w| !w.handle.is_finished());
         if live.len() >= MAX_CONCURRENT_WATCHES {
             return Err(format!(
                 "watch: this session already has {MAX_CONCURRENT_WATCHES} live watches \
                  (the per-session cap); let one finish before registering another."
             ));
         }
-        live.push(handle);
+        live.push(entry);
         Ok(())
+    }
+
+    /// mu-spk7: is an identical registration (same `command` AND `note`)
+    /// still live? Weak models answer the "Watch registered — end your
+    /// turn" tool result by re-issuing the very same call; each duplicate
+    /// used to spawn a second process and deliver a second wakeup.
+    /// Finished entries are pruned first, so a COMPLETED watch stays
+    /// re-registerable — only a still-running twin is a duplicate.
+    fn has_live_duplicate(&self, command: &str, note: &str) -> bool {
+        match self.registry.lock() {
+            Ok(mut live) => {
+                live.retain(|w| !w.handle.is_finished());
+                live.iter().any(|w| w.command == command && w.note == note)
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -128,8 +153,8 @@ impl Drop for WatchTool {
         // task, dropping its `kill_on_drop` `Child`, which SIGKILLs the
         // spawned process — no orphans survive the session (mu-xac).
         if let Ok(mut live) = self.registry.lock() {
-            for h in live.drain(..) {
-                h.abort();
+            for w in live.drain(..) {
+                w.handle.abort();
             }
         }
     }
@@ -322,6 +347,18 @@ impl Tool for WatchTool {
             let command = command.ok_or("watch: missing required argument: command")?;
             let note = note.ok_or("watch: missing required argument: note")?;
 
+            // mu-spk7: idempotent registration — checked BEFORE spawn so a
+            // duplicate never starts a second process or books a second
+            // wakeup. Returned as a non-error so the model reads it as
+            // state, not as a failure to retry differently.
+            if self.has_live_duplicate(&command, &note) {
+                return Ok(format!(
+                    "Watch '{note}' is ALREADY registered and still running `{command}` — \
+                     duplicate ignored, no second process started. End your turn; the \
+                     existing watch will wake you with its result."
+                ));
+            }
+
             // Gate + spawn synchronously so a rejected (allowlist miss) or
             // un-spawnable command is reported NOW — the model can fix it
             // this turn, and a rejected watch is never registered, so the
@@ -350,7 +387,12 @@ impl Tool for WatchTool {
 
             // Race-free cap enforcement: if we're over the cap, abort the
             // task we just spawned — which drops the `kill_on_drop` child.
-            if let Err(e) = self.reserve_slot(task.abort_handle()) {
+            let entry = LiveWatch {
+                handle: task.abort_handle(),
+                command: command.clone(),
+                note: note.clone(),
+            };
+            if let Err(e) = self.reserve_slot(entry) {
                 task.abort();
                 return Err(e);
             }
@@ -453,20 +495,110 @@ mod tests {
         assert!(res.content.contains("Watch registered"), "{}", res.content);
     }
 
+    fn entry(handle: AbortHandle, tag: usize) -> LiveWatch {
+        LiveWatch {
+            handle,
+            command: format!("cmd-{tag}"),
+            note: format!("note-{tag}"),
+        }
+    }
+
     #[tokio::test]
     async fn concurrency_cap_rejects_overflow() {
         let t = tool();
         // Fill the registry with MAX never-finishing tasks.
-        for _ in 0..MAX_CONCURRENT_WATCHES {
+        for i in 0..MAX_CONCURRENT_WATCHES {
             let task = tokio::spawn(async { std::future::pending::<()>().await });
-            t.reserve_slot(task.abort_handle()).expect("under cap");
+            t.reserve_slot(entry(task.abort_handle(), i))
+                .expect("under cap");
         }
         // The next reservation is over the cap and must be rejected.
         let extra = tokio::spawn(async { std::future::pending::<()>().await });
         let err = t
-            .reserve_slot(extra.abort_handle())
+            .reserve_slot(entry(extra.abort_handle(), 99))
             .expect_err("over cap must reject");
         assert!(err.contains("cap"), "{err}");
+    }
+
+    // ── mu-spk7: idempotent registration ──
+
+    #[tokio::test]
+    async fn duplicate_live_registration_is_ignored() {
+        // The reported incident: the model answers "Watch registered —
+        // end your turn" by re-issuing the identical call; the duplicate
+        // used to spawn a second process and deliver a second wakeup.
+        let t = tool();
+        let (_tx1, rx1) = oneshot::channel();
+        let res1 = t
+            .execute(json!({ "command": "sleep 30", "note": "dup" }), rx1)
+            .await;
+        assert!(
+            res1.content.contains("Watch registered"),
+            "{}",
+            res1.content
+        );
+        let (_tx2, rx2) = oneshot::channel();
+        let res2 = t
+            .execute(json!({ "command": "sleep 30", "note": "dup" }), rx2)
+            .await;
+        assert!(!res2.is_error, "duplicate is state, not an error");
+        assert!(
+            res2.content.contains("ALREADY registered"),
+            "{}",
+            res2.content
+        );
+        assert_eq!(
+            t.registry.lock().unwrap().len(),
+            1,
+            "second registration must not add a live watch"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_command_different_note_is_not_a_duplicate() {
+        // Only an exact (command, note) twin is refused — a deliberate
+        // second watch on the same command under a new label still runs.
+        let t = tool();
+        let (_tx1, rx1) = oneshot::channel();
+        t.execute(json!({ "command": "sleep 30", "note": "first" }), rx1)
+            .await;
+        let (_tx2, rx2) = oneshot::channel();
+        let res = t
+            .execute(json!({ "command": "sleep 30", "note": "second" }), rx2)
+            .await;
+        assert!(res.content.contains("Watch registered"), "{}", res.content);
+        assert_eq!(t.registry.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn finished_watch_can_be_reregistered() {
+        // Pruning keeps a COMPLETED watch re-registerable: only a
+        // still-running twin counts as a duplicate.
+        let t = tool();
+        let (_tx1, rx1) = oneshot::channel();
+        let res = t
+            .execute(json!({ "command": "true", "note": "again" }), rx1)
+            .await;
+        assert!(res.content.contains("Watch registered"), "{}", res.content);
+        // Wait (bounded) for the background task to finish; the wake send
+        // is a no-op against the test's dead registry.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while t.has_live_duplicate("true", "again") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watch task should finish well within 10s"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (_tx2, rx2) = oneshot::channel();
+        let res2 = t
+            .execute(json!({ "command": "true", "note": "again" }), rx2)
+            .await;
+        assert!(
+            res2.content.contains("Watch registered"),
+            "finished watch must be re-registerable: {}",
+            res2.content
+        );
     }
 
     // ── mu-qnag: watch routes commands through the shared bash gate ──
@@ -595,11 +727,11 @@ mod tests {
         // Register more than the cap's worth of immediately-finishing
         // watches, one at a time: because each completes (and is pruned)
         // before the next reservation, the cap is never hit.
-        for _ in 0..(MAX_CONCURRENT_WATCHES * 2) {
+        for i in 0..(MAX_CONCURRENT_WATCHES * 2) {
             let handle = tokio::spawn(async {}).abort_handle();
             // Let the empty task finish so the NEXT reserve_slot prunes it.
             tokio::task::yield_now().await;
-            t.reserve_slot(handle)
+            t.reserve_slot(entry(handle, i))
                 .expect("finished handles are pruned before the cap check");
         }
     }

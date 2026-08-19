@@ -1929,9 +1929,38 @@ fn plan_post_invoke_llm_with_tools_and_buffered() {
 
 #[test]
 fn plan_post_execute_tools_basic() {
-    let actions = plan_post_execute_tools(vec![]);
+    let actions = plan_post_execute_tools(vec![], false);
     assert_eq!(actions.len(), 1);
     assert!(matches!(actions[0], Action::InvokeLlm));
+}
+
+// ── mu-spk7: an all-ends-turn round completes the ask instead of
+// re-invoking the model into the "end your turn" trap. ──
+
+#[test]
+fn plan_post_execute_tools_all_ends_turn_finishes_instead_of_reinvoking() {
+    let actions = plan_post_execute_tools(vec![], true);
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(actions[0], Action::MaybeFinish));
+}
+
+#[test]
+fn plan_post_execute_tools_all_ends_turn_finishes_before_buffered() {
+    // Mirror of the text-only path (mu-wf5w): MaybeFinish FIRST so the
+    // completed ask emits `done` before any buffered input starts the
+    // next ask.
+    let buffered = vec![AgentInput::UserMessage(user_msg("next"), None, None)];
+    let actions = plan_post_execute_tools(buffered, true);
+    assert_eq!(actions.len(), 2);
+    assert!(matches!(actions[0], Action::MaybeFinish));
+    assert!(matches!(
+        actions[1],
+        Action::External(AgentInput::UserMessage(..))
+    ));
+    assert!(
+        !actions.iter().any(|a| matches!(a, Action::InvokeLlm)),
+        "an all-ends-turn round must not re-invoke the model"
+    );
 }
 
 #[test]
@@ -1940,7 +1969,7 @@ fn plan_post_execute_tools_preserves_buffered_fifo_before_continuation() {
         AgentInput::UserMessage(user_msg("first"), None, None),
         AgentInput::UserMessage(user_msg("second"), None, None),
     ];
-    let actions = plan_post_execute_tools(buffered);
+    let actions = plan_post_execute_tools(buffered, false);
     // Buffered inputs keep their baseline FIFO position so their context and
     // command tickets land before the continuation. StartAutonomous has its
     // own turn-boundary deferral guard and cannot add a duplicate invocation.
@@ -2428,6 +2457,7 @@ async fn capability_refuses_tool_missing_required_aws_capability() {
         retry: RetryPolicy::ModelDecides,
         required_aws_capability: Some("aws.scout.readonly".to_string()),
         idempotent: false,
+        ends_turn_on_success: false,
     });
     let cap: SessionCapability = Arc::new(Mutex::new(Capability::root()));
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -2499,6 +2529,7 @@ async fn capability_allows_tool_when_required_aws_capability_is_held() {
         retry: RetryPolicy::ModelDecides,
         required_aws_capability: Some("aws.scout.readonly".to_string()),
         idempotent: false,
+        ends_turn_on_success: false,
     });
     let cap: SessionCapability = Arc::new(Mutex::new(Capability {
         aws: HashSet::from([AwsCapability {
@@ -2568,6 +2599,7 @@ async fn run_one_tool_with_side_effects(
         retry: RetryPolicy::ModelDecides,
         required_aws_capability: None,
         idempotent: false,
+        ends_turn_on_success: false,
     });
     let cap: SessionCapability = Arc::new(Mutex::new(cap));
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));

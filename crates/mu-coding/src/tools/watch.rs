@@ -298,6 +298,11 @@ impl Tool for WatchTool {
             retry: mu_core::agent::RetryPolicy::ModelDecides,
             required_aws_capability: None,
             idempotent: false,
+            // mu-spk7: a successful registration ("Watch registered — end
+            // your turn") parks the ask instead of re-invoking the model,
+            // which is what made weak models re-issue the identical call.
+            // Errors (allowlist reject, cap hit) still return to the model.
+            ends_turn_on_success: true,
         })
     }
 
@@ -518,6 +523,14 @@ mod tests {
             .reserve_slot(entry(extra.abort_handle(), 99))
             .expect_err("over cap must reject");
         assert!(err.contains("cap"), "{err}");
+    }
+
+    #[test]
+    fn spec_declares_ends_turn_on_success() {
+        // mu-spk7: registration success parks the ask; the loop keys off
+        // this flag. If it's ever dropped, the "end your turn" re-invoke
+        // trap (duplicate registrations from weak models) comes back.
+        assert!(tool().spec().policy.ends_turn_on_success);
     }
 
     // ── mu-spk7: idempotent registration ──

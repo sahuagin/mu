@@ -184,6 +184,7 @@ impl Tool for BashTool {
                     retry: RetryPolicy::Never,
                     required_aws_capability: None,
                     idempotent: false, // file system can change between calls
+                    ends_turn_on_success: false,
                 },
             ),
             BashMode::Strict { prompt: true, .. } => (
@@ -198,6 +199,7 @@ impl Tool for BashTool {
                     retry: RetryPolicy::Never,
                     required_aws_capability: None,
                     idempotent: false,
+                    ends_turn_on_success: false,
                 },
             ),
             BashMode::Yolo => (
@@ -211,6 +213,7 @@ impl Tool for BashTool {
                     retry: RetryPolicy::ModelDecides,
                     required_aws_capability: None,
                     idempotent: false,
+                    ends_turn_on_success: false,
                 },
             ),
         };

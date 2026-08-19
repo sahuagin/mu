@@ -709,6 +709,7 @@ mod tests {
             retry: RetryPolicy::ModelDecides,
             required_aws_capability: None,
             idempotent: false,
+            ends_turn_on_success: false,
         });
         assert_eq!(mutating.filesystem, FsEffect::Write);
 
@@ -719,6 +720,7 @@ mod tests {
             retry: RetryPolicy::ModelDecides,
             required_aws_capability: Some("ec2:DescribeInstances".to_string()),
             idempotent: true,
+            ends_turn_on_success: false,
         });
         assert!(aws.network && aws.spend);
     }

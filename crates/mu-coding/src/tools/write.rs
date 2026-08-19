@@ -50,6 +50,7 @@ impl Tool for WriteTool {
             retry: RetryPolicy::ModelDecides,
             required_aws_capability: None,
             idempotent: true, // same path + same content = same end state
+            ends_turn_on_success: false,
         })
     }
 

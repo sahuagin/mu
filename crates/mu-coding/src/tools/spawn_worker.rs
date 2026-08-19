@@ -132,6 +132,7 @@ impl Tool for SpawnWorkerTool {
             retry: mu_core::agent::RetryPolicy::ModelDecides,
             required_aws_capability: None,
             idempotent: false,
+            ends_turn_on_success: false,
         })
     }
 

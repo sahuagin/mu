@@ -142,6 +142,7 @@ impl Tool for AwsReconTool {
             retry: RetryPolicy::ModelDecides,
             required_aws_capability: Some(DEFAULT_CAPABILITY.to_owned()),
             idempotent: false,
+            ends_turn_on_success: false,
         })
     }
 

@@ -469,6 +469,39 @@ impl Sessions {
         None
     }
 
+    /// Look up a session's event log among sessions that are suitable
+    /// for durability-critical writes. Checks inner, workers, and
+    /// rehydrated tiers. The rehydrated tier is gated on
+    /// `has_disk_writer()` (ghosts loaded by `lazy_load_from_disk`
+    /// have no writer and are excluded; the supervisor, which is
+    /// rehydrated but disk-backed, is included). Inner and workers
+    /// tiers are returned as-is: in production they always have disk
+    /// writers (attached at session creation), but a failed
+    /// `attach_disk_writer` (logged-and-ignored at creation) would
+    /// slip through — callers that need a hard guarantee should check
+    /// `has_disk_writer()` on the returned log.
+    /// (mu-session-context-orchestration-rurq.7)
+    pub fn live_event_log(&self, id: &str) -> Option<Arc<SessionEventLog>> {
+        if let Ok(map) = self.inner.lock() {
+            if let Some(s) = map.get(id) {
+                return Some(s.event_log.clone());
+            }
+        }
+        if let Ok(map) = self.workers.lock() {
+            if let Some(s) = map.get(id) {
+                return Some(s.event_log.clone());
+            }
+        }
+        if let Ok(map) = self.rehydrated.lock() {
+            if let Some(s) = map.get(id) {
+                if s.event_log.has_disk_writer() {
+                    return Some(s.event_log.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// Look up a session's event log, with a lazy find-by-id load from
     /// disk on a full in-memory miss (mu-lazy-session-rehydration-bh4f):
     /// the daemon no longer bulk-rehydrates every log at startup, so a

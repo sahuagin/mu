@@ -189,6 +189,10 @@ pub fn derive_status_from_events(
             | EventPayload::WorkerExited { .. }
             | EventPayload::WorkerFailed { .. }
             | EventPayload::WorkerTimeout { .. }
+            // mu-session-context-orchestration-rurq.7: obligation/terminal
+            // records are durability bookkeeping, not status-driving.
+            | EventPayload::WorkerAssignmentObligation { .. }
+            | EventPayload::WorkerTerminalResult { .. }
             // mu-operator-mark-5mwr: operator judgment, not
             // session-status-driving.
             | EventPayload::OperatorMark { .. }

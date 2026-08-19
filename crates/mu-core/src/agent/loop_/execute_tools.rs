@@ -122,6 +122,9 @@ pub(crate) enum ExecuteToolsExit {
     Completed {
         tool_messages: Vec<AgentMessage>,
         buffered: Vec<AgentInput>,
+        /// mu-spk7: every executed call was an ends-turn tool (watch) and
+        /// succeeded — complete the ask instead of re-invoking the model.
+        all_ends_turn: bool,
     },
     /// The current ask was narrow-cancelled while one or more assistant
     /// tool calls were outstanding. `tool_messages` contains synthetic
@@ -268,6 +271,12 @@ pub(crate) async fn handle_execute_tools(
     let mut buffered: Vec<AgentInput> = Vec::new();
     let mut tool_messages: Vec<AgentMessage> = Vec::new();
     let mut calls: VecDeque<ToolCall> = calls.into_iter().collect();
+    // mu-spk7: true iff every executed call came from an ends-turn tool
+    // (watch) AND succeeded — the caller then completes the ask instead
+    // of re-invoking the model into the "end your turn" trap. Starts
+    // true only when there are calls at all; any refusal, error, or
+    // ordinary tool flips it off.
+    let mut all_ends_turn = !calls.is_empty();
 
     while let Some(call) = calls.pop_front() {
         let _ = events
@@ -520,10 +529,17 @@ pub(crate) async fn handle_execute_tools(
         let permission_denied = matches!(permission_decision, Some(ApprovalDecision::Deny));
 
         let result = if let Some(cap_reason) = capability_refusal_reason {
+            // mu-spk7: cause-neutral phrasing. The old text asserted "this
+            // session has been delegated a narrower scope than the root"
+            // unconditionally — false and misleading on a ROOT session that
+            // simply wasn't launched with the tool (observed: a bare
+            // `mu ask` session was told to ask the user to "widen scope"
+            // for a tool that was never in its launch set).
             let msg = format!(
                 "runtime refused: tool `{}` blocked by session capability ({cap_reason}). \
-                 This session has been delegated a narrower scope than the root; \
-                 the requested tool falls outside it. Use a different tool, ask the \
+                 The tool is not in this session's granted set — either the session \
+                 was not launched with it, or a delegation narrowed the scope. Call \
+                 `discover` with your intent to find a granted alternative, ask the \
                  user to widen scope, or report the obstacle.",
                 call.name
             );
@@ -735,11 +751,16 @@ pub(crate) async fn handle_execute_tools(
         };
 
         let verbatim = tool.map(|t| t.spec().verbatim_result).unwrap_or(false);
+        all_ends_turn &= !result.is_error
+            && tool
+                .map(|t| t.spec().policy.ends_turn_on_success)
+                .unwrap_or(false);
         finish_tool_call(events, history, &mut tool_messages, call, result, verbatim).await;
     }
 
     Ok(ExecuteToolsExit::Completed {
         tool_messages,
         buffered,
+        all_ends_turn,
     })
 }

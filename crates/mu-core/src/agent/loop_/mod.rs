@@ -955,8 +955,23 @@ fn plan_post_invoke_llm(
 /// `InvokeLlm`; `StartAutonomous` itself defers when that continuation is
 /// already queued, so it cannot interpose an autonomous model turn between an
 /// assistant tool call and its tool results.
-fn plan_post_execute_tools(buffered: Vec<AgentInput>) -> Vec<Action> {
+///
+/// mu-spk7: when EVERY executed call was an ends-turn tool (watch) and
+/// succeeded, the ask completes here — `MaybeFinish` first (the per-ask
+/// `Done` terminus, same ordering rationale as the text-only path in
+/// `plan_post_invoke_llm` / mu-wf5w), then any buffered inputs start the
+/// next ask. Re-invoking instead handed the model its own "Watch
+/// registered — end your turn" result and demanded a response; weak
+/// models answered by re-issuing the identical call.
+fn plan_post_execute_tools(buffered: Vec<AgentInput>, all_ends_turn: bool) -> Vec<Action> {
     let mut actions = Vec::with_capacity(buffered.len() + 1);
+    if all_ends_turn {
+        actions.push(Action::MaybeFinish);
+        for input in buffered {
+            actions.push(Action::External(input));
+        }
+        return actions;
+    }
     for input in buffered {
         actions.push(Action::External(input));
     }
@@ -2539,6 +2554,7 @@ async fn run_inner(
                     Ok(ExecuteToolsExit::Completed {
                         tool_messages,
                         buffered,
+                        all_ends_turn,
                     }) => {
                         if let RunMode::Autonomous {
                             tool_calls_consumed,
@@ -2552,7 +2568,7 @@ async fn run_inner(
                             messages.push(r);
                         }
                         let _ = events.send(AgentEvent::TurnEnd).await;
-                        for action in plan_post_execute_tools(buffered) {
+                        for action in plan_post_execute_tools(buffered, all_ends_turn) {
                             queue.push_back(action);
                         }
                     }

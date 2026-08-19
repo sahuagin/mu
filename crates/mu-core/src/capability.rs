@@ -1791,6 +1791,7 @@ mod tests {
             retry: RetryPolicy::ModelDecides,
             required_aws_capability: Some("aws.scout.readonly".to_string()),
             idempotent: true,
+            ends_turn_on_success: false,
         };
         // derived_effects() adds network+spend for the AWS grant.
         let eff = policy.derived_effects();

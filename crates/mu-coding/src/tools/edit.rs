@@ -79,6 +79,7 @@ impl Tool for EditTool {
             retry: RetryPolicy::ModelDecides,
             required_aws_capability: None,
             idempotent: true, // same args produce same result (or same error)
+            ends_turn_on_success: false,
         })
     }
 

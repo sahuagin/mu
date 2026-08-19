@@ -131,6 +131,16 @@ pub struct ToolPolicy {
     /// tool's effect depends on external state (e.g. bash, since
     /// the file system can change between calls).
     pub idempotent: bool,
+    /// mu-spk7: park-and-wake tools (watch). When a turn's executed tool
+    /// calls ALL come from ends-turn tools and ALL succeeded, the loop
+    /// completes the ask instead of re-invoking the model. Such a tool's
+    /// success result says "end your turn — you'll be woken"; re-invoking
+    /// anyway forced the model to answer that instruction with SOMETHING,
+    /// and weak models answered it by re-issuing the identical call. An
+    /// is_error result never ends the turn — the model must see the error
+    /// and correct course now.
+    #[serde(default)]
+    pub ends_turn_on_success: bool,
 }
 
 impl Default for ToolPolicy {
@@ -160,6 +170,7 @@ impl Default for ToolPolicy {
             retry: RetryPolicy::ModelDecides,
             required_aws_capability: None,
             idempotent: false,
+            ends_turn_on_success: false,
         }
     }
 }
@@ -175,6 +186,7 @@ impl ToolPolicy {
             retry: RetryPolicy::ModelDecides,
             required_aws_capability: None,
             idempotent: true,
+            ends_turn_on_success: false,
         }
     }
 

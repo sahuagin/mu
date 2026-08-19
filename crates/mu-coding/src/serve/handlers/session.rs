@@ -2124,7 +2124,7 @@ pub async fn handle_spawn_worker(
         prompt: req.prompt.clone(),
         provider: req.provider,
         model: req.model,
-        pot_name: req.pot_name,
+        worker_name: req.worker_name,
         timeout_secs: req.timeout_secs,
         parent_session_id: req.parent_session_id,
         tools: crate::serve::worker::derive_child_tool_grant_from_capability(
@@ -2136,7 +2136,7 @@ pub async fn handle_spawn_worker(
         Ok(result) => {
             let resp = SpawnWorkerResponse {
                 session_id: result.session_id,
-                pot_name: result.pot_name,
+                worker_name: result.worker_name,
             };
             ok_response(request.id, to_value_or_null(resp))
         }

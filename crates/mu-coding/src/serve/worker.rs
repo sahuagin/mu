@@ -23,7 +23,7 @@ use super::sessions::{Sessions, SubprocessSession};
 /// Everything the caller needs to know after a successful spawn.
 pub(crate) struct SpawnResult {
     pub session_id: String,
-    pub pot_name: String, // wire-compatible worker name (legacy field)
+    pub worker_name: String, // wire-compatible worker name (legacy field)
 }
 
 /// Configuration for spawning a worker.
@@ -31,7 +31,7 @@ pub(crate) struct SpawnWorkerConfig {
     pub prompt: String,
     pub provider: Option<String>,
     pub model: Option<String>,
-    pub pot_name: Option<String>, // optional worker name (legacy field)
+    pub worker_name: Option<String>, // optional worker name (legacy field)
     pub timeout_secs: Option<u64>,
     pub parent_session_id: Option<String>,
     /// Built-in mu tools the child may receive via `mu ask --tools` / agent_dispatch.
@@ -157,8 +157,8 @@ pub(crate) async fn spawn_worker(
             std::env::var("MU_SPAWN_RANK").unwrap_or_else(|_| "0".into())
         )
     });
-    let pot_name = config
-        .pot_name
+    let worker_name = config
+        .worker_name
         .unwrap_or_else(|| format!("mu-worker-{}", session_id));
     let timeout_secs = config.timeout_secs.unwrap_or(3600);
 
@@ -204,7 +204,7 @@ pub(crate) async fn spawn_worker(
             event_log: event_log.clone(),
             mailbox: mailbox.clone(),
             parent_session_id: config.parent_session_id.clone(),
-            pot_name: pot_name.clone(),
+            worker_name: worker_name.clone(),
             status: Mutex::new(WorkerStatus::Spawning),
             started_at_unix_ms: started_at,
             child_handle: None,
@@ -275,7 +275,7 @@ pub(crate) async fn spawn_worker(
     event_log.append(
         EventActor::System,
         EventPayload::WorkerSpawned {
-            pot_name: pot_name.clone(),
+            worker_name: worker_name.clone(),
             model: model.clone(),
             pid: child.id(),
             prompt_summary: Some(truncate(&config.prompt, 200)),
@@ -303,7 +303,7 @@ pub(crate) async fn spawn_worker(
 
     Ok(SpawnResult {
         session_id,
-        pot_name,
+        worker_name,
     })
 }
 
@@ -574,7 +574,7 @@ mod tests {
                 prompt: "say hello".into(),
                 provider: Some("test-provider".into()),
                 model: Some("test-model".into()),
-                pot_name: None,
+                worker_name: None,
                 timeout_secs: Some(5),
                 parent_session_id: None,
                 tools: vec!["read".into(), "grep".into()],

@@ -43,6 +43,7 @@ AGENT_ROLE=${AGENT_ROLE:-$SCRIPT_DIR/agent-role}
 AGENT_DISPATCH_LIB=${AGENT_DISPATCH_LIB:-$SCRIPT_DIR/lib/agent-dispatch.sh}
 ROLE=coding
 RANK=0
+RANK_SET=0
 PROVIDER=${MU_SPAWN_PROVIDER:-}
 MODEL=${MU_SPAWN_MODEL:-}
 SESSION_ID=${MU_SESSION_ID:-}
@@ -62,7 +63,7 @@ DRY_RUN=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --role) ROLE=${2:?--role needs a value}; shift 2 ;;
-    --rank) RANK=${2:?--rank needs a value}; shift 2 ;;
+    --rank) RANK=${2:?--rank needs a value}; RANK_SET=1; shift 2 ;;
     --provider) PROVIDER=${2:?--provider needs a value}; shift 2 ;;
     --model) MODEL=${2:?--model needs a value}; shift 2 ;;
     --session-id) SESSION_ID=${2:?--session-id needs a value}; shift 2 ;;
@@ -80,14 +81,32 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ -z "$PROVIDER" ] || [ -z "$MODEL" ]; then
+# Seat selection (mu-hqr6). A PINNED seat — any of --provider/--model (or
+# their env defaults) or an explicit --rank — resolves to exactly one target
+# and dispatches once, no fallback: the caller asked for that seat. Otherwise
+# TARGETS holds the role's FULL ranking (one "provider model" per line) and
+# dispatch walks it top-down: a seat exiting 75 (EX_TEMPFAIL — agent-dispatch's
+# "unusable in this environment": nested-cc claude guard, missing binary,
+# held/unreachable ollama box) is skipped with a note and the next rank runs.
+# Any other exit code is a real result and propagates immediately — fallback
+# never re-runs a task on a different model after a genuine failure.
+if [ -n "$PROVIDER" ] || [ -n "$MODEL" ] || [ "$RANK_SET" -eq 1 ]; then
+  if [ -z "$PROVIDER" ] || [ -z "$MODEL" ]; then
+    [ -x "$AGENT_ROLE" ] || die "agent-role not executable at $AGENT_ROLE"
+    role_line=$($AGENT_ROLE "$ROLE" "$RANK") || exit $?
+    role_provider=$(printf '%s\n' "$role_line" | awk 'NR==1 {print $1}')
+    role_model=$(printf '%s\n' "$role_line" | awk 'NR==1 {$1=""; sub(/^ /, ""); print}')
+    [ -n "$role_provider" ] && [ -n "$role_model" ] || die "agent-role returned no provider/model for $ROLE rank $RANK"
+    [ -n "$PROVIDER" ] || PROVIDER=$role_provider
+    [ -n "$MODEL" ] || MODEL=$role_model
+  fi
+  TARGETS="$PROVIDER $MODEL"
+  PINNED=1
+else
   [ -x "$AGENT_ROLE" ] || die "agent-role not executable at $AGENT_ROLE"
-  role_line=$($AGENT_ROLE "$ROLE" "$RANK") || exit $?
-  role_provider=$(printf '%s\n' "$role_line" | awk 'NR==1 {print $1}')
-  role_model=$(printf '%s\n' "$role_line" | awk 'NR==1 {$1=""; sub(/^ /, ""); print}')
-  [ -n "$role_provider" ] && [ -n "$role_model" ] || die "agent-role returned no provider/model for $ROLE rank $RANK"
-  [ -n "$PROVIDER" ] || PROVIDER=$role_provider
-  [ -n "$MODEL" ] || MODEL=$role_model
+  TARGETS=$($AGENT_ROLE "$ROLE") || exit $?
+  [ -n "$TARGETS" ] || die "agent-role returned no targets for role $ROLE"
+  PINNED=0
 fi
 
 PROMPT_FILE=$(mktemp "${TMPDIR:-/tmp}/mu-spawn.prompt.XXXXXX")
@@ -117,18 +136,18 @@ Worker identity:
 If mcp-dialogue tools are available, register presence before work by polling your own inbox once (dialogue_poll with a short timeout is enough). Use peer id '${PEER_ID:-unknown}'. For mu-native dialogue_say, the 'from' field is bound automatically by the runtime; do not spoof it. If you need to notify the parent and know its peer id, send a short result there as well as printing stdout. If dialogue tools are unavailable, stdout is the fallback result channel.
 EOF
 
-printf '[mu-spawn] provider=%s model=%s role=%s rank=%s tools=%s session=%s peer=%s\n' \
-  "$PROVIDER" "$MODEL" "$ROLE" "$RANK" "${SPAWN_TOOLS:-<none>}" "${SESSION_ID:-unknown}" "${PEER_ID:-unknown}" >&2
-
 [ -r "$AGENT_DISPATCH_LIB" ] || die "agent-dispatch.sh not readable at $AGENT_DISPATCH_LIB"
 # shellcheck source=scripts/lib/agent-dispatch.sh
 . "$AGENT_DISPATCH_LIB"
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  printf 'cd %s && TOOLS=%s TIMEOUT=%s MAX_TURNS=%s MU=%s SYSPROMPT=%s MCP_CONFIG=%s agent_dispatch %s %s %s\n' \
-    "$(q "$CWD")" "$(q "$SPAWN_TOOLS")" "$(q "$TIMEOUT_SECS")" \
-    "$(q "${MU_SPAWN_MAX_TURNS:-40}")" "$(q "$MU_BIN")" "$(q "$SYS_FILE")" \
-    "$(q "$MCP_CONFIG")" "$(q "$PROVIDER")" "$(q "$MODEL")" "$(q "$PROMPT_FILE")"
+  printf '%s\n' "$TARGETS" | while IFS= read -r target; do
+    [ -n "$target" ] || continue
+    printf 'cd %s && TOOLS=%s TIMEOUT=%s MAX_TURNS=%s MU=%s SYSPROMPT=%s MCP_CONFIG=%s agent_dispatch %s %s %s\n' \
+      "$(q "$CWD")" "$(q "$SPAWN_TOOLS")" "$(q "$TIMEOUT_SECS")" \
+      "$(q "${MU_SPAWN_MAX_TURNS:-40}")" "$(q "$MU_BIN")" "$(q "$SYS_FILE")" \
+      "$(q "$MCP_CONFIG")" "$(q "${target%% *}")" "$(q "${target#* }")" "$(q "$PROMPT_FILE")"
+  done
   exit 0
 fi
 
@@ -142,4 +161,44 @@ MAX_TURNS=${MU_SPAWN_MAX_TURNS:-40}
 MU=$MU_BIN
 MCP_CONFIG=$MCP_CONFIG
 export TOOLS SYSPROMPT TIMEOUT MAX_TURNS MU MCP_CONFIG
-agent_dispatch "$PROVIDER" "$MODEL" "$PROMPT_FILE"
+
+# Walk the seat list. Exit 75 => seat unusable here, fall to the next rank
+# (each skip logged for provenance); anything else is the worker's real
+# result. Newline iteration: targets are "provider model" lines.
+seat_index=0
+skipped=""
+OLD_IFS=$IFS
+IFS='
+'
+for target in $TARGETS; do
+  IFS=$OLD_IFS
+  [ -n "$target" ] || { IFS='
+'; continue; }
+  SEAT_PROVIDER=${target%% *}
+  SEAT_MODEL=${target#* }
+  printf '[mu-spawn] provider=%s model=%s role=%s rank=%s tools=%s session=%s peer=%s\n' \
+    "$SEAT_PROVIDER" "$SEAT_MODEL" "$ROLE" "$seat_index" "${SPAWN_TOOLS:-<none>}" \
+    "${SESSION_ID:-unknown}" "${PEER_ID:-unknown}" >&2
+  rc=0
+  agent_dispatch "$SEAT_PROVIDER" "$SEAT_MODEL" "$PROMPT_FILE" || rc=$?
+  if [ "$rc" -eq 75 ]; then
+    if [ "$PINNED" -eq 1 ]; then
+      printf 'mu-spawn: pinned seat %s/%s unusable in this environment (exit 75); no fallback for a pinned seat\n' \
+        "$SEAT_PROVIDER" "$SEAT_MODEL" >&2
+      exit 75
+    fi
+    printf 'mu-spawn: seat %s/%s (rank %s) unusable in this environment; falling to next rank\n' \
+      "$SEAT_PROVIDER" "$SEAT_MODEL" "$seat_index" >&2
+    skipped="${skipped:+$skipped, }$SEAT_PROVIDER/$SEAT_MODEL"
+    seat_index=$((seat_index + 1))
+    IFS='
+'
+    continue
+  fi
+  exit "$rc"
+done
+IFS=$OLD_IFS
+
+printf 'mu-spawn: no usable seat for role %s in this environment (skipped: %s)\n' \
+  "$ROLE" "${skipped:-none}" >&2
+exit 75

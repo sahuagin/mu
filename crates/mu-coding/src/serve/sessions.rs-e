@@ -120,7 +120,7 @@ pub(crate) struct SubprocessSession {
     pub event_log: Arc<SessionEventLog>,
     pub mailbox: MailboxStateHandle,
     pub parent_session_id: Option<String>,
-    pub worker_name: String,
+    pub pot_name: String,
     pub status: Mutex<WorkerStatus>,
     pub started_at_unix_ms: u64,
     pub child_handle: Option<JoinHandle<()>>,

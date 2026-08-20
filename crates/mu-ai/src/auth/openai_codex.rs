@@ -71,14 +71,18 @@ pub async fn login_flow() -> Result<OAuthToken, AuthError> {
     // Start the callback listener BEFORE opening the browser. If the
     // user is fast, the browser-side callback would otherwise race
     // with our listener bind.
-    let listener = TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
-        .await
-        .map_err(|e| {
-            AuthError::OAuthFlow(format!(
-                "could not bind callback listener on port {CALLBACK_PORT}: {e}. \
-                 Make sure no other process is using that port and retry."
-            ))
-        })?;
+    // A failed bind (port in use, restricted jail networking) is no longer
+    // fatal: the paste-back path below still completes the login.
+    let listener = match TcpListener::bind(("127.0.0.1", CALLBACK_PORT)).await {
+        Ok(l) => Some(l),
+        Err(e) => {
+            eprintln!(
+                "note: could not bind the localhost:{CALLBACK_PORT} callback \
+                 listener ({e}); continuing in paste-back mode only."
+            );
+            None
+        }
+    };
 
     // Always print the URL prominently up front. `webbrowser::open`
     // returns Ok as soon as it *spawns* a launcher process — even if
@@ -100,29 +104,47 @@ pub async fn login_flow() -> Result<OAuthToken, AuthError> {
         .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(false);
     if no_browser {
-        eprintln!("MU_NO_BROWSER set — skipping auto-open. Waiting for callback…");
+        eprintln!("MU_NO_BROWSER set — skipping auto-open.");
     } else {
         match webbrowser::open(&url_str) {
             Ok(_) => eprintln!(
                 "Attempted browser auto-open. If your browser shows \
                  \"profile already in use\" or never loads the page, \
-                 paste the URL above into a running browser tab. \
-                 Waiting for callback…"
+                 paste the URL above into a running browser tab."
             ),
-            Err(_) => eprintln!(
-                "No browser launcher available — paste the URL above \
-                 into a browser. Waiting for callback…"
-            ),
+            Err(_) => {
+                eprintln!("No browser launcher available — paste the URL above into a browser.")
+            }
         }
     }
+    // Headless / jail path: the redirect goes to localhost:1455 on the
+    // machine RUNNING THE BROWSER, which is not this machine when mu runs
+    // in a jail or over ssh. The browser then shows a dead
+    // "localhost:1455/auth/callback?..." link — that URL still carries the
+    // auth code, so pasting it here completes the login with no port
+    // forwarding. Both paths race below; whichever produces a code wins.
+    eprintln!();
+    eprintln!(
+        "Waiting for the browser callback on localhost:{CALLBACK_PORT} …\n\
+         If the browser ends on an unreachable localhost:{CALLBACK_PORT} page \
+         (mu running in a jail / over ssh), paste that page's FULL URL here \
+         and press enter:"
+    );
 
-    // Wait for the callback, with a generous timeout.
-    let (received_code, received_state) =
-        match timeout(CALLBACK_TIMEOUT, wait_for_callback(listener)).await {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(AuthError::CallbackTimeout),
-        };
+    // Race the local callback against a pasted redirect URL on stdin,
+    // under the same overall timeout.
+    let (received_code, received_state) = match timeout(CALLBACK_TIMEOUT, async {
+        tokio::select! {
+            cb = callback_or_pending(listener) => cb,
+            pasted = read_pasted_redirect() => pasted,
+        }
+    })
+    .await
+    {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(AuthError::CallbackTimeout),
+    };
 
     // CSRF check.
     if received_state != *csrf_token.secret() {
@@ -213,6 +235,76 @@ fn from_token_response(
             .replace('"', ""),
         expires_at,
     }
+}
+
+/// Await the local callback when a listener bound; park forever when it
+/// didn't (paste-back is then the only resolver in the caller's race).
+async fn callback_or_pending(listener: Option<TcpListener>) -> Result<(String, String), AuthError> {
+    match listener {
+        Some(l) => wait_for_callback(l).await,
+        None => {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+}
+
+/// Read stdin lines until one parses as a pasted redirect URL, and
+/// return its (code, state). Unparseable lines get a retry nudge; EOF
+/// (stdin closed / piped) parks forever so the callback path — racing
+/// in the caller's `select!` — remains the sole resolver.
+async fn read_pasted_redirect() -> Result<(String, String), AuthError> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                match parse_pasted_redirect(line) {
+                    Some(pair) => return Ok(pair),
+                    None => eprintln!(
+                        "Could not find code+state in that paste — paste the full \
+                         URL from the browser's address bar (it looks like \
+                         http://localhost:1455/auth/callback?code=…&state=…):"
+                    ),
+                }
+            }
+            Ok(None) | Err(_) => {
+                // stdin closed — never resolve; the callback branch owns it.
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        }
+    }
+}
+
+/// Parse a pasted redirect into (code, state). Accepts the full URL,
+/// just the query string (with or without a leading '?'), or the
+/// browser's URL with a trailing fragment.
+fn parse_pasted_redirect(input: &str) -> Option<(String, String)> {
+    let query = match input.split_once('?') {
+        Some((_, q)) => q,
+        None if input.contains("code=") => input,
+        None => return None,
+    };
+    let query = query.split('#').next().unwrap_or(query);
+    let mut code = None;
+    let mut state = None;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=')?;
+        let v = urlencoding::decode(v)
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| v.into());
+        match k {
+            "code" => code = Some(v),
+            "state" => state = Some(v),
+            _ => {}
+        }
+    }
+    Some((code?, state?))
 }
 
 /// Listen for the OAuth redirect, return (code, state) on success.
@@ -333,6 +425,42 @@ mod tests {
         // Scopes
         assert!(url_str.contains("openid"));
         assert!(url_str.contains("offline_access"));
+    }
+
+    #[test]
+    fn paste_full_url_parses() {
+        let (code, state) =
+            parse_pasted_redirect("http://localhost:1455/auth/callback?code=abc123&state=xyz%2B9")
+                .expect("parse");
+        assert_eq!(code, "abc123");
+        assert_eq!(state, "xyz+9");
+    }
+
+    #[test]
+    fn paste_bare_query_parses() {
+        assert_eq!(
+            parse_pasted_redirect("code=c&state=s"),
+            Some(("c".into(), "s".into()))
+        );
+        assert_eq!(
+            parse_pasted_redirect("?code=c&state=s"),
+            Some(("c".into(), "s".into()))
+        );
+    }
+
+    #[test]
+    fn paste_with_fragment_and_extra_params_parses() {
+        let (code, state) =
+            parse_pasted_redirect("http://localhost:1455/auth/callback?foo=1&code=c&state=s#frag")
+                .expect("parse");
+        assert_eq!(code, "c");
+        assert_eq!(state, "s");
+    }
+
+    #[test]
+    fn paste_garbage_is_none() {
+        assert_eq!(parse_pasted_redirect("hello world"), None);
+        assert_eq!(parse_pasted_redirect("http://x/?state=s"), None);
     }
 
     #[test]

@@ -1101,6 +1101,11 @@ impl AgentLoop {
     }
 
     /// Push input. Returns `Err` with the input if the loop has terminated.
+    // result_large_err: returning the rejected input by value IS the API —
+    // mpsc::Sender::send semantics, so a caller can retry or log what was
+    // dropped. Boxing it would churn every caller to save a stack copy on
+    // the error path only.
+    #[allow(clippy::result_large_err)]
     pub async fn send(&self, input: AgentInput) -> Result<(), AgentInput> {
         self.tx.send(input).await.map_err(|e| e.0)
     }

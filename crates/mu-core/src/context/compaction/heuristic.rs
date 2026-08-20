@@ -433,7 +433,7 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
                         matches!(spans[j].kind, SpanKind::ToolCall | SpanKind::ToolResult)
                     })
                     .last()
-                    .map_or(i, |j| j);
+                    .unwrap_or(i);
                 if (i + 1..=cluster_end).any(|j| !evictable(&spans[j])) {
                     continue;
                 }

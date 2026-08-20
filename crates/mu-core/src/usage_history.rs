@@ -303,6 +303,10 @@ pub fn extract_per_session_metric_segments(events: &[SessionEvent]) -> Vec<PerSe
             | EventPayload::WorkerExited { .. }
             | EventPayload::WorkerFailed { .. }
             | EventPayload::WorkerTimeout { .. }
+            // mu-session-context-orchestration-rurq.7: obligation/terminal
+            // records are durability bookkeeping, not usage signals.
+            | EventPayload::WorkerAssignmentObligation { .. }
+            | EventPayload::WorkerTerminalResult { .. }
             // mu-operator-mark-5mwr: operator quality judgment, not a
             // usage/timing signal.
             | EventPayload::OperatorMark { .. }

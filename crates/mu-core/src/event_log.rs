@@ -68,6 +68,27 @@ pub struct AutonomousSleepStatus {
     pub reason: String,
 }
 
+/// mu-session-context-orchestration-rurq.7: terminal status for a
+/// worker obligation. Unit variants serialize as snake_case strings
+/// (`"success"`, `"timeout"`, etc.); the `Failed` struct variant
+/// serializes as `{"failed": {"exit_code": N}}` under the externally-
+/// tagged representation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerTerminalStatus {
+    /// Worker exited with code 0.
+    Success,
+    /// Worker exited with a non-zero code.
+    Failed { exit_code: Option<i32> },
+    /// Worker was killed by the deadline.
+    Timeout,
+    /// Worker was cancelled by the operator.
+    Cancelled,
+    /// Daemon restarted; the worker process is gone and the terminal
+    /// outcome is unknown.
+    Orphaned,
+}
+
 /// Typed event payload. Common envelope, different shapes per kind.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -514,6 +535,45 @@ pub enum EventPayload {
     WorkerFailed { reason: String },
     /// mu-slat: worker killed by timeout.
     WorkerTimeout { elapsed_ms: u64 },
+    /// mu-session-context-orchestration-rurq.7: parent-side assignment
+    /// obligation. Journaled on the PARENT session's log at spawn time,
+    /// before the worker process is launched. This is the "I owe a
+    /// result" record: on daemon restart, a `WorkerAssignmentObligation`
+    /// without a matching `WorkerTerminalResult` in the same log is an
+    /// orphaned obligation the recovery pass must resolve.
+    WorkerAssignmentObligation {
+        /// The worker session id this obligation is owed to.
+        worker_session_id: String,
+        /// Truncated prompt for human-readable recovery.
+        prompt_summary: String,
+        /// Wall-clock deadline (unix ms) after which the obligation is
+        /// considered timed out.
+        deadline_unix_ms: u64,
+        /// The session id of the log this obligation was journaled into.
+        /// Carries the pairing target so the recovery pass can re-pair
+        /// the obligation with its terminal result even if the parent
+        /// is evicted between spawn and worker completion (the terminal
+        /// result may land in the supervisor log instead).
+        target_log_session_id: String,
+    },
+    /// mu-session-context-orchestration-rurq.7: durable terminal result
+    /// for a worker obligation. Journaled on the PARENT session's log
+    /// (or the dead-letter/supervisor log if the parent is gone) BEFORE
+    /// any in-memory wake. Carries the worker's stdout/stderr so the
+    /// result survives daemon restart and parent death. Exactly one of
+    /// these terminates a `WorkerAssignmentObligation`.
+    WorkerTerminalResult {
+        /// The worker session id this result belongs to.
+        worker_session_id: String,
+        /// Terminal status discriminator.
+        status: WorkerTerminalStatus,
+        /// Worker stdout (empty on failure/timeout).
+        stdout: String,
+        /// Worker stderr (may be empty on success).
+        stderr: String,
+        /// Wall-clock elapsed time in milliseconds.
+        elapsed_ms: u64,
+    },
     /// mu-operator-mark-5mwr: operator-assigned session quality mark,
     /// captured from the console or the `mu mark` CLI. Append-only —
     /// re-marking appends a newer event and projections take the
@@ -669,6 +729,8 @@ impl EventPayload {
             Self::WorkerExited { .. } => "worker_exited",
             Self::WorkerFailed { .. } => "worker_failed",
             Self::WorkerTimeout { .. } => "worker_timeout",
+            Self::WorkerAssignmentObligation { .. } => "worker_assignment_obligation",
+            Self::WorkerTerminalResult { .. } => "worker_terminal_result",
             Self::OperatorMark { .. } => "operator_mark",
             Self::HeadAttached { .. } => "head_attached",
             Self::ContinuationSeeded { .. } => "continuation_seeded",
@@ -1084,6 +1146,35 @@ impl SessionEventLog {
             .lock()
             .map(|g| g.is_some())
             .unwrap_or(false)
+    }
+
+    /// mu-session-context-orchestration-rurq.7: append a durability-
+    /// critical event. Uses `append_durable` (fsync + error propagation)
+    /// when a disk writer is attached; falls back to best-effort
+    /// `append` (with a warning) when there is none (ephemeral daemons,
+    /// tests). Returns the event seq in both cases.
+    pub fn append_durable_or_fallback(&self, actor: EventActor, payload: EventPayload) -> u64 {
+        if self.has_disk_writer() {
+            let fallback_actor = actor.clone();
+            let fallback_payload = payload.clone();
+            match self.append_durable(actor, payload) {
+                Ok(seq) => seq,
+                Err(e) => {
+                    tracing::error!(
+                        session_id = %self.session_id,
+                        error = %e,
+                        "durable append failed; falling back to best-effort append"
+                    );
+                    self.append(fallback_actor, fallback_payload)
+                }
+            }
+        } else {
+            tracing::warn!(
+                session_id = %self.session_id,
+                "no disk writer; durability-critical append is best-effort only"
+            );
+            self.append(actor, payload)
+        }
     }
 
     /// Snapshot the log. Clones the inner vec — safe to read without

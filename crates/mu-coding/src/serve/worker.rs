@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 
 use mu_core::capability::Capability;
-use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
+use mu_core::event_log::{EventActor, EventPayload, SessionEventLog, WorkerTerminalStatus};
 use mu_core::protocol::WorkerStatus;
 
 use super::daemon_info::DaemonInfo;
@@ -218,6 +218,47 @@ pub(crate) async fn spawn_worker(
         .parent_session_id
         .clone()
         .unwrap_or_else(|| "supervisor".into());
+
+    // mu-session-context-orchestration-rurq.7: journal the parent-side
+    // assignment obligation BEFORE spawning the process. This is the
+    // "I owe a result" record. On daemon restart, a WorkerAssignmentObligation
+    // without a matching WorkerTerminalResult is an orphaned obligation.
+    //
+    // Resolution: parent log → supervisor log (same fallback as the
+    // terminal result delivery). The target_log_session_id field records
+    // where this obligation landed so the recovery pass can locate it
+    // even if the parent is evicted before the worker completes (the
+    // terminal result may then land in the supervisor log instead).
+    let deadline_unix_ms = started_at.saturating_add(timeout_secs.saturating_mul(1000));
+    let obligation_log = sessions
+        .live_event_log(&reply_to)
+        .or_else(|| sessions.live_event_log("supervisor"));
+    if let Some(log) = &obligation_log {
+        let target_id = log.session_id().to_string();
+        log.append_durable_or_fallback(
+            EventActor::System,
+            EventPayload::WorkerAssignmentObligation {
+                worker_session_id: session_id.clone(),
+                prompt_summary: truncate(&config.prompt, 200).to_string(),
+                deadline_unix_ms,
+                target_log_session_id: target_id,
+            },
+        );
+    } else {
+        // Neither parent nor supervisor in memory (ephemeral daemon).
+        // Record in the worker's own log as a last resort.
+        let target_id = session_id.clone();
+        event_log.append_durable_or_fallback(
+            EventActor::System,
+            EventPayload::WorkerAssignmentObligation {
+                worker_session_id: session_id.clone(),
+                prompt_summary: truncate(&config.prompt, 200).to_string(),
+                deadline_unix_ms,
+                target_log_session_id: target_id,
+            },
+        );
+    }
+
     let task_seq = mailbox.allocate_seq();
     event_log.append(
         EventActor::System,
@@ -261,15 +302,87 @@ pub(crate) async fn spawn_worker(
         }
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to run mu-spawn: {}", e))?;
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let reason = format!("failed to run mu-spawn: {}", e);
+            // Compensating terminal result: the obligation was journaled
+            // but the worker never started.
+            if let Some(log) = sessions
+                .live_event_log(&reply_to)
+                .or_else(|| sessions.live_event_log("supervisor"))
+            {
+                log.append_durable_or_fallback(
+                    EventActor::System,
+                    EventPayload::WorkerTerminalResult {
+                        worker_session_id: session_id.clone(),
+                        status: WorkerTerminalStatus::Failed { exit_code: None },
+                        stdout: String::new(),
+                        stderr: reason.clone(),
+                        elapsed_ms: now_unix_ms().saturating_sub(started_at),
+                    },
+                );
+            } else {
+                event_log.append_durable_or_fallback(
+                    EventActor::System,
+                    EventPayload::WorkerTerminalResult {
+                        worker_session_id: session_id.clone(),
+                        status: WorkerTerminalStatus::Failed { exit_code: None },
+                        stdout: String::new(),
+                        stderr: reason.clone(),
+                        elapsed_ms: now_unix_ms().saturating_sub(started_at),
+                    },
+                );
+            }
+            sessions.set_worker_status(
+                &session_id,
+                WorkerStatus::Failed {
+                    reason: reason.clone(),
+                },
+            );
+            return Err(reason);
+        }
+    };
+    let mut child = child;
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
-        stdin
-            .write_all(config.prompt.as_bytes())
-            .await
-            .map_err(|e| format!("failed to write prompt to mu-spawn: {}", e))?;
+        if let Err(e) = stdin.write_all(config.prompt.as_bytes()).await {
+            let reason = format!("failed to write prompt to mu-spawn: {}", e);
+            // Compensating terminal result: stdin write failed.
+            if let Some(log) = sessions
+                .live_event_log(&reply_to)
+                .or_else(|| sessions.live_event_log("supervisor"))
+            {
+                log.append_durable_or_fallback(
+                    EventActor::System,
+                    EventPayload::WorkerTerminalResult {
+                        worker_session_id: session_id.clone(),
+                        status: WorkerTerminalStatus::Failed { exit_code: None },
+                        stdout: String::new(),
+                        stderr: reason.clone(),
+                        elapsed_ms: now_unix_ms().saturating_sub(started_at),
+                    },
+                );
+            } else {
+                event_log.append_durable_or_fallback(
+                    EventActor::System,
+                    EventPayload::WorkerTerminalResult {
+                        worker_session_id: session_id.clone(),
+                        status: WorkerTerminalStatus::Failed { exit_code: None },
+                        stdout: String::new(),
+                        stderr: reason.clone(),
+                        elapsed_ms: now_unix_ms().saturating_sub(started_at),
+                    },
+                );
+            }
+            sessions.set_worker_status(
+                &session_id,
+                WorkerStatus::Failed {
+                    reason: reason.clone(),
+                },
+            );
+            return Err(reason);
+        }
     }
 
     event_log.append(
@@ -358,6 +471,7 @@ async fn monitor_worker(args: MonitorArgs) {
         Ok(Ok(status)) => status,
         Ok(Err(e)) => {
             let reason = format!("mu-spawn wait error: {}", e);
+            let elapsed = now_unix_ms().saturating_sub(started_at);
             tracing::error!(session_id = %session_id, error = %reason, "worker wait failed");
             event_log.append(
                 EventActor::System,
@@ -371,7 +485,17 @@ async fn monitor_worker(args: MonitorArgs) {
                     reason: reason.clone(),
                 },
             );
-            notify_parent(&sessions, &reply_to, &session_id, &reason);
+            notify_parent(TerminalNotification {
+                sessions: &sessions,
+                reply_to: &reply_to,
+                worker_session_id: &session_id,
+                daemon_id: &daemon_id,
+                status: WorkerTerminalStatus::Failed { exit_code: None },
+                stderr: &reason,
+                elapsed_ms: elapsed,
+                subject: &format!("Worker failed: {reason}"),
+                worker_log: &event_log,
+            });
             return;
         }
         Err(_) => {
@@ -390,12 +514,17 @@ async fn monitor_worker(args: MonitorArgs) {
                     reason: format!("deadline exceeded ({}s)", timeout_secs),
                 },
             );
-            notify_parent(
-                &sessions,
-                &reply_to,
-                &session_id,
-                &format!("Worker timed out after {}s", timeout_secs),
-            );
+            notify_parent(TerminalNotification {
+                sessions: &sessions,
+                reply_to: &reply_to,
+                worker_session_id: &session_id,
+                daemon_id: &daemon_id,
+                status: WorkerTerminalStatus::Timeout,
+                stderr: "",
+                elapsed_ms: elapsed,
+                subject: &format!("Worker timed out after {}s", timeout_secs),
+                worker_log: &event_log,
+            });
             return;
         }
     };
@@ -427,14 +556,16 @@ async fn monitor_worker(args: MonitorArgs) {
                 elapsed_ms: elapsed,
             },
         );
-        post_result_to_parent(
-            &sessions,
-            &reply_to,
-            &session_id,
-            &daemon_id,
-            &stdout,
-            &stderr,
-        );
+        post_result_to_parent(SuccessDelivery {
+            sessions: &sessions,
+            reply_to: &reply_to,
+            worker_session_id: &session_id,
+            daemon_id: &daemon_id,
+            stdout: &stdout,
+            stderr: &stderr,
+            elapsed_ms: elapsed,
+            worker_log: &event_log,
+        });
     } else {
         let reason = format!(
             "exit code {:?}: {}",
@@ -454,45 +585,105 @@ async fn monitor_worker(args: MonitorArgs) {
                 reason: reason.clone(),
             },
         );
-        notify_parent(
-            &sessions,
-            &reply_to,
-            &session_id,
-            &format!("Worker failed ({})", truncate(&reason, 100)),
-        );
+        notify_parent(TerminalNotification {
+            sessions: &sessions,
+            reply_to: &reply_to,
+            worker_session_id: &session_id,
+            daemon_id: &daemon_id,
+            status: WorkerTerminalStatus::Failed {
+                exit_code: status_result.code(),
+            },
+            stderr: &stderr,
+            elapsed_ms: elapsed,
+            subject: &format!("Worker failed ({})", truncate(&reason, 100)),
+            worker_log: &event_log,
+        });
     }
 }
 
-fn post_result_to_parent(
-    sessions: &Sessions,
-    reply_to: &str,
-    worker_session_id: &str,
-    daemon_id: &str,
-    stdout: &str,
-    stderr: &str,
-) {
-    let Some(event_log) = sessions.event_log(reply_to) else {
-        return;
-    };
-    let Some(mailbox) = sessions.mailbox(reply_to) else {
-        return;
-    };
-    let seq = mailbox.allocate_seq();
-    event_log.append(
-        EventActor::System,
-        EventPayload::MailboxMessagePosted {
-            seq,
-            from_daemon_id: daemon_id.to_string(),
-            from_session_id: worker_session_id.to_string(),
-            message_kind: "task_result".into(),
-            subject: "worker result".into(),
-            body: serde_json::json!({
-                "stdout": stdout,
-                "stderr": stderr,
-            }),
-            expires_at_unix_ms: None,
-        },
-    );
+struct SuccessDelivery<'a> {
+    sessions: &'a Sessions,
+    reply_to: &'a str,
+    worker_session_id: &'a str,
+    daemon_id: &'a str,
+    stdout: &'a str,
+    stderr: &'a str,
+    elapsed_ms: u64,
+    worker_log: &'a Arc<SessionEventLog>,
+}
+
+fn post_result_to_parent(args: SuccessDelivery<'_>) {
+    let SuccessDelivery {
+        sessions,
+        reply_to,
+        worker_session_id,
+        daemon_id,
+        stdout,
+        stderr,
+        elapsed_ms,
+        worker_log,
+    } = args;
+    // mu-session-context-orchestration-rurq.7: journal the durable
+    // terminal result on the parent's log BEFORE any in-memory wake.
+    // If the parent is gone, fall back to the supervisor/dead-letter log.
+    // Uses live_event_log (gates rehydrated tier on has_disk_writer)
+    // so the append reaches a log with a disk writer.
+    let parent_log = sessions
+        .live_event_log(reply_to)
+        .or_else(|| sessions.live_event_log("supervisor"));
+    if let Some(log) = &parent_log {
+        log.append_durable_or_fallback(
+            EventActor::System,
+            EventPayload::WorkerTerminalResult {
+                worker_session_id: worker_session_id.to_string(),
+                status: WorkerTerminalStatus::Success,
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
+                elapsed_ms,
+            },
+        );
+    } else {
+        // Last resort: write to the worker's own log so the terminal
+        // record is not lost. The recovery pass can find it via the
+        // obligation's target_log_session_id.
+        worker_log.append_durable_or_fallback(
+            EventActor::System,
+            EventPayload::WorkerTerminalResult {
+                worker_session_id: worker_session_id.to_string(),
+                status: WorkerTerminalStatus::Success,
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
+                elapsed_ms,
+            },
+        );
+        tracing::warn!(
+            worker_session_id = %worker_session_id,
+            reply_to = %reply_to,
+            "worker terminal result: no parent or supervisor log; wrote to worker's own log"
+        );
+    }
+
+    // In-memory wake (lossy — the durable record above is the source of truth).
+    if let Some(mailbox) = sessions.mailbox(reply_to) {
+        let seq = mailbox.allocate_seq();
+        if let Some(event_log) = sessions.event_log(reply_to) {
+            event_log.append(
+                EventActor::System,
+                EventPayload::MailboxMessagePosted {
+                    seq,
+                    from_daemon_id: daemon_id.to_string(),
+                    from_session_id: worker_session_id.to_string(),
+                    message_kind: "task_result".into(),
+                    subject: "worker result".into(),
+                    body: serde_json::json!({
+                        "stdout": stdout,
+                        "stderr": stderr,
+                    }),
+                    expires_at_unix_ms: None,
+                },
+            );
+        }
+    }
     if let Some(tx) = sessions.input_sender(reply_to) {
         let summary = format!(
             "Worker {worker_session_id} completed.
@@ -508,14 +699,102 @@ stderr:
     }
 }
 
-fn notify_parent(sessions: &Sessions, reply_to: &str, worker_session_id: &str, subject: &str) {
-    if let Some(tx) = sessions.input_sender(reply_to) {
-        let _ = tx.try_send(mu_core::agent::AgentInput::MailboxMessage {
-            from_session_id: worker_session_id.to_string(),
-            message_kind: "worker_status".into(),
-            subject: subject.to_string(),
-            seq: 0,
-        });
+/// mu-session-context-orchestration-rurq.7: inputs for delivering a
+/// failure/timeout terminal outcome durably.
+struct TerminalNotification<'a> {
+    sessions: &'a Sessions,
+    reply_to: &'a str,
+    worker_session_id: &'a str,
+    daemon_id: &'a str,
+    status: WorkerTerminalStatus,
+    stderr: &'a str,
+    elapsed_ms: u64,
+    subject: &'a str,
+    worker_log: &'a Arc<SessionEventLog>,
+}
+
+/// mu-session-context-orchestration-rurq.7: deliver a failure/timeout
+/// terminal outcome durably. Journals `WorkerTerminalResult` on the
+/// parent's log (or supervisor dead-letter) BEFORE the in-memory wake.
+/// The wake carries a real mailbox seq (not seq 0) so the model can
+/// actually read the message.
+fn notify_parent(args: TerminalNotification<'_>) {
+    let TerminalNotification {
+        sessions,
+        reply_to,
+        worker_session_id,
+        daemon_id,
+        status,
+        stderr,
+        elapsed_ms,
+        subject,
+        worker_log,
+    } = args;
+    // Durable terminal record first.
+    // Uses live_event_log (gates rehydrated tier on has_disk_writer)
+    // to avoid appending into a writer-less ghost.
+    let parent_log = sessions
+        .live_event_log(reply_to)
+        .or_else(|| sessions.live_event_log("supervisor"));
+    if let Some(log) = &parent_log {
+        log.append_durable_or_fallback(
+            EventActor::System,
+            EventPayload::WorkerTerminalResult {
+                worker_session_id: worker_session_id.to_string(),
+                status: status.clone(),
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+                elapsed_ms,
+            },
+        );
+    } else {
+        // Last resort: write to the worker's own log.
+        worker_log.append_durable_or_fallback(
+            EventActor::System,
+            EventPayload::WorkerTerminalResult {
+                worker_session_id: worker_session_id.to_string(),
+                status: status.clone(),
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+                elapsed_ms,
+            },
+        );
+        tracing::warn!(
+            worker_session_id = %worker_session_id,
+            reply_to = %reply_to,
+            "worker terminal result: no parent or supervisor log; wrote to worker's own log"
+        );
+    }
+
+    // In-memory wake with a real mailbox seq (not seq 0).
+    if let Some(mailbox) = sessions.mailbox(reply_to) {
+        let seq = mailbox.allocate_seq();
+        if let Some(event_log) = sessions.event_log(reply_to) {
+            event_log.append(
+                EventActor::System,
+                EventPayload::MailboxMessagePosted {
+                    seq,
+                    from_daemon_id: daemon_id.to_string(),
+                    from_session_id: worker_session_id.to_string(),
+                    message_kind: "worker_status".into(),
+                    subject: subject.to_string(),
+                    body: serde_json::json!({
+                        "status": serde_json::to_value(&status).unwrap_or_else(|_| serde_json::Value::String("unknown".into())),
+                        "stderr": stderr,
+                        "elapsed_ms": elapsed_ms,
+                    }),
+                    expires_at_unix_ms: None,
+                },
+            );
+        }
+        if let Some(tx) = sessions.input_sender(reply_to) {
+            let _ = tx.try_send(mu_core::agent::AgentInput::MailboxMessage {
+                from_session_id: worker_session_id.to_string(),
+                message_kind: "worker_status".into(),
+                subject: subject.to_string(),
+                seq,
+            });
+        }
     }
 }
 
@@ -657,5 +936,210 @@ mod tests {
             derive_child_tool_grant_from_capability(None),
             vec!["read".to_string(), "grep".to_string()]
         );
+    }
+
+    // mu-session-context-orchestration-rurq.7: dead-parent test.
+    // When the parent session is not in the registry, the terminal result
+    // must still be journaled durably (to the supervisor dead-letter log)
+    // rather than silently dropped.
+    #[tokio::test]
+    async fn dead_parent_terminal_result_is_durable() {
+        let _guard = env_lock().await;
+        let sessions = Sessions::new();
+        let daemon_info = DaemonInfo::new("test-daemon");
+
+        // Create a supervisor session (the dead-letter fallback target).
+        // Attach a disk writer so live_event_log will find it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sup_log = Arc::new(SessionEventLog::new("supervisor".to_string()));
+        sup_log
+            .attach_disk_writer(&tmp.path().join("supervisor.jsonl"))
+            .expect("attach disk writer");
+        sessions.insert_rehydrated("supervisor".to_string(), sup_log.clone(), None);
+
+        // Simulate a worker terminal result delivery with a dead parent.
+        post_result_to_parent(SuccessDelivery {
+            sessions: &sessions,
+            reply_to: "session-dead",
+            worker_session_id: "session-worker-1",
+            daemon_id: daemon_info.daemon_id(),
+            stdout: "hello from worker",
+            stderr: "",
+            elapsed_ms: 1234,
+            worker_log: &sup_log,
+        });
+
+        // The terminal result must be in the supervisor log.
+        let events = sup_log.snapshot();
+        let terminal: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.payload, EventPayload::WorkerTerminalResult { .. }))
+            .collect();
+        assert_eq!(
+            terminal.len(),
+            1,
+            "exactly one WorkerTerminalResult in supervisor log"
+        );
+        match &terminal[0].payload {
+            EventPayload::WorkerTerminalResult {
+                worker_session_id,
+                status,
+                stdout,
+                elapsed_ms,
+                ..
+            } => {
+                assert_eq!(worker_session_id, "session-worker-1");
+                assert_eq!(*status, WorkerTerminalStatus::Success);
+                assert_eq!(stdout, "hello from worker");
+                assert_eq!(*elapsed_ms, 1234);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // mu-session-context-orchestration-rurq.7: notify_parent posts a real
+    // mailbox seq (not seq 0) so the model can actually read the message.
+    #[tokio::test]
+    async fn notify_parent_uses_real_mailbox_seq() {
+        let _guard = env_lock().await;
+        let sessions = Sessions::new();
+        let daemon_info = DaemonInfo::new("test-daemon");
+
+        // Create a live parent session with a disk writer.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent_log = Arc::new(SessionEventLog::new("session-parent".to_string()));
+        parent_log
+            .attach_disk_writer(&tmp.path().join("session-parent.jsonl"))
+            .expect("attach disk writer");
+        sessions.insert_rehydrated("session-parent".to_string(), parent_log.clone(), None);
+
+        // Simulate a timeout notification.
+        notify_parent(TerminalNotification {
+            sessions: &sessions,
+            reply_to: "session-parent",
+            worker_session_id: "session-worker-2",
+            daemon_id: daemon_info.daemon_id(),
+            status: WorkerTerminalStatus::Timeout,
+            stderr: "timed out",
+            elapsed_ms: 5000,
+            subject: "Worker timed out after 5s",
+            worker_log: &parent_log,
+        });
+
+        // The parent log must have a WorkerTerminalResult AND a
+        // MailboxMessagePosted with a real (non-zero) seq.
+        let events = parent_log.snapshot();
+        let terminal: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.payload, EventPayload::WorkerTerminalResult { .. }))
+            .collect();
+        assert_eq!(terminal.len(), 1);
+        match &terminal[0].payload {
+            EventPayload::WorkerTerminalResult { status, .. } => {
+                assert_eq!(*status, WorkerTerminalStatus::Timeout);
+            }
+            _ => unreachable!(),
+        }
+
+        let mailbox_msgs: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.payload, EventPayload::MailboxMessagePosted { .. }))
+            .collect();
+        assert_eq!(mailbox_msgs.len(), 1);
+        match &mailbox_msgs[0].payload {
+            EventPayload::MailboxMessagePosted { seq, .. } => {
+                assert!(
+                    *seq > 0,
+                    "mailbox seq must be a real allocated seq, got {seq}"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // mu-session-context-orchestration-rurq.7: obligation is journaled
+    // on the parent's log at spawn time.
+    #[tokio::test]
+    async fn spawn_journals_obligation_on_parent_log() {
+        let _guard = env_lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = tmp.path().join("mu-spawn-test");
+        std::fs::write(&script, "#!/bin/sh\ncat >/dev/null\necho done\n").expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+
+        std::env::set_var("MU_SPAWN", &script);
+        let sessions = Sessions::new();
+        let daemon_info = DaemonInfo::new("test-daemon");
+
+        // Create a live parent session with a disk writer.
+        let parent_log = Arc::new(SessionEventLog::new("session-parent".to_string()));
+        parent_log
+            .attach_disk_writer(&tmp.path().join("session-parent.jsonl"))
+            .expect("attach disk writer");
+        sessions.insert_rehydrated("session-parent".to_string(), parent_log.clone(), None);
+
+        let result = spawn_worker(
+            SpawnWorkerConfig {
+                prompt: "do the thing".into(),
+                provider: Some("test".into()),
+                model: Some("test-model".into()),
+                pot_name: None,
+                timeout_secs: Some(5),
+                parent_session_id: Some("session-parent".into()),
+                tools: vec!["read".into()],
+            },
+            sessions.clone(),
+            daemon_info,
+        )
+        .await
+        .expect("spawn worker");
+
+        std::env::remove_var("MU_SPAWN");
+
+        // The parent log must have a WorkerAssignmentObligation.
+        let events = parent_log.snapshot();
+        let obligations: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.payload, EventPayload::WorkerAssignmentObligation { .. }))
+            .collect();
+        assert_eq!(
+            obligations.len(),
+            1,
+            "exactly one WorkerAssignmentObligation on parent log"
+        );
+        match &obligations[0].payload {
+            EventPayload::WorkerAssignmentObligation {
+                worker_session_id,
+                prompt_summary,
+                deadline_unix_ms,
+                target_log_session_id,
+            } => {
+                assert_eq!(worker_session_id, &result.session_id);
+                assert!(prompt_summary.contains("do the thing"));
+                assert!(*deadline_unix_ms > 0);
+                assert_eq!(
+                    target_log_session_id, "session-parent",
+                    "obligation must record which log it landed in"
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        // Wait briefly for the worker to finish so we don't leak the child.
+        for _ in 0..50 {
+            if matches!(
+                sessions.worker_status(&result.session_id),
+                Some(WorkerStatus::Done { .. }) | Some(WorkerStatus::Failed { .. })
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }

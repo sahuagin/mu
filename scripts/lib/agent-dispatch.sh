@@ -63,7 +63,7 @@ _ad_claude_tools() {  # $1=csv
 agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   local ad_prov ad_model ad_pf ad_tools ad_timeout ad_maxturns ad_thinking ad_mu ad_errlog
   local ad_clsys ad_sysflags ad_cltools ad_perm ad_yolo ad_lease ad_mcpflag ad_turnflag
-  local ad_mu_tools ad_tool ad_old_ifs
+  local ad_mu_tools ad_tool ad_old_ifs ad_rc
   ad_prov="$1"; ad_model="$2"
   ad_pf="${3:-${PROMPT_FILE:-}}"
   [ -n "$ad_pf" ] || { echo "agent_dispatch: no prompt file (arg 3 or \$PROMPT_FILE)" >&2; return 2; }
@@ -91,9 +91,19 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
     # external launch (CLAUDECODE unset); a cc session must use the harness's
     # native Agent tool for a claude worker, not this seat. Mirrors the guard
     # in spline-review-dispatch.
+    #
+    # mu-hqr6: exit 75 (EX_TEMPFAIL), the same "seat unusable here, route
+    # around" code the ollama held/unreachable paths use — so rank-walking
+    # callers (mu-spawn, ci-aipr) skip to the next seat instead of failing.
     if [ -n "${CLAUDECODE:-}" ]; then
-      echo "agent-dispatch: claude-oauth ('claude -p') cannot run nested in a claude-code session (CLAUDECODE=1) — it hangs. Use a non-claude seat, or the harness Agent tool." >&2
-      return 1
+      echo "agent-dispatch: claude-oauth ('claude -p') cannot run nested in a claude-code session (CLAUDECODE=1) — it hangs. Skipping this seat (exit 75); use a non-claude seat, or the harness Agent tool." >&2
+      return 75
+    fi
+    # Same class: no claude binary on PATH means this seat cannot run in this
+    # environment at all — route around rather than error.
+    if ! command -v claude >/dev/null 2>&1; then
+      echo "agent-dispatch: claude-oauth seat unusable: no 'claude' binary on PATH. Skipping this seat (exit 75)." >&2
+      return 75
     fi
     ad_clsys=""
     [ -n "${SYSPROMPT:-}" ] && [ -r "$SYSPROMPT" ] && ad_clsys="--append-system-prompt-file $SYSPROMPT"
@@ -178,16 +188,30 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   esac
 
   # shellcheck disable=SC2086 — $ad_lease/$ad_sysflags/$ad_yolo/$ad_mcpflag/$ad_turnflag/tool flags intentionally word-split
+  ad_rc=0
   if [ -n "$ad_tools" ] && [ -n "$ad_mu_tools" ]; then
     $ad_lease timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
       --thinking "$ad_thinking" $ad_sysflags $ad_yolo $ad_mcpflag $ad_turnflag --tools "$ad_mu_tools" \
-      --prompt-file "$ad_pf" 2>>"$ad_errlog"
+      --prompt-file "$ad_pf" 2>>"$ad_errlog" || ad_rc=$?
   elif [ -n "$ad_tools" ]; then
     $ad_lease timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
       --thinking "$ad_thinking" $ad_sysflags $ad_yolo $ad_mcpflag $ad_turnflag \
-      --prompt-file "$ad_pf" 2>>"$ad_errlog"
+      --prompt-file "$ad_pf" 2>>"$ad_errlog" || ad_rc=$?
   else
     $ad_lease timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
-      --thinking "$ad_thinking" $ad_sysflags $ad_turnflag --prompt-file "$ad_pf" 2>>"$ad_errlog"
+      --thinking "$ad_thinking" $ad_sysflags $ad_turnflag --prompt-file "$ad_pf" 2>>"$ad_errlog" || ad_rc=$?
   fi
+  # mu-hqr6: provider-auth failure = seat unusable in this environment
+  # (missing/expired credential), same route-around class as the nested-cc
+  # and held-box guards. Safe for these one-shot dispatches: an auth
+  # failure means the task never ran, so trying the next rank cannot
+  # double-execute anything. Narrow signature ("provider: auth" is mu's
+  # error prefix) on the errlog tail; timeouts (124) and lease skips (75)
+  # keep their own meanings.
+  if [ "$ad_rc" -ne 0 ] && [ "$ad_rc" -ne 75 ] && [ "$ad_rc" -ne 124 ] &&
+     tail -n 5 "$ad_errlog" 2>/dev/null | grep -q 'provider: auth'; then
+    echo "agent-dispatch: $ad_prov seat unusable: provider auth failed (see $ad_errlog). Skipping this seat (exit 75)." >&2
+    return 75
+  fi
+  return "$ad_rc"
 }

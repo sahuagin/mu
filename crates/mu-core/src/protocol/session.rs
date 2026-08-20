@@ -774,9 +774,11 @@ pub struct SpawnWorkerRequest {
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    // Legacy wire name; now interpreted as optional worker name.
-    pub pot_name: Option<String>,
+    /// Optional worker label. Serialized as `pot_name` — fossil wire
+    /// name from the deleted pot era, kept for client compatibility
+    /// (mu-hqr6).
+    #[serde(default, rename = "pot_name", skip_serializing_if = "Option::is_none")]
+    pub worker_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pot_template: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -792,8 +794,10 @@ impl SpawnWorkerRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpawnWorkerResponse {
     pub session_id: String,
-    // Legacy wire name; now interpreted as worker name.
-    pub pot_name: String,
+    /// Worker label. Serialized as `pot_name` — fossil wire name from
+    /// the deleted pot era, kept for client compatibility (mu-hqr6).
+    #[serde(rename = "pot_name")]
+    pub worker_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -82,7 +82,7 @@ impl SpawnWorkerTool {
             prompt,
             provider,
             model,
-            pot_name: None,
+            worker_name: None,
             timeout_secs: arguments.get("timeout_secs").and_then(Value::as_u64),
             parent_session_id: self.parent_session_id.clone(),
             tools: derive_child_tool_grant(&self.parent_tool_grant, parent_capability),
@@ -191,7 +191,7 @@ impl Tool for SpawnWorkerTool {
                              The task has been posted to the worker's mailbox. \
                              The daemon will wake this session with the worker result; \
                              do not poll dialogue for it.",
-                            r.session_id, r.pot_name,
+                            r.session_id, r.worker_name,
                         ),
                         is_error: false,
                     },

@@ -522,7 +522,12 @@ pub enum EventPayload {
     /// session. Emitted once by the supervisor when the worker process
     /// starts successfully.
     WorkerSpawned {
-        pot_name: String,
+        /// Worker label (e.g. `mu-worker-session-2`). Serialized as
+        /// `pot_name` — a fossil wire name from the deleted pot era,
+        /// kept so existing logs and consumers stay compatible
+        /// (mu-hqr6; the spawn is a plain subprocess via mu-spawn).
+        #[serde(rename = "pot_name")]
+        worker_name: String,
         model: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pid: Option<u32>,
@@ -1518,6 +1523,24 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_spawned_keeps_pot_name_wire_field() {
+        // mu-hqr6: the Rust field is `worker_name` but the wire/log field
+        // stays `pot_name` (fossil from the deleted pot era) so existing
+        // logs and consumers keep parsing. This test is the promise.
+        let e = EventPayload::WorkerSpawned {
+            worker_name: "mu-worker-1".into(),
+            model: "m".into(),
+            pid: None,
+            prompt_summary: None,
+        };
+        let v = serde_json::to_value(&e).expect("serialize");
+        assert_eq!(v["pot_name"], "mu-worker-1");
+        assert!(v.get("worker_name").is_none(), "wire name must not change");
+        let back: EventPayload = serde_json::from_value(v).expect("round trip");
+        assert_eq!(back, e);
+    }
     use crate::agent::ContentBlock;
     use serde_json::json;
 

@@ -307,11 +307,14 @@ pub(crate) async fn spawn_worker(
         Err(e) => {
             let reason = format!("failed to run mu-spawn: {}", e);
             // Compensating terminal result: the obligation was journaled
-            // but the worker never started.
-            if let Some(log) = sessions
-                .live_event_log(&reply_to)
-                .or_else(|| sessions.live_event_log("supervisor"))
-            {
+            // but the worker never started. Use the obligation's target
+            // log to keep the pair co-located.
+            let target = obligation_log
+                .filter(|l| l.has_disk_writer())
+                .clone()
+                .or_else(|| sessions.live_event_log(&reply_to))
+                .or_else(|| sessions.live_event_log("supervisor"));
+            if let Some(log) = target {
                 log.append_durable_or_fallback(
                     EventActor::System,
                     EventPayload::WorkerTerminalResult {
@@ -348,11 +351,14 @@ pub(crate) async fn spawn_worker(
         use tokio::io::AsyncWriteExt;
         if let Err(e) = stdin.write_all(config.prompt.as_bytes()).await {
             let reason = format!("failed to write prompt to mu-spawn: {}", e);
-            // Compensating terminal result: stdin write failed.
-            if let Some(log) = sessions
-                .live_event_log(&reply_to)
-                .or_else(|| sessions.live_event_log("supervisor"))
-            {
+            // Compensating terminal result: stdin write failed. Use the
+            // obligation's target log to keep the pair co-located.
+            let target = obligation_log
+                .filter(|l| l.has_disk_writer())
+                .clone()
+                .or_else(|| sessions.live_event_log(&reply_to))
+                .or_else(|| sessions.live_event_log("supervisor"));
+            if let Some(log) = target {
                 log.append_durable_or_fallback(
                     EventActor::System,
                     EventPayload::WorkerTerminalResult {
@@ -400,6 +406,7 @@ pub(crate) async fn spawn_worker(
     let monitor_session_id = session_id.clone();
     let monitor_sessions = sessions.clone();
     let monitor_reply_to = reply_to.clone();
+    let monitor_obligation_log = obligation_log.clone();
     tokio::spawn(async move {
         monitor_worker(MonitorArgs {
             child,
@@ -410,6 +417,7 @@ pub(crate) async fn spawn_worker(
             timeout_secs,
             reply_to: monitor_reply_to,
             daemon_id: daemon_id_str.clone(),
+            obligation_log: monitor_obligation_log,
         })
         .await;
     });
@@ -431,6 +439,11 @@ struct MonitorArgs {
     timeout_secs: u64,
     reply_to: String,
     daemon_id: String,
+    /// The log the WorkerAssignmentObligation was journaled into.
+    /// Threaded through so the terminal result lands in the same log,
+    /// preventing the pairing split when the parent is evicted between
+    /// spawn and completion. (mu-session-context-orchestration-rurq.19)
+    obligation_log: Option<Arc<SessionEventLog>>,
 }
 
 async fn monitor_worker(args: MonitorArgs) {
@@ -443,6 +456,7 @@ async fn monitor_worker(args: MonitorArgs) {
         timeout_secs,
         reply_to,
         daemon_id,
+        obligation_log,
     } = args;
 
     let stdout_task = child.stdout.take().map(|mut out| {
@@ -495,6 +509,7 @@ async fn monitor_worker(args: MonitorArgs) {
                 elapsed_ms: elapsed,
                 subject: &format!("Worker failed: {reason}"),
                 worker_log: &event_log,
+                obligation_log: obligation_log.as_ref(),
             });
             return;
         }
@@ -524,6 +539,7 @@ async fn monitor_worker(args: MonitorArgs) {
                 elapsed_ms: elapsed,
                 subject: &format!("Worker timed out after {}s", timeout_secs),
                 worker_log: &event_log,
+                obligation_log: obligation_log.as_ref(),
             });
             return;
         }
@@ -565,6 +581,7 @@ async fn monitor_worker(args: MonitorArgs) {
             stderr: &stderr,
             elapsed_ms: elapsed,
             worker_log: &event_log,
+            obligation_log: obligation_log.as_ref(),
         });
     } else {
         let reason = format!(
@@ -597,6 +614,7 @@ async fn monitor_worker(args: MonitorArgs) {
             elapsed_ms: elapsed,
             subject: &format!("Worker failed ({})", truncate(&reason, 100)),
             worker_log: &event_log,
+            obligation_log: obligation_log.as_ref(),
         });
     }
 }
@@ -610,6 +628,10 @@ struct SuccessDelivery<'a> {
     stderr: &'a str,
     elapsed_ms: u64,
     worker_log: &'a Arc<SessionEventLog>,
+    /// The log the obligation was journaled into. Used as the primary
+    /// target so the terminal result lands in the same log, preserving
+    /// the pairing invariant. (mu-session-context-orchestration-rurq.19)
+    obligation_log: Option<&'a Arc<SessionEventLog>>,
 }
 
 fn post_result_to_parent(args: SuccessDelivery<'_>) {
@@ -622,14 +644,17 @@ fn post_result_to_parent(args: SuccessDelivery<'_>) {
         stderr,
         elapsed_ms,
         worker_log,
+        obligation_log,
     } = args;
     // mu-session-context-orchestration-rurq.7: journal the durable
     // terminal result on the parent's log BEFORE any in-memory wake.
-    // If the parent is gone, fall back to the supervisor/dead-letter log.
-    // Uses live_event_log (gates rehydrated tier on has_disk_writer)
-    // so the append reaches a log with a disk writer.
-    let parent_log = sessions
-        .live_event_log(reply_to)
+    // mu-session-context-orchestration-rurq.19: prefer the obligation's
+    // target log so the pair stays in the same log even if the parent
+    // is evicted between spawn and completion.
+    let parent_log = obligation_log
+        .filter(|l| l.has_disk_writer())
+        .cloned()
+        .or_else(|| sessions.live_event_log(reply_to))
         .or_else(|| sessions.live_event_log("supervisor"));
     if let Some(log) = &parent_log {
         log.append_durable_or_fallback(
@@ -711,6 +736,10 @@ struct TerminalNotification<'a> {
     elapsed_ms: u64,
     subject: &'a str,
     worker_log: &'a Arc<SessionEventLog>,
+    /// The log the obligation was journaled into. Used as the primary
+    /// target so the terminal result lands in the same log, preserving
+    /// the pairing invariant. (mu-session-context-orchestration-rurq.19)
+    obligation_log: Option<&'a Arc<SessionEventLog>>,
 }
 
 /// mu-session-context-orchestration-rurq.7: deliver a failure/timeout
@@ -729,12 +758,15 @@ fn notify_parent(args: TerminalNotification<'_>) {
         elapsed_ms,
         subject,
         worker_log,
+        obligation_log,
     } = args;
     // Durable terminal record first.
-    // Uses live_event_log (gates rehydrated tier on has_disk_writer)
-    // to avoid appending into a writer-less ghost.
-    let parent_log = sessions
-        .live_event_log(reply_to)
+    // mu-session-context-orchestration-rurq.19: prefer the obligation's
+    // target log so the pair stays in the same log.
+    let parent_log = obligation_log
+        .filter(|l| l.has_disk_writer())
+        .cloned()
+        .or_else(|| sessions.live_event_log(reply_to))
         .or_else(|| sessions.live_event_log("supervisor"));
     if let Some(log) = &parent_log {
         log.append_durable_or_fallback(
@@ -967,6 +999,7 @@ mod tests {
             stderr: "",
             elapsed_ms: 1234,
             worker_log: &sup_log,
+            obligation_log: None,
         });
 
         // The terminal result must be in the supervisor log.
@@ -1024,6 +1057,7 @@ mod tests {
             elapsed_ms: 5000,
             subject: "Worker timed out after 5s",
             worker_log: &parent_log,
+            obligation_log: None,
         });
 
         // The parent log must have a WorkerTerminalResult AND a
@@ -1089,7 +1123,7 @@ mod tests {
                 prompt: "do the thing".into(),
                 provider: Some("test".into()),
                 model: Some("test-model".into()),
-                pot_name: None,
+                worker_name: None,
                 timeout_secs: Some(5),
                 parent_session_id: Some("session-parent".into()),
                 tools: vec!["read".into()],
@@ -1141,5 +1175,91 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    // mu-session-context-orchestration-rurq.19: the terminal result
+    // goes to the same log the obligation landed in, even if the parent
+    // is evicted between spawn and completion.
+    #[tokio::test]
+    async fn terminal_result_follows_obligation_log_after_parent_eviction() {
+        let _guard = env_lock().await;
+        let sessions = Sessions::new();
+        let daemon_info = DaemonInfo::new("test-daemon");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // Create a parent session with a disk writer (the obligation's target).
+        let parent_log = Arc::new(SessionEventLog::new("session-parent".to_string()));
+        parent_log
+            .attach_disk_writer(&tmp.path().join("session-parent.jsonl"))
+            .expect("attach disk writer");
+        sessions.insert_rehydrated("session-parent".to_string(), parent_log.clone(), None);
+
+        // Create a supervisor with a disk writer (the dead-letter fallback).
+        let sup_log = Arc::new(SessionEventLog::new("supervisor".to_string()));
+        sup_log
+            .attach_disk_writer(&tmp.path().join("supervisor.jsonl"))
+            .expect("attach disk writer");
+        sessions.insert_rehydrated("supervisor".to_string(), sup_log.clone(), None);
+
+        // A distinct worker log (the last-resort fallback).
+        let worker_log = Arc::new(SessionEventLog::new("session-worker-3".to_string()));
+
+        // Simulate: obligation was journaled to the parent log.
+        // Then the parent is evicted (removed from the registry).
+        sessions.remove("session-parent");
+
+        // The terminal result should go to the parent log (via the
+        // captured obligation_log), NOT the supervisor or worker log.
+        post_result_to_parent(SuccessDelivery {
+            sessions: &sessions,
+            reply_to: "session-parent",
+            worker_session_id: "session-worker-3",
+            daemon_id: daemon_info.daemon_id(),
+            stdout: "result after eviction",
+            stderr: "",
+            elapsed_ms: 999,
+            worker_log: &worker_log,
+            obligation_log: Some(&parent_log),
+        });
+
+        // The terminal result must be in the parent log (the obligation's target).
+        let events = parent_log.snapshot();
+        let terminal: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.payload, EventPayload::WorkerTerminalResult { .. }))
+            .collect();
+        assert_eq!(
+            terminal.len(),
+            1,
+            "terminal result must land in the obligation's target log"
+        );
+        match &terminal[0].payload {
+            EventPayload::WorkerTerminalResult {
+                worker_session_id,
+                stdout,
+                ..
+            } => {
+                assert_eq!(worker_session_id, "session-worker-3");
+                assert_eq!(stdout, "result after eviction");
+            }
+            _ => unreachable!(),
+        }
+
+        // The supervisor and worker logs must be empty (no terminal result).
+        let sup_events = sup_log.snapshot();
+        assert!(
+            sup_events
+                .iter()
+                .all(|e| !matches!(e.payload, EventPayload::WorkerTerminalResult { .. })),
+            "supervisor log must not contain the terminal result"
+        );
+        let worker_events = worker_log.snapshot();
+        assert!(
+            worker_events
+                .iter()
+                .all(|e| !matches!(e.payload, EventPayload::WorkerTerminalResult { .. })),
+            "worker log must not contain the terminal result"
+        );
     }
 }

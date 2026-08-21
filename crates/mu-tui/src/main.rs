@@ -459,9 +459,10 @@ impl App {
         let (sessions, firehose) = if connected {
             (
                 Vec::new(),
-                vec![format!(
+                vec![
                     "[startup] connected to mu serve; type `n` to create a session, `i` to send a prompt to selected."
-                )],
+                        .to_string(),
+                ],
             )
         } else {
             (mock_sessions(), mock_firehose())

@@ -1089,7 +1089,7 @@ mod tests {
                 prompt: "do the thing".into(),
                 provider: Some("test".into()),
                 model: Some("test-model".into()),
-                pot_name: None,
+                worker_name: None,
                 timeout_secs: Some(5),
                 parent_session_id: Some("session-parent".into()),
                 tools: vec!["read".into()],

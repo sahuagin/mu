@@ -26,6 +26,15 @@ use super::{AgentEvent, AgentInput, Outcome, PendingApprovals, SessionCapability
 pub const TOOL_HISTORY_WINDOW: usize = 8;
 const RETRY_STREAK_LIMIT: usize = 3;
 
+/// mu-503qk: loop guard. After this many consecutive byte-identical
+/// SUCCESSFUL calls to the same tool, the next identical repeat is
+/// refused. The retry gate above only watches errors, so a model
+/// re-issuing an identical successful call looped unbounded (13,357
+/// executions of one grep over ~20h, session e863711713132c5b) —
+/// saturating the context with identical spans until every new prompt,
+/// including cancels and direct questions, continued the pattern.
+const IDENTICAL_SUCCESS_LIMIT: usize = 3;
+
 /// Monotonic counter used to generate `request_id`s for
 /// `InputRequired` prompts. Combined with the tool_call_id for
 /// readability + uniqueness even across sessions.
@@ -77,6 +86,27 @@ impl ToolHistory {
         self.entries
             .iter()
             .any(|e| e.is_error && e.tool_name == tool_name && &e.arguments == arguments)
+    }
+
+    /// mu-503qk: successes inside the tail run of calls byte-identical
+    /// to (tool_name, arguments). The run spans matching entries
+    /// regardless of error status — so the guard's own refusals (which
+    /// record as errors with the same arguments) do NOT reset the
+    /// count, and an armed guard stays armed until the model does
+    /// something different. Any non-matching call ends the run: after a
+    /// different action, one fresh identical re-run is allowed and the
+    /// guard re-arms at the limit.
+    pub(crate) fn identical_success_streak(
+        &self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> usize {
+        self.entries
+            .iter()
+            .rev()
+            .take_while(|e| e.tool_name == tool_name && &e.arguments == arguments)
+            .filter(|e| !e.is_error)
+            .count()
     }
 
     /// Count consecutive errors for `tool_name` starting from the
@@ -365,6 +395,20 @@ pub(crate) async fn handle_execute_tools(
             None => None,
         };
 
+        // mu-503qk: loop guard — independent of RetryPolicy, which only
+        // watches errors. An identical call that keeps SUCCEEDING yields
+        // no new information; refusing the repeat is the only
+        // model-agnostic way to break the pattern before it saturates
+        // the context.
+        let loop_refusal_streak: Option<usize> = match tool {
+            Some(_) if capability_refusal_reason.is_none() && retry_refusal_reason.is_none() => {
+                let streak =
+                    history.identical_success_streak(&call.name, call.arguments.as_value());
+                (streak >= IDENTICAL_SUCCESS_LIMIT).then_some(streak)
+            }
+            _ => None,
+        };
+
         // mu-bkjr: argument-aware pre-flight check. Tools that reject
         // specific argument shapes (e.g. bash's allowlist) can fail the
         // call here, BEFORE the PermissionLevel::Ask gate dispatches a
@@ -374,19 +418,22 @@ pub(crate) async fn handle_execute_tools(
         // Only run when no higher-priority refusal applies — keeps the
         // refusal-reason ordering stable (capability > retry > validate >
         // permission-denied > execute).
-        let validate_refusal_reason: Option<String> =
-            if capability_refusal_reason.is_none() && retry_refusal_reason.is_none() {
-                tool.as_ref()
-                    .and_then(|t| t.validate(call.arguments.as_value()).err())
-            } else {
-                None
-            };
+        let validate_refusal_reason: Option<String> = if capability_refusal_reason.is_none()
+            && retry_refusal_reason.is_none()
+            && loop_refusal_streak.is_none()
+        {
+            tool.as_ref()
+                .and_then(|t| t.validate(call.arguments.as_value()).err())
+        } else {
+            None
+        };
 
         // mu-8stm.1: a no-approver / dropped-channel timeout produces a
         // refusal distinct from a human denial, so the model doesn't read
         // "fail-closed, no approver" as "the user said no".
         let mut permission_refusal_reason: Option<String> = None;
         let permission_decision = if retry_refusal_reason.is_none()
+            && loop_refusal_streak.is_none()
             && validate_refusal_reason.is_none()
         {
             match tool.as_ref().map(|t| t.spec().policy.permission) {
@@ -553,6 +600,32 @@ pub(crate) async fn handle_execute_tools(
                     }),
                     theme: Some("warning".to_owned()),
                     context_refs: vec!["spec:capability-delegation".to_owned()],
+                })
+                .await;
+            ToolResult {
+                content: msg,
+                is_error: true,
+            }
+        } else if let Some(streak) = loop_refusal_streak {
+            let msg = format!(
+                "runtime refused: loop guard. This exact `{}` call already succeeded \
+                 {streak} consecutive times with identical arguments — its result is \
+                 unchanged and re-running it produces no new information. Use the \
+                 output you already have, take a materially different action, or \
+                 report to the user what you are stuck on.",
+                call.name
+            );
+            let _ = events
+                .send(AgentEvent::Callout {
+                    category: "warning".to_owned(),
+                    title: format!("loop guard refused {}", call.name),
+                    body: serde_json::json!({
+                        "tool": call.name,
+                        "arguments": call.arguments,
+                        "identical_successes": streak,
+                    }),
+                    theme: Some("warning".to_owned()),
+                    context_refs: vec![],
                 })
                 .await;
             ToolResult {

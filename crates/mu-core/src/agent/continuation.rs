@@ -128,7 +128,13 @@ pub struct Continuation {
 /// One projected, sendable boundary: the messages up to and including
 /// a coherent point, and the event id of that point.
 struct Boundary {
-    messages: Vec<AgentMessage>,
+    /// Message count at the boundary — an INDEX into the fold's growing
+    /// vec, not a clone of it. The old shape cloned the entire message
+    /// vector at every clean boundary, which made projection O(n^2) in
+    /// conversation length: the 13k-turn incident log took ~100s to
+    /// resume, nearly all of it deep-cloning strings (mu-lzkv6 finding).
+    /// The final messages are produced by ONE truncate at the end.
+    len: usize,
     event_id: u64,
 }
 
@@ -194,7 +200,7 @@ fn project_internal(events: &[SessionEvent]) -> Result<Continuation, Continuatio
     // where the conversation is naturally sendable to a provider.
     let capture = |messages: &[AgentMessage], id: u64, last_clean: &mut Option<Boundary>| {
         *last_clean = Some(Boundary {
-            messages: messages.to_vec(),
+            len: messages.len(),
             event_id: id,
         });
     };
@@ -213,7 +219,17 @@ fn project_internal(events: &[SessionEvent]) -> Result<Continuation, Continuatio
             // clear (the loop drops them with the history), so the
             // post-clear state is itself a clean boundary.
             EventPayload::ContextCleared { .. } => {
-                messages.clear();
+                // Clear-race rule (mirrors the live loop's
+                // apply_context_clear): trailing not-yet-answered user
+                // messages survive the marker, so an ask accepted just
+                // before a clear replays coherently with its post-clear
+                // answer.
+                let tail_users = messages
+                    .iter()
+                    .rev()
+                    .take_while(|m| matches!(m, AgentMessage::User { .. }))
+                    .count();
+                messages.drain(..messages.len() - tail_users);
                 pending_tool_calls.clear();
                 capture(&messages, ev.id, &mut last_clean);
             }
@@ -387,8 +403,9 @@ fn project_internal(events: &[SessionEvent]) -> Result<Continuation, Continuatio
         None
     };
 
+    messages.truncate(boundary.len);
     Ok(Continuation {
-        messages: boundary.messages,
+        messages,
         fork_event_id: Some(boundary.event_id),
         had_ragged_tail,
         first_ragged_event_id,
@@ -643,6 +660,31 @@ mod tests {
         match &c.messages[0] {
             AgentMessage::User { content } => assert_eq!(content, "new question"),
             other => panic!("expected post-clear user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_cleared_preserves_trailing_unanswered_user_messages() {
+        // Clear-race: an ask accepted just before the clear must survive
+        // it (else the model receives an empty conversation — the vllm
+        // 400 observed live). Its post-clear answer then pairs with it.
+        let events = vec![
+            user(1, "old question"),
+            assistant_text(2, "old answer"),
+            user(3, "pending question"),
+            ev(
+                4,
+                EventPayload::ContextCleared {
+                    reason: "test".into(),
+                },
+            ),
+            assistant_text(5, "fresh answer"),
+        ];
+        let c = project_strict(&events).expect("projection");
+        assert_eq!(c.messages.len(), 2, "messages: {:?}", c.messages);
+        match &c.messages[0] {
+            AgentMessage::User { content } => assert_eq!(content, "pending question"),
+            other => panic!("expected preserved pending question, got {other:?}"),
         }
     }
 

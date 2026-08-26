@@ -2039,6 +2039,51 @@ fn tool_history_does_not_match_succeeded_calls() {
     assert!(!h.errored_match("read", &json!({"path": "/etc/hosts"})));
 }
 
+// ── mu-503qk: loop guard — identical-success streak ──
+
+#[test]
+fn identical_success_streak_counts_tail_repeats() {
+    let mut h = ToolHistory::default();
+    let args = json!({"command": "grep -n foo bar.rs"});
+    for _ in 0..3 {
+        h.record("bash".into(), args.clone(), false);
+    }
+    assert_eq!(h.identical_success_streak("bash", &args), 3);
+    // Different args — fresh streak.
+    assert_eq!(
+        h.identical_success_streak("bash", &json!({"command": "ls"})),
+        0
+    );
+}
+
+#[test]
+fn identical_success_streak_survives_guard_refusals() {
+    // The guard's own refusals record as ERRORS with the same args; they
+    // must NOT reset the streak, or the guard would let the call through
+    // once per few refusals instead of holding.
+    let mut h = ToolHistory::default();
+    let args = json!({"command": "grep -n foo bar.rs"});
+    for _ in 0..3 {
+        h.record("bash".into(), args.clone(), false);
+    }
+    h.record("bash".into(), args.clone(), true); // refusal
+    h.record("bash".into(), args.clone(), true); // refusal
+    assert_eq!(h.identical_success_streak("bash", &args), 3);
+}
+
+#[test]
+fn identical_success_streak_broken_by_different_call() {
+    // A materially different action ends the run: one fresh identical
+    // re-run is then allowed, and the guard re-arms at the limit.
+    let mut h = ToolHistory::default();
+    let args = json!({"command": "grep -n foo bar.rs"});
+    for _ in 0..3 {
+        h.record("bash".into(), args.clone(), false);
+    }
+    h.record("read".into(), json!({"path": "x"}), false);
+    assert_eq!(h.identical_success_streak("bash", &args), 0);
+}
+
 #[test]
 fn tool_history_window_evicts_oldest() {
     let mut h = ToolHistory::default();

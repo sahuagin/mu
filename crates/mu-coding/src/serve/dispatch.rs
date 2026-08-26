@@ -210,6 +210,9 @@ pub(crate) async fn dispatch_inner(
         AskSessionRequest::METHOD => handle_ask_session(request, sessions, ask_ticket).await,
         CancelSessionRequest::METHOD => handle_cancel_session(request, sessions).await,
         CancelOutstandingRequest::METHOD => handle_cancel_outstanding(request, sessions).await,
+        mu_core::protocol::ClearContextRequest::METHOD => {
+            crate::serve::handlers::session::handle_clear_context(request, sessions).await
+        }
         CloseSessionRequest::METHOD => handle_close_session(request, sessions).await,
         SessionStatsRequest::METHOD => handle_session_stats(request, sessions),
         SessionListRequest::METHOD => handle_session_list(request, discovery).await,

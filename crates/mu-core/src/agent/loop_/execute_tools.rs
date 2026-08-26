@@ -526,7 +526,8 @@ pub(crate) async fn handle_execute_tools(
                             | Some(AgentInput::SwitchProvider { .. })
                             | Some(AgentInput::WatchCompleted { .. })
                             | Some(AgentInput::DialogueMessage { .. })
-                            | Some(AgentInput::MailboxMessage { .. }) => {
+                            | Some(AgentInput::MailboxMessage { .. })
+                            | Some(AgentInput::ClearContext { .. }) => {
                                 if let Ok(mut pending) = pending_approvals.lock() {
                                     pending.remove(&request_id);
                                 }
@@ -726,75 +727,76 @@ pub(crate) async fn handle_execute_tools(
                     let mut input_drained_local = false;
                     loop {
                         tokio::select! {
-                            result = &mut execute_fut => break result,
-                            input_opt = async {
-                                if input_drained_local {
-                                    std::future::pending::<Option<AgentInput>>().await
-                                } else {
-                                    input_rx.recv().await
+                                result = &mut execute_fut => break result,
+                                input_opt = async {
+                                    if input_drained_local {
+                                        std::future::pending::<Option<AgentInput>>().await
+                                    } else {
+                                        input_rx.recv().await
+                                    }
+                                } => match input_opt {
+                                    Some(AgentInput::Cancel) => {
+                                        let _ = cancel_tx.send(());
+                                        let reason = "session cancelled while tool was executing";
+                                        let remaining = calls.drain(..).collect();
+                                        cancel_current_and_remaining(
+                                            events,
+                                            history,
+                                            &mut tool_messages,
+                                            call.clone(),
+                                            remaining,
+                                            reason,
+                                            "session.cancel",
+                                        )
+                                        .await;
+                                        return Ok(ExecuteToolsExit::Cancelled { tool_messages });
+                                    }
+                                    Some(AgentInput::CancelOutstanding { reason }) => {
+                                        let _ = cancel_tx.send(());
+                                        let remaining = calls.drain(..).collect();
+                                        cancel_current_and_remaining(
+                                            events,
+                                            history,
+                                            &mut tool_messages,
+                                            call.clone(),
+                                            remaining,
+                                            &reason,
+                                            "session.cancel_outstanding",
+                                        )
+                                        .await;
+                                        return Ok(ExecuteToolsExit::OutstandingCancelled {
+                                            reason,
+                                            tool_messages,
+                                        });
+                                    }
+                                    Some(input @ AgentInput::UserMessage(..))
+                                    | Some(input @ AgentInput::StartAutonomous { .. })
+                                    | Some(input @ AgentInput::ScheduleWakeup { .. })
+                                    | Some(input @ AgentInput::SwitchProvider { .. })
+                                    | Some(input @ AgentInput::WatchCompleted { .. })
+                                    | Some(input @ AgentInput::DialogueMessage { .. })
+                                    | Some(input @ AgentInput::MailboxMessage { .. })
+                        | Some(input @ AgentInput::ClearContext { .. }) => {
+                                        buffered.push(input);
+                                    }
+                                    None => {
+                                        input_drained_local = true;
+                                    }
+                                },
+                                _ = tool_tick.tick() => {
+                                    let elapsed_ms =
+                                        tool_call_started_at.elapsed().as_millis() as u64;
+                                    let _ = events
+                                        .send(AgentEvent::ProviderStatus {
+                                            state: crate::protocol::ProviderStatusKind::ToolExecuting,
+                                            started_at_unix_ms: tool_state_started_unix_ms,
+                                            elapsed_ms,
+                                            bytes_received: None,
+                                            tool_call_id: Some(call.id.clone()),
+                                        })
+                                        .await;
                                 }
-                            } => match input_opt {
-                                Some(AgentInput::Cancel) => {
-                                    let _ = cancel_tx.send(());
-                                    let reason = "session cancelled while tool was executing";
-                                    let remaining = calls.drain(..).collect();
-                                    cancel_current_and_remaining(
-                                        events,
-                                        history,
-                                        &mut tool_messages,
-                                        call.clone(),
-                                        remaining,
-                                        reason,
-                                        "session.cancel",
-                                    )
-                                    .await;
-                                    return Ok(ExecuteToolsExit::Cancelled { tool_messages });
-                                }
-                                Some(AgentInput::CancelOutstanding { reason }) => {
-                                    let _ = cancel_tx.send(());
-                                    let remaining = calls.drain(..).collect();
-                                    cancel_current_and_remaining(
-                                        events,
-                                        history,
-                                        &mut tool_messages,
-                                        call.clone(),
-                                        remaining,
-                                        &reason,
-                                        "session.cancel_outstanding",
-                                    )
-                                    .await;
-                                    return Ok(ExecuteToolsExit::OutstandingCancelled {
-                                        reason,
-                                        tool_messages,
-                                    });
-                                }
-                                Some(input @ AgentInput::UserMessage(..))
-                                | Some(input @ AgentInput::StartAutonomous { .. })
-                                | Some(input @ AgentInput::ScheduleWakeup { .. })
-                                | Some(input @ AgentInput::SwitchProvider { .. })
-                                | Some(input @ AgentInput::WatchCompleted { .. })
-                                | Some(input @ AgentInput::DialogueMessage { .. })
-                                | Some(input @ AgentInput::MailboxMessage { .. }) => {
-                                    buffered.push(input);
-                                }
-                                None => {
-                                    input_drained_local = true;
-                                }
-                            },
-                            _ = tool_tick.tick() => {
-                                let elapsed_ms =
-                                    tool_call_started_at.elapsed().as_millis() as u64;
-                                let _ = events
-                                    .send(AgentEvent::ProviderStatus {
-                                        state: crate::protocol::ProviderStatusKind::ToolExecuting,
-                                        started_at_unix_ms: tool_state_started_unix_ms,
-                                        elapsed_ms,
-                                        bytes_received: None,
-                                        tool_call_id: Some(call.id.clone()),
-                                    })
-                                    .await;
                             }
-                        }
                     }
                 }
                 // mu-uz0n layer 2: the moment the model invents a tool

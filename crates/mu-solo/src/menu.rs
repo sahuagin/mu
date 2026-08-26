@@ -213,7 +213,10 @@ mod tests {
             MenuItem::new("/provider", "Change the provider"),
             MenuItem::new("/quit", "Exit mu-solo"),
             MenuItem::new("/status", "Show session status"),
-            MenuItem::new("/clear", "Clear and start fresh"),
+            MenuItem::new(
+                "/clear",
+                "Start a fresh session (new context; scrollback cleared)",
+            ),
             MenuItem::new("/effort", "Set effort level"),
             MenuItem::new("/focus", "Toggle focus mode"),
             MenuItem::new("/goal-protocol", "Set up a goal session"),

@@ -5045,18 +5045,59 @@ impl App {
         self.cmd_cancel_with_reason(vp, "user ran /cancel in mu-solo")
     }
 
-    /// /clear — clear the visible scrollback. Doesn't touch the
-    /// daemon's event log; this is a display-only reset. The inline
-    /// viewport redraws on the next tick.
+    /// /clear — clear the session's CONTEXT in place (mu-lzkv6):
+    /// cancel anything outstanding, then send session.clear_context —
+    /// the agent loop drops conversation history and tool-call memory
+    /// and appends a durable ContextCleared marker to the event log.
+    /// Session identity, WAL, grants, and system prompt stay; prompt +
+    /// tool schemas are assembled per-request, so the next ask starts
+    /// launch-time fresh. History before the marker stays on disk and
+    /// queryable — it just stops being replayed into the model. (The
+    /// old implementation cleared pixels only, while the menu promised
+    /// "start fresh" — during the 13k-grep incident (mu-503qk) a
+    /// poisoned context therefore had no in-app remedy.)
     fn cmd_clear(&mut self, vp: &mut DynamicViewport) -> Result<()> {
-        // Drop the in-memory transcript. In fullscreen the owned-buffer render
-        // windows `self.transcript`, so this visibly empties the screen the next
-        // frame (mu-5h9m). Inline mode also clears the live viewport region;
-        // terminal scrollback above it belongs to the multiplexer and is left
+        // Stop an in-flight ask first so a runaway doesn't keep burning
+        // the provider while we clear. Best-effort.
+        let _ = self.client.request(
+            "session.cancel_outstanding",
+            serde_json::json!({
+                "session_id": self.session_id,
+                "reason": "user ran /clear in mu-solo",
+            }),
+        );
+        match self.client.request(
+            "session.clear_context",
+            serde_json::json!({
+                "session_id": self.session_id,
+                "reason": "user ran /clear in mu-solo",
+            }),
+        ) {
+            Ok(resp) if resp.get("cleared").and_then(|v| v.as_bool()) == Some(true) => {
+                self.set_flash("context cleared — history kept on disk, model starts fresh");
+            }
+            Ok(_) => {
+                self.set_flash("clear failed: session loop unavailable; context unchanged");
+                return Ok(());
+            }
+            Err(e) => {
+                // Context survives — say so rather than letting a cleared
+                // screen imply a fresh start that didn't happen.
+                self.set_flash(format!("clear failed ({e}); context unchanged"));
+                return Ok(());
+            }
+        }
+
+        // Display reset (the pre-mu-lzkv6 entirety of /clear). In
+        // fullscreen the owned-buffer render windows `self.transcript`,
+        // so this visibly empties the screen the next frame (mu-5h9m).
+        // Inline mode also clears the live viewport region; terminal
+        // scrollback above it belongs to the multiplexer and is left
         // alone (it's the user's scroll history, not ours to wipe).
         self.transcript.clear();
         self.transcript_scroll = 0;
         self.selected_block = None;
+        self.maximized_block = None;
         // Reset the replay watermark: after a clear, everything committed
         // from here on is post-watermark by definition. A stale watermark
         // above the new (shorter) transcript length would make the
@@ -5353,7 +5394,10 @@ impl App {
                 "Side question via sidecar (main history unaffected)",
             ),
             MenuItem::new("/cancel", "Abort the in-flight provider call"),
-            MenuItem::new("/clear", "Clear the visible scrollback"),
+            MenuItem::new(
+                "/clear",
+                "Start a fresh session (new context; scrollback cleared)",
+            ),
             MenuItem::new("/transcript", "Write semantic transcript to a file"),
             MenuItem::new("/copy", "Copy last/assistant/user/all semantic content"),
             MenuItem::new("/quit", "Leave the session (/q, /exit)"),
@@ -5394,7 +5438,7 @@ impl App {
             Line::from("  /config k=v        set one, e.g. index.discover_injection=false"),
             Line::from("  /btw <message>     side question via sidecar (main history unaffected)"),
             Line::from("  /cancel            abort the in-flight provider call"),
-            Line::from("  /clear             clear the visible scrollback"),
+            Line::from("  /clear             clear context (fresh start; history kept on disk)"),
             Line::from("  /transcript [PATH] write semantic transcript to PATH/tempfile"),
             Line::from("  /copy [WHAT]       copy last|assistant|user|all semantically"),
             Line::from("  Alt-Up/Down or Alt-k/j select previous/next semantic block"),

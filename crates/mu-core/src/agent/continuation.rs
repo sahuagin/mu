@@ -207,6 +207,16 @@ fn project_internal(events: &[SessionEvent]) -> Result<Continuation, Continuatio
         }
 
         match &ev.payload {
+            // mu-lzkv6: a clear marker restarts history — everything
+            // before it stays on the log (queryable) but is not replayed
+            // into a continuation. Pending tool calls cannot straddle a
+            // clear (the loop drops them with the history), so the
+            // post-clear state is itself a clean boundary.
+            EventPayload::ContextCleared { .. } => {
+                messages.clear();
+                pending_tool_calls.clear();
+                capture(&messages, ev.id, &mut last_clean);
+            }
             EventPayload::UserMessage { content } => {
                 saw_conversational_event = true;
                 messages.push(AgentMessage::User {
@@ -529,6 +539,12 @@ fn ragged_detail(events: &[SessionEvent], first_ragged_event_id: Option<u64>) ->
             EventPayload::ToolResult { call_id, .. } => {
                 pending.retain(|(c, _)| c != call_id);
             }
+            // mu-lzkv6: a clear discards any dangling calls with the
+            // history — nothing before it can be ragged for the tail scan.
+            EventPayload::ContextCleared { .. } => {
+                pending.clear();
+                terminal_err = None;
+            }
             EventPayload::Error { message } => terminal_err = Some(message.clone()),
             EventPayload::ErrorInvalidMessage {
                 validation_error, ..
@@ -602,6 +618,48 @@ mod tests {
                 },
             },
         )
+    }
+
+    // ── mu-lzkv6: ContextCleared restarts continuation history ──
+
+    #[test]
+    fn context_cleared_restarts_history_at_marker() {
+        let events = vec![
+            user(1, "old question"),
+            assistant_text(2, "old answer"),
+            ev(
+                3,
+                EventPayload::ContextCleared {
+                    reason: "test".into(),
+                },
+            ),
+            user(4, "new question"),
+            assistant_text(5, "new answer"),
+        ];
+        let c = project_strict(&events).expect("projection");
+        // Only post-clear history is replayed; pre-clear stays on the
+        // log but out of the continuation.
+        assert_eq!(c.messages.len(), 2, "messages: {:?}", c.messages);
+        match &c.messages[0] {
+            AgentMessage::User { content } => assert_eq!(content, "new question"),
+            other => panic!("expected post-clear user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_cleared_alone_is_clean_and_empty() {
+        let events = vec![
+            user(1, "old"),
+            assistant_text(2, "answer"),
+            ev(
+                3,
+                EventPayload::ContextCleared {
+                    reason: "test".into(),
+                },
+            ),
+        ];
+        let c = project_strict(&events).expect("projection");
+        assert!(c.messages.is_empty(), "messages: {:?}", c.messages);
     }
 
     fn assistant_toolcall(id: u64, call_id: &str, name: &str) -> SessionEvent {

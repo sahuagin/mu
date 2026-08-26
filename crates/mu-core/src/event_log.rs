@@ -518,6 +518,12 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tz: Option<String>,
     },
+    /// mu-lzkv6: the operator cleared the session's context in place
+    /// (/clear). Conversation history before this marker stays on disk
+    /// and queryable but is NOT replayed into the model's context;
+    /// continuation/resume projections restart from the latest marker.
+    /// Session identity, grants, and system prompt are unaffected.
+    ContextCleared { reason: String },
     /// mu-slat: a worker subprocess was spawned as a subprocess
     /// session. Emitted once by the supervisor when the worker process
     /// starts successfully.
@@ -730,6 +736,7 @@ impl EventPayload {
             Self::MailboxMessagePosted { .. } => "mailbox_message_posted",
             Self::MailboxMessageConsumed { .. } => "mailbox_message_consumed",
             Self::TaskTelemetry { .. } => "task_telemetry",
+            Self::ContextCleared { .. } => "context_cleared",
             Self::WorkerSpawned { .. } => "worker_spawned",
             Self::WorkerExited { .. } => "worker_exited",
             Self::WorkerFailed { .. } => "worker_failed",

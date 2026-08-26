@@ -399,6 +399,31 @@ impl CancelOutstandingRequest {
     pub const METHOD: &'static str = "session.cancel_outstanding";
 }
 
+/// mu-lzkv6: clear the session's context IN PLACE — conversation
+/// history and tool memory drop; session identity, event log, WAL,
+/// grants, and system prompt stay. The log gains a ContextCleared
+/// marker; continuation/resume projections restart from the latest
+/// marker, so earlier history remains on disk and queryable without
+/// re-entering the model's context.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClearContextRequest {
+    pub session_id: String,
+    /// Free-form reason, recorded on the ContextCleared marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl ClearContextRequest {
+    pub const METHOD: &'static str = "session.clear_context";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClearContextResponse {
+    /// True iff the clear input was delivered to the session's loop.
+    /// (The loop applies it before its next model call.)
+    pub cleared: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CancelOutstandingResponse {
     /// True iff a provider call was actually in flight at the time of

@@ -294,6 +294,10 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
         | AgentEvent::MessageEnd { .. }
         | AgentEvent::ContextAssembly { .. }
         | AgentEvent::CompactionAssembly { .. }
+        // mu-lzkv6: no dedicated client notification — the initiating
+        // client handles its own display; the durable marker is the
+        // to_log_event mapping.
+        | AgentEvent::ContextCleared { .. }
         | AgentEvent::ProviderSwitched { .. } => None,
     }
 }
@@ -774,6 +778,14 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
             EventActor::Agent,
             EventPayload::Error {
                 message: message.clone(),
+            },
+        )),
+        // mu-lzkv6: durable clear marker — projections restart history
+        // from the latest one; earlier events stay on disk, queryable.
+        AgentEvent::ContextCleared { reason } => Some((
+            EventActor::Agent,
+            EventPayload::ContextCleared {
+                reason: reason.clone(),
             },
         )),
         AgentEvent::Callout {

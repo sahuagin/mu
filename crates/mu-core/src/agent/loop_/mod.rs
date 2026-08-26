@@ -191,6 +191,14 @@ pub enum AgentInput {
     /// keep the session alive for subsequent ask_sessions. Distinct
     /// from `Cancel`, which terminates the entire agent loop.
     CancelOutstanding { reason: String },
+    /// mu-lzkv6: drop the session's conversation history and tool-call
+    /// memory IN PLACE — session id, event log, WAL, grants, and system
+    /// prompt all stay (prompt + tool schemas are assembled per-request,
+    /// so the next ask starts launch-time fresh). The event log records
+    /// a ContextCleared marker; continuation/resume projections restart
+    /// history from the latest marker, so past events stay on disk and
+    /// queryable without re-entering the model's context.
+    ClearContext { reason: String },
     /// mu-036 Phase B: transition the session into RunMode::Autonomous
     /// with `goal` + `options`. The daemon's
     /// `handle_start_autonomous` constructs this after checking the
@@ -298,6 +306,10 @@ impl std::fmt::Debug for AgentInput {
                 .debug_struct("CancelOutstanding")
                 .field("reason", reason)
                 .finish(),
+            Self::ClearContext { reason } => f
+                .debug_struct("ClearContext")
+                .field("reason", reason)
+                .finish(),
             Self::StartAutonomous { goal, options } => f
                 .debug_struct("StartAutonomous")
                 .field("goal", goal)
@@ -344,6 +356,12 @@ impl std::fmt::Debug for AgentInput {
 pub enum AgentEvent {
     AgentStart,
     TurnStart,
+    /// mu-lzkv6: the loop applied a ClearContext input — history and
+    /// tool memory dropped, session continuous. The forwarder appends
+    /// the durable ContextCleared marker from this.
+    ContextCleared {
+        reason: String,
+    },
     MessageStart {
         message: AgentMessage,
     },
@@ -1258,6 +1276,14 @@ async fn run_inner(
             match input {
                 AgentInput::Cancel => return Outcome::Cancelled,
                 AgentInput::CancelOutstanding { .. } => {}
+                AgentInput::ClearContext { reason } => {
+                    // mu-lzkv6: in-place context reset. History and tool
+                    // memory drop; session/WAL/grants/system prompt stay
+                    // (prompt + schemas are assembled per-request).
+                    messages.clear();
+                    tool_history.clear();
+                    let _ = events.send(AgentEvent::ContextCleared { reason }).await;
+                }
                 AgentInput::SwitchProvider {
                     provider: new,
                     provider_kind: new_kind,
@@ -1409,6 +1435,15 @@ async fn run_inner(
                 return Outcome::Cancelled;
             }
             Action::External(AgentInput::CancelOutstanding { .. }) => {
+                continue;
+            }
+            Action::External(AgentInput::ClearContext { reason }) => {
+                // mu-lzkv6: same reset as the idle-drain arm — a clear
+                // that arrived mid-round (buffered during tool execution)
+                // applies before the next model call.
+                messages.clear();
+                tool_history.clear();
+                let _ = events.send(AgentEvent::ContextCleared { reason }).await;
                 continue;
             }
             Action::External(AgentInput::SwitchProvider {
@@ -2636,6 +2671,12 @@ async fn run_inner(
                     match input {
                         AgentInput::Cancel => return Outcome::Cancelled,
                         AgentInput::CancelOutstanding { .. } => {}
+                        AgentInput::ClearContext { reason } => {
+                            // mu-lzkv6: same reset as the idle-drain arm.
+                            messages.clear();
+                            tool_history.clear();
+                            let _ = events.send(AgentEvent::ContextCleared { reason }).await;
+                        }
                         AgentInput::SwitchProvider {
                             provider: new,
                             provider_kind: new_kind,

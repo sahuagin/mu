@@ -836,6 +836,27 @@ pub fn default_max_turns_for(provider_kind: &str) -> u32 {
     }
 }
 
+/// mu-lzkv6 clear-race fix: apply a context clear, PRESERVING any trailing
+/// not-yet-answered user messages. An ask accepted just before the clear
+/// has already appended its user message; wiping it sends the provider an
+/// empty (or ragged) conversation — observed as a vllm 400 "Cannot apply
+/// chat template to an empty conversation" when a clear raced two queued
+/// asks. Semantics: history dies, pending questions survive and get
+/// answered on the fresh context. The continuation projection applies the
+/// same rule at the ContextCleared marker so live context and replay agree.
+fn apply_context_clear(
+    messages: &mut Vec<AgentMessage>,
+    tool_history: &mut execute_tools::ToolHistory,
+) {
+    let tail_users = messages
+        .iter()
+        .rev()
+        .take_while(|m| matches!(m, AgentMessage::User { .. }))
+        .count();
+    messages.drain(..messages.len() - tail_users);
+    tool_history.clear();
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
     Done(StopReason),
@@ -1229,6 +1250,16 @@ async fn run_inner(
     // with the continuation projection of its predecessor's log; a fresh
     // session starts empty (the default — seed_messages is `Vec::new()`).
     let mut messages: Vec<AgentMessage> = config.seed_messages.clone();
+    // mu-lzkv6 clear-leak fix: context epoch. A ClearContext bumps it;
+    // compaction state (the baseline rope and any in-flight background
+    // compaction) belongs to the epoch it was captured in and must never
+    // survive into the next — the baseline holds the full pre-clear
+    // conversation, so installing or reusing it after a clear silently
+    // resurrects the cleared context (observed: /clear on a resumed
+    // session kept sending the poisoned 138k rope while the message vec
+    // said 1).
+    let mut context_epoch: u64 = 0;
+    let mut bg_compaction_epoch: u64 = 0;
     let mut queue: VecDeque<Action> = VecDeque::new();
     let mut turn_count: u32 = 0;
     // mu-rb4u: consecutive actionless (empty / reasoning-only) turns since
@@ -1280,8 +1311,12 @@ async fn run_inner(
                     // mu-lzkv6: in-place context reset. History and tool
                     // memory drop; session/WAL/grants/system prompt stay
                     // (prompt + schemas are assembled per-request).
-                    messages.clear();
-                    tool_history.clear();
+                    // Trailing unanswered user messages survive (clear-race
+                    // fix — see apply_context_clear).
+                    apply_context_clear(&mut messages, &mut tool_history);
+                    compaction_baseline = None;
+                    feedback_anchor = None;
+                    context_epoch += 1;
                     let _ = events.send(AgentEvent::ContextCleared { reason }).await;
                 }
                 AgentInput::SwitchProvider {
@@ -1440,9 +1475,12 @@ async fn run_inner(
             Action::External(AgentInput::ClearContext { reason }) => {
                 // mu-lzkv6: same reset as the idle-drain arm — a clear
                 // that arrived mid-round (buffered during tool execution)
-                // applies before the next model call.
-                messages.clear();
-                tool_history.clear();
+                // applies before the next model call. Trailing unanswered
+                // user messages survive (clear-race fix).
+                apply_context_clear(&mut messages, &mut tool_history);
+                compaction_baseline = None;
+                feedback_anchor = None;
+                context_epoch += 1;
                 let _ = events.send(AgentEvent::ContextCleared { reason }).await;
                 continue;
             }
@@ -1982,7 +2020,14 @@ async fn run_inner(
                 let cache_strategy = provider.cache_strategy();
 
                 if let Some(Some(complete)) = bg_compaction.try_take().await {
-                    {
+                    // mu-lzkv6: a completion spawned before a ClearContext
+                    // describes the CLEARED conversation — installing it
+                    // would resurrect the cleared context. Drop it.
+                    if bg_compaction_epoch != context_epoch {
+                        tracing::debug!(
+                            "dropping stale background compaction from a pre-clear epoch"
+                        );
+                    } else {
                         let policy_label = provider.compaction_policy().policy_label().to_owned();
                         let tokens_after = renderer.estimate_tokens(&complete.result.rope);
                         let _ = events
@@ -2240,6 +2285,7 @@ async fn run_inner(
                     // `target_tokens` (the post-compaction goal) is
                     // computed above and shared with the reservation cap.
                     if policy.is_async() && bg_compaction.can_start() {
+                        bg_compaction_epoch = context_epoch;
                         bg_compaction.start(
                             policy.clone(),
                             rope.clone(),
@@ -2673,8 +2719,10 @@ async fn run_inner(
                         AgentInput::CancelOutstanding { .. } => {}
                         AgentInput::ClearContext { reason } => {
                             // mu-lzkv6: same reset as the idle-drain arm.
-                            messages.clear();
-                            tool_history.clear();
+                            apply_context_clear(&mut messages, &mut tool_history);
+                            compaction_baseline = None;
+                            feedback_anchor = None;
+                            context_epoch += 1;
                             let _ = events.send(AgentEvent::ContextCleared { reason }).await;
                         }
                         AgentInput::SwitchProvider {

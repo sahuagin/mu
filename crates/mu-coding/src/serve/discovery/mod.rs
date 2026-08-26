@@ -183,6 +183,9 @@ pub fn derive_status_from_events(
             // mu-k56u: provider switch is an identity change, not
             // a status-driving event.
             | EventPayload::ProviderSwitched { .. }
+            // mu-lzkv6: clear marker is history bookkeeping, not
+            // status-driving.
+            | EventPayload::ContextCleared { .. }
             // mu-slat: worker lifecycle events are supervisor-side
             // bookkeeping, not session-status-driving.
             | EventPayload::WorkerSpawned { .. }

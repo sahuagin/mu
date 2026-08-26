@@ -297,6 +297,9 @@ pub fn extract_per_session_metric_segments(events: &[SessionEvent]) -> Vec<PerSe
             // mu-recall-provenance-audit-vnc9.1: recall provenance
             // refs are context-composition audit, not usage/timing.
             | EventPayload::RecallProvenance { .. }
+            // mu-lzkv6: a context-clear marker is history bookkeeping,
+            // not a usage/timing signal.
+            | EventPayload::ContextCleared { .. }
             // mu-slat: worker lifecycle events are supervisor-side
             // bookkeeping, not per-call usage signals.
             | EventPayload::WorkerSpawned { .. }

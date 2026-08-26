@@ -422,7 +422,8 @@ pub(crate) async fn handle_invoke_llm(
                     | Some(input @ AgentInput::SwitchProvider { .. })
                     | Some(input @ AgentInput::WatchCompleted { .. })
                     | Some(input @ AgentInput::DialogueMessage { .. })
-                    | Some(input @ AgentInput::MailboxMessage { .. }) => {
+                    | Some(input @ AgentInput::MailboxMessage { .. })
+                    | Some(input @ AgentInput::ClearContext { .. }) => {
                         buffered.push(input);
                     }
                     None => {

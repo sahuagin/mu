@@ -415,6 +415,7 @@ fn kind(event: &AgentEvent) -> &'static str {
     match event {
         AgentEvent::AgentStart => "agent_start",
         AgentEvent::TurnStart => "turn_start",
+        AgentEvent::ContextCleared { .. } => "context_cleared",
         AgentEvent::MessageStart { .. } => "message_start",
         AgentEvent::TextDelta { .. } => "text_delta",
         AgentEvent::ThinkingDelta { .. } => "thinking_delta",

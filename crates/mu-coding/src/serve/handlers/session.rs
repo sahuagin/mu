@@ -1237,6 +1237,36 @@ pub async fn handle_cancel_outstanding(
     }
 }
 
+/// mu-lzkv6: session.clear_context — deliver AgentInput::ClearContext to
+/// the session's loop. The loop drops history + tool memory and emits
+/// the durable ContextCleared marker; session stays alive and continuous.
+pub async fn handle_clear_context(request: Request<Value>, sessions: Sessions) -> Response<Value> {
+    let params: mu_core::protocol::ClearContextRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "clear_context: invalid params"
+    );
+    match sessions.input_sender(&params.session_id) {
+        None => err_response(
+            request.id,
+            codes::INVALID_PARAMS,
+            format!("session not found: {}", params.session_id),
+        ),
+        Some(tx) => {
+            let reason = params
+                .reason
+                .unwrap_or_else(|| "client request".to_string());
+            let cleared = tx
+                .send(mu_core::agent::AgentInput::ClearContext { reason })
+                .await
+                .is_ok();
+            let resp = mu_core::protocol::ClearContextResponse { cleared };
+            ok_response(request.id, to_value_or_null(resp))
+        }
+    }
+}
+
 pub fn handle_session_stats(request: Request<Value>, sessions: Sessions) -> Response<Value> {
     let params: SessionStatsRequest = ok_or_respond!(
         serde_json::from_value(request.params.clone()),

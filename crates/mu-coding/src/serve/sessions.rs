@@ -27,12 +27,12 @@ use super::provider_status::{ProviderCallState, ProviderStatusTracker};
 /// Per-session state held by the daemon.
 struct SessionState {
     input_tx: mpsc::Sender<AgentInput>,
-    /// Forwarder task handle. Stored to keep it conceptually owned by
-    /// the session; tokio spawned tasks run regardless of whether
-    /// JoinHandle is held, but storage documents lifetime intent.
-    _forwarder: JoinHandle<()>,
-    /// Wrapper around the agent loop's JoinHandle. Same intent.
-    _agent: JoinHandle<()>,
+    /// Labeled task guards — the agent loop and forwarder handles, in
+    /// dataflow order (bead mu-0xhja). Close runs these (bounded await,
+    /// then abort) instead of dropping handles and trusting the
+    /// channel-closure cascade; `labels()` answers "what is this session
+    /// still holding?" without forensics.
+    guards: super::guards::SessionGuards,
     /// Per-session durable-ish event log. v1 is in-memory; future
     /// work persists. The forwarder appends; readers (cumulative
     /// usage queries, future replay) snapshot via the log's own
@@ -145,6 +145,12 @@ pub struct Sessions {
     inner: Arc<Mutex<HashMap<String, SessionState>>>,
     workers: Arc<Mutex<HashMap<String, SubprocessSession>>>,
     rehydrated: Arc<Mutex<HashMap<String, RehydratedSession>>>,
+    /// Closed sessions whose tasks are still draining (bead mu-0xhja):
+    /// session id → guard labels not yet joined. The detached supervisor
+    /// spawned at close keeps this current; [`Self::guard_labels`] reads
+    /// it so a wedged task stays visible after close instead of vanishing
+    /// with the registry entry.
+    draining: super::guards::DrainingMap,
     /// On-disk events root. Not hardcoded here — it's resolved elsewhere
     /// and handed in at construction: `serve::resolve_events_dir(config)`
     /// derives it from `[session].state_dir` (overridable) and
@@ -174,6 +180,7 @@ pub struct WeakSessions {
     inner: Weak<Mutex<HashMap<String, SessionState>>>,
     workers: Weak<Mutex<HashMap<String, SubprocessSession>>>,
     rehydrated: Weak<Mutex<HashMap<String, RehydratedSession>>>,
+    draining: Weak<Mutex<HashMap<String, Vec<&'static str>>>>,
     events_dir: Option<PathBuf>,
 }
 
@@ -186,6 +193,7 @@ impl WeakSessions {
             inner: self.inner.upgrade()?,
             workers: self.workers.upgrade()?,
             rehydrated: self.rehydrated.upgrade()?,
+            draining: self.draining.upgrade()?,
             events_dir: self.events_dir.clone(),
         })
     }
@@ -256,6 +264,7 @@ impl Sessions {
             inner: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
             rehydrated: Arc::new(Mutex::new(HashMap::new())),
+            draining: Arc::new(Mutex::new(HashMap::new())),
             events_dir,
         }
     }
@@ -268,6 +277,7 @@ impl Sessions {
             inner: Arc::downgrade(&self.inner),
             workers: Arc::downgrade(&self.workers),
             rehydrated: Arc::downgrade(&self.rehydrated),
+            draining: Arc::downgrade(&self.draining),
             events_dir: self.events_dir.clone(),
         }
     }
@@ -289,8 +299,15 @@ impl Sessions {
                 id,
                 SessionState {
                     input_tx: new.input_tx,
-                    _forwarder: new.forwarder,
-                    _agent: new.agent,
+                    // Dataflow order: the agent loop is the source (it owns
+                    // the event sender), the forwarder is the sink; disposal
+                    // awaits them in this order (see guards.rs module docs).
+                    guards: {
+                        let mut guards = super::guards::SessionGuards::new();
+                        guards.push_task("agent-loop", new.agent);
+                        guards.push_task("forwarder", new.forwarder);
+                        guards
+                    },
                     event_log: new.event_log,
                     pending_approvals: new.pending_approvals,
                     parent_session_id: new.parent_session_id,
@@ -842,15 +859,23 @@ impl Sessions {
     }
 
     /// Remove a session and its worker / ghost entries, returning whether
-    /// anything was removed. Async + named `*_with_teardown` because it used
-    /// to also tear down a per-session dialogue poller; that poller was
-    /// removed in mu-rkhj (the inbound dialogue path is being rebuilt as a
-    /// server→daemon push), leaving this equivalent to [`remove`](Self::remove).
+    /// anything was removed. For a live session: drop the state (closing
+    /// the input channel, which asks the tasks to stop), then hand the
+    /// task guards to the detached supervisor — see `guards.rs`. Returns
+    /// immediately; still-draining tasks stay visible via
+    /// [`Self::guard_labels`].
     pub async fn remove_with_teardown(&self, id: &str) -> bool {
-        let live = match self.inner.lock() {
-            Ok(mut map) => map.remove(id).is_some(),
-            Err(_) => false,
+        let taken = match self.inner.lock() {
+            Ok(mut map) => map.remove(id),
+            Err(_) => None,
         };
+        let live = taken.is_some();
+        if let Some(state) = taken {
+            // Partial move: keep the guards, drop everything else NOW —
+            // input_tx closing is what asks the agent loop to finish.
+            let SessionState { guards, .. } = state;
+            guards.supervise(id.to_string(), Arc::clone(&self.draining));
+        }
         let worker = match self.workers.lock() {
             Ok(mut map) => map.remove(id).is_some(),
             Err(_) => false,
@@ -860,6 +885,24 @@ impl Sessions {
             Err(_) => false,
         };
         live || worker || ghost
+    }
+
+    /// The live guard labels for a session, in registration order — the
+    /// "what is this session still holding?" diagnostic (bead mu-0xhja).
+    /// Live sessions report their registered guards; a CLOSED session
+    /// whose tasks are still draining reports the not-yet-joined labels
+    /// until the supervisor finishes. `None` once nothing is running.
+    pub fn guard_labels(&self, id: &str) -> Option<Vec<&'static str>> {
+        if let Some(labels) = self
+            .inner
+            .lock()
+            .ok()?
+            .get(id)
+            .map(|state| state.guards.labels())
+        {
+            return Some(labels);
+        }
+        self.draining.lock().ok()?.get(id).cloned()
     }
 
     /// mu-slat: insert a spawned worker subprocess session.
@@ -947,6 +990,61 @@ mod tests {
         assert!(sessions.input_sender(&id).is_none());
         assert!(sessions.event_log(&id).is_none());
         assert!(!sessions.remove(&id));
+    }
+
+    #[tokio::test]
+    async fn close_never_waits_and_wedged_tasks_stay_visible() {
+        // bead mu-0xhja (no-timer rework): close acks immediately, never
+        // kills anything, and tasks that keep running after close remain
+        // inspectable via guard_labels until they actually finish.
+        let sessions = Sessions::new();
+        let id = "wedged-session".to_string();
+        let (tx, _rx) = mpsc::channel::<AgentInput>(1);
+        sessions.insert(
+            id.clone(),
+            NewSession {
+                input_tx: tx,
+                forwarder: tokio::spawn(async {
+                    std::future::pending::<()>().await;
+                }),
+                agent: tokio::spawn(async {
+                    std::future::pending::<()>().await;
+                }),
+                event_log: Arc::new(SessionEventLog::new(id.clone())),
+                pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+                parent_session_id: None,
+                capability: Arc::new(Mutex::new(Capability::root())),
+                cache_ttl: CacheTtl::default(),
+                provider_status: Arc::new(Mutex::new(ProviderStatusTracker::new())),
+                mailbox: Arc::new(MailboxState::new()),
+                status_watch: None,
+                autonomy_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                live_context_soft_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                live_discover_hints: None,
+            },
+        );
+        assert_eq!(
+            sessions.guard_labels(&id),
+            Some(vec!["agent-loop", "forwarder"]),
+            "dataflow-ordered labels visible on a live session"
+        );
+        let start = std::time::Instant::now();
+        assert!(sessions.remove_with_teardown(&id).await);
+        // NO timer, NO abort: close returns immediately regardless of
+        // wedged tasks — the drain is a detached supervisor's problem.
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(200),
+            "close never waits on the drain"
+        );
+        // The wedged tasks stay VISIBLE after close (draining registry)
+        // instead of being killed on a clock or vanishing with the entry.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            sessions.guard_labels(&id),
+            Some(vec!["agent-loop", "forwarder"]),
+            "still-draining tasks remain queryable after close"
+        );
+        assert!(sessions.input_sender(&id).is_none());
     }
 
     #[tokio::test]

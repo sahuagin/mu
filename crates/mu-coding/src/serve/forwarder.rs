@@ -298,6 +298,12 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
         // client handles its own display; the durable marker is the
         // to_log_event mapping.
         | AgentEvent::ContextCleared { .. }
+        // mu-roz1e: the Interjected marker is a transient signal with no
+        // wire notification and no separate durable row. The interjection's
+        // message content reaches clients via the durable log (to_log_event
+        // records it as a UserMessage via MessageEnd), not via a dedicated
+        // wire notification.
+        | AgentEvent::Interjected { .. }
         | AgentEvent::ProviderSwitched { .. } => None,
     }
 }
@@ -930,6 +936,11 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
         | AgentEvent::AgentStart
         | AgentEvent::TurnStart
         | AgentEvent::TurnEnd
+        // mu-roz1e: the interjection's message is already durably recorded
+        // via its MessageEnd (UserMessage payload); the Interjected marker
+        // is a transient signal that the message joined an ACTIVE ask's
+        // context (vs. a fresh ask) — no separate durable row.
+        | AgentEvent::Interjected { .. }
         // InputRequired is a transient wire-level prompt; the
         // resulting ToolCall (approved) or ToolResult (denied)
         // already lands in the log.

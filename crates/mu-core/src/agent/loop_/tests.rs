@@ -425,6 +425,7 @@ fn kind(event: &AgentEvent) -> &'static str {
         AgentEvent::ToolCallDelta { .. } => "tool_call_delta",
         AgentEvent::ToolCallCompleted { .. } => "tool_call_completed",
         AgentEvent::MessageEnd { .. } => "message_end",
+        AgentEvent::Interjected { .. } => "interjected",
         AgentEvent::TurnEnd => "turn_end",
         AgentEvent::Done { .. } => "done",
         AgentEvent::Error { .. } => "error",
@@ -1269,14 +1270,16 @@ async fn b7_user_message_during_tool_pushes_to_back() {
         .expect("missing tool_call_completed");
 
     // The MessageStart for the "second" user message must come AFTER
-    // tool_call_completed.
+    // tool_call_completed. mu-roz1e: a mid-tool interjection is INJECTED
+    // into the current ask's context (wrapped as a mid-turn correction), so
+    // the content is the wrapper + "second", not the bare "second".
     let second_user_idx = events
         .iter()
         .enumerate()
         .find_map(|(i, e)| match e {
             AgentEvent::MessageStart {
                 message: AgentMessage::User { content },
-            } if content == "second" => Some(i),
+            } if content.contains("second") => Some(i),
             _ => None,
         })
         .expect("missing MessageStart for 'second'");
@@ -1287,9 +1290,19 @@ async fn b7_user_message_during_tool_pushes_to_back() {
         tool_completed_idx
     );
 
-    // The next TurnStart after second_user_idx must be from the second
-    // InvokeLlm (which sees both the tool result and the second user
-    // message). That TurnStart must appear AFTER second's MessageEnd.
+    // mu-roz1e: the interjection was injected mid-turn (an `interjected`
+    // event fired), not deferred to a fresh ask.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Interjected { .. })),
+        "mid-tool interjection must emit an interjected event"
+    );
+
+    // The next TurnStart after second_user_idx must be from the
+    // continuation InvokeLlm (which sees both the tool result and the
+    // injected interjection). That TurnStart must appear AFTER second's
+    // MessageEnd.
     let second_user_end_idx = events
         .iter()
         .enumerate()
@@ -1297,7 +1310,7 @@ async fn b7_user_message_during_tool_pushes_to_back() {
         .find_map(|(i, e)| match e {
             AgentEvent::MessageEnd {
                 message: AgentMessage::User { content },
-            } if content == "second" => Some(i),
+            } if content.contains("second") => Some(i),
             _ => None,
         })
         .expect("missing MessageEnd for 'second'");
@@ -1725,6 +1738,109 @@ async fn wf5w_buffered_um_does_not_suppress_done() {
     );
 }
 
+/// mu-roz1e: an operator interjection that arrives at a turn boundary (between
+/// tool-call iterations) DURING an active response is injected into the
+/// current ask's context — the model sees it on the next iteration — instead
+/// of being deferred to a fresh ask. Pre-fix, the interjection became a
+/// separate ask (its own `Done` terminus) and the agent had already gone down
+/// the wrong path.
+///
+/// Scenario: ask one → tool call (delayed) → interjection arrives while the
+/// tool runs (buffered) → tool completes → interjection injected → second
+/// provider call (the model "sees" the steer) → text answer. The whole thing
+/// is ONE ask: a single `Done` terminus, and the interjection's message lands
+/// in context BEFORE the second provider call.
+#[tokio::test]
+async fn roz1e_mid_tool_interjection_injected_into_current_ask() {
+    let provider = MockProvider::new(vec![
+        // Turn 1: the model issues a tool call.
+        vec![ProviderEvent::Done(assistant_tool_msg("t1", "echo"))],
+        // Turn 2: after the tool + the injected interjection, the model
+        // answers with text (it "saw" the steer).
+        vec![
+            ProviderEvent::TextDelta("steered".into()),
+            ProviderEvent::Done(assistant_text("steered")),
+        ],
+    ]);
+    // A delayed tool so the interjection can land while it runs (buffered
+    // during ExecuteTools' input drain).
+    let tools = vec![MockTool::delayed(
+        "echo",
+        "echoed",
+        Duration::from_millis(120),
+    )];
+
+    let (loop_, events_rx) = spawn_loop(provider, tools, AgentConfig::default());
+
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("do the thing"),
+            None,
+            None,
+        ))
+        .await
+        .expect("send ask");
+    // Let the loop enter the tool execution, then race the interjection in:
+    // it lands in handle_execute_tools' `buffered`.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("actually, steer left"),
+            None,
+            None,
+        ))
+        .await
+        .expect("send interjection");
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+
+    let kinds: Vec<&str> = events.iter().map(kind).collect();
+
+    // ONE ask: exactly one `done` terminus (the interjection did NOT start a
+    // fresh ask with its own Done).
+    let done_count = kinds.iter().filter(|k| **k == "done").count();
+    assert_eq!(done_count, 1, "one ask, one done; kinds={kinds:?}");
+
+    // The interjection was injected: an `interjected` event fired.
+    assert!(
+        kinds.iter().any(|k| *k == "interjected"),
+        "interjection must emit an interjected event; kinds={kinds:?}"
+    );
+
+    // Ordering: the interjection's message_start lands AFTER the tool result
+    // (turn_end of turn 1) and BEFORE the second provider call (turn_start of
+    // turn 2) — i.e. it is in context for the model's next iteration.
+    let turn_ends: Vec<usize> = kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| **k == "turn_end")
+        .map(|(i, _)| i)
+        .collect();
+    assert!(turn_ends.len() >= 2, "two turns expected; kinds={kinds:?}");
+    let first_turn_end = turn_ends[0];
+    let second_turn_start = kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| **k == "turn_start")
+        .nth(1)
+        .map(|(i, _)| i)
+        .expect("no second turn_start");
+    let interjected_idx = kinds
+        .iter()
+        .position(|k| *k == "interjected")
+        .expect("no interjected event");
+    assert!(
+        first_turn_end < interjected_idx && interjected_idx < second_turn_start,
+        "interjection must land between turn 1's end and turn 2's start; \
+         first_turn_end={first_turn_end} interjected={interjected_idx} \
+         second_turn_start={second_turn_start} kinds={kinds:?}"
+    );
+}
+
 /// mu-loop-buffered-switchprovider-drop-425f: a provider switch sent while an
 /// LLM stream is in progress is buffered by handle_invoke_llm. It must still be
 /// applied after the current ask terminates, before a buffered follow-up ask
@@ -1873,7 +1989,7 @@ fn assistant_tool_msg(id: &str, name: &str) -> AssistantMessage {
 
 #[test]
 fn plan_post_invoke_llm_text_only_no_buffered() {
-    let plan = plan_post_invoke_llm(&assistant_text_msg("done"), vec![]);
+    let plan = plan_post_invoke_llm(&assistant_text_msg("done"), vec![], 0);
     assert!(plan.emit_turn_end);
     assert_eq!(plan.actions.len(), 1);
     assert!(matches!(plan.actions[0], Action::MaybeFinish));
@@ -1882,7 +1998,7 @@ fn plan_post_invoke_llm_text_only_no_buffered() {
 #[test]
 fn plan_post_invoke_llm_text_only_with_buffered() {
     let buffered = vec![AgentInput::UserMessage(user_msg("more"), None, None)];
-    let plan = plan_post_invoke_llm(&assistant_text_msg("ok"), buffered);
+    let plan = plan_post_invoke_llm(&assistant_text_msg("ok"), buffered, 0);
     // mu-wf5w: MaybeFinish comes FIRST so the completed ask emits its
     // `done` terminus before the buffered UM starts the next ask. The
     // pre-fix shape (External only, no MaybeFinish) suppressed the
@@ -1899,7 +2015,7 @@ fn plan_post_invoke_llm_text_only_with_buffered() {
 
 #[test]
 fn plan_post_invoke_llm_with_tools_no_buffered() {
-    let plan = plan_post_invoke_llm(&assistant_tool_msg("t1", "echo"), vec![]);
+    let plan = plan_post_invoke_llm(&assistant_tool_msg("t1", "echo"), vec![], 0);
     // TurnEnd defers until ExecuteTools completes.
     assert!(!plan.emit_turn_end);
     assert_eq!(plan.actions.len(), 1);
@@ -1915,22 +2031,23 @@ fn plan_post_invoke_llm_with_tools_no_buffered() {
 
 #[test]
 fn plan_post_invoke_llm_with_tools_and_buffered() {
-    // Tool calls + buffered UMs: both go on the queue, ExecuteTools
-    // first so tools run before the user's queued message is
-    // processed.
+    // Tool calls + a buffered driver input (operator interjection that
+    // arrived during the stream): ExecuteTools first, then the interjection
+    // is INJECTED into the current ask's context (mu-roz1e) so the model
+    // sees it on the next iteration — not deferred to a fresh ask.
     let buffered = vec![AgentInput::UserMessage(user_msg("inject"), None, None)];
-    let plan = plan_post_invoke_llm(&assistant_tool_msg("t1", "echo"), buffered);
+    let plan = plan_post_invoke_llm(&assistant_tool_msg("t1", "echo"), buffered, 0);
     assert_eq!(plan.actions.len(), 2);
     assert!(matches!(plan.actions[0], Action::ExecuteTools(_)));
     assert!(matches!(
         plan.actions[1],
-        Action::External(AgentInput::UserMessage(..))
+        Action::Interject(AgentInput::UserMessage(..), _)
     ));
 }
 
 #[test]
 fn plan_post_execute_tools_basic() {
-    let actions = plan_post_execute_tools(vec![], false);
+    let actions = plan_post_execute_tools(vec![], false, 0);
     assert_eq!(actions.len(), 1);
     assert!(matches!(actions[0], Action::InvokeLlm));
 }
@@ -1940,7 +2057,7 @@ fn plan_post_execute_tools_basic() {
 
 #[test]
 fn plan_post_execute_tools_all_ends_turn_finishes_instead_of_reinvoking() {
-    let actions = plan_post_execute_tools(vec![], true);
+    let actions = plan_post_execute_tools(vec![], true, 0);
     assert_eq!(actions.len(), 1);
     assert!(matches!(actions[0], Action::MaybeFinish));
 }
@@ -1951,7 +2068,7 @@ fn plan_post_execute_tools_all_ends_turn_finishes_before_buffered() {
     // completed ask emits `done` before any buffered input starts the
     // next ask.
     let buffered = vec![AgentInput::UserMessage(user_msg("next"), None, None)];
-    let actions = plan_post_execute_tools(buffered, true);
+    let actions = plan_post_execute_tools(buffered, true, 0);
     assert_eq!(actions.len(), 2);
     assert!(matches!(actions[0], Action::MaybeFinish));
     assert!(matches!(
@@ -1966,24 +2083,81 @@ fn plan_post_execute_tools_all_ends_turn_finishes_before_buffered() {
 
 #[test]
 fn plan_post_execute_tools_preserves_buffered_fifo_before_continuation() {
+    // Non-driver inputs (ScheduleWakeup) keep their baseline External
+    // position so their context and command tickets land before the
+    // continuation. StartAutonomous has its own turn-boundary deferral
+    // guard and cannot add a duplicate invocation.
     let buffered = vec![
-        AgentInput::UserMessage(user_msg("first"), None, None),
-        AgentInput::UserMessage(user_msg("second"), None, None),
+        AgentInput::ScheduleWakeup {
+            wake_at_unix_ms: 1000,
+            reason: "test".into(),
+        },
+        AgentInput::ScheduleWakeup {
+            wake_at_unix_ms: 2000,
+            reason: "test2".into(),
+        },
     ];
-    let actions = plan_post_execute_tools(buffered, false);
-    // Buffered inputs keep their baseline FIFO position so their context and
-    // command tickets land before the continuation. StartAutonomous has its
-    // own turn-boundary deferral guard and cannot add a duplicate invocation.
+    let actions = plan_post_execute_tools(buffered, false, 0);
     assert_eq!(actions.len(), 3);
     assert!(matches!(
         actions[0],
-        Action::External(AgentInput::UserMessage(..))
+        Action::External(AgentInput::ScheduleWakeup { .. })
     ));
+    assert!(matches!(
+        actions[1],
+        Action::External(AgentInput::ScheduleWakeup { .. })
+    ));
+    assert!(matches!(actions[2], Action::InvokeLlm));
+}
+
+// ── mu-roz1e: a turn-boundary interjection is injected into the current
+// ask's context (Interject) instead of deferred to a fresh ask. ──
+
+#[test]
+fn plan_post_execute_tools_interjected_user_injected_into_current_ask() {
+    // A buffered UserMessage that arrived at a turn boundary during an active
+    // response (interjected=true) becomes an Interject action, not an
+    // External — it joins the current ask's context, and the continuation
+    // InvokeLlm follows so the model sees it on the next iteration.
+    let buffered = vec![AgentInput::UserMessage(user_msg("steer"), None, None)];
+    let actions = plan_post_execute_tools(buffered, false, 0);
+    assert_eq!(actions.len(), 2);
+    assert!(matches!(
+        actions[0],
+        Action::Interject(AgentInput::UserMessage(..), _)
+    ));
+    assert!(matches!(actions[1], Action::InvokeLlm));
+}
+
+#[test]
+fn plan_post_execute_tools_interjected_watch_injected() {
+    // A WatchCompleted interjection is also injected (it drives the model).
+    let buffered = vec![AgentInput::WatchCompleted {
+        note: "CI".into(),
+        summary: "passed".into(),
+    }];
+    let actions = plan_post_execute_tools(buffered, false, 0);
+    assert_eq!(actions.len(), 2);
+    assert!(matches!(
+        actions[0],
+        Action::Interject(AgentInput::WatchCompleted { .. }, _)
+    ));
+    assert!(matches!(actions[1], Action::InvokeLlm));
+}
+
+#[test]
+fn plan_post_execute_tools_interjected_all_ends_turn_still_finishes() {
+    // all_ends_turn wins: the ask completes (MaybeFinish) and the buffered
+    // input is deferred (External) — interjection does not apply to an
+    // ends-turn round (there is no continuation InvokeLlm to inject into).
+    let buffered = vec![AgentInput::UserMessage(user_msg("next"), None, None)];
+    let actions = plan_post_execute_tools(buffered, true, 0);
+    assert_eq!(actions.len(), 2);
+    assert!(matches!(actions[0], Action::MaybeFinish));
     assert!(matches!(
         actions[1],
         Action::External(AgentInput::UserMessage(..))
     ));
-    assert!(matches!(actions[2], Action::InvokeLlm));
 }
 
 #[test]

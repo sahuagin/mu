@@ -153,6 +153,64 @@ pub fn detect_emission_strategy() -> (EmissionStrategy, &'static str) {
     select_emission_strategy(force.as_deref(), std::env::var_os("ZELLIJ").is_some())
 }
 
+/// Where viewport escape output goes (bead mu-afwxa slice 1).
+///
+/// `Terminal` is the production path — a fresh `io::stdout()` handle per
+/// emission, byte-for-byte the pre-headless behavior. `Memory` collects the
+/// exact same bytes into a shared buffer so tests can drive the full
+/// viewport lifecycle (insert_before / set_height / flush) without a TTY;
+/// the in-memory `history` mirror is then the semantic assertion surface.
+#[derive(Clone)]
+enum OutTarget {
+    Terminal,
+    Memory(std::sync::Arc<std::sync::Mutex<Vec<u8>>>),
+}
+
+/// Per-emission writer handle. Mirrors the old `let mut stdout =
+/// io::stdout()` pattern — a fresh value per call, so no borrow of `self`
+/// is held across an emission body.
+enum OutHandle {
+    Terminal(std::io::Stdout),
+    Memory(std::sync::Arc<std::sync::Mutex<Vec<u8>>>),
+}
+
+impl Write for OutHandle {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            OutHandle::Terminal(s) => s.write(buf),
+            OutHandle::Memory(m) => {
+                m.lock()
+                    .map_err(|_| io::Error::other("headless sink mutex poisoned"))?
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            OutHandle::Terminal(s) => s.flush(),
+            OutHandle::Memory(_) => Ok(()),
+        }
+    }
+}
+
+/// Where the screen dimensions come from. Terminal mode queries live on
+/// every use (resizes are picked up); headless mode is a fixed size — a
+/// headless "terminal" never resizes mid-test unless the test says so.
+enum ScreenSource {
+    Terminal,
+    Fixed(u16, u16),
+}
+
+impl ScreenSource {
+    fn size(&self) -> io::Result<(u16, u16)> {
+        match self {
+            ScreenSource::Terminal => terminal::size(),
+            ScreenSource::Fixed(cols, rows) => Ok((*cols, *rows)),
+        }
+    }
+}
+
 /// A minimal terminal that manages a dynamically-sized inline viewport.
 /// Content above the viewport lives in native terminal scrollback.
 pub struct DynamicViewport {
@@ -188,6 +246,10 @@ pub struct DynamicViewport {
     /// How insert_before emits escape sequences. Read from the
     /// environment exactly once, in `new` (mu-solo-zellij-blank-band-ptvm).
     strategy: EmissionStrategy,
+    /// Escape-output destination (terminal vs headless memory sink).
+    out: OutTarget,
+    /// Screen-size source (live terminal queries vs fixed headless size).
+    screen: ScreenSource,
 }
 
 impl DynamicViewport {
@@ -252,11 +314,88 @@ impl DynamicViewport {
             gap_rows: 0,
             journal,
             strategy,
+            out: OutTarget::Terminal,
+            screen: ScreenSource::Terminal,
         };
         // Make the selection visible in the flight recorder so a band
         // report can be correlated with the path that produced it.
         vp.journal_strategy(strategy_reason);
         Ok(vp)
+    }
+
+    /// Create a headless viewport for tests: a fixed `cols`×`rows` screen,
+    /// escape output captured into a memory sink instead of a TTY, the
+    /// viewport bottom-anchored (the steady in-session state). No journal,
+    /// and the strategy is a parameter — never environment-derived — so
+    /// tests are deterministic (bead mu-afwxa slice 1).
+    ///
+    /// Assertion surfaces: [`Self::history_plain`] (semantic — what
+    /// insert_before committed), [`Self::headless_output`] (the exact
+    /// bytes an equivalent terminal session would have received).
+    pub fn new_headless(
+        cols: u16,
+        rows: u16,
+        initial_height: u16,
+        strategy: EmissionStrategy,
+    ) -> Self {
+        let initial_height = initial_height.min(rows.saturating_sub(1)).max(1);
+        let viewport = Rect::new(0, rows.saturating_sub(initial_height), cols, initial_height);
+        Self {
+            viewport,
+            buffers: [Buffer::empty(viewport), Buffer::empty(viewport)],
+            screen_cache: vec![None; viewport.width as usize * viewport.height as usize],
+            current: 0,
+            screen_size: (cols, rows),
+            history: Vec::new(),
+            scrollback_committed: 0,
+            gap_rows: 0,
+            journal: None,
+            strategy,
+            out: OutTarget::Memory(std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))),
+            screen: ScreenSource::Fixed(cols, rows),
+        }
+    }
+
+    /// Fresh per-emission writer — terminal stdout in production, the shared
+    /// memory sink when headless. Cheap by construction (a handle, not a
+    /// buffer copy).
+    fn out(&self) -> OutHandle {
+        match &self.out {
+            OutTarget::Terminal => OutHandle::Terminal(io::stdout()),
+            OutTarget::Memory(sink) => OutHandle::Memory(std::sync::Arc::clone(sink)),
+        }
+    }
+
+    /// Bytes emitted so far by a headless viewport (empty for terminal mode).
+    pub fn headless_output(&self) -> Vec<u8> {
+        match &self.out {
+            OutTarget::Terminal => Vec::new(),
+            OutTarget::Memory(sink) => sink.lock().map(|v| v.clone()).unwrap_or_default(),
+        }
+    }
+
+    /// The committed history as plain text, one string per inserted line
+    /// (cell symbols joined, trailing blanks trimmed). The semantic record
+    /// of everything `insert_before` ever emitted — styles and escape
+    /// framing are deliberately excluded so assertions don't break on
+    /// strategy or color changes.
+    pub fn history_plain(&self) -> Vec<String> {
+        self.history
+            .iter()
+            .map(|line| {
+                let mut s: String = line.cells.iter().map(|(sym, ..)| sym.as_str()).collect();
+                while s.ends_with(' ') {
+                    s.pop();
+                }
+                s
+            })
+            .collect()
+    }
+
+    /// Number of history entries already committed to native scrollback
+    /// (exposed for invariant assertions in headless tests).
+    pub fn scrollback_committed(&self) -> usize {
+        self.scrollback_committed
     }
 
     /// Get the current viewport area for rendering into.
@@ -267,7 +406,7 @@ impl DynamicViewport {
     /// Resize the viewport to a full-screen-style overlay, leaving one row
     /// above so insert_before still has a safe history region on tiny terms.
     pub fn maximize_height(&mut self) -> io::Result<()> {
-        let (_, rows) = terminal::size()?;
+        let (_, rows) = self.screen.size()?;
         self.set_height(rows.saturating_sub(1).max(1))
     }
 
@@ -292,7 +431,7 @@ impl DynamicViewport {
     /// remainder scrolls the history region up, through the
     /// scrollback-feeding CRLF pattern so exiting rows are preserved.
     pub fn set_height(&mut self, new_height: u16) -> io::Result<()> {
-        let (cols, rows) = terminal::size()?;
+        let (cols, rows) = self.screen.size()?;
         self.screen_size = (cols, rows);
         let new_height = new_height.min(rows.saturating_sub(1)); // leave at least 1 row above
 
@@ -325,7 +464,7 @@ impl DynamicViewport {
                 let viewport_top = self.viewport.y;
                 let push = push_needed.min(viewport_top);
                 if push > 0 {
-                    let mut stdout = io::stdout();
+                    let mut stdout = self.out();
                     match self.strategy {
                         EmissionStrategy::Fast => {
                             emit_region_push_up_fast(&mut stdout, viewport_top, push)?
@@ -348,7 +487,7 @@ impl DynamicViewport {
             // put; the vacated rows in between become gap (see method docs).
             let old_y = self.viewport.y;
             let new_y = rows.saturating_sub(new_height);
-            let mut stdout = io::stdout();
+            let mut stdout = self.out();
             for row in old_y..new_y {
                 queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
             }
@@ -363,7 +502,7 @@ impl DynamicViewport {
         self.buffers[1].resize(self.viewport);
         // Clear the entire viewport area on screen so stale content
         // doesn't bleed through. Force full redraw on next flush.
-        let mut stdout = io::stdout();
+        let mut stdout = self.out();
         for row in self.viewport.y..self.viewport.y + self.viewport.height {
             queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
         }
@@ -376,7 +515,7 @@ impl DynamicViewport {
     /// Clear the viewport area on screen (used before insert_before
     /// to erase the raw prompt before the formatted "you" block replaces it).
     pub fn clear_viewport(&mut self) -> io::Result<()> {
-        let mut stdout = io::stdout();
+        let mut stdout = self.out();
         for row in self.viewport.y..(self.viewport.y + self.viewport.height) {
             queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
         }
@@ -394,11 +533,11 @@ impl DynamicViewport {
     /// (mu-8oqp).
     pub fn snap_to_bottom(&mut self) -> io::Result<()> {
         self.gap_rows = 0;
-        let (_, screen_rows) = terminal::size()?;
+        let (_, screen_rows) = self.screen.size()?;
         let target_y = screen_rows.saturating_sub(self.viewport.height);
         if self.viewport.y < target_y {
             // Clear old position
-            let mut stdout = io::stdout();
+            let mut stdout = self.out();
             for row in self.viewport.y..(self.viewport.y + self.viewport.height) {
                 queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
             }
@@ -449,7 +588,7 @@ impl DynamicViewport {
             return Ok(());
         }
 
-        let mut stdout = io::stdout();
+        let mut stdout = self.out();
         // Begin synchronized output (terminal buffers until end bracket)
         write!(stdout, "\x1b[?2026h")?;
         queue!(stdout, Hide)?;
@@ -505,9 +644,9 @@ impl DynamicViewport {
             return Ok(());
         }
 
-        let (_, screen_rows) = terminal::size()?;
+        let (_, screen_rows) = self.screen.size()?;
         let width = self.viewport.width;
-        let mut stdout = io::stdout();
+        let mut stdout = self.out();
 
         // If the viewport isn't at the bottom of the screen (free rows left
         // by an in-place shrink, mu-8oqp), push it DOWN first to make room
@@ -1073,11 +1212,8 @@ pub(crate) fn to_crossterm_color(color: Color) -> CtColor {
 impl Drop for DynamicViewport {
     fn drop(&mut self) {
         // Move cursor below viewport on exit
-        let _ = execute!(
-            io::stdout(),
-            MoveTo(0, self.viewport.y + self.viewport.height),
-            Show
-        );
+        let mut out = self.out();
+        let _ = execute!(out, MoveTo(0, self.viewport.y + self.viewport.height), Show);
     }
 }
 
@@ -1105,8 +1241,99 @@ mod tests {
 
     use super::{
         committed_delta_for_push, emit_region_push_up_conservative, emit_region_push_up_fast,
-        grow_split,
+        grow_split, DynamicViewport,
     };
+
+    // ── headless viewport lifecycle (bead mu-afwxa slice 1) ──────────────────
+    //
+    // These drive the REAL DynamicViewport methods — insert_before /
+    // set_height and their accounting — against a fixed screen and a memory
+    // sink, removing the old "cannot instantiate without a TTY" limitation.
+    // `history_plain` is the semantic assertion surface; byte-level framing
+    // stays covered by the emission free-function tests above.
+
+    /// Insert `lines` as one insert_before batch of plain text rows.
+    fn insert_lines(vp: &mut DynamicViewport, lines: &[&str]) {
+        let texts: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+        vp.insert_before(texts.len() as u16, |buf| {
+            for (i, text) in texts.iter().enumerate() {
+                buf.set_string(0, i as u16, text, ratatui::style::Style::default());
+            }
+        })
+        .expect("headless insert_before");
+    }
+
+    #[test]
+    fn headless_insert_records_history_and_emits_bytes() {
+        // 40x24 screen, 5-row viewport → history region is rows 0..19.
+        let mut vp = DynamicViewport::new_headless(40, 24, 5, EmissionStrategy::Fast);
+        insert_lines(&mut vp, &["alpha", "beta"]);
+        assert_eq!(vp.history_plain(), vec!["alpha", "beta"]);
+        // 2 lines into a 19-row region: nothing overflowed to scrollback.
+        assert_eq!(vp.scrollback_committed(), 0);
+        assert!(
+            !vp.headless_output().is_empty(),
+            "emission bytes must reach the sink"
+        );
+    }
+
+    #[test]
+    fn headless_overflow_maintains_committed_invariant() {
+        let mut vp = DynamicViewport::new_headless(40, 24, 5, EmissionStrategy::Fast);
+        let lines: Vec<String> = (0..30).map(|i| format!("line-{i}")).collect();
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        insert_lines(&mut vp, &refs);
+        // Invariant (module docs): committed = history.len() − (viewport.y − gap).
+        let region = vp.area().y as usize;
+        assert_eq!(vp.history_plain().len(), 30);
+        assert_eq!(vp.scrollback_committed(), 30usize.saturating_sub(region));
+        // Committed is monotonic: a further insert can only raise it.
+        let before = vp.scrollback_committed();
+        insert_lines(&mut vp, &["tail"]);
+        assert!(vp.scrollback_committed() >= before);
+    }
+
+    #[test]
+    fn headless_history_content_identical_across_strategies() {
+        // The strategies differ only in escape framing, never in content —
+        // the stated property behind the shared history mirror.
+        let run = |strategy: EmissionStrategy| {
+            let mut vp = DynamicViewport::new_headless(40, 24, 5, strategy);
+            insert_lines(&mut vp, &["one", "two"]);
+            insert_lines(&mut vp, &["three"]);
+            vp.history_plain()
+        };
+        assert_eq!(
+            run(EmissionStrategy::Fast),
+            run(EmissionStrategy::Conservative)
+        );
+    }
+
+    #[test]
+    fn headless_shrink_gap_insert_stays_uncommitted() {
+        let mut vp = DynamicViewport::new_headless(40, 24, 8, EmissionStrategy::Fast);
+        insert_lines(&mut vp, &["kept"]);
+        // Chrome-pinned shrink: vacated rows become the tracked gap.
+        vp.set_height(4).expect("shrink");
+        // The next insert paints into the gap — nothing scrolls, nothing
+        // newly committed (mu-8oqp gap-paint path).
+        insert_lines(&mut vp, &["into-gap"]);
+        assert_eq!(vp.history_plain(), vec!["kept", "into-gap"]);
+        assert_eq!(vp.scrollback_committed(), 0);
+    }
+
+    #[test]
+    fn headless_grow_after_content_keeps_history() {
+        let mut vp = DynamicViewport::new_headless(40, 24, 5, EmissionStrategy::Conservative);
+        insert_lines(&mut vp, &["a", "b", "c"]);
+        vp.set_height(10).expect("grow");
+        insert_lines(&mut vp, &["d"]);
+        assert_eq!(vp.history_plain(), vec!["a", "b", "c", "d"]);
+        // Invariant still holds after the height change reshaped the region.
+        let region = (vp.area().y as usize).saturating_sub(0);
+        assert!(vp.scrollback_committed() <= vp.history_plain().len());
+        assert!(vp.scrollback_committed() >= vp.history_plain().len().saturating_sub(region));
+    }
 
     // ── scrollback_committed invariant ───────────────────────────────────────
 

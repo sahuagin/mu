@@ -15,7 +15,7 @@ records rather than pending work lists.
 | Date | Document | Subject | Outcome |
 |---|---|---|---|
 | 2026-08-26 | [deepseek-harness-cordis](2026-08-26-deepseek-harness-cordis.md) | DeepSeek Harness (`dsh`) and its vendored Cordis micro-kernel | Beads `mu-eyfd8` (rope span epoch invalidation), `mu-0xhja` (per-session disposer tree); model-visible-means-logged gap located at rope assembly; capability-seam idea dissolved (mu already has it) |
-| 2026-08-27 | [codex](2026-08-27-codex.md) | OpenAI Codex CLI (`codex-rs`), TUI focus | (this session) |
+| 2026-08-27 | [codex](2026-08-27-codex.md) | OpenAI Codex CLI (`codex-rs`) at trunk 694edc23, TUI focus | The scrollback-commitment model as a parts list for mu-solo (single mutation frontier, newline-gated commits, exactly-once insertion, adaptive drain, log-replay testing); SQ/EQ + rollout notes; agent-roles convergence |
 
 ## Prior art note
 

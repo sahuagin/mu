@@ -1791,6 +1791,13 @@ pub struct AppOptions<'a> {
     /// `[session] system_prompt_file` by the caller). None ⇒ field
     /// omitted from create_session; daemon default prompt applies.
     pub system_prompt: Option<String>,
+    /// mu-io71s: predecessor session ref to RESUME instead of starting
+    /// fresh — `daemon:session` or `mu:<daemon>/<session>` (the same
+    /// forms `session.resume` accepts). Empty string ⇒ start a fresh
+    /// session, exactly as before. When set, the daemon forks the
+    /// predecessor's log to its last clean boundary and the TUI attaches
+    /// to the resumed head.
+    pub resume: String,
 }
 
 impl App {
@@ -1825,6 +1832,7 @@ impl App {
             autonomy,
             max_side_effects,
             system_prompt,
+            resume,
         } = opts;
         let valid_effort_levels: Vec<String> = effort_levels
             .into_iter()
@@ -1901,13 +1909,64 @@ impl App {
                 }
             }
         }
-        let resp = client
-            .request("create_session", create_params)
-            .context("create_session failed")?;
+        let resp = if resume.trim().is_empty() {
+            client
+                .request("create_session", create_params)
+                .context("create_session failed")?
+        } else {
+            // mu-io71s: resume a past session instead of starting fresh.
+            // The daemon forks the predecessor's log to its last clean
+            // boundary and births a live head seeded with that history —
+            // the same machinery `mu resume` (CLI) drives, surfaced here
+            // so the TUI can attach to the resumed head. The provider
+            // selector is the one the operator chose for THIS launch
+            // (resume can switch providers, e.g. away from the one that
+            // died); the predecessor's own provider is irrelevant.
+            //
+            // mu-io71s (panel finding): a cross-daemon resume (the normal
+            // mu-solo case — each launch spawns its own daemon) starts from
+            // the launch capability (root). To preserve the operator's
+            // configured ceiling, send attenuations carrying max_side_effects
+            // and autonomy — the one narrowing hook on the wire. Without
+            // this, a profile with max_side_effects = ReadOnly would get an
+            // unrestricted session on --resume (privilege escalation).
+            let mut resume_params = serde_json::json!({
+                "session_ref": resume,
+                "provider": provider_value,
+                "cwd": cwd,
+                // mu-io71s: mu-solo spawns its own daemon, so the resuming
+                // daemon IS the launch authority — opt in to the launch
+                // capability grant. Without this, a cross-daemon resume
+                // fails closed to read_only (the mu-mh4 invariant) and
+                // every tool call is refused.
+                "grant_launch_capability": true,
+            });
+            // mu-io71s: forward the operator's autonomy grant DIRECTLY (not
+            // via attenuation — attenuate intersects and can never widen
+            // root's Disallowed autonomy). The daemon grants it on the launch
+            // capability when grant_launch_capability is true.
+            if let Some(autonomy) = &autonomy {
+                if let Ok(v) = serde_json::to_value(autonomy) {
+                    resume_params["autonomy"] = v;
+                }
+            }
+            // Forward the operator's side-effects ceiling as an attenuation
+            // (narrowing-only — the daemon intersects it with the base
+            // capability). Omitted when None (no narrowing requested → the
+            // base capability stands).
+            if let Some(max_side_effects) = &max_side_effects {
+                if let Ok(v) = serde_json::to_value(max_side_effects) {
+                    resume_params["attenuations"] = serde_json::json!({ "max_side_effects": v });
+                }
+            }
+            client
+                .request("session.resume", resume_params)
+                .context("session.resume failed")?
+        };
         let session_id = resp
             .get("session_id")
             .and_then(|v| v.as_str())
-            .context("session.create response missing session_id")?
+            .context("session.resume response missing session_id")?
             .to_string();
         let wal = crate::wal::TurnWal::open(&session_id);
 
@@ -1933,11 +1992,14 @@ impl App {
         // the struct. dirs::data_dir() returns None only on
         // pathological setups (no $HOME / no equivalent); in that
         // case the diagnostic silently degrades to "(pending)".
+        // mu-io71s: use the ACTUAL session id (a resumed head is
+        // session-N, not session-1) so the renderer/model probe reads
+        // the right log.
         let events_file = dirs::data_dir().map(|p| {
             p.join("mu")
                 .join("events")
                 .join(&daemon_id)
-                .join("session-1.jsonl")
+                .join(format!("{}.jsonl", session_id))
         });
 
         let (mcp_daemon_status, mcp_daemon_status_error) = fetch_mcp_daemon_status(&mut client);

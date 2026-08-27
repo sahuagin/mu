@@ -660,6 +660,29 @@ pub struct ResumeSessionRequest {
     /// the `HeadAttached` event for attribution. None → "operator".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
+    /// mu-io71s: opt-in launch-capability grant for a cross-daemon resume.
+    /// When `true`, a cross-daemon resume (predecessor dead on a different
+    /// daemon) grants the launch capability (root + the daemon's launch tool
+    /// grant) instead of failing closed to `read_only`. This is the
+    /// explicit re-grant the mu-mh4 fail-closed floor requires: the
+    /// widening is caller-supplied, not inferred from a daemon-id string
+    /// compare (which is `rand::random()` per process and reclassifies a
+    /// restricted session as cross-daemon after a restart). Default
+    /// `false` → cross-daemon resume fails closed to `read_only`, same as
+    /// the same-daemon cold case. mu-solo `--resume` passes `true` (it
+    /// spawns its own daemon, so the resuming daemon IS the launch
+    /// authority).
+    #[serde(default)]
+    pub grant_launch_capability: bool,
+    /// mu-io71s: autonomy grant for the resumed session. When
+    /// `grant_launch_capability` is true, this is granted DIRECTLY on the
+    /// launch capability (like `create_session` does), NOT via attenuation
+    /// (which intersects and can never widen root's Disallowed autonomy).
+    /// When `grant_launch_capability` is false, this is ignored (the
+    /// fail-closed read_only floor has no autonomy to grant). None →
+    /// Disallowed (the root default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autonomy: Option<crate::capability::AutonomyCapability>,
 }
 
 impl ResumeSessionRequest {

@@ -22,6 +22,7 @@ reference** belongs in `docs/`. Cross-link rather than duplicate.
 | Topic | Status | Summary |
 |---|---|---|
 | [harness-model-fit/](harness-model-fit/) | on-the-wire knobs landed 2026-06-22; meta-harness Path A next | Why harnesses suit some models more than others + what `mu` changed to fit all models. The three on-the-wire slices (effort→reasoning, dialect rescue, per-model sampling) are merged; the forward direction is a Stanford-IRIS *meta-harness*–style self-improvement loop over those knobs. |
+| [harness-internals/](harness-internals/) | active 2026-08 | Source-level analyses of competing harnesses (DeepSeek Harness/Cordis, Codex CLI): mechanisms worth adopting, with beads filed for the actionable ones. |
 
 ## Related, but not here
 

@@ -85,6 +85,14 @@ struct Cli {
     /// Omit to use `[session]`.
     #[arg(short = 'p', long, value_name = "NAME")]
     profile: Option<String>,
+
+    /// mu-io71s: resume a PAST session instead of starting fresh. The
+    /// predecessor ref is `daemon:session` or `mu:<daemon>/<session>` —
+    /// the same forms `mu resume` accepts. The spawned daemon forks the
+    /// predecessor's log to its last clean boundary and the TUI attaches
+    /// to the resumed head. Omit to start a fresh session (default).
+    #[arg(long, value_name = "SESSION")]
+    resume: Option<String>,
 }
 
 impl Cli {
@@ -103,6 +111,7 @@ impl Cli {
             effort: self.effort.clone(),
             focus_mode: if self.focus { Some(true) } else { None },
             clipboard_command: None,
+            resume: self.resume.clone(),
         }
     }
 }
@@ -212,6 +221,8 @@ async fn main() -> Result<()> {
         max_side_effects,
         // mu-sftz: [session] system_prompt_file → create_session prompt.
         system_prompt,
+        // mu-io71s: predecessor session ref to resume (empty = fresh).
+        resume: cfg.session.resume.clone(),
     })
     .context("App::new failed (is the mu binary path correct?)")?;
 

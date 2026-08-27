@@ -174,6 +174,14 @@ async fn resume_session(
         attenuations: None,
         cwd,
         actor: None,
+        // mu-io71s: the `mu resume` CLI is the operator's explicit intent to
+        // resume with the launch capability — opt in to the grant. Without
+        // this, a cross-daemon resume fails closed to read_only (the mu-mh4
+        // invariant) and every tool call is refused.
+        grant_launch_capability: true,
+        // The `mu resume` CLI doesn't forward autonomy config (that's a
+        // mu-solo feature) — None → Disallowed (the root default).
+        autonomy: None,
     };
     let req = json!({
         "jsonrpc": "2.0",

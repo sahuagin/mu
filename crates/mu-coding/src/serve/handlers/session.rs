@@ -203,14 +203,23 @@ pub fn handle_delegate_session(
 /// precise diagnosis and preserved for a future explicit recovery path; it is
 /// never silently truncated.
 ///
-/// The resumed session's capability is the predecessor's ∩ any requested
-/// attenuations (intersection-only — resume can only narrow). When the
-/// predecessor's live capability is gone (a cold rehydrated session has
-/// no capability handle — the NORMAL resume case), it FAILS CLOSED to the
-/// most-restrictive baseline ([`Capability::read_only`]) and then applies
-/// the attenuations — so a resume can never WIDEN privileges past a
-/// read-only floor (mu-mh4; capability persistence is the real fix —
-/// mu-nqn5).
+/// The resumed session's capability depends on the resume path:
+/// - **Same-daemon warm** (predecessor's live capability present): the
+///   predecessor's capability ∩ any requested attenuations (intersection-only
+///   — resume can only narrow).
+/// - **Same-daemon cold** (predecessor's live capability gone): FAILS CLOSED
+///   to the most-restrictive baseline ([`Capability::read_only`]) (mu-mh4).
+/// - **Cross-daemon without opt-in** (`grant_launch_capability = false`, the
+///   default): FAILS CLOSED to [`Capability::read_only`] (mu-mh4).
+/// - **Cross-daemon with opt-in** (`grant_launch_capability = true`): grants
+///   the launch capability (root + the daemon's launch tool grant). The
+///   caller (mu-solo `--resume`, `mu resume`) asserts the resuming daemon is
+///   the launch authority. The `autonomy` field is granted DIRECTLY on the
+///   launch capability (like `create_session` does), NOT via attenuation.
+///   `max_side_effects` is forwarded as an attenuation (narrowing-only).
+///
+/// Capability persistence (mu-nqn5) is the real fix for the cold case; until
+/// then, the fail-closed floor preserves the mu-mh4 invariant.
 pub fn handle_resume_session(
     request: Request<Value>,
     notif: NotificationWriter,
@@ -303,18 +312,74 @@ pub fn handle_resume_session(
     // The operator's `attenuations` can only narrow further from this
     // floor, never widen past it; explicit re-grants are out of scope
     // until capability persistence (mu-nqn5) lands.
+    // mu-io71s: a resume on a daemon that has NO live predecessor is a fresh
+    // launch — the predecessor is dead (its log is on disk, its in-memory
+    // capability is gone) and the resuming daemon is the one the operator
+    // spawned to run the resumed session (mu-solo always spawns its own
+    // daemon, so this is the NORMAL case there). Granting the launch
+    // capability (root, with the launch tool grant applied below) is
+    // correct: the operator's `mu serve --tools` launch is the authority
+    // boundary, and the resumed session is a new live session on THIS
+    // daemon. The old fail-closed-to-read_only floor made the resumed
+    // session silently useless — every tool call refused — while the TUI
+    // looked normal (panel finding, mu-io71s).
+    //
+    // A WARM same-daemon resume (predecessor's live capability still
+    // present) still intersects from it — resume can only narrow there.
+    //
+    // A COLD same-daemon resume (predecessor's live capability handle is
+    // GONE — e.g. the session was closed on this still-running daemon)
+    // FAILS CLOSED to read_only: the mu-mh4 attenuation-only-narrows
+    // invariant. A restricted session closed and re-resumed on the same
+    // daemon must NOT be re-granted root (that would widen privileges).
+    //
+    // mu-io71s: a CROSS-daemon resume (predecessor dead on a different
+    // daemon) ALSO fails closed to read_only BY DEFAULT. The launch
+    // capability grant is OPT-IN via `grant_launch_capability` — the
+    // widening is caller-supplied, not inferred from a daemon-id string
+    // compare (which is `rand::random()` per process and reclassifies a
+    // restricted session as cross-daemon after a restart). mu-solo
+    // `--resume` passes `true` (it spawns its own daemon, so the resuming
+    // daemon IS the launch authority).
     let base_cap = if parsed.daemon == daemon_info.daemon_id() {
+        // Same-daemon resume: intersect from the predecessor's live
+        // capability if present (warm); fail closed to read_only if gone
+        // (cold — the mu-mh4 invariant).
         sessions
             .capability(&parsed.session)
             .and_then(|h| h.lock().ok().map(|c| c.clone()))
             .unwrap_or_else(Capability::read_only)
+    } else if params.grant_launch_capability {
+        // Cross-daemon resume with explicit opt-in: the caller (mu-solo)
+        // asserts the resuming daemon is the launch authority. Grant the
+        // launch capability (root_launch_tool_capability populates
+        // allowed_tools from the daemon's concrete tool list below).
+        Capability::root()
     } else {
+        // Cross-daemon resume WITHOUT opt-in: fail closed to read_only.
+        // The mu-mh4 invariant — a restricted predecessor's log must not
+        // be re-granted root without an explicit re-grant.
         Capability::read_only()
     };
     let resumed_capability = match &params.attenuations {
         Some(attn) => base_cap.attenuate(attn),
         None => base_cap,
     };
+    // mu-io71s: grant autonomy DIRECTLY on the launch capability (like
+    // create_session does), NOT via attenuation (which intersects and can
+    // never widen root's Disallowed autonomy). Gated on the SAME cross-daemon
+    // condition as root_launch_tool_capability — a same-daemon resume must
+    // not widen autonomy past the predecessor's (mu-mh4 narrows-only).
+    let resumed_capability =
+        if parsed.daemon != daemon_info.daemon_id() && params.grant_launch_capability {
+            let mut cap = resumed_capability;
+            if let Some(autonomy) = &params.autonomy {
+                cap.autonomy = autonomy.clone();
+            }
+            cap
+        } else {
+            resumed_capability
+        };
 
     let seeded_message_count = continuation.messages.len();
     // mu-mh4 (panel finding 3): the actor is CALLER-SUPPLIED and
@@ -366,7 +431,13 @@ pub fn handle_resume_session(
         parent_session_id: Some(parsed.session.clone()),
         branched_at_parent_event_id: continuation.fork_event_id,
         capability: resumed_capability,
-        root_launch_tool_capability: false,
+        // mu-io71s: a cross-daemon resume with explicit opt-in
+        // (grant_launch_capability) is a fresh launch — apply the launch
+        // tool grant so the resumed session gets the daemon's `--tools`
+        // capability. A same-daemon resume or a cross-daemon resume without
+        // opt-in keeps its predecessor's capability (no widening).
+        root_launch_tool_capability: parsed.daemon != daemon_info.daemon_id()
+            && params.grant_launch_capability,
         seed_messages: continuation.messages,
         seed_events: vec![continuation_seeded, head_attached],
         cache_ttl: CacheTtl::default(),
@@ -627,7 +698,16 @@ fn apply_root_launch_tool_capability(
     let allowed_tools = session_tool_name_set(session_tools);
     match capability.lock() {
         Ok(mut cap) => {
-            cap.allowed_tools = Some(allowed_tools);
+            // mu-io71s: intersect with the existing allowed_tools (if present)
+            // rather than overwriting. A cross-daemon resume may carry
+            // operator-supplied attenuations that narrow the tool axis; the
+            // launch tool grant should grant the daemon's tools INTERSECTED
+            // with that narrowing, not discard it. For a fresh root launch
+            // (allowed_tools = None), the intersection is the full grant.
+            cap.allowed_tools = Some(match cap.allowed_tools.take() {
+                Some(existing) => existing.intersection(&allowed_tools).cloned().collect(),
+                None => allowed_tools,
+            });
         }
         Err(_) => {
             tracing::warn!(
@@ -3299,14 +3379,22 @@ mod tests {
     /// to root would let resume WIDEN privileges (attenuation-only-narrows
     /// violation). This pins the fix until capability persistence
     /// (mu-nqn5) lets us recover the predecessor's actual capability.
+    // mu-mh4 / mu-io71s: a SAME-daemon cold resume (predecessor closed on
+    // this still-running daemon, no live capability handle) FAILS CLOSED to
+    // read_only — the attenuation-only-narrows invariant. A restricted
+    // session closed and re-resumed on the same daemon must NOT be re-granted
+    // root.
+    //
+    // The CROSS-daemon case (predecessor dead on a different daemon) is a
+    // fresh launch and grants the launch capability — that's the path mu-solo
+    // uses (it spawns its own daemon). It's covered by the end-to-end
+    // mu-solo --resume smoke test (a faux session forked via mu-solo
+    // --resume gets a working tool grant).
     #[tokio::test]
-    async fn resume_of_cold_session_does_not_yield_root_authority() {
+    async fn resume_of_same_daemon_cold_session_fails_closed() {
         use mu_core::capability::Capability;
 
         let predecessor_id = "cold-predecessor";
-        // rehydrated_session_with_events uses `insert_rehydrated`, which
-        // registers the log WITHOUT a live capability handle — exactly the
-        // cold case that previously fell back to root().
         let sessions = rehydrated_session_with_events(predecessor_id);
         assert!(
             sessions.capability(predecessor_id).is_none(),
@@ -3315,7 +3403,7 @@ mod tests {
 
         let factory = crate::serve::factory::make_provider_factory(false, None);
         let tools: Arc<Vec<Arc<dyn Tool>>> = Arc::new(Vec::new());
-        let di = DaemonInfo::new("test-daemon"); // no events_dir — in-memory only
+        let di = DaemonInfo::new("test-daemon");
         let daemon_id = di.daemon_id().to_string();
 
         let req = Request {
@@ -3351,33 +3439,249 @@ mod tests {
             .expect("resumed session has a live capability handle");
         let cap = cap_handle.lock().expect("lock capability").clone();
 
-        assert_ne!(
-            cap,
-            Capability::root(),
-            "FAIL-CLOSED: resuming a cold session must NOT yield root authority",
-        );
+        // mu-mh4: same-daemon cold resume fails closed to read_only.
         assert_eq!(
             cap,
             Capability::read_only(),
-            "resumed cold session must get the read_only fail-closed baseline",
+            "same-daemon cold resume must fail closed to read_only (mu-mh4 invariant)",
         );
-        // Spell out the load-bearing axes so a regression is legible.
         assert_eq!(
             cap.allowed_tools,
             Some(std::collections::HashSet::new()),
             "fail-closed baseline allows no tools",
         );
-        assert!(
-            matches!(
-                cap.autonomy,
-                mu_core::capability::AutonomyCapability::Disallowed
-            ),
-            "fail-closed baseline disallows autonomy",
+    }
+
+    // mu-io71s: a CROSS-daemon resume WITHOUT opt-in (grant_launch_capability
+    // = false, the default) FAILS CLOSED to read_only — the mu-mh4 invariant.
+    // The predecessor is dead on a different daemon (its log is on disk under
+    // a different daemon id), and the caller did NOT explicitly grant the
+    // launch capability. A restricted predecessor's log must not be re-granted
+    // root without an explicit re-grant.
+    #[tokio::test]
+    async fn resume_of_cross_daemon_session_fails_closed_without_opt_in() {
+        use mu_core::capability::Capability;
+
+        // Set up a daemon with an events_dir, and write a predecessor log
+        // under a DIFFERENT daemon id ("other-daemon").
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let events_dir = tmp.path().to_path_buf();
+        let other_daemon_dir = events_dir.join("other-daemon");
+        std::fs::create_dir_all(&other_daemon_dir).expect("create other-daemon dir");
+
+        // Write a minimal predecessor log (SessionCreated + UserMessage + Done)
+        // under the other daemon.
+        let predecessor_id = "cold-predecessor";
+        let log = mu_core::event_log::SessionEventLog::new(predecessor_id.to_string());
+        log.append(
+            mu_core::event_log::EventActor::System,
+            mu_core::event_log::EventPayload::SessionCreated {
+                provider_kind: "anthropic_api".into(),
+                model: "haiku".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        log.append(
+            mu_core::event_log::EventActor::User,
+            mu_core::event_log::EventPayload::UserMessage {
+                content: "hello".into(),
+            },
+        );
+        log.append(
+            mu_core::event_log::EventActor::System,
+            mu_core::event_log::EventPayload::Done {
+                stop_reason: mu_core::agent::StopReason::EndTurn,
+                usage: None,
+                turn_count: 1,
+                elapsed_ms: Some(42),
+            },
+        );
+        // Serialize the log to JSONL and write it under the other daemon.
+        let jsonl_path = other_daemon_dir.join(format!("{predecessor_id}.jsonl"));
+        let jsonl_content: Vec<String> = log
+            .snapshot()
+            .into_iter()
+            .map(|e| serde_json::to_string(&e).expect("serialize event"))
+            .collect();
+        std::fs::write(&jsonl_path, jsonl_content.join("\n")).expect("write predecessor log");
+
+        // The resuming daemon has the same events_dir (so it can read the
+        // other daemon's log) but a DIFFERENT daemon id.
+        let sessions = Sessions::new_with_events_dir(Some(events_dir));
+        let factory = crate::serve::factory::make_provider_factory(false, None);
+        let tools: Arc<Vec<Arc<dyn Tool>>> = Arc::new(Vec::new());
+        let di = DaemonInfo::new("test-daemon");
+        let daemon_id = di.daemon_id().to_string();
+        assert_ne!(
+            "other-daemon", daemon_id,
+            "precondition: the predecessor's daemon differs from this daemon's id"
+        );
+
+        // Cross-daemon ref WITHOUT grant_launch_capability (the default).
+        let req = Request {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id: json!(1),
+            method: "session.resume".into(),
+            params: json!({
+                "session_ref": format!("other-daemon:{predecessor_id}"),
+                "provider": { "kind": "anthropic_api", "model": "faux" },
+            }),
+        };
+
+        let resp = handle_resume_session(
+            req,
+            mu_core::transport::NotificationWriter::sink(),
+            sessions.clone(),
+            factory,
+            tools,
+            Arc::new(Vec::new()),
+            di,
+        );
+        let value = serde_json::to_value(&resp).expect("serialize response");
+        let result = value
+            .get("result")
+            .unwrap_or_else(|| panic!("resume must succeed, got {value}"));
+        let new_id = result["session_id"]
+            .as_str()
+            .expect("session_id in result")
+            .to_string();
+
+        let cap_handle = sessions
+            .capability(&new_id)
+            .expect("resumed session has a live capability handle");
+        let cap = cap_handle.lock().expect("lock capability").clone();
+
+        // mu-io71s: cross-daemon resume WITHOUT opt-in fails closed to
+        // read_only (the mu-mh4 invariant).
+        assert_eq!(
+            cap,
+            Capability::read_only(),
+            "cross-daemon resume without opt-in must fail closed to read_only (mu-mh4 invariant)",
         );
         assert_eq!(
+            cap.allowed_tools,
+            Some(std::collections::HashSet::new()),
+            "fail-closed baseline allows no tools",
+        );
+    }
+
+    // mu-io71s: a CROSS-daemon resume WITH opt-in (grant_launch_capability =
+    // true) grants the launch capability (root + the daemon's launch tool
+    // grant). This is the path mu-solo uses (it spawns its own daemon, so the
+    // resuming daemon IS the launch authority).
+    #[tokio::test]
+    async fn resume_of_cross_daemon_session_grants_launch_with_opt_in() {
+        // Set up a daemon with an events_dir, and write a predecessor log
+        // under a DIFFERENT daemon id ("other-daemon").
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let events_dir = tmp.path().to_path_buf();
+        let other_daemon_dir = events_dir.join("other-daemon");
+        std::fs::create_dir_all(&other_daemon_dir).expect("create other-daemon dir");
+
+        let predecessor_id = "cold-predecessor";
+        let log = mu_core::event_log::SessionEventLog::new(predecessor_id.to_string());
+        log.append(
+            mu_core::event_log::EventActor::System,
+            mu_core::event_log::EventPayload::SessionCreated {
+                provider_kind: "anthropic_api".into(),
+                model: "haiku".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        log.append(
+            mu_core::event_log::EventActor::User,
+            mu_core::event_log::EventPayload::UserMessage {
+                content: "hello".into(),
+            },
+        );
+        log.append(
+            mu_core::event_log::EventActor::System,
+            mu_core::event_log::EventPayload::Done {
+                stop_reason: mu_core::agent::StopReason::EndTurn,
+                usage: None,
+                turn_count: 1,
+                elapsed_ms: Some(42),
+            },
+        );
+        let jsonl_path = other_daemon_dir.join(format!("{predecessor_id}.jsonl"));
+        let jsonl_content: Vec<String> = log
+            .snapshot()
+            .into_iter()
+            .map(|e| serde_json::to_string(&e).expect("serialize event"))
+            .collect();
+        std::fs::write(&jsonl_path, jsonl_content.join("\n")).expect("write predecessor log");
+
+        let sessions = Sessions::new_with_events_dir(Some(events_dir));
+        let factory = crate::serve::factory::make_provider_factory(false, None);
+        // A non-empty tool list so the launch tool grant is observable.
+        let tools: Arc<Vec<Arc<dyn Tool>>> =
+            Arc::new(vec![Arc::new(crate::tools::ReadTool::default())]);
+        let di = DaemonInfo::new("test-daemon");
+        let daemon_id = di.daemon_id().to_string();
+        assert_ne!(
+            "other-daemon", daemon_id,
+            "precondition: the predecessor's daemon differs from this daemon's id"
+        );
+
+        // Cross-daemon ref WITH grant_launch_capability = true.
+        let req = Request {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id: json!(1),
+            method: "session.resume".into(),
+            params: json!({
+                "session_ref": format!("other-daemon:{predecessor_id}"),
+                "provider": { "kind": "anthropic_api", "model": "faux" },
+                "grant_launch_capability": true,
+            }),
+        };
+
+        let resp = handle_resume_session(
+            req,
+            mu_core::transport::NotificationWriter::sink(),
+            sessions.clone(),
+            factory,
+            tools,
+            Arc::new(Vec::new()),
+            di,
+        );
+        let value = serde_json::to_value(&resp).expect("serialize response");
+        let result = value
+            .get("result")
+            .unwrap_or_else(|| panic!("resume must succeed, got {value}"));
+        let new_id = result["session_id"]
+            .as_str()
+            .expect("session_id in result")
+            .to_string();
+
+        let cap_handle = sessions
+            .capability(&new_id)
+            .expect("resumed session has a live capability handle");
+        let cap = cap_handle.lock().expect("lock capability").clone();
+
+        // mu-io71s: cross-daemon resume WITH opt-in grants the launch
+        // capability. The base is root (no side-effects ceiling, no
+        // max_tool_calls), and the launch tool grant populates allowed_tools
+        // from the daemon's concrete tool list.
+        assert!(
+            cap.max_side_effects.is_none(),
+            "launch capability must not pin the side-effects ceiling; got {:?}",
             cap.max_side_effects,
-            Some(mu_core::agent::tool::SideEffects::ReadOnly),
-            "fail-closed baseline pins the side-effects ceiling to ReadOnly",
+        );
+        assert!(
+            cap.max_tool_calls_remaining.is_none(),
+            "launch capability must not cap tool calls; got {:?}",
+            cap.max_tool_calls_remaining,
+        );
+        // The launch tool grant populated allowed_tools from the daemon's
+        // concrete tool list (not the empty read_only set).
+        assert!(
+            cap.allowed_tools.as_ref().is_some_and(|s| !s.is_empty()),
+            "launch tool grant must populate allowed_tools from the daemon's tool list; got {:?}",
+            cap.allowed_tools,
         );
     }
 

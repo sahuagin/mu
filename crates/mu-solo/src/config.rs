@@ -319,6 +319,13 @@ pub struct SessionConfig {
     /// never launch into work) while other profiles keep the global
     /// grant — or grant profile-specific bounds the same way.
     pub autonomy: Option<AutonomyConfig>,
+    /// mu-io71s: predecessor session ref to RESUME instead of starting
+    /// fresh — `daemon:session` or `mu:<daemon>/<session>` (the same
+    /// forms `mu resume` / `session.resume` accept). Empty string (the
+    /// DEFAULT) = start a fresh session, exactly as before. When set,
+    /// the spawned daemon forks the predecessor's log to its last clean
+    /// boundary and the TUI attaches to the resumed head.
+    pub resume: String,
 }
 
 impl Default for SessionConfig {
@@ -347,6 +354,8 @@ impl Default for SessionConfig {
             system_prompt_file: String::new(),
             // mu-yopt: inherit the top-level [autonomy] by default.
             autonomy: None,
+            // mu-io71s: no resume by default — start a fresh session.
+            resume: String::new(),
         }
     }
 }
@@ -456,6 +465,9 @@ pub struct CliOverrides {
     pub effort: Option<String>,
     pub focus_mode: Option<bool>,
     pub clipboard_command: Option<Vec<String>>,
+    /// mu-io71s: predecessor session ref to resume (`daemon:session` or
+    /// `mu:<daemon>/<session>`). `None` = start fresh (default).
+    pub resume: Option<String>,
 }
 
 /// Apply CLI Options on top of an already-loaded config. Some fields
@@ -491,6 +503,9 @@ pub fn apply_cli_overrides(config: &mut SoloConfig, cli: &CliOverrides) {
     }
     if let Some(v) = &cli.clipboard_command {
         config.tui.clipboard_command = Some(v.clone());
+    }
+    if let Some(v) = &cli.resume {
+        config.session.resume = v.clone();
     }
 }
 
@@ -729,6 +744,31 @@ mod tests {
         assert_eq!(c.session.thinking, "high");
         // Untouched fields keep their defaults.
         assert_eq!(c.session.model, "gpt-5.5");
+    }
+
+    // mu-io71s: resume defaults to fresh (empty) and the CLI flag
+    // overrides it; an unset flag leaves the lower-precedence layer.
+    #[test]
+    fn resume_defaults_fresh_and_cli_overrides() {
+        let c = SoloConfig::default();
+        assert_eq!(c.session.resume, "", "resume defaults to fresh");
+
+        let mut c = SoloConfig::default();
+        let cli = CliOverrides {
+            resume: Some("mu:abc123/session-1".into()),
+            ..Default::default()
+        };
+        apply_cli_overrides(&mut c, &cli);
+        assert_eq!(c.session.resume, "mu:abc123/session-1");
+
+        // A CLI that doesn't set resume leaves the config value alone.
+        let mut c = SoloConfig::default();
+        c.session.resume = "from-toml:session-9".into();
+        let cli = CliOverrides {
+            ..Default::default()
+        };
+        apply_cli_overrides(&mut c, &cli);
+        assert_eq!(c.session.resume, "from-toml:session-9");
     }
 
     #[test]

@@ -43,6 +43,17 @@ pub fn wal_path(session_id: &str) -> Option<PathBuf> {
 }
 
 impl TurnWal {
+    /// An inert WAL that never touches disk — for replay tests (bead
+    /// mu-afwxa slice 2), where appends must not write the operator's real
+    /// WAL directory. `warned` starts true so the inert file is silent.
+    #[cfg(test)]
+    pub(crate) fn disabled() -> Self {
+        Self {
+            file: None,
+            warned: true,
+        }
+    }
+
     /// Open (create) the WAL for `session_id`. Non-fatal: on any failure the
     /// WAL is inert and the TUI proceeds without it.
     pub fn open(session_id: &str) -> Self {

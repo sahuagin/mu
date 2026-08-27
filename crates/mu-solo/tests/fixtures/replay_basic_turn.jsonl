@@ -1,0 +1,6 @@
+# One plain assistant turn: stream in two deltas, finalize, terminal done.
+# Line shape = the future client-side notification journal (mu-afwxa slice 2).
+{"method": "session.text_delta", "params": {"session_id": "session-main", "delta": "The answer "}}
+{"method": "session.text_delta", "params": {"session_id": "session-main", "delta": "is 42."}}
+{"method": "session.assistant_text_finalized", "params": {"session_id": "session-main", "text": "The answer is 42."}}
+{"method": "session.done", "params": {"session_id": "session-main", "stop_reason": "end_turn", "turn_count": 1}}

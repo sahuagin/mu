@@ -146,6 +146,34 @@ fn route_message(
 }
 
 impl Client {
+    /// Daemonless stub for replay tests (bead mu-afwxa slice 2): a quiet
+    /// child that blocks on stdin (exits on the EOF our drop of its stdin
+    /// eventually produces), no reader thread, a dead response channel.
+    /// `request()` on a stub errors immediately — the replay path never
+    /// issues requests, and a test that accidentally does should fail loud.
+    #[cfg(test)]
+    pub(crate) fn stub() -> Result<Self> {
+        let mut child = Command::new("sh")
+            .args(["-c", "read -r _line || true"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn stub child")?;
+        let stdin = child.stdin.take();
+        // Sender dropped on purpose: the sync response channel is dead.
+        let (_resp_tx, rx) = mpsc::channel();
+        Ok(Self {
+            child,
+            stdin,
+            rx,
+            next_id: AtomicI64::new(1),
+            default_read_timeout: Duration::from_millis(100),
+            notif_rx: None,
+            async_pending: Arc::new(Mutex::new(HashSet::new())),
+        })
+    }
+
     /// Spawn `mu serve` and start a stdout-reader thread. `mu_binary`
     /// is the daemon executable path (typically `target/release/mu`).
     /// `bash_yolo` controls whether the daemon auto-approves bash

@@ -1,0 +1,10 @@
+# An agent-loop turn: text segment, bash tool call + ok result, closing
+# text segment, terminal done. Exercises the segment-bounded finalize
+# (mu-b20l) and the ToolCall/ToolResult item path.
+{"method": "session.text_delta", "params": {"session_id": "session-main", "delta": "Checking."}}
+{"method": "session.assistant_text_finalized", "params": {"session_id": "session-main", "text": "Checking."}}
+{"method": "session.tool_call_started", "params": {"session_id": "session-main", "tool_name": "bash", "tool_call_id": "call-1", "arguments": {"command": "echo hi"}}}
+{"method": "session.tool_call_completed", "params": {"session_id": "session-main", "outcome": {"kind": "ok", "result": "hi"}}}
+{"method": "session.text_delta", "params": {"session_id": "session-main", "delta": "Done: hi"}}
+{"method": "session.assistant_text_finalized", "params": {"session_id": "session-main", "text": "Done: hi"}}
+{"method": "session.done", "params": {"session_id": "session-main", "stop_reason": "end_turn", "turn_count": 2}}

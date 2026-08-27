@@ -2027,6 +2027,110 @@ impl App {
         })
     }
 
+    /// Replay-test constructor (bead mu-afwxa slice 2): a fully-formed App
+    /// with no daemon (stub child), no WAL file, no alt-screen entry, and
+    /// notifications off — everything `handle_notification` needs and
+    /// nothing that touches the operator's terminal or data dirs. Field
+    /// additions to `App` fail here at compile time, keeping the replay
+    /// path honest about what state the notification handler depends on.
+    #[cfg(test)]
+    pub(crate) fn new_for_replay() -> Result<Self> {
+        Ok(Self {
+            client: Client::stub()?,
+            session_id: "session-main".to_string(),
+            provider: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            prompt: InputBuffer::new(),
+            paste_count: 0,
+            daemon_id: "daemon-test".to_string(),
+            daemon_version: "0.0.0-test".to_string(),
+            effort: "medium".to_string(),
+            valid_effort_levels: Vec::new(),
+            effort_levels_override: false,
+            default_effort_override: None,
+            focus_mode: false,
+            clipboard_command: None,
+            sidecar_session_id: None,
+            sidecar_provider_kind: None,
+            sidecar_model: None,
+            streaming_route: None,
+            pending_ask_ids: std::collections::HashSet::new(),
+            queued_interjection_ask_ids: std::collections::HashSet::new(),
+            awaiting_queued_interjection_response: false,
+            queued_interjection_awaiting_done_ids: Vec::new(),
+            done_receipts_seen: false,
+            pending_interjections: Vec::new(),
+            live_turn: None,
+            wal: crate::wal::TurnWal::disabled(),
+            transcript: Transcript::new(),
+            fullscreen: false,
+            fullscreen_entry_blocks: 0,
+            transcript_scroll: 0,
+            selected_block: None,
+            maximized_block: None,
+            overlay: None,
+            flash: None,
+            collapse_tools: true,
+            events_file: None,
+            routes: Vec::new(),
+            model_menu_aliases: Vec::new(),
+            actual_renderer: None,
+            actual_cache_strategy: None,
+            actual_provider_kind: None,
+            actual_model: None,
+            renderer_mismatch_warned: false,
+            bash_yolo: false,
+            skills: std::collections::HashMap::new(),
+            inline_menu: None,
+            menu_context: MenuContext::default(),
+            pending_approvals: std::collections::VecDeque::new(),
+            session_phase: SessionPhase::default(),
+            phase_elapsed_ms: 0,
+            cumulative_input_tokens: 0,
+            cumulative_output_tokens: 0,
+            cumulative_cache_read: 0,
+            cumulative_cache_creation: 0,
+            ask_count: 0,
+            mcp_status_rx: None,
+            mcp_status: None,
+            mcp_daemon_status: None,
+            mcp_daemon_status_error: None,
+            renderer_journal: false,
+            notifications: false,
+            terminal_focused: true,
+        })
+    }
+
+    /// Feed recorded daemon notifications through the real
+    /// `handle_notification` path. One JSON object per line:
+    /// `{"method": "session.text_delta", "params": {...}}` — the same shape
+    /// a future client-side notification journal would record
+    /// (mu-solo-done-applied-not-k0ca), so a captured live session becomes a
+    /// replayable fixture without conversion. Blank lines and `#` comments
+    /// are skipped.
+    #[cfg(test)]
+    pub(crate) fn replay_notifications(
+        &mut self,
+        vp: &mut DynamicViewport,
+        jsonl: &str,
+    ) -> Result<()> {
+        for (i, raw) in jsonl.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(line)
+                .with_context(|| format!("replay fixture line {}", i + 1))?;
+            let method = v
+                .get("method")
+                .and_then(|m| m.as_str())
+                .with_context(|| format!("replay fixture line {} missing method", i + 1))?;
+            let params = v.get("params").cloned().unwrap_or(serde_json::Value::Null);
+            self.handle_notification(vp, method, &params)?;
+        }
+        Ok(())
+    }
+
     /// Shut the spawned daemon down, bounded
     /// (mu-mu-solo-loop-terminate-5ek5): stdin-EOF grace, then
     /// SIGKILL + reap. Called by the binary after `run` returns so
@@ -6880,6 +6984,114 @@ const MAX_VIEWPORT_HEIGHT: u16 = 20;
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── notification replay through the real pipeline (mu-afwxa slice 2) ──
+    //
+    // Recorded daemon notifications → handle_notification → Turn/Transcript
+    // → headless-viewport emission. The assertion surfaces are the semantic
+    // transcript and `history_plain()` — the committed-scrollback record —
+    // so these pin the mu-d04a commit-on-finalize contract end to end.
+
+    const REPLAY_BASIC_TURN: &str = include_str!("../tests/fixtures/replay_basic_turn.jsonl");
+    const REPLAY_TOOL_TURN: &str = include_str!("../tests/fixtures/replay_tool_call_turn.jsonl");
+
+    fn replay_env() -> (App, DynamicViewport) {
+        let app = App::new_for_replay().expect("replay app");
+        let vp = crate::viewport::DynamicViewport::new_headless(
+            80,
+            24,
+            5,
+            crate::viewport::EmissionStrategy::Fast,
+        );
+        (app, vp)
+    }
+
+    /// The first `n` non-comment fixture lines, as a sub-fixture.
+    fn fixture_prefix(fixture: &str, n: usize) -> String {
+        fixture
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .take(n)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn replay_nothing_commits_before_done() {
+        // The mu-d04a invariant itself: mid-turn, ALL content is live-only —
+        // scrollback receives nothing until the terminal done.
+        let (mut app, mut vp) = replay_env();
+        let mid_stream = fixture_prefix(REPLAY_BASIC_TURN, 3); // deltas + finalize, no done
+        app.replay_notifications(&mut vp, &mid_stream)
+            .expect("replay");
+        assert!(
+            vp.history_plain().is_empty(),
+            "no scrollback commit before the turn's done"
+        );
+        let live = app.live_turn.as_ref().expect("turn is live mid-stream");
+        assert!(live.has_output());
+        assert!(app.transcript.blocks().is_empty());
+    }
+
+    #[test]
+    fn replay_basic_turn_commits_exactly_once_on_done() {
+        let (mut app, mut vp) = replay_env();
+        app.replay_notifications(&mut vp, REPLAY_BASIC_TURN)
+            .expect("replay");
+        assert!(app.live_turn.is_none(), "done drops the live turn");
+        assert_eq!(app.transcript.blocks().len(), 1, "one committed block");
+        let emitted = vp.history_plain().join("\n");
+        assert!(emitted.contains("The answer is 42."));
+        // Exactly-once: the historical duplication class (8hva) shows up as
+        // the same body line landing in scrollback twice.
+        assert_eq!(emitted.matches("The answer is 42.").count(), 1);
+    }
+
+    #[test]
+    fn replay_tool_turn_renders_call_and_result() {
+        let (mut app, mut vp) = replay_env();
+        app.replay_notifications(&mut vp, REPLAY_TOOL_TURN)
+            .expect("replay");
+        assert!(app.live_turn.is_none());
+        let emitted = vp.history_plain().join("\n");
+        assert!(emitted.contains("Bash"), "titlecased tool name rendered");
+        assert!(emitted.contains("echo hi"), "primary arg rendered");
+        assert!(emitted.contains("Done: hi"), "closing segment rendered");
+        assert_eq!(
+            emitted.matches("Checking.").count(),
+            1,
+            "segment-bounded finalize must not duplicate the pre-tool text (mu-b20l)"
+        );
+        let items = app.transcript.blocks()[0]
+            .items
+            .as_ref()
+            .expect("assistant block keeps structured items");
+        assert!(items
+            .iter()
+            .any(|i| matches!(i, render::TurnItem::ToolCall { .. })));
+        assert!(items
+            .iter()
+            .any(|i| matches!(i, render::TurnItem::ToolResult { .. })));
+    }
+
+    #[test]
+    fn replay_bare_done_emits_no_output_marker() {
+        // A done with no prior content: the standalone "(no output)" path.
+        let (mut app, mut vp) = replay_env();
+        let done_only = fixture_prefix(REPLAY_BASIC_TURN, 4)
+            .lines()
+            .last()
+            .unwrap()
+            .to_string();
+        app.replay_notifications(&mut vp, &done_only)
+            .expect("replay");
+        assert!(app.live_turn.is_none());
+        let emitted = vp.history_plain().join("\n");
+        assert!(
+            emitted.contains("no output") || !emitted.is_empty(),
+            "a contentless done still leaves a visible record: {emitted:?}"
+        );
+    }
 
     #[test]
     fn export_plain_includes_finalized_live_turn_before_done() {

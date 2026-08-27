@@ -1287,6 +1287,9 @@ pub fn handle_session_stats(request: Request<Value>, sessions: Sessions) -> Resp
         None => (None, None),
     };
 
+    let live_guards = sessions
+        .guard_labels(&params.session_id)
+        .map(|labels| labels.into_iter().map(String::from).collect());
     let resp = SessionStatsResponse {
         session_id: params.session_id,
         provider_kind,
@@ -1299,6 +1302,7 @@ pub fn handle_session_stats(request: Request<Value>, sessions: Sessions) -> Resp
         tool_call_count: log.tool_call_count(),
         elapsed_total_ms: log.elapsed_total_ms(),
         usage: log.cumulative_usage(),
+        live_guards,
     };
     ok_response(request.id, to_value_or_null(resp))
 }

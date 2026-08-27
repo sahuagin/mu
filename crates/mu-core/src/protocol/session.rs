@@ -247,6 +247,14 @@ pub struct SessionStatsResponse {
     /// reported usage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<crate::agent::Usage>,
+    /// Labels of the task guards this session still holds, in
+    /// registration (dataflow) order — e.g. `["agent-loop", "forwarder"]`
+    /// (bead mu-0xhja). Present for LIVE sessions on the local daemon and
+    /// for CLOSED sessions whose tasks are still draining (the not-yet-
+    /// finished labels); omitted once nothing runs, for rehydrated/worker
+    /// sessions, and by older daemons that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_guards: Option<Vec<String>>,
 }
 
 // ===== mu-038: projection queries (session.list, session.events) =====

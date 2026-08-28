@@ -27,6 +27,19 @@ const PROVIDER_STATUS_TICK_MS: u64 = 1000;
 /// Ceiling on any single retry pause, server-suggested or backoff.
 const MAX_RETRY_DELAY_MS: u64 = 30_000;
 
+/// mu-197pd: liveness deadlines for a silent provider stream. A peer
+/// that dies without FIN/RST (host freeze, yanked cable) leaves the
+/// connection half-open: `stream.next()` neither resolves nor errors,
+/// TCP keepalive is hours away, and the session sleeps forever — the
+/// operator's watch never rewakes (observed 2026-08-27: box froze at
+/// 16:44 mid-experiment; the mu session sat in `streaming` until found
+/// by eye). The status tick converts sustained byte-silence into an
+/// error like any other stream failure. Awaiting-first-token tolerates
+/// more silence than mid-stream: a 200k+ prefill on a local lane
+/// legitimately takes minutes.
+const FIRST_TOKEN_STALL_SECS: u64 = 600;
+const STREAM_STALL_SECS: u64 = 300;
+
 fn retryable_provider_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     // Never retry: the request itself is the problem, or the quota window
@@ -244,6 +257,10 @@ pub(crate) async fn handle_invoke_llm(
         let mut bytes_received: u64 = 0;
         let mut seen_first_token = false;
         let mut current_state = ProviderStatusKind::AwaitingFirstToken;
+        // mu-197pd: byte-progress snapshot for the stall check in the
+        // tick arm. tokio Instant so paused-time tests can drive it.
+        let mut last_bytes_seen: u64 = 0;
+        let mut quiet_since = tokio::time::Instant::now();
         // Per-attempt clocks: a retried call's awaiting-first-token wait
         // is measured from ITS start, not the original call's (attempt 1
         // is within a tick of call_started_at, so nothing shifts there).
@@ -367,7 +384,15 @@ pub(crate) async fn handle_invoke_llm(
                         arguments_delta,
                     }) => {
                         // Partial tool-call args also count as streaming output (a
-                        // tool-only turn may produce no text at all).
+                        // tool-only turn may produce no text at all). Name deltas
+                        // count too: Anthropic opens every tool_use block with a
+                        // name-only delta, and the mu-197pd stall watchdog keys
+                        // liveness on bytes_received — progress that doesn't
+                        // count is progress the watchdog can misread as silence
+                        // (ci-aipr panel finding).
+                        if let Some(name) = name_delta.as_deref() {
+                            bytes_received = bytes_received.saturating_add(name.len() as u64);
+                        }
                         if let Some(args) = arguments_delta.as_deref() {
                             bytes_received = bytes_received.saturating_add(args.len() as u64);
                         }
@@ -446,6 +471,56 @@ pub(crate) async fn handle_invoke_llm(
                                 tool_call_id: None,
                             })
                             .await;
+                    }
+                    // mu-197pd: stall check. Byte progress since the
+                    // last tick resets the clock; sustained silence past
+                    // the phase deadline is treated as a stream failure —
+                    // a half-open connection to a dead peer produces
+                    // exactly this shape and would otherwise hang the
+                    // session forever.
+                    if bytes_received != last_bytes_seen {
+                        last_bytes_seen = bytes_received;
+                        quiet_since = tokio::time::Instant::now();
+                    } else {
+                        let limit_secs = if seen_first_token {
+                            STREAM_STALL_SECS
+                        } else {
+                            FIRST_TOKEN_STALL_SECS
+                        };
+                        if quiet_since.elapsed().as_secs() >= limit_secs {
+                            let message = format!(
+                                "provider stream stalled: no bytes for {limit_secs}s \
+                                 ({} phase) — treating the connection as dead",
+                                if seen_first_token { "streaming" } else { "awaiting-first-token" },
+                            );
+                            let _ = cancel_tx.send(());
+                            if seen_first_token || attempt >= PROVIDER_START_MAX_ATTEMPTS {
+                                return Err(Outcome::Error(message));
+                            }
+                            drop(stream);
+                            let delay_ms = provider_retry_delay_ms(attempt, &message);
+                            let _ = events
+                                .send(AgentEvent::Callout {
+                                    category: "warning".to_owned(),
+                                    title: "provider stream stalled — retrying".to_owned(),
+                                    body: retry_callout_body(&message, attempt, delay_ms),
+                                    theme: Some("warning".to_owned()),
+                                    context_refs: vec!["bead:mu-197pd".to_owned()],
+                                })
+                                .await;
+                            backoff_or_cancel(delay_ms, input_rx, &mut buffered).await?;
+                            attempt += 1;
+                            let _ = events
+                                .send(AgentEvent::ProviderStatus {
+                                    state: ProviderStatusKind::AwaitingFirstToken,
+                                    started_at_unix_ms: now_unix_ms(),
+                                    elapsed_ms: 0,
+                                    bytes_received: None,
+                                    tool_call_id: None,
+                                })
+                                .await;
+                            continue 'attempt;
+                        }
                     }
                 },
             }

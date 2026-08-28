@@ -62,6 +62,9 @@ enum MockResponse {
     /// Stream that never produces events. Used to simulate a long-
     /// running provider call for cancel and queue-ordering tests.
     Pending,
+    /// mu-197pd: yields the events, then hangs forever — a peer that
+    /// died mid-stream without closing the connection.
+    EventsThenPending(Vec<ProviderEvent>),
 }
 
 struct MockProvider {
@@ -89,6 +92,30 @@ impl MockProvider {
     fn pending() -> Self {
         let mut q = VecDeque::new();
         q.push_back(MockResponse::Pending);
+        Self {
+            responses: Mutex::new(q),
+            truncates_over_window: false,
+        }
+    }
+
+    /// mu-197pd: n consecutive streams that never yield — the shape of
+    /// a peer that died without FIN/RST, once per retry attempt.
+    fn pending_times(n: usize) -> Self {
+        let mut q = VecDeque::new();
+        for _ in 0..n {
+            q.push_back(MockResponse::Pending);
+        }
+        Self {
+            responses: Mutex::new(q),
+            truncates_over_window: false,
+        }
+    }
+
+    /// mu-197pd: a stream that yields `events` then hangs forever —
+    /// the peer died mid-stream.
+    fn events_then_hang(events: Vec<ProviderEvent>) -> Self {
+        let mut q = VecDeque::new();
+        q.push_back(MockResponse::EventsThenPending(events));
         Self {
             responses: Mutex::new(q),
             truncates_over_window: false,
@@ -173,6 +200,9 @@ impl Provider for MockProvider {
                 .flatten(),
             )),
             Some(MockResponse::Pending) => Ok(Box::pin(stream::pending())),
+            Some(MockResponse::EventsThenPending(events)) => {
+                Ok(Box::pin(stream::iter(events).chain(stream::pending())))
+            }
             None => Ok(Box::pin(stream::iter(Vec::<ProviderEvent>::new()))),
         }
     }
@@ -1074,6 +1104,73 @@ async fn non_retryable_stream_error_fails_immediately() {
             AgentEvent::Callout { title, .. } if title == "provider stream retrying"
         )),
         "non-retryable error must not retry"
+    );
+}
+
+/// mu-197pd: a stream that never produces a byte (half-open connection
+/// to a dead peer) must not hang the session forever. Before the first
+/// token the stall is retryable — each attempt gets a fresh
+/// connection — and the attempt cap then surfaces an error.
+#[tokio::test(start_paused = true)]
+async fn stalled_stream_before_first_token_retries_then_errors() {
+    let provider = MockProvider::pending_times(3);
+    let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { message } if message.contains("stalled"))),
+        "silent stream must surface a stall error, not hang"
+    );
+    let retries = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::Callout { title, .. } if title == "provider stream stalled — retrying"
+            )
+        })
+        .count();
+    assert_eq!(retries, 2, "attempts 1 and 2 retry; attempt 3 errors out");
+}
+
+/// mu-197pd: a peer that dies AFTER bytes flowed is a hard error (no
+/// retry — partial output would be silently re-billed and re-generated),
+/// surfaced within the mid-stream deadline instead of sleeping forever.
+#[tokio::test(start_paused = true)]
+async fn stalled_stream_mid_stream_errors_without_retry() {
+    let provider =
+        MockProvider::events_then_hang(vec![ProviderEvent::TextDelta("partial ".into())]);
+    let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { message } if message.contains("stalled"))),
+        "mid-stream stall must surface an error"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Callout { title, .. } if title == "provider stream stalled — retrying"
+        )),
+        "mid-stream stall must not retry"
     );
 }
 

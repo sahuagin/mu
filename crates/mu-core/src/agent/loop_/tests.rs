@@ -2121,7 +2121,7 @@ fn tool_history_empty_has_no_match() {
 #[test]
 fn tool_history_matches_errored_call_exactly() {
     let mut h = ToolHistory::default();
-    h.record("bash".into(), json!({"command": "ls; rm /"}), true);
+    h.record("bash".into(), json!({"command": "ls; rm /"}), true, 0);
     assert!(h.errored_match("bash", &json!({"command": "ls; rm /"})));
     // Same tool, different args — no match.
     assert!(!h.errored_match("bash", &json!({"command": "ls"})));
@@ -2133,7 +2133,7 @@ fn tool_history_matches_errored_call_exactly() {
 fn tool_history_does_not_match_succeeded_calls() {
     let mut h = ToolHistory::default();
     // Successful call — not in the "should refuse retry" set.
-    h.record("read".into(), json!({"path": "/etc/hosts"}), false);
+    h.record("read".into(), json!({"path": "/etc/hosts"}), false, 0);
     assert!(!h.errored_match("read", &json!({"path": "/etc/hosts"})));
 }
 
@@ -2144,7 +2144,7 @@ fn identical_success_streak_counts_tail_repeats() {
     let mut h = ToolHistory::default();
     let args = json!({"command": "grep -n foo bar.rs"});
     for _ in 0..3 {
-        h.record("bash".into(), args.clone(), false);
+        h.record("bash".into(), args.clone(), false, 0);
     }
     assert_eq!(h.identical_success_streak("bash", &args), 3);
     // Different args — fresh streak.
@@ -2162,10 +2162,10 @@ fn identical_success_streak_survives_guard_refusals() {
     let mut h = ToolHistory::default();
     let args = json!({"command": "grep -n foo bar.rs"});
     for _ in 0..3 {
-        h.record("bash".into(), args.clone(), false);
+        h.record("bash".into(), args.clone(), false, 0);
     }
-    h.record("bash".into(), args.clone(), true); // refusal
-    h.record("bash".into(), args.clone(), true); // refusal
+    h.record("bash".into(), args.clone(), true, 0); // refusal
+    h.record("bash".into(), args.clone(), true, 0); // refusal
     assert_eq!(h.identical_success_streak("bash", &args), 3);
 }
 
@@ -2176,7 +2176,7 @@ fn identical_error_streak_counts_tail_identical_errors() {
     let mut h = ToolHistory::default();
     let args = json!({"command": "timeout 3590 python3 -c 'poll()'"});
     for _ in 0..5 {
-        h.record("watch".into(), args.clone(), true);
+        h.record("watch".into(), args.clone(), true, 0);
     }
     assert_eq!(h.identical_error_streak("watch", &args), 5);
     // Different args — fresh streak.
@@ -2195,10 +2195,10 @@ fn identical_error_streak_broken_by_matching_success() {
     let mut h = ToolHistory::default();
     let args = json!({"command": "curl flaky-endpoint"});
     for _ in 0..4 {
-        h.record("bash".into(), args.clone(), true);
+        h.record("bash".into(), args.clone(), true, 0);
     }
-    h.record("bash".into(), args.clone(), false);
-    h.record("bash".into(), args.clone(), true);
+    h.record("bash".into(), args.clone(), false, 0);
+    h.record("bash".into(), args.clone(), true, 0);
     assert_eq!(h.identical_error_streak("bash", &args), 1);
 }
 
@@ -2207,9 +2207,9 @@ fn identical_error_streak_broken_by_different_call() {
     let mut h = ToolHistory::default();
     let args = json!({"command": "timeout 3590 python3 -c 'poll()'"});
     for _ in 0..5 {
-        h.record("watch".into(), args.clone(), true);
+        h.record("watch".into(), args.clone(), true, 0);
     }
-    h.record("bash".into(), json!({"command": "wc -l app.rs"}), false);
+    h.record("bash".into(), json!({"command": "wc -l app.rs"}), false, 0);
     assert_eq!(h.identical_error_streak("watch", &args), 0);
 }
 
@@ -2222,11 +2222,76 @@ fn identical_error_streak_held_by_own_refusals() {
     let mut h = ToolHistory::default();
     let args = json!({"command": "timeout 3590 python3 -c 'poll()'"});
     for _ in 0..5 {
-        h.record("watch".into(), args.clone(), true);
+        h.record("watch".into(), args.clone(), true, 0);
     }
-    h.record("watch".into(), args.clone(), true); // refusal
-    h.record("watch".into(), args.clone(), true); // refusal
+    h.record("watch".into(), args.clone(), true, 0); // refusal
+    h.record("watch".into(), args.clone(), true, 0); // refusal
     assert_eq!(h.identical_error_streak("watch", &args), 7);
+}
+
+// ── mu-hgg4v: novelty annotation — identical-result repeat counting ──
+
+#[test]
+fn identical_result_repeats_counts_matching_hashes_only() {
+    let mut h = ToolHistory::default();
+    let args = json!({"command": "grep -A 45 render bar.rs"});
+    h.record("bash".into(), args.clone(), false, 42);
+    h.record("bash".into(), args.clone(), false, 42);
+    assert_eq!(h.identical_result_repeats("bash", &args, 42), 2);
+    // Same call, different content — the run resets.
+    assert_eq!(h.identical_result_repeats("bash", &args, 7), 0);
+    // Different args — fresh.
+    assert_eq!(
+        h.identical_result_repeats("bash", &json!({"command": "ls"}), 42),
+        0
+    );
+}
+
+#[tokio::test]
+async fn repeated_identical_tool_result_gets_novelty_annotation() {
+    // Two identical calls returning identical content: the second
+    // result must carry the repeat marker; the first must not.
+    let provider = MockProvider::new(vec![
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "t1",
+            "echo",
+            json!({}),
+        ))],
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "t2",
+            "echo",
+            json!({}),
+        ))],
+        vec![ProviderEvent::Done(assistant_text("done"))],
+    ]);
+    let tools = vec![MockTool::always_ok("echo", "same bytes every time")];
+    let (loop_, events_rx) = spawn_loop(provider, tools, AgentConfig::default());
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    let completed: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCallCompleted { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completed.len(), 2, "both tool calls complete");
+    assert!(
+        !completed[0].contains("[runtime note:"),
+        "first result is novel — no annotation"
+    );
+    assert!(
+        completed[1].contains("byte-identical to the previous 1 result"),
+        "second identical result must carry the repeat marker, got: {}",
+        completed[1]
+    );
 }
 
 #[test]
@@ -2236,9 +2301,9 @@ fn identical_success_streak_broken_by_different_call() {
     let mut h = ToolHistory::default();
     let args = json!({"command": "grep -n foo bar.rs"});
     for _ in 0..3 {
-        h.record("bash".into(), args.clone(), false);
+        h.record("bash".into(), args.clone(), false, 0);
     }
-    h.record("read".into(), json!({"path": "x"}), false);
+    h.record("read".into(), json!({"path": "x"}), false, 0);
     assert_eq!(h.identical_success_streak("bash", &args), 0);
 }
 
@@ -2247,7 +2312,12 @@ fn tool_history_window_evicts_oldest() {
     let mut h = ToolHistory::default();
     // Fill past the window; oldest should evict.
     for i in 0..(TOOL_HISTORY_WINDOW + 3) {
-        h.record("bash".into(), json!({"command": format!("cmd{i}")}), true);
+        h.record(
+            "bash".into(),
+            json!({"command": format!("cmd{i}")}),
+            true,
+            0,
+        );
     }
     // Window is capped.
     assert_eq!(h.entries.len(), TOOL_HISTORY_WINDOW);
@@ -2261,7 +2331,7 @@ fn tool_history_window_evicts_oldest() {
 #[test]
 fn tool_history_clear_empties_window() {
     let mut h = ToolHistory::default();
-    h.record("bash".into(), json!({"command": "x"}), true);
+    h.record("bash".into(), json!({"command": "x"}), true, 0);
     assert!(h.errored_match("bash", &json!({"command": "x"})));
     h.clear();
     assert!(!h.errored_match("bash", &json!({"command": "x"})));
@@ -2273,9 +2343,9 @@ fn tool_history_streak_counts_consecutive_errors_per_tool() {
     let mut h = ToolHistory::default();
     // Three different bash commands, all errored. The streak from
     // bash's perspective is 3, regardless of args.
-    h.record("bash".into(), json!({"command": "a"}), true);
-    h.record("bash".into(), json!({"command": "b"}), true);
-    h.record("bash".into(), json!({"command": "c"}), true);
+    h.record("bash".into(), json!({"command": "a"}), true, 0);
+    h.record("bash".into(), json!({"command": "b"}), true, 0);
+    h.record("bash".into(), json!({"command": "c"}), true, 0);
     assert_eq!(h.consecutive_errors_for("bash"), 3);
     // Other tools at zero.
     assert_eq!(h.consecutive_errors_for("read"), 0);
@@ -2284,11 +2354,11 @@ fn tool_history_streak_counts_consecutive_errors_per_tool() {
 #[test]
 fn tool_history_streak_breaks_on_success() {
     let mut h = ToolHistory::default();
-    h.record("bash".into(), json!({"command": "a"}), true);
-    h.record("bash".into(), json!({"command": "b"}), true);
+    h.record("bash".into(), json!({"command": "a"}), true, 0);
+    h.record("bash".into(), json!({"command": "b"}), true, 0);
     // Success in the middle breaks the streak.
-    h.record("bash".into(), json!({"command": "c"}), false);
-    h.record("bash".into(), json!({"command": "d"}), true);
+    h.record("bash".into(), json!({"command": "c"}), false, 0);
+    h.record("bash".into(), json!({"command": "d"}), true, 0);
     // From the latest entry walking back: error (d), then success
     // (c) — streak is 1.
     assert_eq!(h.consecutive_errors_for("bash"), 1);
@@ -2297,9 +2367,9 @@ fn tool_history_streak_breaks_on_success() {
 #[test]
 fn tool_history_streak_skips_other_tools_without_breaking() {
     let mut h = ToolHistory::default();
-    h.record("bash".into(), json!({"command": "a"}), true);
-    h.record("read".into(), json!({"path": "/x"}), false); // unrelated, skipped
-    h.record("bash".into(), json!({"command": "b"}), true);
+    h.record("bash".into(), json!({"command": "a"}), true, 0);
+    h.record("read".into(), json!({"path": "/x"}), false, 0); // unrelated, skipped
+    h.record("bash".into(), json!({"command": "b"}), true, 0);
     // bash streak from newest: error, [skip read], error — count 2.
     assert_eq!(h.consecutive_errors_for("bash"), 2);
 }

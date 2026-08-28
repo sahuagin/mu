@@ -79,6 +79,10 @@ pub(crate) struct ToolHistoryEntry {
     pub tool_name: String,
     pub arguments: serde_json::Value,
     pub is_error: bool,
+    /// mu-hgg4v: hash of the RAW result content (pre-filter, pre-
+    /// annotation), so byte-identical repeats of the same call can be
+    /// detected and marked for the model.
+    pub content_hash: u64,
 }
 
 impl ToolHistory {
@@ -87,15 +91,44 @@ impl ToolHistory {
     }
 
     /// Record a completed dispatch. Drops the oldest if over capacity.
-    pub fn record(&mut self, tool_name: String, arguments: serde_json::Value, is_error: bool) {
+    pub fn record(
+        &mut self,
+        tool_name: String,
+        arguments: serde_json::Value,
+        is_error: bool,
+        content_hash: u64,
+    ) {
         self.entries.push_back(ToolHistoryEntry {
             tool_name,
             arguments,
             is_error,
+            content_hash,
         });
         while self.entries.len() > TOOL_HISTORY_WINDOW {
             self.entries.pop_front();
         }
+    }
+
+    /// mu-hgg4v: length of the tail run of calls byte-identical to
+    /// (tool_name, arguments) whose RAW result content also hashed
+    /// identically. This is the repeat count the model cannot tally
+    /// for itself — identical blocks blur together in attention — so
+    /// the dispatcher surfaces it as an explicit annotation.
+    pub(crate) fn identical_result_repeats(
+        &self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        content_hash: u64,
+    ) -> usize {
+        self.entries
+            .iter()
+            .rev()
+            .take_while(|e| {
+                e.tool_name == tool_name
+                    && &e.arguments == arguments
+                    && e.content_hash == content_hash
+            })
+            .count()
     }
 
     /// Has a matching (tool_name, arguments) call in the window
@@ -224,10 +257,21 @@ async fn finish_tool_call(
     result: ToolResult,
     verbatim: bool,
 ) {
+    // mu-hgg4v: hash the RAW content before any filtering or
+    // annotation, so repeats compare like-with-like across turns.
+    let content_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        result.content.hash(&mut h);
+        h.finish()
+    };
+    let repeats =
+        history.identical_result_repeats(&call.name, call.arguments.as_value(), content_hash);
     history.record(
         call.name.clone(),
         call.arguments.clone().into(),
         result.is_error,
+        content_hash,
     );
 
     // mu-2e0h tier 1: deterministic ingestion hygiene (ANSI strip,
@@ -240,7 +284,7 @@ async fn finish_tool_call(
     // Tools that declare `verbatim_result` (read-like tools whose
     // output must stay byte-identical to disk for exact-match
     // editing) bypass the filter entirely.
-    let content = if verbatim {
+    let mut content = if verbatim {
         result.content
     } else {
         match super::super::tool_result_filter::filter_tool_result(&result.content) {
@@ -248,6 +292,26 @@ async fn finish_tool_call(
             std::borrow::Cow::Owned(filtered) => filtered,
         }
     };
+
+    // mu-hgg4v: novelty annotation. Identical informative results are
+    // as trajectory-inert as empty ones — the redirect signal is the
+    // novelty DELTA, which the model cannot tally across identical
+    // context blocks (the 2026-08-25 13k-call loop stacked identical
+    // grep results with nothing marking the repetition). Surface the
+    // repeat count as tokens the model conditions on, BEFORE the hard
+    // guards have to fire. Verbatim tools are exempt: their output
+    // must stay byte-identical to disk.
+    if !verbatim && repeats >= 1 {
+        use std::fmt::Write;
+        let _ = write!(
+            content,
+            "\n\n[runtime note: this result is byte-identical to the previous {repeats} \
+             result{} of this exact call. The content is already in your context — \
+             re-running the same call adds no new information; change the approach \
+             or move on.]",
+            if repeats == 1 { "" } else { "s" },
+        );
+    }
 
     let _ = events
         .send(AgentEvent::ToolCallCompleted {

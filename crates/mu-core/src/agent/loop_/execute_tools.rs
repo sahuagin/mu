@@ -40,13 +40,15 @@ const IDENTICAL_SUCCESS_LIMIT: usize = 3;
 
 /// mu-rsvx7: identical-error bound for tools whose retry policy is NOT
 /// `Never`. The `Never` gates above don't run for `ModelDecides`, which
-/// meant a byte-identical call drawing a byte-identical error could
-/// repeat unbounded — 23 identical `watch` submissions, each rejected
-/// by the same strict-mode message, ran straight to the turn cap in the
-/// 2026-08-28 reflection eval (session 9d7ad468d29b70f3). ModelDecides
-/// still owes the model room for judicious retry (transient failures,
-/// races), so this bound is looser than `RETRY_STREAK_LIMIT`; but this
-/// many identical calls ALL erroring is a loop, not judgment.
+/// meant a byte-identical call could error-and-repeat unbounded — 23
+/// identical `watch` submissions, each rejected by the same strict-mode
+/// message, ran straight to the turn cap in the 2026-08-28 reflection
+/// eval (session 9d7ad468d29b70f3). The bound is on CALL identity: the
+/// error text may vary between attempts (panel finding, ci-aipr on
+/// mu-rsvx7) — five straight failures of the byte-same call warrant a
+/// strategy change regardless. ModelDecides still owes the model room
+/// for judicious retry (transient failures, races), so this bound is
+/// looser than `RETRY_STREAK_LIMIT`.
 const MODEL_DECIDES_IDENTICAL_ERROR_LIMIT: usize = 5;
 
 // The streak is computed over the bounded history window; a limit that
@@ -490,17 +492,19 @@ pub(crate) async fn handle_execute_tools(
                     }
                 }
                 // mu-rsvx7: ModelDecides trusts the model to retry
-                // judiciously, but an exact-identical call that has
-                // errored identically N times running is a loop, not
-                // judgment — bound it. (`UpTo` is reserved/unwired;
-                // give it the same backstop rather than no gate.)
+                // judiciously, but an exact-identical call erroring N
+                // times running is a loop, not judgment — bound it.
+                // Call identity only; the error text may vary between
+                // attempts. (`UpTo` is reserved/unwired; give it the
+                // same backstop rather than no gate.)
                 RetryPolicy::ModelDecides | RetryPolicy::UpTo { .. } => {
                     if history.identical_error_streak(&call.name, call.arguments.as_value())
                         >= MODEL_DECIDES_IDENTICAL_ERROR_LIMIT
                     {
                         Some(
-                            "this exact call has errored identically several times in a row — \
-                             resubmitting it unchanged cannot produce a different result",
+                            "this exact call has errored on every recent attempt — \
+                             resubmitting it unchanged is not working; take a materially \
+                             different action or report the obstacle",
                         )
                     } else {
                         None

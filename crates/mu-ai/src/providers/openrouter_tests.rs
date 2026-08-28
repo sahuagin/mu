@@ -788,17 +788,24 @@ fn sampling_for_model_resolves_catalog_temperature_top_p() {
             model: Some("z-ai/glm-5.2".to_string()),
             temperature: Some(0.6),
             top_p: Some(0.95),
+            presence_penalty: Some(1.5),
+            top_k: Some(20),
             ..Default::default()
         },
     );
     assert_eq!(
         sampling_for_model_with_catalog(&catalog, "z-ai/glm-5.2"),
-        (Some(0.6), Some(0.95))
+        Sampling {
+            temperature: Some(0.6),
+            top_p: Some(0.95),
+            presence_penalty: Some(1.5),
+            top_k: Some(20),
+        }
     );
     // A model with no catalog entry → no sampling (provider default).
     assert_eq!(
         sampling_for_model_with_catalog(&catalog, "openai/gpt-5.5"),
-        (None, None)
+        Sampling::default()
     );
 }
 
@@ -806,18 +813,36 @@ fn sampling_for_model_resolves_catalog_temperature_top_p() {
 fn inject_sampling_adds_fields_only_when_set() {
     // All-None leaves the body untouched (byte-for-byte parity).
     let mut body = json!({"model": "m"});
-    inject_sampling(&mut body, None, None);
+    inject_sampling(&mut body, Sampling::default());
     assert_eq!(body, json!({"model": "m"}));
-    // Both set → JSON numbers.
+    // Full card set → JSON numbers (mu-4sivd: presence_penalty/top_k too).
     let mut body = json!({"model": "m"});
-    inject_sampling(&mut body, Some(0.6), Some(0.95));
+    inject_sampling(
+        &mut body,
+        Sampling {
+            temperature: Some(0.6),
+            top_p: Some(0.95),
+            presence_penalty: Some(1.5),
+            top_k: Some(20),
+        },
+    );
     assert_eq!(body["temperature"], json!(0.6));
     assert_eq!(body["top_p"], json!(0.95));
-    // Only temperature → no top_p key.
+    assert_eq!(body["presence_penalty"], json!(1.5));
+    assert_eq!(body["top_k"], json!(20));
+    // Only temperature → no other keys.
     let mut body = json!({});
-    inject_sampling(&mut body, Some(0.2), None);
+    inject_sampling(
+        &mut body,
+        Sampling {
+            temperature: Some(0.2),
+            ..Default::default()
+        },
+    );
     assert_eq!(body["temperature"], json!(0.2));
     assert!(body.get("top_p").is_none());
+    assert!(body.get("presence_penalty").is_none());
+    assert!(body.get("top_k").is_none());
 }
 
 #[test]

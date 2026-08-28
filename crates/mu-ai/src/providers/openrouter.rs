@@ -300,11 +300,23 @@ fn apply_dialect_rescue(
 
 /// Per-model sampling resolved from the model catalog (mu-y8gp), mirroring
 /// [`super::output_limits::max_tokens_for_model`]'s catalog lookup. Returns
-/// `(temperature, top_p)`; either is `None` when the catalog declares none,
-/// in which case the caller sends no such field and the request body is
-/// byte-for-byte unchanged.
-fn sampling_for_model(model: &str) -> (Option<f64>, Option<f64>) {
+/// the full [`Sampling`] set; each field is `None` when the catalog declares
+/// none, in which case the caller sends no such field and the request body
+/// is byte-for-byte unchanged.
+fn sampling_for_model(model: &str) -> Sampling {
     sampling_for_model_with_catalog(mu_core::model_catalog::global(), model)
+}
+
+/// mu-4sivd: the catalog's full per-model sampling set. Grown from the
+/// original (temperature, top_p) pair so presence_penalty — the
+/// anti-repetition knob — no longer rides solely on a serve-side
+/// launcher flag.
+#[derive(Debug, Default, PartialEq)]
+struct Sampling {
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    presence_penalty: Option<f64>,
+    top_k: Option<u32>,
 }
 
 /// [`sampling_for_model`] against an explicit catalog — the testable seam (a
@@ -313,23 +325,37 @@ fn sampling_for_model(model: &str) -> (Option<f64>, Option<f64>) {
 fn sampling_for_model_with_catalog(
     catalog: &mu_core::model_catalog::ModelCatalogConfig,
     model: &str,
-) -> (Option<f64>, Option<f64>) {
+) -> Sampling {
     let r = catalog.resolve_model(model);
-    (r.temperature, r.top_p)
+    Sampling {
+        temperature: r.temperature,
+        top_p: r.top_p,
+        presence_penalty: r.presence_penalty,
+        top_k: r.top_k,
+    }
 }
 
-/// Inject per-model sampling (mu-y8gp) into an OpenRouter request body. No-op
-/// when the catalog declares no temperature/top_p for `model`, so the body is
-/// byte-for-byte unchanged — preserving the yqeq6 Legacy/Projected parity.
+/// Inject per-model sampling (mu-y8gp, mu-4sivd) into an OpenRouter request
+/// body. No-op when the catalog declares no sampling fields for `model`, so
+/// the body is byte-for-byte unchanged — preserving the yqeq6
+/// Legacy/Projected parity.
 fn apply_sampling(body: &mut Value, model: &str) {
-    let (temperature, top_p) = sampling_for_model(model);
-    // mu-y8gp: clamp to provider-valid ranges and drop non-finite, so an
-    // operator catalog typo (temperature = 5.0, a NaN, …) can't ship an
-    // invalid sampling value — temperature ∈ [0, 2], top_p ∈ [0, 1].
+    let s = sampling_for_model(model);
+    // mu-y8gp: clamp the f64 knobs to provider-valid ranges and drop
+    // non-finite, so an operator catalog typo (temperature = 5.0, a NaN, …)
+    // can't ship an invalid value — temperature ∈ [0, 2], top_p ∈ [0, 1],
+    // presence_penalty ∈ [-2, 2] (mu-4sivd). top_k is only floored (dropped
+    // when 0): it has no principled upper bound here — providers clamp it to
+    // their vocab size, and inventing a ceiling would silently rewrite a
+    // deliberate operator value.
     inject_sampling(
         body,
-        clamp_sampling(temperature, 0.0, 2.0),
-        clamp_sampling(top_p, 0.0, 1.0),
+        Sampling {
+            temperature: clamp_sampling(s.temperature, 0.0, 2.0),
+            top_p: clamp_sampling(s.top_p, 0.0, 1.0),
+            presence_penalty: clamp_sampling(s.presence_penalty, -2.0, 2.0),
+            top_k: s.top_k.filter(|k| *k > 0),
+        },
     );
 }
 
@@ -380,14 +406,20 @@ fn combine_system(base: Option<&str>, addendum: Option<String>) -> Option<String
 }
 
 /// Pure injection step of [`apply_sampling`] — testable without the global
-/// catalog. Adds `temperature`/`top_p` only when `Some`, so all-`None` leaves
+/// catalog. Adds each sampling field only when `Some`, so all-`None` leaves
 /// the body byte-for-byte unchanged.
-fn inject_sampling(body: &mut Value, temperature: Option<f64>, top_p: Option<f64>) {
-    if let Some(t) = temperature {
+fn inject_sampling(body: &mut Value, s: Sampling) {
+    if let Some(t) = s.temperature {
         body["temperature"] = json!(t);
     }
-    if let Some(p) = top_p {
+    if let Some(p) = s.top_p {
         body["top_p"] = json!(p);
+    }
+    if let Some(pp) = s.presence_penalty {
+        body["presence_penalty"] = json!(pp);
+    }
+    if let Some(k) = s.top_k {
+        body["top_k"] = json!(k);
     }
 }
 

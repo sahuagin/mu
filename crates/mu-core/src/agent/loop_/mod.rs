@@ -1093,6 +1093,34 @@ fn plan_post_execute_tools(
     actions
 }
 
+/// mu-htbz0 (panel finding): driver inputs already PLANNED into the queue —
+/// `External` or `Interject` actions from an earlier buffering round of this
+/// ask — must survive an abort the same way the aborting stage's own drained
+/// vec does. (Concrete loss without this: a message buffered during the
+/// stream is queued as `Interject`; the cancel lands during the NEXT stage's
+/// tool run; that stage's buffered vec is empty and `queue.clear()` destroys
+/// the queued `Interject` — message and mu-046 ticket both gone.)
+///
+/// Drains the queue, returning every queued INPUT (`External` payloads of
+/// any kind — driver and lifecycle alike, matching what the abort arms
+/// requeue from the stages' buffered vecs — plus `Interject` payloads) in
+/// queue order. Turn-chain actions (`InvokeLlm` / `ExecuteTools` /
+/// `MaybeFinish` / `StartAutonomousIteration`) belong to the aborted ask and
+/// are dropped, exactly as the bare `queue.clear()` did before. `Interject`
+/// demotes to a fresh-ask input: the ask it was going to interject into no
+/// longer exists.
+fn salvage_queued_driver_inputs(queue: &mut VecDeque<Action>) -> Vec<AgentInput> {
+    let mut salvaged = Vec::new();
+    for action in queue.drain(..) {
+        match action {
+            Action::External(input) => salvaged.push(input),
+            Action::Interject(input, _) => salvaged.push(input),
+            _ => {}
+        }
+    }
+    salvaged
+}
+
 /// Pure dedup check: should we push `InvokeLlm` after processing a
 /// UserMessage? Yes unless one is already queued (back-to-back UMs
 /// share one LLM call).
@@ -2708,6 +2736,12 @@ async fn run_inner(
                     continue;
                 }
 
+                // mu-htbz0: owned by this arm (not by handle_invoke_llm) so
+                // driver inputs drained during the stream survive the abort
+                // exits — the OutstandingCancelled and Error arms below
+                // requeue them after clearing the queue, instead of silently
+                // dropping the operator's message with the aborted ask.
+                let mut invoke_buffered: Vec<AgentInput> = Vec::new();
                 match handle_invoke_llm(
                     provider.as_ref(),
                     effective_system_prompt.as_deref(),
@@ -2716,10 +2750,12 @@ async fn run_inner(
                     &tool_specs,
                     &mut input_rx,
                     &events,
+                    &mut invoke_buffered,
                 )
                 .await
                 {
-                    Ok((assistant_msg, buffered)) => {
+                    Ok(assistant_msg) => {
+                        let buffered = invoke_buffered;
                         if let Some(u) = assistant_msg.usage {
                             aggregated_usage = Some(match aggregated_usage {
                                 Some(prev) => prev + u,
@@ -2850,7 +2886,15 @@ async fn run_inner(
                         turn_count = 0;
                         tool_history.clear();
                         last_stop_reason = None;
-                        queue.clear();
+                        // mu-htbz0: the narrow-cancel aborts the ASK, not the
+                        // inputs that arrived while it streamed. Salvage
+                        // driver inputs an earlier round already queued, then
+                        // this stream's drained vec, so they start the next
+                        // ask instead of vanishing.
+                        let salvaged = salvage_queued_driver_inputs(&mut queue);
+                        for input in salvaged.into_iter().chain(invoke_buffered) {
+                            queue.push_back(Action::External(input));
+                        }
                         continue;
                     }
                     Err(Outcome::Error(m)) => {
@@ -2870,7 +2914,13 @@ async fn run_inner(
                         turn_count = 0;
                         tool_history.clear();
                         last_stop_reason = None;
-                        queue.clear();
+                        // mu-htbz0: same preservation as the narrow-cancel arm
+                        // — a stream error ends the ask, not the operator's
+                        // buffered inputs (queued earlier rounds included).
+                        let salvaged = salvage_queued_driver_inputs(&mut queue);
+                        for input in salvaged.into_iter().chain(invoke_buffered) {
+                            queue.push_back(Action::External(input));
+                        }
                         continue;
                     }
                     Err(outcome) => {
@@ -2934,6 +2984,7 @@ async fn run_inner(
                     Ok(ExecuteToolsExit::OutstandingCancelled {
                         reason,
                         tool_messages,
+                        buffered,
                     }) => {
                         // Even though the ask is aborted, keep the conversation
                         // history structurally complete: every assistant
@@ -2966,7 +3017,16 @@ async fn run_inner(
                         turn_count = 0;
                         tool_history.clear();
                         last_stop_reason = None;
-                        queue.clear();
+                        // mu-htbz0: the narrow-cancel aborts the ASK, not the
+                        // inputs that arrived while tools ran. Salvage driver
+                        // inputs an earlier round already queued (e.g. an
+                        // Interject planned from the preceding stream), then
+                        // this stage's drained vec, so they start the next ask
+                        // instead of vanishing.
+                        let salvaged = salvage_queued_driver_inputs(&mut queue);
+                        for input in salvaged.into_iter().chain(buffered) {
+                            queue.push_back(Action::External(input));
+                        }
                         continue;
                     }
                     Ok(ExecuteToolsExit::Cancelled { tool_messages }) => {

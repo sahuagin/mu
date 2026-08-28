@@ -172,6 +172,7 @@ async fn backoff_or_cancel(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // same shape as handle_execute_tools
 pub(crate) async fn handle_invoke_llm(
     provider: &dyn Provider,
     system_prompt: Option<&str>,
@@ -183,7 +184,15 @@ pub(crate) async fn handle_invoke_llm(
     tool_specs: &[ToolSpec],
     input_rx: &mut mpsc::Receiver<AgentInput>,
     events: &mpsc::Sender<AgentEvent>,
-) -> Result<(AssistantMessage, Vec<AgentInput>), Outcome> {
+    // mu-htbz0: caller-owned so each exit path can decide what happens to
+    // driver inputs drained off `input_rx` during the stream. The caller
+    // requeues them on OutstandingCancelled and Error (the ask aborts, the
+    // inputs start the next ask); on full Cancel the session is ending and
+    // they are dropped with it (an orphaned ticket there is INV-4-allowed).
+    // Returning the vec only on the Ok path silently dropped inputs buffered
+    // before a narrow-cancel or stream error.
+    buffered: &mut Vec<AgentInput>,
+) -> Result<AssistantMessage, Outcome> {
     use crate::protocol::ProviderStatusKind;
 
     let call_started_at = Instant::now();
@@ -198,7 +207,7 @@ pub(crate) async fn handle_invoke_llm(
         })
         .await;
 
-    let mut buffered: Vec<AgentInput> = Vec::new();
+    // (mu-htbz0: `buffered` is the caller's vec — see the signature note.)
     // One attempt budget covers BOTH failure surfaces: provider.stream()
     // refusing to start (HTTP-level, bead mu-tds4) and an error event
     // arriving on the stream before any output token (SSE-level, bead
@@ -247,7 +256,7 @@ pub(crate) async fn handle_invoke_llm(
                                 context_refs: vec!["bead:mu-tds4".to_owned()],
                             })
                             .await;
-                        backoff_or_cancel(delay_ms, input_rx, &mut buffered).await?;
+                        backoff_or_cancel(delay_ms, input_rx, &mut *buffered).await?;
                         attempt += 1;
                     }
                 }
@@ -316,7 +325,7 @@ pub(crate) async fn handle_invoke_llm(
                                 .await;
                         }
                         let _ = cancel_tx.send(());
-                        return Ok((msg, buffered));
+                        return Ok(msg);
                     }
                     Some(super::super::provider::ProviderEvent::Error(e)) => {
                         let _ = cancel_tx.send(());
@@ -340,7 +349,7 @@ pub(crate) async fn handle_invoke_llm(
                                 context_refs: vec!["bead:mu-openai-stream-retry-y0dw".to_owned()],
                             })
                             .await;
-                        backoff_or_cancel(delay_ms, input_rx, &mut buffered).await?;
+                        backoff_or_cancel(delay_ms, input_rx, &mut *buffered).await?;
                         attempt += 1;
                         // Fresh call: put the status projection back to
                         // awaiting-first-token, clock starting now.
@@ -508,7 +517,7 @@ pub(crate) async fn handle_invoke_llm(
                                     context_refs: vec!["bead:mu-197pd".to_owned()],
                                 })
                                 .await;
-                            backoff_or_cancel(delay_ms, input_rx, &mut buffered).await?;
+                            backoff_or_cancel(delay_ms, input_rx, &mut *buffered).await?;
                             attempt += 1;
                             let _ = events
                                 .send(AgentEvent::ProviderStatus {

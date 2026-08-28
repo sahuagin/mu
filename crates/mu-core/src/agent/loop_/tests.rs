@@ -2072,6 +2072,66 @@ fn identical_success_streak_survives_guard_refusals() {
     assert_eq!(h.identical_success_streak("bash", &args), 3);
 }
 
+// ── mu-rsvx7: ModelDecides bound — identical-error streak ──
+
+#[test]
+fn identical_error_streak_counts_tail_identical_errors() {
+    let mut h = ToolHistory::default();
+    let args = json!({"command": "timeout 3590 python3 -c 'poll()'"});
+    for _ in 0..5 {
+        h.record("watch".into(), args.clone(), true);
+    }
+    assert_eq!(h.identical_error_streak("watch", &args), 5);
+    // Different args — fresh streak.
+    assert_eq!(
+        h.identical_error_streak("watch", &json!({"command": "ls"})),
+        0
+    );
+    // Different tool — fresh streak.
+    assert_eq!(h.identical_error_streak("bash", &args), 0);
+}
+
+#[test]
+fn identical_error_streak_broken_by_matching_success() {
+    // A success of the SAME call proves it can work — retries after
+    // that are the model's judgment again, so the streak resets.
+    let mut h = ToolHistory::default();
+    let args = json!({"command": "curl flaky-endpoint"});
+    for _ in 0..4 {
+        h.record("bash".into(), args.clone(), true);
+    }
+    h.record("bash".into(), args.clone(), false);
+    h.record("bash".into(), args.clone(), true);
+    assert_eq!(h.identical_error_streak("bash", &args), 1);
+}
+
+#[test]
+fn identical_error_streak_broken_by_different_call() {
+    let mut h = ToolHistory::default();
+    let args = json!({"command": "timeout 3590 python3 -c 'poll()'"});
+    for _ in 0..5 {
+        h.record("watch".into(), args.clone(), true);
+    }
+    h.record("bash".into(), json!({"command": "wc -l app.rs"}), false);
+    assert_eq!(h.identical_error_streak("watch", &args), 0);
+}
+
+#[test]
+fn identical_error_streak_held_by_own_refusals() {
+    // The bound's own refusals record as errors with the same args, so
+    // an armed guard stays armed until the model does something
+    // different — resubmitting through refusals (observed 9x in the
+    // 2026-08-28 eval, session c81509df23d47091) cannot outlast it.
+    let mut h = ToolHistory::default();
+    let args = json!({"command": "timeout 3590 python3 -c 'poll()'"});
+    for _ in 0..5 {
+        h.record("watch".into(), args.clone(), true);
+    }
+    h.record("watch".into(), args.clone(), true); // refusal
+    h.record("watch".into(), args.clone(), true); // refusal
+    assert_eq!(h.identical_error_streak("watch", &args), 7);
+}
+
 #[test]
 fn identical_success_streak_broken_by_different_call() {
     // A materially different action ends the run: one fresh identical

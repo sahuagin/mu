@@ -23,6 +23,9 @@ use super::{AgentEvent, AgentInput, Outcome, PendingApprovals, SessionCapability
 ///      Catches the "model trying variants of a rejected command"
 ///      pattern observed in the bash strict-mode live test
 ///      2026-05-10.
+///
+/// The same window backs the `ModelDecides` identical-error bound
+/// (mu-rsvx7) and the mu-503qk identical-success loop guard.
 pub const TOOL_HISTORY_WINDOW: usize = 8;
 const RETRY_STREAK_LIMIT: usize = 3;
 
@@ -34,6 +37,21 @@ const RETRY_STREAK_LIMIT: usize = 3;
 /// saturating the context with identical spans until every new prompt,
 /// including cancels and direct questions, continued the pattern.
 const IDENTICAL_SUCCESS_LIMIT: usize = 3;
+
+/// mu-rsvx7: identical-error bound for tools whose retry policy is NOT
+/// `Never`. The `Never` gates above don't run for `ModelDecides`, which
+/// meant a byte-identical call drawing a byte-identical error could
+/// repeat unbounded — 23 identical `watch` submissions, each rejected
+/// by the same strict-mode message, ran straight to the turn cap in the
+/// 2026-08-28 reflection eval (session 9d7ad468d29b70f3). ModelDecides
+/// still owes the model room for judicious retry (transient failures,
+/// races), so this bound is looser than `RETRY_STREAK_LIMIT`; but this
+/// many identical calls ALL erroring is a loop, not judgment.
+const MODEL_DECIDES_IDENTICAL_ERROR_LIMIT: usize = 5;
+
+// The streak is computed over the bounded history window; a limit that
+// doesn't fit inside it could never fire.
+const _: () = assert!(MODEL_DECIDES_IDENTICAL_ERROR_LIMIT < TOOL_HISTORY_WINDOW);
 
 /// Monotonic counter used to generate `request_id`s for
 /// `InputRequired` prompts. Combined with the tool_call_id for
@@ -86,6 +104,23 @@ impl ToolHistory {
         self.entries
             .iter()
             .any(|e| e.is_error && e.tool_name == tool_name && &e.arguments == arguments)
+    }
+
+    /// mu-rsvx7: length of the tail run of calls byte-identical to
+    /// (tool_name, arguments) in which EVERY entry errored. A matching
+    /// call that succeeded breaks the streak — the call evidently can
+    /// work, so further retries are judgment again. Any non-matching
+    /// call also ends the run.
+    pub(crate) fn identical_error_streak(
+        &self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> usize {
+        self.entries
+            .iter()
+            .rev()
+            .take_while(|e| e.tool_name == tool_name && &e.arguments == arguments && e.is_error)
+            .count()
     }
 
     /// mu-503qk: successes inside the tail run of calls byte-identical
@@ -380,18 +415,34 @@ pub(crate) async fn handle_execute_tools(
         };
 
         let retry_refusal_reason: Option<&'static str> = match tool {
-            Some(t) => {
-                let policy = t.spec().policy;
-                if !matches!(policy.retry, RetryPolicy::Never) {
-                    None
-                } else if history.errored_match(&call.name, call.arguments.as_value()) {
-                    Some("exact-match retry of a previously-errored call")
-                } else if history.consecutive_errors_for(&call.name) >= RETRY_STREAK_LIMIT {
-                    Some("error streak — the last several calls to this tool all errored")
-                } else {
-                    None
+            Some(t) => match t.spec().policy.retry {
+                RetryPolicy::Never => {
+                    if history.errored_match(&call.name, call.arguments.as_value()) {
+                        Some("exact-match retry of a previously-errored call")
+                    } else if history.consecutive_errors_for(&call.name) >= RETRY_STREAK_LIMIT {
+                        Some("error streak — the last several calls to this tool all errored")
+                    } else {
+                        None
+                    }
                 }
-            }
+                // mu-rsvx7: ModelDecides trusts the model to retry
+                // judiciously, but an exact-identical call that has
+                // errored identically N times running is a loop, not
+                // judgment — bound it. (`UpTo` is reserved/unwired;
+                // give it the same backstop rather than no gate.)
+                RetryPolicy::ModelDecides | RetryPolicy::UpTo { .. } => {
+                    if history.identical_error_streak(&call.name, call.arguments.as_value())
+                        >= MODEL_DECIDES_IDENTICAL_ERROR_LIMIT
+                    {
+                        Some(
+                            "this exact call has errored identically several times in a row — \
+                             resubmitting it unchanged cannot produce a different result",
+                        )
+                    } else {
+                        None
+                    }
+                }
+            },
             None => None,
         };
 
@@ -635,7 +686,7 @@ pub(crate) async fn handle_execute_tools(
             }
         } else if let Some(reason) = retry_refusal_reason {
             let msg = format!(
-                "runtime refused: tool `{}` blocked by RetryPolicy::Never ({reason}). \
+                "runtime refused: tool `{}` blocked by the retry guard ({reason}). \
                  Do not retry with variants of the same approach. Switch tools, \
                  change strategy materially, or report the obstacle to the user.",
                 call.name

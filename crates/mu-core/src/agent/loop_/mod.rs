@@ -414,6 +414,16 @@ pub enum AgentEvent {
     MessageEnd {
         message: AgentMessage,
     },
+    /// mu-roz1e: a driver input (operator UserMessage, watch completion,
+    /// dialogue message, or mailbox message) arrived DURING an active
+    /// response (buffered at a turn boundary or during the provider stream)
+    /// and was injected into the current ask's context instead of being
+    /// deferred to a fresh ask. The model sees it on the next iteration. The
+    /// forwarder maps this to no wire notification and no separate durable
+    /// row (the message is already recorded via `MessageEnd` → `UserMessage`).
+    Interjected {
+        message: AgentMessage,
+    },
     TurnEnd,
     Done {
         stop_reason: StopReason,
@@ -881,6 +891,16 @@ pub enum Outcome {
 #[derive(Debug)]
 enum Action {
     External(AgentInput),
+    /// mu-roz1e: inject a turn-boundary driver input (operator UserMessage,
+    /// watch completion, dialogue message, or mailbox message) into the
+    /// current ask's context (push the message + emit `Interjected`) instead
+    /// of deferring it to a fresh ask. The queued `InvokeLlm` that follows
+    /// then runs the model with the input in context. The `arrival_unix_ms`
+    /// is captured at PLANNING time (when the planner runs, after the
+    /// tool/stream completes), not at the true arrival/buffering time — the
+    /// wrapper conveys that the input predates work done since, but the skew
+    /// equals the remaining tool/stream duration.
+    Interject(AgentInput, u64),
     InvokeLlm,
     ExecuteTools(Vec<ToolCall>),
     MaybeFinish,
@@ -943,6 +963,7 @@ struct PostInvokeLlmPlan {
 fn plan_post_invoke_llm(
     assistant_msg: &AssistantMessage,
     buffered: Vec<AgentInput>,
+    arrival_unix_ms: u64,
 ) -> PostInvokeLlmPlan {
     let tool_calls: Vec<ToolCall> = assistant_msg
         .content
@@ -979,8 +1000,28 @@ fn plan_post_invoke_llm(
     } else {
         // Tool calls — defer TurnEnd until after ExecuteTools.
         actions.push(Action::ExecuteTools(tool_calls));
+        // mu-roz1e: a driver input (operator interjection / watch / dialogue /
+        // mailbox) buffered DURING the provider stream is injected into the
+        // current ask's context (Interject) so the model sees it on the next
+        // iteration — the same mid-turn path as a tool-boundary interjection.
+        // Non-driver inputs (StartAutonomous / ScheduleWakeup) keep their
+        // baseline External position.
+        // The timestamp is captured at PLANNING time (when the planner runs,
+        // after the provider stream completes), not at the true arrival/
+        // buffering time. The wrapper still conveys that the message predates
+        // work done since, but the skew equals the remaining stream duration.
         for input in buffered {
-            actions.push(Action::External(input));
+            if matches!(
+                input,
+                AgentInput::UserMessage(..)
+                    | AgentInput::WatchCompleted { .. }
+                    | AgentInput::DialogueMessage { .. }
+                    | AgentInput::MailboxMessage { .. }
+            ) {
+                actions.push(Action::Interject(input, arrival_unix_ms));
+            } else {
+                actions.push(Action::External(input));
+            }
         }
         PostInvokeLlmPlan {
             emit_turn_end: false,
@@ -995,6 +1036,14 @@ fn plan_post_invoke_llm(
 /// already queued, so it cannot interpose an autonomous model turn between an
 /// assistant tool call and its tool results.
 ///
+/// mu-roz1e: a buffered driver input (UserMessage, WatchCompleted,
+/// DialogueMessage, MailboxMessage) that arrived DURING an active response
+/// (at a turn boundary or during the provider stream) is injected into the
+/// current ask's context (Interject) instead of deferred to a fresh ask —
+/// the operator steers mid-flight without the agent having already gone down
+/// the wrong path. Non-driver inputs (StartAutonomous, ScheduleWakeup) keep
+/// their baseline External position.
+///
 /// mu-spk7: when EVERY executed call was an ends-turn tool (watch) and
 /// succeeded, the ask completes here — `MaybeFinish` first (the per-ask
 /// `Done` terminus, same ordering rationale as the text-only path in
@@ -1002,7 +1051,11 @@ fn plan_post_invoke_llm(
 /// next ask. Re-invoking instead handed the model its own "Watch
 /// registered — end your turn" result and demanded a response; weak
 /// models answered by re-issuing the identical call.
-fn plan_post_execute_tools(buffered: Vec<AgentInput>, all_ends_turn: bool) -> Vec<Action> {
+fn plan_post_execute_tools(
+    buffered: Vec<AgentInput>,
+    all_ends_turn: bool,
+    arrival_unix_ms: u64,
+) -> Vec<Action> {
     let mut actions = Vec::with_capacity(buffered.len() + 1);
     if all_ends_turn {
         actions.push(Action::MaybeFinish);
@@ -1011,8 +1064,30 @@ fn plan_post_execute_tools(buffered: Vec<AgentInput>, all_ends_turn: bool) -> Ve
         }
         return actions;
     }
+    // mu-roz1e: the timestamp is captured at PLANNING time (when the planner
+    // runs, after the tool/stream completes), not at the true arrival/buffering
+    // time. The wrapper still conveys that the message predates work done
+    // since (the planner runs after the work), but the skew equals the
+    // remaining tool-call duration. Stamping at the buffering site
+    // (execute_tools.rs / invoke.rs) would require changing the `buffered`
+    // type to carry per-input arrival times — a follow-up refactor.
     for input in buffered {
-        actions.push(Action::External(input));
+        // mu-roz1e: a driver input (operator interjection / watch / dialogue /
+        // mailbox) is injected into the current ask's context (Interject)
+        // rather than deferred to a fresh ask. Non-driver inputs
+        // (StartAutonomous / ScheduleWakeup) keep their baseline External
+        // position.
+        if matches!(
+            input,
+            AgentInput::UserMessage(..)
+                | AgentInput::WatchCompleted { .. }
+                | AgentInput::DialogueMessage { .. }
+                | AgentInput::MailboxMessage { .. }
+        ) {
+            actions.push(Action::Interject(input, arrival_unix_ms));
+        } else {
+            actions.push(Action::External(input));
+        }
     }
     actions.push(Action::InvokeLlm);
     actions
@@ -1439,6 +1514,180 @@ async fn run_inner(
                 if should_push_invoke_llm(&queue) {
                     queue.push_back(Action::InvokeLlm);
                 }
+            }
+            Action::Interject(input, arrival_unix_ms) => {
+                // mu-roz1e: a turn-boundary interjection — inject the message
+                // into the current ask's context (so the model sees it on the
+                // next iteration) instead of starting a fresh ask. The queued
+                // `InvokeLlm` that follows runs the model with it in context.
+                // Per-ask state (turn_count / started_at / aggregated_usage)
+                // is deliberately NOT reset: the interjection is part of THIS
+                // ask, not a new one.
+                //
+                // mu-roz1e (panel finding): if the queue already has a
+                // `MaybeFinish` (pushed by `plan_post_execute_tools` when
+                // `all_ends_turn` is true), there is no continuation to
+                // inject into — the ask is ending. Defer the interjection to
+                // a fresh ask (External) instead of injecting it into a
+                // context that will never be run. Use push_back so the
+                // deferred input is processed AFTER the current ask's Done
+                // terminus (the interjection is for the NEXT ask, not the
+                // current one).
+                if queue.iter().any(|a| matches!(a, Action::MaybeFinish)) {
+                    queue.push_back(Action::External(input));
+                    continue;
+                }
+                // mu-roz1e (panel finding): only UserMessage is an operator
+                // interjection. WatchCompleted/DialogueMessage/MailboxMessage
+                // are NOT operator steering — the wrapper must not mislabel
+                // them as "operator interjection ... correction to the current
+                // trajectory". The notification text already identifies the
+                // source ([Watch], [Dialogue], [Mailbox]).
+                let is_user_message = matches!(input, AgentInput::UserMessage(..));
+                let (msg, ticket, effort) = match input {
+                    AgentInput::UserMessage(msg, ticket, effort) => (msg, ticket, effort),
+                    // mu-roz1e (panel finding): use the SAME notification
+                    // formats as the External handlers — the Interject path
+                    // must not drop the load-bearing retrieval instructions
+                    // (mailbox mu-07g0), the watch "Act on this result" nudge,
+                    // or the dialogue reply guidance.
+                    AgentInput::WatchCompleted { note, summary } => (
+                        AgentMessage::User {
+                            content: format!(
+                                "[Watch] '{note}' finished.\n{summary}\n\nAct on this result."
+                            ),
+                        },
+                        None,
+                        None,
+                    ),
+                    AgentInput::DialogueMessage { from, content } => (
+                        AgentMessage::User {
+                            content: format!(
+                                "[Dialogue] {from}: {content}\n\n\
+                                 You may reply with dialogue_say if appropriate."
+                            ),
+                        },
+                        None,
+                        None,
+                    ),
+                    AgentInput::MailboxMessage {
+                        from_session_id,
+                        message_kind,
+                        subject,
+                        seq,
+                    } => (
+                        AgentMessage::User {
+                            content: format!(
+                                "[Mailbox] New {message_kind} message (seq {seq}) from \
+                                 {from_session_id}: {subject}\n\
+                                 Stored durably in your mailbox. To read the full \
+                                 message: mailbox tool, action=read, seq={seq}."
+                            ),
+                        },
+                        None,
+                        None,
+                    ),
+                    // StartAutonomous / ScheduleWakeup are lifecycle inputs,
+                    // not context injections — defer them to a fresh ask.
+                    _ => {
+                        queue.push_back(Action::External(input));
+                        continue;
+                    }
+                };
+                if let Some(t) = ticket {
+                    pending_tickets.push(*t);
+                }
+                if let Some(e) = effort {
+                    current_effort = Some(e);
+                }
+                // mu-roz1e: wrap the interjection so the model can tell it
+                // arrived MID-TURN (during an active response) rather than as
+                // a fresh ask. The timestamp is captured at PLANNING time
+                // (after the tool/stream completes), not at the true arrival/
+                // buffering time — the wrapper conveys that the message
+                // predates work done since, but the skew equals the remaining
+                // tool/stream duration. Rendered as readable UTC.
+                //
+                // mu-roz1e (panel finding): only UserMessage is an operator
+                // interjection. WatchCompleted/DialogueMessage/MailboxMessage
+                // are NOT operator steering — the "operator interjection ...
+                // correction to the current trajectory" framing is semantically
+                // wrong for a watch completion (an autonomous result the agent
+                // asked for) or a peer's dialogue/mailbox message. Those get a
+                // simpler mid-turn marker without the operator-attribution.
+                let arrived_at_utc = {
+                    let secs = arrival_unix_ms / 1000;
+                    // Render as UTC ISO 8601 (YYYY-MM-DDTHH:MM:SSZ).
+                    // This is a simple civil-from-days conversion (no
+                    // external crate needed).
+                    let days = (secs / 86400) as i64;
+                    let secs_of_day = secs % 86400;
+                    let hh = secs_of_day / 3600;
+                    let mm = (secs_of_day % 3600) / 60;
+                    let ss = secs_of_day % 60;
+                    // Civil from days (Howard Hinnant's algorithm).
+                    let z = days + 719468;
+                    let era = z / 146097;
+                    let doe = z - era * 146097;
+                    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+                    let y = yoe + era * 400;
+                    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                    let mp = (5 * doy + 2) / 153;
+                    let d = doy - (153 * mp + 2) / 5 + 1;
+                    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+                    let y = if m <= 2 { y + 1 } else { y };
+                    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hh, mm, ss)
+                };
+                let inner_content = match &msg {
+                    AgentMessage::User { content } => content.clone(),
+                    AgentMessage::Assistant(am) => am
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    AgentMessage::ToolResult { content, .. } => content.clone(),
+                };
+                let wrapped = if is_user_message {
+                    // Operator interjection: the operator steered mid-flight.
+                    // The timestamp is when the planner ran (after the
+                    // tool/stream completed), so the input was buffered
+                    // BEFORE this time — the model can see it predates work
+                    // done since.
+                    AgentMessage::User {
+                        content: format!(
+                            "[operator interjection — buffered before {arrived_at_utc}, \
+                             mid-turn during an active response; treat as a correction \
+                             to the current trajectory, not a new task] {inner_content}"
+                        ),
+                    }
+                } else {
+                    // Non-operator driver input (watch/dialogue/mailbox): the
+                    // notification text already identifies the source. A
+                    // simpler mid-turn marker without operator attribution.
+                    AgentMessage::User {
+                        content: format!(
+                            "[mid-turn — buffered before {arrived_at_utc}] {inner_content}"
+                        ),
+                    }
+                };
+                let _ = events
+                    .send(AgentEvent::MessageStart {
+                        message: wrapped.clone(),
+                    })
+                    .await;
+                messages.push(wrapped.clone());
+                let _ = events
+                    .send(AgentEvent::MessageEnd {
+                        message: wrapped.clone(),
+                    })
+                    .await;
+                let _ = events
+                    .send(AgentEvent::Interjected { message: wrapped })
+                    .await;
             }
             Action::External(AgentInput::UserMessage(msg, ticket, effort)) => {
                 // spec mu-046 WP4: a journaled ask's ticket joins the
@@ -2560,7 +2809,15 @@ async fn run_inner(
                                 .send(AgentEvent::MessageEnd { message: assistant })
                                 .await;
 
-                            let plan = plan_post_invoke_llm(&assistant_msg, buffered);
+                            let arrival_unix_ms = {
+                                use std::time::{SystemTime, UNIX_EPOCH};
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0)
+                            };
+                            let plan =
+                                plan_post_invoke_llm(&assistant_msg, buffered, arrival_unix_ms);
                             if plan.emit_turn_end {
                                 let _ = events.send(AgentEvent::TurnEnd).await;
                             }
@@ -2654,7 +2911,23 @@ async fn run_inner(
                             messages.push(r);
                         }
                         let _ = events.send(AgentEvent::TurnEnd).await;
-                        for action in plan_post_execute_tools(buffered, all_ends_turn) {
+                        // mu-roz1e: a turn-boundary interjection (a buffered
+                        // UserMessage/WatchCompleted/etc. that arrived between
+                        // tool-call iterations during this active response) is
+                        // injected into the current ask's context so the model
+                        // sees it on the next iteration — the operator steers
+                        // mid-flight instead of the agent having already gone
+                        // down the wrong path.
+                        let arrival_unix_ms = {
+                            use std::time::{SystemTime, UNIX_EPOCH};
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0)
+                        };
+                        for action in
+                            plan_post_execute_tools(buffered, all_ends_turn, arrival_unix_ms)
+                        {
                             queue.push_back(action);
                         }
                     }

@@ -6508,3 +6508,346 @@ async fn rb4u_persistent_empty_turns_give_up_after_bound() {
     );
     assert_eq!(gave_up, 1, "should give up exactly once");
 }
+
+/// mu-htbz0: a UserMessage buffered while the provider streams must
+/// survive a narrow-cancel. The cancel aborts the ASK (Done/Aborted),
+/// then the buffered message starts the NEXT ask on its own — no
+/// operator re-send. Before the fix, handle_invoke_llm dropped its
+/// buffered vec on the OutstandingCancelled return and the caller's
+/// queue.clear() lost the message silently.
+#[tokio::test]
+async fn htbz0_narrow_cancel_during_stream_preserves_buffered_user_message() {
+    // Stream 1 hangs (long-running provider call); stream 2 answers the
+    // requeued buffered ask.
+    let mut q = VecDeque::new();
+    q.push_back(MockResponse::Pending);
+    q.push_back(MockResponse::Events(vec![
+        ProviderEvent::TextDelta("answer to buffered".into()),
+        ProviderEvent::Done(assistant_text("answer to buffered")),
+    ]));
+    let provider = Arc::new(MockProvider {
+        responses: Mutex::new(q),
+        truncates_over_window: false,
+    });
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let loop_ = loop_with(
+        provider as Arc<dyn Provider>,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        Vec::new(),
+        AgentConfig::default(),
+        events_tx,
+        approvals,
+        capability,
+    );
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("first ask"), None, None))
+        .await
+        .expect("send first ask");
+    // Let the hanging stream start, then interject + narrow-cancel.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("buffered during stream"),
+            None,
+            None,
+        ))
+        .await
+        .expect("send buffered message");
+    loop_
+        .send(AgentInput::CancelOutstanding {
+            reason: "operator changed direction".into(),
+        })
+        .await
+        .expect("send narrow cancel");
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    // The buffered ask completed — the loop ended on its EndTurn, not on
+    // the aborted first ask.
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+
+    let aborted_idx = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::Done {
+                    stop_reason: StopReason::Aborted,
+                    ..
+                }
+            )
+        })
+        .expect("narrow-cancel must emit an Aborted done");
+    let buffered_start_idx = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::MessageStart { message: AgentMessage::User { content } }
+                    if content.contains("buffered during stream")
+            )
+        })
+        .expect("buffered message must start the next ask instead of vanishing");
+    assert!(
+        aborted_idx < buffered_start_idx,
+        "buffered ask must start AFTER the aborted ask's Done terminus"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                ..
+            }
+        )),
+        "buffered ask must run to its own EndTurn done"
+    );
+}
+
+/// mu-htbz0, tool-path twin: a UserMessage buffered while a tool runs
+/// must survive a narrow-cancel of that tool and start the next ask.
+/// Before the fix, ExecuteToolsExit::OutstandingCancelled did not carry
+/// the drained inputs and the caller cleared the queue over them.
+#[tokio::test]
+async fn htbz0_narrow_cancel_during_tool_preserves_buffered_user_message() {
+    let (provider, _records) = RecordingProvider::new(vec![
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "t1",
+            "slow",
+            json!({}),
+        ))],
+        vec![
+            ProviderEvent::TextDelta("answer to buffered".into()),
+            ProviderEvent::Done(assistant_text("answer to buffered")),
+        ],
+    ]);
+    let tools_arc: Vec<Arc<dyn Tool>> = vec![MockTool::delayed(
+        "slow",
+        "tool result that should not land",
+        Duration::from_secs(5),
+    )]
+    .into_iter()
+    .map(|t| Arc::new(t) as Arc<dyn Tool>)
+    .collect();
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let loop_ = loop_with(
+        provider as Arc<dyn Provider>,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        tools_arc,
+        AgentConfig::default(),
+        events_tx,
+        approvals,
+        capability,
+    );
+
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("start slow tool"),
+            None,
+            None,
+        ))
+        .await
+        .expect("send first ask");
+
+    let mut events = Vec::new();
+    loop {
+        let event = timeout(Duration::from_millis(500), events_rx.recv())
+            .await
+            .expect("timed out waiting for tool start")
+            .expect("event channel closed before tool start");
+        let saw_tool_start = matches!(
+            &event,
+            AgentEvent::ToolCallStarted { tool_call_id, .. } if tool_call_id == "t1"
+        );
+        events.push(event);
+        if saw_tool_start {
+            break;
+        }
+    }
+
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("buffered during tool"),
+            None,
+            None,
+        ))
+        .await
+        .expect("send buffered message");
+    loop_
+        .send(AgentInput::CancelOutstanding {
+            reason: "operator changed direction".into(),
+        })
+        .await
+        .expect("send narrow cancel");
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    events.extend(events_handle.await.expect("events drain"));
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+
+    let aborted_idx = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::Done {
+                    stop_reason: StopReason::Aborted,
+                    ..
+                }
+            )
+        })
+        .expect("narrow-cancel must emit an Aborted done");
+    let buffered_start_idx = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::MessageStart { message: AgentMessage::User { content } }
+                    if content.contains("buffered during tool")
+            )
+        })
+        .expect("buffered message must start the next ask instead of vanishing");
+    assert!(
+        aborted_idx < buffered_start_idx,
+        "buffered ask must start AFTER the aborted ask's Done terminus"
+    );
+}
+
+/// mu-htbz0, panel round-2 finding (opus-5): the one-stage-later loss. A
+/// message buffered during the STREAM is planned into the queue as an
+/// `Interject` action; the narrow-cancel then lands during the NEXT
+/// stage's tool run, whose own drained vec is empty. The abort arm must
+/// salvage the queued Interject (demoted to a fresh ask) rather than
+/// `queue.clear()` over it.
+#[tokio::test]
+async fn htbz0_queued_interject_survives_cancel_one_stage_later() {
+    // Turn 1 is gated so the test can buffer a message while the stream
+    // is open; it returns a tool call so the buffered message is planned
+    // as [ExecuteTools, Interject(B)]. Turn 2 answers B's fresh ask.
+    let (provider, gate_tx) = MockProvider::gated_first(
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "t1",
+            "slow",
+            json!({}),
+        ))],
+        vec![vec![
+            ProviderEvent::TextDelta("answer to B".into()),
+            ProviderEvent::Done(assistant_text("answer to B")),
+        ]],
+    );
+    let tools_arc: Vec<Arc<dyn Tool>> = vec![MockTool::delayed(
+        "slow",
+        "tool result that should not land",
+        Duration::from_secs(5),
+    )]
+    .into_iter()
+    .map(|t| Arc::new(t) as Arc<dyn Tool>)
+    .collect();
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let loop_ = loop_with(
+        Arc::new(provider) as Arc<dyn Provider>,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        tools_arc,
+        AgentConfig::default(),
+        events_tx,
+        approvals,
+        capability,
+    );
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("first ask"), None, None))
+        .await
+        .expect("send first ask");
+    // Buffer B while the gated stream is open, then release the gate.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("B buffered during stream"),
+            None,
+            None,
+        ))
+        .await
+        .expect("send B");
+    gate_tx.send(()).expect("release gate");
+
+    // Wait for the slow tool to start (B is now a queued Interject), then
+    // narrow-cancel — this stage's own buffered vec is empty.
+    let mut events = Vec::new();
+    loop {
+        let event = timeout(Duration::from_millis(500), events_rx.recv())
+            .await
+            .expect("timed out waiting for tool start")
+            .expect("event channel closed before tool start");
+        let saw_tool_start = matches!(
+            &event,
+            AgentEvent::ToolCallStarted { tool_call_id, .. } if tool_call_id == "t1"
+        );
+        events.push(event);
+        if saw_tool_start {
+            break;
+        }
+    }
+    loop_
+        .send(AgentInput::CancelOutstanding {
+            reason: "operator changed direction".into(),
+        })
+        .await
+        .expect("send narrow cancel");
+
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    events.extend(events_handle.await.expect("events drain"));
+
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+
+    let aborted_idx = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::Done {
+                    stop_reason: StopReason::Aborted,
+                    ..
+                }
+            )
+        })
+        .expect("narrow-cancel must emit an Aborted done");
+    let b_start_idx = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::MessageStart { message: AgentMessage::User { content } }
+                    if content.contains("B buffered during stream")
+            )
+        })
+        .expect("queued Interject must be salvaged into the next ask, not cleared");
+    assert!(
+        aborted_idx < b_start_idx,
+        "salvaged message must start AFTER the aborted ask's Done terminus"
+    );
+    // Salvage demotes Interject to a fresh ask — B must NOT carry the
+    // mid-turn interjection wrapper (the ask it would have interjected
+    // into no longer exists).
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::MessageStart { message: AgentMessage::User { content } }
+                if content.contains("operator interjection") && content.contains("B buffered")
+        )),
+        "salvaged input must be a plain fresh ask, not a mid-turn interjection"
+    );
+}

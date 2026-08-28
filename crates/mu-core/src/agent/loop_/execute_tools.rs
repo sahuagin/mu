@@ -234,6 +234,14 @@ pub(crate) enum ExecuteToolsExit {
     OutstandingCancelled {
         reason: String,
         tool_messages: Vec<AgentMessage>,
+        /// mu-htbz0: inputs drained off `input_rx` before the
+        /// narrow-cancel arrived — driver inputs (UserMessage / watch /
+        /// dialogue / mailbox) and lifecycle inputs (SwitchProvider /
+        /// ClearContext / StartAutonomous / ScheduleWakeup) alike, exactly
+        /// what the buffering arm accumulates. The caller requeues them so
+        /// they apply after the abort — the cancel aborts the ask, not the
+        /// inputs that arrived during it.
+        buffered: Vec<AgentInput>,
     },
     /// The whole session was cancelled while tool calls were outstanding.
     /// We still return synthetic tool results for log/history hygiene before
@@ -637,6 +645,7 @@ pub(crate) async fn handle_execute_tools(
                                 return Ok(ExecuteToolsExit::OutstandingCancelled {
                                     reason,
                                     tool_messages,
+                                    buffered,
                                 });
                             }
                             Some(AgentInput::UserMessage(..))
@@ -886,6 +895,7 @@ pub(crate) async fn handle_execute_tools(
                                         return Ok(ExecuteToolsExit::OutstandingCancelled {
                                             reason,
                                             tool_messages,
+                                            buffered,
                                         });
                                     }
                                     Some(input @ AgentInput::UserMessage(..))

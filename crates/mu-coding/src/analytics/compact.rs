@@ -28,6 +28,21 @@ pub struct CompactSummary {
     pub tasks_upserted: usize,
     pub malformed_lines_skipped: usize,
     pub tasks_filtered_out: usize,
+    /// mu-pmqld: files whose (size, mtime) matched the compact
+    /// manifest and were skipped without being read.
+    pub files_skipped_unchanged: usize,
+}
+
+/// mu-pmqld: stat `path` into the manifest's (size, mtime-ms) identity.
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    Some((meta.len(), mtime))
 }
 
 /// Scan every `*.jsonl` file under `events_dir/<daemon_id>/` (one level
@@ -61,6 +76,27 @@ pub fn compact_dir(
                 continue;
             }
             summary.files_scanned += 1;
+            // mu-pmqld: incremental skip. Event logs are append-only and
+            // go cold once their session ends, so an unchanged (size,
+            // mtime) means the file's tasks are already in the sink —
+            // steady-state runs only re-read files that grew. Whole-file
+            // granularity on change (not byte offsets): the running
+            // tool-call counter accumulates from the top of the file, so
+            // a partial resume would misattribute calls. The manifest is
+            // BYPASSED when a min_ended_at filter is set — a filtered
+            // run skips tasks and must never mark a file as fully done.
+            let key = path.to_string_lossy().into_owned();
+            let identity = file_identity(&path);
+            if min_ended_at_unix_ms.is_none() {
+                if let (Some((size, mtime)), Ok(Some((m_size, m_mtime)))) =
+                    (identity, super::sink::manifest_lookup(conn, &key))
+                {
+                    if size == m_size && mtime == m_mtime {
+                        summary.files_skipped_unchanged += 1;
+                        continue;
+                    }
+                }
+            }
             let daemon_id = daemon_entry.file_name().to_string_lossy().into_owned();
             compact_file_scoped(
                 conn,
@@ -69,6 +105,11 @@ pub fn compact_dir(
                 &mut summary,
                 Some(daemon_id.as_str()),
             )?;
+            if min_ended_at_unix_ms.is_none() {
+                if let Some((size, mtime)) = identity {
+                    super::sink::manifest_record(conn, &key, size, mtime)?;
+                }
+            }
         }
     }
 
@@ -431,6 +472,87 @@ mod tests {
 
         drop(conn);
         let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&dbpath);
+    }
+
+    #[test]
+    fn compact_dir_skips_unchanged_files_via_manifest() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("mu_pmqld_events_{stamp}"));
+        let dbpath = std::env::temp_dir().join(format!("mu_pmqld_{stamp}.sqlite"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&dbpath);
+        std::fs::create_dir_all(root.join("daemon-a")).unwrap();
+        let log = root.join("daemon-a").join("session-1.jsonl");
+        std::fs::write(&log, serde_json::to_string(&telemetry_event()).unwrap()).unwrap();
+
+        let conn = super::super::sink::open(&dbpath).unwrap();
+
+        // First run reads the file and records it in the manifest.
+        let first = compact_dir(&conn, &root, None).unwrap();
+        assert_eq!(first.files_scanned, 1);
+        assert_eq!(first.files_skipped_unchanged, 0);
+        assert_eq!(first.tasks_upserted, 1);
+
+        // Second run: unchanged (size, mtime) — skipped without a read.
+        let second = compact_dir(&conn, &root, None).unwrap();
+        assert_eq!(second.files_scanned, 1);
+        assert_eq!(second.files_skipped_unchanged, 1);
+        assert_eq!(second.lines_read, 0);
+        assert_eq!(second.tasks_upserted, 0);
+
+        // Grow the file (append a second task): re-read in full.
+        let mut ev2 = telemetry_event();
+        if let EventPayload::TaskTelemetry {
+            ref mut task_id, ..
+        } = ev2.payload
+        {
+            *task_id = "task-2".to_owned();
+        }
+        let mut content = std::fs::read_to_string(&log).unwrap();
+        content.push('\n');
+        content.push_str(&serde_json::to_string(&ev2).unwrap());
+        std::fs::write(&log, content).unwrap();
+
+        let third = compact_dir(&conn, &root, None).unwrap();
+        assert_eq!(third.files_skipped_unchanged, 0);
+        assert_eq!(third.tasks_upserted, 2); // whole file re-read; upserts idempotent
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&dbpath);
+    }
+
+    #[test]
+    fn compact_dir_filtered_runs_bypass_manifest() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("mu_pmqld_f_events_{stamp}"));
+        let dbpath = std::env::temp_dir().join(format!("mu_pmqld_f_{stamp}.sqlite"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&dbpath);
+        std::fs::create_dir_all(root.join("daemon-a")).unwrap();
+        let log = root.join("daemon-a").join("session-1.jsonl");
+        std::fs::write(&log, serde_json::to_string(&telemetry_event()).unwrap()).unwrap();
+
+        let conn = super::super::sink::open(&dbpath).unwrap();
+
+        // A filtered run must neither consult nor write the manifest: it
+        // skips tasks and must never mark the file as fully compacted.
+        let filtered = compact_dir(&conn, &root, Some(u64::MAX)).unwrap();
+        assert_eq!(filtered.tasks_upserted, 0);
+        assert_eq!(filtered.files_skipped_unchanged, 0);
+
+        // The later unfiltered run still processes the file in full.
+        let full = compact_dir(&conn, &root, None).unwrap();
+        assert_eq!(full.files_skipped_unchanged, 0);
+        assert_eq!(full.tasks_upserted, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&dbpath);
     }
 

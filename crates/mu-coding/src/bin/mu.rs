@@ -813,9 +813,10 @@ fn run_analytics(cmd: AnalyticsCmd) -> Result<()> {
                 .with_context(|| format!("opening sink at {}", db_path.display()))?;
             let summary = compact_dir(&conn, &ev_dir, since)?;
             println!(
-                "compacted: {} file(s), {} line(s), {} task(s) upserted, \
-                 {} malformed, {} filtered",
+                "compacted: {} file(s), {} unchanged (skipped), {} line(s), \
+                 {} task(s) upserted, {} malformed, {} filtered",
                 summary.files_scanned,
+                summary.files_skipped_unchanged,
                 summary.lines_read,
                 summary.tasks_upserted,
                 summary.malformed_lines_skipped,

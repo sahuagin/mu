@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_provider_model ON tasks(provider, model);
 CREATE INDEX IF NOT EXISTS idx_tasks_ended_at ON tasks(ended_at_unix_ms);
 CREATE INDEX IF NOT EXISTS idx_tasks_outcome ON tasks(outcome_class);
+CREATE TABLE IF NOT EXISTS compact_manifest (
+    path            TEXT PRIMARY KEY,
+    size_bytes      INTEGER NOT NULL,
+    mtime_unix_ms   INTEGER NOT NULL
+);
 ";
 
 /// Lightweight additive migrations applied to existing DBs. Each
@@ -113,6 +118,45 @@ pub struct TaskRow {
 
 /// UPSERT a task row by task_id. Re-running compact over the same logs
 /// produces no duplicates.
+/// mu-pmqld: manifest lookup — what (size, mtime) did we last fully
+/// compact this file at? `None` = never seen.
+pub fn manifest_lookup(conn: &Connection, path: &str) -> Result<Option<(u64, u64)>> {
+    let mut stmt = conn
+        .prepare("SELECT size_bytes, mtime_unix_ms FROM compact_manifest WHERE path = ?1")
+        .context("preparing manifest lookup")?;
+    let mut rows = stmt.query([path]).context("querying manifest")?;
+    match rows.next().context("reading manifest row")? {
+        Some(row) => {
+            let size: i64 = row.get(0)?;
+            let mtime: i64 = row.get(1)?;
+            Ok(Some((size as u64, mtime as u64)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// mu-pmqld: record that `path` was fully compacted at (size, mtime).
+/// Written AFTER the file's tasks are upserted; a crash between the two
+/// just means the file is re-compacted next run (upserts are
+/// idempotent by task_id), never silently skipped.
+pub fn manifest_record(
+    conn: &Connection,
+    path: &str,
+    size_bytes: u64,
+    mtime_unix_ms: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO compact_manifest (path, size_bytes, mtime_unix_ms)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(path) DO UPDATE SET
+             size_bytes = excluded.size_bytes,
+             mtime_unix_ms = excluded.mtime_unix_ms",
+        rusqlite::params![path, size_bytes as i64, mtime_unix_ms as i64],
+    )
+    .context("recording manifest entry")?;
+    Ok(())
+}
+
 pub fn upsert_task(conn: &Connection, row: &TaskRow) -> Result<()> {
     conn.execute(
         "INSERT INTO tasks (

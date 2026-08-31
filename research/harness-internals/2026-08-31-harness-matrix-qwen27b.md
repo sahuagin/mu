@@ -175,9 +175,55 @@ Envelope minimization stays worth doing — it is a 2–3x speed difference
 today and context headroom as tasks grow — but nothing here says schema
 size costs correctness at this scale.
 
+## Addendum: the search-tool claim, tested causally
+
+After the sections above were written, two follow-ups turned the "dsh's
+losses are a missing search tool" reading from a correlation into a tested
+cause.
+
+First, the same five-case matrix was rerun against the mu repository
+(larger than the first fixture; one stale case dropped after checking its
+answer still held). mu and Claude Code both scored 15/15. dsh dropped to
+8/15, and now timed out even on positive symbol hunts — the cost of having
+no search tool grows with repository size, which is what that explanation
+predicts.
+
+Then dsh was run two more ways on the identical cases:
+
+| dsh variant | score | trap question | symbol hunt |
+|---|---|---|---|
+| stock, FreeBSD port (no search tool) | 8/15 | 0/3, all timeouts | 0/3, all timeouts |
+| + code-index search over MCP | 13/15 | 2/3 | 3/3, 38–98s |
+| stock, Linux node under the linuxulator | 14/15 | 3/3, 139–235s | 3/3, 27–41s |
+
+The MCP variant is one inserted plugin entry in the profile — dsh's own
+MCP client (which the port never disabled, and which speaks plain HTTP to
+a server we run) pointed at our code-index service. No harness or port
+changes. The wire captures show the model calling the search tool
+repeatedly. That alone recovered five of the seven lost points, which is
+the discovery model doing exactly what the last section claims: capability
+delivered by lookup, not by a bigger built-in surface.
+
+The Linux run (a stock checkout under a Linux node binary via the
+linuxulator, which restores dsh's own bash, grep, and glob) recovered six
+of seven and fixed the trap question completely: proving a function does
+not exist takes one exhaustive grep. The semantic search variant got the
+trap question to 2/3 but kept second-guessing itself on one run — an
+embedding search returning nothing is weaker evidence of absence than an
+exhaustive text search finding nothing. Exact search and semantic search
+answer different questions; a toolset wants both within reach.
+
+One build note for anyone repeating the Linux run: building dsh under the
+linuxulator fails inside the Rust-based bundler because the linuxulator's
+`statx` returns the wrong error code (EFAULT instead of ENOENT) when
+probing paths that do not exist, which aborts the bundler's tsconfig
+lookup chain. The bundles are platform-neutral, so build on FreeBSD node
+and run on Linux node. Diagnosed with truss and ktrace; recorded as memory
+c51ceeb1.
+
 ## Not measured yet
 
 The cross-family cells (a frontier model in mu, the same tasks), coding
-tasks with reference tests (needs a bash-capable dsh, meaning a Linux run),
-pi and codex as additional harnesses, envelope effects on tasks large
-enough to crowd the window, and more than three repeats anywhere.
+tasks with reference tests (now unblocked: the Linux dsh has a working
+bash), pi and codex as additional harnesses, envelope effects on tasks
+large enough to crowd the window, and more than three repeats anywhere.

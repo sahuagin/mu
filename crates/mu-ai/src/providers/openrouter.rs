@@ -1010,7 +1010,12 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                     }
                 }
             }
-            // Tool call delta(s)?
+            // Tool call delta(s)? Accumulate for Done-side assembly AND
+            // stream a ToolCallDelta so the loop's stall watchdog counts
+            // the bytes (mu-b82rr): a large file written via one tool call
+            // streams arguments for minutes with no text/reasoning deltas
+            // at all, and an unemitted fragment is invisible progress the
+            // watchdog misreads as a dead connection.
             if let Some(deltas) = choice.delta.tool_calls {
                 for tc_delta in deltas {
                     let entry = state.tool_calls.entry(tc_delta.index).or_insert_with(|| {
@@ -1021,17 +1026,29 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                     if let Some(id) = tc_delta.id {
                         entry.id = id;
                     }
+                    let mut name_delta = None;
+                    let mut arguments_delta = None;
                     if let Some(func) = tc_delta.function {
                         if let Some(name) = func.name {
+                            name_delta = Some(name.clone());
                             entry.name = name;
                         }
                         if let Some(args) = func.arguments {
+                            arguments_delta = Some(args.clone());
                             entry.args_json.push_str(&args);
                         }
                     }
-                    // v1: don't emit ProviderEvent::ToolCallDelta;
-                    // the loop ignores it. Final tool calls are
-                    // surfaced in Done.
+                    if emitted_event.is_none()
+                        && (name_delta.is_some() || arguments_delta.is_some())
+                    {
+                        // Continuation fragments may carry no id; the loop
+                        // uses it only for status display.
+                        emitted_event = Some(ProviderEvent::ToolCallDelta {
+                            id: entry.id.clone(),
+                            name_delta,
+                            arguments_delta,
+                        });
+                    }
                 }
             }
             // finish_reason landed?
@@ -1043,9 +1060,8 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
         if let Some(event) = emitted_event {
             return Some((event, state));
         }
-        // No emittable event for this chunk (e.g. it was a delta
-        // with only tool_calls or a finish_reason). Loop and pull
-        // the next SSE event.
+        // No emittable event for this chunk (e.g. it carried only a
+        // finish_reason or usage). Loop and pull the next SSE event.
     }
 }
 

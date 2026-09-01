@@ -1034,9 +1034,16 @@ async fn b8_sse_tool_call_accumulation() {
         v
     };
 
-    // Just one Done event (we don't emit ToolCallDelta during streaming in v1).
-    assert_eq!(events.len(), 1);
-    let done = match events.into_iter().next().unwrap() {
+    // One ToolCallDelta per fragment chunk (mu-b82rr: the stall watchdog
+    // counts these bytes), then Done.
+    assert_eq!(events.len(), 4, "got {events:?}");
+    for e in &events[..3] {
+        assert!(
+            matches!(e, ProviderEvent::ToolCallDelta { .. }),
+            "expected ToolCallDelta, got {e:?}"
+        );
+    }
+    let done = match events.into_iter().nth(3).unwrap() {
         ProviderEvent::Done(msg) => msg,
         other => panic!("expected Done, got {other:?}"),
     };
@@ -1075,9 +1082,14 @@ async fn b9_sse_mixed_text_and_tool_call() {
         events.push(e);
     }
 
-    // 1 TextDelta + 1 Done.
-    assert_eq!(events.len(), 2);
-    let done = match events.into_iter().nth(1).unwrap() {
+    // 1 TextDelta + 1 ToolCallDelta (mu-b82rr) + 1 Done.
+    assert_eq!(events.len(), 3, "got {events:?}");
+    assert!(
+        matches!(&events[1], ProviderEvent::ToolCallDelta { .. }),
+        "expected ToolCallDelta, got {:?}",
+        events[1]
+    );
+    let done = match events.into_iter().nth(2).unwrap() {
         ProviderEvent::Done(msg) => msg,
         other => panic!("expected Done, got {other:?}"),
     };
@@ -1286,5 +1298,84 @@ mod live_tests {
             text_arg.to_lowercase().contains("hi"),
             "expected text arg to contain 'hi', got: {text_arg:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn sse_tool_call_fragments_emit_toolcalldelta_mu_b82rr() {
+    // mu-b82rr: a tool call whose arguments stream for minutes (large file
+    // write on a slow lane) used to emit NO events between the last text
+    // delta and Done — the loop's stall watchdog counted zero bytes and
+    // killed the live connection at STREAM_STALL_SECS. Every argument
+    // fragment must surface as a ToolCallDelta; Done still assembles the
+    // complete call.
+    let raw = concat!(
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_w1","function":{"name":"write","arguments":"{\"path\":\"a.h"}}]}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"tml\",\"content\":\"<!doctype html>\"}"}}]}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "\n\n",
+        r#"data: [DONE]"#,
+        "\n\n",
+    );
+    let bytes = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+        raw.as_bytes(),
+    ))]);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let mut stream = test_events_stream(bytes, rx);
+
+    let mut events = Vec::new();
+    while let Some(e) = stream.next().await {
+        events.push(e);
+    }
+
+    // 2 ToolCallDelta (one per fragment chunk) + 1 Done.
+    assert_eq!(events.len(), 3, "got {events:?}");
+    match &events[0] {
+        ProviderEvent::ToolCallDelta {
+            id,
+            name_delta,
+            arguments_delta,
+        } => {
+            assert_eq!(id, "call_w1");
+            assert_eq!(name_delta.as_deref(), Some("write"));
+            assert_eq!(arguments_delta.as_deref(), Some("{\"path\":\"a.h"));
+        }
+        other => panic!("expected ToolCallDelta, got {other:?}"),
+    }
+    match &events[1] {
+        ProviderEvent::ToolCallDelta {
+            id,
+            name_delta,
+            arguments_delta,
+        } => {
+            // Continuation fragment: id already known from the builder.
+            assert_eq!(id, "call_w1");
+            assert!(name_delta.is_none());
+            assert_eq!(
+                arguments_delta.as_deref(),
+                Some("tml\",\"content\":\"<!doctype html>\"}")
+            );
+        }
+        other => panic!("expected ToolCallDelta, got {other:?}"),
+    }
+    match &events[2] {
+        ProviderEvent::Done(msg) => {
+            assert_eq!(msg.stop_reason, StopReason::ToolUse);
+            assert_eq!(msg.content.len(), 1, "got {:?}", msg.content);
+            match &msg.content[0] {
+                ContentBlock::ToolCall(tc) => {
+                    assert_eq!(tc.id, "call_w1");
+                    assert_eq!(tc.name, "write");
+                    assert_eq!(
+                        tc.arguments.as_value().get("path").and_then(|v| v.as_str()),
+                        Some("a.html")
+                    );
+                }
+                other => panic!("expected ToolCall, got {other:?}"),
+            }
+        }
+        other => panic!("expected Done, got {other:?}"),
     }
 }

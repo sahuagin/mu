@@ -72,6 +72,31 @@ fn build_request_body_basics() {
     assert_eq!(body["messages"][0]["role"], "user");
 }
 
+// Pins that the Anthropic wire carries NO sampling parameters, ever. The
+// catalog's per-model sampling (mu-y8gp/mu-4sivd) is forwarded only on the
+// OpenAI-compat wire; on gen-5 Claude models the same fields are wire
+// errors — Sonnet 5 returns 400 for any non-default `temperature`/`top_p`/
+// `top_k`, and Fable/Mythos 5 reject manual thinking budgets outright
+// (2026-06..08 API release notes). If sampling ever gets wired into this
+// body, it must be gated per-model on card capability flags first.
+// (mu-provider-drift-2026q3-y43la)
+#[test]
+fn build_request_body_sends_no_sampling_params() {
+    let messages = vec![AgentMessage::User {
+        content: "hi".into(),
+    }];
+    for model in ["claude-sonnet-5", "claude-opus-5", "claude-fable-5"] {
+        let body = build_request_body(model, None, &messages, &[]);
+        let obj = body.as_object().expect("body is an object");
+        for key in ["temperature", "top_p", "top_k", "presence_penalty"] {
+            assert!(
+                !obj.contains_key(key),
+                "anthropic body for {model} must not carry `{key}`"
+            );
+        }
+    }
+}
+
 #[test]
 fn build_request_body_max_tokens_is_model_aware() {
     // mu-ql2: real-model identifiers get their catalog max_output so longer

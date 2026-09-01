@@ -229,6 +229,21 @@ pub enum StopReason {
     ToolUse,
     /// Model hit a token limit mid-response.
     MaxTokens,
+    /// Provider declined the request or cut generation on a safety/policy
+    /// classifier (Anthropic gen-5 `stop_reason: "refusal"`). The turn is
+    /// over and mu does not retry; distinct from [`StopReason::EndTurn`] so
+    /// receipts and exit-reason analytics can see refusals instead of
+    /// counting them as normal completions. The empty-turn auto-continue
+    /// guard explicitly excludes this reason: a refusal's normal body shape
+    /// IS an empty turn, and re-invoking would hammer the safety classifier
+    /// with the same conversation. (mu-provider-drift-2026q3-y43la)
+    Refusal,
+    /// Server paused a long-running turn (`stop_reason: "pause_turn"`) and
+    /// expects the client to resend the conversation to continue. mu does
+    /// not implement that continuation: the ask ends, but under its own
+    /// label so receipts/analytics don't misreport a paused turn as a
+    /// natural completion. (mu-provider-drift-2026q3-y43la)
+    PauseTurn,
     /// Provider errored; assistant message may be partial.
     Error,
     /// Cancel was requested (via AgentInput::Cancel or via cancellation

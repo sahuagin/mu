@@ -222,6 +222,32 @@ fn build_request_body_basic() {
     assert!(body.get("tools").is_none());
 }
 
+// Output cap on the Responses wire (mu-provider-drift-2026q3-y43la): the
+// field rides only when a cap is resolved; `None` omits it entirely so the
+// server default (the model's own maximum) applies. Pinned through
+// `build_request` directly — catalog resolution itself is covered by
+// output_limits tests, and a body test must not depend on the process-global
+// catalog (an operator's ~/.config/mu/models.toml would change it; mu-nzxa).
+#[test]
+fn max_output_tokens_sent_only_when_resolved() {
+    let input = vec![InputItem::user_text("hi")];
+    let capped = request_to_value(build_request(
+        "m",
+        "high",
+        "sys",
+        input.clone(),
+        &[],
+        Some(9999),
+    ));
+    assert_eq!(capped["max_output_tokens"], 9999);
+
+    let uncapped = request_to_value(build_request("m", "high", "sys", input, &[], None));
+    assert!(
+        uncapped.get("max_output_tokens").is_none(),
+        "no catalog cap must mean no field, not a floor"
+    );
+}
+
 #[test]
 fn instructions_under_cap_unchanged() {
     let short = "you are mu";

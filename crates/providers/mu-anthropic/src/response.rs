@@ -45,6 +45,12 @@ pub enum StopReason {
 /// body shape). Unmodeled keys round-trip via `extra` (forward-compat).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StopDetails {
+    /// Refusal category on a `stop_reason: "refusal"` response. Documented
+    /// values as of 2026-08: `"cyber"`, `"bio"`, and (Fable 5, 2026-06-09)
+    /// `"reasoning_extraction"`. Kept as a free string — new categories must
+    /// not break deserialization. (mu-provider-drift-2026q3-y43la)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_credit_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -348,6 +354,28 @@ mod tests {
         assert_eq!(sd.fallback_credit_token.as_deref(), Some("fct_abc"));
         assert_eq!(sd.fallback_has_prefill_claim, Some(false));
         assert_eq!(sd.extra["some_future_key"].as_value(), &json!(1));
+        assert_eq!(
+            serde_json::to_value(&m).unwrap(),
+            raw,
+            "round-trips verbatim"
+        );
+    }
+
+    #[test]
+    fn stop_details_category_parses_typed() {
+        // Gen-5 refusal category (docs: "cyber", "bio", "reasoning_extraction")
+        // is a typed field; an undocumented future category is still a plain
+        // string, not a break. (mu-provider-drift-2026q3-y43la)
+        let raw = json!({
+            "id": "msg_x", "type": "message", "role": "assistant", "model": "m",
+            "content": [], "stop_reason": "refusal",
+            "stop_details": { "category": "reasoning_extraction" }
+        });
+        let m: Message = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(
+            m.stop_details.as_ref().unwrap().category.as_deref(),
+            Some("reasoning_extraction")
+        );
         assert_eq!(
             serde_json::to_value(&m).unwrap(),
             raw,

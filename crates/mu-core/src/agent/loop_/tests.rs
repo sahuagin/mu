@@ -6469,6 +6469,55 @@ async fn rb4u_empty_turn_auto_continues_then_recovers() {
     );
 }
 
+/// A safety-classifier refusal's normal body shape IS an actionless turn
+/// (empty content, only stop_reason/stop_details) — but it must NOT be
+/// auto-continued: re-invoking resends the refused conversation to the
+/// classifier. The ask ends immediately under StopReason::Refusal.
+/// (mu-provider-drift-2026q3-y43la)
+#[tokio::test]
+async fn refusal_turn_is_not_auto_continued() {
+    let provider = MockProvider::new(vec![vec![ProviderEvent::Done(AssistantMessage {
+        content: vec![],
+        stop_reason: StopReason::Refusal,
+        usage: None,
+    })]]);
+    let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
+    loop_
+        .send(AgentInput::UserMessage(user_msg("go"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("join must not hang");
+    let events = events_handle.await.expect("events drain");
+
+    // The join Outcome reports why the LOOP ended (input channel closed),
+    // not the ask's stop reason — that rides the per-ask Done event.
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+    assert!(
+        events.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::Done {
+                    stop_reason: StopReason::Refusal,
+                    ..
+                }
+            )
+        }),
+        "the ask's Done event must carry StopReason::Refusal",
+    );
+    assert!(
+        !events.iter().any(|e| {
+            matches!(e, AgentEvent::Callout { title, .. }
+                if title == "empty model turn — auto-continuing")
+        }),
+        "a refusal must not trigger the empty-turn auto-continue",
+    );
+    let turn_starts = events.iter().filter(|e| kind(e) == "turn_start").count();
+    assert_eq!(turn_starts, 1, "no re-invoke after a refusal");
+}
+
 /// A provider stuck emitting actionless turns is bounded: the loop
 /// auto-continues `MAX_EMPTY_TURN_RETRIES` times, then gives up and ends
 /// the ask rather than spinning forever. (mu-rb4u)

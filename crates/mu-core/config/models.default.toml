@@ -66,6 +66,35 @@ context_soft_limit = 200000
 context_hard_limit = 200000
 max_output_tokens = 8192
 
+# Claude gen-5 (2026-06..08 API release notes; mu-provider-drift-2026q3-y43la):
+# all three carry a 1M context window and 128k max output. Behavior contract on
+# this generation (enforced as wire absences, see anthropic provider tests):
+# Sonnet 5 rejects non-default sampling params; Fable/Mythos 5 and Sonnet 5 are
+# adaptive-thinking-only; Opus 5 rejects thinking-disable at xhigh/max effort.
+[models.claude_opus_5]
+model = "claude-opus-5"
+family = "claude-opus-5"
+label = "Claude Opus 5"
+context_soft_limit = 1000000
+context_hard_limit = 1000000
+max_output_tokens = 128000
+
+[models.claude_sonnet_5]
+model = "claude-sonnet-5"
+family = "claude-sonnet-5"
+label = "Claude Sonnet 5"
+context_soft_limit = 1000000
+context_hard_limit = 1000000
+max_output_tokens = 128000
+
+[models.claude_fable_5]
+model = "claude-fable-5"
+family = "claude-fable-5"
+label = "Claude Fable 5"
+context_soft_limit = 1000000
+context_hard_limit = 1000000
+max_output_tokens = 128000
+
 [models.gpt_5_5]
 model = "gpt-5.5"
 family = "gpt-5"
@@ -84,6 +113,13 @@ max_output_tokens = 128000
 [model_rules.claude_sonnet_haiku_4]
 prefixes = ["claude-sonnet-4", "claude-haiku-4"]
 max_output_tokens = 8192
+
+# Gen-5 family fallback: date-stamped ids (claude-opus-5-2026xxxx) and
+# not-yet-cataloged gen-5 variants inherit the generation-wide 128k output
+# ceiling. Exact [models.*] entries above still override per model.
+[model_rules.claude_gen_5]
+prefixes = ["claude-opus-5", "claude-sonnet-5", "claude-fable-5", "claude-mythos-5"]
+max_output_tokens = 128000
 
 [model_rules.openrouter_anthropic_opus]
 prefix = "anthropic/claude-opus-4."

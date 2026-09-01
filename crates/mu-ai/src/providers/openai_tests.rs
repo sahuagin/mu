@@ -229,6 +229,19 @@ fn build_request_body_basic() {
 // output_limits tests, and a body test must not depend on the process-global
 // catalog (an operator's ~/.config/mu/models.toml would change it; mu-nzxa).
 #[test]
+fn codex_strip_removes_max_output_tokens() {
+    // The chatgpt-backend rejects the field with 400 "Unsupported
+    // parameter" — observed live 2026-09-01 when #576 started sending it:
+    // every codex review seat returned empty. The public API-key endpoint
+    // accepts it, so only the codex path strips.
+    let mut body = json!({"model": "m", "max_output_tokens": 9999, "stream": true});
+    strip_codex_unsupported(&mut body);
+    assert!(body.get("max_output_tokens").is_none());
+    assert_eq!(body["model"], "m");
+    assert_eq!(body["stream"], true);
+}
+
+#[test]
 fn max_output_tokens_sent_only_when_resolved() {
     let input = vec![InputItem::user_text("hi")];
     let capped = request_to_value(build_request(

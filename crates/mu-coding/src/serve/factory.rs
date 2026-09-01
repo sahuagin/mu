@@ -165,6 +165,7 @@ pub fn build_provider_from_selector(
             base_url,
             api_key,
             model,
+            prompt_caching,
         } => match protocol.as_str() {
             "openai-chat" => {
                 log_thinking_ignored(name, thinking);
@@ -177,14 +178,40 @@ pub fn build_provider_from_selector(
                 Ok(Arc::new(provider))
             }
             "anthropic-messages" => {
-                let mut provider =
-                    OllamaProvider::with_endpoint(base_url.clone(), api_key.clone(), model.clone());
-                if let Some(t) = thinking {
-                    if !t.is_empty() {
-                        provider = provider.with_thinking_flag(t);
+                // mu-iah94: two dialects share this wire. Hosted/metered
+                // endpoints get the NATIVE Anthropic path — cache_control
+                // markers (a configured api.anthropic.com lane once ran 62
+                // requests / 286k input tokens with zero cache hits, ~10x
+                // the cached price) and adaptive thinking with effort
+                // levels. Local ollama-compat servers get the ollama
+                // dialect — no cache_control (ollama's anthropic endpoint
+                // accepts none) and on/off thinking. `prompt_caching` in
+                // the endpoint config decides; omitted, an endpoint with a
+                // resolved API key is assumed hosted.
+                let native = prompt_caching.unwrap_or(!api_key.is_empty());
+                if native {
+                    let mut provider = AnthropicProvider::new(api_key.clone(), model.clone())
+                        .with_api_base(base_url.clone())
+                        .with_cache_ttl(cache_ttl);
+                    if let Some(t) = thinking {
+                        if !t.is_empty() {
+                            provider = provider.with_thinking_flag(t);
+                        }
                     }
+                    Ok(Arc::new(provider))
+                } else {
+                    let mut provider = OllamaProvider::with_endpoint(
+                        base_url.clone(),
+                        api_key.clone(),
+                        model.clone(),
+                    );
+                    if let Some(t) = thinking {
+                        if !t.is_empty() {
+                            provider = provider.with_thinking_flag(t);
+                        }
+                    }
+                    Ok(Arc::new(provider))
                 }
-                Ok(Arc::new(provider))
             }
             "openai-responses" => {
                 anyhow::bail!(
@@ -518,6 +545,7 @@ mod tests {
                 protocol: ProtocolKind::OpenaiChat,
                 base_url: "http://10.1.1.143:11435".into(),
                 api_key_env: None,
+                prompt_caching: None,
             }],
             ..Default::default()
         };
@@ -530,8 +558,50 @@ mod tests {
                 base_url: "http://10.1.1.143:11435".into(),
                 api_key: String::new(),
                 model: "ornith-q4-r0".into(),
+                prompt_caching: None,
             }
         );
+    }
+
+    // mu-iah94: the anthropic-messages dialect choice. A keyed endpoint is
+    // hosted/metered and MUST get the native Anthropic path (cache_control —
+    // the uncached lane billed ~10x on repeat prefixes; adaptive thinking);
+    // an auth-less endpoint is a local ollama-compat server and must NOT
+    // send cache_control (ollama's anthropic endpoint accepts none).
+    // `prompt_caching` overrides the inference both ways.
+    #[test]
+    fn configured_anthropic_messages_picks_dialect_from_key_and_override() {
+        let build = |api_key: &str, prompt_caching: Option<bool>| {
+            build_provider_from_selector(
+                &ProviderSelector::Configured {
+                    name: "lane".into(),
+                    protocol: "anthropic-messages".into(),
+                    base_url: "http://127.0.0.1:9".into(),
+                    api_key: api_key.into(),
+                    model: "m".into(),
+                    prompt_caching,
+                },
+                false,
+                None,
+                CacheTtl::default(),
+            )
+            .expect("provider builds")
+        };
+        // Keyed ⇒ native: prompt caching advertised, anthropic label.
+        let hosted = build("sk-test", None);
+        assert!(hosted.capabilities().supports_prompt_caching);
+        assert_eq!(hosted.provider_label(), "anthropic");
+        // Auth-less ⇒ ollama dialect: no caching advertised.
+        let local = build("", None);
+        assert!(!local.capabilities().supports_prompt_caching);
+        assert_eq!(local.provider_label(), "ollama");
+        // Explicit overrides win in both directions.
+        assert!(
+            !build("sk-test", Some(false))
+                .capabilities()
+                .supports_prompt_caching
+        );
+        assert!(build("", Some(true)).capabilities().supports_prompt_caching);
     }
 
     #[test]
@@ -543,6 +613,7 @@ mod tests {
                 protocol: ProtocolKind::OpenaiChat,
                 base_url: "http://x".into(),
                 api_key_env: None,
+                prompt_caching: None,
             }],
             ..Default::default()
         };
@@ -558,6 +629,7 @@ mod tests {
                 protocol: ProtocolKind::AnthropicMessages,
                 base_url: "http://x".into(),
                 api_key_env: None,
+                prompt_caching: None,
             }],
             ..Default::default()
         };

@@ -149,6 +149,12 @@ pub enum ProviderSelector {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         api_key: String,
         model: String,
+        /// mu-iah94: `[[providers.endpoints]].prompt_caching`, carried so the
+        /// factory can pick the anthropic-messages dialect (native cached vs
+        /// ollama-compat) without config access. `None` = infer from
+        /// `api_key` presence. Additive/optional: absent on old selectors.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_caching: Option<bool>,
     },
 }
 

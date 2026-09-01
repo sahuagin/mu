@@ -2793,9 +2793,16 @@ async fn run_inner(
                         // up to MAX_EMPTY_TURN_RETRIES times. A refusal is a
                         // terminal verdict, not a transient hiccup — let it
                         // fall through and end the ask with its own stop
-                        // reason. (mu-provider-drift-2026q3-y43la)
+                        // reason. PauseTurn likewise: until real turn
+                        // continuation exists, a paused ask ends under its
+                        // own label per the StopReason::PauseTurn contract,
+                        // rather than being blindly re-invoked here.
+                        // (mu-provider-drift-2026q3-y43la)
                         if is_actionless_turn(&assistant_msg)
-                            && assistant_msg.stop_reason != StopReason::Refusal
+                            && !matches!(
+                                assistant_msg.stop_reason,
+                                StopReason::Refusal | StopReason::PauseTurn
+                            )
                             && buffered.is_empty()
                             && consecutive_empty_turns < MAX_EMPTY_TURN_RETRIES
                         {

@@ -6518,6 +6518,48 @@ async fn refusal_turn_is_not_auto_continued() {
     assert_eq!(turn_starts, 1, "no re-invoke after a refusal");
 }
 
+/// Same contract for a server-paused turn: until real continuation exists,
+/// an actionless pause_turn ends the ask under its own label instead of
+/// being auto-continued. (mu-provider-drift-2026q3-y43la)
+#[tokio::test]
+async fn pause_turn_is_not_auto_continued() {
+    let provider = MockProvider::new(vec![vec![ProviderEvent::Done(AssistantMessage {
+        content: vec![],
+        stop_reason: StopReason::PauseTurn,
+        usage: None,
+    })]]);
+    let (loop_, events_rx) = spawn_loop(provider, vec![], AgentConfig::default());
+    loop_
+        .send(AgentInput::UserMessage(user_msg("go"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("join must not hang");
+    let events = events_handle.await.expect("events drain");
+
+    assert!(
+        events.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::Done {
+                    stop_reason: StopReason::PauseTurn,
+                    ..
+                }
+            )
+        }),
+        "the ask's Done event must carry StopReason::PauseTurn",
+    );
+    assert!(
+        !events.iter().any(|e| {
+            matches!(e, AgentEvent::Callout { title, .. }
+                if title == "empty model turn — auto-continuing")
+        }),
+        "a paused turn must not trigger the empty-turn auto-continue",
+    );
+}
+
 /// A provider stuck emitting actionless turns is bounded: the loop
 /// auto-continues `MAX_EMPTY_TURN_RETRIES` times, then gives up and ends
 /// the ask rather than spinning forever. (mu-rb4u)

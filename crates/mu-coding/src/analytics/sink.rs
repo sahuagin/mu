@@ -220,6 +220,8 @@ pub fn exit_reason_str(r: TaskExitReason) -> &'static str {
         TaskExitReason::BudgetCap => "budget_cap",
         TaskExitReason::Timeout => "timeout",
         TaskExitReason::OperatorStopped => "operator_stopped",
+        TaskExitReason::Refusal => "refusal",
+        TaskExitReason::PauseTurn => "pause_turn",
     }
 }
 
@@ -236,6 +238,7 @@ pub fn outcome_str(o: Outcome) -> &'static str {
         Outcome::ErrorExit => "error_exit",
         Outcome::Timeout => "timeout",
         Outcome::OperatorIntervention => "operator_intervention",
+        Outcome::Refused => "refused",
         Outcome::Unclassified => "unclassified",
     }
 }

@@ -775,6 +775,18 @@ pub enum TaskExitReason {
     Timeout,
     /// Operator-issued stop distinct from Cancelled. Reserved.
     OperatorStopped,
+    /// Provider safety-classifier refusal (`StopReason::Refusal`). The task
+    /// completed — the refusal IS the terminal answer — but analytics must
+    /// not count it as a normal `Done`. Provider-agnostic: any wire's
+    /// refusal shape folds into `StopReason::Refusal` at its adapter before
+    /// reaching this enum. (mu-provider-drift-2026q3-y43la)
+    Refusal,
+    /// Server paused a long-running turn (`StopReason::PauseTurn`) and mu
+    /// ended the ask because turn continuation is unimplemented. Distinct
+    /// from `Done` so analytics can see server-paused asks; the work-quality
+    /// classifier still runs (partial work may exist).
+    /// (mu-provider-drift-2026q3-y43la)
+    PauseTurn,
 }
 
 /// mu-recall-provenance-audit-vnc9.1 (P0): source type of one injected

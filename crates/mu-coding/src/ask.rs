@@ -156,6 +156,25 @@ pub async fn run(opts: AskOptions) -> Result<()> {
              closed without a terminal stop event (connection drop or upstream \
              truncation). Output above may be a fragment."
         ),
+        // mu-provider-drift-2026q3-y43la: the gen-5 terminal states must not
+        // exit 0 — a refused ask has no answer, and a server-paused ask ended
+        // early. Same rationale as max_tokens: the nonzero exit keeps
+        // headless scoring pipelines and spawn callers from reading a
+        // non-answer as a clean success. Edge (panel-raised): if a refusal
+        // ever cut a turn that ALSO completed a final_answer call, the
+        // answer still prints above but the exit is nonzero — deliberate:
+        // an answer the safety classifier cut mid-delivery should force
+        // caller scrutiny, not score as clean.
+        Some("refusal") => bail!(
+            "ask refused (stop_reason=refusal): the provider's safety \
+             classifier declined the request or cut generation. There is no \
+             answer; consider a different seat/model."
+        ),
+        Some("pause_turn") => bail!(
+            "response paused (stop_reason=pause_turn): the server paused a \
+             long-running turn and mu does not implement continuation. \
+             Output above may be partial."
+        ),
         _ => Ok(()),
     }
 }

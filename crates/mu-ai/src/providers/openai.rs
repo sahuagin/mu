@@ -560,12 +560,13 @@ fn make_instructions_overflow_item(content: &str) -> InputItem {
 /// Assemble a [`CreateResponseRequest`] from resolved instructions, the
 /// already-translated `input` items, and tools. Shared by both the
 /// Legacy and Projected paths so they produce byte-identical wire JSON.
-fn build_request(
+pub(crate) fn build_request(
     model: &str,
     thinking: &str,
     instructions: &str,
     mut input: Vec<InputItem>,
     tools: &[ToolSpec],
+    max_output_tokens: Option<u64>,
 ) -> CreateResponseRequest {
     let (instructions_field, overflow) = split_oversized_instructions(instructions);
     if let Some(o) = overflow {
@@ -582,6 +583,14 @@ fn build_request(
     // mu runs stateless (store=false); CreateResponseRequest::new
     // already defaults store to Some(false), but be explicit.
     req.store = Some(false);
+    // Output cap: send `max_output_tokens` only when the catalog explicitly
+    // states one for this model (callers resolve it; None omits the field).
+    // The field is optional on the Responses API and its server default is
+    // the model's own maximum, so omitting it for an unknown model is
+    // strictly better than sending the 4096 floor.
+    // (mu-provider-drift-2026q3-y43la; the `incomplete`/`max_output_tokens`
+    // handler downstream already reports a cap hit.)
+    req.max_output_tokens = max_output_tokens;
     // Ask the backend to return the reasoning item's encrypted_content
     // so we can thread it back verbatim on the next turn (stateless
     // chain-of-thought; PR-B). Required because store=false means the
@@ -605,7 +614,21 @@ pub(crate) fn build_request_value(
     tools: &[ToolSpec],
 ) -> Value {
     let input: Vec<InputItem> = messages.iter().flat_map(translate_message).collect();
-    request_to_value(build_request(model, thinking, instructions, input, tools))
+    request_to_value(build_request(
+        model,
+        thinking,
+        instructions,
+        input,
+        tools,
+        resolved_max_output_tokens(model),
+    ))
+}
+
+/// Catalog-explicit output cap for the Responses wire: `Some` only when the
+/// catalog states one, so the field can be omitted (server default = model
+/// maximum) for models the catalog doesn't know.
+fn resolved_max_output_tokens(model: &str) -> Option<u64> {
+    super::output_limits::explicit_max_tokens_for_model(model).map(u64::from)
 }
 
 // ============================================================================
@@ -709,7 +732,14 @@ pub(crate) fn build_request_value_from_projection(
         Some(s) if !s.is_empty() => s,
         _ => default_instructions,
     };
-    request_to_value(build_request(model, thinking, instructions, input, tools))
+    request_to_value(build_request(
+        model,
+        thinking,
+        instructions,
+        input,
+        tools,
+        resolved_max_output_tokens(model),
+    ))
 }
 
 /// Serialize a built `CreateResponseRequest` to the wire `Value`.

@@ -775,6 +775,15 @@ fn map_stop_reason(s: Option<&AnthropicStopReason>) -> StopReason {
         Some(AnthropicStopReason::ToolUse) => StopReason::ToolUse,
         Some(AnthropicStopReason::MaxTokens) => StopReason::MaxTokens,
         Some(AnthropicStopReason::StopSequence) => StopReason::EndTurn,
+        // Gen-5 safety-classifier refusal: the turn is over, but it is not a
+        // normal completion — surface it so receipts/analytics can see it.
+        Some(AnthropicStopReason::Refusal) => StopReason::Refusal,
+        // `pause_turn`: the server paused a long-running turn and expects the
+        // client to send the conversation back to continue. mu does not
+        // implement that continuation — the ask ends, but under its own core
+        // reason so the degradation stays visible instead of reading as a
+        // natural completion. (mu-provider-drift-2026q3-y43la)
+        Some(AnthropicStopReason::PauseTurn) => StopReason::PauseTurn,
         Some(other) => {
             tracing::warn!(stop_reason = ?other, "unrecognized anthropic stop_reason");
             StopReason::EndTurn

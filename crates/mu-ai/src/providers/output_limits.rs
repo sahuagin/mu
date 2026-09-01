@@ -40,10 +40,30 @@ pub fn max_tokens_for_model_with_catalog(
     catalog: &mu_core::model_catalog::ModelCatalogConfig,
     model: &str,
 ) -> u32 {
-    catalog
-        .resolve_model(model)
-        .max_output_tokens
-        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+    explicit_max_tokens_for_model_with_catalog(catalog, model).unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+}
+
+/// Catalog-explicit output cap, WITHOUT the unknown-model floor: `None` when
+/// neither a `[models.*]` entry nor a `[model_rules.*]` prefix carries
+/// `max_output_tokens` for this model.
+///
+/// For wires where the field is optional and the server default is the model's
+/// own maximum (the OpenAI Responses API), sending the 4096 floor for a model
+/// the catalog doesn't know would SHRINK output far below the server default —
+/// there, send a cap only when the catalog states one, and omit the field
+/// otherwise. Wires that REQUIRE the field (Anthropic Messages) keep using
+/// [`max_tokens_for_model`], floor included. (mu-provider-drift-2026q3-y43la)
+pub fn explicit_max_tokens_for_model(model: &str) -> Option<u32> {
+    explicit_max_tokens_for_model_with_catalog(mu_core::model_catalog::global(), model)
+}
+
+/// [`explicit_max_tokens_for_model`] against an explicit catalog — the
+/// testable seam (same rationale as [`max_tokens_for_model_with_catalog`]).
+pub fn explicit_max_tokens_for_model_with_catalog(
+    catalog: &mu_core::model_catalog::ModelCatalogConfig,
+    model: &str,
+) -> Option<u32> {
+    catalog.resolve_model(model).max_output_tokens
 }
 
 #[cfg(test)]
@@ -104,6 +124,38 @@ mod tests {
         assert_eq!(mt("qwen3.6:35b-a3b-q8_0"), 16384);
         // Non-reasoning local models keep the conservative default.
         assert_eq!(mt("qwen3-coder:30b"), 4096);
+    }
+
+    #[test]
+    fn claude_gen_5_gets_128k() {
+        // Exact entries and the claude_gen_5 family rule (date-stamped ids)
+        // both carry the generation-wide 128k output ceiling.
+        assert_eq!(mt("claude-opus-5"), 128000);
+        assert_eq!(mt("claude-sonnet-5"), 128000);
+        assert_eq!(mt("claude-fable-5"), 128000);
+        assert_eq!(mt("claude-opus-5-20260724"), 128000);
+        assert_eq!(mt("claude-mythos-5"), 128000);
+    }
+
+    #[test]
+    fn explicit_lookup_has_no_floor() {
+        // The Option-returning seam: a cataloged model reports its cap, an
+        // unknown model reports None (NOT the 4096 floor) so optional wires
+        // (OpenAI Responses `max_output_tokens`) can omit the field and keep
+        // the server's model-maximum default.
+        let cat = mu_core::model_catalog::built_in();
+        assert_eq!(
+            explicit_max_tokens_for_model_with_catalog(&cat, "claude-opus-4-7"),
+            Some(128000)
+        );
+        assert_eq!(
+            explicit_max_tokens_for_model_with_catalog(&cat, "gpt-5"),
+            Some(16384)
+        );
+        assert_eq!(
+            explicit_max_tokens_for_model_with_catalog(&cat, "some-future-model-v9"),
+            None
+        );
     }
 
     #[test]

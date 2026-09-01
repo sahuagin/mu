@@ -2786,7 +2786,16 @@ async fn run_inner(
                         // MAX_EMPTY_TURN_RETRIES, backstopped by max_turns.
                         // Skipped when a buffered UserMessage is waiting:
                         // that's the operator's own next ask; let it run.
+                        // Also skipped on a safety-classifier refusal: its
+                        // normal body shape IS an actionless turn (empty
+                        // content, only stop_details), and re-invoking would
+                        // resend the refused conversation to the classifier
+                        // up to MAX_EMPTY_TURN_RETRIES times. A refusal is a
+                        // terminal verdict, not a transient hiccup — let it
+                        // fall through and end the ask with its own stop
+                        // reason. (mu-provider-drift-2026q3-y43la)
                         if is_actionless_turn(&assistant_msg)
+                            && assistant_msg.stop_reason != StopReason::Refusal
                             && buffered.is_empty()
                             && consecutive_empty_turns < MAX_EMPTY_TURN_RETRIES
                         {

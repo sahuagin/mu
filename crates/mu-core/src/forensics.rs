@@ -38,6 +38,10 @@ pub enum Outcome {
     Timeout,
     /// `TaskExitReason::Cancelled` / `OperatorStopped` — human stop.
     OperatorIntervention,
+    /// `TaskExitReason::Refusal` — provider safety-classifier refusal. The
+    /// task terminated on policy, not on the work's own merit; kept out of
+    /// both the success and error buckets. (mu-provider-drift-2026q3-y43la)
+    Refused,
     /// None of the above discriminators matched. Escape hatch.
     Unclassified,
 }
@@ -229,8 +233,17 @@ pub fn classify_task(inputs: &ClassificationInputs<'_>) -> Classification {
                 rationale: format!("exit_reason={:?}", inputs.telemetry.exit_reason),
             };
         }
-        TaskExitReason::Done => {
-            // Fall through to commit/PR-aware discriminators.
+        TaskExitReason::Refusal => {
+            return Classification {
+                outcome: Outcome::Refused,
+                confidence: Confidence::Definite,
+                rationale: "exit_reason=Refusal".to_owned(),
+            };
+        }
+        TaskExitReason::Done | TaskExitReason::PauseTurn => {
+            // Fall through to commit/PR-aware discriminators: a paused ask
+            // may still have produced classifiable work; exit_reason itself
+            // preserves the pause distinction in the sink.
         }
     }
 

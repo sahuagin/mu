@@ -610,6 +610,12 @@ pub(crate) fn task_telemetry_for(
         } => {
             let reason = match stop_reason {
                 StopReason::Aborted => TaskExitReason::Cancelled,
+                // Keep refusals distinct through the telemetry projection:
+                // exit_reason=done would make a safety refusal look like a
+                // normal completion in the analytics sink.
+                // (mu-provider-drift-2026q3-y43la)
+                StopReason::Refusal => TaskExitReason::Refusal,
+                StopReason::PauseTurn => TaskExitReason::PauseTurn,
                 _ => TaskExitReason::Done,
             };
             (reason, *elapsed_ms, *usage)
@@ -662,6 +668,11 @@ pub(crate) fn task_telemetry_for(
 ///   `CommandFailed`, NOT `CommandRejected`: the ask was accepted and
 ///   entered processing — abort is a processing outcome, and Rejected
 ///   is reserved for pre-handler refusals (auth/validation/routing).
+/// - `StopReason::Refusal` (provider safety classifier) → `CommandFailed`:
+///   terminal-without-an-answer; receipt-driven callers should fall back
+///   rather than read a refused worker as a good empty result.
+/// - `StopReason::PauseTurn` → `CommandSucceeded`: the turn may carry
+///   partial work; `result.stop_reason` reports `"pause_turn"`.
 pub(crate) fn ask_receipt_for(
     ticket: &CommandTicket,
     stop_reason: StopReason,
@@ -688,6 +699,25 @@ pub(crate) fn ask_receipt_for(
             code: codes::INTERNAL_ERROR,
             message: error_message
                 .unwrap_or("ask terminated with an error")
+                .to_string(),
+            elapsed_ms: receipt_elapsed_ms,
+        },
+        // A safety-classifier refusal is terminal-without-an-answer: the
+        // caller did not get what it asked for, and exit-code/receipt-driven
+        // callers (worker spawns, rank fallback) should treat it as failed —
+        // possibly re-running on another seat, which mirrors the API-side
+        // `fallbacks` concept. NOT CommandSucceeded: a refused worker must
+        // not look like a good result with empty output.
+        // PauseTurn deliberately stays in the Succeeded arm below: the turn
+        // may carry partial work, and the receipt's result reports
+        // stop_reason: "pause_turn" for callers that care.
+        // (mu-provider-drift-2026q3-y43la)
+        StopReason::Refusal => EventPayload::CommandFailed {
+            command_event_id: ticket.command_event_id,
+            command: ticket.echo.clone(),
+            code: codes::INTERNAL_ERROR,
+            message: "ask refused by the provider's safety classifier \
+                      (stop_reason=refusal)"
                 .to_string(),
             elapsed_ms: receipt_elapsed_ms,
         },
@@ -1090,6 +1120,53 @@ mod tests {
     /// mu-z9ol: the wire Done must carry one receipt per satisfied ask —
     /// clients reconcile queued prompts against them. Several asks share
     /// one Done when a mid-ask user message is absorbed (spec mu-046 WP4).
+    // Receipt mapping for the gen-5 stop reasons: a refusal must read as
+    // FAILED to receipt-driven callers (never a good empty result), while a
+    // paused turn stays a Succeeded receipt whose result names the pause.
+    // (mu-provider-drift-2026q3-y43la)
+    #[test]
+    fn ask_receipt_refusal_fails_pause_turn_succeeds() {
+        let ticket = mu_core::command_journal::CommandTicket {
+            command_event_id: 7,
+            echo: mu_core::command_journal::CommandEcho {
+                request_id: json!(1),
+                method: "ask_session".into(),
+                params: json!({}),
+            },
+            received_at_unix_ms: 1_000,
+        };
+        let refused = ask_receipt_for(
+            &ticket,
+            mu_core::agent::StopReason::Refusal,
+            1,
+            None,
+            None,
+            None,
+            2_000,
+        );
+        match refused {
+            EventPayload::CommandFailed { message, .. } => {
+                assert!(message.contains("refused"), "message: {message}");
+            }
+            other => panic!("refusal must map to CommandFailed, got {other:?}"),
+        }
+        let paused = ask_receipt_for(
+            &ticket,
+            mu_core::agent::StopReason::PauseTurn,
+            1,
+            None,
+            None,
+            None,
+            2_000,
+        );
+        match paused {
+            EventPayload::CommandSucceeded { result, .. } => {
+                assert_eq!(result["stop_reason"], "pause_turn");
+            }
+            other => panic!("pause_turn must map to CommandSucceeded, got {other:?}"),
+        }
+    }
+
     #[test]
     fn translate_done_carries_command_receipts() {
         use mu_core::command_journal::CommandEcho;

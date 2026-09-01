@@ -8092,6 +8092,7 @@ mod tests {
                 protocol: ProtocolKind::OpenaiChat,
                 base_url: "http://10.1.1.143:11435".into(),
                 api_key_env: None,
+                prompt_caching: None,
             }],
             ..Default::default()
         };
@@ -8112,6 +8113,7 @@ mod tests {
                 protocol: ProtocolKind::OpenaiChat,
                 base_url: "http://x".into(),
                 api_key_env: None,
+                prompt_caching: None,
             }],
             ..Default::default()
         };

@@ -669,6 +669,17 @@ pub struct ProviderEndpoint {
     /// servers that ignore auth (ollama, llama-server, vLLM).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    /// Anthropic prompt caching for `anthropic-messages` endpoints
+    /// (mu-iah94). `true` = full native Anthropic dialect: `cache_control`
+    /// markers (5m TTL) and adaptive thinking with effort levels. `false` =
+    /// the ollama-compat dialect: no cache_control (ollama's
+    /// anthropic-compatibility endpoint accepts none), on/off thinking.
+    /// Omitted = inferred from auth: an endpoint with a resolved API key is
+    /// treated as hosted/metered (caching ON — running one uncached cost
+    /// ~10x on repeat prefixes before this knob existed), an auth-less one
+    /// as a local server (caching OFF). Ignored by other protocols.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_caching: Option<bool>,
 }
 
 /// The wire protocol a provider speaks — the axis mu-v8ye splits out from the
@@ -753,6 +764,7 @@ pub fn resolve_configured_selector(
         base_url,
         api_key,
         model,
+        prompt_caching: ep.prompt_caching,
     })
 }
 

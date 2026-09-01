@@ -41,6 +41,10 @@ pub struct OpenRouterProvider {
     /// this provider but overrides the label with its configured name so the
     /// trait-path label matches the event-path label (`with_label`).
     label: &'static str,
+    /// mu-6fj1b: construction-time default reasoning effort (the daemon's
+    /// `--thinking` flag). A per-turn `effort` on `stream` wins; this fills
+    /// in when the turn carries none. `None` = no default (server decides).
+    default_effort: Option<String>,
 }
 
 impl OpenRouterProvider {
@@ -52,6 +56,7 @@ impl OpenRouterProvider {
             api_base: OPENROUTER_API_BASE.to_string(),
             api_path: OPENROUTER_API_PATH.to_string(),
             label: "openrouter",
+            default_effort: None,
         }
     }
 
@@ -81,7 +86,7 @@ impl OpenRouterProvider {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_default();
-        if api_key.is_empty() && api_base == OPENROUTER_API_BASE {
+        if api_key.is_empty() && is_hosted_openrouter(&api_base) {
             return Err(ProviderError::Other(
                 "OPENROUTER_API_KEY not set or empty (required when OPENROUTER_API_BASE points at openrouter.ai)".into(),
             ));
@@ -93,6 +98,7 @@ impl OpenRouterProvider {
             api_base,
             api_path,
             label: "openrouter",
+            default_effort: None,
         })
     }
 
@@ -105,6 +111,16 @@ impl OpenRouterProvider {
     /// Override the chat-completions path (default `/api/v1/chat/completions`).
     pub fn with_api_path(mut self, path: String) -> Self {
         self.api_path = path;
+        self
+    }
+
+    /// mu-6fj1b: set the default reasoning effort from a raw `--thinking`
+    /// flag value. Stored verbatim; the wire mappers normalize it (and treat
+    /// unrecognized values as absent), so the accepted vocabulary lives in
+    /// exactly one place per dialect.
+    pub fn with_thinking_flag(mut self, flag: &str) -> Self {
+        let f = flag.trim();
+        self.default_effort = (!f.is_empty()).then(|| f.to_string());
         self
     }
 
@@ -164,8 +180,37 @@ impl Provider for OpenRouterProvider {
         // mu-13ve: thread the per-turn reasoning effort into OpenRouter's
         // normalized `reasoning` field. None / "off" / unrecognized → no
         // key, so the pre-mu-13ve request body stays byte-for-byte intact.
+        // mu-6fj1b: the per-turn selection falls back to the daemon's
+        // `--thinking` default (previously dropped on this wire).
+        let effort = effort.or(self.default_effort.as_deref());
         if let Some(reasoning) = reasoning_param(effort) {
             body["reasoning"] = reasoning;
+        }
+        // mu-6fj1b: the openai-chat wire fronts more than OpenRouter — the
+        // same provider drives local ollama and vLLM serves, and neither
+        // reads OpenRouter's `reasoning` object. Emit both local dialects
+        // whenever an effort selection exists (including "off", which MUST
+        // reach the serve: ollama 0.32.5 disables thinking only via
+        // `"reasoning_effort":"none"` — `"think":false` is ignored there,
+        // and omitting the field leaves the server default):
+        //   - `reasoning_effort` — ollama's /v1/chat/completions ladder
+        //     (none/low/medium/high, wire-verified on 0.32.5); also a valid
+        //     OpenAI chat-completions param, and vLLM ignores it.
+        //   - `chat_template_kwargs.enable_thinking` — vLLM + qwen3-family
+        //     chat templates toggle thinking per request (wire-verified
+        //     against the :11435 lane, 2026-09-01); other serves ignore it.
+        // No selection at all still sends neither key (server default).
+        // Gated OFF for hosted openrouter.ai (panel finding, conceded):
+        // OpenRouter FORWARDS unknown params to the backing provider, and
+        // "none" is not a valid OpenAI reasoning_effort value — a strict
+        // backend could reject the request. Hosted OpenRouter keeps only
+        // the normalized `reasoning` object above; every other base (local
+        // ollama/vLLM serves, lab proxies) gets the local dialects.
+        if emits_local_dialects(&self.api_base) {
+            if let Some((ladder, enable)) = local_dialect_params(effort) {
+                body["reasoning_effort"] = json!(ladder);
+                body["chat_template_kwargs"] = json!({ "enable_thinking": enable });
+            }
         }
         let resp = self
             .client
@@ -266,6 +311,40 @@ fn reasoning_param(effort: Option<&str>) -> Option<Value> {
         _ => return None,
     };
     Some(json!({ "effort": level }))
+}
+
+/// Whether a base URL is the hosted openrouter.ai endpoint, tolerant of the
+/// operator-input variants raw string equality misses (panel finding on
+/// mu-6fj1b): surrounding whitespace and trailing slashes, either of which
+/// previously defeated BOTH the API-key requirement guard and the
+/// local-dialect gate below.
+fn is_hosted_openrouter(api_base: &str) -> bool {
+    api_base.trim().trim_end_matches('/') == OPENROUTER_API_BASE
+}
+
+/// Whether this base URL gets the local openai-chat dialect fields
+/// (mu-6fj1b). Hosted openrouter.ai does not: it forwards unknown params to
+/// backing providers, where `reasoning_effort:"none"` is invalid OpenAI
+/// vocabulary. Everything else — local serves, configured endpoints, lab
+/// proxies — does.
+fn emits_local_dialects(api_base: &str) -> bool {
+    !is_hosted_openrouter(api_base)
+}
+
+/// Map mu's effort selection to the LOCAL openai-chat dialects (mu-6fj1b):
+/// ollama's `reasoning_effort` ladder plus vLLM's
+/// `chat_template_kwargs.enable_thinking` toggle. Unlike
+/// [`reasoning_param`], the explicit OFF forms map to `("none", false)`
+/// rather than to no key — disabling must reach the serve. `None`/empty/
+/// unrecognized values return `None` (no keys, server default).
+fn local_dialect_params(effort: Option<&str>) -> Option<(&'static str, bool)> {
+    match effort?.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "false" | "0" | "disabled" => Some(("none", false)),
+        "minimal" | "low" => Some(("low", true)),
+        "medium" | "med" => Some(("medium", true)),
+        "high" | "xhigh" | "max" => Some(("high", true)),
+        _ => None,
+    }
 }
 
 /// Wrap a provider event stream so a terminal [`ProviderEvent::Done`] whose

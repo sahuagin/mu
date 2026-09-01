@@ -627,6 +627,15 @@ pub(crate) fn build_request_value(
 /// Catalog-explicit output cap for the Responses wire: `Some` only when the
 /// catalog states one, so the field can be omitted (server default = model
 /// maximum) for models the catalog doesn't know.
+/// Remove request fields the chatgpt-backend (codex OAuth) Responses
+/// variant rejects with 400 "Unsupported parameter". Kept as a helper so
+/// the exclusion list is pinned by a unit test.
+pub(crate) fn strip_codex_unsupported(body: &mut Value) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("max_output_tokens");
+    }
+}
+
 fn resolved_max_output_tokens(model: &str) -> Option<u64> {
     super::output_limits::explicit_max_tokens_for_model(model).map(u64::from)
 }
@@ -1550,7 +1559,7 @@ impl Provider for OpenaiProvider {
         // accepted vocabulary is MODEL-dependent; an out-of-vocabulary
         // level surfaces as a provider 400.
         let eff_thinking: &str = effort.unwrap_or(&self.thinking);
-        let body = match input {
+        let mut body = match input {
             MessageInput::Legacy(msgs) => {
                 // mu-n48: a session-level system_prompt overrides the
                 // provider's default `instructions`.
@@ -1585,6 +1594,16 @@ impl Provider for OpenaiProvider {
                 ));
             }
         };
+        // mu-iah94-follow-up (regression from mu-provider-drift-2026q3-y43la
+        // #576): the chatgpt-backend Responses variant used by the codex
+        // OAuth lane REJECTS `max_output_tokens` outright (400 "Unsupported
+        // parameter"), which silenced the gpt-5.5 review seat fleet-wide.
+        // Only the public API-key endpoint accepts the field, so strip it on
+        // the codex path; the server's own cap still applies and the
+        // `incomplete`/`max_output_tokens` handler still reports cap hits.
+        if matches!(self.mode, AuthMode::Codex { .. }) {
+            strip_codex_unsupported(&mut body);
+        }
 
         debug!(
             target: "mu_ai::providers::openai",

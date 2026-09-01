@@ -705,6 +705,44 @@ fn reasoning_param_maps_levels() {
     );
 }
 
+// mu-6fj1b: effort -> local openai-chat dialects (ollama reasoning_effort +
+// vLLM chat_template_kwargs.enable_thinking).
+#[test]
+fn local_dialect_params_off_forms_reach_the_wire_as_none() {
+    // Unlike reasoning_param, OFF must produce keys: ollama 0.32.5 disables
+    // thinking only via "reasoning_effort":"none" (omitting = server default).
+    for off in ["off", "none", "false", "0", "disabled"] {
+        assert_eq!(local_dialect_params(Some(off)), Some(("none", false)));
+    }
+    // No selection at all: no keys, server default preserved.
+    assert_eq!(local_dialect_params(None), None);
+    assert_eq!(local_dialect_params(Some("")), None);
+    assert_eq!(local_dialect_params(Some("turbo")), None);
+}
+
+#[test]
+fn local_dialect_params_levels_enable_thinking() {
+    assert_eq!(local_dialect_params(Some("low")), Some(("low", true)));
+    assert_eq!(local_dialect_params(Some("medium")), Some(("medium", true)));
+    assert_eq!(local_dialect_params(Some("high")), Some(("high", true)));
+    // mu's xhigh/max clamp to ollama's ladder ceiling.
+    assert_eq!(local_dialect_params(Some("xhigh")), Some(("high", true)));
+    assert_eq!(local_dialect_params(Some("max")), Some(("high", true)));
+}
+
+#[test]
+fn local_dialects_gated_off_for_hosted_openrouter() {
+    // Hosted openrouter.ai forwards unknown params to backing providers
+    // (where reasoning_effort:"none" is invalid) — only the normalized
+    // `reasoning` object may ship there. Any other base gets the dialects.
+    assert!(!emits_local_dialects(OPENROUTER_API_BASE));
+    // Operator-input variants must not defeat the gate (panel finding):
+    assert!(!emits_local_dialects("https://openrouter.ai/"));
+    assert!(!emits_local_dialects("  https://openrouter.ai  "));
+    assert!(emits_local_dialects("http://10.1.1.143:11434"));
+    assert!(emits_local_dialects("http://127.0.0.1:8436"));
+}
+
 #[test]
 fn reasoning_param_clamps_above_high_to_high() {
     // mu's xhigh/max have no OpenRouter level above `high`.

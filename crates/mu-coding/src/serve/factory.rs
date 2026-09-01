@@ -139,13 +139,26 @@ pub fn build_provider_from_selector(
             };
             Ok(Arc::new(provider))
         }
+        // mu-6fj1b: --thinking now reaches the openai-chat wire (both the
+        // OpenRouter `reasoning` object and the local ollama/vLLM dialects)
+        // instead of being logged as ignored.
         ProviderSelector::Openrouter { model } => {
-            log_thinking_ignored("openrouter", thinking);
-            Ok(Arc::new(OpenRouterProvider::from_env(model.clone())?))
+            let mut provider = OpenRouterProvider::from_env(model.clone())?;
+            if let Some(t) = thinking {
+                if !t.is_empty() {
+                    provider = provider.with_thinking_flag(t);
+                }
+            }
+            Ok(Arc::new(provider))
         }
         ProviderSelector::Vllm { model } => {
-            log_thinking_ignored("vllm", thinking);
-            Ok(Arc::new(VllmProvider::from_env(model.clone())?))
+            let mut provider = VllmProvider::from_env(model.clone())?;
+            if let Some(t) = thinking {
+                if !t.is_empty() {
+                    provider = provider.with_thinking_flag(t);
+                }
+            }
+            Ok(Arc::new(provider))
         }
         ProviderSelector::Ollama { model } => {
             let mut provider = OllamaProvider::from_env(model.clone())?;
@@ -167,13 +180,19 @@ pub fn build_provider_from_selector(
             model,
         } => match protocol.as_str() {
             "openai-chat" => {
-                log_thinking_ignored(name, thinking);
-                let provider = OpenRouterProvider::new(api_key.clone(), model.clone())
+                let mut provider = OpenRouterProvider::new(api_key.clone(), model.clone())
                     .with_api_base(base_url.clone())
                     .with_api_path("/v1/chat/completions".to_string())
                     // mu-v8ye: label by the configured name so the trait-path
                     // label agrees with the event-path label in session.rs.
                     .with_label(name);
+                // mu-6fj1b: --thinking reaches this wire now (ollama
+                // reasoning_effort + vLLM chat_template_kwargs dialects).
+                if let Some(t) = thinking {
+                    if !t.is_empty() {
+                        provider = provider.with_thinking_flag(t);
+                    }
+                }
                 Ok(Arc::new(provider))
             }
             "anthropic-messages" => {
@@ -289,17 +308,6 @@ fn resolve_launch_selection_with_catalog(
         }
     }
     (provider.to_string(), model.map(str::to_string))
-}
-
-fn log_thinking_ignored(provider: &str, thinking: Option<&str>) {
-    if let Some(t) = thinking {
-        if !t.is_empty() {
-            tracing::debug!(
-                provider, thinking = %t,
-                "--thinking is ignored for this provider (no reasoning surface)"
-            );
-        }
-    }
 }
 
 /// Build a tools vec from a list of names. Unknown names error.

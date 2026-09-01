@@ -624,9 +624,6 @@ pub(crate) fn build_request_value(
     ))
 }
 
-/// Catalog-explicit output cap for the Responses wire: `Some` only when the
-/// catalog states one, so the field can be omitted (server default = model
-/// maximum) for models the catalog doesn't know.
 /// Remove request fields the chatgpt-backend (codex OAuth) Responses
 /// variant rejects with 400 "Unsupported parameter". Kept as a helper so
 /// the exclusion list is pinned by a unit test.
@@ -636,6 +633,9 @@ pub(crate) fn strip_codex_unsupported(body: &mut Value) {
     }
 }
 
+/// Catalog-explicit output cap for the Responses wire: `Some` only when the
+/// catalog states one, so the field can be omitted (server default = model
+/// maximum) for models the catalog doesn't know.
 fn resolved_max_output_tokens(model: &str) -> Option<u64> {
     super::output_limits::explicit_max_tokens_for_model(model).map(u64::from)
 }

@@ -53,6 +53,13 @@ impl VllmProvider {
         Ok(Self { inner })
     }
 
+    /// mu-6fj1b: default reasoning effort from the daemon's `--thinking`
+    /// flag, forwarded to the shared openai-chat wire impl.
+    pub fn with_thinking_flag(mut self, flag: &str) -> Self {
+        self.inner = self.inner.with_thinking_flag(flag);
+        self
+    }
+
     pub async fn discover_models(
         base: &str,
         timeout: std::time::Duration,

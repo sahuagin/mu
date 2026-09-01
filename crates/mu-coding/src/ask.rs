@@ -393,6 +393,15 @@ pub(crate) async fn ask_and_drain(
     let mut got_done = false;
     let mut got_response = false;
     let mut stop_reason: Option<String> = None;
+    // mu-bm6za: when the session ends via the `final_answer` tool, the
+    // answer travels as the tool's argument, not as assistant text — a
+    // final_answer-only closing turn can leave `finalized` empty (or
+    // holding only earlier narration). Capture the argument so it can
+    // stand in as stdout when no finalized text arrived. The capture is
+    // two-phase (pending → promoted on an ok completion) so a refused or
+    // errored final_answer call can never supply stdout.
+    let mut final_answer_arg: Option<String> = None;
+    let mut pending_final_answer: Option<String> = None;
 
     loop {
         let line = read_line(stdout).await?;
@@ -443,12 +452,30 @@ pub(crate) async fn ask_and_drain(
                     // call below is the useful unit.
                     let name = line["params"]["tool_name"].as_str().unwrap_or("?");
                     let args = &line["params"]["arguments"];
+                    if name == "final_answer" {
+                        // Only PENDING here — tool_call_started fires before
+                        // the runtime's refusal gates (capability / retry /
+                        // validation / permission), so a refused or errored
+                        // call must never become stdout. Promotion happens on
+                        // the matching completed event below; tool execution
+                        // is serial, so adjacency pairing is sound.
+                        // (ci-aipr gpt-5.5 finding, PR #577 round 1.)
+                        pending_final_answer = args
+                            .get("answer")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                    }
                     eprintln!("[tool] {name} {args}");
                 }
             }
             Some("session.tool_call_completed") => {
                 if line["params"]["session_id"] == session_id {
                     let kind = line["params"]["outcome"]["kind"].as_str().unwrap_or("?");
+                    if let Some(answer) = pending_final_answer.take() {
+                        if kind == "ok" {
+                            final_answer_arg = Some(answer);
+                        }
+                    }
                     eprintln!("[tool result: {kind}]");
                 }
             }
@@ -481,6 +508,16 @@ pub(crate) async fn ask_and_drain(
             // keep it as a defensive fallback for providers/paths that
             // never emit assistant_text_finalized.
             finalized.push_str(&current);
+            // mu-bm6za: a final_answer-terminated ask whose closing turn
+            // carried no assistant text still has an authoritative
+            // answer — the tool argument. Only substitute when NO text
+            // arrived at all: any finalized narration keeps priority so
+            // this cannot mask ordinary output.
+            if finalized.trim().is_empty() {
+                if let Some(answer) = final_answer_arg {
+                    return Ok((answer, stop_reason));
+                }
+            }
             return Ok((finalized, stop_reason));
         }
     }

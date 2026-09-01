@@ -18,8 +18,8 @@ use mu_core::model_catalog::ModelCatalogConfig;
 use mu_core::protocol::ProviderSelector;
 
 use crate::tools::{
-    AwsReconTool, BashMode, BashTool, EditTool, GlobTool, GrepTool, LsTool, MemoryRecallTool,
-    ReadTool, WriteTool,
+    AwsReconTool, BashMode, BashTool, EditTool, FinalAnswerTool, GlobTool, GrepTool, LsTool,
+    MemoryRecallTool, ReadTool, WriteTool,
 };
 
 /// Settings that parameterize how the `bash` tool is built.
@@ -322,6 +322,8 @@ pub fn build_tools(names: &[String], bash: &BashSettings) -> Result<Vec<Arc<dyn 
             // store — the discoverable tail that the small-kernel
             // injection (mu-zk2i) demotes everything into.
             "memory_recall" => Ok(Arc::new(MemoryRecallTool::new()) as Arc<dyn Tool>),
+            // mu-bm6za: stop-at-answer protocol tool for one-shot sessions.
+            "final_answer" => Ok(Arc::new(FinalAnswerTool::new()) as Arc<dyn Tool>),
             "aws_recon" => Ok(
                 Arc::new(AwsReconTool::from_env().map_err(|e| anyhow::anyhow!(e))?)
                     as Arc<dyn Tool>,
@@ -343,7 +345,7 @@ pub fn build_tools(names: &[String], bash: &BashSettings) -> Result<Vec<Arc<dyn 
             }
             other => anyhow::bail!(
                 "unknown tool: {other} (expected: read, write, ls, edit, grep, glob, \
-                 memory_recall, aws_recon, bash)"
+                 memory_recall, aws_recon, bash, final_answer)"
             ),
         })
         .collect()

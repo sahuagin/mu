@@ -6,6 +6,7 @@ pub mod dialogue;
 pub mod discover;
 pub mod edit;
 pub mod edit_matcher;
+pub mod final_answer;
 pub mod glob;
 pub mod grep;
 pub mod ls;
@@ -23,6 +24,7 @@ pub use bash::{BashMode, BashTool};
 pub use dialogue::{DialogueBind, SessionDialogueTool};
 pub use discover::DiscoverTool;
 pub use edit::EditTool;
+pub use final_answer::FinalAnswerTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
@@ -64,6 +66,10 @@ mod policy_invariants {
                  args — the model cannot make it run arbitrary work",
             ),
             "discover" => Some("ranks the session's own tools; read-only projection"),
+            "final_answer" => Some(
+                "pure control-flow: echoes its argument and ends the ask via \
+                 ends_turn_on_success (mu-bm6za); no fs, no exec, no network",
+            ),
             "start_autonomous" | "schedule_wakeup" => Some(
                 "affects only this session's own control flow, not world state; \
                  gated by AutonomyCapability at tool-presence + the loop input \
@@ -107,6 +113,7 @@ mod policy_invariants {
             Arc::new(GrepTool::new()),
             Arc::new(GlobTool::new()),
             Arc::new(MemoryRecallTool::new()),
+            Arc::new(FinalAnswerTool::new()),
             Arc::new(BashTool::new(BashMode::Yolo)),
             Arc::new(WatchTool::new(
                 sessions.downgrade(),

@@ -111,6 +111,14 @@ enum Command {
         /// explicitly for a pure-chat session.
         #[arg(long, default_value = "read,grep,glob,memory_recall")]
         tools: String,
+        /// mu-bm6za: opt OUT of the `final_answer` tool. A one-shot ask
+        /// always has a final answer, so ask appends `final_answer` to any
+        /// non-empty toolset by default (A/B: zero answer loss, zero
+        /// accuracy cost, ~one round trip; bead comments carry the data).
+        /// Pure-chat sessions (`--tools ""`) never get it — their text IS
+        /// the answer.
+        #[arg(long)]
+        no_final_answer: bool,
         /// Forwarded as `--ephemeral` to `mu serve`. See `mu serve --help`.
         #[arg(long)]
         ephemeral: bool,
@@ -531,6 +539,7 @@ async fn main() -> Result<()> {
             provider,
             model,
             tools,
+            no_final_answer,
             ephemeral,
             thinking,
             effort,
@@ -554,6 +563,21 @@ async fn main() -> Result<()> {
                 Some(path) => std::fs::read_to_string(&path)
                     .with_context(|| format!("--prompt-file: reading {}", path.display()))?,
                 None => prompt.expect("clap: prompt required unless --prompt-file"),
+            };
+            // mu-bm6za: one-shot asks default to carrying `final_answer` —
+            // completion as a protocol event beats scraping stdout, and a
+            // model that ignores the tool behaves exactly as before. Applied
+            // here (not in the clap default) so an explicit --tools list
+            // still gets it; "" pure-chat stays tool-free.
+            let tools = if no_final_answer
+                || tools.trim().is_empty()
+                || mu_coding::serve::parse_tools_csv(&tools)
+                    .iter()
+                    .any(|t| t == "final_answer")
+            {
+                tools
+            } else {
+                format!("{tools},final_answer")
             };
             mu_coding::ask::run(mu_coding::ask::AskOptions {
                 prompt,

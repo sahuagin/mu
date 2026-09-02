@@ -65,6 +65,15 @@ mod check;
 mod mesh;
 mod presence;
 
+/// Serializes tests that mutate process-global env (`HOME`, `MU_CONFIG`).
+/// Two such tests exist (presence.rs config-resolution, check.rs candidates);
+/// under parallel test threads they raced — one test's temp HOME landing
+/// mid-way through the other's assertions, failing ~1 in 5 runs
+/// (mu-dialogue-presence-test-flake-eypd9). `unwrap_or_else(into_inner)`
+/// keeps a panicked holder from poisoning every later run.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const SERVER_NAME: &str = "mu-dialogue";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_POLL_TIMEOUT_MS: u64 = 30_000;

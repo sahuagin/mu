@@ -8,7 +8,11 @@ it" record.
 
 ## Captured
 
-- **Date:** 2026-06-22
+- **Date:** 2026-09-02 (refreshed from 2026-06-22; delta since the original
+  pin: request/response gained `moderation` + `prompt_cache_options`,
+  `reasoning.effort` gained `max`, and eight stream-event schemas were added
+  (Beta/WebSocket wrappers + shell-call events) — all modeled or tolerated
+  as of this refresh)
 - **Source:** https://github.com/openai/openai-openapi (the official OpenAPI 3.1
   spec of record for the OpenAI REST API)
 

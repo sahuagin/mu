@@ -443,8 +443,12 @@ fn translate_tool_spec(spec: &ToolSpec) -> Tool {
         description: Some(spec.description.clone()),
         parameters: openai_json(spec.input_schema.clone()),
         // strict omitted (None) — matches the hand-rolled provider's
-        // wire shape, which never set `strict`.
+        // wire shape, which never set `strict`. The gpt-5.6 programmatic
+        // tool-calling fields likewise stay absent until mu grows a use.
         strict: None,
+        output_schema: None,
+        defer_loading: None,
+        allowed_callers: Vec::new(),
     })
 }
 
@@ -630,6 +634,10 @@ pub(crate) fn build_request_value(
 pub(crate) fn strip_codex_unsupported(body: &mut Value) {
     if let Some(obj) = body.as_object_mut() {
         obj.remove("max_output_tokens");
+        // Wire-verified 2026-09-02, same 400 as max_output_tokens: the
+        // chatgpt-backend manages prompt caching server-side and rejects
+        // client control of it.
+        obj.remove("prompt_cache_options");
     }
 }
 

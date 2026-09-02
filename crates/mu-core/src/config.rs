@@ -483,6 +483,34 @@ pub struct RecallConfig {
     /// Cosine floor passed to `agent kx recall --min-score`.
     #[serde(default = "default_kx_min_score")]
     pub kx_min_score: f32,
+    /// mu-pcvqx: prompt-relevant memory injection. When true, each user
+    /// turn runs `agent memory recall <prompt> --json` (the scored semantic
+    /// path the `memory_recall` tool uses), drops hits below
+    /// `memory_hints_min_score`, and injects the survivors as a compact
+    /// span anchored to that user message — never re-injecting a memory
+    /// still in context. This is the prompt-AWARE complement to the
+    /// prompt-agnostic session-start kernel (`tier`), which cannot be
+    /// relevance-filtered because it never sees a prompt. Default false:
+    /// recall embeds the query through the configured embedder (~1-2 s).
+    /// Uses `memory_binary`; forced off by `--bare` and `MU_NO_RECALL`.
+    #[serde(default)]
+    pub memory_hints: bool,
+    /// Hit cap per turn for prompt-time memory injection.
+    #[serde(default = "default_memory_hints_limit")]
+    pub memory_hints_limit: usize,
+    /// Relevance floor on the recall `score` (rank v1: cosine × trust ×
+    /// freshness), applied by mu. Measured on the tool path (mu-316wl
+    /// battery 3): a planted relevant memory scored 0.725, the unrelated
+    /// runners-up 0.52-0.53 — 0.60 keeps the one and drops the noise.
+    #[serde(default = "default_memory_hints_min_score")]
+    pub memory_hints_min_score: f32,
+    /// Wall-clock cap (ms) on one prompt-time `agent memory recall` call;
+    /// on expiry the turn proceeds without a hint. Default 15000: the
+    /// call is 1-2 s warm but ~9 s when the embedder loads cold on a
+    /// session's first turn — a tighter cap silently drops the feature
+    /// exactly then.
+    #[serde(default = "default_memory_hints_timeout_ms")]
+    pub memory_hints_timeout_ms: u64,
 }
 
 /// serde default helper: `true`. A bare `#[serde(default)]` on a `bool`
@@ -501,6 +529,18 @@ fn default_kx_min_score() -> f32 {
     0.60
 }
 
+fn default_memory_hints_limit() -> usize {
+    3
+}
+
+fn default_memory_hints_min_score() -> f32 {
+    0.60
+}
+
+fn default_memory_hints_timeout_ms() -> u64 {
+    15_000
+}
+
 impl Default for RecallConfig {
     fn default() -> Self {
         Self {
@@ -515,6 +555,10 @@ impl Default for RecallConfig {
             kx_binary: None,
             kx_limit: default_kx_limit(),
             kx_min_score: default_kx_min_score(),
+            memory_hints: false,
+            memory_hints_limit: default_memory_hints_limit(),
+            memory_hints_min_score: default_memory_hints_min_score(),
+            memory_hints_timeout_ms: default_memory_hints_timeout_ms(),
         }
     }
 }
@@ -1307,6 +1351,29 @@ mod tests {
         let c: Config =
             toml::from_str("[index]\ndiscover_injection_min_score_ratio = 0.8\n").expect("parse");
         assert_eq!(c.index.discover_injection_min_score_ratio, 0.8);
+    }
+
+    #[test]
+    fn memory_hints_default_off_with_tuned_floor_and_toml_can_enable() {
+        // mu-pcvqx: opt-in (embedder cost), and the defaults encode the
+        // measured separation (0.60 floor, top-3).
+        let d = Config::default();
+        assert!(!d.recall.memory_hints);
+        assert_eq!(d.recall.memory_hints_limit, 3);
+        assert_eq!(d.recall.memory_hints_min_score, 0.60);
+        assert_eq!(d.recall.memory_hints_timeout_ms, 15_000);
+        let c: Config = toml::from_str(
+            "[recall]\nmemory_hints = true\nmemory_hints_limit = 2\nmemory_hints_min_score = 0.65\nmemory_hints_timeout_ms = 4000\n",
+        )
+        .expect("parse");
+        assert!(c.recall.memory_hints);
+        assert_eq!(c.recall.memory_hints_limit, 2);
+        assert_eq!(c.recall.memory_hints_min_score, 0.65);
+        assert_eq!(c.recall.memory_hints_timeout_ms, 4000);
+        // A partial [recall] section keeps the defaults for the rest.
+        let p: Config = toml::from_str("[recall]\nmemory_hints = true\n").expect("parse");
+        assert_eq!(p.recall.memory_hints_limit, 3);
+        assert_eq!(p.recall.memory_hints_min_score, 0.60);
     }
 
     #[test]

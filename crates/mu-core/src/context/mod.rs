@@ -39,6 +39,7 @@ pub mod capability_hints;
 pub mod compaction;
 pub mod event;
 pub mod kx_hints;
+pub mod memory_hints;
 pub mod recall;
 pub mod renderer;
 pub mod rope;

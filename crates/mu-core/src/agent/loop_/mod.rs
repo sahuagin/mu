@@ -780,6 +780,13 @@ pub struct AgentConfig {
     /// transient doc-pointer block after that user span. `None` (default) keeps
     /// pre-kx behavior and avoids any embedder/API cost.
     pub kx_hints: Option<crate::context::kx_hints::KxHints>,
+    /// mu-pcvqx: prompt-relevant memory injection. When `Some`, each turn
+    /// the loop runs the last user message through `agent memory recall`,
+    /// thresholds the scored hits, and anchors the survivors to that user
+    /// span with the capability-hints dedup discipline — see
+    /// [`crate::context::memory_hints`]. `None` (default) ⇒ off; wired by
+    /// the daemon from `[recall].memory_hints`.
+    pub memory_hints: Option<crate::context::memory_hints::MemoryHints>,
     /// mu-vcbm: the session's launch-time reasoning-effort default
     /// (`CreateSessionRequest.effort`). Seeds the loop's standing effort
     /// at session start; subsequent `/effort` changes ride in on
@@ -801,6 +808,7 @@ impl std::fmt::Debug for AgentConfig {
             )
             .field("discover_hints", &self.discover_hints.is_some())
             .field("kx_hints", &self.kx_hints.is_some())
+            .field("memory_hints", &self.memory_hints.is_some())
             .field("effort", &self.effort)
             .finish()
     }
@@ -819,6 +827,7 @@ impl Default for AgentConfig {
             seed_messages: Vec::new(),
             discover_hints: None,
             kx_hints: None,
+            memory_hints: None,
             effort: None,
         }
     }
@@ -1398,6 +1407,12 @@ async fn run_inner(
     // iteration so tool rounds don't re-run the embedder or mutate the
     // provider prompt.
     let mut kx_hint_memo: Option<(String, Option<String>)> = None;
+    // mu-pcvqx: prompt-relevant memory hints, anchored + deduped exactly
+    // like capability hints (a memory named by a live record is never
+    // re-injected; a record whose anchor compaction dropped is pruned and
+    // re-arms its memories). `text: None` memoizes "ranked to nothing" so
+    // tool rounds don't re-run the embedder.
+    let mut memory_hints: Vec<crate::context::memory_hints::InjectedMemoryHint> = Vec::new();
     // mu-wsgx: feedback anchor for the compaction-trigger measure.
     // None until the first provider-reported usage; reset on provider
     // switch (different tokenizer + accounting convention).
@@ -2494,6 +2509,57 @@ async fn run_inner(
                             }
                             None => rope,
                         }
+                    }
+                    None => rope,
+                };
+
+                // mu-pcvqx: prompt-relevant memory recall. The session-start
+                // kernel is prompt-agnostic by construction (it runs before
+                // any prompt exists), so THIS is where task-relevant memory
+                // enters: rank the last user message through `agent memory
+                // recall`, keep only hits above the floor, and anchor them
+                // to that user span. Same anchoring/dedup discipline as the
+                // capability hints above; same subprocess posture as kx.
+                let rope: RetainedRope = match &config.memory_hints {
+                    Some(mh) => {
+                        use crate::context::capability_hints::rope_has_anchor;
+                        use crate::context::memory_hints as memhints;
+                        memory_hints.retain(|h| rope_has_anchor(&rope, h.anchor_msg_idx));
+                        let anchor = messages
+                            .iter()
+                            .rposition(|m| matches!(m, AgentMessage::User { .. }));
+                        if let Some(idx) = anchor {
+                            let ranked = memory_hints.iter().any(|h| h.anchor_msg_idx == idx);
+                            if !ranked {
+                                let intent = match &messages[idx] {
+                                    AgentMessage::User { content } => content.to_string(),
+                                    _ => String::new(),
+                                };
+                                let already: std::collections::HashSet<String> = memory_hints
+                                    .iter()
+                                    .flat_map(|h| h.keys.iter().cloned())
+                                    .collect();
+                                // `render_for_intent` shells out and blocks on
+                                // the child (embedder round-trip); keep it off
+                                // the tokio worker.
+                                let mh = mh.clone();
+                                let ranked = tokio::task::spawn_blocking(move || {
+                                    mh.render_for_intent(&intent, &already)
+                                })
+                                .await
+                                .unwrap_or(None);
+                                let (text, keys) = match ranked {
+                                    Some((text, keys)) => (Some(text), keys),
+                                    None => (None, Vec::new()),
+                                };
+                                memory_hints.push(memhints::InjectedMemoryHint {
+                                    anchor_msg_idx: idx,
+                                    text,
+                                    keys,
+                                });
+                            }
+                        }
+                        memhints::with_memory_hints(&rope, &memory_hints)
                     }
                     None => rope,
                 };

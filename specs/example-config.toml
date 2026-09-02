@@ -182,6 +182,23 @@ kx = false
 kx_limit = 4
 kx_min_score = 0.60
 
+# Prompt-relevant memory injection (mu-pcvqx). The session-start kernel above
+# (`tier`) is a fixed standing dump that never sees your prompt, so it cannot
+# be relevance-filtered. When memory_hints = true, each user turn instead runs
+# `agent memory recall <prompt>` (the scored semantic path the memory_recall
+# tool uses), drops hits scoring below memory_hints_min_score, and injects the
+# rest as a small block anchored to that prompt — a memory already in context
+# is never re-injected. Default false because recall embeds the query through
+# your configured embedder (~1-2 s per turn). Uses memory_binary; forced off
+# by --bare and MU_NO_RECALL.
+memory_hints = false
+memory_hints_limit = 3
+memory_hints_min_score = 0.60
+# Cap on one recall call; past it the turn proceeds without a hint. The call
+# is 1-2 s warm but ~9 s when the embedder loads cold on a session's first
+# turn, so keep this generous.
+memory_hints_timeout_ms = 15000
+
 # First-position "this is startup orientation, not the task" preamble.
 # false (default) = no preamble. The MU_RECALL_BOOTLOADER=0/1 env var
 # overrides this per-session.

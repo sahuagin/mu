@@ -90,6 +90,20 @@ own assessment: "irrelevant wallowing."
   session's remainder; evicting it cost ≈$0.83 in re-cache. Stable
   content stays pinned at the prefix; volatile content lives at the tail;
   compaction drops from the tail region only (see mu-tlri).
+- **Prompt-relevant injection is a per-turn path, not a session-start
+  tier** (mu-pcvqx, 2026-09-02). The session-start kernel shells
+  `agent memory context --tier`, a fixed standing dump that never sees a
+  prompt — so it cannot be relevance-filtered, which is why the `full`
+  tier "injected irrelevant material" and got dialed back to identity.
+  Task-relevant memory enters through `[recall].memory_hints`: each user
+  turn runs `agent memory recall <prompt>` (the scored path the
+  `memory_recall` tool uses), keeps hits at or above
+  `memory_hints_min_score` (0.60; measured separation on the battery-3
+  probes: relevant 0.67–0.91, best unrelated 0.56), and anchors a compact
+  block (top-3, ≤2.4 KB) right after that user span with the
+  capability-hints discipline — never re-injecting a memory still in
+  context, re-arming it when compaction drops the anchor. The kernel stays
+  small and prompt-agnostic; relevance lives at the tail.
 
 ## Working-set prefetch: context planning, not inject-everything
 

@@ -5979,6 +5979,164 @@ printf '%s\n' '{{"results":[{{"name":"doc","description":"desc","score":0.91,"pa
     );
 }
 
+/// mu-pcvqx: prompt-relevant memory hints are anchored to the user message
+/// they were ranked for (like capability hints), memoized across the tool
+/// rounds of one ask, and a memory already in context is never re-injected
+/// on a later turn — the stub returns the same hit both turns, so turn 2
+/// must rank to nothing while turn 1's anchored span stays in place.
+#[tokio::test]
+async fn pcvqx_memory_hint_anchors_dedups_and_memoizes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("mu-memhint-loop-test-{pid}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("agent");
+    let log = dir.join("calls.log");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {log}
+printf '%s\n' '{{"results":[{{"id":"zeph","name":"zephyr-constant","description":"the Zephyr seven tuning constant","content":"logged value 7","score":0.73,"type":"project","trust":"recorded"}},{{"id":"noise","name":"unrelated","description":"noise","score":0.52}}]}}'
+"#,
+            log = shell_escape_path(&log)
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (provider, records) = RecordingProvider::new(vec![
+        // Turn 1: tool round-trip = two provider calls.
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "t1",
+            "echo",
+            json!({}),
+        ))],
+        vec![ProviderEvent::Done(assistant_text("done"))],
+        // Turn 2: single call.
+        vec![ProviderEvent::Done(assistant_text("done again"))],
+    ]);
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool::ok("echo", "ok"))];
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let config = AgentConfig {
+        memory_hints: Some(
+            crate::context::memory_hints::MemoryHints::new(&script).with_min_score(0.60),
+        ),
+        ..AgentConfig::default()
+    };
+    let loop_ = loop_with(
+        provider,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        tools,
+        config,
+        events_tx,
+        approvals,
+        capability,
+    );
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("what was the zephyr constant"),
+            None,
+            None,
+        ))
+        .await
+        .expect("send");
+    // Back-to-back asks share one LLM call (spec mu-046 WP4), so a genuine
+    // second turn needs message 2 sent only after turn 1's TurnEnd — the
+    // same watcher pattern as the mu-8bkf two-turn test.
+    let loop_tx = loop_.sender();
+    let watcher = tokio::spawn(async move {
+        let mut rx = events_rx;
+        let mut loop_tx_opt = Some(loop_tx);
+        while let Some(e) = rx.recv().await {
+            if let Some(tx) = loop_tx_opt.take() {
+                if matches!(e, AgentEvent::TurnEnd) {
+                    let _ = tx
+                        .send(AgentInput::UserMessage(
+                            user_msg("and again, the zephyr constant"),
+                            None,
+                            None,
+                        ))
+                        .await;
+                } else {
+                    loop_tx_opt = Some(tx);
+                }
+            }
+        }
+    });
+    let _ = timeout(Duration::from_secs(10), loop_.join())
+        .await
+        .expect("loop did not complete within 10 seconds");
+    watcher.await.expect("watcher drain");
+
+    let records = records.lock().expect("records").clone();
+    assert_eq!(records.len(), 3, "two turns = three provider calls");
+    let hint0 = crate::context::memory_hints::memory_hint_span_id(0);
+    let mut hint_positions = Vec::new();
+    for (i, rec) in records.iter().enumerate() {
+        let user_pos = rec
+            .first_span_ids
+            .iter()
+            .position(|id| id == "msg-0-user")
+            .unwrap_or_else(|| panic!("call {i}: user span missing: {:?}", rec.first_span_ids));
+        let hint_pos = rec
+            .first_span_ids
+            .iter()
+            .position(|id| *id == hint0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "call {i}: memory hint span missing: {:?}",
+                    rec.first_span_ids
+                )
+            });
+        assert_eq!(
+            hint_pos,
+            user_pos + 1,
+            "call {i}: hint anchored right after its user span"
+        );
+        hint_positions.push(hint_pos);
+    }
+    assert_eq!(
+        hint_positions[0], hint_positions[1],
+        "byte-stable across rounds"
+    );
+    assert_eq!(hint_positions[1], hint_positions[2], "and across turns");
+    // Turn 2's anchor is a later user message; its hit was already in
+    // context, so no second hint span exists anywhere — while turn 1's
+    // anchored span is still aboard.
+    let turn2 = &records[2].all_span_ids;
+    assert!(
+        !turn2.iter().any(|id| id
+            .starts_with(crate::context::memory_hints::MEMORY_HINT_SPAN_PREFIX)
+            && *id != hint0),
+        "already-injected memory must not be re-injected: {turn2:?}"
+    );
+    assert!(turn2.iter().any(|id| *id == hint0), "{turn2:?}");
+    // Rendered content: the fact injected, the sub-floor hit not.
+    let contents = &records[0].provider_contents;
+    assert!(
+        contents.iter().any(|c| c.contains("logged value 7")),
+        "fact must reach the provider: {contents:?}"
+    );
+    assert!(
+        !contents.iter().any(|c| c.contains("unrelated")),
+        "sub-floor hit must not: {contents:?}"
+    );
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls.lines().count(),
+        2,
+        "one recall per turn: memoized across tool rounds, re-ranked on the new turn"
+    );
+    // Default limit 3 ⇒ rank depth 12 (limit×4, clamped to 8..=20).
+    assert!(calls.contains("memory recall what was the zephyr constant --json --k 12 --full"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn shell_escape_path(path: &std::path::Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }

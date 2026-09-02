@@ -104,6 +104,11 @@ impl KxHints {
             .arg(self.limit.to_string())
             .arg("--min-score")
             .arg(format!("{:.3}", self.min_score))
+            // mu-pcvqx drive-by: never inherit stdin. Under `mu ask` the
+            // daemon's stdin is the JSON-RPC pipe; a CLI that reads stdin
+            // when it isn't a tty blocks until EOF and the hint times out
+            // (see memory_hints.rs for the measurement).
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // Defense in depth for the ambient-billing incident class: kx recall

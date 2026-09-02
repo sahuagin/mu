@@ -64,7 +64,7 @@ struct DaemonInfoInner {
     /// `spawn_mesh_dialogue` succeeds at startup (same "filled in after boot"
     /// shape as `mcp_status`). `None` when mesh dialogue is off or failed to
     /// start, in which case sessions simply never join the mesh.
-    mesh_sessions: Arc<Mutex<Option<crate::serve::mesh_dialogue::MeshSessions>>>,
+    mesh_sessions: Arc<Mutex<Option<crate::serve::mesh_dialogue::WeakMeshSessions>>>,
 }
 
 impl DaemonInfo {
@@ -193,20 +193,28 @@ impl DaemonInfo {
 
     /// mu-6s7s: hand the daemon its per-session mesh registry once mesh
     /// dialogue is up. Called once from `serve::run`.
-    pub(crate) fn set_mesh_sessions(&self, mesh: crate::serve::mesh_dialogue::MeshSessions) {
+    pub(crate) fn set_mesh_sessions(&self, mesh: &crate::serve::mesh_dialogue::MeshSessions) {
+        // mu-1ibj: store a WEAK handle — the strong owner is
+        // MeshDialogueHandle, so daemon state never pins the registry's
+        // Router/NATS-client clones past shutdown.
+        let weak = mesh.downgrade();
         match self.inner.mesh_sessions.lock() {
-            Ok(mut guard) => *guard = Some(mesh),
-            Err(poisoned) => *poisoned.into_inner() = Some(mesh),
+            Ok(mut guard) => *guard = Some(weak),
+            Err(poisoned) => *poisoned.into_inner() = Some(weak),
         }
     }
 
     /// The per-session mesh registry, or None when mesh dialogue is off.
     pub(crate) fn mesh_sessions(&self) -> Option<crate::serve::mesh_dialogue::MeshSessions> {
-        self.inner
+        // Upgrade the weak handle: `None` if mesh is off/failed OR the daemon
+        // is shutting down and the handle has released the registry.
+        let weak = self
+            .inner
             .mesh_sessions
             .lock()
             .map(|g| g.clone())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+        weak.and_then(|w| w.upgrade())
     }
 
     pub fn mcp_status_snapshot(&self) -> Vec<McpServerStatus> {

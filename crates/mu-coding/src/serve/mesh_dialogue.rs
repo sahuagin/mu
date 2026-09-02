@@ -33,7 +33,9 @@ use mu_core::event_log::{EventActor, EventPayload};
 use mu_core::transport::Router;
 use mu_peer::{PeerId, META_PEER_ID};
 
-use super::sessions::Sessions;
+use std::sync::Weak;
+
+use super::sessions::{Sessions, WeakSessions};
 
 /// Mesh agent presence prefix — an agent `x` registers the Micro service
 /// `agent_x`, and `who` strips this prefix from `$SRV` responders. Must match
@@ -394,6 +396,44 @@ pub(crate) struct MeshSessions {
     inner: Arc<MeshSessionsInner>,
 }
 
+/// mu-1ibj: a non-owning handle to the mesh registry. `DaemonInfo` holds this
+/// rather than a strong [`MeshSessions`] so the registry's NATS client and
+/// Router clones are NOT kept alive by the long-lived daemon state. The sole
+/// PERSISTENT strong owner is [`MeshDialogueHandle`] (dropped with the
+/// connection handler at shutdown); `join_detached` upgrades a weak only for
+/// the lifetime of one join. That handle drop releases the Router producer
+/// clone the transport's writer task waits on, so `mu serve` exits cleanly
+/// instead of being SIGKILLed at the 5s grace (the exit-1-after-a-good-answer
+/// bug).
+#[derive(Clone)]
+pub(crate) struct WeakMeshSessions {
+    inner: Weak<MeshSessionsInner>,
+}
+
+impl std::fmt::Debug for WeakMeshSessions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakMeshSessions")
+            .field("live", &(self.inner.strong_count() > 0))
+            .finish()
+    }
+}
+
+impl WeakMeshSessions {
+    /// Upgrade to a usable registry, or `None` once the daemon is shutting
+    /// down (the handle has dropped the last strong ref).
+    pub(crate) fn upgrade(&self) -> Option<MeshSessions> {
+        self.inner.upgrade().map(|inner| MeshSessions { inner })
+    }
+}
+
+impl MeshSessions {
+    pub(crate) fn downgrade(&self) -> WeakMeshSessions {
+        WeakMeshSessions {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+}
+
 impl std::fmt::Debug for MeshSessions {
     /// `DaemonInfo` derives Debug; the NATS client and live registrations
     /// have none, so report the shape rather than the contents.
@@ -410,7 +450,7 @@ struct MeshSessionsInner {
     client: async_nats::Client,
     issuer: PublicKey,
     daemon_id: String,
-    sessions: Sessions,
+    sessions: WeakSessions,
     router: Router,
     joined: std::sync::Mutex<std::collections::HashMap<String, JoinedSession>>,
 }
@@ -435,12 +475,36 @@ impl MeshSessions {
     /// is a synchronous path and must not block on, or fail for, the mesh —
     /// same posture as the rest of the mesh surface.
     pub(crate) fn join_detached(&self, session_id: &str) {
-        let this = self.clone();
+        // Hand the detached task a WEAK ref, not a strong clone: otherwise an
+        // in-flight join pins the registry across its NATS awaits and would be
+        // a transient second strong owner, breaking the guard's "sole
+        // persistent owner" contract (and briefly re-arming the shutdown hang
+        // if a join races daemon exit). Upgrade at the top; if the registry is
+        // already gone (shutting down), skip — nothing to join. (mu-1ibj)
+        let weak = self.downgrade();
         let session_id = session_id.to_string();
         tokio::spawn(async move {
-            if let Err(e) = this.join(&session_id).await {
-                tracing::warn!(session = %session_id, error = %e,
-                    "mesh dialogue: session could not join the mesh");
+            let Some(this) = weak.upgrade() else {
+                return;
+            };
+            // Bound the NATS work the strong `this` is held across (presence
+            // register / subscribe / flush). Without it a join racing daemon
+            // shutdown could pin the registry's Router/client clone for an
+            // unbounded NATS stall, re-arming the very hang this bead fixes.
+            // On timeout the future (and its strong `this`) drops, releasing
+            // the registry. The cap is 3s, deliberately UNDER `mu ask`'s 5s
+            // daemon-kill grace (ask.rs), so even a join that stalls the full
+            // timeout leaves ~2s for the shutdown cascade to complete before
+            // the kill deadline. (mu-1ibj, panel findings)
+            let joined =
+                tokio::time::timeout(std::time::Duration::from_secs(3), this.join(&session_id))
+                    .await;
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(session = %session_id, error = %e,
+                    "mesh dialogue: session could not join the mesh"),
+                Err(_) => tracing::warn!(session = %session_id,
+                    "mesh dialogue: session join timed out after 3s; not joined"),
             }
         });
     }
@@ -518,13 +582,24 @@ impl MeshSessions {
 fn spawn_inbound(
     mut sub: async_nats::Subscriber,
     issuer: PublicKey,
-    sessions: Sessions,
+    sessions: WeakSessions,
     router: Router,
     fixed_target: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
     use futures::StreamExt;
     tokio::spawn(async move {
         while let Some(msg) = sub.next().await {
+            // mu-1ibj/mu-4hk7t: this long-running task must not keep the
+            // session registry alive — a strong `Sessions` here holds every
+            // session's input_tx, the agent loops never see channel-close,
+            // and `transport::serve`'s shutdown wait times out (then `mu
+            // ask` SIGKILLs the daemon and exits 1 after a complete
+            // answer). Same cycle mu-qc08 broke for SpawnWorkerTool: hold
+            // Weak, upgrade per message, exit when the registry is gone.
+            let Some(sessions) = sessions.upgrade() else {
+                tracing::debug!("mesh dialogue: inbound task exiting — session registry dropped (daemon shutdown)");
+                break;
+            };
             let Ok(env) = serde_json::from_slice::<DmEnvelope>(&msg.payload) else {
                 tracing::debug!("mesh dialogue: dropping malformed dm envelope");
                 continue;
@@ -570,6 +645,14 @@ pub(crate) struct MeshDialogueHandle {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Presence registration lives exactly as long as this handle.
     _presence: async_nats::service::Service,
+    /// mu-1ibj: the sole PERSISTENT strong ref to the mesh registry.
+    /// `DaemonInfo` holds only a `WeakMeshSessions`, and `join_detached`
+    /// upgrades a weak for the duration of one join, bounded by a 3s
+    /// timeout, so no strong ref outlives this handle by more than that join
+    /// window. Dropping the handle (with the connection handler
+    /// at shutdown) therefore drops the registry's Router + NATS client
+    /// clones, unblocking the transport writer task.
+    _mesh_sessions: MeshSessions,
 }
 
 impl Drop for MeshDialogueHandle {
@@ -642,15 +725,18 @@ pub(crate) async fn spawn_mesh_dialogue(
             )
         })??;
 
-    let inbound_task = spawn_inbound(sub, issuer, sessions.clone(), router.clone(), None);
-    let inbound_hier = spawn_inbound(sub_hier, issuer, sessions.clone(), router.clone(), None);
+    let inbound_task = spawn_inbound(sub, issuer, sessions.downgrade(), router.clone(), None);
+    let inbound_hier = spawn_inbound(sub_hier, issuer, sessions.downgrade(), router.clone(), None);
 
     let mesh_sessions = MeshSessions {
         inner: Arc::new(MeshSessionsInner {
             client: client.clone(),
             issuer,
             daemon_id: daemon_id.to_string(),
-            sessions,
+            // Weak for the same reason as spawn_inbound above: MeshSessions
+            // rides inside DaemonInfo, which tools hold — a strong Sessions
+            // here reopened the mu-qc08 cycle through the back door.
+            sessions: sessions.downgrade(),
             router,
             joined: std::sync::Mutex::new(std::collections::HashMap::new()),
         }),
@@ -715,6 +801,7 @@ pub(crate) async fn spawn_mesh_dialogue(
         MeshDialogueHandle {
             tasks: vec![inbound_task, inbound_hier],
             _presence: presence,
+            _mesh_sessions: mesh_sessions.clone(),
         },
         tools,
         mesh_sessions,

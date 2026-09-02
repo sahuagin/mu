@@ -486,7 +486,7 @@ where
                 mesh_dialogue_guard = Some(guard);
                 // mu-6s7s: sessions become first-class mesh participants —
                 // handlers/session.rs joins each one as it is created.
-                daemon_info.set_mesh_sessions(mesh_sessions);
+                daemon_info.set_mesh_sessions(&mesh_sessions);
                 for tool in dialogue_tools {
                     let name = tool.spec().name;
                     if tools.iter().any(|t| t.spec().name == name) {

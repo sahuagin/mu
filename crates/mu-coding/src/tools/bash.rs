@@ -79,6 +79,16 @@ fn is_secret_env_var(name: &str) -> bool {
         || upper == "PASSWORD"
 }
 
+/// The environment a spawned child may see: the whitelist minus any
+/// secret-pattern name. Shared with the `verify` runner (mu-lg8j1) so
+/// model-written artifact code gets the same scrubbed environment as a
+/// strict-mode shell — never the daemon's API keys.
+pub(crate) fn scrubbed_env_vars() -> Vec<(String, String)> {
+    std::env::vars()
+        .filter(|(k, _)| ENV_WHITELIST.contains(&k.as_str()) && !is_secret_env_var(k))
+        .collect()
+}
+
 /// Shell-metacharacters that strict mode rejects in the command
 /// string. Allowing any of these would let the agent bypass the
 /// allowlist via shell features (chaining, substitution, redirect).
@@ -143,14 +153,77 @@ pub struct BashTool {
     /// [`crate::tools::action_recall`]). Arc because `execute`'s
     /// async block must own a handle independent of `&self`.
     action_recall: std::sync::Arc<crate::tools::action_recall::ActionRecall>,
+    /// mu-lg8j1: when the session also carries the `verify` tool, a
+    /// command that reaches for a hand-built browser harness
+    /// (puppeteer, playwright, jsdom, headless Chrome) gets a ONE-TIME
+    /// advisory pointing at `verify` instead — the same
+    /// refuse-once-then-allow shape as mu-8puo, for the same reason:
+    /// the model does not remember its tools at the point of action
+    /// (battery-1 rerun: 40 min spent npm-installing puppeteer with
+    /// `verify` sitting in the tool list). `None` ⇒ no sibling, no nudge.
+    verify_nudge: Option<std::sync::Arc<std::sync::Mutex<HashSet<u64>>>>,
 }
+
+/// Command fragments that mean "building my own browser/DOM harness".
+const VERIFY_NUDGE_MARKERS: &[&str] = &[
+    "puppeteer",
+    "playwright",
+    "jsdom",
+    "--headless",
+    "chrome-headless",
+    "chromium",
+    "google-chrome",
+    "remote-debugging",
+    "selenium",
+];
 
 impl BashTool {
     pub fn new(mode: BashMode) -> Self {
         Self {
             mode,
             action_recall: std::sync::Arc::new(crate::tools::action_recall::ActionRecall::default()),
+            verify_nudge: None,
         }
+    }
+
+    /// mu-lg8j1: enable the browser-harness advisory (the session has
+    /// `verify`).
+    ///
+    /// Not armed under `--bash-prompt`: there the operator approves every
+    /// command already, and an advisory returned AFTER that approval would
+    /// spend the approval on a no-op and prompt again on the re-issue.
+    pub fn with_verify_sibling(mut self, present: bool) -> Self {
+        let prompting = matches!(self.mode, BashMode::Strict { prompt: true, .. });
+        self.verify_nudge = (present && !prompting)
+            .then(|| std::sync::Arc::new(std::sync::Mutex::new(HashSet::new())));
+        self
+    }
+
+    /// The one-time `verify` advisory for `command`, or `None`.
+    fn verify_nudge_for(
+        nudge: &Option<std::sync::Arc<std::sync::Mutex<HashSet<u64>>>>,
+        command: &str,
+    ) -> Option<String> {
+        let seen = nudge.as_ref()?;
+        let lower = command.to_ascii_lowercase();
+        if !VERIFY_NUDGE_MARKERS.iter().any(|m| lower.contains(m)) {
+            return None;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(command, &mut hasher);
+        let key = std::hash::Hasher::finish(&hasher);
+        let first_time = seen.lock().map(|mut s| s.insert(key)).unwrap_or(false);
+        first_time.then(|| {
+            "verify-tool advisory (shown once for this command; NOT executed yet): this session has a \
+             `verify` tool that runs an artifact in its REAL runtime in one call — for an .html file, a \
+             real headless Chrome that returns uncaught exceptions with file:line:col, console output, \
+             whether requestAnimationFrame ticks, whether the page animates and responds to scripted \
+             input_events, and screenshot paths. Hand-building a puppeteer/playwright/jsdom harness \
+             costs many turns and a Node DOM stub misses the bugs a real browser throws. Call \
+             verify {\"artifact\": \"<path to your .html>\"} instead (add input_events to exercise \
+             gameplay). If you still need this exact command, re-issue it verbatim and it will run."
+                .to_string()
+        })
     }
 
     /// mu-8puo test hook: substitute the advisory engine (stub binary
@@ -226,7 +299,10 @@ impl Tool for BashTool {
                  NOTE: some destructive commands (rm, git push --force, jj abandon, …) may return a \
                  one-time memory advisory INSTEAD of executing — a standing operator rule surfaced at \
                  the point of action. Read it; if the command is still appropriate, re-issue it \
-                 verbatim and it will run."
+                 verbatim and it will run. Likewise, when this session has the `verify` tool, a \
+                 command that builds a browser harness (puppeteer/playwright/jsdom/headless \
+                 Chrome) returns a one-time advisory pointing at `verify` instead of running; \
+                 re-issue verbatim if you still need it."
             ),
             display: None,
             when: None,
@@ -305,10 +381,20 @@ impl Tool for BashTool {
         }
         let mode = self.mode.clone();
         let action_recall = std::sync::Arc::clone(&self.action_recall);
+        let verify_nudge = self.verify_nudge.clone();
         Box::pin(async move {
             // validate() succeeded — parse_command_arg cannot fail now.
             let command = parse_command_arg(&arguments)
                 .expect("parse_command_arg succeeded in validate() just above");
+
+            // mu-lg8j1: point-of-action nudge toward `verify` (once per
+            // command; is_error:false so a verbatim re-issue proceeds).
+            if let Some(advice) = Self::verify_nudge_for(&verify_nudge, &command) {
+                return ToolResult {
+                    content: advice,
+                    is_error: false,
+                };
+            }
 
             // mu-8puo: point-of-action memory advisory. Fires at most
             // once per command; the advisory result is is_error:false
@@ -954,5 +1040,56 @@ mod tests {
         assert!(!marker.exists(), "re-issue must actually run the command");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// mu-lg8j1: with `verify` aboard, the first browser-harness command
+    /// returns the advisory (is_error:false) instead of running; the
+    /// verbatim re-issue runs; unrelated commands are untouched; without
+    /// the sibling nothing changes.
+    #[tokio::test]
+    async fn verify_nudge_fires_once_per_harness_command_only_with_sibling() {
+        fn rx() -> oneshot::Receiver<()> {
+            let (tx, rx) = oneshot::channel();
+            std::mem::forget(tx);
+            rx
+        }
+        let nudged = BashTool::new(BashMode::Yolo)
+            .with_action_recall(crate::tools::action_recall::ActionRecall::disabled())
+            .with_verify_sibling(true);
+        let cmd = json!({"command": "echo npm install puppeteer-core"});
+        let first = nudged.execute(cmd.clone(), rx()).await;
+        assert!(!first.is_error);
+        assert!(
+            first.content.contains("verify-tool advisory"),
+            "{}",
+            first.content
+        );
+        let second = nudged.execute(cmd.clone(), rx()).await;
+        assert!(
+            second.content.contains("npm install puppeteer-core"),
+            "verbatim re-issue must run: {}",
+            second.content
+        );
+        let plain = nudged.execute(json!({"command": "echo hello"}), rx()).await;
+        assert!(
+            plain.content.starts_with("hello"),
+            "unrelated commands run untouched: {}",
+            plain.content
+        );
+        // --bash-prompt: the operator approves each call already; no nudge,
+        // so an approval is never spent on an advisory.
+        let prompting = BashTool::new(BashMode::strict_with_extras(&["echo".into()], true))
+            .with_action_recall(crate::tools::action_recall::ActionRecall::disabled())
+            .with_verify_sibling(true);
+        assert!(prompting.verify_nudge.is_none());
+        let alone = BashTool::new(BashMode::Yolo)
+            .with_action_recall(crate::tools::action_recall::ActionRecall::disabled())
+            .with_verify_sibling(false);
+        let r = alone.execute(cmd, rx()).await;
+        assert!(
+            r.content.contains("npm install puppeteer-core"),
+            "no sibling ⇒ no nudge: {}",
+            r.content
+        );
     }
 }

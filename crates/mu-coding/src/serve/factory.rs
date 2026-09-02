@@ -19,7 +19,7 @@ use mu_core::protocol::ProviderSelector;
 
 use crate::tools::{
     AwsReconTool, BashMode, BashTool, EditTool, FinalAnswerTool, GlobTool, GrepTool, LsTool,
-    MemoryRecallTool, ReadTool, WriteTool,
+    MemoryRecallTool, ReadTool, VerifySettings, VerifyTool, WriteTool,
 };
 
 /// Settings that parameterize how the `bash` tool is built.
@@ -376,11 +376,41 @@ pub fn build_tools(names: &[String], bash: &BashSettings) -> Result<Vec<Arc<dyn 
                 } else if bash.prompt {
                     tracing::info!("bash tool: strict + per-call approval (mu-029) active.");
                 }
-                Ok(Arc::new(BashTool::new(bash.resolve_mode())) as Arc<dyn Tool>)
+                // mu-lg8j1: with `verify` aboard, bash nudges the model
+                // toward it the first time a command builds a browser harness.
+                let verify_sibling = names.iter().any(|n| n == "verify");
+                Ok(
+                    Arc::new(BashTool::new(bash.resolve_mode()).with_verify_sibling(verify_sibling))
+                        as Arc<dyn Tool>,
+                )
+            }
+            // mu-lg8j1: run-and-verify. Runtimes come from the operator's
+            // `[verify]` config (same load path `selector_from_cli` uses for
+            // configured providers). Permission mirrors bash's: Allow in
+            // strict and yolo sessions, per-call Ask under `--bash-prompt`.
+            // Rationale, since this went both ways under review: verify is
+            // never in a default toolset, so `--tools verify` IS the
+            // operator's consent to run artifacts (in scrubbed env, own
+            // process group, bounded); and the one-shot `mu ask` lane —
+            // the lane run-and-verify targets — cannot answer approval
+            // prompts, so an Ask default would stall 180 s and deny there.
+            // `--bash-prompt` keeps a human in the loop when wanted.
+            "verify" => {
+                let cfg = mu_core::config::Config::load_default();
+                // From the EFFECTIVE mode (`resolve_mode`: yolo wins over
+                // prompt), so `--bash-yolo --bash-prompt` is Allow for both.
+                let permission = match bash.resolve_mode() {
+                    BashMode::Strict { prompt: true, .. } => mu_core::agent::PermissionLevel::Ask,
+                    _ => mu_core::agent::PermissionLevel::Allow,
+                };
+                Ok(Arc::new(VerifyTool::new(
+                    VerifySettings::from_config(&cfg.verify),
+                    permission,
+                )) as Arc<dyn Tool>)
             }
             other => anyhow::bail!(
                 "unknown tool: {other} (expected: read, write, ls, edit, grep, glob, \
-                 memory_recall, aws_recon, bash, final_answer)"
+                 memory_recall, aws_recon, bash, final_answer, verify)"
             ),
         })
         .collect()
@@ -752,6 +782,46 @@ mod tests {
         assert_eq!(tools[0].spec().name, "glob");
 
         // Bash: strict mode by default, yolo by setting.
+        // mu-lg8j1: verify builds by name; permission mirrors bash — Allow
+        // in strict (default) and yolo, Ask under --bash-prompt. Opting in
+        // via --tools is the consent; the mu ask lane can't answer prompts.
+        let tools = build_tools(&["verify".to_string()], &BashSettings::default())
+            .expect("build_tools(verify) should succeed");
+        assert_eq!(tools[0].spec().name, "verify");
+        assert_eq!(
+            tools[0].spec().policy.permission,
+            mu_core::agent::PermissionLevel::Allow,
+            "default (strict bash) must not stall the one-shot ask lane on an Ask gate"
+        );
+        let prompt = BashSettings {
+            prompt: true,
+            ..BashSettings::default()
+        };
+        let tools = build_tools(&["verify".to_string()], &prompt).expect("verify with prompt");
+        assert_eq!(
+            tools[0].spec().policy.permission,
+            mu_core::agent::PermissionLevel::Ask
+        );
+        let yolo = BashSettings {
+            yolo: true,
+            ..BashSettings::default()
+        };
+        let tools = build_tools(&["verify".to_string()], &yolo).expect("verify with yolo");
+        assert_eq!(
+            tools[0].spec().policy.permission,
+            mu_core::agent::PermissionLevel::Allow
+        );
+        // yolo wins over prompt for bash (resolve_mode); verify follows.
+        let both = BashSettings {
+            yolo: true,
+            prompt: true,
+            ..BashSettings::default()
+        };
+        let tools = build_tools(&["verify".to_string()], &both).expect("verify yolo+prompt");
+        assert_eq!(
+            tools[0].spec().policy.permission,
+            mu_core::agent::PermissionLevel::Allow
+        );
         let tools = build_tools(&["bash".to_string()], &BashSettings::default())
             .expect("build_tools(bash) should succeed");
         assert_eq!(tools.len(), 1);

@@ -98,6 +98,68 @@ pub struct Config {
     /// (via `serve/mesh.rs`), in addition to stdio. Default disabled, so a
     /// bare install touches no NATS.
     pub mesh: MeshConfig,
+    /// `[verify]` — runtimes for the `verify` run-and-verify tool
+    /// (mu-lg8j1): where Chrome / node / python live, screenshot dir,
+    /// default timeouts. All optional; defaults probe the usual places.
+    pub verify: VerifyConfig,
+}
+
+/// `[verify]` section (mu-lg8j1). Runtimes the `verify` tool launches so a
+/// model can run an artifact in its REAL runtime and get the runtime's
+/// output back into the loop (the battery-1 lever from mu-316wl: the bugs
+/// that beat mu were uncaught exceptions a real browser throws on load).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VerifyConfig {
+    /// Chrome / Chromium binary for `kind = "web"`. `None` ⇒ probe
+    /// `$CHROME`, then `~/chrome-test/chrome-linux64/chrome` (the
+    /// user-level chrome-for-testing install), then `google-chrome`,
+    /// `chromium`, `chromium-browser`, `chrome` on PATH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome: Option<PathBuf>,
+    /// Run Chrome on another host: `ssh -o BatchMode=yes <this> …`. The
+    /// artifact is served from mu's host on a loopback port and reaches
+    /// the remote browser through a reverse port-forward carried by the
+    /// same ssh session, so nothing but ssh has to be reachable. `chrome`
+    /// is then the path ON THAT HOST.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_ssh: Option<String>,
+    /// Extra Chrome flags appended to the built-in headless set
+    /// (`--headless=new --disable-gpu --enable-unsafe-swiftshader
+    /// --no-sandbox --remote-debugging-pipe …`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chrome_args: Vec<String>,
+    /// Where web-probe screenshots are written. `None` ⇒
+    /// `<TMPDIR>/mu-verify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_dir: Option<PathBuf>,
+    /// `node` binary for `kind = "node"`. `None` ⇒ `node` on PATH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<PathBuf>,
+    /// `python` binary for `kind = "python"`. `None` ⇒ `python3` on PATH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python: Option<PathBuf>,
+    /// Default per-call wall-clock cap (s); a call may raise it to 600.
+    pub timeout_secs: u64,
+    /// Default settle window after the page's load event before the
+    /// web probe samples (s). SwiftShader WebGL is slow; 8 s was the
+    /// battery-1 grading rig's value.
+    pub settle_secs: u64,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            chrome: None,
+            chrome_ssh: None,
+            chrome_args: Vec::new(),
+            screenshot_dir: None,
+            node: None,
+            python: None,
+            timeout_secs: 90,
+            settle_secs: 8,
+        }
+    }
 }
 
 /// `[mesh]` section (mu-wxc4). Off by default.
@@ -1374,6 +1436,31 @@ mod tests {
         let p: Config = toml::from_str("[recall]\nmemory_hints = true\n").expect("parse");
         assert_eq!(p.recall.memory_hints_limit, 3);
         assert_eq!(p.recall.memory_hints_min_score, 0.60);
+    }
+
+    #[test]
+    fn verify_section_defaults_and_toml_parse() {
+        // mu-lg8j1: absent section ⇒ probe-the-usual-places defaults.
+        let d = Config::default();
+        assert_eq!(d.verify, VerifyConfig::default());
+        assert_eq!(d.verify.timeout_secs, 90);
+        assert_eq!(d.verify.settle_secs, 8);
+        assert!(d.verify.chrome.is_none() && d.verify.chrome_ssh.is_none());
+        let c: Config = toml::from_str(
+            "[verify]\nchrome = \"/opt/chrome/chrome\"\nchrome_ssh = \"gpubox\"\n\
+             chrome_args = [\"--foo\"]\nsettle_secs = 3\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            c.verify.chrome.as_deref(),
+            Some(Path::new("/opt/chrome/chrome"))
+        );
+        assert_eq!(c.verify.chrome_ssh.as_deref(), Some("gpubox"));
+        assert_eq!(c.verify.chrome_args, vec!["--foo".to_string()]);
+        assert_eq!(c.verify.settle_secs, 3);
+        assert_eq!(c.verify.timeout_secs, 90, "partial section keeps defaults");
+        // Unknown keys are rejected like every other section.
+        assert!(toml::from_str::<Config>("[verify]\nbogus = 1\n").is_err());
     }
 
     #[test]

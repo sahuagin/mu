@@ -212,3 +212,39 @@ bootloader = false
 # session gets NO mu-injected system content. Set by `mu ask/serve --bare`;
 # here for completeness.
 bare = false
+
+# ── [verify] — the run-and-verify tool (mu-lg8j1) ─────────────────────
+# `--tools …,verify` gives the model a tool that runs an artifact in its
+# REAL runtime and returns the runtime's output: node/python (stdout,
+# stderr, exit) or a web page in headless Chrome (uncaught exceptions with
+# locations, console output, requestAnimationFrame ticking, animation and
+# input response by screenshot diff, screenshot paths). Execute-class; it is
+# never in a default toolset, so listing it in --tools is the consent to run
+# artifacts (scrubbed env, own process group, bounded). Permission mirrors
+# bash: runs without prompting in strict/yolo sessions, asks per call under
+# --bash-prompt (note: the one-shot `mu ask` lane cannot answer prompts).
+# Everything here is optional; unset keys probe the usual places.
+[verify]
+# Chrome / Chromium binary. Unset ⇒ $CHROME, then
+# ~/chrome-test/chrome-linux64/chrome (chrome-for-testing, user-level
+# install: no root, WebGL via SwiftShader on the CPU), then google-chrome /
+# chromium / chrome on PATH.
+# chrome = "/home/me/chrome-test/chrome-linux64/chrome"
+# Run Chrome on another host over ssh (BatchMode; keys must already work).
+# `chrome` is then the path on that host. The artifact is served from this
+# host on a loopback port and reaches the remote browser through a reverse
+# port-forward on the same ssh session — nothing else needs to be reachable.
+# chrome_ssh = "gpubox"
+# Extra Chrome flags appended to the built-in headless set.
+# chrome_args = []
+# Screenshots land here (unset ⇒ $TMPDIR/mu-verify).
+# screenshot_dir = "/home/me/.local/share/mu/verify"
+# node / python binaries (unset ⇒ `node` / `python3` on PATH).
+# node = "/opt/node/bin/node"
+# python = "/usr/bin/python3"
+# Default per-call wall-clock cap (s); a call may raise it to 600.
+timeout_secs = 90
+# Settle window after the page's load event before the web probe samples
+# (world generation, asset decode; SwiftShader is slow).
+settle_secs = 8
+

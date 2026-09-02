@@ -32,6 +32,13 @@ pub struct Response {
     pub error: Option<ResponseError>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incomplete_details: Option<IncompleteDetails>,
+    /// Echo of the request's prompt-caching options (spec 2026-08 addition).
+    /// Modeled so the drift canary round-trips it instead of flagging a drop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<crate::JsonValue>,
+    /// Moderation results/echo (spec 2026-06 addition); shallow JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moderation: Option<crate::JsonValue>,
 }
 
 impl Response {

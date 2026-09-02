@@ -37,6 +37,16 @@ pub struct CreateResponseRequest {
     pub reasoning: Option<Reasoning>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    /// Explicit prompt-caching controls (gpt-5.6+, spec 2026-07). NOTE:
+    /// wire-verified 2026-09-02 — the codex/chatgpt-backend REJECTS this
+    /// parameter (400 "Unsupported parameter"); public API only. mu never
+    /// sets it today; modeled for spec currency and the drift canary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<PromptCacheOptions>,
+    /// Moderation configuration (spec 2026-06+). Deep policy schema modeled
+    /// shallowly as JSON until something mu-side consumes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moderation: Option<JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
     /// Whether the backend persists the response server-side. mu runs stateless
@@ -79,6 +89,8 @@ impl CreateResponseRequest {
             tool_choice: None,
             reasoning: None,
             max_output_tokens: None,
+            prompt_cache_options: None,
+            moderation: None,
             stream: None,
             store: Some(false),
             parallel_tool_calls: None,
@@ -205,6 +217,30 @@ pub struct FunctionTool {
     /// Strict-schema adherence. Optional on the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
+    /// JSON Schema for the tool's OUTPUT (gpt-5.6+ programmatic tool
+    /// calling surface; spec 2026-07).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<JsonValue>,
+    /// Defer loading the tool definition until first use (gpt-5.6+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer_loading: Option<bool>,
+    /// Which callers may invoke this tool (gpt-5.6+ programmatic tool
+    /// calling: e.g. "model", "programmatic").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_callers: Vec<String>,
+}
+
+/// `prompt_cache_options` (gpt-5.6+): explicit cache-breakpoint control.
+/// `mode`: `implicit` (default; server adds one implicit breakpoint) or
+/// `explicit` (only request-supplied `prompt_cache_breakpoint`s). `ttl`:
+/// `"30m"` is the only documented value today; kept a string so a new tier
+/// is not a crate-level parse failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptCacheOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
 }
 
 /// `tool_choice`: either a mode string (`auto`/`none`/`required`) or a named
@@ -299,6 +335,9 @@ mod tests {
                 description: Some("Read a file".into()),
                 parameters: JsonValue::new(json!({"type": "object"})).unwrap(),
                 strict: Some(true),
+                output_schema: None,
+                defer_loading: None,
+                allowed_callers: Vec::new(),
             })]);
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(

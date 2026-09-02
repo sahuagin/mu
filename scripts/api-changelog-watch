@@ -1,0 +1,129 @@
+#!/bin/sh
+# api-changelog-watch — daily watcher for provider API changelogs (cron, .172).
+#
+# Fetches each source's markdown changelog, diffs it against the last-seen copy,
+# and on change asks a model (resolved by role via agent-role — never hardcoded)
+# to classify the new entries for mu-protocol impact, then files the report as a
+# GitHub issue on sahuagin/mu (📰 prefix, like the claude-code changelog watch).
+# First sight of a source seeds state silently. A model failure still files the
+# raw diff — the xycf lesson: a watcher must never fail silently.
+#
+# Install (claude@10.1.1.172 crontab):
+#   30 12 * * * $HOME/.local/bin/api-changelog-watch >> $HOME/.local/share/api-watch/cron.log 2>&1
+#
+# No ANTHROPIC_API_KEY anywhere: the claude-oauth lane is `claude -p` on the
+# subscription, and the metered selectors are scrubbed before dispatch.
+set -u
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+
+STATE="${API_WATCH_STATE:-$HOME/.local/share/api-watch}"
+REPO="${API_WATCH_REPO:-sahuagin/mu}"
+mkdir -p "$STATE"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+# Resolve the classifier command by ROLE (config: ~/.config/mu/agent_roles.toml).
+# Falls back down the research ranks; empty means no seat resolved.
+classifier_cmd() {
+    r=0
+    while [ "$r" -lt 3 ]; do
+        cmd=$(agent-role --cmd research "$r" 2>/dev/null) && [ -n "$cmd" ] && { printf '%s' "$cmd"; return 0; }
+        r=$((r + 1))
+    done
+    return 1
+}
+
+watch_one() { # $1=slug $2=title-name $3=url
+    slug=$1; name=$2; url=$3
+    last="$STATE/$slug.md"
+    new="$STATE/$slug.new.$$"
+
+    if ! curl -fsSL --max-time 120 "$url" -o "$new" || [ ! -s "$new" ]; then
+        log "$slug: fetch FAILED ($url)"
+        rm -f "$new"
+        return 1
+    fi
+
+    if [ ! -f "$last" ]; then
+        mv "$new" "$last"
+        log "$slug: seeded baseline ($(wc -c < "$last") bytes)"
+        return 0
+    fi
+
+    if cmp -s "$last" "$new"; then
+        rm -f "$new"
+        log "$slug: no change"
+        return 0
+    fi
+
+    diff_file="$STATE/$slug.diff.$$"
+    diff -u "$last" "$new" > "$diff_file" 2>/dev/null
+    # Changelogs are append-at-top: the interesting lines are additions. Cap the
+    # prompt so a site redesign can't produce a megabyte dispatch.
+    added=$(grep '^+' "$diff_file" | grep -v '^+++' | cut -c2- | head -400)
+    log "$slug: CHANGED ($(grep -c '^+' "$diff_file") added lines)"
+
+    today=$(date '+%Y-%m-%d')
+    prompt_file="$STATE/$slug.prompt.$$"
+    cat > "$prompt_file" <<EOF
+You are a changelog classifier for the mu project (a Rust agent runtime with
+provider adapters: openai-codex OAuth, openrouter/vllm/ollama OpenAI-compat
+chat-completions, and a currently-dormant anthropic wire; model catalog in
+~/.config/mu/models.toml with per-model context limits and sampling params).
+
+Below are the lines newly added to the $name changelog. Write a markdown report:
+
+# $name changes — $today
+
+Then for each new entry: date, one-line summary, and a tag:
+- [protocol] wire/parameter/endpoint changes that could affect mu's adapters
+- [pricing] price changes (mu keeps a cost ladder)
+- [models] new/retired model ids
+- [noise] anything else
+
+End with a "## Recommended actions" list (may be empty). Be terse and factual;
+do not invent entries not present in the input. Output ONLY the report.
+
+NEW LINES:
+$added
+EOF
+
+    report_file="$STATE/$slug.report.$$"
+    if cmd=$(classifier_cmd); then
+        # shellcheck disable=SC2086 — the resolved command intentionally word-splits
+        if ! env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL \
+             timeout 600 $cmd < "$prompt_file" > "$report_file" 2>>"$STATE/$slug.stderr.log"; then
+            log "$slug: classifier failed (see $slug.stderr.log) — filing raw diff"
+            {
+                echo "# $name changes — $today (UNCLASSIFIED: model dispatch failed)"
+                echo
+                echo '```diff'
+                head -300 "$diff_file"
+                echo '```'
+            } > "$report_file"
+        fi
+    else
+        log "$slug: no classifier seat resolved — filing raw diff"
+        {
+            echo "# $name changes — $today (UNCLASSIFIED: no model seat)"
+            echo
+            echo '```diff'
+            head -300 "$diff_file"
+            echo '```'
+        } > "$report_file"
+    fi
+
+    if gh issue create -R "$REPO" \
+         --title "📰 $name changes on $today" \
+         --body-file "$report_file" > "$STATE/$slug.issue-url" 2>>"$STATE/$slug.stderr.log"; then
+        log "$slug: filed $(cat "$STATE/$slug.issue-url")"
+        mv "$new" "$last"   # advance baseline only after the report is durable
+    else
+        log "$slug: gh issue create FAILED — baseline NOT advanced, will retry next run"
+        rm -f "$new"
+    fi
+    rm -f "$diff_file" "$prompt_file" "$report_file"
+}
+
+watch_one anthropic-api "Anthropic API" "https://platform.claude.com/docs/en/release-notes/api.md"
+watch_one openai-api    "OpenAI API"    "https://developers.openai.com/api/docs/changelog.md"

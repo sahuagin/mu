@@ -15,6 +15,7 @@ pub mod memory_recall;
 pub mod path;
 pub mod read;
 pub mod spawn_worker;
+pub mod verify;
 pub mod watch;
 pub mod write;
 
@@ -31,6 +32,7 @@ pub use ls::LsTool;
 pub use memory_recall::MemoryRecallTool;
 pub use read::ReadTool;
 pub use spawn_worker::SpawnWorkerTool;
+pub use verify::{VerifySettings, VerifyTool};
 pub use watch::WatchTool;
 pub use write::WriteTool;
 
@@ -123,6 +125,11 @@ mod policy_invariants {
             Arc::new(SpawnWorkerTool::new(sessions.downgrade(), di.clone(), None)),
             Arc::new(StartAutonomousTool::new(sessions.downgrade(), "s".into())),
             Arc::new(ScheduleWakeupTool::new(sessions.downgrade(), "s".into())),
+            // mu-lg8j1: runs artifacts (node/python/headless Chrome) — Execute.
+            Arc::new(VerifyTool::new(
+                VerifySettings::default(),
+                PermissionLevel::Allow,
+            )),
         ];
         // NOTE: aws_recon (env-dependent ctor) and discover (needs a
         // sibling-tool snapshot) are not constructed here; both are on
@@ -147,5 +154,6 @@ mod policy_invariants {
             spec_of("spawn_worker").policy.side_effects,
             SideEffects::Execute
         );
+        assert_eq!(spec_of("verify").policy.side_effects, SideEffects::Execute);
     }
 }

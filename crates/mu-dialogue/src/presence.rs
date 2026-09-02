@@ -304,6 +304,7 @@ mod tests {
     /// does not disable the other.
     #[test]
     fn sections_resolve_from_the_agent_config_first_then_fall_back() {
+        let _env = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("mu-dlg-cfgres-{}", std::process::id()));
         let agent = dir.join(".config/agent");
         let mu = dir.join(".config/mu");

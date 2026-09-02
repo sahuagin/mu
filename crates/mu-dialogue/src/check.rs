@@ -354,6 +354,7 @@ mod tests {
         )
         .unwrap();
 
+        let _env = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("HOME").ok();
         let prev_cfg = std::env::var("MU_CONFIG").ok();
         std::env::set_var("HOME", &d);

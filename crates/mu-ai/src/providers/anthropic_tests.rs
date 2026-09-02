@@ -997,8 +997,11 @@ fn map_stop_reason_known_and_unknown() {
     assert_eq!(map_stop_reason(Some(&A::EndTurn)), StopReason::EndTurn);
     assert_eq!(map_stop_reason(Some(&A::ToolUse)), StopReason::ToolUse);
     assert_eq!(map_stop_reason(Some(&A::MaxTokens)), StopReason::MaxTokens);
-    // unmapped wire reasons (stop_sequence / refusal / pause_turn / unknown)
-    // all fold to EndTurn.
+    // Gen-5 terminal states map to their own core reasons
+    // (mu-provider-drift-2026q3-y43la).
+    assert_eq!(map_stop_reason(Some(&A::Refusal)), StopReason::Refusal);
+    assert_eq!(map_stop_reason(Some(&A::PauseTurn)), StopReason::PauseTurn);
+    // stop_sequence and unknown/absent reasons fold to EndTurn.
     assert_eq!(map_stop_reason(Some(&A::StopSequence)), StopReason::EndTurn);
     assert_eq!(map_stop_reason(Some(&A::Other)), StopReason::EndTurn);
     assert_eq!(map_stop_reason(None), StopReason::EndTurn);

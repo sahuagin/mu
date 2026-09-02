@@ -154,6 +154,21 @@ pub async fn run(opts: ResumeOptions) -> Result<()> {
         Some("degraded_eof") => {
             bail!("response degraded (stop_reason=degraded_eof). Output above may be a fragment.")
         }
+        // Same guard as ask.rs (mu-provider-drift-2026q3-y43la): a refused or
+        // server-paused resumed ask must not exit 0 as if it answered.
+        Some("refusal") => {
+            bail!(
+                "ask refused (stop_reason=refusal): the provider's safety classifier \
+                 declined the request or cut generation. There is no answer."
+            )
+        }
+        Some("pause_turn") => {
+            bail!(
+                "response paused (stop_reason=pause_turn): the server paused a \
+                 long-running turn and mu does not implement continuation. Output \
+                 above may be partial."
+            )
+        }
         _ => Ok(()),
     }
 }

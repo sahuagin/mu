@@ -85,22 +85,22 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   # STDIN, not argv (a ~1MB prompt overflows ARG_MAX, mu-b6tl). --exclude-dynamic-
   # system-prompt-sections strips claude's agent scaffolding.
   if [ "$ad_prov" = "claude-oauth" ]; then
-    # Nested-cc guard: `claude -p` hangs when run inside a claude-code session
-    # (CLAUDECODE=1) — the child does its work but never returns. Fail loud
-    # instead of freezing the caller. claude -p is correct for mu's standalone
-    # external launch (CLAUDECODE unset); a cc session must use the harness's
-    # native Agent tool for a claude worker, not this seat. Mirrors the guard
-    # in spline-review-dispatch.
-    #
-    # mu-hqr6: exit 75 (EX_TEMPFAIL), the same "seat unusable here, route
-    # around" code the ollama held/unreachable paths use — so rank-walking
-    # callers (mu-spawn, ci-aipr) skip to the next seat instead of failing.
-    if [ -n "${CLAUDECODE:-}" ]; then
-      echo "agent-dispatch: claude-oauth ('claude -p') cannot run nested in a claude-code session (CLAUDECODE=1) — it hangs. Skipping this seat (exit 75); use a non-claude seat, or the harness Agent tool." >&2
-      return 75
-    fi
-    # Same class: no claude binary on PATH means this seat cannot run in this
-    # environment at all — route around rather than error.
+    # The nested-cc "hang" was never structural: the child finished its work
+    # and then the cc Stop-hook idle watcher long-polled before the process
+    # returned (diagnosed by probe 2026-07-30). The watcher lives OUTSIDE
+    # this repo — agent_tools scripts/hooks/dialogue-rewake.sh, wired via
+    # ~/.claude/settings.json — and reads DIALOGUE_REWAKE_MAX, whose default
+    # is the 30-minute cap itself (`max="${DIALOGUE_REWAKE_MAX:-1800}"`,
+    # dialogue-rewake.sh:75). Setting it to 0 suppresses the watch: correct
+    # for a one-shot review seat, which never wants an idle rewake.
+    # Wire-verified nested 2026-09-02: pong in ~30s where the old path sat
+    # for the full watch. The former CLAUDECODE skip guard (exit 75) is
+    # gone; both claude panel seats are live again. If a host lacks the
+    # hook, nothing changes (no watcher, no wait); if a future hook ignores
+    # the var, the seat degrades to `timeout $ad_timeout` below — bounded,
+    # not a hang — and shows up as a timed-out seat, not a frozen caller.
+    # No claude binary on PATH means this seat cannot run in this
+    # environment at all — route around rather than error (exit 75).
     if ! command -v claude >/dev/null 2>&1; then
       echo "agent-dispatch: claude-oauth seat unusable: no 'claude' binary on PATH. Skipping this seat (exit 75)." >&2
       return 75
@@ -118,7 +118,17 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
     # OAuth/subscription lane: scrub the metered-API selectors before `claude` —
     # if ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL leak in from the operator shell,
     # the CLI silently switches to per-token API billing (the mu-odtc trap).
+    # A timed-out seat stays exit 124, deliberately. 75 means "seat never
+    # ran — safe to re-run the task on another rank" (mu-spawn:184 falls
+    # through on 75 only); a timed-out claude PROCESS may have partially
+    # executed, and for a write-capable worker re-running elsewhere risks
+    # double-execution. Keeping 124: the panel's retry loops
+    # (review-panel/dispatch.sh, consensus.sh, ai-review.sh) retry a
+    # timed-out seat once; a rank-walk aborts loudly instead of silently
+    # re-running — the conservative failure if the out-of-repo rewake
+    # contract above ever stops holding.
     timeout "$ad_timeout" env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL \
+      DIALOGUE_REWAKE_MAX=0 \
       claude -p --model "$ad_model" $ad_clsys $ad_mcpflag $ad_perm \
       --exclude-dynamic-system-prompt-sections \
       $ad_cltools --output-format text <"$ad_pf" 2>>"$ad_errlog"
@@ -202,8 +212,8 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
       --thinking "$ad_thinking" $ad_sysflags $ad_turnflag --prompt-file "$ad_pf" 2>>"$ad_errlog" || ad_rc=$?
   fi
   # mu-hqr6: provider-auth failure = seat unusable in this environment
-  # (missing/expired credential), same route-around class as the nested-cc
-  # and held-box guards. Safe for these one-shot dispatches: an auth
+  # (missing/expired credential), same route-around class as the held-box
+  # guard. Safe for these one-shot dispatches: an auth
   # failure means the task never ran, so trying the next rank cannot
   # double-execute anything. Narrow signature ("provider: auth" is mu's
   # error prefix) on the errlog tail; timeouts (124) and lease skips (75)

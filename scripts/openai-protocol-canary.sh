@@ -50,11 +50,16 @@ say "=== run $(date) on $(hostname); repo=$repo ==="
 
 # (1) THE drift signal: replay every captured message through drift_check.
 #     Exit 3 from the example means a modeled type dropped/changed a field.
+# One corpus dir for BOTH sides: live capture writes here and offline replay
+# reads here — including the DEFAULT location, so default-mode captures are
+# replayed on later runs (panel finding: the earlier form only read the dir
+# when the env var was explicitly set, orphaning default captures).
+corpus_dir="${MU_OPENAI_CANARY_CORPUS:-$HOME/.local/share/openai-canary-corpus}"
 corpus=()
 for f in "$crate"/tests/fixtures/*.json; do [ -e "$f" ] && corpus+=("$f"); done
-if [ -n "${MU_OPENAI_CANARY_CORPUS:-}" ] && [ -d "$MU_OPENAI_CANARY_CORPUS" ]; then
+if [ -d "$corpus_dir" ]; then
   while IFS= read -r f; do corpus+=("$f"); done \
-    < <(find "$MU_OPENAI_CANARY_CORPUS" -name '*.json' -type f)
+    < <(find "$corpus_dir" -name '*.json' -type f)
 fi
 say "replaying ${#corpus[@]} captured message file(s) through drift_check"
 run_check drift_replay cargo run --quiet --manifest-path "$crate/Cargo.toml" \
@@ -75,8 +80,40 @@ if [ "$live" = 1 ]; then
     export OPENAI_API_KEY
   fi
   if [ -n "${OPENAI_API_KEY:-}" ] && [ "${OPENAI_API_KEY}" != "null" ]; then
-    run_check live_public_openai env MU_LIVE_OPENAI_API=1 \
-      cargo test --quiet --manifest-path "$repo/Cargo.toml" -p mu-ai live_public_api
+    # Live public check WITH corpus capture. (The previous form ran
+    # `cargo test -p mu-ai live_public_api`, which matches ZERO tests and
+    # passed vacuously — mu-canary-hardening-1ljgx.) One minimal real
+    # Responses request, tool included so the capture exercises the
+    # function-call surface; the response must parse drift-clean, and is
+    # kept in a rolling corpus so every later offline run replays CURRENT
+    # wire shapes, not launch-week fixtures.
+    mkdir -p "$corpus_dir"
+    cap="$corpus_dir/capture-$(date +%Y%m%d).json"
+    req='{"model":"gpt-5.5","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Call the ping tool once."}]}],"tools":[{"type":"function","name":"ping","description":"Reply check","parameters":{"type":"object","properties":{}}}],"store":false,"max_output_tokens":64}'
+    # Token-bearing config file and the in-flight capture live OUTSIDE the
+    # corpus and are trap-cleaned, so an interrupt cannot leave a credential
+    # file behind and a failed capture (an error body with id/object-shaped
+    # fields, say) cannot poison the replay corpus — only a validated
+    # response is copied in (panel findings).
+    hdr="$(mktemp "${TMPDIR:-/tmp}/oai-canary-hdr.XXXXXX")"
+    cap_tmp="$(mktemp "${TMPDIR:-/tmp}/oai-canary-cap.XXXXXX")"
+    trap 'rm -f "$hdr" "$cap_tmp"' EXIT INT TERM
+    printf 'header = "Authorization: Bearer %s"\n' "$OPENAI_API_KEY" > "$hdr"
+    if curl -sS --max-time 60 --config "$hdr" \
+         -H 'content-type: application/json' \
+         -d "$req" https://api.openai.com/v1/responses -o "$cap_tmp" \
+       && jq -e '.id? and (.object? == "response")' "$cap_tmp" >/dev/null 2>&1; then
+      cp "$cap_tmp" "$cap"
+      run_check live_public_capture cargo run --quiet \
+        --manifest-path "$crate/Cargo.toml" --example openai_drift_check -- "$cap"
+      # Rolling window: keep the newest 8 captures.
+      ls -t "$corpus_dir"/capture-*.json 2>/dev/null | tail -n +9 | xargs rm -f 2>/dev/null || true
+    else
+      failures+=(live_public_capture)
+      mv "$cap_tmp" "$cap_tmp.failed" 2>/dev/null || true
+      say "FAIL live_public_capture (request failed or response not a Response object; body preserved at $cap_tmp.failed)"
+    fi
+    rm -f "$hdr"
   else
     say "OPENAI_API_KEY unavailable; skipping public live checks"
   fi

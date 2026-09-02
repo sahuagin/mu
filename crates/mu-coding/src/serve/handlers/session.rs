@@ -1001,6 +1001,24 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
             .with_limit(recall_cfg.kx_limit)
             .with_min_score(recall_cfg.kx_min_score)
     });
+    // mu-pcvqx: prompt-relevant memory injection. Gated like session-start
+    // memory recall (`recall_enabled()` covers `[recall].enabled` and
+    // `MU_NO_RECALL`) AND like kx (bare sessions are hermetic) — this is
+    // memory injection, so the operator's "no injection" levers must
+    // silence it. Shares `[recall].memory_binary` with the session-start
+    // provider: one CLI, one path to configure.
+    let memory_hints = (recall_cfg.memory_hints && recall_enabled && !bare).then(|| {
+        let hints = match &recall_cfg.memory_binary {
+            Some(path) => mu_core::context::memory_hints::MemoryHints::new(path.clone()),
+            None => mu_core::context::memory_hints::MemoryHints::default_binary(),
+        };
+        hints
+            .with_limit(recall_cfg.memory_hints_limit)
+            .with_min_score(recall_cfg.memory_hints_min_score)
+            .with_timeout(std::time::Duration::from_millis(
+                recall_cfg.memory_hints_timeout_ms,
+            ))
+    });
     // mu-context-limits-wire phase 2: shared live soft limit. Seeded with
     // the resolved soft limit (0 = unknown ⇒ loop uses its config/default
     // fallback). session.set_config writes this atomic and the loop reads
@@ -1034,6 +1052,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
             seed_messages,
             discover_hints,
             kx_hints,
+            memory_hints,
             // mu-vcbm: launch-time effort default → loop's standing effort.
             effort: effort.map(|e| Arc::from(e.as_str())),
         },

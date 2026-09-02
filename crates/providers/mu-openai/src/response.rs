@@ -39,6 +39,82 @@ pub struct Response {
     /// Moderation results/echo (spec 2026-06 addition); shallow JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moderation: Option<crate::JsonValue>,
+    // ------------------------------------------------------------------
+    // Request-echo + accounting fields. A REAL (untrimmed) wire response
+    // carries every one of these; the original June fixtures were minimal
+    // captures that hid the gap, discovered when the canary's first live
+    // capture flagged ~24 "drops" (mu-canary-hardening-1ljgx). Modeled
+    // shallowly (primitives where the spec is scalar, JsonValue where
+    // structured) so only genuinely NEW upstream fields flag as drift.
+    // ------------------------------------------------------------------
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<crate::JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::deserialize_option_finite"
+    )]
+    pub frequency_penalty: Option<crate::FiniteF64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<crate::JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::deserialize_option_finite"
+    )]
+    pub presence_penalty: Option<crate::FiniteF64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<crate::JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<crate::JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::deserialize_option_finite"
+    )]
+    pub temperature: Option<crate::FiniteF64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<crate::JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<crate::JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_usage: Option<crate::JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<crate::JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::deserialize_option_finite"
+    )]
+    pub top_p: Option<crate::FiniteF64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<crate::JsonValue>,
 }
 
 impl Response {
@@ -155,6 +231,11 @@ pub struct Usage {
 pub struct UsageInputDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u64>,
+    /// Cache-write accounting (post-June 2026 addition; first seen on the
+    /// canary's 2026-09-02 live capture — the one genuine drift its first
+    /// current-wire replay found).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

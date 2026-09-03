@@ -25,6 +25,8 @@
 # the operator exports it for the one invocation when a live run is wanted.
 #
 # Exit: 0 = clean, non-zero = drift / failure (also logged + alerted).
+# --alert=bead keeps ONE live drift bead per canary (scripts/lib/canary-bead.sh):
+# a failing run comments on the open one, or files it if none is open.
 
 set -euo pipefail
 
@@ -130,15 +132,38 @@ fi
 msg="Anthropic protocol canary failed: ${failures[*]}"
 say "$msg"
 
-if [ "$alert" = "bead" ] && command -v beads >/dev/null 2>&1; then
-  url="${BEADS_REMOTE:-$(awk -F= '/^mu=/{print $2}' "$HOME/.config/beads/remotes.env" 2>/dev/null || true)}"
-  if [ -n "$url" ]; then
-    beads --url "$url" exec -- create \
-      --title "$msg" \
-      --slug anthropic-protocol-canary-drift \
-      --type bug --priority P1 \
-      --description "Anthropic protocol canary on $(hostname) detected: ${failures[*]}. See $log." \
-      --actor anthropic-protocol-canary >/dev/null 2>&1 || true
+if [ "$alert" = "bead" ]; then
+  # One live drift bead per canary: reuse it (comment / retitle) rather than
+  # filing a sibling per run (mu-ztmla). Best-effort; never changes our exit,
+  # and every degraded path is spelled out in the `bead:` log line.
+  # The lib beside this script matches this script's version; the MU_REPO
+  # checkout is the fallback for wrapper/symlink invocations.
+  lib=""
+  for cand in "$(dirname "$0")/lib/canary-bead.sh" "$repo/scripts/lib/canary-bead.sh"; do
+    [ -r "$cand" ] || continue
+    lib="$cand"; break
+  done
+  body="Anthropic protocol canary on $(hostname) detected: ${failures[*]}. See $log."
+  if [ -n "$lib" ]; then
+    # shellcheck source=lib/canary-bead.sh
+    . "$lib"
+    rc=0; filed="$(canary_file_bead anthropic-protocol-canary-drift "$msg" "$body" anthropic-protocol-canary)" || rc=$?
+    case $rc in
+      0) say "bead: $filed" ;;
+      2) say "bead: not filed (the comment on the live bead failed; that bead stays open)" ;;
+      3) say "bead: not filed (create failed; not retried in case it was written)" ;;
+      *) say "bead: not filed (no beads client or beadsd url)" ;;
+    esac
+  elif command -v beads >/dev/null 2>&1 \
+       && url="${BEADS_REMOTE:-$(sed -n 's/^mu=[[:space:]]*//p' "$HOME/.config/beads/remotes.env" 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)}" \
+       && [ -n "$url" ] && tmo="$(command -v timeout || true)" \
+       && ${tmo:+"$tmo" "${CANARY_BEAD_TIMEOUT:-60}"} beads --url "$url" exec -- create --title "$msg" --slug anthropic-protocol-canary-drift \
+            --type bug --priority P1 --description "$body" --actor anthropic-protocol-canary >/dev/null 2>&1; then
+    # A lost lib costs dedupe, not the alert: this is the pre-lib create,
+    # and the lib's adoption lookup labels such a bead once it is back.
+    say "bead: filed without dedupe (canary-bead.sh missing beside $0 and under $repo/scripts/lib)"
+  else
+    say "bead: not filed (canary-bead.sh missing beside $0 and under $repo/scripts/lib; then no beads client, no beadsd url, or the plain create failed)"
   fi
 fi
 exit 1

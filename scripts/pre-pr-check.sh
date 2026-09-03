@@ -82,6 +82,25 @@ converge_audit_step() {
 }
 run_step "review-panel converge audit" converge_audit_step
 
+# Canary bead-filing idempotency (mu-ztmla). The offline cases run against a
+# strict fake beads client. When a real client and a beadsd url are present
+# the test also probes that client READ-ONLY (lists nothing matches plus
+# `--help` of the mutating subcommands) so the fake's pinned surface is
+# checked against the real br here rather than trusted; nothing is written.
+# Escape hatch: an exported CANARY_BEAD_CONTRACT=0 keeps the run offline-only
+# (e.g. while a br upgrade is being absorbed); an exported 1 forces the probe.
+canary_bead_step() {
+  local t="$REPO_ROOT/scripts/tests/canary-bead-test.sh"
+  [ -f "$t" ] || { printf "%s    canary-bead-test.sh missing — skipping%s\n\n" "$C_DIM" "$C_OFF"; return 0; }
+  local contract=0
+  if command -v beads >/dev/null 2>&1 \
+     && [ -n "${BEADS_REMOTE:-$(sed -n 's/^mu=[[:space:]]*//p' "$HOME/.config/beads/remotes.env" 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)}" ]; then
+    contract=1
+  fi
+  CANARY_BEAD_CONTRACT="${CANARY_BEAD_CONTRACT:-$contract}" sh "$t"
+}
+run_step "canary bead filing" canary_bead_step
+
 # verify-claims gate (mu-b5kl): iterate every non-merge commit in main..@ (jj)
 # or main..HEAD (git) and run scripts/verify-claims.sh on each. Opt-in
 # strictness: commits without a `## Files` block exit 0 with a skip note.

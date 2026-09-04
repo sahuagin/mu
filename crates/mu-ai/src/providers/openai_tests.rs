@@ -1477,7 +1477,7 @@ fn projected_excludes_tool_schema_from_instructions() {
 #[test]
 fn render_http_error_surfaces_usage_limit() {
     let body = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"prolite","resets_at":1782114418,"resets_in_seconds":3501}}"#;
-    let msg = render_codex_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, body);
+    let msg = render_codex_http_error_with(reqwest::StatusCode::TOO_MANY_REQUESTS, None, body);
     assert!(msg.contains("usage limit reached"), "got: {msg}");
     assert!(msg.contains("prolite"), "got: {msg}");
     assert!(msg.contains("58m21s"), "got: {msg}");
@@ -1486,14 +1486,47 @@ fn render_http_error_surfaces_usage_limit() {
 
 #[test]
 fn render_http_error_generic_429_and_other_status() {
+    // A 429 that is not the usage cap goes through the shared renderer:
+    // status, then the body's discriminator, then its message.
     let body = r#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#;
-    let msg = render_codex_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, body);
-    assert!(msg.contains("rate limited (429)"), "got: {msg}");
-    assert!(msg.contains("slow down"), "got: {msg}");
+    let msg = render_codex_http_error_with(reqwest::StatusCode::TOO_MANY_REQUESTS, None, body);
+    assert!(msg.contains("returned 429"), "got: {msg}");
+    assert!(msg.contains("rate_limit_exceeded: slow down"), "got: {msg}");
+    assert!(!msg.contains("usage limit"), "got: {msg}");
 
-    let msg = render_codex_http_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom");
+    let msg =
+        render_codex_http_error_with(reqwest::StatusCode::INTERNAL_SERVER_ERROR, None, "boom");
     assert!(msg.contains("500"), "got: {msg}");
     assert!(msg.contains("boom"), "got: {msg}");
+}
+
+// mu #595: the two codes OpenAI added on 2026-09-02, with the header
+// the loop is to honour before it backs off.
+#[test]
+fn render_http_error_names_slow_down_and_overloaded_with_retry_after() {
+    let body = r#"{"error":{"code":"slow_down","type":"rate_limit_error","message":"Traffic is ramping too fast."}}"#;
+    let msg = render_codex_http_error_with(reqwest::StatusCode::TOO_MANY_REQUESTS, Some(12), body);
+    assert_eq!(
+        msg,
+        "openai returned 429 Too Many Requests slow_down (rate_limit_error): Traffic is ramping too fast. (retry after 12s)"
+    );
+
+    let body = r#"{"error":{"code":"server_is_overloaded","type":"server_error","message":"The model is temporarily overloaded."}}"#;
+    let msg = render_codex_http_error_with(reqwest::StatusCode::SERVICE_UNAVAILABLE, Some(4), body);
+    assert_eq!(
+        msg,
+        "openai returned 503 Service Unavailable server_is_overloaded (server_error): The model is temporarily overloaded. (retry after 4s)"
+    );
+
+    // The usage cap keeps its own rendering even when Retry-After is set:
+    // it is the one 429 the loop must not retry.
+    let body = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"prolite","resets_in_seconds":3501}}"#;
+    let msg = render_codex_http_error_with(reqwest::StatusCode::TOO_MANY_REQUESTS, Some(60), body);
+    assert!(
+        msg.starts_with("codex usage limit reached (plan prolite)"),
+        "got: {msg}"
+    );
+    assert!(!msg.contains("retry after"), "got: {msg}");
 }
 
 // ============================================================================

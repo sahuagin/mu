@@ -8,6 +8,7 @@
 //! `codex`), `bedrock`.
 
 pub mod anthropic;
+pub mod http_error;
 pub mod ollama;
 pub mod openai;
 pub mod openrouter;

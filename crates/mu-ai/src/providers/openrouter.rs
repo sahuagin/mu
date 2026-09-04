@@ -225,10 +225,16 @@ impl Provider for OpenRouterProvider {
 
         if !resp.status().is_success() {
             let status = resp.status();
+            let retry_after = super::http_error::retry_after_secs(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Other(format!(
-                "openrouter returned {status}: {text}"
-            )));
+            return Err(ProviderError::Other(
+                super::http_error::render_with_retry_after(
+                    "openrouter",
+                    status,
+                    retry_after,
+                    &text,
+                ),
+            ));
         }
 
         let bytes = resp.bytes_stream();

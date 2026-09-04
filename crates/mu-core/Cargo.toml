@@ -27,6 +27,7 @@ figment = { workspace = true }  # config-backed provider/model catalog
 dirs = { workspace = true }  # mu-l1z: resolves ~/.config and platform-specific paths
 t4c = { path = "../t4c" }  # mu-kex4.6 phase 3: project mu's live tools+skills into t4c (leaf: mu-core -> t4c only)
 anyhow = { workspace = true }  # impl t4c::RegistrySource — its capabilities() returns anyhow::Result
+shlex = { workspace = true }  # mu-83bw9: shell-tokenize a bash command line so the verification gate matches a RUN of the verify command, not a mention of it
 
 [dev-dependencies]
 tempfile = "3"

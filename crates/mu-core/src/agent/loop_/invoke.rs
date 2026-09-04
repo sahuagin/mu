@@ -72,9 +72,12 @@ fn retryable_provider_error(message: &str) -> bool {
     }
 
     // Provider overload/rate-limit classes, in both the HTTP-status shape
-    // ("openai returned 429: ...") and the stream-error shape composed by
-    // mu-openai ("rate_limit_exceeded: ... (http 429)"). Status-specific
-    // auth, validation, spend, and context errors are not retryable.
+    // ("openai returned 429 ...", now carrying the body's code —
+    // `slow_down` for a traffic ramp, `server_is_overloaded` for a
+    // temporary 503 — and any Retry-After as "(retry after Ns)", mu #595)
+    // and the stream-error shape composed by mu-openai
+    // ("rate_limit_exceeded: ... (http 429)"). Status-specific auth,
+    // validation, spend, and context errors are not retryable.
     lower.contains("returned 429")
         || lower.contains("returned 500")
         || lower.contains("returned 502")
@@ -92,13 +95,30 @@ fn retryable_provider_error(message: &str) -> bool {
         || lower.contains("(http 529")
 }
 
-/// Parse a server-suggested retry delay out of an error message —
-/// "Please try again in 11.054s." / "in 28ms" / "in 35 seconds" (the
-/// shapes OpenAI and Azure emit in rate-limit bodies). None ⇒ use
-/// exponential backoff.
+/// Parse a server-suggested retry delay out of an error message. Two
+/// sources, in order of trust: the canonical `(retry after 12s)` suffix
+/// that mu-ai's shared renderer appends from a `Retry-After` header (mu
+/// #595 — OpenAI sends it with both `429 slow_down` and `503
+/// server_is_overloaded`), then the prose hint OpenAI and Azure put in
+/// rate-limit bodies: "Please try again in 11.054s." / "in 28ms" / "in 35
+/// seconds". None ⇒ use exponential backoff.
 fn server_suggested_delay_ms(message: &str) -> Option<u64> {
     let lower = message.to_ascii_lowercase();
-    let tail = &lower[lower.find("try again in ")? + "try again in ".len()..];
+    // The renderer's suffix is parenthesised, so prose that merely says
+    // "retry after the reset window" cannot claim this branch; when the
+    // suffix is absent or does not parse, the prose hint still counts.
+    lower
+        .rfind("(retry after ")
+        .and_then(|i| delay_from(&lower[i + "(retry after ".len()..]))
+        .or_else(|| {
+            let i = lower.find("try again in ")?;
+            delay_from(&lower[i + "try again in ".len()..])
+        })
+}
+
+/// "11.054s" / "28ms" / "35 seconds" at the head of `tail`, in ms,
+/// clamped to the retry ceiling. Zero is no suggestion.
+fn delay_from(tail: &str) -> Option<u64> {
     let num: String = tail
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.')
@@ -112,7 +132,8 @@ fn server_suggested_delay_ms(message: &str) -> Option<u64> {
     } else {
         return None;
     };
-    Some((ms as u64).clamp(1, MAX_RETRY_DELAY_MS))
+    let ms = ms as u64;
+    (ms > 0).then(|| ms.min(MAX_RETRY_DELAY_MS))
 }
 
 fn provider_retry_delay_ms(attempt: u32, error: &str) -> u64 {
@@ -555,6 +576,17 @@ mod tests {
             "rate_limit_exceeded: Rate limit reached. Please try again in 11.054s. (http 429)"
         ));
         assert!(retryable_provider_error("server_is_overloaded (http 503)"));
+        // The shared renderer's shapes (mu #595): code after the status,
+        // Retry-After as a suffix.
+        assert!(retryable_provider_error(
+            "openai returned 429 Too Many Requests slow_down: Traffic is ramping too fast. (retry after 12s)"
+        ));
+        assert!(retryable_provider_error(
+            "openrouter returned 503 Service Unavailable server_is_overloaded: The model is temporarily overloaded. (retry after 4s)"
+        ));
+        assert!(retryable_provider_error(
+            "anthropic returned 529 <unknown status code> overloaded_error: Overloaded (retry after 3s)"
+        ));
         assert!(retryable_provider_error(
             "openai stream transport error: connection reset by peer"
         ));
@@ -598,5 +630,37 @@ mod tests {
             Some(super::MAX_RETRY_DELAY_MS)
         );
         assert_eq!(server_suggested_delay_ms("no delay here"), None);
+    }
+
+    #[test]
+    fn retry_after_suffix_wins_over_body_prose_and_is_capped() {
+        // The header-derived suffix is authoritative even when the body's
+        // prose says otherwise.
+        assert_eq!(
+            server_suggested_delay_ms(
+                "openai returned 429 Too Many Requests slow_down: Please try again in 2s. (retry after 12s)"
+            ),
+            Some(12_000)
+        );
+        assert_eq!(
+            server_suggested_delay_ms("openrouter returned 503 Service Unavailable server_is_overloaded: busy (retry after 4s)"),
+            Some(4_000)
+        );
+        // Zero is no suggestion (the renderer never emits it, but a body
+        // could): back off instead of firing at once.
+        assert_eq!(server_suggested_delay_ms("x (retry after 0s)"), None);
+        assert_eq!(server_suggested_delay_ms("please try again in 0s"), None);
+        // Prose that only mentions the phrase does not eat the real hint.
+        assert_eq!(
+            server_suggested_delay_ms(
+                "Rate limit reached; please retry after the reset window. Please try again in 11.054s."
+            ),
+            Some(11_054)
+        );
+        // A server asking for minutes is capped like the prose form.
+        assert_eq!(
+            server_suggested_delay_ms("x (retry after 120s)"),
+            Some(super::MAX_RETRY_DELAY_MS)
+        );
     }
 }

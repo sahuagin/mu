@@ -780,7 +780,17 @@ fn request_to_value(req: CreateResponseRequest) -> Value {
 /// transient rate limit. Surfacing it cleanly (plan + reset window)
 /// tells the operator it's a cap and when it clears, instead of dumping
 /// the raw JSON into the agent's error event. (mu-rb4u)
-fn render_codex_http_error(status: reqwest::StatusCode, body: &str) -> String {
+/// `retry_after` is the `Retry-After` header already reduced to seconds
+/// (mu #595). Every non-cap reply goes through the shared renderer, so a
+/// `429 slow_down` (traffic ramp: brief backoff) reads differently from
+/// the usage cap above and a `503 server_is_overloaded` carries its code
+/// and the server's own pause. The `usage_limit_reached` rendering stays
+/// special: it is the one 429 the loop must NOT retry, and it says so.
+fn render_codex_http_error_with(
+    status: reqwest::StatusCode,
+    retry_after: Option<u64>,
+    body: &str,
+) -> String {
     #[derive(Deserialize)]
     struct ErrBody {
         error: Option<ErrInner>,
@@ -789,8 +799,6 @@ fn render_codex_http_error(status: reqwest::StatusCode, body: &str) -> String {
     struct ErrInner {
         #[serde(default, rename = "type")]
         type_: Option<String>,
-        #[serde(default)]
-        message: Option<String>,
         #[serde(default)]
         plan_type: Option<String>,
         #[serde(default)]
@@ -811,14 +819,10 @@ fn render_codex_http_error(status: reqwest::StatusCode, body: &str) -> String {
                      reset or switch providers (e.g. `/model`, or `--provider`)."
                 );
             }
-            if let Some(msg) = e.message.as_deref() {
-                return format!("codex rate limited (429): {msg}");
-            }
         }
-        return format!("codex rate limited (429): {body}");
     }
 
-    format!("openai returned {status}: {body}")
+    super::http_error::render_with_retry_after("openai", status, retry_after, body)
 }
 
 // ============================================================================
@@ -1665,7 +1669,7 @@ impl Provider for OpenaiProvider {
 impl OpenaiProvider {
     /// Send the request, dispatching on auth mode. Codex refreshes once
     /// on 401 and retries; the public path has no refresh. Non-2xx
-    /// becomes a `ProviderError` via [`render_codex_http_error`].
+    /// becomes a `ProviderError` via [`render_codex_http_error_with`].
     async fn send(&self, body: &Value) -> Result<reqwest::Response, ProviderError> {
         match &self.mode {
             AuthMode::Codex { token, store } => {
@@ -1745,8 +1749,13 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, Prov
         return Ok(resp);
     }
     let status = resp.status();
+    let retry_after = super::http_error::retry_after_secs(resp.headers());
     let text = resp.text().await.unwrap_or_default();
-    Err(ProviderError::Other(render_codex_http_error(status, &text)))
+    Err(ProviderError::Other(render_codex_http_error_with(
+        status,
+        retry_after,
+        &text,
+    )))
 }
 
 /// If the in-memory token still matches `seen` (we're first to notice

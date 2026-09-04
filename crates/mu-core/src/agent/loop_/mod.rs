@@ -798,6 +798,11 @@ pub struct AgentConfig {
     /// error (see [`DEFAULT_MAX_GUARD_REFUSALS`]); `0` disables the floor.
     /// Wired from `[session].max_guard_refusals` at session creation.
     pub max_guard_refusals: u32,
+    /// mu-83bw9: the command the verification gate RUNS after
+    /// file-mutating calls, before an ask-ending call passes (see
+    /// `execute_tools::handle_execute_tools`). `None` (the default) ⇒
+    /// gate off. Wired from `[session].verify_command`.
+    pub verify_command: Option<String>,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -816,6 +821,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("memory_hints", &self.memory_hints.is_some())
             .field("effort", &self.effort)
             .field("max_guard_refusals", &self.max_guard_refusals)
+            .field("verify_command", &self.verify_command)
             .finish()
     }
 }
@@ -836,6 +842,7 @@ impl Default for AgentConfig {
             memory_hints: None,
             effort: None,
             max_guard_refusals: DEFAULT_MAX_GUARD_REFUSALS,
+            verify_command: None,
         }
     }
 }
@@ -1404,7 +1411,9 @@ async fn run_inner(
     let mut aggregated_usage: Option<Usage> = None;
     let mut last_stop_reason: Option<StopReason> = None;
     let mut started_at: Option<Instant> = None;
-    let mut tool_history = ToolHistory::default();
+    // mu-83bw9: the history also hosts the verification gate, keyed on the
+    // session's verify command.
+    let mut tool_history = ToolHistory::with_verify_command(config.verify_command.clone());
     let mut model_call_id: u32 = 0;
 
     let session_started_at = Instant::now();
@@ -1557,6 +1566,11 @@ async fn run_inner(
                 motivation,
                 inject_message,
             } => {
+                // mu-83bw9: the iteration is the unit that ends with an
+                // answer, so it is the unit the verify gate's once-per-ask
+                // latch belongs to. Reset it here, where every iteration
+                // starts, whichever path scheduled it (finish or wakeup).
+                tool_history.reset_verify_gate();
                 let _ = events
                     .send(AgentEvent::AutonomousIterationStarted {
                         iteration,
@@ -2325,6 +2339,8 @@ async fn run_inner(
                     consecutive_empty_turns = 0;
                     // mu-ucjhg: and a fresh guard-refusal budget.
                     consecutive_guard_refused_rounds = 0;
+                    // mu-83bw9: and a fresh verification gate.
+                    tool_history.reset_verify_gate();
                 }
                 turn_count += 1;
                 let _ = events.send(AgentEvent::TurnStart).await;
@@ -3034,6 +3050,17 @@ async fn run_inner(
                 }
             }
             Action::ExecuteTools(calls) => {
+                // mu-83bw9: turns still available to this ask, counting
+                // the one in flight (`turn_count` was incremented when it
+                // started). `None` = no cap — `max_turns` unset, or
+                // `Some(0)`, which disables it (mu-779s). A failing verify
+                // run costs a round trip (refuse, fix, finish), so the
+                // gate stands down below three rather than spending the
+                // ask's last turn on a refusal nothing can act on.
+                let turns_remaining = config
+                    .max_turns
+                    .filter(|&max| max > 0)
+                    .map(|max| max.saturating_sub(turn_count).saturating_add(1));
                 match handle_execute_tools(
                     &tools,
                     calls,
@@ -3046,6 +3073,7 @@ async fn run_inner(
                         .discover_hints
                         .as_ref()
                         .is_some_and(|h| h.live.enabled()),
+                    turns_remaining,
                 )
                 .await
                 {

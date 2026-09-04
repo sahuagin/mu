@@ -133,6 +133,19 @@ resume_on_daemon_restart = false
 # keeps issuing calls the guards refuse. 0 disables the floor.
 max_guard_refusals = 5
 
+# Verification gate (mu-83bw9). When set, and the model tries to end an
+# ask after any file-mutating tool call succeeded, the RUNTIME runs this
+# command itself through the session's shell tool (bash) before letting
+# the ask end. If it passes the ask ends; if it fails, the ask-ending call
+# is refused once with the last 40 lines of output so the model can fix
+# and finish, and the next one goes through. The gate runs at most once
+# per ask, and stands down when the session has no shell the runtime may
+# run unasked, the shell refuses the command, the session's tool-call
+# budget is spent, or fewer than three turns remain. The run costs one
+# tool call against that budget, and answers session.cancel like any
+# other long call. Blank or unset = no gate.
+# verify_command = "cargo test"
+
 
 # ── UI (TUI) ──────────────────────────────────────────────────────
 

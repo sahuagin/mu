@@ -871,6 +871,30 @@ pub struct SessionConfig {
     /// budget ends the ask with an error the caller can see (`mu ask`
     /// prints the reason and exits non-zero). `0` disables the floor.
     pub max_guard_refusals: u32,
+    /// mu-83bw9: the session's verify command, e.g. `cargo test`. When
+    /// set, and the model tries to end an ask after any file-mutating
+    /// tool call succeeded, the RUNTIME runs this command through the
+    /// session's shell tool before letting the ask end. It passes ⇒ the
+    /// ask ends; it fails ⇒ the ask-ending call is refused once with the
+    /// output tail, and the next one goes through. Blank ⇒ unset ⇒ no
+    /// gate.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_command",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub verify_command: Option<String>,
+}
+
+/// mu-83bw9: read an optional command string, normalizing blank and
+/// whitespace-only values to `None`. `verify_command = ""` is an operator
+/// typo, not a command, and must not arm a gate no run can satisfy.
+fn deserialize_optional_command<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()))
 }
 
 impl Default for SessionConfig {
@@ -881,6 +905,7 @@ impl Default for SessionConfig {
             state_dir: None,
             default_max_turns: None,
             max_guard_refusals: crate::agent::loop_::DEFAULT_MAX_GUARD_REFUSALS,
+            verify_command: None,
         }
     }
 }
@@ -1280,6 +1305,30 @@ mod tests {
         );
         let c: Config = toml::from_str("[session]\nmax_guard_refusals = 0\n").expect("parse");
         assert_eq!(c.session.max_guard_refusals, 0);
+    }
+
+    #[test]
+    fn session_verify_command_defaults_off_and_toml_can_set() {
+        // mu-83bw9: the verification gate is off unless a command is set.
+        assert_eq!(Config::default().session.verify_command, None);
+        let c: Config =
+            toml::from_str("[session]\nverify_command = \"cargo test\"\n").expect("parse");
+        assert_eq!(c.session.verify_command.as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn session_blank_verify_command_normalizes_to_unset() {
+        // mu-83bw9: a blank or whitespace-only value is a typo, not a
+        // command — it must read as "gate off", and a set command is
+        // stored trimmed.
+        for blank in ["\"\"", "\"   \"", "\"\\t\"", "\"\\n\""] {
+            let c: Config = toml::from_str(&format!("[session]\nverify_command = {blank}\n"))
+                .unwrap_or_else(|e| panic!("parse {blank}: {e}"));
+            assert_eq!(c.session.verify_command, None, "{blank}");
+        }
+        let c: Config =
+            toml::from_str("[session]\nverify_command = \"  cargo test  \"\n").expect("parse");
+        assert_eq!(c.session.verify_command.as_deref(), Some("cargo test"));
     }
 
     #[test]

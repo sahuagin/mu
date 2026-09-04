@@ -228,6 +228,9 @@ struct MockTool {
     /// mu-2e0h: when true the spec declares verbatim_result, so the
     /// tier-1 ingestion filter must bypass this tool's output.
     verbatim_result: bool,
+    /// mu-83bw9: when Some, the spec declares this `input_schema`
+    /// instead of the bare `{"type": "object"}` default.
+    input_schema: Option<Value>,
 }
 
 impl MockTool {
@@ -246,6 +249,7 @@ impl MockTool {
             policy_override: None,
             validate_rejection: None,
             verbatim_result: false,
+            input_schema: None,
         }
     }
 
@@ -264,6 +268,7 @@ impl MockTool {
             policy_override: None,
             validate_rejection: None,
             verbatim_result: false,
+            input_schema: None,
         }
     }
 
@@ -284,13 +289,33 @@ impl MockTool {
             policy_override: None,
             validate_rejection: None,
             verbatim_result: false,
+            input_schema: None,
         }
+    }
+
+    /// mu-83bw9: as `always_ok`, but every call answers `is_error`.
+    /// The verification gate reads exactly that bit as the verify
+    /// command's exit status.
+    fn always_err(name: &str, content: &str) -> Self {
+        let mut mock = Self::always_ok(name, content);
+        for (_, result) in mock.responses.get_mut().expect("mutex poisoned").iter_mut() {
+            result.is_error = true;
+        }
+        mock
     }
 
     /// Set a non-default policy on this MockTool. Used by mu-029
     /// tests to mark a mock as PermissionLevel::Ask, etc.
     fn with_policy(mut self, policy: crate::agent::tool::ToolPolicy) -> Self {
         self.policy_override = Some(policy);
+        self
+    }
+
+    /// mu-83bw9: declare a real `input_schema`. The verification gate
+    /// finds the session's shell by the arguments a tool DECLARES, so a
+    /// mock shell needs more than the bare `{"type": "object"}` default.
+    fn with_input_schema(mut self, schema: Value) -> Self {
+        self.input_schema = Some(schema);
         self
     }
 
@@ -324,6 +349,7 @@ impl MockTool {
             policy_override: None,
             validate_rejection: None,
             verbatim_result: false,
+            input_schema: None,
         }
     }
 }
@@ -334,7 +360,10 @@ impl Tool for MockTool {
         ToolSpec {
             name: self.name.clone(),
             description: format!("Mock tool: {}", self.name),
-            input_schema: json!({"type": "object"}),
+            input_schema: self
+                .input_schema
+                .clone()
+                .unwrap_or_else(|| json!({"type": "object"})),
             // mu-cvm5: the production default now FAILS CLOSED (Mutating +
             // Ask). These mocks model "a benign tool that just runs" unless
             // a test explicitly sets a stricter policy via with_policy(),
@@ -6965,6 +6994,930 @@ async fn ucjhg_guard_refusal_count_resets_on_executed_call() {
         AgentEvent::Callout { title, .. } if title == "guard refusal budget exhausted"
     )));
     assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+// ── mu-83bw9: verification gate — the runtime runs the verify command before the ask ends ──
+
+const VERIFY_RUN_TITLE: &str = "verify run";
+const VERIFY_STAND_DOWN_TITLE: &str = "verify gate stood down";
+
+/// A bash-shaped shell: `SideEffects::Mutating` (what the real bash tool
+/// declares in strict mode) and an `input_schema` that declares the
+/// `command` + `timeout_secs` arguments the gate builds its own call
+/// from. `result` answers EVERY call — the model's and the runtime's.
+fn verify_shell_mock(name: &str, result: &str, is_error: bool) -> MockTool {
+    use crate::agent::tool::{SideEffects, ToolPolicy};
+    let mock = if is_error {
+        MockTool::always_err(name, result)
+    } else {
+        MockTool::always_ok(name, result)
+    };
+    mock.with_policy(ToolPolicy {
+        side_effects: SideEffects::Mutating,
+        idempotent: false,
+        ..ToolPolicy::read_only()
+    })
+    .with_input_schema(json!({
+        "type": "object",
+        "properties": {
+            "command": {"type": "string"},
+            "timeout_secs": {"type": "integer", "maximum": 600}
+        },
+        "required": ["command"]
+    }))
+}
+
+/// `edit` (a file-mutating tool), a bash-shaped shell answering
+/// `verify_result`, and a `final_answer` with the production ends-turn
+/// policy. The gate reads DECLARED policy and schema, never these names.
+fn verify_gate_tools(verify_result: &str, verify_fails: bool) -> Vec<MockTool> {
+    use crate::agent::tool::{SideEffects, ToolPolicy};
+    vec![
+        MockTool::always_ok("edit", "edited").with_policy(ToolPolicy {
+            side_effects: SideEffects::Mutating,
+            ..ToolPolicy::read_only()
+        }),
+        verify_shell_mock("bash", verify_result, verify_fails),
+        MockTool::always_ok("final_answer", "done").with_policy(ToolPolicy {
+            ends_turn_on_success: true,
+            ..ToolPolicy::read_only()
+        }),
+    ]
+}
+
+fn edit_turn(id: &str, path: &str) -> Vec<ProviderEvent> {
+    vec![ProviderEvent::Done(assistant_tool_call(
+        id,
+        "edit",
+        json!({"path": path, "old_string": "a", "new_string": "b"}),
+    ))]
+}
+
+fn bash_turn(id: &str, command: &str) -> Vec<ProviderEvent> {
+    vec![ProviderEvent::Done(assistant_tool_call(
+        id,
+        "bash",
+        json!({"command": command}),
+    ))]
+}
+
+/// `final_answer` calls carry an `fa` id prefix so their results can be
+/// picked out of `ToolCallCompleted` (which has no tool name).
+fn final_answer_turn(id: &str) -> Vec<ProviderEvent> {
+    vec![ProviderEvent::Done(assistant_tool_call(
+        id,
+        "final_answer",
+        json!({"answer": "done"}),
+    ))]
+}
+
+/// Run `script` to the end of the ask on `tools`; the loop's events and
+/// the join outcome.
+async fn run_verify_gate_script(
+    script: Vec<Vec<ProviderEvent>>,
+    tools: Vec<MockTool>,
+    verify_command: Option<&str>,
+) -> (Vec<AgentEvent>, Outcome) {
+    let max_turns = AgentConfig::default().max_turns;
+    run_verify_gate_script_capped(script, tools, verify_command, max_turns).await
+}
+
+/// mu-83bw9: as above with an explicit `max_turns` — the gate's
+/// turn-budget stand-down is only reachable near the cap.
+async fn run_verify_gate_script_capped(
+    script: Vec<Vec<ProviderEvent>>,
+    tools: Vec<MockTool>,
+    verify_command: Option<&str>,
+    max_turns: Option<u32>,
+) -> (Vec<AgentEvent>, Outcome) {
+    let config = AgentConfig {
+        verify_command: verify_command.map(str::to_owned),
+        max_turns,
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(MockProvider::new(script), tools, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("go"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("join must not hang");
+    (events_handle.await.expect("events drain"), outcome)
+}
+
+/// `(is_error, content)` of every `final_answer` result, in order.
+fn final_answer_results(events: &[AgentEvent]) -> Vec<(bool, &str)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCallCompleted {
+                tool_call_id,
+                content,
+                is_error,
+            } if tool_call_id.starts_with("fa") => Some((*is_error, content.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The body of every mu-83bw9 callout carrying `title`, in order.
+fn verify_gate_callouts<'a>(events: &'a [AgentEvent], want: &str) -> Vec<&'a serde_json::Value> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Callout {
+                title,
+                body,
+                context_refs,
+                ..
+            } if title == want && context_refs.iter().any(|r| r == "bead:mu-83bw9") => Some(body),
+            _ => None,
+        })
+        .collect()
+}
+
+fn turn_starts(events: &[AgentEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::TurnStart))
+        .count()
+}
+
+const VERIFY_GREEN: &str = "running 3 tests\ntest result: ok. 3 passed\nelapsed: 10ms";
+const VERIFY_RED: &str = "test result: FAILED. 1 failed\nexit: 101\nelapsed: 10ms";
+
+/// An edit then `final_answer`: the RUNTIME runs the verify command
+/// itself, it passes, and the first `final_answer` goes through. The run
+/// and its output are in the event log.
+#[tokio::test]
+async fn bw9_runtime_runs_verify_command_and_final_answer_passes() {
+    let script = vec![edit_turn("e1", "src/lib.rs"), final_answer_turn("fa1")];
+    let (events, outcome) = run_verify_gate_script(
+        script,
+        verify_gate_tools(VERIFY_GREEN, false),
+        Some("cargo test"),
+    )
+    .await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    let runs = verify_gate_callouts(&events, VERIFY_RUN_TITLE);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["verify_command"], json!("cargo test"));
+    assert_eq!(runs[0]["tool"], json!("bash"));
+    assert_eq!(runs[0]["failed"], json!(false));
+    assert_eq!(runs[0]["output"], json!(VERIFY_GREEN));
+    assert!(verify_gate_callouts(&events, VERIFY_STAND_DOWN_TITLE).is_empty());
+    assert_eq!(
+        turn_starts(&events),
+        2,
+        "edit, finish — no extra round trip"
+    );
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// A failing verify run refuses the ask-ending call ONCE, with the
+/// command and the output tail in the refusal; the latch lets the next
+/// one through without re-running.
+#[tokio::test]
+async fn bw9_failed_verify_run_refuses_final_answer_once() {
+    let script = vec![
+        edit_turn("e1", "src/lib.rs"),
+        final_answer_turn("fa1"),
+        final_answer_turn("fa2"),
+    ];
+    let (events, outcome) = run_verify_gate_script(
+        script,
+        verify_gate_tools(VERIFY_RED, true),
+        Some("cargo test"),
+    )
+    .await;
+
+    let results = final_answer_results(&events);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert_eq!(
+        results[0],
+        (
+            true,
+            format!(
+                "runtime refused: final_answer. `cargo test` failed after your edits:\n\
+                 {VERIFY_RED}\nFix and finish."
+            )
+            .as_str()
+        ),
+        "{results:?}"
+    );
+    assert_eq!(results[1], (false, "done"));
+    // The latch means exactly one run, not one per ask-ending call.
+    let runs = verify_gate_callouts(&events, VERIFY_RUN_TITLE);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["failed"], json!(true));
+    assert_eq!(runs[0]["output"], json!(VERIFY_RED));
+    assert_eq!(turn_starts(&events), 3, "edit, refused, passed");
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-83bw9: the model running the verify command itself is not a
+/// shortcut. There is no text inference to read it out of the model's
+/// shell calls, so the runtime runs the command again — the extra run is
+/// the price of the gate resting on execution rather than on guesswork.
+#[tokio::test]
+async fn bw9_model_running_the_command_does_not_skip_the_runtime_run() {
+    let script = vec![
+        edit_turn("e1", "src/lib.rs"),
+        bash_turn("b1", "cargo test"),
+        final_answer_turn("fa1"),
+    ];
+    let (events, outcome) = run_verify_gate_script(
+        script,
+        verify_gate_tools(VERIFY_GREEN, false),
+        Some("cargo test"),
+    )
+    .await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    assert_eq!(verify_gate_callouts(&events, VERIFY_RUN_TITLE).len(), 1);
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// No file-mutating call: nothing to verify, so nothing runs.
+#[tokio::test]
+async fn bw9_no_edit_runs_nothing() {
+    let mut tools = verify_gate_tools(VERIFY_GREEN, false);
+    tools.push(MockTool::always_ok("read", "file contents"));
+    let script = vec![
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "r1",
+            "read",
+            json!({"path": "src/lib.rs"}),
+        ))],
+        final_answer_turn("fa1"),
+    ];
+    let (events, outcome) = run_verify_gate_script(script, tools, Some("cargo test")).await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    assert!(verify_gate_callouts(&events, VERIFY_RUN_TITLE).is_empty());
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// No verify command configured: the gate never runs anything.
+#[tokio::test]
+async fn bw9_no_verify_command_never_runs() {
+    let script = vec![edit_turn("e1", "src/main.rs"), final_answer_turn("fa1")];
+    let (events, outcome) =
+        run_verify_gate_script(script, verify_gate_tools(VERIFY_RED, true), None).await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    assert!(verify_gate_callouts(&events, VERIFY_RUN_TITLE).is_empty());
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-83bw9: a blank verify command is a typo, not a command — it must
+/// read as "gate off" rather than arming a gate with nothing to run.
+#[tokio::test]
+async fn bw9_blank_verify_command_never_runs() {
+    let script = vec![edit_turn("e1", "src/main.rs"), final_answer_turn("fa1")];
+    let (events, outcome) =
+        run_verify_gate_script(script, verify_gate_tools(VERIFY_RED, true), Some("   ")).await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    assert!(verify_gate_callouts(&events, VERIFY_RUN_TITLE).is_empty());
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-83bw9: the gate must not spend turns the ask does not have. A
+/// failing run mandates a round trip — see it, fix, finish — so with the
+/// refusal landing on the last turn it stands down and the ask finishes.
+#[tokio::test]
+async fn bw9_gate_stands_down_when_turn_budget_cannot_fit_the_rerun() {
+    let script = vec![edit_turn("e1", "src/lib.rs"), final_answer_turn("fa1")];
+    let (events, outcome) = run_verify_gate_script_capped(
+        script,
+        verify_gate_tools(VERIFY_RED, true),
+        Some("cargo test"),
+        Some(2),
+    )
+    .await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    assert!(verify_gate_callouts(&events, VERIFY_RUN_TITLE).is_empty());
+    assert!(!events.iter().any(
+        |e| matches!(e, AgentEvent::Done { stop_reason, .. } if *stop_reason
+            == StopReason::IterationCap)
+    ));
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-83bw9: the other side of that boundary — with exactly the three
+/// turns the round trip needs (refuse, fix, finish), the gate runs and
+/// the ask still completes inside the cap.
+#[tokio::test]
+async fn bw9_gate_fires_when_the_turn_budget_just_fits() {
+    let script = vec![
+        edit_turn("e1", "src/lib.rs"),
+        final_answer_turn("fa1"),
+        edit_turn("e2", "src/lib.rs"),
+        final_answer_turn("fa2"),
+    ];
+    let (events, outcome) = run_verify_gate_script_capped(
+        script,
+        verify_gate_tools(VERIFY_RED, true),
+        Some("cargo test"),
+        Some(4),
+    )
+    .await;
+
+    let results = final_answer_results(&events);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(results[0].0, "first final_answer refused: {results:?}");
+    assert_eq!(results[1], (false, "done"));
+    assert_eq!(verify_gate_callouts(&events, VERIFY_RUN_TITLE).len(), 1);
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-83bw9: with no shell to run the command through, the gate stands
+/// down and says so in the log rather than blocking the ask on a run it
+/// cannot make.
+#[tokio::test]
+async fn bw9_missing_shell_tool_stands_down_with_a_callout() {
+    use crate::agent::tool::{SideEffects, ToolPolicy};
+    let tools = vec![
+        MockTool::always_ok("edit", "edited").with_policy(ToolPolicy {
+            side_effects: SideEffects::Mutating,
+            ..ToolPolicy::read_only()
+        }),
+        MockTool::always_ok("final_answer", "done").with_policy(ToolPolicy {
+            ends_turn_on_success: true,
+            ..ToolPolicy::read_only()
+        }),
+    ];
+    let script = vec![edit_turn("e1", "src/lib.rs"), final_answer_turn("fa1")];
+    let (events, outcome) = run_verify_gate_script(script, tools, Some("cargo test")).await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    assert!(verify_gate_callouts(&events, VERIFY_RUN_TITLE).is_empty());
+    let stood_down = verify_gate_callouts(&events, VERIFY_STAND_DOWN_TITLE);
+    assert_eq!(stood_down.len(), 1, "{stood_down:?}");
+    assert_eq!(stood_down[0]["verify_command"], json!("cargo test"));
+    assert!(
+        stood_down[0]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("no shell tool")),
+        "{stood_down:?}"
+    );
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-83bw9: a shell the user must approve per call is not the runtime's
+/// to dispatch unasked (bash has such a mode) — the gate stands down
+/// rather than spending an approval the model never requested.
+#[tokio::test]
+async fn bw9_approval_gated_shell_stands_down_with_a_callout() {
+    use crate::agent::tool::PermissionLevel;
+    let mut tools = verify_gate_tools(VERIFY_GREEN, false);
+    tools[1] = {
+        let mut policy = tools[1].spec().policy;
+        policy.permission = PermissionLevel::Ask;
+        verify_shell_mock("bash", VERIFY_GREEN, false).with_policy(policy)
+    };
+    let script = vec![edit_turn("e1", "src/lib.rs"), final_answer_turn("fa1")];
+    let (events, outcome) = run_verify_gate_script(script, tools, Some("cargo test")).await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    assert!(verify_gate_callouts(&events, VERIFY_RUN_TITLE).is_empty());
+    assert_eq!(
+        verify_gate_callouts(&events, VERIFY_STAND_DOWN_TITLE).len(),
+        1
+    );
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-83bw9: a shell that rejects the configured command (a strict-mode
+/// allowlist) is an operator misconfiguration, not a model failure — the
+/// gate stands down with the shell's own reason.
+#[tokio::test]
+async fn bw9_shell_rejecting_the_command_stands_down_with_a_callout() {
+    let mut tools = verify_gate_tools(VERIFY_GREEN, false);
+    tools[1] = verify_shell_mock("bash", VERIFY_GREEN, false)
+        .with_validate_rejection("bash: command not in the allowlist");
+    let script = vec![edit_turn("e1", "src/lib.rs"), final_answer_turn("fa1")];
+    let (events, outcome) = run_verify_gate_script(script, tools, Some("cargo test")).await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    assert!(verify_gate_callouts(&events, VERIFY_RUN_TITLE).is_empty());
+    let stood_down = verify_gate_callouts(&events, VERIFY_STAND_DOWN_TITLE);
+    assert_eq!(stood_down.len(), 1, "{stood_down:?}");
+    assert!(
+        stood_down[0]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("not in the allowlist")),
+        "{stood_down:?}"
+    );
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-83bw9: a shell whose run never finishes on its own. `started`
+/// lets a test cancel only once the runtime's verify run is genuinely
+/// in flight; `cancelled` records that the runtime's cancel signal
+/// REACHED the shell — the watcher is a detached task because the gate
+/// drops the run future the moment it decides to abort, so the tool's
+/// own body would never observe the send.
+struct BlockingShell {
+    name: String,
+    started: Arc<std::sync::atomic::AtomicBool>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Tool for BlockingShell {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name.clone(),
+            description: "shell whose run never completes".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }),
+            policy: crate::agent::tool::ToolPolicy::read_only(),
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, _arguments: Value, cancel_rx: oneshot::Receiver<()>) -> ToolResult {
+        let cancelled = Arc::clone(&self.cancelled);
+        tokio::spawn(async move {
+            if cancel_rx.await.is_ok() {
+                cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        self.started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        std::future::pending().await
+    }
+}
+
+/// mu-83bw9: as `run_verify_gate_script_capped`, but with prebuilt tools
+/// and an explicit session capability — the handle a test needs to hold
+/// to assert on the budget, or to mix a non-`MockTool` shell in.
+fn spawn_verify_gate_loop(
+    script: Vec<Vec<ProviderEvent>>,
+    tools: Vec<Arc<dyn Tool>>,
+    verify_command: Option<&str>,
+    capability: SessionCapability,
+) -> (AgentLoop, mpsc::Receiver<AgentEvent>) {
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let config = AgentConfig {
+        verify_command: verify_command.map(str::to_owned),
+        ..AgentConfig::default()
+    };
+    let loop_ = loop_with(
+        Arc::new(MockProvider::new(script)) as Arc<dyn Provider>,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        tools,
+        config,
+        events_tx,
+        Arc::new(Mutex::new(std::collections::HashMap::new())),
+        capability,
+    );
+    (loop_, events_rx)
+}
+
+/// mu-83bw9: the runtime's own verify run must answer `session.cancel`
+/// as promptly as a model-issued call does. Before the fix the run was
+/// awaited inline, so a `cargo test` that hung held the session deaf to
+/// cancel for the whole 300s backstop — the one stretch of an ask during
+/// which an operator is most likely to press it.
+#[tokio::test]
+async fn bw9_cancel_during_the_runtime_verify_run_ends_the_ask_promptly() {
+    use crate::agent::tool::{SideEffects, ToolPolicy};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let started = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(
+            MockTool::always_ok("edit", "edited").with_policy(ToolPolicy {
+                side_effects: SideEffects::Mutating,
+                ..ToolPolicy::read_only()
+            }),
+        ),
+        Arc::new(BlockingShell {
+            name: "bash".into(),
+            started: Arc::clone(&started),
+            cancelled: Arc::clone(&cancelled),
+        }),
+        Arc::new(
+            MockTool::always_ok("final_answer", "done").with_policy(ToolPolicy {
+                ends_turn_on_success: true,
+                ..ToolPolicy::read_only()
+            }),
+        ),
+    ];
+    let script = vec![edit_turn("e1", "src/lib.rs"), final_answer_turn("fa1")];
+    let (loop_, events_rx) = spawn_verify_gate_loop(
+        script,
+        tools,
+        Some("cargo test"),
+        Arc::new(Mutex::new(crate::capability::Capability::root())),
+    );
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    loop_
+        .send(AgentInput::UserMessage(user_msg("go"), None, None))
+        .await
+        .expect("send");
+
+    // Cancel only once the run is actually in flight; before that a
+    // cancel would land on the provider stream, not on the gate.
+    for _ in 0..500 {
+        if started.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(started.load(Ordering::SeqCst), "verify run never started");
+    loop_.send(AgentInput::Cancel).await.expect("send cancel");
+
+    // Well under VERIFY_RUN_TIMEOUT_SECS (300): the point is that the
+    // cancel is answered, not that the backstop eventually expires.
+    let outcome = timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("cancel must end the ask, not wait out the verify backstop");
+    assert_eq!(outcome, Outcome::Cancelled);
+
+    for _ in 0..500 {
+        if cancelled.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        cancelled.load(Ordering::SeqCst),
+        "the shell's own cancel signal must fire, not just the ask unwind"
+    );
+
+    // The ask-ending call was outstanding when the cancel landed; it
+    // must come back answered so the next turn has no dangling call.
+    let events = events_handle.await.expect("events drain");
+    let results = final_answer_results(&events);
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(results[0].0, "{results:?}");
+    assert!(
+        results[0].1.contains("cancelled before completion"),
+        "{results:?}"
+    );
+}
+
+/// mu-83bw9: `Execute` is file-write reach plus process reach, and the
+/// tools in that class (spawned workers, MCP shells) change files
+/// without naming them. The arming predicate used to exclude anything
+/// with process reach, which left the gate blind to exactly that
+/// surface; file-write reach alone arms it.
+#[tokio::test]
+async fn bw9_execute_class_tool_arms_the_gate() {
+    use crate::agent::tool::{PermissionLevel, SideEffects, ToolPolicy};
+    let mut tools = verify_gate_tools(VERIFY_GREEN, false);
+    tools.push(
+        MockTool::always_ok("spawn_worker", "worker done").with_policy(ToolPolicy {
+            side_effects: SideEffects::Execute,
+            permission: PermissionLevel::Allow,
+            ..ToolPolicy::read_only()
+        }),
+    );
+    let script = vec![
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "w1",
+            "spawn_worker",
+            json!({"task": "edit the crate"}),
+        ))],
+        final_answer_turn("fa1"),
+    ];
+    let (events, outcome) = run_verify_gate_script(script, tools, Some("cargo test")).await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    let runs = verify_gate_callouts(&events, VERIFY_RUN_TITLE);
+    assert_eq!(
+        runs.len(),
+        1,
+        "Execute-class call must arm the gate: {runs:?}"
+    );
+    assert_eq!(runs[0]["verify_command"], json!("cargo test"));
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-83bw9: the runtime's run is a real dispatch and spends from the
+/// session's tool-call budget like the model's own. Run the same script
+/// with the gate on and off: the difference is exactly one call.
+#[tokio::test]
+async fn bw9_verify_run_spends_one_call_from_the_session_budget() {
+    async fn remaining_after(verify_command: Option<&str>) -> u32 {
+        let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability {
+            max_tool_calls_remaining: Some(10),
+            ..crate::capability::Capability::root()
+        }));
+        let tools: Vec<Arc<dyn Tool>> = verify_gate_tools(VERIFY_GREEN, false)
+            .into_iter()
+            .map(|t| Arc::new(t) as Arc<dyn Tool>)
+            .collect();
+        let script = vec![edit_turn("e1", "src/lib.rs"), final_answer_turn("fa1")];
+        let (loop_, events_rx) =
+            spawn_verify_gate_loop(script, tools, verify_command, Arc::clone(&capability));
+        let events_handle = tokio::spawn(collect_events(events_rx));
+        loop_
+            .send(AgentInput::UserMessage(user_msg("go"), None, None))
+            .await
+            .expect("send");
+        let outcome = timeout(Duration::from_secs(5), loop_.join())
+            .await
+            .expect("join must not hang");
+        assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+        let events = events_handle.await.expect("events drain");
+        assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+        let cap = capability.lock().expect("capability lock");
+        cap.max_tool_calls_remaining.expect("budget set")
+    }
+
+    // edit + final_answer, and with the gate on the runtime's run too.
+    let gate_off = remaining_after(None).await;
+    let gate_on = remaining_after(Some("cargo test")).await;
+    assert_eq!(gate_off, 8, "edit + final_answer");
+    assert_eq!(
+        gate_on,
+        gate_off - 1,
+        "the runtime's verify run must cost a tool call"
+    );
+}
+
+/// mu-83bw9: run `script` on the standard gate tools under an explicit
+/// tool-call budget. Returns the loop's events and what the budget had
+/// left, so a test can assert executions never outran it.
+async fn run_verify_gate_script_with_budget(
+    script: Vec<Vec<ProviderEvent>>,
+    verify_fails: bool,
+    budget: u32,
+) -> (Vec<AgentEvent>, u32) {
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability {
+        max_tool_calls_remaining: Some(budget),
+        ..crate::capability::Capability::root()
+    }));
+    let verify_result = if verify_fails {
+        VERIFY_RED
+    } else {
+        VERIFY_GREEN
+    };
+    let tools: Vec<Arc<dyn Tool>> = verify_gate_tools(verify_result, verify_fails)
+        .into_iter()
+        .map(|t| Arc::new(t) as Arc<dyn Tool>)
+        .collect();
+    let (loop_, events_rx) =
+        spawn_verify_gate_loop(script, tools, Some("cargo test"), Arc::clone(&capability));
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    loop_
+        .send(AgentInput::UserMessage(user_msg("go"), None, None))
+        .await
+        .expect("send");
+    let outcome = timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("join must not hang");
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+    let events = events_handle.await.expect("events drain");
+    let left = capability
+        .lock()
+        .expect("capability lock")
+        .max_tool_calls_remaining
+        .expect("budget set");
+    (events, left)
+}
+
+/// mu-83bw9: the turn reserve has a tool-call twin. The gate's own run
+/// spends from `max_tool_calls_remaining`, so with fewer than the round
+/// trip needs (run, fix, finish) it stands down rather than spending the
+/// budget's last units on a refusal nothing can act on.
+#[tokio::test]
+async fn bw9_gate_stands_down_when_the_tool_call_budget_cannot_fit_the_round_trip() {
+    // edit spends one, leaving two — one short of the reserve.
+    let script = vec![edit_turn("e1", "src/lib.rs"), final_answer_turn("fa1")];
+    let (events, left) = run_verify_gate_script_with_budget(script, true, 3).await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    assert!(verify_gate_callouts(&events, VERIFY_RUN_TITLE).is_empty());
+    let stood_down = verify_gate_callouts(&events, VERIFY_STAND_DOWN_TITLE);
+    assert_eq!(stood_down.len(), 1, "{stood_down:?}");
+    assert!(
+        stood_down[0]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("tool-call budget")),
+        "{stood_down:?}"
+    );
+    assert_eq!(left, 1, "edit + final_answer, no runtime run");
+}
+
+/// mu-83bw9: the other side of that boundary — with exactly the three
+/// calls the round trip needs, the gate runs, refuses, and the ask still
+/// finishes inside the budget.
+#[tokio::test]
+async fn bw9_gate_fires_when_the_tool_call_budget_just_fits() {
+    let script = vec![
+        edit_turn("e1", "src/lib.rs"),
+        final_answer_turn("fa1"),
+        final_answer_turn("fa2"),
+    ];
+    let (events, left) = run_verify_gate_script_with_budget(script, true, 4).await;
+
+    let results = final_answer_results(&events);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(results[0].0, "first final_answer refused: {results:?}");
+    assert_eq!(results[1], (false, "done"));
+    assert_eq!(verify_gate_callouts(&events, VERIFY_RUN_TITLE).len(), 1);
+    assert!(verify_gate_callouts(&events, VERIFY_STAND_DOWN_TITLE).is_empty());
+    assert_eq!(left, 1, "edit + verify run + final_answer");
+}
+
+/// mu-83bw9: an unlimited budget has no reserve to fail — the gate runs
+/// exactly as it does with no cap configured.
+#[tokio::test]
+async fn bw9_unlimited_tool_call_budget_never_stands_the_gate_down() {
+    let script = vec![edit_turn("e1", "src/lib.rs"), final_answer_turn("fa1")];
+    let (events, outcome) = run_verify_gate_script(
+        script,
+        verify_gate_tools(VERIFY_GREEN, false),
+        Some("cargo test"),
+    )
+    .await;
+
+    assert!(verify_gate_callouts(&events, VERIFY_STAND_DOWN_TITLE).is_empty());
+    assert_eq!(verify_gate_callouts(&events, VERIFY_RUN_TITLE).len(), 1);
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-83bw9: a shell whose own run spends further session tool calls
+/// (`extra_calls` on top of the one the gate charged for the run itself).
+/// It makes the window between the gate's run and the held ask-ending
+/// call observable: the budget the call was cleared against is not the
+/// budget in force when it dispatches.
+struct BudgetSpendingShell {
+    capability: SessionCapability,
+    extra_calls: u32,
+}
+
+#[async_trait]
+impl Tool for BudgetSpendingShell {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "bash".to_owned(),
+            description: "shell whose run spends session tool calls".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }),
+            policy: crate::agent::tool::ToolPolicy::read_only(),
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, _arguments: Value, _cancel_rx: oneshot::Receiver<()>) -> ToolResult {
+        if let Ok(mut cap) = self.capability.lock() {
+            for _ in 0..self.extra_calls {
+                cap.consume_tool_call();
+            }
+        }
+        ToolResult {
+            content: VERIFY_GREEN.to_owned(),
+            is_error: false,
+        }
+    }
+}
+
+/// mu-83bw9: the ask-ending call is held across the gate's own run, so
+/// the capability verdict computed for it before the gate is stale by
+/// whatever that run spent. It must be recomputed: a budget the verify
+/// run exhausted refuses the call with the ordinary capability text
+/// instead of executing it. Before the fix the stale verdict let it
+/// through and a budget of N executed N+1 calls.
+#[tokio::test]
+async fn bw9_budget_exhausted_by_the_verify_run_refuses_the_held_call() {
+    use crate::agent::tool::{SideEffects, ToolPolicy};
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability {
+        max_tool_calls_remaining: Some(4),
+        ..crate::capability::Capability::root()
+    }));
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(
+            MockTool::always_ok("edit", "edited").with_policy(ToolPolicy {
+                side_effects: SideEffects::Mutating,
+                ..ToolPolicy::read_only()
+            }),
+        ),
+        Arc::new(BudgetSpendingShell {
+            capability: Arc::clone(&capability),
+            extra_calls: 2,
+        }),
+        Arc::new(
+            MockTool::always_ok("final_answer", "done").with_policy(ToolPolicy {
+                ends_turn_on_success: true,
+                ..ToolPolicy::read_only()
+            }),
+        ),
+    ];
+    // edit (1) leaves 3 — the reserve's floor, so the gate runs; the run
+    // itself (1) plus the 2 it spends leave nothing for the held call.
+    let script = vec![
+        edit_turn("e1", "src/lib.rs"),
+        final_answer_turn("fa1"),
+        vec![ProviderEvent::Done(assistant_text("stopping"))],
+    ];
+    let (loop_, events_rx) =
+        spawn_verify_gate_loop(script, tools, Some("cargo test"), Arc::clone(&capability));
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    loop_
+        .send(AgentInput::UserMessage(user_msg("go"), None, None))
+        .await
+        .expect("send");
+    let outcome = timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("join must not hang");
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+    let events = events_handle.await.expect("events drain");
+
+    assert_eq!(verify_gate_callouts(&events, VERIFY_RUN_TITLE).len(), 1);
+    let results = final_answer_results(&events);
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(results[0].0, "the held call must be refused: {results:?}");
+    assert!(
+        results[0].1.contains("blocked by session capability")
+            && results[0].1.contains("budget exhausted"),
+        "refused with the ordinary capability text: {results:?}"
+    );
+    assert!(
+        !results[0].1.contains("done"),
+        "the held call must not have executed: {results:?}"
+    );
+    // 4 executions for a budget of 4: edit, the verify run, and the two
+    // the run spent. The held call is not a fifth.
+    assert_eq!(
+        capability
+            .lock()
+            .expect("capability lock")
+            .max_tool_calls_remaining,
+        Some(0)
+    );
+}
+
+/// mu-83bw9: the gate latches per ASK, and an autonomous run is one long
+/// ask — so without a reset at the iteration boundary it fires in
+/// iteration 1 and never again, and every later iteration's edits ship
+/// unverified. Two iterations, each with an edit: the gate must act in
+/// both.
+#[tokio::test]
+async fn bw9_gate_acts_in_every_autonomous_iteration() {
+    let script = vec![
+        // iteration 1: edit, refused ask-ending call, finish
+        edit_turn("e1", "src/lib.rs"),
+        final_answer_turn("fa1"),
+        final_answer_turn("fa2"),
+        // iteration 2: the same again
+        edit_turn("e2", "src/lib.rs"),
+        final_answer_turn("fa3"),
+        final_answer_turn("fa4"),
+    ];
+    let config = AgentConfig {
+        verify_command: Some("cargo test".to_owned()),
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop_with_autonomy(
+        MockProvider::new(script),
+        verify_gate_tools(VERIFY_RED, true),
+        config,
+        autonomy_allowed(2),
+    );
+    loop_
+        .send(AgentInput::StartAutonomous {
+            goal: "edit twice".to_owned(),
+            options: crate::protocol::AutonomyOptions::default(),
+        })
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("join must not hang");
+    let events = events_handle.await.expect("events drain");
+
+    let runs = verify_gate_callouts(&events, VERIFY_RUN_TITLE);
+    assert_eq!(runs.len(), 2, "one run per iteration: {runs:?}");
+    let results = final_answer_results(&events);
+    assert_eq!(results.len(), 4, "{results:?}");
+    assert!(
+        results[0].0 && results[2].0,
+        "the failing run must refuse the first ask-ending call of BOTH \
+         iterations: {results:?}"
+    );
+    assert_eq!(results[1], (false, "done"));
+    assert_eq!(results[3], (false, "done"));
 }
 
 /// mu-htbz0: a UserMessage buffered while the provider streams must

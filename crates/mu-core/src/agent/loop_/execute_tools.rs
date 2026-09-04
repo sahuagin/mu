@@ -6,10 +6,12 @@ use std::time::Instant;
 
 use tokio::sync::mpsc;
 
+use t4c::FsEffect;
+
 use crate::capability::CapabilityCheck;
 use crate::protocol::ApprovalDecision;
 
-use super::super::tool::{PermissionLevel, RetryPolicy, Tool, ToolResult};
+use super::super::tool::{PermissionLevel, RetryPolicy, Tool, ToolPolicy, ToolResult};
 use super::super::types::{AgentMessage, ToolCall};
 
 use super::{AgentEvent, AgentInput, Outcome, PendingApprovals, SessionCapability};
@@ -55,6 +57,30 @@ const MODEL_DECIDES_IDENTICAL_ERROR_LIMIT: usize = 5;
 // doesn't fit inside it could never fire.
 const _: () = assert!(MODEL_DECIDES_IDENTICAL_ERROR_LIMIT < TOOL_HISTORY_WINDOW);
 
+/// mu-83bw9: turns the verification gate needs before it will spend one
+/// on a refusal. The verify run is inline in the refused turn, so the
+/// three are: the refused turn, a turn to fix what the run caught, and a
+/// turn to finish. Below that the mandated round trip cannot complete
+/// before `max_turns` and the ask would end on the refusal — no answer.
+/// An uncapped session always has the room.
+const VERIFY_GATE_MIN_TURNS: u32 = 3;
+
+/// mu-83bw9: the same reserve in tool calls — the gate's own run, one
+/// call to fix what it caught, one to finish. The gate's run spends from
+/// `max_tool_calls_remaining` like any dispatch, so below this it would
+/// be spending the budget's last units on a round trip that cannot
+/// complete. A refused ask-ending call costs nothing, which is why it is
+/// not counted. An unlimited budget always has the room.
+const VERIFY_GATE_MIN_TOOL_CALLS: u32 = 3;
+
+/// mu-83bw9: callout title for a verify run the runtime made, whatever
+/// its outcome — the event log's record that the RUNTIME ran the command
+/// and what it returned.
+const VERIFY_RUN_TITLE: &str = "verify run";
+
+/// mu-83bw9: callout title for a gate that wanted to run but could not.
+const VERIFY_STAND_DOWN_TITLE: &str = "verify gate stood down";
+
 /// Monotonic counter used to generate `request_id`s for
 /// `InputRequired` prompts. Combined with the tool_call_id for
 /// readability + uniqueness even across sessions.
@@ -74,6 +100,26 @@ const APPROVAL_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 #[derive(Debug, Default)]
 pub(crate) struct ToolHistory {
     pub(crate) entries: VecDeque<ToolHistoryEntry>,
+    /// mu-83bw9: the session's verify command (`[session].verify_command`).
+    /// `None` ⇒ the verification gate below is off.
+    verify_command: Option<String>,
+    /// mu-83bw9: verification-gate state. Per ask: reset at ask start,
+    /// NOT by `clear` — a mid-ask context clear drops the window, not the
+    /// fact that files changed.
+    verify: VerifyState,
+}
+
+/// mu-83bw9: everything the verification gate knows about the current
+/// ask — one bit for "files changed", one for "the gate already fired".
+/// The runtime runs the verify command itself, so nothing here has to
+/// reconstruct what the model did from its tool arguments or output.
+#[derive(Debug, Default)]
+struct VerifyState {
+    /// A file-mutating tool has succeeded since the last passing verify
+    /// run (or since the ask began).
+    edited: bool,
+    /// The gate has refused an ask-ending call this ask; the next passes.
+    fired: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -88,8 +134,84 @@ pub(crate) struct ToolHistoryEntry {
 }
 
 impl ToolHistory {
+    /// mu-83bw9: a history whose verification gate runs `verify_command`.
+    /// `None` and blank/whitespace both leave the gate off. Config
+    /// normalizes blanks at load; this is the floor for every other caller.
+    pub(crate) fn with_verify_command(verify_command: Option<String>) -> Self {
+        Self {
+            verify_command: verify_command
+                .map(|c| c.trim().to_owned())
+                .filter(|c| !c.is_empty()),
+            ..Self::default()
+        }
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    /// mu-83bw9: fresh per-ask gate state. Called at ask start alongside
+    /// the other per-ask budgets.
+    pub(crate) fn reset_verify_gate(&mut self) {
+        self.verify = VerifyState::default();
+    }
+
+    /// mu-83bw9: note one completed dispatch for the verification gate.
+    /// Any successful call to a tool that DECLARES file-write reach arms
+    /// it — no reading of arguments, paths or output. The declared
+    /// effects class is the tool's own statement that it can change
+    /// files; second-guessing it from argument shapes meant encoding one
+    /// language's project layout in the agent loop.
+    ///
+    /// File-write reach is the WHOLE predicate: process reach does not
+    /// exempt a tool. `Execute` projects to filesystem Write plus
+    /// process, and that class is exactly where the unnamed edits live —
+    /// spawned workers and MCP shells change files without ever saying
+    /// which. Excluding them left the gate blind to the largest edit
+    /// surface a session has, while bash (Mutating/Destructive) armed it
+    /// all along.
+    pub(crate) fn note_tool_edit(&mut self, policy: Option<&ToolPolicy>, result: &ToolResult) {
+        if result.is_error {
+            return;
+        }
+        let Some(policy) = policy else {
+            return;
+        };
+        if policy.derived_effects().filesystem == FsEffect::Write {
+            self.verify.edited = true;
+        }
+    }
+
+    /// mu-83bw9: `Some(verify command)` iff the runtime should run it
+    /// before letting this ask-ending call through — the gate is
+    /// configured, has not fired this ask, a file-mutating call has
+    /// succeeded since the last passing run, and the ask still has the
+    /// turns to act on a refusal. `turns_remaining` counts the turn in
+    /// flight; `None` means the session has no turn cap, which always has
+    /// room. The matching tool-call reserve is the caller's
+    /// [`verify_call_headroom`] — it needs the capability, which this
+    /// history does not hold.
+    pub(crate) fn verify_command_due(&self, turns_remaining: Option<u32>) -> Option<&str> {
+        let budget_allows = turns_remaining.is_none_or(|left| left >= VERIFY_GATE_MIN_TURNS);
+        if self.verify.fired || !self.verify.edited || !budget_allows {
+            return None;
+        }
+        self.verify_command.as_deref()
+    }
+
+    /// mu-83bw9: the verify command passed — the edits behind it are
+    /// verified, so nothing is owed until the next one.
+    pub(crate) fn note_verify_passed(&mut self) {
+        self.verify.edited = false;
+    }
+
+    /// mu-83bw9: the gate refused an ask-ending call. Latching means the
+    /// gate costs at most one model round trip per ask and cannot loop:
+    /// the next ask-ending call passes whatever the state. Standing down
+    /// (no shell, refused capability, no turn budget) does NOT latch — the
+    /// gate simply had nothing to spend a turn on.
+    pub(crate) fn note_verify_refused(&mut self) {
+        self.verify.fired = true;
     }
 
     /// Record a completed dispatch. Drops the oldest if over capacity.
@@ -198,6 +320,231 @@ impl ToolHistory {
     }
 }
 
+/// mu-83bw9: how long the runtime lets its own verify run take, in
+/// seconds. Passed to the shell tool's own timeout argument when it
+/// declares one (bash: `timeout_secs`, clamped to the schema's maximum),
+/// and enforced here as a backstop so a shell without one cannot wedge
+/// the session.
+const VERIFY_RUN_TIMEOUT_SECS: u64 = 300;
+
+/// mu-83bw9: argument keys a shell tool uses to carry its command line.
+/// The gate reads the shell's declared `input_schema` to pick one; it
+/// never guesses a tool NAME, because this crate hosts the gate but does
+/// not own the tool set.
+const SHELL_COMMAND_KEYS: [&str; 2] = ["command", "cmd"];
+
+/// mu-83bw9: lines the gate keeps of a verify run's output — enough to
+/// carry a failing test's summary or a compiler error into the refusal
+/// without pasting a whole build log into the context.
+const VERIFY_OUTPUT_TAIL_LINES: usize = 40;
+
+/// The last [`VERIFY_OUTPUT_TAIL_LINES`] lines of `content`.
+fn output_tail(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    lines[lines.len().saturating_sub(VERIFY_OUTPUT_TAIL_LINES)..].join("\n")
+}
+
+/// mu-83bw9: the session's tool-call headroom for the round trip the
+/// gate mandates — see [`VERIFY_GATE_MIN_TOOL_CALLS`]. `Err(reason)`
+/// stands the gate down; an unlimited budget always passes.
+fn verify_call_headroom(capability: &SessionCapability) -> Result<(), String> {
+    let remaining = capability
+        .lock()
+        .ok()
+        .and_then(|c| c.max_tool_calls_remaining);
+    match remaining {
+        Some(left) if left < VERIFY_GATE_MIN_TOOL_CALLS => Err(format!(
+            "the session's tool-call budget has {left} left, fewer than the \
+             {VERIFY_GATE_MIN_TOOL_CALLS} the verify run, a fix and a finishing call need"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// mu-83bw9: the shell the runtime runs the verify command through, and
+/// the ready-built arguments for it. Selection is on schema and policy
+/// alone: the FIRST tool that declares a command-shaped argument
+/// ([`SHELL_COMMAND_KEYS`]), is not park-and-wake, and needs no per-call
+/// approval. Only then do that tool's capability check and `validate`
+/// run; either failing stands the gate down — a second candidate is
+/// never tried. `Err(reason)` says which of the three it was.
+///
+/// A shell that declares a `timeout_secs` argument gets one, bounded by
+/// its own schema maximum; the caller's backstop covers the rest.
+fn verify_shell(
+    tools: &[Arc<dyn Tool>],
+    capability: &SessionCapability,
+    command: &str,
+) -> Result<(Arc<dyn Tool>, serde_json::Value), String> {
+    let found = tools.iter().find_map(|t| {
+        let spec = t.spec();
+        // Park-and-wake tools never run a command to completion, and a
+        // shell the user must approve per call is not the runtime's to
+        // dispatch unasked — the gate would be spending a human approval
+        // the model never requested.
+        if spec.policy.ends_turn_on_success || spec.policy.permission != PermissionLevel::Allow {
+            return None;
+        }
+        let properties = spec.input_schema.get("properties")?;
+        let key = SHELL_COMMAND_KEYS
+            .iter()
+            .find(|k| properties.get(**k).is_some())?;
+        let mut arguments = serde_json::Map::new();
+        arguments.insert((*key).to_owned(), command.into());
+        if let Some(timeout) = properties.get("timeout_secs") {
+            let max = timeout
+                .get("maximum")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(VERIFY_RUN_TIMEOUT_SECS);
+            arguments.insert(
+                "timeout_secs".to_owned(),
+                VERIFY_RUN_TIMEOUT_SECS.min(max).into(),
+            );
+        }
+        Some((Arc::clone(t), serde_json::Value::Object(arguments)))
+    });
+    let (tool, arguments) = found.ok_or_else(|| {
+        "this session has no shell tool the runtime may run it through (none \
+         declares a command argument at permission `allow`)"
+            .to_owned()
+    })?;
+    let name = tool.spec().name;
+    // The same capability and effects gate a model-issued call passes.
+    if let Some(reason) = capability_refusal(capability, Some(&tool), &name) {
+        return Err(format!(
+            "`{name}` is blocked by the session capability ({reason})"
+        ));
+    }
+    // And the shell's own pre-flight — a strict-mode allowlist that
+    // rejects the configured command is an operator misconfiguration, not
+    // a model failure, so it stands the gate down rather than refusing.
+    if let Err(reason) = tool.validate(&arguments) {
+        return Err(format!("`{name}` rejected it: {reason}"));
+    }
+    Ok((tool, arguments))
+}
+
+/// mu-83bw9: run the verify command and report what it returned. Executes
+/// through the ordinary [`Tool::execute`] path, panic-isolated like a
+/// model-issued call and bounded by [`VERIFY_RUN_TIMEOUT_SECS`] in case
+/// the shell has no timeout of its own.
+///
+/// `cancel_rx` is the shell's cancel signal; its sender stays with
+/// [`run_verify_command_cancellable`], which fires it when a cancel
+/// arrives mid-run. The sender must OUTLIVE this future — a dropped
+/// oneshot sender reads to the shell as an immediate cancel.
+async fn execute_verify_command(
+    tool: &Arc<dyn Tool>,
+    arguments: serde_json::Value,
+    cancel_rx: tokio::sync::oneshot::Receiver<()>,
+) -> ToolResult {
+    use futures::FutureExt as _;
+    let name = tool.spec().name;
+    let execute = std::panic::AssertUnwindSafe(tool.execute(arguments, cancel_rx)).catch_unwind();
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(VERIFY_RUN_TIMEOUT_SECS),
+        execute,
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(panic)) => ToolResult {
+            content: format!("tool `{name}` panicked: {}", panic_message(panic.as_ref())),
+            is_error: true,
+        },
+        Err(_) => ToolResult {
+            content: format!("timed out after {VERIFY_RUN_TIMEOUT_SECS}s"),
+            is_error: true,
+        },
+    }
+}
+
+/// mu-83bw9: how a runtime verify run ended.
+enum VerifyRunExit {
+    /// The command finished (or hit the backstop timeout).
+    Finished(ToolResult),
+    /// A cancel arrived while it was running; the shell's cancel signal
+    /// has been fired. `Some(reason)` is a narrow `CancelOutstanding`,
+    /// `None` a whole-session `Cancel` — the caller ends the ask the way
+    /// the model-issued dispatch path ends it for each.
+    Cancelled(Option<String>),
+}
+
+/// mu-83bw9: drive the verify run under the SAME select the model-issued
+/// dispatch uses. A verify run is an ordinary long tool call as far as
+/// the operator is concerned — a full test suite can take minutes — so
+/// awaiting it inline made the session deaf to `session.cancel` for the
+/// whole run, the one stretch during which someone is most likely to
+/// press it. Cancel fires the shell's own signal (which is why the
+/// sender lives here rather than inside [`execute_verify_command`]),
+/// non-cancel inputs buffer for the caller to requeue, and the
+/// `ToolExecuting` heartbeat keeps ticking so the run doesn't read as a
+/// stalled session.
+///
+/// `tool_call_id` is the ask-ending call the gate is holding: from a
+/// client's side that call is still executing, and this run is why.
+async fn run_verify_command_cancellable(
+    shell: &Arc<dyn Tool>,
+    arguments: serde_json::Value,
+    input_rx: &mut mpsc::Receiver<AgentInput>,
+    events: &mpsc::Sender<AgentEvent>,
+    buffered: &mut Vec<AgentInput>,
+    tool_call_id: &str,
+) -> VerifyRunExit {
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let mut run = Box::pin(execute_verify_command(shell, arguments, cancel_rx));
+
+    let started_at = Instant::now();
+    let started_unix_ms = now_unix_ms();
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(1000));
+    tick.tick().await;
+
+    // A closed input channel is not a cancel: the run still owes a
+    // result. Park the recv arm instead of spinning on `None`.
+    let mut input_drained = false;
+    loop {
+        tokio::select! {
+            result = &mut run => return VerifyRunExit::Finished(result),
+            input_opt = async {
+                if input_drained {
+                    std::future::pending::<Option<AgentInput>>().await
+                } else {
+                    input_rx.recv().await
+                }
+            } => match input_opt {
+                Some(AgentInput::Cancel) => {
+                    let _ = cancel_tx.send(());
+                    return VerifyRunExit::Cancelled(None);
+                }
+                Some(AgentInput::CancelOutstanding { reason }) => {
+                    let _ = cancel_tx.send(());
+                    return VerifyRunExit::Cancelled(Some(reason));
+                }
+                Some(input @ AgentInput::UserMessage(..))
+                | Some(input @ AgentInput::StartAutonomous { .. })
+                | Some(input @ AgentInput::ScheduleWakeup { .. })
+                | Some(input @ AgentInput::SwitchProvider { .. })
+                | Some(input @ AgentInput::WatchCompleted { .. })
+                | Some(input @ AgentInput::DialogueMessage { .. })
+                | Some(input @ AgentInput::MailboxMessage { .. })
+                | Some(input @ AgentInput::ClearContext { .. }) => buffered.push(input),
+                None => input_drained = true,
+            },
+            _ = tick.tick() => {
+                let _ = events
+                    .send(AgentEvent::ProviderStatus {
+                        state: crate::protocol::ProviderStatusKind::ToolExecuting,
+                        started_at_unix_ms: started_unix_ms,
+                        elapsed_ms: started_at.elapsed().as_millis() as u64,
+                        bytes_received: None,
+                        tool_call_id: Some(tool_call_id.to_owned()),
+                    })
+                    .await;
+            }
+        }
+    }
+}
+
 /// Best-effort extraction of a panic payload's message. Panics carry
 /// `&str` or `String` in practice; anything else gets a placeholder.
 pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
@@ -254,6 +601,71 @@ pub(crate) enum ExecuteToolsExit {
     Cancelled { tool_messages: Vec<AgentMessage> },
 }
 
+/// The session capability's verdict on dispatching `name`. `Some(reason)`
+/// refuses; `None` allows. Shared by the model-issued dispatch path and
+/// the mu-83bw9 verification gate's own run, so both pass exactly the
+/// same gate.
+fn capability_refusal(
+    capability: &SessionCapability,
+    tool: Option<&Arc<dyn Tool>>,
+    name: &str,
+) -> Option<String> {
+    let cap = capability.lock().ok();
+    cap.as_ref().and_then(|c| match c.check_allow(name) {
+        CapabilityCheck::Allowed => {
+            // mu-8stm.2 (1b): the STRUCTURED appropriateness gate
+            // (canonical successor to mu-n25a's linear ceiling). Check
+            // the tool's canonical Effects against the session's
+            // per-axis constraints via the SAME `disallowed_by`
+            // predicate the discovery surface uses (single source of
+            // truth), BEFORE the AWS + permission gates so a
+            // `permission: Allow` tool cannot free-ride a restrictive
+            // posture (the SELF-CLASSIFIED-AUTHORITY bug class, mu-usfj).
+            // Unconstrained sessions (no ceiling) allow everything
+            // (back-compat). A missing tool falls through to the
+            // not-found path below. Unannotated effects fail closed —
+            // dormant today (`derived_effects()` is total over every
+            // dispatchable tool), it bites only a future unclassified
+            // dispatchable source.
+            //
+            // Use `derived_effects()` — the SAME projection discovery
+            // uses (including the aws->network/spend reach) — so the gate
+            // and `allowed_by_session` agree exactly, and an AWS-gated
+            // tool can't slip its network/spend reach past a
+            // no-network/no-spend posture just because the grant is held.
+            // The AWS-grant gate below is an ADDITIONAL check, not a
+            // substitute for the posture (review: gpt-5.5).
+            if let Some(t) = tool.as_ref() {
+                let effects = t.spec().policy.derived_effects();
+                if let CapabilityCheck::DeniedInappropriate { reason } =
+                    c.check_effects(Some(&effects))
+                {
+                    return Some(reason);
+                }
+            }
+            let required_aws = tool
+                .as_ref()
+                .and_then(|t| t.spec().policy.required_aws_capability.clone());
+            match required_aws {
+                Some(required) if !c.aws.iter().any(|aws_cap| aws_cap.name == required) => {
+                    Some(format!("missing required AWS capability `{required}`"))
+                }
+                _ => None,
+            }
+        }
+        CapabilityCheck::DeniedToolNotAllowed => {
+            Some("tool not in session's capability".to_owned())
+        }
+        CapabilityCheck::DeniedExpired => Some("session capability has expired".to_owned()),
+        CapabilityCheck::DeniedBudgetExhausted => {
+            Some("session capability's tool-call budget exhausted".to_owned())
+        }
+        CapabilityCheck::DeniedAutonomyDisallowed
+        | CapabilityCheck::DeniedSideEffectsExceeded { .. }
+        | CapabilityCheck::DeniedInappropriate { .. } => None,
+    })
+}
+
 async fn emit_tool_call_started(events: &mpsc::Sender<AgentEvent>, call: &ToolCall) {
     let _ = events
         .send(AgentEvent::ToolCallStarted {
@@ -271,6 +683,11 @@ async fn finish_tool_call(
     call: ToolCall,
     result: ToolResult,
     verbatim: bool,
+    // mu-83bw9: the dispatched tool's declared policy — the verification
+    // gate arms on a successful call to one that declares file-write
+    // reach. `None` when no tool answered it: an unknown name, or a
+    // cancellation tombstone.
+    policy: Option<&ToolPolicy>,
 ) {
     // mu-hgg4v: hash the RAW content before any filtering or
     // annotation, so repeats compare like-with-like across turns.
@@ -282,6 +699,7 @@ async fn finish_tool_call(
     };
     let repeats =
         history.identical_result_repeats(&call.name, call.arguments.as_value(), content_hash);
+    history.note_tool_edit(policy, &result);
     history.record(
         call.name.clone(),
         call.arguments.clone().into(),
@@ -376,6 +794,7 @@ async fn cancel_current_and_remaining(
         current.clone(),
         cancelled_tool_result(&current, reason, source, true),
         false,
+        None,
     )
     .await;
 
@@ -391,6 +810,7 @@ async fn cancel_current_and_remaining(
             call.clone(),
             cancelled_tool_result(&call, reason, source, false),
             false,
+            None,
         )
         .await;
     }
@@ -411,6 +831,11 @@ pub(crate) async fn handle_execute_tools(
     // near-miss suggestion below, which used to run unconditionally — so
     // an operator who turned the feature off still got half of it.
     discover_hints_enabled: bool,
+    // mu-83bw9: turns still available to this ask, counting the one in
+    // flight; `None` when the session has no turn cap. The verification
+    // gate stands down when the round trip it mandates cannot finish
+    // inside the budget.
+    turns_remaining: Option<u32>,
 ) -> Result<ExecuteToolsExit, Outcome> {
     let mut buffered: Vec<AgentInput> = Vec::new();
     let mut tool_messages: Vec<AgentMessage> = Vec::new();
@@ -441,62 +866,8 @@ pub(crate) async fn handle_execute_tools(
 
         let tool = tools.iter().find(|t| t.spec().name == call.name);
 
-        let capability_refusal_reason: Option<String> = {
-            let cap = capability.lock().ok();
-            cap.as_ref().and_then(|c| match c.check_allow(&call.name) {
-                CapabilityCheck::Allowed => {
-                    // mu-8stm.2 (1b): the STRUCTURED appropriateness gate
-                    // (canonical successor to mu-n25a's linear ceiling). Check
-                    // the tool's canonical Effects against the session's
-                    // per-axis constraints via the SAME `disallowed_by`
-                    // predicate the discovery surface uses (single source of
-                    // truth), BEFORE the AWS + permission gates so a
-                    // `permission: Allow` tool cannot free-ride a restrictive
-                    // posture (the SELF-CLASSIFIED-AUTHORITY bug class, mu-usfj).
-                    // Unconstrained sessions (no ceiling) allow everything
-                    // (back-compat). A missing tool falls through to the
-                    // not-found path below. Unannotated effects fail closed —
-                    // dormant today (`derived_effects()` is total over every
-                    // dispatchable tool), it bites only a future unclassified
-                    // dispatchable source.
-                    //
-                    // Use `derived_effects()` — the SAME projection discovery
-                    // uses (including the aws->network/spend reach) — so the gate
-                    // and `allowed_by_session` agree exactly, and an AWS-gated
-                    // tool can't slip its network/spend reach past a
-                    // no-network/no-spend posture just because the grant is held.
-                    // The AWS-grant gate below is an ADDITIONAL check, not a
-                    // substitute for the posture (review: gpt-5.5).
-                    if let Some(t) = tool.as_ref() {
-                        let effects = t.spec().policy.derived_effects();
-                        if let CapabilityCheck::DeniedInappropriate { reason } =
-                            c.check_effects(Some(&effects))
-                        {
-                            return Some(reason);
-                        }
-                    }
-                    let required_aws = tool
-                        .as_ref()
-                        .and_then(|t| t.spec().policy.required_aws_capability.clone());
-                    match required_aws {
-                        Some(required) if !c.aws.iter().any(|aws_cap| aws_cap.name == required) => {
-                            Some(format!("missing required AWS capability `{required}`"))
-                        }
-                        _ => None,
-                    }
-                }
-                CapabilityCheck::DeniedToolNotAllowed => {
-                    Some("tool not in session's capability".to_owned())
-                }
-                CapabilityCheck::DeniedExpired => Some("session capability has expired".to_owned()),
-                CapabilityCheck::DeniedBudgetExhausted => {
-                    Some("session capability's tool-call budget exhausted".to_owned())
-                }
-                CapabilityCheck::DeniedAutonomyDisallowed
-                | CapabilityCheck::DeniedSideEffectsExceeded { .. }
-                | CapabilityCheck::DeniedInappropriate { .. } => None,
-            })
-        };
+        let mut capability_refusal_reason: Option<String> =
+            capability_refusal(capability, tool, &call.name);
 
         let retry_refusal_reason: Option<&'static str> = match tool {
             Some(t) => match t.spec().policy.retry {
@@ -546,6 +917,174 @@ pub(crate) async fn handle_execute_tools(
             _ => None,
         };
 
+        // mu-83bw9: set once the gate's own run has spent a tool call, so
+        // the ask-ending call's capability verdict can be refreshed below.
+        let mut verify_run_spent_a_call = false;
+
+        // mu-83bw9: verification gate. When the model ends the ask after
+        // file-mutating calls, the RUNTIME runs the session's verify
+        // command itself and only then lets the ask-ending call through.
+        // Prose ("run the tests before you finish") does not reliably
+        // trigger the run, and inferring whether the model already ran it
+        // from the text of its shell commands was guesswork; executing the
+        // command is the fact. Fires at most once per ask (the history
+        // latches), so it cannot loop; nothing else is gated. Sits with
+        // the guards above so a gated call never reaches validate or an
+        // approver.
+        //
+        // "Ask-ending" is the tool's own `ends_turn_on_success` — the same
+        // policy flag the mu-spk7 completion path below keys on — not a
+        // tool name: this crate must not encode another crate's tool
+        // vocabulary. That reaches `final_answer` and equally any
+        // park-and-wake tool, which ends the ask just as finally.
+        let verify_refusal: Option<String> = if tool
+            .is_some_and(|t| t.spec().policy.ends_turn_on_success)
+            && capability_refusal_reason.is_none()
+            && retry_refusal_reason.is_none()
+            && loop_refusal_streak.is_none()
+        {
+            match history
+                .verify_command_due(turns_remaining)
+                .map(str::to_owned)
+            {
+                None => None,
+                Some(command) => match verify_call_headroom(capability)
+                    .and_then(|()| verify_shell(tools, capability, &command))
+                {
+                    // No shell, or one the session will not let the
+                    // runtime use for this: the gate cannot establish
+                    // anything, so it stands down (and does not latch)
+                    // rather than blocking the ask on a run it cannot make.
+                    Err(reason) => {
+                        let _ = events
+                            .send(AgentEvent::Callout {
+                                category: "warning".to_owned(),
+                                title: VERIFY_STAND_DOWN_TITLE.to_owned(),
+                                body: serde_json::json!({
+                                    "verify_command": command,
+                                    "reason": reason,
+                                }),
+                                theme: Some("warning".to_owned()),
+                                context_refs: vec!["bead:mu-83bw9".to_owned()],
+                            })
+                            .await;
+                        None
+                    }
+                    Ok((shell, arguments)) => {
+                        // mu-83bw9: budget parity. `check_allow` does not
+                        // decrement, so without this the runtime's run
+                        // was the one dispatch in the session that
+                        // executed for free and left `max_tool_calls`
+                        // overstating what remained. Exhaustion is
+                        // already handled: `verify_shell` above asks the
+                        // same `check_allow`, which refuses at zero
+                        // remaining and stands the gate down with a
+                        // callout instead of running.
+                        if let Ok(mut cap) = capability.lock() {
+                            cap.consume_tool_call();
+                        }
+                        verify_run_spent_a_call = true;
+                        let run = match run_verify_command_cancellable(
+                            &shell,
+                            arguments,
+                            input_rx,
+                            events,
+                            &mut buffered,
+                            &call.id,
+                        )
+                        .await
+                        {
+                            VerifyRunExit::Finished(result) => result,
+                            // Same two exits the model-issued dispatch
+                            // takes, synthetic tool results included: the
+                            // ask-ending call is still outstanding, and a
+                            // dangling function call breaks the next turn.
+                            VerifyRunExit::Cancelled(narrow) => {
+                                let remaining: Vec<ToolCall> = calls.drain(..).collect();
+                                match narrow {
+                                    None => {
+                                        let reason = "session cancelled while the runtime's \
+                                                      verify run was executing";
+                                        cancel_current_and_remaining(
+                                            events,
+                                            history,
+                                            &mut tool_messages,
+                                            call.clone(),
+                                            remaining,
+                                            reason,
+                                            "session.cancel",
+                                        )
+                                        .await;
+                                        return Ok(ExecuteToolsExit::Cancelled { tool_messages });
+                                    }
+                                    Some(reason) => {
+                                        cancel_current_and_remaining(
+                                            events,
+                                            history,
+                                            &mut tool_messages,
+                                            call.clone(),
+                                            remaining,
+                                            &reason,
+                                            "session.cancel_outstanding",
+                                        )
+                                        .await;
+                                        return Ok(ExecuteToolsExit::OutstandingCancelled {
+                                            reason,
+                                            tool_messages,
+                                            buffered,
+                                        });
+                                    }
+                                }
+                            }
+                        };
+                        let tail = output_tail(&run.content);
+                        // The run itself goes in the event log — the only
+                        // record that the runtime, not the model, ran it
+                        // and what came back.
+                        let _ = events
+                            .send(AgentEvent::Callout {
+                                category: if run.is_error { "warning" } else { "info" }.to_owned(),
+                                title: VERIFY_RUN_TITLE.to_owned(),
+                                body: serde_json::json!({
+                                    "verify_command": command,
+                                    "tool": shell.spec().name,
+                                    "failed": run.is_error,
+                                    "output": tail,
+                                }),
+                                theme: Some(
+                                    if run.is_error { "warning" } else { "info" }.to_owned(),
+                                ),
+                                context_refs: vec!["bead:mu-83bw9".to_owned()],
+                            })
+                            .await;
+                        if run.is_error {
+                            history.note_verify_refused();
+                            Some(format!(
+                                "runtime refused: {}. `{command}` failed after your edits:\n\
+                                 {tail}\nFix and finish.",
+                                call.name
+                            ))
+                        } else {
+                            history.note_verify_passed();
+                            None
+                        }
+                    }
+                },
+            }
+        } else {
+            None
+        };
+
+        // mu-83bw9: the gate's run spends from the same budget the
+        // capability check above read, so that verdict is stale by exactly
+        // the call it consumed. Recompute before dispatch: a budget the
+        // verify run exhausted must refuse this call with the ordinary
+        // capability text, not let it through on a check made when there
+        // was still room. Without this a budget of N executed N+1 calls.
+        if verify_run_spent_a_call {
+            capability_refusal_reason = capability_refusal(capability, tool, &call.name);
+        }
+
         // mu-bkjr: argument-aware pre-flight check. Tools that reject
         // specific argument shapes (e.g. bash's allowlist) can fail the
         // call here, BEFORE the PermissionLevel::Ask gate dispatches a
@@ -553,11 +1092,12 @@ pub(crate) async fn handle_execute_tools(
         // asked to approve a call that the tool will reject anyway.
         //
         // Only run when no higher-priority refusal applies — keeps the
-        // refusal-reason ordering stable (capability > retry > validate >
-        // permission-denied > execute).
+        // refusal-reason ordering stable (capability > retry > verify >
+        // validate > permission-denied > execute).
         let validate_refusal_reason: Option<String> = if capability_refusal_reason.is_none()
             && retry_refusal_reason.is_none()
             && loop_refusal_streak.is_none()
+            && verify_refusal.is_none()
         {
             tool.as_ref()
                 .and_then(|t| t.validate(call.arguments.as_value()).err())
@@ -571,6 +1111,7 @@ pub(crate) async fn handle_execute_tools(
         let mut permission_refusal_reason: Option<String> = None;
         let permission_decision = if retry_refusal_reason.is_none()
             && loop_refusal_streak.is_none()
+            && verify_refusal.is_none()
             && validate_refusal_reason.is_none()
         {
             match tool.as_ref().map(|t| t.spec().policy.permission) {
@@ -800,6 +1341,14 @@ pub(crate) async fn handle_execute_tools(
                 content: msg,
                 is_error: true,
             }
+        } else if let Some(msg) = verify_refusal {
+            // mu-83bw9: the runtime already ran the command and emitted
+            // its own callout above; this is the model's copy of the
+            // failure, tail included, so it can fix and finish.
+            ToolResult {
+                content: msg,
+                is_error: true,
+            }
         } else if let Some(reason) = validate_refusal_reason {
             // mu-bkjr: tool's pre-flight check rejected the arguments.
             // No InputRequired was dispatched — the user was never asked
@@ -969,16 +1518,24 @@ pub(crate) async fn handle_execute_tools(
             }
         };
 
-        let verbatim = tool.map(|t| t.spec().verbatim_result).unwrap_or(false);
-        all_ends_turn &= !result.is_error
-            && tool
-                .map(|t| t.spec().policy.ends_turn_on_success)
-                .unwrap_or(false);
+        let spec = tool.map(|t| t.spec());
+        let verbatim = spec.as_ref().is_some_and(|s| s.verbatim_result);
+        all_ends_turn &=
+            !result.is_error && spec.as_ref().is_some_and(|s| s.policy.ends_turn_on_success);
         all_guard_refused &= guard_refused;
         if guard_refused {
             last_guard_refusal = Some(result.content.clone());
         }
-        finish_tool_call(events, history, &mut tool_messages, call, result, verbatim).await;
+        finish_tool_call(
+            events,
+            history,
+            &mut tool_messages,
+            call,
+            result,
+            verbatim,
+            spec.as_ref().map(|s| &s.policy),
+        )
+        .await;
     }
 
     Ok(ExecuteToolsExit::Completed {

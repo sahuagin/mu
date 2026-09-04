@@ -8,15 +8,53 @@ record.)
 
 ## Captured
 
-- **Date:** 2026-06-13
+- **Date:** 2026-09-04 (refreshed from 2026-06-13). The delta since the
+  original pin, taken from the release notes between the two dates and
+  confirmed present in this snapshot: new models Claude Sonnet 5, Opus 5,
+  Fable 5.1 and Mythos 5.1 (Fable 5 and Mythos 5 were already in the June
+  pin), and on the Messages API: `role: "system"` messages inside `messages`
+  with per-message `output_config.effort` (`mid-conversation-output-config-2026-07-01`)
+  and turn-scoped `clear_at` (`mid-conversation-system-clear-at-2026-08-21`);
+  mid-conversation tool changes (`mid-conversation-tool-changes-2026-07-01`);
+  `thinking.display: "updates"` (`thinking-display-updates-2026-08-18`);
+  thinking-block binding — `thinking.block_binding.prefix_mismatch_behavior`
+  on the request and `input_transformations` on the response
+  (`thinking-binding-controls-2026-08-01`); the `fallbacks` request parameter
+  and its `"default"` mode (`server-side-fallback-2026-07-01`); `usage.speed`;
+  the `computer_toolset_20260801` and `browser_toolset_20260801` toolsets; the
+  Files and Skills APIs out of beta.
+- **Modeled so far, of that delta:** only mid-conversation tool changes, as
+  the request header the mu-ai lane sends (PR #604). NOT yet modeled by this
+  crate: system-role messages inside `messages` (`Role` is still User |
+  Assistant; a `{"role":"system"}` message does not deserialize), per-message
+  `output_config.effort`, `clear_at`, `thinking.display`, thinking-block
+  binding and `input_transformations`, the `fallbacks` parameter, `usage.speed`,
+  the two toolsets. The itemized plan is bead mu-anthropic-protocol-2026q3-6uqho.
+- **Shape change between the pins, not truncation:** the previous `llms.txt`
+  listed every API-reference page once per SDK language — 1305 entries tagged
+  `(cli)`, `(csharp)`, `(Go)`, `(Java)`, `(php)`, `(Python)`, `(Ruby)`,
+  `(terraform)`, `(TypeScript)` — and the refreshed one lists each page once
+  (1698 → 698 entries, all `docs/en/`, no translations in either). The full
+  file shrank from 79M to 42M raw for the same reason. Coverage was checked
+  page by page, not by heading count: every one of the 698 indexed page paths
+  appears in the refreshed full file (698 of 698; `# ` lines are not page
+  delimiters in this export, so do not count them). New top-level sections:
+  `about-claude`, `models`, `release-notes`, `resources`, `cli-sdks-libraries`.
+- **Citations into the snapshot:** comments in `src/` written before
+  2026-09-04 cite line offsets of the *previous* file (`llms-full.txt.xz:2660`,
+  `spec :55971`, and the "verified against … 2026-06-13" headers). Those offsets
+  do not apply to this file; the superseded snapshot is in history:
+  `git show f4641f0b:crates/providers/mu-anthropic/specifications/llms-full.txt.xz | xzcat`.
+  New citations should quote a page heading or a phrase (`xzgrep`-able), not a
+  line number.
 - **Source host:** https://platform.claude.com
 
 ## Files
 
 | file | source URL | stored | what it is |
 |---|---|---|---|
-| `llms.txt` | https://platform.claude.com/llms.txt | ~179K raw | Annotated INDEX of the docs — a link manifest. Use it to find and fetch individual pages on demand. |
-| `llms-full.txt.xz` | https://platform.claude.com/llms-full.txt | ~1.1M (xz; 79M raw) | The ENTIRE rendered docs in one file, the full spec of record. Stored `xz -9` compressed (79M → 1.1M, ~70×). Keeps the repo light; the text is xz-redundant. |
+| `llms.txt` | https://platform.claude.com/llms.txt | ~73K raw | Annotated INDEX of the docs — a link manifest. Use it to find and fetch individual pages on demand. |
+| `llms-full.txt.xz` | https://platform.claude.com/llms-full.txt | ~1.3M (xz; 42M raw) | The ENTIRE rendered docs in one file, the full spec of record. Stored `xz -9` compressed (42M → 1.3M, ~32×). Keeps the repo light; the text is xz-redundant. |
 
 ## Reading the compressed full spec (works offline)
 

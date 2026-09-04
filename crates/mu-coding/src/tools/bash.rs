@@ -8,7 +8,10 @@
 //!   allowlist. Explicit user opt-in.
 //!
 //! Both modes enforce timeout (60s default) and output cap (64KB)
-//! to bound denial-of-service / context-flood risks.
+//! to bound denial-of-service / context-flood risks. A timed-out or
+//! cancelled command is taken down as a whole process group, so
+//! grandchildren (cargo → test binary, backgrounded jobs) cannot
+//! outlive the tool call (mu-c1b3t).
 //!
 //! See spec mu-026.
 
@@ -21,7 +24,10 @@ use std::time::{Duration, Instant};
 use mu_core::agent::{
     PermissionLevel, RetryPolicy, SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec,
 };
+use nix::sys::signal::{killpg, Signal};
+use nix::unistd::Pid;
 use serde_json::{json, Value};
+use tokio::io::AsyncReadExt;
 use tokio::sync::oneshot;
 
 /// Default-baked allowlist of read-only commands. Each entry is the
@@ -55,6 +61,10 @@ pub const OUTPUT_CAP_BYTES: usize = 64 * 1024;
 /// enforce; max is enforced at 600s (10 min).
 pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 pub const MAX_TIMEOUT_SECS: u64 = 600;
+
+/// Grace between SIGTERM and SIGKILL when a timed-out or cancelled
+/// command's process group is taken down (mu-c1b3t).
+const GROUP_KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// Env vars to pass through to spawned processes in strict mode.
 /// Everything else is dropped (notably API keys and custom-named
@@ -346,12 +356,16 @@ impl Tool for BashTool {
             cmd.stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            // `kill_on_drop` ensures the child gets reaped if we drop
-            // the handle (timeout or cancel).
+            // mu-c1b3t: the command leads a fresh process group so a
+            // timeout or cancel can signal every descendant (cargo →
+            // test binary, backgrounded jobs), not just the shell it
+            // spawned. `kill_on_drop` stays as the last-resort SIGKILL
+            // of the direct child; `ProcessGroup` covers the rest.
+            cmd.process_group(0);
             cmd.kill_on_drop(true);
 
             let started_at = Instant::now();
-            let child = match cmd.spawn() {
+            let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
                     return ToolResult {
@@ -360,35 +374,57 @@ impl Tool for BashTool {
                     };
                 }
             };
+            // process_group(0) makes the child's pid its pgid.
+            let mut group = ProcessGroup::new(child.id());
 
-            // Race the wait against timeout and external cancel.
-            let wait = child.wait_with_output();
-            let outcome = tokio::select! {
-                out = wait => Some(out),
-                _ = tokio::time::sleep(timeout) => None,
-                _ = cancel_rx => {
-                    return ToolResult {
-                        content: "bash: cancelled".to_owned(),
-                        is_error: true,
-                    };
+            // Drain both pipes while waiting so a chatty child never
+            // blocks on a full pipe. The child handle stays owned here
+            // (not moved into `wait_with_output`) so the abnormal-exit
+            // arms below can still take the group down and reap it.
+            let mut stdout_buf = Vec::new();
+            let mut stderr_buf = Vec::new();
+            let outcome = {
+                let mut stdout = child.stdout.take().expect("stdout is piped just above");
+                let mut stderr = child.stderr.take().expect("stderr is piped just above");
+                let run = async {
+                    let (status, _, _) = tokio::try_join!(
+                        child.wait(),
+                        stdout.read_to_end(&mut stdout_buf),
+                        stderr.read_to_end(&mut stderr_buf),
+                    )?;
+                    Ok::<_, std::io::Error>(status)
+                };
+                // Race the wait against timeout and external cancel.
+                tokio::select! {
+                    r = run => RunOutcome::Exited(r),
+                    _ = tokio::time::sleep(timeout) => RunOutcome::TimedOut,
+                    _ = cancel_rx => RunOutcome::Cancelled,
                 }
             };
 
             let elapsed_ms = started_at.elapsed().as_millis() as u64;
 
-            let output = match outcome {
-                Some(Ok(o)) => o,
-                Some(Err(e)) => {
+            let status = match outcome {
+                RunOutcome::Exited(Ok(status)) => {
+                    // Normal exit: a deliberately detached background
+                    // job is left alone, as before.
+                    group.disarm();
+                    status
+                }
+                RunOutcome::Exited(Err(e)) => {
+                    group.terminate(&mut child).await;
                     return ToolResult {
                         content: format!("bash: wait failed after {elapsed_ms}ms: {e}"),
                         is_error: true,
                     };
                 }
-                None => {
-                    // Timeout: child is dropped (kill_on_drop fires).
-                    // We can't recover its partial output cleanly
-                    // because we moved it into wait_with_output. The
-                    // process is dead; report timeout.
+                RunOutcome::TimedOut => {
+                    // mu-c1b3t: take the whole group down (SIGTERM,
+                    // grace, SIGKILL) and reap the child before
+                    // reporting, so nothing the command started
+                    // outlives the timeout. Partial output is not
+                    // recovered; the result text is unchanged.
+                    group.terminate(&mut child).await;
                     return ToolResult {
                         content: format!(
                             "bash: timed out after {timeout_secs}s (command: {command:?})"
@@ -396,13 +432,20 @@ impl Tool for BashTool {
                         is_error: true,
                     };
                 }
+                RunOutcome::Cancelled => {
+                    group.terminate(&mut child).await;
+                    return ToolResult {
+                        content: "bash: cancelled".to_owned(),
+                        is_error: true,
+                    };
+                }
             };
 
             // Cap and format output.
-            let stdout = truncate_to_cap(&output.stdout, OUTPUT_CAP_BYTES / 2);
-            let stderr = truncate_to_cap(&output.stderr, OUTPUT_CAP_BYTES / 2);
-            let exit_code = output.status.code();
-            let is_error = !output.status.success();
+            let stdout = truncate_to_cap(&stdout_buf, OUTPUT_CAP_BYTES / 2);
+            let stderr = truncate_to_cap(&stderr_buf, OUTPUT_CAP_BYTES / 2);
+            let exit_code = status.code();
+            let is_error = !status.success();
 
             let mut content = stdout;
             if !stderr.is_empty() {
@@ -421,6 +464,84 @@ impl Tool for BashTool {
 
             ToolResult { content, is_error }
         })
+    }
+}
+
+/// How the spawned command's race against timeout / cancel ended.
+enum RunOutcome {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    TimedOut,
+    Cancelled,
+}
+
+/// The process group a spawned command leads (`process_group(0)` makes
+/// pgid == pid). While armed it means "this group must not outlive the
+/// tool call": [`ProcessGroup::terminate`] takes it down gracefully on
+/// timeout / cancel, and `Drop` SIGKILLs whatever is left if the tool
+/// future is torn down some other way. [`ProcessGroup::disarm`] after a
+/// normal exit leaves deliberately detached background jobs alone.
+/// (mu-c1b3t)
+struct ProcessGroup {
+    pgid: Option<Pid>,
+}
+
+impl ProcessGroup {
+    fn new(pid: Option<u32>) -> Self {
+        Self {
+            pgid: pid.and_then(|p| i32::try_from(p).ok()).map(Pid::from_raw),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.pgid = None;
+    }
+
+    /// `killpg`; with `None` (signal 0) this only probes whether any
+    /// member of the group still exists.
+    fn signal(pgid: Pid, sig: Option<Signal>) -> bool {
+        killpg(pgid, sig).is_ok()
+    }
+
+    /// SIGTERM the group, give it [`GROUP_KILL_GRACE`] to exit, SIGKILL
+    /// whatever is left, and reap the direct child. Returns as soon as
+    /// the group is empty. The group stays armed until the end so a
+    /// drop mid-way still SIGKILLs it.
+    async fn terminate(&mut self, child: &mut tokio::process::Child) {
+        let Some(pgid) = self.pgid else {
+            let _ = child.kill().await;
+            return;
+        };
+        Self::signal(pgid, Some(Signal::SIGTERM));
+        let deadline = Instant::now() + GROUP_KILL_GRACE;
+        let mut leader_reaped = false;
+        loop {
+            if !leader_reaped {
+                leader_reaped = !matches!(child.try_wait(), Ok(None));
+            }
+            // A zombie leader keeps the group alive for killpg, so the
+            // emptiness probe is only meaningful once it is reaped.
+            if leader_reaped && !Self::signal(pgid, None) {
+                self.pgid = None;
+                return;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Self::signal(pgid, Some(Signal::SIGKILL));
+        if !leader_reaped {
+            let _ = child.wait().await;
+        }
+        self.pgid = None;
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid {
+            Self::signal(pgid, Some(Signal::SIGKILL));
+        }
     }
 }
 
@@ -821,6 +942,78 @@ mod tests {
         let result = execute_bash(mode, json!({ "command": "sleep 5", "timeout_secs": 1 })).await;
         assert!(result.is_error);
         assert!(result.content.contains("timed out") || result.content.contains("timeout"));
+    }
+
+    /// mu-c1b3t: a timeout must take the whole process group down, not
+    /// just the direct child. Runs a command that backgrounds `sleep`
+    /// as a grandchild and records its pid, then asserts the sleep is
+    /// gone shortly after the tool reports the timeout.
+    async fn assert_timeout_kills_grandchild(
+        mode: BashMode,
+        command: String,
+        pidfile: &std::path::Path,
+    ) {
+        let result = execute_bash(mode, json!({ "command": command, "timeout_secs": 1 })).await;
+        assert!(result.is_error, "got: {}", result.content);
+        assert!(
+            result.content.contains("timed out after 1s"),
+            "got: {}",
+            result.content
+        );
+        let pid: i32 = std::fs::read_to_string(pidfile)
+            .expect("grandchild pid was recorded before the timeout")
+            .trim()
+            .parse()
+            .expect("pidfile holds a pid");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        // kill with `None` (signal 0) only probes for the pid's existence.
+        while nix::sys::signal::kill(Pid::from_raw(pid), None).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "grandchild sleep (pid {pid}) survived the tool timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn b7_yolo_timeout_kills_grandchildren() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("skipping: /bin/sh not present");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        // bash -c → sh -c → sleep: the sleep is two levels below the
+        // process the tool spawned.
+        let command = format!("sh -c 'sleep 60 & echo $! > {}; wait'", pidfile.display());
+        assert_timeout_kills_grandchild(BashMode::Yolo, command, &pidfile).await;
+    }
+
+    #[tokio::test]
+    async fn b7_strict_timeout_kills_grandchildren() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("skipping: /bin/sh not present");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        // Strict mode rejects shell metacharacters in the command, so
+        // the backgrounding lives in an allowlisted script.
+        let script = dir.path().join("spawn-sleep.sh");
+        {
+            let mut f = std::fs::File::create(&script).unwrap();
+            writeln!(f, "#!/bin/sh\nsleep 60 & echo $! > \"$1\"; wait").unwrap();
+            let mut perms = f.metadata().unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        let mode = BashMode::strict_with_extras(&[script.display().to_string()], false);
+        let command = format!("{} {}", script.display(), pidfile.display());
+        assert_timeout_kills_grandchild(mode, command, &pidfile).await;
     }
 
     #[tokio::test]

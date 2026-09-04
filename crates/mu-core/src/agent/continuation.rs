@@ -123,6 +123,12 @@ pub struct Continuation {
     /// `had_ragged_tail`. Used by a repairing caller to know where to
     /// start laying tombstones.
     pub first_ragged_event_id: Option<u64>,
+    /// mu-t4l5e: deferred tools the predecessor loaded (`ToolLoaded`
+    /// events, in log order, deduplicated). The resumed session seeds its
+    /// loaded set from this so a tool the model already reached stays in
+    /// the request. Loads persist across a context clear — the schema is
+    /// presentation, not history — and are never unloaded.
+    pub loaded_tools: Vec<String>,
 }
 
 /// One projected, sendable boundary: the messages up to and including
@@ -188,6 +194,7 @@ fn project_internal(events: &[SessionEvent]) -> Result<Continuation, Continuatio
     // never-answered call — not at whatever event happened to come next.
     let mut messages: Vec<AgentMessage> = Vec::new();
     let mut pending_tool_calls: Vec<(String, u64)> = Vec::new();
+    let mut loaded_tools: Vec<String> = Vec::new();
     let mut saw_conversational_event = false;
     let mut saw_continuation_seed = false;
 
@@ -355,6 +362,11 @@ fn project_internal(events: &[SessionEvent]) -> Result<Continuation, Continuatio
                     format!("invalid provider message: {validation_error}"),
                 ));
             }
+            // mu-t4l5e: a load is session state outside the message
+            // history — replayed into the loaded set, never a boundary.
+            EventPayload::ToolLoaded { name, .. } if !loaded_tools.iter().any(|n| n == name) => {
+                loaded_tools.push(name.clone());
+            }
             // All other event kinds (ContextAssembly, CompactionAssembly,
             // ProviderStatusUpdate, telemetry, mailbox, autonomy
             // bookkeeping, marks; tombstones already handled above) are
@@ -409,6 +421,7 @@ fn project_internal(events: &[SessionEvent]) -> Result<Continuation, Continuatio
         fork_event_id: Some(boundary.event_id),
         had_ragged_tail,
         first_ragged_event_id,
+        loaded_tools,
     })
 }
 
@@ -635,6 +648,118 @@ mod tests {
                 },
             },
         )
+    }
+
+    // ── mu-t4l5e: ToolLoaded replays into the loaded set ──
+
+    #[test]
+    fn tool_loaded_events_project_into_loaded_tools_and_survive_a_clear() {
+        use crate::agent::deferred_tools::{DeferredTools, ToolLoadReason};
+        let load = |id: u64, name: &str, reason: ToolLoadReason| {
+            ev(
+                id,
+                EventPayload::ToolLoaded {
+                    name: name.into(),
+                    reason,
+                },
+            )
+        };
+        let events = vec![
+            user(1, "watch the build"),
+            load(2, "watch", ToolLoadReason::Preselect),
+            assistant_text(3, "ok"),
+            // A repeat load is one name; loads persist across a clear.
+            load(4, "watch", ToolLoadReason::Touch),
+            load(5, "mailbox", ToolLoadReason::Touch),
+            ev(
+                6,
+                EventPayload::ContextCleared {
+                    reason: "test".into(),
+                },
+            ),
+            user(7, "again"),
+            assistant_text(8, "ok"),
+        ];
+        let c = project_strict(&events).expect("projection");
+        assert_eq!(
+            c.loaded_tools,
+            vec!["watch", "mailbox"],
+            "log order, deduplicated, across a clear"
+        );
+        assert_eq!(c.messages.len(), 2, "loads are not messages");
+        // What resume does with the projection: the handle rehydrates.
+        let d = DeferredTools::new(
+            ["watch", "mailbox", "aws_recon"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        d.seed_loaded(c.loaded_tools);
+        assert!(d.is_visible("watch"));
+        assert!(d.is_visible("mailbox"));
+        assert!(d.is_withheld("aws_recon"));
+    }
+
+    /// mu-t4l5e: the SECOND-generation resume. A resumed head's log
+    /// carries its inherited loads as `Inherited` rows (written next to
+    /// `ContinuationSeeded`), so projecting THAT log recovers them and a
+    /// resume of the resumed head keeps the original session's loads.
+    #[test]
+    fn inherited_loads_project_off_a_resumed_head_so_they_survive_a_second_resume() {
+        use crate::agent::deferred_tools::{DeferredTools, ToolLoadReason};
+        // Head B's log as `session.resume` writes it: seed events, then
+        // B's own exchange. No preselect/touch row of its own.
+        let events = vec![
+            ev(
+                1,
+                EventPayload::ContinuationSeeded {
+                    predecessor_session_id: "a".into(),
+                    branched_at_event_id: Some(9),
+                    messages: vec![AgentMessage::User {
+                        content: "watch the build".into(),
+                    }],
+                },
+            ),
+            ev(
+                2,
+                EventPayload::HeadAttached {
+                    daemon_id: "d1".into(),
+                    claimed_actor: "operator".into(),
+                    predecessor_session_id: "a".into(),
+                    branched_at_event_id: Some(9),
+                },
+            ),
+            ev(
+                3,
+                EventPayload::ToolLoaded {
+                    name: "watch".into(),
+                    reason: ToolLoadReason::Inherited,
+                },
+            ),
+            ev(
+                4,
+                EventPayload::ToolLoaded {
+                    name: "mailbox".into(),
+                    reason: ToolLoadReason::Inherited,
+                },
+            ),
+            user(5, "and again"),
+            assistant_text(6, "ok"),
+        ];
+        let c = project_strict(&events).expect("projection");
+        assert_eq!(
+            c.loaded_tools,
+            vec!["watch", "mailbox"],
+            "head C inherits head A's loads through head B's own rows"
+        );
+        let d = DeferredTools::new(
+            ["watch", "mailbox", "aws_recon"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        d.seed_loaded(c.loaded_tools);
+        assert!(d.is_visible("watch"));
+        assert!(d.is_visible("mailbox"));
+        assert!(d.is_withheld("aws_recon"));
     }
 
     // ── mu-lzkv6: ContextCleared restarts continuation history ──

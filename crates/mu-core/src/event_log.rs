@@ -524,6 +524,19 @@ pub enum EventPayload {
     /// continuation/resume projections restart from the latest marker.
     /// Session identity, grants, and system prompt are unaffected.
     ContextCleared { reason: String },
+    /// mu-t4l5e: a deferred tool's schema was promoted into the request
+    /// for the rest of the session. Appended BEFORE the loop's in-memory
+    /// loaded set changes (log first, then project); a resumed session
+    /// replays these into its own loaded set. `reason` is `preselect`
+    /// (the turn-start ranker matched the user message), `touch` (the
+    /// model called the tool by name), or `inherited` (a resume carried
+    /// the load over from the predecessor and re-wrote it here, so the
+    /// new head's log is self-sufficient). The deferred-names manifest
+    /// the model sees is derived from the set, never stored.
+    ToolLoaded {
+        name: String,
+        reason: crate::agent::deferred_tools::ToolLoadReason,
+    },
     /// mu-slat: a worker subprocess was spawned as a subprocess
     /// session. Emitted once by the supervisor when the worker process
     /// starts successfully.
@@ -737,6 +750,7 @@ impl EventPayload {
             Self::MailboxMessageConsumed { .. } => "mailbox_message_consumed",
             Self::TaskTelemetry { .. } => "task_telemetry",
             Self::ContextCleared { .. } => "context_cleared",
+            Self::ToolLoaded { .. } => "tool_loaded",
             Self::WorkerSpawned { .. } => "worker_spawned",
             Self::WorkerExited { .. } => "worker_exited",
             Self::WorkerFailed { .. } => "worker_failed",

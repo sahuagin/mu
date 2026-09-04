@@ -1,7 +1,9 @@
-//! Deterministic `DynamicViewport` scenario driver for the pty screen-scrape
-//! test (`tests/pty_scrape.rs`, mu-8oqp) — a miniature in-repo mu-vt-probe.
-//! Run under a pty; the parent test parses the emitted escape stream with an
-//! independent vt100 model and asserts on the resulting screen.
+//! Deterministic `DynamicViewport` scenario driver — a miniature in-repo
+//! mu-vt-probe for running the mu-8oqp scenarios against a REAL terminal
+//! by hand (`cargo run -p mu-solo --bin vt-scenario -- collapse`). The
+//! automated check of the same scenarios is `tests/vt_scrape.rs`, which
+//! drives the viewport headless and parses its output with vt100; keep the
+//! two scenario lists in step.
 
 use mu_solo::viewport::DynamicViewport;
 use ratatui::style::Style;

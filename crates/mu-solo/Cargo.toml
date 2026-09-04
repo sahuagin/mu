@@ -51,15 +51,16 @@ arboard = { version = "3.6.1", default-features = false }
 # ratatui; same version).
 unicode-width = "0.2"
 
-# Deterministic viewport scenario driver for the pty screen-scrape test
-# (mu-8oqp) — a miniature in-repo mu-vt-probe. Normal deps only.
+# Deterministic viewport scenario driver (mu-8oqp) — a miniature in-repo
+# mu-vt-probe for running the tests/vt_scrape.rs scenarios against a REAL
+# terminal by hand, through the production constructor. Normal deps only.
 [[bin]]
 name = "vt-scenario"
 path = "src/bin/vt-scenario.rs"
 
 [dev-dependencies]
-# Screen-scrape validation (mu-8oqp): an INDEPENDENT terminal model. Two
-# prior fixes in this bug family were green on their own bookkeeping tests
-# and wrong on the real screen; asserting through vt100 breaks that loop.
+# Screen validation (mu-8oqp): an INDEPENDENT terminal model. Two prior
+# fixes in this bug family were green on their own bookkeeping tests and
+# wrong on the real screen; asserting through vt100 breaks that loop.
+# (tests/vt_scrape.rs; runs the viewport headless, no pty, no subprocess.)
 vt100 = "0.15"
-nix = { version = "0.29.0", features = ["term", "poll"] }

@@ -862,6 +862,15 @@ pub struct SessionConfig {
     /// daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_max_turns: Option<u32>,
+    /// mu-ucjhg: how many consecutive assistant turns may consist solely
+    /// of tool calls the retry/loop guard refused before the loop ends
+    /// the ask. A refusal is an ordinary error tool result, so a model
+    /// that keeps issuing calls the guards refuse costs one model round
+    /// trip per refusal with nothing ending the ask — with the turn cap
+    /// disabled the only stop was an external wall timeout. Reaching the
+    /// budget ends the ask with an error the caller can see (`mu ask`
+    /// prints the reason and exits non-zero). `0` disables the floor.
+    pub max_guard_refusals: u32,
 }
 
 impl Default for SessionConfig {
@@ -871,6 +880,7 @@ impl Default for SessionConfig {
             resume_on_daemon_restart: false,
             state_dir: None,
             default_max_turns: None,
+            max_guard_refusals: crate::agent::loop_::DEFAULT_MAX_GUARD_REFUSALS,
         }
     }
 }
@@ -1259,6 +1269,17 @@ mod tests {
         // operators opt into discover-on-demand via TOML
         let c: Config = toml::from_str("[recall]\nenabled = false\n").expect("parse");
         assert!(!c.recall.enabled);
+    }
+
+    #[test]
+    fn session_max_guard_refusals_defaults_on_and_toml_can_disable() {
+        // mu-ucjhg: the guard-refusal floor is on by default; 0 disables it.
+        assert_eq!(
+            Config::default().session.max_guard_refusals,
+            crate::agent::loop_::DEFAULT_MAX_GUARD_REFUSALS
+        );
+        let c: Config = toml::from_str("[session]\nmax_guard_refusals = 0\n").expect("parse");
+        assert_eq!(c.session.max_guard_refusals, 0);
     }
 
     #[test]

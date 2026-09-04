@@ -225,6 +225,11 @@ pub(crate) enum ExecuteToolsExit {
         /// mu-spk7: every executed call was an ends-turn tool (watch) and
         /// succeeded — complete the ask instead of re-invoking the model.
         all_ends_turn: bool,
+        /// mu-ucjhg: `Some(last refusal text)` iff every call in this round
+        /// was refused by the retry/loop guard (capability, validation, and
+        /// permission refusals do not count). The loop tallies such rounds
+        /// against `AgentConfig::max_guard_refusals`.
+        guard_refused: Option<String>,
     },
     /// The current ask was narrow-cancelled while one or more assistant
     /// tool calls were outstanding. `tool_messages` contains synthetic
@@ -416,6 +421,11 @@ pub(crate) async fn handle_execute_tools(
     // true only when there are calls at all; any refusal, error, or
     // ordinary tool flips it off.
     let mut all_ends_turn = !calls.is_empty();
+    // mu-ucjhg: true iff every call so far was refused by the retry/loop
+    // guard; `last_guard_refusal` keeps the most recent refusal text for
+    // the loop's stop message. Seeded like `all_ends_turn`.
+    let mut all_guard_refused = !calls.is_empty();
+    let mut last_guard_refusal: Option<String> = None;
 
     while let Some(call) = calls.pop_front() {
         let _ = events
@@ -704,6 +714,11 @@ pub(crate) async fn handle_execute_tools(
 
         let permission_denied = matches!(permission_decision, Some(ApprovalDecision::Deny));
 
+        // mu-ucjhg: a retry/loop-guard refusal, as distinct from the
+        // capability refusal that takes precedence over both below.
+        let guard_refused = capability_refusal_reason.is_none()
+            && (loop_refusal_streak.is_some() || retry_refusal_reason.is_some());
+
         let result = if let Some(cap_reason) = capability_refusal_reason {
             // mu-spk7: cause-neutral phrasing. The old text asserted "this
             // session has been delegated a narrower scope than the root"
@@ -959,6 +974,10 @@ pub(crate) async fn handle_execute_tools(
             && tool
                 .map(|t| t.spec().policy.ends_turn_on_success)
                 .unwrap_or(false);
+        all_guard_refused &= guard_refused;
+        if guard_refused {
+            last_guard_refusal = Some(result.content.clone());
+        }
         finish_tool_call(events, history, &mut tool_messages, call, result, verbatim).await;
     }
 
@@ -966,5 +985,6 @@ pub(crate) async fn handle_execute_tools(
         tool_messages,
         buffered,
         all_ends_turn,
+        guard_refused: all_guard_refused.then_some(last_guard_refusal).flatten(),
     })
 }

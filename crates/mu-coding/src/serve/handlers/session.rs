@@ -1055,6 +1055,8 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
             memory_hints,
             // mu-vcbm: launch-time effort default → loop's standing effort.
             effort: effort.map(|e| Arc::from(e.as_str())),
+            // mu-ucjhg: guard-refusal floor; config-driven only.
+            max_guard_refusals: daemon_info.config().session.max_guard_refusals,
         },
         events: events_tx,
         pending_approvals: pending_approvals.clone(),

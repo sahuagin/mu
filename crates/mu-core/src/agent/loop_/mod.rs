@@ -793,6 +793,11 @@ pub struct AgentConfig {
     /// `AgentInput::UserMessage` and override it. `None` ⇒ the provider's
     /// own construction-time default (its `--thinking` value, if any).
     pub effort: Option<Arc<str>>,
+    /// mu-ucjhg: budget of consecutive tool rounds in which every call was
+    /// refused by the retry/loop guard. Reaching it ends the ask with an
+    /// error (see [`DEFAULT_MAX_GUARD_REFUSALS`]); `0` disables the floor.
+    /// Wired from `[session].max_guard_refusals` at session creation.
+    pub max_guard_refusals: u32,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -810,6 +815,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("kx_hints", &self.kx_hints.is_some())
             .field("memory_hints", &self.memory_hints.is_some())
             .field("effort", &self.effort)
+            .field("max_guard_refusals", &self.max_guard_refusals)
             .finish()
     }
 }
@@ -829,6 +835,7 @@ impl Default for AgentConfig {
             kx_hints: None,
             memory_hints: None,
             effort: None,
+            max_guard_refusals: DEFAULT_MAX_GUARD_REFUSALS,
         }
     }
 }
@@ -938,6 +945,16 @@ enum Action {
 /// `max_turns` iteration cap, which every re-invoke counts against).
 /// (mu-rb4u)
 const MAX_EMPTY_TURN_RETRIES: u32 = 3;
+
+/// mu-ucjhg: default for [`AgentConfig::max_guard_refusals`] — consecutive
+/// tool rounds consisting solely of retry/loop-guard refusals before the
+/// loop ends the ask. The guards bound the tool call, not the turn: each
+/// refusal is an ordinary error tool result and so a full model round
+/// trip, and a model that answers every refusal with the same call runs
+/// until an external cap (observed 2026-09-03: one byte-identical bash
+/// call refused 205 times — 5 loop guard, 200 retry guard — up to the
+/// driver's 1200 s wall timeout at 250 requests). This bounds the turn.
+pub const DEFAULT_MAX_GUARD_REFUSALS: u32 = 5;
 
 /// A turn is "actionless" when the model returned neither a tool call nor
 /// any visible text — e.g. an OpenAI Responses-API reasoning-only
@@ -1379,6 +1396,10 @@ async fn run_inner(
     // ask start and on any non-actionless turn; bounds the empty-turn
     // auto-continue at `MAX_EMPTY_TURN_RETRIES`.
     let mut consecutive_empty_turns: u32 = 0;
+    // mu-ucjhg: consecutive tool rounds in which every call was refused by
+    // the retry/loop guard. Reset at ask start and on any round with a call
+    // the guards let through; ends the ask at `config.max_guard_refusals`.
+    let mut consecutive_guard_refused_rounds: u32 = 0;
     let mut mode: RunMode = RunMode::Idle;
     let mut aggregated_usage: Option<Usage> = None;
     let mut last_stop_reason: Option<StopReason> = None;
@@ -2302,6 +2323,8 @@ async fn run_inner(
                     started_at = Some(Instant::now());
                     // mu-rb4u: a fresh ask gets a fresh empty-turn budget.
                     consecutive_empty_turns = 0;
+                    // mu-ucjhg: and a fresh guard-refusal budget.
+                    consecutive_guard_refused_rounds = 0;
                 }
                 turn_count += 1;
                 let _ = events.send(AgentEvent::TurnStart).await;
@@ -3030,6 +3053,7 @@ async fn run_inner(
                         tool_messages,
                         buffered,
                         all_ends_turn,
+                        guard_refused,
                     }) => {
                         if let RunMode::Autonomous {
                             tool_calls_consumed,
@@ -3043,6 +3067,93 @@ async fn run_inner(
                             messages.push(r);
                         }
                         let _ = events.send(AgentEvent::TurnEnd).await;
+                        // mu-ucjhg: guard-refusal floor. The retry/loop
+                        // guards refuse per call and a refusal is an ordinary
+                        // error tool result, so a model that keeps issuing
+                        // calls the guards refuse — the same call verbatim,
+                        // or a never-retry tool's run of varied failing calls
+                        // — pays a model round trip per refusal and nothing
+                        // ends the ask. Count rounds in which EVERY call was
+                        // guard-refused; a round with any call the guards let
+                        // through resets the count.
+                        consecutive_guard_refused_rounds = match guard_refused {
+                            Some(_) => consecutive_guard_refused_rounds.saturating_add(1),
+                            None => 0,
+                        };
+                        if let Some(last_refusal) = guard_refused.filter(|_| {
+                            config.max_guard_refusals > 0
+                                && consecutive_guard_refused_rounds >= config.max_guard_refusals
+                        }) {
+                            let message = format!(
+                                "the runtime stopped this session: every tool call in the \
+                                 last {n} consecutive turns was refused by the retry/loop \
+                                 guard ([session].max_guard_refusals = {budget}); last \
+                                 refusal: {last_refusal}",
+                                n = consecutive_guard_refused_rounds,
+                                budget = config.max_guard_refusals,
+                            );
+                            let _ = events
+                                .send(AgentEvent::Callout {
+                                    category: "error".to_owned(),
+                                    title: "guard refusal budget exhausted".to_owned(),
+                                    body: serde_json::json!({
+                                        "consecutive_refused_rounds": consecutive_guard_refused_rounds,
+                                        "max_guard_refusals": config.max_guard_refusals,
+                                        "last_refusal": last_refusal,
+                                    }),
+                                    theme: Some("error".to_owned()),
+                                    context_refs: vec!["bead:mu-ucjhg".to_owned()],
+                                })
+                                .await;
+                            // One final runtime message, in the conversation
+                            // and (via the forwarder) the event log, so a later
+                            // ask on this session and a reader of the log see
+                            // why the ask ended rather than a bare error.
+                            let stop_msg = AgentMessage::User {
+                                content: message.clone(),
+                            };
+                            let _ = events
+                                .send(AgentEvent::MessageStart {
+                                    message: stop_msg.clone(),
+                                })
+                                .await;
+                            messages.push(stop_msg.clone());
+                            let _ = events
+                                .send(AgentEvent::MessageEnd { message: stop_msg })
+                                .await;
+                            // Then end the ask the way a stream error does:
+                            // Error + Done(Error), so `mu ask` prints the
+                            // reason and exits non-zero and the ask's receipt
+                            // is a CommandFailed.
+                            let _ = events
+                                .send(AgentEvent::Error {
+                                    message: message.clone(),
+                                })
+                                .await;
+                            terminate_autonomous_error_if_active(&events, &mut mode, message).await;
+                            let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
+                            let _ = events
+                                .send(AgentEvent::Done {
+                                    stop_reason: StopReason::Error,
+                                    turn_count,
+                                    usage: aggregated_usage.take(),
+                                    elapsed_ms,
+                                    command_receipts: std::mem::take(pending_tickets),
+                                })
+                                .await;
+                            started_at = None;
+                            turn_count = 0;
+                            tool_history.clear();
+                            last_stop_reason = None;
+                            consecutive_guard_refused_rounds = 0;
+                            // Inputs that arrived during the round start the
+                            // next ask instead of vanishing with this one.
+                            let salvaged = salvage_queued_driver_inputs(&mut queue);
+                            for input in salvaged.into_iter().chain(buffered) {
+                                queue.push_back(Action::External(input));
+                            }
+                            continue;
+                        }
                         // mu-roz1e: a turn-boundary interjection (a buffered
                         // UserMessage/WatchCompleted/etc. that arrived between
                         // tool-call iterations during this active response) is

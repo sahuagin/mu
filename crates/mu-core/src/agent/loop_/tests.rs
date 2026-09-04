@@ -6758,6 +6758,215 @@ async fn rb4u_persistent_empty_turns_give_up_after_bound() {
     assert_eq!(gave_up, 1, "should give up exactly once");
 }
 
+// ── mu-ucjhg: guard-refusal floor — consecutive refused rounds end the ask ──
+
+/// The tool-result text of every retry/loop-guard refusal in `events`, in
+/// order.
+fn guard_refusal_results(events: &[AgentEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCallCompleted {
+                content, is_error, ..
+            } if *is_error && content.starts_with("runtime refused:") => Some(content.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One successful call re-issued forever. Helper for the floor tests: the
+/// loop guard (mu-503qk) refuses from the 4th call on, and the refusals
+/// record as errors with the same arguments, so from the 9th call the retry
+/// guard (mu-rsvx7) holds instead — the shape of the 2026-09-03 runaway.
+fn forever_same_call() -> (MockProvider, Vec<MockTool>) {
+    let provider = MockProvider::forever(vec![ProviderEvent::Done(assistant_tool_call(
+        "t1",
+        "echo",
+        json!({"command": "cargo test"}),
+    ))]);
+    let tools = vec![MockTool::always_ok("echo", "same bytes every time")];
+    (provider, tools)
+}
+
+/// Before the floor, each refusal was a fresh model round trip that nothing
+/// ended — 205 identical refusals to a 1200 s wall cap with the turn cap
+/// disabled. With the budget at 5 the ask ends after the fifth consecutive
+/// refused round, with the reason in the conversation, in a callout, and on
+/// the error the caller sees (`mu ask` bails on `session.error`).
+#[tokio::test]
+async fn ucjhg_guard_refusal_budget_ends_ask_with_error() {
+    let (provider, tools) = forever_same_call();
+    let config = AgentConfig {
+        // No turn cap: the floor is the only thing that can end this ask.
+        max_turns: None,
+        max_guard_refusals: 5,
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(provider, tools, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("go"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("join must not hang");
+    let events = events_handle.await.expect("events drain");
+
+    // 3 executed rounds + 5 refused rounds; the model is not invoked again.
+    let refusals = guard_refusal_results(&events);
+    assert_eq!(refusals.len(), 5, "refusals: {refusals:?}");
+    assert!(refusals.iter().all(|r| r.contains("loop guard")));
+    let turns = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::TurnStart))
+        .count();
+    assert_eq!(turns, 8, "no re-invoke after the stop");
+
+    let errors: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Error { message } => Some(message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors.len(), 1, "errors: {errors:?}");
+    let reason = errors[0];
+    assert!(
+        reason.starts_with("the runtime stopped this session"),
+        "{reason}"
+    );
+    assert!(reason.contains("5 consecutive turns"), "{reason}");
+    assert!(
+        reason.contains("last refusal: runtime refused: loop guard"),
+        "{reason}"
+    );
+
+    // The same text is the final message of the conversation.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::MessageEnd {
+                message: AgentMessage::User { content }
+            } if content == reason
+        )),
+        "the runtime stop message must be recorded as a conversation message"
+    );
+    let callouts = events
+        .iter()
+        .filter(|e| {
+            matches!(e, AgentEvent::Callout { category, title, .. }
+                if category == "error" && title == "guard refusal budget exhausted")
+        })
+        .count();
+    assert_eq!(callouts, 1);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Done {
+                stop_reason: StopReason::Error,
+                ..
+            }
+        )),
+        "the ask ends under StopReason::Error"
+    );
+    // The SESSION outlives the stopped ask: join returns the idle sentinel,
+    // as after any other ask-ending error.
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// `[session].max_guard_refusals = 0` disables the floor: the same runaway
+/// runs to the turn cap, as before.
+#[tokio::test]
+async fn ucjhg_guard_refusal_budget_zero_disables_floor() {
+    let (provider, tools) = forever_same_call();
+    let config = AgentConfig {
+        max_turns: Some(12),
+        max_guard_refusals: 0,
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(provider, tools, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("go"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("join must not hang");
+    let events = events_handle.await.expect("events drain");
+
+    let refusals = guard_refusal_results(&events);
+    assert_eq!(refusals.len(), 9, "12 turns - 3 executed: {refusals:?}");
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Callout { title, .. } if title == "guard refusal budget exhausted"
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Done {
+            stop_reason: StopReason::IterationCap,
+            ..
+        }
+    )));
+}
+
+/// The budget counts CONSECUTIVE all-refused rounds: a round with a call
+/// the guards let through resets it, so a model that alternates real work
+/// with the occasional refused repeat is never stopped.
+#[tokio::test]
+async fn ucjhg_guard_refusal_count_resets_on_executed_call() {
+    let a = || {
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "ta",
+            "echo",
+            json!({"command": "a"}),
+        ))]
+    };
+    let b = || {
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "tb",
+            "echo",
+            json!({"command": "b"}),
+        ))]
+    };
+    let mut script: Vec<Vec<ProviderEvent>> = Vec::new();
+    // 3 executed, then 4 refused (one short of the budget).
+    script.extend((0..7).map(|_| a()));
+    // A different action: executed, resets the count.
+    script.push(b());
+    // The loop guard re-arms after 3 fresh successes; 4 more refusals.
+    script.extend((0..7).map(|_| a()));
+    script.push(vec![ProviderEvent::Done(assistant_text("done"))]);
+    let provider = MockProvider::new(script);
+    let tools = vec![MockTool::always_ok("echo", "same bytes every time")];
+    let config = AgentConfig {
+        max_turns: None,
+        max_guard_refusals: 5,
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(provider, tools, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("go"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("join must not hang");
+    let events = events_handle.await.expect("events drain");
+
+    let refusals = guard_refusal_results(&events);
+    assert_eq!(refusals.len(), 8, "4 + 4 refusals: {refusals:?}");
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Callout { title, .. } if title == "guard refusal budget exhausted"
+    )));
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
 /// mu-htbz0: a UserMessage buffered while the provider streams must
 /// survive a narrow-cancel. The cancel aborts the ASK (Done/Aborted),
 /// then the buffered message starts the NEXT ask on its own — no

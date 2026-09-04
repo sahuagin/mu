@@ -1,5 +1,6 @@
 pub mod capabilities;
 pub mod continuation;
+pub mod deferred_tools;
 pub mod loop_;
 pub mod provider;
 pub mod tool;

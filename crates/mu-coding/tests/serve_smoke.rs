@@ -1949,6 +1949,115 @@ async fn mh4_resume_forks_clean_session_at_tail() {
     let _ = std::fs::remove_dir_all(&events_dir);
 }
 
+/// mu-t4l5e: a resumed head's inherited tool loads are DURABLE ROWS on
+/// its OWN log (`ToolLoaded` with reason `inherited`), so a resume of the
+/// resumed head keeps them. Seeding the new head's loaded set in process
+/// only would die at the second generation: head B's log would carry just
+/// `ContinuationSeeded` + `HeadAttached`, and projecting it for head C
+/// would find no `ToolLoaded` at all.
+#[tokio::test]
+async fn t4l5e_inherited_tool_loads_survive_a_second_resume() {
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let events_dir = unique_test_dir("t4l5e-resume-loads");
+    let config = Config {
+        auth: AuthConfig::Bearer {
+            tokens: vec![TEST_BEARER_TOKEN.to_string()],
+        },
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
+        session: mu_core::config::SessionConfig {
+            defer_tools: true,
+            ..Default::default()
+        },
+        // Floor at 0 keeps this about the load surviving resume; the
+        // ranker's threshold is unit-tested in `agent::deferred_tools`.
+        index: mu_core::config::IndexConfig {
+            discover_injection_min_score_ratio: 0.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (mut client, server_handle) =
+        spawn_server_full(provider, Vec::new(), config, Some(events_dir.clone())).await;
+
+    // A disk-backed session defers `spawn_worker`; naming it in the ask
+    // makes turn-start pre-selection load it before the first request.
+    let predecessor = create_and_ask_to_done(&mut client, 1, "spawn a worker to run this").await;
+    let daemon_id = std::fs::read_dir(&events_dir)
+        .expect("events dir")
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().is_dir())
+        .expect("daemon events directory")
+        .file_name()
+        .to_string_lossy()
+        .into_owned();
+
+    let resume = |id: u64, session_ref: String| {
+        let req = json!({
+            "jsonrpc": "2.0", "id": id, "method": "session.resume",
+            "params": {
+                "session_ref": session_ref,
+                "provider": { "kind": "anthropic_api", "model": "x" }
+            }
+        });
+        format!("{req}\n")
+    };
+
+    client
+        .write_all(resume(100, format!("{daemon_id}:{predecessor}")).as_bytes())
+        .await
+        .expect("write first resume");
+    let first = loop {
+        let line = read_line(&mut client).await;
+        if line["id"] == 100 {
+            break line;
+        }
+    };
+    assert!(first.get("error").is_none(), "first resume: {first}");
+    let head_b = first["result"]["session_id"]
+        .as_str()
+        .expect("head B id")
+        .to_string();
+
+    client
+        .write_all(resume(101, format!("{daemon_id}:{head_b}")).as_bytes())
+        .await
+        .expect("write second resume");
+    let second = loop {
+        let line = read_line(&mut client).await;
+        if line["id"] == 101 {
+            break line;
+        }
+    };
+    assert!(second.get("error").is_none(), "second resume: {second}");
+    let head_c = second["result"]["session_id"]
+        .as_str()
+        .expect("head C id")
+        .to_string();
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+
+    let log = |session: &str| {
+        std::fs::read_to_string(events_dir.join(&daemon_id).join(format!("{session}.jsonl")))
+            .unwrap_or_else(|e| panic!("read {session} log: {e}"))
+    };
+    let origin = log(&predecessor);
+    assert!(
+        origin.contains(r#""kind":"tool_loaded""#) && origin.contains(r#""reason":"preselect""#),
+        "pre-selection loaded a deferred tool on the original session: {origin}"
+    );
+    for (label, session) in [("head B", &head_b), ("head C", &head_c)] {
+        let persisted = log(session);
+        assert!(
+            persisted.contains(r#""reason":"inherited""#),
+            "{label} carries its inherited loads as its own rows: {persisted}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&events_dir);
+}
+
 /// mu-mh4: session.resume REFUSES an unknown predecessor with a clear
 /// not-found error (does not panic or silently create an empty session).
 #[tokio::test]

@@ -304,6 +304,10 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
         // records it as a UserMessage via MessageEnd), not via a dedicated
         // wire notification.
         | AgentEvent::Interjected { .. }
+        // mu-t4l5e: a load is visible to clients through the next
+        // ContextAssembly's tool count and the durable row; no wire
+        // notification of its own.
+        | AgentEvent::ToolLoaded { .. }
         | AgentEvent::ProviderSwitched { .. } => None,
     }
 }
@@ -822,6 +826,15 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
             EventActor::Agent,
             EventPayload::ContextCleared {
                 reason: reason.clone(),
+            },
+        )),
+        // mu-t4l5e: durable load marker — the loop sends it before its
+        // loaded set changes; resume replays it into the new head.
+        AgentEvent::ToolLoaded { name, reason } => Some((
+            EventActor::System,
+            EventPayload::ToolLoaded {
+                name: name.clone(),
+                reason: *reason,
             },
         )),
         AgentEvent::Callout {

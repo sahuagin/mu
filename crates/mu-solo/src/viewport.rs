@@ -1221,9 +1221,9 @@ impl Drop for DynamicViewport {
 //
 // These tests exercise the scrollback_committed invariant, the grow-split /
 // committed-delta arithmetic, and the region-push emission byte streams
-// (mu-8oqp).  We cannot instantiate a real DynamicViewport here (no TTY), so
-// we test the pure helpers directly; the on-screen behavior is validated by
-// tests/pty_scrape.rs under a real pty.
+// (mu-8oqp), through the pure helpers and `new_headless`; the on-screen
+// behavior — what an independent terminal model displays after the same
+// operations — is validated by tests/vt_scrape.rs.
 
 #[cfg(test)]
 mod tests {

@@ -2199,7 +2199,6 @@ dependencies = [
  "futures",
  "gethostname",
  "mu-core",
- "nix",
  "rand 0.8.6",
  "ratatui",
  "rmcp",

@@ -446,6 +446,7 @@ fn kind(event: &AgentEvent) -> &'static str {
         AgentEvent::AgentStart => "agent_start",
         AgentEvent::TurnStart => "turn_start",
         AgentEvent::ContextCleared { .. } => "context_cleared",
+        AgentEvent::ToolLoaded { .. } => "tool_loaded",
         AgentEvent::MessageStart { .. } => "message_start",
         AgentEvent::TextDelta { .. } => "text_delta",
         AgentEvent::ThinkingDelta { .. } => "thinking_delta",
@@ -4905,6 +4906,9 @@ struct InputRecord {
     all_span_ids: Vec<String>,
     /// mu-vcbm: the per-call effort the loop passed to `stream()`.
     effort: Option<String>,
+    /// mu-t4l5e: names of the tool specs the loop passed to `stream()`,
+    /// in list order — what the model was offered this call.
+    tool_names: Vec<String>,
 }
 
 impl RecordingProvider {
@@ -4925,10 +4929,11 @@ impl Provider for RecordingProvider {
         _system_prompt: Option<&str>,
         effort: Option<&str>,
         input: MessageInput<'_>,
-        _tools: &[ToolSpec],
+        tools: &[ToolSpec],
         _cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
         let effort = effort.map(str::to_owned);
+        let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
         let record = match input {
             MessageInput::Legacy(msgs) => InputRecord {
                 variant: InputVariant::Legacy,
@@ -4938,6 +4943,7 @@ impl Provider for RecordingProvider {
                 first_span_ids: Vec::new(),
                 all_span_ids: Vec::new(),
                 effort,
+                tool_names: tool_names.clone(),
             },
             MessageInput::Projected(pmsgs) => InputRecord {
                 variant: InputVariant::Projected,
@@ -4960,6 +4966,7 @@ impl Provider for RecordingProvider {
                     .flat_map(|m| m.source_span_ids().iter().map(|s| s.as_ref().to_string()))
                     .collect(),
                 effort,
+                tool_names,
             },
         };
         self.records.lock().expect("records mutex").push(record);
@@ -7098,5 +7105,520 @@ async fn htbz0_queued_interject_survives_cancel_one_stage_later() {
                 if content.contains("operator interjection") && content.contains("B buffered")
         )),
         "salvaged input must be a plain fresh ask, not a mid-turn interjection"
+    );
+}
+
+// ============================================================================
+// mu-t4l5e: deferred tool schemas — pre-selection + hydrate-on-touch.
+// ============================================================================
+
+use crate::agent::deferred_tools::{
+    DeferredTools, PreselectConfig, ToolLoadReason, MANIFEST_SPAN_ID,
+};
+
+fn deferred_handle(names: &[&str]) -> Arc<DeferredTools> {
+    Arc::new(DeferredTools::new(names.iter().map(|s| s.to_string())))
+}
+
+/// One ask through a RecordingProvider with a deferred handle on the
+/// config; returns the provider's per-call records and the loop events.
+async fn run_deferred_ask(
+    responses: Vec<Vec<ProviderEvent>>,
+    tools: Vec<Arc<dyn Tool>>,
+    deferred: Arc<DeferredTools>,
+    user: &str,
+) -> (Vec<InputRecord>, Vec<AgentEvent>) {
+    run_deferred_ask_with_capability(
+        responses,
+        tools,
+        deferred,
+        crate::capability::Capability::root(),
+        user,
+    )
+    .await
+}
+
+/// As [`run_deferred_ask`], with the session capability spelled out — the
+/// pre-selection and touch paths both consult it before loading.
+async fn run_deferred_ask_with_capability(
+    responses: Vec<Vec<ProviderEvent>>,
+    tools: Vec<Arc<dyn Tool>>,
+    deferred: Arc<DeferredTools>,
+    cap: crate::capability::Capability,
+    user: &str,
+) -> (Vec<InputRecord>, Vec<AgentEvent>) {
+    let (provider, records) = RecordingProvider::new(responses);
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(cap));
+    let config = AgentConfig {
+        system_prompt: Some(Arc::from("you are mu")),
+        deferred_tools: Some(deferred),
+        ..AgentConfig::default()
+    };
+    let loop_ = loop_with(
+        provider,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        tools,
+        config,
+        events_tx,
+        approvals,
+        capability,
+    );
+    loop_
+        .send(AgentInput::UserMessage(user_msg(user), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("drain");
+    let records = records.lock().expect("records").clone();
+    (records, events)
+}
+
+fn has_tool(rec: &InputRecord, name: &str) -> bool {
+    rec.tool_names.iter().any(|n| n == name)
+}
+
+fn loaded_at(events: &[AgentEvent], name: &str, why: ToolLoadReason) -> Option<usize> {
+    events.iter().position(
+        |e| matches!(e, AgentEvent::ToolLoaded { name: n, reason } if n == name && *reason == why),
+    )
+}
+
+/// (a) With deferral on and nothing loaded, the request carries only the
+/// core schemas and one System span right after the system prompt names
+/// the withheld tools. Nothing loads on a non-matching ask.
+#[tokio::test]
+async fn t4l5e_withheld_schemas_stay_out_and_the_manifest_names_them() {
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(MockTool::ok("read", "ok")),
+        Arc::new(MockTool::ok("zorblax_gizmo", "ok")),
+    ];
+    let (records, events) = run_deferred_ask(
+        vec![vec![ProviderEvent::Done(assistant_text("done"))]],
+        tools,
+        deferred_handle(&["zorblax_gizmo"]),
+        "hello",
+    )
+    .await;
+    assert_eq!(records.len(), 1);
+    let rec = &records[0];
+    assert_eq!(rec.tool_names, vec!["read"], "only core schemas are sent");
+    let sys = rec
+        .all_span_ids
+        .iter()
+        .position(|id| id == "system-prompt")
+        .expect("system span");
+    let manifest = rec
+        .all_span_ids
+        .iter()
+        .position(|id| id == MANIFEST_SPAN_ID)
+        .expect("manifest span");
+    assert_eq!(
+        manifest,
+        sys + 1,
+        "manifest sits right after the system prompt"
+    );
+    assert!(
+        rec.provider_contents
+            .iter()
+            .any(|c| c.contains("Deferred tools") && c.contains("zorblax_gizmo")),
+        "manifest names the withheld tool: {:?}",
+        rec.provider_contents
+    );
+    assert!(
+        !events.iter().any(|e| kind(e) == "tool_loaded"),
+        "a non-matching ask loads nothing"
+    );
+    let tool_count = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ContextAssembly { tool_count, .. } => Some(*tool_count),
+            _ => None,
+        })
+        .expect("context assembly");
+    assert_eq!(tool_count, 1, "the audit row counts the sent specs only");
+}
+
+/// (b) Calling a withheld tool by name loads it and runs the call in the
+/// same round; the load is logged before the result, and the schema is
+/// in the next request (with no manifest left once nothing is withheld).
+#[tokio::test]
+async fn t4l5e_touch_loads_the_tool_and_runs_the_call_in_the_same_round() {
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(MockTool::ok("read", "ok")),
+        Arc::new(MockTool::ok("zorblax_gizmo", "gizmo ok")),
+    ];
+    let (records, events) = run_deferred_ask(
+        vec![
+            vec![ProviderEvent::Done(assistant_tool_call(
+                "t1",
+                "zorblax_gizmo",
+                json!({}),
+            ))],
+            vec![ProviderEvent::Done(assistant_text("done"))],
+        ],
+        tools,
+        deferred_handle(&["zorblax_gizmo"]),
+        "hello",
+    )
+    .await;
+    assert_eq!(records.len(), 2, "one tool round, then the answer");
+    assert_eq!(records[0].tool_names, vec!["read"]);
+    assert!(
+        has_tool(&records[1], "zorblax_gizmo"),
+        "loaded schema joins the next request: {:?}",
+        records[1].tool_names
+    );
+    assert!(
+        !records[1]
+            .all_span_ids
+            .iter()
+            .any(|id| id == MANIFEST_SPAN_ID),
+        "nothing withheld ⇒ no manifest span"
+    );
+    let loaded = loaded_at(&events, "zorblax_gizmo", ToolLoadReason::Touch).expect("touch logged");
+    let completed = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::ToolCallCompleted { tool_call_id, content, is_error: false }
+                    if tool_call_id == "t1" && content == "gizmo ok"
+            )
+        })
+        .expect("the call executed in the same round");
+    assert!(
+        loaded < completed,
+        "the load is logged before the call's result"
+    );
+}
+
+/// (c) A touch whose arguments fail `validate` still loads the tool but
+/// does not run it: the error carries the description and input schema
+/// so the retry is informed.
+#[tokio::test]
+async fn t4l5e_touch_with_invalid_arguments_returns_the_schema_without_running() {
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(MockTool::ok("read", "ok")),
+        Arc::new(
+            MockTool::ok("zorblax_gizmo", "gizmo ok").with_validate_rejection("needs `target`"),
+        ),
+    ];
+    let (records, events) = run_deferred_ask(
+        vec![
+            vec![ProviderEvent::Done(assistant_tool_call(
+                "t1",
+                "zorblax_gizmo",
+                json!({}),
+            ))],
+            vec![ProviderEvent::Done(assistant_text("done"))],
+        ],
+        tools,
+        deferred_handle(&["zorblax_gizmo"]),
+        "hello",
+    )
+    .await;
+    let (content, is_error) = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolCallCompleted {
+                tool_call_id,
+                content,
+                is_error,
+            } if tool_call_id == "t1" => Some((content.clone(), *is_error)),
+            _ => None,
+        })
+        .expect("a result for t1");
+    assert!(is_error);
+    assert!(
+        content.starts_with(
+            "`zorblax_gizmo` is now loaded; arguments did not validate: needs `target`"
+        ),
+        "got: {content}"
+    );
+    assert!(
+        content.contains("Mock tool: zorblax_gizmo"),
+        "description rides along"
+    );
+    assert!(
+        content.contains("\"type\":\"object\""),
+        "input schema rides along"
+    );
+    assert!(!content.contains("gizmo ok"), "the tool did not run");
+    assert!(loaded_at(&events, "zorblax_gizmo", ToolLoadReason::Touch).is_some());
+    assert!(
+        has_tool(&records[1], "zorblax_gizmo"),
+        "loaded regardless of the bad arguments"
+    );
+}
+
+/// (d) Pre-selection: a deferred tool whose name matches the user message
+/// is loaded — and logged — before the first request is built, and the
+/// manifest shrinks to the ones still withheld. (`min_score_ratio: 0.0`
+/// keeps this about the mechanism; the floor is unit-tested in
+/// `agent::deferred_tools`.)
+#[tokio::test]
+async fn t4l5e_preselect_loads_a_matching_deferred_tool_before_the_first_request() {
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(MockTool::ok("read", "ok")),
+        Arc::new(MockTool::ok("frobnicate_widget", "ok")),
+        Arc::new(MockTool::ok("zorblax_gizmo", "ok")),
+    ];
+    let deferred = Arc::new(
+        DeferredTools::new(["frobnicate_widget".to_string(), "zorblax_gizmo".to_string()])
+            .with_preselect(PreselectConfig {
+                limit: 5,
+                min_score_ratio: 0.0,
+            }),
+    );
+    let (records, events) = run_deferred_ask(
+        vec![vec![ProviderEvent::Done(assistant_text("done"))]],
+        tools,
+        deferred,
+        "frobnicate the widget for me",
+    )
+    .await;
+    assert_eq!(records.len(), 1);
+    let rec = &records[0];
+    assert!(has_tool(rec, "read"));
+    assert!(
+        has_tool(rec, "frobnicate_widget"),
+        "the matching deferred tool is in the FIRST request: {:?}",
+        rec.tool_names
+    );
+    assert!(
+        !has_tool(rec, "zorblax_gizmo"),
+        "a non-matching deferred tool stays withheld"
+    );
+    let loaded = loaded_at(&events, "frobnicate_widget", ToolLoadReason::Preselect)
+        .expect("preselect logged");
+    let assembled = events
+        .iter()
+        .position(|e| kind(e) == "context_assembly")
+        .expect("context assembly");
+    assert!(loaded < assembled, "logged before the request is assembled");
+    assert!(
+        rec.provider_contents
+            .iter()
+            .any(|c| c.contains("Deferred tools")
+                && c.contains("zorblax_gizmo")
+                && !c.contains("frobnicate_widget")),
+        "manifest names only what is still withheld: {:?}",
+        rec.provider_contents
+    );
+}
+
+/// (d2) Pre-selection never loads a tool the session may not invoke, even
+/// when the message names it: the manifest is attenuated (so the denied
+/// tool neither ranks nor sets the floor for the ones that may) and the
+/// candidate filter applies the same `check_allow` rule hydrate-on-touch
+/// uses. A permitted deferred tool on the same turn still loads.
+#[tokio::test]
+async fn t4l5e_preselect_skips_a_tool_the_session_capability_denies() {
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(MockTool::ok("read", "ok")),
+        Arc::new(MockTool::ok("frobnicate_widget", "ok")),
+        Arc::new(MockTool::ok("zorblax_gizmo", "ok")),
+    ];
+    let deferred = Arc::new(
+        DeferredTools::new(["frobnicate_widget".to_string(), "zorblax_gizmo".to_string()])
+            .with_preselect(PreselectConfig {
+                limit: 5,
+                min_score_ratio: 0.0,
+            }),
+    );
+    let allowed: std::collections::HashSet<String> = ["read", "frobnicate_widget"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let (records, events) = run_deferred_ask_with_capability(
+        vec![vec![ProviderEvent::Done(assistant_text("done"))]],
+        tools,
+        deferred,
+        crate::capability::Capability {
+            allowed_tools: Some(allowed),
+            ..Default::default()
+        },
+        "frobnicate the widget, then use the zorblax gizmo",
+    )
+    .await;
+    let rec = &records[0];
+    assert!(
+        has_tool(rec, "frobnicate_widget"),
+        "a permitted deferred hit still loads: {:?}",
+        rec.tool_names
+    );
+    assert!(
+        !has_tool(rec, "zorblax_gizmo"),
+        "the denied tool's schema never joins the request: {:?}",
+        rec.tool_names
+    );
+    assert!(
+        loaded_at(&events, "zorblax_gizmo", ToolLoadReason::Preselect).is_none(),
+        "a denied tool is not loaded and no ToolLoaded is logged for it"
+    );
+    assert!(
+        rec.provider_contents
+            .iter()
+            .any(|c| c.contains("Deferred tools") && c.contains("zorblax_gizmo")),
+        "it stays withheld (still a name in the manifest, still callable): {:?}",
+        rec.provider_contents
+    );
+}
+
+/// (d3) The pre-selection filter is the SESSION's whole rule, not just the
+/// grant: a deferred tool that IS in `allowed_tools` but whose derived
+/// effects the session posture forbids must not pre-load, and touching it
+/// must be refused for that same reason. Ranking through
+/// `discover_view_constrained` plus the shared `session_permits` predicate
+/// is what makes the two agree; filtering on `check_allow` alone put a
+/// schema in the request for a tool no call could ever run (PR #600 panel).
+#[tokio::test]
+async fn t4l5e_preselect_skips_a_tool_the_session_posture_forbids() {
+    use crate::agent::tool::{PermissionLevel, RetryPolicy, SideEffects, ToolPolicy};
+
+    // `permission: Allow` is the free-ride shape — only the posture stops it.
+    let execute_policy = ToolPolicy {
+        side_effects: SideEffects::Execute,
+        permission: PermissionLevel::Allow,
+        retry: RetryPolicy::ModelDecides,
+        required_aws_capability: None,
+        idempotent: false,
+        ends_turn_on_success: false,
+    };
+    let tools = || -> Vec<Arc<dyn Tool>> {
+        vec![
+            Arc::new(MockTool::ok("read", "ok")),
+            Arc::new(MockTool::ok("frobnicate_widget", "ok")),
+            Arc::new(MockTool::ok("zorblax_gizmo", "gizmo ok").with_policy(execute_policy.clone())),
+        ]
+    };
+    // Every tool is GRANTED; only the read-only posture forbids the
+    // Execute-class one.
+    let cap = || crate::capability::Capability {
+        allowed_tools: Some(
+            ["read", "frobnicate_widget", "zorblax_gizmo"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        ),
+        max_side_effects: Some(SideEffects::ReadOnly),
+        ..Default::default()
+    };
+    let deferred = || {
+        Arc::new(
+            DeferredTools::new(["frobnicate_widget".to_string(), "zorblax_gizmo".to_string()])
+                .with_preselect(PreselectConfig {
+                    limit: 5,
+                    min_score_ratio: 0.0,
+                }),
+        )
+    };
+
+    // Pre-selection half: the message names both tools.
+    let (records, events) = run_deferred_ask_with_capability(
+        vec![vec![ProviderEvent::Done(assistant_text("done"))]],
+        tools(),
+        deferred(),
+        cap(),
+        "frobnicate the widget, then use the zorblax gizmo",
+    )
+    .await;
+    let rec = &records[0];
+    assert!(
+        has_tool(rec, "frobnicate_widget"),
+        "a deferred tool the posture permits still loads: {:?}",
+        rec.tool_names
+    );
+    assert!(
+        !has_tool(rec, "zorblax_gizmo"),
+        "the posture-forbidden tool's schema never joins the request: {:?}",
+        rec.tool_names
+    );
+    assert!(
+        loaded_at(&events, "zorblax_gizmo", ToolLoadReason::Preselect).is_none(),
+        "no ToolLoaded for a tool the dispatch gate would refuse"
+    );
+    assert!(
+        rec.provider_contents
+            .iter()
+            .any(|c| c.contains("Deferred tools") && c.contains("zorblax_gizmo")),
+        "it stays withheld — still a name in the manifest: {:?}",
+        rec.provider_contents
+    );
+
+    // Touch half: the same tool called by name is refused, naming the
+    // posture rather than the grant, and the touch does not load it.
+    let (_records, events) = run_deferred_ask_with_capability(
+        vec![
+            vec![ProviderEvent::Done(assistant_tool_call(
+                "t1",
+                "zorblax_gizmo",
+                json!({}),
+            ))],
+            vec![ProviderEvent::Done(assistant_text("done"))],
+        ],
+        tools(),
+        deferred(),
+        cap(),
+        "hello",
+    )
+    .await;
+    let (content, is_error) = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolCallCompleted {
+                tool_call_id,
+                content,
+                is_error,
+            } if tool_call_id == "t1" => Some((content.clone(), *is_error)),
+            _ => None,
+        })
+        .expect("a result for t1");
+    assert!(is_error, "the touch is refused");
+    assert!(
+        content.contains("read-only") || content.contains("no filesystem writes"),
+        "refused for the POSTURE — the same reason pre-selection skipped it; got: {content}"
+    );
+    assert!(!content.contains("gizmo ok"), "the tool did not run");
+    assert!(
+        loaded_at(&events, "zorblax_gizmo", ToolLoadReason::Touch).is_none(),
+        "a capability refusal wins over the load on touch too"
+    );
+}
+
+/// (e) Replay: a loaded set seeded from the log (what resume does with
+/// `Continuation::loaded_tools`) is visible from the first request and is
+/// not re-logged — the event already exists on the predecessor's log.
+#[tokio::test]
+async fn t4l5e_seeded_loads_are_visible_from_the_first_request_without_relogging() {
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(MockTool::ok("read", "ok")),
+        Arc::new(MockTool::ok("zorblax_gizmo", "ok")),
+        Arc::new(MockTool::ok("other_gadget", "ok")),
+    ];
+    let deferred = deferred_handle(&["zorblax_gizmo", "other_gadget"]);
+    deferred.seed_loaded(["zorblax_gizmo".to_string()]);
+    let (records, events) = run_deferred_ask(
+        vec![vec![ProviderEvent::Done(assistant_text("done"))]],
+        tools,
+        deferred,
+        "hello",
+    )
+    .await;
+    assert!(
+        has_tool(&records[0], "zorblax_gizmo"),
+        "replayed load is visible"
+    );
+    assert!(
+        !has_tool(&records[0], "other_gadget"),
+        "the rest stays withheld"
+    );
+    assert!(
+        !events.iter().any(|e| kind(e) == "tool_loaded"),
+        "replayed state is not logged again"
     );
 }

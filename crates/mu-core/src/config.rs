@@ -231,11 +231,32 @@ pub struct IndexConfig {
     /// lexical floor instead of billing per turn.
     #[serde(default)]
     pub discover_injection_semantic: bool,
+    /// mu-t4l5e: turn-start pre-selection of deferred tools. Only
+    /// meaningful with `[session].defer_tools`: each user message is
+    /// ranked through the `discover` ranker (lexical, the same floor rule
+    /// as `discover_injection_min_score_ratio`) and the deferred tools
+    /// that qualify are loaded — schema in the request — before the model
+    /// is called. The harness selects, so no model propensity to call
+    /// `discover` is required. Default `true`; a session with deferral
+    /// off never ranks.
+    #[serde(default = "default_true")]
+    pub preselect: bool,
+    /// mu-t4l5e: max deferred tools pre-selection loads per user message.
+    /// Each load rewrites the tool list (one prefix-cache miss), so this
+    /// bounds churn per turn rather than the session total; loads never
+    /// unload.
+    #[serde(default = "default_preselect_limit")]
+    pub preselect_limit: usize,
 }
 
 /// serde default helper for [`IndexConfig::discover_injection_limit`].
 fn default_discover_injection_limit() -> usize {
     3
+}
+
+/// serde default helper for [`IndexConfig::preselect_limit`].
+fn default_preselect_limit() -> usize {
+    5
 }
 
 /// serde default helper for [`IndexConfig::discover_injection_min_score_ratio`].
@@ -257,6 +278,8 @@ impl Default for IndexConfig {
             discover_injection_limit: default_discover_injection_limit(),
             discover_injection_min_score_ratio: default_discover_injection_min_score_ratio(),
             discover_injection_semantic: false,
+            preselect: true,
+            preselect_limit: default_preselect_limit(),
         }
     }
 }
@@ -862,6 +885,42 @@ pub struct SessionConfig {
     /// daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_max_turns: Option<u32>,
+    /// mu-t4l5e: withhold non-core tool schemas from the request. Tools
+    /// outside [`Self::core_tools`] are still granted (the capability and
+    /// effects gates keep the full set) but the model sees only a compact
+    /// names manifest until a tool is loaded — by turn-start pre-selection
+    /// (`[index].preselect`) or by calling it by name (hydrate-on-touch:
+    /// the call runs in the same round). Off by default until the battery
+    /// shows no regression; applies to `--bare` sessions too when set.
+    pub defer_tools: bool,
+    /// mu-t4l5e: tools whose schema is always in the request when
+    /// `defer_tools` is on. Names not present in the session are ignored.
+    /// `final_answer` and `discover` are core whether or not this list
+    /// names them (`DeferredTools::ALWAYS_CORE`): the loop ends a turn
+    /// through one and the deferred manifest points at the other, so
+    /// withholding either breaks the tier rather than shrinking it.
+    #[serde(default = "default_core_tools")]
+    pub core_tools: Vec<String>,
+}
+
+/// serde default helper for [`SessionConfig::core_tools`]: the file
+/// tools, `bash`, the two the loop itself relies on (`final_answer`,
+/// `discover`).
+fn default_core_tools() -> Vec<String> {
+    [
+        "read",
+        "write",
+        "edit",
+        "ls",
+        "grep",
+        "glob",
+        "bash",
+        "final_answer",
+        "discover",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 impl Default for SessionConfig {
@@ -871,6 +930,8 @@ impl Default for SessionConfig {
             resume_on_daemon_restart: false,
             state_dir: None,
             default_max_turns: None,
+            defer_tools: false,
+            core_tools: default_core_tools(),
         }
     }
 }
@@ -1311,6 +1372,57 @@ mod tests {
         assert_eq!(c.recall.tier, "full");
         // tier composes with enabled untouched
         assert!(c.recall.enabled);
+    }
+
+    #[test]
+    fn defer_tools_defaults_off_with_core_set_and_preselect_on() {
+        // mu-t4l5e: deferral is opt-in; the pre-selection knobs default on
+        // so enabling `defer_tools` alone gets the harness-side selection.
+        let c = Config::default();
+        assert!(!c.session.defer_tools);
+        assert_eq!(
+            c.session.core_tools,
+            [
+                "read",
+                "write",
+                "edit",
+                "ls",
+                "grep",
+                "glob",
+                "bash",
+                "final_answer",
+                "discover"
+            ]
+        );
+        assert!(c.index.preselect);
+        assert_eq!(c.index.preselect_limit, 5);
+        // An empty file and a partial [session] section both keep the
+        // defaults (the `deny_unknown_fields` + `serde(default)` contract).
+        let parsed: Config = toml::from_str("").expect("parse");
+        assert_eq!(parsed, c);
+        let partial: Config = toml::from_str("[session]\ndefault_max_turns = 3\n").expect("parse");
+        assert!(!partial.session.defer_tools);
+        assert_eq!(partial.session.core_tools, c.session.core_tools);
+    }
+
+    #[test]
+    fn defer_tools_toml_enables_with_custom_core_tools() {
+        let c: Config = toml::from_str(
+            "[session]\ndefer_tools = true\ncore_tools = [\"read\", \"bash\"]\n\n\
+             [index]\npreselect = false\npreselect_limit = 2\n",
+        )
+        .expect("parse");
+        assert!(c.session.defer_tools);
+        assert_eq!(c.session.core_tools, ["read", "bash"]);
+        assert!(!c.index.preselect);
+        assert_eq!(c.index.preselect_limit, 2);
+        // `defer_tools` alone keeps the default core list.
+        let only_flag: Config = toml::from_str("[session]\ndefer_tools = true\n").expect("parse");
+        assert!(only_flag.session.defer_tools);
+        assert_eq!(
+            only_flag.session.core_tools,
+            Config::default().session.core_tools
+        );
     }
 
     #[test]

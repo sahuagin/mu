@@ -300,6 +300,9 @@ pub fn extract_per_session_metric_segments(events: &[SessionEvent]) -> Vec<PerSe
             // mu-lzkv6: a context-clear marker is history bookkeeping,
             // not a usage/timing signal.
             | EventPayload::ContextCleared { .. }
+            // mu-t4l5e: a deferred-tool load is tool-list bookkeeping,
+            // not a usage/timing signal.
+            | EventPayload::ToolLoaded { .. }
             // mu-slat: worker lifecycle events are supervisor-side
             // bookkeeping, not per-call usage signals.
             | EventPayload::WorkerSpawned { .. }

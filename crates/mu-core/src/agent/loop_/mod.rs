@@ -20,6 +20,9 @@ mod invoke;
 // Re-exports
 pub use autonomy::RunMode;
 pub use execute_tools::TOOL_HISTORY_WINDOW;
+// mu-t4l5e: the dispatch gate's session check, reused by pre-selection in
+// `agent::deferred_tools` so the two paths cannot drift apart.
+pub(crate) use execute_tools::session_permits;
 
 // Internal module imports
 use execute_tools::ToolHistory;
@@ -361,6 +364,13 @@ pub enum AgentEvent {
     /// the durable ContextCleared marker from this.
     ContextCleared {
         reason: String,
+    },
+    /// mu-t4l5e: a deferred tool's schema was promoted into the request.
+    /// Sent BEFORE the loop mutates its loaded set (log first, then
+    /// project); the forwarder appends the durable `ToolLoaded` row.
+    ToolLoaded {
+        name: String,
+        reason: crate::agent::deferred_tools::ToolLoadReason,
     },
     MessageStart {
         message: AgentMessage,
@@ -793,6 +803,14 @@ pub struct AgentConfig {
     /// `AgentInput::UserMessage` and override it. `None` ⇒ the provider's
     /// own construction-time default (its `--thinking` value, if any).
     pub effort: Option<Arc<str>>,
+    /// mu-t4l5e: deferred tool schemas. When `Some`, only core and loaded
+    /// tools' schemas go in the request; the rest are named in one compact
+    /// System span after the system prompt, and load by turn-start
+    /// pre-selection or by being called (hydrate-on-touch). Shared with the
+    /// `discover` tool so it can mark withheld entries. `None` (the
+    /// default) ⇒ every tool's schema every request, as before; wired by
+    /// the daemon from `[session].defer_tools`.
+    pub deferred_tools: Option<Arc<crate::agent::deferred_tools::DeferredTools>>,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -810,6 +828,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("kx_hints", &self.kx_hints.is_some())
             .field("memory_hints", &self.memory_hints.is_some())
             .field("effort", &self.effort)
+            .field("deferred_tools", &self.deferred_tools.is_some())
             .finish()
     }
 }
@@ -829,6 +848,7 @@ impl Default for AgentConfig {
             kx_hints: None,
             memory_hints: None,
             effort: None,
+            deferred_tools: None,
         }
     }
 }
@@ -1413,6 +1433,10 @@ async fn run_inner(
     // re-arms its memories). `text: None` memoizes "ranked to nothing" so
     // tool rounds don't re-run the embedder.
     let mut memory_hints: Vec<crate::context::memory_hints::InjectedMemoryHint> = Vec::new();
+    // mu-t4l5e: pre-selection runs once per user message — keyed by the
+    // message index within the context epoch so tool rounds of the same
+    // ask don't re-rank, and a post-clear message at a reused index does.
+    let mut preselect_memo: Option<(u64, usize)> = None;
     // mu-wsgx: feedback anchor for the compaction-trigger measure.
     // None until the first provider-reported usage; reset on provider
     // switch (different tokenizer + accounting convention).
@@ -2306,7 +2330,59 @@ async fn run_inner(
                 turn_count += 1;
                 let _ = events.send(AgentEvent::TurnStart).await;
 
-                let tool_specs: Vec<ToolSpec> = tools.iter().map(|t| t.spec()).collect();
+                // mu-t4l5e: pre-selection. Rank the last user-role message
+                // against the session's PERMITTED tool surface with the
+                // `discover` ranker and load the deferred tools that clear
+                // the floor BEFORE the specs are built, so the schema is in
+                // this very request. The harness selects; the model never
+                // has to ask. Each load is an event first, then a set
+                // mutation. The capability snapshot is taken once per rank
+                // (same shape as the hint ranker below); it attenuates the
+                // manifest, supplies the posture the ranking is constrained
+                // by, and filters the candidates through the same predicate
+                // the dispatch gate uses — so a tool the session may not
+                // invoke never loads here either.
+                if let Some(deferred) = config.deferred_tools.as_deref() {
+                    let anchor = deferred
+                        .preselect()
+                        .and_then(|_| {
+                            messages
+                                .iter()
+                                .rposition(|m| matches!(m, AgentMessage::User { .. }))
+                        })
+                        .filter(|idx| preselect_memo != Some((context_epoch, *idx)));
+                    if let Some(idx) = anchor {
+                        preselect_memo = Some((context_epoch, idx));
+                        let intent = match &messages[idx] {
+                            AgentMessage::User { content } => content.as_str(),
+                            _ => "",
+                        };
+                        let cap_snapshot = capability.lock().map(|c| c.clone()).unwrap_or_default();
+                        for name in deferred.preselect_candidates(&tools, &cap_snapshot, intent) {
+                            let _ = events
+                                .send(AgentEvent::ToolLoaded {
+                                    name: name.clone(),
+                                    reason: crate::agent::deferred_tools::ToolLoadReason::Preselect,
+                                })
+                                .await;
+                            deferred.load(&name);
+                        }
+                    }
+                }
+
+                // mu-t4l5e: withheld schemas stay out of the request; the
+                // tool itself stays in `tools` so a call by name still
+                // resolves (hydrate-on-touch in execute_tools).
+                let tool_specs: Vec<ToolSpec> = tools
+                    .iter()
+                    .map(|t| t.spec())
+                    .filter(|spec| {
+                        config
+                            .deferred_tools
+                            .as_deref()
+                            .is_none_or(|d| d.is_visible(&spec.name))
+                    })
+                    .collect();
 
                 let renderer = provider.renderer();
                 let cache_strategy = provider.cache_strategy();
@@ -2359,6 +2435,20 @@ async fn run_inner(
                         &messages,
                         &tool_specs,
                     ),
+                };
+
+                // mu-t4l5e: the deferred-names manifest — one System span
+                // right after the system prompt, derived from the loaded
+                // set each call (never stored) and byte-stable between
+                // loads. Post-processed so both assembly paths above get
+                // it; on the baseline path it REPLACES the copy compaction
+                // carried over.
+                let rope: RetainedRope = match config.deferred_tools.as_deref() {
+                    Some(deferred) => crate::agent::deferred_tools::with_manifest(
+                        &rope,
+                        deferred.manifest_text().as_deref(),
+                    ),
+                    None => rope,
                 };
 
                 // mu-uz0n / mu-0x5i: implicit capability discovery — rank
@@ -3023,6 +3113,7 @@ async fn run_inner(
                         .discover_hints
                         .as_ref()
                         .is_some_and(|h| h.live.enabled()),
+                    config.deferred_tools.as_deref(),
                 )
                 .await
                 {

@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use std::path::PathBuf;
 
+use mu_core::agent::deferred_tools::ToolLoadReason;
 use mu_core::agent::{AgentConfig, AgentInput, AgentLoop, AgentMessage, SpawnArgs, Tool};
 use mu_core::capability::Capability;
 use mu_core::context::capability_hints::LiveHintConfig;
@@ -87,10 +88,11 @@ pub fn handle_create_session(
         capability, // root: unrestricted except launch tool grant applied below
         root_launch_tool_capability: true,
         seed_messages: Vec::new(), // mu-mh4: fresh session starts empty
-        seed_events: Vec::new(),   // mu-mh4: fresh session has no seed events
+        seed_loaded_tools: Vec::new(),
+        seed_events: Vec::new(), // mu-mh4: fresh session has no seed events
         cache_ttl: params.cache_ttl.unwrap_or_default(), // mu-f1a0
         max_turns: params.max_turns, // mu-779s: per-session cap override
-        effort: params.effort,     // mu-vcbm: launch-time effort default
+        effort: params.effort,   // mu-vcbm: launch-time effort default
         notif,
         sessions,
         factory,
@@ -164,6 +166,7 @@ pub fn handle_delegate_session(
         // recorded for audit). session.resume is the path that seeds a
         // continuation history; delegate-with-seed is future work.
         seed_messages: Vec::new(),
+        seed_loaded_tools: Vec::new(),
         seed_events: Vec::new(), // mu-mh4: delegate sessions have no seed events
         // mu-f1a0: delegated workers are PINNED to the 5m tier
         // regardless of the parent's — they run gap-free tool loops,
@@ -422,6 +425,21 @@ pub fn handle_resume_session(
         messages: continuation.messages.clone(),
     };
 
+    // mu-t4l5e: the inherited loads are STATE, so they are rows on the new
+    // head's own log, not just an in-process seed. Without them this head's
+    // log carries no `ToolLoaded` at all and a resume OF THIS HEAD projects
+    // an empty loaded set — the loads would survive exactly one generation.
+    let mut seed_events = vec![continuation_seeded, head_attached];
+    seed_events.extend(
+        continuation
+            .loaded_tools
+            .iter()
+            .map(|name| EventPayload::ToolLoaded {
+                name: name.clone(),
+                reason: ToolLoadReason::Inherited,
+            }),
+    );
+
     let new_session_id = build_and_register_session(BuildSessionRequest {
         selector: &params.provider,
         system_prompt: None,
@@ -439,7 +457,8 @@ pub fn handle_resume_session(
         root_launch_tool_capability: parsed.daemon != daemon_info.daemon_id()
             && params.grant_launch_capability,
         seed_messages: continuation.messages,
-        seed_events: vec![continuation_seeded, head_attached],
+        seed_loaded_tools: continuation.loaded_tools,
+        seed_events,
         cache_ttl: CacheTtl::default(),
         max_turns: None, // resume sessions inherit the cap from the predecessor
         effort: None,    // mu-vcbm: resumed sessions use the provider default
@@ -535,6 +554,12 @@ struct BuildSessionRequest<'a> {
     /// session (continuation projection of the predecessor's log).
     /// Empty for fresh and (current) delegate sessions.
     seed_messages: Vec<AgentMessage>,
+    /// mu-t4l5e: deferred tools the predecessor had loaded (continuation
+    /// projection of its `ToolLoaded` events). Seeds the resumed session's
+    /// loaded set in process; the caller also passes them as `Inherited`
+    /// `ToolLoaded` seed events so the new head's own log carries them.
+    /// Empty for fresh and delegate sessions.
+    seed_loaded_tools: Vec<String>,
     /// mu-mh4 (panel finding 4): system events to append to the new
     /// session's log immediately after `SessionCreated` and BEFORE the
     /// session is registered in the Sessions map. Appending here (rather
@@ -730,6 +755,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
         capability,
         root_launch_tool_capability,
         seed_messages,
+        seed_loaded_tools,
         seed_events,
         notif,
         sessions,
@@ -930,6 +956,34 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
     // daemon-discovered skills against a free-text intent, so the agent can
     // find the right capability in-loop instead of shelling out to the
     // allowlist-blocked bash path.
+    // mu-t4l5e: deferred tool schemas. Split the session's tools by name
+    // into core (schema always sent) and deferred (granted, schema
+    // withheld until loaded). Built before the `discover` push because the
+    // tool takes the handle, so `discover` is named explicitly to keep the
+    // split total. Authority is untouched — the launch grant below still
+    // names the FULL set; deferral is presentation only. Applies to bare
+    // sessions too: the key, not the flag, decides.
+    let deferred_tools = {
+        let cfg = daemon_info.config();
+        cfg.session.defer_tools.then(|| {
+            use mu_core::agent::deferred_tools::{DeferredTools, PreselectConfig};
+            let names = session_tools
+                .iter()
+                .map(|t| t.spec().name)
+                .chain(std::iter::once("discover".to_owned()));
+            let mut deferred = DeferredTools::partition(names, &cfg.session.core_tools);
+            if cfg.index.preselect {
+                deferred = deferred.with_preselect(PreselectConfig {
+                    limit: cfg.index.preselect_limit,
+                    // The same relative floor the hint ranker uses.
+                    min_score_ratio: cfg.index.discover_injection_min_score_ratio,
+                });
+            }
+            // Replay: a resumed head inherits its predecessor's loads.
+            deferred.seed_loaded(seed_loaded_tools);
+            Arc::new(deferred)
+        })
+    };
     let discover_siblings = Arc::new(session_tools.clone());
     session_tools.push(Arc::new(crate::tools::DiscoverTool::new(
         discover_siblings,
@@ -937,6 +991,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
         capability_handle.clone(),
         // mu-kex4.6.3: semantic ranking is opt-in via [index].semantic_discover.
         daemon_info.config().index.semantic_discover,
+        deferred_tools.clone(),
     )));
     if root_launch_tool_capability {
         // mu-session-capability-allowed-tools-launch-grant-4hd8: a root
@@ -1053,6 +1108,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
             discover_hints,
             kx_hints,
             memory_hints,
+            deferred_tools,
             // mu-vcbm: launch-time effort default → loop's standing effort.
             effort: effort.map(|e| Arc::from(e.as_str())),
         },
@@ -3113,6 +3169,7 @@ mod tests {
             Arc::new(Vec::new()),
             capability.clone(),
             false,
+            None,
         )));
 
         apply_root_launch_tool_capability(&capability, &tools);

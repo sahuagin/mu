@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
+use mu_core::agent::deferred_tools::DeferredTools;
 use mu_core::agent::{Tool, ToolResult, ToolSpec};
 use mu_core::capability::Capability;
 use mu_core::skill::loader::LoadedSkill;
@@ -42,6 +43,10 @@ pub struct DiscoverTool {
     /// (default false). `discover` is a rare orientation call, so the per-call
     /// embed cost is acceptable when enabled.
     semantic: bool,
+    /// mu-t4l5e: the session's deferred-tool handle, when schemas are
+    /// deferred. Entries whose schema is still withheld are marked in the
+    /// result text so the model knows a call by name loads them.
+    deferred: Option<Arc<DeferredTools>>,
 }
 
 impl DiscoverTool {
@@ -50,12 +55,14 @@ impl DiscoverTool {
         skills: Arc<Vec<LoadedSkill>>,
         capability: Arc<Mutex<Capability>>,
         semantic: bool,
+        deferred: Option<Arc<DeferredTools>>,
     ) -> Self {
         Self {
             tools,
             skills,
             capability,
             semantic,
+            deferred,
         }
     }
 }
@@ -146,7 +153,7 @@ impl Tool for DiscoverTool {
                     {
                         Ok(Ok(results)) => {
                             return ToolResult {
-                                content: format_results(intent, &results),
+                                content: format_results(intent, &results, self.deferred.as_deref()),
                                 is_error: false,
                             };
                         }
@@ -185,14 +192,20 @@ impl Tool for DiscoverTool {
         };
         let results = mu_core::t4c_source::discover_view(&tree, intent, limit);
         ToolResult {
-            content: format_results(intent, &results),
+            content: format_results(intent, &results, self.deferred.as_deref()),
             is_error: false,
         }
     }
 }
 
-/// Render ranked capabilities as compact, model-readable text.
-fn format_results(intent: &str, results: &[mu_core::t4c_source::CapabilityView]) -> String {
+/// Render ranked capabilities as compact, model-readable text. With a
+/// deferred handle (mu-t4l5e), a `tool.*` entry whose schema is withheld
+/// is marked so the model knows calling it by name is how it loads.
+fn format_results(
+    intent: &str,
+    results: &[mu_core::t4c_source::CapabilityView],
+    deferred: Option<&DeferredTools>,
+) -> String {
     if results.is_empty() {
         return format!(
             "No capabilities matched \"{intent}\". Try a broader intent, or fall back to your \
@@ -212,9 +225,67 @@ fn format_results(intent: &str, results: &[mu_core::t4c_source::CapabilityView])
             let why = v.disallowed_reason.as_deref().unwrap_or("not permitted");
             out.push_str(&format!("  [unavailable this session: {why}]"));
         }
+        if v.path
+            .strip_prefix("tool.")
+            .is_some_and(|name| deferred.is_some_and(|d| d.is_withheld(name)))
+        {
+            out.push_str("  (deferred — call by name to load)");
+        }
         if !v.summary.is_empty() {
             out.push_str(&format!("\n    {}", v.summary));
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mu_core::t4c_source::CapabilityView;
+
+    fn view(path: &str) -> CapabilityView {
+        CapabilityView {
+            path: path.to_string(),
+            summary: format!("summary of {path}"),
+            keywords: Vec::new(),
+            score: 1.0,
+            effects: None,
+            allowed_by_session: true,
+            disallowed_reason: None,
+            source: None,
+        }
+    }
+
+    /// mu-t4l5e: only a `tool.*` entry whose schema is still withheld gets
+    /// the marker — loaded, core, and non-tool paths read as before, and
+    /// no handle means no marker anywhere.
+    #[test]
+    fn format_results_marks_withheld_deferred_tools_only() {
+        let deferred = DeferredTools::new(["watch".to_string(), "mailbox".to_string()]);
+        deferred.load("mailbox");
+        let results = vec![
+            view("tool.watch"),
+            view("tool.mailbox"),
+            view("tool.read"),
+            view("skill.watch"),
+        ];
+        let out = format_results("watch things", &results, Some(&deferred));
+        let line = |needle: &str| {
+            out.lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no line for {needle} in {out}"))
+                .to_string()
+        };
+        assert!(line("• tool.watch").contains("(deferred — call by name to load)"));
+        assert!(
+            !line("• tool.mailbox").contains("deferred"),
+            "loaded ⇒ plain"
+        );
+        assert!(!line("• tool.read").contains("deferred"), "core ⇒ plain");
+        assert!(
+            !line("• skill.watch").contains("deferred"),
+            "only tool.* paths map onto the deferred set"
+        );
+        assert!(!format_results("watch things", &results, None).contains("deferred"));
+    }
 }

@@ -6,10 +6,10 @@ use std::time::Instant;
 
 use tokio::sync::mpsc;
 
-use crate::capability::CapabilityCheck;
+use crate::capability::{Capability, CapabilityCheck};
 use crate::protocol::ApprovalDecision;
 
-use super::super::tool::{PermissionLevel, RetryPolicy, Tool, ToolResult};
+use super::super::tool::{PermissionLevel, RetryPolicy, Tool, ToolResult, ToolSpec};
 use super::super::types::{AgentMessage, ToolCall};
 
 use super::{AgentEvent, AgentInput, Outcome, PendingApprovals, SessionCapability};
@@ -391,6 +391,96 @@ async fn cancel_current_and_remaining(
     }
 }
 
+/// mu-t4l5e: the result a touched-but-invalid call returns. The tool is
+/// loaded now; the description and input schema ride along so the
+/// model's next attempt is informed rather than a blind retry.
+pub(crate) fn hydrated_validation_error(spec: &ToolSpec, reason: &str) -> String {
+    format!(
+        "`{}` is now loaded; arguments did not validate: {reason}; description: {}; schema: {}",
+        spec.name,
+        spec.description,
+        serde_json::to_string(&spec.input_schema).unwrap_or_default()
+    )
+}
+
+/// The session's "may this tool be used at all" decision, in one place.
+/// `None` = permitted; `Some(reason)` = refused, carrying the text the
+/// dispatch gate hands back to the model.
+///
+/// Three checks, in the order the dispatch gate applies them: the capability
+/// grant (`check_allow`), the session's per-axis posture over the tool's
+/// canonical `derived_effects()` (`check_effects`), and the required-AWS
+/// grant. `tool` is `None` when the name resolves to no registered tool —
+/// only the grant check can speak then, and the caller's not-found path
+/// handles the rest.
+///
+/// Extracted from the dispatch gate (mu-t4l5e, PR #600 panel) so
+/// pre-selection asks EXACTLY what dispatch will ask: it used to filter on
+/// `check_allow` alone, which let a posture-restricted session pre-load a
+/// schema this gate would then refuse.
+pub(crate) fn session_refusal_reason(
+    cap: &Capability,
+    name: &str,
+    tool: Option<&dyn Tool>,
+) -> Option<String> {
+    match cap.check_allow(name) {
+        CapabilityCheck::Allowed => {
+            // mu-8stm.2 (1b): the STRUCTURED appropriateness gate (canonical
+            // successor to mu-n25a's linear ceiling). Check the tool's
+            // canonical Effects against the session's per-axis constraints
+            // via the SAME `disallowed_by` predicate the discovery surface
+            // uses (single source of truth), BEFORE the AWS + permission
+            // gates so a `permission: Allow` tool cannot free-ride a
+            // restrictive posture (the SELF-CLASSIFIED-AUTHORITY bug class,
+            // mu-usfj). Unconstrained sessions (no ceiling) allow everything
+            // (back-compat). A missing tool falls through to the caller's
+            // not-found path. Unannotated effects fail closed — dormant today
+            // (`derived_effects()` is total over every dispatchable tool), it
+            // bites only a future unclassified dispatchable source.
+            //
+            // Use `derived_effects()` — the SAME projection discovery uses
+            // (including the aws->network/spend reach) — so the gate and
+            // `allowed_by_session` agree exactly, and an AWS-gated tool can't
+            // slip its network/spend reach past a no-network/no-spend posture
+            // just because the grant is held. The AWS-grant gate below is an
+            // ADDITIONAL check, not a substitute for the posture (review:
+            // gpt-5.5).
+            if let Some(t) = tool {
+                let effects = t.spec().policy.derived_effects();
+                if let CapabilityCheck::DeniedInappropriate { reason } =
+                    cap.check_effects(Some(&effects))
+                {
+                    return Some(reason);
+                }
+            }
+            let required_aws = tool.and_then(|t| t.spec().policy.required_aws_capability.clone());
+            match required_aws {
+                Some(required) if !cap.aws.iter().any(|aws_cap| aws_cap.name == required) => {
+                    Some(format!("missing required AWS capability `{required}`"))
+                }
+                _ => None,
+            }
+        }
+        CapabilityCheck::DeniedToolNotAllowed => {
+            Some("tool not in session's capability".to_owned())
+        }
+        CapabilityCheck::DeniedExpired => Some("session capability has expired".to_owned()),
+        CapabilityCheck::DeniedBudgetExhausted => {
+            Some("session capability's tool-call budget exhausted".to_owned())
+        }
+        CapabilityCheck::DeniedAutonomyDisallowed
+        | CapabilityCheck::DeniedSideEffectsExceeded { .. }
+        | CapabilityCheck::DeniedInappropriate { .. } => None,
+    }
+}
+
+/// The yes/no form of [`session_refusal_reason`] over a resolved tool — what
+/// mu-t4l5e pre-selection needs per candidate
+/// (`DeferredTools::preselect_candidates`).
+pub(crate) fn session_permits(cap: &Capability, tool: &dyn Tool) -> bool {
+    session_refusal_reason(cap, &tool.spec().name, Some(tool)).is_none()
+}
+
 // One dispatch call needs the whole per-round context; bundling it into a
 // struct would just move the same fields behind another name.
 #[allow(clippy::too_many_arguments)]
@@ -406,6 +496,9 @@ pub(crate) async fn handle_execute_tools(
     // near-miss suggestion below, which used to run unconditionally — so
     // an operator who turned the feature off still got half of it.
     discover_hints_enabled: bool,
+    // mu-t4l5e: the session's deferred-tool handle. A call to a withheld
+    // name loads it here (hydrate-on-touch) and runs in the same round.
+    deferred: Option<&crate::agent::deferred_tools::DeferredTools>,
 ) -> Result<ExecuteToolsExit, Outcome> {
     let mut buffered: Vec<AgentInput> = Vec::new();
     let mut tool_messages: Vec<AgentMessage> = Vec::new();
@@ -431,61 +524,37 @@ pub(crate) async fn handle_execute_tools(
 
         let tool = tools.iter().find(|t| t.spec().name == call.name);
 
+        // The whole session decision — grant, posture, AWS grant — lives in
+        // `session_refusal_reason` so turn-start pre-selection (mu-t4l5e)
+        // can apply the identical rule instead of a subset of it.
         let capability_refusal_reason: Option<String> = {
             let cap = capability.lock().ok();
-            cap.as_ref().and_then(|c| match c.check_allow(&call.name) {
-                CapabilityCheck::Allowed => {
-                    // mu-8stm.2 (1b): the STRUCTURED appropriateness gate
-                    // (canonical successor to mu-n25a's linear ceiling). Check
-                    // the tool's canonical Effects against the session's
-                    // per-axis constraints via the SAME `disallowed_by`
-                    // predicate the discovery surface uses (single source of
-                    // truth), BEFORE the AWS + permission gates so a
-                    // `permission: Allow` tool cannot free-ride a restrictive
-                    // posture (the SELF-CLASSIFIED-AUTHORITY bug class, mu-usfj).
-                    // Unconstrained sessions (no ceiling) allow everything
-                    // (back-compat). A missing tool falls through to the
-                    // not-found path below. Unannotated effects fail closed —
-                    // dormant today (`derived_effects()` is total over every
-                    // dispatchable tool), it bites only a future unclassified
-                    // dispatchable source.
-                    //
-                    // Use `derived_effects()` — the SAME projection discovery
-                    // uses (including the aws->network/spend reach) — so the gate
-                    // and `allowed_by_session` agree exactly, and an AWS-gated
-                    // tool can't slip its network/spend reach past a
-                    // no-network/no-spend posture just because the grant is held.
-                    // The AWS-grant gate below is an ADDITIONAL check, not a
-                    // substitute for the posture (review: gpt-5.5).
-                    if let Some(t) = tool.as_ref() {
-                        let effects = t.spec().policy.derived_effects();
-                        if let CapabilityCheck::DeniedInappropriate { reason } =
-                            c.check_effects(Some(&effects))
-                        {
-                            return Some(reason);
-                        }
-                    }
-                    let required_aws = tool
-                        .as_ref()
-                        .and_then(|t| t.spec().policy.required_aws_capability.clone());
-                    match required_aws {
-                        Some(required) if !c.aws.iter().any(|aws_cap| aws_cap.name == required) => {
-                            Some(format!("missing required AWS capability `{required}`"))
-                        }
-                        _ => None,
-                    }
-                }
-                CapabilityCheck::DeniedToolNotAllowed => {
-                    Some("tool not in session's capability".to_owned())
-                }
-                CapabilityCheck::DeniedExpired => Some("session capability has expired".to_owned()),
-                CapabilityCheck::DeniedBudgetExhausted => {
-                    Some("session capability's tool-call budget exhausted".to_owned())
-                }
-                CapabilityCheck::DeniedAutonomyDisallowed
-                | CapabilityCheck::DeniedSideEffectsExceeded { .. }
-                | CapabilityCheck::DeniedInappropriate { .. } => None,
-            })
+            cap.as_ref()
+                .and_then(|c| session_refusal_reason(c, &call.name, tool.map(|t| &**t)))
+        };
+
+        // mu-t4l5e: hydrate-on-touch. A withheld tool is still in `tools`
+        // (deferral is presentation, not authority), so a call by name
+        // resolves above rather than in the not-found arm below. The load
+        // is logged first, then projected, and the call goes on through
+        // the ordinary gates in this same round — `validate` decides
+        // whether it runs or the model gets the schema back (see the
+        // validate arm). A capability refusal wins: loading a tool the
+        // session may not use would only advertise it.
+        let touched = match (tool, deferred) {
+            (Some(_), Some(d))
+                if capability_refusal_reason.is_none() && d.is_withheld(&call.name) =>
+            {
+                let _ = events
+                    .send(AgentEvent::ToolLoaded {
+                        name: call.name.clone(),
+                        reason: crate::agent::deferred_tools::ToolLoadReason::Touch,
+                    })
+                    .await;
+                d.load(&call.name);
+                true
+            }
+            _ => false,
         };
 
         let retry_refusal_reason: Option<&'static str> = match tool {
@@ -790,8 +859,16 @@ pub(crate) async fn handle_execute_tools(
             // No InputRequired was dispatched — the user was never asked
             // to approve a call that would fail. The reason string is
             // already user-facing (e.g. bash's allowlist message).
+            //
+            // mu-t4l5e: on a touch the model has never seen this tool's
+            // schema, so the refusal carries it — the retry is informed
+            // instead of costing a bare "not loaded" round trip.
+            let content = match (touched, tool) {
+                (true, Some(t)) => hydrated_validation_error(&t.spec(), &reason),
+                _ => reason,
+            };
             ToolResult {
-                content: reason,
+                content,
                 is_error: true,
             }
         } else if let Some(reason) = permission_refusal_reason {

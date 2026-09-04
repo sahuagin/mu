@@ -13,9 +13,13 @@
 //! "only one element / only one form" bug. Here it is a typed enum
 //! ([`Content`]) — the wrong shape is unrepresentable.
 //!
-//! NOTE on roles: on the Messages API the per-message `role` is only `user` or
-//! `assistant`. `system` is an ENVELOPE field (top-level `system`), not a
-//! message role. mu's internal `ProviderRole` additionally has `System` and
+//! NOTE on roles: this crate models the per-message `role` as `user` or
+//! `assistant`, with `system` as an ENVELOPE field (top-level `system`). Since
+//! the 2026-07 changelog the API also documents `role: "system"` messages
+//! INSIDE `messages` (mid-conversation system messages, carrying per-message
+//! `output_config.effort` and `clear_at` behind betas); that shape is not yet
+//! modeled here — bead mu-anthropic-protocol-2026q3-6uqho, where extending
+//! this enum is the first item. mu's internal `ProviderRole` additionally has `System` and
 //! `ToolResult`; mapping those onto this two-role wire shape (system → envelope,
 //! tool_result → a `user` message of `tool_result` blocks) is the mu-side
 //! `From`'s job, not this crate's. See INTEGRATION.md.

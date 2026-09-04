@@ -6,10 +6,12 @@ use std::time::Instant;
 
 use tokio::sync::mpsc;
 
+use t4c::FsEffect;
+
 use crate::capability::CapabilityCheck;
 use crate::protocol::ApprovalDecision;
 
-use super::super::tool::{PermissionLevel, RetryPolicy, Tool, ToolResult};
+use super::super::tool::{PermissionLevel, RetryPolicy, Tool, ToolPolicy, ToolResult};
 use super::super::types::{AgentMessage, ToolCall};
 
 use super::{AgentEvent, AgentInput, Outcome, PendingApprovals, SessionCapability};
@@ -55,6 +57,13 @@ const MODEL_DECIDES_IDENTICAL_ERROR_LIMIT: usize = 5;
 // doesn't fit inside it could never fire.
 const _: () = assert!(MODEL_DECIDES_IDENTICAL_ERROR_LIMIT < TOOL_HISTORY_WINDOW);
 
+/// mu-83bw9: turns the verification gate needs before it will spend one
+/// on a refusal — the refused turn itself, one to run the verify command,
+/// one to finish. Below that the mandated round trip cannot complete
+/// before `max_turns`, and refusing would end the ask on the refusal: no
+/// verify run, no answer. An uncapped session always has the room.
+const VERIFY_GATE_MIN_TURNS: u32 = 3;
+
 /// Monotonic counter used to generate `request_id`s for
 /// `InputRequired` prompts. Combined with the tool_call_id for
 /// readability + uniqueness even across sessions.
@@ -74,6 +83,41 @@ const APPROVAL_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 #[derive(Debug, Default)]
 pub(crate) struct ToolHistory {
     pub(crate) entries: VecDeque<ToolHistoryEntry>,
+    /// mu-83bw9: the session's verify command (`[session].verify_command`),
+    /// tokenized once. `None` ⇒ the verification gate below is off.
+    verify_command: Option<VerifyCommand>,
+    /// mu-83bw9: verification-gate state. Per ask: reset at ask start,
+    /// NOT by `clear` — a mid-ask context clear drops the window, not the
+    /// fact that source files changed.
+    verify: VerifyState,
+}
+
+/// mu-83bw9: what the verification gate knows about the current ask. The
+/// window above is bounded, so the gate keeps dispatch positions of its
+/// own rather than scanning entries an edit may have aged out of.
+#[derive(Debug, Default)]
+struct VerifyState {
+    /// Dispatch sequence within the ask; the positions below index it.
+    seq: u64,
+    /// Position of the last successful `write`/`edit` to a source path
+    /// ([`is_source_path`]).
+    last_source_edit: Option<u64>,
+    /// Position of the last green run of the verify command
+    /// ([`is_green_verify_result`]).
+    last_green_verify: Option<u64>,
+    /// The gate has refused an ask-ending call this ask; the next passes.
+    fired: bool,
+}
+
+/// mu-83bw9: the configured verify command, kept both as the text the
+/// refusal names and as the argv a dispatched command line is matched
+/// against. Tokenized once, at construction: a command that is blank or
+/// does not shell-tokenize leaves the gate OFF rather than arming a gate
+/// no run could ever satisfy.
+#[derive(Debug)]
+struct VerifyCommand {
+    text: String,
+    words: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,8 +132,103 @@ pub(crate) struct ToolHistoryEntry {
 }
 
 impl ToolHistory {
+    /// mu-83bw9: a history whose verification gate watches for
+    /// `verify_command`. `None`, blank/whitespace, or a string that does
+    /// not shell-tokenize all leave the gate off. Config normalizes blanks
+    /// at load; this is the floor for every other caller.
+    pub(crate) fn with_verify_command(verify_command: Option<String>) -> Self {
+        let verify_command = verify_command.and_then(|text| {
+            let text = text.trim().to_owned();
+            let words = shlex::split(&text).filter(|words| !words.is_empty())?;
+            Some(VerifyCommand { text, words })
+        });
+        Self {
+            verify_command,
+            ..Self::default()
+        }
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    /// mu-83bw9: fresh per-ask gate state. Called at ask start alongside
+    /// the other per-ask budgets.
+    pub(crate) fn reset_verify_gate(&mut self) {
+        self.verify = VerifyState::default();
+    }
+
+    /// mu-83bw9: advance the gate's view of the ask with one completed
+    /// dispatch. Takes the RAW result, before filtering, like `record`.
+    ///
+    /// Classified by the call's DECLARED policy and argument shape, never
+    /// by its tool name: this crate hosts the gate but does not own the
+    /// tool set, and a name table here would silently stop recognising a
+    /// renamed, wrapped, or third-party editor/shell. A successful call
+    /// carrying a command line whose leading words run the verify command
+    /// green marks a verify run ([`shell_command_arg`],
+    /// [`runs_verify_command`]); otherwise a successful call to a
+    /// file-mutating tool naming a source path marks an edit
+    /// ([`edited_path_arg`]). Command-shaped is tested first because it is
+    /// the narrower shape. Errors, refusals, and everything else only
+    /// advance the sequence.
+    pub(crate) fn note_verify_progress(
+        &mut self,
+        policy: Option<&ToolPolicy>,
+        arguments: &serde_json::Value,
+        result: &ToolResult,
+    ) {
+        let seq = self.verify.seq;
+        self.verify.seq += 1;
+        if result.is_error {
+            return;
+        }
+        let Some(policy) = policy else {
+            return;
+        };
+        if let Some(command) = shell_command_arg(policy, arguments) {
+            let ran_green = self
+                .verify_command
+                .as_ref()
+                .is_some_and(|verify| runs_verify_command(command, &verify.words))
+                && is_green_verify_result(&result.content);
+            if ran_green {
+                self.verify.last_green_verify = Some(seq);
+            }
+        } else if edited_path_arg(policy, arguments).is_some_and(is_source_path) {
+            self.verify.last_source_edit = Some(seq);
+        }
+    }
+
+    /// mu-83bw9: `Some(verify command)` iff an ask-ending call must be
+    /// refused now — the gate is configured, has not fired this ask, a
+    /// source edit postdates the last green verify run (or no green run
+    /// exists), and the ask still has the turns to act on the refusal.
+    /// `turns_remaining` counts the turn in flight; `None` means the
+    /// session has no turn cap, which always has room.
+    ///
+    /// Latches on the way out: the next call passes whatever the state, so
+    /// the gate costs at most one model round trip per ask and cannot
+    /// loop. Standing down for budget does NOT latch — the gate is simply
+    /// not worth a turn it cannot see acted on.
+    pub(crate) fn take_verify_gate_refusal(
+        &mut self,
+        turns_remaining: Option<u32>,
+    ) -> Option<&str> {
+        let unverified_edit = self.verify.last_source_edit.is_some_and(|edit| {
+            self.verify
+                .last_green_verify
+                .is_none_or(|green| green < edit)
+        });
+        let budget_allows = turns_remaining.is_none_or(|left| left >= VERIFY_GATE_MIN_TURNS);
+        if self.verify_command.is_none() || self.verify.fired || !unverified_edit || !budget_allows
+        {
+            return None;
+        }
+        self.verify.fired = true;
+        self.verify_command
+            .as_ref()
+            .map(|verify| verify.text.as_str())
     }
 
     /// Record a completed dispatch. Drops the oldest if over capacity.
@@ -198,6 +337,348 @@ impl ToolHistory {
     }
 }
 
+/// mu-83bw9: extensions the gate reads as documentation. Prose cannot
+/// break a verify run, so editing it does not arm the gate.
+const DOC_EXTENSIONS: [&str; 5] = ["md", "markdown", "txt", "rst", "adoc"];
+
+/// mu-83bw9: bare repository files that are documentation whatever their
+/// extension. `LICENSE`/`CHANGELOG` take suffixes in the wild
+/// (`LICENSE-MIT`, `CHANGELOG-2024`); `NOTICE`/`AUTHORS` do not.
+fn is_doc_file_name(file: &str) -> bool {
+    let upper = file.to_ascii_uppercase();
+    // The whole name, or the name plus an extension/suffix (`LICENSE.md`,
+    // `LICENSE-MIT`) — not a prefix of a source name (`LICENSED.rs`).
+    let named = |name: &str| {
+        upper == name
+            || upper
+                .strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with(['.', '-', '_']))
+    };
+    named("LICENSE") || named("CHANGELOG") || upper == "NOTICE" || upper == "AUTHORS"
+}
+
+/// mu-83bw9: is `path` one the verification gate treats as source? Test
+/// trees (`tests/`, `test/`), `*_test.*` files, build output (`target/`),
+/// and documentation ([`DOC_EXTENSIONS`], [`is_doc_file_name`]) are not,
+/// so an ask that only touches tests or prose is never gated. Build
+/// INPUTS (`Cargo.toml`, `Makefile`, `justfile`, lockfiles) stay source:
+/// they change what the verify run does. A fixed list; language-aware
+/// detection is a follow-up.
+pub(crate) fn is_source_path(path: &str) -> bool {
+    let parts: Vec<&str> = path.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+    let Some((file, dirs)) = parts.split_last() else {
+        return false;
+    };
+    if dirs
+        .iter()
+        .any(|d| matches!(*d, "tests" | "test" | "target"))
+    {
+        return false;
+    }
+    let (stem, extension) = file.rsplit_once('.').map_or((*file, ""), |(s, e)| (s, e));
+    if stem.ends_with("_test") || is_doc_file_name(file) {
+        return false;
+    }
+    !DOC_EXTENSIONS
+        .iter()
+        .any(|doc| extension.eq_ignore_ascii_case(doc))
+}
+
+/// mu-83bw9: argument keys a file-mutating tool uses to name its target.
+const PATH_ARG_KEYS: [&str; 3] = ["path", "file_path", "file"];
+
+/// mu-83bw9: argument keys a shell-running tool uses to carry its command.
+const COMMAND_ARG_KEYS: [&str; 2] = ["command", "cmd"];
+
+/// First string-valued argument found under any of `keys`.
+fn string_arg<'a>(arguments: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(serde_json::Value::as_str))
+}
+
+/// mu-83bw9: the file this dispatch edited, if it edited one — the tool
+/// DECLARES filesystem-write reach and names a path. Only reached after
+/// [`shell_command_arg`] has declined the call, so a shell's command line
+/// is never read as a write; the process-reach exclusion below still
+/// covers a process-reaching tool that names a path without carrying a
+/// command.
+fn edited_path_arg<'a>(policy: &ToolPolicy, arguments: &'a serde_json::Value) -> Option<&'a str> {
+    let effects = policy.derived_effects();
+    if effects.filesystem != FsEffect::Write || effects.process {
+        return None;
+    }
+    string_arg(arguments, &PATH_ARG_KEYS)
+}
+
+/// mu-83bw9: the shell command this dispatch ran, if it ran one — the
+/// call carries a command-shaped argument ([`COMMAND_ARG_KEYS`]) and its
+/// tool is not park-and-wake.
+///
+/// Deliberately NOT keyed on `derived_effects().process`. That axis is set
+/// only by `SideEffects::Execute`, which no shipped shell declares: the
+/// bash tool is `Mutating` in strict mode and `Destructive` in yolo mode.
+/// Keying on it matched no production shell at all, so no green run was
+/// ever recorded and the gate refused once after every source edit however
+/// many times the verify command had actually been run. The argument shape
+/// is the part of a dispatch that says "this is a command line"; the
+/// side-effects class answers a different question (how dangerous is it),
+/// and is left to the permission gates that own it.
+///
+/// Park-and-wake tools (`ends_turn_on_success`) stay excluded: their
+/// success result is a registration acknowledgement, not the command's
+/// output, so it can never evidence a green run. A call with no
+/// command-shaped argument is not a run — that is what keeps an editor's
+/// path write from being read as a command line.
+pub(crate) fn shell_command_arg<'a>(
+    policy: &ToolPolicy,
+    arguments: &'a serde_json::Value,
+) -> Option<&'a str> {
+    if policy.ends_turn_on_success {
+        return None;
+    }
+    string_arg(arguments, &COMMAND_ARG_KEYS)
+}
+
+/// mu-83bw9: characters that, as a whole token or as a run at a token's
+/// edge, end one command and start the next — `;`, `&&`, `||`, `|`, `&`.
+const SEGMENT_SEPARATORS: &[char] = &[';', '&', '|'];
+
+/// mu-83bw9: the heredoc delimiters a command line opens, in the order
+/// their bodies follow — `<<EOF`, `<< EOF`, `<<-EOF`, `<<'EOF'`. `shlex`
+/// unquotes, so a quoted delimiter arrives bare and the terminator line
+/// (which is never quoted) compares equal. `<<<` is a here-string: its
+/// data is on the same line, so it opens no body.
+fn heredoc_delimiters(line: &str) -> Vec<String> {
+    // shlex unquotes before tokenizing, so `echo '<<EOF'` would read as a
+    // heredoc opener; only a `<<` outside quotes on the raw line counts.
+    if !has_unquoted_heredoc_marker(line) {
+        return Vec::new();
+    }
+    let Some(tokens) = shlex::split(line) else {
+        return Vec::new();
+    };
+    let mut delimiters = Vec::new();
+    let mut tokens = tokens.into_iter();
+    while let Some(token) = tokens.next() {
+        let Some(rest) = token
+            .strip_prefix("<<-")
+            .or_else(|| token.strip_prefix("<<"))
+            .filter(|rest| !rest.starts_with('<'))
+        else {
+            continue;
+        };
+        let delimiter = if rest.is_empty() {
+            tokens.next()
+        } else {
+            Some(rest.to_owned())
+        };
+        if let Some(delimiter) = delimiter.filter(|d| !d.is_empty()) {
+            delimiters.push(delimiter);
+        }
+    }
+    delimiters
+}
+
+/// mu-83bw9: does the raw line carry a `<<` outside single or double
+/// quotes (and not backslash-escaped)? Cheap quote-state scan; the token
+/// walk in [`heredoc_delimiters`] does the rest.
+fn has_unquoted_heredoc_marker(line: &str) -> bool {
+    let (mut single, mut double, mut prev_lt, mut escaped) = (false, false, false, false);
+    for c in line.chars() {
+        if escaped {
+            escaped = false;
+            prev_lt = false;
+            continue;
+        }
+        match c {
+            '\\' if !single => {
+                escaped = true;
+                prev_lt = false;
+            }
+            '\'' if !double => {
+                single = !single;
+                prev_lt = false;
+            }
+            '"' if !single => {
+                double = !double;
+                prev_lt = false;
+            }
+            '<' if !single && !double => {
+                if prev_lt {
+                    return true;
+                }
+                prev_lt = true;
+            }
+            _ => prev_lt = false,
+        }
+    }
+    false
+}
+
+/// mu-83bw9: the lines of a command line that are COMMANDS, with heredoc
+/// bodies dropped. A body is data the shell feeds to a command, not
+/// commands the shell runs: `cat > notes.md <<'EOF'` / `cargo test` /
+/// `EOF` writes a file whose second line merely READS like the verify
+/// command, and tokenizing it minted a green verify run. The introducing
+/// line stays — `cargo test <<'EOF'` really does run `cargo test` — and
+/// the lines after it are dropped up to and including the terminator. An
+/// unterminated heredoc swallows the rest, as the shell would.
+fn command_lines(command: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut pending: VecDeque<String> = VecDeque::new();
+    for line in command.lines() {
+        if let Some(delimiter) = pending.front() {
+            if line.trim() == delimiter {
+                pending.pop_front();
+            }
+            continue;
+        }
+        lines.push(line);
+        pending.extend(heredoc_delimiters(line));
+    }
+    lines
+}
+
+/// mu-83bw9: split a command line into its command segments. Heredoc
+/// bodies are dropped first ([`command_lines`]), then each remaining line
+/// is tokenized with `shlex` (the same shell semantics the bash tool's
+/// allowlist parses with) and cut at [`SEGMENT_SEPARATORS`] and at
+/// newlines. A line that does not tokenize (an unbalanced quote)
+/// contributes nothing, so an unparseable command can never mint a green
+/// verify run.
+fn command_segments(command: &str) -> Vec<Vec<String>> {
+    let mut segments: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    // A segment introduced by `||` only runs when the one before it
+    // failed. Without modelling the shell that cannot be taken as a run,
+    // so such a segment is dropped rather than counted (`true || cargo
+    // test` is not a run; a `||` fallback is at worst one extra refusal).
+    let mut skip_current = false;
+    fn close(segments: &mut Vec<Vec<String>>, current: &mut Vec<String>, skip: bool) {
+        let segment = std::mem::take(current);
+        if !skip {
+            segments.push(segment);
+        }
+    }
+    for line in command_lines(command) {
+        let Some(tokens) = shlex::split(line) else {
+            current.clear();
+            skip_current = false;
+            continue;
+        };
+        for token in tokens {
+            let head = token.trim_start_matches(SEGMENT_SEPARATORS);
+            let prefix = &token[..token.len() - head.len()];
+            if !prefix.is_empty() {
+                close(&mut segments, &mut current, skip_current);
+                skip_current = prefix.contains("||");
+            }
+            let body = head.trim_end_matches(SEGMENT_SEPARATORS);
+            let suffix = &head[body.len()..];
+            if !body.is_empty() {
+                current.push(body.to_owned());
+            }
+            if !suffix.is_empty() {
+                close(&mut segments, &mut current, skip_current);
+                skip_current = suffix.contains("||");
+            }
+        }
+        close(&mut segments, &mut current, skip_current);
+        skip_current = false;
+    }
+    segments
+}
+
+/// mu-83bw9: `NAME=value`, an environment assignment prefixed to a
+/// command rather than the command itself.
+fn is_env_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// mu-83bw9: an operand `timeout` consumes before the command — a flag or
+/// a duration (`600`, `10m`).
+fn is_timeout_operand(word: &str) -> bool {
+    if word.starts_with('-') {
+        return true;
+    }
+    let digits = word.trim_end_matches(['s', 'm', 'h', 'd']);
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// mu-83bw9: drop leading tokens that wrap a command without changing
+/// WHICH command runs — environment assignments, `env`, `timeout` and its
+/// operands. Anything less obvious ends the strip, so the segment simply
+/// fails to match instead of matching the wrong command.
+fn strip_command_wrappers(mut words: &[String]) -> &[String] {
+    loop {
+        let Some(first) = words.first().map(String::as_str) else {
+            return words;
+        };
+        if is_env_assignment(first) || first == "env" {
+            words = &words[1..];
+            continue;
+        }
+        if first == "timeout" {
+            words = &words[1..];
+            while words.first().is_some_and(|w| is_timeout_operand(w)) {
+                words = &words[1..];
+            }
+            continue;
+        }
+        return words;
+    }
+}
+
+/// mu-83bw9: does this command line actually RUN the verify command? A
+/// segment matches when its leading words, after the wrapper strip, EQUAL
+/// `verify` word-for-word; trailing arguments are fine (`cargo test
+/// --offline`, `cargo test 2>&1 | tail`). A MENTION is not a run: `echo
+/// cargo test`, `printf`, `grep 'cargo test' README`, and a `#` comment
+/// all lead with a different word, which is why the old substring test
+/// (`command.contains(verify)`) counted them as green runs.
+pub(crate) fn runs_verify_command(command: &str, verify: &[String]) -> bool {
+    if verify.is_empty() {
+        return false;
+    }
+    command_segments(command).iter().any(|segment| {
+        let words = strip_command_wrappers(segment);
+        words.len() >= verify.len() && words[..verify.len()] == *verify
+    })
+}
+
+/// mu-83bw9: output fragments that mark a verify run red whatever the
+/// exit status: the harness summary, the compiler, and cargo's own
+/// trailers — `error: test failed, to rerun pass ...` (fail-fast) and
+/// `error: N target(s) failed:` (`--no-fail-fast`), which are the LAST
+/// lines of a failing run and so the only failure text a small
+/// `| tail -N` keeps.
+const RED_VERIFY_MARKERS: [&str; 5] = [
+    "test result: FAILED",
+    "could not compile",
+    "error: test failed",
+    "target failed:",
+    "targets failed:",
+];
+
+/// mu-83bw9: did a `bash` result show the verify command passing? The
+/// bash tool appends an `exit: N` line only for a non-zero status, and a
+/// pipeline reports its LAST command's status (`cargo test 2>&1 | tail`
+/// exits 0 when `tail` does), so any of [`RED_VERIFY_MARKERS`] in the
+/// output counts as red as well.
+pub(crate) fn is_green_verify_result(content: &str) -> bool {
+    let nonzero_exit = content.lines().any(|line| {
+        line.strip_prefix("exit: ")
+            .and_then(|code| code.trim().parse::<i64>().ok())
+            .is_some_and(|code| code != 0)
+    });
+    !nonzero_exit && !RED_VERIFY_MARKERS.iter().any(|m| content.contains(m))
+}
+
 /// Best-effort extraction of a panic payload's message. Panics carry
 /// `&str` or `String` in practice; anything else gets a placeholder.
 pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
@@ -271,6 +752,11 @@ async fn finish_tool_call(
     call: ToolCall,
     result: ToolResult,
     verbatim: bool,
+    // mu-83bw9: the dispatched tool's declared policy — how the
+    // verification gate classifies the call (editor / shell runner /
+    // neither). `None` when no tool answered it: an unknown name, or a
+    // cancellation tombstone.
+    policy: Option<&ToolPolicy>,
 ) {
     // mu-hgg4v: hash the RAW content before any filtering or
     // annotation, so repeats compare like-with-like across turns.
@@ -282,6 +768,7 @@ async fn finish_tool_call(
     };
     let repeats =
         history.identical_result_repeats(&call.name, call.arguments.as_value(), content_hash);
+    history.note_verify_progress(policy, call.arguments.as_value(), &result);
     history.record(
         call.name.clone(),
         call.arguments.clone().into(),
@@ -376,6 +863,7 @@ async fn cancel_current_and_remaining(
         current.clone(),
         cancelled_tool_result(&current, reason, source, true),
         false,
+        None,
     )
     .await;
 
@@ -391,6 +879,7 @@ async fn cancel_current_and_remaining(
             call.clone(),
             cancelled_tool_result(&call, reason, source, false),
             false,
+            None,
         )
         .await;
     }
@@ -411,6 +900,11 @@ pub(crate) async fn handle_execute_tools(
     // near-miss suggestion below, which used to run unconditionally — so
     // an operator who turned the feature off still got half of it.
     discover_hints_enabled: bool,
+    // mu-83bw9: turns still available to this ask, counting the one in
+    // flight; `None` when the session has no turn cap. The verification
+    // gate stands down when the round trip it mandates cannot finish
+    // inside the budget.
+    turns_remaining: Option<u32>,
 ) -> Result<ExecuteToolsExit, Outcome> {
     let mut buffered: Vec<AgentInput> = Vec::new();
     let mut tool_messages: Vec<AgentMessage> = Vec::new();
@@ -546,6 +1040,35 @@ pub(crate) async fn handle_execute_tools(
             _ => None,
         };
 
+        // mu-83bw9: verification gate. Refuse the first ASK-ENDING call of
+        // an ask in which a source file was written after the last green
+        // run of the session's verify command — the model then runs it and
+        // acts on the result instead of finishing on unverified edits.
+        // Programmatic because prose ("run the tests before you finish")
+        // does not reliably trigger the run; the gate is the mechanism the
+        // 2026-09 harness battery found to be the lever. Fires at most once
+        // per ask (the history latches), so it cannot loop; nothing else is
+        // gated. Sits with the guards above so a gated call never reaches
+        // validate or an approver.
+        //
+        // "Ask-ending" is the tool's own `ends_turn_on_success` — the same
+        // policy flag the mu-spk7 completion path below keys on — not a
+        // tool name: this crate must not encode another crate's tool
+        // vocabulary. That reaches `final_answer` and equally any
+        // park-and-wake tool, which ends the ask just as finally.
+        let verify_refusal: Option<String> = if tool
+            .is_some_and(|t| t.spec().policy.ends_turn_on_success)
+            && capability_refusal_reason.is_none()
+            && retry_refusal_reason.is_none()
+            && loop_refusal_streak.is_none()
+        {
+            history
+                .take_verify_gate_refusal(turns_remaining)
+                .map(str::to_owned)
+        } else {
+            None
+        };
+
         // mu-bkjr: argument-aware pre-flight check. Tools that reject
         // specific argument shapes (e.g. bash's allowlist) can fail the
         // call here, BEFORE the PermissionLevel::Ask gate dispatches a
@@ -553,11 +1076,12 @@ pub(crate) async fn handle_execute_tools(
         // asked to approve a call that the tool will reject anyway.
         //
         // Only run when no higher-priority refusal applies — keeps the
-        // refusal-reason ordering stable (capability > retry > validate >
-        // permission-denied > execute).
+        // refusal-reason ordering stable (capability > retry > verify >
+        // validate > permission-denied > execute).
         let validate_refusal_reason: Option<String> = if capability_refusal_reason.is_none()
             && retry_refusal_reason.is_none()
             && loop_refusal_streak.is_none()
+            && verify_refusal.is_none()
         {
             tool.as_ref()
                 .and_then(|t| t.validate(call.arguments.as_value()).err())
@@ -571,6 +1095,7 @@ pub(crate) async fn handle_execute_tools(
         let mut permission_refusal_reason: Option<String> = None;
         let permission_decision = if retry_refusal_reason.is_none()
             && loop_refusal_streak.is_none()
+            && verify_refusal.is_none()
             && validate_refusal_reason.is_none()
         {
             match tool.as_ref().map(|t| t.spec().policy.permission) {
@@ -800,6 +1325,32 @@ pub(crate) async fn handle_execute_tools(
                 content: msg,
                 is_error: true,
             }
+        } else if let Some(cmd) = verify_refusal {
+            // mu-83bw9: the message names the command and says the gate is
+            // one-shot, so the model neither guesses the command nor
+            // expects to be blocked again after acting on the result.
+            let msg = format!(
+                "runtime refused: {}. Source files changed after the last \
+                 green verify run (`{cmd}`); run it and act on the result, then \
+                 finish. (This gate fires once per ask.)",
+                call.name
+            );
+            let _ = events
+                .send(AgentEvent::Callout {
+                    category: "warning".to_owned(),
+                    title: "verify before finishing".to_owned(),
+                    body: serde_json::json!({
+                        "tool": call.name,
+                        "verify_command": cmd,
+                    }),
+                    theme: Some("warning".to_owned()),
+                    context_refs: vec!["bead:mu-83bw9".to_owned()],
+                })
+                .await;
+            ToolResult {
+                content: msg,
+                is_error: true,
+            }
         } else if let Some(reason) = validate_refusal_reason {
             // mu-bkjr: tool's pre-flight check rejected the arguments.
             // No InputRequired was dispatched — the user was never asked
@@ -969,16 +1520,24 @@ pub(crate) async fn handle_execute_tools(
             }
         };
 
-        let verbatim = tool.map(|t| t.spec().verbatim_result).unwrap_or(false);
-        all_ends_turn &= !result.is_error
-            && tool
-                .map(|t| t.spec().policy.ends_turn_on_success)
-                .unwrap_or(false);
+        let spec = tool.map(|t| t.spec());
+        let verbatim = spec.as_ref().is_some_and(|s| s.verbatim_result);
+        all_ends_turn &=
+            !result.is_error && spec.as_ref().is_some_and(|s| s.policy.ends_turn_on_success);
         all_guard_refused &= guard_refused;
         if guard_refused {
             last_guard_refusal = Some(result.content.clone());
         }
-        finish_tool_call(events, history, &mut tool_messages, call, result, verbatim).await;
+        finish_tool_call(
+            events,
+            history,
+            &mut tool_messages,
+            call,
+            result,
+            verbatim,
+            spec.as_ref().map(|s| &s.policy),
+        )
+        .await;
     }
 
     Ok(ExecuteToolsExit::Completed {

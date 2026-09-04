@@ -133,6 +133,19 @@ resume_on_daemon_restart = false
 # keeps issuing calls the guards refuse. 0 disables the floor.
 max_guard_refusals = 5
 
+# Verification gate (mu-83bw9). When set, the first ask-ending call of an
+# ask in which a source file was written after the last green run of this
+# command is refused once, so the model runs it and acts on the result
+# before finishing; the next one passes. A shell call counts as a run when
+# one of its command segments actually INVOKES this command (its leading
+# words match; extra arguments, pipes and `timeout`/env wrappers are fine)
+# — echoing or grepping the text is not a run. Edits under `tests/` or
+# `test/`, to `*_test.*` files, and to documentation do not arm the gate (a
+# `#[cfg(test)]` module inside a source file does); edits to build inputs do. The gate
+# also stands down when the turn budget cannot fit the re-run it mandates.
+# Blank or unset = no gate.
+# verify_command = "cargo test"
+
 
 # ── UI (TUI) ──────────────────────────────────────────────────────
 

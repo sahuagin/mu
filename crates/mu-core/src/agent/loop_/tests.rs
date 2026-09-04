@@ -6967,6 +6967,689 @@ async fn ucjhg_guard_refusal_count_resets_on_executed_call() {
     assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
 }
 
+// ── mu-83bw9: verification gate — final_answer refused once after unverified source edits ──
+
+const VERIFY_GATE_TITLE: &str = "verify before finishing";
+const VERIFY_GATE_REFUSAL: &str = "runtime refused: final_answer. Source files changed after the \
+                                   last green verify run (`cargo test`); run it and act on the \
+                                   result, then finish. (This gate fires once per ask.)";
+
+/// `edit`, `bash` (every call answers `bash_result`, not an error — the
+/// shape of a piped `cargo test 2>&1 | tail`), and a `final_answer`
+/// with the production ends-turn policy.
+///
+/// mu-83bw9: each mock declares the POLICY its production counterpart
+/// declares, so these tests exercise the shapes that actually ship. In
+/// particular `bash` is `SideEffects::Mutating` — what the real bash tool
+/// declares in strict mode — NOT `Execute`, which no shipped shell
+/// declares. An earlier `Execute` mock was the only reason the gate's
+/// runner check looked like it worked. The gate reads policy and argument
+/// shape, never the names.
+fn verify_gate_tools(bash_result: &str) -> Vec<MockTool> {
+    use crate::agent::tool::SideEffects;
+    verify_gate_tools_with_bash_effects(bash_result, SideEffects::Mutating)
+}
+
+/// mu-83bw9: as above with the shell's declared side-effects class chosen
+/// by the caller — strict-mode bash is `Mutating`, yolo bash is
+/// `Destructive`, and the gate must not care which.
+fn verify_gate_tools_with_bash_effects(
+    bash_result: &str,
+    bash_effects: crate::agent::tool::SideEffects,
+) -> Vec<MockTool> {
+    use crate::agent::tool::{SideEffects, ToolPolicy};
+    vec![
+        MockTool::always_ok("edit", "edited").with_policy(ToolPolicy {
+            side_effects: SideEffects::Mutating,
+            ..ToolPolicy::read_only()
+        }),
+        MockTool::always_ok("bash", bash_result).with_policy(ToolPolicy {
+            side_effects: bash_effects,
+            idempotent: false,
+            ..ToolPolicy::read_only()
+        }),
+        MockTool::always_ok("final_answer", "done").with_policy(ToolPolicy {
+            ends_turn_on_success: true,
+            ..ToolPolicy::read_only()
+        }),
+    ]
+}
+
+fn edit_turn(id: &str, path: &str) -> Vec<ProviderEvent> {
+    vec![ProviderEvent::Done(assistant_tool_call(
+        id,
+        "edit",
+        json!({"path": path, "old_string": "a", "new_string": "b"}),
+    ))]
+}
+
+fn bash_turn(id: &str, command: &str) -> Vec<ProviderEvent> {
+    vec![ProviderEvent::Done(assistant_tool_call(
+        id,
+        "bash",
+        json!({"command": command}),
+    ))]
+}
+
+/// `final_answer` calls carry an `fa` id prefix so their results can be
+/// picked out of `ToolCallCompleted` (which has no tool name).
+fn final_answer_turn(id: &str) -> Vec<ProviderEvent> {
+    vec![ProviderEvent::Done(assistant_tool_call(
+        id,
+        "final_answer",
+        json!({"answer": "done"}),
+    ))]
+}
+
+/// Run `script` to the end of the ask on `tools`; the loop's events and
+/// the join outcome.
+async fn run_verify_gate_script(
+    script: Vec<Vec<ProviderEvent>>,
+    tools: Vec<MockTool>,
+    verify_command: Option<&str>,
+) -> (Vec<AgentEvent>, Outcome) {
+    let max_turns = AgentConfig::default().max_turns;
+    run_verify_gate_script_capped(script, tools, verify_command, max_turns).await
+}
+
+/// mu-83bw9: as above with an explicit `max_turns` — the gate's
+/// turn-budget stand-down is only reachable near the cap.
+async fn run_verify_gate_script_capped(
+    script: Vec<Vec<ProviderEvent>>,
+    tools: Vec<MockTool>,
+    verify_command: Option<&str>,
+    max_turns: Option<u32>,
+) -> (Vec<AgentEvent>, Outcome) {
+    let config = AgentConfig {
+        verify_command: verify_command.map(str::to_owned),
+        max_turns,
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(MockProvider::new(script), tools, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("go"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("join must not hang");
+    (events_handle.await.expect("events drain"), outcome)
+}
+
+/// `(is_error, content)` of every `final_answer` result, in order.
+fn final_answer_results(events: &[AgentEvent]) -> Vec<(bool, &str)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCallCompleted {
+                tool_call_id,
+                content,
+                is_error,
+            } if tool_call_id.starts_with("fa") => Some((*is_error, content.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn verify_gate_callouts(events: &[AgentEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| {
+            matches!(e, AgentEvent::Callout { category, title, context_refs, .. }
+                if category == "warning"
+                    && title == VERIFY_GATE_TITLE
+                    && context_refs.iter().any(|r| r == "bead:mu-83bw9"))
+        })
+        .count()
+}
+
+fn turn_starts(events: &[AgentEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::TurnStart))
+        .count()
+}
+
+/// A source edit with no verify run: the first `final_answer` is refused
+/// with the verify command named, a warning callout is emitted, and the
+/// second passes and ends the ask normally — the gate is one-shot.
+#[tokio::test]
+async fn bw9_verify_gate_refuses_final_answer_once_after_source_edit() {
+    let script = vec![
+        edit_turn("e1", "crates/mu-core/src/agent/loop_/mod.rs"),
+        final_answer_turn("fa1"),
+        final_answer_turn("fa2"),
+    ];
+    let (events, outcome) =
+        run_verify_gate_script(script, verify_gate_tools("unused"), Some("cargo test")).await;
+
+    let results = final_answer_results(&events);
+    assert_eq!(
+        results,
+        vec![(true, VERIFY_GATE_REFUSAL), (false, "done")],
+        "{results:?}"
+    );
+    assert_eq!(verify_gate_callouts(&events), 1);
+    assert_eq!(turn_starts(&events), 3, "edit, refused, passed");
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+    // The ask ends on final_answer's ends-turn path (which reports the
+    // closing turn's own stop reason), not by error or cap.
+    let done: Vec<&StopReason> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Done { stop_reason, .. } => Some(stop_reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert!(
+        !matches!(done[0], StopReason::Error | StopReason::IterationCap),
+        "{done:?}"
+    );
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// A green run of the verify command after the edit satisfies the gate:
+/// the first `final_answer` passes. Matching is on the command SEGMENT's
+/// leading words, so a piped invocation with extra arguments counts.
+#[tokio::test]
+async fn bw9_green_verify_run_after_edit_passes_first_final_answer() {
+    let script = vec![
+        edit_turn("e1", "crates/mu-core/src/config.rs"),
+        bash_turn("b1", "cargo test -p mu-core 2>&1 | tail -n 20"),
+        final_answer_turn("fa1"),
+    ];
+    let tools = verify_gate_tools("test result: ok. 12 passed; 0 failed\nelapsed: 3000ms");
+    let (events, outcome) = run_verify_gate_script(script, tools, Some("cargo test")).await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    assert_eq!(verify_gate_callouts(&events), 0);
+    assert_eq!(turn_starts(&events), 3);
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-83bw9: the same green run under the yolo-mode bash policy
+/// (`Destructive`). The two production bash policies are the whole
+/// population of shipped shells, and neither sets the process-reach bit
+/// the gate's runner check used to require.
+#[tokio::test]
+async fn bw9_green_verify_run_counts_under_destructive_bash_policy() {
+    use crate::agent::tool::SideEffects;
+    let script = vec![
+        edit_turn("e1", "crates/mu-core/src/config.rs"),
+        bash_turn("b1", "cargo test -p mu-core"),
+        final_answer_turn("fa1"),
+    ];
+    let tools = verify_gate_tools_with_bash_effects(
+        "test result: ok. 12 passed; 0 failed\nelapsed: 3000ms",
+        SideEffects::Destructive,
+    );
+    let (events, outcome) = run_verify_gate_script(script, tools, Some("cargo test")).await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    assert_eq!(verify_gate_callouts(&events), 0);
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// A verify run whose output reports failure is not green even when the
+/// bash result itself is not an error (a pipeline reports `tail`'s exit
+/// status): the gate still fires once.
+#[tokio::test]
+async fn bw9_failed_verify_run_does_not_satisfy_gate() {
+    let script = vec![
+        edit_turn("e1", "crates/mu-core/src/config.rs"),
+        bash_turn("b1", "cargo test 2>&1 | tail -n 20"),
+        final_answer_turn("fa1"),
+        final_answer_turn("fa2"),
+    ];
+    let tools = verify_gate_tools("test result: FAILED. 11 passed; 1 failed\nelapsed: 3000ms");
+    let (events, outcome) = run_verify_gate_script(script, tools, Some("cargo test")).await;
+
+    assert_eq!(
+        final_answer_results(&events),
+        vec![(true, VERIFY_GATE_REFUSAL), (false, "done")]
+    );
+    assert_eq!(verify_gate_callouts(&events), 1);
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// Ordering is by dispatch position: a green run followed by another
+/// source edit re-arms the gate.
+#[tokio::test]
+async fn bw9_source_edit_after_green_run_rearms_gate() {
+    let script = vec![
+        edit_turn("e1", "src/lib.rs"),
+        bash_turn("b1", "cargo test"),
+        edit_turn("e2", "src/lib.rs"),
+        final_answer_turn("fa1"),
+        final_answer_turn("fa2"),
+    ];
+    let tools = verify_gate_tools("test result: ok. 3 passed\nelapsed: 10ms");
+    let (events, _) = run_verify_gate_script(script, tools, Some("cargo test")).await;
+
+    assert_eq!(
+        final_answer_results(&events),
+        vec![(true, VERIFY_GATE_REFUSAL), (false, "done")]
+    );
+}
+
+/// Edits under a test tree are not source edits: no gate.
+#[tokio::test]
+async fn bw9_test_only_edit_does_not_gate() {
+    let script = vec![
+        edit_turn("e1", "crates/mu-core/tests/loop_smoke.rs"),
+        final_answer_turn("fa1"),
+    ];
+    let (events, outcome) =
+        run_verify_gate_script(script, verify_gate_tools("unused"), Some("cargo test")).await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    assert_eq!(verify_gate_callouts(&events), 0);
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// No verify command configured: never gates, whatever was edited.
+#[tokio::test]
+async fn bw9_no_verify_command_never_gates() {
+    let script = vec![edit_turn("e1", "src/main.rs"), final_answer_turn("fa1")];
+    let (events, outcome) = run_verify_gate_script(script, verify_gate_tools("unused"), None).await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    assert_eq!(verify_gate_callouts(&events), 0);
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-83bw9: MENTIONING the verify command is not running it. Each of
+/// these bash calls contains the exact string `cargo test` and answers
+/// with green-looking output; none of them is a run, so the gate still
+/// fires. This is the substring-match hole the review found.
+#[tokio::test]
+async fn bw9_mentioning_the_verify_command_is_not_a_run() {
+    let script = vec![
+        edit_turn("e1", "src/lib.rs"),
+        bash_turn("b1", "echo cargo test"),
+        bash_turn("b2", "grep 'cargo test' README.md"),
+        bash_turn("b3", "# cargo test"),
+        final_answer_turn("fa1"),
+        final_answer_turn("fa2"),
+    ];
+    // Output a real green run would produce — only the command line
+    // decides these are not runs.
+    let tools = verify_gate_tools("test result: ok. 3 passed\nelapsed: 10ms");
+    let (events, outcome) = run_verify_gate_script(script, tools, Some("cargo test")).await;
+
+    assert_eq!(
+        final_answer_results(&events),
+        vec![(true, VERIFY_GATE_REFUSAL), (false, "done")]
+    );
+    assert_eq!(verify_gate_callouts(&events), 1);
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-83bw9: a real invocation still counts through the wrappers a model
+/// actually types — an env assignment, a `timeout`, extra flags, a pipe.
+#[tokio::test]
+async fn bw9_wrapped_verify_invocation_satisfies_the_gate() {
+    let script = vec![
+        edit_turn("e1", "src/lib.rs"),
+        bash_turn(
+            "b1",
+            "RUSTFLAGS=-Awarnings timeout 600 cargo test --offline 2>&1 | tail -n 5",
+        ),
+        final_answer_turn("fa1"),
+    ];
+    let tools = verify_gate_tools("test result: ok. 3 passed\nelapsed: 10ms");
+    let (events, outcome) = run_verify_gate_script(script, tools, Some("cargo test")).await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    assert_eq!(verify_gate_callouts(&events), 0);
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-83bw9: the gate classifies by DECLARED POLICY and ARGUMENT SHAPE,
+/// not by tool name — mu-core hosts the gate but does not own the tool
+/// set. The same trajectory with an editor called `patch_file` (a
+/// `file_path` argument), a shell called `sh` (a `cmd` argument), and a
+/// finisher called `submit` gates identically, and the refusal names the
+/// call. `sh` declares `Execute`, the third shell shape in circulation —
+/// what an MCP-provided tool gets when it declares nothing.
+#[tokio::test]
+async fn bw9_gate_keys_on_policy_not_tool_name() {
+    use crate::agent::tool::{SideEffects, ToolPolicy};
+    let tools = vec![
+        MockTool::always_ok("patch_file", "patched").with_policy(ToolPolicy {
+            side_effects: SideEffects::Mutating,
+            ..ToolPolicy::read_only()
+        }),
+        MockTool::always_ok("sh", "test result: ok. 3 passed").with_policy(ToolPolicy {
+            side_effects: SideEffects::Execute,
+            idempotent: false,
+            ..ToolPolicy::read_only()
+        }),
+        MockTool::always_ok("submit", "done").with_policy(ToolPolicy {
+            ends_turn_on_success: true,
+            ..ToolPolicy::read_only()
+        }),
+    ];
+    let script = vec![
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "p1",
+            "patch_file",
+            json!({"file_path": "src/lib.rs", "content": "x"}),
+        ))],
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "fa1",
+            "submit",
+            json!({"answer": "done"}),
+        ))],
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "s1",
+            "sh",
+            json!({"cmd": "cargo test"}),
+        ))],
+        vec![ProviderEvent::Done(assistant_tool_call(
+            "fa2",
+            "submit",
+            json!({"answer": "done"}),
+        ))],
+    ];
+    let (events, outcome) = run_verify_gate_script(script, tools, Some("cargo test")).await;
+
+    let refusal = VERIFY_GATE_REFUSAL.replace("final_answer", "submit");
+    assert_eq!(
+        final_answer_results(&events),
+        vec![(true, refusal.as_str()), (false, "done")]
+    );
+    assert_eq!(verify_gate_callouts(&events), 1);
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-83bw9: the gate must not spend turns the ask does not have. The
+/// refusal mandates a round trip — see it, run the verify command, finish
+/// — so with the refusal landing on the LAST turn it stands down and the
+/// ask finishes instead of dying on its own nudge.
+#[tokio::test]
+async fn bw9_gate_stands_down_when_turn_budget_cannot_fit_the_rerun() {
+    let script = vec![edit_turn("e1", "src/lib.rs"), final_answer_turn("fa1")];
+    let (events, outcome) = run_verify_gate_script_capped(
+        script,
+        verify_gate_tools("unused"),
+        Some("cargo test"),
+        Some(2),
+    )
+    .await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    assert_eq!(verify_gate_callouts(&events), 0);
+    assert!(!events.iter().any(
+        |e| matches!(e, AgentEvent::Done { stop_reason, .. } if *stop_reason
+            == StopReason::IterationCap)
+    ));
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-83bw9: the other side of that boundary — with exactly the three
+/// turns the round trip needs (refuse, verify, finish), the gate fires
+/// and the ask still completes inside the cap.
+#[tokio::test]
+async fn bw9_gate_fires_when_the_turn_budget_just_fits() {
+    let script = vec![
+        edit_turn("e1", "src/lib.rs"),
+        final_answer_turn("fa1"),
+        bash_turn("b1", "cargo test"),
+        final_answer_turn("fa2"),
+    ];
+    let tools = verify_gate_tools("test result: ok. 3 passed\nelapsed: 10ms");
+    let (events, outcome) =
+        run_verify_gate_script_capped(script, tools, Some("cargo test"), Some(4)).await;
+
+    assert_eq!(
+        final_answer_results(&events),
+        vec![(true, VERIFY_GATE_REFUSAL), (false, "done")]
+    );
+    assert_eq!(verify_gate_callouts(&events), 1);
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-83bw9: a blank verify command is a typo, not a command. It must
+/// read as "gate off" rather than arming a gate no run could satisfy.
+#[tokio::test]
+async fn bw9_blank_verify_command_never_gates() {
+    let script = vec![edit_turn("e1", "src/main.rs"), final_answer_turn("fa1")];
+    let (events, outcome) =
+        run_verify_gate_script(script, verify_gate_tools("unused"), Some("   ")).await;
+
+    assert_eq!(final_answer_results(&events), vec![(false, "done")]);
+    assert_eq!(verify_gate_callouts(&events), 0);
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+#[test]
+fn bw9_runs_verify_command_matches_invocations_not_mentions() {
+    use execute_tools::runs_verify_command;
+    let verify: Vec<String> = ["cargo", "test"].iter().map(|w| (*w).to_owned()).collect();
+    for run in [
+        "cargo test",
+        "cargo test --offline",
+        "cargo test 2>&1 | tail -n 20",
+        "cargo fmt && cargo test",
+        "just fmt\ncargo test -p mu-core",
+        "CARGO_TARGET_DIR=/tmp/t cargo test",
+        "timeout 600 cargo test",
+        "env RUSTFLAGS=-Awarnings timeout -k 5s 600 cargo test --offline",
+        "cargo test; cargo clippy",
+        "cargo test # after the edit",
+    ] {
+        assert!(runs_verify_command(run, &verify), "{run} should be a run");
+    }
+    for mention in [
+        "echo cargo test",
+        "printf 'cargo test\\n'",
+        "grep 'cargo test' README.md",
+        "# cargo test",
+        "echo 'run cargo test next' >> notes.txt",
+        // A different command, and a prefix that is not the whole command.
+        "cargo build",
+        "cargo",
+        "cargo-test",
+        // Unbalanced quote: unparseable, so it can never mint a green run.
+        "cargo test 'unterminated",
+    ] {
+        assert!(
+            !runs_verify_command(mention, &verify),
+            "{mention} should not be a run"
+        );
+    }
+    // An empty verify command matches nothing (the gate is off anyway).
+    assert!(!runs_verify_command("cargo test", &[]));
+}
+
+/// mu-83bw9: the runner check must accept the policy shapes production
+/// shells actually declare. It used to require `derived_effects().process`
+/// — a bit only `SideEffects::Execute` sets — while the bash tool declares
+/// `Mutating` (strict) or `Destructive` (yolo), so no shipped shell was
+/// ever recognised and no verify run was ever recorded green.
+#[test]
+fn bw9_shell_command_arg_accepts_every_production_shell_policy() {
+    use crate::agent::tool::{SideEffects, ToolPolicy};
+    use execute_tools::shell_command_arg;
+
+    let shell = |side_effects| ToolPolicy {
+        side_effects,
+        idempotent: false,
+        ..ToolPolicy::read_only()
+    };
+    for side_effects in [
+        SideEffects::Mutating,    // bash, strict mode
+        SideEffects::Destructive, // bash, yolo mode
+        SideEffects::Execute,     // an MCP tool that declares nothing
+    ] {
+        let policy = shell(side_effects);
+        assert_eq!(
+            shell_command_arg(&policy, &json!({"command": "cargo test"})),
+            Some("cargo test"),
+            "{side_effects:?} carries a command line"
+        );
+        assert_eq!(
+            shell_command_arg(&policy, &json!({"cmd": "cargo test"})),
+            Some("cargo test"),
+            "{side_effects:?} with a `cmd` argument"
+        );
+    }
+
+    // Park-and-wake (`watch`): its success result acknowledges the
+    // registration, so it can never evidence a green run.
+    let watch = ToolPolicy {
+        side_effects: SideEffects::Execute,
+        ends_turn_on_success: true,
+        ..ToolPolicy::read_only()
+    };
+    assert_eq!(
+        shell_command_arg(&watch, &json!({"command": "cargo test", "note": "tests"})),
+        None
+    );
+
+    // No command-shaped argument: an editor's write is not a command line,
+    // and a worker spawn carries a prompt.
+    assert_eq!(
+        shell_command_arg(
+            &shell(SideEffects::Mutating),
+            &json!({"path": "src/lib.rs", "old_string": "a", "new_string": "cargo test"})
+        ),
+        None
+    );
+    assert_eq!(
+        shell_command_arg(
+            &shell(SideEffects::Execute),
+            &json!({"prompt": "run cargo test"})
+        ),
+        None
+    );
+    // A non-string `command` is not a command line either.
+    assert_eq!(
+        shell_command_arg(
+            &shell(SideEffects::Mutating),
+            &json!({"command": ["cargo", "test"]})
+        ),
+        None
+    );
+}
+
+/// mu-83bw9: a heredoc BODY is data, not commands. Tokenizing every line
+/// independently let `cat > notes.md <<'EOF'` / `cargo test` / `EOF` —
+/// which only writes a file — mint a green verify run.
+#[test]
+fn bw9_heredoc_body_is_not_a_verify_run() {
+    use execute_tools::runs_verify_command;
+    let verify: Vec<String> = ["cargo", "test"].iter().map(|w| (*w).to_owned()).collect();
+
+    for body in [
+        "cat > notes.md <<'EOF'\ncargo test\nEOF",
+        "cat > notes.md <<\"EOF\"\ncargo test\nEOF",
+        "cat > notes.md <<EOF\ncargo test\nEOF",
+        "cat > notes.md << EOF\ncargo test\nEOF",
+        "cat > notes.md <<-'EOF'\n\tcargo test\n\tEOF",
+        // Unterminated: the body runs to the end of the command line.
+        "cat > notes.md <<'EOF'\ncargo test",
+        // Two heredocs on one line: both bodies are data.
+        "cat <<A <<B\ncargo test\nA\ncargo test\nB",
+        // A line that only LOOKS like the terminator does not end it.
+        "cat > notes.md <<'EOF'\nEOFX\ncargo test\nEOF",
+    ] {
+        assert!(
+            !runs_verify_command(body, &verify),
+            "{body:?} should not be a run"
+        );
+    }
+
+    for run in [
+        // The introducing line's own command still runs.
+        "cargo test <<'EOF'\ninput\nEOF",
+        // ... and so does anything after the terminator.
+        "cat > notes.md <<'EOF'\nnotes\nEOF\ncargo test",
+        // `<<-` strips leading tabs from the terminator, so the trimmed
+        // comparison ends the body and the next line is a command again.
+        "cat > notes.md <<-EOF\n\tnotes\n\tEOF\ncargo test",
+        // A here-string keeps its data on the same line: no body to skip.
+        "cargo test <<< input",
+    ] {
+        assert!(runs_verify_command(run, &verify), "{run:?} should be a run");
+    }
+}
+
+#[test]
+fn bw9_is_source_path_excludes_tests_docs_and_build_output() {
+    use execute_tools::is_source_path;
+    for src in [
+        "src/lib.rs",
+        "crates/mu-core/src/agent/loop_/mod.rs",
+        "/abs/path/to/app.py",
+        "src/testing_utils.rs",
+        // Build INPUTS change what the verify run does, so they are source.
+        "Makefile",
+        "justfile",
+        "Cargo.toml",
+        "Cargo.lock",
+        "package-lock.json",
+    ] {
+        assert!(is_source_path(src), "{src} should be source");
+    }
+    for not_src in [
+        "tests/it.rs",
+        "crates/mu-core/tests/smoke.rs",
+        "test/fixtures/a.json",
+        "src/foo_test.go",
+        "pkg/bar_test.py",
+        "target/debug/build.rs",
+        "",
+        // Documentation: no verify command can fail on prose.
+        "README.md",
+        "crates/mu-core/README.MD",
+        "docs/design.markdown",
+        "notes.txt",
+        "guide.rst",
+        "book.adoc",
+        "LICENSE",
+        "LICENSE-MIT",
+        "CHANGELOG",
+        "CHANGELOG.md",
+        "NOTICE",
+        "AUTHORS",
+    ] {
+        assert!(!is_source_path(not_src), "{not_src} should not be source");
+    }
+}
+
+#[test]
+fn bw9_is_green_verify_result_reads_exit_line_and_failure_text() {
+    use execute_tools::is_green_verify_result;
+    assert!(is_green_verify_result(
+        "running 3 tests\ntest result: ok. 3 passed\nelapsed: 10ms"
+    ));
+    assert!(is_green_verify_result("exit: 0\nelapsed: 1ms"));
+    assert!(!is_green_verify_result(
+        "stderr:\nerror[E0308]\nexit: 101\nelapsed: 1ms"
+    ));
+    assert!(!is_green_verify_result(
+        "test result: FAILED. 1 failed\nelapsed: 1ms"
+    ));
+    assert!(!is_green_verify_result(
+        "error: could not compile `mu-core` (lib)\nelapsed: 1ms"
+    ));
+    // A small `| tail -N` keeps only cargo's trailer, not the harness
+    // summary; the pipeline exits 0 either way.
+    assert!(!is_green_verify_result(
+        "error: test failed, to rerun pass `-p mu-core --lib`\nelapsed: 1ms"
+    ));
+    assert!(!is_green_verify_result(
+        "error: 1 target failed:\n    `-p mu-solo --test pty_scrape`\nelapsed: 1ms"
+    ));
+    assert!(!is_green_verify_result(
+        "error: 2 targets failed:\n    `-p mu-core --lib`\n    `-p mu-solo --test pty_scrape`\nelapsed: 1ms"
+    ));
+}
+
 /// mu-htbz0: a UserMessage buffered while the provider streams must
 /// survive a narrow-cancel. The cancel aborts the ASK (Done/Aborted),
 /// then the buffered message starts the NEXT ask on its own — no
@@ -7308,4 +7991,33 @@ async fn htbz0_queued_interject_survives_cancel_one_stage_later() {
         )),
         "salvaged input must be a plain fresh ask, not a mid-turn interjection"
     );
+}
+
+/// mu-83bw9, board run 3: LICENSE/CHANGELOG match a file, not a prefix of
+/// a source name; a quoted `<<` is text, not a heredoc; a `||` fallback is
+/// not a run.
+#[test]
+fn bw9_doc_names_quoted_markers_and_or_fallbacks() {
+    use execute_tools::{is_source_path, runs_verify_command};
+    let verify: Vec<String> = ["cargo", "test"].iter().map(|w| (*w).to_owned()).collect();
+    for doc in [
+        "LICENSE",
+        "LICENSE.md",
+        "LICENSE-MIT",
+        "CHANGELOG.md",
+        "docs/CHANGELOG",
+    ] {
+        assert!(!is_source_path(doc), "{doc} is documentation");
+    }
+    for src in ["LICENSED.rs", "src/CHANGELOGO.rs", "licensing.rs"] {
+        assert!(is_source_path(src), "{src} is source");
+    }
+    assert!(runs_verify_command("echo '<<EOF'\ncargo test", &verify));
+    assert!(runs_verify_command(
+        "grep \"<<EOF\" notes.md; cargo test",
+        &verify
+    ));
+    assert!(!runs_verify_command("true || cargo test", &verify));
+    assert!(runs_verify_command("cargo test || echo failed", &verify));
+    assert!(runs_verify_command("cargo fmt && cargo test", &verify));
 }

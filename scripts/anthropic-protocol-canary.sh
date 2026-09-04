@@ -58,6 +58,25 @@ run_check() {
   if ! "$@" >>"$log" 2>&1; then failures+=("$name"); say "FAIL $name"; fi
 }
 
+# A live test selected by cargo's name filter: cargo exits 0 when the filter
+# matches nothing, which would be a blind pass — the same failure mode the
+# corpus replay guards against below. Require the summary to show that at
+# least one test actually ran.
+run_check_live() {
+  local name="$1" filter="$2" out rc
+  say "running $name"
+  # `set -e` is on: a plain `out=$(...)` would exit the script on the first
+  # failing live test, before the bead alert at the end — the errexit-safe
+  # form the bead filing below already uses.
+  rc=0
+  out="$(env MU_LIVE_ANTHROPIC=1 cargo test --quiet --manifest-path "$repo/Cargo.toml" -p mu-ai "$filter" 2>&1)" || rc=$?
+  printf '%s\n' "$out" >>"$log"
+  if [ "$rc" -ne 0 ]; then failures+=("$name"); say "FAIL $name"; return; fi
+  if ! printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; then
+    failures+=("$name"); say "FAIL $name (filter '$filter' matched no test — a blind pass)"
+  fi
+}
+
 say "=== run $(date) on $(hostname); repo=$repo ==="
 
 # (1) THE drift signal: replay every captured message through drift_check.
@@ -113,12 +132,14 @@ run_check spec_event_name xzgrep -q 'content_block_delta' "$spec"
 #     key must already be exported by the operator, never fetched here).
 if [ "$live" = 1 ]; then
   if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-    # Two MU_LIVE_ANTHROPIC-gated tests exist under different name stems;
+    # The MU_LIVE_ANTHROPIC-gated tests live under different name stems;
     # cargo test takes one filter, so run each explicitly.
-    run_check live_anthropic env MU_LIVE_ANTHROPIC=1 \
-      cargo test --quiet --manifest-path "$repo/Cargo.toml" -p mu-ai live_anthropic
-    run_check live_text_smoke env MU_LIVE_ANTHROPIC=1 \
-      cargo test --quiet --manifest-path "$repo/Cargo.toml" -p mu-ai live_text_smoke
+    run_check_live live_anthropic live_anthropic
+    run_check_live live_text_smoke live_text_smoke
+    # mid-conversation-tool-changes beta: a changed tool list must still read
+    # the prompt cache. A silently expired or renamed beta identifier is
+    # exactly the drift this canary exists to catch.
+    run_check_live live_tool_list_change live_tool_list_change_keeps_prompt_cache
   else
     say "ANTHROPIC_API_KEY not in environment; skipping live checks (operator-key-only by policy)"
   fi

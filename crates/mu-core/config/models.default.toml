@@ -117,9 +117,28 @@ max_output_tokens = 8192
 # Gen-5 family fallback: date-stamped ids (claude-opus-5-2026xxxx) and
 # not-yet-cataloged gen-5 variants inherit the generation-wide 128k output
 # ceiling. Exact [models.*] entries above still override per model.
-[model_rules.claude_gen_5]
-prefixes = ["claude-opus-5", "claude-sonnet-5", "claude-fable-5", "claude-mythos-5"]
+#
+# `mid_conversation_tool_changes`: the Anthropic lane sends the
+# `mid-conversation-tool-changes-2026-07-01` beta header, so tools can be
+# added or removed between turns without a prompt-cache miss. The 2026-07-24
+# changelog entry names Claude Fable 5, Mythos 5, Opus 4.8 and Opus 5 — not
+# Sonnet 5, hence the split rule. Exact entries above have no quirks, so
+# these merge in for them too (claude-opus-5, claude-fable-5).
+[model_rules.claude_gen_5_frontier]
+prefixes = ["claude-opus-5", "claude-fable-5", "claude-mythos-5"]
 max_output_tokens = 128000
+quirks = ["mid_conversation_tool_changes"]
+
+[model_rules.claude_sonnet_5]
+prefix = "claude-sonnet-5"
+max_output_tokens = 128000
+
+# Opus 4.8 is the one 4.x model on the mid-conversation tool-changes beta;
+# the longer prefix wins over `claude_opus_4` above (longest-prefix rule).
+[model_rules.claude_opus_4_8]
+prefix = "claude-opus-4-8"
+max_output_tokens = 128000
+quirks = ["mid_conversation_tool_changes"]
 
 [model_rules.openrouter_anthropic_opus]
 prefix = "anthropic/claude-opus-4."

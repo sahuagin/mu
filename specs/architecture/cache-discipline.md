@@ -82,10 +82,14 @@ Anthropic allows **up to 4 `cache_control` markers per request**. They are hiera
 
 mu's `AnthropicCacheStrategy` (after mu-yqeq.8) uses **2 of 4 markers**:
 
-1. **System span boundary** — caches the system prompt alone. Survives even if tools change.
+1. **System span boundary** — caches the system prompt alone. Note: tools precede `system` on the Anthropic wire, so a tool-list change shifts the bytes under this marker too; it does NOT survive a tool change on its own. What does is the `mid-conversation-tool-changes-2026-07-01` beta (see below).
 2. **Last stable-and-cacheable span boundary** — typically the last tool-schema span. Caches system + tools as a single prefix.
 
 The 2-marker shape mirrors the pre-mu-yqeq.8 live-loop annotation (which tagged system + last tool unconditionally). The shape isn't a maximum; it's the minimum that doesn't regress vs the legacy behavior. **There's real headroom to use markers 3 and 4 for more advanced caching strategies** — see the "Hierarchical marker strategies" section below.
+
+## Mid-conversation tool changes (implemented, mu-anthropic-protocol-2026q3-6uqho.1)
+
+Anthropic's changelog entry of 2026-07-24 introduced the beta header `mid-conversation-tool-changes-2026-07-01`: on Claude Fable 5, Mythos 5, Opus 4.8 and Opus 5, tools may be added or removed between turns while the prompt cache is preserved. mu sends it on the Anthropic lane when three gates agree: the model's catalog quirk `mid_conversation_tool_changes` (models.default.toml rules, operator-tunable), the endpoint being Anthropic's own API (a gateway or ollama box may reject an unknown beta), and no `MU_ANTHROPIC_MID_CONVERSATION_TOOL_CHANGES=0` override. The header is constant for a session, so it is not itself a per-turn invalidator. On those families it supersedes the marker-3 pattern below for the append-tool case; the pattern remains the fallback for models without the beta.
 
 ## Hierarchical marker strategies (future direction, not implemented)
 
@@ -124,7 +128,7 @@ Adapted from the Claude Code prompt-caching documentation (per tcovert's researc
 | Action | Why |
 |---|---|
 | Model switch | Cache keyed by model |
-| Tool name set changes | Tool names in cached prefix |
+| Tool name set changes | Tool names in cached prefix — except on families with the mid-conversation tool-changes beta (above), where adding/removing tools between turns keeps the cache |
 | MCP server connect/disconnect | Tool definitions change |
 | System prompt mid-session edit | The cached prefix is the system prompt |
 | Working directory change | Embedded in system prompt typically |

@@ -1450,6 +1450,196 @@ mod live_tests {
     use super::*;
     use mu_core::agent::AgentMessage;
 
+    // ----------------------------------------------------------------------
+    // mu-anthropic-protocol-2026q3-6uqho.1: mid-conversation tool changes
+    // ----------------------------------------------------------------------
+
+    /// The shipped catalog carries the quirk for exactly the families the
+    /// 2026-07-24 changelog names (and their successors by prefix), and
+    /// for nothing else: not Sonnet 5, not Opus 4.7, not a local tag.
+    #[test]
+    fn shipped_catalog_grants_the_tool_changes_quirk_to_the_documented_families() {
+        let catalog = mu_core::model_catalog::built_in();
+        for model in [
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "claude-opus-4-8",
+            "claude-opus-4-8-20260901",
+            "claude-opus-5",
+        ] {
+            assert_eq!(
+                beta_headers_for(&catalog, model, ANTHROPIC_API_BASE, None),
+                vec![MID_CONVERSATION_TOOL_CHANGES_BETA],
+                "{model}"
+            );
+        }
+        for model in [
+            "claude-sonnet-5",
+            "claude-opus-4-7",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+            "qwen3.6:27b",
+            "",
+        ] {
+            assert!(
+                beta_headers_for(&catalog, model, ANTHROPIC_API_BASE, None).is_empty(),
+                "{model}"
+            );
+        }
+    }
+
+    /// The other two gates: only Anthropic's own endpoint gets the header
+    /// (a gateway or an ollama box addressed with a Claude id may 400 on an
+    /// unknown beta; a trailing slash or case on the configured base must
+    /// not hide the real endpoint), and the operator override: off is
+    /// absolute, on still stops at the endpoint so it cannot leak the
+    /// header onto the ollama lane that shares this provider in one daemon.
+    #[test]
+    fn beta_header_is_gated_on_endpoint_and_operator_override() {
+        let catalog = mu_core::model_catalog::built_in();
+        let on = vec![MID_CONVERSATION_TOOL_CHANGES_BETA];
+        assert!(
+            beta_headers_for(&catalog, "claude-opus-5", "http://10.1.1.143:11434", None).is_empty()
+        );
+        assert!(
+            beta_headers_for(&catalog, "claude-opus-5", "https://gateway.example", None).is_empty()
+        );
+        for base in ["https://api.anthropic.com/", "HTTPS://API.ANTHROPIC.COM"] {
+            assert_eq!(
+                beta_headers_for(&catalog, "claude-opus-5", base, None),
+                on,
+                "{base}"
+            );
+        }
+        assert!(
+            beta_headers_for(&catalog, "claude-opus-5", ANTHROPIC_API_BASE, Some(false)).is_empty()
+        );
+        assert_eq!(
+            beta_headers_for(&catalog, "qwen3.6:27b", ANTHROPIC_API_BASE, Some(true)),
+            on
+        );
+        assert!(beta_headers_for(
+            &catalog,
+            "qwen3.6:27b",
+            "http://10.1.1.143:11434",
+            Some(true)
+        )
+        .is_empty());
+    }
+
+    /// A 400 that names the header is the beta being refused; any other
+    /// 400 is the request's own problem and must not trigger the retry.
+    #[test]
+    fn beta_rejection_is_told_apart_from_other_bad_requests() {
+        assert!(beta_rejected(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"Unexpected value(s) `mid-conversation-tool-changes-2026-07-01` for the `anthropic-beta` header."}}"#
+        ));
+        assert!(!beta_rejected(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages: at least one message is required"}}"#
+        ));
+        // A body that merely echoes the header's name (a tool result quoting
+        // this file, say) is not a rejection of our beta.
+        assert!(!beta_rejected(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"tool_result content too large: ... `anthropic-beta` ..."}}"#
+        ));
+    }
+
+    /// The header on the wire, not just in a helper: build the request the
+    /// stream path sends and read its headers back. Hermetic: the shipped
+    /// catalog and an explicit no-override are injected, so neither this
+    /// machine's ~/.config/mu/models.toml nor its environment can flip it.
+    #[test]
+    fn beta_header_lands_on_the_wire_for_a_documented_model_only() {
+        let catalog = mu_core::model_catalog::built_in();
+        let body = serde_json::json!({"model": "x", "messages": [], "max_tokens": 1});
+        let build = |p: &AnthropicProvider| {
+            p.messages_request_with(&body, &catalog, None)
+                .build()
+                .expect("build")
+        };
+
+        let req = build(&AnthropicProvider::new(
+            "k".into(),
+            "claude-fable-5-1".into(),
+        ));
+        assert_eq!(
+            req.headers()
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok()),
+            Some(MID_CONVERSATION_TOOL_CHANGES_BETA),
+            "{:?}",
+            req.headers()
+        );
+        assert_eq!(
+            req.headers().get("anthropic-version").unwrap(),
+            ANTHROPIC_VERSION
+        );
+
+        let req = build(&AnthropicProvider::new(
+            "k".into(),
+            "claude-sonnet-5".into(),
+        ));
+        assert!(
+            req.headers().get("anthropic-beta").is_none(),
+            "{:?}",
+            req.headers()
+        );
+
+        let req = build(
+            &AnthropicProvider::new("k".into(), "claude-fable-5-1".into())
+                .with_api_base("http://10.1.1.143:11434".into()),
+        );
+        assert!(
+            req.headers().get("anthropic-beta").is_none(),
+            "{:?}",
+            req.headers()
+        );
+    }
+
+    /// What map_tools does when a tool is appended between turns: the
+    /// `cache_control` marker moves to the new last tool and the earlier
+    /// tool's definition is otherwise unchanged. That alone does NOT keep
+    /// the cache warm — tools precede `system` on the wire, so the bytes
+    /// under the system marker shift too — which is why the beta header
+    /// exists; the live test below is what proves the cache survives.
+    #[test]
+    fn appending_a_tool_between_turns_only_moves_the_cache_marker() {
+        let read = ToolSpec {
+            name: "read".into(),
+            description: "read a file".into(),
+            input_schema: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+            ..ToolSpec::default()
+        };
+        let grep = ToolSpec {
+            name: "grep".into(),
+            description: "search files".into(),
+            input_schema: serde_json::json!({"type":"object","properties":{"pattern":{"type":"string"}}}),
+            ..ToolSpec::default()
+        };
+        let turn1 = map_tools(std::slice::from_ref(&read), true, CacheTtl::default());
+        let turn2 = map_tools(&[read, grep], true, CacheTtl::default());
+        let j1: Vec<Value> = turn1
+            .iter()
+            .map(|t| serde_json::to_value(t).unwrap())
+            .collect();
+        let j2: Vec<Value> = turn2
+            .iter()
+            .map(|t| serde_json::to_value(t).unwrap())
+            .collect();
+
+        // Turn 1: the only tool carries the marker.
+        assert!(j1[0].get("cache_control").is_some());
+        // Turn 2: the marker moved to the appended tool; the earlier tool is
+        // the same definition minus the marker, nothing else changed. (The
+        // marker itself moving is a byte change — see the docstring.)
+        assert!(j2[0].get("cache_control").is_none());
+        assert!(j2[1].get("cache_control").is_some());
+        let mut earlier = j1[0].clone();
+        earlier.as_object_mut().unwrap().remove("cache_control");
+        assert_eq!(j2[0], earlier);
+    }
+
     fn live_enabled() -> bool {
         std::env::var("MU_LIVE_ANTHROPIC")
             .ok()
@@ -1504,6 +1694,97 @@ mod live_tests {
             "expected response to contain 'hello', got: {final_text:?}"
         );
         assert_eq!(text.as_str(), final_text.as_ref());
+    }
+
+    /// mu-anthropic-protocol-2026q3-6uqho.1: with the mid-conversation
+    /// tool-changes beta on the wire, appending a tool between two turns
+    /// must still read the prompt cache written by the first turn.
+    /// Only runs when MU_LIVE_ANTHROPIC=1; the model must be one the
+    /// beta is documented for (MU_LIVE_ANTHROPIC_MODEL, default Opus 4.8).
+    #[tokio::test]
+    async fn live_tool_list_change_keeps_prompt_cache() {
+        if !live_enabled() {
+            eprintln!("skipping live_tool_list_change_keeps_prompt_cache (set MU_LIVE_ANTHROPIC=1 to run)");
+            return;
+        }
+        let model =
+            std::env::var("MU_LIVE_ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-opus-4-8".into());
+        assert!(
+            !beta_headers_for(
+                mu_core::model_catalog::global(),
+                &model,
+                ANTHROPIC_API_BASE,
+                None
+            )
+            .is_empty(),
+            "{model} does not carry the mid_conversation_tool_changes quirk in the catalog"
+        );
+        let provider = AnthropicProvider::from_env(model.clone())
+            .expect("ANTHROPIC_API_KEY must be set when MU_LIVE_ANTHROPIC=1");
+
+        // A system prompt comfortably above the model's minimum cacheable
+        // prefix (1024 tokens on the Opus/Fable families).
+        let filler = "You are a careful assistant. Answer with one word. ".repeat(220);
+        let messages = vec![AgentMessage::User {
+            content: "Say ok.".into(),
+        }];
+        let tool = |name: &str, desc: &str| ToolSpec {
+            name: name.into(),
+            description: desc.into(),
+            input_schema: json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+            display: None,
+            when: None,
+            policy: Default::default(),
+            ..Default::default()
+        };
+        let turn1 = vec![tool("read", "Read a file")];
+        let turn2 = vec![tool("read", "Read a file"), tool("grep", "Search files")];
+
+        async fn usage_of(
+            provider: &AnthropicProvider,
+            model: &str,
+            system: &str,
+            messages: &[AgentMessage],
+            tools: &[ToolSpec],
+        ) -> Usage {
+            let projection = build_projection_with_cache_strategy(Some(system), messages, tools);
+            let body =
+                build_request_body_from_projection(model, &projection, tools, CacheTtl::default());
+            let resp = provider
+                .messages_request_with(&body, mu_core::model_catalog::global(), None)
+                .send()
+                .await
+                .expect("send");
+            assert!(
+                resp.status().is_success(),
+                "anthropic returned {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
+            let (_tx, rx) = tokio::sync::oneshot::channel();
+            let mut stream = events_stream(resp.bytes_stream(), rx);
+            while let Some(event) = stream.next().await {
+                match event {
+                    ProviderEvent::Done(msg) => return msg.usage.expect("usage on Done"),
+                    ProviderEvent::Error(e) => panic!("anthropic error: {e}"),
+                    _ => {}
+                }
+            }
+            panic!("stream ended without Done");
+        }
+
+        let first = usage_of(&provider, &model, &filler, &messages, &turn1).await;
+        let second = usage_of(&provider, &model, &filler, &messages, &turn2).await;
+        eprintln!("turn 1 usage: {first:?}\nturn 2 usage: {second:?}");
+        assert!(
+            first.cache_creation_input_tokens.unwrap_or(0) > 0
+                || first.cache_read_input_tokens.unwrap_or(0) > 0,
+            "turn 1 neither wrote nor read the cache: {first:?}"
+        );
+        assert!(
+            second.cache_read_input_tokens.unwrap_or(0) > 0,
+            "turn 2 read nothing from the cache after the tool list changed: {second:?}"
+        );
     }
 
     /// B-9: live API tool round-trip. Sends a tool spec; verifies the

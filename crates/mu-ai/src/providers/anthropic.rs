@@ -38,6 +38,100 @@ use super::sse::{ByteSse, SseStream};
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// Mid-conversation tool changes (beta): tools may be added or removed
+/// between turns while the prompt cache is preserved. Announced in the
+/// changelog entry of 2026-07-24 for Claude Fable 5, Mythos 5, Opus 4.8 and
+/// Opus 5; the identifier carries its own date and is copied verbatim from
+/// that entry ("Include the `mid-conversation-tool-changes-2026-07-01` beta
+/// header in your requests"). mu attaches `cache_control` to the LAST tool
+/// (see [`map_tools`]), so without this header any change to the tool list
+/// is a prefix miss on every following turn — which is exactly what deferred
+/// tool schemas loaded at turn boundaries do (mu-t4l5e).
+/// mu-anthropic-protocol-2026q3-6uqho.1.
+const MID_CONVERSATION_TOOL_CHANGES_BETA: &str = "mid-conversation-tool-changes-2026-07-01";
+/// Which models get it is the catalog's call, not this file's: the quirk on
+/// `[model_rules.*]` / `[models.*]` in models.default.toml (operator-tunable
+/// in ~/.config/mu/models.toml). Per-model wire gating lives on the card,
+/// per the convention pinned in anthropic_tests.rs (mu-provider-drift-2026q3).
+const MID_CONVERSATION_TOOL_CHANGES_QUIRK: &str = "mid_conversation_tool_changes";
+/// Operator override: `0` forces the header off everywhere; `1` forces it on
+/// regardless of the catalog, but still only on Anthropic's own endpoint
+/// (see [`beta_headers`] — the ollama lane rides this provider in the same
+/// daemon and must never see the header).
+const MID_CONVERSATION_TOOL_CHANGES_ENV: &str = "MU_ANTHROPIC_MID_CONVERSATION_TOOL_CHANGES";
+
+/// Is `api_base` Anthropic's own API? Tolerates a trailing slash and case,
+/// the two variants an operator's ANTHROPIC_BASE_URL is likely to carry.
+fn on_anthropic_api(api_base: &str) -> bool {
+    api_base
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(ANTHROPIC_API_BASE)
+}
+
+/// The `anthropic-beta` values the lane opts into. One header carries them
+/// comma-joined; an empty list sends no header at all. Three gates: the
+/// operator override (off is absolute; on still stops at the endpoint, since
+/// one daemon hosts several lanes and the ollama lane rides this provider),
+/// the endpoint (only Anthropic's own API is known to accept the identifier —
+/// a gateway or an ollama box addressed with a Claude id may reject an
+/// unknown beta with a 400), and the model's catalog quirk.
+fn beta_headers(
+    quirks: &[String],
+    on_anthropic_api: bool,
+    force: Option<bool>,
+) -> Vec<&'static str> {
+    let wanted = match force {
+        Some(false) => false,
+        Some(true) => on_anthropic_api,
+        None => {
+            on_anthropic_api
+                && quirks
+                    .iter()
+                    .any(|q| q == MID_CONVERSATION_TOOL_CHANGES_QUIRK)
+        }
+    };
+    if wanted {
+        vec![MID_CONVERSATION_TOOL_CHANGES_BETA]
+    } else {
+        Vec::new()
+    }
+}
+
+/// [`beta_headers`] resolved from a catalog for a model and endpoint.
+fn beta_headers_for(
+    catalog: &mu_core::model_catalog::ModelCatalogConfig,
+    model: &str,
+    api_base: &str,
+    force: Option<bool>,
+) -> Vec<&'static str> {
+    let quirks = catalog.resolve_model(model).quirks;
+    beta_headers(&quirks, on_anthropic_api(api_base), force)
+}
+
+/// Did a 400 reject the beta header itself? Anthropic names both the header
+/// and the offending value in that error ("Unexpected value(s)
+/// `mid-conversation-tool-changes-2026-07-01` for the `anthropic-beta`
+/// header"), so a retired or renamed identifier can be told apart from any
+/// other bad request — including one whose body merely echoes request
+/// content that mentions the header, which a coding agent's tool results
+/// can — and the lane degrades to a request without it.
+fn beta_rejected(body: &str) -> bool {
+    body.contains("anthropic-beta") && body.contains(MID_CONVERSATION_TOOL_CHANGES_BETA)
+}
+
+/// The operator override, read from the environment: `1` on, `0` off,
+/// anything else no override.
+fn beta_override_from_env() -> Option<bool> {
+    match std::env::var(MID_CONVERSATION_TOOL_CHANGES_ENV)
+        .ok()
+        .as_deref()
+    {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
+}
+
 /// Direct API Provider. Holds an API key (ENV-sourced is fine — this
 /// isn't an OAuth token).
 pub struct AnthropicProvider {
@@ -56,6 +150,12 @@ pub struct AnthropicProvider {
     /// with_thinking_flag) from the `--thinking` flag.
     thinking_effort: Option<String>,
     thinking_wire: ThinkingWire,
+    /// Set once the endpoint has refused the beta header (a retired or
+    /// renamed identifier); every later request on this provider goes out
+    /// without it, so the degradation costs one extra request per provider,
+    /// not two per turn — and the header stays constant across the turns
+    /// that follow, which keeps their prefix cacheable.
+    beta_refused: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +165,40 @@ enum ThinkingWire {
 }
 
 impl AnthropicProvider {
+    /// The `/v1/messages` POST for a built wire body: auth, the protocol
+    /// version, and the catalog-gated beta headers (see [`beta_headers`]),
+    /// with the catalog and override injected. `stream` resolves them from
+    /// the live catalog and the process environment and sends through
+    /// [`Self::messages_request_raw`]; the wire test injects the shipped
+    /// catalog so it asserts on the repo, not on this machine's
+    /// ~/.config/mu/models.toml or environment (the lesson of bead mu-nzxa:
+    /// tests read `built_in()`).
+    #[cfg(test)]
+    fn messages_request_with(
+        &self,
+        body: &Value,
+        catalog: &mu_core::model_catalog::ModelCatalogConfig,
+        force: Option<bool>,
+    ) -> reqwest::RequestBuilder {
+        let betas = beta_headers_for(catalog, &self.model, &self.api_base, force);
+        self.messages_request_raw(body, &betas)
+    }
+
+    /// The request with an explicit beta list; `stream` uses it for the
+    /// retry-without-beta path.
+    fn messages_request_raw(&self, body: &Value, betas: &[&str]) -> reqwest::RequestBuilder {
+        let mut req = self
+            .client
+            .post(format!("{}/v1/messages", self.api_base))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json");
+        if !betas.is_empty() {
+            req = req.header("anthropic-beta", betas.join(","));
+        }
+        req.json(body)
+    }
+
     pub fn new(api_key: String, model: String) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -73,6 +207,7 @@ impl AnthropicProvider {
             api_base: ANTHROPIC_API_BASE.to_string(),
             cache_ttl: CacheTtl::default(),
             thinking_effort: None,
+            beta_refused: std::sync::atomic::AtomicBool::new(false),
             thinking_wire: ThinkingWire::AnthropicAdaptive,
         }
     }
@@ -123,7 +258,7 @@ impl AnthropicProvider {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_default();
-        if api_key.is_empty() && api_base == ANTHROPIC_API_BASE {
+        if api_key.is_empty() && on_anthropic_api(&api_base) {
             return Err(ProviderError::Other(
                 "ANTHROPIC_API_KEY not set or empty (required when ANTHROPIC_BASE_URL points at api.anthropic.com)".into(),
             ));
@@ -135,6 +270,7 @@ impl AnthropicProvider {
             api_base,
             cache_ttl: CacheTtl::default(),
             thinking_effort: None,
+            beta_refused: std::sync::atomic::AtomicBool::new(false),
             thinking_wire: ThinkingWire::AnthropicAdaptive,
         })
     }
@@ -213,16 +349,47 @@ impl Provider for AnthropicProvider {
             }
         }
 
-        let resp = self
-            .client
-            .post(format!("{}/v1/messages", self.api_base))
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&body)
+        let betas = if self.beta_refused.load(std::sync::atomic::Ordering::Relaxed) {
+            Vec::new()
+        } else {
+            beta_headers_for(
+                mu_core::model_catalog::global(),
+                &self.model,
+                &self.api_base,
+                beta_override_from_env(),
+            )
+        };
+        let mut resp = self
+            .messages_request_raw(&body, &betas)
             .send()
             .await
             .map_err(|e| ProviderError::Other(format!("anthropic request: {e}")))?;
+
+        // A retired or renamed beta identifier must not brick the lane: on a
+        // 400 that names the header, retry without it, say so, and latch.
+        if !betas.is_empty() && resp.status() == reqwest::StatusCode::BAD_REQUEST {
+            let text = resp.text().await.unwrap_or_default();
+            if !beta_rejected(&text) {
+                return Err(ProviderError::Other(format!(
+                    "anthropic returned {}: {text}",
+                    reqwest::StatusCode::BAD_REQUEST
+                )));
+            }
+            self.beta_refused
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                betas = %betas.join(","),
+                body = %text,
+                "anthropic rejected the beta header; retrying without it and \
+                 dropping it for the rest of this provider's life (set \
+                 {MID_CONVERSATION_TOOL_CHANGES_ENV}=0 to stop sending it at all)"
+            );
+            resp = self
+                .messages_request_raw(&body, &[])
+                .send()
+                .await
+                .map_err(|e| ProviderError::Other(format!("anthropic request: {e}")))?;
+        }
 
         if !resp.status().is_success() {
             let status = resp.status();

@@ -262,11 +262,39 @@ pub struct InboundDm {
 // ─────────────────────────────── Gateway ────────────────────────────────────
 
 /// A peer this gateway fronts on the mesh: its DM subscription and its `$SRV`
-/// presence registration. Dropping it releases both (aborting the task ends
-/// the subscription; dropping the Micro `Service` deregisters presence).
+/// presence registration. Both must be ENDED through [`Fronted::release`]:
+/// aborting the task ends the subscription, and the Micro `Service` has to be
+/// `stop()`ped — dropping it does NOT deregister presence. async-nats 0.49's
+/// `Service` has no `Drop`; its `$SRV` responder task runs until `stop()`
+/// aborts it, and `stop()` only reaches that abort when the service has at
+/// least one endpoint (its shutdown broadcast needs a live receiver, and only
+/// endpoints hold one — hence `_stop_anchor`). Relying on drop left every cc
+/// session ever fronted answering `$SRV.PING` until the gateway restarted:
+/// 783 phantom peers on 2026-09-08 (mu-gateway-phantom-srv-presence-se0nc).
 struct Fronted {
     task: tokio::task::JoinHandle<()>,
-    _presence: async_nats::service::Service,
+    /// `Some` until [`Fronted::release`] consumes it; `stop()` is async, so
+    /// it cannot run from `Drop`.
+    presence: Option<async_nats::service::Service>,
+    /// The endpoint that makes `stop()` effective (see above). Never polled;
+    /// nothing publishes on its subject. `None` only if registering it failed:
+    /// the peer keeps its inbox and presence, and `release` then cannot
+    /// deregister (it says so).
+    _stop_anchor: Option<async_nats::service::endpoint::Endpoint>,
+}
+
+impl Fronted {
+    /// End the DM subscription and deregister `$SRV` presence. A failed stop
+    /// is logged, not fatal: the sweep must keep going, and the peer then
+    /// stays discoverable only until the gateway restarts.
+    async fn release(mut self, peer_id: &str) {
+        self.task.abort();
+        if let Some(presence) = self.presence.take() {
+            if let Err(e) = presence.stop().await {
+                warn!(peer = %peer_id, "gateway: $SRV presence stop failed, peer stays discoverable until restart: {e}");
+            }
+        }
+    }
 }
 
 impl Drop for Fronted {
@@ -517,7 +545,7 @@ impl Gateway {
         let subject = PeerId::parse(peer_id).dm_subject();
         // Bounded: front_peer runs from touch_peer, i.e. on EVERY say and poll
         // by a peer not yet fronted. An unreachable broker must not hang that.
-        let (presence, mut sub) = bounded(&format!("fronting {peer_id}"), async {
+        let (presence, stop_anchor, mut sub) = bounded(&format!("fronting {peer_id}"), async {
             let presence = self
                 .client
                 .service_builder()
@@ -529,6 +557,19 @@ impl Gateway {
                 )
                 .await
                 .map_err(|e| anyhow!("gateway: presence register {peer_id}: {e}"))?;
+            // The endpoint exists so `stop()` can deregister this presence
+            // later (see `Fronted`). Private to the gateway; never published
+            // on. Best-effort: a peer must not lose its mesh inbox over it.
+            let stop_anchor = match presence
+                .endpoint(format!("{subject}.gateway-presence"))
+                .await
+            {
+                Ok(ep) => Some(ep),
+                Err(e) => {
+                    warn!(peer = %peer_id, "gateway: presence anchor endpoint failed; release will not deregister this peer's $SRV presence: {e}");
+                    None
+                }
+            };
             let sub = self
                 .client
                 .subscribe(subject.clone())
@@ -538,7 +579,7 @@ impl Gateway {
                 .flush()
                 .await
                 .map_err(|e| anyhow!("gateway: flush: {e}"))?;
-            Ok::<_, anyhow::Error>((presence, sub))
+            Ok::<_, anyhow::Error>((presence, stop_anchor, sub))
         })
         .await?;
 
@@ -576,20 +617,20 @@ impl Gateway {
             }
         });
 
+        let ours = Fronted {
+            task,
+            presence: Some(presence),
+            _stop_anchor: stop_anchor,
+        };
         let mut fronted = self.fronted.lock().await;
         if fronted.contains_key(peer_id) {
             // Lost a race: another call registered while we were awaiting.
-            // Dropping ours releases both the subscription and the presence.
-            task.abort();
+            // Release ours — subscription AND presence — outside the lock.
+            drop(fronted);
+            ours.release(peer_id).await;
             return Ok(false);
         }
-        fronted.insert(
-            peer_id.to_string(),
-            Fronted {
-                task,
-                _presence: presence,
-            },
-        );
+        fronted.insert(peer_id.to_string(), ours);
         info!(peer = %peer_id, "mesh gateway: fronting peer (presence + dm inbox)");
         Ok(true)
     }
@@ -597,11 +638,12 @@ impl Gateway {
     /// Stop fronting a peer — releases its subscription and deregisters its
     /// presence. Used by the stale-peer sweep.
     pub async fn release_peer(&self, peer_id: &str) -> bool {
-        let removed = self.fronted.lock().await.remove(peer_id).is_some();
-        if removed {
-            info!(peer = %peer_id, "mesh gateway: released peer");
-        }
-        removed
+        let Some(fronted) = self.fronted.lock().await.remove(peer_id) else {
+            return false;
+        };
+        fronted.release(peer_id).await;
+        info!(peer = %peer_id, "mesh gateway: released peer (dm inbox + $SRV presence)");
+        true
     }
 
     /// The peers this gateway currently fronts.
@@ -856,6 +898,42 @@ mod live_tests {
             .to_vec()
             .unwrap();
         base64::engine::general_purpose::STANDARD.encode(token)
+    }
+
+    /// Releasing a fronted peer must END its `$SRV` presence, not merely drop
+    /// the handle: `$SRV.PING` is what `srv_agents()` (and mu's `who`) call
+    /// "on the mesh", so a leaked responder is a phantom peer that keeps
+    /// attracting mesh-routed messages nobody will read
+    /// (mu-gateway-phantom-srv-presence-se0nc). The abort lands asynchronously,
+    /// so the sweep is retried briefly before the verdict.
+    #[tokio::test]
+    #[ignore = "requires a live NATS server"]
+    async fn releasing_a_fronted_peer_ends_its_srv_presence() {
+        let (gw, _rx, _root) = live_gateway().await;
+        let peer = format!("cc:gw-release-{}", std::process::id());
+        assert!(gw.front_peer(&peer).await.expect("front a cc: peer"));
+        let live = gw.srv_agents().await.expect("$SRV sweep");
+        assert!(
+            live.contains_key(&peer),
+            "a fronted peer answers $SRV.PING: {live:?}"
+        );
+
+        assert!(gw.release_peer(&peer).await, "release reports the removal");
+        assert!(gw.fronted_peers().await.is_empty());
+        let mut last = HashMap::new();
+        for _ in 0..10 {
+            last = gw.srv_agents().await.expect("$SRV sweep");
+            if !last.contains_key(&peer) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            !last.contains_key(&peer),
+            "a released peer must stop answering $SRV.PING: {last:?}"
+        );
+        // Releasing twice is a no-op, not an error.
+        assert!(!gw.release_peer(&peer).await);
     }
 
     /// Micro accepts only `[A-Za-z0-9_-]` in a service NAME, so identity is

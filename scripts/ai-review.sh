@@ -409,6 +409,12 @@ elif [ -r "$ROOT/AGENTS.md" ]; then
   INVARIANTS="$(awk '/^## Architecture invariants/{f=1} /^## /{if(f && !/^## Architecture invariants/) exit} f' "$ROOT/AGENTS.md")"
 fi
 INVARIANTS_CLAUSE=""; INVARIANTS_BLOCK=""
+# The panel's conformance seat asks THIS flag whether invariants exist, never
+# the prompt text (which embeds untrusted diff/file content that could carry a
+# look-alike heading). Exported: consensus.sh -> dispatch.sh -> seat-prompt.sh.
+MU_REVIEW_INVARIANTS_PRESENT=0
+[ -n "$INVARIANTS" ] && MU_REVIEW_INVARIANTS_PRESENT=1
+export MU_REVIEW_INVARIANTS_PRESENT
 if [ -z "$INVARIANTS" ]; then
   # Say so, once: a repo without a declared invariants section gets no
   # conformance criteria, and a `seam = "conformance"` seat in the roster then

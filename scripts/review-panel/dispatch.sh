@@ -107,12 +107,18 @@ while [ "$r" -lt "$N" ]; do
   # be built, the seat falls back to the SHARED prompt — a duplicate review
   # beats a review of half a prompt — and .done records the fallback.
   seat_pf="${OUT}.${tag}.prompt"
-  seat_mode=$(seat_prompt "$PF" "$seat_pf" "$focus" "$seam" "$checklist") || {
+  # MU_REVIEW_INVARIANTS_PRESENT is the gate's own statement of whether an
+  # invariants block exists — never inferred from the prompt text, which
+  # embeds untrusted repo content.
+  seat_mode=$(seat_prompt "$PF" "$seat_pf" "$focus" "$seam" "$checklist" "${MU_REVIEW_INVARIANTS_PRESENT:-}") || {
     echo "dispatch.sh: could not build the seat prompt for $tag (focus=[$focus] seam=[$seam]) — falling back to the shared prompt" >&2
     rm -f "$seat_pf"
     seat_mode=shared; focus=""; seam=""
   }
-  [ "$seat_mode" = shared ] && seat_pf="$PF"
+  case "$seat_mode" in
+    shared) seat_pf="$PF" ;;
+    seam|conformance) focus="" ;;  # the seam won; keep the .done record honest
+  esac
   (
     [ -n "$rank_env" ] && eval "export $rank_env"
     warmup "$prov" "$model"

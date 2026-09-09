@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use serde_json::{json, Value};
+use strum::IntoEnumIterator as _;
 use tokio::sync::oneshot;
 
 use mu_anthropic::{
@@ -38,58 +39,148 @@ use super::sse::{ByteSse, SseStream};
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-/// Mid-conversation tool changes (beta): tools may be added or removed
-/// between turns while the prompt cache is preserved. Announced in the
-/// changelog entry of 2026-07-24 for Claude Fable 5, Mythos 5, Opus 4.8 and
-/// Opus 5; the identifier carries its own date and is copied verbatim from
-/// that entry ("Include the `mid-conversation-tool-changes-2026-07-01` beta
-/// header in your requests"). mu attaches `cache_control` to the LAST tool
-/// (see [`map_tools`]), so without this header any change to the tool list
-/// is a prefix miss on every following turn — which is exactly what deferred
-/// tool schemas loaded at turn boundaries do (mu-t4l5e).
-/// mu-anthropic-protocol-2026q3-6uqho.1.
-const MID_CONVERSATION_TOOL_CHANGES_BETA: &str = "mid-conversation-tool-changes-2026-07-01";
-/// Which models get it is the catalog's call, not this file's: the quirk on
-/// `[model_rules.*]` / `[models.*]` in models.default.toml (operator-tunable
-/// in ~/.config/mu/models.toml). Per-model wire gating lives on the card,
-/// per the convention pinned in anthropic_tests.rs (mu-provider-drift-2026q3).
-const MID_CONVERSATION_TOOL_CHANGES_QUIRK: &str = "mid_conversation_tool_changes";
-/// Operator override: `0` forces the header off everywhere; `1` forces it on
-/// regardless of the catalog, but still only on Anthropic's own endpoint
-/// (see [`beta_headers`] — the ollama lane rides this provider in the same
-/// daemon and must never see the header).
-const MID_CONVERSATION_TOOL_CHANGES_ENV: &str = "MU_ANTHROPIC_MID_CONVERSATION_TOOL_CHANGES";
+// ============================================================================
+// Beta headers (mu-anthropic-protocol-2026q3-6uqho.1, .3, .4, .5)
+// ============================================================================
 
-/// Per-message effort: `output_config.effort` on a `role: "system"` message
-/// inside `messages` (Fable 5.1, Mythos 5.1, Opus 5; the effort page's
-/// "Per-message effort (beta)"). Required whenever a message carries the
-/// field and never otherwise, so it follows the body rather than a catalog
-/// quirk — see [`body_betas`]. mu-anthropic-protocol-2026q3-6uqho.3.
-const MID_CONVERSATION_OUTPUT_CONFIG_BETA: &str = "mid-conversation-output-config-2026-07-01";
-/// Turn-scoped system messages: `clear_at` on a `role: "system"` message
-/// (the mid-conversation-system-messages page's "Turn-scoped system
-/// messages"). Same rule: sent exactly when a message carries the field.
-const MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA: &str = "mid-conversation-system-clear-at-2026-08-21";
-/// `thinking.display: "updates"` — progress updates between tool calls come
-/// back as readable text while reasoning stays empty (the thinking page's
-/// "Progress updates between tool calls"). Sent exactly when the body's
-/// `thinking.display` is that value; the other two values need no header.
-const THINKING_DISPLAY_UPDATES_BETA: &str = "thinking-display-updates-2026-08-18";
-/// `thinking.block_binding` on the request and `input_transformations` on the
-/// response (the preserved-thinking page's "Set the mismatch behavior and
-/// read input_transformations"). Sent exactly when the body's `thinking`
-/// carries `block_binding`, whichever value it holds.
-const THINKING_BINDING_CONTROLS_BETA: &str = "thinking-binding-controls-2026-08-01";
-/// The request-side `fallbacks` parameter, `"default"` or an explicit list
-/// (the refusals-and-fallback page's "Server-side fallback"). The header
-/// "must carry exactly the date 2026-07-01, which supports both forms";
-/// sent exactly when the body carries the field.
-const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
-/// The object form of `fallback_credit_token` (`{token, mode}`; the beta
-/// create reference: "without that header the field accepts the bare string
-/// only"). Sent exactly when the body's token is an object; the bare string
-/// needs no header.
-const FALLBACK_CREDIT_BETA: &str = "fallback-credit-2026-07-01";
+/// The `anthropic-beta` identifiers the lane knows, one variant per feature.
+/// The string form ([`Beta::as_str`], `Display`) is the header value, copied
+/// verbatim from the changelog entry or page that introduced it; each
+/// carries its own date. One is catalog-gated ([`beta_headers`]); the rest
+/// follow the body ([`Beta::asked_for_by`]). Declaration order is header
+/// order.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, strum::Display, strum::IntoStaticStr, strum::EnumIter,
+)]
+enum Beta {
+    /// Mid-conversation tool changes: tools may be added or removed between
+    /// turns while the prompt cache is preserved. Announced in the changelog
+    /// entry of 2026-07-24 for Claude Fable 5, Mythos 5, Opus 4.8 and Opus 5
+    /// ("Include the `mid-conversation-tool-changes-2026-07-01` beta header
+    /// in your requests"). mu attaches `cache_control` to the LAST tool (see
+    /// [`map_tools`]), so without this header any change to the tool list is
+    /// a prefix miss on every following turn — which is exactly what
+    /// deferred tool schemas loaded at turn boundaries do (mu-t4l5e). The
+    /// feature leaves no trace in the body, so which models get it is the
+    /// catalog's call: [`Quirk::MidConversationToolChanges`].
+    #[strum(serialize = "mid-conversation-tool-changes-2026-07-01")]
+    MidConversationToolChanges,
+    /// Per-message effort: `output_config.effort` on a `role: "system"`
+    /// message inside `messages` (Fable 5.1, Mythos 5.1, Opus 5; the effort
+    /// page's "Per-message effort (beta)"). Asked for exactly when a message
+    /// carries the field; the top-level `output_config` (the `--thinking`
+    /// effort knob on every request) is not a per-message field and asks for
+    /// nothing.
+    #[strum(serialize = "mid-conversation-output-config-2026-07-01")]
+    MidConversationOutputConfig,
+    /// Turn-scoped system messages: `clear_at` on a `role: "system"` message
+    /// (the mid-conversation-system-messages page's "Turn-scoped system
+    /// messages"). Without the header the API rejects the field as unknown
+    /// ("clear_at: Extra inputs are not permitted").
+    #[strum(serialize = "mid-conversation-system-clear-at-2026-08-21")]
+    MidConversationSystemClearAt,
+    /// `thinking.display: "updates"` — progress updates between tool calls
+    /// come back as readable text while reasoning stays empty (the thinking
+    /// page's "Progress updates between tool calls"). The other two display
+    /// values, including the `summarized` that [`apply_thinking`] sends,
+    /// need no header.
+    #[strum(serialize = "thinking-display-updates-2026-08-18")]
+    ThinkingDisplayUpdates,
+    /// `thinking.block_binding` on the request and `input_transformations`
+    /// on the response (the preserved-thinking page's "Set the mismatch
+    /// behavior and read input_transformations"), whichever behavior the
+    /// object names.
+    #[strum(serialize = "thinking-binding-controls-2026-08-01")]
+    ThinkingBindingControls,
+    /// The request-side `fallbacks` parameter, `"default"` or an explicit
+    /// list (the refusals-and-fallback page's "Server-side fallback"). The
+    /// header "must carry exactly the date 2026-07-01, which supports both
+    /// forms".
+    #[strum(serialize = "server-side-fallback-2026-07-01")]
+    ServerSideFallback,
+    /// The object form of `fallback_credit_token` (`{token, mode}`; the beta
+    /// create reference: "without that header the field accepts the bare
+    /// string only"). The bare string needs no header.
+    #[strum(serialize = "fallback-credit-2026-07-01")]
+    FallbackCredit,
+}
+
+impl Beta {
+    /// The header value.
+    fn as_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Does a built body ask for this beta by carrying its field? Decided by
+    /// the body alone — no catalog quirk, no endpoint gate, no operator
+    /// override: a body that carries the field is only valid where the beta
+    /// is accepted, so the header cannot make a request worse, and a gateway
+    /// that forwards to Anthropic needs it. The tool-changes beta is the
+    /// exception (its feature leaves no trace in the body) and is the
+    /// catalog's call, see [`beta_headers`]. Of all of these, what mu sends
+    /// today is `thinking.display: "summarized"` (from [`apply_thinking`]),
+    /// which needs no header; no mu path emits the per-message fields,
+    /// `display: "updates"`, `block_binding`, `fallbacks` or a credit token
+    /// yet. The transport is ready for the one that will.
+    fn asked_for_by(self, body: &Value) -> bool {
+        match self {
+            Beta::MidConversationToolChanges => false,
+            Beta::MidConversationOutputConfig => a_message_carries(body, "output_config"),
+            Beta::MidConversationSystemClearAt => a_message_carries(body, "clear_at"),
+            Beta::ThinkingDisplayUpdates => thinking_objects(body)
+                .any(|t| t.get("display").and_then(Value::as_str) == Some("updates")),
+            Beta::ThinkingBindingControls => {
+                thinking_objects(body).any(|t| t.get("block_binding").is_some_and(|b| !b.is_null()))
+            }
+            Beta::ServerSideFallback => body.get("fallbacks").is_some_and(|f| !f.is_null()),
+            Beta::FallbackCredit => body
+                .get("fallback_credit_token")
+                .is_some_and(Value::is_object),
+        }
+    }
+}
+
+/// Does any message in `body.messages` carry `field` (present and not
+/// null)?
+fn a_message_carries(body: &Value, field: &str) -> bool {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|m| {
+            m.iter()
+                .any(|msg| msg.get(field).is_some_and(|v| !v.is_null()))
+        })
+}
+
+/// Every `thinking` object the request carries: the top-level one and each
+/// explicit fallback target's per-attempt override (a target "can override
+/// max_tokens, thinking, output_config, and speed for that attempt only"),
+/// since the override is validated like a direct request to that model and
+/// needs the same headers.
+fn thinking_objects(body: &Value) -> impl Iterator<Item = &Value> {
+    body.get("thinking").into_iter().chain(
+        body.get("fallbacks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|target| target.get("thinking")),
+    )
+}
+
+/// The `anthropic-beta` header value for a list: comma-joined.
+fn header_value(betas: &[Beta]) -> String {
+    betas
+        .iter()
+        .copied()
+        .map(Beta::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Operator override for the catalog-gated beta: `0` forces the header off
+/// everywhere; `1` forces it on regardless of the catalog, but still only on
+/// Anthropic's own endpoint (see [`beta_headers`] — the ollama lane rides
+/// this provider in the same daemon and must never see the header).
+const MID_CONVERSATION_TOOL_CHANGES_ENV: &str = "MU_ANTHROPIC_MID_CONVERSATION_TOOL_CHANGES";
 
 /// Is `api_base` Anthropic's own API? Tolerates a trailing slash and case,
 /// the two variants an operator's ANTHROPIC_BASE_URL is likely to carry.
@@ -99,30 +190,25 @@ fn on_anthropic_api(api_base: &str) -> bool {
         .eq_ignore_ascii_case(ANTHROPIC_API_BASE)
 }
 
-/// The `anthropic-beta` values the lane opts into. One header carries them
-/// comma-joined; an empty list sends no header at all. Three gates: the
-/// operator override (off is absolute; on still stops at the endpoint, since
-/// one daemon hosts several lanes and the ollama lane rides this provider),
-/// the endpoint (only Anthropic's own API is known to accept the identifier —
-/// a gateway or an ollama box addressed with a Claude id may reject an
-/// unknown beta with a 400), and the model's catalog quirk.
-fn beta_headers(
-    quirks: &[String],
-    on_anthropic_api: bool,
-    force: Option<bool>,
-) -> Vec<&'static str> {
+/// The catalog-gated beta the lane opts into. Three gates: the operator
+/// override (off is absolute; on still stops at the endpoint, since one
+/// daemon hosts several lanes and the ollama lane rides this provider), the
+/// endpoint (only Anthropic's own API is known to accept the identifier — a
+/// gateway or an ollama box addressed with a Claude id may reject an unknown
+/// beta with a 400), and the model's catalog quirk. Which models get it is
+/// the catalog's call, not this file's: [`Quirk::MidConversationToolChanges`]
+/// on `[model_rules.*]` / `[models.*]` in models.default.toml
+/// (operator-tunable in ~/.config/mu/models.toml). Per-model wire gating
+/// lives on the card, per the convention pinned in anthropic_tests.rs
+/// (mu-provider-drift-2026q3).
+fn beta_headers(quirks: &[Quirk], on_anthropic_api: bool, force: Option<bool>) -> Vec<Beta> {
     let wanted = match force {
         Some(false) => false,
         Some(true) => on_anthropic_api,
-        None => {
-            on_anthropic_api
-                && quirks
-                    .iter()
-                    .any(|q| q == MID_CONVERSATION_TOOL_CHANGES_QUIRK)
-        }
+        None => on_anthropic_api && quirks.contains(&Quirk::MidConversationToolChanges),
     };
     if wanted {
-        vec![MID_CONVERSATION_TOOL_CHANGES_BETA]
+        vec![Beta::MidConversationToolChanges]
     } else {
         Vec::new()
     }
@@ -134,83 +220,18 @@ fn beta_headers_for(
     model: &str,
     api_base: &str,
     force: Option<bool>,
-) -> Vec<&'static str> {
-    let quirks = catalog.resolve_model(model).quirks;
-    beta_headers(&quirks, on_anthropic_api(api_base), force)
+) -> Vec<Beta> {
+    beta_headers(
+        &Quirk::resolve(catalog, model),
+        on_anthropic_api(api_base),
+        force,
+    )
 }
 
-/// The betas a request body asks for by carrying their fields: a message
-/// with `output_config` needs the output-config beta, one with `clear_at`
-/// the clear-at beta — without the header the API rejects the field as
-/// unknown ("clear_at: Extra inputs are not permitted"); `thinking.display:
-/// "updates"` needs the display-updates beta and `thinking.block_binding`
-/// the binding-controls beta, both 400s without it; `fallbacks` needs the
-/// server-side-fallback beta, and an object-form `fallback_credit_token`
-/// the fallback-credit beta. Unlike the
-/// tool-changes beta, whose feature leaves no trace in the body, these are
-/// decided by the body alone: no catalog quirk, no endpoint gate, no
-/// operator override. A body that carries the field is only valid where the
-/// beta is accepted, so the header cannot make a request worse, and a
-/// gateway that forwards to Anthropic needs it. The top-level `output_config`
-/// (the `--thinking` effort knob on every request) is not a per-message
-/// field and asks for nothing. Of all of these, what mu sends today is
-/// `thinking.display: "summarized"` (from `apply_thinking`), which needs no
-/// header; no mu path emits the per-message fields, `display: "updates"`,
-/// `block_binding`, `fallbacks` or a credit token yet. The transport is
-/// ready for the one that will.
-fn body_betas(body: &Value) -> Vec<&'static str> {
-    let messages = body.get("messages").and_then(Value::as_array);
-    let carries = |field: &str| {
-        messages.is_some_and(|m| {
-            m.iter()
-                .any(|msg| msg.get(field).is_some_and(|v| !v.is_null()))
-        })
-    };
-    let mut betas = Vec::new();
-    if carries("output_config") {
-        betas.push(MID_CONVERSATION_OUTPUT_CONFIG_BETA);
-    }
-    if carries("clear_at") {
-        betas.push(MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA);
-    }
-    // Every `thinking` object the request carries: the top-level one and
-    // each explicit fallback target's per-attempt override (a target "can
-    // override max_tokens, thinking, output_config, and speed for that
-    // attempt only"), since the override is validated like a direct request
-    // to that model and needs the same headers.
-    let thinking_objects = body
-        .get("thinking")
-        .into_iter()
-        .chain(
-            body.get("fallbacks")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|target| target.get("thinking")),
-        )
-        .collect::<Vec<_>>();
-    if thinking_objects
-        .iter()
-        .any(|t| t.get("display").and_then(Value::as_str) == Some("updates"))
-    {
-        betas.push(THINKING_DISPLAY_UPDATES_BETA);
-    }
-    if thinking_objects
-        .iter()
-        .any(|t| t.get("block_binding").is_some_and(|b| !b.is_null()))
-    {
-        betas.push(THINKING_BINDING_CONTROLS_BETA);
-    }
-    if body.get("fallbacks").is_some_and(|f| !f.is_null()) {
-        betas.push(SERVER_SIDE_FALLBACK_BETA);
-    }
-    if body
-        .get("fallback_credit_token")
-        .is_some_and(Value::is_object)
-    {
-        betas.push(FALLBACK_CREDIT_BETA);
-    }
-    betas
+/// The betas a request body asks for by carrying their fields (see
+/// [`Beta::asked_for_by`]), in header order.
+fn body_betas(body: &Value) -> Vec<Beta> {
+    Beta::iter().filter(|b| b.asked_for_by(body)).collect()
 }
 
 /// The `anthropic-beta` values for one request, kept as two lists because
@@ -219,8 +240,8 @@ fn body_betas(body: &Value) -> Vec<&'static str> {
 /// cannot be dropped without dropping their fields. One assembly path for
 /// the request the lane sends and for the wire tests.
 struct RequestBetas {
-    catalog: Vec<&'static str>,
-    body: Vec<&'static str>,
+    catalog: Vec<Beta>,
+    body: Vec<Beta>,
 }
 
 impl RequestBetas {
@@ -246,7 +267,7 @@ impl RequestBetas {
     }
 
     /// Everything the header carries, catalog first.
-    fn all(&self) -> Vec<&'static str> {
+    fn all(&self) -> Vec<Beta> {
         self.catalog
             .iter()
             .chain(self.body.iter())
@@ -263,7 +284,7 @@ impl RequestBetas {
 /// content that mentions the header, which a coding agent's tool results
 /// can — and the lane degrades to a request without it.
 fn beta_rejected(body: &str) -> bool {
-    body.contains("anthropic-beta") && body.contains(MID_CONVERSATION_TOOL_CHANGES_BETA)
+    body.contains("anthropic-beta") && body.contains(Beta::MidConversationToolChanges.as_str())
 }
 
 /// The operator override, read from the environment: `1` on, `0` off,
@@ -280,61 +301,207 @@ fn beta_override_from_env() -> Option<bool> {
 }
 
 // ============================================================================
-// Per-model request rules (mu-anthropic-protocol-2026q3-6uqho.6)
+// Catalog quirks and per-model request rules (mu-anthropic-protocol-2026q3-
+// 6uqho.1 and .6)
 // ============================================================================
-//
-// The request shapes a model answers with a 400 are catalog quirks on its
-// `[model_rules.*]` entry in models.default.toml (operator-tunable in
-// ~/.config/mu/models.toml), one name per rule the 2026-09-04 spec snapshot
-// states. [`model_rule_hits`] reads a built body against them and `stream`
-// refuses a request that trips one before it is sent, so the lane reports the
-// model, the field and the rule instead of relaying Anthropic's error. The
-// endpoint gate is the one [`beta_headers`] has: the catalog describes
-// Anthropic's own API, so a hit refuses there and is sent with a warning
-// anywhere else (a gateway or an ollama box addressed with a Claude id may
-// map it to anything, and the ollama lane rides this provider in the same
-// daemon). Only the shape rules refuse: `retired` is a calendar fact, so it
-// warns and lets Anthropic answer. The wire tests pin that mu's own shaping trips none of the rules
-// for any cataloged Claude model, which is how each rule is "enforced as a
-// wire absence" today. The names are data the catalog and this file share: a
-// quirk this file does not know is ignored, and a rule the catalog does not
-// grant is not applied.
 
-/// `thinking: {type: "enabled", budget_tokens}` — every model from Opus 4.7 on
-/// (`thinking-troubleshooting § Thinking support, defaults, and rejected
-/// configurations by model`).
-const REJECTS_MANUAL_THINKING_QUIRK: &str = "rejects_manual_thinking";
-/// `thinking: {type: "disabled"}` — the always-on models (same table).
-const REJECTS_THINKING_DISABLED_QUIRK: &str = "rejects_thinking_disabled";
-/// `thinking: {type: "disabled"}` together with `output_config.effort`
-/// `xhigh` or `max` — Opus 5, which accepts `disabled` at `high` or below
-/// (same table, note 2). The API default effort is `high`, so `disabled`
-/// with no effort passes.
-const REJECTS_THINKING_DISABLED_ABOVE_HIGH_EFFORT_QUIRK: &str =
-    "rejects_thinking_disabled_above_high_effort";
-/// A non-default `temperature`, `top_p` or `top_k` (`thinking § Response
-/// prefill and forced tool use`). The rule reads presence: the API's default
-/// is the absent field, and mu has no reason to send one on this wire — the
-/// catalog's sampling fields ride the OpenAI-compat wires only.
-const REJECTS_SAMPLING_PARAMS_QUIRK: &str = "rejects_sampling_params";
-/// `tool_choice` `any` or `tool` (`whats-new-fable-5-1 § Forced tool use is
-/// not supported`); `auto` and `none` are fine.
-const REJECTS_FORCED_TOOL_CHOICE_QUIRK: &str = "rejects_forced_tool_choice";
-/// `speed: "fast"` is an error (`fast-mode`, the Opus 4.7 note).
-const REJECTS_FAST_MODE_QUIRK: &str = "rejects_fast_mode";
-/// `speed: "fast"` is accepted but runs and bills at standard speed, and
-/// `usage.speed` says so (`fast-mode`, the Opus 4.6 note). A warning, not a
-/// refusal: the request succeeds.
-const IGNORES_FAST_MODE_QUIRK: &str = "ignores_fast_mode";
-/// The id is retired on the Claude API (`model-deprecations § Model
-/// status`). A warning, never a refusal: unlike the shape rules this one
-/// encodes a calendar fact, not a body mu built, and a mis-transcribed row
-/// or a postponed retirement must not brick a lane, so the request goes and
-/// Anthropic's own answer is the authority; the warning names the rule so a
-/// 404 that follows reads as what it is. Raised on api.anthropic.com only:
-/// Bedrock and Google Cloud still serve some retired ids, a gateway may map
-/// the id to anything, and a warning on every request there would be noise.
-const RETIRED_QUIRK: &str = "retired";
+/// A catalog quirk the Anthropic lane acts on: the strings on a model's
+/// `[model_rules.*]` / `[models.*]` entry in models.default.toml
+/// (operator-tunable in ~/.config/mu/models.toml), parsed at the catalog edge
+/// by [`Quirk::resolve`] — the string form is the variant name in snake case
+/// (`rejects_manual_thinking`), the same both ways (`FromStr`, `Display`,
+/// [`Quirk::as_str`]). One variant is a capability (send a beta header); the
+/// rest are the request rules the 2026-09-04 spec snapshot states — the
+/// shapes a model answers with a 400, or accepts and disregards — which
+/// [`Quirk::check`] applies to a built body and `stream` acts on before the
+/// request is sent, so the lane reports the model, the field and the rule
+/// instead of relaying Anthropic's error. The endpoint gate is the one
+/// [`beta_headers`] has: the catalog describes Anthropic's own API, so a
+/// refusal holds there and becomes a warning anywhere else (a gateway or an
+/// ollama box addressed with a Claude id may map it to anything, and the
+/// ollama lane rides this provider in the same daemon). Only the shape rules
+/// refuse: `retired` is a calendar fact, so it warns and lets Anthropic
+/// answer. The wire tests pin that mu's own shaping trips none of the rules
+/// for any cataloged Claude model, which is how each rule is "enforced as a
+/// wire absence" today. The names are data the catalog and this enum share: a
+/// string the lane does not know parses to nothing and is ignored, and a
+/// quirk the catalog does not grant is not applied. Declaration order is the
+/// order hits are reported in.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    strum::Display,
+    strum::IntoStaticStr,
+    strum::EnumString,
+    strum::EnumIter,
+)]
+#[strum(serialize_all = "snake_case")]
+enum Quirk {
+    /// Send [`Beta::MidConversationToolChanges`] on Anthropic's own endpoint.
+    /// The 2026-07-24 changelog entry names Claude Fable 5, Mythos 5, Opus 4.8
+    /// and Opus 5 — the shipped catalog's rules grant it to those.
+    MidConversationToolChanges,
+    /// `thinking: {type: "enabled", budget_tokens}` — every model from Opus
+    /// 4.7 on (`thinking-troubleshooting § Thinking support, defaults, and
+    /// rejected configurations by model`).
+    RejectsManualThinking,
+    /// `thinking: {type: "disabled"}` — the always-on models (same table).
+    RejectsThinkingDisabled,
+    /// `thinking: {type: "disabled"}` together with `output_config.effort`
+    /// `xhigh` or `max` — Opus 5, which accepts `disabled` at `high` or below
+    /// (same table, note 2). The API default effort is `high`, so `disabled`
+    /// with no effort passes.
+    RejectsThinkingDisabledAboveHighEffort,
+    /// A non-default `temperature`, `top_p` or `top_k` (`thinking § Response
+    /// prefill and forced tool use`). The rule reads presence: the API's
+    /// default is the absent field, and mu has no reason to send one on this
+    /// wire — the catalog's sampling fields ride the OpenAI-compat wires only.
+    RejectsSamplingParams,
+    /// `tool_choice` `any` or `tool` (`whats-new-fable-5-1 § Forced tool use
+    /// is not supported`); `auto` and `none` are fine.
+    RejectsForcedToolChoice,
+    /// `speed: "fast"` is an error (`fast-mode`, the Opus 4.7 note).
+    RejectsFastMode,
+    /// `speed: "fast"` is accepted but runs and bills at standard speed, and
+    /// `usage.speed` says so (`fast-mode`, the Opus 4.6 note). A warning, not
+    /// a refusal: the request succeeds.
+    IgnoresFastMode,
+    /// The id is retired on the Claude API (`model-deprecations § Model
+    /// status`). A warning, never a refusal: unlike the shape rules this one
+    /// encodes a calendar fact, not a body mu built, and a mis-transcribed
+    /// row or a postponed retirement must not brick a lane, so the request
+    /// goes and Anthropic's own answer is the authority; the warning names the
+    /// rule so a 404 that follows reads as what it is. Raised on
+    /// api.anthropic.com only: Bedrock and Google Cloud still serve some
+    /// retired ids, a gateway may map the id to anything, and a warning on
+    /// every request there would be noise.
+    Retired,
+}
+
+impl Quirk {
+    /// The catalog string.
+    fn as_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// The quirks the catalog grants a model, in declaration order. A string
+    /// the lane does not know (a local model's serving quirks, say) is
+    /// dropped here.
+    fn resolve(catalog: &mu_core::model_catalog::ModelCatalogConfig, model: &str) -> Vec<Quirk> {
+        let granted = catalog.resolve_model(model).quirks;
+        Quirk::iter()
+            .filter(|q| granted.iter().any(|g| g == q.as_str()))
+            .collect()
+    }
+
+    /// Apply this quirk's rule to a built body: `None` when the quirk is not
+    /// a rule, or the body does not trip it; otherwise what the lane does
+    /// about it. Each arm is the rule's own verdict as Anthropic's API
+    /// answers it; the endpoint policy — off that API a refusal becomes a
+    /// warning, since the catalog says what that API does with the shape,
+    /// not what the endpoint behind an operator's base URL does — is applied
+    /// once, after the match.
+    fn check(self, view: &RuleView<'_>, on_anthropic_api: bool) -> Option<RuleHit> {
+        use RuleSeverity::{Refuse, Warn};
+        let verdict: Option<(RuleSeverity, String)> = match self {
+            Quirk::MidConversationToolChanges => None,
+            Quirk::RejectsManualThinking => (view.thinking_type == Some("enabled")).then(|| {
+                (
+                    Refuse,
+                    "`thinking: {type: \"enabled\"}` (a manual budget) is a 400 on this model; \
+                     use `adaptive` with `output_config.effort`"
+                        .to_string(),
+                )
+            }),
+            Quirk::RejectsThinkingDisabled => (view.thinking_type == Some("disabled")).then(|| {
+                (
+                    Refuse,
+                    "thinking is always on: `thinking: {type: \"disabled\"}` is a 400 on this \
+                     model; omit `thinking` or send `adaptive`"
+                        .to_string(),
+                )
+            }),
+            Quirk::RejectsThinkingDisabledAboveHighEffort => {
+                match (view.thinking_type, view.effort) {
+                    (Some("disabled"), Some(effort @ ("xhigh" | "max"))) => Some((
+                        Refuse,
+                        format!(
+                            "`thinking: {{type: \"disabled\"}}` at effort `{effort}` is a 400 \
+                             on this model; `disabled` is accepted at `high` or below"
+                        ),
+                    )),
+                    _ => None,
+                }
+            }
+            Quirk::RejectsSamplingParams => (!view.sampling.is_empty()).then(|| {
+                (
+                    Refuse,
+                    format!(
+                        "`{}` is a 400 on this model (non-default sampling is rejected); \
+                         steer with the prompt instead",
+                        view.sampling.join("`, `")
+                    ),
+                )
+            }),
+            Quirk::RejectsForcedToolChoice => match view.tool_choice {
+                Some(choice @ ("any" | "tool")) => Some((
+                    Refuse,
+                    format!(
+                        "`tool_choice: {{type: \"{choice}\"}}` is a 400 on this model; use \
+                         `auto` (the default) or `none`, with `strict: true` tools or \
+                         structured outputs to force a schema"
+                    ),
+                )),
+                _ => None,
+            },
+            Quirk::RejectsFastMode => (view.speed == Some("fast")).then(|| {
+                (
+                    Refuse,
+                    "`speed: \"fast\"` is an error on this model (fast mode is not offered \
+                     for it); omit `speed`"
+                        .to_string(),
+                )
+            }),
+            Quirk::IgnoresFastMode => (view.speed == Some("fast")).then(|| {
+                (
+                    Warn,
+                    "`speed: \"fast\"` runs at standard speed and standard billing on this \
+                     model; `usage.speed` will report `standard`"
+                        .to_string(),
+                )
+            }),
+            // A warning on the API (Anthropic's answer is the authority) and
+            // nothing at all off it, where a retired-on-Anthropic id is a
+            // live model on Bedrock or Google Cloud.
+            Quirk::Retired => on_anthropic_api.then(|| {
+                (
+                    Warn,
+                    "the model id is retired on the Claude API per the 2026-09-04 snapshot; \
+                     sending anyway, and a not-found error that follows is that retirement — \
+                     pick a current id (`mu models`)"
+                        .to_string(),
+                )
+            }),
+        };
+        let (mut severity, mut detail) = verdict?;
+        if severity == Refuse && !on_anthropic_api {
+            severity = Warn;
+            detail.push_str(
+                "; sent anyway, since the endpoint is not Anthropic's own API and the id may \
+                 map to anything there",
+            );
+        }
+        Some(RuleHit {
+            quirk: self,
+            model: view.model.to_string(),
+            severity,
+            detail,
+        })
+    }
+}
 
 /// What a tripped rule means for the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,7 +521,7 @@ enum RuleSeverity {
 /// one or an explicit fallback target), and what the body did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuleHit {
-    quirk: &'static str,
+    quirk: Quirk,
     model: String,
     severity: RuleSeverity,
     detail: String,
@@ -412,123 +579,17 @@ impl<'a> RuleView<'a> {
         }
     }
 
+    /// Every rule this view trips among the quirks the catalog grants its
+    /// model, in declaration order.
     fn hits(
         &self,
         catalog: &mu_core::model_catalog::ModelCatalogConfig,
         on_anthropic_api: bool,
     ) -> Vec<RuleHit> {
-        let quirks = catalog.resolve_model(self.model).quirks;
-        let has = |q: &str| quirks.iter().any(|x| x == q);
-        let mut hits = Vec::new();
-        // Off Anthropic's own API a refusal becomes a warning: the catalog
-        // says what that API does with the shape, not what the endpoint
-        // behind an operator's base URL does with it.
-        let mut hit = |quirk: &'static str, severity: RuleSeverity, mut detail: String| {
-            let severity = if severity == RuleSeverity::Refuse && !on_anthropic_api {
-                detail.push_str(
-                    "; sent anyway, since the endpoint is not Anthropic's own API and the \
-                     id may map to anything there",
-                );
-                RuleSeverity::Warn
-            } else {
-                severity
-            };
-            hits.push(RuleHit {
-                quirk,
-                model: self.model.to_string(),
-                severity,
-                detail,
-            })
-        };
-        // `retired` is a warning on the API (Anthropic's answer is the
-        // authority; see the constant) and nothing at all off it, where a
-        // retired-on-Anthropic id is a live model on Bedrock or Google Cloud.
-        if on_anthropic_api && has(RETIRED_QUIRK) {
-            hit(
-                RETIRED_QUIRK,
-                RuleSeverity::Warn,
-                "the model id is retired on the Claude API per the 2026-09-04 snapshot; \
-                 sending anyway, and a not-found error that follows is that retirement — \
-                 pick a current id (`mu models`)"
-                    .into(),
-            );
-        }
-        if has(REJECTS_MANUAL_THINKING_QUIRK) && self.thinking_type == Some("enabled") {
-            hit(
-                REJECTS_MANUAL_THINKING_QUIRK,
-                RuleSeverity::Refuse,
-                "`thinking: {type: \"enabled\"}` (a manual budget) is a 400 on this model; \
-                 use `adaptive` with `output_config.effort`"
-                    .into(),
-            );
-        }
-        if has(REJECTS_THINKING_DISABLED_QUIRK) && self.thinking_type == Some("disabled") {
-            hit(
-                REJECTS_THINKING_DISABLED_QUIRK,
-                RuleSeverity::Refuse,
-                "thinking is always on: `thinking: {type: \"disabled\"}` is a 400 on this \
-                 model; omit `thinking` or send `adaptive`"
-                    .into(),
-            );
-        }
-        if has(REJECTS_THINKING_DISABLED_ABOVE_HIGH_EFFORT_QUIRK)
-            && self.thinking_type == Some("disabled")
-        {
-            if let Some(effort @ ("xhigh" | "max")) = self.effort {
-                hit(
-                    REJECTS_THINKING_DISABLED_ABOVE_HIGH_EFFORT_QUIRK,
-                    RuleSeverity::Refuse,
-                    format!(
-                        "`thinking: {{type: \"disabled\"}}` at effort `{effort}` is a 400 on \
-                         this model; `disabled` is accepted at `high` or below"
-                    ),
-                );
-            }
-        }
-        if has(REJECTS_SAMPLING_PARAMS_QUIRK) && !self.sampling.is_empty() {
-            hit(
-                REJECTS_SAMPLING_PARAMS_QUIRK,
-                RuleSeverity::Refuse,
-                format!(
-                    "`{}` is a 400 on this model (non-default sampling is rejected); \
-                     steer with the prompt instead",
-                    self.sampling.join("`, `")
-                ),
-            );
-        }
-        if has(REJECTS_FORCED_TOOL_CHOICE_QUIRK) {
-            if let Some(choice @ ("any" | "tool")) = self.tool_choice {
-                hit(
-                    REJECTS_FORCED_TOOL_CHOICE_QUIRK,
-                    RuleSeverity::Refuse,
-                    format!(
-                        "`tool_choice: {{type: \"{choice}\"}}` is a 400 on this model; use \
-                         `auto` (the default) or `none`, with `strict: true` tools or \
-                         structured outputs to force a schema"
-                    ),
-                );
-            }
-        }
-        if self.speed == Some("fast") {
-            if has(REJECTS_FAST_MODE_QUIRK) {
-                hit(
-                    REJECTS_FAST_MODE_QUIRK,
-                    RuleSeverity::Refuse,
-                    "`speed: \"fast\"` is an error on this model (fast mode is not offered \
-                     for it); omit `speed`"
-                        .into(),
-                );
-            } else if has(IGNORES_FAST_MODE_QUIRK) {
-                hit(
-                    IGNORES_FAST_MODE_QUIRK,
-                    RuleSeverity::Warn,
-                    "`speed: \"fast\"` runs at standard speed and standard billing on this \
-                     model; `usage.speed` will report `standard`"
-                        .into(),
-                );
-            }
-        }
-        hits
+        Quirk::resolve(catalog, self.model)
+            .into_iter()
+            .filter_map(|q| q.check(self, on_anthropic_api))
+            .collect()
     }
 }
 
@@ -650,7 +711,7 @@ impl AnthropicProvider {
 
     /// The request with an explicit beta list; `stream` uses it for the
     /// retry-without-beta path.
-    fn messages_request_raw(&self, body: &Value, betas: &[&str]) -> reqwest::RequestBuilder {
+    fn messages_request_raw(&self, body: &Value, betas: &[Beta]) -> reqwest::RequestBuilder {
         let mut req = self
             .client
             .post(format!("{}/v1/messages", self.api_base))
@@ -658,7 +719,7 @@ impl AnthropicProvider {
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json");
         if !betas.is_empty() {
-            req = req.header("anthropic-beta", betas.join(","));
+            req = req.header("anthropic-beta", header_value(betas));
         }
         req.json(body)
     }
@@ -828,7 +889,7 @@ impl Provider for AnthropicProvider {
                     )));
                 }
                 RuleSeverity::Warn => {
-                    tracing::warn!(model = %hit.model, quirk = hit.quirk, "{}", hit.detail);
+                    tracing::warn!(model = %hit.model, quirk = %hit.quirk, "{}", hit.detail);
                 }
             }
         }
@@ -872,7 +933,7 @@ impl Provider for AnthropicProvider {
             self.beta_refused
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
-                betas = %betas.catalog.join(","),
+                betas = %header_value(&betas.catalog),
                 body = %text,
                 "anthropic rejected the beta header; retrying without it and \
                  dropping it for the rest of this provider's life (set \

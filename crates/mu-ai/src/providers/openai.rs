@@ -61,6 +61,7 @@ use mu_openai::{
     ResponseStreamEvent, Tool, ToolChoice, Usage as OpenaiUsage,
 };
 
+use mu_core::agent::tool_call_cut::{CutCause, ToolCallCut, DEFAULT_MAX_TOOL_CALL_BYTES};
 use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
     ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
@@ -71,6 +72,7 @@ use mu_core::context::{
 
 use crate::auth::{self, FileSystemTokenStore, OAuthToken, TokenStore};
 
+use super::cut_detect::{cut_marker_or, detect_truncated_arguments};
 use super::sse::{ByteSse, SseStream};
 
 // ============================================================================
@@ -141,6 +143,10 @@ pub struct OpenaiProvider {
     http: reqwest::Client,
     /// Test seam — defaults to the mode's canonical endpoint.
     endpoint: String,
+    /// mu-c9b2l: `[session].max_tool_call_bytes`. Per-function_call ceiling
+    /// on accumulated argument bytes; `None` reads to the model's own output
+    /// ceiling.
+    max_tool_call_bytes: Option<usize>,
 }
 
 impl OpenaiProvider {
@@ -183,6 +189,7 @@ impl OpenaiProvider {
             },
             http: reqwest::Client::new(),
             endpoint: CODEX_ENDPOINT.into(),
+            max_tool_call_bytes: Some(DEFAULT_MAX_TOOL_CALL_BYTES),
         }
     }
 
@@ -206,6 +213,7 @@ impl OpenaiProvider {
             mode: AuthMode::Public { api_key },
             http: reqwest::Client::new(),
             endpoint,
+            max_tool_call_bytes: Some(DEFAULT_MAX_TOOL_CALL_BYTES),
         }
     }
 
@@ -236,6 +244,14 @@ impl OpenaiProvider {
     /// Test seam: override the endpoint URL (for wiremock-style tests).
     pub fn with_endpoint(mut self, endpoint: String) -> Self {
         self.endpoint = endpoint;
+        self
+    }
+
+    /// mu-c9b2l: set the per-tool-call argument-byte ceiling from
+    /// `[session].max_tool_call_bytes`. `None` (the config's `0`) reads to
+    /// the model's own output ceiling, as before this bead.
+    pub fn with_max_tool_call_bytes(mut self, max_bytes: Option<usize>) -> Self {
+        self.max_tool_call_bytes = max_bytes.filter(|n| *n > 0);
         self
     }
 
@@ -849,6 +865,11 @@ struct ToolCallBuilder {
     call_id: String,
     name: String,
     args_json: String,
+    /// mu-c9b2l: set once this call's accumulated argument bytes crossed
+    /// `max_tool_call_bytes`, or once a terminal snapshot handed over
+    /// arguments that stop mid-value. [`assemble_content`] then emits the cut
+    /// marker instead of the truncated JSON.
+    cut: Option<ToolCallCut>,
 }
 
 struct StreamState {
@@ -884,20 +905,35 @@ struct StreamState {
     emitted_done: bool,
     /// Errors that arrived via response.failed / response.error / error.
     error_message: Option<String>,
+    /// mu-c9b2l: `[session].max_tool_call_bytes`; `None` = read to the
+    /// model's own output ceiling.
+    max_tool_call_bytes: Option<usize>,
+    /// mu-c9b2l: the argument bytes this request's `max_output_tokens` buys.
+    /// The other ceiling on a tool call, and the one only this layer can see
+    /// — the marker carries it downstream so the refusal advises parts the
+    /// model has room to emit. `None` when the request omitted the field.
+    output_budget_bytes: Option<usize>,
 }
 
 fn events_stream(
     bytes: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
     cancel_rx: oneshot::Receiver<()>,
+    max_tool_call_bytes: Option<usize>,
+    output_budget_bytes: Option<usize>,
 ) -> BoxStream<'static, ProviderEvent> {
     let bytes: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> =
         Box::pin(bytes.map(|r| r.map_err(|e| e.to_string())));
     let sse = SseStream::new(bytes);
-    let state = new_stream_state(sse, cancel_rx);
+    let state = new_stream_state(sse, cancel_rx, max_tool_call_bytes, output_budget_bytes);
     Box::pin(futures::stream::unfold(state, next_event))
 }
 
-fn new_stream_state(sse: ByteSse, cancel_rx: oneshot::Receiver<()>) -> StreamState {
+fn new_stream_state(
+    sse: ByteSse,
+    cancel_rx: oneshot::Receiver<()>,
+    max_tool_call_bytes: Option<usize>,
+    output_budget_bytes: Option<usize>,
+) -> StreamState {
     StreamState {
         sse,
         accumulated_text: String::new(),
@@ -913,6 +949,8 @@ fn new_stream_state(sse: ByteSse, cancel_rx: oneshot::Receiver<()>) -> StreamSta
         finished: false,
         emitted_done: false,
         error_message: None,
+        max_tool_call_bytes,
+        output_budget_bytes,
     }
 }
 
@@ -935,6 +973,17 @@ fn openai_usage_to_mu(u: &OpenaiUsage) -> Usage {
             .as_ref()
             .and_then(|d| d.reasoning_tokens),
     }
+}
+
+/// mu-c9b2l: did this turn end against the model's own output ceiling?
+///
+/// The Responses API says so two ways, and [`map_stop`] already honours
+/// both: an explicit `incomplete_details.reason` of `max_output_tokens`, and
+/// a terminal `status: incomplete`. Either one landing mid-`arguments` means
+/// the call was cut rather than malformed.
+fn hit_output_limit(state: &StreamState) -> bool {
+    state.incomplete_reason.as_deref() == Some("max_output_tokens")
+        || matches!(state.final_status, Some(ResponseStatus::Incomplete))
 }
 
 fn map_stop(state: &StreamState) -> StopReason {
@@ -1027,9 +1076,21 @@ fn assemble_content(state: &StreamState) -> Vec<ContentBlock> {
             text: state.accumulated_text.as_str().into(),
         });
     }
+    // mu-c9b2l: a call whose arguments stop mid-value is cut, not malformed
+    // — the marker replaces them so the loop can say so instead of
+    // dispatching `{}`.
+    let hit_limit = hit_output_limit(state);
     for idx in &state.tool_call_order {
         if let Some(builder) = state.tool_calls.get(idx) {
-            let arguments = parse_tool_input(&builder.args_json);
+            let cut = builder.cut.or_else(|| {
+                detect_truncated_arguments(
+                    &builder.args_json,
+                    hit_limit,
+                    state.max_tool_call_bytes,
+                    state.output_budget_bytes,
+                )
+            });
+            let arguments = cut_marker_or(cut, || parse_tool_input(&builder.args_json));
             out.push(ContentBlock::ToolCall(ToolCall {
                 id: builder.call_id.clone(),
                 name: builder.name.clone(),
@@ -1145,6 +1206,15 @@ fn apply_terminal_response(state: &mut StreamState, response: &Response) {
 /// are repopulated alongside so `map_stop` and the EOF diagnostics keep
 /// working.
 fn adopt_snapshot_output(state: &mut StreamState, output: &[OutputItem]) {
+    // mu-c9b2l: an `incomplete` response carries the partial function_call in
+    // its snapshot, arguments and all — so this is where a mid-argument
+    // output-limit cut actually lands on this wire. Read the ceilings out
+    // before the loop borrows `state` mutably; `apply_terminal_response` has
+    // already recorded status and incomplete_details.
+    let hit_limit = hit_output_limit(state);
+    let byte_cap = state.max_tool_call_bytes;
+    let output_budget = state.output_budget_bytes;
+
     state.tool_calls.clear();
     state.tool_call_order.clear();
     // Clear the streamed item_id→index map too: we're replacing the
@@ -1200,6 +1270,9 @@ fn adopt_snapshot_output(state: &mut StreamState, output: &[OutputItem]) {
                 flush_text(&mut pending_text, &mut blocks);
                 let idx = next_idx;
                 next_idx += 1;
+                let args_json = arguments.clone().unwrap_or_default();
+                let cut =
+                    detect_truncated_arguments(&args_json, hit_limit, byte_cap, output_budget);
                 state.tool_call_order.push(idx);
                 state.tool_calls.insert(
                     idx,
@@ -1207,10 +1280,11 @@ fn adopt_snapshot_output(state: &mut StreamState, output: &[OutputItem]) {
                         item_id: id.clone(),
                         call_id: call_id.clone().unwrap_or_default(),
                         name: name.clone().unwrap_or_default(),
-                        args_json: arguments.clone().unwrap_or_default(),
+                        args_json: args_json.clone(),
+                        cut,
                     },
                 );
-                let arguments = parse_tool_input(arguments.as_deref().unwrap_or(""));
+                let arguments = cut_marker_or(cut, || parse_tool_input(&args_json));
                 blocks.push(ContentBlock::ToolCall(ToolCall {
                     id: call_id.clone().unwrap_or_default(),
                     name: name.clone().unwrap_or_default(),
@@ -1430,9 +1504,48 @@ fn fold_frame(state: &mut StreamState, frame: ResponseStreamEvent) -> Option<Pro
             // The arg-delta event carries `item_id` + `output_index`. We
             // key accumulators on output_index; record the mapping too.
             state.item_id_to_index.insert(item_id, output_index);
+            // mu-c9b2l: copied out because the entry below holds a mutable
+            // borrow of `state` while it needs the two ceilings.
+            let byte_cap = state.max_tool_call_bytes;
+            let output_budget = state.output_budget_bytes;
             let entry = tool_call_entry(state, output_index);
             entry.args_json.push_str(&delta);
             let id = entry.call_id.clone();
+            // mu-c9b2l: one call's arguments crossing the cap ends the whole
+            // response. Everything after this point is generation mu will
+            // discard — the JSON is already longer than any call it will
+            // dispatch.
+            let mut cut_call: Option<(String, ToolCallCut)> = None;
+            if entry.cut.is_none() {
+                if let Some(cap) = byte_cap {
+                    if entry.args_json.len() > cap {
+                        let cut = ToolCallCut::new(
+                            entry.args_json.len(),
+                            CutCause::ByteCap,
+                            byte_cap,
+                            output_budget,
+                        );
+                        entry.cut = Some(cut);
+                        cut_call = Some((entry.name.clone(), cut));
+                    }
+                }
+            }
+            // mu-c9b2l: abort at the cap. Replacing the SSE stream drops the
+            // reqwest response body, which closes the connection the same way
+            // a cancel does; the calls accumulated so far still go out on
+            // Done so the loop can answer the cut one.
+            if let Some((tool_name, cut)) = cut_call {
+                tracing::warn!(
+                    tool = %tool_name,
+                    bytes = cut.bytes,
+                    cap = ?byte_cap,
+                    "tool call arguments exceeded max_tool_call_bytes; aborting the stream"
+                );
+                state.sse = SseStream::new(Box::pin(futures::stream::empty()));
+                state.finished = true;
+                state.emitted_done = true;
+                return Some(done_event(state, StopReason::MaxTokens));
+            }
             Some(ProviderEvent::ToolCallDelta {
                 id,
                 name_delta: None,
@@ -1624,9 +1737,23 @@ impl Provider for OpenaiProvider {
                 .unwrap_or_else(|e| format!("(serialize failed: {e})"))
         );
 
+        // mu-c9b2l: read the output ceiling back off the body rather than
+        // recomputing it, so the marker carries the budget actually sent —
+        // and nothing when the field was omitted (an uncataloged model) or
+        // stripped (the codex lane), where the server's own model maximum
+        // applies and this layer cannot name it.
+        let output_budget_bytes = body["max_output_tokens"]
+            .as_u64()
+            .map(|t| mu_core::agent::tool_call_cut::output_budget_bytes(t as u32));
+
         let resp = self.send(&body).await?;
         let bytes = resp.bytes_stream();
-        Ok(events_stream(bytes, cancel_rx))
+        Ok(events_stream(
+            bytes,
+            cancel_rx,
+            self.max_tool_call_bytes,
+            output_budget_bytes,
+        ))
     }
 
     /// Identify as `"openai_codex"` in BOTH modes so ContextAssembly

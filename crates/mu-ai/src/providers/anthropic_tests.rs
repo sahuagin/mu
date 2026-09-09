@@ -831,6 +831,19 @@ fn test_events_stream(
     bytes: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     cancel_rx: oneshot::Receiver<()>,
 ) -> BoxStream<'static, ProviderEvent> {
+    // mu-c9b2l: the shipped default cap, so the existing scenarios exercise
+    // the same accumulator production runs.
+    test_events_stream_budgeted(bytes, cancel_rx, Some(DEFAULT_MAX_TOOL_CALL_BYTES), None)
+}
+
+/// mu-c9b2l: [`test_events_stream`] with both ceilings spelled out — the
+/// session's `max_tool_call_bytes` and what the request's `max_tokens` buys.
+fn test_events_stream_budgeted(
+    bytes: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    cancel_rx: oneshot::Receiver<()>,
+    max_tool_call_bytes: Option<usize>,
+    output_budget_bytes: Option<usize>,
+) -> BoxStream<'static, ProviderEvent> {
     let bytes: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> =
         Box::pin(bytes.map(|r| r.map_err(|e| e.to_string())));
     let sse = SseStream::new(bytes);
@@ -843,6 +856,8 @@ fn test_events_stream(
         cancel_rx: Some(cancel_rx),
         finished: false,
         emitted_done: false,
+        max_tool_call_bytes,
+        output_budget_bytes,
     };
     Box::pin(futures::stream::unfold(state, next_event))
 }
@@ -2547,7 +2562,12 @@ mod live_tests {
                 resp.text().await.unwrap_or_default()
             );
             let (_tx, rx) = tokio::sync::oneshot::channel();
-            let mut stream = events_stream(resp.bytes_stream(), rx);
+            let mut stream = events_stream(
+                resp.bytes_stream(),
+                rx,
+                Some(DEFAULT_MAX_TOOL_CALL_BYTES),
+                None,
+            );
             while let Some(event) = stream.next().await {
                 match event {
                     ProviderEvent::Done(msg) => return msg.usage.expect("usage on Done"),
@@ -3216,5 +3236,301 @@ fn apply_ollama_thinking_off_disables_without_output_config() {
     assert!(
         body.get("output_config").is_none(),
         "ollama must not get Anthropic effort"
+    );
+}
+
+// ============================================================================
+// mu-c9b2l — a cut-off tool call is legible on the Messages wire too, and the
+// stream stops at the cap
+// ============================================================================
+
+/// One Anthropic SSE frame: the `event:` line and its single-line `data:`
+/// payload, as its own chunk so a test can count how many the accumulator
+/// actually pulled.
+fn cut_frame(kind: &str, value: serde_json::Value) -> Bytes {
+    Bytes::from(format!("event: {kind}\ndata: {value}\n\n"))
+}
+
+fn tool_use_start_frame(index: u32, id: &str, name: &str) -> Bytes {
+    cut_frame(
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+        }),
+    )
+}
+
+fn input_json_frame(index: u32, partial: &str) -> Bytes {
+    cut_frame(
+        "content_block_delta",
+        json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "input_json_delta", "partial_json": partial}
+        }),
+    )
+}
+
+fn message_delta_frame(stop_reason: &str) -> Bytes {
+    cut_frame(
+        "message_delta",
+        json!({"type": "message_delta", "delta": {"stop_reason": stop_reason}}),
+    )
+}
+
+fn message_stop_frame() -> Bytes {
+    cut_frame("message_stop", json!({"type": "message_stop"}))
+}
+
+/// A byte source that counts the frames actually pulled out of it, so a test
+/// can assert the accumulator stopped reading rather than merely stopped
+/// accumulating.
+fn counted_frames(
+    frames: Vec<Bytes>,
+) -> (
+    impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let pulled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = pulled.clone();
+    let stream = futures::stream::iter(frames).map(move |frame| {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok::<_, std::io::Error>(frame)
+    });
+    (stream, pulled)
+}
+
+async fn drain_to_done(mut stream: BoxStream<'static, ProviderEvent>) -> AssistantMessage {
+    while let Some(event) = stream.next().await {
+        if let ProviderEvent::Done(msg) = event {
+            return msg;
+        }
+    }
+    panic!("stream ended without Done");
+}
+
+fn only_tool_call(msg: &AssistantMessage) -> &ToolCall {
+    let calls: Vec<&ToolCall> = msg
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolCall(tc) => Some(tc),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        calls.len(),
+        1,
+        "expected one tool call, got {:?}",
+        msg.content
+    );
+    calls[0]
+}
+
+/// The measured failure, on the Messages wire: a `write` whose input runs past
+/// the ceiling. The cap ends the message at the moment the block is already
+/// too big — the frames after it are never pulled — and the call goes out
+/// marked cut, not as `{}`.
+#[tokio::test]
+async fn mu_c9b2l_byte_cap_cuts_the_call_and_stops_reading() {
+    const CAP: usize = 64;
+    let head = r#"{"path":"/tmp/big","content":""#;
+    let filler = "x".repeat(40);
+
+    let mut frames = vec![
+        tool_use_start_frame(0, "toolu_big", "write"),
+        input_json_frame(0, head),
+    ];
+    for _ in 0..8 {
+        frames.push(input_json_frame(0, &filler));
+    }
+    // A second block, and the terminators, that the accumulator must not reach.
+    frames.push(tool_use_start_frame(1, "toolu_after", "read"));
+    frames.push(input_json_frame(1, r#"{"path":"/tmp/after"}"#));
+    frames.push(message_delta_frame("tool_use"));
+    frames.push(message_stop_frame());
+    let total_frames = frames.len();
+
+    let (bytes, pulled) = counted_frames(frames);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let done = drain_to_done(test_events_stream_budgeted(bytes, rx, Some(CAP), None)).await;
+
+    // start + head (30 bytes) + one 40-byte fragment crosses 64 — three
+    // frames read.
+    assert_eq!(
+        pulled.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "the stream must stop at the cap, not read to the end ({total_frames} frames available)"
+    );
+    assert_eq!(done.stop_reason, StopReason::MaxTokens);
+
+    let call = only_tool_call(&done);
+    assert_eq!(call.name, "write");
+    assert_eq!(call.id, "toolu_big");
+    let cut = mu_core::agent::tool_call_cut::detect(call.arguments.as_value())
+        .expect("the emitted call carries the cut marker, not an empty object");
+    assert_eq!(cut.cause, mu_core::agent::CutCause::ByteCap);
+    assert_eq!(cut.bytes, head.len() + 40);
+    assert!(cut.bytes > CAP, "cut recorded at {} bytes", cut.bytes);
+    // mu-c9b2l: the cap in force rides along, so the refusal quotes the
+    // session's limit rather than the compile-time default.
+    assert_eq!(cut.cap, Some(CAP));
+}
+
+/// `stop_reason: "max_tokens"` landing mid-input is the same event seen from
+/// the model's side: it ran out of room, so the unparseable input is a cut
+/// rather than a malformed call. The request's `max_tokens` — which only this
+/// layer sees — rides along, so the refusal advises parts the model has room
+/// to emit.
+#[tokio::test]
+async fn mu_c9b2l_stop_reason_max_tokens_mid_input_is_a_cut() {
+    // The unknown-model floor, asserted against the DEFAULT catalog so an
+    // operator's models.toml cannot move it (bead mu-nzxa).
+    assert_eq!(
+        crate::providers::output_limits::max_tokens_for_model_with_catalog(
+            &mu_core::model_catalog::built_in(),
+            "some-future-model-v9",
+        ),
+        4096
+    );
+    let budget = mu_core::agent::tool_call_cut::output_budget_bytes(4096);
+
+    let partial = r#"{"path":"/tmp/game.py","content":"import pygame"#;
+    let frames = vec![
+        tool_use_start_frame(0, "toolu_len", "write"),
+        input_json_frame(0, partial),
+        message_delta_frame("max_tokens"),
+        message_stop_frame(),
+    ];
+    let (bytes, _pulled) = counted_frames(frames);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let done = drain_to_done(test_events_stream_budgeted(
+        bytes,
+        rx,
+        Some(DEFAULT_MAX_TOOL_CALL_BYTES),
+        Some(budget),
+    ))
+    .await;
+
+    assert_eq!(done.stop_reason, StopReason::MaxTokens);
+    let call = only_tool_call(&done);
+    let cut = mu_core::agent::tool_call_cut::detect(call.arguments.as_value())
+        .expect("a max_tokens-truncated call is marked cut");
+    assert_eq!(cut.cause, mu_core::agent::CutCause::OutputLimit);
+    assert_eq!(cut.bytes, partial.len());
+    assert_eq!(cut.cap, Some(DEFAULT_MAX_TOOL_CALL_BYTES));
+    assert_eq!(cut.budget_bytes, Some(budget));
+
+    let text = mu_core::agent::tool_call_cut::refusal_text("write", &cut);
+    assert!(text.contains("under ~6 KB"), "{text}");
+    assert!(!text.contains("~16 KB"), "{text}");
+}
+
+/// No `max_tokens` stop reason, just input that ends mid-string: serde_json
+/// reports EOF, which is the same cut by another route.
+#[tokio::test]
+async fn mu_c9b2l_input_ending_mid_string_is_a_cut() {
+    let partial = r#"{"path":"/tmp/x","content":"half a fi"#;
+    let frames = vec![
+        tool_use_start_frame(0, "toolu_eof", "write"),
+        input_json_frame(0, partial),
+        message_delta_frame("tool_use"),
+        message_stop_frame(),
+    ];
+    let (bytes, _pulled) = counted_frames(frames);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let done = drain_to_done(test_events_stream(bytes, rx)).await;
+
+    let call = only_tool_call(&done);
+    let cut = mu_core::agent::tool_call_cut::detect(call.arguments.as_value())
+        .expect("an EOF-truncated input is marked cut");
+    assert_eq!(cut.cause, mu_core::agent::CutCause::TruncatedJson);
+    assert_eq!(cut.bytes, partial.len());
+}
+
+/// Parity: a call under the cap streams and parses exactly as before — no
+/// marker, input intact, every frame read.
+#[tokio::test]
+async fn mu_c9b2l_call_under_the_cap_is_unchanged() {
+    let content = "y".repeat(4096);
+    let input = json!({"path": "/tmp/ok.txt", "content": content}).to_string();
+    assert!(input.len() < DEFAULT_MAX_TOOL_CALL_BYTES);
+
+    let frames = vec![
+        tool_use_start_frame(0, "toolu_ok", "write"),
+        input_json_frame(0, &input),
+        message_delta_frame("tool_use"),
+        message_stop_frame(),
+    ];
+    let expected_frames = frames.len();
+    let (bytes, pulled) = counted_frames(frames);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let done = drain_to_done(test_events_stream(bytes, rx)).await;
+
+    assert_eq!(
+        pulled.load(std::sync::atomic::Ordering::SeqCst),
+        expected_frames
+    );
+    assert_eq!(done.stop_reason, StopReason::ToolUse);
+    let call = only_tool_call(&done);
+    assert!(
+        mu_core::agent::tool_call_cut::detect(call.arguments.as_value()).is_none(),
+        "an under-cap call carries no cut marker"
+    );
+    assert_eq!(call.arguments.as_value()["path"], "/tmp/ok.txt");
+    assert_eq!(call.arguments.as_value()["content"], content);
+}
+
+/// `[session].max_tool_call_bytes = 0` reads to the model's own ceiling, as
+/// before this bead.
+#[tokio::test]
+async fn mu_c9b2l_disabled_cap_reads_the_whole_oversized_call() {
+    let content = "z".repeat(64 * 1024);
+    let input = json!({"path": "/tmp/huge.txt", "content": content}).to_string();
+    assert!(input.len() > DEFAULT_MAX_TOOL_CALL_BYTES);
+
+    let frames = vec![
+        tool_use_start_frame(0, "toolu_huge", "write"),
+        input_json_frame(0, &input),
+        message_delta_frame("tool_use"),
+        message_stop_frame(),
+    ];
+    let expected_frames = frames.len();
+    let (bytes, pulled) = counted_frames(frames);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let done = drain_to_done(test_events_stream_budgeted(bytes, rx, None, None)).await;
+
+    assert_eq!(
+        pulled.load(std::sync::atomic::Ordering::SeqCst),
+        expected_frames,
+        "no cap means no early abort"
+    );
+    let call = only_tool_call(&done);
+    assert!(mu_core::agent::tool_call_cut::detect(call.arguments.as_value()).is_none());
+    assert_eq!(call.arguments.as_value()["content"], content);
+}
+
+/// The config's `0` (cap disabled) reaches the accumulator as `None`, the
+/// same way the openai-chat builder handles it.
+#[test]
+fn mu_c9b2l_zero_cap_disables_the_ceiling() {
+    let provider = AnthropicProvider::new("k".into(), "m".into());
+    assert_eq!(
+        provider.max_tool_call_bytes,
+        Some(DEFAULT_MAX_TOOL_CALL_BYTES)
+    );
+    assert_eq!(
+        AnthropicProvider::new("k".into(), "m".into())
+            .with_max_tool_call_bytes(Some(0))
+            .max_tool_call_bytes,
+        None
+    );
+    assert_eq!(
+        AnthropicProvider::new("k".into(), "m".into())
+            .with_max_tool_call_bytes(Some(4096))
+            .max_tool_call_bytes,
+        Some(4096)
     );
 }

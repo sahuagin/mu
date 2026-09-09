@@ -96,8 +96,10 @@ pub fn build_provider_from_selector(
     // mu-f1a0: per-session cache TTL tier. Only the Anthropic arm
     // consumes it — other providers have no tiered caching surface.
     cache_ttl: CacheTtl,
-    // mu-c9b2l: `[session].max_tool_call_bytes`. Only the openai-chat arms
-    // consume it — that is the accumulator the cut lands in.
+    // mu-c9b2l: `[session].max_tool_call_bytes`, for every streaming
+    // accumulator that a cut can land in — the openai-chat arms, the
+    // Anthropic Messages arms (ollama's included, through the wrapper), and
+    // the OpenAI Responses arms.
     max_tool_call_bytes: Option<usize>,
 ) -> Result<Arc<dyn Provider>> {
     match selector {
@@ -116,8 +118,9 @@ pub fn build_provider_from_selector(
             // (was previously ignored). The provider parses the flag value
             // into an effort level and sends `thinking: {type: adaptive,
             // display: summarized}` + `output_config.effort`.
-            let mut provider =
-                AnthropicProvider::from_env(model.clone())?.with_cache_ttl(cache_ttl);
+            let mut provider = AnthropicProvider::from_env(model.clone())?
+                .with_cache_ttl(cache_ttl)
+                .with_max_tool_call_bytes(max_tool_call_bytes);
             if let Some(t) = thinking {
                 if !t.is_empty() {
                     provider = provider.with_thinking_flag(t);
@@ -136,7 +139,8 @@ pub fn build_provider_from_selector(
             // Public OpenAI Responses API (direct API key). Same provider
             // struct as the codex/OAuth path, in its API-key mode.
             let provider = OpenaiProvider::from_env(model.clone())
-                .map_err(|e| anyhow::anyhow!("openai-api: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("openai-api: {e}"))?
+                .with_max_tool_call_bytes(max_tool_call_bytes);
             let provider = match thinking {
                 Some(t) if !t.is_empty() => provider.with_thinking(t.to_string()),
                 _ => provider,
@@ -149,7 +153,8 @@ pub fn build_provider_from_selector(
             } else {
                 OpenaiProvider::from_store(model.clone())
             }
-            .map_err(|e| anyhow::anyhow!("openai-codex: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("openai-codex: {e}"))?
+            .with_max_tool_call_bytes(max_tool_call_bytes);
             let provider = match thinking {
                 Some(t) if !t.is_empty() => provider.with_thinking(t.to_string()),
                 _ => provider,
@@ -180,7 +185,8 @@ pub fn build_provider_from_selector(
             Ok(Arc::new(provider))
         }
         ProviderSelector::Ollama { model } => {
-            let mut provider = OllamaProvider::from_env(model.clone())?;
+            let mut provider = OllamaProvider::from_env(model.clone())?
+                .with_max_tool_call_bytes(max_tool_call_bytes);
             if let Some(t) = thinking {
                 if !t.is_empty() {
                     provider = provider.with_thinking_flag(t);
@@ -231,7 +237,8 @@ pub fn build_provider_from_selector(
                 if native {
                     let mut provider = AnthropicProvider::new(api_key.clone(), model.clone())
                         .with_api_base(base_url.clone())
-                        .with_cache_ttl(cache_ttl);
+                        .with_cache_ttl(cache_ttl)
+                        .with_max_tool_call_bytes(max_tool_call_bytes);
                     if let Some(t) = thinking {
                         if !t.is_empty() {
                             provider = provider.with_thinking_flag(t);
@@ -243,7 +250,8 @@ pub fn build_provider_from_selector(
                         base_url.clone(),
                         api_key.clone(),
                         model.clone(),
-                    );
+                    )
+                    .with_max_tool_call_bytes(max_tool_call_bytes);
                     if let Some(t) = thinking {
                         if !t.is_empty() {
                             provider = provider.with_thinking_flag(t);

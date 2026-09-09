@@ -23,6 +23,7 @@ use mu_anthropic::{
     Message as AnthMessage, MessagesRequest, StopReason as AnthropicStopReason, StreamEvent, Tool,
     ToolDef, Usage as AnthropicUsage,
 };
+use mu_core::agent::tool_call_cut::{CutCause, ToolCallCut, DEFAULT_MAX_TOOL_CALL_BYTES};
 use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
     ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
@@ -34,6 +35,7 @@ use mu_core::context::{
 
 use crate::context::{AnthropicCacheStrategy, AnthropicProviderRenderer};
 
+use super::cut_detect::{cut_marker_or, detect_truncated_arguments};
 use super::sse::{ByteSse, SseStream};
 
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
@@ -681,6 +683,11 @@ pub struct AnthropicProvider {
     /// not two per turn — and the header stays constant across the turns
     /// that follow, which keeps their prefix cacheable.
     beta_refused: std::sync::atomic::AtomicBool,
+    /// mu-c9b2l: `[session].max_tool_call_bytes`. Per-tool_use-block ceiling
+    /// on accumulated `input_json_delta` bytes; `None` reads to the model's
+    /// own output ceiling. Readable from the sibling wrapper modules that
+    /// compose this provider, so their forwarding is testable.
+    pub(super) max_tool_call_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -734,6 +741,7 @@ impl AnthropicProvider {
             thinking_effort: None,
             beta_refused: std::sync::atomic::AtomicBool::new(false),
             thinking_wire: ThinkingWire::AnthropicAdaptive,
+            max_tool_call_bytes: Some(DEFAULT_MAX_TOOL_CALL_BYTES),
         }
     }
 
@@ -797,12 +805,21 @@ impl AnthropicProvider {
             thinking_effort: None,
             beta_refused: std::sync::atomic::AtomicBool::new(false),
             thinking_wire: ThinkingWire::AnthropicAdaptive,
+            max_tool_call_bytes: Some(DEFAULT_MAX_TOOL_CALL_BYTES),
         })
     }
 
     /// Test hook: override the API base URL for mock servers.
     pub fn with_api_base(mut self, base: String) -> Self {
         self.api_base = base;
+        self
+    }
+
+    /// mu-c9b2l: set the per-tool-call argument-byte ceiling from
+    /// `[session].max_tool_call_bytes`. `None` (the config's `0`) reads to
+    /// the model's own output ceiling, as before this bead.
+    pub fn with_max_tool_call_bytes(mut self, max_bytes: Option<usize>) -> Self {
+        self.max_tool_call_bytes = max_bytes.filter(|n| *n > 0);
         self
     }
 }
@@ -956,8 +973,21 @@ impl Provider for AnthropicProvider {
             ));
         }
 
+        // mu-c9b2l: read the output ceiling back off the body rather than
+        // recomputing it, so the marker carries the budget actually sent —
+        // including the unknown-model floor a model absent from the catalog
+        // gets, which is far below the byte cap and cuts first. The Messages
+        // wire requires `max_tokens`, so this is never absent in practice.
+        let output_budget_bytes = body["max_tokens"]
+            .as_u64()
+            .map(|t| mu_core::agent::tool_call_cut::output_budget_bytes(t as u32));
         let bytes = resp.bytes_stream();
-        Ok(events_stream(bytes, cancel_rx))
+        Ok(events_stream(
+            bytes,
+            cancel_rx,
+            self.max_tool_call_bytes,
+            output_budget_bytes,
+        ))
     }
 
     fn renderer(&self) -> Arc<dyn ProviderRenderer> {
@@ -1577,6 +1607,8 @@ fn anthropic_usage_to_mu(u: &AnthropicUsage) -> Option<Usage> {
 fn events_stream(
     bytes: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
     cancel_rx: oneshot::Receiver<()>,
+    max_tool_call_bytes: Option<usize>,
+    output_budget_bytes: Option<usize>,
 ) -> BoxStream<'static, ProviderEvent> {
     // Box::pin the input to satisfy SseStream's `S: Unpin` bound;
     // reqwest::Response::bytes_stream() returns a !Unpin type.
@@ -1592,6 +1624,8 @@ fn events_stream(
         cancel_rx: Some(cancel_rx),
         finished: false,
         emitted_done: false,
+        max_tool_call_bytes,
+        output_budget_bytes,
     };
     Box::pin(futures::stream::unfold(state, next_event))
 }
@@ -1607,6 +1641,10 @@ enum BlockBuilder {
         name: String,
         /// Accumulated input JSON; parsed at `message_stop` time.
         input_json: String,
+        /// mu-c9b2l: set once this block's accumulated input crossed
+        /// `max_tool_call_bytes`. [`assemble_content`] then emits the cut
+        /// marker instead of the truncated JSON.
+        cut: Option<ToolCallCut>,
     },
     /// Accumulated extended-thinking text. The block's `signature_delta`
     /// (mu_anthropic `BlockDelta::SignatureDelta`) is intentionally NOT
@@ -1634,6 +1672,14 @@ struct StreamState {
     cancel_rx: Option<oneshot::Receiver<()>>,
     finished: bool,
     emitted_done: bool,
+    /// mu-c9b2l: `[session].max_tool_call_bytes`; `None` = read to the
+    /// model's own output ceiling.
+    max_tool_call_bytes: Option<usize>,
+    /// mu-c9b2l: the argument bytes this request's `max_tokens` buys. The
+    /// other ceiling on a tool call, and the one only this layer can see —
+    /// the marker carries it downstream so the refusal advises parts the
+    /// model has room to emit.
+    output_budget_bytes: Option<usize>,
 }
 
 async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamState)> {
@@ -1651,7 +1697,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                     let usage = anthropic_usage_to_mu(&state.usage);
                     return Some((
                         ProviderEvent::Done(AssistantMessage {
-                            content: assemble_content(&state.blocks, &state.block_order),
+                            content: assemble_content(&state),
                             stop_reason: StopReason::Aborted,
                             usage,
                         }),
@@ -1686,7 +1732,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                     let usage = anthropic_usage_to_mu(&state.usage);
                     return Some((
                         ProviderEvent::Done(AssistantMessage {
-                            content: assemble_content(&state.blocks, &state.block_order),
+                            content: assemble_content(&state),
                             stop_reason: StopReason::DegradedEof,
                             usage,
                         }),
@@ -1720,6 +1766,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                         id,
                         name,
                         input_json: String::new(),
+                        cut: None,
                     },
                     BlockStart::Thinking { thinking } => BlockBuilder::Thinking(thinking),
                     BlockStart::Other => continue,
@@ -1767,18 +1814,45 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                     // Done payload stays authoritative/complete) AND
                     // surface the fragment live so the loop can stream
                     // partial tool args.
-                    match state.blocks.get_mut(&index) {
-                        Some(BlockBuilder::ToolUse { id, input_json, .. }) => {
+                    //
+                    // mu-c9b2l: copied out because the tool_use arm holds a
+                    // mutable borrow of `state.blocks` while it needs the
+                    // two ceilings.
+                    let byte_cap = state.max_tool_call_bytes;
+                    let output_budget = state.output_budget_bytes;
+                    let mut cut_call: Option<(String, ToolCallCut)> = None;
+                    let live = match state.blocks.get_mut(&index) {
+                        Some(BlockBuilder::ToolUse {
+                            id,
+                            name,
+                            input_json,
+                            cut,
+                        }) => {
                             input_json.push_str(&partial_json);
-                            let id = id.clone();
-                            return Some((
-                                ProviderEvent::ToolCallDelta {
-                                    id,
-                                    name_delta: None,
-                                    arguments_delta: Some(partial_json),
-                                },
-                                state,
-                            ));
+                            // mu-c9b2l: one block's input crossing the cap
+                            // ends the whole message. Everything after this
+                            // point is generation mu will discard — the JSON
+                            // is already longer than any call it will
+                            // dispatch.
+                            if cut.is_none() {
+                                if let Some(cap) = byte_cap {
+                                    if input_json.len() > cap {
+                                        let recorded = ToolCallCut::new(
+                                            input_json.len(),
+                                            CutCause::ByteCap,
+                                            byte_cap,
+                                            output_budget,
+                                        );
+                                        *cut = Some(recorded);
+                                        cut_call = Some((name.clone(), recorded));
+                                    }
+                                }
+                            }
+                            Some(ProviderEvent::ToolCallDelta {
+                                id: id.clone(),
+                                name_delta: None,
+                                arguments_delta: Some(partial_json),
+                            })
                         }
                         _ => {
                             // Delta for a tool block we never saw start —
@@ -1787,7 +1861,36 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                                 index,
                                 "input_json_delta arrived for unknown or non-tool block"
                             );
+                            None
                         }
+                    };
+                    // mu-c9b2l: abort at the cap. Replacing the SSE stream
+                    // drops the reqwest response body, which closes the
+                    // connection the same way a cancel does; the blocks
+                    // accumulated so far still go out on Done so the loop
+                    // can answer the cut call.
+                    if let Some((tool_name, cut)) = cut_call {
+                        tracing::warn!(
+                            tool = %tool_name,
+                            bytes = cut.bytes,
+                            cap = ?byte_cap,
+                            "tool call arguments exceeded max_tool_call_bytes; aborting the stream"
+                        );
+                        state.sse = SseStream::new(Box::pin(futures::stream::empty()));
+                        state.finished = true;
+                        state.emitted_done = true;
+                        let usage = anthropic_usage_to_mu(&state.usage);
+                        return Some((
+                            ProviderEvent::Done(AssistantMessage {
+                                content: assemble_content(&state),
+                                stop_reason: StopReason::MaxTokens,
+                                usage,
+                            }),
+                            state,
+                        ));
+                    }
+                    if let Some(ev) = live {
+                        return Some((ev, state));
                     }
                 }
                 BlockDelta::ThinkingDelta { thinking } => {
@@ -1835,7 +1938,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 let usage = anthropic_usage_to_mu(&state.usage);
                 return Some((
                     ProviderEvent::Done(AssistantMessage {
-                        content: assemble_content(&state.blocks, &state.block_order),
+                        content: assemble_content(&state),
                         stop_reason: stop,
                         usage,
                     }),
@@ -1887,11 +1990,17 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
 /// Walks `block_order` so the result reflects Anthropic's intended
 /// order regardless of HashMap iteration order. Tool-use blocks
 /// parse their accumulated input_json; on parse error or non-object
-/// result, falls back to an empty object per INV-5.
-fn assemble_content(blocks: &HashMap<u32, BlockBuilder>, block_order: &[u32]) -> Vec<ContentBlock> {
-    block_order
+/// result, falls back to an empty object per INV-5 — except for a cut
+/// call (mu-c9b2l), which carries the marker instead.
+fn assemble_content(state: &StreamState) -> Vec<ContentBlock> {
+    // mu-c9b2l: `stop_reason: "max_tokens"` says the model ran out of output
+    // room, so a tool_use input that does not parse was cut rather than
+    // malformed — that turns an at-EOF syntax error into a cut too.
+    let hit_output_limit = matches!(state.stop_reason, Some(AnthropicStopReason::MaxTokens));
+    state
+        .block_order
         .iter()
-        .filter_map(|idx| blocks.get(idx))
+        .filter_map(|idx| state.blocks.get(idx))
         .map(|builder| match builder {
             BlockBuilder::Text(text) => ContentBlock::Text {
                 text: text.as_str().into(),
@@ -1900,8 +2009,17 @@ fn assemble_content(blocks: &HashMap<u32, BlockBuilder>, block_order: &[u32]) ->
                 id,
                 name,
                 input_json,
+                cut,
             } => {
-                let arguments = parse_tool_input(input_json);
+                let cut = (*cut).or_else(|| {
+                    detect_truncated_arguments(
+                        input_json,
+                        hit_output_limit,
+                        state.max_tool_call_bytes,
+                        state.output_budget_bytes,
+                    )
+                });
+                let arguments = cut_marker_or(cut, || parse_tool_input(input_json));
                 ContentBlock::ToolCall(ToolCall {
                     id: id.clone(),
                     name: name.clone(),

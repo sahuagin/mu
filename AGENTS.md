@@ -62,11 +62,28 @@ The `mu` CLI subcommands: `serve` (daemon), `ask` (one-shot), `resume`, `tui`,
   plus `verify-claims`). **Nothing runs it for you** — there is no PR-open hook
   or `gh` shim. Run it yourself.
 - `just check-quick` — fmt + clippy only (fast inner loop).
-- **`just ci-aipr` is required before opening a PR** — it runs `just check` then
-  the cross-provider review panel (`scripts/ai-review.sh`). Local-only, not a CI
-  step, so nothing else will run it for you. Reviewer seats come from
+- **`just ci-aipr` is required before opening a PR** — it runs the pre-PR checks
+  then the cross-provider review panel (`scripts/ai-review.sh`). Local-only, not
+  a CI step, so nothing else will run it for you. Reviewer seats come from
   `agent-role code_review`; probe `/api/ps` before using an ollama seat so a
-  panel run can't evict a model someone is holding.
+  panel run can't evict a model someone is holding. Budget **10-20 min** on the
+  all-API roster (it was 45-80 before mu-ash9p; a timing run of the new path took
+  639s) — a local seat can hold a round open longer, on purpose. The panel runs
+  at most `MU_REVIEW_MAX_ROUNDS` (3) rounds and caps each seat by provider class,
+  with no retry (a non-empty reply that parses to nothing gets one verdict
+  re-ask, itself capped by `MU_REVIEW_REASK_TIMEOUT_SECS`, 180s):
+  `MU_REVIEW_SEAT_TIMEOUT_SECS` (900s) for an API seat,
+  `MU_REVIEW_LOCAL_SEAT_TIMEOUT_SECS` (1800s) for an ollama/vllm/LAN-endpoint one,
+  since measured local seats take 26-36 min while every API seat answers inside
+  13. A seat that times out or returns unparseable output is ABSENT for that
+  round rather than a dissenter — so a dead seat no longer forces every round; at
+  least `MU_REVIEW_MIN_LIVE_SEATS` (3, a majority of the five seats) must answer
+  for a round to conclude, an approve additionally needs every exclusive seam
+  seat live (nobody else reviews its checklist), and the absent ones are named
+  on the PANEL line. The
+  cargo steps are not repeated when `just ci` or `just check` was already green
+  **on this exact commit** (receipt: `target/ci-green-<commit>`; the cheap audits
+  and `verify-claims` still run) — `MU_REVIEW_FORCE_CHECK=1` re-runs them.
 - **Seats are seams.** A `[[code_review.ranked]]` rank in
   `~/.config/mu/agent_roles.toml` carries either `focus` (soft emphasis) or
   `seam` + `checklist` (exclusive: that seat reviews for its checklist only).

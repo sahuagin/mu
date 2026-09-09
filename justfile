@@ -26,16 +26,41 @@ check:
 check-quick:
     PRE_PR_QUICK=1 ./scripts/pre-pr-check.sh
 
-# Exactly what CI runs: fmt-check + clippy + test, fail-fast in CI order (mirrors .github/workflows/ci.yml; fmt is check-only, never edits files). bead: mu-608b
-ci: fmt-check clippy test
+# Exactly what CI runs: fmt-check + clippy + test, fail-fast in CI order (mirrors
+# .github/workflows/ci.yml; fmt is check-only, never edits files). On success it
+# records target/ci-green-<commit> — the receipt `just ci-aipr` honours so the
+# review gate does not repeat these three steps on a tree they just passed.
+#
+# The three steps are called rather than declared as dependencies for one
+# reason: the receipt has to name the tree the checks RAN on, so the commit id
+# is captured before the first of them. just runs dependencies before the recipe
+# body, which leaves no point earlier than the checks to capture from (panel
+# finding, PR #611). Order and fail-fast are unchanged. beads: mu-608b, mu-ash9p
+ci:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # No id (not a repo, dirty tree, jj hiccup) means no receipt, never a failed
+    # ci: the receipt is an optimization and must fail open (panel, PR #611).
+    id="$(scripts/ci-green-marker.sh id || true)"
+    just fmt-check
+    just clippy
+    just test
+    scripts/ci-green-marker.sh write "$id"
 
-# Pre-PR cross-provider review gate (bead mu-6qst): run the full PR checks
-# (fmt + clippy + tests + verify-claims), then have two independent reviewers
-# inspect the diff before a PR: one local Ollama model and one OpenRouter model.
-# Local only (needs provider auth + network; not a CI step). Verdict comes from
-# the reviewer's stdout, not its exit code. Disagree with a REJECT via
-# MU_REVIEW_OVERRIDE=1. See scripts/ai-review.sh.
-ci-aipr: check
+# Pre-PR cross-provider review gate (bead mu-6qst): run the pre-PR checks, then
+# have the `code_review` panel inspect the diff before a PR. Local only (needs
+# provider auth + network; not a CI step). The verdict comes from the reviewers'
+# JSON, not from exit codes. Disagree with a BLOCK via MU_REVIEW_OVERRIDE=1.
+# See scripts/ai-review.sh.
+#
+# `check` is a dependency in spirit but not in just's dependency list, because
+# just cannot skip one: when ci-green-marker.sh shows fmt/clippy/tests already
+# green at THIS commit, only the cheap gates re-run (the offline self-tests plus
+# verify-claims) instead of the 5-15 min cargo repeat; anything that goes wrong
+# with the marker script falls through to the full check. MU_REVIEW_FORCE_CHECK=1
+# forces it. bead: mu-ash9p
+ci-aipr:
+    if scripts/ci-green-marker.sh gate; then PRE_PR_SKIP_CARGO=1 ./scripts/pre-pr-check.sh; else just check; fi
     scripts/ai-review.sh
 
 # ── build ─────────────────────────────────────────────────────────────────

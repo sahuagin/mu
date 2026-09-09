@@ -4,8 +4,14 @@
 Subcommands:
   agree  <prefix>
       Read <prefix>.rank*.out, parse each reviewer's verdict. Print
-      "AGREE <verdict>" and exit 0 iff every reviewer parsed AND all verdicts
-      are equal; otherwise print "SPLIT <json of per-reviewer verdicts>" exit 1.
+      "AGREE <verdict>" and exit 0 iff every LIVE seat gave the same verdict AND
+      at least MU_REVIEW_MIN_LIVE_SEATS (default 3) seats were live; otherwise
+      print "SPLIT <json of per-reviewer verdicts>" exit 1. A seat that timed out
+      or returned no recoverable verdict is ABSENT for that round, not a
+      dissenter: it can never join a consensus, so counting it as dissent made
+      one dead seat run every round and escalate a panel whose live seats agreed
+      (mu-ash9p). A second line, "SEATS live <n>/<total>[: <seat> <why>, ...]",
+      carries the census; consensus.sh forwards it to the PANEL line.
 
   prompt <prev-prefix> <round> <diff-file> <self-tag> <out-file>
       Write <self-tag>'s convergence prompt for <round>: the diff, the standing
@@ -158,6 +164,50 @@ def skipped_ollama_lease(done_text):
     )
 
 
+TIMEOUT_REVIEW = {
+    "verdict": "timeout",
+    "summary": "reviewer timed out before producing a parseable verdict",
+    "findings": [
+        {
+            "file": "<reviewer>",
+            "line": 0,
+            "severity": "medium",
+            "issue": "reviewer timed out (exit 124); treat this seat as inconclusive rather than empty output",
+        }
+    ],
+}
+
+
+def parse_out(f):
+    """The seat's reply as extract() reads it, or None when nothing parses."""
+    try:
+        # errors="replace": a broken multibyte sequence (mu-4xfs) would
+        # otherwise raise before extract() ran, silently dropping that
+        # seat's findings from the ledger.
+        with open(f, encoding="utf-8", errors="replace") as fh:
+            return extract(fh.read())
+    except Exception:
+        return None
+
+
+def seams(prefix):
+    """{tag: seam} from the .done lines — non-empty only for an EXCLUSIVE seat
+    (a rank carrying `seam`, seat-prompt.sh), which reviews its checklist and
+    nothing else, so no other seat covers it."""
+    out = {}
+    base = os.path.basename(prefix)
+    for f in glob.glob(prefix + ".rank*.done"):
+        tag = os.path.basename(f)[len(base) + 1:-5]
+        try:
+            with open(f) as fh:
+                m = re.search(r'\bseam=\[([^\]]*)\]', fh.read())
+        except OSError:
+            m = None
+        if m and m.group(1).strip():
+            out[tag] = m.group(1).strip()
+    return out
+
+
 def load(prefix):
     base = os.path.basename(prefix)
     out = {}
@@ -174,29 +224,20 @@ def load(prefix):
                     # Omit it from quorum rather than counting it as unparsed.
                     continue
                 if re.search(r'\bexit=124\b', done_text):
-                    out[tag] = {
-                        "verdict": "timeout",
-                        "summary": "reviewer timed out before producing a parseable verdict",
-                        "findings": [
-                            {
-                                "file": "<reviewer>",
-                                "line": 0,
-                                "severity": "medium",
-                                "issue": "reviewer timed out (exit 124); treat this seat as inconclusive rather than empty output",
-                            }
-                        ],
-                    }
+                    # The cap killed the PROCESS, not necessarily the review: a
+                    # reply that finished streaming before the kill (a seat
+                    # hanging at exit) or that the verdict re-ask recovered is
+                    # a real opinion. Hiding it behind the synthetic timeout let
+                    # three approves pass over a complete needs-changes once
+                    # timeouts stopped counting as dissent (panel finding,
+                    # PR #611). Parse first; synthesize only for nothing usable.
+                    real = parse_out(f)
+                    out[tag] = (real if seat_verdict(real) not in ABSENT_VERDICTS
+                                else dict(TIMEOUT_REVIEW))
                     continue
         except Exception:
             pass
-        try:
-            # errors="replace": a broken multibyte sequence (mu-4xfs) would
-            # otherwise raise before extract() ran, silently dropping that
-            # seat's findings from the ledger.
-            with open(f, encoding="utf-8", errors="replace") as fh:
-                out[tag] = extract(fh.read())
-        except Exception:
-            out[tag] = None
+        out[tag] = parse_out(f)
     return out
 
 
@@ -331,18 +372,114 @@ def erased(entries, floor='medium'):
     return [e for e in unresolved(entries, floor) if not e['live']]
 
 
+# A round's live seats are the ones that produced an opinion. The other two
+# outcomes are ABSENCE, not opinion: `timeout` (load() below, from exit=124) and
+# `unparsed` (nothing recoverable from the reply — no verdict AND no findings).
+# Neither can ever agree with anything, so treating them as dissent pinned the
+# panel at "no convergence" — measured on PR #608, where four live seats agreed
+# in every round and the gate still ESCALATEd after four rounds (mu-ash9p).
+ABSENT_VERDICTS = ("unparsed", "timeout")
+
+
+def min_live_seats():
+    """How many seats must answer for a round's agreement to count.
+
+    Three by default: a majority of the five-seat code_review roster. Two was
+    too weak in practice — a timing run of this gate on PR #611 passed in one
+    round on 2/5 live seats (one unparsed, two timed out under load), which is
+    two opinions wearing a panel's clothes. A roster smaller than this can never
+    converge: lower the knob with the roster, don't pad the roster to fit it."""
+    raw = os.environ.get("MU_REVIEW_MIN_LIVE_SEATS", "3").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        print("converge.py: ignoring MU_REVIEW_MIN_LIVE_SEATS=%r; using 3" % raw,
+              file=sys.stderr)
+        return 3
+
+
+def seat_verdict(review):
+    """This seat's verdict, or 'unparsed' when none could be recovered.
+
+    Non-dict output (a bare list, a string, None) is unparsed rather than an
+    exception: an absent seat must not be able to crash the round's tally.
+
+    A dict that lists findings but no verdict is NOT absent: the seat reviewed
+    and left the field blank. Counting it absent let three approves outvote it
+    into a round-1 AGREE approve that consensus.sh accepts without an audit, so
+    its high-severity finding was never aired (panel finding, PR #611). It
+    counts as needs-changes — a seat listing defects has not approved — and the
+    SPLIT that forces gives it the next round to say so itself. Only a reply with
+    neither verdict nor findings has nothing to lose and stays unparsed.
+    """
+    if not isinstance(review, dict):
+        return "unparsed"
+    v = str(review.get("verdict") or "").strip().lower()
+    if v:
+        return v
+    findings = review.get("findings")
+    if isinstance(findings, list) and findings:
+        return "needs-changes"
+    return "unparsed"
+
+
+def census(verdicts, quorum=None):
+    """One line: how many seats were live, and who was absent and why.
+
+    The denominator is the seats that REPORTED: a rank load() drops entirely —
+    an ollama seat that routed around an operator-held box — was never dispatched
+    and is neither live nor absent.
+
+    When fewer seats are live than the quorum, the line says so: a two-seat
+    roster agreeing every round would otherwise escalate with nothing in the
+    output naming the quorum as the cause (panel finding, PR #611).
+    """
+    absent = [(t, v) for t, v in sorted(verdicts.items()) if v in ABSENT_VERDICTS]
+    live_n = len(verdicts) - len(absent)
+    line = "live %d/%d" % (live_n, len(verdicts))
+    if quorum is not None and live_n < quorum:
+        line += " (quorum %d unmet)" % quorum
+    if absent:
+        line += ": " + ", ".join("%s %s" % (re.sub(r"^rank\d+\.", "", t), v)
+                                 for t, v in absent)
+    return line
+
+
 def main():
     cmd = sys.argv[1]
     if cmd == "agree":
         data = load(sys.argv[2])
-        verdicts = {t: (d.get('verdict', '?').lower() if d else 'unparsed')
-                    for t, d in data.items()}
-        real = [v for v in verdicts.values() if v in ('approve', 'needs-changes')]
-        if data and len(set(real)) == 1 and len(real) == len(verdicts):
-            print("AGREE " + real[0])
-            return 0
-        print("SPLIT " + json.dumps(verdicts))
-        return 1
+        verdicts = {t: seat_verdict(d) for t, d in data.items()}
+        live = [v for v in verdicts.values() if v not in ABSENT_VERDICTS]
+        # A verdict outside the contract ("reject", "unclear") is a LIVE seat
+        # that did not agree — absence is only the two failure modes above.
+        quorum = min_live_seats()
+        # The quorum counts seats; it must also know WHICH seat is absent. An
+        # exclusive seam seat (seam="conformance" on the roster) is the only
+        # reviewer of its checklist, so an approve reached while it is absent
+        # is an approve of a change nobody checked against that checklist.
+        # A needs-changes still stands — a block needs no missing reviewer
+        # (panel finding, PR #611, three live seats unanimous).
+        # Iterate the seam map, not the tally: a seat load() dropped entirely
+        # (lease-skipped ollama, exit=75) is not in `verdicts` but its .done
+        # still says it was the exclusive reviewer (panel finding, PR #611).
+        seam_of = seams(sys.argv[2])
+        live_tags = {t for t, v in verdicts.items() if v not in ABSENT_VERDICTS}
+        exclusive_absent = sorted(t for t in seam_of if t not in live_tags)
+        agreed = (len(live) >= quorum and len(set(live)) == 1
+                  and live[0] in ('approve', 'needs-changes'))
+        withheld = agreed and live[0] == 'approve' and exclusive_absent
+        if withheld:
+            agreed = False
+        print(("AGREE " + live[0]) if agreed else ("SPLIT " + json.dumps(verdicts)))
+        line = census(verdicts, quorum)
+        if withheld:
+            line += " (approve withheld: exclusive seam seat%s %s absent)" % (
+                "s" if len(exclusive_absent) > 1 else "",
+                ", ".join("%s=%s" % (re.sub(r"^rank\d+\.", "", t), seam_of[t])
+                          for t in exclusive_absent))
+        print("SEATS " + line)
+        return 0 if agreed else 1
 
     if cmd == "audit":
         out_dir, final_round = sys.argv[2], int(sys.argv[3])

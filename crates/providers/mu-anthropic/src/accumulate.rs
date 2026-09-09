@@ -132,21 +132,60 @@ fn parse_tool_input(json: &str) -> JsonValue {
     }
 }
 
+/// Fold one event's `usage` into the running total: every optional field
+/// the event carries replaces the running value, and a field it does not
+/// carry leaves the running value alone (`message_start` gives the input
+/// baseline plus `service_tier` / `inference_geo` / `speed`; the final
+/// `message_delta` gives the output total plus `output_tokens_details` /
+/// `iterations`). `iterations` is a `Vec` whose absent and empty forms
+/// deserialize alike, so only a non-empty one replaces. Nothing the
+/// non-streaming parse keeps is dropped on this path.
 fn merge_usage(into: &mut Usage, from: &Usage) {
-    if from.input_tokens.is_some() {
-        into.input_tokens = from.input_tokens;
+    let Usage {
+        input_tokens,
+        output_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
+        cache_creation,
+        service_tier,
+        inference_geo,
+        output_tokens_details,
+        server_tool_use,
+        iterations,
+        speed,
+    } = from;
+    if input_tokens.is_some() {
+        into.input_tokens = *input_tokens;
     }
-    if from.output_tokens.is_some() {
-        into.output_tokens = from.output_tokens;
+    if output_tokens.is_some() {
+        into.output_tokens = *output_tokens;
     }
-    if from.cache_read_input_tokens.is_some() {
-        into.cache_read_input_tokens = from.cache_read_input_tokens;
+    if cache_read_input_tokens.is_some() {
+        into.cache_read_input_tokens = *cache_read_input_tokens;
     }
-    if from.cache_creation_input_tokens.is_some() {
-        into.cache_creation_input_tokens = from.cache_creation_input_tokens;
+    if cache_creation_input_tokens.is_some() {
+        into.cache_creation_input_tokens = *cache_creation_input_tokens;
     }
-    if from.cache_creation.is_some() {
-        into.cache_creation = from.cache_creation.clone();
+    if cache_creation.is_some() {
+        into.cache_creation = cache_creation.clone();
+    }
+    if service_tier.is_some() {
+        into.service_tier = service_tier.clone();
+    }
+    if inference_geo.is_some() {
+        into.inference_geo = inference_geo.clone();
+    }
+    if output_tokens_details.is_some() {
+        into.output_tokens_details = output_tokens_details.clone();
+    }
+    if server_tool_use.is_some() {
+        into.server_tool_use = server_tool_use.clone();
+    }
+    if !iterations.is_empty() {
+        into.iterations = iterations.clone();
+    }
+    if speed.is_some() {
+        into.speed = speed.clone();
     }
 }
 
@@ -462,6 +501,44 @@ mod tests {
         assert!(
             matches!(err, AccumulateError::InputTransformations(_)),
             "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_metadata_survives_the_streaming_merge() {
+        // The non-token usage fields the non-streaming parse keeps must reach
+        // the streamed result too: the routing echoes and `speed` arrive on
+        // message_start, `iterations` (the fallback feature's own attempt
+        // record) on the final message_delta.
+        let acc = accumulate(stream(vec![
+            ev(json!({"type":"message_start","message":{"usage":{
+                "input_tokens":25,"output_tokens":1,
+                "service_tier":"standard","inference_geo":"us","speed":"fast"}}})),
+            ev(json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},
+                "usage":{"output_tokens":15,
+                    "output_tokens_details":{"thinking_tokens":4},
+                    "iterations":[{"type":"message","model":"claude-fable-5","output_tokens":3},
+                                  {"type":"fallback_message","model":"claude-opus-4-8","output_tokens":12}]}})),
+            ev(json!({"type":"message_stop"})),
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(acc.usage.speed.as_deref(), Some("fast"));
+        assert_eq!(acc.usage.service_tier.as_deref(), Some("standard"));
+        assert_eq!(acc.usage.inference_geo.as_deref(), Some("us"));
+        assert_eq!(acc.usage.input_tokens, Some(25));
+        assert_eq!(acc.usage.output_tokens, Some(15));
+        assert_eq!(
+            acc.usage
+                .output_tokens_details
+                .as_ref()
+                .and_then(|d| d.thinking_tokens),
+            Some(4)
+        );
+        assert_eq!(acc.usage.iterations.len(), 2);
+        assert_eq!(
+            acc.usage.iterations[1].kind.as_deref(),
+            Some("fallback_message")
         );
     }
 

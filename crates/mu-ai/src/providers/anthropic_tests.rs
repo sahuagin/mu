@@ -1726,6 +1726,67 @@ mod live_tests {
         assert!(body_betas(&nulled).is_empty(), "{nulled}");
     }
 
+    /// The fallback family follows the body too: `fallbacks` in either form
+    /// asks for the server-side-fallback beta; a `fallback_credit_token`
+    /// asks for the fallback-credit beta only in its object form (the bare
+    /// string needs none). Bodies from the crate's typed request.
+    #[test]
+    fn fallback_betas_follow_the_body() {
+        use mu_anthropic::{CreditRedemption, FallbackCreditToken, FallbackTarget, Fallbacks};
+        let body = |r: MessagesRequest| serde_json::to_value(r).unwrap();
+        let base = || MessagesRequest::new("x", 1, vec![AnthMessage::user("hi")]);
+        assert!(body_betas(&body(base())).is_empty());
+        assert_eq!(
+            body_betas(&body(base().with_fallbacks(Fallbacks::Default))),
+            vec![SERVER_SIDE_FALLBACK_BETA]
+        );
+        assert_eq!(
+            body_betas(&body(base().with_fallbacks(Fallbacks::Models(vec![
+                FallbackTarget::model("claude-opus-4-8")
+            ])))),
+            vec![SERVER_SIDE_FALLBACK_BETA]
+        );
+        assert!(body_betas(&body(
+            base().with_fallback_credit_token(FallbackCreditToken::Token("fct_01".into()))
+        ))
+        .is_empty());
+        assert_eq!(
+            body_betas(&body(base().with_fallback_credit_token(
+                FallbackCreditToken::WithMode {
+                    token: "fct_01".into(),
+                    mode: Some(CreditRedemption::BestEffort),
+                }
+            ))),
+            vec![FALLBACK_CREDIT_BETA]
+        );
+        let mut nulled = body(base());
+        nulled["fallbacks"] = Value::Null;
+        assert!(body_betas(&nulled).is_empty(), "{nulled}");
+
+        // A thinking override inside a fallback target asks for its betas
+        // like the top-level one: the attempt is validated as a direct
+        // request to that model.
+        use mu_anthropic::{PrefixMismatchBehavior, ThinkingConfig, ThinkingDisplay};
+        let target = mu_anthropic::FallbackTarget {
+            thinking: Some(
+                ThinkingConfig::adaptive()
+                    .with_display(ThinkingDisplay::Updates)
+                    .with_prefix_mismatch_behavior(PrefixMismatchBehavior::DropBlock),
+            ),
+            ..FallbackTarget::model("claude-opus-5")
+        };
+        assert_eq!(
+            body_betas(&body(
+                base().with_fallbacks(Fallbacks::Models(vec![target]))
+            )),
+            vec![
+                THINKING_DISPLAY_UPDATES_BETA,
+                THINKING_BINDING_CONTROLS_BETA,
+                SERVER_SIDE_FALLBACK_BETA
+            ]
+        );
+    }
+
     /// One assembly path for the lane and the tests, in two lists that
     /// degrade differently: the refusal latch drops the catalog beta and
     /// nothing else, and the header carries catalog first, body after.

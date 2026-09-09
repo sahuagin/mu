@@ -44,7 +44,9 @@ pub enum StopReason {
 /// message (usually with null fields); populated on a `refusal` with
 /// fallback-credit info (spec: fallback-credit beta — `fallback_credit_token`
 /// is an opaque one-time credit; `fallback_has_prefill_claim` picks the retry
-/// body shape). Unmodeled keys round-trip via `extra` (forward-compat).
+/// body shape). The refusal fields are the ones
+/// `/docs/en/build-with-claude/refusals-and-fallback § What a refusal looks
+/// like` lists. Unmodeled keys round-trip via `extra` (forward-compat).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StopDetails {
     /// Refusal category on a `stop_reason: "refusal"` response. Documented
@@ -53,6 +55,15 @@ pub struct StopDetails {
     /// not break deserialization. (mu-provider-drift-2026q3-y43la)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// Human-readable refusal description; "the text is not stable, so
+    /// display it rather than parse it".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+    /// "Present only on requests that set `fallbacks`": a model to retry
+    /// directly when the API skipped the fallback attempt (the fallback
+    /// model was rate limited, say). A hint, not a guarantee.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_credit_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,6 +162,12 @@ pub struct Usage {
     pub server_tool_use: Option<ServerToolUseUsage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub iterations: Vec<IterationUsage>,
+    /// Inference speed mode the response was served at (`standard` or
+    /// `fast`; `/docs/en/api/beta/messages/create § Returns`). A String like
+    /// `service_tier` beside it — inbound, so lossless over a set the API may
+    /// extend; the request side types it as [`Speed`](crate::Speed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
 }
 
 /// A code-execution container handle, echoed at the TOP LEVEL of the response
@@ -486,6 +503,54 @@ mod tests {
             other => panic!("expected ThinkingDropped, got {other:?}"),
         }
         assert_eq!(serde_json::to_value(&m).unwrap(), odd);
+    }
+
+    #[test]
+    fn usage_speed_parses_from_the_reference_example() {
+        // /docs/en/api/beta/messages/create § Returns — the example's usage
+        // carries service_tier and speed side by side.
+        let u: Usage = serde_json::from_value(json!({
+            "input_tokens": 2095, "output_tokens": 503,
+            "service_tier": "standard", "speed": "standard"
+        }))
+        .unwrap();
+        assert_eq!(u.speed.as_deref(), Some("standard"));
+        assert_eq!(u.service_tier.as_deref(), Some("standard"));
+        let back = serde_json::to_value(&u).unwrap();
+        assert_eq!(back["speed"], json!("standard"));
+        let u: Usage =
+            serde_json::from_value(json!({"input_tokens": 1, "output_tokens": 1})).unwrap();
+        assert_eq!(u.speed, None);
+        assert!(serde_json::to_value(&u).unwrap().get("speed").is_none());
+    }
+
+    #[test]
+    fn refusal_stop_details_fields_parse_typed() {
+        // /docs/en/build-with-claude/refusals-and-fallback § What a refusal
+        // looks like — category, explanation, recommended_model (the last
+        // only on requests that set fallbacks); nulls are normal values.
+        let d: StopDetails = serde_json::from_value(json!({
+            "category": "cyber",
+            "explanation": "The request asked for working exploit code.",
+            "recommended_model": "claude-opus-4-8",
+            "fallback_credit_token": null,
+            "fallback_has_prefill_claim": null
+        }))
+        .unwrap();
+        assert_eq!(d.category.as_deref(), Some("cyber"));
+        assert_eq!(
+            d.explanation.as_deref(),
+            Some("The request asked for working exploit code.")
+        );
+        assert_eq!(d.recommended_model.as_deref(), Some("claude-opus-4-8"));
+        assert!(
+            d.extra.is_empty(),
+            "the typed fields no longer land in extra: {:?}",
+            d.extra
+        );
+        let d: StopDetails =
+            serde_json::from_value(json!({"category": null, "explanation": null})).unwrap();
+        assert_eq!(d, StopDetails::default());
     }
 
     #[test]

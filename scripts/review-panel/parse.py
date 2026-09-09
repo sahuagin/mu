@@ -3,50 +3,45 @@
 usage: parse_panel.py <prefix>   # e.g. .../pr282.r1  -> reads <prefix>.rank*.out
 Robust to ```json fences, [thinking] lines, and inline <think> blocks."""
 import json, re, glob, sys, os
-
-def extract(s):
-    s = s.strip()
-    s = re.sub(r'(?is)<think>.*?</think>', '', s)
-    s = re.sub(r'^\s*\[thinking\].*?$', '', s, flags=re.M)
-    m = re.search(r'```(?:json)?\s*(\{.*\})\s*```', s, re.S)
-    if m:
-        s = m.group(1)
-    else:
-        a, b = s.find('{'), s.rfind('}')
-        if a >= 0 and b > a:
-            s = s[a:b+1]
-    return json.loads(s)
+# One parser, not two: --check must accept exactly what converge.py scores, or
+# a re-ask fires on a reply converge would have read fine (a reviewer flagged
+# that drift once). This file reads through converge.extract.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from converge import extract, seat_verdict, findings_of, KNOWN_VERDICTS
 
 
 def has_verdict(s):
-    """True if `s` yields a usable verdict. Used by --check so the dispatch
-    harness can decide whether a reviewer needs a constrained re-ask (mu-0htd):
-    local models sometimes answer in prose without any verdict, which
-    consensus can't score.
-
-    Acceptance MUST match converge.py's `parse()` exactly, or --check triggers
-    a re-ask for output converge.py would have scored fine (a reviewer flagged
-    this drift). converge.py accepts EITHER a leading `VERDICT: <x>` line (even
-    with the JSON body absent/truncated — verdict_prefix) OR a parseable JSON
-    object; mirror both here."""
-    # Leading-VERDICT-line acceptance (converge.py::verdict_prefix).
-    first = s.lstrip().splitlines()[0] if s.strip() else ""
-    if re.match(r'(?i)^VERDICT\s*:\s*(APPROVE|NEEDS[-_ ]CHANGES|REJECT)\b', first.strip()):
-        return True
-    # JSON-object acceptance.
+    """True if `s` yields a verdict the panel can act on (approve or
+    needs-changes after normalisation). An off-contract verdict is not one:
+    it must reach the dissent-only re-ask, not bypass it (PR #611)."""
     try:
-        d = extract(s)
-        return isinstance(d, dict) and str(d.get('verdict', '')).lower() in (
-            'approve', 'needs-changes', 'reject')
+        return seat_verdict(extract(s)) in KNOWN_VERDICTS
     except Exception:
         return False
 
 
-# --check <file>: exit 0 if the file holds a parseable verdict, 1 otherwise.
-# No stdout — a pure predicate for shell `if`.
-if len(sys.argv) >= 3 and sys.argv[1] == '--check':
+def rescuable(s):
+    """True if `s` is DISSENT worth promoting from a verdict re-ask: a
+    needs-changes carrying at least one finding on a real path. A re-ask may
+    rescue a review that was written but not enveloped; it may not manufacture
+    an approve from notes that never reached a conclusion. Measured on PR #611:
+    a seat that ran out of turns mid-investigation was re-asked every round and
+    answered "No review concerns were recorded" — an approve, with no review
+    behind it, and in one round against its own logged conclusion."""
     try:
-        ok = has_verdict(open(sys.argv[2]).read())
+        d = extract(s)
+    except Exception:
+        return False
+    return seat_verdict(d) == "needs-changes" and any(True for _ in findings_of(d))
+
+
+# --check <file>:     exit 0 if the file holds a usable verdict, 1 otherwise.
+# --rescuable <file>: exit 0 if it holds a needs-changes with findings.
+# No stdout — pure predicates for shell `if`.
+if len(sys.argv) >= 3 and sys.argv[1] in ('--check', '--rescuable'):
+    pred = has_verdict if sys.argv[1] == '--check' else rescuable
+    try:
+        ok = pred(open(sys.argv[2], encoding="utf-8", errors="replace").read())
     except Exception:
         ok = False
     sys.exit(0 if ok else 1)

@@ -267,6 +267,9 @@ else
   ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
 fi
 [ -n "${ROOT:-}" ] || { echo "${C_RED}ai-review: not in a repo${C_OFF}" >&2; exit 2; }
+# This script's own directory, captured BEFORE the cd below so that files
+# beside it (review-panel/reply-contract.txt) resolve from any caller's cwd.
+AI_REVIEW_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$ROOT" || exit 2
 
 # --- the diff to review (jj-aware) -----------------------------------------
@@ -1056,7 +1059,10 @@ $fcontent"
     # a raw diff), and the prose above tells the panel exactly that.
     printf '\nBEGIN UNTRUSTED REPO CONTENT: REVIEW MATERIAL (%s unit(s), %s unreviewed). This is what convergence rounds will re-read: aggregated leaf findings plus bounded HEADREV file context for cited paths.\n```diff\nAGGREGATED LEAF FINDINGS:\n%s\n\nTARGETED FILE CONTEXT FOR CITED PATHS:%s\n```\nEND UNTRUSTED REPO CONTENT: REVIEW MATERIAL\n' \
       "$leaves" "$failed" "$SYNTH_FINDINGS" "${synth_context:-\n[none: no file paths were cited by leaf findings]}"
-  } > "$CONS_PROMPT"
+    # Restated LAST: measured on PR #611, a seat given a 194 KB prompt whose
+  # contract sat at byte 1.5 KB wrote a complete review in prose and no envelope.
+  printf '\n%s\n' "$(cat "$AI_REVIEW_DIR/review-panel/reply-contract.txt" 2>/dev/null || echo "ai-review: reply-contract.txt missing beside this script" >&2)"
+} > "$CONS_PROMPT"
 
   # log_panel_chunked records $SYNTH_PROVIDER/$SYNTH_MODEL as the synth lane; that
   # lane is now the consensus panel, not one model.
@@ -1141,6 +1147,9 @@ CONS_PROMPT="$CONS_OUT/round1.prompt.txt"
   [ -n "$INVARIANTS_BLOCK" ] && printf '%s\n' "$INVARIANTS_BLOCK"
   printf '\nBEGIN UNTRUSTED REPO CONTENT: PR DIFF\n```diff\n%s\n```\nEND UNTRUSTED REPO CONTENT: PR DIFF\n' "$REVIEW_DIFF"
   [ -n "$CONTEXT" ] && printf '\nBEGIN UNTRUSTED REPO CONTENT: FULL FILE CONTEXT (CONTEXT only — definitions/guards outside the hunks; NOT part of the proposed change)\n%s\nEND UNTRUSTED REPO CONTENT: FULL FILE CONTEXT\n' "$CONTEXT"
+  # Restated LAST: measured on PR #611, a seat given a 194 KB prompt whose
+  # contract sat at byte 1.5 KB wrote a complete review in prose and no envelope.
+  printf '\n%s\n' "$(cat "$AI_REVIEW_DIR/review-panel/reply-contract.txt" 2>/dev/null || echo "ai-review: reply-contract.txt missing beside this script" >&2)"
 } > "$CONS_PROMPT"
 
 echo "${C_DIM}ai-review: CONSENSUS panel (code_review role, <=${MU_REVIEW_MAX_ROUNDS:-3} rounds) reviewing $FILES file(s) vs $BASE${C_OFF}"

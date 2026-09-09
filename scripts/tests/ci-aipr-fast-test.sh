@@ -6,7 +6,8 @@
 #
 #   1. converge.py `agree` — LIVE-SEAT quorum. A seat that timed out or returned
 #      nothing recoverable is ABSENT for the round, not a dissenter (a reply that
-#      lists findings without a verdict is a needs-changes, not an absence); agreement
+#      lists findings without a verdict is a needs-changes, not an absence; a
+#      seat whose process failed is named with its error); agreement
 #      still needs MU_REVIEW_MIN_LIVE_SEATS seats that actually answered (default
 #      3, a majority of the five-seat roster). Two measured runs are pinned here:
 #      four seats agreeing every round while a fifth emitted unparseable JSON and
@@ -43,6 +44,38 @@ MU_REVIEW_PROVIDER_CONFIG="$TMP/no-such-config.toml"; export MU_REVIEW_PROVIDER_
 # Write one round-1 seat. Shapes are the ones dispatch.sh actually produces:
 #   approve | needs-changes  a contract-shaped reply
 #   unparsed                 prose, no JSON at all (what a chatty seat emits)
+#   failed                   empty reply, exit=1, stderr names the error (the
+#                            dead-roster-entry shape: 21 of 23 absences measured)
+#   limit                    exit=1, stderr silent, stdout carries the provider's
+#                            one-line refusal (claude -p at the session limit)
+#   braces                   a complete needs-changes wrapped in prose with
+#                            braces and followed by a second JSON object
+#   quoted-example           VERDICT: needs-changes, then a QUOTED approve
+#                            envelope from the diff, then the real envelope
+#   prefix-only              VERDICT: needs-changes, then only a quoted approve
+#                            envelope (the real one never came)
+#   last-wins                no VERDICT line; a quoted approve envelope, then
+#                            the real needs-changes envelope
+#   dissent-then-quote       no VERDICT line; the real needs-changes envelope,
+#                            then a quoted approve fixture
+#   quotes-only              no VERDICT line; two quoted approve fixtures and
+#                            "I still need to investigate"
+#   json-only-approve        no VERDICT line; a single approve envelope
+#   same-verdict-quote       VERDICT: needs-changes, the real envelope, then a
+#                            quoted needs-changes fixture with no findings
+#   off-contract             a JSON-only envelope whose verdict is "unclear"
+#   off-contract-findings    verdict "blocked" beside a concrete high finding
+#   preamble                 one sentence, THEN the VERDICT line and envelope
+#   think-verdict            a tentative VERDICT: approve inside <think>, then
+#                            the real needs-changes line and envelope
+#   quoted-verdict-line      prose quoting "VERDICT: approve / VERDICT:
+#                            needs-changes" on its own line, no conclusion
+#   verdict-line-only        line 1 is VERDICT: needs-changes, no JSON (the
+#                            truncation-safe prefix, kept)
+#   quoted-contract-brace    the quoted slash line, then a bare "{", then prose
+#   quoted-verdict-example   a quoted single VERDICT: approve line, a quoted
+#                            example envelope, then "I still need to..."
+#   reject                   VERDICT: reject with a matching envelope
 #   noverdict                valid JSON with no verdict field and no findings
 #   findings-noverdict       valid JSON listing a finding, verdict field blank
 #   timeout                  .done carries exit=124, as `timeout` leaves it
@@ -70,14 +103,72 @@ seat() { # $1=dir $2=tag $3=shape[:seam]   (seam marks an EXCLUSIVE seat)
     timeout-parsed)
       printf 'VERDICT: needs-changes\n{"verdict":"needs-changes","summary":"s","findings":[{"severity":"high","file":"x.rs","line":1,"issue":"unchecked"}]}\n' \
         > "$1/r1.$2.out" ;;
+    failed)
+      : > "$1/r1.$2.out"
+      printf 'Error: model_not_found\n' > "$1/r1.$2.err" ;;
+    limit)
+      printf "You've hit your session limit - resets 3:20pm (America/New_York)\n" > "$1/r1.$2.out" ;;
+    braces)
+      printf 'Looking at ${VAR} handling, see {below}.\nVERDICT: needs-changes\n{"verdict":"needs-changes","summary":"s","findings":[{"severity":"high","file":"x.rs","line":1,"issue":"a {b} c"}]}\nAside: {"note":"a second object"}\n' \
+        > "$1/r1.$2.out" ;;
+    quoted-example)
+      printf 'VERDICT: needs-changes\nThe test writes {"verdict":"approve","summary":"No review concerns were recorded.","findings":[]} as its fixture.\n{"verdict":"needs-changes","summary":"s","findings":[{"severity":"high","file":"x.rs","line":1,"issue":"real"}]}\n' \
+        > "$1/r1.$2.out" ;;
+    prefix-only)
+      printf 'VERDICT: needs-changes\nThe fixture is {"verdict":"approve","summary":"s","findings":[]} and\n' \
+        > "$1/r1.$2.out" ;;
+    last-wins)
+      printf 'Compare the fixture {"verdict":"approve","summary":"s","findings":[]} with mine:\n{"verdict":"needs-changes","summary":"s","findings":[{"severity":"high","file":"x.rs","line":1,"issue":"real"}]}\n' \
+        > "$1/r1.$2.out" ;;
+    dissent-then-quote)
+      printf '{"verdict":"needs-changes","summary":"s","findings":[{"severity":"high","file":"x.rs","line":1,"issue":"real"}]}\nThe fixture it ships is {"verdict":"approve","summary":"No review concerns were recorded.","findings":[]}.\n' \
+        > "$1/r1.$2.out" ;;
+    quotes-only)
+      printf 'Compare fixture {"verdict":"approve","summary":"s","findings":[]} against fixture {"verdict":"approve","summary":"t","findings":[]}; I still need to investigate.\n' \
+        > "$1/r1.$2.out" ;;
+    json-only-approve)
+      printf '{"verdict":"approve","summary":"s","findings":[]}\n' > "$1/r1.$2.out" ;;
+    same-verdict-quote)
+      printf 'VERDICT: needs-changes\n{"verdict":"needs-changes","summary":"s","findings":[{"severity":"high","file":"x.rs","line":1,"issue":"real"}]}\nAs in the fixture {"verdict":"needs-changes","summary":"s","findings":[]}.\n' \
+        > "$1/r1.$2.out" ;;
+    off-contract)
+      printf '{"verdict":"unclear","summary":"s","findings":[]}\n' > "$1/r1.$2.out" ;;
+    off-contract-findings)
+      printf '{"verdict":"blocked","summary":"s","findings":[{"severity":"high","file":"x.rs","line":1,"issue":"unchecked access"}]}\n' > "$1/r1.$2.out" ;;
+    preamble)
+      printf "I've completed a thorough static review. Findings from my analysis:\nVERDICT: approve\n{\"verdict\":\"approve\",\"summary\":\"clean\",\"findings\":[]}\n" > "$1/r1.$2.out" ;;
+    think-verdict)
+      printf '<think>\nVERDICT: approve\nno wait, the guard is missing\n</think>\nVERDICT: needs-changes\n{"verdict":"needs-changes","summary":"s","findings":[{"severity":"high","file":"x.rs","line":1,"issue":"guard missing"}]}\n' > "$1/r1.$2.out" ;;
+    quoted-verdict-line)
+      printf 'The contract says the first line must be one of:\nVERDICT: approve / VERDICT: needs-changes\nI still need to investigate the marker script.\n' > "$1/r1.$2.out" ;;
+    verdict-line-only)
+      printf 'VERDICT: needs-changes\n' > "$1/r1.$2.out" ;;
+    quoted-contract-brace)
+      printf 'The required format is:\nVERDICT: approve / VERDICT: needs-changes\n{\nI still need to investigate.\n' > "$1/r1.$2.out" ;;
+    quoted-verdict-example)
+      printf 'The contract example reads:\nVERDICT: approve\n{"verdict":"approve","summary":"<1-2 sentences>","findings":[]}\nI still need to investigate the marker script.\n' > "$1/r1.$2.out" ;;
+    reject)
+      printf 'VERDICT: reject\n{"verdict":"reject","summary":"s","findings":[{"severity":"high","file":"x.rs","line":1,"issue":"real"}]}\n' \
+        > "$1/r1.$2.out" ;;
   esac
-  if [ "$3" = timeout ] || [ "$3" = timeout-parsed ]; then
-    echo "exit=124 retry=0 prov=openrouter model=$2 seam=[$_seam]" > "$1/r1.$2.done"
-  elif [ "$3" = skipped ]; then
-    echo "exit=75 retry=0 prov=ollama model=$2 seam=[$_seam]" > "$1/r1.$2.done"
-  else
-    echo "exit=0 retry=0 prov=openrouter model=$2 seam=[$_seam]" > "$1/r1.$2.done"
-  fi
+  case "$3" in
+    timeout|timeout-parsed) _exit=124; _prov=openrouter ;;
+    skipped) _exit=75; _prov=ollama ;;
+    failed|limit) _exit=1; _prov=openrouter ;;
+    *) _exit=0; _prov=openrouter ;;
+  esac
+  echo "exit=$_exit retry=0 prov=$_prov model=$2 seam=[$_seam]" > "$1/r1.$2.done"
+}
+
+expect_eq() { # $1=label $2=expected $3=got
+  if [ "$3" = "$2" ]; then echo "ok   $1"
+  else echo "FAIL $1: expected '$2', got '$3'"; fails=$((fails + 1)); fi
+}
+
+findings_n() { # $1=file -> "<verdict> <number of findings>" of the envelope converge.py picks
+  python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import converge as cv
+d = cv.parse_out(sys.argv[2]) or {}; print(cv.seat_verdict(d), len(d.get("findings") or []))' \
+    "$HERE/../review-panel" "$1"
 }
 
 panel() { # $1=dir-name, then <tag>=<shape> pairs
@@ -106,11 +197,109 @@ check() { # $1=label $2=dir $3=expected-first-line $4=expected-census $5=expecte
 d=$(panel all-live rank0.a=approve rank1.b=approve rank2.c=approve)
 check "a fully live panel still agrees" "$d" "AGREE approve" "live 3/3" 0
 
-# (a) the measured PR #608 shape: four seats agree, one emits unparseable prose.
+# (a) the measured PR #608 shape: four seats agree, one returned nothing —
+# a 404 on a roster entry that no longer existed. That read "unparsed" for four
+# days; the census now names the error.
+d=$(panel failed-seat rank0.opus-5=approve rank1.gpt-5.5=failed \
+          rank2.glm=approve rank3.kimi=approve rank4.opus-4-8=approve)
+check "4 live agree + 1 failed seat converges, and the failure is named" "$d" \
+  "AGREE approve" "live 4/5: gpt-5.5 failed (exit 1: Error: model_not_found)" 0
+
+# (a') a chatty seat: prose, no JSON at all.
 d=$(panel unparsed-seat rank0.opus-5=approve rank1.gpt-5.5=unparsed \
           rank2.glm=approve rank3.kimi=approve rank4.opus-4-8=approve)
 check "4 live agree + 1 unparsed seat converges" "$d" \
   "AGREE approve" "live 4/5: gpt-5.5 unparsed" 0
+
+# A provider's one-line refusal on stdout with silent stderr: the census
+# carries the line (claude -p at the operator's session limit, run 7).
+d=$(panel limit-seat rank0.a=approve rank1.b=approve rank2.c=approve rank3.d=limit)
+check "a seat refused by its provider is named with the refusal" "$d" \
+  "AGREE approve" "live 3/4: d failed (exit 1: You've hit your session limit - resets 3:20pm (America/New_York))" 0
+
+# An off-contract verdict is absent and named; "reject" reads as needs-changes.
+d=$(panel off-contract-seat rank0.a=approve rank1.b=approve rank2.c=approve rank3.d=off-contract)
+check "an off-contract verdict is absent, named with its verdict" "$d" \
+  "AGREE approve" "live 3/4: d unparsed (verdict 'unclear' is off contract)" 0
+if python3 "$HERE/../review-panel/parse.py" --check "$d/r1.rank3.d.out" 2>/dev/null; then
+  echo "FAIL parse.py --check accepted an off-contract verdict (no re-ask would fire)"; fails=$((fails + 1))
+else
+  echo "ok   parse.py --check rejects an off-contract verdict so the re-ask fires"
+fi
+d=$(panel off-contract-findings-seat rank0.a=approve rank1.b=approve rank2.c=approve rank3.d=off-contract-findings)
+check "an off-contract verdict WITH findings is dissent, not absence" "$d" \
+  'SPLIT {"rank0.a": "approve", "rank1.b": "approve", "rank2.c": "approve", "rank3.d": "needs-changes"}' \
+  "live 4/4" 1
+d=$(panel preamble-seat rank0.a=approve rank1.b=approve rank2.c=preamble)
+check "a preamble sentence before the VERDICT line does not void a declared approve" "$d" \
+  "AGREE approve" "live 3/3" 0
+d=$(panel verdict-line-shapes rank0.a=think-verdict rank1.b=quoted-verdict-line rank2.c=verdict-line-only)
+expect_eq "a tentative VERDICT line inside reasoning is not the declaration" \
+  "needs-changes 1" "$(findings_n "$d/r1.rank0.a.out")"
+expect_eq "a quoted VERDICT line in prose with no envelope after it declares nothing" \
+  "unparsed 0" "$(findings_n "$d/r1.rank1.b.out")"
+expect_eq "a lone VERDICT line on line 1 is still scored (truncation-safe prefix)" \
+  "needs-changes 0" "$(findings_n "$d/r1.rank2.c.out")"
+d=$(panel quoted-shapes rank0.a=quoted-contract-brace rank1.b=quoted-verdict-example)
+expect_eq "a quoted contract line followed by a bare brace declares nothing" \
+  "unparsed 0" "$(findings_n "$d/r1.rank0.a.out")"
+expect_eq "a quoted VERDICT line and example envelope followed by more prose declare nothing" \
+  "unparsed 0" "$(findings_n "$d/r1.rank1.b.out")"
+d=$(panel reject-seat rank0.a=approve rank1.b=approve rank2.c=approve rank3.d=reject)
+check "VERDICT: reject reads as needs-changes" "$d" \
+  'SPLIT {"rank0.a": "approve", "rank1.b": "approve", "rank2.c": "approve", "rank3.d": "needs-changes"}' \
+  "live 4/4" 1
+
+# A complete verdict wrapped in braces-bearing prose with a second object after
+# it: the old first-'{' to last-'}' slice threw this away (measured on PR #611).
+d=$(panel braces-seat rank0.a=approve rank1.b=approve rank2.c=approve rank3.d=braces)
+check "a verdict wrapped in brace-bearing prose is still read" "$d" \
+  'SPLIT {"rank0.a": "approve", "rank1.b": "approve", "rank2.c": "approve", "rank3.d": "needs-changes"}' \
+  "live 4/4" 1
+if python3 "$HERE/../review-panel/parse.py" --check "$d/r1.rank3.d.out"; then
+  echo "ok   parse.py --check reads the same reply (no spurious re-ask)"
+else
+  echo "FAIL parse.py --check rejected a reply converge.py scored"; fails=$((fails + 1))
+fi
+
+# Which envelope is the reply when a reply carries more than one? This repo's
+# own diffs quote `{"verdict":"approve"...}` fixtures (panel findings, PR #611).
+d=$(panel envelope-choice rank0.a=quoted-example rank1.b=prefix-only rank2.c=last-wins rank3.d=same-verdict-quote)
+expect_eq "a quoted approve before the real envelope does not win (VERDICT line agrees with the envelope)" \
+  "needs-changes 1" "$(findings_n "$d/r1.rank0.a.out")"
+expect_eq "a VERDICT line with only a quoted envelope after it keeps its own verdict" \
+  "needs-changes 0" "$(findings_n "$d/r1.rank1.b.out")"
+expect_eq "with no VERDICT line a needs-changes envelope is the reply" \
+  "needs-changes 1" "$(findings_n "$d/r1.rank2.c.out")"
+expect_eq "a trailing same-verdict fixture does not replace the real findings" \
+  "needs-changes 1" "$(findings_n "$d/r1.rank3.d.out")"
+d=$(panel envelope-choice-2 rank0.a=dissent-then-quote rank1.b=quotes-only rank2.c=json-only-approve)
+expect_eq "a quoted approve AFTER the real needs-changes does not flip the seat" \
+  "needs-changes 1" "$(findings_n "$d/r1.rank0.a.out")"
+expect_eq "several quoted envelopes and no conclusion score nothing" \
+  "unparsed 0" "$(findings_n "$d/r1.rank1.b.out")"
+expect_eq "an approve with no VERDICT line is not an approval" \
+  "unparsed 0" "$(findings_n "$d/r1.rank2.c.out")"
+
+# The reply contract is the LAST thing a convergence prompt says, and it is the
+# CONVERGENCE contract (concede/maintain/refute), not the round-1 one.
+printf 'diff --git a/x b/x\n' > "$d/diff.txt"
+python3 "$HERE/../review-panel/converge.py" prompt "$d/r1" 2 "$d/diff.txt" rank0.a "$d/r2.rank0.a.prompt" >/dev/null 2>&1
+if tail -c 900 "$d/r2.rank0.a.prompt" | grep -q "REPLY FORMAT, restated" \
+   && tail -c 900 "$d/r2.rank0.a.prompt" | grep -q '"refute"'; then
+  echo "ok   the convergence prompt restates ITS contract last (refute array included)"
+else
+  echo "FAIL the convergence prompt does not end with the convergence contract"; fails=$((fails + 1))
+fi
+
+# ...and a per-seat clause (focus / seam) does not push it up the prompt again.
+printf 'shared prompt\n' > "$d/shared.txt"
+( HERE="$HERE/../review-panel"; . "$HERE/seat-prompt.sh"; seat_prompt "$d/shared.txt" "$d/seat.txt" "error handling" "" "" "" >/dev/null )
+if tail -c 700 "$d/seat.txt" | grep -q "REPLY FORMAT, restated"; then
+  echo "ok   a focused seat prompt still ends with the reply contract"
+else
+  echo "FAIL a focused seat prompt does not end with the reply contract"; fails=$((fails + 1))
+fi
 
 # (b) same, but the fifth seat hit the wall-clock cap.
 d=$(panel timeout-seat rank0.opus-5=approve rank1.gpt-5.5=approve \
@@ -294,13 +483,18 @@ fi
 # used to inherit the seat's full cap, so a seat could cost 2x its cap in every
 # round (panel finding, PR #611); now it carries its own short one.
 reask_dir="$TMP/reask"; mkdir -p "$reask_dir"
-agent_dispatch() { # stub: record the cap the re-ask ran under, answer in contract
+REASK_REPLY=approve
+agent_dispatch() { # stub: record the cap the re-ask ran under, answer as told
   printf '%s\n' "${TIMEOUT:-unset}" > "$reask_dir/timeout-seen"
-  printf 'VERDICT: approve\n{"verdict":"approve","summary":"s","findings":[]}\n'
+  if [ "$REASK_REPLY" = approve ]; then
+    printf 'VERDICT: approve\n{"verdict":"approve","summary":"No review concerns were recorded.","findings":[]}\n'
+  else
+    printf 'VERDICT: needs-changes\n{"verdict":"needs-changes","summary":"s","findings":[{"severity":"high","file":"x.rs","line":3,"issue":"unchecked"}]}\n'
+  fi
 }
 reask() { # $1=extra env assignment
   printf 'I looked at the change and it seems fine. What would you like next?\n' > "$reask_dir/r1.rank0.a.out"
-  rm -f "$reask_dir/timeout-seen"
+  rm -f "$reask_dir/timeout-seen" "$reask_dir/r1.rank0.a.out.orig"
   ( HERE="$HERE/../review-panel"; . "$HERE/verdict-retry.sh"; ERRLOG=/dev/null
     eval "$1"; reask_if_unparsed openrouter m "$reask_dir/r1.rank0.a.out" )
   cat "$reask_dir/timeout-seen" 2>/dev/null
@@ -309,10 +503,20 @@ expect_cap "the verdict re-ask carries its own 180s cap, not the seat's" 180 \
   "$(reask 'TIMEOUT=900')"
 expect_cap "the re-ask cap is env-settable" 60 \
   "$(reask 'TIMEOUT=900; MU_REVIEW_REASK_TIMEOUT_SECS=60')"
+
+# The re-ask may rescue dissent; it may not manufacture an approve (measured:
+# a turn-exhausted seat re-asked into "No review concerns were recorded").
 if python3 "$HERE/../review-panel/parse.py" --check "$reask_dir/r1.rank0.a.out" 2>/dev/null; then
-  echo "ok   a parseable re-ask is promoted to the seat's reply"
+  echo "FAIL an approve reformatted from unfinished notes was promoted"; fails=$((fails + 1))
 else
-  echo "FAIL the re-ask answer was not promoted"; fails=$((fails + 1))
+  echo "ok   a re-ask that approves is not promoted; the seat stays unparsed"
+fi
+REASK_REPLY=needs-changes; reask '' >/dev/null
+if python3 "$HERE/../review-panel/parse.py" --rescuable "$reask_dir/r1.rank0.a.out" 2>/dev/null \
+   && [ -f "$reask_dir/r1.rank0.a.out.orig" ]; then
+  echo "ok   a re-ask that dissents with findings is promoted, original kept as .orig"
+else
+  echo "FAIL a needs-changes re-ask was not promoted (or the original was not kept)"; fails=$((fails + 1))
 fi
 unset -f agent_dispatch
 

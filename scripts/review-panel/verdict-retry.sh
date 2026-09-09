@@ -12,10 +12,16 @@
 # `reask_if_unparsed` re-asks that SAME reviewer for ONLY the verdict, feeding
 # back its own review notes. No tools, no investigation — pure reformatting.
 #
-# ADDITIVE-ONLY, by construction: it runs only when the original output does
-# NOT parse, and it promotes the re-ask ONLY when the re-ask DOES parse.
-# Original parses → no-op. Re-ask fails → canonical .out untouched. So the gate
-# can never be weakened, only rescued.
+# RESCUES DISSENT ONLY: it runs only when the original output does NOT parse,
+# and it promotes the re-ask ONLY when the re-ask is a needs-changes carrying
+# findings (parse.py --rescuable). It used to promote any parseable re-ask, and
+# that manufactured approvals: on PR #611 a seat that spent its turn budget
+# mid-investigation was re-asked in every round and, told "otherwise approve",
+# answered "No review concerns were recorded" — an approve with no review
+# behind it, once against its own logged needs-changes. An approve cannot be
+# reformatted out of unfinished notes; that seat stays unparsed and is named on
+# the PANEL line. Original parses → no-op. Re-ask fails or approves → canonical
+# .out untouched. The original is kept as .out.orig when a re-ask is promoted.
 #
 # BOUNDED: the re-ask carries its own cap, MU_REVIEW_REASK_TIMEOUT_SECS (default
 # 180), not the seat's. It used to inherit the caller's TIMEOUT, so a seat that
@@ -39,7 +45,7 @@ reask_if_unparsed() {
     printf 'The FIRST line MUST be exactly one of: VERDICT: approve / VERDICT: needs-changes\n'
     printf 'Then exactly one JSON object on the following lines:\n'
     printf '{"verdict":"approve"|"needs-changes","summary":"<1-2 sentences>","findings":[{"file":"<path>","line":<int>,"severity":"high"|"medium"|"low","issue":"<desc>"}]}\n'
-    printf 'Every "findings" element is an object with exactly those four keys (use [] if none). Base the verdict on your notes: any unresolved high/medium correctness or design concern => needs-changes, otherwise approve.\n\n'
+    printf 'Every "findings" element is an object with exactly those four keys (use [] if none). Base the verdict ONLY on what the notes conclude: unresolved high/medium correctness or design concerns => needs-changes, each listed as a finding. If the notes stop before a conclusion or reach none, answer VERDICT: incomplete and nothing else — never infer approval from the absence of recorded concerns.\n\n'
     # The fenced notes are the model's OWN prior output, but that output was
     # derived from an untrusted diff and may contain prompt-injection text. Fence
     # it as data-to-reformat, never instructions to obey (matches ai-review.sh's
@@ -58,12 +64,13 @@ reask_if_unparsed() {
     agent_dispatch "$_rp_prov" "$_rp_model" "$_rp_prompt" ) \
     > "${_rp_out}.reask" 2>>"${ERRLOG:-/dev/null}"
 
-  if python3 "$HERE/parse.py" --check "${_rp_out}.reask" 2>/dev/null; then
+  if python3 "$HERE/parse.py" --rescuable "${_rp_out}.reask" 2>/dev/null; then
+    cp "$_rp_out" "${_rp_out}.orig" 2>/dev/null || true
     mv "${_rp_out}.reask" "$_rp_out"
-    printf '%s\n' "mu-0htd: verdict re-ask succeeded (original had no parseable envelope)" >> "${ERRLOG:-/dev/null}"
+    printf '%s\n' "mu-0htd: verdict re-ask rescued a needs-changes with findings (original had no parseable envelope; kept as .orig)" >> "${ERRLOG:-/dev/null}"
   else
     rm -f "${_rp_out}.reask"
-    printf '%s\n' "mu-0htd: verdict re-ask did not parse either; leaving original output" >> "${ERRLOG:-/dev/null}"
+    printf '%s\n' "mu-0htd: verdict re-ask yielded no dissent to rescue; seat stays unparsed (an approve reformatted from unfinished notes is not a review)" >> "${ERRLOG:-/dev/null}"
   fi
   rm -f "$_rp_prompt"
 }

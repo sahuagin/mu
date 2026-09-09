@@ -60,6 +60,17 @@ const MID_CONVERSATION_TOOL_CHANGES_QUIRK: &str = "mid_conversation_tool_changes
 /// daemon and must never see the header).
 const MID_CONVERSATION_TOOL_CHANGES_ENV: &str = "MU_ANTHROPIC_MID_CONVERSATION_TOOL_CHANGES";
 
+/// Per-message effort: `output_config.effort` on a `role: "system"` message
+/// inside `messages` (Fable 5.1, Mythos 5.1, Opus 5; the effort page's
+/// "Per-message effort (beta)"). Required whenever a message carries the
+/// field and never otherwise, so it follows the body rather than a catalog
+/// quirk — see [`body_betas`]. mu-anthropic-protocol-2026q3-6uqho.3.
+const MID_CONVERSATION_OUTPUT_CONFIG_BETA: &str = "mid-conversation-output-config-2026-07-01";
+/// Turn-scoped system messages: `clear_at` on a `role: "system"` message
+/// (the mid-conversation-system-messages page's "Turn-scoped system
+/// messages"). Same rule: sent exactly when a message carries the field.
+const MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA: &str = "mid-conversation-system-clear-at-2026-08-21";
+
 /// Is `api_base` Anthropic's own API? Tolerates a trailing slash and case,
 /// the two variants an operator's ANTHROPIC_BASE_URL is likely to carry.
 fn on_anthropic_api(api_base: &str) -> bool {
@@ -106,6 +117,78 @@ fn beta_headers_for(
 ) -> Vec<&'static str> {
     let quirks = catalog.resolve_model(model).quirks;
     beta_headers(&quirks, on_anthropic_api(api_base), force)
+}
+
+/// The betas a request body asks for by carrying their fields: a message
+/// with `output_config` needs the output-config beta, one with `clear_at`
+/// the clear-at beta — without the header the API rejects the field as
+/// unknown ("clear_at: Extra inputs are not permitted"). Unlike the
+/// tool-changes beta, whose feature leaves no trace in the body, these are
+/// decided by the body alone: no catalog quirk, no endpoint gate, no
+/// operator override. A body that carries the field is only valid where the
+/// beta is accepted, so the header cannot make a request worse, and a
+/// gateway that forwards to Anthropic needs it. The top-level `output_config`
+/// (the `--thinking` effort knob on every request) is not a per-message
+/// field and asks for nothing. No mu path emits either field yet; the
+/// transport is ready for the one that will.
+fn body_betas(body: &Value) -> Vec<&'static str> {
+    let messages = body.get("messages").and_then(Value::as_array);
+    let carries = |field: &str| {
+        messages.is_some_and(|m| {
+            m.iter()
+                .any(|msg| msg.get(field).is_some_and(|v| !v.is_null()))
+        })
+    };
+    let mut betas = Vec::new();
+    if carries("output_config") {
+        betas.push(MID_CONVERSATION_OUTPUT_CONFIG_BETA);
+    }
+    if carries("clear_at") {
+        betas.push(MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA);
+    }
+    betas
+}
+
+/// The `anthropic-beta` values for one request, kept as two lists because
+/// they degrade differently: the catalog-gated beta (see [`beta_headers`])
+/// is dropped on a 400 that names it; the body's betas (see [`body_betas`])
+/// cannot be dropped without dropping their fields. One assembly path for
+/// the request the lane sends and for the wire tests.
+struct RequestBetas {
+    catalog: Vec<&'static str>,
+    body: Vec<&'static str>,
+}
+
+impl RequestBetas {
+    /// `latched` is the provider's refusal latch: once set, the catalog beta
+    /// stays out; the body's betas do not.
+    fn resolve(
+        catalog: &mu_core::model_catalog::ModelCatalogConfig,
+        model: &str,
+        api_base: &str,
+        force: Option<bool>,
+        latched: bool,
+        body: &Value,
+    ) -> Self {
+        let catalog_betas = if latched {
+            Vec::new()
+        } else {
+            beta_headers_for(catalog, model, api_base, force)
+        };
+        Self {
+            catalog: catalog_betas,
+            body: body_betas(body),
+        }
+    }
+
+    /// Everything the header carries, catalog first.
+    fn all(&self) -> Vec<&'static str> {
+        self.catalog
+            .iter()
+            .chain(self.body.iter())
+            .copied()
+            .collect()
+    }
 }
 
 /// Did a 400 reject the beta header itself? Anthropic names both the header
@@ -166,9 +249,9 @@ enum ThinkingWire {
 
 impl AnthropicProvider {
     /// The `/v1/messages` POST for a built wire body: auth, the protocol
-    /// version, and the catalog-gated beta headers (see [`beta_headers`]),
-    /// with the catalog and override injected. `stream` resolves them from
-    /// the live catalog and the process environment and sends through
+    /// version, and the beta headers (see [`RequestBetas`]), with the
+    /// catalog and override injected. `stream` resolves them from the live
+    /// catalog and the process environment and sends through
     /// [`Self::messages_request_raw`]; the wire test injects the shipped
     /// catalog so it asserts on the repo, not on this machine's
     /// ~/.config/mu/models.toml or environment (the lesson of bead mu-nzxa:
@@ -180,8 +263,8 @@ impl AnthropicProvider {
         catalog: &mu_core::model_catalog::ModelCatalogConfig,
         force: Option<bool>,
     ) -> reqwest::RequestBuilder {
-        let betas = beta_headers_for(catalog, &self.model, &self.api_base, force);
-        self.messages_request_raw(body, &betas)
+        let betas = RequestBetas::resolve(catalog, &self.model, &self.api_base, force, false, body);
+        self.messages_request_raw(body, &betas.all())
     }
 
     /// The request with an explicit beta list; `stream` uses it for the
@@ -300,8 +383,8 @@ impl Provider for AnthropicProvider {
         // to the Legacy arm; the parity test in this file asserts that
         // invariant for the canonical scenarios (text-only, single
         // tool call, consecutive tool results, system+tools, Thinking-
-        // block skip). The agent loop's mod.rs:818 still passes Legacy
-        // until mu-yqeq.8 wires the cutover.
+        // block skip). The agent loop sends Projected (mu-core's invoke
+        // step); the compaction provider judge still sends Legacy.
         let body = match input {
             MessageInput::Legacy(msgs) => {
                 build_request_body(&self.model, system_prompt, msgs, tools)
@@ -349,43 +432,52 @@ impl Provider for AnthropicProvider {
             }
         }
 
-        let betas = if self.beta_refused.load(std::sync::atomic::Ordering::Relaxed) {
-            Vec::new()
-        } else {
-            beta_headers_for(
-                mu_core::model_catalog::global(),
-                &self.model,
-                &self.api_base,
-                beta_override_from_env(),
-            )
-        };
+        let betas = RequestBetas::resolve(
+            mu_core::model_catalog::global(),
+            &self.model,
+            &self.api_base,
+            beta_override_from_env(),
+            self.beta_refused.load(std::sync::atomic::Ordering::Relaxed),
+            &body,
+        );
         let mut resp = self
-            .messages_request_raw(&body, &betas)
+            .messages_request_raw(&body, &betas.all())
             .send()
             .await
             .map_err(|e| ProviderError::Other(format!("anthropic request: {e}")))?;
 
-        // A retired or renamed beta identifier must not brick the lane: on a
-        // 400 that names the header, retry without it, say so, and latch.
-        if !betas.is_empty() && resp.status() == reqwest::StatusCode::BAD_REQUEST {
+        // A retired or renamed catalog beta must not brick the lane: on a 400
+        // that names it, retry without it, say so, and latch. Only a request
+        // that sent the catalog beta can be in that state, so the guard is
+        // that list, not the whole header; any other 400 renders like every
+        // other failure. The body's betas ride the retry too: a message that
+        // carries `clear_at` or `output_config` is rejected without its
+        // header.
+        if !betas.catalog.is_empty() && resp.status() == reqwest::StatusCode::BAD_REQUEST {
+            let status = resp.status();
+            let retry_after = super::http_error::retry_after_secs(resp.headers());
             let text = resp.text().await.unwrap_or_default();
             if !beta_rejected(&text) {
-                return Err(ProviderError::Other(format!(
-                    "anthropic returned {}: {text}",
-                    reqwest::StatusCode::BAD_REQUEST
-                )));
+                return Err(ProviderError::Other(
+                    super::http_error::render_with_retry_after(
+                        "anthropic",
+                        status,
+                        retry_after,
+                        &text,
+                    ),
+                ));
             }
             self.beta_refused
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
-                betas = %betas.join(","),
+                betas = %betas.catalog.join(","),
                 body = %text,
                 "anthropic rejected the beta header; retrying without it and \
                  dropping it for the rest of this provider's life (set \
                  {MID_CONVERSATION_TOOL_CHANGES_ENV}=0 to stop sending it at all)"
             );
             resp = self
-                .messages_request_raw(&body, &[])
+                .messages_request_raw(&body, &betas.body)
                 .send()
                 .await
                 .map_err(|e| ProviderError::Other(format!("anthropic request: {e}")))?;

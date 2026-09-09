@@ -23,13 +23,15 @@ record.)
   and its `"default"` mode (`server-side-fallback-2026-07-01`); `usage.speed`;
   the `computer_toolset_20260801` and `browser_toolset_20260801` toolsets; the
   Files and Skills APIs out of beta.
-- **Modeled so far, of that delta:** only mid-conversation tool changes, as
-  the request header the mu-ai lane sends (PR #604). NOT yet modeled by this
-  crate: system-role messages inside `messages` (`Role` is still User |
-  Assistant; a `{"role":"system"}` message does not deserialize), per-message
-  `output_config.effort`, `clear_at`, `thinking.display`, thinking-block
-  binding and `input_transformations`, the `fallbacks` parameter, `usage.speed`,
-  the two toolsets. The itemized plan is bead mu-anthropic-protocol-2026q3-6uqho.
+- **Modeled so far, of that delta:** mid-conversation tool changes, as the
+  request header the mu-ai lane sends (PR #604); `role: "system"` messages
+  inside `messages` with per-message `output_config` and `clear_at`
+  (`Role::System`, `ClearAt`, the `Message::system` / `system_effort` /
+  `turn_scoped` constructors; the mu-ai lane sends each beta header exactly
+  when a message carries its field). NOT yet modeled by this crate:
+  `thinking.display`, thinking-block binding and `input_transformations`, the
+  `fallbacks` parameter, `usage.speed`, the two toolsets. The itemized plan is
+  bead mu-anthropic-protocol-2026q3-6uqho.
 - **Shape change between the pins, not truncation:** the previous `llms.txt`
   listed every API-reference page once per SDK language — 1305 entries tagged
   `(cli)`, `(csharp)`, `(Go)`, `(Java)`, `(php)`, `(Python)`, `(Ruby)`,
@@ -40,13 +42,13 @@ record.)
   appears in the refreshed full file (698 of 698; `# ` lines are not page
   delimiters in this export, so do not count them). New top-level sections:
   `about-claude`, `models`, `release-notes`, `resources`, `cli-sdks-libraries`.
-- **Citations into the snapshot:** comments in `src/` written before
-  2026-09-04 cite line offsets of the *previous* file (`llms-full.txt.xz:2660`,
-  `spec :55971`, and the "verified against … 2026-06-13" headers). Those offsets
-  do not apply to this file; the superseded snapshot is in history:
-  `git show f4641f0b:crates/providers/mu-anthropic/specifications/llms-full.txt.xz | xzcat`.
-  New citations should quote a page heading or a phrase (`xzgrep`-able), not a
-  line number.
+- **Citations into the snapshot:** comments in `src/` cite a page path from
+  `llms.txt` plus a heading (`/docs/en/build-with-claude/prompt-caching
+  § 1-hour cache duration`) or a quoted phrase, both of which `xzgrep` finds
+  in the full file after a refresh. Line offsets (`spec :55971`) were the
+  pre-2026-09-04 convention; they pointed into the superseded file
+  (`git show f4641f0b:crates/providers/mu-anthropic/specifications/llms-full.txt.xz | xzcat`)
+  and have all been converted. Do not add new ones.
 - **Source host:** https://platform.claude.com
 
 ## Files

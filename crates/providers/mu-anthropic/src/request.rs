@@ -6,13 +6,18 @@
 //! `messages` array. Envelope points AT the payload; the payload knows nothing
 //! of the envelope.
 //!
-//! Required fields (spec :985 minimal body): `model`, `max_tokens`, `messages`.
+//! Required fields (`/docs/en/api/messages/create`, the three parameters not
+//! marked optional): `model`, `max_tokens`, `messages`.
 //! Everything else is optional and OMITTED when absent (skip_serializing_if) —
 //! Anthropic rejects some requests that carry `null` where a field should be
 //! absent, so we never emit `null` for an unset knob.
 //!
 //! `system` is POLYMORPHIC exactly like message content — a bare string
-//! (:45088) or a block array (:6921). We reuse [`Content`] for it.
+//! (`/docs/en/build-with-claude/mid-conversation-effort-example § Set up the
+//! loop`) or a block array (`/docs/en/build-with-claude/batch-processing
+//! § Using prompt caching with Message Batches`). We reuse [`Content`] for
+//! it. A `role: "system"` entry INSIDE `messages` is a different thing — a
+//! mid-conversation system message, see [`Message`].
 
 use std::collections::BTreeMap;
 
@@ -24,7 +29,8 @@ use crate::content::CacheControl;
 use crate::message::{Content, Message};
 
 /// A tool the model may call. Wire shape: `{name, description, input_schema}`
-/// where `input_schema` is a JSON Schema object (spec :8990). `cache_control`
+/// where `input_schema` is a JSON Schema object
+/// (`/docs/en/build-with-claude/handling-stop-reasons § tool_use`). `cache_control`
 /// may be attached to the LAST tool to cache the tool block (legacy mu marks
 /// the last spec); modeled as optional per-tool for fidelity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -517,7 +523,7 @@ impl MessagesRequest {
 mod tests {
     use super::*;
     use crate::content::ContentBlock;
-    use crate::message::Message;
+    use crate::message::{ClearAt, Message, Role};
     use serde_json::json;
 
     fn round_trip(r: &MessagesRequest) {
@@ -528,7 +534,8 @@ mod tests {
 
     #[test]
     fn minimal_request_matches_spec_shape() {
-        // spec :985 — the documented minimal body.
+        // /docs/en/api/messages/create — the three required parameters and
+        // the `messages` parameter's single-message example.
         let r = MessagesRequest::new("claude-fable-5", 1024, vec![Message::user("Hello, Claude")]);
         assert_eq!(
             serde_json::to_value(&r).unwrap(),
@@ -573,7 +580,8 @@ mod tests {
 
     #[test]
     fn system_string_form() {
-        // spec :45088 — system as a bare string.
+        // /docs/en/build-with-claude/mid-conversation-effort-example § Set up
+        // the loop — system as a bare string.
         let r = MessagesRequest::new("m", 10, vec![Message::user("hi")])
             .with_system("You are a helpful general-purpose agent.");
         let v = serde_json::to_value(&r).unwrap();
@@ -586,8 +594,9 @@ mod tests {
 
     #[test]
     fn system_block_array_form_with_cache_control() {
-        // spec :6921 — system as a block array, with cache_control for prompt
-        // caching of a large system prompt.
+        // /docs/en/build-with-claude/batch-processing § Using prompt caching
+        // with Message Batches — system as a block array, with cache_control
+        // for prompt caching of a large system prompt.
         let r = MessagesRequest::new("m", 10, vec![Message::user("hi")]).with_system(vec![
             ContentBlock::Text {
                 text: "<book>".into(),
@@ -604,8 +613,154 @@ mod tests {
     }
 
     #[test]
+    fn per_message_effort_request_matches_spec_shape() {
+        // /docs/en/build-with-claude/effort § Per-message effort (beta) — the
+        // documented request: top-level `high`, then an effort-only system
+        // message drops to `low` for the routine follow-up.
+        let r = MessagesRequest::new(
+            "claude-fable-5-1",
+            4096,
+            vec![
+                Message::user("Plan a migration from SQLite to PostgreSQL in three short steps."),
+                Message::assistant(
+                    "1. Export the SQLite data. 2. Create the PostgreSQL schema. 3. Import the data and verify row counts.",
+                ),
+                Message::system_effort("low"),
+                Message::user("Summarize the plan in one sentence."),
+            ],
+        )
+        .with_output_config(OutputConfig {
+            effort: Some("high".into()),
+            ..OutputConfig::default()
+        });
+        assert_eq!(
+            serde_json::to_value(&r).unwrap(),
+            json!({
+                "model": "claude-fable-5-1",
+                "max_tokens": 4096,
+                "output_config": {"effort": "high"},
+                "messages": [
+                    {"role": "user", "content": "Plan a migration from SQLite to PostgreSQL in three short steps."},
+                    {"role": "assistant", "content": "1. Export the SQLite data. 2. Create the PostgreSQL schema. 3. Import the data and verify row counts."},
+                    {"role": "system", "content": [], "output_config": {"effort": "low"}},
+                    {"role": "user", "content": "Summarize the plan in one sentence."}
+                ]
+            })
+        );
+        round_trip(&r);
+    }
+
+    #[test]
+    fn turn_scoped_reminders_parse_from_the_documented_agent_loop() {
+        // /docs/en/build-with-claude/mid-conversation-system-messages
+        // § Turn-scoped system messages — a later step of an agent loop: the
+        // cleared reminder (messages[3]) left in place verbatim, two live ones
+        // ending the array, thinking blocks with empty text, and the cache
+        // breakpoint on the user turn before the reminders, not on them.
+        let raw = json!({
+            "model": "claude-fable-5-1",
+            "max_tokens": 16000,
+            "messages": [
+                { "role": "user", "content": "Fix the failing test." },
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "thinking", "thinking": "", "signature": "..." },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_01",
+                            "name": "read_file",
+                            "input": { "path": "test_auth.py" }
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [{ "type": "tool_result", "tool_use_id": "toolu_01", "content": "..." }]
+                },
+                {
+                    "role": "system",
+                    "clear_at": "next_user_message",
+                    "content": "Request independent reads in one turn."
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "thinking", "thinking": "", "signature": "..." },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_02",
+                            "name": "read_file",
+                            "input": { "path": "auth.py" }
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_03",
+                            "name": "read_file",
+                            "input": { "path": "tokens.py" }
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "tool_result", "tool_use_id": "toolu_02", "content": "..." },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_03",
+                            "content": "...",
+                            "cache_control": { "type": "ephemeral" }
+                        }
+                    ]
+                },
+                {
+                    "role": "system",
+                    "clear_at": "next_user_message",
+                    "content": "Request independent reads in one turn."
+                },
+                {
+                    "role": "system",
+                    "clear_at": "next_user_message",
+                    "content": "The shell exited with status 137."
+                }
+            ]
+        });
+        let r: MessagesRequest = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(
+            r.messages.iter().map(|m| m.role).collect::<Vec<_>>(),
+            [
+                Role::User,
+                Role::Assistant,
+                Role::User,
+                Role::System,
+                Role::Assistant,
+                Role::User,
+                Role::System,
+                Role::System,
+            ]
+        );
+        for i in [3, 6, 7] {
+            assert_eq!(
+                r.messages[i].clear_at,
+                Some(ClearAt::NextUserMessage),
+                "{i}"
+            );
+            assert!(r.messages[i].output_config.is_none(), "{i}");
+        }
+        assert_eq!(
+            r.messages[3],
+            Message::turn_scoped("Request independent reads in one turn.")
+        );
+        assert_eq!(r.messages[3], r.messages[6], "re-sent verbatim");
+        // The whole document re-serializes to itself: nothing dropped, nothing
+        // added, so the cleared message really does go back out unchanged.
+        assert_eq!(serde_json::to_value(&r).unwrap(), raw);
+    }
+
+    #[test]
     fn tools_match_spec_shape() {
-        // spec :8990 — get_weather tool.
+        // /docs/en/build-with-claude/handling-stop-reasons § tool_use — the
+        // get_weather tool.
         let r = MessagesRequest::new("m", 10, vec![Message::user("weather?")]).with_tools(vec![
             Tool::new(
                 "get_weather",

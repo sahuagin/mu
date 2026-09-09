@@ -1597,6 +1597,137 @@ mod live_tests {
         );
     }
 
+    /// The two system-message betas follow the body, not the catalog: a
+    /// message carrying `clear_at` or `output_config` asks for its header on
+    /// any endpoint and for any model, and nothing else asks for either —
+    /// not the top-level `output_config` that `--thinking` puts on every
+    /// request, not an explicit null. The shapes come from mu-anthropic's
+    /// own constructors, so the crate and the transport agree on what the
+    /// field looks like on the wire.
+    #[test]
+    fn system_message_betas_follow_the_body() {
+        let catalog = mu_core::model_catalog::built_in();
+        let request = |messages: Vec<AnthMessage>| {
+            let mut body = serde_json::to_value(MessagesRequest::new("x", 1, messages)).unwrap();
+            body["output_config"] = serde_json::json!({"effort": "high"});
+            body
+        };
+        let plain = request(vec![AnthMessage::user("hi")]);
+        assert!(body_betas(&plain).is_empty(), "{plain}");
+        let mut nulled = plain.clone();
+        nulled["messages"][0]["clear_at"] = Value::Null;
+        assert!(body_betas(&nulled).is_empty(), "{nulled}");
+
+        let scoped = request(vec![
+            AnthMessage::user("hi"),
+            AnthMessage::turn_scoped("Request independent reads in one turn."),
+        ]);
+        assert_eq!(
+            body_betas(&scoped),
+            vec![MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA]
+        );
+        let effort = request(vec![
+            AnthMessage::user("hi"),
+            AnthMessage::assistant("ok"),
+            AnthMessage::system_effort("low"),
+            AnthMessage::user("more"),
+        ]);
+        assert_eq!(
+            body_betas(&effort),
+            vec![MID_CONVERSATION_OUTPUT_CONFIG_BETA]
+        );
+
+        // On the wire: after the catalog beta for a documented model on
+        // Anthropic's endpoint; alone for a model and endpoint the catalog
+        // beta never reaches; absent when nothing asks.
+        let header = |p: &AnthropicProvider, body: &Value| {
+            p.messages_request_with(body, &catalog, None)
+                .build()
+                .expect("build")
+                .headers()
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            header(
+                &AnthropicProvider::new("k".into(), "claude-fable-5-1".into()),
+                &scoped
+            ),
+            Some(format!(
+                "{MID_CONVERSATION_TOOL_CHANGES_BETA},{MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA}"
+            ))
+        );
+        assert_eq!(
+            header(
+                &AnthropicProvider::new("k".into(), "claude-sonnet-5".into())
+                    .with_api_base("https://gateway.example".into()),
+                &effort
+            ),
+            Some(MID_CONVERSATION_OUTPUT_CONFIG_BETA.to_owned())
+        );
+        assert_eq!(
+            header(
+                &AnthropicProvider::new("k".into(), "claude-sonnet-5".into()),
+                &plain
+            ),
+            None
+        );
+    }
+
+    /// One assembly path for the lane and the tests, in two lists that
+    /// degrade differently: the refusal latch drops the catalog beta and
+    /// nothing else, and the header carries catalog first, body after.
+    #[test]
+    fn request_betas_keep_catalog_and_body_apart() {
+        let catalog = mu_core::model_catalog::built_in();
+        let body = serde_json::to_value(MessagesRequest::new(
+            "x",
+            1,
+            vec![
+                AnthMessage::user("hi"),
+                AnthMessage::turn_scoped("Batch your reads."),
+            ],
+        ))
+        .unwrap();
+        let live = RequestBetas::resolve(
+            &catalog,
+            "claude-fable-5-1",
+            ANTHROPIC_API_BASE,
+            None,
+            false,
+            &body,
+        );
+        assert_eq!(live.catalog, vec![MID_CONVERSATION_TOOL_CHANGES_BETA]);
+        assert_eq!(live.body, vec![MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA]);
+        assert_eq!(
+            live.all(),
+            vec![
+                MID_CONVERSATION_TOOL_CHANGES_BETA,
+                MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA
+            ]
+        );
+        let latched = RequestBetas::resolve(
+            &catalog,
+            "claude-fable-5-1",
+            ANTHROPIC_API_BASE,
+            None,
+            true,
+            &body,
+        );
+        assert!(latched.catalog.is_empty());
+        assert_eq!(latched.body, live.body);
+        let plain = RequestBetas::resolve(
+            &catalog,
+            "claude-sonnet-5",
+            ANTHROPIC_API_BASE,
+            None,
+            false,
+            &serde_json::json!({"model": "x", "messages": [], "max_tokens": 1}),
+        );
+        assert!(plain.catalog.is_empty() && plain.body.is_empty());
+    }
+
     /// What map_tools does when a tool is appended between turns: the
     /// `cache_control` marker moves to the new last tool and the earlier
     /// tool's definition is otherwise unchanged. That alone does NOT keep

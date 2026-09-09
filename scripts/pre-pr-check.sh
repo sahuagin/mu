@@ -91,6 +91,15 @@ seat_prompt_step() {
 }
 run_step "review-panel seat prompts" seat_prompt_step
 
+# Review-gate SIZE gate self-test (mu-review-gate-seam-reviewers-9vkbt.1):
+# throwaway git repo, stops before any reviewer runs — no model spend.
+review_size_gate_step() {
+  local t="$REPO_ROOT/scripts/tests/review-size-gate-test.sh"
+  [ -f "$t" ] || { printf "%s    review-size-gate-test.sh missing — skipping%s\n\n" "$C_DIM" "$C_OFF"; return 0; }
+  bash "$t"
+}
+run_step "review-gate size gate" review_size_gate_step
+
 # Canary bead-filing idempotency (mu-ztmla). The offline cases run against a
 # strict fake beads client. When a real client and a beadsd url are present
 # the test also probes that client READ-ONLY (lists nothing matches plus

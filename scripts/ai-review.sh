@@ -75,14 +75,41 @@
 #     MU_REVIEW_SYSTEM_PROMPT   reviewer system-prompt file (default: ai-review-system-prompt.txt)
 #     MU_REVIEW_LOG             event log (default: ~/.local/share/mu/review-events.jsonl)
 #     MU_REVIEW_NO_COLOR        disable color
-#   Chunked mode (review-gate v2 — beads mu-ja1x overflow detection, mu-u1it fan-out):
+#   Size gate (mu-review-gate-seam-reviewers-9vkbt.1) and chunked mode (review-gate
+#   v2 — beads mu-ja1x overflow detection, mu-u1it fan-out):
+#     MU_REVIEW_MAX_DIFF_LINES  cap on reviewable diff lines (added + removed hunk
+#                               lines; lockfile and binary/media paths excluded;
+#                               default 2000 — the operator's 1-2k-lines-per-
+#                               increment rule; 0 disables). Over it the gate
+#                               BLOCKs — before any build, preflight, or reviewer
+#                               — with a SIZE finding that names split points (per
+#                               commit, per file): a change too big to review as
+#                               one unit is split, not reviewed worse.
 #     MU_REVIEW_SINGLE_SHOT_MAX_BYTES  cap on the assembled single-shot prompt, bytes
 #                               (default 300000 ≈ 85k tokens at ~3.5 bytes/token —
 #                               fits every panel model with headroom). At or under
 #                               the cap the calibrated panel above runs untouched;
-#                               over it the review is CHUNKED: one findings-only
-#                               leaf per commit (primary 1's provider/model), then
-#                               one synthesis verdict over all findings.
+#                               over it the gate BLOCKs with the same SIZE finding.
+#     MU_REVIEW_CHUNK=1         explicit fallback past a SIZE block: review CHUNKED —
+#                               one findings-only leaf per commit (primary 1's
+#                               provider/model; no invariants, no project view), then
+#                               one synthesis verdict over all findings — even when
+#                               the prompt would have fit. Degraded, logged as an
+#                               override of kind "chunk". The chunked VERDICT is
+#                               still binding.
+#     MU_REVIEW_SIZE_OVERRIDE=1 past a SIZE block, review on the NORMAL path
+#                               (single-shot if the prompt fits, chunked only if it
+#                               cannot); logged as kind "size-override". Waives the
+#                               size rule ONLY — the panel verdict is still binding.
+#                               (MU_REVIEW_OVERRIDE=1 also passes the size gate, but
+#                               it is the verdict override: it turns a later BLOCK or
+#                               ESCALATE into exit 0 as well. Use it only when you
+#                               have adjudicated the whole run.)
+#     MU_REVIEW_SIZE_CHECK_ONLY=1  stop right after the size gate — the hermetic test
+#                               seam (scripts/tests/review-size-gate-test.sh). Exits 4
+#                               ("no review performed") and logs a {"mode":"size-check"}
+#                               panel line, so a stray export can never make the gate
+#                               look green.
 #     MU_REVIEW_HEAD            head rev of the review range (default: @ under jj,
 #                               HEAD under git). Pins BASE..HEAD so a branch other
 #                               than the checkout can be reviewed without moving
@@ -94,7 +121,12 @@
 # The log carries every reviewer's verdict: one {"event":"reviewer",...} line per
 # reviewer that RAN plus one {"event":"panel",...} summary with the outcome and all
 # three slots (r3_verdict is "" when the tiebreaker did not run). The panel line
-# carries "mode":"single_shot"|"chunked" so dashboards can tell the paths apart.
+# carries "mode":"single_shot"|"chunked"|"size" so dashboards can tell the paths
+# apart; a "size" line is a SIZE block (fields: why, measure, cap, lines, line_cap,
+# override, override_kind — override true means the operator continued past the
+# block, override_kind "chunk" / "size-override" / "override" says how; one line
+# per run). A "size-check" line means MU_REVIEW_SIZE_CHECK_ONLY stopped the run
+# after the size gate: NO review happened (outcome "NO_REVIEW", exit 4).
 # Chunked mode additionally writes one {"event":"leaf",...} line per leaf that
 # returned usable findings and one {"event":"leaf_error",...} per leaf that did not.
 
@@ -205,6 +237,169 @@ if ! grep -q '[^[:space:]]' <<<"$DIFF"; then
 fi
 FILES=$(printf '%s\n' "$DIFF" | grep -c '^diff --git ')
 
+# Escape a value for embedding inside a JSON string (no surrounding quotes
+# added). Pure bash, no jq dependency — this gate runs on boxes where jq may be
+# absent (pots, fresh hosts), and the script already degrades gracefully on its
+# other tools. Without this, a provider/model/base/verdict value containing a
+# double-quote or backslash would corrupt review-events.jsonl, which the
+# mu-mucm dashboards parse line-by-line. Backslash MUST be escaped first so the
+# escapes added by the later substitutions are not themselves re-escaped.
+# (bead mu-ai-review-log-escaping-augj)
+json_escape() { # $1=raw -> JSON-string-safe text on stdout
+  local s=$1
+  s=${s//\\/\\\\}      # backslash  -> \\   (first, see note above)
+  s=${s//\"/\\\"}      # double quote -> \"
+  s=${s//$'\n'/\\n}    # newline    -> \n
+  s=${s//$'\r'/\\r}    # carriage return -> \r
+  s=${s//$'\t'/\\t}    # tab        -> \t
+  printf '%s' "$s"
+}
+
+# Paths nobody reviews: excluded from the full-file context below AND from the
+# size gate's line count.
+review_context_skip_file() { # $1=repo-relative path
+  case "$1" in
+    Cargo.lock|*/Cargo.lock|*.lock|package-lock.json|*/package-lock.json|pnpm-lock.yaml|*/pnpm-lock.yaml|yarn.lock|*/yarn.lock|bun.lockb|*/bun.lockb|go.sum|*/go.sum)
+      return 0 ;;
+    *.svg|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.ico|*.pdf|*.zip|*.gz|*.xz|*.bz2|*.zst|*.br|*.tar|*.tgz|*.wasm|*.mp3|*.mp4|*.mov|*.bin)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# ── SIZE GATE (mu-review-gate-seam-reviewers-9vkbt.1) ───────────────────────
+# A change too large to review as one unit is split, not reviewed worse. The
+# old behaviour — silently downgrading to CHUNKED mode (per-commit leaves with
+# no invariants and no project view) — rewarded elephant PRs with a weaker
+# review exactly when review matters most. It runs HERE, before the subject
+# file, the invariants, the full-file context, and the mu build/preflight: a
+# block needs only the diff, so it costs nothing and needs no reviewer client.
+# Counted lines are the added+removed HUNK lines of reviewable files; lockfile
+# and binary/media paths (review_context_skip_file) do not count, since nobody
+# reviews them.
+#   MU_REVIEW_CHUNK=1          past a block: review CHUNKED (degraded), verdict binding
+#   MU_REVIEW_SIZE_OVERRIDE=1  past a block: review on the normal path, verdict binding
+#   MU_REVIEW_OVERRIDE=1       the pre-existing VERDICT override; also passes this gate
+SIZE_CAP="${MU_REVIEW_MAX_DIFF_LINES:-2000}"
+case "$SIZE_CAP" in ''|*[!0-9]*) SIZE_CAP=2000 ;; esac
+review_diff_lines() { # stdout: "<added>\t<removed>\t<path>" per file of $DIFF
+  # Only hunk lines count: file headers precede the first @@, so a content
+  # line starting with "++ " or "-- " is never mistaken for one. The path is
+  # taken from the "+++ b/..." header (or "--- a/..." for a deletion), which
+  # holds ONE path — the "diff --git a/X b/X" line is ambiguous when X
+  # contains " b/", and git quotes non-ASCII paths ("a/...") by default; both
+  # are unquoted here. A file with no hunks (binary) falls back to the header.
+  printf '%s\n' "$DIFF" | awk '
+    function unq(p) { sub(/^"/, "", p); sub(/"$/, "", p); sub(/^[ab]\//, "", p); return p }
+    function hdr_path(h) { sub(/^diff --git /, "", h); if (h ~ /^"/) { sub(/^"/, "", h); sub(/".*$/, "", h) } else { sub(/ b\/.*$/, "", h) } return unq(h) }
+    function flush() { if (hdr != "") { if (f == "") f = hdr_path(hdr); print a "\t" r "\t" f } }
+    /^diff --git / { flush(); hdr = $0; f = ""; a = 0; r = 0; hunk = 0; next }
+    hunk == 0 && /^\+\+\+ / { p = substr($0, 5); if (p != "/dev/null") f = unq(p); next }
+    hunk == 0 && /^--- /    { p = substr($0, 5); if (f == "" && p != "/dev/null") f = unq(p); next }
+    /^@@/ { hunk = 1; next }
+    hunk == 0 { next }
+    /^\+/ { a++; next }
+    /^-/  { r++; next }
+    END { flush() }'
+}
+SIZE_LINES=0; SIZE_TABLE=""; SIZE_SKIPPED=""; _size_parsed=0
+while IFS=$'\t' read -r _a _r _p; do
+  [ -n "$_p" ] || continue
+  _size_parsed=$((_size_parsed + 1))
+  if review_context_skip_file "$_p"; then
+    SIZE_SKIPPED="$SIZE_SKIPPED
+$_p"
+    continue
+  fi
+  SIZE_LINES=$((SIZE_LINES + _a + _r))
+  SIZE_TABLE="$SIZE_TABLE
+$((_a + _r))	$_p"
+done < <(review_diff_lines)
+# Fail LOUD, not open: a non-empty diff the parser could not read would
+# otherwise count as zero lines and the line cap would silently not apply.
+if [ "$_size_parsed" -eq 0 ]; then
+  echo "${C_YEL}ai-review: size gate could not parse any file section out of a $FILES-file diff — the line cap is NOT applied to this run (the byte cap still is). Check the diff format / awk.${C_OFF}" >&2
+fi
+# What the single-shot reviewers get: the diff WITHOUT the excluded files.
+# Nobody reviews a lockfile, the full-file context already skips them, and
+# counting their bytes toward the prompt cap would block a tiny source
+# change riding on a lockfile regeneration — the line gate said those
+# files do not count, so the byte gate must not count them either. Each
+# excluded file is replaced by a one-line marker so the omission is visible.
+REVIEW_DIFF="$(printf '%s\n' "$DIFF" | SKIP="$SIZE_SKIPPED" awk '
+  BEGIN { n = split(ENVIRON["SKIP"], arr, "\n"); for (i = 1; i <= n; i++) if (arr[i] != "") skip[arr[i]] = 1 }
+  function unq(p) { sub(/^"/, "", p); sub(/"$/, "", p); sub(/^[ab]\//, "", p); return p }
+  function hdr_path(h) { sub(/^diff --git /, "", h); if (h ~ /^"/) { sub(/^"/, "", h); sub(/".*$/, "", h) } else { sub(/ b\/.*$/, "", h) } return unq(h) }
+  /^diff --git / { path = hdr_path($0); drop = (path in skip); if (drop) { print "[diff of " path " omitted: lockfile/binary/media, not reviewed and not counted]"; next } }
+  !drop { print }')"
+review_size_split_hint() { # stderr helper: per-commit and per-file sizes, so the block names the seams
+  local commits c line st n=0
+  if [ -n "$IS_JJ" ]; then
+    commits="$(jj log -r "$BASE..$HEADREV ~ empty()" --no-graph --reversed -T 'commit_id.short() ++ "\t" ++ description.first_line() ++ "\n"' 2>/dev/null)"
+  else
+    commits="$(git log --reverse --format='%h%x09%s' "$BASE..$HEADREV" 2>/dev/null)"
+  fi
+  echo "  per commit (oldest first):"
+  while IFS=$'\t' read -r c line; do
+    [ -n "$c" ] || continue
+    n=$((n + 1)); [ "$n" -gt 20 ] && { echo "    ..."; break; }
+    if [ -n "$IS_JJ" ]; then st="$(jj diff -r "$c" --stat 2>/dev/null | tail -n 1)"; else st="$(git show --shortstat --format= "$c" 2>/dev/null | tail -n 1)"; fi
+    printf '    %s  %.60s  [%s]\n' "$c" "$line" "${st# }"
+  done <<<"$commits"
+  echo "  per file (largest first):"
+  printf '%s\n' "$SIZE_TABLE" | grep . | sort -rn | head -n 15 | awk -F'\t' '{ printf "    %6d  %s\n", $1, $2 }'
+}
+SIZE_BLOCKED=""      # a block was overridden: a later byte-cap trip is the same decision, not a second log line
+SIZE_BLOCK_KIND=""   # how it was overridden: chunk | size-override | override
+SIZE_FORCE_CHUNK=""  # MU_REVIEW_CHUNK=1 past a block: the mode gate chunks even when the prompt would fit
+review_too_large() { # $1=why (lines|prompt-bytes) $2=measure $3=cap — BLOCK unless the operator opted past it
+  local how="" ov=false
+  if   [ "${MU_REVIEW_CHUNK:-}" = "1" ];         then how=chunk
+  elif [ "${MU_REVIEW_SIZE_OVERRIDE:-}" = "1" ]; then how=size-override
+  elif [ "${MU_REVIEW_OVERRIDE:-}" = "1" ];      then how=override
+  fi
+  [ -n "$how" ] && ov=true
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+  printf '{"ts":"%s","event":"panel","mode":"size","outcome":"BLOCK","why":"%s","measure":%s,"cap":%s,"lines":%s,"line_cap":%s,"base":"%s","files_changed":%s,"override":%s,"override_kind":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" "$SIZE_LINES" "$SIZE_CAP" "$(json_escape "$BASE")" "$FILES" "$ov" "$how" >> "$LOG"
+  {
+    echo "${C_RED}ai-review: PANEL BLOCK — SIZE: $2 $1 > cap $3 ($SIZE_LINES reviewable diff lines across $FILES file(s); lockfiles and binary/media files excluded).${C_OFF}"
+    echo "FINDING|blocker|(branch)|change too large to review as one unit ($2 $1 > $3): split it at seams into reviewable increments and gate each one"
+    echo "${C_DIM}Suggested split points:${C_OFF}"
+    review_size_split_hint
+    case "$how" in
+      chunk)         echo "${C_YEL}ai-review: SIZE block overridden by MU_REVIEW_CHUNK=1: continuing with a DEGRADED CHUNKED review (per-commit leaves, no invariants, no project view); its verdict is binding. Logged.${C_OFF}" ;;
+      size-override) echo "${C_YEL}ai-review: SIZE block overridden by MU_REVIEW_SIZE_OVERRIDE=1: continuing with the normal panel despite the size (chunked only if the prompt cannot fit); its verdict is binding. Logged.${C_OFF}" ;;
+      override)      echo "${C_YEL}ai-review: SIZE block overridden by MU_REVIEW_OVERRIDE=1 — note this is the VERDICT override too: a later BLOCK or ESCALATE will also exit 0. Logged.${C_OFF}" ;;
+      *)             echo "${C_DIM}Split the branch (stacked PRs, one increment each). MU_REVIEW_CHUNK=1 reviews it chunked (degraded); MU_REVIEW_SIZE_OVERRIDE=1 reviews it as is. Both leave the panel verdict binding.${C_OFF}" ;;
+    esac
+  } >&2
+  [ "$ov" = true ] || exit 1
+  SIZE_BLOCKED=1
+  SIZE_BLOCK_KIND="$how"
+  [ "$how" = chunk ] && SIZE_FORCE_CHUNK=1
+  return 0
+}
+if [ "$SIZE_CAP" -gt 0 ] && [ "$SIZE_LINES" -gt "$SIZE_CAP" ]; then
+  review_too_large lines "$SIZE_LINES" "$SIZE_CAP"
+fi
+if [ "${MU_REVIEW_SIZE_CHECK_ONLY:-}" = "1" ]; then
+  # Test seam. NO review happens past this point, so it must never look like
+  # one: a distinct exit code and its own panel line, whatever the shell had
+  # exported.
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+  printf '{"ts":"%s","event":"panel","mode":"size-check","outcome":"NO_REVIEW","lines":%s,"line_cap":%s,"blocked":%s,"override_kind":"%s","base":"%s","files_changed":%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SIZE_LINES" "$SIZE_CAP" "$([ -n "$SIZE_BLOCKED" ] && echo true || echo false)" "$SIZE_BLOCK_KIND" "$(json_escape "$BASE")" "$FILES" >> "$LOG"
+  _skipped_n="$(printf '%s\n' "$SIZE_SKIPPED" | grep -c .)"
+  if [ -n "$SIZE_BLOCKED" ]; then
+    echo "${C_YEL}ai-review: size gate BLOCKED and overridden ($SIZE_BLOCK_KIND; $SIZE_LINES reviewable lines, cap $SIZE_CAP; excluded from the reviewer diff: $_skipped_n file(s)) — MU_REVIEW_SIZE_CHECK_ONLY set, stopping here: NO REVIEW PERFORMED.${C_OFF}"
+  else
+    echo "${C_DIM}ai-review: size gate passed ($SIZE_LINES reviewable lines, cap $SIZE_CAP; excluded from the reviewer diff: $_skipped_n file(s)) — MU_REVIEW_SIZE_CHECK_ONLY set, stopping here: NO REVIEW PERFORMED.${C_OFF}"
+  fi
+  exit 4
+fi
+
+
 file_at_rev() { # $1=rev $2=repo-relative path
   if [ -n "$IS_JJ" ]; then
     jj file show -r "$1" -- "$2" 2>/dev/null
@@ -287,15 +482,6 @@ export _AI_REVIEW_PROJECT_DESC="$PROJECT_DESC"
 # head -c" shape let a single Cargo.lock / SVG / generated fixture consume the
 # whole reviewer window, silently truncating away the output contract for local
 # ollama reviewers (mu-ai-review-context-overflow-fg4j).
-review_context_skip_file() { # $1=repo-relative path
-  case "$1" in
-    Cargo.lock|*/Cargo.lock|*.lock|package-lock.json|*/package-lock.json|pnpm-lock.yaml|*/pnpm-lock.yaml|yarn.lock|*/yarn.lock|bun.lockb|*/bun.lockb|go.sum|*/go.sum)
-      return 0 ;;
-    *.svg|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.ico|*.pdf|*.zip|*.gz|*.xz|*.bz2|*.zst|*.br|*.tar|*.tgz|*.wasm|*.mp3|*.mp4|*.mov|*.bin)
-      return 0 ;;
-  esac
-  return 1
-}
 
 append_review_context() { # $1=chunk; updates CONTEXT/_context_used
   # Budget in BYTES to match head -c and the _MAX_BYTES knobs — bash ${#var}
@@ -439,7 +625,7 @@ Output contract:
 - Your reply's LAST line MUST be exactly 'VERDICT: APPROVE' or 'VERDICT: REJECT' (those literal words). Do not continue after the verdict line.
 $INVARIANTS_BLOCK
 BEGIN UNTRUSTED REPO CONTENT: DIFF
-$DIFF
+$REVIEW_DIFF
 END UNTRUSTED REPO CONTENT: DIFF
 BEGIN UNTRUSTED REPO CONTENT: FULL FILE CONTEXT
 $CONTEXT
@@ -482,23 +668,6 @@ verdict_of() { # stdin -> APPROVE | REJECT | UNCLEAR
   if   printf '%s' "$last" | grep -qiE 'VERDICT[^A-Za-z]{1,8}REJECT';  then echo REJECT
   elif printf '%s' "$last" | grep -qiE 'VERDICT[^A-Za-z]{1,8}APPROVE'; then echo APPROVE
   else echo UNCLEAR; fi
-}
-# Escape a value for embedding inside a JSON string (no surrounding quotes
-# added). Pure bash, no jq dependency — this gate runs on boxes where jq may be
-# absent (pots, fresh hosts), and the script already degrades gracefully on its
-# other tools. Without this, a provider/model/base/verdict value containing a
-# double-quote or backslash would corrupt review-events.jsonl, which the
-# mu-mucm dashboards parse line-by-line. Backslash MUST be escaped first so the
-# escapes added by the later substitutions are not themselves re-escaped.
-# (bead mu-ai-review-log-escaping-augj)
-json_escape() { # $1=raw -> JSON-string-safe text on stdout
-  local s=$1
-  s=${s//\\/\\\\}      # backslash  -> \\   (first, see note above)
-  s=${s//\"/\\\"}      # double quote -> \"
-  s=${s//$'\n'/\\n}    # newline    -> \n
-  s=${s//$'\r'/\\r}    # carriage return -> \r
-  s=${s//$'\t'/\\t}    # tab        -> \t
-  printf '%s' "$s"
 }
 log_reviewer() { # $1=role $2=provider $3=model $4=verdict
   mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
@@ -675,7 +844,9 @@ run_chunked() { # never returns — exits with the gate verdict
 
   local n_commits
   n_commits="$(printf '%s\n' "$commits" | grep -c .)"
-  echo "${C_DIM}ai-review: CHUNKED mode — single-shot prompt ${PROMPT_BYTES}B > cap ${SS_MAX}B; $n_commits commit(s) in $BASE..$HEADREV. Leaves: $PROVIDER/$MODEL, synthesis: $SYNTH_PROVIDER/$SYNTH_MODEL.${C_OFF}"
+  local why="single-shot prompt ${PROMPT_BYTES}B > cap ${SS_MAX}B"
+  [ -n "${SIZE_FORCE_CHUNK:-}" ] && why="MU_REVIEW_CHUNK=1 past a SIZE block (prompt ${PROMPT_BYTES}B, cap ${SS_MAX}B)"
+  echo "${C_DIM}ai-review: CHUNKED mode — $why; $n_commits commit(s) in $BASE..$HEADREV. Leaves: $PROVIDER/$MODEL, synthesis: $SYNTH_PROVIDER/$SYNTH_MODEL.${C_OFF}"
 
   local leaves=0 failed=0 findings_total=0
   local SYNTH_FINDINGS="" ALL_MSGS=""
@@ -869,9 +1040,19 @@ $fcontent"
 # Bytes, not tokens: bytes/3.5 ≈ tokens, so the 300000B default ≈ 85k tokens —
 # inside every panel model's window with headroom. At or under the cap the
 # calibrated single-shot panel below runs EXACTLY as before (do not perturb
-# it); over the cap, run_chunked() takes over and exits with the gate verdict.
+# it); over the cap it is a SIZE block (mu-review-gate-seam-reviewers-9vkbt.1),
+# and only an explicit override — MU_REVIEW_CHUNK=1, MU_REVIEW_SIZE_OVERRIDE=1,
+# or the verdict override MU_REVIEW_OVERRIDE=1 — lets run_chunked() take over
+# and exit with the (degraded) gate verdict. The prompt measured here embeds
+# REVIEW_DIFF, so excluded lockfile/media churn does not count toward the cap.
 PROMPT_BYTES=$(( $(printf '%s' "$PROMPT" | wc -c) ))
-if [ "$PROMPT_BYTES" -gt "$SS_MAX" ]; then
+if [ -n "$SIZE_FORCE_CHUNK" ] || [ "$PROMPT_BYTES" -gt "$SS_MAX" ]; then
+  # A byte-cap trip is a SIZE block of its own — unless a size block was
+  # already overridden above, in which case this is the same decision and
+  # must not log or announce a second time.
+  if [ "$PROMPT_BYTES" -gt "$SS_MAX" ] && [ -z "$SIZE_BLOCKED" ]; then
+    review_too_large prompt-bytes "$PROMPT_BYTES" "$SS_MAX"
+  fi
   run_chunked
 fi
 
@@ -896,7 +1077,7 @@ CONS_PROMPT="$CONS_OUT/round1.prompt.txt"
   printf '{"verdict":"approve"|"needs-changes","summary":"<1-2 sentences>","findings":[{"file":"<path>","line":<int>,"severity":"high"|"medium"|"low","issue":"<desc>"}]}\n'
   printf 'Every element of "findings" MUST be a JSON object with exactly those four keys (file, line, severity, issue), never a bare string and never null. Use [] if there are no findings.\n'
   [ -n "$INVARIANTS_BLOCK" ] && printf '%s\n' "$INVARIANTS_BLOCK"
-  printf '\nBEGIN UNTRUSTED REPO CONTENT: PR DIFF\n```diff\n%s\n```\nEND UNTRUSTED REPO CONTENT: PR DIFF\n' "$DIFF"
+  printf '\nBEGIN UNTRUSTED REPO CONTENT: PR DIFF\n```diff\n%s\n```\nEND UNTRUSTED REPO CONTENT: PR DIFF\n' "$REVIEW_DIFF"
   [ -n "$CONTEXT" ] && printf '\nBEGIN UNTRUSTED REPO CONTENT: FULL FILE CONTEXT (CONTEXT only — definitions/guards outside the hunks; NOT part of the proposed change)\n%s\nEND UNTRUSTED REPO CONTENT: FULL FILE CONTEXT\n' "$CONTEXT"
 } > "$CONS_PROMPT"
 

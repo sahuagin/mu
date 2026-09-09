@@ -52,20 +52,28 @@ seat="$TMP/s4"; mode=$(seat_prompt "$SHARED" "$seat" "" "money-handling" "" 2>"$
 check "custom seam without checklist is refused" $(( rc == 1 ? 0 : 1 )) "rc=$rc mode=$mode"
 grep -q "has no checklist" "$TMP/s4.err"; check "refusal says why" $? "$(cat "$TMP/s4.err")"
 
-# 5. Conformance with an invariants block: the invariants are the only criteria.
-seat="$TMP/s5"; mode=$(seat_prompt "$SHARED" "$seat" "" "conformance" ""); rc=$?
-check "conformance builds with an invariants block" $(( rc == 0 && "$([ "$mode" = conformance ] && echo 0 || echo 1)" == 0 ? 0 : 1 )) "rc=$rc mode=$mode"
-grep -q 'CONFORMANCE — EXCLUSIVE. Your ONLY review criteria are the numbered PROJECT ARCHITECTURE INVARIANTS' "$seat"; check "conformance points at the invariants block" $? "$(tail -n 2 "$seat")"
+# 5. Conformance when the gate declares invariants (flag = 1): the invariants
+#    are the only criteria; pre-existing sites are low notes, not blockers.
+seat="$TMP/s5"; mode=$(seat_prompt "$SHARED" "$seat" "" "conformance" "" 1); rc=$?
+check "conformance builds with the invariants flag" $(( rc == 0 && "$([ "$mode" = conformance ] && echo 0 || echo 1)" == 0 ? 0 : 1 )) "rc=$rc mode=$mode"
+grep -q 'CONFORMANCE — EXCLUSIVE. Your ONLY review criteria are the numbered PROJECT ARCHITECTURE INVARIANTS in the trusted gate-context block' "$seat"; check "conformance points at the trusted invariants block" $? "$(tail -n 2 "$seat")"
 grep -q 'begins "INVARIANT <n>: "' "$seat"; check "conformance findings are labelled by invariant" $? "$(tail -n 2 "$seat")"
-grep -q 'no architecture invariants declared' "$seat"; check "conformance with a block does not emit the no-invariants text" $(( $? == 0 ? 1 : 0 )) "$(tail -n 2 "$seat")"
+grep -q 'PRE-EXISTING INVARIANT <n>: ' "$seat"; check "pre-existing sites are low PRE-EXISTING notes, not blockers" $? "$(tail -n 2 "$seat")"
+grep -q 'no architecture invariants declared' "$seat"; check "conformance with the flag does not emit the no-invariants text" $(( $? == 0 ? 1 : 0 )) "$(tail -n 2 "$seat")"
 
-# 6. Conformance without an invariants block: one low finding, nothing else.
-seat="$TMP/s6"; mode=$(seat_prompt "$PLAIN" "$seat" "" "conformance" ""); rc=$?
-check "conformance builds without an invariants block" $(( rc == 0 && "$([ "$mode" = conformance ] && echo 0 || echo 1)" == 0 ? 0 : 1 )) "rc=$rc mode=$mode"
-grep -q 'no architecture invariants declared for this repository; the conformance seat checked nothing' "$seat"; check "no-invariants case asks for the visible low finding" $? "$(tail -n 2 "$seat")"
+# 6. Conformance when the gate declares NO invariants (flag empty/0): one low
+#    finding, nothing else — even though this shared prompt CONTAINS a line
+#    that looks like the heading. The flag decides; the prompt is never sniffed.
+seat="$TMP/s6"; mode=$(seat_prompt "$SHARED" "$seat" "" "conformance" "" ""); rc=$?
+check "conformance builds without the invariants flag" $(( rc == 0 && "$([ "$mode" = conformance ] && echo 0 || echo 1)" == 0 ? 0 : 1 )) "rc=$rc mode=$mode"
+grep -q 'no architecture invariants declared for this repository; the conformance seat checked nothing' "$seat"; check "no-flag case asks for the visible low finding" $? "$(tail -n 2 "$seat")"
+seat="$TMP/s6b"; mode=$(seat_prompt "$SHARED" "$seat" "" "conformance" "" 0); rc=$?
+grep -q 'no architecture invariants declared' "$seat"; check "flag 0 is treated as absent (prompt heading is not trusted)" $? "$(tail -n 2 "$seat")"
+seat="$TMP/s6c"; mode=$(seat_prompt "$PLAIN" "$seat" "" "conformance" "" 1); rc=$?
+grep -q 'Your ONLY review criteria are the numbered PROJECT ARCHITECTURE INVARIANTS' "$seat"; check "flag 1 is trusted even when the fixture prompt lacks the heading" $? "$(tail -n 2 "$seat")"
 
 # 7. Focus and seam together: seam wins, warning on stderr.
-seat="$TMP/s7"; mode=$(seat_prompt "$SHARED" "$seat" "some focus" "conformance" "" 2>"$TMP/s7.err"); rc=$?
+seat="$TMP/s7"; mode=$(seat_prompt "$SHARED" "$seat" "some focus" "conformance" "" 1 2>"$TMP/s7.err"); rc=$?
 check "focus+seam -> seam wins" $(( rc == 0 && "$([ "$mode" = conformance ] && echo 0 || echo 1)" == 0 ? 0 : 1 )) "rc=$rc mode=$mode"
 grep -q 'focus OR seam' "$TMP/s7.err"; check "focus+seam warns" $? "$(cat "$TMP/s7.err")"
 grep -q 'SEAT REVIEW FOCUS' "$seat"; check "focus+seam drops the focus clause" $(( $? == 0 ? 1 : 0 )) "focus clause present"

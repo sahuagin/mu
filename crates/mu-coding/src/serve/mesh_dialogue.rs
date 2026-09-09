@@ -561,7 +561,13 @@ impl MeshSessions {
         );
         let mut joined = self.inner.joined.lock().expect("mesh sessions");
         if joined.contains_key(session_id) {
-            task.abort(); // lost a race; ours drops, releasing both
+            // Lost a race. Aborting ends OUR subscription; the Micro
+            // `Service` inside the task is only dropped, which does NOT
+            // deregister its `$SRV` presence (see `JoinedSession`), so a
+            // concurrent duplicate join leaks one responder until process
+            // exit. Stopping it properly is part of
+            // mu-mesh-dialogue-teardown-stop-service-4klqp.
+            task.abort();
             return Ok(());
         }
         joined.insert(

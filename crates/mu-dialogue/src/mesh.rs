@@ -268,20 +268,31 @@ pub struct InboundDm {
 /// `Service` has no `Drop`; its `$SRV` responder task runs until `stop()`
 /// aborts it, and `stop()` only reaches that abort when the service has at
 /// least one endpoint (its shutdown broadcast needs a live receiver, and only
-/// endpoints hold one — hence `_stop_anchor`). Relying on drop left every cc
+/// endpoints hold one — hence `stop_anchor`). Relying on drop left every cc
 /// session ever fronted answering `$SRV.PING` until the gateway restarted:
 /// 783 phantom peers on 2026-09-08 (mu-gateway-phantom-srv-presence-se0nc).
 struct Fronted {
-    task: tokio::task::JoinHandle<()>,
-    /// `Some` until [`Fronted::release`] consumes it; `stop()` is async, so
-    /// it cannot run from `Drop`.
-    presence: Option<async_nats::service::Service>,
+    /// The DM subscription task; aborted on drop, so a `Fronted` dropped
+    /// without [`Fronted::release`] still ends its subscription.
+    task: AbortOnDrop,
+    presence: async_nats::service::Service,
     /// The endpoint that makes `stop()` effective (see above). Never polled;
     /// nothing publishes on its subject, which carries the service's own
     /// random id so it is not derivable from the peer id alone. `None` only
     /// if registering it failed: the peer keeps its inbox and presence, and
-    /// `release` then reports that it could not deregister.
-    _stop_anchor: Option<async_nats::service::endpoint::Endpoint>,
+    /// `release` reports that it cannot deregister instead of pretending.
+    stop_anchor: Option<async_nats::service::endpoint::Endpoint>,
+}
+
+/// A task handle that aborts its task when dropped. Kept separate from
+/// `Fronted` so `Fronted` itself has no `Drop` and `release` can take it
+/// apart by value.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl Fronted {
@@ -289,23 +300,31 @@ impl Fronted {
     /// returned, not logged: the caller knows why the release happened and
     /// reports the outcome once. A failed stop leaves the peer discoverable
     /// until the gateway restarts; nothing else is lost.
-    async fn release(mut self, peer_id: &str) -> Result<()> {
-        self.task.abort();
-        match self.presence.take() {
-            // `stop()` is in-process in async-nats 0.49 (a broadcast send and
-            // an abort), but the module rule is one bound per post-connect
-            // NATS await, not per what this library version happens to do
-            // (mu-10fa): release runs on the say/poll hot path via the
-            // front_peer race-loser branch and from the stale-peer sweep.
-            Some(presence) => bounded(&format!("presence stop {peer_id}"), presence.stop()).await,
-            None => Err(anyhow!("no stop anchor was registered for {peer_id}, so $SRV presence cannot be deregistered")),
-        }
-    }
-}
-
-impl Drop for Fronted {
-    fn drop(&mut self) {
-        self.task.abort();
+    async fn release(self, peer_id: &str) -> Result<()> {
+        let Fronted {
+            task,
+            presence,
+            stop_anchor,
+        } = self;
+        drop(task);
+        // Without the anchor, `stop()` cannot reach its abort (its shutdown
+        // broadcast has no receiver), so calling it would only report a
+        // closed channel. Say what is actually wrong.
+        let Some(anchor) = stop_anchor else {
+            return Err(anyhow!(
+                "no stop anchor was registered for {peer_id} at front time, so its $SRV presence cannot be deregistered"
+            ));
+        };
+        // `stop()` is in-process in async-nats 0.49 (a broadcast send and an
+        // abort), but the module rule is one bound per post-connect NATS
+        // await, not per what this library version happens to do (mu-10fa):
+        // release runs on the say/poll hot path via the front_peer race-loser
+        // branch and from the stale-peer sweep.
+        let stopped = bounded(&format!("presence stop {peer_id}"), presence.stop()).await;
+        // The anchor's receiver is what let `stop()` deliver; it is dropped
+        // only now, after the send.
+        drop(anchor);
+        stopped
     }
 }
 
@@ -625,9 +644,9 @@ impl Gateway {
         });
 
         let ours = Fronted {
-            task,
-            presence: Some(presence),
-            _stop_anchor: stop_anchor,
+            task: AbortOnDrop(task),
+            presence,
+            stop_anchor,
         };
         let mut fronted = self.fronted.lock().await;
         if fronted.contains_key(peer_id) {

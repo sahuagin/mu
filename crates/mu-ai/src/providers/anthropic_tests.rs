@@ -1471,7 +1471,7 @@ mod live_tests {
         ] {
             assert_eq!(
                 beta_headers_for(&catalog, model, ANTHROPIC_API_BASE, None),
-                vec![MID_CONVERSATION_TOOL_CHANGES_BETA],
+                vec![Beta::MidConversationToolChanges],
                 "{model}"
             );
         }
@@ -1499,7 +1499,7 @@ mod live_tests {
     #[test]
     fn beta_header_is_gated_on_endpoint_and_operator_override() {
         let catalog = mu_core::model_catalog::built_in();
-        let on = vec![MID_CONVERSATION_TOOL_CHANGES_BETA];
+        let on = vec![Beta::MidConversationToolChanges];
         assert!(
             beta_headers_for(&catalog, "claude-opus-5", "http://10.1.1.143:11434", None).is_empty()
         );
@@ -1568,7 +1568,7 @@ mod live_tests {
             req.headers()
                 .get("anthropic-beta")
                 .and_then(|v| v.to_str().ok()),
-            Some(MID_CONVERSATION_TOOL_CHANGES_BETA),
+            Some(Beta::MidConversationToolChanges.as_str()),
             "{:?}",
             req.headers()
         );
@@ -1625,7 +1625,7 @@ mod live_tests {
         ]);
         assert_eq!(
             body_betas(&scoped),
-            vec![MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA]
+            vec![Beta::MidConversationSystemClearAt]
         );
         let effort = request(vec![
             AnthMessage::user("hi"),
@@ -1633,10 +1633,7 @@ mod live_tests {
             AnthMessage::system_effort("low"),
             AnthMessage::user("more"),
         ]);
-        assert_eq!(
-            body_betas(&effort),
-            vec![MID_CONVERSATION_OUTPUT_CONFIG_BETA]
-        );
+        assert_eq!(body_betas(&effort), vec![Beta::MidConversationOutputConfig]);
 
         // On the wire: after the catalog beta for a documented model on
         // Anthropic's endpoint; alone for a model and endpoint the catalog
@@ -1656,7 +1653,9 @@ mod live_tests {
                 &scoped
             ),
             Some(format!(
-                "{MID_CONVERSATION_TOOL_CHANGES_BETA},{MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA}"
+                "{},{}",
+                Beta::MidConversationToolChanges,
+                Beta::MidConversationSystemClearAt
             ))
         );
         assert_eq!(
@@ -1665,7 +1664,7 @@ mod live_tests {
                     .with_api_base("https://gateway.example".into()),
                 &effort
             ),
-            Some(MID_CONVERSATION_OUTPUT_CONFIG_BETA.to_owned())
+            Some(Beta::MidConversationOutputConfig.to_string())
         );
         assert_eq!(
             header(
@@ -1702,14 +1701,14 @@ mod live_tests {
             body_betas(&body(
                 ThinkingConfig::adaptive().with_display(ThinkingDisplay::Updates)
             )),
-            vec![THINKING_DISPLAY_UPDATES_BETA]
+            vec![Beta::ThinkingDisplayUpdates]
         );
         assert_eq!(
             body_betas(&body(
                 ThinkingConfig::enabled(2048)
                     .with_prefix_mismatch_behavior(PrefixMismatchBehavior::Error)
             )),
-            vec![THINKING_BINDING_CONTROLS_BETA]
+            vec![Beta::ThinkingBindingControls]
         );
         assert_eq!(
             body_betas(&body(
@@ -1717,10 +1716,7 @@ mod live_tests {
                     .with_display(ThinkingDisplay::Updates)
                     .with_prefix_mismatch_behavior(PrefixMismatchBehavior::DropBlock)
             )),
-            vec![
-                THINKING_DISPLAY_UPDATES_BETA,
-                THINKING_BINDING_CONTROLS_BETA
-            ]
+            vec![Beta::ThinkingDisplayUpdates, Beta::ThinkingBindingControls]
         );
         let mut nulled = body(ThinkingConfig::adaptive());
         nulled["thinking"]["block_binding"] = Value::Null;
@@ -1739,13 +1735,13 @@ mod live_tests {
         assert!(body_betas(&body(base())).is_empty());
         assert_eq!(
             body_betas(&body(base().with_fallbacks(Fallbacks::Default))),
-            vec![SERVER_SIDE_FALLBACK_BETA]
+            vec![Beta::ServerSideFallback]
         );
         assert_eq!(
             body_betas(&body(base().with_fallbacks(Fallbacks::Models(vec![
                 FallbackTarget::model("claude-opus-4-8")
             ])))),
-            vec![SERVER_SIDE_FALLBACK_BETA]
+            vec![Beta::ServerSideFallback]
         );
         assert!(body_betas(&body(
             base().with_fallback_credit_token(FallbackCreditToken::Token("fct_01".into()))
@@ -1758,7 +1754,7 @@ mod live_tests {
                     mode: Some(CreditRedemption::BestEffort),
                 }
             ))),
-            vec![FALLBACK_CREDIT_BETA]
+            vec![Beta::FallbackCredit]
         );
         let mut nulled = body(base());
         nulled["fallbacks"] = Value::Null;
@@ -1781,9 +1777,9 @@ mod live_tests {
                 base().with_fallbacks(Fallbacks::Models(vec![target]))
             )),
             vec![
-                THINKING_DISPLAY_UPDATES_BETA,
-                THINKING_BINDING_CONTROLS_BETA,
-                SERVER_SIDE_FALLBACK_BETA
+                Beta::ThinkingDisplayUpdates,
+                Beta::ThinkingBindingControls,
+                Beta::ServerSideFallback
             ]
         );
     }
@@ -1811,13 +1807,13 @@ mod live_tests {
             false,
             &body,
         );
-        assert_eq!(live.catalog, vec![MID_CONVERSATION_TOOL_CHANGES_BETA]);
-        assert_eq!(live.body, vec![MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA]);
+        assert_eq!(live.catalog, vec![Beta::MidConversationToolChanges]);
+        assert_eq!(live.body, vec![Beta::MidConversationSystemClearAt]);
         assert_eq!(
             live.all(),
             vec![
-                MID_CONVERSATION_TOOL_CHANGES_BETA,
-                MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA
+                Beta::MidConversationToolChanges,
+                Beta::MidConversationSystemClearAt
             ]
         );
         let latched = RequestBetas::resolve(
@@ -1888,6 +1884,46 @@ mod live_tests {
     // mu-anthropic-protocol-2026q3-6uqho.6: per-model request rules
     // ----------------------------------------------------------------------
 
+    /// The catalog strings and the enum are one mapping: every quirk parses
+    /// back from its own string, the strings are the snake-case variant
+    /// names the catalog comment documents, an unknown string parses to
+    /// nothing, and every beta's header value carries its date.
+    #[test]
+    fn quirk_and_beta_string_forms_round_trip() {
+        for q in Quirk::iter() {
+            assert_eq!(q.as_str().parse::<Quirk>(), Ok(q), "{q}");
+            assert_eq!(q.to_string(), q.as_str());
+            assert!(
+                q.as_str()
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{q}"
+            );
+        }
+        assert!("thinking_counts_against_max_tokens"
+            .parse::<Quirk>()
+            .is_err());
+        assert!("".parse::<Quirk>().is_err());
+        assert_eq!(Quirk::iter().count(), 9);
+        assert_eq!(
+            Quirk::RejectsThinkingDisabledAboveHighEffort.as_str(),
+            "rejects_thinking_disabled_above_high_effort"
+        );
+        let headers: Vec<&str> = Beta::iter().map(Beta::as_str).collect();
+        assert_eq!(headers.len(), 7);
+        for h in &headers {
+            assert!(
+                h.ends_with(|c: char| c.is_ascii_digit()),
+                "{h} carries no date"
+            );
+            assert_eq!(headers.iter().filter(|x| x == &h).count(), 1, "{h}");
+        }
+        assert_eq!(
+            Beta::MidConversationToolChanges.to_string(),
+            "mid-conversation-tool-changes-2026-07-01"
+        );
+    }
+
     /// The rule quirks the shipped catalog grants, model by model, against
     /// the 2026-09-04 spec snapshot (the thinking table on
     /// thinking-troubleshooting, the sampling note on thinking, the Fable
@@ -1898,29 +1934,16 @@ mod live_tests {
     #[test]
     fn shipped_catalog_states_each_documented_rule_and_no_other() {
         let catalog = mu_core::model_catalog::built_in();
-        const RULES: [&str; 8] = [
-            REJECTS_MANUAL_THINKING_QUIRK,
-            REJECTS_THINKING_DISABLED_QUIRK,
-            REJECTS_THINKING_DISABLED_ABOVE_HIGH_EFFORT_QUIRK,
-            REJECTS_SAMPLING_PARAMS_QUIRK,
-            REJECTS_FORCED_TOOL_CHOICE_QUIRK,
-            REJECTS_FAST_MODE_QUIRK,
-            IGNORES_FAST_MODE_QUIRK,
-            RETIRED_QUIRK,
-        ];
         // Only the rule quirks: the tool-changes beta has its own test above,
-        // and a local model's serving quirks are not rules.
+        // and a local model's serving quirks are not quirks the lane knows.
         let rules = |model: &str| {
-            let mut q = catalog.resolve_model(model).quirks;
-            q.retain(|q| RULES.contains(&q.as_str()));
-            q.sort();
+            let mut q = Quirk::resolve(&catalog, model);
+            q.retain(|q| *q != Quirk::MidConversationToolChanges);
             q
         };
-        let expect = |models: &[&str], quirks: &[&str]| {
-            let mut want: Vec<String> = quirks.iter().map(|q| q.to_string()).collect();
-            want.sort();
+        let expect = |models: &[&str], quirks: &[Quirk]| {
             for model in models {
-                assert_eq!(rules(model), want, "{model}");
+                assert_eq!(rules(model), quirks, "{model}");
             }
         };
         expect(
@@ -1930,26 +1953,26 @@ mod live_tests {
                 "claude-fable-5-1-20261001",
             ],
             &[
-                REJECTS_MANUAL_THINKING_QUIRK,
-                REJECTS_THINKING_DISABLED_QUIRK,
-                REJECTS_SAMPLING_PARAMS_QUIRK,
-                REJECTS_FORCED_TOOL_CHOICE_QUIRK,
+                Quirk::RejectsManualThinking,
+                Quirk::RejectsThinkingDisabled,
+                Quirk::RejectsSamplingParams,
+                Quirk::RejectsForcedToolChoice,
             ],
         );
         expect(
             &["claude-fable-5", "claude-mythos-5"],
             &[
-                REJECTS_MANUAL_THINKING_QUIRK,
-                REJECTS_THINKING_DISABLED_QUIRK,
-                REJECTS_SAMPLING_PARAMS_QUIRK,
+                Quirk::RejectsManualThinking,
+                Quirk::RejectsThinkingDisabled,
+                Quirk::RejectsSamplingParams,
             ],
         );
         expect(
             &["claude-opus-5", "claude-opus-5-20260724"],
             &[
-                REJECTS_MANUAL_THINKING_QUIRK,
-                REJECTS_THINKING_DISABLED_ABOVE_HIGH_EFFORT_QUIRK,
-                REJECTS_SAMPLING_PARAMS_QUIRK,
+                Quirk::RejectsManualThinking,
+                Quirk::RejectsThinkingDisabledAboveHighEffort,
+                Quirk::RejectsSamplingParams,
             ],
         );
         expect(
@@ -1958,17 +1981,17 @@ mod live_tests {
                 "claude-opus-4-8",
                 "claude-opus-4-8-20260901",
             ],
-            &[REJECTS_MANUAL_THINKING_QUIRK, REJECTS_SAMPLING_PARAMS_QUIRK],
+            &[Quirk::RejectsManualThinking, Quirk::RejectsSamplingParams],
         );
         expect(
             &["claude-opus-4-7"],
             &[
-                REJECTS_MANUAL_THINKING_QUIRK,
-                REJECTS_SAMPLING_PARAMS_QUIRK,
-                REJECTS_FAST_MODE_QUIRK,
+                Quirk::RejectsManualThinking,
+                Quirk::RejectsSamplingParams,
+                Quirk::RejectsFastMode,
             ],
         );
-        expect(&["claude-opus-4-6"], &[IGNORES_FAST_MODE_QUIRK]);
+        expect(&["claude-opus-4-6"], &[Quirk::IgnoresFastMode]);
         expect(
             &[
                 "claude-opus-4-1",
@@ -1976,7 +1999,7 @@ mod live_tests {
                 "claude-opus-4-20250514",
                 "claude-sonnet-4-20250514",
             ],
-            &[RETIRED_QUIRK],
+            &[Quirk::Retired],
         );
         expect(
             &[
@@ -2113,7 +2136,7 @@ mod live_tests {
         let hits = |req: MessagesRequest, on_api: bool| {
             model_rule_hits(&catalog, &serde_json::to_value(req).unwrap(), on_api)
         };
-        let one = |req: MessagesRequest, quirk: &str, severity: RuleSeverity| {
+        let one = |req: MessagesRequest, quirk: Quirk, severity: RuleSeverity| {
             let found = hits(req, true);
             assert_eq!(found.len(), 1, "{found:?}");
             assert_eq!(found[0].quirk, quirk);
@@ -2132,7 +2155,7 @@ mod live_tests {
         // Forced tool choice: the 5.1 pair only; auto and none pass everywhere.
         let hit = one(
             base("claude-fable-5-1").with_tool_choice(ToolChoice::any()),
-            REJECTS_FORCED_TOOL_CHOICE_QUIRK,
+            Quirk::RejectsForcedToolChoice,
             RuleSeverity::Refuse,
         );
         assert!(
@@ -2145,10 +2168,12 @@ mod live_tests {
             "{}",
             hit.message()
         );
-        assert!(hit.message().contains(REJECTS_FORCED_TOOL_CHOICE_QUIRK));
+        assert!(hit
+            .message()
+            .contains(Quirk::RejectsForcedToolChoice.as_str()));
         one(
             base("claude-mythos-5-1").with_tool_choice(ToolChoice::tool("read")),
-            REJECTS_FORCED_TOOL_CHOICE_QUIRK,
+            Quirk::RejectsForcedToolChoice,
             RuleSeverity::Refuse,
         );
         none(base("claude-fable-5-1").with_tool_choice(ToolChoice::auto()));
@@ -2165,7 +2190,7 @@ mod live_tests {
         ] {
             one(
                 base(model).with_thinking(ThinkingConfig::enabled(1024)),
-                REJECTS_MANUAL_THINKING_QUIRK,
+                Quirk::RejectsManualThinking,
                 RuleSeverity::Refuse,
             );
         }
@@ -2176,7 +2201,7 @@ mod live_tests {
         // Sonnet 5 accepts it at every effort.
         one(
             base("claude-fable-5-1").with_thinking(ThinkingConfig::Disabled),
-            REJECTS_THINKING_DISABLED_QUIRK,
+            Quirk::RejectsThinkingDisabled,
             RuleSeverity::Refuse,
         );
         none(base("claude-opus-5").with_thinking(ThinkingConfig::Disabled));
@@ -2190,7 +2215,7 @@ mod live_tests {
                 base("claude-opus-5")
                     .with_thinking(ThinkingConfig::Disabled)
                     .with_output_config(effort(level)),
-                REJECTS_THINKING_DISABLED_ABOVE_HIGH_EFFORT_QUIRK,
+                Quirk::RejectsThinkingDisabledAboveHighEffort,
                 RuleSeverity::Refuse,
             );
             assert!(hit.detail.contains(level), "{}", hit.detail);
@@ -2209,7 +2234,7 @@ mod live_tests {
         // Sampling: presence of any of the three, named in the message.
         let hit = one(
             base("claude-sonnet-5").with_temperature(0.7),
-            REJECTS_SAMPLING_PARAMS_QUIRK,
+            Quirk::RejectsSamplingParams,
             RuleSeverity::Refuse,
         );
         assert!(hit.detail.contains("`temperature`"), "{}", hit.detail);
@@ -2217,7 +2242,7 @@ mod live_tests {
         with_top_k.top_k = Some(40);
         let hit = one(
             with_top_k,
-            REJECTS_SAMPLING_PARAMS_QUIRK,
+            Quirk::RejectsSamplingParams,
             RuleSeverity::Refuse,
         );
         assert!(hit.detail.contains("`top_p`, `top_k`"), "{}", hit.detail);
@@ -2227,12 +2252,12 @@ mod live_tests {
         // on Opus 5; `standard` is never a hit.
         one(
             base("claude-opus-4-7").with_speed(Speed::Fast),
-            REJECTS_FAST_MODE_QUIRK,
+            Quirk::RejectsFastMode,
             RuleSeverity::Refuse,
         );
         one(
             base("claude-opus-4-6").with_speed(Speed::Fast),
-            IGNORES_FAST_MODE_QUIRK,
+            Quirk::IgnoresFastMode,
             RuleSeverity::Warn,
         );
         none(base("claude-opus-5").with_speed(Speed::Fast));
@@ -2245,7 +2270,7 @@ mod live_tests {
             "claude-opus-4-20250514",
             "claude-sonnet-4-20250514",
         ] {
-            let hit = one(base(model), RETIRED_QUIRK, RuleSeverity::Warn);
+            let hit = one(base(model), Quirk::Retired, RuleSeverity::Warn);
             assert!(hit.detail.contains("sending anyway"), "{}", hit.detail);
             assert!(hits(base(model), false).is_empty(), "{model} off the API");
         }
@@ -2256,7 +2281,7 @@ mod live_tests {
         // warning from a gateway, and the warning says so.
         let found = hits(base("claude-fable-5-1").with_temperature(0.7), false);
         assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].quirk, REJECTS_SAMPLING_PARAMS_QUIRK);
+        assert_eq!(found[0].quirk, Quirk::RejectsSamplingParams);
         assert_eq!(found[0].severity, RuleSeverity::Warn);
         assert!(
             found[0].detail.contains("sent anyway"),
@@ -2275,10 +2300,7 @@ mod live_tests {
         );
         assert_eq!(
             found.iter().map(|h| h.quirk).collect::<Vec<_>>(),
-            vec![
-                REJECTS_SAMPLING_PARAMS_QUIRK,
-                REJECTS_FORCED_TOOL_CHOICE_QUIRK
-            ]
+            vec![Quirk::RejectsSamplingParams, Quirk::RejectsForcedToolChoice]
         );
     }
 
@@ -2302,7 +2324,7 @@ mod live_tests {
         };
         let off = model_rule_hits(&catalog, &body("claude-fable-5-1"), false);
         assert_eq!(off.len(), 1, "{off:?}");
-        assert_eq!(off[0].quirk, REJECTS_THINKING_DISABLED_QUIRK);
+        assert_eq!(off[0].quirk, Quirk::RejectsThinkingDisabled);
         assert_eq!(off[0].severity, RuleSeverity::Warn);
         let on = model_rule_hits(&catalog, &body("claude-fable-5-1"), true);
         assert_eq!(on.len(), 1, "{on:?}");
@@ -2341,7 +2363,7 @@ mod live_tests {
         );
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].model, "claude-fable-5-1");
-        assert_eq!(found[0].quirk, REJECTS_FORCED_TOOL_CHOICE_QUIRK);
+        assert_eq!(found[0].quirk, Quirk::RejectsForcedToolChoice);
 
         // Disabled thinking at max effort passes on Opus 4.8 and trips the
         // Opus 5 target, which inherits both fields.
@@ -2357,7 +2379,7 @@ mod live_tests {
         assert_eq!(found[0].model, "claude-opus-5");
         assert_eq!(
             found[0].quirk,
-            REJECTS_THINKING_DISABLED_ABOVE_HIGH_EFFORT_QUIRK
+            Quirk::RejectsThinkingDisabledAboveHighEffort
         );
 
         // The same target with its own effort override at high passes.

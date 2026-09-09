@@ -25,9 +25,14 @@
 #   - each rank's tool grant comes from config; "" is passed as `--tools ""` (zero tools),
 #     which is NOT the same as omitting --tools (that falls back to the daemon default set).
 #
+# Per-seat wall-clock caps come from seat-timeout.sh: local seats get a longer
+# one than API seats, and a ranked entry's `timeout_secs` overrides both. The
+# optional <timeout-sec> argument forces ONE cap on every seat (callers pass it
+# only to override the whole panel; consensus.sh does not).
+#
 # usage: panel_review.sh <prompt-file> <out-prefix> [review-cwd] [timeout-sec]
 set -u
-PF="$1"; OUT="$2"; CWD="${3:-$PWD}"; TMO="${4:-600}"
+PF="$1"; OUT="$2"; CWD="${3:-$PWD}"; TMO_ALL="${4:-}"
 # Fail fast on a missing/unreadable prompt — otherwise it only surfaces later
 # as N parallel per-seat failures with no clear cause (panel finding, mu-3ajg).
 [ -r "$PF" ] || { echo "dispatch.sh: prompt file missing or unreadable: $PF" >&2; exit 2; }
@@ -47,6 +52,8 @@ AGENT_DISPATCH_LIB="${AGENT_DISPATCH_LIB:-$HERE/../lib/agent-dispatch.sh}"
 # Seat prompt assembly (focus / seam / conformance), kept model-free so it is
 # unit-tested (scripts/tests/seat-prompt-test.sh).
 . "$HERE/seat-prompt.sh"
+# mu-ash9p: per-provider-class seat caps (seat_timeout).
+. "$HERE/seat-timeout.sh"
 # OpenRouter key for the metered rank — exported silently, never printed.
 OPENROUTER_API_KEY=$(tq -f "$HOME/.config/agent/config.toml" -r openrouter.api_key)
 export OPENROUTER_API_KEY
@@ -84,6 +91,9 @@ while [ "$r" -lt "$N" ]; do
   seam=$(printf '%s' "$ranks_json" | jq -r ".[$r].seam // \"\"")
   checklist=$(printf '%s' "$ranks_json" | jq -r ".[$r].checklist // \"\"")
   max_turns=$(agent-role --max-turns code_review "$r" 2>/dev/null || true)
+  # This seat's cap: roster `timeout_secs` > provider class (local vs API).
+  tmo=$(seat_timeout "$prov" "$(printf '%s' "$ranks_json" | jq -r ".[$r].timeout_secs // \"\"")")
+  [ -n "$TMO_ALL" ] && tmo="$TMO_ALL"
   # Per-rank endpoint/lease (mu-vneb): a config-defined per-card rank pins its
   # server + lock via agent_roles.toml `endpoint`/`lease` keys, emitted by
   # `agent-role --env` as OLLAMA_API_BASE / OLLAMA_LEASE_NAME (or VLLM_API_BASE).
@@ -125,20 +135,22 @@ while [ "$r" -lt "$N" ]; do
     # agent_dispatch reads TOOLS/TIMEOUT/MU/ERRLOG from scope; stdout = the model's
     # output (-> .out), stderr -> $ERRLOG (per-rank .err). claude-oauth now routes
     # to `claude -p` instead of erroring. (Subshell-local assignments: no leakage.)
-    TOOLS="$tools"; TIMEOUT="$TMO"; MAX_TURNS="$max_turns"; ERRLOG="${OUT}.${tag}.err"
+    TOOLS="$tools"; TIMEOUT="$tmo"; MAX_TURNS="$max_turns"; ERRLOG="${OUT}.${tag}.err"
     _out="${OUT}.${tag}.out"
     _retry=0
-    _max_retries="${MU_REVIEW_TIMEOUT_RETRIES:-${AI_REVIEW_TIMEOUT_RETRIES:-1}}"
+    # Default 0: a retry doubles the wall-clock a dead seat costs, and since
+    # mu-ash9p a timed-out seat is absent for the round rather than fatal to it.
+    _max_retries="${MU_REVIEW_TIMEOUT_RETRIES:-${AI_REVIEW_TIMEOUT_RETRIES:-0}}"
     agent_dispatch "$prov" "$model" "$seat_pf" > "$_out"
     _rc=$?
     while [ "$_rc" -eq 124 ] && [ "$_retry" -lt "$_max_retries" ]; do
       _retry=$((_retry + 1))
-      printf '%s\n' "reviewer timeout after ${TMO}s; retry ${_retry}/${_max_retries}" >> "$ERRLOG"
+      printf '%s\n' "reviewer timeout after ${tmo}s; retry ${_retry}/${_max_retries}" >> "$ERRLOG"
       agent_dispatch "$prov" "$model" "$seat_pf" > "$_out"
       _rc=$?
     done
     reask_if_unparsed "$prov" "$model" "$_out"
-    echo "exit=$_rc retry=$_retry prov=$prov model=$model tools=[$tools] focus=[$focus] seam=[$seam]" > "${OUT}.${tag}.done"
+    echo "exit=$_rc retry=$_retry prov=$prov model=$model tmo=$tmo tools=[$tools] focus=[$focus] seam=[$seam]" > "${OUT}.${tag}.done"
   ) &
   r=$((r + 1))
 done

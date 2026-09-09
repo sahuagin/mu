@@ -17,6 +17,12 @@
 # Original parses → no-op. Re-ask fails → canonical .out untouched. So the gate
 # can never be weakened, only rescued.
 #
+# BOUNDED: the re-ask carries its own cap, MU_REVIEW_REASK_TIMEOUT_SECS (default
+# 180), not the seat's. It used to inherit the caller's TIMEOUT, so a seat that
+# hit its cap with partial output could spend a second full cap on the re-ask —
+# 2x per seat per round, against the panel's stated per-seat bound (panel
+# finding, PR #611). Reformatting notes already written needs seconds.
+#
 # Sourced by dispatch.sh (round 1) and consensus.sh (convergence rounds); reads
 # $HERE (the review-panel dir) and $ERRLOG from the caller's scope, and calls
 # the already-sourced agent_dispatch.
@@ -48,7 +54,8 @@ reask_if_unparsed() {
   # No tools / no turn budget: this is formatting, not re-investigation. Runs in
   # the caller's per-rank subshell, so it inherits that rank's OLLAMA_API_BASE /
   # lease (mu-vneb) and hits the same server the review ran on.
-  ( TOOLS=""; MAX_TURNS=""; agent_dispatch "$_rp_prov" "$_rp_model" "$_rp_prompt" ) \
+  ( TOOLS=""; MAX_TURNS=""; TIMEOUT="${MU_REVIEW_REASK_TIMEOUT_SECS:-180}"
+    agent_dispatch "$_rp_prov" "$_rp_model" "$_rp_prompt" ) \
     > "${_rp_out}.reask" 2>>"${ERRLOG:-/dev/null}"
 
   if python3 "$HERE/parse.py" --check "${_rp_out}.reask" 2>/dev/null; then

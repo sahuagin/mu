@@ -2,8 +2,9 @@
 # ai-review.sh — pre-PR review PANEL gate (beads mu-6qst, mu-ai-review-panel-lrwq, mu-f0ls).
 #
 # A reviewer panel checks the working diff before a PR — a check on top of CI and
-# the human/agent. Run it via `just ci-aipr`, which runs `just ci` first and only
-# reviews green code.
+# the human/agent. Run it via `just ci-aipr`, which runs the pre-PR checks first
+# and only reviews green code; since mu-ash9p it repeats fmt/clippy/tests only
+# when scripts/ci-green-marker.sh cannot show them already green at this commit.
 #
 # PANEL SHAPE (mu-feur): the goal-protocol CONSENSUS panel. The `code_review`
 # role in ~/.config/mu/agent_roles.toml is the single source of truth for WHICH
@@ -11,7 +12,7 @@
 # panel reviews, then CONVERGES over antagonistic rounds (scripts/review-panel/):
 # each round every reviewer is shown the others' findings and is pushed to press
 # objections, concede points it now accepts, and move toward ONE agreed verdict
-# (<= MU_REVIEW_MAX_ROUNDS, default 4). Reviewers emit JSON. This replaces the
+# (<= MU_REVIEW_MAX_ROUNDS, default 3). Reviewers emit JSON. This replaces the
 # previous two-primary + conditional-tiebreaker single-shot panel; the chunked
 # path (oversized diffs) now converges this SAME panel over the aggregated leaf
 # findings (mu-feur follow-up).
@@ -22,6 +23,14 @@
 #   consensus APPROVE          → PASS     (exit 0)
 #   consensus NEEDS-CHANGES    → BLOCK    (exit 1)  — a real correctness/design call
 #   no convergence in N rounds → ESCALATE (exit 3)  — operator decides
+#
+# Consensus is among the LIVE seats (mu-ash9p). A seat that times out or returns
+# no parseable verdict is ABSENT for that round — not a dissenter — and is named
+# on the PANEL line: `PANEL PASS (live 4/5: gpt-5.5 unparsed)`. A round needs
+# MU_REVIEW_MIN_LIVE_SEATS live seats (default 3, a majority of the roster) before
+# its agreement counts; below that the run ESCALATEs as an unresolved split does. Before this, a seat emitting
+# unparseable JSON could never join a consensus, so the panel spent every round
+# and reported ESCALATE while the four live seats agreed (measured, PR #608).
 #
 # MU_REVIEW_OVERRIDE=1 is the operator's override on BLOCK *or* ESCALATE: it
 # proceeds (exit 0) and is logged as a calibration signal.
@@ -71,6 +80,56 @@
 #                               response (>5min) plus a possible ollama model reload (~2min)
 #                               overran it, SIGTERMing the reviewer mid-stream before its final
 #                               VERDICT line (spurious UNCLEAR).
+#     MU_REVIEW_MAX_ROUNDS      convergence rounds before ESCALATE (default 3, was 4):
+#                               round 1 plus at most 2 convergence rounds. Each extra
+#                               round measured 5-8 min, bounded by the slowest live seat.
+#     MU_REVIEW_MIN_LIVE_SEATS  live seats a round needs before its agreement counts
+#                               (default 3 — a majority of the five-seat code_review
+#                               roster). Measured why it is not 2: a timing run of this
+#                               gate on PR #611 passed in one round on 2/5 live seats
+#                               (one unparsed, two timed out), which is two opinions
+#                               wearing a panel's clothes. A roster smaller than this
+#                               can never converge: lower the knob with the roster,
+#                               don't pad the roster to fit the knob.
+#     MU_REVIEW_SEAT_TIMEOUT_SECS  wall-clock cap for an API panel seat, seconds
+#                               (default 900 — the value consensus.sh used to hardcode,
+#                               now a knob). What made a dead seat cost 30 min was 900s
+#                               PLUS a retry, not the cap; with retries at 0 it costs the
+#                               cap once (plus the bounded verdict re-ask below when a
+#                               non-empty reply parses to nothing). 600 was tried and is
+#                               too tight: it dropped two
+#                               healthy seats under load on PR #611, and opus-5 answers
+#                               in 5-13 min on a busy box.
+#     MU_REVIEW_REASK_TIMEOUT_SECS  cap for the one verdict re-ask a seat gets when its
+#                               reply parses to nothing (default 180; verdict-retry.sh).
+#                               It no longer inherits the seat cap, so a seat costs at
+#                               most cap + 180s per round — plus, for a LOCAL seat in
+#                               round 1 only, dispatch.sh's 600s model warmup, which
+#                               runs before the cap starts.
+#     MU_REVIEW_LOCAL_SEAT_TIMEOUT_SECS  the same cap for a LOCAL seat — provider ollama
+#                               or vllm, or a [[providers.endpoints]] name whose base_url
+#                               is our own hardware (default 1800). Measured: local seats
+#                               took 26 and 36 min in other sessions' panels while every
+#                               API seat answered inside 13, and one flat number cannot
+#                               serve both — it either wastes 15 idle minutes on a hung
+#                               API seat or throws away every healthy local one. A ranked
+#                               entry in agent_roles.toml may state `timeout_secs`, which
+#                               beats both defaults for that seat. Details and the
+#                               local/API test: scripts/review-panel/seat-timeout.sh.
+#                               A seat that hits its cap is dropped for that round and
+#                               the round finishes with the others. Both are distinct
+#                               from MU_REVIEW_TIMEOUT above, which caps the
+#                               single-shot/leaf lanes.
+#     MU_REVIEW_TIMEOUT_RETRIES re-asks of a seat that timed out. Default 0 in the
+#                               CONSENSUS panel: a retry doubles the wall-clock a dead
+#                               seat costs, and a timed-out seat is now absent rather
+#                               than fatal to the round. The chunked LEAF lane keeps
+#                               its default of 1 — a lost leaf is UNREVIEWED CODE, not
+#                               an absent opinion, and enough of them escalate.
+#     MU_REVIEW_FORCE_CHECK=1   `just ci-aipr`: re-run fmt/clippy/tests even when
+#                               scripts/ci-green-marker.sh records them green for this
+#                               commit (that marker is why ci-aipr no longer repeats a
+#                               `just ci` it already passed minutes earlier).
 #     MU_REVIEW_OVERRIDE=1      operator override: proceed despite BLOCK/ESCALATE (logged)
 #     MU_REVIEW_SYSTEM_PROMPT   reviewer system-prompt file (default: ai-review-system-prompt.txt)
 #     MU_REVIEW_LOG             event log (default: ~/.local/share/mu/review-events.jsonl)
@@ -972,12 +1031,12 @@ $fcontent"
     fi
   done <<<"$finding_files"
 
-  echo "${C_DIM}── synthesis: CONSENSUS panel (code_review role, <=${MU_REVIEW_MAX_ROUNDS:-4} rounds) over $leaves leaf unit(s) ──${C_OFF}"
+  echo "${C_DIM}── synthesis: CONSENSUS panel (code_review role, <=${MU_REVIEW_MAX_ROUNDS:-3} rounds) over $leaves leaf unit(s) ──${C_OFF}"
   # mu-feur follow-up: chunked now converges the SAME antagonistic panel the
   # single-shot path uses, over the aggregated leaf FINDINGS — which are compact
   # and fit one context, even though the leaf diffs (the reason chunked exists)
   # do not. Mirrors the single-shot consensus block's exit/override/telemetry.
-  local PANEL_DIR CONS_OUT CONS_PROMPT CONS_RESULT VERDICT_LINE ROUNDS
+  local PANEL_DIR CONS_OUT CONS_PROMPT CONS_RESULT VERDICT_LINE ROUNDS SEATS
   PANEL_DIR="$(dirname "$0")/review-panel"
   CONS_OUT="$(mktemp -d "${TMPDIR:-/tmp}/ai-review-chunked-consensus.XXXXXX")"
   CONS_PROMPT="$CONS_OUT/round1.prompt.txt"
@@ -1003,35 +1062,38 @@ $fcontent"
   # lane is now the consensus panel, not one model.
   SYNTH_PROVIDER=consensus; SYNTH_MODEL=code_review
 
-  CONS_RESULT="$(MU_BIN="$MU" sh "$PANEL_DIR/consensus.sh" "$CONS_PROMPT" "$CONS_OUT" "$ROOT" "${MU_REVIEW_MAX_ROUNDS:-4}" 2>&1)"
+  CONS_RESULT="$(MU_BIN="$MU" sh "$PANEL_DIR/consensus.sh" "$CONS_PROMPT" "$CONS_OUT" "$ROOT" "${MU_REVIEW_MAX_ROUNDS:-3}" 2>&1)"
   printf '%s\n' "$CONS_RESULT"
   VERDICT_LINE="$(printf '%s\n' "$CONS_RESULT" | grep -E '^CONSENSUS |^NO CONSENSUS' | tail -1)"
   ROUNDS="$(printf '%s\n' "$CONS_RESULT" | grep -cE '^round [0-9]')"
+  # Deciding round's seat census, same shape as the single-shot block above.
+  SEATS="$(printf '%s\n' "$CONS_RESULT" | grep -E '^PANEL SEATS: ' | tail -1)"
+  SEATS="${SEATS#PANEL SEATS: }"; [ -n "$SEATS" ] && SEATS=" ($SEATS)"
 
   # Consensus verdict IS the gate verdict; outcome/override/exit semantics mirror
   # the single-shot panel, telemetry stays in the chunked schema (mode:"chunked").
   case "$VERDICT_LINE" in
     "CONSENSUS approve")
       log_panel_chunked PASS false approve "$leaves" "$failed"
-      echo "${C_GREEN}ai-review: CHUNKED PASS — consensus APPROVE after $ROUNDS round(s) over $leaves leaf unit(s) ($findings_total finding(s), $failed unreviewed).${C_OFF}"
+      echo "${C_GREEN}ai-review: CHUNKED PASS${SEATS} — consensus APPROVE after $ROUNDS round(s) over $leaves leaf unit(s) ($findings_total finding(s), $failed unreviewed).${C_OFF}"
       exit 0 ;;
     "CONSENSUS needs-changes")
       if [ "$ov" = true ]; then
         log_panel_chunked BLOCK true needs-changes "$leaves" "$failed"
-        echo "${C_YEL}ai-review: CHUNKED BLOCK (consensus needs-changes) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
+        echo "${C_YEL}ai-review: CHUNKED BLOCK${SEATS} (consensus needs-changes) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
         exit 0
       fi
       log_panel_chunked BLOCK false needs-changes "$leaves" "$failed"
-      echo "${C_RED}ai-review: CHUNKED BLOCK — consensus NEEDS-CHANGES after $ROUNDS round(s) over $leaves leaf unit(s). Set MU_REVIEW_OVERRIDE=1 to proceed if you disagree.${C_OFF}" >&2
+      echo "${C_RED}ai-review: CHUNKED BLOCK${SEATS} — consensus NEEDS-CHANGES after $ROUNDS round(s) over $leaves leaf unit(s). Set MU_REVIEW_OVERRIDE=1 to proceed if you disagree.${C_OFF}" >&2
       exit 1 ;;
     *)
       if [ "$ov" = true ]; then
         log_panel_chunked ESCALATE true "${VERDICT_LINE:-none}" "$leaves" "$failed"
-        echo "${C_YEL}ai-review: CHUNKED ESCALATE (no consensus) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
+        echo "${C_YEL}ai-review: CHUNKED ESCALATE${SEATS} (no consensus) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
         exit 0
       fi
       log_panel_chunked ESCALATE false "${VERDICT_LINE:-none}" "$leaves" "$failed"
-      echo "${C_YEL}ai-review: CHUNKED ESCALATE — panel did not converge after $ROUNDS round(s) over $leaves leaf unit(s); operator decides. Per-round artifacts in $CONS_OUT. Set MU_REVIEW_OVERRIDE=1 to proceed once adjudicated.${C_OFF}" >&2
+      echo "${C_YEL}ai-review: CHUNKED ESCALATE${SEATS} — panel did not converge after $ROUNDS round(s) over $leaves leaf unit(s); operator decides. Per-round artifacts in $CONS_OUT. Set MU_REVIEW_OVERRIDE=1 to proceed once adjudicated.${C_OFF}" >&2
       exit 3 ;;
   esac
 }
@@ -1081,35 +1143,39 @@ CONS_PROMPT="$CONS_OUT/round1.prompt.txt"
   [ -n "$CONTEXT" ] && printf '\nBEGIN UNTRUSTED REPO CONTENT: FULL FILE CONTEXT (CONTEXT only — definitions/guards outside the hunks; NOT part of the proposed change)\n%s\nEND UNTRUSTED REPO CONTENT: FULL FILE CONTEXT\n' "$CONTEXT"
 } > "$CONS_PROMPT"
 
-echo "${C_DIM}ai-review: CONSENSUS panel (code_review role, <=${MU_REVIEW_MAX_ROUNDS:-4} rounds) reviewing $FILES file(s) vs $BASE${C_OFF}"
-CONS_RESULT="$(MU_BIN="$MU" sh "$PANEL_DIR/consensus.sh" "$CONS_PROMPT" "$CONS_OUT" "$ROOT" "${MU_REVIEW_MAX_ROUNDS:-4}" 2>&1)"
+echo "${C_DIM}ai-review: CONSENSUS panel (code_review role, <=${MU_REVIEW_MAX_ROUNDS:-3} rounds) reviewing $FILES file(s) vs $BASE${C_OFF}"
+CONS_RESULT="$(MU_BIN="$MU" sh "$PANEL_DIR/consensus.sh" "$CONS_PROMPT" "$CONS_OUT" "$ROOT" "${MU_REVIEW_MAX_ROUNDS:-3}" 2>&1)"
 printf '%s\n' "$CONS_RESULT"
 VERDICT_LINE="$(printf '%s\n' "$CONS_RESULT" | grep -E '^CONSENSUS |^NO CONSENSUS' | tail -1)"
 ROUNDS="$(printf '%s\n' "$CONS_RESULT" | grep -cE '^round [0-9]')"
+# Seat census of the LAST round (the one that decided): " (live 4/5: gpt-5.5
+# unparsed)", empty when consensus.sh reported none.
+SEATS="$(printf '%s\n' "$CONS_RESULT" | grep -E '^PANEL SEATS: ' | tail -1)"
+SEATS="${SEATS#PANEL SEATS: }"; [ -n "$SEATS" ] && SEATS=" ($SEATS)"
 OVERRIDE_BOOL=false; [ "${MU_REVIEW_OVERRIDE:-}" = "1" ] && OVERRIDE_BOOL=true
 
 case "$VERDICT_LINE" in
   "CONSENSUS approve")
     log_panel_consensus PASS approve "$ROUNDS" false
-    echo "${C_GREEN}ai-review: PANEL PASS — consensus APPROVE after $ROUNDS round(s).${C_OFF}"
+    echo "${C_GREEN}ai-review: PANEL PASS${SEATS} — consensus APPROVE after $ROUNDS round(s).${C_OFF}"
     exit 0 ;;
   "CONSENSUS needs-changes")
     if [ "$OVERRIDE_BOOL" = true ]; then
       log_panel_consensus BLOCK needs-changes "$ROUNDS" true
-      echo "${C_YEL}ai-review: PANEL BLOCK (consensus needs-changes) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
+      echo "${C_YEL}ai-review: PANEL BLOCK${SEATS} (consensus needs-changes) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
       exit 0
     fi
     log_panel_consensus BLOCK needs-changes "$ROUNDS" false
-    echo "${C_RED}ai-review: PANEL BLOCK — consensus NEEDS-CHANGES after $ROUNDS round(s). Set MU_REVIEW_OVERRIDE=1 to proceed if you disagree.${C_OFF}" >&2
+    echo "${C_RED}ai-review: PANEL BLOCK${SEATS} — consensus NEEDS-CHANGES after $ROUNDS round(s). Set MU_REVIEW_OVERRIDE=1 to proceed if you disagree.${C_OFF}" >&2
     exit 1 ;;
   *)
     # consensus.sh exited 3 (no convergence within max rounds) or emitted no verdict line
     if [ "$OVERRIDE_BOOL" = true ]; then
       log_panel_consensus ESCALATE "${VERDICT_LINE:-none}" "$ROUNDS" true
-      echo "${C_YEL}ai-review: PANEL ESCALATE (no consensus) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
+      echo "${C_YEL}ai-review: PANEL ESCALATE${SEATS} (no consensus) overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
       exit 0
     fi
     log_panel_consensus ESCALATE "${VERDICT_LINE:-none}" "$ROUNDS" false
-    echo "${C_YEL}ai-review: PANEL ESCALATE — panel did not converge after $ROUNDS round(s); operator decides. Per-round artifacts in $CONS_OUT. Set MU_REVIEW_OVERRIDE=1 to proceed once adjudicated.${C_OFF}" >&2
+    echo "${C_YEL}ai-review: PANEL ESCALATE${SEATS} — panel did not converge after $ROUNDS round(s); operator decides. Per-round artifacts in $CONS_OUT. Set MU_REVIEW_OVERRIDE=1 to proceed once adjudicated.${C_OFF}" >&2
     exit 3 ;;
 esac

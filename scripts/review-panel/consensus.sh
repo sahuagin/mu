@@ -3,10 +3,17 @@
 #
 # The code_review panel (agent_roles.toml) reviews a diff, then converges over
 # ANTAGONISTIC rounds: each round every reviewer sees the others' positions and
-# presses or concedes on evidence. Stops when the panel agrees OR after
-# <max-rounds> (default 4); an unresolved split escalates. Models can't talk
+# presses or concedes on evidence. Stops when the LIVE seats agree OR after
+# <max-rounds> (default 3); an unresolved split escalates. Models can't talk
 # directly, so this script mediates the rounds (mu-dialogue peer-convergence is
 # a future swap-in).
+#
+# LIVE SEATS (mu-ash9p): a seat that times out or returns nothing recoverable
+# (no verdict and no findings) is ABSENT for that round, not a dissenter; a reply
+# that lists findings with the verdict blank is a needs-changes. converge.py
+# decides agreement among the seats that answered, and this script forwards its
+# census as a "PANEL SEATS: live <n>/<total>[ (quorum <q> unmet)][: <seat> <why>]"
+# line for ai-review's PANEL line.
 #
 # Reviewers seek the CORRECT verdict, not an agreed one: agreement-seeking is
 # what let convergence erase correct dissent (mu-mhzo). A sustained split is a
@@ -23,8 +30,11 @@
 #          erased an unrefuted finding >= medium (both ESCALATE)
 # env:   MU_REVIEW_AUDIT=0        skip the erasure audit (approve on verdicts alone)
 #        MU_REVIEW_AUDIT_FLOOR    severity bar for the audit (default medium)
+#        MU_REVIEW_MIN_LIVE_SEATS seats that must answer for agreement (default 3)
+#        MU_REVIEW_SEAT_TIMEOUT_SECS        API seat cap, seconds (default 900)
+#        MU_REVIEW_LOCAL_SEAT_TIMEOUT_SECS  local seat cap, seconds (default 1800)
 set -u
-P1="$1"; OUT="$2"; CWD="${3:-$PWD}"; MAXR="${4:-4}"
+P1="$1"; OUT="$2"; CWD="${3:-$PWD}"; MAXR="${4:-3}"
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROLES="${AGENT_ROLES:-$HOME/.config/mu/agent_roles.toml}"
 MU="${MU_BIN:-mu}"; TQ="${TQ:-tq}"
@@ -37,6 +47,9 @@ AGENT_DISPATCH_LIB="${AGENT_DISPATCH_LIB:-$HERE/../lib/agent-dispatch.sh}"
 . "$AGENT_DISPATCH_LIB"
 # mu-0htd: constrained verdict re-ask when a reviewer answers in prose.
 . "$HERE/verdict-retry.sh"
+# mu-ash9p: per-provider-class seat caps, identical in every round. WHY the cap
+# is not one number, and what a timed-out seat costs, is documented there.
+. "$HERE/seat-timeout.sh"
 # ci-aipr/review-panel should route around an operator-held ollama box instead
 # of waiting behind the fair lock. dispatch.sh uses the same default for round 1;
 # keep it exported for convergence rounds that call agent_dispatch directly.
@@ -70,9 +83,20 @@ scrub_utf8 "$P1"
 # aggregated leaf findings plus targeted file context for cited paths.
 awk '/^```diff/{f=1;next} /^```/{if(f)exit} f' "$P1" > "$OUT/diff.txt"
 
+# converge.py agree prints the verdict line first and its seat census second;
+# splitting them keeps the verdict line byte-identical to what ai-review.sh and
+# the AGREE cases below already match on.
+report_round() { # $1=round-label $2=agree-output; sets $res
+  res=$(printf '%s\n' "$2" | sed -n '1p')
+  echo "round $1: $res"
+  seats=$(printf '%s\n' "$2" | sed -n 's/^SEATS //p')
+  [ -n "$seats" ] && echo "PANEL SEATS: $seats"
+  return 0
+}
+
 # round 1: whole panel, same prompt (config-driven dispatch + ollama warm-up).
-sh "$HERE/dispatch.sh" "$P1" "$OUT/r1" "$CWD" 900
-res=$(python3 "$HERE/converge.py" agree "$OUT/r1"); echo "round 1: $res"
+sh "$HERE/dispatch.sh" "$P1" "$OUT/r1" "$CWD"
+report_round 1 "$(python3 "$HERE/converge.py" agree "$OUT/r1")"
 case "$res" in AGREE\ *) echo "CONSENSUS ${res#AGREE }"; exit 0;; esac
 
 ranks_json=$("$TQ" -o json -f "$ROLES" code_review.ranked)
@@ -89,6 +113,12 @@ while [ "$round" -lt "$MAXR" ]; do
     set -- $(agent-role code_review "$r"); prov="$1"; model="$2"
     tools=$(printf '%s' "$ranks_json" | jq -r ".[$r].tools // \"read,grep\"")
     max_turns=$(agent-role --max-turns code_review "$r" 2>/dev/null || true)
+    # Same cap this seat got in round 1: roster `timeout_secs` > provider class.
+    tmo=$(seat_timeout "$prov" "$(printf '%s' "$ranks_json" | jq -r ".[$r].timeout_secs // \"\"")")
+    # An exclusive seam seat (seam-seat change) must be visible to the tally
+    # in every round, not just round 1: converge.py withholds an approve while
+    # such a seat is absent (panel finding, PR #611).
+    seam=$(printf '%s' "$ranks_json" | jq -r ".[$r].seam // \"\"")
     # Per-rank endpoint/lease (mu-vneb) — same as dispatch.sh round 1, so a
     # per-card rank keeps dialing its own server across all convergence rounds.
     # Requires agent-role --env (mu#478); warn once, don't silently no-op.
@@ -104,25 +134,27 @@ while [ "$round" -lt "$MAXR" ]; do
       [ -n "$rank_env" ] && eval "export $rank_env"
       # agent_dispatch reads TOOLS/TIMEOUT/MU/ERRLOG from scope; stdout -> .out,
       # stderr -> $ERRLOG. claude-oauth now routes to `claude -p` instead of erroring.
-      TOOLS="$tools"; TIMEOUT=900; MAX_TURNS="$max_turns"; ERRLOG="$OUT/r${round}.${tag}.err"
+      TOOLS="$tools"; TIMEOUT="$tmo"; MAX_TURNS="$max_turns"; ERRLOG="$OUT/r${round}.${tag}.err"
       _out="$OUT/r${round}.${tag}.out"
       _retry=0
-      _max_retries="${MU_REVIEW_TIMEOUT_RETRIES:-${AI_REVIEW_TIMEOUT_RETRIES:-1}}"
+      # Default 0: a retry doubles the wall-clock a dead seat costs, and since
+      # mu-ash9p a timed-out seat no longer blocks the round it holds up.
+      _max_retries="${MU_REVIEW_TIMEOUT_RETRIES:-${AI_REVIEW_TIMEOUT_RETRIES:-0}}"
       agent_dispatch "$prov" "$model" "$OUT/r${round}.${tag}.prompt" > "$_out"
       _rc=$?
       while [ "$_rc" -eq 124 ] && [ "$_retry" -lt "$_max_retries" ]; do
         _retry=$((_retry + 1))
-        printf '%s\n' "reviewer timeout after ${TIMEOUT}s; retry ${_retry}/${_max_retries}" >> "$ERRLOG"
+        printf '%s\n' "reviewer timeout after ${tmo}s; retry ${_retry}/${_max_retries}" >> "$ERRLOG"
         agent_dispatch "$prov" "$model" "$OUT/r${round}.${tag}.prompt" > "$_out"
         _rc=$?
       done
       reask_if_unparsed "$prov" "$model" "$_out"
-      echo "exit=$_rc retry=$_retry $prov/$model" > "$OUT/r${round}.${tag}.done"
+      echo "exit=$_rc retry=$_retry $prov/$model tmo=$tmo seam=[$seam]" > "$OUT/r${round}.${tag}.done"
     ) &
     r=$((r + 1))
   done
   wait
-  res=$(python3 "$HERE/converge.py" agree "$OUT/r${round}"); echo "round $round: $res"
+  report_round "$round" "$(python3 "$HERE/converge.py" agree "$OUT/r${round}")"
   case "$res" in
     "AGREE approve")
       # A finding >= medium that vanished without an evidenced refutation was

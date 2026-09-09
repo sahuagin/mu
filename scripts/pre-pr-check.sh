@@ -5,8 +5,13 @@
 # the failing step is the last output. Print elapsed time per step.
 #
 # Env:
-#   PRE_PR_QUICK=1   skip cargo test (fmt + clippy only)
-#   PRE_PR_NO_COLOR  disable color output
+#   PRE_PR_QUICK=1       skip cargo test (fmt + clippy only)
+#   PRE_PR_SKIP_CARGO=1  skip fmt + clippy + test entirely and run only the cheap
+#                        gates below (the offline self-tests, verify-claims).
+#                        `just ci-aipr` sets it when scripts/ci-green-marker.sh
+#                        shows those three already green at THIS commit — the
+#                        repeat was 5-15 min of the review gate (mu-ash9p).
+#   PRE_PR_NO_COLOR      disable color output
 
 set -u
 set -o pipefail
@@ -37,6 +42,13 @@ fi
 
 cd "$REPO_ROOT"
 
+# Capture the commit id BEFORE the first check runs (mu-ash9p, panel finding on
+# PR #611). The receipt this run may write has to name the tree the checks
+# actually ran on; resolving the id at the END would fold an edit made during
+# the run into it and certify a tree nothing validated. ci-green-marker.sh
+# re-resolves at write time and refuses if the two no longer agree.
+CI_GREEN_ID="$(sh "$REPO_ROOT/scripts/ci-green-marker.sh" id 2>/dev/null || true)"
+
 # --- step runner -----------------------------------------------------------
 
 run_step() {
@@ -64,13 +76,17 @@ run_step() {
 
 # --- checks ----------------------------------------------------------------
 
-run_step "cargo fmt --check"  cargo fmt --all -- --check
-run_step "cargo clippy"       cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-if [ "${PRE_PR_QUICK:-}" = "1" ]; then
-  printf "%s==> skipping cargo test (PRE_PR_QUICK=1)%s\n\n" "$C_DIM" "$C_OFF"
+if [ "${PRE_PR_SKIP_CARGO:-}" = "1" ]; then
+  printf "%s==> skipping fmt/clippy/test (PRE_PR_SKIP_CARGO=1: already green at this commit)%s\n\n" "$C_DIM" "$C_OFF"
 else
-  run_step "cargo test --workspace" cargo test --workspace --all-features --no-fail-fast
+  run_step "cargo fmt --check"  cargo fmt --all -- --check
+  run_step "cargo clippy"       cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  if [ "${PRE_PR_QUICK:-}" = "1" ]; then
+    printf "%s==> skipping cargo test (PRE_PR_QUICK=1)%s\n\n" "$C_DIM" "$C_OFF"
+  else
+    run_step "cargo test --workspace" cargo test --workspace --all-features --no-fail-fast
+  fi
 fi
 
 # Review-gate self-test (mu-mhzo). Fixtures are captured panel runs, so this
@@ -99,6 +115,16 @@ review_size_gate_step() {
   bash "$t"
 }
 run_step "review-gate size gate" review_size_gate_step
+
+# ci-aipr fast-path self-test (mu-ash9p): the live-seat quorum in converge.py
+# `agree`, and the ci-green marker gate. Synthetic seat files and a throwaway
+# git repo, so this costs no model spend either.
+ci_aipr_fast_step() {
+  local t="$REPO_ROOT/scripts/tests/ci-aipr-fast-test.sh"
+  [ -f "$t" ] || { printf "%s    ci-aipr-fast-test.sh missing — skipping%s\n\n" "$C_DIM" "$C_OFF"; return 0; }
+  sh "$t"
+}
+run_step "ci-aipr fast path (live-seat quorum + ci-green marker)" ci_aipr_fast_step
 
 # Canary bead-filing idempotency (mu-ztmla). The offline cases run against a
 # strict fake beads client. When a real client and a beadsd url are present
@@ -184,5 +210,12 @@ orphans_nudge() {
   return 0
 }
 orphans_nudge
+
+# Record the receipt only when this run actually proved the three cargo steps
+# green here — quick mode skipped the tests, skip-cargo skipped all three, and
+# either would licence a ci-aipr skip it did not earn (mu-ash9p).
+if [ "${PRE_PR_QUICK:-}" != "1" ] && [ "${PRE_PR_SKIP_CARGO:-}" != "1" ]; then
+  sh "$REPO_ROOT/scripts/ci-green-marker.sh" write "$CI_GREEN_ID" || true
+fi
 
 printf "%spre-pr-check: all checks green%s\n" "$C_GREEN" "$C_OFF"

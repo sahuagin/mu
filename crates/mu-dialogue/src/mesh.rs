@@ -298,10 +298,15 @@ impl Drop for AbortOnDrop {
 /// A presence registration not yet owned by a [`Fronted`]. From the moment
 /// `start()` returns the responder answers `$SRV.PING`, so every way out of
 /// the setup path other than success — an error, the `bounded` timeout
-/// dropping the future mid-await, the caller being cancelled — has to end it
-/// (board finding: the setup path leaked the same phantom this fix removes).
-/// `Drop` cannot await, so it hands the (in-process) `stop()` to a detached
-/// task; [`PresenceGuard::into_parts`] disarms it on success.
+/// dropping the future mid-await, the caller being cancelled — ends it by
+/// dropping this guard (board finding: the setup path leaked the same phantom
+/// this fix removes). `Drop` cannot await, so it hands the work to a detached
+/// task running [`stop_presence`], which registers a stop anchor first when
+/// the setup path was cut short before it got one. Best-effort: with the
+/// broker unreachable the detached task logs and the registration stays
+/// until restart. [`PresenceGuard::into_parts`] disarms the guard; callers
+/// must not await between that and handing the parts to a [`Fronted`] that
+/// is reachable for release.
 struct PresenceGuard {
     presence: Option<async_nats::service::Service>,
     anchor: Option<async_nats::service::endpoint::Endpoint>,
@@ -351,11 +356,10 @@ impl Drop for PresenceGuard {
             return;
         };
         rt.spawn(async move {
-            match bounded(&format!("presence stop {peer} (abandoned registration)"), presence.stop()).await {
+            match stop_presence(presence, anchor, &peer).await {
                 Ok(()) => info!(peer = %peer, "gateway: stopped an abandoned presence registration"),
                 Err(e) => warn!(peer = %peer, "gateway: abandoned presence registration could not be stopped, it stays discoverable until restart: {e:#}"),
             }
-            drop(anchor);
         });
     }
 }
@@ -372,25 +376,52 @@ impl Fronted {
             stop_anchor,
         } = self;
         drop(task);
-        // Without the anchor, `stop()` cannot reach its abort (its shutdown
-        // broadcast has no receiver), so calling it would only report a
-        // closed channel. Say what is actually wrong.
-        let Some(anchor) = stop_anchor else {
-            return Err(anyhow!(
-                "no stop anchor was registered for {peer_id} at front time, so its $SRV presence cannot be deregistered"
-            ));
-        };
-        // `stop()` is in-process in async-nats 0.49 (a broadcast send and an
-        // abort), but the module rule is one bound per post-connect NATS
-        // await, not per what this library version happens to do (mu-10fa):
-        // release runs on the say/poll hot path via the front_peer race-loser
-        // branch and from the stale-peer sweep.
-        let stopped = bounded(&format!("presence stop {peer_id}"), presence.stop()).await;
-        // The anchor's receiver is what let `stop()` deliver; it is dropped
-        // only now, after the send.
-        drop(anchor);
-        stopped
+        stop_presence(presence, stop_anchor, peer_id).await
     }
+}
+
+/// The stop-anchor subject for a peer's presence service: under the peer's
+/// own DM subject tree (which the gateway already subscribes to), suffixed
+/// with the service's random id so it is not derivable from the peer id.
+async fn stop_anchor_subject(peer_id: &str, presence: &async_nats::service::Service) -> String {
+    format!(
+        "{}.gateway-presence.{}",
+        PeerId::parse(peer_id).dm_subject(),
+        presence.info().await.id
+    )
+}
+
+/// Deregister one presence registration. `stop()` only reaches its abort
+/// when the service holds an endpoint receiver, so a registration that never
+/// got its anchor (the setup path was cut short, or the endpoint call failed)
+/// gets one registered now, best-effort, before the stop. Every NATS await is
+/// under the module bound (mu-10fa): this runs on the say/poll hot path via
+/// the front_peer race-loser branch, from the stale-peer sweep, and from the
+/// guard's detached task.
+async fn stop_presence(
+    presence: async_nats::service::Service,
+    anchor: Option<async_nats::service::endpoint::Endpoint>,
+    peer_id: &str,
+) -> Result<()> {
+    let anchor = match anchor {
+        Some(anchor) => anchor,
+        None => {
+            let subject = stop_anchor_subject(peer_id, &presence).await;
+            bounded(
+                &format!("presence anchor {peer_id} (late)"),
+                presence.endpoint(subject),
+            )
+            .await
+            .map_err(|e| {
+                anyhow!("no stop anchor for {peer_id}, and registering one now failed, so its $SRV presence cannot be deregistered: {e:#}")
+            })?
+        }
+    };
+    let stopped = bounded(&format!("presence stop {peer_id}"), presence.stop()).await;
+    // The anchor's receiver is what let `stop()` deliver; it is dropped only
+    // now, after the send.
+    drop(anchor);
+    stopped
 }
 
 pub struct Gateway {
@@ -637,8 +668,9 @@ impl Gateway {
         // by a peer not yet fronted. An unreachable broker must not hang that.
         // Step 1: presence + its stop anchor. A PresenceGuard owns the
         // registration from the instant start() returns, so a failure or a
-        // timeout anywhere after that point stops the responder instead of
-        // leaking a phantom peer.
+        // timeout anywhere after that point stops the responder (registering
+        // a late anchor first if this step was cut short) instead of leaking
+        // a phantom peer.
         let guard = bounded(&format!("presence register {peer_id}"), async {
             let presence = self
                 .client
@@ -657,10 +689,7 @@ impl Gateway {
             // on; suffixed with the service's random id so the subject is not
             // predictable from the peer id. Best-effort: a peer must not lose
             // its mesh inbox over it.
-            let anchor_subject = format!(
-                "{subject}.gateway-presence.{}",
-                guard.service().info().await.id
-            );
+            let anchor_subject = stop_anchor_subject(peer_id, guard.service()).await;
             match guard.service().endpoint(anchor_subject).await {
                 Ok(ep) => guard.anchor = Some(ep),
                 Err(e) => {
@@ -720,23 +749,30 @@ impl Gateway {
             }
         });
 
-        let (presence, stop_anchor) = guard.into_parts();
-        let ours = Fronted {
-            task: AbortOnDrop(task),
-            presence,
-            stop_anchor,
-        };
+        let task = AbortOnDrop(task);
+        // Take the lock while the guard is still armed: a cancellation while
+        // waiting here drops the guard, which stops the presence. Only once
+        // the slot is ours does the guard hand over, and nothing awaits
+        // between that and the insert.
         let mut fronted = self.fronted.lock().await;
         if fronted.contains_key(peer_id) {
             // Lost a race: another call registered while we were awaiting.
-            // Release ours — subscription AND presence — outside the lock.
+            // Dropping `task` ends our subscription; dropping `guard` stops
+            // our presence (detached, logged).
             drop(fronted);
-            if let Err(e) = ours.release(peer_id).await {
-                warn!(peer = %peer_id, "gateway: releasing the losing duplicate registration failed: {e:#}");
-            }
+            drop(task);
+            drop(guard);
             return Ok(false);
         }
-        fronted.insert(peer_id.to_string(), ours);
+        let (presence, stop_anchor) = guard.into_parts();
+        fronted.insert(
+            peer_id.to_string(),
+            Fronted {
+                task,
+                presence,
+                stop_anchor,
+            },
+        );
         info!(peer = %peer_id, "mesh gateway: fronting peer (presence + dm inbox)");
         Ok(true)
     }
@@ -1044,6 +1080,44 @@ mod live_tests {
         assert!(
             live.contains_key(&peer),
             "without an endpoint the responder outlives stop(): {live:?}"
+        );
+    }
+
+    /// A registration abandoned before it got its stop anchor (the setup path
+    /// cut short by a timeout or a cancellation) must still end: the guard's
+    /// detached task registers a late anchor and stops it.
+    #[tokio::test]
+    #[ignore = "requires a live NATS server"]
+    async fn an_abandoned_registration_without_an_anchor_is_still_stopped() {
+        use async_nats::service::ServiceExt as _;
+        let (gw, _rx, _root) = live_gateway().await;
+        let client = async_nats::connect(&nats_url()).await.expect("raw client");
+        let peer = format!("cc:gw-abandon-{}", std::process::id());
+        let svc = client
+            .service_builder()
+            .metadata(PeerId::parse(&peer).mesh_metadata())
+            .start(
+                format!("{PRESENCE_PREFIX}{}", PeerId::parse(&peer).micro_name()),
+                "0.1.0",
+            )
+            .await
+            .expect("presence without an endpoint");
+        client.flush().await.unwrap();
+        let live = gw.srv_agents().await.expect("$SRV sweep");
+        assert!(live.contains_key(&peer), "registered: {live:?}");
+
+        drop(PresenceGuard::new(svc, &peer)); // anchor = None: the cut-short case
+        let mut last = HashMap::new();
+        for _ in 0..20 {
+            last = gw.srv_agents().await.expect("$SRV sweep");
+            if !last.contains_key(&peer) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            !last.contains_key(&peer),
+            "an abandoned anchor-less registration must stop answering $SRV.PING: {last:?}"
         );
     }
 

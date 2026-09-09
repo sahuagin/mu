@@ -47,6 +47,18 @@ pub enum StreamEvent {
         /// (clippy::large_enum_variant).
         #[serde(default)]
         usage: Option<Box<Usage>>,
+        /// The post-fallback `input_transformations` when the wire puts the
+        /// array beside `delta`, as it does `usage`. The array's placement on
+        /// this event is unverified (see [`MessageDeltaBody`]), so both
+        /// positions are read; the accumulator prefers this one when both
+        /// are present. Carried RAW here, like `message_start`'s Message: the
+        /// stream layer is lenient by design (every nested type on it
+        /// degrades rather than failing the event), so a malformed entry
+        /// cannot cost this event's `stop_reason` and `usage`. The
+        /// accumulator types it and errors on a malformed known entry, as
+        /// the non-streaming response parse does. Omitted when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_transformations: Option<JsonValue>,
     },
     MessageStop,
     Ping,
@@ -108,6 +120,19 @@ pub struct MessageDeltaBody {
     pub stop_reason: Option<StopReason>,
     #[serde(default)]
     pub stop_sequence: Option<String>,
+    /// `input_transformations` after a mid-stream server-side fallback: the
+    /// serving model's entries, replacing the array `message_start` carried
+    /// (`/docs/en/build-with-claude/streaming § Event types`). That page
+    /// describes `message_delta` as "top-level changes to the final Message
+    /// object" and says the final one "carries the array again", which does
+    /// not settle whether the array sits in `delta` (as `stop_reason` does)
+    /// or beside it (as `usage` does — the mu-yz48 scar above). No captured
+    /// stream has shown the event, so BOTH positions are modeled and read:
+    /// here, and on [`StreamEvent::MessageDelta`] itself. Raw JSON here for
+    /// the reason given on that variant; typed by the accumulator and by
+    /// [`ResponseMessage`](crate::ResponseMessage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_transformations: Option<JsonValue>,
 }
 
 /// An `error` event body.
@@ -138,7 +163,7 @@ mod tests {
             "usage": {"output_tokens": 15}
         }));
         match ev {
-            StreamEvent::MessageDelta { delta, usage } => {
+            StreamEvent::MessageDelta { delta, usage, .. } => {
                 assert_eq!(delta.stop_reason, Some(StopReason::EndTurn));
                 assert_eq!(
                     usage
@@ -147,6 +172,73 @@ mod tests {
                     Some(15),
                     "mu-yz48: reading usage from event top level, not delta.usage"
                 );
+            }
+            other => panic!("expected MessageDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_delta_can_carry_input_transformations() {
+        // /docs/en/build-with-claude/streaming § Event types — after a
+        // mid-stream fallback the final message_delta carries the serving
+        // model's input_transformations.
+        let ev = parse(json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "input_transformations": [
+                    {"type": "thinking_dropped", "path": "messages.1.content.0",
+                     "reason": "model_binding_mismatch"}
+                ]
+            },
+            "usage": {"output_tokens": 15}
+        }));
+        let entries = |v: &Option<JsonValue>| {
+            v.as_ref()
+                .and_then(|v| v.as_value().as_array())
+                .map(Vec::len)
+        };
+        match ev {
+            StreamEvent::MessageDelta { delta, .. } => {
+                assert_eq!(entries(&delta.input_transformations), Some(1));
+            }
+            other => panic!("expected MessageDelta, got {other:?}"),
+        }
+        // The same array beside `delta`, where `usage` rides (mu-yz48): the
+        // placement is unverified, so the sibling position parses too.
+        let ev = parse(json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "usage": {"output_tokens": 15},
+            "input_transformations": [
+                {"type": "thinking_dropped", "path": "messages.1.content.0",
+                 "reason": "model_binding_mismatch"}
+            ]
+        }));
+        match ev {
+            StreamEvent::MessageDelta {
+                delta,
+                input_transformations,
+                ..
+            } => {
+                assert!(delta.input_transformations.is_none());
+                assert_eq!(entries(&input_transformations), Some(1));
+            }
+            other => panic!("expected MessageDelta, got {other:?}"),
+        }
+        // Raw on this layer: a malformed entry does not cost the event its
+        // terminal metadata (the accumulator is where it becomes an error).
+        let ev = parse(json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 15},
+            "input_transformations": [{"type": "thinking_dropped", "path": {"i": 0}}]
+        }));
+        match ev {
+            StreamEvent::MessageDelta { delta, usage, .. } => {
+                assert_eq!(delta.stop_reason, Some(StopReason::EndTurn));
+                assert_eq!(usage.unwrap().output_tokens, Some(15));
             }
             other => panic!("expected MessageDelta, got {other:?}"),
         }

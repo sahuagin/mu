@@ -165,6 +165,142 @@ pub struct Container {
     pub extra: BTreeMap<String, JsonValue>,
 }
 
+/// Why a replayed block was removed (`input_transformations[].reason`). The
+/// four documented binding checks, listed in the precedence order the API
+/// reference gives for a block that would fail several
+/// (`/docs/en/api/beta/messages/create § Returns`, `input_transformations`).
+/// A value not listed there is kept verbatim in
+/// [`TransformationReason::Other`], so a captured response re-serializes as
+/// it arrived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransformationReason {
+    OrganizationBindingMismatch,
+    EndUserBindingMismatch,
+    /// Created by a model whose reasoning the requested model may not read
+    /// (`/docs/en/build-with-claude/preserved-thinking § Switching models
+    /// mid-conversation`).
+    ModelBindingMismatch,
+    /// The conversation before it differs from the one it was created in
+    /// (`§ What the API does with an invalid block`); the rest of that
+    /// turn's consecutive thinking blocks go with it.
+    PrefixBindingMismatch,
+    /// A reason this crate does not name, carried as the wire string.
+    Other(String),
+}
+
+impl TransformationReason {
+    /// The wire string.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::OrganizationBindingMismatch => "organization_binding_mismatch",
+            Self::EndUserBindingMismatch => "end_user_binding_mismatch",
+            Self::ModelBindingMismatch => "model_binding_mismatch",
+            Self::PrefixBindingMismatch => "prefix_binding_mismatch",
+            Self::Other(s) => s,
+        }
+    }
+
+    fn from_wire(s: &str) -> Self {
+        match s {
+            "organization_binding_mismatch" => Self::OrganizationBindingMismatch,
+            "end_user_binding_mismatch" => Self::EndUserBindingMismatch,
+            "model_binding_mismatch" => Self::ModelBindingMismatch,
+            "prefix_binding_mismatch" => Self::PrefixBindingMismatch,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+}
+
+impl Serialize for TransformationReason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TransformationReason {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(Self::from_wire(&s))
+    }
+}
+
+/// One entry of the response's top-level `input_transformations` — a change
+/// the API made to the request's input before showing it to the model, in
+/// request order (`/docs/en/build-with-claude/preserved-thinking § Set the
+/// mismatch behavior and read input_transformations`; beta
+/// `thinking-binding-controls-2026-08-01`). The one documented entry type is
+/// `thinking_dropped`, whose `path` is the `messages.{i}.content.{j}` form
+/// error messages use. The reference says to ignore entry types you do not
+/// recognize, so an entry of another `type` lands in
+/// [`InputTransformation::Unknown`] and round-trips verbatim — but a
+/// `thinking_dropped` entry is parsed STRICTLY, and a malformed one is a hard
+/// error rather than a silent `Unknown` (the [`ContentBlock`] discipline: wire
+/// breakage on a known type must be loud). Keys this crate does not model on
+/// a `thinking_dropped` entry ride in `extra`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputTransformation {
+    ThinkingDropped {
+        path: String,
+        reason: TransformationReason,
+        extra: BTreeMap<String, JsonValue>,
+    },
+    Unknown(JsonValue),
+}
+
+/// The typed body of a `thinking_dropped` entry, minus the `type` tag.
+#[derive(Serialize, Deserialize)]
+struct ThinkingDroppedEntry {
+    path: String,
+    reason: TransformationReason,
+    #[serde(flatten, default)]
+    extra: BTreeMap<String, JsonValue>,
+}
+
+impl<'de> Deserialize<'de> for InputTransformation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        match raw.get("type").and_then(serde_json::Value::as_str) {
+            Some("thinking_dropped") => {
+                let mut m = raw.as_object().cloned().unwrap_or_default();
+                m.remove("type");
+                let e: ThinkingDroppedEntry = serde_json::from_value(serde_json::Value::Object(m))
+                    .map_err(D::Error::custom)?;
+                Ok(InputTransformation::ThinkingDropped {
+                    path: e.path,
+                    reason: e.reason,
+                    extra: e.extra,
+                })
+            }
+            _ => Ok(InputTransformation::Unknown(
+                JsonValue::new(raw).map_err(D::Error::custom)?,
+            )),
+        }
+    }
+}
+
+impl Serialize for InputTransformation {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            InputTransformation::ThinkingDropped {
+                path,
+                reason,
+                extra,
+            } => {
+                let mut map = serde_json::Map::new();
+                map.insert("type".into(), "thinking_dropped".into());
+                map.insert("path".into(), path.clone().into());
+                map.insert("reason".into(), reason.as_str().into());
+                for (k, v) in extra {
+                    map.insert(k.clone(), v.as_value().clone());
+                }
+                serde_json::Value::Object(map).serialize(serializer)
+            }
+            InputTransformation::Unknown(v) => v.serialize(serializer),
+        }
+    }
+}
+
 /// A non-streaming response body. `kind` is the literal `"message"` tag the
 /// API stamps; kept for fidelity / round-trip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +324,15 @@ pub struct Message {
     pub stop_details: Option<StopDetails>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Blocks the API removed from the request before the model saw it
+    /// (beta `thinking-binding-controls-2026-08-01`). Present on every such
+    /// response, as `[]` when nothing was changed, so `Some(vec![])` and
+    /// absent stay distinct and re-serialize as they arrived. When streaming
+    /// it is final on `message_start`; only a mid-stream server-side fallback
+    /// makes the final `message_delta` carry a replacement (see
+    /// [`MessageDeltaBody`](crate::MessageDeltaBody)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_transformations: Option<Vec<InputTransformation>>,
 }
 
 #[cfg(test)]
@@ -239,6 +384,108 @@ mod tests {
         }))
         .unwrap();
         assert!(plain.container.is_none());
+    }
+
+    #[test]
+    fn input_transformations_match_the_documented_entry() {
+        // /docs/en/build-with-claude/preserved-thinking § Switching models
+        // mid-conversation — a block dropped by the model check, at the
+        // path form error messages use.
+        let raw = json!({
+            "id": "msg_01", "type": "message", "role": "assistant",
+            "model": "claude-opus-5", "content": [],
+            "input_transformations": [
+                {
+                    "type": "thinking_dropped",
+                    "path": "messages.3.content.0",
+                    "reason": "model_binding_mismatch"
+                }
+            ]
+        });
+        let m: Message = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(
+            m.input_transformations,
+            Some(vec![InputTransformation::ThinkingDropped {
+                path: "messages.3.content.0".into(),
+                reason: TransformationReason::ModelBindingMismatch,
+                extra: BTreeMap::new(),
+            }])
+        );
+        assert_eq!(serde_json::to_value(&m).unwrap(), raw);
+    }
+
+    #[test]
+    fn malformed_thinking_dropped_errors_not_degrades() {
+        // A known entry type with a missing or mistyped field is wire
+        // breakage and must be loud, not an `Unknown` a consumer matching
+        // on ThinkingDropped would never see.
+        for bad in [
+            json!({"type": "thinking_dropped", "path": "messages.0.content.0"}),
+            json!({"type": "thinking_dropped", "reason": "model_binding_mismatch"}),
+            json!({"type": "thinking_dropped", "path": {"i": 0}, "reason": "model_binding_mismatch"}),
+        ] {
+            assert!(
+                serde_json::from_value::<InputTransformation>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+        // An unmodeled key on a well-formed entry rides in `extra` and comes
+        // back out, so a capture that gains a field still round-trips.
+        let raw = json!({
+            "type": "thinking_dropped", "path": "messages.0.content.0",
+            "reason": "prefix_binding_mismatch", "turn": 3
+        });
+        let e: InputTransformation = serde_json::from_value(raw.clone()).unwrap();
+        match &e {
+            InputTransformation::ThinkingDropped { extra, .. } => {
+                assert_eq!(
+                    extra.get("turn").map(|v| v.as_value().clone()),
+                    Some(json!(3))
+                );
+            }
+            other => panic!("expected ThinkingDropped, got {other:?}"),
+        }
+        assert_eq!(serde_json::to_value(&e).unwrap(), raw);
+    }
+
+    #[test]
+    fn input_transformations_keep_empty_absent_and_unknown_apart() {
+        // The reference: present as `[]` on every response under the beta
+        // when nothing was changed; absent without the beta. The two must
+        // not collapse, or a re-serialized capture drifts.
+        let base =
+            json!({"id": "m", "type": "message", "role": "assistant", "model": "x", "content": []});
+        let absent: Message = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(absent.input_transformations, None);
+        assert!(serde_json::to_value(&absent)
+            .unwrap()
+            .get("input_transformations")
+            .is_none());
+        let mut with_empty = base.clone();
+        with_empty["input_transformations"] = json!([]);
+        let empty: Message = serde_json::from_value(with_empty.clone()).unwrap();
+        assert_eq!(empty.input_transformations, Some(vec![]));
+        assert_eq!(serde_json::to_value(&empty).unwrap(), with_empty);
+        // An entry type we do not recognize is kept verbatim (the reference
+        // asks for it to be ignored, not lost), and a reason we do not
+        // recognize is carried as its wire string; the whole response
+        // re-serializes as it arrived.
+        let mut odd = base;
+        odd["input_transformations"] = json!([
+            {"type": "something_new", "detail": 1},
+            {"type": "thinking_dropped", "path": "messages.0.content.0", "reason": "later_check"}
+        ]);
+        let m: Message = serde_json::from_value(odd.clone()).unwrap();
+        let entries = m.input_transformations.as_deref().unwrap();
+        assert!(matches!(entries[0], InputTransformation::Unknown(_)));
+        match &entries[1] {
+            InputTransformation::ThinkingDropped { reason, .. } => {
+                assert_eq!(*reason, TransformationReason::Other("later_check".into()));
+                assert_eq!(reason.as_str(), "later_check");
+            }
+            other => panic!("expected ThinkingDropped, got {other:?}"),
+        }
+        assert_eq!(serde_json::to_value(&m).unwrap(), odd);
     }
 
     #[test]

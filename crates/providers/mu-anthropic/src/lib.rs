@@ -27,8 +27,12 @@ pub use finite::FiniteF64;
 pub use json::{JsonValue, JsonValueError};
 pub use message::{ClearAt, Content, Message, Role};
 pub use request::{
-    ContextEdit, ContextManagement, McpServer, McpToolConfiguration, MessagesRequest, Metadata,
-    OutputConfig, ServerTool, ThinkingConfig, Tool, ToolChoice, ToolDef,
+    BlockBinding, ContextEdit, ContextManagement, McpServer, McpToolConfiguration, MessagesRequest,
+    Metadata, OutputConfig, PrefixMismatchBehavior, ServerTool, ThinkingConfig, ThinkingDisplay,
+    Tool, ToolChoice, ToolDef,
 };
-pub use response::{CacheCreation, Message as ResponseMessage, StopReason, Usage};
+pub use response::{
+    CacheCreation, InputTransformation, Message as ResponseMessage, StopReason,
+    TransformationReason, Usage,
+};
 pub use stream::{BlockDelta, BlockStart, MessageDeltaBody, StreamError, StreamEvent};

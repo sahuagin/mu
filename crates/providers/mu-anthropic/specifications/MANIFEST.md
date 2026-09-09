@@ -28,10 +28,14 @@ record.)
   inside `messages` with per-message `output_config` and `clear_at`
   (`Role::System`, `ClearAt`, the `Message::system` / `system_effort` /
   `turn_scoped` constructors; the mu-ai lane sends each beta header exactly
-  when a message carries its field). NOT yet modeled by this crate:
-  `thinking.display`, thinking-block binding and `input_transformations`, the
-  `fallbacks` parameter, `usage.speed`, the two toolsets. The itemized plan is
-  bead mu-anthropic-protocol-2026q3-6uqho.
+  when a message carries its field); `thinking.display` including `updates`
+  (`ThinkingDisplay`), thinking-block binding (`BlockBinding`,
+  `PrefixMismatchBehavior`) and the response's `input_transformations`
+  (`InputTransformation`, on the response, the stream's `message_delta` and
+  the accumulator; the lane sends each beta header when the body carries the
+  field). NOT yet modeled by this crate: the `fallbacks` parameter,
+  `usage.speed`, the two toolsets. The itemized plan is bead
+  mu-anthropic-protocol-2026q3-6uqho.
 - **Shape change between the pins, not truncation:** the previous `llms.txt`
   listed every API-reference page once per SDK language — 1305 entries tagged
   `(cli)`, `(csharp)`, `(Go)`, `(Java)`, `(php)`, `(Python)`, `(Ruby)`,

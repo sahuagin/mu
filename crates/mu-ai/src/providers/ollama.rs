@@ -111,6 +111,17 @@ impl OllamaProvider {
         self
     }
 
+    /// mu-c9b2l: `[session].max_tool_call_bytes`, forwarded to the wrapped
+    /// Messages accumulator — the one that measures a cut on this lane. An
+    /// ollama-served model is usually absent from the catalog, so it runs on
+    /// the unknown-model output floor and cuts big tool calls routinely;
+    /// without this the session's configured cap stopped at the wrapper and
+    /// the inner provider kept the compile-time default.
+    pub fn with_max_tool_call_bytes(mut self, max_bytes: Option<usize>) -> Self {
+        self.inner = self.inner.with_max_tool_call_bytes(max_bytes);
+        self
+    }
+
     /// Query the ollama server for its locally-available models via the
     /// native `/api/tags` endpoint. Best-effort: callers (the daemon's
     /// route-catalog probe) should treat any error as "ollama not
@@ -364,6 +375,56 @@ mod tests {
         assert_eq!(
             out,
             "ollama returned 404: model 'qwen3.6:35-a3b-q8_0' not found"
+        );
+    }
+
+    /// mu-c9b2l: this provider composes the Messages accumulator, so the
+    /// session's byte cap only bites if it travels through the wrapper. An
+    /// ollama-served model is usually absent from the catalog, which is
+    /// exactly the lane where calls get cut, so a cap that stopped at the
+    /// wrapper would leave the configured limit unenforced there.
+    #[test]
+    fn mu_c9b2l_session_cap_reaches_the_wrapped_provider() {
+        use mu_core::agent::tool_call_cut::DEFAULT_MAX_TOOL_CALL_BYTES;
+
+        fn endpoint() -> OllamaProvider {
+            OllamaProvider::with_endpoint(
+                "http://127.0.0.1:11434".to_string(),
+                String::new(),
+                "qwen3-coder:30b".to_string(),
+            )
+        }
+
+        // Unconfigured: the inner provider keeps the shipped default.
+        assert_eq!(
+            endpoint().inner.max_tool_call_bytes,
+            Some(DEFAULT_MAX_TOOL_CALL_BYTES)
+        );
+        // A lowered `[session].max_tool_call_bytes` reaches the accumulator.
+        assert_eq!(
+            endpoint()
+                .with_max_tool_call_bytes(Some(4096))
+                .inner
+                .max_tool_call_bytes,
+            Some(4096)
+        );
+        // The config's `0` disables the ceiling all the way down.
+        assert_eq!(
+            endpoint()
+                .with_max_tool_call_bytes(Some(0))
+                .inner
+                .max_tool_call_bytes,
+            None
+        );
+        // The env-resolved constructor the `ollama` selector uses forwards
+        // the same way.
+        assert_eq!(
+            OllamaProvider::from_env("qwen3-coder:30b".to_string())
+                .expect("ollama needs no key")
+                .with_max_tool_call_bytes(Some(8192))
+                .inner
+                .max_tool_call_bytes,
+            Some(8192)
         );
     }
 

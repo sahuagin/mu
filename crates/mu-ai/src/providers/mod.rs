@@ -8,6 +8,7 @@
 //! `codex`), `bedrock`.
 
 pub mod anthropic;
+pub(crate) mod cut_detect;
 pub mod http_error;
 pub mod ollama;
 pub mod openai;

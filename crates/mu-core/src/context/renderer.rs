@@ -245,8 +245,10 @@ pub enum CacheMarker {
 
 /// Cache time-to-live tier for providers with tiered prompt caching
 /// (mu-f1a0). Anthropic semantics: 5-minute writes bill at 1.25x the
-/// input rate, 1-hour writes at 2.0x; reads are 0.10x for both, and
-/// both TTLs slide (refresh on every hit).
+/// input rate, 1-hour writes at 2.0x; reads are the model's
+/// `ModelPricing::cache_read_ratio` (0.10x on most Claude models, 0.025x
+/// on Claude Fable 5.1 / Mythos 5.1) for both tiers, and both TTLs slide
+/// (refresh on every hit).
 ///
 /// Which tier wins is a workload property, measured on the 2026-06-04
 /// baseline session: 74% of its cache writes were expiry re-writes

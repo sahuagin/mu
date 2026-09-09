@@ -46,6 +46,20 @@ aliases = ["qwen36", "local-reasoner"]
 default_effort = "medium"
 ```
 
+Quirks are free-form strings; a provider consumes the ones it knows and
+ignores the rest. The Anthropic lane reads three kinds off the resolved model:
+`mid_conversation_tool_changes` (send that beta header); the `rejects_*`
+request rules, each naming a request shape Anthropic's API answers with a 400,
+which the lane refuses before the wire on that API and sends with a warning
+from any other endpoint; and the warn-only rules `ignores_fast_mode` (a shape
+the model accepts and disregards) and `retired` (an id gone from Anthropic's
+API; the request goes and Anthropic's own not-found is the authority, and off
+that API the rule is silent). A rule with no `prefix`/`prefixes` matches nothing
+and is warned about at load, since a renamed built-in rule leaves an override
+keyed on the old name orphaned. The shipped rules, with the spec page each one
+comes from, are the comment block over `[model_rules.*]` in
+`models.default.toml`.
+
 `daemon.list_routes` exposes the catalog-derived metadata on each route,
 including provider aliases/quirks, model aliases/quirks, `max_output_tokens`,
 and matching favorites.

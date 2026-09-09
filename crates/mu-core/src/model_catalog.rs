@@ -226,7 +226,26 @@ pub fn load(config_path: Option<&Path>) -> ModelCatalogConfig {
         let operator_keys: BTreeSet<String> = load_operator_only(p).models.into_keys().collect();
         fold_operator_overrides(&mut merged.models, &operator_keys);
     }
+    for key in prefixless_rules(&merged) {
+        tracing::warn!(
+            rule = %key,
+            "model catalog: [model_rules.{key}] has no `prefix`/`prefixes` and matches \
+             nothing — an override keyed on a name the built-in catalog no longer uses?"
+        );
+    }
     merged
+}
+
+/// Rule keys that can never match a model: no `prefix` and no `prefixes`.
+/// Figment merges by key, so an operator override of a rule the built-in
+/// catalog has since renamed deserializes into exactly this — a rule that
+/// silently applies to nothing — which is why [`load`] warns about each one.
+fn prefixless_rules(cfg: &ModelCatalogConfig) -> Vec<String> {
+    cfg.model_rules
+        .iter()
+        .filter(|(_, r)| r.prefix.is_none() && r.prefixes.is_empty())
+        .map(|(k, _)| k.clone())
+        .collect()
 }
 
 /// Collapse operator overrides keyed under a custom alias onto the
@@ -654,6 +673,32 @@ pub fn max_output_tokens_for_model(model: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An operator override keyed on a rule name the built-in catalog no
+    /// longer has (claude_gen_5_frontier was split in 6uqho.6) merges into a
+    /// rule with no prefix, which matches nothing; the loader names it. The
+    /// shipped catalog has none.
+    #[test]
+    fn orphaned_rule_override_is_named() {
+        assert!(prefixless_rules(&built_in()).is_empty());
+        let overlay = r#"
+[model_rules.claude_gen_5_frontier]
+max_output_tokens = 100000
+"#;
+        let cfg: ModelCatalogConfig = Figment::from(Serialized::defaults(built_in()))
+            .merge(Toml::string(overlay))
+            .extract()
+            .expect("overlay parses");
+        assert_eq!(
+            prefixless_rules(&cfg),
+            vec!["claude_gen_5_frontier".to_string()]
+        );
+        assert_eq!(
+            cfg.resolve_model("claude-opus-5").max_output_tokens,
+            Some(128000),
+            "the orphaned override changes nothing"
+        );
+    }
 
     #[test]
     fn detects_mis_keyed_model_tables() {

@@ -279,6 +279,323 @@ fn beta_override_from_env() -> Option<bool> {
     }
 }
 
+// ============================================================================
+// Per-model request rules (mu-anthropic-protocol-2026q3-6uqho.6)
+// ============================================================================
+//
+// The request shapes a model answers with a 400 are catalog quirks on its
+// `[model_rules.*]` entry in models.default.toml (operator-tunable in
+// ~/.config/mu/models.toml), one name per rule the 2026-09-04 spec snapshot
+// states. [`model_rule_hits`] reads a built body against them and `stream`
+// refuses a request that trips one before it is sent, so the lane reports the
+// model, the field and the rule instead of relaying Anthropic's error. The
+// endpoint gate is the one [`beta_headers`] has: the catalog describes
+// Anthropic's own API, so a hit refuses there and is sent with a warning
+// anywhere else (a gateway or an ollama box addressed with a Claude id may
+// map it to anything, and the ollama lane rides this provider in the same
+// daemon). Only the shape rules refuse: `retired` is a calendar fact, so it
+// warns and lets Anthropic answer. The wire tests pin that mu's own shaping trips none of the rules
+// for any cataloged Claude model, which is how each rule is "enforced as a
+// wire absence" today. The names are data the catalog and this file share: a
+// quirk this file does not know is ignored, and a rule the catalog does not
+// grant is not applied.
+
+/// `thinking: {type: "enabled", budget_tokens}` — every model from Opus 4.7 on
+/// (`thinking-troubleshooting § Thinking support, defaults, and rejected
+/// configurations by model`).
+const REJECTS_MANUAL_THINKING_QUIRK: &str = "rejects_manual_thinking";
+/// `thinking: {type: "disabled"}` — the always-on models (same table).
+const REJECTS_THINKING_DISABLED_QUIRK: &str = "rejects_thinking_disabled";
+/// `thinking: {type: "disabled"}` together with `output_config.effort`
+/// `xhigh` or `max` — Opus 5, which accepts `disabled` at `high` or below
+/// (same table, note 2). The API default effort is `high`, so `disabled`
+/// with no effort passes.
+const REJECTS_THINKING_DISABLED_ABOVE_HIGH_EFFORT_QUIRK: &str =
+    "rejects_thinking_disabled_above_high_effort";
+/// A non-default `temperature`, `top_p` or `top_k` (`thinking § Response
+/// prefill and forced tool use`). The rule reads presence: the API's default
+/// is the absent field, and mu has no reason to send one on this wire — the
+/// catalog's sampling fields ride the OpenAI-compat wires only.
+const REJECTS_SAMPLING_PARAMS_QUIRK: &str = "rejects_sampling_params";
+/// `tool_choice` `any` or `tool` (`whats-new-fable-5-1 § Forced tool use is
+/// not supported`); `auto` and `none` are fine.
+const REJECTS_FORCED_TOOL_CHOICE_QUIRK: &str = "rejects_forced_tool_choice";
+/// `speed: "fast"` is an error (`fast-mode`, the Opus 4.7 note).
+const REJECTS_FAST_MODE_QUIRK: &str = "rejects_fast_mode";
+/// `speed: "fast"` is accepted but runs and bills at standard speed, and
+/// `usage.speed` says so (`fast-mode`, the Opus 4.6 note). A warning, not a
+/// refusal: the request succeeds.
+const IGNORES_FAST_MODE_QUIRK: &str = "ignores_fast_mode";
+/// The id is retired on the Claude API (`model-deprecations § Model
+/// status`). A warning, never a refusal: unlike the shape rules this one
+/// encodes a calendar fact, not a body mu built, and a mis-transcribed row
+/// or a postponed retirement must not brick a lane, so the request goes and
+/// Anthropic's own answer is the authority; the warning names the rule so a
+/// 404 that follows reads as what it is. Raised on api.anthropic.com only:
+/// Bedrock and Google Cloud still serve some retired ids, a gateway may map
+/// the id to anything, and a warning on every request there would be noise.
+const RETIRED_QUIRK: &str = "retired";
+
+/// What a tripped rule means for the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleSeverity {
+    /// Anthropic would answer 400; the lane refuses before the wire. Only
+    /// on Anthropic's own API: elsewhere the same hit is a [`Warn`]
+    /// (`Self::Warn`) and the request goes.
+    Refuse,
+    /// The request is sent and the rule is logged: a field Anthropic
+    /// accepts but disregards, a retired id (Anthropic's answer is the
+    /// authority), or a refusal-grade hit on an endpoint that is not
+    /// Anthropic's own.
+    Warn,
+}
+
+/// One rule a built body trips: which quirk, on which model (the requested
+/// one or an explicit fallback target), and what the body did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuleHit {
+    quirk: &'static str,
+    model: String,
+    severity: RuleSeverity,
+    detail: String,
+}
+
+impl RuleHit {
+    /// The line the refusal or warning carries.
+    fn message(&self) -> String {
+        format!(
+            "{}: {} (catalog quirk `{}`)",
+            self.model, self.detail, self.quirk
+        )
+    }
+}
+
+/// The fields the rules read, for the requested model or for one explicit
+/// fallback target. A target "can override `max_tokens`, `thinking`,
+/// `output_config`, and `speed` for that attempt only" and is validated
+/// like a direct request to its model, so each override replaces the
+/// top-level value for that target's check, while `tool_choice` and the
+/// sampling fields, which a target cannot override, are the top level's.
+struct RuleView<'a> {
+    model: &'a str,
+    thinking_type: Option<&'a str>,
+    effort: Option<&'a str>,
+    speed: Option<&'a str>,
+    tool_choice: Option<&'a str>,
+    /// Which of `temperature`, `top_p`, `top_k` the body carries.
+    sampling: Vec<&'static str>,
+}
+
+impl<'a> RuleView<'a> {
+    fn new(body: &'a Value, model: &'a str, overrides: Option<&'a Value>) -> Self {
+        let present = |v: Option<&'a Value>| v.filter(|v| !v.is_null());
+        // The override wins only when the target names the field.
+        let field = |name: &str| {
+            present(overrides.and_then(|o| o.get(name))).or_else(|| present(body.get(name)))
+        };
+        Self {
+            model,
+            thinking_type: field("thinking")
+                .and_then(|t| t.get("type"))
+                .and_then(Value::as_str),
+            effort: field("output_config")
+                .and_then(|o| o.get("effort"))
+                .and_then(Value::as_str),
+            speed: field("speed").and_then(Value::as_str),
+            tool_choice: present(body.get("tool_choice"))
+                .and_then(|t| t.get("type"))
+                .and_then(Value::as_str),
+            sampling: ["temperature", "top_p", "top_k"]
+                .into_iter()
+                .filter(|k| present(body.get(*k)).is_some())
+                .collect(),
+        }
+    }
+
+    fn hits(
+        &self,
+        catalog: &mu_core::model_catalog::ModelCatalogConfig,
+        on_anthropic_api: bool,
+    ) -> Vec<RuleHit> {
+        let quirks = catalog.resolve_model(self.model).quirks;
+        let has = |q: &str| quirks.iter().any(|x| x == q);
+        let mut hits = Vec::new();
+        // Off Anthropic's own API a refusal becomes a warning: the catalog
+        // says what that API does with the shape, not what the endpoint
+        // behind an operator's base URL does with it.
+        let mut hit = |quirk: &'static str, severity: RuleSeverity, mut detail: String| {
+            let severity = if severity == RuleSeverity::Refuse && !on_anthropic_api {
+                detail.push_str(
+                    "; sent anyway, since the endpoint is not Anthropic's own API and the \
+                     id may map to anything there",
+                );
+                RuleSeverity::Warn
+            } else {
+                severity
+            };
+            hits.push(RuleHit {
+                quirk,
+                model: self.model.to_string(),
+                severity,
+                detail,
+            })
+        };
+        // `retired` is a warning on the API (Anthropic's answer is the
+        // authority; see the constant) and nothing at all off it, where a
+        // retired-on-Anthropic id is a live model on Bedrock or Google Cloud.
+        if on_anthropic_api && has(RETIRED_QUIRK) {
+            hit(
+                RETIRED_QUIRK,
+                RuleSeverity::Warn,
+                "the model id is retired on the Claude API per the 2026-09-04 snapshot; \
+                 sending anyway, and a not-found error that follows is that retirement — \
+                 pick a current id (`mu models`)"
+                    .into(),
+            );
+        }
+        if has(REJECTS_MANUAL_THINKING_QUIRK) && self.thinking_type == Some("enabled") {
+            hit(
+                REJECTS_MANUAL_THINKING_QUIRK,
+                RuleSeverity::Refuse,
+                "`thinking: {type: \"enabled\"}` (a manual budget) is a 400 on this model; \
+                 use `adaptive` with `output_config.effort`"
+                    .into(),
+            );
+        }
+        if has(REJECTS_THINKING_DISABLED_QUIRK) && self.thinking_type == Some("disabled") {
+            hit(
+                REJECTS_THINKING_DISABLED_QUIRK,
+                RuleSeverity::Refuse,
+                "thinking is always on: `thinking: {type: \"disabled\"}` is a 400 on this \
+                 model; omit `thinking` or send `adaptive`"
+                    .into(),
+            );
+        }
+        if has(REJECTS_THINKING_DISABLED_ABOVE_HIGH_EFFORT_QUIRK)
+            && self.thinking_type == Some("disabled")
+        {
+            if let Some(effort @ ("xhigh" | "max")) = self.effort {
+                hit(
+                    REJECTS_THINKING_DISABLED_ABOVE_HIGH_EFFORT_QUIRK,
+                    RuleSeverity::Refuse,
+                    format!(
+                        "`thinking: {{type: \"disabled\"}}` at effort `{effort}` is a 400 on \
+                         this model; `disabled` is accepted at `high` or below"
+                    ),
+                );
+            }
+        }
+        if has(REJECTS_SAMPLING_PARAMS_QUIRK) && !self.sampling.is_empty() {
+            hit(
+                REJECTS_SAMPLING_PARAMS_QUIRK,
+                RuleSeverity::Refuse,
+                format!(
+                    "`{}` is a 400 on this model (non-default sampling is rejected); \
+                     steer with the prompt instead",
+                    self.sampling.join("`, `")
+                ),
+            );
+        }
+        if has(REJECTS_FORCED_TOOL_CHOICE_QUIRK) {
+            if let Some(choice @ ("any" | "tool")) = self.tool_choice {
+                hit(
+                    REJECTS_FORCED_TOOL_CHOICE_QUIRK,
+                    RuleSeverity::Refuse,
+                    format!(
+                        "`tool_choice: {{type: \"{choice}\"}}` is a 400 on this model; use \
+                         `auto` (the default) or `none`, with `strict: true` tools or \
+                         structured outputs to force a schema"
+                    ),
+                );
+            }
+        }
+        if self.speed == Some("fast") {
+            if has(REJECTS_FAST_MODE_QUIRK) {
+                hit(
+                    REJECTS_FAST_MODE_QUIRK,
+                    RuleSeverity::Refuse,
+                    "`speed: \"fast\"` is an error on this model (fast mode is not offered \
+                     for it); omit `speed`"
+                        .into(),
+                );
+            } else if has(IGNORES_FAST_MODE_QUIRK) {
+                hit(
+                    IGNORES_FAST_MODE_QUIRK,
+                    RuleSeverity::Warn,
+                    "`speed: \"fast\"` runs at standard speed and standard billing on this \
+                     model; `usage.speed` will report `standard`"
+                        .into(),
+                );
+            }
+        }
+        hits
+    }
+}
+
+/// Every rule the body trips, for the requested model (`body.model`) and
+/// then for each explicit `fallbacks` target, in body order. `fallbacks:
+/// "default"` names no model and is Anthropic's to validate.
+fn model_rule_hits(
+    catalog: &mu_core::model_catalog::ModelCatalogConfig,
+    body: &Value,
+    on_anthropic_api: bool,
+) -> Vec<RuleHit> {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut hits = RuleView::new(body, model, None).hits(catalog, on_anthropic_api);
+    for target in body
+        .get("fallbacks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(target_model) = target.get("model").and_then(Value::as_str) {
+            hits.extend(
+                RuleView::new(body, target_model, Some(target)).hits(catalog, on_anthropic_api),
+            );
+        }
+    }
+    hits
+}
+
+/// The identity headers on a Claude API response (`api/overview § Response
+/// headers`): `request-id`, the per-request id support asks for, and
+/// `anthropic-workspace-id`, the `wrkspc_`-prefixed workspace the key
+/// resolved to (`manage-claude/workspaces § Identify the workspace behind an
+/// API response`; absent when the credential resolves to no workspace or the
+/// request failed before authentication). Returned as (request id,
+/// workspace id). What the epic asked of the transport is to log the
+/// workspace id; the request id rides the same line because the two are
+/// what support asks for together.
+fn response_identity(headers: &reqwest::header::HeaderMap) -> (Option<String>, Option<String>) {
+    let get = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    (get("request-id"), get("anthropic-workspace-id"))
+}
+
+/// Log [`response_identity`] for a response, at debug: one line per request
+/// is transport detail, visible when the transport is being watched
+/// (`RUST_LOG=mu_ai=debug`) and silent at the daemon's default level. A
+/// failed request keeps its id either way — Anthropic's error body carries
+/// `request_id` as a sibling of `error`, and the rendered error keeps it.
+fn log_response_identity(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) {
+    let (request_id, workspace_id) = response_identity(headers);
+    if request_id.is_some() || workspace_id.is_some() {
+        tracing::debug!(
+            status = %status,
+            request_id = request_id.as_deref().unwrap_or(""),
+            workspace_id = workspace_id.as_deref().unwrap_or(""),
+            "anthropic response"
+        );
+    }
+}
+
 /// Direct API Provider. Holds an API key (ENV-sourced is fine — this
 /// isn't an OAuth token).
 pub struct AnthropicProvider {
@@ -496,8 +813,28 @@ impl Provider for AnthropicProvider {
             }
         }
 
+        // mu-anthropic-protocol-2026q3-6uqho.6: the catalog's per-model rules,
+        // read off the body the lane is about to send. On Anthropic's own API a
+        // rule it would answer with a 400 refuses here, naming the model, the
+        // field and the quirk; a rule it answers by disregarding the field, or
+        // any hit on another endpoint, is a warning and the request goes.
+        let catalog = mu_core::model_catalog::global();
+        for hit in model_rule_hits(catalog, &body, on_anthropic_api(&self.api_base)) {
+            match hit.severity {
+                RuleSeverity::Refuse => {
+                    return Err(ProviderError::Other(format!(
+                        "anthropic request refused before the wire: {}",
+                        hit.message()
+                    )));
+                }
+                RuleSeverity::Warn => {
+                    tracing::warn!(model = %hit.model, quirk = hit.quirk, "{}", hit.detail);
+                }
+            }
+        }
+
         let betas = RequestBetas::resolve(
-            mu_core::model_catalog::global(),
+            catalog,
             &self.model,
             &self.api_base,
             beta_override_from_env(),
@@ -509,6 +846,7 @@ impl Provider for AnthropicProvider {
             .send()
             .await
             .map_err(|e| ProviderError::Other(format!("anthropic request: {e}")))?;
+        log_response_identity(resp.status(), resp.headers());
 
         // A retired or renamed catalog beta must not brick the lane: on a 400
         // that names it, retry without it, say so, and latch. Only a request
@@ -545,6 +883,7 @@ impl Provider for AnthropicProvider {
                 .send()
                 .await
                 .map_err(|e| ProviderError::Other(format!("anthropic request: {e}")))?;
+            log_response_identity(resp.status(), resp.headers());
         }
 
         if !resp.status().is_success() {
@@ -754,10 +1093,13 @@ fn map_agent_message_single(m: &AgentMessage) -> Option<AnthMessage> {
 /// its no-`thinking` shape — this is why the byte-parity tests still pass).
 ///
 /// For `Some(effort)`, set `thinking: {type:"adaptive", display:"summarized"}`
-/// plus `output_config.effort = <level>`. Rationale (claude-api, 2026): on Opus
-/// 4.6+, Sonnet 4.6, and Fable, the legacy `{type:"enabled", budget_tokens}`
-/// form is removed (400) — `adaptive` is the on-mode and `output_config.effort`
-/// controls depth. `display:"summarized"` is required to surface readable
+/// plus `output_config.effort = <level>`. Rationale (2026-09-04 snapshot,
+/// thinking-troubleshooting § Thinking support, defaults, and rejected
+/// configurations by model): the manual `{type:"enabled", budget_tokens}` form
+/// is deprecated on the 4.6 models (still accepted) and a 400 from Opus 4.7
+/// on, so the lane never sends it — `adaptive` is the on-mode and
+/// `output_config.effort` controls depth; the per-model rejections are the
+/// catalog's `rejects_*` quirks. `display:"summarized"` is required to surface readable
 /// reasoning: the default `"omitted"` returns `thinking` blocks with EMPTY text
 /// (the raw chain of thought is never exposed; only a summary). (mu-upk2)
 fn apply_thinking(body: &mut Value, effort: Option<&str>) {

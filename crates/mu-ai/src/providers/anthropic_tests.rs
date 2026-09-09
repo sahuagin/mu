@@ -262,8 +262,9 @@ fn apply_thinking_none_is_noop() {
 #[test]
 fn apply_thinking_sets_adaptive_summarized_and_effort() {
     // The modern Claude shape: adaptive + summarized display + output_config.effort.
-    // (display:summarized is required for readable reasoning; enabled+budget 400s
-    // on Opus 4.6+/Fable.)
+    // (display:summarized is required for readable reasoning; enabled+budget is
+    // deprecated on the 4.6 models and a 400 from Opus 4.7 on — the catalog's
+    // rejects_manual_thinking rule, tested with the other model rules.)
     let mut body = build_request_body("claude-opus-4-8", None, &[], &[]);
     let base_max = body["max_tokens"].clone();
     apply_thinking(&mut body, Some("high"));
@@ -1881,6 +1882,525 @@ mod live_tests {
         let mut earlier = j1[0].clone();
         earlier.as_object_mut().unwrap().remove("cache_control");
         assert_eq!(j2[0], earlier);
+    }
+
+    // ----------------------------------------------------------------------
+    // mu-anthropic-protocol-2026q3-6uqho.6: per-model request rules
+    // ----------------------------------------------------------------------
+
+    /// The rule quirks the shipped catalog grants, model by model, against
+    /// the 2026-09-04 spec snapshot (the thinking table on
+    /// thinking-troubleshooting, the sampling note on thinking, the Fable
+    /// 5.1 breaking changes, the fast-mode notes, the deprecations table),
+    /// and no rule for the models those pages leave alone. Date-stamped ids
+    /// inherit by prefix; the per-family output ceiling survives the split
+    /// into per-model rules.
+    #[test]
+    fn shipped_catalog_states_each_documented_rule_and_no_other() {
+        let catalog = mu_core::model_catalog::built_in();
+        const RULES: [&str; 8] = [
+            REJECTS_MANUAL_THINKING_QUIRK,
+            REJECTS_THINKING_DISABLED_QUIRK,
+            REJECTS_THINKING_DISABLED_ABOVE_HIGH_EFFORT_QUIRK,
+            REJECTS_SAMPLING_PARAMS_QUIRK,
+            REJECTS_FORCED_TOOL_CHOICE_QUIRK,
+            REJECTS_FAST_MODE_QUIRK,
+            IGNORES_FAST_MODE_QUIRK,
+            RETIRED_QUIRK,
+        ];
+        // Only the rule quirks: the tool-changes beta has its own test above,
+        // and a local model's serving quirks are not rules.
+        let rules = |model: &str| {
+            let mut q = catalog.resolve_model(model).quirks;
+            q.retain(|q| RULES.contains(&q.as_str()));
+            q.sort();
+            q
+        };
+        let expect = |models: &[&str], quirks: &[&str]| {
+            let mut want: Vec<String> = quirks.iter().map(|q| q.to_string()).collect();
+            want.sort();
+            for model in models {
+                assert_eq!(rules(model), want, "{model}");
+            }
+        };
+        expect(
+            &[
+                "claude-fable-5-1",
+                "claude-mythos-5-1",
+                "claude-fable-5-1-20261001",
+            ],
+            &[
+                REJECTS_MANUAL_THINKING_QUIRK,
+                REJECTS_THINKING_DISABLED_QUIRK,
+                REJECTS_SAMPLING_PARAMS_QUIRK,
+                REJECTS_FORCED_TOOL_CHOICE_QUIRK,
+            ],
+        );
+        expect(
+            &["claude-fable-5", "claude-mythos-5"],
+            &[
+                REJECTS_MANUAL_THINKING_QUIRK,
+                REJECTS_THINKING_DISABLED_QUIRK,
+                REJECTS_SAMPLING_PARAMS_QUIRK,
+            ],
+        );
+        expect(
+            &["claude-opus-5", "claude-opus-5-20260724"],
+            &[
+                REJECTS_MANUAL_THINKING_QUIRK,
+                REJECTS_THINKING_DISABLED_ABOVE_HIGH_EFFORT_QUIRK,
+                REJECTS_SAMPLING_PARAMS_QUIRK,
+            ],
+        );
+        expect(
+            &[
+                "claude-sonnet-5",
+                "claude-opus-4-8",
+                "claude-opus-4-8-20260901",
+            ],
+            &[REJECTS_MANUAL_THINKING_QUIRK, REJECTS_SAMPLING_PARAMS_QUIRK],
+        );
+        expect(
+            &["claude-opus-4-7"],
+            &[
+                REJECTS_MANUAL_THINKING_QUIRK,
+                REJECTS_SAMPLING_PARAMS_QUIRK,
+                REJECTS_FAST_MODE_QUIRK,
+            ],
+        );
+        expect(&["claude-opus-4-6"], &[IGNORES_FAST_MODE_QUIRK]);
+        expect(
+            &[
+                "claude-opus-4-1",
+                "claude-opus-4-1-20250805",
+                "claude-opus-4-20250514",
+                "claude-sonnet-4-20250514",
+            ],
+            &[RETIRED_QUIRK],
+        );
+        expect(
+            &[
+                "claude-sonnet-4-6",
+                "claude-haiku-4-5",
+                "claude-opus-4-5-20251101",
+                "qwen3.6:27b",
+                "",
+            ],
+            &[],
+        );
+        for model in [
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "claude-opus-5-20260724",
+            "claude-opus-4-7-20260301",
+            "claude-opus-4-6",
+            // Retired, but a gateway may still serve them: the family
+            // ceiling survives the rule that marks them.
+            "claude-opus-4-1-20250805",
+            "claude-opus-4-20250514",
+        ] {
+            assert_eq!(
+                catalog.resolve_model(model).max_output_tokens,
+                Some(128000),
+                "{model}"
+            );
+        }
+        assert_eq!(
+            catalog
+                .resolve_model("claude-sonnet-4-20250514")
+                .max_output_tokens,
+            Some(8192)
+        );
+    }
+
+    /// Every Claude id the catalog knows, on both wire paths, at every
+    /// effort the lane can be asked for: the body mu builds trips no rule.
+    /// That is the wire-absence half of the contract, stated on the fields
+    /// themselves too — no `tool_choice`, `speed`, sampling or `fallbacks`,
+    /// and `thinking` either absent or `adaptive` — so a change that starts
+    /// sending one of them has to come through the rules.
+    #[test]
+    fn shipped_shaping_trips_no_rule_on_any_cataloged_claude_model() {
+        let catalog = mu_core::model_catalog::built_in();
+        let messages = vec![AgentMessage::User {
+            content: "hi".into(),
+        }];
+        let tools = vec![ToolSpec {
+            name: "read".into(),
+            description: "read a file".into(),
+            input_schema: json!({"type": "object"}),
+            ..Default::default()
+        }];
+        let projection = build_projection_with_cache_strategy(Some("sys"), &messages, &tools);
+        let models: Vec<String> = catalog
+            .models
+            .values()
+            .filter_map(|m| m.model.clone())
+            .filter(|m| m.starts_with("claude-"))
+            .collect();
+        assert!(models.len() >= 9, "{models:?}");
+        for model in &models {
+            for effort in [
+                None,
+                Some("low"),
+                Some("medium"),
+                Some("high"),
+                Some("xhigh"),
+                Some("max"),
+            ] {
+                let legacy = {
+                    let mut b = build_request_body_with_catalog(
+                        &catalog,
+                        model,
+                        Some("sys"),
+                        &messages,
+                        &tools,
+                    );
+                    apply_thinking(&mut b, effort);
+                    b
+                };
+                let projected = {
+                    let mut b = build_request_body_from_projection(
+                        model,
+                        &projection,
+                        &tools,
+                        CacheTtl::default(),
+                    );
+                    apply_thinking(&mut b, effort);
+                    b
+                };
+                for body in [legacy, projected] {
+                    assert_eq!(body["model"], json!(model));
+                    let hits = model_rule_hits(&catalog, &body, true);
+                    assert!(hits.is_empty(), "{model} at {effort:?}: {hits:?}");
+                    let obj = body.as_object().unwrap();
+                    for key in [
+                        "tool_choice",
+                        "speed",
+                        "temperature",
+                        "top_p",
+                        "top_k",
+                        "fallbacks",
+                    ] {
+                        assert!(
+                            !obj.contains_key(key),
+                            "{model} at {effort:?} carries `{key}`"
+                        );
+                    }
+                    let thinking_type = body
+                        .get("thinking")
+                        .and_then(|t| t.get("type"))
+                        .and_then(Value::as_str);
+                    assert!(
+                        matches!(thinking_type, None | Some("adaptive")),
+                        "{model} at {effort:?}: thinking {thinking_type:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Each rule fires on exactly the shape it names, on a model the catalog
+    /// grants it to and not on one it does not, with the model, the field
+    /// and the quirk in the message; the shape rules refuse, `retired` and
+    /// `ignores_fast_mode` warn. Bodies come from mu-anthropic's typed
+    /// request so the crate and the rules agree on the wire shape.
+    #[test]
+    fn each_rule_refuses_the_shape_it_names() {
+        use mu_anthropic::{OutputConfig, Speed, ThinkingConfig, ToolChoice};
+        let catalog = mu_core::model_catalog::built_in();
+        let base = |model: &str| MessagesRequest::new(model, 1, vec![AnthMessage::user("hi")]);
+        let hits = |req: MessagesRequest, on_api: bool| {
+            model_rule_hits(&catalog, &serde_json::to_value(req).unwrap(), on_api)
+        };
+        let one = |req: MessagesRequest, quirk: &str, severity: RuleSeverity| {
+            let found = hits(req, true);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].quirk, quirk);
+            assert_eq!(found[0].severity, severity);
+            found[0].clone()
+        };
+        let none = |req: MessagesRequest| {
+            let found = hits(req, true);
+            assert!(found.is_empty(), "{found:?}");
+        };
+        let effort = |level: &str| OutputConfig {
+            effort: Some(level.into()),
+            ..Default::default()
+        };
+
+        // Forced tool choice: the 5.1 pair only; auto and none pass everywhere.
+        let hit = one(
+            base("claude-fable-5-1").with_tool_choice(ToolChoice::any()),
+            REJECTS_FORCED_TOOL_CHOICE_QUIRK,
+            RuleSeverity::Refuse,
+        );
+        assert!(
+            hit.message().contains("claude-fable-5-1"),
+            "{}",
+            hit.message()
+        );
+        assert!(
+            hit.message().contains("`any`") || hit.message().contains("\"any\""),
+            "{}",
+            hit.message()
+        );
+        assert!(hit.message().contains(REJECTS_FORCED_TOOL_CHOICE_QUIRK));
+        one(
+            base("claude-mythos-5-1").with_tool_choice(ToolChoice::tool("read")),
+            REJECTS_FORCED_TOOL_CHOICE_QUIRK,
+            RuleSeverity::Refuse,
+        );
+        none(base("claude-fable-5-1").with_tool_choice(ToolChoice::auto()));
+        none(base("claude-fable-5-1").with_tool_choice(ToolChoice::None));
+        none(base("claude-opus-5").with_tool_choice(ToolChoice::any()));
+        none(base("claude-fable-5").with_tool_choice(ToolChoice::tool("read")));
+
+        // Manual thinking: every 4.7+ model; Opus 4.6 still takes it (deprecated).
+        for model in [
+            "claude-sonnet-5",
+            "claude-opus-4-7",
+            "claude-fable-5-1",
+            "claude-opus-5",
+        ] {
+            one(
+                base(model).with_thinking(ThinkingConfig::enabled(1024)),
+                REJECTS_MANUAL_THINKING_QUIRK,
+                RuleSeverity::Refuse,
+            );
+        }
+        none(base("claude-opus-4-6").with_thinking(ThinkingConfig::enabled(1024)));
+
+        // Disabled thinking: the always-on models refuse it outright; Opus 5
+        // refuses it at xhigh/max only (the API default effort is high);
+        // Sonnet 5 accepts it at every effort.
+        one(
+            base("claude-fable-5-1").with_thinking(ThinkingConfig::Disabled),
+            REJECTS_THINKING_DISABLED_QUIRK,
+            RuleSeverity::Refuse,
+        );
+        none(base("claude-opus-5").with_thinking(ThinkingConfig::Disabled));
+        none(
+            base("claude-opus-5")
+                .with_thinking(ThinkingConfig::Disabled)
+                .with_output_config(effort("high")),
+        );
+        for level in ["xhigh", "max"] {
+            let hit = one(
+                base("claude-opus-5")
+                    .with_thinking(ThinkingConfig::Disabled)
+                    .with_output_config(effort(level)),
+                REJECTS_THINKING_DISABLED_ABOVE_HIGH_EFFORT_QUIRK,
+                RuleSeverity::Refuse,
+            );
+            assert!(hit.detail.contains(level), "{}", hit.detail);
+        }
+        none(
+            base("claude-opus-5")
+                .with_thinking(ThinkingConfig::adaptive())
+                .with_output_config(effort("max")),
+        );
+        none(
+            base("claude-sonnet-5")
+                .with_thinking(ThinkingConfig::Disabled)
+                .with_output_config(effort("max")),
+        );
+
+        // Sampling: presence of any of the three, named in the message.
+        let hit = one(
+            base("claude-sonnet-5").with_temperature(0.7),
+            REJECTS_SAMPLING_PARAMS_QUIRK,
+            RuleSeverity::Refuse,
+        );
+        assert!(hit.detail.contains("`temperature`"), "{}", hit.detail);
+        let mut with_top_k = base("claude-opus-4-8").with_top_p(0.9);
+        with_top_k.top_k = Some(40);
+        let hit = one(
+            with_top_k,
+            REJECTS_SAMPLING_PARAMS_QUIRK,
+            RuleSeverity::Refuse,
+        );
+        assert!(hit.detail.contains("`top_p`, `top_k`"), "{}", hit.detail);
+        none(base("claude-sonnet-4-6").with_temperature(0.7));
+
+        // Fast mode: an error on Opus 4.7, disregarded on Opus 4.6, offered
+        // on Opus 5; `standard` is never a hit.
+        one(
+            base("claude-opus-4-7").with_speed(Speed::Fast),
+            REJECTS_FAST_MODE_QUIRK,
+            RuleSeverity::Refuse,
+        );
+        one(
+            base("claude-opus-4-6").with_speed(Speed::Fast),
+            IGNORES_FAST_MODE_QUIRK,
+            RuleSeverity::Warn,
+        );
+        none(base("claude-opus-5").with_speed(Speed::Fast));
+        none(base("claude-opus-4-7").with_speed(Speed::Standard));
+
+        // Retired: a warning on Anthropic's own endpoint (the request goes;
+        // Anthropic's not-found is the authority), nothing at all elsewhere.
+        for model in [
+            "claude-opus-4-1-20250805",
+            "claude-opus-4-20250514",
+            "claude-sonnet-4-20250514",
+        ] {
+            let hit = one(base(model), RETIRED_QUIRK, RuleSeverity::Warn);
+            assert!(hit.detail.contains("sending anyway"), "{}", hit.detail);
+            assert!(hits(base(model), false).is_empty(), "{model} off the API");
+        }
+        none(base("claude-opus-4-8"));
+
+        // Every other rule is endpoint-gated the way the beta header is:
+        // the same body that is refused on api.anthropic.com is sent with a
+        // warning from a gateway, and the warning says so.
+        let found = hits(base("claude-fable-5-1").with_temperature(0.7), false);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].quirk, REJECTS_SAMPLING_PARAMS_QUIRK);
+        assert_eq!(found[0].severity, RuleSeverity::Warn);
+        assert!(
+            found[0].detail.contains("sent anyway"),
+            "{}",
+            found[0].detail
+        );
+        let found = hits(base("claude-opus-4-7").with_speed(Speed::Fast), false);
+        assert_eq!(found[0].severity, RuleSeverity::Warn);
+
+        // Several violations report as several hits, in rule order.
+        let found = hits(
+            base("claude-fable-5-1")
+                .with_tool_choice(ToolChoice::any())
+                .with_temperature(0.5),
+            true,
+        );
+        assert_eq!(
+            found.iter().map(|h| h.quirk).collect::<Vec<_>>(),
+            vec![
+                REJECTS_SAMPLING_PARAMS_QUIRK,
+                REJECTS_FORCED_TOOL_CHOICE_QUIRK
+            ]
+        );
+    }
+
+    /// The ollama switch is the one mu-built shape a rule names: `--thinking
+    /// off` on that lane sends `thinking: {type: "disabled"}`. That lane is
+    /// never Anthropic's own endpoint, so on a Claude-tagged model behind it
+    /// the hit is a warning and the request goes; the same body on the API
+    /// itself is refused. A model that accepts `disabled` (Sonnet 5) trips
+    /// nothing either way.
+    #[test]
+    fn ollama_switch_disabled_thinking_warns_off_the_api_and_refuses_on_it() {
+        let catalog = mu_core::model_catalog::built_in();
+        let messages = vec![AgentMessage::User {
+            content: "hi".into(),
+        }];
+        let body = |model: &str| {
+            let mut b = build_request_body_with_catalog(&catalog, model, None, &messages, &[]);
+            apply_ollama_thinking(&mut b, Some("off"));
+            assert_eq!(b["thinking"]["type"], "disabled");
+            b
+        };
+        let off = model_rule_hits(&catalog, &body("claude-fable-5-1"), false);
+        assert_eq!(off.len(), 1, "{off:?}");
+        assert_eq!(off[0].quirk, REJECTS_THINKING_DISABLED_QUIRK);
+        assert_eq!(off[0].severity, RuleSeverity::Warn);
+        let on = model_rule_hits(&catalog, &body("claude-fable-5-1"), true);
+        assert_eq!(on.len(), 1, "{on:?}");
+        assert_eq!(on[0].severity, RuleSeverity::Refuse);
+        for on_api in [false, true] {
+            let found = model_rule_hits(&catalog, &body("claude-sonnet-5"), on_api);
+            assert!(found.is_empty(), "{found:?}");
+        }
+    }
+
+    /// An explicit fallback target is validated like a direct request to
+    /// its own model: its overrides (`thinking`, `output_config`, `speed`)
+    /// replace the top level's for that check, and the fields a target
+    /// cannot override (`tool_choice`, sampling) are read from the top
+    /// level. `fallbacks: "default"` names no model and is not checked.
+    #[test]
+    fn fallback_targets_are_checked_against_their_own_model() {
+        use mu_anthropic::{FallbackTarget, Fallbacks, OutputConfig, ThinkingConfig, ToolChoice};
+        let catalog = mu_core::model_catalog::built_in();
+        let base = |model: &str| MessagesRequest::new(model, 1, vec![AnthMessage::user("hi")]);
+        let hits = |req: MessagesRequest| {
+            model_rule_hits(&catalog, &serde_json::to_value(req).unwrap(), true)
+        };
+        let effort = |level: &str| OutputConfig {
+            effort: Some(level.into()),
+            ..Default::default()
+        };
+
+        // Opus 4.8 accepts forced tool use; its Fable 5.1 target does not.
+        let found = hits(
+            base("claude-opus-4-8")
+                .with_tool_choice(ToolChoice::any())
+                .with_fallbacks(Fallbacks::Models(vec![FallbackTarget::model(
+                    "claude-fable-5-1",
+                )])),
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].model, "claude-fable-5-1");
+        assert_eq!(found[0].quirk, REJECTS_FORCED_TOOL_CHOICE_QUIRK);
+
+        // Disabled thinking at max effort passes on Opus 4.8 and trips the
+        // Opus 5 target, which inherits both fields.
+        let found = hits(
+            base("claude-opus-4-8")
+                .with_thinking(ThinkingConfig::Disabled)
+                .with_output_config(effort("max"))
+                .with_fallbacks(Fallbacks::Models(vec![FallbackTarget::model(
+                    "claude-opus-5",
+                )])),
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].model, "claude-opus-5");
+        assert_eq!(
+            found[0].quirk,
+            REJECTS_THINKING_DISABLED_ABOVE_HIGH_EFFORT_QUIRK
+        );
+
+        // The same target with its own effort override at high passes.
+        let mut target = FallbackTarget::model("claude-opus-5");
+        target.output_config = Some(effort("high"));
+        let found = hits(
+            base("claude-opus-4-8")
+                .with_thinking(ThinkingConfig::Disabled)
+                .with_output_config(effort("max"))
+                .with_fallbacks(Fallbacks::Models(vec![target])),
+        );
+        assert!(found.is_empty(), "{found:?}");
+
+        // Server-chosen targets are Anthropic's to validate.
+        let found = hits(base("claude-fable-5-1").with_fallbacks(Fallbacks::Default));
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// The two identity headers are read by name and only when present.
+    #[test]
+    fn response_identity_reads_request_and_workspace_ids() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        assert_eq!(response_identity(&headers), (None, None));
+        headers.insert(
+            "request-id",
+            HeaderValue::from_static("req_018EeWyXxfu5pfWkrYcMdjWG"),
+        );
+        assert_eq!(
+            response_identity(&headers),
+            (Some("req_018EeWyXxfu5pfWkrYcMdjWG".into()), None)
+        );
+        headers.insert(
+            "anthropic-workspace-id",
+            HeaderValue::from_static("wrkspc_01JwQvzr7rXLA5AGx3HKfFUJ"),
+        );
+        assert_eq!(
+            response_identity(&headers),
+            (
+                Some("req_018EeWyXxfu5pfWkrYcMdjWG".into()),
+                Some("wrkspc_01JwQvzr7rXLA5AGx3HKfFUJ".into())
+            )
+        );
     }
 
     fn live_enabled() -> bool {

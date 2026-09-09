@@ -5858,29 +5858,29 @@ impl App {
         ])
     }
 
-    /// Inline cost computation (mirrors mu-core pricing.rs). Returns
-    /// 0.0 for unknown (provider, model) pairs.
+    /// Inline cost for the status line and `/status`, from mu-core's rate
+    /// card (`mu_core::pricing`) so the two cannot drift — this used to be a
+    /// hand-kept mirror of that table (4.x prefixes, a fixed cache-read
+    /// modifier) and went stale the first time the table grew. An OAuth
+    /// session is priced at the API rate card, as before. Returns 0.0 for
+    /// an unknown (provider, model) pair.
     fn compute_cost(&self) -> f64 {
         let kind = normalize_provider_kind(&self.provider);
-        let (in_rate, out_rate) = match kind.as_str() {
-            "anthropic_api" | "anthropic_oauth" => {
-                if self.model.starts_with("claude-opus-4") {
-                    (5.00_f64, 25.00_f64)
-                } else if self.model.starts_with("claude-sonnet-4") {
-                    (3.00, 15.00)
-                } else if self.model.starts_with("claude-haiku-4") {
-                    (1.00, 5.00)
-                } else {
-                    return 0.0;
-                }
-            }
-            _ => return 0.0,
+        let kind = if kind == "anthropic_oauth" {
+            "anthropic_api"
+        } else {
+            kind.as_str()
         };
-        let inp = self.cumulative_input_tokens as f64;
-        let out = self.cumulative_output_tokens as f64;
-        let cw = self.cumulative_cache_creation as f64;
-        let cr = self.cumulative_cache_read as f64;
-        (inp * in_rate + cw * in_rate * 1.25 + cr * in_rate * 0.10 + out * out_rate) / 1_000_000.0
+        let Some(pricing) = mu_core::pricing::for_model(kind, &self.model) else {
+            return 0.0;
+        };
+        pricing.cost(&mu_core::agent::types::Usage {
+            input_tokens: self.cumulative_input_tokens,
+            output_tokens: self.cumulative_output_tokens,
+            cache_creation_input_tokens: Some(self.cumulative_cache_creation),
+            cache_read_input_tokens: Some(self.cumulative_cache_read),
+            ..Default::default()
+        })
     }
 
     /// Apply a single MCP status update. Syncs the inline accumulators

@@ -66,11 +66,17 @@ context_soft_limit = 200000
 context_hard_limit = 200000
 max_output_tokens = 8192
 
-# Claude gen-5 (2026-06..08 API release notes; mu-provider-drift-2026q3-y43la):
-# all three carry a 1M context window and 128k max output. Behavior contract on
-# this generation (enforced as wire absences, see anthropic provider tests):
-# Sonnet 5 rejects non-default sampling params; Fable/Mythos 5 and Sonnet 5 are
-# adaptive-thinking-only; Opus 5 rejects thinking-disable at xhigh/max effort.
+# Claude gen-5 (2026-06..08 API release notes; mu-provider-drift-2026q3-y43la,
+# mu-anthropic-protocol-2026q3-6uqho.6): every entry below carries a 1M context
+# window (default and maximum) and 128k max output. The request shapes each
+# model answers with a 400 are the `rejects_*` quirks on the `[model_rules.*]`
+# further down; the anthropic provider in mu-ai refuses such a request before
+# the wire and pins, per model, that its own shaping never builds one (the
+# "model rules" tests in anthropic_tests.rs). Tokenizer note, deliberately not
+# a quirk: from Opus 4.7 on (Sonnet 5 included) the same text is roughly 30%
+# more tokens than on older models (models/sonnet-5/whats-new-sonnet-5 § New
+# tokenizer); mu's estimator is cl100k either way, so an output budget tuned
+# on an older model runs short here.
 [models.claude_opus_5]
 model = "claude-opus-5"
 family = "claude-opus-5"
@@ -95,6 +101,22 @@ context_soft_limit = 1000000
 context_hard_limit = 1000000
 max_output_tokens = 128000
 
+[models.claude_fable_5_1]
+model = "claude-fable-5-1"
+family = "claude-fable-5"
+label = "Claude Fable 5.1"
+context_soft_limit = 1000000
+context_hard_limit = 1000000
+max_output_tokens = 128000
+
+[models.claude_mythos_5_1]
+model = "claude-mythos-5-1"
+family = "claude-mythos-5"
+label = "Claude Mythos 5.1"
+context_soft_limit = 1000000
+context_hard_limit = 1000000
+max_output_tokens = 128000
+
 [models.gpt_5_5]
 model = "gpt-5.5"
 family = "gpt-5"
@@ -114,31 +136,158 @@ max_output_tokens = 128000
 prefixes = ["claude-sonnet-4", "claude-haiku-4"]
 max_output_tokens = 8192
 
-# Gen-5 family fallback: date-stamped ids (claude-opus-5-2026xxxx) and
-# not-yet-cataloged gen-5 variants inherit the generation-wide 128k output
-# ceiling. Exact [models.*] entries above still override per model.
+# Per-model request rules (mu-anthropic-protocol-2026q3-6uqho.6), from the
+# 2026-09-04 spec snapshot in crates/providers/mu-anthropic/specifications.
+# Each quirk names a request shape the model answers with a 400 (or, for the
+# one `ignores_*`, accepts and disregards); the anthropic provider in mu-ai
+# reads them off the resolved model and refuses a matching body before the
+# wire. A model matches ONE rule (longest prefix), so each rule lists its
+# model's whole set; the exact [models.*] entries above carry no quirks and
+# merge in.
+#
+#   rejects_manual_thinking      thinking {type: enabled, budget_tokens} —
+#                                every model from Opus 4.7 on (build-with-
+#                                claude/thinking-troubleshooting § Thinking
+#                                support, defaults, and rejected
+#                                configurations by model)
+#   rejects_thinking_disabled    thinking {type: disabled} — thinking is
+#                                always on (same table: Fable/Mythos 5, 5.1)
+#   rejects_thinking_disabled_above_high_effort
+#                                disabled is accepted at effort high or below;
+#                                with xhigh or max it is a 400 (same table,
+#                                note 2: Opus 5)
+#   rejects_sampling_params      a non-default temperature / top_p / top_k, on
+#                                every request (build-with-claude/thinking §
+#                                Response prefill and forced tool use:
+#                                Fable/Mythos 5 and 5.1, Opus 5, Opus 4.8,
+#                                Opus 4.7, Sonnet 5)
+#   rejects_forced_tool_choice   tool_choice any / tool; auto and none are
+#                                fine (models/fable-5-1/whats-new-fable-5-1 §
+#                                Forced tool use is not supported: Fable 5.1,
+#                                Mythos 5.1)
+#   rejects_fast_mode            speed: fast is an error (build-with-claude/
+#                                fast-mode, the Opus 4.7 note)
+#   ignores_fast_mode            speed: fast runs, and bills, at standard
+#                                speed; usage.speed reports standard (same
+#                                page, the Opus 4.6 note)
+#   retired                      the id is gone from the Claude API (about-
+#                                claude/model-deprecations § Model status); a
+#                                warning on api.anthropic.com, where Anthropic's
+#                                own not-found is the authority (a calendar
+#                                fact, unlike the shapes, must not brick a
+#                                lane), and nothing off it, since Bedrock and
+#                                Google Cloud still serve some
+#
+# The thinking rows as the snapshot prints them (thinking-troubleshooting §
+# Thinking support, defaults, and rejected configurations by model; columns
+# "Thinking types | Default | Rejected with 400"), so the transcription can be
+# checked without decompressing llms-full.txt.xz:
+#   Claude Fable 5.1, Mythos 5.1, Fable 5, Mythos 5
+#                      Adaptive only                    | Always on | "enabled", "disabled"
+#   Claude Opus 5      Adaptive only                    | On        | "enabled", "disabled" (note 2:
+#                      accepted at effort high or below; with xhigh or max a 400)
+#   Claude Opus 4.8    Adaptive only                    | Off       | "enabled"
+#   Claude Opus 4.7    Adaptive only                    | Off       | "enabled"
+#   Claude Sonnet 5    Adaptive only                    | On        | "enabled"
+#   Claude Opus 4.6    Adaptive, extended (deprecated)  | Off       | None
+#   Claude Sonnet 4.6  Adaptive, extended (deprecated)  | Off       | None
+# and the sampling sentence (thinking § Response prefill and forced tool use):
+# "On Claude Fable 5.1, Claude Mythos 5.1, Claude Fable 5, Claude Mythos 5,
+# Claude Mythos Preview, Claude Opus 5, Claude Opus 4.8, Claude Opus 4.7, and
+# Claude Sonnet 5, non-default temperature, top_p, or top_k values return a
+# 400 error on every request". Opus 4.6 is therefore the one 4.6+ row with
+# neither a thinking rule nor the sampling rule.
 #
 # `mid_conversation_tool_changes`: the Anthropic lane sends the
 # `mid-conversation-tool-changes-2026-07-01` beta header, so tools can be
 # added or removed between turns without a prompt-cache miss. The 2026-07-24
 # changelog entry names Claude Fable 5, Mythos 5, Opus 4.8 and Opus 5 — not
-# Sonnet 5, hence the split rule. Exact entries above have no quirks, so
-# these merge in for them too (claude-opus-5, claude-fable-5).
-[model_rules.claude_gen_5_frontier]
-prefixes = ["claude-opus-5", "claude-fable-5", "claude-mythos-5"]
-max_output_tokens = 128000
-quirks = ["mid_conversation_tool_changes"]
+# Sonnet 5.
 
+# Gen-5 family fallback: date-stamped ids (claude-opus-5-2026xxxx) and
+# not-yet-cataloged gen-5 variants inherit the generation-wide 128k output
+# ceiling. Exact [models.*] entries above still override per model. This rule
+# and the next two were one rule, `claude_gen_5_frontier`, before 6uqho.6; an
+# operator override keyed on that name now matches nothing, and the loader
+# warns about it (a rule with no prefix).
+[model_rules.claude_opus_5]
+prefix = "claude-opus-5"
+max_output_tokens = 128000
+quirks = [
+  "mid_conversation_tool_changes",
+  "rejects_manual_thinking",
+  "rejects_thinking_disabled_above_high_effort",
+  "rejects_sampling_params",
+]
+
+# Thinking is always on: neither a manual budget nor disabling it.
+[model_rules.claude_fable_mythos_5]
+prefixes = ["claude-fable-5", "claude-mythos-5"]
+max_output_tokens = 128000
+quirks = [
+  "mid_conversation_tool_changes",
+  "rejects_manual_thinking",
+  "rejects_thinking_disabled",
+  "rejects_sampling_params",
+]
+
+# The 5.1 pair adds the forced-tool-choice rejection; the longer prefix wins
+# over the gen-5 rule above.
+[model_rules.claude_fable_mythos_5_1]
+prefixes = ["claude-fable-5-1", "claude-mythos-5-1"]
+max_output_tokens = 128000
+quirks = [
+  "mid_conversation_tool_changes",
+  "rejects_manual_thinking",
+  "rejects_thinking_disabled",
+  "rejects_sampling_params",
+  "rejects_forced_tool_choice",
+]
+
+# Adaptive thinking on by default; `disabled` is accepted at every effort.
 [model_rules.claude_sonnet_5]
 prefix = "claude-sonnet-5"
 max_output_tokens = 128000
+quirks = ["rejects_manual_thinking", "rejects_sampling_params"]
 
 # Opus 4.8 is the one 4.x model on the mid-conversation tool-changes beta;
 # the longer prefix wins over `claude_opus_4` above (longest-prefix rule).
 [model_rules.claude_opus_4_8]
 prefix = "claude-opus-4-8"
 max_output_tokens = 128000
-quirks = ["mid_conversation_tool_changes"]
+quirks = ["mid_conversation_tool_changes", "rejects_manual_thinking", "rejects_sampling_params"]
+
+# Opus 4.7: no fast mode, and a `speed: fast` request errors rather than
+# falling back to standard.
+[model_rules.claude_opus_4_7]
+prefix = "claude-opus-4-7"
+max_output_tokens = 128000
+quirks = ["rejects_manual_thinking", "rejects_sampling_params", "rejects_fast_mode"]
+
+# Opus 4.6: no fast mode either, but `speed: fast` is accepted and runs (and
+# bills) at standard speed; the response says so in usage.speed.
+[model_rules.claude_opus_4_6]
+prefix = "claude-opus-4-6"
+max_output_tokens = 128000
+quirks = ["ignores_fast_mode"]
+
+# Retired on the Claude API: Opus 4.1 (2026-08-05, replacement claude-opus-4-8),
+# Opus 4 and Sonnet 4 (2026-06-15, replacements claude-opus-4-8 and
+# claude-sonnet-4-6). Dated prefixes, so that claude-sonnet-4-6 and
+# claude-opus-4-7 (which the bare family prefixes also match) stay out. One
+# rule per family, each repeating its family's output ceiling: the rule only
+# warns, so these ids still run (and off the API, on Bedrock or Google Cloud,
+# they are live models) and must keep the budget the family rule gave them
+# before this rule shadowed it.
+[model_rules.claude_retired_opus_4]
+prefixes = ["claude-opus-4-1", "claude-opus-4-2025"]
+max_output_tokens = 128000
+quirks = ["retired"]
+
+[model_rules.claude_retired_sonnet_4]
+prefix = "claude-sonnet-4-2025"
+max_output_tokens = 8192
+quirks = ["retired"]
 
 [model_rules.openrouter_anthropic_opus]
 prefix = "anthropic/claude-opus-4."

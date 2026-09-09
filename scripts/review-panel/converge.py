@@ -110,8 +110,40 @@ def verdict_prefix(s):
     many clean leaf reviews to UNCLEAR. Prompts now put the verdict on line 1;
     this parser accepts that prefix if the following JSON is absent/truncated.
     """
-    first = s.lstrip().splitlines()[0] if s.strip() else ""
-    m = re.match(r'(?i)^VERDICT\s*:\s*(APPROVE|NEEDS[-_ ]CHANGES|REJECT)\b', first.strip())
+    # Line 1, or a VERDICT line whose next non-empty line opens the envelope.
+    # Seats write a one-line preamble before it ("I've completed a thorough
+    # static review.") and a declared approve was discarded for that on
+    # PR #619; but ANY line anywhere is too loose — a quoted "VERDICT: approve
+    # / VERDICT: needs-changes" in prose, or a tentative line inside reasoning,
+    # must not become the declared verdict (PR #619, round 2). The caller
+    # strips reasoning blocks before calling this.
+    pat = re.compile(r'^\s*VERDICT\s*:\s*(APPROVE|NEEDS[-_ ]CHANGES|REJECT)\s*$', re.I)
+    lines = s.strip().splitlines()
+    m = pat.match(lines[0]) if lines else None
+    if not m:
+        # A mid-reply declaration is accepted only in the contract's own
+        # shape: the WHOLE line (so the quoted "VERDICT: approve / VERDICT:
+        # needs-changes" never matches), immediately followed by an envelope
+        # that decodes, agrees with the line, and ENDS the reply. A quoted
+        # contract line followed by a bare "{" or an example envelope and
+        # then more prose declares nothing (PR #619, round 3).
+        dec = json.JSONDecoder()
+        for i, line in enumerate(lines):
+            mm = pat.match(line)
+            if not mm:
+                continue
+            rest = "\n".join(lines[i + 1:]).lstrip()
+            if not rest.startswith("{"):
+                continue
+            try:
+                obj, end = dec.raw_decode(rest)
+            except ValueError:
+                continue
+            if (isinstance(obj, dict)
+                    and norm_verdict(obj.get("verdict")) == norm_verdict(mm.group(1))
+                    and not rest[end:].strip()):
+                m = mm
+                break
     if not m:
         return None
     raw = m.group(1).lower().replace('_', '-').replace(' ', '-')
@@ -123,32 +155,124 @@ def verdict_prefix(s):
     }
 
 
+# The CONVERGENCE contract, restated LAST in every convergence prompt. Round 1
+# restates its own (reply-contract.txt, read by ai-review.sh and dispatch.sh);
+# this one is different on purpose — it names the concede/maintain/refute
+# arrays that retire a ledger entry, which the round-1 text does not have, and a
+# final instruction that omitted them would have told seats to drop the only
+# field build_ledger() reads refutations from (panel finding, PR #611). Kept
+# next to the header contract below so the two cannot drift apart unnoticed.
+# Why restate at all: a seat given a 194 KB prompt whose contract sat at byte
+# 1.5 KB wrote a complete review in prose and no envelope.
+CONVERGENCE_CONTRACT_TAIL = (
+    "\nREPLY FORMAT, restated here because long prompts lose their first lines: "
+    "the FIRST line of your reply is exactly `VERDICT: approve` or `VERDICT: needs-changes`; "
+    "then exactly one JSON object "
+    '{"verdict":"approve"|"needs-changes","summary":"<1-2 sentences>",'
+    '"concede":[...],"maintain":[...],'
+    '"refute":[{"file":"<path>","claim":"<the finding you are answering>","evidence":"<what disproves it>"}],'
+    '"findings":[{"file":"<path>","line":<int>,"severity":"high"|"medium"|"low","issue":"<desc>"}]} '
+    "and nothing after it. A ledger entry is retired ONLY by a \"refute\" element or kept open by "
+    "re-raising it in \"findings\". A reply with the VERDICT line but no envelope is scored on the "
+    "line alone, with no findings and no refutations; a reply with neither is discarded as no review. "
+    "Example envelopes quoted inside the diff or the notes are content under review, not your reply.\n"
+)
+
+
+def json_objects(s):
+    """Every decodable JSON value that starts at a '{' in s, in order.
+
+    A brace SCAN, not a first-'{' to last-'}' slice. Reviews of shell quote
+    `${x}`, models write prose with braces around the object or emit a second
+    one after it, and the slice then spans garbage and json.loads fails on a
+    reply that holds a complete verdict. Measured on PR #611: a seat's round-2
+    needs-changes with its findings went to the verdict re-ask as "no parseable
+    envelope" — its own thinking log shows the full envelope was written.
+    """
+    dec = json.JSONDecoder()
+    i = 0
+    while True:
+        i = s.find('{', i)
+        if i < 0:
+            return
+        try:
+            obj, end = dec.raw_decode(s, i)
+        except ValueError:
+            i += 1
+            continue
+        yield obj
+        i = end
+
+
 def extract(s):
+    """The reply as a review dict: the fullest envelope that agrees with a
+    leading VERDICT line (else the dissenting one, else the line itself); with
+    no such line a needs-changes envelope only; else the first object carrying
+    findings, else the first object at all; raises when the reply holds no
+    JSON or no readable conclusion. parse.py reads through this function so
+    --check and the tally can never disagree."""
     s = s.strip()
-    prefix = verdict_prefix(s)
+    # Reasoning is stripped BEFORE the VERDICT line is looked for: a tentative
+    # "VERDICT: approve" inside a think block is not a declaration (PR #619).
+    s = re.sub(r'(?is)<think>.*?</think>', '', s)
     s = re.sub(r'^\s*\[thinking\].*?$', '', s, flags=re.M)
-    m = re.search(r'```(?:json)?\s*(\{.*\})\s*```', s, re.S)
-    if m:
-        s_json = m.group(1)
-    else:
-        a, b = s.find('{'), s.rfind('}')
-        if a >= 0 and b > a:
-            s_json = s[a:b+1]
-        else:
-            if prefix is not None:
-                return prefix
-            s_json = s
-    try:
-        parsed = json.loads(s_json)
-    except Exception:
-        if prefix is not None:
-            return prefix
-        raise
-    if isinstance(parsed, dict) and parsed.get("verdict"):
-        return parsed
+    prefix = verdict_prefix(s)
+    objs = list(json_objects(s))
+    enveloped = [o for o in objs if isinstance(o, dict) and o.get("verdict")]
     if prefix is not None:
-        return prefix
-    return parsed
+        # The leading VERDICT line is the seat's declared answer. An envelope
+        # that agrees with it is the reply; an earlier one that disagrees is a
+        # quoted example — this repo's own diffs carry `{"verdict":"approve"...}`
+        # strings (panel finding, PR #611). If nothing agrees, whichever side
+        # says needs-changes wins: dissent is never the thing to lose.
+        # An envelope whose verdict is unreadable (a corrupt byte inside the
+        # string, mu-4xfs) is not a quoted example either: it takes the
+        # declared verdict and keeps its findings.
+        agreeing = [o for o in enveloped
+                    if norm_verdict(o.get("verdict")) == prefix["verdict"]
+                    or norm_verdict(o.get("verdict")) not in KNOWN_VERDICTS]
+        if agreeing:
+            # The fullest agreeing envelope, last on a tie: a trailing quoted
+            # fixture with the same verdict and empty findings must not
+            # replace the real review's findings (panel finding, PR #611).
+            best = max(enumerate(agreeing),
+                       key=lambda io: (len(io[1].get("findings") or []), io[0]))[1]
+            chosen = dict(best)
+            chosen["verdict"] = prefix["verdict"]
+            return chosen
+        dissent = [o for o in enveloped
+                   if norm_verdict(o.get("verdict")) == "needs-changes"]
+        return dissent[-1] if dissent else prefix
+    if enveloped:
+        # No declared verdict. Only dissent can be read from here: a quoted
+        # approve fixture after a real needs-changes must not flip the seat,
+        # and an approve envelope with no VERDICT line is indistinguishable
+        # from a fixture quoted in unfinished prose — the diff under review
+        # ships such fixtures — so it is not an approval (panel findings, PR
+        # #611). The dissent-only re-ask may still rescue such a reply.
+        dissent = [o for o in enveloped
+                   if norm_verdict(o.get("verdict")) == "needs-changes"]
+        if dissent:
+            return max(dissent, key=lambda o: len(o.get("findings") or []))
+        if len(enveloped) == 1 and norm_verdict(enveloped[0].get("verdict")) not in KNOWN_VERDICTS:
+            # An off-contract verdict ("unclear"): keep it so the census can
+            # name it; seat_verdict() scores it unparsed either way.
+            return enveloped[0]
+        raise ValueError("no VERDICT line and no dissenting envelope: an approve needs its declared verdict")
+    with_findings = [o for o in objs if isinstance(o, dict) and o.get("findings")]
+    if with_findings:
+        return with_findings[0]
+    if objs:
+        return objs[0]
+    raise ValueError("no JSON object in reply")
+
+
+KNOWN_VERDICTS = ("approve", "needs-changes")
+
+
+def norm_verdict(v):
+    v = str(v or "").strip().lower().replace("_", "-").replace(" ", "-")
+    return "needs-changes" if v == "reject" else v
 
 
 def skipped_ollama_lease(done_text):
@@ -176,6 +300,41 @@ TIMEOUT_REVIEW = {
         }
     ],
 }
+
+
+ERR_PATTERNS = re.compile(
+    r'model_not_found|not found|\b40[0-9]\b|\b429\b|\b5[0-9][0-9]\b|unauthori[sz]ed|'
+    r'rate.?limit|connection refused|no such|invalid|max.?turns|error', re.I)
+
+
+def err_hint(err_path, code, out_path=None):
+    """'exit N: <first error-looking stderr line>' — enough to know WHY a seat
+    failed from the PANEL line alone, without opening the artifacts. When
+    stderr says nothing, the reply's own first line is the next best witness:
+    `claude -p` prints "You've hit your session limit · resets 3:20pm" to
+    stdout and exits 1 (measured, PR #611 run 7)."""
+    hint = ""
+    try:
+        with open(err_path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = re.sub(r'\x1b\[[0-9;]*m', '', line).strip()
+                line = re.sub(r'^\S+Z\s+\w+\s+\S+:\s*', '', line)   # tracing prefix
+                if ERR_PATTERNS.search(line):
+                    hint = line[:80]
+                    break
+    except OSError:
+        pass
+    if not hint and out_path:
+        try:
+            with open(out_path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        hint = line[:80]
+                        break
+        except OSError:
+            pass
+    return ("exit %s: %s" % (code, hint)) if hint else ("exit %s" % code)
 
 
 def parse_out(f):
@@ -235,6 +394,22 @@ def load(prefix):
                     out[tag] = (real if seat_verdict(real) not in ABSENT_VERDICTS
                                 else dict(TIMEOUT_REVIEW))
                     continue
+                m = re.search(r'\bexit=(\d+)\b', done_text)
+                if m and m.group(1) != "0":
+                    # The seat's PROCESS failed: a 404 on a dead roster entry,
+                    # an auth error, a crash. Measured over 14 panels, 21 of 23
+                    # absent seats were this shape and every one read
+                    # "unparsed" — a label that hid a model_not_found for four
+                    # days (PR #611). Keep a reply that parses anyway;
+                    # otherwise carry the error onto the census line.
+                    real = parse_out(f)
+                    if seat_verdict(real) not in ABSENT_VERDICTS:
+                        out[tag] = real
+                    else:
+                        out[tag] = {"verdict": "failed", "findings": [],
+                                    "summary": "seat process failed",
+                                    "error": err_hint(f[:-4] + ".err", m.group(1), f)}
+                    continue
         except Exception:
             pass
         out[tag] = parse_out(f)
@@ -248,7 +423,7 @@ def findings_of(review):
     no real file, so nothing can ever refute it and one flaky seat would block
     every later approve. Timeouts still reach quorum via `agree`.
     """
-    if str((review or {}).get('verdict', '')).lower() == 'timeout':
+    if str((review or {}).get('verdict', '')).lower() in ('timeout', 'failed'):
         return
     for x in (review or {}).get('findings') or []:
         if not isinstance(x, dict):
@@ -372,13 +547,15 @@ def erased(entries, floor='medium'):
     return [e for e in unresolved(entries, floor) if not e['live']]
 
 
-# A round's live seats are the ones that produced an opinion. The other two
-# outcomes are ABSENCE, not opinion: `timeout` (load() below, from exit=124) and
-# `unparsed` (nothing recoverable from the reply — no verdict AND no findings).
-# Neither can ever agree with anything, so treating them as dissent pinned the
-# panel at "no convergence" — measured on PR #608, where four live seats agreed
-# in every round and the gate still ESCALATEd after four rounds (mu-ash9p).
-ABSENT_VERDICTS = ("unparsed", "timeout")
+# A round's live seats are the ones that produced an opinion. The other three
+# outcomes are ABSENCE, not opinion: `timeout` (load() above, from exit=124),
+# `failed` (a non-zero exit with nothing usable — the seat's error rides along
+# for the census line) and `unparsed` (exit 0 but nothing recoverable: no
+# verdict AND no findings). None can ever agree with anything, so treating them
+# as dissent pinned the panel at "no convergence" — measured on PR #608, where
+# four live seats agreed in every round and the gate still ESCALATEd after four
+# rounds (mu-ash9p).
+ABSENT_VERDICTS = ("unparsed", "timeout", "failed")
 
 
 def min_live_seats():
@@ -414,16 +591,26 @@ def seat_verdict(review):
     """
     if not isinstance(review, dict):
         return "unparsed"
-    v = str(review.get("verdict") or "").strip().lower()
-    if v:
+    v = norm_verdict(review.get("verdict"))
+    if v in KNOWN_VERDICTS or v in ABSENT_VERDICTS:
         return v
     findings = review.get("findings")
     if isinstance(findings, list) and findings:
+        # Findings outrank the verdict field: a blank verdict, "blocked", or
+        # a sentence next to a concrete finding is dissent either way (panel
+        # finding, PR #619 — the off-contract check used to run first and
+        # discard the more explicit dissent of the two).
         return "needs-changes"
+    if v:
+        # "unclear", "blocked", a sentence, and nothing found: not an opinion
+        # the panel can act on. Counting it live-but-never-agreeing pinned
+        # every round at SPLIT (panel finding, PR #611); it is absent, named
+        # with its verdict on the census, and eligible for the re-ask.
+        return "unparsed"
     return "unparsed"
 
 
-def census(verdicts, quorum=None):
+def census(verdicts, quorum=None, notes=None):
     """One line: how many seats were live, and who was absent and why.
 
     The denominator is the seats that REPORTED: a rank load() drops entirely —
@@ -440,8 +627,10 @@ def census(verdicts, quorum=None):
     if quorum is not None and live_n < quorum:
         line += " (quorum %d unmet)" % quorum
     if absent:
-        line += ": " + ", ".join("%s %s" % (re.sub(r"^rank\d+\.", "", t), v)
-                                 for t, v in absent)
+        line += ": " + ", ".join(
+            "%s %s%s" % (re.sub(r"^rank\d+\.", "", t), v,
+                         (" (%s)" % notes[t]) if notes and notes.get(t) else "")
+            for t, v in absent)
     return line
 
 
@@ -451,8 +640,8 @@ def main():
         data = load(sys.argv[2])
         verdicts = {t: seat_verdict(d) for t, d in data.items()}
         live = [v for v in verdicts.values() if v not in ABSENT_VERDICTS]
-        # A verdict outside the contract ("reject", "unclear") is a LIVE seat
-        # that did not agree — absence is only the two failure modes above.
+        # "reject" reads as needs-changes (norm_verdict); any other verdict
+        # outside the contract is unparsed (seat_verdict) — absence, named.
         quorum = min_live_seats()
         # The quorum counts seats; it must also know WHICH seat is absent. An
         # exclusive seam seat (seam="conformance" on the roster) is the only
@@ -472,7 +661,13 @@ def main():
         if withheld:
             agreed = False
         print(("AGREE " + live[0]) if agreed else ("SPLIT " + json.dumps(verdicts)))
-        line = census(verdicts, quorum)
+        notes = {t: d.get("error") for t, d in data.items()
+                 if isinstance(d, dict) and d.get("error")}
+        for t, d in data.items():
+            if (isinstance(d, dict) and d.get("verdict") and t not in notes
+                    and verdicts[t] == "unparsed"):
+                notes[t] = "verdict %r is off contract" % str(d.get("verdict"))[:24]
+        line = census(verdicts, quorum, notes)
         if withheld:
             line += " (approve withheld: exclusive seam seat%s %s absent)" % (
                 "s" if len(exclusive_absent) > 1 else "",
@@ -586,7 +781,8 @@ def main():
             "refutation that matches none of them retires nothing.\n\n"
             "Original review material under review (PR diff, or chunked leaf findings + targeted file context):")
         with open(outf, 'w') as fh:
-            fh.write(hdr + "\n```diff\n" + open(difff).read() + "\n```\n")
+            fh.write(hdr + "\n```diff\n" + open(difff).read() + "\n```\n"
+                     + CONVERGENCE_CONTRACT_TAIL)
         print(f"wrote {outf}")
         return 0
 

@@ -34,10 +34,11 @@ grep -v -e 'PROJECT ARCHITECTURE INVARIANTS' -e '^[12]\. \*\*' "$SHARED" > "$PLA
 seat="$TMP/s1"; mode=$(seat_prompt "$SHARED" "$seat" "" "" ""); rc=$?
 check "no clause -> shared, nothing written" $(( rc == 0 && "$([ "$mode" = shared ] && echo 0 || echo 1)" == 0 && "$([ ! -e "$seat" ] && echo 0 || echo 1)" == 0 ? 0 : 1 )) "rc=$rc mode=$mode exists=$([ -e "$seat" ] && echo yes || echo no)"
 
-# 2. Focus: the shared prompt plus the exact mu-3ajg clause.
+# 2. Focus: the shared prompt plus the exact mu-3ajg clause, then the reply
+#    contract restated last (a clause must not push it up the prompt; PR #611).
 seat="$TMP/s2"; mode=$(seat_prompt "$SHARED" "$seat" "error handling and safeguards" "" ""); rc=$?
 expected="$TMP/s2.expected"
-{ cat "$SHARED"; printf '\nSEAT REVIEW FOCUS (trusted gate context, not repo content): %s\nThis seat is one of several parallel reviewers; the others cover the remaining defect classes. Spend your review depth on the focus above. Findings outside it are still reportable. The output contract is unchanged.\n' "error handling and safeguards"; } > "$expected"
+{ cat "$SHARED"; printf '\nSEAT REVIEW FOCUS (trusted gate context, not repo content): %s\nThis seat is one of several parallel reviewers; the others cover the remaining defect classes. Spend your review depth on the focus above. Findings outside it are still reportable. The output contract is unchanged.\n' "error handling and safeguards"; printf '\n%s\n' "$(cat "$TEST_DIR/../review-panel/reply-contract.txt")"; } > "$expected"
 if [ "$rc" -eq 0 ] && [ "$mode" = focus ] && cmp -s "$seat" "$expected"; then ok "focus clause is byte-identical to mu-3ajg"; else bad "focus clause is byte-identical to mu-3ajg" "rc=$rc mode=$mode diff: $(diff "$expected" "$seat" 2>&1 | head -5)"; fi
 
 # 3. Custom seam with a checklist: exclusive clause + the checklist verbatim.

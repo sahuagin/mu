@@ -133,6 +133,13 @@ resume_on_daemon_restart = false
 # keeps issuing calls the guards refuse. 0 disables the floor.
 max_guard_refusals = 5
 
+# Ceiling on accumulated argument bytes for ONE streamed tool call
+# (mu-c9b2l). Past this, mu stops reading the response and marks the call
+# cut, so the model gets "cut off after N KB, nothing was executed" instead
+# of a parse failure dispatched as `{}`. 0 reads to the provider's own
+# output ceiling as before.
+max_tool_call_bytes = 32768
+
 
 # ── UI (TUI) ──────────────────────────────────────────────────────
 

@@ -35,6 +35,8 @@ CONVENTIONS apply.
 - **Out:**
   - Wiring `write` into the factory and CLI flags. mu-012 does that.
   - Append mode (`{ append: true }`). Future spec adds the optional flag.
+    (Landed in mu-c9b2l, as the second half of making an over-long call
+    recoverable rather than a repeat.)
   - Atomic writes (write-and-rename). v1 uses plain `std::fs::write`.
   - Sandbox / path filtering. v1 writes wherever the daemon's process
     has permission. Agent-side trust is the user's job for v1.
@@ -50,7 +52,13 @@ CONVENTIONS apply.
 - **INV-2 (errors via is_error, not Err).** Same as `ReadTool`.
 - **INV-3 (cancel honored).** `tokio::task::spawn_blocking` +
   `tokio::select!` against `cancel_rx`. Same shape as `ReadTool`.
-- **INV-4 (file size).** Module under 400 lines including tests.
+  Superseded in mu-c9b2l: a blocking task cannot be aborted, so the
+  `select!` dropped the handle while the write ran on and the tool
+  reported a cancellation that had not happened. `write` now waits for
+  the write and reports the real outcome, noting that the cancel
+  arrived too late. Honoring a cancel is still the invariant; what
+  changed is that the report has to be true.
+- **INV-4 (file size).** Module under 400 lines excluding tests. (Amended mu-c9b2l: the append path and its tests took the file with tests past 400; the non-test half stays under the bound.)
 
 ## Interfaces
 
@@ -184,6 +192,9 @@ impl Tool for WriteTool {
    execute. Result: either Cancelled (`is_error: true`, content
    mentions cancel) OR Ok depending on race. The test's contract:
    no panic, no hang, returns within 500ms.
+   Superseded in mu-c9b2l (see INV-3): the write always lands, so the
+   result is the write's, and the budget covers the write rather than
+   holding it to a latency target.
 
 ## Acceptance
 
@@ -192,7 +203,7 @@ impl Tool for WriteTool {
 - `cargo build` clean.
 - `cargo nextest run` passes — every existing test plus B-1..B-5
   (B-6 best-effort).
-- Module under 400 lines.
+- Module under 400 lines excluding tests (mu-c9b2l).
 
 ## Out-of-circuit warnings
 

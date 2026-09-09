@@ -599,6 +599,29 @@ fn test_events_stream(
     bytes: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     cancel_rx: oneshot::Receiver<()>,
 ) -> BoxStream<'static, ProviderEvent> {
+    // mu-c9b2l: the shipped default cap, so the existing scenarios exercise
+    // the same accumulator production runs.
+    test_events_stream_capped(bytes, cancel_rx, Some(DEFAULT_MAX_TOOL_CALL_BYTES))
+}
+
+/// mu-c9b2l: [`test_events_stream`] with an explicit
+/// `[session].max_tool_call_bytes` and no output budget.
+fn test_events_stream_capped(
+    bytes: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    cancel_rx: oneshot::Receiver<()>,
+    max_tool_call_bytes: Option<usize>,
+) -> BoxStream<'static, ProviderEvent> {
+    test_events_stream_budgeted(bytes, cancel_rx, max_tool_call_bytes, None)
+}
+
+/// mu-c9b2l: [`test_events_stream`] with both ceilings — the byte cap and
+/// what the request's `max_tokens` buys.
+fn test_events_stream_budgeted(
+    bytes: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    cancel_rx: oneshot::Receiver<()>,
+    max_tool_call_bytes: Option<usize>,
+    output_budget_bytes: Option<usize>,
+) -> BoxStream<'static, ProviderEvent> {
     let bytes: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> =
         Box::pin(bytes.map(|r| r.map_err(|e| e.to_string())));
     let sse = SseStream::new(bytes);
@@ -613,6 +636,8 @@ fn test_events_stream(
         cancel_rx: Some(cancel_rx),
         finished: false,
         emitted_done: false,
+        max_tool_call_bytes,
+        output_budget_bytes,
     };
     Box::pin(futures::stream::unfold(state, next_event))
 }
@@ -1141,6 +1166,283 @@ async fn b10_malformed_tool_args_yield_empty_object() {
         }
         _ => panic!("expected ToolCall"),
     }
+}
+
+// ============================================================================
+// mu-c9b2l — a cut-off tool call is legible, and the stream stops at the cap
+// ============================================================================
+
+/// One SSE frame carrying `value` as its `data:` payload.
+fn sse_frame(value: serde_json::Value) -> Bytes {
+    Bytes::from(format!("data: {value}\n\n"))
+}
+
+/// A tool-call argument continuation fragment for `index`.
+fn args_frame(index: u32, args: &str) -> Bytes {
+    sse_frame(json!({
+        "choices": [{"delta": {"tool_calls": [
+            {"index": index, "function": {"arguments": args}}
+        ]}}]
+    }))
+}
+
+/// The opening fragment: id, name, and the head of the argument JSON.
+fn tool_call_open_frame(index: u32, id: &str, name: &str, args: &str) -> Bytes {
+    sse_frame(json!({
+        "choices": [{"delta": {"tool_calls": [{
+            "index": index,
+            "id": id,
+            "type": "function",
+            "function": {"name": name, "arguments": args}
+        }]}}]
+    }))
+}
+
+/// A byte source that counts the frames actually pulled out of it, so a test
+/// can assert the accumulator stopped reading rather than merely stopped
+/// accumulating.
+fn counted_frames(
+    frames: Vec<Bytes>,
+) -> (
+    impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let pulled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = pulled.clone();
+    let stream = futures::stream::iter(frames).map(move |frame| {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok::<_, std::io::Error>(frame)
+    });
+    (stream, pulled)
+}
+
+async fn drain_to_done(mut stream: BoxStream<'static, ProviderEvent>) -> AssistantMessage {
+    while let Some(event) = stream.next().await {
+        if let ProviderEvent::Done(msg) = event {
+            return msg;
+        }
+    }
+    panic!("stream ended without Done");
+}
+
+fn only_tool_call(msg: &AssistantMessage) -> &ToolCall {
+    let calls: Vec<&ToolCall> = msg
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolCall(tc) => Some(tc),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        calls.len(),
+        1,
+        "expected one tool call, got {:?}",
+        msg.content
+    );
+    calls[0]
+}
+
+/// The measured failure: a `write` whose arguments run past the ceiling. The
+/// cap ends the response at the moment the call is already too big — the
+/// frames after it are never pulled — and the call goes out marked cut, not
+/// as `{}`.
+#[tokio::test]
+async fn mu_c9b2l_byte_cap_cuts_the_call_and_stops_reading() {
+    const CAP: usize = 64;
+    let head = r#"{"path":"/tmp/big","content":""#;
+    let filler = "x".repeat(40);
+
+    let mut frames = vec![tool_call_open_frame(0, "call_big", "write", head)];
+    for _ in 0..8 {
+        frames.push(args_frame(0, &filler));
+    }
+    // A second call, and the terminators, that the accumulator must not reach.
+    frames.push(tool_call_open_frame(
+        1,
+        "call_after",
+        "read",
+        r#"{"path":"/tmp/after"}"#,
+    ));
+    frames.push(sse_frame(
+        json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ));
+    frames.push(Bytes::from_static(b"data: [DONE]\n\n"));
+    let total_frames = frames.len();
+
+    let (bytes, pulled) = counted_frames(frames);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let done = drain_to_done(test_events_stream_capped(bytes, rx, Some(CAP))).await;
+
+    // head (30 bytes) + one 40-byte fragment crosses 64 — two frames read.
+    assert_eq!(
+        pulled.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the stream must stop at the cap, not read to the end ({total_frames} frames available)"
+    );
+    assert_eq!(done.stop_reason, StopReason::MaxTokens);
+
+    let call = only_tool_call(&done);
+    assert_eq!(call.name, "write");
+    assert_eq!(call.id, "call_big");
+    let cut = mu_core::agent::tool_call_cut::detect(call.arguments.as_value())
+        .expect("the emitted call carries the cut marker, not an empty object");
+    assert_eq!(cut.cause, mu_core::agent::CutCause::ByteCap);
+    assert_eq!(cut.bytes, head.len() + 40);
+    assert!(cut.bytes > CAP, "cut recorded at {} bytes", cut.bytes);
+    // mu-c9b2l: the cap in force rides along, so the refusal quotes the
+    // session's limit rather than the compile-time default.
+    assert_eq!(cut.cap, Some(CAP));
+}
+
+/// `finish_reason: "length"` landing mid-argument is the same event seen from
+/// the provider's side: the model ran out of room, so the unparseable
+/// arguments are a cut rather than a malformed call.
+#[tokio::test]
+async fn mu_c9b2l_finish_reason_length_mid_argument_is_a_cut() {
+    let partial = r#"{"path":"/tmp/game.py","content":"import pygame"#;
+    let frames = vec![
+        tool_call_open_frame(0, "call_len", "write", partial),
+        sse_frame(json!({"choices": [{"delta": {}, "finish_reason": "length"}]})),
+        Bytes::from_static(b"data: [DONE]\n\n"),
+    ];
+    let (bytes, _pulled) = counted_frames(frames);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let done = drain_to_done(test_events_stream(bytes, rx)).await;
+
+    assert_eq!(done.stop_reason, StopReason::MaxTokens);
+    let call = only_tool_call(&done);
+    let cut = mu_core::agent::tool_call_cut::detect(call.arguments.as_value())
+        .expect("a length-truncated call is marked cut");
+    assert_eq!(cut.cause, mu_core::agent::CutCause::OutputLimit);
+    assert_eq!(cut.bytes, partial.len());
+}
+
+/// No finish_reason, just a stream that ends mid-string: serde_json reports
+/// EOF, which is the same cut by another route.
+#[tokio::test]
+async fn mu_c9b2l_arguments_ending_mid_string_at_eof_are_a_cut() {
+    let partial = r#"{"path":"/tmp/x","content":"half a fi"#;
+    let frames = vec![
+        tool_call_open_frame(0, "call_eof", "write", partial),
+        sse_frame(json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})),
+        Bytes::from_static(b"data: [DONE]\n\n"),
+    ];
+    let (bytes, _pulled) = counted_frames(frames);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let done = drain_to_done(test_events_stream(bytes, rx)).await;
+
+    let call = only_tool_call(&done);
+    let cut = mu_core::agent::tool_call_cut::detect(call.arguments.as_value())
+        .expect("an EOF-truncated argument string is marked cut");
+    assert_eq!(cut.cause, mu_core::agent::CutCause::TruncatedJson);
+    assert_eq!(cut.bytes, partial.len());
+}
+
+/// Parity: a call under the cap streams and parses exactly as before —
+/// no marker, arguments intact, every frame read.
+#[tokio::test]
+async fn mu_c9b2l_call_under_the_cap_is_unchanged() {
+    let content = "y".repeat(4096);
+    let args = json!({"path": "/tmp/ok.txt", "content": content}).to_string();
+    assert!(args.len() < DEFAULT_MAX_TOOL_CALL_BYTES);
+
+    let frames = vec![
+        tool_call_open_frame(0, "call_ok", "write", &args),
+        sse_frame(json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})),
+        Bytes::from_static(b"data: [DONE]\n\n"),
+    ];
+    let expected_frames = frames.len();
+    let (bytes, pulled) = counted_frames(frames);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let done = drain_to_done(test_events_stream(bytes, rx)).await;
+
+    assert_eq!(
+        pulled.load(std::sync::atomic::Ordering::SeqCst),
+        expected_frames
+    );
+    assert_eq!(done.stop_reason, StopReason::ToolUse);
+    let call = only_tool_call(&done);
+    assert!(
+        mu_core::agent::tool_call_cut::detect(call.arguments.as_value()).is_none(),
+        "an under-cap call carries no cut marker"
+    );
+    assert_eq!(call.arguments.as_value()["path"], "/tmp/ok.txt");
+    assert_eq!(call.arguments.as_value()["content"], content);
+}
+
+/// `[session].max_tool_call_bytes = 0` reads to the provider's own ceiling,
+/// as before this bead.
+#[tokio::test]
+async fn mu_c9b2l_disabled_cap_reads_the_whole_oversized_call() {
+    let content = "z".repeat(64 * 1024);
+    let args = json!({"path": "/tmp/huge.txt", "content": content}).to_string();
+    assert!(args.len() > DEFAULT_MAX_TOOL_CALL_BYTES);
+
+    let frames = vec![
+        tool_call_open_frame(0, "call_huge", "write", &args),
+        sse_frame(json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})),
+        Bytes::from_static(b"data: [DONE]\n\n"),
+    ];
+    let expected_frames = frames.len();
+    let (bytes, pulled) = counted_frames(frames);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let done = drain_to_done(test_events_stream_capped(bytes, rx, None)).await;
+
+    assert_eq!(
+        pulled.load(std::sync::atomic::Ordering::SeqCst),
+        expected_frames,
+        "no cap means no early abort"
+    );
+    let call = only_tool_call(&done);
+    assert!(mu_core::agent::tool_call_cut::detect(call.arguments.as_value()).is_none());
+    assert_eq!(call.arguments.as_value()["content"], content);
+}
+
+/// mu-c9b2l: the request's `max_tokens` is the OTHER ceiling, and only this
+/// layer can see it. A model absent from the catalog is sent the 4096-token
+/// floor — about 12 KB of output — so the refusal has to advise ~6 KB parts
+/// rather than the byte cap's 16 KB, which the model has no room to emit.
+#[tokio::test]
+async fn mu_c9b2l_output_budget_rides_on_the_cut_and_shrinks_the_advice() {
+    // The budget this test models is the unknown-model floor, asserted
+    // against the DEFAULT catalog so an operator's models.toml can't move it
+    // (bead mu-nzxa).
+    assert_eq!(
+        crate::providers::output_limits::max_tokens_for_model_with_catalog(
+            &mu_core::model_catalog::built_in(),
+            "some-future-model-v9",
+        ),
+        4096
+    );
+    let budget = mu_core::agent::tool_call_cut::output_budget_bytes(4096);
+
+    let partial = r#"{"path":"/tmp/game.py","content":"import pygame"#;
+    let frames = vec![
+        tool_call_open_frame(0, "call_floor", "write", partial),
+        sse_frame(json!({"choices": [{"delta": {}, "finish_reason": "length"}]})),
+        Bytes::from_static(b"data: [DONE]\n\n"),
+    ];
+    let (bytes, _pulled) = counted_frames(frames);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let done = drain_to_done(test_events_stream_budgeted(
+        bytes,
+        rx,
+        Some(DEFAULT_MAX_TOOL_CALL_BYTES),
+        Some(budget),
+    ))
+    .await;
+
+    let call = only_tool_call(&done);
+    let cut = mu_core::agent::tool_call_cut::detect(call.arguments.as_value())
+        .expect("a length-truncated call is marked cut");
+    assert_eq!(cut.cause, mu_core::agent::CutCause::OutputLimit);
+    assert_eq!(cut.cap, Some(DEFAULT_MAX_TOOL_CALL_BYTES));
+    assert_eq!(cut.budget_bytes, Some(budget));
+
+    let text = mu_core::agent::tool_call_cut::refusal_text("write", &cut);
+    assert!(text.contains("under ~6 KB"), "{text}");
+    assert!(!text.contains("~16 KB"), "{text}");
 }
 
 // ============================================================================

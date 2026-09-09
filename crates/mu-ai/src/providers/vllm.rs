@@ -60,6 +60,13 @@ impl VllmProvider {
         self
     }
 
+    /// mu-c9b2l: `[session].max_tool_call_bytes`, forwarded to the shared
+    /// openai-chat accumulator. This lane is where the cut was measured.
+    pub fn with_max_tool_call_bytes(mut self, max_bytes: Option<usize>) -> Self {
+        self.inner = self.inner.with_max_tool_call_bytes(max_bytes);
+        self
+    }
+
     pub async fn discover_models(
         base: &str,
         timeout: std::time::Duration,

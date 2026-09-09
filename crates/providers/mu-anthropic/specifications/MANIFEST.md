@@ -33,9 +33,12 @@ record.)
   `PrefixMismatchBehavior`) and the response's `input_transformations`
   (`InputTransformation`, on the response, the stream's `message_delta` and
   the accumulator; the lane sends each beta header when the body carries the
-  field). NOT yet modeled by this crate: the `fallbacks` parameter,
-  `usage.speed`, the two toolsets. The itemized plan is bead
-  mu-anthropic-protocol-2026q3-6uqho.
+  field); the request-side fallback family — `fallbacks` (`Fallbacks`:
+  `"default"` or a `FallbackTarget` list), `speed` (`Speed`),
+  `fallback_credit_token` (`FallbackCreditToken`, bare string or
+  `{token, mode}`) — with `usage.speed` and the refusal's `explanation` /
+  `recommended_model` on the response. NOT yet modeled by this crate: the two
+  toolsets. The itemized plan is bead mu-anthropic-protocol-2026q3-6uqho.
 - **Shape change between the pins, not truncation:** the previous `llms.txt`
   listed every API-reference page once per SDK language — 1305 entries tagged
   `(cli)`, `(csharp)`, `(Go)`, `(Java)`, `(php)`, `(Python)`, `(Ruby)`,

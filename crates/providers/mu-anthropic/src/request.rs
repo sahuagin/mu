@@ -456,6 +456,124 @@ pub struct McpToolConfiguration {
     pub allowed_tools: Vec<String>,
 }
 
+/// `speed` — inference speed mode (`/docs/en/api/beta/messages/create § Body
+/// Parameters`): "`fast` provides significantly faster output token generation
+/// at premium pricing. Not all models support `fast`; invalid combinations are
+/// rejected at create time." Which models is the catalog's business.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Speed {
+    Standard,
+    Fast,
+}
+
+/// One entry of an explicit `fallbacks` list
+/// (`/docs/en/build-with-claude/refusals-and-fallback § Naming your own
+/// fallback models`): "Each entry names a `model` and can override
+/// `max_tokens`, `thinking`, `output_config`, and `speed` for that attempt
+/// only." Entries are tried in order, must be distinct from each other and
+/// from the requested model, and must be among the requested model's
+/// permitted targets (`allowed_fallback_models` in the Models API); all of
+/// that is validated server-side. Unmodeled keys round-trip via `extra`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FallbackTarget {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<Speed>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, JsonValue>,
+}
+
+impl FallbackTarget {
+    /// `{"model": ...}` with no per-attempt overrides.
+    pub fn model(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            max_tokens: None,
+            thinking: None,
+            output_config: None,
+            speed: None,
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
+/// `fallbacks` — server-side retry on substitute models when the requested
+/// model declines for policy reasons (`/docs/en/build-with-claude/refusals-and-fallback
+/// § Server-side fallback`; beta `server-side-fallback-2026-07-01`). Two wire
+/// forms: the string `"default"` (`§ Making the request`: the requested
+/// model's server-defined routing picks the fallback by refusal category)
+/// or a list of up to three [`FallbackTarget`]s (`§ Naming your own fallback
+/// models`). Only a safety-classifier decline triggers it; the response side
+/// — the `fallback` content block, `usage.iterations`, the top-level `model`
+/// — is modeled in `content.rs` / `response.rs`. An outbound type, so any
+/// other string is a hard error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fallbacks {
+    Default,
+    Models(Vec<FallbackTarget>),
+}
+
+impl Serialize for Fallbacks {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Fallbacks::Default => serializer.serialize_str("default"),
+            Fallbacks::Models(targets) => targets.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Fallbacks {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        match raw {
+            serde_json::Value::String(s) if s == "default" => Ok(Fallbacks::Default),
+            serde_json::Value::Array(_) => serde_json::from_value(raw)
+                .map(Fallbacks::Models)
+                .map_err(D::Error::custom),
+            other => Err(D::Error::custom(format!(
+                "fallbacks: expected \"default\" or a list of targets, got {other}"
+            ))),
+        }
+    }
+}
+
+/// How a failing `fallback_credit_token` affects the retry
+/// (`/docs/en/api/beta/messages/create § Body Parameters`,
+/// `fallback_credit_token`): `strict` (the default, and the bare-string
+/// behavior) makes a failing redemption a 400; `best_effort` serves the retry
+/// either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditRedemption {
+    Strict,
+    BestEffort,
+}
+
+/// `fallback_credit_token` — the credit from a prior refusal's `stop_details`
+/// (see [`StopDetails`](crate::response::StopDetails)), presented on the retry
+/// so its cache-creation tokens bill at the cache-read rate. Two wire forms
+/// (same reference entry): the bare string, or `{"token", "mode"?}` — the
+/// object form needs beta `fallback-credit-2026-07-01`, and a mode-less
+/// object equals the bare string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FallbackCreditToken {
+    Token(String),
+    WithMode {
+        token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<CreditRedemption>,
+    },
+}
+
 /// The request body for `POST /v1/messages`.
 ///
 /// Construct via [`MessagesRequest::new`] (the three required fields) then the
@@ -525,6 +643,18 @@ pub struct MessagesRequest {
     /// MCP servers exposed to the model (spec: MCP connector). Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServer>,
+
+    /// Server-side fallback on a policy refusal (see [`Fallbacks`]); beta
+    /// `server-side-fallback-2026-07-01`. Omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallbacks: Option<Fallbacks>,
+    /// Inference speed mode (see [`Speed`]). Omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<Speed>,
+    /// A prior refusal's credit, redeemed on the retry (see
+    /// [`FallbackCreditToken`]). Omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_credit_token: Option<FallbackCreditToken>,
 }
 
 impl MessagesRequest {
@@ -550,7 +680,25 @@ impl MessagesRequest {
             service_tier: None,
             container: None,
             mcp_servers: Vec::new(),
+            fallbacks: None,
+            speed: None,
+            fallback_credit_token: None,
         }
+    }
+
+    pub fn with_fallbacks(mut self, fallbacks: Fallbacks) -> Self {
+        self.fallbacks = Some(fallbacks);
+        self
+    }
+
+    pub fn with_speed(mut self, speed: Speed) -> Self {
+        self.speed = Some(speed);
+        self
+    }
+
+    pub fn with_fallback_credit_token(mut self, token: FallbackCreditToken) -> Self {
+        self.fallback_credit_token = Some(token);
+        self
     }
 
     pub fn with_system(mut self, system: impl Into<Content>) -> Self {
@@ -857,6 +1005,98 @@ mod tests {
         // The whole document re-serializes to itself: nothing dropped, nothing
         // added, so the cleared message really does go back out unchanged.
         assert_eq!(serde_json::to_value(&r).unwrap(), raw);
+    }
+
+    #[test]
+    fn fallbacks_match_the_documented_requests() {
+        // /docs/en/build-with-claude/refusals-and-fallback § Making the
+        // request — the string form.
+        let r = MessagesRequest::new("claude-fable-5", 1024, vec![Message::user("Hello, Claude")])
+            .with_fallbacks(Fallbacks::Default);
+        assert_eq!(
+            serde_json::to_value(&r).unwrap(),
+            json!({
+                "model": "claude-fable-5",
+                "max_tokens": 1024,
+                "fallbacks": "default",
+                "messages": [{"role": "user", "content": "Hello, Claude"}]
+            })
+        );
+        round_trip(&r);
+        // § Naming your own fallback models — the explicit list; the only
+        // difference from the default-routing request.
+        let r = MessagesRequest::new("claude-fable-5", 1024, vec![Message::user("Hello, Claude")])
+            .with_fallbacks(Fallbacks::Models(vec![FallbackTarget::model(
+                "claude-opus-4-8",
+            )]));
+        assert_eq!(
+            serde_json::to_value(&r).unwrap()["fallbacks"],
+            json!([{"model": "claude-opus-4-8"}])
+        );
+        round_trip(&r);
+        // Per-attempt overrides ride on the entry, and only when set.
+        let target = FallbackTarget {
+            max_tokens: Some(2048),
+            thinking: Some(ThinkingConfig::adaptive()),
+            output_config: Some(OutputConfig {
+                effort: Some("low".into()),
+                ..OutputConfig::default()
+            }),
+            speed: Some(Speed::Fast),
+            ..FallbackTarget::model("claude-opus-5")
+        };
+        assert_eq!(
+            serde_json::to_value(&target).unwrap(),
+            json!({
+                "model": "claude-opus-5", "max_tokens": 2048,
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "low"}, "speed": "fast"
+            })
+        );
+        round_trip(
+            &MessagesRequest::new("m", 1, vec![Message::user("hi")])
+                .with_fallbacks(Fallbacks::Models(vec![target])),
+        );
+        // An outbound type: the only string the API takes is "default".
+        assert!(serde_json::from_value::<Fallbacks>(json!("recommended")).is_err());
+        assert!(serde_json::from_value::<Fallbacks>(json!({"model": "x"})).is_err());
+    }
+
+    #[test]
+    fn speed_and_fallback_credit_token_match_the_reference_shapes() {
+        // /docs/en/api/beta/messages/create § Body Parameters — `speed`, and
+        // the two forms of `fallback_credit_token`.
+        let r = MessagesRequest::new("m", 1, vec![Message::user("hi")])
+            .with_speed(Speed::Fast)
+            .with_fallback_credit_token(FallbackCreditToken::Token("fct_01".into()));
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["speed"], json!("fast"));
+        assert_eq!(v["fallback_credit_token"], json!("fct_01"));
+        round_trip(&r);
+        let r = MessagesRequest::new("m", 1, vec![Message::user("hi")]).with_fallback_credit_token(
+            FallbackCreditToken::WithMode {
+                token: "fct_01".into(),
+                mode: Some(CreditRedemption::BestEffort),
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(&r).unwrap()["fallback_credit_token"],
+            json!({"token": "fct_01", "mode": "best_effort"})
+        );
+        round_trip(&r);
+        // The mode-less object is the reference's "equals the bare string"
+        // form; it stays an object on the wire.
+        let r = MessagesRequest::new("m", 1, vec![Message::user("hi")]).with_fallback_credit_token(
+            FallbackCreditToken::WithMode {
+                token: "fct_01".into(),
+                mode: None,
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(&r).unwrap()["fallback_credit_token"],
+            json!({"token": "fct_01"})
+        );
+        round_trip(&r);
     }
 
     #[test]

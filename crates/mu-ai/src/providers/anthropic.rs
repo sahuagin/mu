@@ -80,6 +80,16 @@ const THINKING_DISPLAY_UPDATES_BETA: &str = "thinking-display-updates-2026-08-18
 /// read input_transformations"). Sent exactly when the body's `thinking`
 /// carries `block_binding`, whichever value it holds.
 const THINKING_BINDING_CONTROLS_BETA: &str = "thinking-binding-controls-2026-08-01";
+/// The request-side `fallbacks` parameter, `"default"` or an explicit list
+/// (the refusals-and-fallback page's "Server-side fallback"). The header
+/// "must carry exactly the date 2026-07-01, which supports both forms";
+/// sent exactly when the body carries the field.
+const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+/// The object form of `fallback_credit_token` (`{token, mode}`; the beta
+/// create reference: "without that header the field accepts the bare string
+/// only"). Sent exactly when the body's token is an object; the bare string
+/// needs no header.
+const FALLBACK_CREDIT_BETA: &str = "fallback-credit-2026-07-01";
 
 /// Is `api_base` Anthropic's own API? Tolerates a trailing slash and case,
 /// the two variants an operator's ANTHROPIC_BASE_URL is likely to carry.
@@ -134,18 +144,20 @@ fn beta_headers_for(
 /// the clear-at beta — without the header the API rejects the field as
 /// unknown ("clear_at: Extra inputs are not permitted"); `thinking.display:
 /// "updates"` needs the display-updates beta and `thinking.block_binding`
-/// the binding-controls beta, both 400s without it. Unlike the
+/// the binding-controls beta, both 400s without it; `fallbacks` needs the
+/// server-side-fallback beta, and an object-form `fallback_credit_token`
+/// the fallback-credit beta. Unlike the
 /// tool-changes beta, whose feature leaves no trace in the body, these are
 /// decided by the body alone: no catalog quirk, no endpoint gate, no
 /// operator override. A body that carries the field is only valid where the
 /// beta is accepted, so the header cannot make a request worse, and a
 /// gateway that forwards to Anthropic needs it. The top-level `output_config`
 /// (the `--thinking` effort knob on every request) is not a per-message
-/// field and asks for nothing. Of the four, what mu sends today is
+/// field and asks for nothing. Of all of these, what mu sends today is
 /// `thinking.display: "summarized"` (from `apply_thinking`), which needs no
-/// header; no mu path emits the two per-message fields, `display:
-/// "updates"` or `block_binding` yet. The transport is ready for the one
-/// that will.
+/// header; no mu path emits the per-message fields, `display: "updates"`,
+/// `block_binding`, `fallbacks` or a credit token yet. The transport is
+/// ready for the one that will.
 fn body_betas(body: &Value) -> Vec<&'static str> {
     let messages = body.get("messages").and_then(Value::as_array);
     let carries = |field: &str| {
@@ -161,19 +173,42 @@ fn body_betas(body: &Value) -> Vec<&'static str> {
     if carries("clear_at") {
         betas.push(MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA);
     }
-    let thinking = body.get("thinking");
-    if thinking
-        .and_then(|t| t.get("display"))
-        .and_then(Value::as_str)
-        == Some("updates")
+    // Every `thinking` object the request carries: the top-level one and
+    // each explicit fallback target's per-attempt override (a target "can
+    // override max_tokens, thinking, output_config, and speed for that
+    // attempt only"), since the override is validated like a direct request
+    // to that model and needs the same headers.
+    let thinking_objects = body
+        .get("thinking")
+        .into_iter()
+        .chain(
+            body.get("fallbacks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|target| target.get("thinking")),
+        )
+        .collect::<Vec<_>>();
+    if thinking_objects
+        .iter()
+        .any(|t| t.get("display").and_then(Value::as_str) == Some("updates"))
     {
         betas.push(THINKING_DISPLAY_UPDATES_BETA);
     }
-    if thinking
-        .and_then(|t| t.get("block_binding"))
-        .is_some_and(|b| !b.is_null())
+    if thinking_objects
+        .iter()
+        .any(|t| t.get("block_binding").is_some_and(|b| !b.is_null()))
     {
         betas.push(THINKING_BINDING_CONTROLS_BETA);
+    }
+    if body.get("fallbacks").is_some_and(|f| !f.is_null()) {
+        betas.push(SERVER_SIDE_FALLBACK_BETA);
+    }
+    if body
+        .get("fallback_credit_token")
+        .is_some_and(Value::is_object)
+    {
+        betas.push(FALLBACK_CREDIT_BETA);
     }
     betas
 }

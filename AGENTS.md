@@ -67,6 +67,14 @@ The `mu` CLI subcommands: `serve` (daemon), `ask` (one-shot), `resume`, `tui`,
   step, so nothing else will run it for you. Reviewer seats come from
   `agent-role code_review`; probe `/api/ps` before using an ollama seat so a
   panel run can't evict a model someone is holding.
+- **Seats are seams.** A `[[code_review.ranked]]` rank in
+  `~/.config/mu/agent_roles.toml` carries either `focus` (soft emphasis) or
+  `seam` + `checklist` (exclusive: that seat reviews for its checklist only).
+  `seam = "conformance"` checks the diff against this file's *Architecture
+  invariants* verbatim, so keep that section current: it is the reviewer's
+  checklist, not prose. Put the conformance seam on a different model family
+  from the correctness seat; bias diversity pays across families, not within
+  one.
 
 ## Running it
 

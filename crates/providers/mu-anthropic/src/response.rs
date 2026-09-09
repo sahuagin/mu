@@ -2,12 +2,14 @@
 //! `POST /v1/messages` (when not streaming) and the assembled result of a
 //! stream.
 //!
-//! Wire shape (spec :88): `{id, type:"message", role, model, content:[...],
+//! Wire shape (`/docs/en/get-started § Call the API`, the response body):
+//! `{id, type:"message", role, model, content:[...],
 //! stop_reason, stop_sequence?, usage:{...}}`.
 //!
 //! Scar list encoded here (INTEGRATION.md §6):
 //! - usage.cache_creation is a per-TTL-tier breakdown object
-//!   (ephemeral_5m_input_tokens / ephemeral_1h_input_tokens, spec :55971),
+//!   (ephemeral_5m_input_tokens / ephemeral_1h_input_tokens;
+//!   `/docs/en/build-with-claude/prompt-caching § 1-hour cache duration`),
 //!   distinct from the flat cache_creation_input_tokens total
 //!   (mu-cache-write-tier-split-umq6).
 //! - the mu-yz48 'usage at top level of message_delta' scar belongs to the
@@ -59,7 +61,8 @@ pub struct StopDetails {
     pub extra: BTreeMap<String, JsonValue>,
 }
 
-/// Per-TTL-tier cache-write breakdown (spec :55971). Present when the request
+/// Per-TTL-tier cache-write breakdown (`/docs/en/build-with-claude/prompt-caching
+/// § 1-hour cache duration`). Present when the request
 /// wrote into named tiers. mu-cache-write-tier-split-umq6.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CacheCreation {
@@ -194,7 +197,8 @@ mod tests {
 
     #[test]
     fn parses_documented_response_body() {
-        // spec :88 verbatim.
+        // /docs/en/get-started § Call the API — the documented response body,
+        // verbatim.
         let raw = json!({
             "id": "msg_013mHbppMPd2PrVJzGMZPt2D",
             "type": "message",
@@ -239,7 +243,8 @@ mod tests {
 
     #[test]
     fn cache_creation_tier_split_parses() {
-        // SCAR mu-cache-write-tier-split-umq6 — spec :55971.
+        // SCAR mu-cache-write-tier-split-umq6 —
+        // /docs/en/build-with-claude/prompt-caching § 1-hour cache duration.
         let raw = json!({
             "input_tokens": 412,
             "output_tokens": 264,

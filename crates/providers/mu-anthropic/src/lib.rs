@@ -25,7 +25,7 @@ pub use accumulate::{accumulate, AccumulateError, Accumulated};
 pub use content::{CacheControl, ContentBlock};
 pub use finite::FiniteF64;
 pub use json::{JsonValue, JsonValueError};
-pub use message::{Content, Message, Role};
+pub use message::{ClearAt, Content, Message, Role};
 pub use request::{
     ContextEdit, ContextManagement, McpServer, McpToolConfiguration, MessagesRequest, Metadata,
     OutputConfig, ServerTool, ThinkingConfig, Tool, ToolChoice, ToolDef,

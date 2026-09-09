@@ -2,7 +2,8 @@
 //!
 //! A message's `content` is an array of these. The wire shape is an
 //! internally-tagged union keyed on `"type"`. Spec-exact field names (verified
-//! against `specifications/llms-full.txt.xz`, 2026-06-13):
+//! against `specifications/llms-full.txt.xz`, 2026-09-04; each conformance
+//! test names its page and heading):
 //!
 //! - text:        `{"type":"text","text":"..."}`
 //! - tool_use:    `{"type":"tool_use","id":"toolu_...","name":"...","input":{...}}`
@@ -772,10 +773,15 @@ mod tests {
     }
 
     // ----- Tier 2: spec-conformance (our bytes == documented example) -----
-    // Examples lifted verbatim from specifications/llms-full.txt.xz (2026-06-13).
+    // Examples lifted from specifications/llms-full.txt.xz (2026-09-04) name
+    // their page and heading; the other tests here pin a shape property
+    // (a field omitted when unset, an unknown value degrading, a shape seen
+    // on real traffic) rather than a quoted example.
 
     #[test]
     fn text_matches_spec_shape() {
+        // /docs/en/build-with-claude/handling-stop-reasons § end_turn — the
+        // text block of the calculator example.
         let block = ContentBlock::text("Here's the result");
         let v = serde_json::to_value(&block).unwrap();
         assert_eq!(v, json!({"type": "text", "text": "Here's the result"}));
@@ -783,7 +789,8 @@ mod tests {
 
     #[test]
     fn tool_use_matches_spec_shape() {
-        // spec llms-full.txt.xz:2660 — calculator example.
+        // /docs/en/build-with-claude/handling-stop-reasons § end_turn — the
+        // calculator example.
         let block = ContentBlock::ToolUse {
             id: "toolu_123".into(),
             name: "calculator".into(),
@@ -804,7 +811,9 @@ mod tests {
 
     #[test]
     fn tool_result_uses_tool_use_id_not_id() {
-        // SCAR-ADJACENT: the field is `tool_use_id`, NOT `id`. spec :2670.
+        // SCAR-ADJACENT: the field is `tool_use_id`, NOT `id`.
+        // /docs/en/build-with-claude/handling-stop-reasons § end_turn — the
+        // tool_result answering the calculator call.
         let block = ContentBlock::ToolResult {
             tool_use_id: "toolu_123".into(),
             content: "6912".into(),
@@ -903,7 +912,8 @@ mod tests {
 
     #[test]
     fn cache_control_ephemeral_matches_spec() {
-        // spec llms-full.txt.xz:6929 — {"type":"ephemeral"}.
+        // /docs/en/build-with-claude/batch-processing § Using prompt caching
+        // with Message Batches — {"type":"ephemeral"}.
         let block = ContentBlock::Text {
             text: "<book>".into(),
             citations: Vec::new(),

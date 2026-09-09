@@ -10,7 +10,8 @@
 //! Scars encoded:
 //! - usage merges across TWO events: message_start.message.usage gives the
 //!   input_tokens baseline (+output_tokens:1), message_delta.usage gives the
-//!   final output_tokens (spec :16118 / :16136). Reading only one undercounts.
+//!   final output_tokens (`/docs/en/build-with-claude/streaming § Basic
+//!   streaming request`). Reading only one undercounts.
 //! - content blocks are keyed by `index`; final order follows first-seen index
 //!   order, independent of any map iteration order.
 //! - tool args stream as input_json_delta `partial_json` fragments; parse the
@@ -312,7 +313,8 @@ mod tests {
 
     #[tokio::test]
     async fn preserves_block_order_thinking_then_text() {
-        // spec :8840 — thinking block (index 0) precedes text (index 1).
+        // /docs/en/build-with-claude/thinking § Streaming thinking — the
+        // thinking block (index 0) precedes text (index 1).
         let s = stream(vec![
             ev(json!({"type":"content_block_start","index":0,
                 "content_block":{"type":"thinking","thinking":""}})),

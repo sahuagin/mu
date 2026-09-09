@@ -2,14 +2,16 @@
 //! deserializes into a [`StreamEvent`]; an async accumulator (slice 6) folds a
 //! stream of these into a final [`ResponseMessage`](crate::ResponseMessage).
 //!
-//! Event sequence (spec :8840): message_start, then per content block
+//! Event sequence (`/docs/en/build-with-claude/streaming § Basic streaming
+//! request`): message_start, then per content block
 //! {content_block_start, content_block_delta*, content_block_stop}, then
 //! message_delta, then message_stop. `ping` may arrive at any time; `error`
 //! terminates.
 //!
 //! SCAR mu-yz48 (the sharpest one): in `message_delta`, `usage` is a SIBLING
-//! of `delta` at the event's TOP LEVEL — NOT nested inside `delta` (spec
-//! :16136: `{"type":"message_delta","delta":{...},"usage":{"output_tokens":15}}`).
+//! of `delta` at the event's TOP LEVEL — NOT nested inside `delta` (the same
+//! page's `message_delta` line:
+//! `{"type":"message_delta","delta":{...},"usage":{"output_tokens":15}}`).
 //! A type that reads `delta.usage` gets None and freezes output_tokens at the
 //! message_start baseline. [`StreamEvent::MessageDelta`] puts `usage` at the
 //! variant top level; a test pins it.
@@ -128,7 +130,8 @@ mod tests {
 
     #[test]
     fn message_delta_usage_is_top_level_not_nested() {
-        // SCAR mu-yz48 — spec :16136. usage is a sibling of delta.
+        // SCAR mu-yz48 — /docs/en/build-with-claude/streaming § Basic streaming
+        // request. usage is a sibling of delta.
         let ev = parse(json!({
             "type": "message_delta",
             "delta": {"stop_reason": "end_turn", "stop_sequence": null},
@@ -151,7 +154,8 @@ mod tests {
 
     #[test]
     fn message_delta_without_usage_is_fine() {
-        // spec :8871 — a message_delta with no usage sibling.
+        // /docs/en/build-with-claude/thinking § Streaming thinking — a
+        // message_delta with no usage sibling.
         let ev = parse(json!({
             "type": "message_delta",
             "delta": {"stop_reason": "end_turn", "stop_sequence": null}
@@ -164,7 +168,8 @@ mod tests {
 
     #[test]
     fn full_event_sequence_parses() {
-        // spec :8840-8874 — the documented stream.
+        // /docs/en/build-with-claude/streaming § Streaming request with tool
+        // use — the documented event sequence.
         assert!(matches!(
             parse(json!({"type":"message_start","message":{"id":"x"}})),
             StreamEvent::MessageStart { .. }
@@ -284,7 +289,8 @@ mod f8_partial_json_default {
 
     #[test]
     fn input_json_delta_with_empty_partial_json_parses() {
-        // spec :16565 — "partial_json":"" appears in real streams.
+        // /docs/en/build-with-claude/streaming § Streaming request with tool
+        // use — "partial_json":"" appears in real streams.
         let ev: StreamEvent = serde_json::from_value(json!({
             "type": "content_block_delta", "index": 1,
             "delta": {"type": "input_json_delta", "partial_json": ""}

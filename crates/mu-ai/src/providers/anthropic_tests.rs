@@ -1675,6 +1675,57 @@ mod live_tests {
         );
     }
 
+    /// The two thinking betas follow the body the same way: `display:
+    /// "updates"` asks for the display beta (the other two values, including
+    /// the `summarized` that `apply_thinking` sends, do not), and a
+    /// `block_binding` object asks for the binding beta whichever behavior
+    /// it names. Bodies come from mu-anthropic's typed config so the crate
+    /// and the transport agree on the wire shape.
+    #[test]
+    fn thinking_betas_follow_the_body() {
+        use mu_anthropic::{PrefixMismatchBehavior, ThinkingConfig, ThinkingDisplay};
+        let body = |t: ThinkingConfig| {
+            serde_json::to_value(
+                MessagesRequest::new("x", 1, vec![AnthMessage::user("hi")]).with_thinking(t),
+            )
+            .unwrap()
+        };
+        let mut summarized = serde_json::json!({"model": "x", "max_tokens": 1, "messages": []});
+        apply_thinking(&mut summarized, Some("high"));
+        assert!(body_betas(&summarized).is_empty(), "{summarized}");
+        assert!(body_betas(&body(
+            ThinkingConfig::adaptive().with_display(ThinkingDisplay::Omitted)
+        ))
+        .is_empty());
+        assert_eq!(
+            body_betas(&body(
+                ThinkingConfig::adaptive().with_display(ThinkingDisplay::Updates)
+            )),
+            vec![THINKING_DISPLAY_UPDATES_BETA]
+        );
+        assert_eq!(
+            body_betas(&body(
+                ThinkingConfig::enabled(2048)
+                    .with_prefix_mismatch_behavior(PrefixMismatchBehavior::Error)
+            )),
+            vec![THINKING_BINDING_CONTROLS_BETA]
+        );
+        assert_eq!(
+            body_betas(&body(
+                ThinkingConfig::adaptive()
+                    .with_display(ThinkingDisplay::Updates)
+                    .with_prefix_mismatch_behavior(PrefixMismatchBehavior::DropBlock)
+            )),
+            vec![
+                THINKING_DISPLAY_UPDATES_BETA,
+                THINKING_BINDING_CONTROLS_BETA
+            ]
+        );
+        let mut nulled = body(ThinkingConfig::adaptive());
+        nulled["thinking"]["block_binding"] = Value::Null;
+        assert!(body_betas(&nulled).is_empty(), "{nulled}");
+    }
+
     /// One assembly path for the lane and the tests, in two lists that
     /// degrade differently: the refusal latch drops the catalog beta and
     /// nothing else, and the header carries catalog first, body after.

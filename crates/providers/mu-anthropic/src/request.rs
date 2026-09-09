@@ -263,21 +263,123 @@ pub struct Metadata {
     pub extra: BTreeMap<String, JsonValue>,
 }
 
+/// `thinking.display` — what the returned `thinking` blocks carry
+/// (`/docs/en/build-with-claude/thinking § Controlling thinking display`):
+/// `summarized` (a summary of the reasoning), `omitted` (empty `thinking`
+/// text, signature only), and `updates` (empty reasoning text, but the short
+/// progress updates some models write between tool calls come back as
+/// readable text — `§ Progress updates between tool calls`; beta
+/// `thinking-display-updates-2026-08-18`). Invalid with `type: "disabled"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDisplay {
+    Summarized,
+    Omitted,
+    Updates,
+}
+
+/// `thinking.block_binding.prefix_mismatch_behavior` — what the API does with
+/// a replayed thinking block whose conversation prefix has changed
+/// (`/docs/en/build-with-claude/preserved-thinking § What the API does with an
+/// invalid block`): `error`, the default, is a 400 naming the first failing
+/// block; `drop_block` drops it and every thinking block after it, and lists
+/// the drops in the response's `input_transformations`. Beta
+/// `thinking-binding-controls-2026-08-01`, whichever value is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefixMismatchBehavior {
+    Error,
+    DropBlock,
+}
+
+/// `thinking.block_binding`, whose one documented field is
+/// `prefix_mismatch_behavior` (`/docs/en/build-with-claude/preserved-thinking
+/// § Set the mismatch behavior and read input_transformations`). Accepted
+/// alongside `adaptive` and `enabled`. Unmodeled keys round-trip via `extra`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BlockBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_mismatch_behavior: Option<PrefixMismatchBehavior>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, JsonValue>,
+}
+
 /// Extended-thinking config (`thinking`). Internally tagged on `type`. Observed
 /// on the live beta wire: `adaptive`; documented standard forms: `enabled`
 /// (with a token budget) and `disabled`. This is an OUTBOUND type we construct,
 /// so the variant set is intentionally closed — a `type` we don't model
 /// deserializes as a hard error (a loud "the wire changed, update the lib"
 /// signal) rather than silently mis-modeling.
+///
+/// `adaptive` and `enabled` take the same two optional knobs, `display`
+/// ([`ThinkingDisplay`]) and `block_binding` ([`BlockBinding`]), both omitted
+/// when unset, so `{"type":"adaptive"}` is still the bytes the observed wire
+/// carried; `disabled` takes neither (the API rejects `display` there).
+/// Build with [`ThinkingConfig::adaptive`] / [`ThinkingConfig::enabled`] and
+/// the `with_*` setters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThinkingConfig {
     /// `{"type":"adaptive"}` — model self-budgets its reasoning (observed wire).
-    Adaptive,
+    Adaptive {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display: Option<ThinkingDisplay>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        block_binding: Option<BlockBinding>,
+    },
     /// `{"type":"enabled","budget_tokens":N}` — explicit reasoning budget.
-    Enabled { budget_tokens: u32 },
+    Enabled {
+        budget_tokens: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display: Option<ThinkingDisplay>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        block_binding: Option<BlockBinding>,
+    },
     /// `{"type":"disabled"}` — no extended thinking.
     Disabled,
+}
+
+impl ThinkingConfig {
+    /// `{"type":"adaptive"}`.
+    pub fn adaptive() -> Self {
+        ThinkingConfig::Adaptive {
+            display: None,
+            block_binding: None,
+        }
+    }
+
+    /// `{"type":"enabled","budget_tokens":N}`.
+    pub fn enabled(budget_tokens: u32) -> Self {
+        ThinkingConfig::Enabled {
+            budget_tokens,
+            display: None,
+            block_binding: None,
+        }
+    }
+
+    /// Set `display`. `disabled` has no such field (the API rejects it
+    /// there), so this leaves a `Disabled` config unchanged.
+    pub fn with_display(mut self, value: ThinkingDisplay) -> Self {
+        if let ThinkingConfig::Adaptive { display, .. } | ThinkingConfig::Enabled { display, .. } =
+            &mut self
+        {
+            *display = Some(value);
+        }
+        self
+    }
+
+    /// Set `block_binding.prefix_mismatch_behavior` (keeping any other
+    /// `block_binding` keys). Leaves a `Disabled` config unchanged.
+    pub fn with_prefix_mismatch_behavior(mut self, behavior: PrefixMismatchBehavior) -> Self {
+        if let ThinkingConfig::Adaptive { block_binding, .. }
+        | ThinkingConfig::Enabled { block_binding, .. } = &mut self
+        {
+            block_binding
+                .get_or_insert_with(BlockBinding::default)
+                .prefix_mismatch_behavior = Some(behavior);
+        }
+        self
+    }
 }
 
 /// Server-side context-editing directives (`context_management`). Observed:
@@ -969,7 +1071,7 @@ mod tests {
                 user_id: Some("usr_x".into()),
                 extra: BTreeMap::new(),
             })
-            .with_thinking(ThinkingConfig::Adaptive)
+            .with_thinking(ThinkingConfig::adaptive())
             .with_context_management(ContextManagement {
                 edits: vec![ContextEdit {
                     edit_type: "clear_thinking_20251015".into(),
@@ -1047,16 +1149,96 @@ mod tests {
 
     #[test]
     fn thinking_enabled_carries_budget_and_round_trips() {
-        let req = MessagesRequest::new("m", 10, vec![Message::user("hi")]).with_thinking(
-            ThinkingConfig::Enabled {
-                budget_tokens: 4096,
-            },
-        );
+        let req = MessagesRequest::new("m", 10, vec![Message::user("hi")])
+            .with_thinking(ThinkingConfig::enabled(4096));
         assert_eq!(
             serde_json::to_value(&req).unwrap()["thinking"],
             json!({"type": "enabled", "budget_tokens": 4096})
         );
         round_trip(&req);
+    }
+
+    #[test]
+    fn thinking_display_matches_the_documented_shapes() {
+        let thinking = |t: ThinkingConfig| {
+            serde_json::to_value(
+                MessagesRequest::new("m", 16000, vec![Message::user("hi")]).with_thinking(t),
+            )
+            .unwrap()["thinking"]
+                .clone()
+        };
+        // /docs/en/build-with-claude/thinking § Streaming thinking — the
+        // documented request, and the shape mu's lane sends today.
+        assert_eq!(
+            thinking(ThinkingConfig::adaptive().with_display(ThinkingDisplay::Summarized)),
+            json!({"type": "adaptive", "display": "summarized"})
+        );
+        // § Progress updates between tool calls — display "updates" (beta).
+        assert_eq!(
+            thinking(ThinkingConfig::adaptive().with_display(ThinkingDisplay::Updates)),
+            json!({"type": "adaptive", "display": "updates"})
+        );
+        // `enabled` carries the knob too.
+        assert_eq!(
+            thinking(ThinkingConfig::enabled(4096).with_display(ThinkingDisplay::Omitted)),
+            json!({"type": "enabled", "budget_tokens": 4096, "display": "omitted"})
+        );
+        // `disabled` has nowhere to put it: the setter leaves the config
+        // alone and the bytes stay the documented {"type":"disabled"}.
+        assert_eq!(
+            thinking(ThinkingConfig::Disabled.with_display(ThinkingDisplay::Summarized)),
+            json!({"type": "disabled"})
+        );
+        // Closed value set: an undocumented display is a hard error, and a
+        // config that carries display + binding round-trips.
+        assert!(serde_json::from_value::<ThinkingConfig>(
+            json!({"type": "adaptive", "display": "raw"})
+        )
+        .is_err());
+        round_trip(
+            &MessagesRequest::new("m", 1, vec![Message::user("hi")]).with_thinking(
+                ThinkingConfig::enabled(2048)
+                    .with_display(ThinkingDisplay::Updates)
+                    .with_prefix_mismatch_behavior(PrefixMismatchBehavior::Error),
+            ),
+        );
+    }
+
+    #[test]
+    fn thinking_block_binding_matches_the_documented_request() {
+        // /docs/en/build-with-claude/preserved-thinking § Set the mismatch
+        // behavior and read input_transformations — the documented request
+        // that opts into dropping rather than rejecting.
+        let req = MessagesRequest::new(
+            "claude-fable-5-1",
+            16000,
+            vec![Message::user(
+                "What is the greatest common divisor of 1071 and 462?",
+            )],
+        )
+        .with_thinking(
+            ThinkingConfig::adaptive()
+                .with_prefix_mismatch_behavior(PrefixMismatchBehavior::DropBlock),
+        );
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            json!({
+                "model": "claude-fable-5-1",
+                "max_tokens": 16000,
+                "thinking": {
+                    "type": "adaptive",
+                    "block_binding": {"prefix_mismatch_behavior": "drop_block"}
+                },
+                "messages": [
+                    {"role": "user", "content": "What is the greatest common divisor of 1071 and 462?"}
+                ]
+            })
+        );
+        round_trip(&req);
+        assert_eq!(
+            serde_json::to_value(PrefixMismatchBehavior::Error).unwrap(),
+            json!("error")
+        );
     }
 
     #[test]

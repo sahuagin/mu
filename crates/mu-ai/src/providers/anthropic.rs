@@ -70,6 +70,16 @@ const MID_CONVERSATION_OUTPUT_CONFIG_BETA: &str = "mid-conversation-output-confi
 /// (the mid-conversation-system-messages page's "Turn-scoped system
 /// messages"). Same rule: sent exactly when a message carries the field.
 const MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA: &str = "mid-conversation-system-clear-at-2026-08-21";
+/// `thinking.display: "updates"` — progress updates between tool calls come
+/// back as readable text while reasoning stays empty (the thinking page's
+/// "Progress updates between tool calls"). Sent exactly when the body's
+/// `thinking.display` is that value; the other two values need no header.
+const THINKING_DISPLAY_UPDATES_BETA: &str = "thinking-display-updates-2026-08-18";
+/// `thinking.block_binding` on the request and `input_transformations` on the
+/// response (the preserved-thinking page's "Set the mismatch behavior and
+/// read input_transformations"). Sent exactly when the body's `thinking`
+/// carries `block_binding`, whichever value it holds.
+const THINKING_BINDING_CONTROLS_BETA: &str = "thinking-binding-controls-2026-08-01";
 
 /// Is `api_base` Anthropic's own API? Tolerates a trailing slash and case,
 /// the two variants an operator's ANTHROPIC_BASE_URL is likely to carry.
@@ -122,15 +132,20 @@ fn beta_headers_for(
 /// The betas a request body asks for by carrying their fields: a message
 /// with `output_config` needs the output-config beta, one with `clear_at`
 /// the clear-at beta — without the header the API rejects the field as
-/// unknown ("clear_at: Extra inputs are not permitted"). Unlike the
+/// unknown ("clear_at: Extra inputs are not permitted"); `thinking.display:
+/// "updates"` needs the display-updates beta and `thinking.block_binding`
+/// the binding-controls beta, both 400s without it. Unlike the
 /// tool-changes beta, whose feature leaves no trace in the body, these are
 /// decided by the body alone: no catalog quirk, no endpoint gate, no
 /// operator override. A body that carries the field is only valid where the
 /// beta is accepted, so the header cannot make a request worse, and a
 /// gateway that forwards to Anthropic needs it. The top-level `output_config`
 /// (the `--thinking` effort knob on every request) is not a per-message
-/// field and asks for nothing. No mu path emits either field yet; the
-/// transport is ready for the one that will.
+/// field and asks for nothing. Of the four, what mu sends today is
+/// `thinking.display: "summarized"` (from `apply_thinking`), which needs no
+/// header; no mu path emits the two per-message fields, `display:
+/// "updates"` or `block_binding` yet. The transport is ready for the one
+/// that will.
 fn body_betas(body: &Value) -> Vec<&'static str> {
     let messages = body.get("messages").and_then(Value::as_array);
     let carries = |field: &str| {
@@ -145,6 +160,20 @@ fn body_betas(body: &Value) -> Vec<&'static str> {
     }
     if carries("clear_at") {
         betas.push(MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA);
+    }
+    let thinking = body.get("thinking");
+    if thinking
+        .and_then(|t| t.get("display"))
+        .and_then(Value::as_str)
+        == Some("updates")
+    {
+        betas.push(THINKING_DISPLAY_UPDATES_BETA);
+    }
+    if thinking
+        .and_then(|t| t.get("block_binding"))
+        .is_some_and(|b| !b.is_null())
+    {
+        betas.push(THINKING_BINDING_CONTROLS_BETA);
     }
     betas
 }
@@ -1353,7 +1382,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 // No-op; the block stays in the map until assembled at
                 // message_stop.
             }
-            StreamEvent::MessageDelta { delta, usage } => {
+            StreamEvent::MessageDelta { delta, usage, .. } => {
                 state.stop_reason = delta.stop_reason;
                 // mu-yz48: usage is the event-top-level sibling of `delta`
                 // (mu_anthropic models it there, boxed).

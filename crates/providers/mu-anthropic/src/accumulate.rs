@@ -26,7 +26,7 @@ use serde_json::Value;
 use crate::json::JsonValue;
 
 use crate::content::ContentBlock;
-use crate::response::{StopReason, Usage};
+use crate::response::{InputTransformation, StopReason, Usage};
 use crate::stream::{BlockDelta, BlockStart, StreamEvent};
 
 /// Error from accumulating a stream.
@@ -38,6 +38,14 @@ pub enum AccumulateError {
     /// An `error` event arrived mid-stream.
     #[error("stream error event: {0}")]
     StreamError(String),
+    /// `input_transformations` arrived (on `message_start` or the final
+    /// `message_delta`) with an entry of a known type that does not parse —
+    /// the streaming twin of the non-streaming response failing to parse on
+    /// the same input. Wire breakage on a known type stays loud on both
+    /// paths, and a lost dropped-block report never looks like "nothing was
+    /// dropped".
+    #[error("input_transformations does not parse: {0}")]
+    InputTransformations(String),
 }
 
 /// The assembled result of a completed stream.
@@ -47,6 +55,23 @@ pub struct Accumulated {
     pub stop_reason: Option<StopReason>,
     pub stop_sequence: Option<String>,
     pub usage: Usage,
+    /// The response's `input_transformations` (beta
+    /// `thinking-binding-controls-2026-08-01`): taken from `message_start`'s
+    /// Message object, replaced by the final `message_delta`'s copy when one
+    /// arrives. The reference (`/docs/en/api/beta/messages/create § Returns`)
+    /// makes that copy authoritative, empty or not: "the final `message_delta`
+    /// event carries it only when a server-side model fallback happened
+    /// mid-stream, in which case it holds the serving model's entries and
+    /// replaces the one in `message_start`". `None` when neither carried the
+    /// array. A malformed known entry is
+    /// [`AccumulateError::InputTransformations`].
+    pub input_transformations: Option<Vec<InputTransformation>>,
+}
+
+/// Type the raw `input_transformations` array a stream event carried.
+fn typed_transformations(raw: &Value) -> Result<Vec<InputTransformation>, AccumulateError> {
+    serde_json::from_value::<Vec<InputTransformation>>(raw.clone())
+        .map_err(|e| AccumulateError::InputTransformations(e.to_string()))
 }
 
 enum BlockBuilder {
@@ -138,18 +163,26 @@ where
     let mut stop_reason = None;
     let mut stop_sequence = None;
     let mut usage = Usage::default();
+    let mut input_transformations: Option<Vec<InputTransformation>> = None;
 
     while let Some(ev) = events.next().await {
         match ev {
             StreamEvent::MessageStart { message } => {
                 let raw = message.as_value();
-                if let Some(u) = raw
-                    .get("message")
-                    .or(Some(raw))
+                let msg = raw.get("message").or(Some(raw));
+                if let Some(u) = msg
                     .and_then(|m| m.get("usage"))
                     .and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok())
                 {
                     merge_usage(&mut usage, &u);
+                }
+                // An explicit null is absent, as it is for the non-streaming
+                // parse (Option) and for the delta positions (Option<JsonValue>).
+                if let Some(t) = msg
+                    .and_then(|m| m.get("input_transformations"))
+                    .filter(|t| !t.is_null())
+                {
+                    input_transformations = Some(typed_transformations(t)?);
                 }
             }
             StreamEvent::ContentBlockStart {
@@ -197,12 +230,22 @@ where
                 }
             }
             StreamEvent::ContentBlockStop { .. } => {}
-            StreamEvent::MessageDelta { delta, usage: u } => {
+            StreamEvent::MessageDelta {
+                delta,
+                usage: u,
+                input_transformations: beside_delta,
+            } => {
                 if delta.stop_reason.is_some() {
                     stop_reason = delta.stop_reason;
                 }
                 if delta.stop_sequence.is_some() {
                     stop_sequence = delta.stop_sequence;
+                }
+                // Either placement (see MessageDeltaBody); beside `delta`
+                // wins when both are present. The delta's array replaces
+                // message_start's outright, empty or not (see Accumulated).
+                if let Some(t) = beside_delta.or(delta.input_transformations) {
+                    input_transformations = Some(typed_transformations(t.as_value())?);
                 }
                 if let Some(u) = u {
                     merge_usage(&mut usage, &u);
@@ -219,6 +262,7 @@ where
                     stop_reason,
                     stop_sequence,
                     usage,
+                    input_transformations,
                 });
             }
             StreamEvent::Error { error } => {
@@ -276,6 +320,148 @@ mod tests {
             acc.usage.output_tokens,
             Some(15),
             "output from message_delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn input_transformations_come_from_message_start_unless_a_delta_replaces_them() {
+        // /docs/en/build-with-claude/streaming § Event types — final on
+        // message_start; the final message_delta carries a replacement only
+        // after a mid-stream fallback.
+        let dropped = |path: &str| json!({"type": "thinking_dropped", "path": path, "reason": "prefix_binding_mismatch"});
+        let start = |transformations: serde_json::Value| {
+            ev(
+                json!({"type":"message_start","message":{"id":"x","type":"message",
+                "role":"assistant","content":[],"model":"m",
+                "usage":{"input_tokens":5,"output_tokens":1},
+                "input_transformations": transformations}}),
+            )
+        };
+        let stop = || ev(json!({"type":"message_stop"}));
+
+        let acc = accumulate(stream(vec![
+            start(json!([dropped("messages.1.content.0")])),
+            ev(json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}})),
+            stop(),
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(
+            acc.input_transformations,
+            Some(vec![InputTransformation::ThinkingDropped {
+                path: "messages.1.content.0".into(),
+                reason: crate::response::TransformationReason::PrefixBindingMismatch,
+                extra: BTreeMap::new(),
+            }])
+        );
+
+        let acc = accumulate(stream(vec![
+            start(json!([dropped("messages.1.content.0")])),
+            ev(json!({"type":"message_delta",
+                "delta":{"stop_reason":"end_turn",
+                         "input_transformations":[dropped("messages.1.content.0"), dropped("messages.3.content.0")]},
+                "usage":{"output_tokens":2}})),
+            stop(),
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(
+            acc.input_transformations.as_deref().map(<[_]>::len),
+            Some(2),
+            "delta replaces"
+        );
+
+        let acc = accumulate(stream(vec![
+            start(json!([dropped("messages.1.content.0")])),
+            ev(json!({"type":"message_delta",
+                "delta":{"stop_reason":"end_turn"},
+                "usage":{"output_tokens":2},
+                "input_transformations":[dropped("messages.1.content.0"), dropped("messages.3.content.0"), dropped("messages.5.content.0")]})),
+            stop(),
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(
+            acc.input_transformations.as_deref().map(<[_]>::len),
+            Some(3),
+            "the array beside delta replaces too"
+        );
+
+        let acc = accumulate(stream(vec![
+            ev(json!({"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1}}})),
+            ev(json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}})),
+            stop(),
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(acc.input_transformations, None, "absent without the beta");
+
+        // The reference: the delta's copy "holds the serving model's entries
+        // and replaces the one in message_start" — so an empty array on the
+        // delta (the fallback model dropped nothing) replaces a non-empty
+        // one from message_start; it is not a missing value to skip.
+        let acc = accumulate(stream(vec![
+            start(json!([dropped("messages.1.content.0")])),
+            ev(json!({"type":"message_delta",
+                "delta":{"stop_reason":"end_turn","input_transformations":[]},
+                "usage":{"output_tokens":2}})),
+            stop(),
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(
+            acc.input_transformations,
+            Some(vec![]),
+            "an empty delta array replaces"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_null_input_transformations_read_as_absent_on_either_event() {
+        // null == absent, the crate's convention and what the non-streaming
+        // parse does with the same field.
+        let acc = accumulate(stream(vec![
+            ev(json!({"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1},
+                "input_transformations": null}})),
+            ev(json!({"type":"message_delta","delta":{"stop_reason":"end_turn","input_transformations":null},
+                "usage":{"output_tokens":2},"input_transformations":null})),
+            ev(json!({"type":"message_stop"})),
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(acc.input_transformations, None);
+        assert_eq!(acc.stop_reason, Some(StopReason::EndTurn));
+    }
+
+    #[tokio::test]
+    async fn malformed_input_transformations_are_an_error_on_either_event() {
+        // Same input, same outcome as the non-streaming parse: a known-type
+        // entry that does not parse is loud, on message_start and on
+        // message_delta alike, never a silent None.
+        let bad = json!([{"type": "thinking_dropped", "path": {"i": 0}}]);
+        let err = accumulate(stream(vec![
+            ev(json!({"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1},
+                "input_transformations": bad}})),
+            ev(json!({"type":"message_stop"})),
+        ]))
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AccumulateError::InputTransformations(_)),
+            "{err}"
+        );
+
+        let err = accumulate(stream(vec![
+            ev(json!({"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1}}})),
+            ev(json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},
+                "usage":{"output_tokens":2}, "input_transformations": bad})),
+            ev(json!({"type":"message_stop"})),
+        ]))
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AccumulateError::InputTransformations(_)),
+            "{err}"
         );
     }
 

@@ -82,6 +82,15 @@ converge_audit_step() {
 }
 run_step "review-panel converge audit" converge_audit_step
 
+# Seat prompt assembly self-test (mu-review-gate-seam-reviewers-9vkbt.2): the
+# focus / seam / conformance clauses, model-free.
+seat_prompt_step() {
+  local t="$REPO_ROOT/scripts/tests/seat-prompt-test.sh"
+  [ -f "$t" ] || { printf "%s    seat-prompt-test.sh missing — skipping%s\n\n" "$C_DIM" "$C_OFF"; return 0; }
+  bash "$t"
+}
+run_step "review-panel seat prompts" seat_prompt_step
+
 # Canary bead-filing idempotency (mu-ztmla). The offline cases run against a
 # strict fake beads client. When a real client and a beadsd url are present
 # the test also probes that client READ-ONLY (lists nothing matches plus

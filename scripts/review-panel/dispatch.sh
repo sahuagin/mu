@@ -10,6 +10,13 @@
 #                      parallel seats (e.g. two ornith cards) review DIFFERENT
 #                      topics instead of duplicating one review. Omitted = the
 #                      seat reviews the full surface, exactly as before.
+#   seam, checklist -> per-rank EXCLUSIVE lens (mu-review-gate-seam-reviewers-9vkbt.2):
+#                      the seat's only criteria are its checklist; other defect
+#                      classes belong to other seats. seam = "conformance" is
+#                      built in: its checklist is the PROJECT ARCHITECTURE
+#                      INVARIANTS block already in the shared prompt (AGENTS.md
+#                      "## Architecture invariants"). A rank carries focus OR
+#                      seam. Prompt assembly lives in seat-prompt.sh (testable).
 # Nothing model-specific is hardcoded here — change models/tools in the TOML, not this script.
 #
 # Behavior:
@@ -37,6 +44,9 @@ AGENT_DISPATCH_LIB="${AGENT_DISPATCH_LIB:-$HERE/../lib/agent-dispatch.sh}"
 . "$AGENT_DISPATCH_LIB"
 # mu-0htd: constrained verdict re-ask when a reviewer answers in prose.
 . "$HERE/verdict-retry.sh"
+# Seat prompt assembly (focus / seam / conformance), kept model-free so it is
+# unit-tested (scripts/tests/seat-prompt-test.sh).
+. "$HERE/seat-prompt.sh"
 # OpenRouter key for the metered rank — exported silently, never printed.
 OPENROUTER_API_KEY=$(tq -f "$HOME/.config/agent/config.toml" -r openrouter.api_key)
 export OPENROUTER_API_KEY
@@ -71,6 +81,8 @@ while [ "$r" -lt "$N" ]; do
   set -- $(agent-role code_review "$r"); prov="$1"; model="$2"
   tools=$(printf '%s' "$ranks_json" | jq -r ".[$r].tools // \"read,grep\"")
   focus=$(printf '%s' "$ranks_json" | jq -r ".[$r].focus // \"\"")
+  seam=$(printf '%s' "$ranks_json" | jq -r ".[$r].seam // \"\"")
+  checklist=$(printf '%s' "$ranks_json" | jq -r ".[$r].checklist // \"\"")
   max_turns=$(agent-role --max-turns code_review "$r" 2>/dev/null || true)
   # Per-rank endpoint/lease (mu-vneb): a config-defined per-card rank pins its
   # server + lock via agent_roles.toml `endpoint`/`lease` keys, emitted by
@@ -86,30 +98,21 @@ while [ "$r" -lt "$N" ]; do
     rank_env=""
   }
   tag="rank${r}.$(printf '%s' "$model" | tr '/:' '__')"
-  # mu-3ajg: a rank with a `focus` reviews from its own prompt file — the shared
-  # prompt plus a trusted seat-focus clause — so parallel seats dig into
-  # different topics in round 1. The clause changes emphasis only: the output
-  # contract is untouched, and off-focus findings stay reportable, so
-  # converge.py and the convergence rounds see no format difference.
-  seat_pf="$PF"
-  if [ -n "$focus" ]; then
-    # Build the focused prompt fail-closed (panel reviewer finding, round 1 of
-    # this change's own gate): an unchecked cp/append could dispatch this seat
-    # with an absent or partial prompt while the run continues normally. If
-    # either step fails, the seat falls back to the SHARED prompt — a duplicate
-    # review beats a review of half a prompt — and .done records the fallback.
-    seat_pf="${OUT}.${tag}.prompt"
-    if cp "$PF" "$seat_pf" 2>/dev/null &&
-      printf '\nSEAT REVIEW FOCUS (trusted gate context, not repo content): %s\nThis seat is one of several parallel reviewers; the others cover the remaining defect classes. Spend your review depth on the focus above. Findings outside it are still reportable. The output contract is unchanged.\n' \
-        "$focus" >> "$seat_pf" 2>/dev/null; then
-      :
-    else
-      echo "dispatch.sh: could not build focused prompt for $tag — falling back to the shared prompt" >&2
-      rm -f "$seat_pf"
-      seat_pf="$PF"
-      focus=""
-    fi
-  fi
+  # mu-3ajg / 9vkbt.2: a rank with a `focus` or a `seam` reviews from its own
+  # prompt file — the shared prompt plus a trusted seat clause — so parallel
+  # seats dig into different topics in round 1. The clause changes the seat's
+  # criteria only: the output contract is untouched, so converge.py and the
+  # convergence rounds see no format difference. Built fail-closed (panel
+  # reviewer finding, round 1 of mu-3ajg's own gate): if the seat file cannot
+  # be built, the seat falls back to the SHARED prompt — a duplicate review
+  # beats a review of half a prompt — and .done records the fallback.
+  seat_pf="${OUT}.${tag}.prompt"
+  seat_mode=$(seat_prompt "$PF" "$seat_pf" "$focus" "$seam" "$checklist") || {
+    echo "dispatch.sh: could not build the seat prompt for $tag (focus=[$focus] seam=[$seam]) — falling back to the shared prompt" >&2
+    rm -f "$seat_pf"
+    seat_mode=shared; focus=""; seam=""
+  }
+  [ "$seat_mode" = shared ] && seat_pf="$PF"
   (
     [ -n "$rank_env" ] && eval "export $rank_env"
     warmup "$prov" "$model"
@@ -129,7 +132,7 @@ while [ "$r" -lt "$N" ]; do
       _rc=$?
     done
     reask_if_unparsed "$prov" "$model" "$_out"
-    echo "exit=$_rc retry=$_retry prov=$prov model=$model tools=[$tools] focus=[$focus]" > "${OUT}.${tag}.done"
+    echo "exit=$_rc retry=$_retry prov=$prov model=$model tools=[$tools] focus=[$focus] seam=[$seam]" > "${OUT}.${tag}.done"
   ) &
   r=$((r + 1))
 done

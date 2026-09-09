@@ -409,6 +409,13 @@ elif [ -r "$ROOT/AGENTS.md" ]; then
   INVARIANTS="$(awk '/^## Architecture invariants/{f=1} /^## /{if(f && !/^## Architecture invariants/) exit} f' "$ROOT/AGENTS.md")"
 fi
 INVARIANTS_CLAUSE=""; INVARIANTS_BLOCK=""
+if [ -z "$INVARIANTS" ]; then
+  # Say so, once: a repo without a declared invariants section gets no
+  # conformance criteria, and a `seam = "conformance"` seat in the roster then
+  # has nothing to check (it reports that as one low finding). Silent was how
+  # a six-round gate never saw convert-at-boundary (9vkbt.2).
+  echo "${C_YEL}ai-review: no '## Architecture invariants' section in AGENTS.md at $BASE — reviewers get no invariant criteria and a conformance seat has nothing to check.${C_OFF}" >&2
+fi
 if [ -n "$INVARIANTS" ]; then
   INVARIANTS_CLAUSE=" ALSO check the change against the project ARCHITECTURE INVARIANTS shown below: a diff that violates one — or moves the code toward violating it — is a finding even when every line is locally correct; use read/grep to confirm a suspected violation before reporting it."
   INVARIANTS_BLOCK="

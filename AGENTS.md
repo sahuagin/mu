@@ -75,6 +75,13 @@ The `mu` CLI subcommands: `serve` (daemon), `ask` (one-shot), `resume`, `tui`,
   checklist, not prose. Put the conformance seam on a different model family
   from the correctness seat; bias diversity pays across families, not within
   one.
+- **Increments are capped.** `ci-aipr` BLOCKs a diff over
+  `MU_REVIEW_MAX_DIFF_LINES` (default 2000 reviewable lines; lockfiles and
+  binary/media files don't count) with a SIZE finding and suggested split points.
+  Split the branch into stacked PRs, one increment each. `MU_REVIEW_CHUNK=1`
+  (degraded per-commit review) and `MU_REVIEW_SIZE_OVERRIDE=1` (review as is)
+  are the explicit fallbacks; both leave the panel verdict binding.
+  `MU_REVIEW_OVERRIDE=1` is the verdict override and waives that too.
 
 ## Running it
 
@@ -142,6 +149,10 @@ workers, a converger picks the best**]** → **REVIEW** (`ci-aipr`) → **ADJUDI
 4. **Deep design lives in `specs/`** — the `architecture/` subdir, the numbered
    `mu-NNN` specs, and `specs/plans/`. Read it for the *why*; put new design docs
    there, **not** in crate roots.
+5. **Increments are reviewable.** New capability is built at a seam (its own
+   crate or module, to spec, tested in isolation) and integrated in a separate
+   increment. An increment over the review gate's line cap is split, not
+   chunked (see *Build & test*).
 
 ## How work flows here
 

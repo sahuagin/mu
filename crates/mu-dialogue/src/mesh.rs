@@ -277,22 +277,28 @@ struct Fronted {
     /// it cannot run from `Drop`.
     presence: Option<async_nats::service::Service>,
     /// The endpoint that makes `stop()` effective (see above). Never polled;
-    /// nothing publishes on its subject. `None` only if registering it failed:
-    /// the peer keeps its inbox and presence, and `release` then cannot
-    /// deregister (it says so).
+    /// nothing publishes on its subject, which carries the service's own
+    /// random id so it is not derivable from the peer id alone. `None` only
+    /// if registering it failed: the peer keeps its inbox and presence, and
+    /// `release` then reports that it could not deregister.
     _stop_anchor: Option<async_nats::service::endpoint::Endpoint>,
 }
 
 impl Fronted {
-    /// End the DM subscription and deregister `$SRV` presence. A failed stop
-    /// is logged, not fatal: the sweep must keep going, and the peer then
-    /// stays discoverable only until the gateway restarts.
-    async fn release(mut self, peer_id: &str) {
+    /// End the DM subscription and deregister `$SRV` presence. Errors are
+    /// returned, not logged: the caller knows why the release happened and
+    /// reports the outcome once. A failed stop leaves the peer discoverable
+    /// until the gateway restarts; nothing else is lost.
+    async fn release(mut self, peer_id: &str) -> Result<()> {
         self.task.abort();
-        if let Some(presence) = self.presence.take() {
-            if let Err(e) = presence.stop().await {
-                warn!(peer = %peer_id, "gateway: $SRV presence stop failed, peer stays discoverable until restart: {e}");
-            }
+        match self.presence.take() {
+            // `stop()` is in-process in async-nats 0.49 (a broadcast send and
+            // an abort), but the module rule is one bound per post-connect
+            // NATS await, not per what this library version happens to do
+            // (mu-10fa): release runs on the say/poll hot path via the
+            // front_peer race-loser branch and from the stale-peer sweep.
+            Some(presence) => bounded(&format!("presence stop {peer_id}"), presence.stop()).await,
+            None => Err(anyhow!("no stop anchor was registered for {peer_id}, so $SRV presence cannot be deregistered")),
         }
     }
 }
@@ -559,11 +565,12 @@ impl Gateway {
                 .map_err(|e| anyhow!("gateway: presence register {peer_id}: {e}"))?;
             // The endpoint exists so `stop()` can deregister this presence
             // later (see `Fronted`). Private to the gateway; never published
-            // on. Best-effort: a peer must not lose its mesh inbox over it.
-            let stop_anchor = match presence
-                .endpoint(format!("{subject}.gateway-presence"))
-                .await
-            {
+            // on; suffixed with the service's random id so the subject is not
+            // predictable from the peer id. Best-effort: a peer must not lose
+            // its mesh inbox over it.
+            let anchor_subject =
+                format!("{subject}.gateway-presence.{}", presence.info().await.id);
+            let stop_anchor = match presence.endpoint(anchor_subject).await {
                 Ok(ep) => Some(ep),
                 Err(e) => {
                     warn!(peer = %peer_id, "gateway: presence anchor endpoint failed; release will not deregister this peer's $SRV presence: {e}");
@@ -627,7 +634,9 @@ impl Gateway {
             // Lost a race: another call registered while we were awaiting.
             // Release ours — subscription AND presence — outside the lock.
             drop(fronted);
-            ours.release(peer_id).await;
+            if let Err(e) = ours.release(peer_id).await {
+                warn!(peer = %peer_id, "gateway: releasing the losing duplicate registration failed: {e:#}");
+            }
             return Ok(false);
         }
         fronted.insert(peer_id.to_string(), ours);
@@ -641,8 +650,15 @@ impl Gateway {
         let Some(fronted) = self.fronted.lock().await.remove(peer_id) else {
             return false;
         };
-        fronted.release(peer_id).await;
-        info!(peer = %peer_id, "mesh gateway: released peer (dm inbox + $SRV presence)");
+        match fronted.release(peer_id).await {
+            Ok(()) => {
+                info!(peer = %peer_id, "mesh gateway: released peer (dm inbox + $SRV presence)")
+            }
+            Err(e) => warn!(
+                peer = %peer_id,
+                "mesh gateway: released peer's dm inbox, but $SRV presence stop failed — it stays discoverable until the gateway restarts: {e:#}"
+            ),
+        }
         true
     }
 

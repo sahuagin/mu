@@ -455,10 +455,14 @@ struct MeshSessionsInner {
     joined: std::sync::Mutex<std::collections::HashMap<String, JoinedSession>>,
 }
 
-/// One session's mesh footprint. Dropping it ends the subscription and
-/// deregisters presence — today only at daemon exit, since mu has no session
-/// teardown (`Sessions::remove` is test-only, no `session.close` handler). A
-/// future teardown path need only drop the entry from `joined`. See mu-6s7s.
+/// One session's mesh footprint. Dropping it ends the subscription — but NOT
+/// the `$SRV` presence: async-nats 0.49 `Service` has no `Drop`, its responder
+/// runs until `stop()`, and `stop()` needs an endpoint to reach its abort (the
+/// gateway learned this the hard way: mu-dialogue `Fronted`). Today that is
+/// moot, since mu has no session teardown (`Sessions::remove` is test-only,
+/// no `session.close` handler) and presence dies with the process. A future
+/// teardown path must keep the `Service`, anchor it with an endpoint, and
+/// await a bounded `stop()` — see mu-mesh-dialogue-teardown-stop-service-4klqp, mu-6s7s.
 struct JoinedSession {
     task: tokio::task::JoinHandle<()>,
     _presence: async_nats::service::Service,
@@ -639,8 +643,9 @@ fn spawn_inbound(
 }
 
 /// Everything mesh-dialogue: aborting the tasks on drop releases the DM
-/// subscription and presence registration (dropping the Micro `Service`
-/// deregisters it) — same lifetime contract as the other mesh guards.
+/// subscription. The Micro `Service` inside is NOT deregistered by drop (see
+/// `JoinedSession`); at daemon exit the process ending is what removes the
+/// presence. Per-session teardown is mu-mesh-dialogue-teardown-stop-service-4klqp.
 pub(crate) struct MeshDialogueHandle {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Presence registration lives exactly as long as this handle.

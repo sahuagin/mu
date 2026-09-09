@@ -3084,9 +3084,13 @@ async fn run_inner(
                             config.max_guard_refusals > 0
                                 && consecutive_guard_refused_rounds >= config.max_guard_refusals
                         }) {
+                            // mu-c9b2l: "a runtime guard", not "the
+                            // retry/loop guard" — cut-off calls count toward
+                            // this budget too, and the last refusal names
+                            // which guard held.
                             let message = format!(
                                 "the runtime stopped this session: every tool call in the \
-                                 last {n} consecutive turns was refused by the retry/loop \
+                                 last {n} consecutive turns was refused by a runtime \
                                  guard ([session].max_guard_refusals = {budget}); last \
                                  refusal: {last_refusal}",
                                 n = consecutive_guard_refused_rounds,

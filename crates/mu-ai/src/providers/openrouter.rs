@@ -14,6 +14,7 @@ use futures::stream::{BoxStream, Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
+use mu_core::agent::tool_call_cut::{CutCause, ToolCallCut, DEFAULT_MAX_TOOL_CALL_BYTES};
 use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
     ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
@@ -45,6 +46,10 @@ pub struct OpenRouterProvider {
     /// `--thinking` flag). A per-turn `effort` on `stream` wins; this fills
     /// in when the turn carries none. `None` = no default (server decides).
     default_effort: Option<String>,
+    /// mu-c9b2l: `[session].max_tool_call_bytes`. Per-tool-call ceiling on
+    /// accumulated argument bytes; `None` reads to the provider's own
+    /// ceiling.
+    max_tool_call_bytes: Option<usize>,
 }
 
 impl OpenRouterProvider {
@@ -57,6 +62,7 @@ impl OpenRouterProvider {
             api_path: OPENROUTER_API_PATH.to_string(),
             label: "openrouter",
             default_effort: None,
+            max_tool_call_bytes: Some(DEFAULT_MAX_TOOL_CALL_BYTES),
         }
     }
 
@@ -99,6 +105,7 @@ impl OpenRouterProvider {
             api_path,
             label: "openrouter",
             default_effort: None,
+            max_tool_call_bytes: Some(DEFAULT_MAX_TOOL_CALL_BYTES),
         })
     }
 
@@ -133,6 +140,14 @@ impl OpenRouterProvider {
     /// `-> &'static str` contract.
     pub fn with_label(mut self, label: &str) -> Self {
         self.label = Box::leak(label.to_string().into_boxed_str());
+        self
+    }
+
+    /// mu-c9b2l: set the per-tool-call argument-byte ceiling from
+    /// `[session].max_tool_call_bytes`. `None` (the config's `0`) reads to
+    /// the provider's own output ceiling, as before this bead.
+    pub fn with_max_tool_call_bytes(mut self, max_bytes: Option<usize>) -> Self {
+        self.max_tool_call_bytes = max_bytes.filter(|n| *n > 0);
         self
     }
 }
@@ -212,6 +227,13 @@ impl Provider for OpenRouterProvider {
                 body["chat_template_kwargs"] = json!({ "enable_thinking": enable });
             }
         }
+        // mu-c9b2l: read the ceiling back off the body rather than
+        // recomputing it, so the marker carries the budget actually sent —
+        // including the unknown-model floor a model absent from the catalog
+        // gets, which is far below the byte cap and cuts first.
+        let output_budget_bytes = body["max_tokens"]
+            .as_u64()
+            .map(|t| mu_core::agent::tool_call_cut::output_budget_bytes(t as u32));
         let resp = self
             .client
             .post(format!("{}{}", self.api_base, self.api_path))
@@ -241,7 +263,15 @@ impl Provider for OpenRouterProvider {
         // mu-xblz: recover training-native tool-call dialect that GLM/Qwen-class
         // models (served via OpenRouter / vLLM) sometimes leak as assistant text
         // instead of structured `tool_calls`. No-op for well-behaved models.
-        Ok(apply_dialect_rescue(events_stream(bytes, cancel_rx), tools))
+        Ok(apply_dialect_rescue(
+            events_stream(
+                bytes,
+                cancel_rx,
+                self.max_tool_call_bytes,
+                output_budget_bytes,
+            ),
+            tools,
+        ))
     }
 
     /// Identify as `"openrouter"` (or the configured name for a mu-v8ye
@@ -863,6 +893,10 @@ struct ToolCallBuilder {
     id: String,
     name: String,
     args_json: String,
+    /// mu-c9b2l: set once this call's accumulated argument bytes crossed
+    /// `max_tool_call_bytes`. `assemble_content` then emits the cut marker
+    /// instead of the truncated JSON.
+    cut: Option<ToolCallCut>,
 }
 
 struct StreamState {
@@ -878,11 +912,21 @@ struct StreamState {
     cancel_rx: Option<oneshot::Receiver<()>>,
     finished: bool,
     emitted_done: bool,
+    /// mu-c9b2l: `[session].max_tool_call_bytes`; `None` = read to the
+    /// provider's own ceiling.
+    max_tool_call_bytes: Option<usize>,
+    /// mu-c9b2l: the argument bytes this request's `max_tokens` buys. The
+    /// other ceiling on a tool call, and the one only this layer can see —
+    /// the marker carries it downstream so the refusal advises parts the
+    /// model has room to emit. `None` when the request sent no `max_tokens`.
+    output_budget_bytes: Option<usize>,
 }
 
 fn events_stream(
     bytes: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
     cancel_rx: oneshot::Receiver<()>,
+    max_tool_call_bytes: Option<usize>,
+    output_budget_bytes: Option<usize>,
 ) -> BoxStream<'static, ProviderEvent> {
     let bytes: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> =
         Box::pin(bytes.map(|r| r.map_err(|e| e.to_string())));
@@ -898,6 +942,8 @@ fn events_stream(
         cancel_rx: Some(cancel_rx),
         finished: false,
         emitted_done: false,
+        max_tool_call_bytes,
+        output_budget_bytes,
     };
     Box::pin(futures::stream::unfold(state, next_event))
 }
@@ -993,6 +1039,11 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
 
         // Process every choice (typically just one, choices[0]).
         let mut emitted_event: Option<ProviderEvent> = None;
+        // mu-c9b2l: copied out because the tool-call arm holds a mutable
+        // borrow of `state.tool_calls` while it needs the two ceilings.
+        let byte_cap = state.max_tool_call_bytes;
+        let output_budget = state.output_budget_bytes;
+        let mut cut_call: Option<(String, ToolCallCut)> = None;
         for choice in chunk.choices {
             // Text delta?
             if let Some(content) = choice.delta.content {
@@ -1042,6 +1093,25 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                         if let Some(args) = func.arguments {
                             arguments_delta = Some(args.clone());
                             entry.args_json.push_str(&args);
+                            // mu-c9b2l: one call's arguments crossing the cap
+                            // ends the whole response. Everything after this
+                            // point is generation mu will discard — the JSON
+                            // is already longer than any call it will
+                            // dispatch.
+                            if entry.cut.is_none() {
+                                if let Some(cap) = byte_cap {
+                                    if entry.args_json.len() > cap {
+                                        let cut = ToolCallCut::new(
+                                            entry.args_json.len(),
+                                            CutCause::ByteCap,
+                                            byte_cap,
+                                            output_budget,
+                                        );
+                                        entry.cut = Some(cut);
+                                        cut_call = Some((entry.name.clone(), cut));
+                                    }
+                                }
+                            }
                         }
                     }
                     if emitted_event.is_none()
@@ -1061,6 +1131,30 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
             if let Some(reason) = choice.finish_reason {
                 state.finish_reason = Some(reason);
             }
+        }
+
+        // mu-c9b2l: abort at the cap. Replacing the SSE stream drops the
+        // reqwest response body, which closes the connection the same way a
+        // cancel does; the accumulated calls still go out on Done so the
+        // loop can answer the cut one.
+        if let Some((tool_name, cut)) = cut_call {
+            tracing::warn!(
+                tool = %tool_name,
+                bytes = cut.bytes,
+                cap = ?byte_cap,
+                "tool call arguments exceeded max_tool_call_bytes; aborting the stream"
+            );
+            state.sse = SseStream::new(Box::pin(futures::stream::empty()));
+            state.finished = true;
+            state.emitted_done = true;
+            return Some((
+                ProviderEvent::Done(AssistantMessage {
+                    content: assemble_content(&state),
+                    stop_reason: StopReason::MaxTokens,
+                    usage: state.usage,
+                }),
+                state,
+            ));
         }
 
         if let Some(event) = emitted_event {
@@ -1088,9 +1182,27 @@ fn assemble_content(state: &StreamState) -> Vec<ContentBlock> {
             text: state.accumulated_text.as_str().into(),
         });
     }
+    // mu-c9b2l: `finish_reason == "length"` means the model ran out of
+    // output room, so a tool call whose JSON does not parse was cut rather
+    // than malformed — that turns an at-EOF syntax error into a cut too.
+    let hit_output_limit = state.finish_reason.as_deref() == Some("length");
     for idx in &state.tool_call_order {
         if let Some(builder) = state.tool_calls.get(idx) {
-            let arguments = parse_tool_input(&builder.args_json);
+            let arguments = match builder.cut.or_else(|| {
+                detect_truncated_arguments(
+                    &builder.args_json,
+                    hit_output_limit,
+                    state.max_tool_call_bytes,
+                    state.output_budget_bytes,
+                )
+            }) {
+                // mu-c9b2l: the marker replaces the arguments wholesale.
+                // Half an arrived JSON string has nothing safe to keep, and
+                // `{}` is what made the cut illegible in the first place.
+                Some(cut) => mu_core::agent::ToolArgs::new(cut.marker_arguments())
+                    .expect("cut marker holds no non-finite numbers"),
+                None => parse_tool_input(&builder.args_json),
+            };
             out.push(ContentBlock::ToolCall(ToolCall {
                 id: builder.id.clone(),
                 name: builder.name.clone(),
@@ -1099,6 +1211,50 @@ fn assemble_content(state: &StreamState) -> Vec<ContentBlock> {
         }
     }
     out
+}
+
+/// mu-c9b2l: was this argument string cut off mid-value, rather than simply
+/// malformed?
+///
+/// Two signals, and only these: serde_json classifies the failure as `Eof`
+/// (the observed "EOF while parsing a string" from an 85,622-character
+/// `write` that ended at the completion ceiling), or the turn's
+/// `finish_reason` already said `length`. A syntax or data error on a
+/// complete-looking string is a broken model, not a cut, and keeps the
+/// pre-existing empty-object fallback.
+fn detect_truncated_arguments(
+    args_json: &str,
+    hit_output_limit: bool,
+    // mu-c9b2l: the session's effective cap, carried on the marker so the
+    // refusal quotes the limit in force rather than the compile-time default.
+    cap: Option<usize>,
+    // mu-c9b2l: what this request's `max_tokens` buys in argument bytes —
+    // the ceiling the model actually hit on an `output_limit` cut.
+    budget_bytes: Option<usize>,
+) -> Option<ToolCallCut> {
+    if args_json.is_empty() {
+        return None;
+    }
+    let err = serde_json::from_str::<Value>(args_json).err()?;
+    match err.classify() {
+        serde_json::error::Category::Eof => Some(ToolCallCut::new(
+            args_json.len(),
+            if hit_output_limit {
+                CutCause::OutputLimit
+            } else {
+                CutCause::TruncatedJson
+            },
+            cap,
+            budget_bytes,
+        )),
+        _ if hit_output_limit => Some(ToolCallCut::new(
+            args_json.len(),
+            CutCause::OutputLimit,
+            cap,
+            budget_bytes,
+        )),
+        _ => None,
+    }
 }
 
 fn parse_tool_input(input_json: &str) -> mu_core::agent::ToolArgs {

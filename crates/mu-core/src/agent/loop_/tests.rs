@@ -2891,6 +2891,98 @@ async fn capability_refuses_tool_outside_allowed_set() {
     );
 }
 
+/// mu-c9b2l: an openai-chat `write` whose arguments were cut off mid-stream
+/// reaches the loop marked, not as `{}`. The dispatcher answers with the size
+/// and the append route, executes nothing, and the ask continues — the whole
+/// point being that the model gets a fact it can act on instead of a generic
+/// validation error it can only retry.
+#[tokio::test]
+async fn cut_off_tool_call_is_refused_with_a_legible_error() {
+    use crate::agent::tool_call_cut::{CutCause, ToolCallCut};
+    use crate::capability::Capability;
+
+    let cut = ToolCallCut::new(85_622, CutCause::OutputLimit, Some(32 * 1024), None);
+    let provider = mock_provider_one_tool_call("write", cut.marker_arguments());
+    let tool = MockTool::ok("write", "this should not run");
+    let cap: SessionCapability = Arc::new(Mutex::new(Capability::root()));
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let loop_ = loop_with(
+        Arc::new(provider),
+        Arc::from("faux"),
+        Arc::from("faux"),
+        vec![Arc::new(tool) as Arc<dyn Tool>],
+        AgentConfig::default(),
+        events_tx,
+        approvals,
+        cap,
+    );
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("write the game"),
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+    let mut cut_callout_body: Option<Value> = None;
+    let mut completed: Option<(String, bool)> = None;
+    let mut got_input_required = false;
+    let mut assistant_texts: Vec<String> = Vec::new();
+    while let Some(ev) = events_rx.recv().await {
+        match ev {
+            AgentEvent::Callout {
+                category,
+                title,
+                body,
+                context_refs,
+                ..
+            } if title == "tool call cut off" => {
+                assert_eq!(category, "warning");
+                assert!(
+                    context_refs.contains(&"bead:mu-c9b2l".to_string()),
+                    "callout should cite the bead; got {context_refs:?}"
+                );
+                cut_callout_body = Some(body);
+            }
+            AgentEvent::InputRequired { .. } => got_input_required = true,
+            AgentEvent::ToolCallCompleted {
+                content, is_error, ..
+            } => completed = Some((content, is_error)),
+            AgentEvent::AssistantTextFinalized { text } => assistant_texts.push(text),
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+
+    let body = cut_callout_body.expect("a 'tool call cut off' callout");
+    assert_eq!(body["tool"], "write");
+    assert_eq!(body["argument_bytes"], 85_622);
+    assert_eq!(body["cause"], "output_limit");
+    assert_eq!(body["cap"], 32 * 1024);
+    assert!(!got_input_required, "a cut call must not reach an approver");
+
+    let (content, is_error) = completed.expect("ToolCallCompleted should fire");
+    assert!(is_error, "a cut call is an error result");
+    assert_eq!(
+        content,
+        "runtime: your `write` call hit the model's output limit after 84 KB; \
+         nothing was executed. Split the work into smaller calls — write the first \
+         part, then `write` the rest with `append: true`, keeping each part under ~16 KB."
+    );
+    assert!(
+        !content.contains("this should not run"),
+        "the tool body must not have executed; got: {content}"
+    );
+
+    // The scripted provider's second turn ran, so the ask carried on.
+    assert!(
+        assistant_texts.iter().any(|t| t == "ok"),
+        "the next round should proceed normally; saw {assistant_texts:?}"
+    );
+}
+
 #[tokio::test]
 async fn capability_refuses_tool_missing_required_aws_capability() {
     use crate::agent::tool::{PermissionLevel, RetryPolicy, SideEffects, ToolPolicy};
@@ -6963,6 +7055,116 @@ async fn ucjhg_guard_refusal_count_resets_on_executed_call() {
     assert!(!events.iter().any(|e| matches!(
         e,
         AgentEvent::Callout { title, .. } if title == "guard refusal budget exhausted"
+    )));
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+}
+
+/// mu-c9b2l: a cut-off call counts toward the mu-ucjhg floor. Nothing else
+/// can stop a model that keeps issuing oversized calls — the cut arm refuses
+/// before dispatch, so the retry guard never sees an execution, and the
+/// marker's byte count differs per attempt, so the identical-argument guards
+/// never match. Before this the round returned `guard_refused: None` and RESET
+/// the count, buying the runaway a fresh model round trip every time.
+#[tokio::test]
+async fn mu_c9b2l_repeated_cut_calls_hit_the_guard_refusal_floor() {
+    use crate::agent::tool_call_cut::{CutCause, ToolCallCut};
+
+    // Each attempt gets a little further before the cap bites, which is what
+    // a real run looks like and what defeats the identical-argument guards:
+    // the arguments differ every round even though the refusal is the same.
+    let cut = |bytes: usize| ToolCallCut::new(bytes, CutCause::ByteCap, Some(32 * 1024), None);
+    let script: Vec<Vec<ProviderEvent>> = (0..10)
+        .map(|i| {
+            vec![ProviderEvent::Done(assistant_tool_call(
+                &format!("t{i}"),
+                "write",
+                cut(33_000 + i * 97).marker_arguments(),
+            ))]
+        })
+        .collect();
+    let provider = MockProvider::new(script);
+    let tools = vec![MockTool::always_ok("write", "this must never run")];
+    let config = AgentConfig {
+        // No turn cap: the floor is the only thing that can end this ask.
+        max_turns: None,
+        max_guard_refusals: 3,
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(provider, tools, config);
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("write the game"),
+            None,
+            None,
+        ))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = timeout(Duration::from_secs(5), loop_.join())
+        .await
+        .expect("join must not hang");
+    let events = events_handle.await.expect("events drain");
+
+    // Same text every round — a ByteCap refusal quotes the cap, not the size
+    // reached — while the arguments behind it never repeat.
+    let expected_refusal = crate::agent::tool_call_cut::refusal_text("write", &cut(33_000));
+    let cut_results: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCallCompleted {
+                content, is_error, ..
+            } if *is_error => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        cut_results.len(),
+        3,
+        "one refused round per budget unit: {cut_results:?}"
+    );
+    assert!(
+        cut_results.iter().all(|r| *r == expected_refusal),
+        "every round is the cut refusal: {cut_results:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCallCompleted { content, .. } if content.contains("this must never run")
+        )),
+        "a cut call executes nothing"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TurnStart))
+            .count(),
+        3,
+        "no re-invoke after the stop"
+    );
+
+    let errors: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Error { message } => Some(message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors.len(), 1, "errors: {errors:?}");
+    assert!(
+        errors[0].starts_with("the runtime stopped this session"),
+        "{}",
+        errors[0]
+    );
+    assert!(errors[0].contains("3 consecutive turns"), "{}", errors[0]);
+    assert!(
+        errors[0].ends_with(&format!("last refusal: {expected_refusal}")),
+        "the cut text is the last refusal; got: {}",
+        errors[0]
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Callout { category, title, .. }
+            if category == "error" && title == "guard refusal budget exhausted"
     )));
     assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
 }

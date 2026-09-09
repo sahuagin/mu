@@ -907,6 +907,16 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
             mu_core::context::recall::recall_provenance_payload(ctx),
         );
     }
+    // mu-c9b2l: a model the catalog has no entry or rule for runs on mu-ai's
+    // unknown-model output floor, which quietly caps every response and cuts
+    // big tool calls mid-argument. Say it once, here, while the selector is
+    // in hand. Appended to the log like the other creation-time rows rather
+    // than pushed through `events_tx`: a `session.callout` notification
+    // emitted during creation races the create response, and would reach the
+    // client for a session it has not been told the id of yet.
+    if let Some(payload) = catalog_gap_callout(mu_core::model_catalog::global(), selector) {
+        event_log.append(EventActor::System, payload);
+    }
     // mu-7e21: snapshot the autonomy grant before `capability` moves
     // into its handle — the tool list is built from it (injection is
     // capability-gated; see session_spawn_tools).
@@ -1167,6 +1177,82 @@ fn describe_selector(selector: &ProviderSelector) -> (String, String) {
         // mu-v8ye: label a config-defined provider by its configured name so
         // event payloads distinguish e.g. card1 from card2.
         ProviderSelector::Configured { name, model, .. } => (name.clone(), model.clone()),
+    }
+}
+
+/// mu-c9b2l: the startup alarm for a model the catalog has never heard of.
+///
+/// `[models.*]` / `[model_rules.*]` carry each model's `max_output_tokens`.
+/// A model with neither gets mu-ai's conservative unknown-model floor, and on
+/// a wire that sends the field regardless that floor IS the response ceiling
+/// — a few thousand tokens, whatever the model can really produce. Nothing
+/// else reports it: the session runs, replies come back short, and large tool
+/// calls are cut mid-argument until somebody reads the wire. So say it once,
+/// at creation, with the entry that fixes it — as a durable log row for
+/// readers and status projections, and a `tracing::warn!` for the operator
+/// watching the daemon.
+///
+/// `None` when the catalog states a cap, or when the wire omits the field
+/// (OpenAI Responses) and the server's own model maximum stands instead.
+/// Takes the catalog explicitly so the decision is testable without reading
+/// the operator's `models.toml` (bead mu-nzxa).
+fn catalog_gap_callout(
+    catalog: &mu_core::model_catalog::ModelCatalogConfig,
+    selector: &ProviderSelector,
+) -> Option<EventPayload> {
+    use mu_ai::providers::output_limits::{
+        explicit_max_tokens_for_model_with_catalog, max_tokens_for_model_with_catalog,
+    };
+
+    if !wire_sends_the_output_floor(selector) {
+        return None;
+    }
+    let (provider, model) = describe_selector(selector);
+    if explicit_max_tokens_for_model_with_catalog(catalog, &model).is_some() {
+        return None;
+    }
+    let floor = max_tokens_for_model_with_catalog(catalog, &model);
+    tracing::warn!(
+        provider = %provider,
+        model = %model,
+        max_tokens = floor,
+        "model absent from the catalog; every request sends the unknown-model output floor"
+    );
+    Some(EventPayload::Callout {
+        category: "warning".to_owned(),
+        title: "model not in the catalog".to_owned(),
+        body: serde_json::json!({
+            "provider": provider,
+            "model": model,
+            "max_tokens": floor,
+            "fix": format!(
+                "add a [models.\"{model}\"] entry with max_output_tokens = <this model's \
+                 real output ceiling> to ~/.config/mu/models.toml"
+            ),
+        }),
+        theme: Some("warning".to_owned()),
+        context_refs: vec!["bead:mu-c9b2l".to_owned()],
+    })
+}
+
+/// mu-c9b2l: does this wire send a `max_tokens` it has to invent when the
+/// catalog is silent? Anthropic Messages REQUIRES the field and openai-chat
+/// takes it unconditionally, so both fall back to the floor — and ollama
+/// (Messages) and vllm (openai-chat) inherit that from the providers they
+/// wrap. The OpenAI Responses wire makes it optional and OMITS it instead,
+/// leaving the server's own model maximum in force, so there is nothing to
+/// warn about (mu-provider-drift-2026q3-y43la).
+fn wire_sends_the_output_floor(selector: &ProviderSelector) -> bool {
+    match selector {
+        ProviderSelector::AnthropicApi { .. }
+        | ProviderSelector::AnthropicOauth { .. }
+        | ProviderSelector::Ollama { .. }
+        | ProviderSelector::Openrouter { .. }
+        | ProviderSelector::Vllm { .. } => true,
+        ProviderSelector::OpenaiApi { .. } | ProviderSelector::OpenaiCodex { .. } => false,
+        ProviderSelector::Configured { protocol, .. } => {
+            matches!(protocol.as_str(), "openai-chat" | "anthropic-messages")
+        }
     }
 }
 
@@ -2432,7 +2518,10 @@ fn resolve_hash_and_summary_policy(
             // currently-implemented provider kinds are attempted; an
             // unrecognised provider string is logged and skipped.
             let selector = ranking_entry_to_selector(entry)?;
-            match build_provider_from_selector(&selector, false, None, CacheTtl::default()) {
+            // mu-c9b2l: the compaction judge summarizes; it issues no tool
+            // calls, so the streamed-tool-call byte cap has nothing to bound
+            // here.
+            match build_provider_from_selector(&selector, false, None, CacheTtl::default(), None) {
                 Ok(p) => {
                     tracing::info!(
                         provider = %entry.provider,
@@ -2658,6 +2747,96 @@ mod tests {
             resolve_context_limits_from_metadata(Some(150_000), route, &model),
             (Some(150_000), Some(900_000), Some(128_000))
         );
+    }
+
+    /// mu-c9b2l: a model with no `[models.*]` entry and no matching
+    /// `[model_rules.*]` prefix is sent the unknown-model output floor on
+    /// every request. The session says so once, at creation, and names the
+    /// entry that fixes it.
+    #[test]
+    fn mu_c9b2l_uncataloged_model_calls_out_the_output_floor() {
+        // The DEFAULT catalog, never the operator's models.toml (mu-nzxa).
+        let catalog = mu_core::model_catalog::built_in();
+        let unlisted = "some-future-model-v9";
+
+        let event = catalog_gap_callout(
+            &catalog,
+            &ProviderSelector::Openrouter {
+                model: unlisted.into(),
+            },
+        )
+        .expect("an uncataloged model on the openai-chat wire is called out");
+        let EventPayload::Callout {
+            category,
+            title,
+            body,
+            ..
+        } = event
+        else {
+            panic!("expected a Callout payload");
+        };
+        assert_eq!(category, "warning");
+        assert_eq!(title, "model not in the catalog");
+        assert_eq!(body["provider"], "openrouter");
+        assert_eq!(body["model"], unlisted);
+        assert_eq!(body["max_tokens"], 4096);
+        let fix = body["fix"].as_str().expect("fix is text");
+        assert!(fix.contains(r#"[models."some-future-model-v9"]"#), "{fix}");
+        assert!(fix.contains("max_output_tokens"), "{fix}");
+        assert!(fix.contains("models.toml"), "{fix}");
+
+        // A cataloged model states its own ceiling — nothing to report.
+        assert!(catalog_gap_callout(
+            &catalog,
+            &ProviderSelector::Openrouter {
+                model: "gpt-5".into()
+            },
+        )
+        .is_none());
+
+        // The Anthropic Messages wire sends the floor too, config-defined
+        // endpoints included.
+        assert!(catalog_gap_callout(
+            &catalog,
+            &ProviderSelector::AnthropicApi {
+                model: unlisted.into()
+            },
+        )
+        .is_some());
+        assert!(catalog_gap_callout(
+            &catalog,
+            &ProviderSelector::Configured {
+                name: "card1".into(),
+                protocol: "anthropic-messages".into(),
+                base_url: "http://127.0.0.1:11434".into(),
+                api_key: String::new(),
+                model: unlisted.into(),
+                prompt_caching: None,
+            },
+        )
+        .is_some());
+
+        // The OpenAI Responses wire omits the field, so the server's own
+        // model maximum applies and there is no floor to warn about.
+        assert!(catalog_gap_callout(
+            &catalog,
+            &ProviderSelector::OpenaiApi {
+                model: unlisted.into()
+            },
+        )
+        .is_none());
+        assert!(catalog_gap_callout(
+            &catalog,
+            &ProviderSelector::Configured {
+                name: "lab".into(),
+                protocol: "openai-responses".into(),
+                base_url: "https://example.invalid".into(),
+                api_key: String::new(),
+                model: unlisted.into(),
+                prompt_caching: None,
+            },
+        )
+        .is_none());
     }
 
     #[test]
@@ -3422,7 +3601,7 @@ mod tests {
             "precondition: rehydrated predecessor has no live capability handle",
         );
 
-        let factory = crate::serve::factory::make_provider_factory(false, None);
+        let factory = crate::serve::factory::make_provider_factory(false, None, None);
         let tools: Arc<Vec<Arc<dyn Tool>>> = Arc::new(Vec::new());
         let di = DaemonInfo::new("test-daemon");
         let daemon_id = di.daemon_id().to_string();
@@ -3531,7 +3710,7 @@ mod tests {
         // The resuming daemon has the same events_dir (so it can read the
         // other daemon's log) but a DIFFERENT daemon id.
         let sessions = Sessions::new_with_events_dir(Some(events_dir));
-        let factory = crate::serve::factory::make_provider_factory(false, None);
+        let factory = crate::serve::factory::make_provider_factory(false, None, None);
         let tools: Arc<Vec<Arc<dyn Tool>>> = Arc::new(Vec::new());
         let di = DaemonInfo::new("test-daemon");
         let daemon_id = di.daemon_id().to_string();
@@ -3637,7 +3816,7 @@ mod tests {
         std::fs::write(&jsonl_path, jsonl_content.join("\n")).expect("write predecessor log");
 
         let sessions = Sessions::new_with_events_dir(Some(events_dir));
-        let factory = crate::serve::factory::make_provider_factory(false, None);
+        let factory = crate::serve::factory::make_provider_factory(false, None, None);
         // A non-empty tool list so the launch tool grant is observable.
         let tools: Arc<Vec<Arc<dyn Tool>>> =
             Arc::new(vec![Arc::new(crate::tools::ReadTool::default())]);

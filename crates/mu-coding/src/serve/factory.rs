@@ -64,9 +64,23 @@ pub type ProviderFactory =
 
 /// Construct a `ProviderFactory` from daemon flags. Each session
 /// gets its own `Arc<dyn Provider>` built by this closure.
-pub fn make_provider_factory(ephemeral: bool, thinking: Option<String>) -> ProviderFactory {
+///
+/// mu-c9b2l: `max_tool_call_bytes` is `[session].max_tool_call_bytes`,
+/// resolved once at daemon startup because the factory runs per session and
+/// must not re-read config on that path. `None` disables the cap.
+pub fn make_provider_factory(
+    ephemeral: bool,
+    thinking: Option<String>,
+    max_tool_call_bytes: Option<usize>,
+) -> ProviderFactory {
     Arc::new(move |selector: &ProviderSelector, cache_ttl: CacheTtl| {
-        build_provider_from_selector(selector, ephemeral, thinking.as_deref(), cache_ttl)
+        build_provider_from_selector(
+            selector,
+            ephemeral,
+            thinking.as_deref(),
+            cache_ttl,
+            max_tool_call_bytes,
+        )
     })
 }
 
@@ -82,6 +96,9 @@ pub fn build_provider_from_selector(
     // mu-f1a0: per-session cache TTL tier. Only the Anthropic arm
     // consumes it — other providers have no tiered caching surface.
     cache_ttl: CacheTtl,
+    // mu-c9b2l: `[session].max_tool_call_bytes`. Only the openai-chat arms
+    // consume it — that is the accumulator the cut lands in.
+    max_tool_call_bytes: Option<usize>,
 ) -> Result<Arc<dyn Provider>> {
     match selector {
         // Faux is encoded on the wire as `anthropic_api`-with-a-known
@@ -143,7 +160,8 @@ pub fn build_provider_from_selector(
         // OpenRouter `reasoning` object and the local ollama/vLLM dialects)
         // instead of being logged as ignored.
         ProviderSelector::Openrouter { model } => {
-            let mut provider = OpenRouterProvider::from_env(model.clone())?;
+            let mut provider = OpenRouterProvider::from_env(model.clone())?
+                .with_max_tool_call_bytes(max_tool_call_bytes);
             if let Some(t) = thinking {
                 if !t.is_empty() {
                     provider = provider.with_thinking_flag(t);
@@ -152,7 +170,8 @@ pub fn build_provider_from_selector(
             Ok(Arc::new(provider))
         }
         ProviderSelector::Vllm { model } => {
-            let mut provider = VllmProvider::from_env(model.clone())?;
+            let mut provider = VllmProvider::from_env(model.clone())?
+                .with_max_tool_call_bytes(max_tool_call_bytes);
             if let Some(t) = thinking {
                 if !t.is_empty() {
                     provider = provider.with_thinking_flag(t);
@@ -186,7 +205,8 @@ pub fn build_provider_from_selector(
                     .with_api_path("/v1/chat/completions".to_string())
                     // mu-v8ye: label by the configured name so the trait-path
                     // label agrees with the event-path label in session.rs.
-                    .with_label(name);
+                    .with_label(name)
+                    .with_max_tool_call_bytes(max_tool_call_bytes);
                 // mu-6fj1b: --thinking reaches this wire now (ollama
                 // reasoning_effort + vLLM chat_template_kwargs dialects).
                 if let Some(t) = thinking {
@@ -343,12 +363,24 @@ fn resolve_launch_selection_with_catalog(
 /// daemon-level settings (`BashSettings`) rather than being a
 /// no-arg `Tool::new()`. Pass `BashSettings::default()` for "off"
 /// behavior (yolo=false, no extra allowlist entries).
-pub fn build_tools(names: &[String], bash: &BashSettings) -> Result<Vec<Arc<dyn Tool>>> {
+///
+/// mu-c9b2l: `max_tool_call_bytes` is the resolved
+/// `[session].max_tool_call_bytes`. `write` states the per-call size limit
+/// in its schema, which is the only place a model reads it, so the figure
+/// has to be the effective one. `None` (cap disabled, or a caller without
+/// config) advises the default's part size.
+pub fn build_tools(
+    names: &[String],
+    bash: &BashSettings,
+    max_tool_call_bytes: Option<usize>,
+) -> Result<Vec<Arc<dyn Tool>>> {
     names
         .iter()
         .map(|n| match n.as_str() {
             "read" => Ok(Arc::new(ReadTool::new()) as Arc<dyn Tool>),
-            "write" => Ok(Arc::new(WriteTool::new()) as Arc<dyn Tool>),
+            "write" => Ok(
+                Arc::new(WriteTool::with_max_tool_call_bytes(max_tool_call_bytes)) as Arc<dyn Tool>,
+            ),
             "ls" => Ok(Arc::new(LsTool::new()) as Arc<dyn Tool>),
             "edit" => Ok(Arc::new(EditTool::new()) as Arc<dyn Tool>),
             "grep" => Ok(Arc::new(GrepTool::new()) as Arc<dyn Tool>),
@@ -419,7 +451,7 @@ mod tests {
     /// Test helper: build_tools with default BashSettings (no yolo,
     /// no extra allowlist entries). Keeps test sites tidy.
     fn build_tools_default(names: &[String]) -> Result<Vec<Arc<dyn Tool>>> {
-        build_tools(names, &BashSettings::default())
+        build_tools(names, &BashSettings::default(), None)
     }
 
     #[test]
@@ -429,18 +461,19 @@ mod tests {
         let sel = ProviderSelector::AnthropicApi {
             model: "faux".into(),
         };
-        assert!(build_provider_from_selector(&sel, false, None, CacheTtl::default()).is_ok());
+        assert!(build_provider_from_selector(&sel, false, None, CacheTtl::default(), None).is_ok());
         // ephemeral / thinking are tolerated even though faux ignores
         // them.
         assert!(
-            build_provider_from_selector(&sel, true, Some("high"), CacheTtl::default()).is_ok()
+            build_provider_from_selector(&sel, true, Some("high"), CacheTtl::default(), None)
+                .is_ok()
         );
     }
 
     #[test]
     fn build_from_selector_anthropic_oauth_errors() {
         let sel = ProviderSelector::AnthropicOauth { model: "x".into() };
-        match build_provider_from_selector(&sel, false, None, CacheTtl::default()) {
+        match build_provider_from_selector(&sel, false, None, CacheTtl::default(), None) {
             Ok(_) => panic!("anthropic_oauth should not be implemented"),
             Err(e) => assert!(
                 e.to_string().contains("not yet implemented")
@@ -458,7 +491,7 @@ mod tests {
         let sel = ProviderSelector::OpenaiApi {
             model: "gpt-5".into(),
         };
-        match build_provider_from_selector(&sel, false, None, CacheTtl::default()) {
+        match build_provider_from_selector(&sel, false, None, CacheTtl::default(), None) {
             Ok(_) => {} // a key was available in this environment
             Err(e) => {
                 let msg = e.to_string();
@@ -533,7 +566,7 @@ mod tests {
         let sel = ProviderSelector::Ollama {
             model: "qwen3-coder:30b".into(),
         };
-        assert!(build_provider_from_selector(&sel, false, None, CacheTtl::default()).is_ok());
+        assert!(build_provider_from_selector(&sel, false, None, CacheTtl::default(), None).is_ok());
     }
 
     #[test]
@@ -592,6 +625,7 @@ mod tests {
                 false,
                 None,
                 CacheTtl::default(),
+                None,
             )
             .expect("provider builds")
         };
@@ -697,7 +731,7 @@ mod tests {
 
     #[test]
     fn factory_closure_constructs_per_session() {
-        let factory = make_provider_factory(false, None);
+        let factory = make_provider_factory(false, None, None);
         // Two sessions, same kind, different models.
         let sel_a = ProviderSelector::AnthropicApi {
             model: "faux".into(),
@@ -752,7 +786,7 @@ mod tests {
         assert_eq!(tools[0].spec().name, "glob");
 
         // Bash: strict mode by default, yolo by setting.
-        let tools = build_tools(&["bash".to_string()], &BashSettings::default())
+        let tools = build_tools(&["bash".to_string()], &BashSettings::default(), None)
             .expect("build_tools(bash) should succeed");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].spec().name, "bash");
@@ -765,6 +799,7 @@ mod tests {
                 extra_allow: vec![],
                 prompt: false,
             },
+            None,
         )
         .expect("build_tools(bash, yolo) should succeed");
         assert!(tools[0].spec().description.contains("YOLO MODE"));
@@ -778,6 +813,7 @@ mod tests {
                 extra_allow: vec![],
                 prompt: true,
             },
+            None,
         )
         .expect("build_tools(bash, strict+prompt) should succeed");
         let spec = tools[0].spec();

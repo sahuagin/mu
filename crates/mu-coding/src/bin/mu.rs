@@ -509,14 +509,25 @@ async fn main() -> Result<()> {
             bare,
             max_turns,
         } => {
-            let factory = mu_coding::serve::make_provider_factory(ephemeral, thinking);
+            // mu-c9b2l: the streamed-tool-call byte cap is a daemon-level
+            // knob, resolved here because the factory closure runs per
+            // session. `serve::run` reloads the same file for the rest of
+            // the config; this reads only the one key the factory needs.
+            let max_tool_call_bytes = mu_core::config::Config::load_default()
+                .session
+                .tool_call_byte_cap();
+            let factory =
+                mu_coding::serve::make_provider_factory(ephemeral, thinking, max_tool_call_bytes);
             let tool_names = mu_coding::serve::parse_tools_csv(&tools);
             let bash_settings = mu_coding::serve::BashSettings {
                 yolo: bash_yolo,
                 extra_allow: bash_allow,
                 prompt: bash_prompt,
             };
-            let tool_vec = mu_coding::serve::build_tools(&tool_names, &bash_settings)?;
+            // mu-c9b2l: the same cap the provider factory got — `write`
+            // states it in its schema, which is where the model reads it.
+            let tool_vec =
+                mu_coding::serve::build_tools(&tool_names, &bash_settings, max_tool_call_bytes)?;
 
             // mu-qnag: hand the daemon its command policy so `watch` gates
             // through the SAME BashMode as `bash` (build_tools borrowed it).
@@ -782,7 +793,13 @@ fn run_capabilities(cmd: CapabilitiesCmd) -> Result<()> {
                 extra_allow: Vec::new(),
                 prompt: false,
             };
-            let tool_vec = mu_coding::serve::build_tools(&tool_names, &bash_settings)?;
+            // mu-c9b2l: the manifest quotes `write`'s size limit, so read the
+            // configured cap here too rather than describing the default.
+            let max_tool_call_bytes = mu_core::config::Config::load_default()
+                .session
+                .tool_call_byte_cap();
+            let tool_vec =
+                mu_coding::serve::build_tools(&tool_names, &bash_settings, max_tool_call_bytes)?;
 
             let project_root = std::env::current_dir().ok();
             let mut dirs = mu_core::skill::loader::default_search_dirs(project_root.as_deref());

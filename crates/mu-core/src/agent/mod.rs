@@ -3,6 +3,7 @@ pub mod continuation;
 pub mod loop_;
 pub mod provider;
 pub mod tool;
+pub mod tool_call_cut;
 pub mod tool_result_filter;
 pub mod types;
 
@@ -16,6 +17,7 @@ pub use loop_::{
 };
 pub use provider::{MessageInput, Provider, ProviderError, ProviderEvent};
 pub use tool::{PermissionLevel, RetryPolicy, SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec};
+pub use tool_call_cut::{CutCause, ToolCallCut, DEFAULT_MAX_TOOL_CALL_BYTES};
 pub use types::{
     AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolArgs, ToolArgsError, ToolCall,
     Usage,

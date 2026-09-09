@@ -390,8 +390,10 @@ pub trait Tool: Send + Sync {
         Ok(())
     }
 
-    /// Execute the tool. The Tool impl owns `cancel_rx` and must
-    /// abort when it fires.
+    /// Execute the tool. The Tool impl owns `cancel_rx` and should stop
+    /// work when it fires; an impl whose work cannot be aborted once
+    /// started (a `spawn_blocking` file write, mu-c9b2l) may instead let it
+    /// finish and report the true outcome, noting the late cancel.
     async fn execute(&self, arguments: Value, cancel_rx: oneshot::Receiver<()>) -> ToolResult;
 }
 

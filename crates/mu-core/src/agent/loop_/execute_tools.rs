@@ -10,6 +10,7 @@ use crate::capability::CapabilityCheck;
 use crate::protocol::ApprovalDecision;
 
 use super::super::tool::{PermissionLevel, RetryPolicy, Tool, ToolResult};
+use super::super::tool_call_cut;
 use super::super::types::{AgentMessage, ToolCall};
 
 use super::{AgentEvent, AgentInput, Outcome, PendingApprovals, SessionCapability};
@@ -441,6 +442,13 @@ pub(crate) async fn handle_execute_tools(
 
         let tool = tools.iter().find(|t| t.spec().name == call.name);
 
+        // mu-c9b2l: the provider marked this call's arguments as cut off
+        // mid-stream. There is nothing to validate and nothing to run — the
+        // arguments the model meant never arrived — so this outranks every
+        // gate below, including the approval modal (asking a human to
+        // approve a call that does not exist).
+        let cut = tool_call_cut::detect(call.arguments.as_value());
+
         let capability_refusal_reason: Option<String> = {
             let cap = capability.lock().ok();
             cap.as_ref().and_then(|c| match c.check_allow(&call.name) {
@@ -555,7 +563,8 @@ pub(crate) async fn handle_execute_tools(
         // Only run when no higher-priority refusal applies — keeps the
         // refusal-reason ordering stable (capability > retry > validate >
         // permission-denied > execute).
-        let validate_refusal_reason: Option<String> = if capability_refusal_reason.is_none()
+        let validate_refusal_reason: Option<String> = if cut.is_none()
+            && capability_refusal_reason.is_none()
             && retry_refusal_reason.is_none()
             && loop_refusal_streak.is_none()
         {
@@ -569,7 +578,8 @@ pub(crate) async fn handle_execute_tools(
         // refusal distinct from a human denial, so the model doesn't read
         // "fail-closed, no approver" as "the user said no".
         let mut permission_refusal_reason: Option<String> = None;
-        let permission_decision = if retry_refusal_reason.is_none()
+        let permission_decision = if cut.is_none()
+            && retry_refusal_reason.is_none()
             && loop_refusal_streak.is_none()
             && validate_refusal_reason.is_none()
         {
@@ -716,10 +726,49 @@ pub(crate) async fn handle_execute_tools(
 
         // mu-ucjhg: a retry/loop-guard refusal, as distinct from the
         // capability refusal that takes precedence over both below.
-        let guard_refused = capability_refusal_reason.is_none()
-            && (loop_refusal_streak.is_some() || retry_refusal_reason.is_some());
+        //
+        // mu-c9b2l: a cut call counts as one. It is refused and not executed,
+        // exactly like a guard refusal, and the identical-argument guards can
+        // never catch it — the marker carries the byte count reached, which
+        // varies per attempt. Left out of the tally, a round of nothing but
+        // cut calls RESET `consecutive_guard_refused_rounds`, so a model
+        // reissuing oversized calls paid a round trip each time with nothing
+        // to end the ask.
+        let guard_refused = if cut.is_some() {
+            true
+        } else {
+            capability_refusal_reason.is_none()
+                && (loop_refusal_streak.is_some() || retry_refusal_reason.is_some())
+        };
 
-        let result = if let Some(cap_reason) = capability_refusal_reason {
+        let result = if let Some(cut) = cut {
+            // mu-c9b2l: answer with the fact the model cannot observe — its
+            // call was cut, and how big it got — instead of dispatching the
+            // empty object a truncated JSON used to decay into. The result
+            // reaches the durable log through `finish_tool_call` like any
+            // other tool result (invariant 1).
+            let msg = tool_call_cut::refusal_text(&call.name, &cut);
+            let _ = events
+                .send(AgentEvent::Callout {
+                    category: "warning".to_owned(),
+                    title: "tool call cut off".to_owned(),
+                    body: serde_json::json!({
+                        "tool": call.name,
+                        "argument_bytes": cut.bytes,
+                        "cause": cut.cause.as_str(),
+                        // The cap in force, so a byte_cap cut reads without a
+                        // config lookup.
+                        "cap": cut.cap,
+                    }),
+                    theme: Some("warning".to_owned()),
+                    context_refs: vec!["bead:mu-c9b2l".to_owned()],
+                })
+                .await;
+            ToolResult {
+                content: msg,
+                is_error: true,
+            }
+        } else if let Some(cap_reason) = capability_refusal_reason {
             // mu-spk7: cause-neutral phrasing. The old text asserted "this
             // session has been delegated a narrower scope than the root"
             // unconditionally — false and misleading on a ROOT session that

@@ -871,6 +871,27 @@ pub struct SessionConfig {
     /// budget ends the ask with an error the caller can see (`mu ask`
     /// prints the reason and exits non-zero). `0` disables the floor.
     pub max_guard_refusals: u32,
+    /// mu-c9b2l: per-tool-call ceiling on accumulated argument bytes in a
+    /// streaming provider. A model that tries to write a whole file in one
+    /// call streams arguments until its output ceiling cuts the JSON
+    /// mid-string; the rest of that generation is spent on output nothing
+    /// can use. At this many bytes mu stops reading the response and marks
+    /// the call cut, so the model gets the size back as a fact instead of a
+    /// parse failure. `0` (or unset-to-`None`) reads to the ceiling as
+    /// before.
+    ///
+    /// No field-level `#[serde(default)]` on purpose: it would beat the
+    /// container default and resolve an ABSENT key to `None` — silently
+    /// turning the cap off for anyone who writes any other `[session]` key.
+    pub max_tool_call_bytes: Option<usize>,
+}
+
+impl SessionConfig {
+    /// mu-c9b2l: the effective cap, with both "no cap" spellings collapsed
+    /// to `None` so callers test one thing.
+    pub fn tool_call_byte_cap(&self) -> Option<usize> {
+        self.max_tool_call_bytes.filter(|n| *n > 0)
+    }
 }
 
 impl Default for SessionConfig {
@@ -881,6 +902,7 @@ impl Default for SessionConfig {
             state_dir: None,
             default_max_turns: None,
             max_guard_refusals: crate::agent::loop_::DEFAULT_MAX_GUARD_REFUSALS,
+            max_tool_call_bytes: Some(crate::agent::tool_call_cut::DEFAULT_MAX_TOOL_CALL_BYTES),
         }
     }
 }
@@ -1280,6 +1302,45 @@ mod tests {
         );
         let c: Config = toml::from_str("[session]\nmax_guard_refusals = 0\n").expect("parse");
         assert_eq!(c.session.max_guard_refusals, 0);
+    }
+
+    #[test]
+    fn session_max_tool_call_bytes_defaults_on_and_zero_disables() {
+        // mu-c9b2l: the streamed-argument cap ships on; `0` reads to the
+        // provider's own ceiling as before.
+        let default = Config::default().session;
+        assert_eq!(
+            default.max_tool_call_bytes,
+            Some(crate::agent::tool_call_cut::DEFAULT_MAX_TOOL_CALL_BYTES)
+        );
+        assert_eq!(
+            default.tool_call_byte_cap(),
+            Some(crate::agent::tool_call_cut::DEFAULT_MAX_TOOL_CALL_BYTES)
+        );
+
+        let zero: Config =
+            toml::from_str("[session]\nmax_tool_call_bytes = 0\n").expect("parse zero");
+        assert_eq!(zero.session.max_tool_call_bytes, Some(0));
+        assert_eq!(
+            zero.session.tool_call_byte_cap(),
+            None,
+            "0 disables the cap"
+        );
+
+        let tuned: Config =
+            toml::from_str("[session]\nmax_tool_call_bytes = 8192\n").expect("parse override");
+        assert_eq!(tuned.session.tool_call_byte_cap(), Some(8192));
+
+        // A `[session]` table that omits the key keeps the default rather
+        // than falling to the field type's `None` (which would mean "no
+        // cap" — the opposite of what an operator editing an unrelated
+        // session key intends).
+        let other_key: Config =
+            toml::from_str("[session]\nmax_guard_refusals = 3\n").expect("parse sibling key");
+        assert_eq!(
+            other_key.session.tool_call_byte_cap(),
+            Some(crate::agent::tool_call_cut::DEFAULT_MAX_TOOL_CALL_BYTES)
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@
 //!   body and the mesh id alike, and the `+mu.id` client tag only when
 //!   message-tags is negotiated.
 //!
-//! Increment **2b**, first slice — the adapter:
+//! Increment **2b**, so far — the adapter and membership:
 //!
 //! - [`adapter`] — a single-connection registration/capability state machine
 //!   over a small [`adapter::Transport`] seam: CAP negotiation, mandatory SASL
@@ -27,16 +27,22 @@
 //!   registering unauthenticated, chunked per IRCv3, and never retained in any
 //!   printable state), optional message-tags/account capabilities, and live
 //!   `CASEMAPPING`/`CHANNELLEN` from ISUPPORT.
+//! - [`membership`] — disposable channel membership folded under the live
+//!   CASEMAPPING, reconciled from generation-scoped NAMES against intervening
+//!   JOIN/PART/KICK/QUIT/NICK; the sole authority on human presence; plus a
+//!   channel reconciler that decides which channels to be in and backs off a
+//!   refused JOIN.
 //!
-//! Membership and mesh→IRC routing complete 2b and the IRC→mesh direction is
-//! increment 3; the maintained IRC client and network execution (integration,
-//! increment 5) and the textual bot verbs (increment 4) are deliberately
-//! absent, each landing in its own independently reviewed increment.
+//! Mesh→IRC routing completes 2b and the IRC→mesh direction is increment 3;
+//! the maintained IRC client and network execution (integration, increment 5)
+//! and the textual bot verbs (increment 4) are deliberately absent, each
+//! landing in its own independently reviewed increment.
 
 pub mod adapter;
 pub mod config;
 pub mod framing;
 pub mod mapping;
+pub mod membership;
 
 pub use adapter::{
     AdapterError, Clock, ConnectRequest, Diagnostic, FixedClock, IrcMessage, IsupportSettings,
@@ -49,8 +55,9 @@ pub use config::{
 pub use framing::{frame_privmsg, FrameParams, FramingError, CONTINUATION_MARKER, LINE_BUDGET};
 pub use mapping::{
     channel_for, fold_nick, human_identity, human_peer, peer_alias, resolve_channel, CaseMapping,
-    HumanIdentity, Resolved,
+    HumanIdentity, Resolved, SelfNick,
 };
+pub use membership::{ChannelEffect, ChannelReconciler, HumanEffect, Member, Membership};
 
 // The shared mesh config type, re-exported so a consumer configures the mesh
 // side through this crate without a second dependency edge.

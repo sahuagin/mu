@@ -31,6 +31,11 @@
 _sp_dir="${HERE:-}"
 [ -f "$_sp_dir/reply-contract.txt" ] || _sp_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/../review-panel"
 _sp_tail() { # $1=seat file
+  # A chunked-mode leaf (leaf-prompt.sh) reuses the seam CLAUSE below but keeps
+  # its OWN output contract (FINDING lines, no verdict), so it sets this to skip
+  # the panel's JSON reply-contract envelope. Panel seats (dispatch.sh) leave it
+  # unset and get the tail as before.
+  [ "${SEAT_PROMPT_NO_REPLY_CONTRACT:-}" = 1 ] && return 0
   [ -f "$_sp_dir/reply-contract.txt" ] || return 0
   printf '\n%s\n' "$(cat "$_sp_dir/reply-contract.txt")" >> "$1" 2>/dev/null || return 0
 }

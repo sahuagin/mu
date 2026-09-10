@@ -91,7 +91,9 @@ The `mu` CLI subcommands: `serve` (daemon), `ask` (one-shot), `resume`, `tui`,
   invariants* verbatim, so keep that section current: it is the reviewer's
   checklist, not prose. Put the conformance seam on a different model family
   from the correctness seat; bias diversity pays across families, not within
-  one.
+  one. Chunked mode (oversized branches) reviews each unit through these same
+  seam lenses too: an unseamed leaf plus one leaf per seam, capped by
+  `MU_REVIEW_CHUNK_MAX_DISPATCHES` (default 40 total dispatches).
 - **Increments are capped.** `ci-aipr` BLOCKs a diff over
   `MU_REVIEW_MAX_DIFF_LINES` (default 2000 reviewable lines; lockfiles and
   binary/media files don't count) with a SIZE finding and suggested split points.

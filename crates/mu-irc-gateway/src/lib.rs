@@ -19,7 +19,7 @@
 //!   body and the mesh id alike, and the `+mu.id` client tag only when
 //!   message-tags is negotiated.
 //!
-//! Increment **2b**, so far — the adapter and membership:
+//! Increment **2b** — the adapter, membership, and mesh→IRC routing:
 //!
 //! - [`adapter`] — a single-connection registration/capability state machine
 //!   over a small [`adapter::Transport`] seam: CAP negotiation, mandatory SASL
@@ -32,17 +32,28 @@
 //!   JOIN/PART/KICK/QUIT/NICK; the sole authority on human presence; plus a
 //!   channel reconciler that decides which channels to be in and backs off a
 //!   refused JOIN.
+//! - [`routing`] — mesh→IRC decisions behind the fail-closed
+//!   `mesh::verify_and_decode_dm` ingress: exactly-once endpoint/observer
+//!   overlap handling over a bounded [`recent`] window, channel delivery to
+//!   agents whose exact peer id is discovered (with a collision label when the
+//!   channel is shared), lobby fallbacks naming the intended target, and
+//!   exclusive human precedence (remembered channel / private / body-free
+//!   notice) against current observed membership.
+//! - [`recent`] — the one bounded retention policy the gateway's
+//!   "have I seen this id?" memories share.
 //!
-//! Mesh→IRC routing completes 2b and the IRC→mesh direction is increment 3;
-//! the maintained IRC client and network execution (integration, increment 5)
-//! and the textual bot verbs (increment 4) are deliberately absent, each
-//! landing in its own independently reviewed increment.
+//! The IRC→mesh direction (increment 3), the maintained IRC client and network
+//! execution (integration, increment 5) and the textual bot verbs (increment 4)
+//! are deliberately absent, each landing in its own independently reviewed
+//! increment.
 
 pub mod adapter;
 pub mod config;
 pub mod framing;
 pub mod mapping;
 pub mod membership;
+pub mod recent;
+pub mod routing;
 
 pub use adapter::{
     AdapterError, Clock, ConnectRequest, Diagnostic, FixedClock, IrcMessage, IsupportSettings,
@@ -52,13 +63,25 @@ pub use config::{
     default_config_path, load, load_irc, validate_nick, ConfigError, GatewayConfig, IrcConfig,
     NickFault, SaslCreds, Secret, NICK_MAX_LEN,
 };
-pub use framing::{frame_privmsg, FrameParams, FramingError, CONTINUATION_MARKER, LINE_BUDGET};
+pub use framing::{
+    frame_privmsg, validate_target, FrameParams, FramingError, CONTINUATION_MARKER, LINE_BUDGET,
+};
 pub use mapping::{
     channel_for, fold_nick, human_identity, human_peer, peer_alias, resolve_channel, CaseMapping,
     HumanIdentity, Resolved, SelfNick,
 };
 pub use membership::{ChannelEffect, ChannelReconciler, HumanEffect, Member, Membership};
+pub use recent::{RecentSet, DEFAULT_CAPACITY};
+pub use routing::{
+    DropReason, IngressRejected, OversizedField, RouteDecision, RouteEnv, Router,
+    MAX_DESTINATION_LEN, MAX_FIELD_LEN,
+};
 
 // The shared mesh config type, re-exported so a consumer configures the mesh
 // side through this crate without a second dependency edge.
 pub use mu_dialogue::mesh::MeshConfig;
+
+// The verified-DM types the routing ingress produces and consumes, re-exported
+// so a consumer stays on this crate's surface. Verification is unchanged — the
+// SAME `mesh::verify_and_decode_dm` the daemon runs.
+pub use mu_dialogue::mesh::{DmRejected, MeshDmEvent, Reception};

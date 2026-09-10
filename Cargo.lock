@@ -2164,10 +2164,12 @@ name = "mu-irc-gateway"
 version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
+ "biscuit-auth",
  "blake3",
  "mu-dialogue",
  "mu-peer",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "toml",
 ]

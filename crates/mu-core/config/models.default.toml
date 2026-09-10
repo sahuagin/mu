@@ -125,6 +125,32 @@ context_soft_limit = 1000000
 context_hard_limit = 1000000
 max_output_tokens = 16384
 
+# GPT-6 Astra (released 2026-09-03; developers.openai.com/api/docs/models/
+# gpt-6-astra, changelog Sep 3; mu-openai-protocol-2026q3-yyg3j.3): 1,050,000
+# context window, 922,000 maximum input tokens (the soft limit: past it the
+# request cannot be sent at all), 128,000 max output. `reasoning.effort`
+# "supports low, medium, high, xhigh, and max" and the model "does not
+# support the `none` reasoning effort level": effort_levels below is what the
+# OpenAI lane refuses against before the wire, and what mu-solo's /effort
+# picker offers. "Does not support custom temperature or top_p values or log
+# probabilities": the Responses body mu builds carries none of them (pinned in
+# openai_tests). Tool calling requires the Responses API, which mu-openai is.
+# Pricing per MTok: $10 input, $1 cached input, $12.5 cache write, $50 output;
+# requests over 272k input tokens are 2x input and cache rates and 1.5x output
+# for the whole request. Not in pricing.rs yet: the codex lane is the
+# subscription, and the cost formula does not model OpenAI's inclusive cached
+# input (a bead tracks that). Misalignment monitoring: a stopped
+# conversation is an HTTP 403 or a response.failed with code
+# misalignment_policy_violation, which the lane surfaces and never retries.
+[models.gpt_6_astra]
+model = "gpt-6-astra"
+family = "gpt-6"
+label = "GPT-6 Astra"
+context_soft_limit = 922000
+context_hard_limit = 1050000
+max_output_tokens = 128000
+effort_levels = ["low", "medium", "high", "xhigh", "max"]
+
 # Opus-4 family fallback: the Anthropic-queried extended-output ceiling (128000),
 # so date-stamped / not-yet-cataloged opus-4 ids inherit the family value instead
 # of an older, smaller cap. Exact [models.*] entries still override per model.
@@ -300,6 +326,13 @@ max_output_tokens = 8192
 [model_rules.openai_reasoning]
 prefixes = ["gpt-5", "o4", "o3"]
 max_output_tokens = 16384
+
+# GPT-6 family fallback for date-stamped ids: the Astra ceiling and effort
+# vocabulary, until a sibling model says otherwise.
+[model_rules.gpt_6]
+prefix = "gpt-6"
+max_output_tokens = 128000
+effort_levels = ["low", "medium", "high", "xhigh", "max"]
 
 # ollama-served reasoning models: thinking arrives on the reasoning channel and
 # counts against max_tokens. Measured 2026-06-05: gpt-oss:20b reviewing a

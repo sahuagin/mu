@@ -27,7 +27,7 @@ pub use request::{
     PromptCacheOptions, Reasoning, Tool, ToolChoice, ToolChoiceMode,
 };
 pub use response::{
-    IncompleteDetails, OutputContent, OutputItem, Response, ResponseError, ResponseStatus, Usage,
-    UsageInputDetails, UsageOutputDetails,
+    IncompleteDetails, MisalignmentErrorDetails, MisalignmentSteer, OutputContent, OutputItem,
+    Response, ResponseError, ResponseStatus, Usage, UsageInputDetails, UsageOutputDetails,
 };
 pub use stream::{stream_error_message, ResponseStreamEvent};

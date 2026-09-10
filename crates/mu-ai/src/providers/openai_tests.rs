@@ -255,6 +255,112 @@ fn codex_strip_removes_max_output_tokens() {
     assert_eq!(body["stream"], true);
 }
 
+// ============================================================================
+// mu-openai-protocol-2026q3-yyg3j.3: gpt-6-astra rules and misalignment stops
+// ============================================================================
+
+/// The catalog's stated effort levels guard the wire: gpt-6-astra (and a
+/// date-stamped id under the gpt-6 rule) refuses `none` before the request
+/// is built and takes `max`; a model with no stated levels (gpt-5.5) is not
+/// guarded. Asserted against the shipped catalog, not the operator's file
+/// (mu-nzxa).
+#[test]
+fn effort_outside_the_catalog_levels_is_refused_before_the_wire() {
+    let catalog = mu_core::model_catalog::built_in();
+    let refused = effort_outside_catalog(&catalog, "gpt-6-astra", "none").expect("refused");
+    assert!(
+        refused.contains("`none`") && refused.contains("gpt-6-astra"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("low, medium, high, xhigh, max"),
+        "{refused}"
+    );
+    assert!(effort_outside_catalog(&catalog, "gpt-6-astra-2026-10-01", "none").is_some());
+    for level in ["low", "medium", "high", "xhigh", "max"] {
+        assert!(
+            effort_outside_catalog(&catalog, "gpt-6-astra", level).is_none(),
+            "{level}"
+        );
+    }
+    assert!(effort_outside_catalog(&catalog, "gpt-5.5", "none").is_none());
+    assert!(effort_outside_catalog(&catalog, "", "none").is_none());
+}
+
+/// GPT-6 Astra "does not support custom `temperature` or `top_p` values or
+/// log probabilities"; the Responses body mu builds carries none of them,
+/// for it or for any model, on both wire paths. Pinned as a wire absence.
+#[test]
+fn gpt_6_astra_body_carries_no_sampling_or_logprobs() {
+    let input = vec![InputItem::user_text("hi")];
+    let body = request_to_value(build_request(
+        "gpt-6-astra",
+        "max",
+        "sys",
+        input,
+        &[],
+        Some(128_000),
+    ));
+    assert_eq!(body["reasoning"]["effort"], "max");
+    let obj = body.as_object().unwrap();
+    for key in ["temperature", "top_p", "logprobs", "top_logprobs"] {
+        assert!(!obj.contains_key(key), "body carries `{key}`");
+    }
+}
+
+/// A conversation stopped for review mid-stream: `response.failed` with the
+/// misalignment code becomes one Error event that carries the explanation,
+/// the steer, the code (which the loop's classifier reads as never-retry)
+/// and the guide's instruction not to re-dispatch.
+#[test]
+fn sse_misalignment_stop_is_a_legible_non_retryable_error() {
+    let raw = concat!(
+        r#"data: {"type":"response.output_text.delta","item_id":"m","output_index":0,"content_index":0,"delta":"Deleting","sequence_number":1}"#,
+        "\n\n",
+        r#"data: {"type":"response.failed","sequence_number":2,"response":{"id":"r","status":"failed","output":[],"error":{"code":"misalignment_policy_violation","message":"The conversation was stopped for review.","type":"invalid_request_error","misalignment":{"error_type":"potentially_unintended_destructive_activity","detailed_explanation":"The agent began deleting files outside the task's directory.","steer":{"message":"Confirm the target directory with the user before deleting."}}}}}"#,
+        "\n\n",
+    );
+    let events = run(raw);
+    let msg = match events.last() {
+        Some(ProviderEvent::Error(m)) => m.clone(),
+        other => panic!("expected Error last, got {other:?}"),
+    };
+    for needle in [
+        "stopped this conversation for review",
+        "misalignment_policy_violation",
+        "outside the task's directory",
+        "[steer: Confirm the target directory",
+        "must not be re-dispatched",
+    ] {
+        assert!(msg.contains(needle), "{needle} missing from: {msg}");
+    }
+}
+
+/// The same stop before streaming begins is an HTTP 403 whose body carries
+/// the code; the renderer matches the code, not the message, and produces
+/// the same line as the mid-stream path.
+#[test]
+fn http_403_misalignment_stop_renders_like_the_stream_path() {
+    let body = r#"{"error":{"message":"The conversation was stopped for review.","type":"invalid_request_error","code":"misalignment_policy_violation","param":null,"misalignment":{"error_type":"potentially_unintended_data_access","detailed_explanation":"Credentials were read outside the task."}}}"#;
+    let msg = render_codex_http_error_with(reqwest::StatusCode::FORBIDDEN, None, body);
+    assert!(
+        msg.starts_with("openai stopped this conversation for review"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("(http 403)") && msg.contains("Credentials were read"),
+        "{msg}"
+    );
+    assert!(!msg.contains("[steer:"), "{msg}");
+    // A 403 for any other reason renders like every other failure.
+    let other = render_codex_http_error_with(
+        reqwest::StatusCode::FORBIDDEN,
+        None,
+        r#"{"error":{"message":"You do not have access to this model.","type":"invalid_request_error","code":"model_not_found"}}"#,
+    );
+    assert!(!other.contains("stopped this conversation"), "{other}");
+}
+
 #[test]
 fn max_output_tokens_sent_only_when_resolved() {
     let input = vec![InputItem::user_text("hi")];

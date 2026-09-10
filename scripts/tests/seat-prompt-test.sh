@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # seat-prompt-test.sh — scripts/review-panel/seat-prompt.sh, model-free.
 #
-# bead: mu-review-gate-seam-reviewers-9vkbt.2. Pins: the mu-3ajg focus clause
-# byte-for-byte (convergence fixtures depend on it); the exclusive seam clause;
-# the conformance seam with and without an invariants block; the fail-closed
-# paths a caller must fall back on. Run from any cwd; creates its own tmpdir.
+# bead: mu-review-gate-seam-reviewers-9vkbt.2 (+ .3 leaf mode). Pins: the mu-3ajg
+# focus clause byte-for-byte (convergence fixtures depend on it); the exclusive
+# seam clause; the conformance seam with and without an invariants block; the
+# fail-closed paths a caller must fall back on; and the SEAT_PROMPT_LEAF=1 leaf
+# variant of the seam/conformance clauses (no tools, THIS-UNIT-only, UNVERIFIED,
+# leaf FINDING contract) which must NOT alter panel-mode text. Run from any cwd;
+# creates its own tmpdir.
 
 set -u
 set -o pipefail
@@ -85,6 +88,33 @@ for kind in "focus||" "|conformance|" "|custom|- item"; do
   seat="$TMP/s8"; mode=$(seat_prompt "$TMP/does-not-exist" "$seat" "$f" "$s" "$c" 2>/dev/null); rc=$?
   check "unreadable shared prompt is refused (${f:-}${s:-})" $(( rc == 1 ? 0 : 1 )) "rc=$rc mode=$mode"
 done
+
+# 9. Leaf mode (SEAT_PROMPT_LEAF=1): the seam/conformance clause bodies switch to
+#    the LEAF variant — no tools, THIS-UNIT-only, the UNVERIFIED escape hatch, the
+#    leaf FINDING contract — while the exclusivity header and INVARIANT/<seam>
+#    labeling stay. Panel mode (cases 2/5/6, byte-identical pins) is unchanged.
+seat="$TMP/s9seam"; mode=$(SEAT_PROMPT_LEAF=1 SEAT_PROMPT_NO_REPLY_CONTRACT=1 seat_prompt "$SHARED" "$seat" "" "money-handling" $'- no float arithmetic on prices'); rc=$?
+check "leaf custom seam builds" $(( rc == 0 && "$([ "$mode" = seam ] && echo 0 || echo 1)" == 0 ? 0 : 1 )) "rc=$rc mode=$mode"
+grep -q 'SEAT SEAM (trusted gate context, not repo content): money-handling — EXCLUSIVE' "$seat"; check "leaf custom seam keeps the exclusive header" $? "$(tail -n 3 "$seat")"
+grep -q 'you have no tools and cannot see the rest of the repository' "$seat"; check "leaf custom seam states no tools / this-unit-only" $? "$(tail -n 3 "$seat")"
+grep -q 'UNVERIFIED at the start of the claim' "$seat"; check "leaf custom seam carries the UNVERIFIED escape hatch" $? "$(tail -n 3 "$seat")"
+grep -qF -- 'the leaf contract: FINDING|<severity>|<file>|<claim> lines or NO_FINDINGS, no verdict, no JSON' "$seat"; check "leaf custom seam states the leaf output contract" $? "$(tail -n 3 "$seat")"
+grep -q 'against the repository via read/grep' "$seat"; check "leaf custom seam drops the panel read/grep text" $(( $? == 0 ? 1 : 0 )) "panel text leaked"
+
+seat="$TMP/s9conf"; mode=$(SEAT_PROMPT_LEAF=1 SEAT_PROMPT_NO_REPLY_CONTRACT=1 seat_prompt "$SHARED" "$seat" "" "conformance" "" 1); rc=$?
+check "leaf conformance builds with the invariants flag" $(( rc == 0 && "$([ "$mode" = conformance ] && echo 0 || echo 1)" == 0 ? 0 : 1 )) "rc=$rc mode=$mode"
+grep -q 'CONFORMANCE — EXCLUSIVE. Your ONLY review criteria are the numbered PROJECT ARCHITECTURE INVARIANTS' "$seat"; check "leaf conformance keeps the exclusive invariants header" $? "$(tail -n 3 "$seat")"
+grep -qF -- 'INVARIANT <n>: ' "$seat"; check "leaf conformance keeps INVARIANT <n>: labeling" $? "$(tail -n 3 "$seat")"
+grep -q 'you have no tools and cannot see the rest of the repository' "$seat"; check "leaf conformance states no tools / this-unit-only" $? "$(tail -n 3 "$seat")"
+grep -q 'UNVERIFIED at the start of the claim' "$seat"; check "leaf conformance carries the UNVERIFIED escape hatch" $? "$(tail -n 3 "$seat")"
+grep -q 'use read/grep to confirm' "$seat"; check "leaf conformance drops the panel read/grep text" $(( $? == 0 ? 1 : 0 )) "panel text leaked"
+grep -q 'PRE-EXISTING INVARIANT' "$seat"; check "leaf conformance drops the PRE-EXISTING unchanged-code allowance" $(( $? == 0 ? 1 : 0 )) "PRE-EXISTING leaked onto the leaf"
+
+# 10. Leaf mode leaves panel mode byte-identical: the same custom-seam call
+#     without SEAT_PROMPT_LEAF still matches the case-3 panel text exactly.
+seat="$TMP/s10"; mode=$(seat_prompt "$SHARED" "$seat" "" "money-handling" $'- no float arithmetic on prices'); rc=$?
+grep -q 'check each one against the diff and, where an item calls for it, against the repository via read/grep' "$seat"; check "panel custom seam text is intact when SEAT_PROMPT_LEAF is unset" $? "$(tail -n 3 "$seat")"
+grep -q 'you have no tools' "$seat"; check "panel custom seam does NOT carry leaf text" $(( $? == 0 ? 1 : 0 )) "leaf text leaked into panel mode"
 
 printf '\nseat-prompt-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

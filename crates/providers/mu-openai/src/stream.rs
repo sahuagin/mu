@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{JsonValue, OutputContent, OutputItem, Response, ResponseError};
+use crate::{JsonValue, OutputContent, OutputItem, Response, ResponseError, SteerInput};
 
 /// One decoded streaming event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +211,55 @@ pub enum ResponseStreamEvent {
         error: Option<ResponseError>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sequence_number: Option<u64>,
+        /// Over WebSocket (`ResponseWsError`): "the WebSocket lane that
+        /// emitted this event … present when the originating
+        /// `response.create` event supplied a `stream_id`."
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_id: Option<String>,
+    },
+
+    // ---- WebSocket steering (`ResponsesServerEvent`; never on the SSE
+    // wire — a lane with a WebSocket transport is what decodes these) ----
+    /// "Emitted when steering input has been validated and queued.
+    /// Acceptance means the server owns the input, not that it has been
+    /// applied. The successor's `response.created` event is the commit
+    /// point."
+    #[serde(rename = "response.steer.accepted")]
+    SteerAccepted {
+        sequence_number: u64,
+        steer: SteerRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_id: Option<String>,
+    },
+    /// "Emitted when accepted steering input remains queued after the
+    /// target response completes. The server still owns the input. Do not
+    /// resend it." With `reason` `waiting_for_required_input` (an
+    /// extensible enum, kept a string) the `required_input` stubs name the
+    /// tool results or approval decisions to supply: "Copy those stubs, fill
+    /// their result fields using the ordinary `response.create` input
+    /// schemas, and submit one continuation per parent with the same
+    /// `previous_response_id` and WebSocket lane." The stubs are seven
+    /// output-item shapes (`ResponseSteerRequiredInput`), carried raw.
+    #[serde(rename = "response.steer.pending")]
+    SteerPending {
+        sequence_number: u64,
+        steer: SteerRef,
+        reason: String,
+        required_input: Vec<JsonValue>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_id: Option<String>,
+    },
+    /// "Emitted when steering input is rejected or cannot be committed to a
+    /// successor response. Returns the original, uncommitted input so the
+    /// client can carry it into `response.create` when appropriate."
+    /// "Failures before an ID is allocated omit `steer.id`."
+    #[serde(rename = "response.steer.failed")]
+    SteerFailed {
+        sequence_number: u64,
+        steer: SteerRejected,
+        error: SteerError,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_id: Option<String>,
     },
 
     /// An event type we don't model. Round-trips losslessly; never fails the
@@ -218,6 +267,37 @@ pub enum ResponseStreamEvent {
     /// land here; they're out of scope for agent/text.)
     #[serde(untagged)]
     Unknown(JsonValue),
+}
+
+/// `steer` on `response.steer.accepted` / `.pending`: the steering id the
+/// server allocated and the response it targets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteerRef {
+    pub id: String,
+    pub previous_response_id: String,
+}
+
+/// `steer` on `response.steer.failed`: the original, uncommitted input, with
+/// the id when one had been allocated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteerRejected {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub previous_response_id: String,
+    pub input: SteerInput,
+}
+
+/// `error` on `response.steer.failed`: `type` is `invalid_request_error`;
+/// `code` is `ResponseSteerErrorCode`, an extensible enum — `response_not_found`,
+/// `invalid_input`, `steering_not_supported`, `too_many_pending_steers`,
+/// `response_already_completed`, `response_not_active`,
+/// `successor_creation_failed` are the documented values — kept a string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteerError {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub code: String,
+    pub message: String,
 }
 
 /// Render an `Error` stream event's fields as one displayable message,
@@ -425,6 +505,89 @@ mod tests {
             "misalignment_policy_violation: Stopped for review. (http 403) \
              [potentially_unintended_data_access] — The agent read credentials outside the \
              task. [steer: Ask before reading secrets.]"
+        );
+    }
+
+    /// The three steering server events and the WebSocket error frame, as
+    /// the spec's examples print them, round-trip through the event enum.
+    #[test]
+    fn steer_server_events_and_ws_error_round_trip() {
+        let accepted = json!({"type": "response.steer.accepted", "sequence_number": 2,
+                              "steer": {"id": "steer_456", "previous_response_id": "resp_123"}});
+        assert_eq!(
+            parse(accepted.clone()),
+            ResponseStreamEvent::SteerAccepted {
+                sequence_number: 2,
+                steer: SteerRef {
+                    id: "steer_456".into(),
+                    previous_response_id: "resp_123".into()
+                },
+                stream_id: None,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(parse(accepted.clone())).unwrap(),
+            accepted
+        );
+
+        let pending = json!({"type": "response.steer.pending", "sequence_number": 10,
+                             "steer": {"id": "steer_456", "previous_response_id": "resp_123"},
+                             "reason": "waiting_for_required_input",
+                             "required_input": [{"type": "function_call_output",
+                                                 "call_id": "call_789", "name": "lookup"}]});
+        match parse(pending.clone()) {
+            ResponseStreamEvent::SteerPending {
+                reason,
+                required_input,
+                ..
+            } => {
+                assert_eq!(reason, "waiting_for_required_input");
+                assert_eq!(required_input.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_value(parse(pending.clone())).unwrap(),
+            pending
+        );
+
+        let failed = json!({"type": "response.steer.failed", "sequence_number": 5,
+            "steer": {"id": "steer_456", "previous_response_id": "resp_123",
+                      "input": [{"type": "message", "role": "user",
+                                 "content": [{"type": "input_text",
+                                              "text": "Prioritize the database rollout."}]}]},
+            "error": {"type": "invalid_request_error", "code": "successor_creation_failed",
+                      "message": "We couldn't start the next response. Send this steering input again with response.create."}});
+        match parse(failed.clone()) {
+            ResponseStreamEvent::SteerFailed { steer, error, .. } => {
+                assert_eq!(steer.id.as_deref(), Some("steer_456"));
+                assert!(matches!(steer.input, SteerInput::Items(ref i) if i.len() == 1));
+                assert_eq!(error.code, "successor_creation_failed");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(serde_json::to_value(parse(failed.clone())).unwrap(), failed);
+
+        let ws_error = json!({"type": "error", "status": 400, "stream_id": "agent_1",
+            "error": {"type": "invalid_request_error", "code": "websocket_stream_limit_reached",
+                      "message": "This WebSocket connection has reached its stream limit."}});
+        match parse(ws_error.clone()) {
+            ResponseStreamEvent::Error {
+                stream_id, error, ..
+            } => {
+                assert_eq!(stream_id.as_deref(), Some("agent_1"));
+                assert_eq!(
+                    error.unwrap().code.as_deref(),
+                    Some("websocket_stream_limit_reached")
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // `param: null` in the spec example is not modeled on ResponseError;
+        // the example above omits it so the round-trip is exact.
+        assert_eq!(
+            serde_json::to_value(parse(ws_error.clone())).unwrap(),
+            ws_error
         );
     }
 

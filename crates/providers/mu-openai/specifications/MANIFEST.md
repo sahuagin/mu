@@ -38,9 +38,23 @@ Beta namespace alongside the GA one) and two are Beta-only
 (`BetaResponseInjectCreatedEvent` / `BetaResponseInjectFailedEvent`). The GA
 additions, grouped by what they are for, and where the crate stands on each:
 
-**Modeled** (no change needed): nothing in the delta touches a shape the crate
-already types except as noted under tolerated; the crate's 39 unit tests and
-the offline drift canary pass unchanged against this capture.
+**Modeled** — as of the refresh itself, nothing in the delta touched a shape
+the crate already typed except as noted under tolerated. Since then, the
+long-running-work shapes (yyg3j.4): the `configuration_update` item on both
+sides (`InputItem::ConfigurationUpdate`,
+`OutputItem::ConfigurationUpdate`), `async` on `FunctionTool` and on the
+function-call items, `prompt_cache_options.comparison_response_id`,
+`Response.prompt_cache_diagnostics` (`PromptCacheDiagnostics`), and the
+WebSocket steering vocabulary — `ResponsesClientEvent` (`response.create` +
+`stream_id`, `response.steer` with `SteerInput`) and the server events
+`response.steer.accepted` / `.pending` / `.failed` plus `stream_id` on the
+`error` frame — with the spec's own examples as a golden fixture
+(`ws_steer_events_20260909.json`). Still no WebSocket transport, and mu sends
+none of the new request shapes (pinned as wire absences in mu-ai).
+`error.misalignment` and the `misalignment_policy_violation` code are typed
+by yyg3j.3 (#626, merged 2026-09-10): `ResponseError.misalignment`
+(`MisalignmentErrorDetails`) and `ResponseError::is_misalignment_stop`. The
+classification below is as of the refresh.
 
 **Tolerated** (a live response carrying it round-trips or is dropped
 harmlessly today; the typed field is the epic's work):

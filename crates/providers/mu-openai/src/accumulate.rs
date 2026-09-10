@@ -44,6 +44,9 @@ struct CallBuilder {
     call_id: Option<String>,
     name: Option<String>,
     args: String,
+    /// `async: true` as announced on the item (yyg3j.4), kept so a call
+    /// backfilled from deltas carries it like an authoritative one would.
+    is_async: Option<bool>,
 }
 
 impl Deltas {
@@ -83,6 +86,7 @@ impl Deltas {
                     name: b.name,
                     arguments: Some(b.args),
                     status: None,
+                    is_async: b.is_async,
                 });
             }
         }
@@ -139,7 +143,11 @@ where
             ResponseStreamEvent::OutputItemAdded { item, .. }
             | ResponseStreamEvent::OutputItemDone { item, .. } => {
                 if let OutputItem::FunctionCall {
-                    id, call_id, name, ..
+                    id,
+                    call_id,
+                    name,
+                    is_async,
+                    ..
                 } = item
                 {
                     let b = deltas.call_mut(&id);
@@ -148,6 +156,9 @@ where
                     }
                     if name.is_some() {
                         b.name = name;
+                    }
+                    if is_async.is_some() {
+                        b.is_async = is_async;
                     }
                 }
             }
@@ -265,6 +276,34 @@ mod tests {
                 assert_eq!(call_id.as_deref(), Some("c1"));
                 assert_eq!(name.as_deref(), Some("read"));
                 assert_eq!(arguments.as_deref(), Some("{\"p\":1}"));
+            }
+            other => panic!("expected function_call, got {other:?}"),
+        }
+    }
+
+    /// An async call announced on the stream keeps its flag when the
+    /// terminal snapshot is empty and the call is rebuilt from deltas
+    /// (yyg3j.4; the authoritative path carries it by construction).
+    #[tokio::test]
+    async fn backfilled_async_call_keeps_its_flag() {
+        let events = vec![
+            ev(
+                json!({"type": "response.output_item.added", "output_index": 0, "sequence_number": 1,
+                      "item": {"type": "function_call", "id": "fc_a", "call_id": "c_a",
+                               "name": "lookup", "arguments": "", "async": true}}),
+            ),
+            ev(
+                json!({"type": "response.function_call_arguments.done", "item_id": "fc_a",
+                      "output_index": 0, "arguments": "{}", "sequence_number": 2}),
+            ),
+            ev(json!({"type": "response.completed", "sequence_number": 3,
+                      "response": {"id": "r", "status": "completed"}})),
+        ];
+        let r = accumulate(stream::iter(events)).await.unwrap();
+        match &r.output[0] {
+            OutputItem::FunctionCall { is_async, name, .. } => {
+                assert_eq!(*is_async, Some(true));
+                assert_eq!(name.as_deref(), Some("lookup"));
             }
             other => panic!("expected function_call, got {other:?}"),
         }

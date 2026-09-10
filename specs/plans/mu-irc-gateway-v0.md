@@ -152,13 +152,31 @@ durable-wake path. The mu daemon stays entirely unaware that IRC exists.
      Offline regression tests only; **no IRC client, adapter, membership, or
      routing yet.** This is the completion boundary of the present increment.
    - **2b — adapter, membership, routing.** IRC adapter over a maintained Rust
-     IRC client (one connection, TLS, mandatory SASL PLAIN when configured,
-     optional message-tags/account caps, live CASEMAPPING/CHANNELLEN handling);
+     IRC client (one connection, TLS, mandatory SASL PLAIN when configured —
+     mandatory meaning fail-closed: a CAP reply that does not acknowledge
+     `sasl`, a terminal SASL numeric in either exchange phase, and a welcome
+     numeric before `903` all fail registration rather than completing it
+     unauthenticated, an unsolicited `sasl` ACK is ignored rather than entering
+     the exchange, and the response is chunked at 400 base64 characters with the
+     `AUTHENTICATE +` terminator an exact multiple requires; the configured nick
+     is validated before it is interpolated into `NICK`/`USER`, and every
+     outbound `AUTHENTICATE` payload is redacted in `Debug`), optional
+     message-tags/account caps — `CAP LS 302` implies cap-notify, so a later
+     `CAP DEL` clears the withdrawn flags in every phase including after
+     registration, and a `CAP NEW` is recorded as available but not requested,
+     v0 negotiating once — live CASEMAPPING/CHANNELLEN handling);
      disposable membership/channel lifecycle from NAMES and
      JOIN/PART/KICK/QUIT/NICK plus fresh discovery; mesh→IRC routing with agent
      channels, collision labels, lobby fallbacks, exclusive human routing,
      per-withdrawal bodiless-notice suppression, and exactly-once
      endpoint/observer overlap handling.
+
+     The 2b slice lands as **offline library capabilities only**, mirroring 2a:
+     the adapter is a registration/capability *state machine* over a small
+     single-connection transport trait — the trait's real TLS socket, the
+     maintained IRC client crate, and event-loop wiring are the integration
+     increment's job. Nothing here opens a socket or subscribes a subject; every
+     capability is exercised offline.
 3. **IRC → mesh.** Delivery for present-agent channels and lobby/private
    fan-out, canonical human senders, one shared id per broadcast, refusal of
    absent/human destinations and nonmember private senders, and routing-memory

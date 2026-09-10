@@ -8,9 +8,11 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
-# Increment 2a is a library of tested capabilities (configuration, pure
-# mapping, framing). There is deliberately NO binary yet: the runnable bridge
-# is wired in the integration increment, after these capabilities are reviewed.
+# So far this is a library of tested, OFFLINE capabilities: configuration +
+# mapping + framing (2a), plus the registration/capability adapter state machine
+# (2b). There is deliberately NO binary yet: the maintained IRC client, the real
+# TLS/mesh transport, and the event loop that executes these decisions are wired
+# in the integration increment, after each capability slice is reviewed.
 [lib]
 name = "mu_irc_gateway"
 path = "src/lib.rs"
@@ -22,6 +24,10 @@ thiserror = { workspace = true }
 # Deterministic channel-tail hashing (a stable short hash when the full alias
 # would exceed CHANNELLEN). blake3 is already a workspace dependency.
 blake3 = { workspace = true }
+# SASL PLAIN response encoding for the offline adapter's registration state
+# machine (base64 of the `authzid \0 authcid \0 password` frame). Same workspace
+# crate the mesh client already uses for biscuit capability bytes.
+base64 = { workspace = true }
 # The shared peer identity type — the SAME one the mesh addresses with, so a
 # human folded here derives the same DM subject the daemon already routes.
 mu-peer = { workspace = true }

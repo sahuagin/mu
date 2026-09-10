@@ -176,6 +176,24 @@
 #                               skipped (on-disk files belong to @, not HEAD).
 #     MU_REVIEW_SYNTH_PROVIDER  synthesis provider (default: primary 2's)
 #     MU_REVIEW_SYNTH_MODEL     synthesis model    (default: primary 2's)
+#     MU_REVIEW_CHUNK_MAX_DISPATCHES  TRUE cap on ACTUAL chunked leaf model calls,
+#                               timeout retries included (default 40). Each unit is
+#                               reviewed once unseamed plus once per SEAM the
+#                               code_review roster declares (9vkbt.3), so the PLAN
+#                               is units × (1 + seams). The cap is enforced twice:
+#                               up-front on the plan, in two tiers —
+#                                 - units alone > cap: the branch cannot be chunked
+#                                   (even one leaf per unit overflows the budget) —
+#                                   the gate ESCALATEs (exit 3) and asks you to
+#                                   split the branch;
+#                                 - units fit but units × (1 + seams) > cap: only
+#                                   the unseamed leaves run, and a one-line notice
+#                                   names the cap and the count;
+#                               and again at runtime — a leaf that times out is not
+#                               retried once the running count of actual leaf calls
+#                               (retries counted) has reached the cap; that leaf is
+#                               recorded as unreviewed. Raise it to allow the seam
+#                               lenses (or a larger branch) instead of splitting.
 #
 # The log carries every reviewer's verdict: one {"event":"reviewer",...} line per
 # reviewer that RAN plus one {"event":"panel",...} summary with the outcome and all
@@ -774,6 +792,25 @@ log_panel_consensus() { # $1=outcome(PASS|BLOCK|ESCALATE) $2=verdict $3=rounds $
 # logged as leaf_error and shown to synthesis as UNREVIEWED; if >1/3 of leaves
 # fail, synthesis is SKIPPED and the gate ESCALATEs — it must not approve a
 # mostly-unreviewed branch.
+#
+# SEAM LEAVES (mu-review-gate-seam-reviewers-9vkbt.3): the unseamed leaf above is
+# the generic pass (one prompt, no invariants, no lens — so conformance is absent
+# from it). Each unit is ALSO reviewed once per SEAM the code_review roster
+# declares — a rank carrying a `seam` key (ranks with only `focus` are not seams)
+# — on the SAME leaf lane, so a unit is reviewed (1 + #seams) times. Leaf prompt
+# assembly lives in review-panel/leaf-prompt.sh (model-free, testable); a seam
+# leaf reuses the panel's seam clause (seat-prompt.sh, LEAF variant) and prefixes
+# its findings with "<seam>: ". Guardrail: MU_REVIEW_CHUNK_MAX_DISPATCHES is a
+# TRUE total cap on units × (1 + seams) — if units alone exceed it the branch
+# cannot be chunked and the gate ESCALATEs (split the branch); if units fit but
+# the product does not, only the unseamed leaves run. The conformance seam is
+# dropped from the roster when BASE declares no "## Architecture invariants".
+
+# Leaf prompt assembler (sourced; model-free). LEAF_PROMPT_DIR pins its sibling
+# seat-prompt.sh so source-time location never depends on $0.
+LEAF_PROMPT_DIR="$AI_REVIEW_DIR/review-panel"
+[ -r "$LEAF_PROMPT_DIR/leaf-prompt.sh" ] || { echo "${C_RED}ai-review: missing leaf-prompt.sh at $LEAF_PROMPT_DIR${C_OFF}" >&2; exit 2; }
+. "$LEAF_PROMPT_DIR/leaf-prompt.sh"
 
 leaf_findings() { # stdin = raw leaf output -> <=5 FINDING| lines, or NO_FINDINGS, or "" (unusable)
   # Tolerate leading whitespace/markdown bullets around contract lines, but
@@ -810,40 +847,65 @@ log_panel_chunked() { # $1=outcome $2=override $3=synth-verdict $4=leaves $5=lea
     "$(json_escape "$BASE")" "$(json_escape "$HEADREV")" "$FILES" "$2" >> "$LOG"
 }
 
-review_leaf() { # $1=commit $2=short-id $3=unit-label ("" = whole commit) $4=message $5=diff
+review_leaf() { # $1=commit $2=short-id $3=unit-label ("" = whole commit) $4=message $5=diff $6=seam $7=checklist
   # Runs ONE leaf and folds its result into the caller's (run_chunked's)
   # accumulators — leaves/failed/findings_total/SYNTH_FINDINGS via bash
   # dynamic scoping, same pattern as verify_claims_step in pre-pr-check.sh.
-  local c="$1" cshort="$2" unit="${3:-commit $2}" msg="$4" d="$5"
+  # $6/$7 empty = the generic unseamed leaf; a non-empty seam adds " [seam: X]"
+  # to the label (so leaf/leaf_error log lines name the lens) and reviews the
+  # unit through that seam's clause.
+  local c="$1" cshort="$2" unit="${3:-commit $2}" msg="$4" d="$5" seam="${6:-}" checklist="${7:-}"
+  [ -n "$seam" ] && unit="$unit [seam: $seam]"
   leaves=$((leaves + 1))
   echo "${C_DIM}── leaf $leaves: $unit ($PROVIDER/$MODEL) ─────────────────${C_OFF}"
-  {
-    printf '%s\n' "You are one LEAF of a chunked pre-PR review: the branch is too large for a single review, so each commit is reviewed in isolation against its own stated intent, and a separate synthesis pass renders the verdict. Review ONLY the diff below for: correctness bugs; concurrency / lifecycle hazards; missing error handling; safeguards that nearby code in the diff applies but this change omits; and mismatches between the commit message's claims and the change. You see one unit — the branch context is orientation only; do NOT raise findings about code you cannot see, and do NOT call any tools. $UNTRUSTED_REPO_CONTENT_RULE"
-    printf '%s\n' ""
-    printf '%s\n' "Output contract (STRICT):"
-    printf '%s\n' "- One line per finding: FINDING|<blocker|should-fix|note>|<file>|<one-line claim>"
-    printf '%s\n' "- At most 5 findings, highest severity first; omit low-confidence concerns."
-    printf '%s\n' "- If there is nothing worth reporting, output the single line: NO_FINDINGS"
-    printf '%s\n' "- NO verdict line, NO narration, NOTHING else."
-    printf '%s\n' ""
-    printf '%s\n' "BRANCH COMMITS (orientation; you are reviewing $unit):"
-    printf '%s\n' "$COMMIT_LIST"
-    printf '%s\n' "TOTAL BRANCH DIFFSTAT:"
-    printf '%s\n' "$DIFFSTAT"
-    printf '%s\n' "UNIT UNDER REVIEW: $unit"
-    printf '%s\n' "COMMIT MESSAGE:"
-    printf '%s\n' "$msg"
-    printf '%s\n' ""
-    printf '%s\n' "BEGIN UNTRUSTED REPO CONTENT: UNIT DIFF"
-    printf '%s\n' "$d"
-    printf '%s\n' "END UNTRUSTED REPO CONTENT: UNIT DIFF"
-  } > "$LEAF_FILE"
+  # Prompt assembly moved to review-panel/leaf-prompt.sh (model-free, testable).
+  # Files, not argv: the diff can be large. COMMIT_LIST/DIFFSTAT/INVARIANTS_BLOCK
+  # are constant across leaves, so run_chunked wrote their files once; the
+  # per-leaf message and diff are written here.
+  # Fail closed (fix: fail closed on prompt assembly): a leaf whose prompt cannot
+  # be assembled — an unwritable temp file here, or any failed read/write inside
+  # leaf_prompt — is recorded as an unreviewed leaf with the reason, exactly like
+  # a timed-out leaf (it counts toward the >1/3 failure threshold), never a silent
+  # dispatch of a half-built prompt.
+  local _asm_err=""
+  if ! printf '%s' "$msg" > "$LEAF_MSG_FILE" 2>/dev/null; then
+    _asm_err="cannot write leaf message temp file $LEAF_MSG_FILE"
+  elif ! printf '%s' "$d" > "$LEAF_DIFF_FILE" 2>/dev/null; then
+    _asm_err="cannot write leaf diff temp file $LEAF_DIFF_FILE"
+  elif ! _asm_err="$(leaf_prompt "$LEAF_FILE" "$unit" "$LEAF_MSG_FILE" "$LEAF_DIFF_FILE" \
+        "$LEAF_CLIST_FILE" "$LEAF_STAT_FILE" "$seam" "$checklist" \
+        "${MU_REVIEW_INVARIANTS_PRESENT:-0}" "$LEAF_INV_FILE" 2>&1)"; then
+    _asm_err="${_asm_err:-leaf_prompt failed}"
+  else
+    _asm_err=""
+  fi
+  if [ -n "$_asm_err" ]; then
+    failed=$((failed + 1))
+    log_leaf_error "$c" "$unit" "prompt assembly failed: $_asm_err"
+    echo "${C_YEL}  → leaf FAILED (prompt assembly, seam=[$seam]) — recorded as unreviewed. reason: $_asm_err${C_OFF}"
+    SYNTH_FINDINGS="$SYNTH_FINDINGS
+$unit: REVIEW FAILED — treat as unreviewed"
+    return 0
+  fi
   local out rc f retry=0 max_timeout_retries
   max_timeout_retries="${MU_REVIEW_TIMEOUT_RETRIES:-${AI_REVIEW_TIMEOUT_RETRIES:-1}}"
+  # Count every ACTUAL leaf model call against chunk_cap (bash dynamic scope:
+  # dispatches/chunk_cap live in run_chunked). Retries count too, so a run of
+  # timeouts cannot blow past the operator's dispatch budget.
+  dispatches=$((dispatches + 1))
   out="$(run_review "$PROVIDER" "$MODEL" "$LEAF_FILE")"; rc=$?
   while [ "$rc" -eq 124 ] && [ "$retry" -lt "$max_timeout_retries" ]; do
+    if [ "$dispatches" -ge "$chunk_cap" ]; then
+      failed=$((failed + 1))
+      log_leaf_error "$c" "$unit" "timeout; retry skipped: dispatch cap $chunk_cap reached"
+      echo "${C_YEL}  → leaf timed out; retry skipped: dispatch cap $chunk_cap reached — recorded as unreviewed.${C_OFF}"
+      SYNTH_FINDINGS="$SYNTH_FINDINGS
+$unit: REVIEW FAILED — treat as unreviewed"
+      return 0
+    fi
     retry=$((retry + 1))
     echo "${C_YEL}  → leaf timed out after ${TIMEOUT}s; retry ${retry}/${max_timeout_retries}${C_OFF}"
+    dispatches=$((dispatches + 1))
     out="$(run_review "$PROVIDER" "$MODEL" "$LEAF_FILE")"; rc=$?
   done
   f="$(printf '%s' "$out" | leaf_findings)"
@@ -873,10 +935,60 @@ $unit — $(printf '%s' "$msg" | head -n 1):
 $f"
 }
 
+# Count the leaf UNITS this branch produces (a fitting commit = 1 unit; a commit
+# whose diff exceeds SS_MAX splits per-file = one unit per file), so the dispatch
+# cap can be decided before any model runs. Mirrors the review loop's unit
+# determination, including its empty-diff skip. Reads $commits/$IS_JJ/$SS_MAX
+# from run_chunked's scope (bash dynamic scope).
+count_leaf_units() { # stdout: integer
+  local c cdiff nf total=0
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    if [ -n "$IS_JJ" ]; then cdiff="$(jj diff -r "$c" --git 2>/dev/null)"; else cdiff="$(git show --format= "$c" 2>/dev/null)"; fi
+    grep -q '[^[:space:]]' <<<"$cdiff" || continue
+    if [ "$(printf '%s' "$cdiff" | wc -c)" -le "$SS_MAX" ]; then
+      total=$((total + 1))
+    else
+      nf="$(printf '%s\n' "$cdiff" | sed -n 's#^diff --git a/.* b/##p' | grep -c .)"
+      [ "$nf" -lt 1 ] && nf=1
+      total=$((total + nf))
+    fi
+  done <<<"$commits"
+  printf '%s' "$total"
+}
+
+# One unit, once per SEAM: the extra leaves beyond the unseamed one. Skipped when
+# the dispatch cap disabled seams (enable_seams=0) or the roster declares none.
+# Same args as review_leaf minus the seam pair. Reads enable_seams/n_seams/
+# SEAM_NAMES/SEAM_CHECKLISTS from run_chunked's scope.
+review_leaf_seams() { # $1=commit $2=short-id $3=unit-label $4=message $5=diff
+  [ "$enable_seams" -eq 1 ] || return 0
+  local _si=0
+  while [ "$_si" -lt "$n_seams" ]; do
+    review_leaf "$1" "$2" "$3" "$4" "$5" "${SEAM_NAMES[$_si]}" "${SEAM_CHECKLISTS[$_si]}"
+    _si=$((_si + 1))
+  done
+}
+
 run_chunked() { # never returns — exits with the gate verdict
-  local LEAF_FILE
+  local LEAF_FILE LEAF_MSG_FILE LEAF_DIFF_FILE LEAF_CLIST_FILE LEAF_STAT_FILE LEAF_INV_FILE
   LEAF_FILE="$(mktemp "${TMPDIR:-/tmp}/ai-review-leaf.XXXXXX")"
-  trap 'rm -f "$PROMPT_FILE" "$LEAF_FILE"' EXIT
+  LEAF_MSG_FILE="$(mktemp "${TMPDIR:-/tmp}/ai-review-leaf-msg.XXXXXX")"
+  LEAF_DIFF_FILE="$(mktemp "${TMPDIR:-/tmp}/ai-review-leaf-diff.XXXXXX")"
+  LEAF_CLIST_FILE="$(mktemp "${TMPDIR:-/tmp}/ai-review-leaf-clist.XXXXXX")"
+  LEAF_STAT_FILE="$(mktemp "${TMPDIR:-/tmp}/ai-review-leaf-stat.XXXXXX")"
+  LEAF_INV_FILE="$(mktemp "${TMPDIR:-/tmp}/ai-review-leaf-inv.XXXXXX")"
+  trap 'rm -f "$PROMPT_FILE" "$LEAF_FILE" "$LEAF_MSG_FILE" "$LEAF_DIFF_FILE" "$LEAF_CLIST_FILE" "$LEAF_STAT_FILE" "$LEAF_INV_FILE"' EXIT
+  # Invariants block is constant across leaves; write it once. It rides ONLY the
+  # conformance seam leaf (leaf-prompt.sh gates on has-invariants), never the
+  # generic unseamed leaf. Fail closed: these constant files are read by
+  # leaf_prompt for EVERY leaf, so a failed write here would silently feed every
+  # leaf an empty-but-readable file as if it were complete. Abort before any leaf
+  # is dispatched rather than review against a truncated prompt.
+  if ! printf '%s' "$INVARIANTS_BLOCK" > "$LEAF_INV_FILE" 2>/dev/null; then
+    echo "${C_RED}ai-review: chunked mode cannot write invariants temp file $LEAF_INV_FILE — aborting before any leaf is dispatched${C_OFF}" >&2
+    exit 2
+  fi
 
   local ov=false
   [ "${MU_REVIEW_OVERRIDE:-}" = "1" ] && ov=true
@@ -903,6 +1015,63 @@ run_chunked() { # never returns — exits with the gate verdict
     COMMIT_LIST="$(git log --reverse --format='%h %s' "$BASE..$HEADREV" 2>/dev/null)"
     DIFFSTAT="$(git diff --stat "$BASE...$HEADREV" 2>/dev/null | tail -c 6000)"
   fi
+  # Constant across leaves; write once for leaf_prompt (files, not argv). Fail
+  # closed, same reason as the invariants file above: a failed write would hand
+  # every leaf an empty commit-list/diffstat as if complete, so abort before any
+  # leaf is dispatched.
+  if ! printf '%s' "$COMMIT_LIST" > "$LEAF_CLIST_FILE" 2>/dev/null; then
+    echo "${C_RED}ai-review: chunked mode cannot write commit-list temp file $LEAF_CLIST_FILE — aborting before any leaf is dispatched${C_OFF}" >&2
+    exit 2
+  fi
+  if ! printf '%s' "$DIFFSTAT" > "$LEAF_STAT_FILE" 2>/dev/null; then
+    echo "${C_RED}ai-review: chunked mode cannot write diffstat temp file $LEAF_STAT_FILE — aborting before any leaf is dispatched${C_OFF}" >&2
+    exit 2
+  fi
+
+  # Seam roster (9vkbt.3): the distinct seams the code_review panel declares,
+  # read from the SAME agent_roles.toml dispatch.sh reads (tq + jq). Each seam
+  # gives every unit one EXTRA leaf beyond the unseamed one, on the same leaf
+  # lane. A rank with only `focus` is soft emphasis, not a seam, so it spawns no
+  # leaf. Deduped by seam name (first checklist wins). Degrades to no seams when
+  # tq/jq/the roster is absent — the leaf lane still runs unseamed.
+  local -a SEAM_NAMES=() SEAM_CHECKLISTS=()
+  local _roles _tqbin _ranks_json _rj_n _ri _s_seam _s_checklist _existing _seen _conf_skipped=0
+  _roles="${AGENT_ROLES:-$HOME/.config/mu/agent_roles.toml}"
+  _tqbin="${TQ:-$HOME/.cargo/bin/tq}"; command -v "$_tqbin" >/dev/null 2>&1 || _tqbin=tq
+  if command -v "$_tqbin" >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 && [ -r "$_roles" ]; then
+    _ranks_json="$("$_tqbin" -o json -f "$_roles" code_review.ranked 2>/dev/null)" || _ranks_json=""
+    if [ -n "$_ranks_json" ]; then
+      _rj_n="$(printf '%s' "$_ranks_json" | jq -r 'length' 2>/dev/null || echo 0)"
+      case "$_rj_n" in ''|*[!0-9]*) _rj_n=0 ;; esac
+      _ri=0
+      while [ "$_ri" -lt "$_rj_n" ]; do
+        _s_seam="$(printf '%s' "$_ranks_json" | jq -r ".[$_ri].seam // \"\"" 2>/dev/null)"
+        if [ "$_s_seam" = conformance ] && [ "${MU_REVIEW_INVARIANTS_PRESENT:-0}" != 1 ]; then
+          # Fix: conformance leaf without invariants. With no "## Architecture
+          # invariants" at BASE the conformance seam has no criteria; drop it from
+          # the roster entirely (so it never dispatches and never inflates the
+          # cap) rather than emit a leaf with the panel's VERDICT/JSON no-invariants
+          # clause, which contradicts the leaf's FINDING/NO_FINDINGS contract.
+          [ "$_conf_skipped" -eq 1 ] || echo "${C_DIM}ai-review: conformance seam skipped: no ## Architecture invariants at BASE${C_OFF}"
+          _conf_skipped=1
+          _ri=$((_ri + 1)); continue
+        fi
+        if [ -n "$_s_seam" ]; then
+          _seen=0
+          for _existing in ${SEAM_NAMES[@]+"${SEAM_NAMES[@]}"}; do
+            [ "$_existing" = "$_s_seam" ] && { _seen=1; break; }
+          done
+          if [ "$_seen" -eq 0 ]; then
+            _s_checklist="$(printf '%s' "$_ranks_json" | jq -r ".[$_ri].checklist // \"\"" 2>/dev/null)"
+            SEAM_NAMES+=("$_s_seam")
+            SEAM_CHECKLISTS+=("$_s_checklist")
+          fi
+        fi
+        _ri=$((_ri + 1))
+      done
+    fi
+  fi
+  local n_seams=${#SEAM_NAMES[@]}
 
   local n_commits
   n_commits="$(printf '%s\n' "$commits" | grep -c .)"
@@ -910,7 +1079,54 @@ run_chunked() { # never returns — exits with the gate verdict
   [ -n "${SIZE_FORCE_CHUNK:-}" ] && why="MU_REVIEW_CHUNK=1 past a SIZE block (prompt ${PROMPT_BYTES}B, cap ${SS_MAX}B)"
   echo "${C_DIM}ai-review: CHUNKED mode — $why; $n_commits commit(s) in $BASE..$HEADREV. Leaves: $PROVIDER/$MODEL, synthesis: $SYNTH_PROVIDER/$SYNTH_MODEL.${C_OFF}"
 
-  local leaves=0 failed=0 findings_total=0
+  # Dispatch cap (9vkbt.3; fix: cap ACTUAL leaf calls, retries included): a unit
+  # reviewed per seam multiplies model calls, so cap the leaf dispatches at
+  # MU_REVIEW_CHUNK_MAX_DISPATCHES (default 40). This up-front check plans on
+  # units × (1 + seams); the runtime counter (dispatches, in this scope) then
+  # enforces the same cap on the ACTUAL calls review_leaf makes, so timeout
+  # retries can't overrun the budget. Count units up front (a fitting commit =
+  # 1 unit; an oversized one splits per file) so the plan decision is made before
+  # any model runs. chunk_dispatch_plan (leaf-prompt.sh, pure/testable)
+  # renders the three-way decision on total = units × (1 + seams):
+  #   units_over_cap — units alone overflow: the branch cannot be chunked at all,
+  #                    ESCALATE and tell the operator to split (same exit/logging
+  #                    as the leaf-failure escalation below);
+  #   drop_seams     — units fit, the product does not: run unseamed leaves only;
+  #   ok             — the full product fits (or no seams declared).
+  local n_units chunk_cap planned enable_seams=1 plan
+  n_units="$(count_leaf_units)"
+  chunk_cap="${MU_REVIEW_CHUNK_MAX_DISPATCHES:-40}"
+  case "$chunk_cap" in ''|*[!0-9]*) chunk_cap=40 ;; esac
+  planned=$(( n_units * (1 + n_seams) ))
+  plan="$(chunk_dispatch_plan "$n_units" "$n_seams" "$chunk_cap")"
+  case "$plan" in
+    units_over_cap)
+      if [ "$ov" = true ]; then
+        log_panel_chunked ESCALATE true "" 0 0
+        echo "${C_YEL}ai-review: chunked review needs $n_units leaf dispatches for $n_units units, over MU_REVIEW_CHUNK_MAX_DISPATCHES=$chunk_cap — overridden by operator (MU_REVIEW_OVERRIDE=1). Logged.${C_OFF}"
+        exit 0
+      fi
+      log_panel_chunked ESCALATE false "" 0 0
+      echo "${C_RED}ai-review: chunked review needs $n_units leaf dispatches for $n_units units, over MU_REVIEW_CHUNK_MAX_DISPATCHES=$chunk_cap: split the branch${C_OFF}" >&2
+      exit 3 ;;
+    drop_seams)
+      enable_seams=0
+      echo "${C_YEL}ai-review: chunked seam lenses SKIPPED — $n_units unit(s) × (1 + $n_seams seam(s)) = $planned dispatches would exceed MU_REVIEW_CHUNK_MAX_DISPATCHES=$chunk_cap; running the $n_units unseamed leaf/leaves only.${C_OFF}" ;;
+    *)
+      [ "$n_seams" -gt 0 ] && echo "${C_DIM}ai-review: chunked seam lenses ON — $n_units unit(s) × (1 + $n_seams seam(s)) = $planned leaf dispatch(es) (cap MU_REVIEW_CHUNK_MAX_DISPATCHES=$chunk_cap). Seams: ${SEAM_NAMES[*]}.${C_OFF}" ;;
+  esac
+
+  # dispatches: ACTUAL leaf model calls made so far (first attempt + every retry),
+  # in run_chunked's scope so review_leaf increments it via bash dynamic scoping
+  # (like leaves/failed). chunk_cap caps this too at runtime: a timeout retry that
+  # would push past the cap is skipped and the leaf recorded as failed.
+  # No hermetic test: the retry-skip is entangled with run_review (live dispatch)
+  # and dynamic scope, not an isolable pure function like chunk_dispatch_plan.
+  # MANUAL CHECK: set MU_REVIEW_CHUNK_MAX_DISPATCHES low and force timeouts (stub
+  # run_review to `return 124`, MU_REVIEW_TIMEOUT_RETRIES high) on a multi-unit
+  # branch; leaf_error lines should read 'timeout; retry skipped: dispatch cap N
+  # reached' once the running count hits N, and no leaf call fires past N.
+  local leaves=0 failed=0 findings_total=0 dispatches=0
   local SYNTH_FINDINGS="" ALL_MSGS=""
   local c cshort msg cdiff
   while IFS= read -r c; do
@@ -927,7 +1143,8 @@ run_chunked() { # never returns — exits with the gate verdict
 $msg"
     grep -q '[^[:space:]]' <<<"$cdiff" || continue
     if [ "$(printf '%s' "$cdiff" | wc -c)" -le "$SS_MAX" ]; then
-      review_leaf "$c" "$cshort" "" "$msg" "$cdiff"
+      review_leaf "$c" "$cshort" "" "$msg" "$cdiff" "" ""
+      review_leaf_seams "$c" "$cshort" "" "$msg" "$cdiff"
     else
       # One commit alone exceeds the cap: split per-file. The commit message
       # (the claim) rides along on every slice so each leaf still reviews
@@ -948,7 +1165,8 @@ $msg"
           fdiff="$(printf '%s' "$fdiff" | head -c "$SS_MAX")
 [diff truncated at ${SS_MAX} bytes]"
         fi
-        review_leaf "$c" "$cshort" "file $i/$nf of commit $cshort: $f" "$msg" "$fdiff"
+        review_leaf "$c" "$cshort" "file $i/$nf of commit $cshort: $f" "$msg" "$fdiff" "" ""
+        review_leaf_seams "$c" "$cshort" "file $i/$nf of commit $cshort: $f" "$msg" "$fdiff"
       done <<<"$files"
     fi
   done <<<"$commits"
@@ -1044,7 +1262,7 @@ $fcontent"
   CONS_OUT="$(mktemp -d "${TMPDIR:-/tmp}/ai-review-chunked-consensus.XXXXXX")"
   CONS_PROMPT="$CONS_OUT/round1.prompt.txt"
   {
-    printf '%s\n' "You are a strict pre-PR code reviewer for ${PROJECT_DESC}. This branch was too large for one review, so each commit was reviewed in isolation by a leaf reviewer; their findings are the review material below, in the form FINDING|<severity>|<file>|<claim>. You hold the only branch-wide view: judge which findings are REAL (a later commit may already fix what an earlier leaf flagged) and whether any INTERACT across commits into a larger hazard no single commit shows. Units marked 'REVIEW FAILED — treat as unreviewed' carry unknown risk; weigh that. If a SPEC section is included, judge whether the branch delivers what it claims. If PROJECT ARCHITECTURE INVARIANTS are included, a violation (or a move toward one) is needs-changes even when each commit is locally correct. Targeted HEADREV file context for paths named by leaf findings may be included in the review-material fence; you also have read/grep tools via the code_review role. Do NOT assert terrain facts (line numbers, function existence/non-existence, nearby safeguards) unless you verified them against the provided context or by reading/grepping the repository. If you cannot verify a terrain-dependent rebuttal, mark the risk as unresolved rather than inventing confidence. $UNTRUSTED_REPO_CONTENT_RULE"
+    printf '%s\n' "You are a strict pre-PR code reviewer for ${PROJECT_DESC}. This branch was too large for one review, so each commit was reviewed in isolation by a leaf reviewer; their findings are the review material below, in the form FINDING|<severity>|<file>|<claim>. You hold the only branch-wide view: judge which findings are REAL (a later commit may already fix what an earlier leaf flagged) and whether any INTERACT across commits into a larger hazard no single commit shows. Units marked 'REVIEW FAILED — treat as unreviewed' carry unknown risk; weigh that. If a SPEC section is included, judge whether the branch delivers what it claims. If PROJECT ARCHITECTURE INVARIANTS are included, a violation (or a move toward one) is needs-changes even when each commit is locally correct. Some leaves reviewed a unit through ONE seam lens and prefixed their findings' claims with that lens name (e.g. 'conformance: INVARIANT 3: ...'); a 'conformance:' finding reporting an invariant VIOLATION is needs-changes regardless of the other findings. Targeted HEADREV file context for paths named by leaf findings may be included in the review-material fence; you also have read/grep tools via the code_review role. Do NOT assert terrain facts (line numbers, function existence/non-existence, nearby safeguards) unless you verified them against the provided context or by reading/grepping the repository. If you cannot verify a terrain-dependent rebuttal, mark the risk as unresolved rather than inventing confidence. $UNTRUSTED_REPO_CONTENT_RULE"
     printf 'Output contract (strict, truncation-safe):\n'
     printf '1. The FIRST line of your reply MUST be exactly one of: VERDICT: approve / VERDICT: needs-changes.\n'
     printf '2. After that first line, emit exactly one JSON object (no prose, no markdown fence, nothing after it):\n'

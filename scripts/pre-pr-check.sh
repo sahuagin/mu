@@ -107,6 +107,16 @@ seat_prompt_step() {
 }
 run_step "review-panel seat prompts" seat_prompt_step
 
+# Chunked-mode leaf prompt assembly self-test
+# (mu-review-gate-seam-reviewers-9vkbt.3): the unseamed leaf byte-identity, the
+# seam leaves and the conformance invariants block, model-free.
+leaf_prompt_step() {
+  local t="$REPO_ROOT/scripts/tests/leaf-prompt-test.sh"
+  [ -f "$t" ] || { printf "%s    leaf-prompt-test.sh missing — skipping%s\n\n" "$C_DIM" "$C_OFF"; return 0; }
+  bash "$t"
+}
+run_step "review-panel leaf prompts" leaf_prompt_step
+
 # Review-gate SIZE gate self-test (mu-review-gate-seam-reviewers-9vkbt.1):
 # throwaway git repo, stops before any reviewer runs — no model spend.
 review_size_gate_step() {

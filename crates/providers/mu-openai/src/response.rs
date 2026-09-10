@@ -36,6 +36,11 @@ pub struct Response {
     /// Modeled so the drift canary round-trips it instead of flagging a drop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_options: Option<crate::JsonValue>,
+    /// "Prompt cache diagnostics requested for this response" (2026-09-09
+    /// capture) — present when the request's `prompt_cache_options` named a
+    /// `comparison_response_id`. See [`PromptCacheDiagnostics`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_diagnostics: Option<PromptCacheDiagnostics>,
     /// Moderation results/echo (spec 2026-06 addition); shallow JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moderation: Option<crate::JsonValue>,
@@ -173,6 +178,20 @@ pub enum OutputItem {
         arguments: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+        /// "Whether the function tool call runs asynchronously" (2026-09-09
+        /// capture): the call was made against a tool defined with
+        /// `async: true`, and its output may arrive on a later request.
+        #[serde(default, rename = "async", skip_serializing_if = "Option::is_none")]
+        is_async: Option<bool>,
+    },
+    /// `configuration_update` echoed in `output` (2026-09-09 capture,
+    /// `ResponseConfigurationUpdate`, `id` `cnfu_…`): the reasoning effort
+    /// now in force "for subsequent responses until it is replaced by
+    /// another configuration update". mu-openai-protocol-2026q3-yyg3j.4.
+    ConfigurationUpdate {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<crate::ConfigurationReasoning>,
     },
     /// Reasoning item — modeled fully (not just `id`) so the mu provider can
     /// thread it back into the next request's `input` verbatim (encrypted_content
@@ -209,6 +228,32 @@ pub enum OutputContent {
     Refusal {
         refusal: String,
     },
+    #[serde(untagged)]
+    Unknown(JsonValue),
+}
+
+/// `prompt_cache_diagnostics` (2026-09-09 capture, `PromptCacheDiagnostics`:
+/// a `type`-discriminated union). `cache_miss` carries the reason
+/// (`CacheMissReasonTypeEnum`: `model_changed`, `prompt_cache_key_changed`,
+/// `tools_changed`, `text_format_changed`, `reasoning_effort_changed`,
+/// `verbosity_changed`, `context_compacted`, `input_changed`,
+/// `service_tier_changed` — kept a string), the tokens the miss cost and,
+/// when the comparison response had them, how many were reusable. The
+/// `reasoning_effort_changed` reason is the one `configuration_update`
+/// exists to avoid. A body of a kind this crate does not know lands in
+/// `Unknown` and round-trips.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PromptCacheDiagnostics {
+    CacheHit,
+    CacheMiss {
+        reason: String,
+        cache_missed_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        comparison_reusable_tokens: Option<u64>,
+    },
+    ComparisonResponseNotFound,
+    Unavailable,
     #[serde(untagged)]
     Unknown(JsonValue),
 }
@@ -404,6 +449,76 @@ mod tests {
             Some("some_new_category")
         );
         round_trip(sparse);
+    }
+
+    /// The long-running-work shapes on the response side (yyg3j.4): an
+    /// async function call, the `configuration_update` echo with the
+    /// server's id, and each prompt-cache diagnostics body, all
+    /// round-tripping; an undocumented diagnostics type degrades to
+    /// `Unknown` instead of failing the parse.
+    #[test]
+    fn async_call_configuration_update_and_cache_diagnostics_round_trip() {
+        let v = json!({
+            "id": "resp_2",
+            "status": "completed",
+            "output": [
+                {"id": "cnfu_123", "type": "configuration_update", "reasoning": {"effort": "high"}},
+                {"id": "fc_1", "type": "function_call", "call_id": "call_1", "name": "lookup",
+                 "arguments": "{}", "status": "in_progress", "async": true}
+            ],
+            "prompt_cache_diagnostics": {"type": "cache_miss", "reason": "reasoning_effort_changed",
+                                         "cache_missed_tokens": 1200, "comparison_reusable_tokens": 800}
+        });
+        let r: Response = serde_json::from_value(v.clone()).unwrap();
+        match &r.output[0] {
+            OutputItem::ConfigurationUpdate { id, reasoning } => {
+                assert_eq!(id, "cnfu_123");
+                assert_eq!(
+                    reasoning.as_ref().and_then(|c| c.effort.as_deref()),
+                    Some("high")
+                );
+            }
+            other => panic!("expected configuration_update, got {other:?}"),
+        }
+        match &r.output[1] {
+            OutputItem::FunctionCall { is_async, .. } => assert_eq!(*is_async, Some(true)),
+            other => panic!("expected function_call, got {other:?}"),
+        }
+        assert_eq!(
+            r.prompt_cache_diagnostics,
+            Some(PromptCacheDiagnostics::CacheMiss {
+                reason: "reasoning_effort_changed".into(),
+                cache_missed_tokens: 1200,
+                comparison_reusable_tokens: Some(800),
+            })
+        );
+        round_trip(v);
+        for (body, want) in [
+            (
+                json!({"type": "cache_hit"}),
+                PromptCacheDiagnostics::CacheHit,
+            ),
+            (
+                json!({"type": "comparison_response_not_found"}),
+                PromptCacheDiagnostics::ComparisonResponseNotFound,
+            ),
+            (
+                json!({"type": "unavailable"}),
+                PromptCacheDiagnostics::Unavailable,
+            ),
+        ] {
+            let v = json!({"id": "r", "prompt_cache_diagnostics": body});
+            let r: Response = serde_json::from_value(v.clone()).unwrap();
+            assert_eq!(r.prompt_cache_diagnostics, Some(want));
+            round_trip(v);
+        }
+        let v = json!({"id": "r", "prompt_cache_diagnostics": {"type": "partial", "x": 1}});
+        let r: Response = serde_json::from_value(v.clone()).unwrap();
+        assert!(matches!(
+            r.prompt_cache_diagnostics,
+            Some(PromptCacheDiagnostics::Unknown(_))
+        ));
+        round_trip(v);
     }
 
     #[test]

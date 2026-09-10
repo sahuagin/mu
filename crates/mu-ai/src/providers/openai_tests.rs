@@ -361,6 +361,34 @@ fn http_403_misalignment_stop_renders_like_the_stream_path() {
     assert!(!other.contains("stopped this conversation"), "{other}");
 }
 
+/// The long-running-work shapes are typed, not sent: mu's tool loop is
+/// synchronous (no `async` on any tool it declares), its history is rebuilt
+/// every turn (no `configuration_update` item — see the crate's docs on the
+/// variant), and it asks for no cache diagnostics. Pinned so adopting one
+/// of them is a deliberate change. mu-openai-protocol-2026q3-yyg3j.4.
+#[test]
+fn long_running_work_shapes_are_absent_from_the_wire() {
+    let tools = vec![ToolSpec {
+        name: "read".into(),
+        description: "read".into(),
+        input_schema: json!({"type": "object"}),
+        ..Default::default()
+    }];
+    let body = request_to_value(build_request(
+        "gpt-6-astra",
+        "high",
+        "sys",
+        vec![InputItem::user_text("hi")],
+        &tools,
+        None,
+    ));
+    let text = body.to_string();
+    assert!(!text.contains("\"async\""), "{text}");
+    assert!(!text.contains("configuration_update"), "{text}");
+    assert!(body.get("prompt_cache_options").is_none(), "{text}");
+    assert_eq!(body["tools"][0]["type"], "function");
+}
+
 #[test]
 fn max_output_tokens_sent_only_when_resolved() {
     let input = vec![InputItem::user_text("hi")];

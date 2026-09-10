@@ -18,16 +18,21 @@ mod json;
 mod request;
 mod response;
 mod stream;
+mod ws;
 
 pub use accumulate::{accumulate, AccumulateError};
 pub use finite::{deserialize_option_finite, FiniteF64, NonFinite};
 pub use json::{JsonValue, JsonValueError};
+pub use request::ConfigurationReasoning;
 pub use request::{
     CreateResponseRequest, FunctionTool, InputContent, InputItem, NamedToolChoice,
     PromptCacheOptions, Reasoning, Tool, ToolChoice, ToolChoiceMode,
 };
+pub use response::PromptCacheDiagnostics;
 pub use response::{
     IncompleteDetails, MisalignmentErrorDetails, MisalignmentSteer, OutputContent, OutputItem,
     Response, ResponseError, ResponseStatus, Usage, UsageInputDetails, UsageOutputDetails,
 };
 pub use stream::{stream_error_message, ResponseStreamEvent};
+pub use stream::{SteerError, SteerRef, SteerRejected};
+pub use ws::{ResponsesClientEvent, SteerInput};

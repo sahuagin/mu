@@ -136,6 +136,14 @@ pub struct Reasoning {
     pub summary: Option<String>,
 }
 
+/// `reasoning` on a `configuration_update` item — "Updates to reasoning
+/// configuration. Only effort is supported." (2026-09-09 spec capture).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ConfigurationReasoning {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
 /// One item in the `input` array.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -151,6 +159,33 @@ pub enum InputItem {
         arguments: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
+        /// `async: true` marks a call the model made asynchronously
+        /// (2026-09-09 spec capture, `FunctionToolCall`: "Whether the
+        /// function tool call runs asynchronously"); replayed as history
+        /// verbatim. mu-openai-protocol-2026q3-yyg3j.4.
+        #[serde(default, rename = "async", skip_serializing_if = "Option::is_none")]
+        is_async: Option<bool>,
+    },
+    /// `configuration_update` (2026-09-09 spec capture,
+    /// `ResponseConfigurationUpdateItemParam`; the reasoning guide's "Change
+    /// reasoning mid-conversation"): "Use `configuration_update` to increase
+    /// reasoning effort for difficult work or reduce it for routine
+    /// follow-ups. Add the update between responses while leaving the
+    /// request-level `reasoning.effort` unchanged. This preserves the
+    /// original prompt prefix for prompt caching." Placed before the next
+    /// user message; "supported only by GPT-6 Astra in standard,
+    /// single-agent mode. They change only reasoning effort"; in force
+    /// "until another update overrides it"; the API rejects two adjacent
+    /// updates, and updates combined with automatic compaction or
+    /// truncation. `id` is the server's (`cnfu_…`) when the item is echoed
+    /// back, absent when sent. mu never sends one yet: mu rebuilds `input`
+    /// from its own history every turn, so an effort change would have to
+    /// live in that history as an item to stay in place across turns.
+    /// mu-openai-protocol-2026q3-yyg3j.4.
+    ConfigurationUpdate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        reasoning: ConfigurationReasoning,
     },
     FunctionCallOutput {
         call_id: String,
@@ -186,6 +221,16 @@ impl InputItem {
         Self::Message {
             role: "assistant".into(),
             content: vec![InputContent::OutputText { text: text.into() }],
+        }
+    }
+    /// A `configuration_update` selecting `effort` for the responses that
+    /// follow, as the reasoning guide shows it.
+    pub fn configuration_update(effort: impl Into<String>) -> Self {
+        Self::ConfigurationUpdate {
+            id: None,
+            reasoning: ConfigurationReasoning {
+                effort: Some(effort.into()),
+            },
         }
     }
 }
@@ -228,19 +273,35 @@ pub struct FunctionTool {
     /// calling: e.g. "model", "programmatic").
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_callers: Vec<String>,
+    /// Async tool calling (2026-09-09 spec capture, `FunctionToolParam`):
+    /// "Whether the tool response can be returned asynchronously versus
+    /// immediately returned on next response creation." With `true` the
+    /// model keeps working while the application runs the tool, and the
+    /// result comes back on a later request as a `function_call_output`
+    /// matched by `call_id` (the async-tool-calling guide). mu's tool loop
+    /// is synchronous and never sets it. mu-openai-protocol-2026q3-yyg3j.4.
+    #[serde(default, rename = "async", skip_serializing_if = "Option::is_none")]
+    pub is_async: Option<bool>,
 }
 
-/// `prompt_cache_options` (gpt-5.6+): explicit cache-breakpoint control.
-/// `mode`: `implicit` (default; server adds one implicit breakpoint) or
-/// `explicit` (only request-supplied `prompt_cache_breakpoint`s). `ttl`:
-/// `"30m"` is the only documented value today; kept a string so a new tier
-/// is not a crate-level parse failure.
+/// `prompt_cache_options` (gpt-5.6+; `ResponsePromptCacheOptionsParam` in
+/// the 2026-09-09 capture): explicit cache-breakpoint control. `mode`:
+/// `implicit` (default; "OpenAI creates one implicit breakpoint and writes
+/// up to the latest three explicit breakpoints") or `explicit` ("does not
+/// create an implicit breakpoint and writes up to the latest four"). `ttl`:
+/// `30m`, "currently the only supported value"; kept a string so a new tier
+/// is not a crate-level parse failure. `comparison_response_id`: "the ID of a
+/// response to compare when diagnosing prompt cache reuse. Supplying this
+/// field requests prompt cache diagnostics" — answered in
+/// `Response.prompt_cache_diagnostics`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptCacheOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison_response_id: Option<String>,
 }
 
 /// `tool_choice`: either a mode string (`auto`/`none`/`required`) or a named
@@ -338,6 +399,7 @@ mod tests {
                 output_schema: None,
                 defer_loading: None,
                 allowed_callers: Vec::new(),
+                is_async: None,
             })]);
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -396,6 +458,7 @@ mod tests {
                     name: "read".into(),
                     arguments: "{\"path\":\"a\"}".into(),
                     id: Some("fc_1".into()),
+                    is_async: None,
                 },
                 InputItem::FunctionCallOutput {
                     call_id: "call_1".into(),

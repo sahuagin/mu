@@ -71,3 +71,33 @@ async fn streamed_tool_call_accumulates_to_final_response() {
         other => panic!("expected function_call, got {other:?}"),
     }
 }
+
+/// The WebSocket steering events from the 2026-09-09 spec's own examples
+/// (`ws_steer_events_20260909.json`): each parses to its typed variant and
+/// re-serializes byte-for-byte, so the drift canary replays them too.
+/// mu-openai-protocol-2026q3-yyg3j.4.
+#[test]
+fn ws_steer_events_parse_typed_and_round_trip() {
+    let raw = fixture("ws_steer_events_20260909.json");
+    let orig: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap();
+    let events: Vec<ResponseStreamEvent> = orig
+        .iter()
+        .map(|v| serde_json::from_value(v.clone()).unwrap())
+        .collect();
+    assert!(matches!(
+        events[0],
+        ResponseStreamEvent::SteerAccepted { .. }
+    ));
+    assert!(matches!(
+        events[1],
+        ResponseStreamEvent::SteerPending { .. }
+    ));
+    assert!(matches!(events[2], ResponseStreamEvent::SteerFailed { .. }));
+    assert!(matches!(
+        &events[3],
+        ResponseStreamEvent::Error { stream_id: Some(s), .. } if s == "agent_1"
+    ));
+    for (e, o) in events.iter().zip(&orig) {
+        assert_eq!(&serde_json::to_value(e).unwrap(), o);
+    }
+}

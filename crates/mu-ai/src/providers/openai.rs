@@ -465,6 +465,7 @@ fn translate_tool_spec(spec: &ToolSpec) -> Tool {
         output_schema: None,
         defer_loading: None,
         allowed_callers: Vec::new(),
+        is_async: None,
     })
 }
 
@@ -522,6 +523,7 @@ fn translate_assistant_blocks(blocks: &[ContentBlock]) -> Vec<InputItem> {
                     name: tc.name.clone(),
                     arguments: args_str,
                     id: None,
+                    is_async: None,
                 });
             }
             // Reasoning round-trip: re-emit the verbatim reasoning item
@@ -1379,6 +1381,9 @@ fn adopt_snapshot_output(state: &mut StreamState, output: &[OutputItem]) {
                     opaque,
                 });
             }
+            // A configuration_update echo changes nothing in the content;
+            // the effort it states is the server's bookkeeping.
+            OutputItem::ConfigurationUpdate { .. } => {}
             // Unknown items: ignored (the drift canary in mu-openai owns
             // surfacing un-modeled shapes).
             OutputItem::Unknown(_) => {}

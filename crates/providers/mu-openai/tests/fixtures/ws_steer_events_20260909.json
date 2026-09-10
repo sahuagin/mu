@@ -1,0 +1,17 @@
+[
+  {"type": "response.steer.accepted", "sequence_number": 2,
+   "steer": {"id": "steer_456", "previous_response_id": "resp_123"}},
+  {"type": "response.steer.pending", "sequence_number": 10,
+   "steer": {"id": "steer_456", "previous_response_id": "resp_123"},
+   "reason": "waiting_for_required_input",
+   "required_input": [{"type": "function_call_output", "call_id": "call_789", "name": "lookup"}]},
+  {"type": "response.steer.failed", "sequence_number": 5,
+   "steer": {"id": "steer_456", "previous_response_id": "resp_123",
+             "input": [{"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "Prioritize the database rollout."}]}]},
+   "error": {"type": "invalid_request_error", "code": "successor_creation_failed",
+             "message": "We couldn't start the next response. Send this steering input again with response.create."}},
+  {"type": "error", "status": 400, "stream_id": "agent_1",
+   "error": {"type": "invalid_request_error", "code": "websocket_stream_limit_reached",
+             "message": "This WebSocket connection has reached its stream limit."}}
+]

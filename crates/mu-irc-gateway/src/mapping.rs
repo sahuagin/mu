@@ -47,6 +47,65 @@ pub fn fold_nick(nick: &str, cm: CaseMapping) -> String {
     fold_name(nick, cm)
 }
 
+/// The gateway's OWN nick, kept in the spelling the server knows it by, with the
+/// folded form derived on demand.
+///
+/// Folding is lossy and mapping-specific: under `rfc1459` `[` folds to `{`,
+/// under `ascii` it does not. So a folded nick cannot be re-folded under a new
+/// `CASEMAPPING` and still mean the same person — `gw[` folded to `gw{` under
+/// rfc1459 stays `gw{` when the server switches to `ascii`, while the real nick
+/// now folds to `gw[`. The gateway would then fail to recognize its own NAMES
+/// entry, front ITSELF as a human, and stop treating its own PART as a
+/// self-departure.
+///
+/// Holding the original spelling makes that unrepresentable: every fold starts
+/// from the wire nick, so [`SelfNick::set_casemapping`] re-derives rather than
+/// re-folds. Both the membership view and the outbound router use this one type
+/// so the rule cannot drift between them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfNick {
+    original: String,
+    folded: String,
+}
+
+impl SelfNick {
+    /// The gateway's nick as the server spells it, folded under `cm`.
+    pub fn new(original: &str, cm: CaseMapping) -> Self {
+        SelfNick {
+            original: original.to_string(),
+            folded: fold_nick(original, cm),
+        }
+    }
+
+    /// The wire spelling — what the server calls the gateway.
+    pub fn original(&self) -> &str {
+        &self.original
+    }
+
+    /// The folded form under the casemapping last applied. Compare observed
+    /// nicks against this.
+    pub fn folded(&self) -> &str {
+        &self.folded
+    }
+
+    /// Whether `nick`, folded under `cm`, is the gateway itself.
+    pub fn matches(&self, nick: &str, cm: CaseMapping) -> bool {
+        fold_nick(nick, cm) == self.folded
+    }
+
+    /// The server changed `CASEMAPPING`: re-derive the folded form FROM THE
+    /// ORIGINAL, never from the previous folded value.
+    pub fn set_casemapping(&mut self, cm: CaseMapping) {
+        self.folded = fold_nick(&self.original, cm);
+    }
+
+    /// The gateway renamed itself to `original` (a NICK the server accepted).
+    pub fn rename(&mut self, original: &str, cm: CaseMapping) {
+        self.original = original.to_string();
+        self.folded = fold_nick(original, cm);
+    }
+}
+
 /// A human operator's identity plus the account label the server reported for
 /// them, kept SEPARATE from identity on purpose: identity is the folded nick
 /// (what addresses the person on the mesh); the account is metadata that never

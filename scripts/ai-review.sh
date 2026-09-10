@@ -176,20 +176,24 @@
 #                               skipped (on-disk files belong to @, not HEAD).
 #     MU_REVIEW_SYNTH_PROVIDER  synthesis provider (default: primary 2's)
 #     MU_REVIEW_SYNTH_MODEL     synthesis model    (default: primary 2's)
-#     MU_REVIEW_CHUNK_MAX_DISPATCHES  TRUE cap on TOTAL chunked leaf dispatches
-#                               (default 40). Each unit is reviewed once unseamed
-#                               plus once per SEAM the code_review roster declares
-#                               (9vkbt.3), so total = units × (1 + seams). The cap
-#                               applies to that total, in two tiers:
+#     MU_REVIEW_CHUNK_MAX_DISPATCHES  TRUE cap on ACTUAL chunked leaf model calls,
+#                               timeout retries included (default 40). Each unit is
+#                               reviewed once unseamed plus once per SEAM the
+#                               code_review roster declares (9vkbt.3), so the PLAN
+#                               is units × (1 + seams). The cap is enforced twice:
+#                               up-front on the plan, in two tiers —
 #                                 - units alone > cap: the branch cannot be chunked
 #                                   (even one leaf per unit overflows the budget) —
 #                                   the gate ESCALATEs (exit 3) and asks you to
 #                                   split the branch;
 #                                 - units fit but units × (1 + seams) > cap: only
 #                                   the unseamed leaves run, and a one-line notice
-#                                   names the cap and the count.
-#                               Raise it to allow the seam lenses (or a larger
-#                               branch) instead of splitting.
+#                                   names the cap and the count;
+#                               and again at runtime — a leaf that times out is not
+#                               retried once the running count of actual leaf calls
+#                               (retries counted) has reached the cap; that leaf is
+#                               recorded as unreviewed. Raise it to allow the seam
+#                               lenses (or a larger branch) instead of splitting.
 #
 # The log carries every reviewer's verdict: one {"event":"reviewer",...} line per
 # reviewer that RAN plus one {"event":"panel",...} summary with the outcome and all
@@ -885,10 +889,23 @@ $unit: REVIEW FAILED — treat as unreviewed"
   fi
   local out rc f retry=0 max_timeout_retries
   max_timeout_retries="${MU_REVIEW_TIMEOUT_RETRIES:-${AI_REVIEW_TIMEOUT_RETRIES:-1}}"
+  # Count every ACTUAL leaf model call against chunk_cap (bash dynamic scope:
+  # dispatches/chunk_cap live in run_chunked). Retries count too, so a run of
+  # timeouts cannot blow past the operator's dispatch budget.
+  dispatches=$((dispatches + 1))
   out="$(run_review "$PROVIDER" "$MODEL" "$LEAF_FILE")"; rc=$?
   while [ "$rc" -eq 124 ] && [ "$retry" -lt "$max_timeout_retries" ]; do
+    if [ "$dispatches" -ge "$chunk_cap" ]; then
+      failed=$((failed + 1))
+      log_leaf_error "$c" "$unit" "timeout; retry skipped: dispatch cap $chunk_cap reached"
+      echo "${C_YEL}  → leaf timed out; retry skipped: dispatch cap $chunk_cap reached — recorded as unreviewed.${C_OFF}"
+      SYNTH_FINDINGS="$SYNTH_FINDINGS
+$unit: REVIEW FAILED — treat as unreviewed"
+      return 0
+    fi
     retry=$((retry + 1))
     echo "${C_YEL}  → leaf timed out after ${TIMEOUT}s; retry ${retry}/${max_timeout_retries}${C_OFF}"
+    dispatches=$((dispatches + 1))
     out="$(run_review "$PROVIDER" "$MODEL" "$LEAF_FILE")"; rc=$?
   done
   f="$(printf '%s' "$out" | leaf_findings)"
@@ -964,8 +981,14 @@ run_chunked() { # never returns — exits with the gate verdict
   trap 'rm -f "$PROMPT_FILE" "$LEAF_FILE" "$LEAF_MSG_FILE" "$LEAF_DIFF_FILE" "$LEAF_CLIST_FILE" "$LEAF_STAT_FILE" "$LEAF_INV_FILE"' EXIT
   # Invariants block is constant across leaves; write it once. It rides ONLY the
   # conformance seam leaf (leaf-prompt.sh gates on has-invariants), never the
-  # generic unseamed leaf.
-  printf '%s' "$INVARIANTS_BLOCK" > "$LEAF_INV_FILE"
+  # generic unseamed leaf. Fail closed: these constant files are read by
+  # leaf_prompt for EVERY leaf, so a failed write here would silently feed every
+  # leaf an empty-but-readable file as if it were complete. Abort before any leaf
+  # is dispatched rather than review against a truncated prompt.
+  if ! printf '%s' "$INVARIANTS_BLOCK" > "$LEAF_INV_FILE" 2>/dev/null; then
+    echo "${C_RED}ai-review: chunked mode cannot write invariants temp file $LEAF_INV_FILE — aborting before any leaf is dispatched${C_OFF}" >&2
+    exit 2
+  fi
 
   local ov=false
   [ "${MU_REVIEW_OVERRIDE:-}" = "1" ] && ov=true
@@ -992,9 +1015,18 @@ run_chunked() { # never returns — exits with the gate verdict
     COMMIT_LIST="$(git log --reverse --format='%h %s' "$BASE..$HEADREV" 2>/dev/null)"
     DIFFSTAT="$(git diff --stat "$BASE...$HEADREV" 2>/dev/null | tail -c 6000)"
   fi
-  # Constant across leaves; write once for leaf_prompt (files, not argv).
-  printf '%s' "$COMMIT_LIST" > "$LEAF_CLIST_FILE"
-  printf '%s' "$DIFFSTAT"    > "$LEAF_STAT_FILE"
+  # Constant across leaves; write once for leaf_prompt (files, not argv). Fail
+  # closed, same reason as the invariants file above: a failed write would hand
+  # every leaf an empty commit-list/diffstat as if complete, so abort before any
+  # leaf is dispatched.
+  if ! printf '%s' "$COMMIT_LIST" > "$LEAF_CLIST_FILE" 2>/dev/null; then
+    echo "${C_RED}ai-review: chunked mode cannot write commit-list temp file $LEAF_CLIST_FILE — aborting before any leaf is dispatched${C_OFF}" >&2
+    exit 2
+  fi
+  if ! printf '%s' "$DIFFSTAT" > "$LEAF_STAT_FILE" 2>/dev/null; then
+    echo "${C_RED}ai-review: chunked mode cannot write diffstat temp file $LEAF_STAT_FILE — aborting before any leaf is dispatched${C_OFF}" >&2
+    exit 2
+  fi
 
   # Seam roster (9vkbt.3): the distinct seams the code_review panel declares,
   # read from the SAME agent_roles.toml dispatch.sh reads (tq + jq). Each seam
@@ -1047,11 +1079,14 @@ run_chunked() { # never returns — exits with the gate verdict
   [ -n "${SIZE_FORCE_CHUNK:-}" ] && why="MU_REVIEW_CHUNK=1 past a SIZE block (prompt ${PROMPT_BYTES}B, cap ${SS_MAX}B)"
   echo "${C_DIM}ai-review: CHUNKED mode — $why; $n_commits commit(s) in $BASE..$HEADREV. Leaves: $PROVIDER/$MODEL, synthesis: $SYNTH_PROVIDER/$SYNTH_MODEL.${C_OFF}"
 
-  # Dispatch cap (9vkbt.3; fix: true total cap): a unit reviewed per seam
-  # multiplies model calls, so cap the TOTAL leaf dispatches at
-  # MU_REVIEW_CHUNK_MAX_DISPATCHES (default 40). Count units up front (a fitting
-  # commit = 1 unit; an oversized one splits per file) so the decision is made
-  # before any model runs. chunk_dispatch_plan (leaf-prompt.sh, pure/testable)
+  # Dispatch cap (9vkbt.3; fix: cap ACTUAL leaf calls, retries included): a unit
+  # reviewed per seam multiplies model calls, so cap the leaf dispatches at
+  # MU_REVIEW_CHUNK_MAX_DISPATCHES (default 40). This up-front check plans on
+  # units × (1 + seams); the runtime counter (dispatches, in this scope) then
+  # enforces the same cap on the ACTUAL calls review_leaf makes, so timeout
+  # retries can't overrun the budget. Count units up front (a fitting commit =
+  # 1 unit; an oversized one splits per file) so the plan decision is made before
+  # any model runs. chunk_dispatch_plan (leaf-prompt.sh, pure/testable)
   # renders the three-way decision on total = units × (1 + seams):
   #   units_over_cap — units alone overflow: the branch cannot be chunked at all,
   #                    ESCALATE and tell the operator to split (same exit/logging
@@ -1081,7 +1116,17 @@ run_chunked() { # never returns — exits with the gate verdict
       [ "$n_seams" -gt 0 ] && echo "${C_DIM}ai-review: chunked seam lenses ON — $n_units unit(s) × (1 + $n_seams seam(s)) = $planned leaf dispatch(es) (cap MU_REVIEW_CHUNK_MAX_DISPATCHES=$chunk_cap). Seams: ${SEAM_NAMES[*]}.${C_OFF}" ;;
   esac
 
-  local leaves=0 failed=0 findings_total=0
+  # dispatches: ACTUAL leaf model calls made so far (first attempt + every retry),
+  # in run_chunked's scope so review_leaf increments it via bash dynamic scoping
+  # (like leaves/failed). chunk_cap caps this too at runtime: a timeout retry that
+  # would push past the cap is skipped and the leaf recorded as failed.
+  # No hermetic test: the retry-skip is entangled with run_review (live dispatch)
+  # and dynamic scope, not an isolable pure function like chunk_dispatch_plan.
+  # MANUAL CHECK: set MU_REVIEW_CHUNK_MAX_DISPATCHES low and force timeouts (stub
+  # run_review to `return 124`, MU_REVIEW_TIMEOUT_RETRIES high) on a multi-unit
+  # branch; leaf_error lines should read 'timeout; retry skipped: dispatch cap N
+  # reached' once the running count hits N, and no leaf call fires past N.
+  local leaves=0 failed=0 findings_total=0 dispatches=0
   local SYNTH_FINDINGS="" ALL_MSGS=""
   local c cshort msg cdiff
   while IFS= read -r c; do

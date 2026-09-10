@@ -93,11 +93,14 @@ The `mu` CLI subcommands: `serve` (daemon), `ask` (one-shot), `resume`, `tui`,
   from the correctness seat; bias diversity pays across families, not within
   one. Chunked mode (oversized branches) reviews each unit through these same
   seam lenses too: an unseamed leaf plus one leaf per seam.
-  `MU_REVIEW_CHUNK_MAX_DISPATCHES` (default 40) is a TRUE total cap on
-  units × (1 + seams): if units alone exceed it the branch can't be chunked and
-  the gate ESCALATEs (split the branch); if units fit but the product doesn't, the
-  seam lenses are dropped and only the unseamed leaves run. The conformance seam
-  is skipped when this file declares no *Architecture invariants*.
+  `MU_REVIEW_CHUNK_MAX_DISPATCHES` (default 40) is a TRUE cap on the actual leaf
+  model calls, timeout retries included: up front on the plan units × (1 + seams)
+  — if units alone exceed it the branch can't be chunked and the gate ESCALATEs
+  (split the branch); if units fit but the product doesn't, the seam lenses are
+  dropped and only the unseamed leaves run — and again at runtime, where a leaf
+  that times out is not retried once the running count of leaf calls has reached
+  the cap (that leaf is recorded as unreviewed). The conformance seam is skipped
+  when this file declares no *Architecture invariants*.
 - **Increments are capped.** `ci-aipr` BLOCKs a diff over
   `MU_REVIEW_MAX_DIFF_LINES` (default 2000 reviewable lines; lockfiles and
   binary/media files don't count) with a SIZE finding and suggested split points.

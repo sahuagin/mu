@@ -13,6 +13,17 @@ dependency. It reads a rules TOML and a repo tree and writes lines to stdout, so
 it can be lifted into any repo — drop in an invariants.toml describing that
 repo's shapes and run it.
 
+Revision pinning: --changed-from BASE diffs BASE..REV, where REV is --to (default
+@ under jj, HEAD under git). The changed paths come from that diff and each file's
+CONTENT is read AT REV (jj file show -r REV / git show REV:PATH), never from the
+working tree, so a pinned commit is audited exactly as it was. forbidden_path
+rules fire on the same REV path list. --all always scans the WORKING TREE.
+
+Severity vocabulary: rules and the INVARIANT output lines speak high|medium|low.
+--gate-severity re-renders the emitted severity in the review gate's own
+vocabulary (blocker|should-fix|note) so downstream wiring reuses one mapping
+instead of inventing another; the rules file is unchanged either way.
+
 The baseline ratchet (scripts/invariants.baseline): each line is one accepted
 PRE-EXISTING site as `<rule id> <path> <sha256[:16] of the stripped matched
 line>` (no line numbers, so a site survives edits above it). A site already in
@@ -40,6 +51,16 @@ BINARY_SNIFF_BYTES = 8 * 1024        # a NUL in the first 8 KB means "binary"
 # Directory basenames never walked under --all: VCS internals and build output.
 # The rules' exclude globs also cover these; pruning here is the speed win.
 PRUNE_DIRS = {".git", ".jj", "target", "node_modules"}
+
+# The one mapping from a rule's severity (high|medium|low) to the review gate's
+# vocabulary (blocker|should-fix|note). Kept here so the future gate wiring reuses
+# it rather than inventing its own; --gate-severity renders output through it. An
+# unknown value passes through unchanged so a new severity can never silently drop.
+GATE_SEVERITY = {"high": "blocker", "medium": "should-fix", "low": "note"}
+
+
+def gate_severity(sev):
+    return GATE_SEVERITY.get(sev, sev)
 
 
 def die(msg, code=2) -> NoReturn:
@@ -180,11 +201,16 @@ def walk_repo(root):
             yield os.path.relpath(ap, root).replace(os.sep, "/")
 
 
-def changed_paths(root, rev):
+def default_head(root):
+    """The default far end of --changed-from: @ under jj, HEAD under git."""
+    return "@" if os.path.isdir(os.path.join(root, ".jj")) else "HEAD"
+
+
+def changed_paths(root, rev, to):
     if os.path.isdir(os.path.join(root, ".jj")):
-        cmd = ["jj", "diff", "--from", rev, "--to", "@", "--name-only"]
+        cmd = ["jj", "diff", "--from", rev, "--to", to, "--name-only"]
     else:
-        cmd = ["git", "diff", "--name-only", "%s...HEAD" % rev]
+        cmd = ["git", "diff", "--name-only", "%s...%s" % (rev, to)]
     try:
         out = subprocess.run(cmd, cwd=root, capture_output=True, text=True)
     except OSError as e:
@@ -192,6 +218,21 @@ def changed_paths(root, rev):
     if out.returncode != 0:
         die("%s failed: %s" % (" ".join(cmd), out.stderr.strip()))
     return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+
+
+def content_at_rev(root, rev, path):
+    """File bytes at REV, or None if the path does not exist there."""
+    if os.path.isdir(os.path.join(root, ".jj")):
+        cmd = ["jj", "file", "show", "-r", rev, "--", path]
+    else:
+        cmd = ["git", "show", "%s:%s" % (rev, path)]
+    try:
+        out = subprocess.run(cmd, cwd=root, capture_output=True)
+    except OSError as e:
+        die("cannot run %s: %s" % (cmd[0], e))
+    if out.returncode != 0:
+        return None
+    return out.stdout
 
 
 # --- scanning --------------------------------------------------------------
@@ -215,42 +256,62 @@ class Site:
     def key(self):
         return (self.rule_id, self.path, self.digest)
 
-    def render(self):
+    def render(self, gate=False):
+        sev = gate_severity(self.severity) if gate else self.severity
         return "INVARIANT %s|%s|%s:%d|%s|%s" % (
-            self.rule_id, self.severity, self.path, self.line,
+            self.rule_id, sev, self.path, self.line,
             self.title, self.text)
 
 
-def scan(rules, root, paths):
-    """Yield Site objects for every match across `paths` (repo-relative)."""
+def scan(rules, root, paths, rev=None):
+    """Yield Site objects for every match across `paths` (repo-relative).
+
+    rev=None reads each file's existence/content from the WORKING TREE; a set rev
+    reads them AT THAT REVISION (content_at_rev), so a pinned commit is audited as
+    it was, not as the tree is now. forbidden_path uses the same existence source.
+    """
     sites = []
     for path in paths:
         abspath = os.path.join(root, path)
-        # forbidden_path rules fire on the path alone (no content read).
-        for rule in rules:
-            if rule.kind != "forbidden_path" or not rule.wants_path(path):
-                continue
-            if os.path.isfile(abspath) and any_glob(rule.patterns, path):
-                sites.append(Site(rule, path, 0, path))
-        # regex rules read the file once, shared across all regex rules.
+        fp_rules = [r for r in rules
+                    if r.kind == "forbidden_path" and r.wants_path(path)]
         regex_rules = [r for r in rules
                        if r.kind == "regex" and r.wants_path(path)]
-        if not regex_rules:
+        if not fp_rules and not regex_rules:
             continue
-        if not os.path.isfile(abspath):
+        # Resolve existence (and, at a rev, the raw bytes) once for this path.
+        if rev is None:
+            exists = os.path.isfile(abspath)
+            raw_bytes = None
+        else:
+            raw_bytes = content_at_rev(root, rev, path)
+            exists = raw_bytes is not None
+        # forbidden_path rules fire on the path alone, given the file exists.
+        for rule in fp_rules:
+            if exists and any_glob(rule.patterns, path):
+                sites.append(Site(rule, path, 0, path))
+        if not regex_rules or not exists:
             continue
-        try:
-            if os.path.getsize(abspath) > MAX_BYTES:
+        # regex rules read the file once, shared across all regex rules.
+        if rev is None:
+            try:
+                if os.path.getsize(abspath) > MAX_BYTES:
+                    continue
+            except OSError:
                 continue
-        except OSError:
-            continue
-        if is_binary(abspath):
-            continue
-        try:
-            with open(abspath, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-        except OSError:
-            continue
+            if is_binary(abspath):
+                continue
+            try:
+                with open(abspath, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+            except OSError:
+                continue
+        else:
+            if len(raw_bytes) > MAX_BYTES:
+                continue
+            if b"\x00" in raw_bytes[:BINARY_SNIFF_BYTES]:
+                continue
+            lines = raw_bytes.decode("utf-8", "replace").splitlines(keepends=True)
         for rule in regex_rules:
             for lineno, raw in enumerate(lines, 1):
                 if any(rx.search(raw) for rx in rule.regexes):
@@ -310,7 +371,15 @@ def build_parser():
     p.add_argument("--changed", nargs="+", metavar="FILE",
                    help="scan only these repo-relative files")
     p.add_argument("--changed-from", metavar="REV",
-                   help="scan files changed vs REV (jj diff / git diff)")
+                   help="scan files changed vs REV (jj diff / git diff); "
+                        "content is read at --to, not from the working tree")
+    p.add_argument("--to", metavar="REV",
+                   help="far end of --changed-from's range AND the revision file "
+                        "content is read at (default @ under jj, HEAD under git); "
+                        "ignored by --all, which always scans the working tree")
+    p.add_argument("--gate-severity", action="store_true",
+                   help="render severities in the review gate's vocabulary "
+                        "(blocker|should-fix|note) instead of high|medium|low")
     p.add_argument("--baseline", help="baseline file (default <root>/scripts/invariants.baseline)")
     p.add_argument("--update-baseline", action="store_true",
                    help="rewrite the baseline from the current sites and exit 0")
@@ -338,14 +407,24 @@ def main(argv):
     if sum(modes) != 1:
         die("choose exactly one of --all, --changed FILE..., --changed-from REV")
 
+    # --to only means anything for --changed-from (the pinned range + read rev).
+    if args.to and not args.changed_from:
+        die("--to is only valid with --changed-from")
+
     if args.all:
+        # --all scans the working tree, never a pinned revision.
         paths = list(walk_repo(root))
+        scan_rev = None
     elif args.changed_from:
-        paths = [rel_path(root, p) for p in changed_paths(root, args.changed_from)]
+        to = args.to or default_head(root)
+        paths = [rel_path(root, p)
+                 for p in changed_paths(root, args.changed_from, to)]
+        scan_rev = to
     else:
         paths = [rel_path(root, p) for p in args.changed]
+        scan_rev = None
 
-    sites = scan(rules, root, paths)
+    sites = scan(rules, root, paths, scan_rev)
 
     if args.update_baseline:
         write_baseline(baseline_path, sites)
@@ -365,9 +444,12 @@ def main(argv):
     fixed = sorted(baseline - seen_keys) if args.all else []
     exit_code = 1 if new_sites else 0
 
+    def sev(s):
+        return gate_severity(s.severity) if args.gate_severity else s.severity
+
     if args.json:
         obj = {
-            "new": [{"id": s.rule_id, "severity": s.severity, "file": s.path,
+            "new": [{"id": s.rule_id, "severity": sev(s), "file": s.path,
                      "line": s.line, "title": s.title, "match": s.text}
                     for s in new_sites],
             "baselined": len(seen_keys & baseline),
@@ -379,7 +461,7 @@ def main(argv):
         return exit_code
 
     for s in new_sites:
-        print(s.render())
+        print(s.render(gate=args.gate_severity))
     if not args.quiet:
         for (i, p, d) in fixed:
             print("fixed: remove from baseline: %s %s %s" % (i, p, d))

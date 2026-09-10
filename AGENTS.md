@@ -99,16 +99,17 @@ The `mu` CLI subcommands: `serve` (daemon), `ask` (one-shot), `resume`, `tui`,
   (degraded per-commit review) and `MU_REVIEW_SIZE_OVERRIDE=1` (review as is)
   are the explicit fallbacks; both leave the panel verdict binding.
   `MU_REVIEW_OVERRIDE=1` is the verdict override and waives that too.
-- **Invariants are audited mechanically.** `scripts/review-panel/invariant_audit.py`
-  (stdlib Python) pattern-matches the *declared* shapes in `scripts/invariants.toml`
-  — the ones a regex or path glob can see — against the tree and, in `ai-review.sh`,
-  hands new sites to the panel as trusted context. It is a pre-filter for the
+- **Invariants can be audited mechanically (standalone).** Run it by hand:
+  `python3 scripts/review-panel/invariant_audit.py --all`. This stdlib-Python tool
+  pattern-matches the *declared* shapes in `scripts/invariants.toml` — the ones a
+  regex or path glob can see — across the working tree. It is a pre-filter for the
   conformance seat, not a replacement: invariants with no reliable pattern stay the
   seat's job. A **baseline ratchet** (`scripts/invariants.baseline`) holds accepted
-  pre-existing sites: a new site fails `just check`, a baselined site passes, a
-  baseline entry whose site is gone is reported "fixed: remove from baseline". A
-  baseline line is a **debt marker, never a free pass** — fix the site and drop the
-  line, or bead it and keep the line (`--update-baseline` regenerates the file).
+  pre-existing sites: a new site fails, a baselined site passes, a baseline entry
+  whose site is gone is reported "fixed: remove from baseline". A baseline line is a
+  **debt marker, never a free pass** — fix the site and drop the line, or bead it and
+  keep the line (`--update-baseline` regenerates the file). Wiring this audit into
+  the review gate (`ai-review.sh` / `pre-pr-check.sh`) is a separate increment.
 
 ## Running it
 

@@ -123,6 +123,40 @@ if run 1 "changed-from: diffs vs a revision" -- --changed-from "$BASE_REV"; then
 fi
 git checkout -q main; git branch -qD feature
 
+# 3b. --to pins BOTH the far end of the range and the revision file CONTENT is
+#     read at. (i) A violation present only at a pinned commit — and gone from the
+#     working tree — is still found when --to names that commit.
+git checkout -qb pinned
+printf 'let p = FORBIDDEN_TOKEN;\n' > src/pinned.rs
+git add -A && git commit -qm "pinned violation"
+PIN_REV="$(git rev-parse HEAD)"
+git rm -q src/pinned.rs && git commit -qm "remove pinned from the tree"
+rm -f "$BASE"
+if run 1 "to: violation at a pinned rev is found though gone from the tree" -- --changed-from "$BASE_REV" --to "$PIN_REV"; then
+  printf '%s\n' "$OUT" | grep -q 'src/pinned.rs' && ok "to: pinned-commit-only violation found via --to" || bad "to: pinned-commit-only violation found via --to" "$OUT"
+  [ -f "$REPO/src/pinned.rs" ] && bad "to: fixture invariant — file should be gone from the tree" "present" || ok "to: the violation is genuinely absent from the working tree"
+fi
+git checkout -q main; git branch -qD pinned
+
+# 3c. (ii) A violation present ONLY in the working tree is NOT found: content is
+#     read at REV, never from disk. clean.rs is benignly touched on a branch so it
+#     IS in the BASE..REV diff, then a violation is added to it in the tree only.
+git checkout -qb worktree
+printf 'fn g() { ok(); } // touched\n' > src/clean.rs
+git add -A && git commit -qm "touch clean.rs"
+WT_REV="$(git rev-parse HEAD)"
+printf 'fn g() { ok(); } // touched\nlet w = FORBIDDEN_TOKEN;\n' > src/clean.rs   # tree-only, uncommitted
+rm -f "$BASE"
+if run 0 "to: a tree-only violation in a diffed file is not found" -- --changed-from "$BASE_REV" --to "$WT_REV"; then
+  printf '%s\n' "$OUT" | grep -q 'src/clean.rs' && bad "to: tree-only violation must not fire (content read at REV)" "$OUT" || ok "to: tree-only violation not reported (content read at REV)"
+fi
+git checkout -q -- src/clean.rs                 # discard the tree-only edit
+git checkout -q main; git branch -qD worktree
+
+# 3d. --to without --changed-from is a usage error (exit 2).
+python3 "$AUDIT" --root "$REPO" --rules "$RULES" --baseline "$BASE" --all --to "$BASE_REV" >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -eq 2 ] && ok "to: --to without --changed-from exits 2" || bad "to: --to without --changed-from exits 2" "rc=$rc err=$(cat "$TMP/err")"
+
 # 4. Baseline ratchet: --update-baseline records every current site; the re-run
 #    then passes (exit 0) with the same tree.
 run 0 "update-baseline writes and exits 0" -- --all --update-baseline && {
@@ -177,6 +211,35 @@ python3 "$AUDIT" --root "$REPO" --rules "$BADRULES" --baseline "$BASE" --all >/d
 # 6c. Choosing zero or two selection modes is a usage error (exit 2).
 python3 "$AUDIT" --root "$REPO" --rules "$RULES" --baseline "$BASE" >/dev/null 2>"$TMP/err"; rc=$?
 [ "$rc" -eq 2 ] && ok "no selection mode exits 2" || bad "no selection mode exits 2" "rc=$rc err=$(cat "$TMP/err")"
+
+# 7. --gate-severity re-renders the emitted severity in the gate's vocabulary
+#    (blocker|should-fix|note) while the rules keep high|medium|low.
+rm -f "$BASE"
+if run 1 "gate-severity maps high|medium|low -> blocker|should-fix|note" -- --all --gate-severity; then
+  printf '%s\n' "$OUT" | grep -q '^INVARIANT R1|blocker|src/hit.rs:1|' && ok "gate-severity: high -> blocker" || bad "gate-severity: high -> blocker" "$OUT"
+  printf '%s\n' "$OUT" | grep -q '^INVARIANT R2|should-fix|bad/design.md:0|' && ok "gate-severity: medium -> should-fix" || bad "gate-severity: medium -> should-fix" "$OUT"
+fi
+# 7b. Default (no flag) keeps the raw high|medium|low vocabulary.
+rm -f "$BASE"
+if run 1 "no gate-severity keeps raw high|medium|low" -- --all; then
+  printf '%s\n' "$OUT" | grep -q '^INVARIANT R1|high|' && ok "default: severity stays high" || bad "default: severity stays high" "$OUT"
+fi
+# 7c. low -> note, via an isolated one-rule file (the main fixture has no low rule).
+LOWRULES="$TMP/low-rules.toml"
+cat > "$LOWRULES" <<'EOF'
+[[rule]]
+id = "L1"
+title = "low token"
+kind = "regex"
+pattern = ['FORBIDDEN_TOKEN']
+include = ["**/*.rs"]
+exclude = ["**/tests/**"]
+severity = "low"
+why = "test low"
+EOF
+rm -f "$BASE"
+OUT="$(python3 "$AUDIT" --root "$REPO" --rules "$LOWRULES" --baseline "$BASE" --all --gate-severity 2>"$TMP/err")"
+printf '%s\n' "$OUT" | grep -q '^INVARIANT L1|note|' && ok "gate-severity: low -> note" || bad "gate-severity: low -> note (err=$(cat "$TMP/err"))" "$OUT"
 
 printf '\ninvariant-audit-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

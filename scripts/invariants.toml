@@ -75,5 +75,12 @@ severity = "medium"
 why = "deep design lives in specs/, not crate roots — see AGENTS.md invariant 4"
 
 # ── Invariant 5 (increments are reviewable / capped) ───────────────────────
-# ENFORCED ELSEWHERE. The review-gate SIZE gate (scripts/ai-review.sh,
-# MU_REVIEW_MAX_DIFF_LINES) already blocks an over-cap increment; no rule here.
+# Two distinct properties, enforced in two distinct places — no rule here for
+# either:
+#   (b) "an increment over the review gate's line cap is split, not chunked" is
+#       ENFORCED by the SIZE gate (scripts/ai-review.sh, MU_REVIEW_MAX_DIFF_LINES),
+#       which blocks an over-cap increment before any review.
+#   (a) "new capability is built at a seam and integrated in a separate
+#       increment" has NO reliable pattern — a regex cannot see whether a change
+#       stands up a seam and defers integration — so it stays with the review
+#       gate's conformance seat.

@@ -172,6 +172,43 @@ if run 1 "changed-from: a non-ASCII filename is audited, not skipped" -- --chang
 fi
 git checkout -q main; git branch -qD unicode
 
+# 3f. content_at_rev distinguishes "path absent at REV" from a VCS failure.
+#  (i) A path DELETED by REV is in the BASE..REV diff but absent at REV: it is
+#      skipped SILENTLY (no fire, exit 0, no error) — not read from disk or BASE.
+git checkout -qb deleted
+printf 'fn d() { FORBIDDEN_TOKEN; }\n' > src/doomed.rs
+git add -A && git commit -qm "add a file that will be deleted"
+DB_REV="$(git rev-parse HEAD)"
+git rm -q src/doomed.rs && git commit -qm "delete it"
+DEL_REV="$(git rev-parse HEAD)"
+rm -f "$BASE"
+if run 0 "absent: a path absent at REV is skipped silently" -- --changed-from "$DB_REV" --to "$DEL_REV"; then
+  printf '%s\n' "$OUT" | grep -q 'src/doomed.rs' && bad "absent: a deleted-at-REV path must not fire" "$OUT" || ok "absent: deleted-at-REV path skipped, does not fire"
+  [ -s "$TMP/err" ] && bad "absent: a path absent at REV must not error" "$(cat "$TMP/err")" || ok "absent: no error for a path absent at REV"
+fi
+git checkout -q main; git branch -qD deleted
+
+#  (ii) A VCS failure (a bogus REV) is a hard error (exit 2), never a silent skip.
+#       Tested directly against content_at_rev so the failure is in the READ, not
+#       in the earlier diff (which shares the same rev and would fail first).
+python3 - "$AUDIT" "$REPO" "$BASE_REV" <<'PY'
+import importlib.util, sys
+audit_path, repo, good_rev = sys.argv[1], sys.argv[2], sys.argv[3]
+spec = importlib.util.spec_from_file_location("invariant_audit", audit_path)
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+# absent path at a VALID rev -> None, no error (the skipped-silently branch)
+if m.content_at_rev(repo, good_rev, "no/such/absent.rs") is not None:
+    sys.exit(3)
+# bogus rev -> die(2), not a silent None
+try:
+    m.content_at_rev(repo, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "src/hit.rs")
+    sys.exit(4)            # returned instead of dying
+except SystemExit as e:
+    sys.exit(0 if e.code == 2 else 5)
+PY
+rc=$?
+[ "$rc" -eq 0 ] && ok "content_at_rev: absent->None, bogus rev->die(2)" || bad "content_at_rev branches" "rc=$rc (3=absent-not-None,4=bogus-returned,5=wrong-exit)"
+
 # 4. Baseline ratchet: --update-baseline records every current site; the re-run
 #    then passes (exit 0) with the same tree.
 run 0 "update-baseline writes and exits 0" -- --all --update-baseline && {
@@ -233,6 +270,38 @@ fi
 git checkout -q main; git branch -qD dup
 rm -f "$BASE"
 
+# 4f. Baseline round-trip for paths containing whitespace. The line shape stays
+#     `<rule> <path> <digest16> [count]` but is parsed from the ends, so a path
+#     with a space — or two consecutive spaces — round-trips through
+#     --update-baseline and load, its internal whitespace preserved verbatim.
+printf 'let s = FORBIDDEN_TOKEN;\n' > "$REPO/src/one space.rs"
+printf 'let s = FORBIDDEN_TOKEN;\n' > "$REPO/src/two  spaces.rs"
+rm -f "$BASE"
+if run 0 "ws: --update-baseline records paths with spaces" -- --all --update-baseline; then
+  grep -qF 'R1 src/one space.rs ' "$BASE" && ok "ws: single-space path written verbatim" || bad "ws: single-space path in baseline" "$(cat "$BASE")"
+  grep -qF 'R1 src/two  spaces.rs ' "$BASE" && ok "ws: two-space path written verbatim" || bad "ws: two-space path in baseline" "$(cat "$BASE")"
+fi
+run 0 "ws: paths with spaces re-load and match the baseline" -- --all && ok "ws: space paths round-trip (exit 0, all baselined)" || bad "ws: space paths round-trip" "out=$OUT err=$(cat "$TMP/err")"
+rm -f "$REPO/src/one space.rs" "$REPO/src/two  spaces.rs"
+
+# 4g. A baseline line that does not parse is a hard error (exit 2), naming the line.
+rm -f "$BASE"
+printf 'this is not a valid baseline line\n' > "$BASE"
+run 2 "ws: a malformed baseline line exits 2" -- --all && ok "malformed baseline line exits 2" || true
+grep -q 'line 1' "$TMP/err" && ok "malformed baseline error names the line number" || bad "malformed baseline names line number" "$(cat "$TMP/err")"
+rm -f "$BASE"
+
+# 4h. --update-baseline needs --all: with --changed / --changed-from it would
+#     rewrite the whole file from a subset of sites, so it is a usage error (2).
+rm -f "$BASE"
+python3 "$AUDIT" --root "$REPO" --rules "$RULES" --baseline "$BASE" --changed src/hit.rs --update-baseline >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -eq 2 ] && ok "update-baseline with --changed exits 2" || bad "update-baseline with --changed exits 2" "rc=$rc err=$(cat "$TMP/err")"
+grep -q 'needs --all' "$TMP/err" && ok "update-baseline error explains it needs --all" || bad "update-baseline reason mentions --all" "$(cat "$TMP/err")"
+[ -f "$BASE" ] && bad "update-baseline must not write the baseline on the usage error" "exists" || ok "update-baseline wrote nothing on the usage error"
+python3 "$AUDIT" --root "$REPO" --rules "$RULES" --baseline "$BASE" --changed-from "$BASE_REV" --update-baseline >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -eq 2 ] && ok "update-baseline with --changed-from exits 2" || bad "update-baseline with --changed-from exits 2" "rc=$rc err=$(cat "$TMP/err")"
+rm -f "$BASE"
+
 # 5. --json shape: valid JSON with the documented keys.
 rm -f "$BASE"
 if run 1 "json emits one object" -- --all --json; then
@@ -291,9 +360,10 @@ printf '%s\n' "$OUT" | grep -q '^INVARIANT L1|note|' && ok "gate-severity: low -
 
 # 8. Rule 2 (journal append discarded/defaulted) false-positive guard, using an
 #    isolated rules file that mirrors the real invariants.toml rule 2 patterns.
-#    `let _ = ...append_command(...)?;` PROPAGATES the error (the greedy `let _ =`
-#    pattern runs to the last ')' before ';', so a trailing '?' breaks the match)
-#    and must NOT fire; the plain discard `let _ = ...append_command(...);` must.
+#    A statement containing '?' ANYWHERE is assumed to propagate: the char classes
+#    exclude both ';' and '?', so `let _ = log.append_command(a, p)?;` (trailing ?)
+#    AND `let _ = Some(log.append_command(a, p)?);` (? nested inside Some) both
+#    fail to match; only the plain discard `let _ = ...append_command(...);` fires.
 R2RULES="$TMP/rule2.toml"
 cat > "$R2RULES" <<'EOF'
 [[rule]]
@@ -301,24 +371,25 @@ id = "J"
 title = "journal append discarded"
 kind = "regex"
 pattern = [
-  'append_command\([^;]*\)\s*\.ok\(\)',
-  'append_command\([^;]*\)\s*\.unwrap_or',
-  'let _ = [^;]*append_command\([^;]*\)\s*;',
+  'append_command\([^;?]*\)\s*\.ok\(\)',
+  'append_command\([^;?]*\)\s*\.unwrap_or',
+  'let _ = [^;?]*append_command\([^;?]*\)[^;?]*;',
 ]
 include = ["**/*.rs"]
 severity = "high"
 why = "test rule 2 shape"
 EOF
 {
-  printf 'let _ = log.append_command(actor, payload)?;\n'   # propagates — NO match
-  printf 'let _ = log.append_command(actor, payload);\n'    # discarded — match
+  printf 'let _ = Some(log.append_command(a, p)?);\n'       # ? nested in Some — NO match
+  printf 'let _ = log.append_command(actor, payload)?;\n'   # trailing ? propagates — NO match
+  printf 'let _ = log.append_command(a, p);\n'              # discarded — match (line 3)
 } > "$REPO/src/journal.rs"
 rm -f "$BASE"
 OUT="$(python3 "$AUDIT" --root "$REPO" --rules "$R2RULES" --baseline "$BASE" --changed src/journal.rs 2>"$TMP/err")"; rc=$?
 [ "$rc" -eq 1 ] && ok "rule2: a plain discard is a violation (exit 1)" || bad "rule2: plain discard fires" "rc=$rc err=$(cat "$TMP/err") out=$OUT"
-printf '%s\n' "$OUT" | grep -q '^INVARIANT J|high|src/journal.rs:2|' && ok "rule2: the discard (line 2) is the match" || bad "rule2: discard match at line 2" "$OUT"
+printf '%s\n' "$OUT" | grep -q '^INVARIANT J|high|src/journal.rs:3|' && ok "rule2: the discard (line 3) is the match" || bad "rule2: discard match at line 3" "$OUT"
 n=$(printf '%s\n' "$OUT" | grep -c '^INVARIANT J|')
-[ "$n" -eq 1 ] && ok "rule2: the ?-propagating line (line 1) does NOT match" || bad "rule2: only the discard matches, not the ? line" "n=$n; $OUT"
+[ "$n" -eq 1 ] && ok "rule2: the ?-bearing lines (Some(...?) and trailing ?) do NOT match" || bad "rule2: only the discard matches, not the ? lines" "n=$n; $OUT"
 rm -f "$REPO/src/journal.rs"
 
 printf '\ninvariant-audit-test: %d passed, %d failed\n' "$PASS" "$FAIL"

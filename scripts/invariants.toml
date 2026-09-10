@@ -25,14 +25,18 @@
 id = "2"
 title = "journal append result discarded/defaulted (must be fail-closed)"
 kind = "regex"
-# `.ok()` / `.unwrap_or` name the discarding call explicitly, so a `?` (which
-# propagates) can't satisfy them. The `let _ =` shape must run greedily to the
-# last `)` before the statement `;`: a trailing `?` then falls outside the match,
-# so `let _ = log.append_command(a, p)?;` (error propagated) is NOT a violation.
+# A statement containing `?` ANYWHERE is assumed to propagate, so none of these
+# shapes may cross a `?`: the char classes exclude both `;` (the statement end)
+# and `?`. The `let _ =` discard is `let _ = [^;?]*append_command\([^;?]*\)[^;?]*;`,
+# and the same `?`-exclusion is applied to the `.ok()` / `.unwrap_or` arg classes
+# so a `?` inside the call's arguments is treated as propagation too. This can MISS
+# a genuine discard that also contains a `?` elsewhere in the statement (e.g.
+# `let _ = Some(log.append_command(a, p)?);` does not match); that is an accepted
+# trade to kill the false positive, and the conformance seat still reads the diff.
 pattern = [
-  'append_command\([^;]*\)\s*\.ok\(\)',
-  'append_command\([^;]*\)\s*\.unwrap_or',
-  'let _ = [^;]*append_command\([^;]*\)\s*;',
+  'append_command\([^;?]*\)\s*\.ok\(\)',
+  'append_command\([^;?]*\)\s*\.unwrap_or',
+  'let _ = [^;?]*append_command\([^;?]*\)[^;?]*;',
 ]
 include = ["**/*.rs"]
 exclude = [

@@ -233,19 +233,50 @@ def changed_paths(root, rev, to):
     return [p for p in text.split("\0") if p]
 
 
-def content_at_rev(root, rev, path):
-    """File bytes at REV, or None if the path does not exist there."""
-    if os.path.isdir(os.path.join(root, ".jj")):
-        cmd = ["jj", "file", "show", "-r", rev, "--", path]
-    else:
-        cmd = ["git", "show", "%s:%s" % (rev, path)]
+def _run(cmd, root):
     try:
-        out = subprocess.run(cmd, cwd=root, capture_output=True)
+        return subprocess.run(cmd, cwd=root, capture_output=True)
     except OSError as e:
         die("cannot run %s: %s" % (cmd[0], e))
-    if out.returncode != 0:
+
+
+def content_at_rev(root, rev, path):
+    """File bytes at REV, or None if the path is ABSENT there.
+
+    "Absent at REV" (a path in the diff that does not exist at the pinned
+    revision — e.g. a deletion) is distinguished from a VCS FAILURE (a bogus
+    rev, a broken invocation): absence returns None so the caller skips the path
+    silently; a failure is a hard error (die, exit 2) so a typo never masquerades
+    as a clean scan. We key absence off the stderr MESSAGE, not the numeric exit
+    code — git reports a missing path with status 128 ("... does not exist ..."),
+    not 1, and a bad rev reports a different message ("invalid object name",
+    "exists on disk, but not in ..."), so the phrase is the reliable signal.
+    """
+    if os.path.isdir(os.path.join(root, ".jj")):
+        cmd = ["jj", "file", "show", "-r", rev, "--", path]
+        out = _run(cmd, root)
+        if out.returncode == 0:
+            return out.stdout
+        err = out.stderr.decode("utf-8", "replace")
+        if "No such path" in err:
+            return None
+        die("%s failed: %s" % (" ".join(cmd), err.strip()))
+    # git: probe existence at REV first, so a genuinely missing path (status != 0
+    # with a "does not exist" / "Not a valid object name" message) is absent while
+    # anything else is a failure; only then read the bytes with `git show`.
+    probe = ["git", "cat-file", "-e", "%s:%s" % (rev, path)]
+    pr = _run(probe, root)
+    if pr.returncode == 0:
+        show = ["git", "show", "%s:%s" % (rev, path)]
+        out = _run(show, root)
+        if out.returncode != 0:
+            die("%s failed: %s"
+                % (" ".join(show), out.stderr.decode("utf-8", "replace").strip()))
+        return out.stdout
+    err = pr.stderr.decode("utf-8", "replace")
+    if "does not exist" in err or "Not a valid object name" in err:
         return None
-    return out.stdout
+    die("%s failed: %s" % (" ".join(probe), err.strip()))
 
 
 # --- scanning --------------------------------------------------------------
@@ -346,27 +377,35 @@ BASELINE_HEADER = (
 )
 
 
+# A baseline line is `<rule> <path> <digest16> [<count>]`, but PATHS MAY CONTAIN
+# SPACES, so we parse from the ends, not by a fixed field count: rule is the first
+# token; from the right, an optional all-digit count then a 16-hex digest; the
+# path is everything between, with its internal whitespace preserved verbatim. The
+# greedy `(.+)` backtracks only as far as the rightmost digest(+count), so a digest
+# is always taken from the right.
+BASELINE_LINE_RE = re.compile(
+    r"^(\S+)\s+(.+)\s+([0-9a-fA-F]{16})(?:\s+(\d+))?$")
+
+
 def load_baseline(path):
     """Map (rule, path, digest) -> accepted count. A 3-field line means count 1
-    (backward compatible); an optional 4th field records how many identical
-    stripped lines are accepted. Repeated keys accumulate."""
+    (backward compatible); an optional trailing count records how many identical
+    stripped lines are accepted. Repeated keys accumulate. A non-comment, non-blank
+    line that does not parse is a hard error (exit 2, with its line number)."""
     counts = {}
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for raw in f:
+            for lineno, raw in enumerate(f, 1):
                 s = raw.strip()
                 if not s or s.startswith("#"):
                     continue
-                parts = s.split()
-                if len(parts) not in (3, 4):
-                    continue
-                key = (parts[0], parts[1], parts[2])
-                n = 1
-                if len(parts) == 4:
-                    try:
-                        n = int(parts[3])
-                    except ValueError:
-                        continue
+                m = BASELINE_LINE_RE.match(s)
+                if not m:
+                    die("baseline %s line %d: cannot parse %r "
+                        "(want '<rule> <path> <digest16> [count]')"
+                        % (path, lineno, s))
+                key = (m.group(1), m.group(2), m.group(3))
+                n = int(m.group(4)) if m.group(4) is not None else 1
                 counts[key] = counts.get(key, 0) + n
     except FileNotFoundError:
         pass
@@ -414,7 +453,8 @@ def build_parser():
                         "(blocker|should-fix|note) instead of high|medium|low")
     p.add_argument("--baseline", help="baseline file (default <root>/scripts/invariants.baseline)")
     p.add_argument("--update-baseline", action="store_true",
-                   help="rewrite the baseline from the current sites and exit 0")
+                   help="rewrite the baseline from the current sites and exit 0 "
+                        "(requires --all: it replaces the whole file)")
     p.add_argument("--json", action="store_true", help="emit one JSON object")
     p.add_argument("--quiet", action="store_true",
                    help="suppress the summary and the fixed-site notes")
@@ -442,6 +482,12 @@ def main(argv):
     # --to only means anything for --changed-from (the pinned range + read rev).
     if args.to and not args.changed_from:
         die("--to is only valid with --changed-from")
+
+    # --update-baseline rewrites the WHOLE file from the scanned sites, so it must
+    # see the whole tree; a --changed / --changed-from subset would silently drop
+    # every baselined site outside the subset.
+    if args.update_baseline and not args.all:
+        die("--update-baseline rewrites the whole baseline and needs --all")
 
     if args.all:
         # --all scans the working tree, never a pinned revision.

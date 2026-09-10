@@ -116,6 +116,28 @@ review_size_gate_step() {
 }
 run_step "review-gate size gate" review_size_gate_step
 
+# Mechanical invariant audit (mu-review-gate-seam-reviewers-9vkbt.6): pattern-
+# match the declared AGENTS.md invariant violation shapes across the whole tree,
+# ratcheted by scripts/invariants.baseline. Standard-library Python, no model
+# spend. A NEW site (not in the baseline) fails; a baselined site is accepted
+# debt; a baseline entry whose site is gone is flagged for removal. Skipped with
+# a dim note if python3 is absent.
+invariant_audit_step() {
+  command -v python3 >/dev/null 2>&1 || {
+    printf "%s    python3 missing — skipping invariant audit%s\n\n" "$C_DIM" "$C_OFF"; return 0; }
+  python3 "$REPO_ROOT/scripts/review-panel/invariant_audit.py" --all
+}
+run_step "invariant audit (AGENTS.md ratchet)" invariant_audit_step
+
+# invariant_audit self-test (mu-review-gate-seam-reviewers-9vkbt.6): throwaway
+# git repo, its own rules — no network, no model.
+invariant_audit_test_step() {
+  local t="$REPO_ROOT/scripts/tests/invariant-audit-test.sh"
+  [ -f "$t" ] || { printf "%s    invariant-audit-test.sh missing — skipping%s\n\n" "$C_DIM" "$C_OFF"; return 0; }
+  bash "$t"
+}
+run_step "invariant audit self-test" invariant_audit_test_step
+
 # ci-aipr fast-path self-test (mu-ash9p): the live-seat quorum in converge.py
 # `agree`, and the ci-green marker gate. Synthetic seat files and a throwaway
 # git repo, so this costs no model spend either.

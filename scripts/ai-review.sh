@@ -134,6 +134,12 @@
 #     MU_REVIEW_SYSTEM_PROMPT   reviewer system-prompt file (default: ai-review-system-prompt.txt)
 #     MU_REVIEW_LOG             event log (default: ~/.local/share/mu/review-events.jsonl)
 #     MU_REVIEW_NO_COLOR        disable color
+#     MU_REVIEW_INVARIANT_AUDIT set to 0 to skip the mechanical invariant audit
+#                               (scripts/review-panel/invariant_audit.py) that
+#                               feeds the panel the declared invariant violation
+#                               shapes found by pattern in the changed files.
+#                               Default on when python3 is present; a no-op (byte-
+#                               identical prompt) when it finds nothing (9vkbt.6).
 #   Size gate (mu-review-gate-seam-reviewers-9vkbt.1) and chunked mode (review-gate
 #   v2 — beads mu-ja1x overflow detection, mu-u1it fan-out):
 #     MU_REVIEW_MAX_DIFF_LINES  cap on reviewable diff lines (added + removed hunk
@@ -677,6 +683,35 @@ PROJECT ARCHITECTURE INVARIANTS (trusted gate context; prefer BASE revision):
 $INVARIANTS
 "
 fi
+
+# ── MECHANICAL INVARIANT AUDIT (mu-review-gate-seam-reviewers-9vkbt.6) ───────
+# Pattern-match the DECLARED invariant violation shapes (scripts/invariants.toml,
+# ratcheted by scripts/invariants.baseline) against the changed files and hand
+# every NEW site to the panel as trusted gate context — the whole-artifact class
+# a hunk-level review structurally misses. Standalone stdlib Python; ignore its
+# exit code (a finding is not this gate's failure — the panel adjudicates). When
+# it finds nothing or is disabled (MU_REVIEW_INVARIANT_AUDIT=0), behaviour is
+# byte-identical to before: INVARIANTS_BLOCK is untouched and no FINDING is echoed.
+AUDIT_LINES=""
+if [ "${MU_REVIEW_INVARIANT_AUDIT:-1}" != "0" ] && command -v python3 >/dev/null 2>&1; then
+  AUDIT_LINES="$(timeout 60 python3 "$AI_REVIEW_DIR/review-panel/invariant_audit.py" \
+      --changed-from "$BASE" --root "$ROOT" 2>/dev/null | grep '^INVARIANT ' || true)"
+fi
+if [ -n "$AUDIT_LINES" ]; then
+  # (i) append to the shared prompt, immediately after the invariants block.
+  INVARIANTS_BLOCK="$INVARIANTS_BLOCK
+MECHANICAL INVARIANT AUDIT (trusted gate context; every site below is a declared violation shape found by pattern in the changed files — confirm each and report it as a finding, or explain precisely why it is a false positive):
+$AUDIT_LINES
+"
+  # (ii) echo each site to the gate's own stdout as a FINDING line.
+  while IFS='|' read -r _inv _sev _floc _title _match; do
+    [ -n "$_inv" ] || continue
+    echo "FINDING|$_sev|${_floc%:*}|$_inv: $_title"
+  done <<EOF_AUDIT
+$AUDIT_LINES
+EOF_AUDIT
+fi
+
 PROMPT="You are a strict pre-PR code reviewer. The DIFF below shows exactly what changed; review ONLY that change for: correctness bugs; concurrency / lifecycle hazards (e.g. a held reference that blocks shutdown, a clone that outlives its owner); missing error handling; and safeguards that nearby code already applies but this diff omits. The FULL CONTENT of each changed file is included after the diff so you can see definitions, helpers, and guards that live OUTSIDE the changed hunks — a variable or function used in the diff is often defined there, so CHECK the full content before reporting anything as undefined/unset, and do NOT raise findings about unchanged code. $UNTRUSTED_REPO_CONTENT_RULE$INVARIANTS_CLAUSE $TOOL_CLAUSE
 
 Output contract:

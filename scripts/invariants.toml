@@ -1,0 +1,79 @@
+# invariants.toml — mechanical shapes of the AGENTS.md "Architecture invariants"
+# section, consumed by scripts/review-panel/invariant_audit.py. One [[rule]] per
+# violation shape a pattern can actually see. HONESTY RULE: a rule here only
+# exists when a regex or a path glob can detect the shape without understanding
+# the code; the invariants with no reliable pattern are left to the review gate's
+# conformance seat and are documented as comments below, not faked into rules.
+#
+# kind = "regex"          — pattern(s) matched per line against text files
+# kind = "forbidden_path" — pattern(s) are path globs; a matching file is a site
+# include / exclude       — path globs (**/ = any dirs, * = within one segment)
+
+# ── Invariant 1 (event log is the source of truth) ─────────────────────────
+# NO RELIABLE PATTERN. "write to disk first, then map into memory" is an
+# ordering property across functions; a regex cannot see whether an in-memory
+# projection was mutated before its event was persisted. Left to the conformance
+# seat.
+
+# ── Invariant 2 (durability is fail-closed; command journal) ───────────────
+# The journal append MUST reject the command on failure (JOURNAL_UNAVAILABLE).
+# Detectable shape: the result of append_command(...) being DISCARDED or
+# DEFAULTED instead of propagated — .ok(), unwrap_or*, or `let _ =`. This cannot
+# see #[cfg(test)] blocks, so test files are excluded by path (tests/ dirs and
+# *_test.rs); a genuine test helper that swallows the error is legitimate.
+[[rule]]
+id = "2"
+title = "journal append result discarded/defaulted (must be fail-closed)"
+kind = "regex"
+pattern = [
+  'append_command\([^;]*\)\s*\.ok\(\)',
+  'append_command\([^;]*\)\s*\.unwrap_or',
+  'let _ = [^;]*append_command\(',
+]
+include = ["**/*.rs"]
+exclude = [
+  "**/tests/**", "**/*_test.rs",
+  "**/target/**", ".jj/**", ".git/**", "specs/**",
+  "scripts/invariants.toml", "scripts/invariants.baseline",
+  "scripts/review-panel/invariant_audit.py",
+  "scripts/tests/invariant-audit-test.sh",
+]
+severity = "high"
+why = "a swallowed journal append breaks the fail-closed write-ahead path (mu-046)"
+
+# ── Invariant 3 (rehydration is lazy and request-driven) ───────────────────
+# NO RELIABLE PATTERN. "mu serve parses nothing on cold start" is an absence —
+# a regex cannot prove a cold path does NOT eagerly load sessions. Left to the
+# conformance seat.
+
+# ── Invariant 4 (deep design lives in specs/) ──────────────────────────────
+# New design docs belong in specs/, not in crate roots. Detectable shape: a
+# design/architecture doc committed under a crate root or a crate docs/ tree, or
+# under mesh-slice/. README.md and CHANGELOG.md are legitimate crate docs and are
+# excluded. specs/ itself is excluded (that IS the right home).
+[[rule]]
+id = "4"
+title = "design doc outside specs/ (crate root or crate docs/)"
+kind = "forbidden_path"
+pattern = [
+  "crates/*/DESIGN*.md",
+  "crates/*/ARCHITECTURE*.md",
+  "crates/*/design*.md",
+  "crates/*/architecture*.md",
+  "crates/*/docs/**",
+  "mesh-slice/DESIGN*.md",
+]
+include = []
+exclude = [
+  "**/README.md", "**/CHANGELOG.md",
+  "**/target/**", ".jj/**", ".git/**", "specs/**",
+  "scripts/invariants.toml", "scripts/invariants.baseline",
+  "scripts/review-panel/invariant_audit.py",
+  "scripts/tests/invariant-audit-test.sh",
+]
+severity = "medium"
+why = "deep design lives in specs/, not crate roots — see AGENTS.md invariant 4"
+
+# ── Invariant 5 (increments are reviewable / capped) ───────────────────────
+# ENFORCED ELSEWHERE. The review-gate SIZE gate (scripts/ai-review.sh,
+# MU_REVIEW_MAX_DIFF_LINES) already blocks an over-cap increment; no rule here.

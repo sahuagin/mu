@@ -1,0 +1,6 @@
+# invariant_audit baseline — accepted PRE-EXISTING invariant sites.
+# One per line: <rule id> <repo-relative path> <sha256[:16] of the stripped matched line>.
+# A line here is a DEBT MARKER, never a free pass: fix the site and remove the line, or bead it and keep the line.
+# Blank lines and lines starting with # are ignored. Regenerate with:
+#   python3 scripts/review-panel/invariant_audit.py --all --update-baseline
+4 crates/t4c/docs/help-ai-standard.md 2ed362733711d296

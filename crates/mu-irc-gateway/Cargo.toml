@@ -8,12 +8,13 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
-# So far this is a library of tested, OFFLINE capabilities: configuration +
-# mapping + framing (2a); the registration/capability adapter state machine, the
-# disposable membership/channel lifecycle, and mesh→IRC routing (2b). There is
-# deliberately NO binary yet: the maintained IRC client, the real TLS/mesh
-# transport, and the event loop that executes these decisions are wired in the
-# integration increment, after each capability slice is reviewed.
+# Through increment 3 this is a library of tested, OFFLINE capabilities:
+# configuration + mapping + framing (2a); the registration/capability adapter
+# state machine, disposable membership/channel lifecycle, and mesh→IRC routing
+# (2b); and IRC→mesh routing with both loop guards (3). There is deliberately NO
+# binary yet: the maintained IRC client, the real TLS/mesh transport, and the
+# event loop that executes these decisions are wired in the integration
+# increment, after each capability slice is reviewed.
 [lib]
 name = "mu_irc_gateway"
 path = "src/lib.rs"

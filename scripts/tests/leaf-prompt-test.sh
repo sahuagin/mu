@@ -3,11 +3,14 @@
 #
 # bead: mu-review-gate-seam-reviewers-9vkbt.3. Pins: the UNSEAMED leaf prompt
 # byte-for-byte (downstream leaf_findings() and the FINDING contract depend on
-# it); a custom seam leaf carries its checklist and the exclusive seam clause; a
-# conformance leaf carries the invariants block before the clause when invariants
-# are present, and the no-invariants instruction when they are not; the FINDING
-# output contract survives every path and the panel's JSON reply-contract tail is
-# NOT appended to a leaf. Run from any cwd; creates its own tmpdir. No model.
+# it); a custom seam leaf carries its checklist and the LEAF-variant exclusive
+# seam clause (no tools, THIS-UNIT-only, UNVERIFIED escape hatch, leaf contract);
+# a conformance leaf carries the invariants block before the leaf-variant clause
+# when invariants are present, and is REFUSED (rc 1) when they are not; the
+# FINDING output contract survives every path and the panel's JSON reply-contract
+# tail is NOT appended to a leaf; leaf_prompt fails closed (rc 1 + reason) on any
+# unreadable input or unwritable output; and chunk_dispatch_plan renders the
+# true-total-cap decision. Run from any cwd; creates its own tmpdir. No model.
 
 set -u
 set -o pipefail
@@ -98,6 +101,13 @@ grep -q 'PREFIX every finding' "$out"; check "custom seam instructs the <seam>: 
 grep -qF -- "$FINDING_CONTRACT" "$out"; check "custom seam leaf keeps the FINDING contract" $? "prefix differs"
 # The panel's JSON reply-contract envelope must NOT leak onto a leaf.
 grep -q 'REPLY FORMAT, restated here' "$out"; check "custom seam leaf does NOT carry the panel reply-contract tail" $(( $? == 0 ? 1 : 0 )) "reply contract leaked onto the leaf"
+# Leaf-mode clause (fix: contradictory instructions in seam leaves): no tools,
+# THIS-UNIT-only, the UNVERIFIED escape hatch, the leaf contract — and NOT the
+# panel's read/grep / "output contract is unchanged" text.
+grep -q 'you have no tools and cannot see the rest of the repository' "$out"; check "custom seam leaf states no tools / this-unit-only" $? "$(tail -n 8 "$out")"
+grep -q 'UNVERIFIED at the start of the claim' "$out"; check "custom seam leaf carries the UNVERIFIED escape hatch" $? "$(tail -n 8 "$out")"
+grep -qF -- 'the leaf contract: FINDING|<severity>|<file>|<claim> lines or NO_FINDINGS, no verdict, no JSON' "$out"; check "custom seam leaf states the leaf output contract" $? "$(tail -n 8 "$out")"
+grep -q 'against the repository via read/grep' "$out"; check "custom seam leaf does NOT carry the panel read/grep text" $(( $? == 0 ? 1 : 0 )) "panel tool text leaked onto the leaf"
 # The base leaf prompt is preserved as the prefix of the seam leaf.
 head -n "$(wc -l < "$TMP/unseamed.expected")" "$out" >/dev/null 2>&1
 
@@ -115,15 +125,47 @@ grep -q 'Money is Decimal' "$out"; check "conformance leaf carries the actual in
 grep -qF -- "$FINDING_CONTRACT" "$out"; check "conformance leaf keeps the FINDING contract" $? "contract missing"
 grep -q 'REPLY FORMAT, restated here' "$out"; check "conformance leaf does NOT carry the panel reply-contract tail" $(( $? == 0 ? 1 : 0 )) "reply contract leaked"
 grep -q 'no architecture invariants declared' "$out"; check "conformance-with-invariants does NOT emit the no-invariants text" $(( $? == 0 ? 1 : 0 )) "$(tail -n 3 "$out")"
+# Leaf-mode conformance clause (fix: contradictory instructions in seam leaves):
+# no tools, THIS-UNIT-only, UNVERIFIED, INVARIANT <n>: labeling — NOT the panel's
+# read/grep confirmation text.
+grep -q 'you have no tools and cannot see the rest of the repository' "$out"; check "conformance leaf states no tools / this-unit-only" $? "$(tail -n 4 "$out")"
+grep -q 'UNVERIFIED at the start of the claim' "$out"; check "conformance leaf carries the UNVERIFIED escape hatch" $? "$(tail -n 4 "$out")"
+grep -qF -- 'INVARIANT <n>: ' "$out"; check "conformance leaf keeps INVARIANT <n>: labeling" $? "$(tail -n 4 "$out")"
+grep -q 'use read/grep to confirm' "$out"; check "conformance leaf does NOT carry the panel read/grep text" $(( $? == 0 ? 1 : 0 )) "panel tool text leaked"
 
-# ── 4. Conformance leaf, no invariants (flag 0): the no-invariants instruction ─
-out="$TMP/conf0"
-leaf_prompt "$out" "$confunit" "$MSGF" "$DIFFF" "$CLF" "$STATF" "conformance" "" 0 "$INVF"; rc=$?
-check "conformance leaf (no invariants) builds" $(( rc == 0 ? 0 : 1 )) "rc=$rc"
-grep -q 'no architecture invariants declared for this repository; the conformance seat checked nothing' "$out"; check "no-invariants conformance carries the no-invariants instruction" $? "$(tail -n 3 "$out")"
-# With the flag off, the invariants block must NOT be appended even though a file exists.
-grep -q 'PROJECT ARCHITECTURE INVARIANTS (trusted gate context' "$out"; check "no-invariants conformance does NOT append the invariants block" $(( $? == 0 ? 1 : 0 )) "invariants block leaked with flag 0"
-grep -qF -- "$FINDING_CONTRACT" "$out"; check "no-invariants conformance keeps the FINDING contract" $? "contract missing"
+# ── 4. Conformance leaf, no invariants (flag 0): REFUSED (fix: conformance leaf
+#      without invariants). The leaf contract has FINDING|... / NO_FINDINGS, no
+#      verdict/JSON — so a conformance leaf with no criteria must NOT fall back to
+#      seat_prompt's "VERDICT: approve" + JSON no-invariants clause. leaf_prompt
+#      returns rc 1 with a reason (defensive backstop; run_chunked drops the seam
+#      upstream). This inverts the old expectation, which built that clause.
+out="$TMP/conf0"; : > "$out"
+leaf_prompt "$out" "$confunit" "$MSGF" "$DIFFF" "$CLF" "$STATF" "conformance" "" 0 "$INVF" 2>"$TMP/conf0.err"; rc=$?
+check "conformance leaf with no invariants is REFUSED (rc 1)" $(( rc == 1 ? 0 : 1 )) "rc=$rc"
+grep -q 'conformance leaf requested with no invariants present' "$TMP/conf0.err"; check "refusal names the no-invariants conformance cause" $? "$(cat "$TMP/conf0.err")"
+grep -q 'no architecture invariants declared' "$out"; check "refused conformance leaf does NOT emit the panel no-invariants VERDICT clause" $(( $? == 0 ? 1 : 0 )) "$(cat "$out")"
+
+# ── 5. Fail closed on prompt assembly (fix: fail closed on prompt assembly) ────
+out="$TMP/fc-out"; : > "$out"
+leaf_prompt "$out" "$UNIT" "$TMP/does-not-exist" "$DIFFF" "$CLF" "$STATF" "" "" 0 "$INVF" 2>"$TMP/fc1.err"; rc=$?
+check "missing input file -> rc 1" $(( rc == 1 ? 0 : 1 )) "rc=$rc"
+grep -q 'cannot read message file' "$TMP/fc1.err"; check "missing input names the unreadable file" $? "$(cat "$TMP/fc1.err")"
+# Unwritable output: a path whose parent directory does not exist.
+leaf_prompt "$TMP/no-such-dir/out" "$UNIT" "$MSGF" "$DIFFF" "$CLF" "$STATF" "" "" 0 "$INVF" 2>"$TMP/fc2.err"; rc=$?
+check "unwritable output -> rc 1" $(( rc == 1 ? 0 : 1 )) "rc=$rc"
+grep -q 'cannot write leaf prompt file' "$TMP/fc2.err"; check "unwritable output names the write failure" $? "$(cat "$TMP/fc2.err")"
+
+# ── 6. chunk_dispatch_plan: the true-total-cap arithmetic (fix: true total cap) ─
+check_plan() { # $1=name $2=units $3=seams $4=cap $5=expected
+  local got; got="$(chunk_dispatch_plan "$2" "$3" "$4")"
+  if [ "$got" = "$5" ]; then ok "$1"; else bad "$1" "units=$2 seams=$3 cap=$4 -> $got (want $5)"; fi
+}
+check_plan "units alone over cap -> units_over_cap" 41 2 40 units_over_cap
+check_plan "units fit but product over cap -> drop_seams" 20 2 40 drop_seams
+check_plan "product fits -> ok" 10 2 40 ok
+check_plan "no seams, units fit -> ok" 40 0 40 ok
+check_plan "no seams, units over cap still escalates -> units_over_cap" 41 0 40 units_over_cap
+check_plan "units exactly at cap is not over -> ok" 40 0 40 ok
 
 printf '\nleaf-prompt-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -46,13 +46,29 @@ done
 leaf_prompt() {
   _lp_out="$1"; _lp_unit="$2"; _lp_msgf="$3"; _lp_difff="$4"; _lp_clf="$5"
   _lp_statf="$6"; _lp_seam="$7"; _lp_checklist="$8"; _lp_inv="${9:-0}"; _lp_invf="${10:-}"
+  # Defensive (fix: conformance leaf without invariants). A conformance leaf with
+  # no invariants has NO criteria; falling back to seat_prompt's no-invariants
+  # clause would ask the leaf for a panel-style "VERDICT: approve" and a JSON
+  # finding, contradicting the leaf's FINDING|... / NO_FINDINGS contract.
+  # run_chunked drops the conformance seam upstream when invariants are absent;
+  # this is the backstop that refuses to assemble it at all.
+  if [ "$_lp_seam" = conformance ] && [ "$_lp_inv" != 1 ]; then
+    echo "leaf-prompt: conformance leaf requested with no invariants present (has-invariants=$_lp_inv); run_chunked must skip the conformance seam when MU_REVIEW_INVARIANTS_PRESENT is not 1" >&2
+    return 1
+  fi
   # Read the variable-length inputs from files (the diff can be large — files,
   # not argv). $(...) strips trailing newlines exactly as the old inline capture
   # of $msg/$cdiff/$COMMIT_LIST/$DIFFSTAT did, so the base stays byte-identical.
-  _lp_msg="$(cat "$_lp_msgf" 2>/dev/null)"
-  _lp_diff="$(cat "$_lp_difff" 2>/dev/null)"
-  _lp_cl="$(cat "$_lp_clf" 2>/dev/null)"
-  _lp_stat="$(cat "$_lp_statf" 2>/dev/null)"
+  # Fail closed (fix: fail closed on prompt assembly): every read is checked, so a
+  # missing/unreadable input is rc 1 with a reason, never a silently empty prompt.
+  if ! _lp_msg="$(cat "$_lp_msgf" 2>/dev/null)"; then
+    echo "leaf-prompt: cannot read message file '$_lp_msgf'" >&2; return 1; fi
+  if ! _lp_diff="$(cat "$_lp_difff" 2>/dev/null)"; then
+    echo "leaf-prompt: cannot read diff file '$_lp_difff'" >&2; return 1; fi
+  if ! _lp_cl="$(cat "$_lp_clf" 2>/dev/null)"; then
+    echo "leaf-prompt: cannot read commit-list file '$_lp_clf'" >&2; return 1; fi
+  if ! _lp_stat="$(cat "$_lp_statf" 2>/dev/null)"; then
+    echo "leaf-prompt: cannot read diffstat file '$_lp_statf'" >&2; return 1; fi
 
   # Base leaf prompt — byte-identical to the old inline text in review_leaf.
   {
@@ -75,7 +91,7 @@ leaf_prompt() {
     printf '%s\n' "BEGIN UNTRUSTED REPO CONTENT: UNIT DIFF"
     printf '%s\n' "$_lp_diff"
     printf '%s\n' "END UNTRUSTED REPO CONTENT: UNIT DIFF"
-  } > "$_lp_out" 2>/dev/null || return 1
+  } > "$_lp_out" 2>/dev/null || { echo "leaf-prompt: cannot write leaf prompt file '$_lp_out'" >&2; return 1; }
 
   # Unseamed leaf: nothing more.
   [ -z "$_lp_seam" ] && return 0
@@ -85,19 +101,50 @@ leaf_prompt() {
   # append the SAME seam clause the panel uses (no duplicated text). seat_prompt
   # cp's its shared file over the seat file, so shared (scratch) must differ from
   # seat ($_lp_out).
-  _lp_scratch="$(mktemp "${TMPDIR:-/tmp}/ai-review-leaf-seam.XXXXXX")" || return 1
+  _lp_scratch="$(mktemp "${TMPDIR:-/tmp}/ai-review-leaf-seam.XXXXXX")" || { echo "leaf-prompt: cannot create scratch file" >&2; return 1; }
+  # Read the invariants block up front so the read is checked (fail closed): it
+  # rides ONLY the conformance seam leaf, and only when invariants are present.
+  _lp_invtxt=""
+  if [ "$_lp_seam" = conformance ] && [ "$_lp_inv" = 1 ]; then
+    if ! _lp_invtxt="$(cat "$_lp_invf" 2>/dev/null)"; then
+      echo "leaf-prompt: cannot read invariants file '$_lp_invf'" >&2; rm -f "$_lp_scratch"; return 1
+    fi
+  fi
   {
     cat "$_lp_out"
     if [ "$_lp_seam" = conformance ] && [ "$_lp_inv" = 1 ]; then
-      printf '%s\n' "$(cat "$_lp_invf" 2>/dev/null)"
+      printf '%s\n' "$_lp_invtxt"
     fi
     printf '%s\n' ""
     printf 'SEAM LENS (trusted gate context, not repo content): this leaf reviews the change through ONE lens only, named below. Keep the output contract above unchanged — FINDING|<severity>|<file>|<claim>, at most 5 findings, NO verdict line, exactly four |-separated fields — but PREFIX every finding'"'"'s <claim> field with "%s: " so the synthesis pass can tell which lens produced it (e.g. "%s: INVARIANT 2: ...").\n' \
       "$_lp_seam" "$_lp_seam"
-  } > "$_lp_scratch" 2>/dev/null || { rm -f "$_lp_scratch"; return 1; }
+  } > "$_lp_scratch" 2>/dev/null || { echo "leaf-prompt: cannot write scratch seam file" >&2; rm -f "$_lp_scratch"; return 1; }
 
-  SEAT_PROMPT_NO_REPLY_CONTRACT=1 seat_prompt "$_lp_scratch" "$_lp_out" "" "$_lp_seam" "$_lp_checklist" "$_lp_inv" >/dev/null
+  # SEAT_PROMPT_LEAF=1 renders the LEAF variant of the seam/conformance clause
+  # (no tools, THIS-UNIT-only, UNVERIFIED escape hatch, leaf FINDING contract);
+  # SEAT_PROMPT_NO_REPLY_CONTRACT=1 keeps the panel's JSON reply-contract tail off.
+  SEAT_PROMPT_LEAF=1 SEAT_PROMPT_NO_REPLY_CONTRACT=1 seat_prompt "$_lp_scratch" "$_lp_out" "" "$_lp_seam" "$_lp_checklist" "$_lp_inv" >/dev/null
   _lp_rc=$?
   rm -f "$_lp_scratch"
+  [ "$_lp_rc" -eq 0 ] || echo "leaf-prompt: seat_prompt failed to append the seam clause (rc $_lp_rc)" >&2
   return "$_lp_rc"
+}
+
+# chunk_dispatch_plan <units> <seams> <cap> — the MU_REVIEW_CHUNK_MAX_DISPATCHES
+# arithmetic as a pure, testable function (fix: true total cap). The cap is a
+# TRUE total: total = units × (1 + seams). Pure stdout, no side effects, so
+# leaf-prompt-test.sh can pin the three outcomes.
+#   units_over_cap  units alone exceed the cap — the branch cannot be chunked at
+#                   all (even one leaf per unit is too many); the caller ESCALATEs
+#                   and tells the operator to split the branch.
+#   drop_seams      units fit but units × (1 + seams) does not — run the unseamed
+#                   leaves only (the existing seam-skip notice).
+#   ok              the full units × (1 + seams) fits (or no seams are declared).
+chunk_dispatch_plan() { # $1=units $2=seams $3=cap ; stdout: plan word
+  _cdp_u="${1:-0}"; _cdp_s="${2:-0}"; _cdp_cap="${3:-0}"
+  if [ "$_cdp_u" -gt "$_cdp_cap" ]; then echo units_over_cap; return 0; fi
+  if [ "$_cdp_s" -gt 0 ] && [ "$(( _cdp_u * (1 + _cdp_s) ))" -gt "$_cdp_cap" ]; then
+    echo drop_seams; return 0
+  fi
+  echo ok
 }

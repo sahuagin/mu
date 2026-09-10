@@ -10,7 +10,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{mesh, presence};
+use crate::presence;
+use mu_dialogue::mesh;
 
 /// One place a value is set.
 struct Origin {
@@ -309,7 +310,7 @@ mod tests {
             "mu.toml",
             "[mesh]\nnats_url = \"fleet:4222\"\nissuer_key = \"beef\"\n",
         );
-        let loaded = crate::mesh::load(&cfg, &fleet).expect("loads");
+        let loaded = mesh::load(&cfg, &fleet).expect("loads");
         let found = origins(&cfg, &fleet, "nats_url");
         assert_eq!(found[0].value, loaded.nats_url);
         // The fleet value is still reported as shadowed, from the other file.

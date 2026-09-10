@@ -8,6 +8,14 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+# The mesh client is shared with mu-irc-gateway, so it lives behind a library
+# target rather than a binary-private `mod`. The binary imports it exactly like
+# any other consumer (`use mu_dialogue::mesh`), so there is one copy of the
+# client and one set of its tests.
+[lib]
+name = "mu_dialogue"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mu-dialogue"
 path = "src/main.rs"

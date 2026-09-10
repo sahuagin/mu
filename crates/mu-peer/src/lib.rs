@@ -19,6 +19,35 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// The role prefix of a mu daemon or session.
 pub const ROLE_MU: &str = "mu";
 
+/// The role prefix of a human operator addressed on the mesh — the identity a
+/// gateway fronts on a person's behalf. Additive: it uses the same
+/// `role:id[:sub]` grammar and the same [`PeerId::dm_subject`] rule as every
+/// other role, so `human:alice` addresses `mu.agent.human.alice.dm` with no
+/// special case (mu-irc-gateway v0).
+pub const ROLE_HUMAN: &str = "human";
+
+/// The subject prefix under which every mesh peer's DM subject is built. One
+/// literal, so the per-peer subject ([`PeerId::dm_subject`]) and the wildcard
+/// that observes all of them ([`agent_dm_observer_subject`]) cannot drift apart.
+pub const MESH_SUBJECT_PREFIX: &str = "mu.agent.";
+
+/// The NATS subject that observes every peer's DM traffic at once:
+/// `mu.agent.>`. The `>` full-wildcard matches DM subjects at any depth
+/// (`mu.agent.cc.<uuid>.dm`, `mu.agent.mu.<daemon>[.<session>].dm`,
+/// `mu.agent.human.<nick>.dm`).
+///
+/// Two consequences the observer path must handle, not this helper:
+/// - It also matches non-DM subjects under the same tree (e.g. a gateway's
+///   private `…gateway-presence.<id>` stop anchor), so a consumer filters to
+///   subjects ending in `.dm`.
+/// - It OVERLAPS a gateway's own human-endpoint subjects
+///   (`mu.agent.human.*.dm`), so a message minted once can arrive on both an
+///   endpoint subscription and this wildcard; the consumer de-duplicates by
+///   mesh message id.
+pub fn agent_dm_observer_subject() -> String {
+    format!("{MESH_SUBJECT_PREFIX}>")
+}
+
 /// NATS Micro metadata key carrying a peer's identity, unmangled. Micro service
 /// NAMES are restricted to `[A-Za-z0-9_-]`; metadata is not, so identity rides
 /// here and the name stays a mere key (mu-b1lq).
@@ -74,6 +103,32 @@ impl PeerId {
         }
     }
 
+    /// A human operator peer: `human:<nick>`. The nick is used verbatim — the
+    /// caller has already folded it per the IRC server's `CASEMAPPING` — so two
+    /// spellings that fold to the same nick must arrive here already identical.
+    pub fn human(nick: impl Into<String>) -> Self {
+        Self {
+            role: ROLE_HUMAN.to_string(),
+            id: Some(nick.into()),
+            sub: None,
+        }
+    }
+
+    /// Whether this peer is a human operator (`human:<nick>`).
+    pub fn is_human(&self) -> bool {
+        self.role == ROLE_HUMAN
+    }
+
+    /// The nick of a `human:<nick>` peer, or `None` for any other role. Empty
+    /// when the id carried no separator (`"human"` with nothing after it),
+    /// which names no one and so is not a resolvable human.
+    pub fn human_nick(&self) -> Option<&str> {
+        if self.role != ROLE_HUMAN {
+            return None;
+        }
+        self.id.as_deref().filter(|n| !n.is_empty())
+    }
+
     /// The role prefix — what `dialogue_peers` groups on.
     pub fn role(&self) -> &str {
         &self.role
@@ -112,7 +167,7 @@ impl PeerId {
     /// then the session. A daemon watches all of its sessions with
     /// `mu.agent.mu.<daemon>.*.dm` (mu-b1lq).
     pub fn dm_subject(&self) -> String {
-        let mut s = String::from("mu.agent.");
+        let mut s = String::from(MESH_SUBJECT_PREFIX);
         s.push_str(&self.role);
         if let Some(id) = self.id.as_deref().filter(|i| !i.is_empty()) {
             s.push('.');
@@ -333,5 +388,73 @@ mod tests {
     fn typed_constructors_agree_with_parsing() {
         assert_eq!(PeerId::mu_daemon("d"), PeerId::parse("mu:d"));
         assert_eq!(PeerId::mu_session("d", "s"), PeerId::parse("mu:d:s"));
+    }
+
+    /// Every existing role's DM subject is pinned byte for byte: adding the
+    /// human role and routing `dm_subject` through `MESH_SUBJECT_PREFIX` must
+    /// not have moved a single character of what the mesh already addresses.
+    #[test]
+    fn existing_role_subjects_are_unchanged() {
+        assert_eq!(
+            PeerId::parse("cc:deploy-test").dm_subject(),
+            "mu.agent.cc.deploy-test.dm"
+        );
+        assert_eq!(
+            PeerId::parse("mu:100c058851c356a5").dm_subject(),
+            "mu.agent.mu.100c058851c356a5.dm"
+        );
+        assert_eq!(
+            PeerId::parse("mu:100c058851c356a5:session-2").dm_subject(),
+            "mu.agent.mu.100c058851c356a5.session-2.dm"
+        );
+        assert_eq!(
+            PeerId::parse("warden:sub_agent_3").dm_subject(),
+            "mu.agent.warden.sub_agent_3.dm"
+        );
+    }
+
+    /// The human role is additive: it uses the same grammar and the same
+    /// subject rule as every other role, so `human:<nick>` derives
+    /// `mu.agent.human.<nick>.dm` with no special case — and it round-trips.
+    #[test]
+    fn human_peers_address_and_round_trip() {
+        let alice = PeerId::human("alice");
+        assert_eq!(alice, PeerId::parse("human:alice"));
+        assert_eq!(alice.to_string(), "human:alice");
+        assert_eq!(alice.dm_subject(), "mu.agent.human.alice.dm");
+        assert!(alice.is_human());
+        assert_eq!(alice.human_nick(), Some("alice"));
+        // The caller folds the nick per CASEMAPPING before it gets here; this
+        // type keeps whatever it was handed and does not fold.
+        let folded = PeerId::human("bob");
+        assert_eq!(folded.human_nick(), Some("bob"));
+        // Non-human roles have no nick.
+        assert_eq!(PeerId::parse("mu:d:s").human_nick(), None);
+        assert!(!PeerId::parse("cc:abc").is_human());
+        // A bare `human` names no one.
+        assert_eq!(PeerId::parse("human").human_nick(), None);
+        // A human is never an addressable mu peer.
+        assert!(alice.as_mu().is_none());
+    }
+
+    /// The observer wildcard is the DM prefix plus a full-wildcard, so it
+    /// matches every role's DM subject and is derived from the SAME prefix
+    /// `dm_subject` uses — a change to one moves the other.
+    #[test]
+    fn observer_subject_covers_every_dm_subject() {
+        assert_eq!(agent_dm_observer_subject(), "mu.agent.>");
+        for peer in [
+            PeerId::parse("cc:abc"),
+            PeerId::parse("mu:d"),
+            PeerId::parse("mu:d:s"),
+            PeerId::parse("warden:x"),
+            PeerId::human("alice"),
+        ] {
+            assert!(
+                peer.dm_subject().starts_with(MESH_SUBJECT_PREFIX),
+                "{} is not under the observed prefix",
+                peer.dm_subject()
+            );
+        }
     }
 }

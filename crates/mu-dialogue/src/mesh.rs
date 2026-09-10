@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -202,7 +203,12 @@ pub enum AgentCommand {
 /// Verify an inbound envelope's capability against `issuer` for [`DM_RIGHT`].
 /// Any failure — bad base64, bad signature, missing right — is `false`; there
 /// is no fail-open path.
-fn dm_authorized(capability_b64: &str, issuer: PublicKey) -> bool {
+///
+/// Public because it is the ONE fail-closed check every consumer of mesh DMs
+/// must run before exposing a payload — `mu-irc-gateway` reuses it verbatim for
+/// both its human-endpoint and observer reception paths, so there is no second,
+/// looser gate. Subscription success is not authorization.
+pub fn dm_authorized(capability_b64: &str, issuer: PublicKey) -> bool {
     let Ok(token) = base64::engine::general_purpose::STANDARD.decode(capability_b64) else {
         return false;
     };
@@ -257,6 +263,108 @@ pub struct InboundDm {
     pub from_peer: String,
     pub body: String,
     pub subject: Option<String>,
+}
+
+/// Which subscription a verified DM arrived on.
+///
+/// A gateway may subscribe both a peer's own DM subject (an ENDPOINT it fronts)
+/// and the agent-DM OBSERVER wildcard (`mu.agent.>`). Those overlap: a single
+/// minted id published to a human endpoint also matches the observer wildcard,
+/// so the same [`MeshDmEvent::id`] can arrive twice. The reception tag plus the
+/// id are what let a consumer collapse that overlap to exactly one delivery
+/// without dropping genuinely distinct messages that share a fan-out id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reception {
+    Endpoint,
+    Observer,
+}
+
+/// A capability-verified inbound DM, carrying the two things [`InboundDm`] does
+/// not: the mesh message `id` (needed for loop-guarding and exactly-once
+/// overlap handling) and the `destination` subject it was addressed to (needed
+/// for routing). Additive — [`InboundDm`] and its store path are unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshDmEvent {
+    /// The envelope's mesh message id. One fan-out publish shares it across
+    /// every destination it was sent to.
+    pub id: String,
+    /// The subject this DM was addressed to (an endpoint subject, or whatever
+    /// the observer wildcard matched).
+    pub destination: String,
+    /// The sender's full peer id, normalized exactly as the store path does
+    /// (a separate `from_session` is folded in by [`inbound_peer_id`]). NOT
+    /// trusted for authorization — the capability is what was verified — but
+    /// used for attribution, reply routing and loop-guarding.
+    pub from: String,
+    pub body: String,
+    pub subject: Option<String>,
+    /// The envelope's target session, when it named one.
+    pub session: Option<String>,
+    pub reception: Reception,
+}
+
+/// Why a raw payload was refused before any body reached a consumer.
+///
+/// Body-free by construction: it names the failure class, never the message
+/// content, so a diagnostic built from it cannot leak a rejected DM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmRejected {
+    /// The bytes did not decode as a [`DmEnvelope`].
+    NotAnEnvelope,
+    /// Decoded, but the capability failed the fail-closed [`dm_authorized`]
+    /// check (wrong issuer, wrong right, or malformed token).
+    Unauthorized,
+}
+
+impl std::fmt::Display for DmRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately body-free — safe to log verbatim.
+        match self {
+            DmRejected::NotAnEnvelope => f.write_str("malformed dm envelope"),
+            DmRejected::Unauthorized => f.write_str("unauthorized dm (capability rejected)"),
+        }
+    }
+}
+
+/// Decode raw bytes into a verified [`MeshDmEvent`], running the shared
+/// fail-closed [`dm_authorized`] check before returning anything. A free
+/// function so it is testable without a live connection and so both the
+/// endpoint and observer paths share ONE gate.
+///
+/// `destination` is the subject the payload arrived on, recorded on the event
+/// for routing. Failures are body-free ([`DmRejected`]).
+pub fn verify_and_decode_dm(
+    issuer: PublicKey,
+    destination: &str,
+    payload: &[u8],
+    reception: Reception,
+) -> Result<MeshDmEvent, DmRejected> {
+    let Ok(env) = serde_json::from_slice::<DmEnvelope>(payload) else {
+        return Err(DmRejected::NotAnEnvelope);
+    };
+    if !dm_authorized(&env.capability, issuer) {
+        return Err(DmRejected::Unauthorized);
+    }
+    let DmEnvelope { id, command, .. } = env;
+    let AgentCommand::Dm {
+        from,
+        body,
+        session,
+        subject,
+        from_session,
+        ..
+    } = command;
+    Ok(MeshDmEvent {
+        id,
+        destination: destination.to_string(),
+        // Same normalization as the store path: a separate `from_session`
+        // (the at-uws shape) is folded into the sender's full peer id.
+        from: inbound_peer_id(&from, from_session.as_deref()).to_string(),
+        body,
+        subject,
+        session,
+        reception,
+    })
 }
 
 // ─────────────────────────────── Gateway ────────────────────────────────────
@@ -437,6 +545,11 @@ pub struct Gateway {
     /// [`WHO_WINDOW`] — far too much to pay per message. Mesh membership
     /// changes on the scale of process lifetimes, so a short TTL is plenty.
     live_cache: Mutex<Option<(tokio::time::Instant, HashMap<String, String>)>>,
+    /// How many payloads the OBSERVER path has refused verification. Endpoint
+    /// rejections are the sender's problem; an observer rejection is a gap in
+    /// what a watcher can see, so it is counted for the operator (mu-irc-gateway
+    /// surfaces it). Relaxed: a monotonic diagnostic counter, never a gate.
+    observer_verify_failures: AtomicU64,
 }
 
 /// How long a `$SRV` sweep's result is trusted for routing decisions. Short
@@ -445,14 +558,41 @@ pub struct Gateway {
 /// window is small), long enough that a burst of messages costs one sweep.
 const LIVENESS_TTL: Duration = Duration::from_secs(5);
 
+/// Derive the biscuit keypair from the configured issuer key. One place, so
+/// `connect` and `connect_with_events` cannot disagree about key handling.
+fn derive_root(cfg: &MeshConfig) -> Result<KeyPair> {
+    Ok(KeyPair::from(
+        &PrivateKey::from_bytes_hex(&cfg.issuer_key, biscuit_auth::builder::Algorithm::Ed25519)
+            .map_err(|e| anyhow!("[mesh].issuer_key is not a valid hex Ed25519 key: {e}"))?,
+    ))
+}
+
+/// Assemble a [`Gateway`] and its inbound channel around an already-connected
+/// client. Shared by both connect paths so their gateways are identical.
+fn assemble_gateway(
+    client: async_nats::Client,
+    root: KeyPair,
+) -> (Gateway, mpsc::UnboundedReceiver<InboundDm>) {
+    let issuer = root.public();
+    let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+    (
+        Gateway {
+            client,
+            root,
+            issuer,
+            inbound_tx,
+            fronted: Mutex::new(HashMap::new()),
+            live_cache: Mutex::new(None),
+            observer_verify_failures: AtomicU64::new(0),
+        },
+        inbound_rx,
+    )
+}
+
 /// Connect to the mesh. Bounded setup — this runs on the startup path, and a
 /// NATS that is down must fail fast rather than hang the server.
 pub async fn connect(cfg: &MeshConfig) -> Result<(Gateway, mpsc::UnboundedReceiver<InboundDm>)> {
-    let root = KeyPair::from(
-        &PrivateKey::from_bytes_hex(&cfg.issuer_key, biscuit_auth::builder::Algorithm::Ed25519)
-            .map_err(|e| anyhow!("[mesh].issuer_key is not a valid hex Ed25519 key: {e}"))?,
-    );
-    let issuer = root.public();
+    let root = derive_root(cfg)?;
     let client = bounded_in(NATS_SETUP_TIMEOUT, "gateway: NATS setup", async {
         let client = async_nats::connect(&cfg.nats_url)
             .await
@@ -465,22 +605,67 @@ pub async fn connect(cfg: &MeshConfig) -> Result<(Gateway, mpsc::UnboundedReceiv
     })
     .await?;
 
-    let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
     info!(nats = %cfg.nats_url, "mesh gateway: connected");
-    Ok((
-        Gateway {
-            client,
-            root,
-            issuer,
-            inbound_tx,
-            fronted: Mutex::new(HashMap::new()),
-            live_cache: Mutex::new(None),
-        },
-        inbound_rx,
-    ))
+    Ok(assemble_gateway(client, root))
+}
+
+/// Connect like [`connect`], but also stream async-nats connection transitions
+/// (`Connected` / `Disconnected` / `Closed` / …). Opt-in and additive: the
+/// existing [`connect`] and its callers are untouched. `mu-irc-gateway` uses
+/// the transition stream for connection-aware dropping — after a reconnect it
+/// rebuilds membership from fresh discovery rather than replaying anything, so
+/// it must know when a transition happened. A dropped receiver just stops the
+/// callback's sends; it never blocks the client.
+pub async fn connect_with_events(
+    cfg: &MeshConfig,
+) -> Result<(
+    Gateway,
+    mpsc::UnboundedReceiver<InboundDm>,
+    mpsc::UnboundedReceiver<async_nats::Event>,
+)> {
+    let root = derive_root(cfg)?;
+    let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+    let client = bounded_in(NATS_SETUP_TIMEOUT, "gateway: NATS setup", async {
+        let client = async_nats::ConnectOptions::new()
+            .event_callback(move |event| {
+                let ev_tx = ev_tx.clone();
+                async move {
+                    // Best-effort: if the consumer has gone away the transition
+                    // is simply not observed, which is exactly the semantics a
+                    // dropped receiver should have.
+                    let _ = ev_tx.send(event);
+                }
+            })
+            .connect(&cfg.nats_url)
+            .await
+            .map_err(|e| anyhow!("gateway: connect NATS at {}: {e}", cfg.nats_url))?;
+        client
+            .flush()
+            .await
+            .map_err(|e| anyhow!("gateway: flush: {e}"))?;
+        Ok::<_, anyhow::Error>(client)
+    })
+    .await?;
+
+    info!(nats = %cfg.nats_url, "mesh gateway: connected (with connection-event stream)");
+    let (gw, inbound_rx) = assemble_gateway(client, root);
+    Ok((gw, inbound_rx, ev_rx))
 }
 
 impl Gateway {
+    /// How many observer envelopes have been dropped by capability
+    /// verification since this gateway connected.
+    ///
+    /// An endpoint rejection is the sender's problem and is reported to the
+    /// sender; an observer rejection is invisible to everyone — it is a hole in
+    /// what a watcher can see — so it is counted here for the operator instead.
+    /// Monotonic and `Relaxed`: a diagnostic, never a gate, so a reader may see
+    /// a slightly stale count and must not derive control flow from it. The
+    /// gateway of the next increment surfaces it.
+    pub fn observer_verify_failures(&self) -> u64 {
+        self.observer_verify_failures.load(Ordering::Relaxed)
+    }
+
     /// Publish a DM to a mesh target on `from_peer`'s behalf, capability minted
     /// per send. Returns the envelope id. Fire-and-forget: core NATS does not
     /// tell us whether anyone was subscribed, which is exactly why the caller
@@ -901,6 +1086,69 @@ mod tests {
 
         assert!(!dm_authorized("!!!not-base64!!!", root.public()));
         assert!(!dm_authorized("", root.public()));
+    }
+
+    /// The verified-event decoder attributes a split-form sender (bare `from`
+    /// plus a separate `from_session`, the at-uws shape) to the sending
+    /// SESSION, exactly as the store path does — otherwise a gateway consumer
+    /// sees only the daemon and a reply lands on its supervisor session.
+    #[test]
+    fn verified_event_folds_from_session_into_the_sender_like_the_store_path() {
+        let root = KeyPair::new();
+        let token = biscuit!(r#"right({r});"#, r = DM_RIGHT)
+            .build(&root)
+            .unwrap()
+            .to_vec()
+            .unwrap();
+        let capability = base64::engine::general_purpose::STANDARD.encode(&token);
+        let envelope = |from: &str, from_session: Option<&str>| {
+            serde_json::to_vec(&DmEnvelope {
+                id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+                capability: capability.clone(),
+                command: AgentCommand::Dm {
+                    from: from.to_string(),
+                    body: "hi".to_string(),
+                    session: Some("session-2".to_string()),
+                    subject: None,
+                    from_session: from_session.map(str::to_string),
+                },
+            })
+            .unwrap()
+        };
+
+        let ev = verify_and_decode_dm(
+            root.public(),
+            "mu.agent.cc.abc.dm",
+            &envelope("bb073ae9893a123a", Some("session-3")),
+            Reception::Endpoint,
+        )
+        .expect("an authorized envelope decodes");
+        assert_eq!(ev.from, "mu:bb073ae9893a123a:session-3");
+        // The TARGET session is a different thing and stays as sent.
+        assert_eq!(ev.session.as_deref(), Some("session-2"));
+        assert_eq!(ev.id, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(ev.destination, "mu.agent.cc.abc.dm");
+        assert_eq!(ev.reception, Reception::Endpoint);
+
+        // A sender that already names its session wins over `from_session`,
+        // and a sender without one is attributed to the daemon — the same
+        // three shapes `inbound_peer_id` documents.
+        let ev = verify_and_decode_dm(
+            root.public(),
+            "mu.agent.cc.abc.dm",
+            &envelope("mu:bb073ae9893a123a:session-9", Some("session-3")),
+            Reception::Observer,
+        )
+        .unwrap();
+        assert_eq!(ev.from, "mu:bb073ae9893a123a:session-9");
+        let ev = verify_and_decode_dm(
+            root.public(),
+            "mu.agent.cc.abc.dm",
+            &envelope("bb073ae9893a123a", None),
+            Reception::Observer,
+        )
+        .unwrap();
+        assert_eq!(ev.from, "mu:bb073ae9893a123a");
     }
 
     /// A mesh `from` becomes a peer id a reply can be addressed to — the

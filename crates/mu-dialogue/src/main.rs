@@ -61,8 +61,11 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 use ulid::Ulid;
 
+// The mesh client now lives in this crate's library target (shared with
+// mu-irc-gateway); the binary imports it like any other consumer.
+use mu_dialogue::mesh;
+
 mod check;
-mod mesh;
 mod presence;
 
 /// Serializes tests that mutate process-global env (`HOME`, `MU_CONFIG`).

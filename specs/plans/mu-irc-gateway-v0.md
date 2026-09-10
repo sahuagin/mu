@@ -206,10 +206,29 @@ durable-wake path. The mu daemon stays entirely unaware that IRC exists.
      subject; every capability is exercised offline.
 3. **IRC → mesh.** Delivery for present-agent channels and lobby/private
    fan-out, canonical human senders, one shared id per broadcast, refusal of
-   absent/human destinations and nonmember private senders, and routing-memory
-   updates only for specifically addressed messages; both loop guards (ignore
-   the gateway's own nick; suppress `human:` senders and gateway-minted ids,
-   tracked before publication can race observation).
+   absent/human destinations — an explicit destination is present only on exact
+   peer-id membership in the discovery snapshot, never on a matching DM subject,
+   since `dm_subject()` is not injective (`mu:d:s` and `mu:d.s` share
+   `mu.agent.mu.d.s.dm`) and an absent identity must not inherit a present
+   peer's reachability — and one sender-authorization check applied to
+   every IRC-originated line ahead of all destination logic — the gateway
+   asserts `human:<nick>` under its own mesh capability, so a sender it observes
+   in no shared channel is refused whatever destination the line names, and an
+   explicit `role:id:` address cannot select a path that skips the check.
+   Routing-memory updates only for specifically addressed messages; both loop
+   guards (ignore the gateway's own nick, matched against the nick's wire
+   spelling folded under the CURRENT casemapping; suppress `human:` senders and
+   gateway-minted ids, tracked before publication can race observation, in the
+   same bounded window the mesh→IRC overlap dedup uses).
+
+   Like 2b, this increment is an **offline library capability**: it decides what
+   to publish (one caller-supplied minted id per fan-out, the set of destination
+   peers, the routing-memory updates) and records minted ids for loop-guarding
+   *before* the caller's publication effect can become observable. The actual
+   `publish_dm`/fan-out call, and the `mu-dialogue::mesh` seam that mints one id
+   across several `DmEnvelope`s, remain the integration increment's work — this
+   slice does not reopen increment 1. Textual bot-command dispatch stays in
+   increment 4.
 4. **Bot verbs.** `mu peers` and `mu say <peer> <text>` dispatched ahead of
    ordinary routing, with live full-id/alias resolution, ambiguity replies
    naming colliding peers, correct explicit-address routing-memory updates, and

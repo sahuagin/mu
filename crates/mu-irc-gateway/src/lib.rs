@@ -42,16 +42,27 @@
 //! - [`recent`] — the one bounded retention policy the gateway's
 //!   "have I seen this id?" memories share.
 //!
-//! The IRC→mesh direction (increment 3), the maintained IRC client and network
-//! execution (integration, increment 5) and the textual bot verbs (increment 4)
-//! are deliberately absent, each landing in its own independently reviewed
-//! increment.
+//! Increment **3** — the IRC→mesh direction:
+//!
+//! - [`outbound`] — a human's IRC line becomes a mesh publish decision: an
+//!   explicit `role:id:` address, the agent a channel maps to, or a fan-out
+//!   across every discovered agent under ONE caller-supplied minted id; with
+//!   one sender-authorization check ahead of all destination logic,
+//!   destination/ambiguity/human refusals, routing-memory writes only for
+//!   specifically-addressed lines, and both loop guards (the gateway's own
+//!   nick, and its own minted ids / `human:` senders recorded before publication
+//!   can race observation, in the bounded [`recent`] window).
+//!
+//! The maintained IRC client and network execution (integration, increment 5)
+//! and the textual bot verbs (increment 4) are deliberately absent, each landing
+//! in its own independently reviewed increment.
 
 pub mod adapter;
 pub mod config;
 pub mod framing;
 pub mod mapping;
 pub mod membership;
+pub mod outbound;
 pub mod recent;
 pub mod routing;
 
@@ -71,6 +82,7 @@ pub use mapping::{
     HumanIdentity, Resolved, SelfNick,
 };
 pub use membership::{ChannelEffect, ChannelReconciler, HumanEffect, Member, Membership};
+pub use outbound::{MemoryUpdate, OutDrop, OutEnv, Outbound, OutboundDecision, RefuseReason};
 pub use recent::{RecentSet, DEFAULT_CAPACITY};
 pub use routing::{
     DropReason, IngressRejected, OversizedField, RouteDecision, RouteEnv, Router,

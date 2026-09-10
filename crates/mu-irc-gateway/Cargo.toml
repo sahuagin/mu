@@ -1,0 +1,31 @@
+[package]
+name = "mu-irc-gateway"
+description = "Standalone single-nick IRC frontend to the mu agent mesh (v0)."
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# Increment 2a is a library of tested capabilities (configuration, pure
+# mapping, framing). There is deliberately NO binary yet: the runnable bridge
+# is wired in the integration increment, after these capabilities are reviewed.
+[lib]
+name = "mu_irc_gateway"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+# Deterministic channel-tail hashing (a stable short hash when the full alias
+# would exceed CHANNELLEN). blake3 is already a workspace dependency.
+blake3 = { workspace = true }
+# The shared peer identity type — the SAME one the mesh addresses with, so a
+# human folded here derives the same DM subject the daemon already routes.
+mu-peer = { workspace = true }
+# The shared mesh client library: increment 2a reuses `mesh::load` /
+# `MeshConfig` for mesh-config loading rather than re-implementing it. No IRC
+# client dependency lands here — that arrives with the 2b adapter.
+mu-dialogue = { path = "../mu-dialogue" }

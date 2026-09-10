@@ -257,6 +257,55 @@ pub struct ResponseError {
     pub plan_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at: Option<i64>,
+    /// Present when misalignment monitoring stopped the conversation
+    /// (`code: "misalignment_policy_violation"`); see
+    /// [`MisalignmentErrorDetails`]. mu-openai-protocol-2026q3-yyg3j.3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub misalignment: Option<MisalignmentErrorDetails>,
+}
+
+impl ResponseError {
+    /// The `code` misalignment monitoring stops a conversation with: on an
+    /// HTTP 403 before streaming begins, or on `response.failed` once
+    /// output has started (the misalignment-monitoring guide: "Streaming
+    /// integrations must also handle errors while consuming the stream, even
+    /// after receiving output"). Added to `ResponseErrorCode` in the
+    /// 2026-09-09 spec capture.
+    pub const MISALIGNMENT_POLICY_VIOLATION: &'static str = "misalignment_policy_violation";
+
+    /// Did misalignment monitoring stop this conversation? Decided by the
+    /// code, as the guide instructs ("Match the error code rather than the
+    /// message text"), never by the message.
+    pub fn is_misalignment_stop(&self) -> bool {
+        self.code.as_deref() == Some(Self::MISALIGNMENT_POLICY_VIOLATION)
+    }
+}
+
+/// `error.misalignment` — `MisalignmentErrorDetailsResource` in the
+/// 2026-09-09 spec capture: what a response stopped by misalignment
+/// monitoring carries next to the code. `error_type` is an extensible enum
+/// ("clients must accept additional values"), so it stays a string; the four
+/// documented values are `potentially_unintended_data_transfer`,
+/// `potentially_unintended_data_access`,
+/// `potentially_unintended_destructive_activity` and `other`.
+/// `detailed_explanation` is "the public explanation for this block" and
+/// `steer` "an optional public continuation instruction". The spec requires
+/// none of the three (`required: []`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MisalignmentErrorDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detailed_explanation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer: Option<MisalignmentSteer>,
+}
+
+/// `error.misalignment.steer` (`_MisalignmentSteer`): the one required field
+/// is `message`, "the public continuation instruction".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MisalignmentSteer {
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +349,61 @@ mod tests {
         assert_eq!(u.total_tokens, Some(5));
         assert_eq!(u.output_tokens_details.unwrap().reasoning_tokens, Some(1));
         round_trip(v);
+    }
+
+    /// A conversation stopped by misalignment monitoring: `status: failed`
+    /// with the code the guide says to match and the details the spec's
+    /// `MisalignmentErrorDetailsResource` names. Built from the schema (the
+    /// capture has no example of one), so every field is exercised, and the
+    /// extensible `error_type` takes a value outside the four documented.
+    /// mu-openai-protocol-2026q3-yyg3j.3.
+    #[test]
+    fn misalignment_stop_round_trips_and_is_detected_by_code() {
+        let v = json!({
+            "id": "resp_9",
+            "status": "failed",
+            "error": {
+                "code": "misalignment_policy_violation",
+                "message": "The conversation was stopped for review.",
+                "type": "invalid_request_error",
+                "misalignment": {
+                    "error_type": "potentially_unintended_destructive_activity",
+                    "detailed_explanation": "The agent began deleting files outside the task's directory.",
+                    "steer": {"message": "Confirm the target directory with the user before deleting."}
+                }
+            }
+        });
+        let r: Response = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(r.status, Some(ResponseStatus::Failed));
+        let e = r.error.clone().expect("error");
+        assert!(e.is_misalignment_stop());
+        let m = e.misalignment.expect("misalignment details");
+        assert_eq!(
+            m.error_type.as_deref(),
+            Some("potentially_unintended_destructive_activity")
+        );
+        assert_eq!(
+            m.steer.as_ref().map(|s| s.message.as_str()),
+            Some("Confirm the target directory with the user before deleting.")
+        );
+        round_trip(v);
+
+        // Extensible enum, every field optional: an undocumented type and
+        // no steer still parse; any other code is not a misalignment stop.
+        let sparse = json!({
+            "id": "resp_10",
+            "status": "failed",
+            "error": {"code": "server_error", "message": "x",
+                      "misalignment": {"error_type": "some_new_category"}}
+        });
+        let r: Response = serde_json::from_value(sparse.clone()).unwrap();
+        let e = r.error.clone().unwrap();
+        assert!(!e.is_misalignment_stop());
+        assert_eq!(
+            e.misalignment.unwrap().error_type.as_deref(),
+            Some("some_new_category")
+        );
+        round_trip(sparse);
     }
 
     #[test]

@@ -577,6 +577,47 @@ fn make_instructions_overflow_item(content: &str) -> InputItem {
     InputItem::user_text(framed)
 }
 
+/// The refusal for a `reasoning.effort` the catalog says the model does not
+/// take, or `None` when it is fine. Only a model whose catalog entry states
+/// `effort_levels` is guarded — GPT-6 Astra's says `low..max` because the
+/// model "does not support the `none` reasoning effort level" (changelog
+/// 2026-09-03); a model with no stated levels keeps today's behaviour, the
+/// API's own 400 being the authority. The per-turn `/effort` and the launch
+/// `--thinking` both pass through here, so `mu ask` is guarded the way
+/// mu-solo's picker already is (it validates against the same levels via
+/// route_catalog). mu-openai-protocol-2026q3-yyg3j.3.
+pub(crate) fn effort_outside_catalog(
+    catalog: &mu_core::model_catalog::ModelCatalogConfig,
+    model: &str,
+    effort: &str,
+) -> Option<String> {
+    let levels = catalog.resolve_model(model).effort_levels;
+    if levels.is_empty() || levels.iter().any(|l| l == effort) {
+        return None;
+    }
+    Some(format!(
+        "openai request refused before the wire: reasoning.effort `{effort}` is not one the \
+         catalog states for {model} ({}); pick one of those",
+        levels.join(", ")
+    ))
+}
+
+/// The line the lane surfaces when misalignment monitoring stops a
+/// conversation, on either path (HTTP 403 before streaming, or
+/// `response.failed` mid-stream): the rendered error, then what the guide
+/// asks of the application — "Stop dispatching further actions for the
+/// affected conversation. Do not automatically retry the blocked workflow."
+/// and "The API does not provide a general way to resume". The code is in
+/// the text, which is what the loop's retry classifier keys on to never
+/// retry it. mu-openai-protocol-2026q3-yyg3j.3.
+fn misalignment_stop_message(rendered: String) -> String {
+    format!(
+        "openai stopped this conversation for review — {rendered}. Not retried, and this \
+         workflow must not be re-dispatched; review the actions already taken against the \
+         intended work (misalignment monitoring)"
+    )
+}
+
 /// Assemble a [`CreateResponseRequest`] from resolved instructions, the
 /// already-translated `input` items, and tools. Shared by both the
 /// Legacy and Projected paths so they produce byte-identical wire JSON.
@@ -819,6 +860,35 @@ fn render_codex_http_error_with(
         plan_type: Option<String>,
         #[serde(default)]
         resets_in_seconds: Option<u64>,
+        #[serde(default)]
+        code: Option<String>,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        misalignment: Option<mu_openai::MisalignmentErrorDetails>,
+    }
+
+    // Misalignment monitoring blocking the request before streaming: "the
+    // API returns HTTP 403, with error type invalid_request_error and code
+    // misalignment_policy_violation. Match the error code rather than the
+    // message text." Rendered through the crate's error line so the 403 and
+    // the mid-stream `response.failed` read the same.
+    if let Ok(ErrBody { error: Some(e) }) = serde_json::from_str::<ErrBody>(body) {
+        let err = mu_openai::ResponseError {
+            code: e.code.clone(),
+            message: e.message.clone(),
+            kind: e.type_.clone(),
+            misalignment: e.misalignment.clone(),
+            ..Default::default()
+        };
+        if err.is_misalignment_stop() {
+            return misalignment_stop_message(mu_openai::stream_error_message(
+                None,
+                None,
+                Some(status.as_u16()),
+                Some(err),
+            ));
+        }
     }
 
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -1631,6 +1701,9 @@ fn fold_frame(state: &mut StreamState, frame: ResponseStreamEvent) -> Option<Pro
         }
         ResponseStreamEvent::Failed { response, .. } => {
             let err_msg = match response.error {
+                Some(e) if e.is_misalignment_stop() => misalignment_stop_message(
+                    mu_openai::stream_error_message(None, None, None, Some(e)),
+                ),
                 Some(e) => mu_openai::stream_error_message(None, None, None, Some(e)),
                 None => "openai response failed".into(),
             };
@@ -1684,6 +1757,11 @@ impl Provider for OpenaiProvider {
         // accepted vocabulary is MODEL-dependent; an out-of-vocabulary
         // level surfaces as a provider 400.
         let eff_thinking: &str = effort.unwrap_or(&self.thinking);
+        if let Some(msg) =
+            effort_outside_catalog(mu_core::model_catalog::global(), &self.model, eff_thinking)
+        {
+            return Err(ProviderError::Other(msg));
+        }
         let mut body = match input {
             MessageInput::Legacy(msgs) => {
                 // mu-n48: a session-level system_prompt overrides the

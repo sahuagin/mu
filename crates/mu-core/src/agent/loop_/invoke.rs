@@ -52,6 +52,11 @@ fn retryable_provider_error(message: &str) -> bool {
         || lower.contains("invalid_prompt")
         || lower.contains("cyber_policy")
         || lower.contains("credentials")
+        // Misalignment monitoring stopped the conversation (OpenAI, code
+        // misalignment_policy_violation, HTTP 403 or response.failed): "Do
+        // not automatically retry the blocked workflow." — the guide;
+        // mu-openai-protocol-2026q3-yyg3j.3.
+        || lower.contains("misalignment_policy_violation")
     {
         return false;
     }
@@ -593,6 +598,12 @@ mod tests {
 
         assert!(!retryable_provider_error(
             "anthropic returned 402: insufficient credits"
+        ));
+        // A misalignment stop is final, whichever path rendered it.
+        assert!(!retryable_provider_error(
+            "openai stopped this conversation for review — misalignment_policy_violation: \
+             Stopped. (http 403) — explanation. Not retried, and this workflow must not be \
+             re-dispatched"
         ));
         assert!(!retryable_provider_error(
             "codex returned 401: unauthorized"

@@ -173,6 +173,12 @@ const MODEL_RATES: &[(&str, &str, ModelPricing)] = &[
     ("anthropic_api", "claude-opus-4", card(5.00, 25.00)),
     ("anthropic_api", "claude-sonnet-4", card(3.00, 15.00)),
     ("anthropic_api", "claude-haiku-4", card(1.00, 5.00)),
+    // No OpenAI rows: this formula assumes Anthropic's disjoint buckets, and
+    // OpenAI's `input_tokens` includes its cached subset, so an OpenAI card
+    // here would bill a cached token at 1.10x the input rate. The
+    // accounting flag and the cache-write mapping come first (bead: pricing,
+    // OpenAI inclusive cached-input accounting); the GPT-6 Astra numbers are
+    // in the model catalog's comment until then.
 ];
 
 #[cfg(test)]
@@ -196,6 +202,10 @@ mod tests {
     fn unknown_pair_returns_none() {
         assert!(for_model("anthropic_api", "claude-future-9").is_none());
         assert!(for_model("openai_codex", "any").is_none());
+        // No OpenAI lane is priced until cost() models inclusive cached
+        // input (see MODEL_RATES); a row added before that double-charges.
+        assert!(for_model("openai_codex", "gpt-6-astra").is_none());
+        assert!(for_model("openai_api", "gpt-6-astra").is_none());
     }
 
     /// Retired ids stay priced (the lane only warns about them, and a

@@ -118,6 +118,12 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_astra_gets_128k() {
+        assert_eq!(mt("gpt-6-astra"), 128000);
+        assert_eq!(mt("gpt-6-astra-2026-10-01"), 128000);
+    }
+
+    #[test]
     fn ollama_reasoning_models_get_16k() {
         assert_eq!(mt("gpt-oss:20b"), 16384);
         assert_eq!(mt("deepseek-r1:32b"), 16384);

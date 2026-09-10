@@ -246,6 +246,21 @@ pub fn stream_error_message(
     if let Some(r) = e.resets_at {
         msg.push_str(&format!(" [resets_at {r}]"));
     }
+    // A misalignment stop carries the public explanation and, when the
+    // service offers one, a continuation instruction; both belong in the
+    // line the operator reads (the guide: "Show the available error
+    // information to the user or operator responsible for the task").
+    if let Some(m) = e.misalignment {
+        if let Some(t) = m.error_type {
+            msg.push_str(&format!(" [{t}]"));
+        }
+        if let Some(x) = m.detailed_explanation {
+            msg.push_str(&format!(" — {x}"));
+        }
+        if let Some(st) = m.steer {
+            msg.push_str(&format!(" [steer: {}]", st.message));
+        }
+    }
     msg
 }
 
@@ -386,6 +401,30 @@ mod tests {
         assert_eq!(
             stream_error_message(message, code, status, error),
             "openai stream error"
+        );
+    }
+
+    /// The misalignment details ride the rendered line: type, explanation
+    /// and steer, after the code, message and status.
+    #[test]
+    fn misalignment_details_render_in_the_message() {
+        let error = ResponseError {
+            code: Some("misalignment_policy_violation".into()),
+            message: Some("Stopped for review.".into()),
+            misalignment: Some(crate::MisalignmentErrorDetails {
+                error_type: Some("potentially_unintended_data_access".into()),
+                detailed_explanation: Some("The agent read credentials outside the task.".into()),
+                steer: Some(crate::MisalignmentSteer {
+                    message: "Ask before reading secrets.".into(),
+                }),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            stream_error_message(None, None, Some(403), Some(error)),
+            "misalignment_policy_violation: Stopped for review. (http 403) \
+             [potentially_unintended_data_access] — The agent read credentials outside the \
+             task. [steer: Ask before reading secrets.]"
         );
     }
 

@@ -26,12 +26,16 @@ instead of inventing another; the rules file is unchanged either way.
 
 The baseline ratchet (scripts/invariants.baseline): each line is one accepted
 PRE-EXISTING site as `<rule id> <path> <sha256[:16] of the stripped matched
-line>` (no line numbers, so a site survives edits above it). A site already in
-the baseline PASSES; a NEW site (not in the baseline) FAILS the run; a baseline
-entry whose site is gone is reported "fixed: remove from baseline" (the run still
-passes). A baseline line is a debt marker, never a free pass: fix the site and
-drop the line, or bead it and keep the line. --update-baseline rewrites the file
-from the current sites.
+line>` (no line numbers, so a site survives edits above it), with an optional
+fourth field `<count>` recording how many identical stripped lines are accepted
+(absent = 1, so old 3-field lines still parse). The ratchet is OCCURRENCE-AWARE:
+current sites are grouped by (rule, path, digest) and their COUNT compared to the
+baseline's. As many copies as the baseline records PASS; any surplus copies FAIL
+as NEW (reported with their line numbers); if fewer copies remain than baselined,
+the shortfall is reported "fixed: N of M" (the run still passes). A baseline line
+is a debt marker, never a free pass: fix the site and drop/decrement the line, or
+bead it and keep it. --update-baseline rewrites the file from the current sites,
+writing the count field only when it exceeds 1.
 
 Exit: 0 when every current site is in the baseline; 1 when any is not; 2 on a
 usage or rules error.
@@ -207,17 +211,26 @@ def default_head(root):
 
 
 def changed_paths(root, rev, to):
-    if os.path.isdir(os.path.join(root, ".jj")):
+    is_jj = os.path.isdir(os.path.join(root, ".jj"))
+    if is_jj:
+        # jj --name-only is newline-separated and does NOT quote paths.
         cmd = ["jj", "diff", "--from", rev, "--to", to, "--name-only"]
     else:
-        cmd = ["git", "diff", "--name-only", "%s...%s" % (rev, to)]
+        # git -z NUL-separates paths and never quotes them (the default octal-
+        # quotes non-ASCII names, which would then be skipped as missing); split
+        # on NUL, dropping only the element after the trailing NUL.
+        cmd = ["git", "diff", "-z", "--name-only", "%s...%s" % (rev, to)]
     try:
-        out = subprocess.run(cmd, cwd=root, capture_output=True, text=True)
+        out = subprocess.run(cmd, cwd=root, capture_output=True)
     except OSError as e:
         die("cannot run %s: %s" % (cmd[0], e))
     if out.returncode != 0:
-        die("%s failed: %s" % (" ".join(cmd), out.stderr.strip()))
-    return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+        die("%s failed: %s"
+            % (" ".join(cmd), out.stderr.decode("utf-8", "replace").strip()))
+    text = out.stdout.decode("utf-8", "surrogateescape")
+    if is_jj:
+        return [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return [p for p in text.split("\0") if p]
 
 
 def content_at_rev(root, rev, path):
@@ -323,7 +336,9 @@ def scan(rules, root, paths, rev=None):
 BASELINE_HEADER = (
     "# invariant_audit baseline — accepted PRE-EXISTING invariant sites.\n"
     "# One per line: <rule id> <repo-relative path> <sha256[:16] of the "
-    "stripped matched line>.\n"
+    "stripped matched line> [<count>].\n"
+    "# The optional <count> is how many identical copies are accepted (absent = "
+    "1); the ratchet compares per-key counts, so a surplus copy fails as new.\n"
     "# A line here is a DEBT MARKER, never a free pass: fix the site and remove "
     "the line, or bead it and keep the line.\n"
     "# Blank lines and lines starting with # are ignored. Regenerate with:\n"
@@ -332,7 +347,10 @@ BASELINE_HEADER = (
 
 
 def load_baseline(path):
-    keys = set()
+    """Map (rule, path, digest) -> accepted count. A 3-field line means count 1
+    (backward compatible); an optional 4th field records how many identical
+    stripped lines are accepted. Repeated keys accumulate."""
+    counts = {}
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for raw in f:
@@ -340,18 +358,32 @@ def load_baseline(path):
                 if not s or s.startswith("#"):
                     continue
                 parts = s.split()
-                if len(parts) != 3:
+                if len(parts) not in (3, 4):
                     continue
-                keys.add((parts[0], parts[1], parts[2]))
+                key = (parts[0], parts[1], parts[2])
+                n = 1
+                if len(parts) == 4:
+                    try:
+                        n = int(parts[3])
+                    except ValueError:
+                        continue
+                counts[key] = counts.get(key, 0) + n
     except FileNotFoundError:
         pass
     except OSError as e:
         die("cannot read baseline %s: %s" % (path, e))
-    return keys
+    return counts
 
 
 def write_baseline(path, sites):
-    lines = sorted({"%s %s %s" % k for k in {s.key for s in sites}})
+    counts = {}
+    for s in sites:
+        counts[s.key] = counts.get(s.key, 0) + 1
+    lines = []
+    for key in sorted(counts):
+        n = counts[key]
+        # Count is omitted when 1, keeping the line 3-field backward compatible.
+        lines.append("%s %s %s" % key if n == 1 else "%s %s %s %d" % (key + (n,)))
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(BASELINE_HEADER)
@@ -434,14 +466,30 @@ def main(argv):
         return 0
 
     baseline = load_baseline(baseline_path)
-    new_sites, seen_keys = [], set()
+    # Group current sites by (rule, path, digest) and compare COUNTS against the
+    # baseline: more current than baselined => the surplus copies are NEW; fewer
+    # => some were fixed. Grouped in first-seen order; the surplus reported is the
+    # copies with the highest line numbers (the later duplicates).
+    current = {}
     for s in sites:
-        seen_keys.add(s.key)
-        if s.key not in baseline:
-            new_sites.append(s)
-    # "fixed" means a baselined site no longer exists — only a whole-tree scan
+        current.setdefault(s.key, []).append(s)
+    new_sites, baselined = [], 0
+    for key, group in current.items():
+        allowed = baseline.get(key, 0)
+        baselined += min(len(group), allowed)
+        if len(group) > allowed:
+            group = sorted(group, key=lambda s: s.line)
+            new_sites.extend(group[allowed:])
+    new_sites.sort(key=lambda s: (s.path, s.line))
+    # "fixed" means fewer current copies than baselined — only a whole-tree scan
     # can assert that; a --changed run saw only a subset, so it stays silent.
-    fixed = sorted(baseline - seen_keys) if args.all else []
+    # Each entry is (key, n_fixed, m_baselined).
+    fixed = []
+    if args.all:
+        for key in sorted(baseline):
+            have = len(current.get(key, []))
+            if have < baseline[key]:
+                fixed.append((key, baseline[key] - have, baseline[key]))
     exit_code = 1 if new_sites else 0
 
     def sev(s):
@@ -452,8 +500,9 @@ def main(argv):
             "new": [{"id": s.rule_id, "severity": sev(s), "file": s.path,
                      "line": s.line, "title": s.title, "match": s.text}
                     for s in new_sites],
-            "baselined": len(seen_keys & baseline),
-            "fixed": [{"id": i, "path": p, "digest": d} for (i, p, d) in fixed],
+            "baselined": baselined,
+            "fixed": [{"id": k[0], "path": k[1], "digest": k[2],
+                       "fixed": n, "baselined": m} for (k, n, m) in fixed],
             "sites": len(sites),
             "exit": exit_code,
         }
@@ -463,11 +512,11 @@ def main(argv):
     for s in new_sites:
         print(s.render(gate=args.gate_severity))
     if not args.quiet:
-        for (i, p, d) in fixed:
-            print("fixed: remove from baseline: %s %s %s" % (i, p, d))
+        for ((i, p, d), n, m) in fixed:
+            print("fixed: %d of %d: %s %s %s" % (n, m, i, p, d))
         print("invariant-audit: %d new, %d baselined, %d fixed "
               "(%d site(s) across %d path(s))"
-              % (len(new_sites), len(seen_keys & baseline), len(fixed),
+              % (len(new_sites), baselined, sum(n for (_, n, _) in fixed),
                  len(sites), len(paths)))
     return exit_code
 

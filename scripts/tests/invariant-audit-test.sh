@@ -157,10 +157,25 @@ git checkout -q main; git branch -qD worktree
 python3 "$AUDIT" --root "$REPO" --rules "$RULES" --baseline "$BASE" --all --to "$BASE_REV" >/dev/null 2>"$TMP/err"; rc=$?
 [ "$rc" -eq 2 ] && ok "to: --to without --changed-from exits 2" || bad "to: --to without --changed-from exits 2" "rc=$rc err=$(cat "$TMP/err")"
 
+# 3e. A changed file with a NON-ASCII name is audited under --changed-from, not
+#     skipped. git diff -z NUL-separates paths and does not octal-quote them (the
+#     default would emit "crates/x/caf\303\251.rs", which then fails to resolve at
+#     REV and is silently skipped), so the café.rs path round-trips to git show.
+git checkout -qb unicode
+mkdir -p crates/x
+printf 'let u = FORBIDDEN_TOKEN;\n' > "crates/x/café.rs"
+git add -A && git commit -qm "add non-ascii-named violation"
+UNI_REV="$(git rev-parse HEAD)"
+rm -f "$BASE"
+if run 1 "changed-from: a non-ASCII filename is audited, not skipped" -- --changed-from "$BASE_REV" --to "$UNI_REV"; then
+  printf '%s\n' "$OUT" | grep -q 'café.rs' && ok "non-ASCII changed path audited under --changed-from" || bad "non-ASCII changed path audited" "$OUT"
+fi
+git checkout -q main; git branch -qD unicode
+
 # 4. Baseline ratchet: --update-baseline records every current site; the re-run
 #    then passes (exit 0) with the same tree.
 run 0 "update-baseline writes and exits 0" -- --all --update-baseline && {
-  grep -q '^R1 src/hit.rs ' "$BASE" && ok "baseline records the regex site (no line number)" || bad "baseline records the regex site" "$(cat "$BASE")"
+  grep -qE '^R1 src/hit.rs [0-9a-f]{16}$' "$BASE" && ok "baseline records the regex site as a 3-field line (count 1 omitted)" || bad "baseline records the regex site" "$(cat "$BASE")"
   grep -q '^R2 bad/design.md ' "$BASE" && ok "baseline records the forbidden_path site" || bad "baseline records the forbidden_path site" "$(cat "$BASE")"
 }
 run 0 "baselined sites pass" -- --all && ok "known sites exit 0 against the baseline" || bad "known sites exit 0" "$OUT"
@@ -174,16 +189,49 @@ if run 1 "new site over a baseline fails" -- --all; then
 fi
 git rm -q src/fresh.rs; git commit -qm "drop fresh"
 
-# 4c. Fixed site: a baseline entry whose site is gone is reported, exit stays 0.
+# 4c. Fixed site: a baseline entry whose site is gone (1 baselined, 0 current) is
+#     reported "fixed: 1 of 1", exit stays 0.
 printf 'R9 gone/removed.rs deadbeefdeadbeef\n' >> "$BASE"
 if run 0 "a fixed baseline entry is reported, run still passes" -- --all; then
-  printf '%s\n' "$OUT" | grep -q '^fixed: remove from baseline: R9 gone/removed.rs deadbeefdeadbeef$' \
+  printf '%s\n' "$OUT" | grep -q '^fixed: 1 of 1: R9 gone/removed.rs deadbeefdeadbeef$' \
     && ok "fixed site reported for removal" || bad "fixed site reported for removal" "$OUT"
 fi
 
 # 4d. Comment and blank lines in the baseline are ignored.
 { printf '\n'; printf '# a comment\n'; printf '   \n'; } >> "$BASE"
 run 0 "comment/blank baseline lines are ignored" -- --all && ok "baseline comments/blanks ignored (still exit 0)" || bad "baseline comments/blanks ignored" "$OUT"
+
+# 4e. Occurrence-aware baseline: two identical sites are recorded as a count-2
+#     line; a third identical copy fails (only the surplus is new); removing one
+#     back below the count reports "fixed: N of M" and passes.
+git checkout -qb dup
+printf 'let d = FORBIDDEN_TOKEN;\nlet d = FORBIDDEN_TOKEN;\n' > src/dup.rs
+git add -A && git commit -qm "two identical sites"
+rm -f "$BASE"
+if run 0 "dup: --update-baseline records the duplicate count" -- --all --update-baseline; then
+  grep -qE '^R1 src/dup.rs [0-9a-f]{16} 2$' "$BASE" \
+    && ok "baseline records count 2 for the duplicated site" || bad "baseline records count 2" "$(cat "$BASE")"
+fi
+run 0 "dup: two copies matching a count-2 baseline pass" -- --all && ok "two baselined copies exit 0" || bad "two baselined copies exit 0" "$OUT"
+
+# 4e-i. A THIRD identical copy (over the baselined count of 2) fails; only the
+#       surplus copy is reported new, not all three.
+printf 'let d = FORBIDDEN_TOKEN;\nlet d = FORBIDDEN_TOKEN;\nlet d = FORBIDDEN_TOKEN;\n' > src/dup.rs
+git add -A && git commit -qm "a third identical site"
+if run 1 "dup: a copy over the baselined count fails" -- --all; then
+  n=$(printf '%s\n' "$OUT" | grep -c '^INVARIANT R1|.*src/dup.rs')
+  [ "$n" -eq 1 ] && ok "only the surplus copy is new (1), not all copies" || bad "surplus copy count" "n=$n; $OUT"
+fi
+
+# 4e-ii. Removing a copy below the baselined count reports "fixed: N of M", exit 0.
+printf 'let d = FORBIDDEN_TOKEN;\n' > src/dup.rs
+git add -A && git commit -qm "back to one site"
+if run 0 "dup: removing a baselined copy reports fixed, run passes" -- --all; then
+  printf '%s\n' "$OUT" | grep -qE '^fixed: 1 of 2: R1 src/dup.rs [0-9a-f]{16}$' \
+    && ok "removed copy reported as fixed: 1 of 2" || bad "fixed: 1 of 2 reported" "$OUT"
+fi
+git checkout -q main; git branch -qD dup
+rm -f "$BASE"
 
 # 5. --json shape: valid JSON with the documented keys.
 rm -f "$BASE"
@@ -240,6 +288,38 @@ EOF
 rm -f "$BASE"
 OUT="$(python3 "$AUDIT" --root "$REPO" --rules "$LOWRULES" --baseline "$BASE" --all --gate-severity 2>"$TMP/err")"
 printf '%s\n' "$OUT" | grep -q '^INVARIANT L1|note|' && ok "gate-severity: low -> note" || bad "gate-severity: low -> note (err=$(cat "$TMP/err"))" "$OUT"
+
+# 8. Rule 2 (journal append discarded/defaulted) false-positive guard, using an
+#    isolated rules file that mirrors the real invariants.toml rule 2 patterns.
+#    `let _ = ...append_command(...)?;` PROPAGATES the error (the greedy `let _ =`
+#    pattern runs to the last ')' before ';', so a trailing '?' breaks the match)
+#    and must NOT fire; the plain discard `let _ = ...append_command(...);` must.
+R2RULES="$TMP/rule2.toml"
+cat > "$R2RULES" <<'EOF'
+[[rule]]
+id = "J"
+title = "journal append discarded"
+kind = "regex"
+pattern = [
+  'append_command\([^;]*\)\s*\.ok\(\)',
+  'append_command\([^;]*\)\s*\.unwrap_or',
+  'let _ = [^;]*append_command\([^;]*\)\s*;',
+]
+include = ["**/*.rs"]
+severity = "high"
+why = "test rule 2 shape"
+EOF
+{
+  printf 'let _ = log.append_command(actor, payload)?;\n'   # propagates — NO match
+  printf 'let _ = log.append_command(actor, payload);\n'    # discarded — match
+} > "$REPO/src/journal.rs"
+rm -f "$BASE"
+OUT="$(python3 "$AUDIT" --root "$REPO" --rules "$R2RULES" --baseline "$BASE" --changed src/journal.rs 2>"$TMP/err")"; rc=$?
+[ "$rc" -eq 1 ] && ok "rule2: a plain discard is a violation (exit 1)" || bad "rule2: plain discard fires" "rc=$rc err=$(cat "$TMP/err") out=$OUT"
+printf '%s\n' "$OUT" | grep -q '^INVARIANT J|high|src/journal.rs:2|' && ok "rule2: the discard (line 2) is the match" || bad "rule2: discard match at line 2" "$OUT"
+n=$(printf '%s\n' "$OUT" | grep -c '^INVARIANT J|')
+[ "$n" -eq 1 ] && ok "rule2: the ?-propagating line (line 1) does NOT match" || bad "rule2: only the discard matches, not the ? line" "n=$n; $OUT"
+rm -f "$REPO/src/journal.rs"
 
 printf '\ninvariant-audit-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

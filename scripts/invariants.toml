@@ -25,10 +25,14 @@
 id = "2"
 title = "journal append result discarded/defaulted (must be fail-closed)"
 kind = "regex"
+# `.ok()` / `.unwrap_or` name the discarding call explicitly, so a `?` (which
+# propagates) can't satisfy them. The `let _ =` shape must run greedily to the
+# last `)` before the statement `;`: a trailing `?` then falls outside the match,
+# so `let _ = log.append_command(a, p)?;` (error propagated) is NOT a violation.
 pattern = [
   'append_command\([^;]*\)\s*\.ok\(\)',
   'append_command\([^;]*\)\s*\.unwrap_or',
-  'let _ = [^;]*append_command\(',
+  'let _ = [^;]*append_command\([^;]*\)\s*;',
 ]
 include = ["**/*.rs"]
 exclude = [

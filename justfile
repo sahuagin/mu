@@ -47,6 +47,22 @@ ci:
     just test
     scripts/ci-green-marker.sh write "$id"
 
+# Architecture-invariant audit (bead mu-invariant-audit-ratchet-8vfks): list
+# every site of each violation shape in .invariants.toml and fail if a count
+# rose above its ceiling — the lower of BASE's (main) and the checkout's
+# baseline, so a PR cannot raise one in the commit that adds the violation.
+# On-demand seam for now; gate wiring (just ci / CI / pre-pr-check) is the
+# separate increment AGENTS.md invariant 5 asks for. Extra args go to the
+# script: where `main` does not resolve (shallow clone, first commit) use
+# `just invariants --no-base` or set MU_INVARIANTS_BASE=<rev>.
+invariants *args:
+    python3 scripts/invariant-audit.py {{args}}
+
+# The same audit listing every site of every shape without failing — the
+# "find them all" view a correction has to cover. Needs no BASE.
+invariants-report *args:
+    python3 scripts/invariant-audit.py --report --no-base {{args}}
+
 # Pre-PR cross-provider review gate (bead mu-6qst): run the pre-PR checks, then
 # have the `code_review` panel inspect the diff before a PR. Local only (needs
 # provider auth + network; not a CI step). The verdict comes from the reviewers'

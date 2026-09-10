@@ -1,0 +1,38 @@
+# Architecture invariants as mechanically checkable violation SHAPES.
+# Audited by scripts/invariant-audit.py (`just invariants` / `just invariants-report`). Each entry names the rule (quote AGENTS.md), where to look, what a
+# violation looks like, and `baseline` = the number of sites the repo has today.
+# The audit lists EVERY site and fails when a count rises; lower the baseline in
+# the PR that removes sites. Baselines only go down, and are pinned to BASE (main).
+# An entry present at BASE may not be deleted outright: mark it `retired = true` first.
+# On-demand via `just invariants` for now; gate wiring is a separate increment.
+# bead: mu-invariant-audit-ratchet-8vfks
+
+[settings]
+exclude = [".git/**", ".jj/**", "target/**"]
+
+[[invariant]]
+id = "providers-standalone"
+rule = "providers/mu-anthropic and providers/mu-openai are standalone wire-protocol crates with no mu-core dependency (AGENTS.md → Workspace layout)"
+# The manifests are parsed, not grepped: any dependency keyed or renamed
+# (package = "mu-core") to the crate, in [dependencies], [dev-dependencies],
+# [build-dependencies] or a target-specific table, is a site. Quoting and
+# comments cannot hide or fake one.
+kind = "cargo-dependency"
+paths = ["crates/providers/mu-anthropic/Cargo.toml", "crates/providers/mu-openai/Cargo.toml"]
+crate = "mu-core"
+baseline = 0
+
+[[invariant]]
+id = "design-docs-live-in-specs"
+rule = "Deep design lives in specs/ (architecture/, the mu-NNN specs, plans/); new design docs go there, not under crates/ (AGENTS.md → Architecture invariants #4)"
+kind = "path"
+paths = ["crates/**/*.md"]
+# README/CHANGELOG/AGENTS/LICENSE are crate-facing, and specifications/ holds the
+# vendored upstream API docs the provider crates are written against — not our design.
+exclude = ["**/README.md", "**/CHANGELOG.md", "**/AGENTS.md", "**/LICENSE*", "**/specifications/**"]
+# Recorded debt, found by the audit's first runs — design docs living under crates/:
+#   crates/providers/mu-anthropic/INTEGRATION.md
+#   crates/providers/mu-openai/INTEGRATION.md
+#   crates/t4c/docs/help-ai-standard.md
+# Move them under specs/ and lower this number in the same PR.
+baseline = 3

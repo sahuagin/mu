@@ -64,7 +64,10 @@
 //!   task per input (the subscriptions behind an ingress gate, an ordered
 //!   presence worker, an ordered per-session publish worker, the discovery sweep,
 //!   and the NATS connection watcher), with connection-aware dropping that
-//!   replays nothing across a reconnect on either side.
+//!   replays nothing across a reconnect on either side. Its [session
+//!   half](bridge::run) is one IRC connection around one state-owning select
+//!   loop, with reconnect backoff; `main.rs` is configuration, signals, and a
+//!   call to [`bridge::run`].
 //!
 //! The textual bot verbs (`mu peers`, `mu say …`) remain absent, landing in
 //! their own independently reviewed increment.

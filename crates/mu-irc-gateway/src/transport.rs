@@ -151,6 +151,28 @@ impl LineWriter {
     pub fn is_connected(&self) -> bool {
         !self.tx.is_closed()
     }
+
+    /// A writer wired to a plain channel instead of a socket: the seam the
+    /// bridge's own tests script an IRC connection through, so a handler's
+    /// effects can be read as lines without a server.
+    ///
+    /// `capacity` is the caller's precisely so an overflow is reachable — the
+    /// real [`OUTBOUND_QUEUE`] takes 512 lines before it refuses one, which is
+    /// not a state a test can arrive at by typing.
+    ///
+    /// There is no connection behind it and so no lifetime to end: the queue is
+    /// the whole of it, and dropping this writer has nothing to cancel.
+    #[cfg(test)]
+    pub(crate) fn scripted(capacity: usize) -> (LineWriter, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            LineWriter {
+                tx,
+                life: Weak::new(),
+            },
+            rx,
+        )
+    }
 }
 
 impl Drop for LineWriter {

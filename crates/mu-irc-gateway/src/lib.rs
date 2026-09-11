@@ -5,9 +5,9 @@
 //! testable *decision* module with no socket and no live mesh, and then a final
 //! increment that runs them against a real server. The split survives in the
 //! structure — [`routing`] decides what to put on IRC, [`outbound`] decides what
-//! to publish, [`membership`] decides who is present, and only [`transport`]
-//! touches the network — which is why every rule below can be tested without
-//! either server.
+//! to publish, [`membership`] decides who is present, and only [`bridge`] and
+//! [`transport`] touch the network — which is why every rule below can be tested
+//! without either server.
 //!
 //! Increment **2a** — configuration and pure mapping/framing:
 //!
@@ -60,12 +60,17 @@
 //! - [`transport`] — one TCP connection, TLS by default, split into a line
 //!   reader and a bounded line writer. Deliberately NOT an IRC client crate:
 //!   [`adapter`] already owns registration, and what was missing is a socket.
+//! - [`bridge`] — where they are run. Its [mesh side](bridge::mesh_side) is one
+//!   task per input (the subscriptions behind an ingress gate, an ordered
+//!   presence worker, an ordered per-session publish worker, the discovery sweep,
+//!   and the NATS connection watcher), with connection-aware dropping that
+//!   replays nothing across a reconnect on either side.
 //!
-//! The bridge loop that executes these decisions over that socket, and the
-//! textual bot verbs (`mu peers`, `mu say …`), remain absent — each landing in
-//! its own independently reviewed increment.
+//! The textual bot verbs (`mu peers`, `mu say …`) remain absent, landing in
+//! their own independently reviewed increment.
 
 pub mod adapter;
+pub mod bridge;
 pub mod config;
 pub mod framing;
 pub mod mapping;

@@ -359,7 +359,7 @@ fn start_registration(
 /// Open the socket. Everything that can go wrong here belongs to a server, a
 /// network or a moment, so it is retried.
 async fn open_connection(irc: &IrcConfig) -> Result<Connection, SessionError> {
-    transport::connect(&irc.server, irc.tls, CONNECT_TIMEOUT)
+    transport::connect_with_trust(&irc.server, irc.tls, &irc.tls_trust, CONNECT_TIMEOUT)
         .await
         .map_err(|e| SessionError::Retry(anyhow!("{e:#}")))
 }
@@ -389,6 +389,10 @@ async fn session(
     info!(
         server = %irc.server,
         tls = irc.tls,
+        // What this connection will verify against, so a private-CA setup is
+        // legible in the log without reading the config back.
+        ca_anchors = irc.tls_trust.extra_anchors(),
+        system_roots = irc.tls_trust.system_roots(),
         sasl = irc.sasl.is_some(),
         observing = mesh_side.observing.load(Ordering::Relaxed),
         "connecting to IRC"

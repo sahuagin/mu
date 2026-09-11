@@ -193,6 +193,77 @@ fn an_oversized_ingress_field_is_refused_body_free() {
     assert_eq!(ev.session.as_deref(), Some(at_cap.as_str()));
 }
 
+/// The live bridge takes events off `mu-dialogue`'s endpoint and observer
+/// subscriptions, which run the SAME shared fail-closed gate before forwarding
+/// anything — so the production path enters the ingress one step later, at
+/// `accept_verified`, with verification already done. The size policy is this
+/// crate's, applies either way, and must not differ between the two doors: a cap
+/// that only the raw door enforced would be no cap at all, since the live path
+/// never uses that door.
+#[test]
+fn both_ingress_doors_apply_exactly_the_same_size_policy() {
+    let issuer = KeyPair::new();
+    let router = Router::new(issuer.public());
+    let huge = "z".repeat(1024 * 1024);
+    let at_cap = "z".repeat(MAX_FIELD_LEN);
+
+    // Every shape the raw door refuses, the verified door refuses identically.
+    for (id, session, destination, expected) in [
+        (
+            huge.clone(),
+            None,
+            "mu.agent.human.alice.dm".to_string(),
+            Some(OversizedField::Id),
+        ),
+        (
+            "01H".to_string(),
+            Some(huge.clone()),
+            "mu.agent.human.alice.dm".to_string(),
+            Some(OversizedField::Session),
+        ),
+        (
+            "01H".to_string(),
+            None,
+            format!("mu.agent.cc.{}.dm", "z".repeat(MAX_DESTINATION_LEN)),
+            Some(OversizedField::Destination),
+        ),
+        (
+            at_cap.clone(),
+            Some(at_cap.clone()),
+            format!("mu.agent.cc.{}.dm", "z".repeat(MAX_DESTINATION_LEN - 15)),
+            None,
+        ),
+    ] {
+        let payload = signed_payload_for(&issuer, &id, "cc:sender", "hi", session.as_deref());
+        let raw = router.accept(&destination, &payload, Reception::Endpoint);
+        let verified = router.accept_verified(MeshDmEvent {
+            id: id.clone(),
+            destination: destination.clone(),
+            from: "cc:sender".to_string(),
+            body: "hi".to_string(),
+            subject: None,
+            session: session.clone(),
+            reception: Reception::Endpoint,
+        });
+        match expected {
+            Some(field) => {
+                assert_eq!(raw, Err(IngressRejected::Oversized(field)));
+                assert_eq!(
+                    verified.map(|ev| ev.id),
+                    Err(IngressRejected::Oversized(field))
+                );
+            }
+            None => {
+                assert_eq!(raw.expect("at the cap, the raw door accepts").id, id);
+                assert_eq!(
+                    verified.expect("at the cap, the verified door accepts").id,
+                    id
+                );
+            }
+        }
+    }
+}
+
 // ─────────────────────────── Exactly-once overlap ───────────────────────────
 
 #[test]

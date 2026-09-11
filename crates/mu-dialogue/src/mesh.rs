@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -31,8 +32,102 @@ use futures::StreamExt;
 use mu_peer::{PeerId, META_DM_SUBJECT, META_PEER_ID};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tracing::{debug, info, warn};
+
+/// A NATS connection transition, as streamed by [`connect_with_events`].
+///
+/// Re-exported rather than left to the caller to name: that function's public
+/// signature already hands out this type, so a consumer would otherwise need its
+/// own `async-nats` dependency — pinned to the same version — just to match on
+/// what this module gave it.
+pub use async_nats::Event as ConnectionEvent;
+
+/// The async-nats client's own view of its connection, as read by
+/// [`Gateway::connection_state`].
+///
+/// Re-exported for the same reason [`ConnectionEvent`] is: a consumer that has
+/// to reason about whether the link held across an operation would otherwise
+/// need its own `async-nats` dependency, pinned to the same version, just to
+/// name what this module handed it.
+pub use async_nats::connection::State as ConnectionState;
+
+/// What a publish is known to have done.
+///
+/// Core NATS gives no delivery receipt, so this is NOT "the peer got it": it is
+/// the narrower fact the gateway actually needs, which is whether the message
+/// went out over the connection it was written for.
+///
+/// ## Why this exists
+///
+/// `async-nats`' `publish` only buffers; `flush` pushes the buffer to the
+/// broker. The client ALSO keeps that buffer across a reconnect, so a message
+/// handed over an instant before the link dropped is written to the NEXT
+/// connection by the client itself, minutes later if that is how long the
+/// outage lasted. For a store-and-forward caller that is a feature. For a live
+/// mirror like `mu-irc-gateway` — which refuses a typed line to the human's
+/// face rather than queueing it, and drops rather than replays across a
+/// reconnect — it is a hole in the guarantee, because the one message already
+/// inside the client is replayed whatever the caller does.
+///
+/// The clean fix would be to connect with the reconnect buffer disabled.
+/// **`async-nats` 0.49 (the pinned version) has no such option** — there is no
+/// `ConnectOptions::reconnect_buffer_size` or equivalent to set — so the
+/// connection is instead OBSERVED either side of the publish and the caller is
+/// told when it did not hold still.
+///
+/// ## The trade-off this encodes
+///
+/// A message in flight at the instant of a drop is reported as neither sent nor
+/// unsent, and the gateway treats that as dropped rather than delivered: it may
+/// still arrive after the reconnect, and the caller must not claim otherwise or
+/// retry it. Nothing here retracts it — the client's buffer is not reachable —
+/// so [`Uncertain`](Publish::Uncertain) is a report, not a cancellation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Publish {
+    /// The connection was up before the write and still up after the flush: the
+    /// message went to the broker over the link it was written for.
+    Delivered,
+    /// The connection was not up, or changed state across the publish. The
+    /// message may have gone, and may yet go when the client reconnects.
+    Uncertain,
+}
+
+/// Classify a publish by the connection state either side of it.
+///
+/// Anything but "connected before, connected after" is uncertain, including a
+/// publish issued while the client already knew it was down — that one is
+/// buffered by definition.
+///
+/// The residual hole is deliberate and named: a drop AND a reconnect that both
+/// land inside the window read `Connected`/`Connected` here, because a state
+/// read cannot see a transition it was not present for. A caller that must
+/// close that hole watches a counter that survives coalescing — the gateway
+/// compares its own link generation, which `nats_watcher` bumps per outage.
+fn publish_outcome(before: ConnectionState, after: ConnectionState) -> Publish {
+    if before == ConnectionState::Connected && after == ConnectionState::Connected {
+        Publish::Delivered
+    } else {
+        Publish::Uncertain
+    }
+}
+
+/// Run `publish` between two reads of the connection state, and report whether
+/// the link held across it.
+///
+/// A seam rather than a method on [`Gateway`] so the rule is testable against a
+/// fake publisher — one that changes the state while it runs — with no broker.
+/// A publish that FAILED is reported as the failure it was; the outcome only
+/// classifies one that returned.
+async fn publish_watching_link<S, F>(state: S, publish: F) -> Result<Publish>
+where
+    S: Fn() -> ConnectionState,
+    F: std::future::Future<Output = Result<()>>,
+{
+    let before = state();
+    publish.await?;
+    Ok(publish_outcome(before, state()))
+}
 
 /// A mesh agent `x` registers the NATS Micro service `agent_x`; `$SRV`
 /// discovery strips this prefix. Must match the mesh contract.
@@ -80,6 +175,42 @@ async fn bounded<T, E: std::fmt::Display>(
 ) -> Result<T> {
     bounded_in(NATS_OP_TIMEOUT, what, fut).await
 }
+
+/// Mint a fresh mesh message id.
+///
+/// One place, because a fan-out publishes several envelopes under a SINGLE id
+/// and the id has to be minted by whoever is about to fan out — `mu-irc-gateway`
+/// records it for loop-guarding *before* the publish can be observed coming back
+/// around, so it cannot be handed an id only after publication. The shape is the
+/// ulid [`Gateway::publish_dm`] has always minted.
+pub fn new_dm_id() -> String {
+    ulid::Ulid::new().to_string()
+}
+
+/// The trailing component every DM subject carries. The observer wildcard
+/// matches more than DM inboxes, so this is what tells the two apart.
+pub const DM_SUBJECT_SUFFIX: &str = ".dm";
+
+/// How many connection transitions the module's internal fan-out holds for a
+/// consumer that has not read yet.
+///
+/// Small on purpose: the only consumer is a just-issued subscription looking at
+/// the next moment's traffic for its own refusal. A receiver that falls behind
+/// is told so by `broadcast` rather than silently missing events.
+const CONNECTION_EVENT_BACKLOG: usize = 64;
+
+/// How long [`Gateway::observe_agent_dms`] waits, after its SUB has reached the
+/// server, to see the server refuse it.
+///
+/// NATS reports a subscription permission violation ASYNCHRONOUSLY, as a
+/// protocol `-ERR` naming the subject: `subscribe()` returns once the SUB is
+/// queued and `flush()` only proves the bytes were written to the socket — it
+/// is not a server round trip — so neither can surface the refusal. Catching it
+/// therefore means watching the connection-event stream for a moment, and a
+/// watch needs a bound. Half a second is long enough for a broker across a
+/// normal link to answer and short enough to disappear into startup; a refusal
+/// that arrives later is still caught, by the running observer task.
+const OBSERVER_REFUSAL_GRACE: Duration = Duration::from_millis(500);
 
 /// A mesh agent's DM inbox subject.
 pub fn dm_subject(agent: &str) -> String {
@@ -283,6 +414,21 @@ pub enum Reception {
 /// not: the mesh message `id` (needed for loop-guarding and exactly-once
 /// overlap handling) and the `destination` subject it was addressed to (needed
 /// for routing). Additive — [`InboundDm`] and its store path are unchanged.
+///
+/// **Delivery is unbounded, deliberately — one assumption, stated once.** Every
+/// API in this module that hands events to a consumer
+/// ([`Gateway::front_peer_events`], [`Gateway::observe_agent_dms`], and the
+/// store path's own `InboundDm` channel) takes an
+/// [`mpsc::UnboundedSender`](tokio::sync::mpsc::UnboundedSender). The send is
+/// synchronous and never blocks, so a slow consumer can never park the NATS
+/// task that is draining the subscription — which is the property that matters,
+/// because that task also drives every OTHER peer's delivery. The cost is that
+/// a consumer which stops draining grows the queue instead of being throttled.
+/// That is accepted rather than solved here: the consumer is a bridge whose
+/// whole job is to drain these promptly, so a queue that grows is a bug in the
+/// bridge, and backpressure applied here would convert it into a stall that
+/// takes the mesh connection with it. Dropping the receiver ends the
+/// subscription task, which is how a consumer says it is done.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeshDmEvent {
     /// The envelope's mesh message id. One fan-out publish shares it across
@@ -390,6 +536,267 @@ struct Fronted {
     /// if registering it failed: the peer keeps its inbox and presence, and
     /// `release` reports that it cannot deregister instead of pretending.
     stop_anchor: Option<async_nats::service::endpoint::Endpoint>,
+}
+
+/// Where a fronted peer's capability-verified DMs are delivered.
+///
+/// Both variants sit behind the SAME fail-closed gate — the shared
+/// [`verify_and_decode_dm`] — so this chooses the shape a verified message is
+/// handed over in, never whether it was checked.
+enum DmSink {
+    /// The store path: an [`InboundDm`] on the gateway's shared inbound
+    /// channel, exactly as [`Gateway::front_peer`] has always delivered.
+    Store(mpsc::UnboundedSender<InboundDm>),
+    /// The event path: a [`MeshDmEvent`], which additionally carries the mesh
+    /// message id and the destination subject — what a router needs and what
+    /// [`InboundDm`] deliberately does not have.
+    Events(mpsc::UnboundedSender<MeshDmEvent>),
+}
+
+impl DmSink {
+    /// Hand an already-verified event over in the shape this sink wants.
+    /// `false` means the consumer is gone, so the subscription has nobody left
+    /// to serve.
+    ///
+    /// The store shape is built HERE rather than at the call site so the two
+    /// paths cannot drift: the sender on an `InboundDm` is the same normalized
+    /// `from` the event carries, which is what [`verify_and_decode_dm`]
+    /// produced. Both arms are a synchronous unbounded send — see
+    /// [`MeshDmEvent`] for the assumption that rests on.
+    fn deliver(&self, to_peer: &str, ev: MeshDmEvent) -> bool {
+        match self {
+            DmSink::Store(tx) => tx
+                .send(InboundDm {
+                    to_peer: to_peer.to_string(),
+                    from_peer: ev.from,
+                    body: ev.body,
+                    subject: ev.subject,
+                })
+                .is_ok(),
+            DmSink::Events(tx) => tx.send(ev).is_ok(),
+        }
+    }
+}
+
+/// One observer message: the wildcard's skip rule, the shared fail-closed gate,
+/// and the failure counter — every decision the observer makes per message.
+///
+/// A free function so those rules are exercisable without a live subscription;
+/// the spawned task is then only a loop around this.
+fn observe_one(
+    issuer: PublicKey,
+    destination: &str,
+    payload: &[u8],
+    failures: &AtomicU64,
+) -> Option<MeshDmEvent> {
+    // The wildcard matches everything under the mesh's agent prefix, not only
+    // DM inboxes. A non-DM subject (a gateway's private presence anchor) carries
+    // no envelope, so it is skipped rather than counted as a hole.
+    if !destination.ends_with(DM_SUBJECT_SUFFIX) {
+        return None;
+    }
+    match verify_and_decode_dm(issuer, destination, payload, Reception::Observer) {
+        Ok(ev) => Some(ev),
+        Err(why) => {
+            // Counted, and body-free: nobody else can see this hole — the
+            // sender believes it sent, the recipient never knew — so the count
+            // is the only signal an operator has that the observer is missing
+            // traffic.
+            failures.fetch_add(1, Ordering::Relaxed);
+            debug!(%why, "gateway: observer dropped an unverified dm");
+            None
+        }
+    }
+}
+
+/// Whether a connection transition is the server refusing a subscription to
+/// `subject`.
+///
+/// The message text is the only place the subject appears. async-nats parses a
+/// protocol `-ERR` into [`ConnectionEvent::ServerError`], and every violation
+/// that is not the literal `authorization violation` lands in the catch-all
+/// `Other(String)` carrying the server's wording verbatim (`Permissions
+/// Violation for Subscription to "mu.agent.>"`). Matching is therefore
+/// case-insensitive containment: the phrasing belongs to the broker, not to a
+/// contract we can pin.
+fn is_subscription_refusal(event: &ConnectionEvent, subject: &str) -> bool {
+    let ConnectionEvent::ServerError(err) = event else {
+        return false;
+    };
+    let text = err.to_string().to_lowercase();
+    text.contains("permissions violation")
+        && text.contains("subscription")
+        && text.contains(&subject.to_lowercase())
+}
+
+/// Watch `transitions` for up to `grace` and report the server refusing
+/// `subject`.
+///
+/// `None` is NOT proof the subscription was authorized — only that nothing said
+/// otherwise in the window. That is the honest limit of what can be checked at
+/// setup time; see [`OBSERVER_REFUSAL_GRACE`].
+async fn subscription_refused_within(
+    transitions: &mut broadcast::Receiver<ConnectionEvent>,
+    subject: &str,
+    grace: Duration,
+) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        match tokio::time::timeout_at(deadline, transitions.recv()).await {
+            Err(_elapsed) => return None,
+            Ok(Ok(event)) if is_subscription_refusal(&event, subject) => {
+                return Some(event.to_string())
+            }
+            Ok(Ok(_unrelated)) => continue,
+            // Lagged: transitions were dropped, and a refusal may have been
+            // among them. Keep watching the rest of the window rather than
+            // claiming either answer.
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) => return None,
+        }
+    }
+}
+
+/// The next refusal of `subject`, for a connection that streams transitions.
+///
+/// Never resolves when there are none to stream — a connection built by
+/// [`connect`] rather than [`connect_with_events`] — so a `select!` arm over
+/// this is simply inert there instead of spinning.
+async fn next_subscription_refusal(
+    transitions: &mut Option<broadcast::Receiver<ConnectionEvent>>,
+    subject: &str,
+) -> String {
+    let Some(rx) = transitions.as_mut() else {
+        return std::future::pending().await;
+    };
+    loop {
+        match rx.recv().await {
+            Ok(event) if is_subscription_refusal(&event, subject) => return event.to_string(),
+            Ok(_unrelated) => continue,
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            // The connection is gone; its own transition ends the loop.
+            Err(broadcast::error::RecvError::Closed) => return std::future::pending().await,
+        }
+    }
+}
+
+/// The observer task's whole body: fan the subscription's messages through
+/// [`observe_one`], watch for a late refusal beside them, and — however it ends
+/// — SAY so on `ended`.
+///
+/// Over a stream of `(subject, payload)` rather than the NATS subscriber, so
+/// the refusal and consumer-gone exits are exercisable without a broker; the
+/// live caller maps its `Subscriber` into that shape.
+///
+/// The final send is the contract [`ObserverEnded`] describes: `events` is a
+/// clone of a sender the caller also feeds from elsewhere, so dropping it here
+/// would tell nobody anything.
+///
+/// The watch sender is shared with the handle — see [`record_end`] — because
+/// [`ObserverSubscription::drop`] aborts this task and has to record the end
+/// the abort prevents it from recording itself.
+#[allow(clippy::too_many_arguments)]
+async fn observe_loop<S>(
+    issuer: PublicKey,
+    messages: S,
+    mut transitions: Option<broadcast::Receiver<ConnectionEvent>>,
+    watched: String,
+    events: mpsc::UnboundedSender<MeshDmEvent>,
+    failures: Arc<AtomicU64>,
+    ended: Arc<watch::Sender<Option<ObserverEnded>>>,
+) where
+    S: futures::Stream<Item = (String, Bytes)>,
+{
+    tokio::pin!(messages);
+    let why = loop {
+        tokio::select! {
+            incoming = messages.next() => {
+                let Some((destination, payload)) = incoming else {
+                    break ObserverEnded::StreamEnded;
+                };
+                if let Some(ev) = observe_one(issuer, &destination, &payload, &failures) {
+                    if events.send(ev).is_err() {
+                        break ObserverEnded::ConsumerGone;
+                    }
+                }
+            }
+            refusal = next_subscription_refusal(&mut transitions, &watched) => {
+                // A refusal arriving after setup, typically a server re-applying
+                // permissions across a reconnect.
+                break ObserverEnded::Refused(refusal);
+            }
+            () = events.closed() => {
+                // Every receiver is gone. Watched here rather than inferred from
+                // the next `events.send` failing, because that send happens ONLY
+                // for a verified DM: an idle subscription, or one carrying only
+                // non-DM subjects and rejected envelopes, would otherwise keep
+                // this task and its NATS subscription alive with nothing left to
+                // observe for.
+                break ObserverEnded::ConsumerGone;
+            }
+        }
+    };
+    match &why {
+        ObserverEnded::Refused(_) => warn!(
+            subject = %watched, %why,
+            "mesh gateway: agent-DM observation refused; ending the observer"
+        ),
+        _ => info!(subject = %watched, %why, "mesh gateway: agent-DM observation ended"),
+    }
+    record_end(&ended, why);
+}
+
+/// Record why an observation ended. First reason wins.
+///
+/// Both the loop and [`ObserverSubscription::drop`] can reach the watch — a
+/// handle dropped while the loop is already breaking, say — and the first
+/// reason recorded is the true one. So `Drop` claims
+/// [`ObserverEnded::Dropped`] only when nothing else was recorded, and a
+/// recorded end never changes afterwards: that is what lets
+/// [`ObserverEndedWatch::ended_now`] be authoritative once it reads `Some`.
+fn record_end(ended: &watch::Sender<Option<ObserverEnded>>, why: ObserverEnded) {
+    let _ = ended.send_if_modified(|recorded| {
+        if recorded.is_some() {
+            return false;
+        }
+        *recorded = Some(why);
+        true
+    });
+}
+
+/// Build one [`DmEnvelope`] per target, all under ONE `id` and one capability.
+///
+/// Separate from the publish so a fan-out's wire shape — one id, one minted
+/// grant, each envelope naming its own target's session — is exercisable
+/// without a broker.
+fn fanout_payloads(
+    id: &str,
+    capability: &str,
+    from_peer: &str,
+    targets: &[MeshTarget],
+    body: &str,
+    subject: Option<&str>,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut payloads = Vec::with_capacity(targets.len());
+    for target in targets {
+        let env = DmEnvelope {
+            id: id.to_string(),
+            capability: capability.to_string(),
+            command: AgentCommand::Dm {
+                // The dialogue peer id, not the gateway's — the receiving
+                // session must see who actually wrote, and be able to reply.
+                from: from_peer.to_string(),
+                body: body.to_string(),
+                session: target.session.clone(),
+                subject: subject.map(str::to_string),
+                // A fronted peer's id is already flat (`cc:<uuid>`), so there
+                // is no second level for the receiver to reassemble.
+                from_session: None,
+            },
+        };
+        payloads.push((target.subject.clone(), serde_json::to_vec(&env)?));
+    }
+    Ok(payloads)
 }
 
 /// A task handle that aborts its task when dropped. Kept separate from
@@ -549,7 +956,129 @@ pub struct Gateway {
     /// rejections are the sender's problem; an observer rejection is a gap in
     /// what a watcher can see, so it is counted for the operator (mu-irc-gateway
     /// surfaces it). Relaxed: a monotonic diagnostic counter, never a gate.
-    observer_verify_failures: AtomicU64,
+    ///
+    /// `Arc` because the observer subscription that feeds it runs in a spawned
+    /// task holding no borrow of the gateway ([`Gateway::observe_agent_dms`]).
+    observer_verify_failures: Arc<AtomicU64>,
+    /// Connection transitions, fanned out to whoever inside this module needs
+    /// to correlate one against something it just did. Today that is exactly
+    /// one thing: the observer checking whether the server refused its
+    /// subscription, which NATS only ever reports this way.
+    ///
+    /// `None` for a gateway built by [`connect`], which installs no event
+    /// callback — there is nothing to correlate against, and the observer says
+    /// so rather than pretending it checked.
+    transitions: Option<broadcast::Sender<ConnectionEvent>>,
+}
+
+/// Why an agent-DM observation ended.
+///
+/// Explicit, and never inferred from the event channel. The channel is an
+/// [`mpsc::UnboundedSender<MeshDmEvent>`] the CALLER owns and normally also
+/// feeds from [`Gateway::front_peer_events`], so the observer task holds one
+/// clone among several: dropping it closes nothing and tells nobody anything.
+/// A caller that has to know the watch is over — to log it, to fall back to
+/// endpoints only — reads [`ObserverEndedWatch`] instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObserverEnded {
+    /// The server refused the subscription after setup, carrying the `-ERR`
+    /// text. The ordinary cause is a server re-applying permissions across a
+    /// reconnect; see [`Gateway::observe_agent_dms`].
+    Refused(String),
+    /// The subscription's message stream ended: the client unsubscribed, or the
+    /// connection is gone for good.
+    StreamEnded,
+    /// Every receiver on the event channel is gone, so there is nothing left to
+    /// observe FOR.
+    ConsumerGone,
+    /// The [`ObserverSubscription`] handle was dropped, which aborts the task:
+    /// the caller ended its own observation. Recorded by the handle's `Drop`,
+    /// not by the loop — the abort is what stops the loop from recording
+    /// anything.
+    Dropped,
+}
+
+impl std::fmt::Display for ObserverEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(why) => write!(f, "the server refused the subscription ({why})"),
+            Self::StreamEnded => f.write_str("the subscription stream ended"),
+            Self::ConsumerGone => f.write_str("the event channel has no receiver left"),
+            Self::Dropped => f.write_str("the subscription handle was dropped"),
+        }
+    }
+}
+
+/// A live observer subscription on the agent-DM wildcard.
+///
+/// Dropping it ends the observation: the gateway keeps no registry of
+/// observers, so the handle IS the subscription's lifetime. Same abort-on-drop
+/// policy as [`AbortOnDrop`], spelled out here because this one is public and
+/// must not expose a private type.
+pub struct ObserverSubscription {
+    task: tokio::task::JoinHandle<()>,
+    ended: watch::Receiver<Option<ObserverEnded>>,
+    /// The loop's own watch sender, shared, so `Drop` can record the end the
+    /// abort keeps the loop from recording. See [`record_end`].
+    ended_tx: Arc<watch::Sender<Option<ObserverEnded>>>,
+}
+
+impl ObserverSubscription {
+    /// A watch on this observation's END, separate from the handle so it can be
+    /// awaited by a task that does not own the subscription. See
+    /// [`ObserverEnded`] for why this exists rather than a closing channel.
+    pub fn ended(&self) -> ObserverEndedWatch {
+        ObserverEndedWatch(self.ended.clone())
+    }
+}
+
+impl Drop for ObserverSubscription {
+    fn drop(&mut self) {
+        // Recorded BEFORE the abort, and only if the loop has not already said
+        // why it ended. The abort is precisely what prevents the loop from
+        // recording anything, so without this the watch would sit at `None` —
+        // reading as "still live" — for the rest of its life.
+        record_end(&self.ended_tx, ObserverEnded::Dropped);
+        self.task.abort();
+    }
+}
+
+/// The end of one observation, watchable independently of the
+/// [`ObserverSubscription`] itself.
+///
+/// Clonable and detachable on purpose: the caller that owns the subscription is
+/// usually not the loop that wants to hear about it ending.
+#[derive(Debug, Clone)]
+pub struct ObserverEndedWatch(watch::Receiver<Option<ObserverEnded>>);
+
+impl ObserverEndedWatch {
+    /// Resolves once the observation has ended, with why — immediately if it
+    /// already has, so a caller that starts watching late cannot miss it.
+    pub async fn ended(&mut self) -> ObserverEnded {
+        loop {
+            let settled = self.0.borrow_and_update().clone();
+            if let Some(why) = settled {
+                return why;
+            }
+            if self.0.changed().await.is_err() {
+                // Every sender is gone with no reason recorded. `Drop` records
+                // `Dropped` before aborting, so this is the backstop for a
+                // subscription that never got that far.
+                return ObserverEnded::Dropped;
+            }
+        }
+    }
+
+    /// Why the observation ended, or `None` while it is still live. The
+    /// non-blocking form, for a status line.
+    ///
+    /// Authoritative once it reads `Some`: the recorded reason never changes,
+    /// and it agrees with [`ended`](Self::ended) in every case — including a
+    /// dropped [`ObserverSubscription`], whose `Drop` records
+    /// [`ObserverEnded::Dropped`] rather than leaving the watch at `None`.
+    pub fn ended_now(&self) -> Option<ObserverEnded> {
+        self.0.borrow().clone()
+    }
 }
 
 /// How long a `$SRV` sweep's result is trusted for routing decisions. Short
@@ -572,6 +1101,7 @@ fn derive_root(cfg: &MeshConfig) -> Result<KeyPair> {
 fn assemble_gateway(
     client: async_nats::Client,
     root: KeyPair,
+    transitions: Option<broadcast::Sender<ConnectionEvent>>,
 ) -> (Gateway, mpsc::UnboundedReceiver<InboundDm>) {
     let issuer = root.public();
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
@@ -583,7 +1113,8 @@ fn assemble_gateway(
             inbound_tx,
             fronted: Mutex::new(HashMap::new()),
             live_cache: Mutex::new(None),
-            observer_verify_failures: AtomicU64::new(0),
+            observer_verify_failures: Arc::new(AtomicU64::new(0)),
+            transitions,
         },
         inbound_rx,
     )
@@ -606,7 +1137,7 @@ pub async fn connect(cfg: &MeshConfig) -> Result<(Gateway, mpsc::UnboundedReceiv
     .await?;
 
     info!(nats = %cfg.nats_url, "mesh gateway: connected");
-    Ok(assemble_gateway(client, root))
+    Ok(assemble_gateway(client, root, None))
 }
 
 /// Connect like [`connect`], but also stream async-nats connection transitions
@@ -625,14 +1156,21 @@ pub async fn connect_with_events(
 )> {
     let root = derive_root(cfg)?;
     let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+    // One callback, two consumers: the caller's stream, and this module's own
+    // correlation channel — an observer has to see a refusal of ITS
+    // subscription, and cannot make the caller hand its stream back.
+    let (transitions, _) = broadcast::channel(CONNECTION_EVENT_BACKLOG);
+    let fanout = transitions.clone();
     let client = bounded_in(NATS_SETUP_TIMEOUT, "gateway: NATS setup", async {
         let client = async_nats::ConnectOptions::new()
             .event_callback(move |event| {
                 let ev_tx = ev_tx.clone();
+                let fanout = fanout.clone();
                 async move {
-                    // Best-effort: if the consumer has gone away the transition
-                    // is simply not observed, which is exactly the semantics a
-                    // dropped receiver should have.
+                    // Best-effort on both: if a consumer has gone away the
+                    // transition is simply not observed, which is exactly the
+                    // semantics a dropped receiver should have.
+                    let _ = fanout.send(event.clone());
                     let _ = ev_tx.send(event);
                 }
             })
@@ -648,7 +1186,7 @@ pub async fn connect_with_events(
     .await?;
 
     info!(nats = %cfg.nats_url, "mesh gateway: connected (with connection-event stream)");
-    let (gw, inbound_rx) = assemble_gateway(client, root);
+    let (gw, inbound_rx) = assemble_gateway(client, root, Some(transitions));
     Ok((gw, inbound_rx, ev_rx))
 }
 
@@ -666,6 +1204,31 @@ impl Gateway {
         self.observer_verify_failures.load(Ordering::Relaxed)
     }
 
+    /// The public half of this gateway's issuer key — what every inbound
+    /// capability is verified against.
+    ///
+    /// Public because a consumer that runs its OWN ingress gate (rather than
+    /// taking already-verified events off a subscription here) needs the same
+    /// key this gateway verifies with, and re-deriving it from the config would
+    /// be a second place for key handling to drift.
+    pub fn issuer(&self) -> PublicKey {
+        self.issuer
+    }
+
+    /// Mint the `agent_dm` capability an outbound envelope carries.
+    ///
+    /// One token per publish CALL, fan-out included: the capability authorizes
+    /// the act of sending a DM and is bound to no destination, so building one
+    /// per envelope would build N identical grants.
+    fn mint_capability(&self) -> Result<String> {
+        let token = biscuit!(r#"right({r});"#, r = DM_RIGHT)
+            .build(&self.root)
+            .map_err(|e| anyhow!("mint capability: {e}"))?
+            .to_vec()
+            .map_err(|e| anyhow!("encode capability: {e}"))?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(token))
+    }
+
     /// Publish a DM to a mesh target on `from_peer`'s behalf, capability minted
     /// per send. Returns the envelope id. Fire-and-forget: core NATS does not
     /// tell us whether anyone was subscribed, which is exactly why the caller
@@ -677,37 +1240,77 @@ impl Gateway {
         body: &str,
         subject: Option<&str>,
     ) -> Result<String> {
-        let token = biscuit!(r#"right({r});"#, r = DM_RIGHT)
-            .build(&self.root)
-            .map_err(|e| anyhow!("mint capability: {e}"))?
-            .to_vec()
-            .map_err(|e| anyhow!("encode capability: {e}"))?;
-        let id = ulid::Ulid::new().to_string();
-        let env = DmEnvelope {
-            id: id.clone(),
-            capability: base64::engine::general_purpose::STANDARD.encode(token),
-            command: AgentCommand::Dm {
-                // The dialogue peer id, not the gateway's — the receiving
-                // session must see who actually wrote, and be able to reply.
-                from: from_peer.to_string(),
-                body: body.to_string(),
-                session: target.session.clone(),
-                subject: subject.map(str::to_string),
-                // A fronted peer's id is already flat (`cc:<uuid>`), so there
-                // is no second level for the receiver to reassemble.
-                from_session: None,
-            },
-        };
-        let payload = serde_json::to_vec(&env)?;
-        bounded("publish dm", async {
-            self.client
-                .publish(target.subject.clone(), payload.into())
-                .await
-                .map_err(|e| anyhow!("publish: {e}"))?;
-            self.client.flush().await.map_err(|e| anyhow!("flush: {e}"))
-        })
-        .await?;
+        let id = new_dm_id();
+        // An UNCERTAIN publish counts as sent here on purpose: this path's
+        // caller keeps a durable row either way, and its stated failure mode is
+        // a duplicate rather than a loss. A caller that cannot tolerate a
+        // message arriving after a reconnect calls `publish_dm_fanout` and reads
+        // the outcome.
+        self.publish_dm_fanout(&id, from_peer, std::slice::from_ref(target), body, subject)
+            .await?;
         Ok(id)
+    }
+
+    /// Publish the SAME message to several mesh targets under ONE caller-minted
+    /// `id`, as [`DmEnvelope`]s exactly like [`publish_dm`]'s — no new envelope
+    /// type, no broadcast subject: the mesh has no native fan-out, so a fan-out
+    /// is N ordinary DMs that happen to share an id.
+    ///
+    /// The id is the caller's because it is also the caller's loop guard:
+    /// `mu-irc-gateway` records the id it is about to publish *before* calling
+    /// this, so an observer subscription cannot see the message come back around
+    /// before the gateway knows it is its own. Sharing one id across the fan-out
+    /// is what lets the receiving side recognise several deliveries as one
+    /// dispatch.
+    ///
+    /// Each envelope still names its own target's `session`, so a legacy daemon
+    /// subject reaches the intended session. Publishes are issued in order and
+    /// flushed once; a failure part-way leaves the earlier targets delivered,
+    /// which is the same best-effort contract [`publish_dm`] has.
+    ///
+    /// Returns [`Publish::Uncertain`] when the connection did not hold still
+    /// across the write — see [`Publish`] for why that is reported rather than
+    /// prevented, and for what a caller that cannot tolerate a replayed message
+    /// must do with it. A store-and-forward caller can ignore the distinction;
+    /// a live mirror cannot.
+    pub async fn publish_dm_fanout(
+        &self,
+        id: &str,
+        from_peer: &str,
+        targets: &[MeshTarget],
+        body: &str,
+        subject: Option<&str>,
+    ) -> Result<Publish> {
+        if targets.is_empty() {
+            return Ok(Publish::Delivered);
+        }
+        let capability = self.mint_capability()?;
+        let payloads = fanout_payloads(id, &capability, from_peer, targets, body, subject)?;
+        publish_watching_link(
+            || self.client.connection_state(),
+            bounded("publish dm", async {
+                for (subject, payload) in payloads {
+                    self.client
+                        .publish(subject, payload.into())
+                        .await
+                        .map_err(|e| anyhow!("publish: {e}"))?;
+                }
+                self.client.flush().await.map_err(|e| anyhow!("flush: {e}"))
+            }),
+        )
+        .await
+    }
+
+    /// The client's own view of its connection right now.
+    ///
+    /// A diagnostic and a publish-time check, never a gate: it is a snapshot of
+    /// something that can change in the next instant, so a caller must not read
+    /// it, decide the mesh is up, and act on that later. [`publish_dm_fanout`]
+    /// uses it the only way it is sound to — either side of one operation.
+    ///
+    /// [`publish_dm_fanout`]: Gateway::publish_dm_fanout
+    pub fn connection_state(&self) -> ConnectionState {
+        self.client.connection_state()
     }
 
     /// Agents present on the mesh right now, via `$SRV.PING` — liveness-derived
@@ -835,6 +1438,33 @@ impl Gateway {
     /// second subscription would double every delivery. Returns whether this
     /// call created the registration.
     pub async fn front_peer(&self, peer_id: &str) -> Result<bool> {
+        self.front_with(peer_id, DmSink::Store(self.inbound_tx.clone()))
+            .await
+    }
+
+    /// Front `peer_id` like [`front_peer`](Gateway::front_peer), but deliver its
+    /// verified DMs as [`MeshDmEvent`]s on `events` instead of as [`InboundDm`]s
+    /// on the store channel.
+    ///
+    /// Same presence registration, same subscription, same fail-closed gate —
+    /// the only difference is that the event carries the mesh message id and the
+    /// destination subject, which a router needs and the store does not.
+    /// [`release_peer`](Gateway::release_peer) releases a peer fronted either
+    /// way; there is one `fronted` registry, so a peer cannot be fronted twice
+    /// by fronting it through the other API.
+    ///
+    /// `events` is unbounded, like the store channel — see [`MeshDmEvent`] for
+    /// why, and for what a caller owes in exchange.
+    pub async fn front_peer_events(
+        &self,
+        peer_id: &str,
+        events: mpsc::UnboundedSender<MeshDmEvent>,
+    ) -> Result<bool> {
+        self.front_with(peer_id, DmSink::Events(events)).await
+    }
+
+    /// The shared body of both fronting paths.
+    async fn front_with(&self, peer_id: &str, sink: DmSink) -> Result<bool> {
         use async_nats::service::ServiceExt as _;
 
         // Claim the slot before any await so a concurrent call cannot
@@ -901,35 +1531,31 @@ impl Gateway {
         .await?;
 
         let issuer = self.issuer;
-        let tx = self.inbound_tx.clone();
         let to_peer = peer_id.to_string();
+        let destination = subject.clone();
         let task = tokio::spawn(async move {
             while let Some(msg) = sub.next().await {
-                let Ok(env) = serde_json::from_slice::<DmEnvelope>(&msg.payload) else {
-                    debug!(peer = %to_peer, "gateway: dropping malformed dm envelope");
-                    continue;
+                // The one fail-closed gate, ahead of holding any body. Its
+                // sender normalization is the store path's, so `InboundDm`
+                // below is byte-for-byte what this task always produced.
+                let ev = match verify_and_decode_dm(
+                    issuer,
+                    &destination,
+                    &msg.payload,
+                    Reception::Endpoint,
+                ) {
+                    Ok(ev) => ev,
+                    Err(DmRejected::NotAnEnvelope) => {
+                        debug!(peer = %to_peer, "gateway: dropping malformed dm envelope");
+                        continue;
+                    }
+                    Err(DmRejected::Unauthorized) => {
+                        warn!(peer = %to_peer, "gateway: dropping unauthorized dm");
+                        continue;
+                    }
                 };
-                if !dm_authorized(&env.capability, issuer) {
-                    warn!(peer = %to_peer, "gateway: dropping unauthorized dm");
-                    continue;
-                }
-                let AgentCommand::Dm {
-                    from,
-                    body,
-                    subject,
-                    from_session,
-                    ..
-                } = env.command;
-                if tx
-                    .send(InboundDm {
-                        to_peer: to_peer.clone(),
-                        from_peer: inbound_peer_id(&from, from_session.as_deref()).to_string(),
-                        body,
-                        subject,
-                    })
-                    .is_err()
-                {
-                    break; // store writer gone; the server is shutting down
+                if !sink.deliver(&to_peer, ev) {
+                    break; // consumer gone; the process is shutting down
                 }
             }
         });
@@ -978,6 +1604,115 @@ impl Gateway {
             ),
         }
         true
+    }
+
+    /// Observe EVERY agent DM on the mesh (`mu.agent.>`), delivering each
+    /// capability-verified envelope as a [`MeshDmEvent`] tagged
+    /// [`Reception::Observer`].
+    ///
+    /// No new subject and no new substrate: this is the wildcard over the DM
+    /// subjects the mesh already uses ([`mu_peer::agent_dm_observer_subject`]).
+    /// Three consequences the caller must expect, all of them inherent to a
+    /// wildcard rather than to this API:
+    ///
+    /// - It OVERLAPS any human endpoint this same gateway fronts, so one minted
+    ///   id can arrive twice, once per [`Reception`]. De-duplicating that is the
+    ///   consumer's job (`mu-irc-gateway` keys on id + destination + session).
+    /// - It sees traffic addressed to peers other than this gateway's own. That
+    ///   is the point — it is what "observe" means — and it is why the caller
+    ///   gates it behind an explicit setting.
+    /// - A subject under `mu.agent.` that is not a DM (a gateway's private
+    ///   presence anchor) is skipped without counting as a verification failure.
+    ///
+    /// **What a refusal looks like, honestly.** NATS does not refuse a `SUB`
+    /// synchronously: `subscribe()` returns once the frame is queued and
+    /// `flush()` only proves the bytes reached the socket, so a permission
+    /// violation arrives afterwards, as a protocol `-ERR` naming the subject.
+    /// This waits [`OBSERVER_REFUSAL_GRACE`] for exactly that and returns `Err`
+    /// when it sees one, so a caller can fall back to endpoints only. Two
+    /// limits come with that, and neither is papered over:
+    ///
+    /// - It needs the connection-event stream, which only
+    ///   [`connect_with_events`] installs. On a gateway from [`connect`] this
+    ///   returns `Err` for synchronous failures ONLY, and logs a `warn!` saying
+    ///   so at setup.
+    /// - A refusal that arrives after the grace window — the ordinary case
+    ///   being a server re-applying permissions across a reconnect — does not
+    ///   turn into an `Err`, because this has already returned. The observer
+    ///   task keeps watching, and on a late refusal logs a `warn!` and ends the
+    ///   observation.
+    ///
+    /// **How the end is signalled.** On [`ObserverSubscription::ended`], and
+    /// nowhere else. NOT by the event channel closing: `events` is a clonable
+    /// sender the CALLER owns, and the same caller normally feeds the same
+    /// channel from [`Gateway::front_peer_events`] — the de-duplication this
+    /// doc already asks for is the giveaway that it does — so the observer task
+    /// dropping its one clone closes nothing. Inferring the end from the
+    /// channel would mean a caller silently losing agent traffic while endpoint
+    /// traffic kept arriving. [`ObserverEnded`] names every way it can end.
+    ///
+    /// `events` is unbounded, like the store channel — see [`MeshDmEvent`] for
+    /// why, and for what a caller owes in exchange. Dropping the returned
+    /// [`ObserverSubscription`] ends the observation.
+    pub async fn observe_agent_dms(
+        &self,
+        events: mpsc::UnboundedSender<MeshDmEvent>,
+    ) -> Result<ObserverSubscription> {
+        let subject = mu_peer::agent_dm_observer_subject();
+        // Subscribed to the transition stream BEFORE the SUB goes out, so a
+        // refusal cannot land in the gap between asking and starting to watch.
+        let mut transitions = self.transitions.as_ref().map(|tx| tx.subscribe());
+        let sub = bounded(&format!("observe {subject}"), async {
+            let sub = self
+                .client
+                .subscribe(subject.clone())
+                .await
+                .map_err(|e| anyhow!("gateway: observe {subject}: {e}"))?;
+            self.client
+                .flush()
+                .await
+                .map_err(|e| anyhow!("gateway: flush: {e}"))?;
+            Ok::<_, anyhow::Error>(sub)
+        })
+        .await?;
+
+        match transitions.as_mut() {
+            Some(rx) => {
+                if let Some(why) =
+                    subscription_refused_within(rx, &subject, OBSERVER_REFUSAL_GRACE).await
+                {
+                    return Err(anyhow!("gateway: observe {subject}: refused ({why})"));
+                }
+            }
+            None => warn!(
+                %subject,
+                "mesh gateway: this connection streams no NATS events, so a subscription the \
+                 server refuses asynchronously cannot be detected; build the gateway with \
+                 connect_with_events for that check"
+            ),
+        }
+
+        let (ended_tx, ended_rx) = watch::channel::<Option<ObserverEnded>>(None);
+        // Shared with the handle, whose `Drop` records the end this task is
+        // aborted before it can record.
+        let ended_tx = Arc::new(ended_tx);
+        let task = tokio::spawn(observe_loop(
+            self.issuer,
+            // The loop takes subjects and payloads, not `async_nats::Message`,
+            // so every decision it makes is reachable without a broker.
+            sub.map(|msg| (msg.subject.to_string(), msg.payload)),
+            transitions,
+            subject.clone(),
+            events,
+            self.observer_verify_failures.clone(),
+            ended_tx.clone(),
+        ));
+        info!(%subject, "mesh gateway: observing agent DMs");
+        Ok(ObserverSubscription {
+            task,
+            ended: ended_rx,
+            ended_tx,
+        })
     }
 
     /// The peers this gateway currently fronts.
@@ -1151,6 +1886,442 @@ mod tests {
         assert_eq!(ev.from, "mu:bb073ae9893a123a");
     }
 
+    // ───────────── the gateway's event seams, exercised offline ─────────────
+    //
+    // These paths are ordinarily fed by a live subscription. Everything they
+    // DECIDE, though, is a free function or a sink over an in-process channel,
+    // so the decisions are tested here on decoded payloads — the same style as
+    // the `verify_and_decode_dm` and wire-shape tests above — and only the
+    // `while let Some(msg) = sub.next()` loop needs a broker.
+
+    /// A payload signed by `root`, ready to hand to the observer or a sink.
+    fn signed_envelope(root: &KeyPair, id: &str, from: &str, body: &str) -> Vec<u8> {
+        let token = biscuit!(r#"right({r});"#, r = DM_RIGHT)
+            .build(root)
+            .unwrap()
+            .to_vec()
+            .unwrap();
+        serde_json::to_vec(&DmEnvelope {
+            id: id.to_string(),
+            capability: base64::engine::general_purpose::STANDARD.encode(&token),
+            command: AgentCommand::Dm {
+                from: from.to_string(),
+                body: body.to_string(),
+                session: None,
+                subject: None,
+                from_session: None,
+            },
+        })
+        .unwrap()
+    }
+
+    fn decoded_event(root: &KeyPair, destination: &str, id: &str) -> MeshDmEvent {
+        verify_and_decode_dm(
+            root.public(),
+            destination,
+            &signed_envelope(root, id, "cc:sender", "hi"),
+            Reception::Endpoint,
+        )
+        .expect("an authorized envelope decodes")
+    }
+
+    /// The observer wildcard is `mu.agent.>`, which matches more than DM
+    /// inboxes. A subject that is not a DM carries no envelope at all, so
+    /// skipping it must NOT look like a verification hole — otherwise the
+    /// counter an operator watches counts the gateway's own presence anchors.
+    #[test]
+    fn the_observer_skips_non_dm_subjects_without_counting_them_as_failures() {
+        let root = KeyPair::new();
+        let failures = AtomicU64::new(0);
+        let dm = signed_envelope(&root, "01ARZ3NDEKTSV4RRFFQ69G5FAV", "cc:sender", "hi");
+
+        // A gateway's private presence anchor: under the wildcard, not a DM.
+        assert!(observe_one(
+            root.public(),
+            "mu.agent.gateway-presence.abc",
+            &dm,
+            &failures
+        )
+        .is_none());
+        // Not even a `.dm` component in the middle counts; the SUFFIX does.
+        assert!(observe_one(root.public(), "mu.agent.cc.dm.anchor", &dm, &failures).is_none());
+        assert_eq!(failures.load(Ordering::Relaxed), 0, "a skip is not a hole");
+
+        let ev = observe_one(root.public(), "mu.agent.cc.abc.dm", &dm, &failures)
+            .expect("a DM subject is observed");
+        assert_eq!(ev.destination, "mu.agent.cc.abc.dm");
+        assert_eq!(ev.reception, Reception::Observer);
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+    }
+
+    /// An observer envelope that fails the fail-closed gate is invisible to
+    /// everyone — the sender believes it sent, the recipient never knew — so
+    /// the counter is the only sign the watch has a hole. It must move for
+    /// both rejection classes, and never for a verified message.
+    #[test]
+    fn the_observer_counts_every_verification_failure_and_forwards_nothing() {
+        let root = KeyPair::new();
+        let stranger = KeyPair::new();
+        let failures = AtomicU64::new(0);
+
+        // Unauthorized: a well-formed envelope signed by somebody else.
+        let forged = signed_envelope(&stranger, "01ARZ3NDEKTSV4RRFFQ69G5FAV", "cc:x", "hi");
+        assert!(observe_one(root.public(), "mu.agent.cc.abc.dm", &forged, &failures).is_none());
+        assert_eq!(failures.load(Ordering::Relaxed), 1);
+
+        // Not an envelope at all.
+        assert!(
+            observe_one(root.public(), "mu.agent.cc.abc.dm", b"{not json", &failures).is_none()
+        );
+        assert_eq!(failures.load(Ordering::Relaxed), 2);
+
+        // A verified one does not move the counter.
+        let good = signed_envelope(&root, "01ARZ3NDEKTSV4RRFFQ69G5FAV", "cc:x", "hi");
+        assert!(observe_one(root.public(), "mu.agent.cc.abc.dm", &good, &failures).is_some());
+        assert_eq!(failures.load(Ordering::Relaxed), 2);
+    }
+
+    /// The two fronting paths differ ONLY in the shape they hand a verified
+    /// message over in: the store gets an `InboundDm` addressed to the fronted
+    /// peer, the event path gets the `MeshDmEvent` with the id and destination
+    /// an `InboundDm` deliberately has no room for. The sender is the same
+    /// normalized one either way.
+    #[test]
+    fn the_sink_chooses_the_shape_not_whether_the_message_was_checked() {
+        let root = KeyPair::new();
+        let ev = decoded_event(&root, "mu.agent.cc.abc.dm", "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+
+        let (store_tx, mut store_rx) = mpsc::unbounded_channel();
+        assert!(DmSink::Store(store_tx).deliver("cc:abc", ev.clone()));
+        let dm = store_rx.try_recv().expect("the store path delivers");
+        assert_eq!(dm.to_peer, "cc:abc");
+        assert_eq!(dm.from_peer, ev.from);
+        assert_eq!(dm.body, "hi");
+
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+        assert!(DmSink::Events(ev_tx).deliver("cc:abc", ev.clone()));
+        let got = ev_rx.try_recv().expect("the event path delivers");
+        assert_eq!(got, ev);
+        assert_eq!(got.id, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(got.destination, "mu.agent.cc.abc.dm");
+    }
+
+    /// The unbounded senders these APIs take have no backpressure, on purpose
+    /// and in the same shape `inbound_tx` has always had (see [`MeshDmEvent`]).
+    /// The property that buys: a consumer that never drains cannot park the
+    /// NATS task, because the task also drives every other peer's delivery.
+    #[tokio::test]
+    async fn a_consumer_that_never_drains_cannot_park_the_subscription_task() {
+        let root = KeyPair::new();
+        let ev = decoded_event(&root, "mu.agent.cc.abc.dm", "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let (tx, rx) = mpsc::unbounded_channel();
+        let sink = DmSink::Events(tx);
+
+        // `rx` is held and never read — the slow-consumer case.
+        let sent = tokio::time::timeout(Duration::from_secs(5), async {
+            for _ in 0..10_000 {
+                assert!(sink.deliver("cc:abc", ev.clone()));
+            }
+            10_000
+        })
+        .await
+        .expect("an unbounded sink must never park the task draining the subscription");
+        assert_eq!(sent, 10_000);
+
+        // Dropping the receiver is how a consumer says it is done, and that is
+        // what ends the subscription loop.
+        drop(rx);
+        assert!(!sink.deliver("cc:abc", ev));
+    }
+
+    /// A fan-out is N ordinary DMs that share ONE id — no new envelope type and
+    /// no broadcast subject, because the mesh has neither. Each envelope still
+    /// names its own target's session, so a legacy daemon subject reaches the
+    /// session it was addressed to.
+    #[test]
+    fn a_fanout_mints_one_id_across_every_destination() {
+        let targets = vec![
+            MeshTarget {
+                subject: "mu.agent.cc.abc.dm".to_string(),
+                session: None,
+            },
+            MeshTarget {
+                subject: "mu.agent.mu.daemon1.dm".to_string(),
+                session: Some("session-7".to_string()),
+            },
+            MeshTarget {
+                subject: "mu.agent.human.alice.dm".to_string(),
+                session: None,
+            },
+        ];
+        let id = new_dm_id();
+        let payloads = fanout_payloads(&id, "AAEC", "human:bob", &targets, "hi all", Some("subj"))
+            .expect("envelopes serialize");
+
+        assert_eq!(payloads.len(), targets.len());
+        for (i, (subject, payload)) in payloads.iter().enumerate() {
+            assert_eq!(
+                subject, &targets[i].subject,
+                "each envelope keeps its own subject"
+            );
+            let env: DmEnvelope = serde_json::from_slice(payload).expect("decode");
+            assert_eq!(env.id, id, "one dispatch, one id");
+            assert_eq!(env.capability, "AAEC", "one grant, not one per destination");
+            let AgentCommand::Dm {
+                from,
+                body,
+                session,
+                subject: subj,
+                from_session,
+            } = env.command;
+            assert_eq!(from, "human:bob");
+            assert_eq!(body, "hi all");
+            assert_eq!(
+                session, targets[i].session,
+                "each target keeps its own session"
+            );
+            assert_eq!(subj.as_deref(), Some("subj"));
+            assert_eq!(from_session, None);
+        }
+
+        // An empty fan-out is not an error and publishes nothing.
+        assert!(fanout_payloads(&id, "AAEC", "human:bob", &[], "hi", None)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Two fresh ids are different and ulid-shaped — the loop guard the caller
+    /// records before publishing depends on both.
+    #[test]
+    fn a_minted_dm_id_is_a_fresh_ulid() {
+        let a = new_dm_id();
+        let b = new_dm_id();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 26);
+        assert!(ulid::Ulid::from_string(&a).is_ok());
+    }
+
+    /// NATS refuses a subscription ASYNCHRONOUSLY: `subscribe()` + `flush()`
+    /// cannot see it, and the refusal arrives as a protocol `-ERR` on the
+    /// connection-event stream. This is the correlation that turns it back into
+    /// an observer failure, driven by a fake event source in place of a broker.
+    #[tokio::test(start_paused = true)]
+    async fn a_permission_violation_on_the_event_stream_is_an_observer_failure() {
+        let subject = mu_peer::agent_dm_observer_subject();
+        let (events, _keep) = broadcast::channel(CONNECTION_EVENT_BACKLOG);
+        let mut rx = events.subscribe();
+
+        // What a NATS server actually sends when the wildcard is not granted.
+        let refusal = ConnectionEvent::ServerError(async_nats::ServerError::Other(format!(
+            "Permissions Violation for Subscription to {subject:?}"
+        )));
+        // Unrelated transitions on the same stream must not be mistaken for it.
+        events.send(ConnectionEvent::Disconnected).unwrap();
+        events.send(ConnectionEvent::Connected).unwrap();
+        events.send(refusal).unwrap();
+
+        let why = subscription_refused_within(&mut rx, &subject, OBSERVER_REFUSAL_GRACE)
+            .await
+            .expect("a refusal naming this subject is an observer failure");
+        assert!(why.contains("Permissions Violation"), "{why}");
+    }
+
+    /// The other half of the same contract: the window closes on silence, and a
+    /// refusal of somebody ELSE'S subscription is not ours. `None` means
+    /// "nothing said otherwise", which is exactly what the doc promises.
+    #[tokio::test(start_paused = true)]
+    async fn an_unrelated_refusal_is_not_this_observers_and_silence_is_not_a_failure() {
+        let subject = mu_peer::agent_dm_observer_subject();
+        let (events, _keep) = broadcast::channel(CONNECTION_EVENT_BACKLOG);
+        let mut rx = events.subscribe();
+
+        events
+            .send(ConnectionEvent::ServerError(
+                async_nats::ServerError::Other(
+                    "Permissions Violation for Subscription to \"mu.other.>\"".to_string(),
+                ),
+            ))
+            .unwrap();
+        // A publish refusal is a different failure and not the observer's.
+        events
+            .send(ConnectionEvent::ServerError(
+                async_nats::ServerError::Other(format!(
+                    "Permissions Violation for Publish to {subject:?}"
+                )),
+            ))
+            .unwrap();
+        assert_eq!(
+            subscription_refused_within(&mut rx, &subject, OBSERVER_REFUSAL_GRACE).await,
+            None
+        );
+
+        // And the matcher itself, on the exact shapes async-nats produces.
+        assert!(is_subscription_refusal(
+            &ConnectionEvent::ServerError(async_nats::ServerError::Other(
+                "Permissions Violation for Subscription to \"mu.agent.>\"".to_string()
+            )),
+            &subject
+        ));
+        assert!(!is_subscription_refusal(
+            &ConnectionEvent::ServerError(async_nats::ServerError::AuthorizationViolation),
+            &subject
+        ));
+        assert!(!is_subscription_refusal(&ConnectionEvent::Closed, &subject));
+    }
+
+    /// The end of an observation has to be SAID. Driven by the same fake event
+    /// source as the tests above, with the shape a real caller has: one event
+    /// channel fed by both an endpoint and the observer. The observer task
+    /// dropping its clone of that sender closes nothing — the endpoint's clone
+    /// is still there — so a consumer inferring the end from the channel would
+    /// never learn it stopped seeing agent traffic.
+    #[tokio::test]
+    async fn a_late_refusal_signals_the_end_explicitly_and_the_shared_channel_stays_open() {
+        let subject = mu_peer::agent_dm_observer_subject();
+        let root = KeyPair::new();
+        let (transitions, _keep) = broadcast::channel(CONNECTION_EVENT_BACKLOG);
+        let (events, mut consumer) = mpsc::unbounded_channel::<MeshDmEvent>();
+        // What `front_peer_events` would hold: the SAME channel, another clone.
+        let endpoint = events.clone();
+        let (ended_tx, ended_rx) = watch::channel::<Option<ObserverEnded>>(None);
+        let mut watcher = ObserverEndedWatch(ended_rx);
+        assert_eq!(
+            watcher.ended_now(),
+            None,
+            "the watch is live until it is not"
+        );
+
+        // Nothing ever arrives on the subscription: the refusal is the only
+        // thing that can end this loop.
+        let task = tokio::spawn(observe_loop(
+            root.public(),
+            futures::stream::pending::<(String, Bytes)>(),
+            Some(transitions.subscribe()),
+            subject.clone(),
+            events,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(ended_tx),
+        ));
+
+        transitions
+            .send(ConnectionEvent::ServerError(
+                async_nats::ServerError::Other(format!(
+                    "Permissions Violation for Subscription to {subject:?}"
+                )),
+            ))
+            .unwrap();
+
+        let why = tokio::time::timeout(Duration::from_secs(5), watcher.ended())
+            .await
+            .expect("a late refusal must signal the end, not just log it");
+        assert!(
+            matches!(&why, ObserverEnded::Refused(e) if e.contains("Permissions Violation")),
+            "{why:?}"
+        );
+        assert_eq!(watcher.ended_now(), Some(why));
+        task.await.expect("the observer task ends cleanly");
+
+        // And the consumer's channel is exactly as open as it was: the endpoint
+        // clone still delivers, which is why the end had to travel separately.
+        endpoint
+            .send(decoded_event(
+                &root,
+                "mu.agent.cc.abc.dm",
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            ))
+            .expect("the shared channel is still open");
+        assert!(consumer.recv().await.is_some());
+    }
+
+    /// A gone consumer ends the observation whatever the traffic looks like.
+    /// Nothing ever arrives on this subscription, so the `events.send` that
+    /// used to be the only receiver check never happens — and dropping the last
+    /// receiver still ends the task with `ConsumerGone`, instead of leaving it
+    /// and its NATS subscription running for a verified DM that may never come.
+    #[tokio::test]
+    async fn a_dropped_receiver_ends_an_idle_observation_with_consumer_gone() {
+        let subject = mu_peer::agent_dm_observer_subject();
+        let root = KeyPair::new();
+        let (events, consumer) = mpsc::unbounded_channel::<MeshDmEvent>();
+        let (ended_tx, ended_rx) = watch::channel::<Option<ObserverEnded>>(None);
+        let mut watcher = ObserverEndedWatch(ended_rx);
+
+        let task = tokio::spawn(observe_loop(
+            root.public(),
+            futures::stream::pending::<(String, Bytes)>(),
+            None,
+            subject.clone(),
+            events,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(ended_tx),
+        ));
+        assert_eq!(
+            watcher.ended_now(),
+            None,
+            "the watch is live until it is not"
+        );
+
+        // The last receiver goes away while the subscription sits idle.
+        drop(consumer);
+
+        let why = tokio::time::timeout(Duration::from_secs(5), watcher.ended())
+            .await
+            .expect("a gone consumer must end an idle observation, not only a busy one");
+        assert_eq!(why, ObserverEnded::ConsumerGone);
+        assert_eq!(watcher.ended_now(), Some(ObserverEnded::ConsumerGone));
+        task.await.expect("the observer task ends cleanly");
+    }
+
+    /// Dropping the handle aborts the task, so the loop never gets to say why
+    /// the observation ended: the handle says it instead. Both accessors have
+    /// to agree — `ended_now` is the one a status line reads, and a dropped
+    /// observation reading as `None` there is a dead observer reported as live.
+    #[tokio::test]
+    async fn dropping_the_subscription_records_dropped_for_both_accessors() {
+        let subject = mu_peer::agent_dm_observer_subject();
+        let root = KeyPair::new();
+        // A receiver that stays, and a stream that never yields: nothing but
+        // the drop can end this observation.
+        let (events, _consumer) = mpsc::unbounded_channel::<MeshDmEvent>();
+        let (ended_tx, ended_rx) = watch::channel::<Option<ObserverEnded>>(None);
+        let ended_tx = Arc::new(ended_tx);
+        let task = tokio::spawn(observe_loop(
+            root.public(),
+            futures::stream::pending::<(String, Bytes)>(),
+            None,
+            subject.clone(),
+            events,
+            Arc::new(AtomicU64::new(0)),
+            ended_tx.clone(),
+        ));
+        let subscription = ObserverSubscription {
+            task,
+            ended: ended_rx,
+            ended_tx,
+        };
+        let mut watcher = subscription.ended();
+        assert_eq!(
+            watcher.ended_now(),
+            None,
+            "the watch is live until it is not"
+        );
+
+        drop(subscription);
+
+        assert_eq!(
+            watcher.ended_now(),
+            Some(ObserverEnded::Dropped),
+            "a dropped subscription must not read as still live"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), watcher.ended())
+                .await
+                .expect("the end is already recorded, so this resolves at once"),
+            ObserverEnded::Dropped,
+            "both accessors must give the same answer"
+        );
+    }
+
     /// A mesh `from` becomes a peer id a reply can be addressed to — the
     /// sending session when the envelope names one, its daemon otherwise.
     #[test]
@@ -1258,6 +2429,92 @@ mod tests {
         .expect("enabled");
         assert_eq!(cfg.nats_url, "10.0.0.9:4222");
         assert_eq!(cfg.issuer_key, "beef");
+    }
+
+    // ───────── A publish the connection did not hold still across ─────────
+
+    /// A fake publisher that reports what the client's connection state was
+    /// when it ran, and can change it mid-publish. This is the whole point of
+    /// the seam: a drop under a publish is not reproducible against a broker on
+    /// demand, but it is trivial to script here.
+    fn fake_link(connected: bool) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(connected))
+    }
+
+    fn read_link(
+        flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> impl Fn() -> ConnectionState + '_ {
+        move || {
+            if flag.load(Ordering::Relaxed) {
+                ConnectionState::Connected
+            } else {
+                ConnectionState::Disconnected
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_publish_over_a_link_that_held_is_delivered() {
+        let link = fake_link(true);
+        let outcome = publish_watching_link(read_link(&link), async { Ok(()) })
+            .await
+            .expect("the fake publisher succeeds");
+        assert_eq!(outcome, Publish::Delivered);
+    }
+
+    #[tokio::test]
+    async fn a_publish_the_link_dropped_under_is_uncertain() {
+        // The message was handed to the client while it was connected, and the
+        // client was disconnected by the time the flush returned: async-nats
+        // still holds it, and will write it to the NEXT connection. Claiming
+        // delivery here is what would make the gateway's "nothing is replayed
+        // across a reconnect" false.
+        let link = fake_link(true);
+        let dropper = link.clone();
+        let outcome = publish_watching_link(read_link(&link), async move {
+            dropper.store(false, Ordering::Relaxed);
+            Ok(())
+        })
+        .await
+        .expect("the fake publisher succeeds");
+        assert_eq!(outcome, Publish::Uncertain);
+    }
+
+    #[tokio::test]
+    async fn a_publish_issued_while_the_link_was_already_down_is_uncertain() {
+        // Buffered by definition: there is no connection to write it to.
+        let link = fake_link(false);
+        let outcome = publish_watching_link(read_link(&link), async { Ok(()) })
+            .await
+            .expect("the fake publisher succeeds");
+        assert_eq!(outcome, Publish::Uncertain);
+    }
+
+    #[tokio::test]
+    async fn a_publish_that_failed_is_an_error_not_an_outcome() {
+        // A failure is reported as the failure it was; the outcome classifies
+        // only a publish that returned.
+        let link = fake_link(true);
+        let err = publish_watching_link(read_link(&link), async { Err(anyhow!("flush: broken")) })
+            .await
+            .expect_err("the fake publisher fails");
+        assert!(err.to_string().contains("flush"));
+    }
+
+    #[test]
+    fn a_reconnect_that_landed_mid_publish_is_the_named_residual_hole() {
+        // Both reads say Connected because a state read cannot see a transition
+        // it was not present for. Documented rather than papered over: the
+        // caller that cannot live with it compares a generation counter that
+        // survives the coalescing, which is what mu-irc-gateway does.
+        assert_eq!(
+            publish_outcome(ConnectionState::Connected, ConnectionState::Connected),
+            Publish::Delivered
+        );
+        assert_eq!(
+            publish_outcome(ConnectionState::Connected, ConnectionState::Pending),
+            Publish::Uncertain
+        );
     }
 }
 

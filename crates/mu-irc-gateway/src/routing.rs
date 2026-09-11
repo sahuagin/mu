@@ -254,6 +254,29 @@ impl Router {
         }
         let ev = verify_and_decode_dm(self.issuer, destination, payload, reception)
             .map_err(IngressRejected::Unverified)?;
+        self.accept_verified(ev)
+    }
+
+    /// The same ingress for an event a subscription already decoded through the
+    /// SAME shared gate.
+    ///
+    /// `mu-dialogue`'s endpoint and observer subscriptions run
+    /// `mesh::verify_and_decode_dm` themselves — they must, since a subscription
+    /// that forwarded an unverified body would put one on the wrong side of the
+    /// fail-closed boundary before this crate ever saw it. What they do NOT have
+    /// is this crate's size policy, which exists because routing fingerprints
+    /// remote-controlled fields into a bounded window and puts the id on an IRC
+    /// line. So the bridge's live path arrives here: verification already done
+    /// once, by the same function [`Router::accept`] would have called, and the
+    /// caps applied at the same ingress either way.
+    ///
+    /// [`Router::accept`] remains the entry point for a raw payload — bytes and
+    /// a destination, nothing pre-decoded — and both funnel through one size
+    /// check, so neither path can drift into accepting what the other refuses.
+    pub fn accept_verified(&self, ev: MeshDmEvent) -> Result<MeshDmEvent, IngressRejected> {
+        if ev.destination.len() > MAX_DESTINATION_LEN {
+            return Err(IngressRejected::Oversized(OversizedField::Destination));
+        }
         if ev.id.len() > MAX_FIELD_LEN {
             return Err(IngressRejected::Oversized(OversizedField::Id));
         }

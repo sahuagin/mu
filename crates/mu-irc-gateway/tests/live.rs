@@ -42,7 +42,7 @@ use tokio::sync::{mpsc, watch};
 use mu_irc_gateway::adapter::{IrcMessage, Transport as _};
 use mu_irc_gateway::bridge;
 use mu_irc_gateway::config::{GatewayConfig, IrcConfig, MeshConfig, SaslCreds, Secret};
-use mu_irc_gateway::transport::{self, ConnectionGuard, FromServer, LineWriter};
+use mu_irc_gateway::transport::{self, ConnectionGuard, FromServer, LineWriter, TlsTrust};
 
 /// How long any single "wait for the server/mesh to do the thing" step gets.
 const STEP: Duration = Duration::from_secs(30);
@@ -121,6 +121,10 @@ async fn the_bridge_registers_joins_fronts_a_human_and_routes_both_ways() {
         irc: IrcConfig {
             server: server.clone(),
             tls,
+            // The system store, as an unconfigured gateway gets: this harness
+            // runs against whatever server the operator points it at, and
+            // choosing its anchors is not this increment's job.
+            tls_trust: TlsTrust::default(),
             nick: nick.clone(),
             sasl,
             channel_prefix: "#".to_string(),

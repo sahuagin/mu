@@ -53,6 +53,10 @@ tokio = { workspace = true }
 # itself. What is missing is a TLS line transport, which is these two.
 tokio-rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
+# Reading an operator's private-CA PEM bundle (`[irc] tls_ca_file`). The canonical
+# rustls PEM reader, already in the graph behind rustls — a hand-rolled scan of
+# BEGIN/END markers is not the place to be inventive about certificate input.
+rustls-pki-types = { workspace = true }
 # The bridge's error plumbing, and the binary's CLI.
 anyhow = { workspace = true }
 clap = { workspace = true }

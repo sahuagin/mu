@@ -2171,6 +2171,7 @@ dependencies = [
  "mu-dialogue",
  "mu-peer",
  "rustls-native-certs",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

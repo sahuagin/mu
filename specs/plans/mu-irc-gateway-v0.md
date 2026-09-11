@@ -294,6 +294,19 @@ durable-wake path. The mu daemon stays entirely unaware that IRC exists.
    mutate the same membership and routing state and a second state-owning task
    would need a lock around all of it.
 
+   Three seams increment 1 specified but left unbuilt land here, since this is
+   the increment that needs them, additively and with no new envelope or
+   subject: `Gateway::front_peer_events` (a fronted peer's verified DMs as
+   `MeshDmEvent`s rather than `InboundDm`s — one fronting path, one gate),
+   `Gateway::observe_agent_dms` (the `mu.agent.>` wildcard, filtered to `.dm`
+   subjects, counting observer verification failures into the counter increment 1
+   added for it), and `publish_dm_fanout`/`new_dm_id` (several envelopes under
+   one caller-minted id, the id being the caller's because the caller records it
+   for loop-guarding before it can be published). Those subscriptions run the
+   shared fail-closed gate before forwarding anything, so the bridge enters this
+   crate's ingress at `Router::accept_verified` — verification already done by
+   the same function, the size caps applied at the same place either way.
+
 ## v0 exclusions
 
 - No IRC-side persistence, scrollback replay, or history buffering.

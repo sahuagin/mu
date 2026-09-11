@@ -99,7 +99,9 @@ pub use mapping::{
     HumanIdentity, Resolved, SelfNick,
 };
 pub use membership::{ChannelEffect, ChannelReconciler, HumanEffect, Member, Membership};
-pub use outbound::{MemoryUpdate, OutDrop, OutEnv, Outbound, OutboundDecision, RefuseReason};
+pub use outbound::{
+    MemoryDestination, MemoryUpdate, OutDrop, OutEnv, Outbound, OutboundDecision, RefuseReason,
+};
 pub use recent::{RecentSet, DEFAULT_CAPACITY};
 pub use routing::{
     DropReason, IngressRejected, OversizedField, RouteDecision, RouteEnv, Router,

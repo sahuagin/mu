@@ -6,7 +6,7 @@ use mu_dialogue::mesh::{MeshDmEvent, Reception};
 use mu_irc_gateway::mapping::{channel_for, CaseMapping};
 use mu_irc_gateway::membership::Membership;
 use mu_irc_gateway::outbound::{
-    MemoryUpdate, OutDrop, OutEnv, Outbound, OutboundDecision, RefuseReason,
+    MemoryDestination, MemoryUpdate, OutDrop, OutEnv, Outbound, OutboundDecision, RefuseReason,
 };
 use mu_peer::PeerId;
 
@@ -146,7 +146,7 @@ fn a_channel_line_to_one_agent_publishes_and_remembers() {
         memory,
         &Some(MemoryUpdate {
             human: "alice".into(),
-            channel: "#cc-abc".into(),
+            destination: MemoryDestination::Channel("#cc-abc".into()),
         })
     );
 }
@@ -186,7 +186,7 @@ fn an_unknown_channel_is_refused() {
 // ───────────────────────────── Explicit address ─────────────────────────────
 
 #[test]
-fn explicit_address_overrides_the_channel_and_remembers() {
+fn explicit_address_from_elsewhere_overrides_the_channel_and_remembers_private() {
     let mut o = out();
     let mem = mem_with_alice();
     let peers = vec![PeerId::parse("cc:abc")];
@@ -199,11 +199,118 @@ fn explicit_address_overrides_the_channel_and_remembers() {
     let (_, targets, body, memory) = published(&d);
     assert_eq!(targets, &[PeerId::parse("cc:abc")]);
     assert_eq!(body, "hey there");
+    // `#cc-abc` is the AGENT's channel, and alice is not in it — she is in the
+    // lobby. Remembering it would aim the reply at a room she never joined, so
+    // the memory says private and the answer comes back as a DM.
     assert_eq!(
         memory,
         &Some(MemoryUpdate {
             human: "alice".into(),
-            channel: "#cc-abc".into(),
+            destination: MemoryDestination::Private,
+        })
+    );
+}
+
+#[test]
+fn explicit_address_inside_the_peers_own_channel_remembers_that_channel() {
+    // The other half of the same rule: the address is typed IN `#cc-abc`, which
+    // is where that conversation is happening, so the reply belongs there.
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+    };
+    let d = o.route_line("alice", "#cc-abc", "cc:abc: hey there", "ID", &env);
+    let (_, targets, body, memory) = published(&d);
+    assert_eq!(targets, &[PeerId::parse("cc:abc")]);
+    assert_eq!(body, "hey there");
+    assert_eq!(
+        memory,
+        &Some(MemoryUpdate {
+            human: "alice".into(),
+            destination: MemoryDestination::Channel("#cc-abc".into()),
+        })
+    );
+}
+
+#[test]
+fn an_explicit_address_in_another_agents_channel_is_private_not_that_channel() {
+    // Addressing `cc:abc` while sitting in `#cc-other` must not remember either
+    // channel: not `#cc-abc` (alice is not there) and not `#cc-other` (that is
+    // not the conversation she directed the line at).
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc"), PeerId::parse("cc:other")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+    };
+    let d = o.route_line("alice", "#cc-other", "cc:abc: hey there", "ID", &env);
+    let (_, targets, _, memory) = published(&d);
+    assert_eq!(targets, &[PeerId::parse("cc:abc")]);
+    assert_eq!(
+        memory,
+        &Some(MemoryUpdate {
+            human: "alice".into(),
+            destination: MemoryDestination::Private,
+        })
+    );
+}
+
+#[test]
+fn a_private_explicit_address_to_the_gateway_remembers_private() {
+    // `/msg mu-gw cc:abc: …` — there is no channel at all, so there is nothing
+    // for a reply to be part of.
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+    };
+    let d = o.route_line("alice", "mu-gw", "cc:abc: hey there", "ID", &env);
+    let (_, targets, _, memory) = published(&d);
+    assert_eq!(targets, &[PeerId::parse("cc:abc")]);
+    assert_eq!(
+        memory,
+        &Some(MemoryUpdate {
+            human: "alice".into(),
+            destination: MemoryDestination::Private,
+        })
+    );
+}
+
+#[test]
+fn a_private_address_replaces_a_channel_this_human_had_remembered() {
+    // The private record is a WRITE, not an omission: alice talks in `#cc-abc`
+    // (remembered), then addresses the same agent from the lobby. The second
+    // line must not leave the first line's channel standing, or the reply lands
+    // in a room she did not name this time.
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+    };
+    let first = o.route_line("alice", "#cc-abc", "hi cc", "ID1", &env);
+    let (_, _, _, memory) = published(&first);
+    assert_eq!(
+        memory,
+        &Some(MemoryUpdate {
+            human: "alice".into(),
+            destination: MemoryDestination::Channel("#cc-abc".into()),
+        })
+    );
+    let second = o.route_line("alice", "#mu", "cc:abc: and again", "ID2", &env);
+    let (_, _, _, memory) = published(&second);
+    assert_eq!(
+        memory,
+        &Some(MemoryUpdate {
+            human: "alice".into(),
+            destination: MemoryDestination::Private,
         })
     );
 }

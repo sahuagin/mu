@@ -1,4 +1,4 @@
-//! IRC → mesh routing (increment 3).
+//! IRC → mesh routing (increments 3 and 4).
 //!
 //! An offline decision function for the other direction: a human types a line in
 //! IRC, and this decides the mesh DM(s) to publish — to one explicitly-addressed
@@ -39,11 +39,35 @@
 //! to a room they never asked about — so those record
 //! [`MemoryDestination::Private`] and the reply comes back as a DM.
 
+//!
+//! # Bot verbs (increment 4)
+//!
+//! Two textual commands are dispatched AHEAD of all of the above, because a
+//! command is not a message: `mu peers` prints the live presence set and
+//! `mu say <peer id or alias> <text>` sends one line to one peer. A line the
+//! command parser claims is never mirrored to the lobby, never fanned out, and
+//! never published as itself — an `mu <verb>` this gateway does not implement
+//! costs a one-line [`USAGE`] reply and nothing else, which is the whole point
+//! of dispatching first: a typo must not become a broadcast.
+//!
+//! `mu say` is `role:id: text` wearing different clothes. It resolves against
+//! the same live presence set (the full peer id first, then the channel alias
+//! `mu peers` printed), refuses the same way, and writes the same routing
+//! memory through the same code path — so which spelling a human used cannot
+//! change where the answer comes back.
+//!
+//! A verb's answer is addressed to whoever typed it, not to the channel they
+//! typed it in ([`OutboundDecision::Reply`]): a roster is for the person who
+//! asked. Those answers are gateway-authored lines, so loop guard 1 is what
+//! keeps them out of the mirror if one ever comes back around.
+
 use mu_peer::PeerId;
 
 use mu_dialogue::mesh::MeshDmEvent;
 
-use crate::mapping::{channel_for, fold_nick, resolve_channel, CaseMapping, Resolved, SelfNick};
+use crate::mapping::{
+    channel_for, fold_nick, peer_alias, resolve_channel, CaseMapping, Resolved, SelfNick,
+};
 use crate::membership::Membership;
 use crate::recent::RecentSet;
 
@@ -79,23 +103,78 @@ pub enum MemoryDestination {
     Private,
 }
 
+/// Where the operator-facing answer to one outbound line belongs when that line
+/// cannot be delivered.
+///
+/// The decision carries this rather than the executor deriving it, because only
+/// the decision knows how the line was SPELLED: an explicit address and a bot
+/// verb reach the mesh through the same publish, and the difference between them
+/// is not visible by the time delivery fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// Back where the line was said — the channel it was typed in, or privately
+    /// when it was typed privately. What ordinary routing has always done: a
+    /// line said to a room is part of that room's conversation, and so is the
+    /// news that it did not go anywhere.
+    WhereItWasSaid,
+    /// Privately to whoever typed the line, whichever target they typed it to.
+    /// A bot verb answers its sender for EVERY outcome, and a mesh that is down
+    /// is one of its outcomes: `mu say` typed in a channel must not turn a
+    /// delivery failure into the one command answer the room gets to read.
+    Sender,
+}
+
 /// What the outbound side decided for one IRC line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundDecision {
     /// Publish `body` from `from` to every peer in `targets`, all sharing the one
-    /// minted `id`. `memory` is applied only for a specifically-addressed line.
+    /// minted `id`. `memory` is applied only for a specifically-addressed line,
+    /// and `answer` is where a failure to deliver it is reported.
     Publish {
         id: String,
         from: PeerId,
         targets: Vec<PeerId>,
         body: String,
         memory: Option<MemoryUpdate>,
+        answer: Answer,
     },
+    /// Answer a bot verb, publishing nothing. The answer goes PRIVATELY to
+    /// whoever typed the line, whichever target they typed it to — a roster,
+    /// a usage line and a `mu say` that named nobody are all for the person who
+    /// asked, not for the room.
+    Reply(CommandReply),
     /// Refuse and tell the operator why (the reason names peers, never a body).
     Refuse(RefuseReason),
     /// Drop silently — the gateway's own echo, or a disconnected transport.
     Drop(OutDrop),
 }
+
+/// What a bot verb answered with. Nothing here is published; every variant is
+/// text on its way back to one human.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandReply {
+    /// The live presence set, already rendered: one line per present agent,
+    /// naming its full peer id and the channel it maps to.
+    ///
+    /// Rendered HERE rather than handed over as peers, because what a peer's
+    /// channel is — and whether that channel is shared with another peer — is
+    /// this crate's mapping knowledge, and the executor deriving it a second
+    /// time is how two answers to the same question start to disagree.
+    Peers(Vec<String>),
+    /// A `mu say` that named no deliverable destination. The reasons are the
+    /// ones ordinary routing already uses, so one vocabulary explains both
+    /// spellings of the same mistake.
+    Refused(RefuseReason),
+    /// An `mu <verb>` this gateway does not implement, `mu say` with nothing to
+    /// say included: one line of [`USAGE`], and no publication.
+    Usage,
+}
+
+/// The one-line answer to an unsupported verb. Names both verbs and their
+/// arguments, because the human who typed the typo is the one who needs it.
+pub const USAGE: &str =
+    "usage: `mu peers` lists the agents on the mesh; `mu say <peer id or alias> <text>` \
+     sends one line to one of them";
 
 /// Why an outbound line was refused, phrased for the operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +185,14 @@ pub enum RefuseReason {
     AbsentDestination(PeerId),
     /// A channel that case-folds onto more than one peer; neither is chosen.
     AmbiguousChannel(Vec<PeerId>),
+    /// A `mu say` alias that more than one present peer answers to; neither is
+    /// chosen, and the colliding peers are named so the human can retype one of
+    /// them as a full id.
+    AmbiguousPeer(Vec<PeerId>),
+    /// A `mu say` destination that is neither a present peer nor any present
+    /// peer's alias — including a token that is not a peer id at all. Carried
+    /// verbatim so the reply can quote what was typed.
+    UnknownPeer(String),
     /// A channel target that maps to no current peer and is not the lobby.
     UnknownChannel(String),
     /// A line from a nick the gateway does not observe in any shared channel.
@@ -249,12 +336,32 @@ impl Outbound {
         }
         let from = PeerId::human(fold_nick(sender, self.cm));
 
+        // Bot verbs are dispatched AHEAD of every routing rule below, which is
+        // what makes "a command is never mirrored" structural: a line the parser
+        // claims cannot reach the lobby fan-out, the channel publish, or the
+        // explicit-address path, whichever target it was typed to. The
+        // authorization above still ran first, because `mu say` publishes under
+        // the gateway's own capability exactly as an explicit address does — and
+        // because the roster is not something to hand a nick this gateway shares
+        // no channel with.
+        if let Some(command) = parse_command(text) {
+            return self.run_command(command, from, target, minted_id, env);
+        }
+
         // An explicit `role:id: body` address overrides the channel/target.
         if let Some((addr, body)) = parse_explicit(text) {
             match classify_address(addr) {
                 Address::Human => return OutboundDecision::Refuse(RefuseReason::HumanDestination),
                 Address::Agent(peer) => {
-                    return self.publish_explicit(from, peer, target, body, minted_id, env);
+                    return self.publish_explicit(
+                        from,
+                        peer,
+                        target,
+                        body,
+                        minted_id,
+                        env,
+                        Answer::WhereItWasSaid,
+                    );
                 }
                 // Not an address at all (ordinary text that happens to hold a
                 // colon): fall through to channel/private handling.
@@ -271,6 +378,150 @@ impl Outbound {
         self.publish_channel(target, from, text, minted_id, env)
     }
 
+    /// Run one parsed bot verb. `source` is the IRC target the human typed the
+    /// command to, which is what `mu say` remembers from — the same rule an
+    /// explicit address follows, so `mu say cc:abc hi` and `cc:abc: hi` typed in
+    /// the same place leave the same routing memory behind.
+    fn run_command(
+        &mut self,
+        command: Command<'_>,
+        from: PeerId,
+        source: &str,
+        minted_id: &str,
+        env: &OutEnv,
+    ) -> OutboundDecision {
+        match command {
+            Command::Peers => OutboundDecision::Reply(CommandReply::Peers(self.peers_lines(env))),
+            Command::Say { dest, body } => match self.resolve_say(dest, env) {
+                // Resolution already proved presence; `publish_explicit` re-checks
+                // it against the same snapshot and owns the routing-memory rule,
+                // which is why `mu say` goes through it rather than beside it.
+                SayTarget::Peer(peer) => {
+                    // The publication carries the command's own destination, so
+                    // the executor answers the SENDER if the mesh turns out to be
+                    // down — the same place every other outcome of this verb is
+                    // answered, rather than the channel it was typed in.
+                    match self.publish_explicit(
+                        from,
+                        peer,
+                        source,
+                        body,
+                        minted_id,
+                        env,
+                        Answer::Sender,
+                    ) {
+                        // Resolution proved presence against this same snapshot,
+                        // so the re-check cannot refuse today. Folding it into the
+                        // verb's private answer anyway means the destination rule
+                        // holds by construction rather than by that argument.
+                        OutboundDecision::Refuse(reason) => {
+                            OutboundDecision::Reply(CommandReply::Refused(reason))
+                        }
+                        published => published,
+                    }
+                }
+                SayTarget::Human => {
+                    OutboundDecision::Reply(CommandReply::Refused(RefuseReason::HumanDestination))
+                }
+                SayTarget::Absent(peer) => OutboundDecision::Reply(CommandReply::Refused(
+                    RefuseReason::AbsentDestination(peer),
+                )),
+                SayTarget::Ambiguous(peers) => OutboundDecision::Reply(CommandReply::Refused(
+                    RefuseReason::AmbiguousPeer(peers),
+                )),
+                SayTarget::Unknown => OutboundDecision::Reply(CommandReply::Refused(
+                    RefuseReason::UnknownPeer(dest.to_string()),
+                )),
+            },
+            Command::Unsupported => OutboundDecision::Reply(CommandReply::Usage),
+        }
+    }
+
+    /// Render the live presence set: a header, then one line per present agent
+    /// naming its FULL peer id (the spelling `mu say` and an explicit address
+    /// both accept) and the channel it maps to.
+    ///
+    /// Humans are left out. They are not mesh destinations, the gateway fronts
+    /// them only while it can see them on IRC, and IRC already shows a person
+    /// who is in the room — so a roster of them would be a second, staler answer
+    /// to a question the client already answers. The contract names no place for
+    /// them here, and inventing one would be inventing a disclosure.
+    ///
+    /// A channel more than one present peer folds onto is marked `(shared)`
+    /// rather than printed as if it addressed the peer on that line: that is
+    /// exactly what [`Resolved::Ambiguous`] means, and it is the same collision
+    /// the mesh→IRC side labels bodies for.
+    fn peers_lines(&self, env: &OutEnv) -> Vec<String> {
+        let agents: Vec<&PeerId> = env.peers.iter().filter(|p| !p.is_human()).collect();
+        if agents.is_empty() {
+            return vec![NO_AGENTS.to_string()];
+        }
+        let mut lines = Vec::with_capacity(agents.len() + 1);
+        lines.push(format!("{} on the mesh right now:", plural(agents.len())));
+        for peer in agents {
+            lines.push(format!("{peer} — {}", self.where_peer_is(peer, env)));
+        }
+        lines
+    }
+
+    /// Where one peer is, as the mapping module reports it: its channel, that
+    /// channel marked `(shared)` when another present peer folds onto it, or
+    /// `(no channel)` for a peer the mapping gives none.
+    fn where_peer_is(&self, peer: &PeerId, env: &OutEnv) -> String {
+        let Some(channel) = channel_for(peer, &self.prefix, self.channellen) else {
+            return "(no channel)".to_string();
+        };
+        let shared = matches!(
+            resolve_channel(&channel, env.peers, &self.prefix, self.channellen, self.cm),
+            Resolved::Ambiguous(_)
+        );
+        if shared {
+            format!("{channel} (shared)")
+        } else {
+            channel
+        }
+    }
+
+    /// Resolve a `mu say` destination against the LIVE presence set.
+    ///
+    /// The full peer id is tried first and exactly, the same rule an explicit
+    /// address uses — a destination is present only on exact membership in the
+    /// discovery snapshot, never on a matching DM subject. Only then is the
+    /// token read as the alias `mu peers` printed a channel from, folded under
+    /// the server's rule because the human typed it into IRC. An alias several
+    /// peers answer to resolves to none of them.
+    fn resolve_say(&self, dest: &str, env: &OutEnv) -> SayTarget {
+        let parsed = PeerId::parse(dest);
+        if parsed.is_human() {
+            return SayTarget::Human;
+        }
+        if discovered(env.peers, &parsed) {
+            return SayTarget::Peer(parsed);
+        }
+        let want = fold_nick(dest, self.cm);
+        let mut hits: Vec<PeerId> = env
+            .peers
+            .iter()
+            .filter(|p| fold_nick(&peer_alias(p), self.cm) == want)
+            .cloned()
+            .collect();
+        match hits.len() {
+            // A named identity the mesh does not currently carry is ABSENT, and
+            // saying so names it back; a token that is no peer id at all is
+            // simply unknown, and quoting it is all that can be said.
+            0 => match classify_address(dest) {
+                Address::Agent(peer) => SayTarget::Absent(peer),
+                Address::Human => SayTarget::Human,
+                Address::Ordinary => SayTarget::Unknown,
+            },
+            1 => match hits.pop().expect("len checked") {
+                peer if peer.is_human() => SayTarget::Human,
+                peer => SayTarget::Peer(peer),
+            },
+            _ => SayTarget::Ambiguous(hits),
+        }
+    }
+
     /// Publish an explicitly-addressed line to one currently-discovered agent,
     /// remembering where the reply belongs — which is decided by `source`, the
     /// IRC target the human typed the line to, not by where the agent lives.
@@ -282,6 +533,10 @@ impl Outbound {
     /// channel would aim the reply at a room they never joined and it would
     /// fall through to a DM anyway — with a stale memory left behind to
     /// mis-route the next one. Those record [`MemoryDestination::Private`].
+    ///
+    /// `answer` is passed through to the decision: the caller knows whether this
+    /// is an explicit address or a `mu say`, and nothing downstream does.
+    #[allow(clippy::too_many_arguments)]
     fn publish_explicit(
         &mut self,
         from: PeerId,
@@ -290,6 +545,7 @@ impl Outbound {
         body: &str,
         minted_id: &str,
         env: &OutEnv,
+        answer: Answer,
     ) -> OutboundDecision {
         if !discovered(env.peers, &peer) {
             return OutboundDecision::Refuse(RefuseReason::AbsentDestination(peer));
@@ -313,6 +569,7 @@ impl Outbound {
             targets: vec![peer],
             body: body.to_string(),
             memory,
+            answer,
         }
     }
 
@@ -352,6 +609,7 @@ impl Outbound {
                     targets: vec![peer],
                     body: text.to_string(),
                     memory,
+                    answer: Answer::WhereItWasSaid,
                 }
             }
         }
@@ -382,6 +640,7 @@ impl Outbound {
             targets,
             body: text.to_string(),
             memory: None,
+            answer: Answer::WhereItWasSaid,
         }
     }
 
@@ -412,6 +671,96 @@ fn human_key(peer: &PeerId) -> String {
 /// nobody has advertised is refused, whatever subject it happens to share.
 fn discovered(peers: &[PeerId], peer: &PeerId) -> bool {
     peers.contains(peer)
+}
+
+/// What an empty presence set is called, in the one place both the `mu peers`
+/// listing and a refused fan-out can read it from. Two sentences for one fact
+/// drift apart; this one does not.
+pub const NO_AGENTS: &str = "no agents are on the mesh right now";
+
+/// `"1 agent"` / `"N agents"` — the count the roster header opens with.
+fn plural(n: usize) -> String {
+    format!("{n} agent{}", if n == 1 { "" } else { "s" })
+}
+
+/// A bot verb, already parsed. Borrowed from the line, because a command's
+/// arguments are used and dropped inside one decision.
+enum Command<'a> {
+    /// `mu peers` — print the live presence set.
+    Peers,
+    /// `mu say <dest> <body>` — one line to one peer.
+    Say { dest: &'a str, body: &'a str },
+    /// An `mu <verb>` this gateway does not implement, or a verb whose
+    /// arguments are not the ones it takes. Answered with [`USAGE`], published
+    /// nowhere.
+    Unsupported,
+}
+
+/// The bot-verb prefix. A line whose FIRST whitespace-delimited token is
+/// exactly this (ASCII case-insensitively) is a command.
+///
+/// `mu:d: hello` is not: its token is `mu:d:`, which is an explicit address and
+/// stays one. That distinction is the token boundary and nothing cleverer,
+/// which is what keeps a peer id from ever being read as a verb.
+const VERB_PREFIX: &str = "mu";
+
+/// Parse a bot-verb line, or `None` if this is ordinary text.
+///
+/// A bare `mu` with no verb is ordinary text on purpose: it is a word, people
+/// type it, and claiming it would silently swallow a line the fan-out should
+/// have carried. Everything after a real verb prefix IS claimed, including an
+/// unknown verb — a command that is nearly right must not fall through and be
+/// broadcast to every agent on the mesh.
+fn parse_command(text: &str) -> Option<Command<'_>> {
+    let (head, rest) = split_token(text.trim());
+    if !head.eq_ignore_ascii_case(VERB_PREFIX) || rest.is_empty() {
+        return None;
+    }
+    let (verb, args) = split_token(rest);
+    if verb.eq_ignore_ascii_case("peers") {
+        // `mu peers` takes no argument. Ignoring one would answer a question
+        // that was not asked; the usage line says what the verbs take instead.
+        return Some(if args.is_empty() {
+            Command::Peers
+        } else {
+            Command::Unsupported
+        });
+    }
+    if verb.eq_ignore_ascii_case("say") {
+        let (dest, body) = split_token(args);
+        // A destination with nothing to say is not a message; it is a
+        // half-typed command, and publishing an empty body would be worse than
+        // answering with the usage.
+        return Some(if dest.is_empty() || body.is_empty() {
+            Command::Unsupported
+        } else {
+            Command::Say { dest, body }
+        });
+    }
+    Some(Command::Unsupported)
+}
+
+/// Split the leading whitespace-delimited token off `s`, returning it and the
+/// remainder with its leading whitespace trimmed.
+fn split_token(s: &str) -> (&str, &str) {
+    match s.find(char::is_whitespace) {
+        Some(end) => (&s[..end], s[end..].trim_start()),
+        None => (s, ""),
+    }
+}
+
+/// What a `mu say` destination resolved to against the live presence set.
+enum SayTarget {
+    /// One present, addressable agent.
+    Peer(PeerId),
+    /// A well-formed agent id that nothing on the mesh currently advertises.
+    Absent(PeerId),
+    /// An alias more than one present peer answers to.
+    Ambiguous(Vec<PeerId>),
+    /// A human — the gateway's own nick included. Never a mesh destination.
+    Human,
+    /// Neither a present peer, nor an alias, nor a peer id at all.
+    Unknown,
 }
 
 /// An explicit address's classification.

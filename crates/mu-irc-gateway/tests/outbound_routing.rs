@@ -1,12 +1,14 @@
-//! Offline IRC→mesh tests for increment 3: intent classification, destination
-//! checks, fan-out, routing-memory rules, and both loop guards — including the
-//! publish-then-observe race. No socket, no live mesh.
+//! Offline IRC→mesh tests for increments 3 and 4: intent classification,
+//! destination checks, fan-out, routing-memory rules, both loop guards —
+//! including the publish-then-observe race — and the bot verbs dispatched ahead
+//! of all of it. No socket, no live mesh.
 
 use mu_dialogue::mesh::{MeshDmEvent, Reception};
 use mu_irc_gateway::mapping::{channel_for, CaseMapping};
 use mu_irc_gateway::membership::Membership;
 use mu_irc_gateway::outbound::{
-    MemoryDestination, MemoryUpdate, OutDrop, OutEnv, Outbound, OutboundDecision, RefuseReason,
+    CommandReply, MemoryDestination, MemoryUpdate, OutDrop, OutEnv, Outbound, OutboundDecision,
+    RefuseReason, NO_AGENTS, USAGE,
 };
 use mu_peer::PeerId;
 
@@ -646,5 +648,334 @@ fn a_live_channellen_change_is_followed_by_channel_resolution() {
             OutboundDecision::Refuse(RefuseReason::UnknownChannel(_))
         ),
         "the old hashed name is no longer a channel the server derives"
+    );
+}
+
+// ────────────────────────── Bot verbs (increment 4) ─────────────────────────
+
+/// Destructure a bot-verb answer.
+fn replied(d: &OutboundDecision) -> &CommandReply {
+    match d {
+        OutboundDecision::Reply(reply) => reply,
+        other => panic!("expected a command Reply, got {other:?}"),
+    }
+}
+
+/// The rendered roster of a `mu peers` answer.
+fn roster(d: &OutboundDecision) -> Vec<String> {
+    match replied(d) {
+        CommandReply::Peers(lines) => lines.clone(),
+        other => panic!("expected a peers listing, got {other:?}"),
+    }
+}
+
+/// The reason a `mu say` was refused.
+fn command_refusal(d: &OutboundDecision) -> RefuseReason {
+    match replied(d) {
+        CommandReply::Refused(reason) => reason.clone(),
+        other => panic!("expected a refused command, got {other:?}"),
+    }
+}
+
+#[test]
+fn mu_peers_lists_every_present_agent_with_its_full_id_and_channel() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    // A session-level peer, a SESSIONLESS daemon, and a cc session: the daemon
+    // is a peer like any other here and must not be filtered out for having no
+    // session.
+    let peers = vec![
+        PeerId::parse("cc:abc"),
+        PeerId::parse("mu:d"),
+        PeerId::parse("mu:d:s"),
+    ];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+    };
+    // Typed in the lobby — where an ordinary line would fan out to all three.
+    let lines = roster(&o.route_line("alice", "#mu", "mu peers", "ID", &env));
+    assert!(lines[0].contains("3 agents"), "{lines:?}");
+    assert_eq!(lines.len(), 4, "a header and one line per peer: {lines:?}");
+    for (peer, channel) in [
+        ("cc:abc", "#cc-abc"),
+        ("mu:d", "#mu-d"),
+        ("mu:d:s", "#mu-d-s"),
+    ] {
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(peer) && l.contains(channel)),
+            "{peer} and {channel} must be on one line: {lines:?}"
+        );
+    }
+}
+
+#[test]
+fn mu_peers_marks_a_shared_channel_and_leaves_humans_out() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    // Two peers whose channels differ only by case fold onto ONE channel, which
+    // is what `(shared)` says; the human is not a mesh destination and is not a
+    // roster entry either.
+    let peers = vec![
+        PeerId::parse("cc:abc"),
+        PeerId::parse("cc:ABC"),
+        PeerId::human("alice"),
+    ];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+    };
+    let lines = roster(&o.route_line("alice", "mu-gw", "mu peers", "ID", &env));
+    assert!(lines[0].contains("2 agents"), "{lines:?}");
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(
+        lines[1..].iter().all(|l| l.contains("(shared)")),
+        "both peers fold onto one channel: {lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("human:") || l.contains("alice")),
+        "humans are not roster entries: {lines:?}"
+    );
+}
+
+#[test]
+fn mu_peers_on_an_empty_mesh_says_so_and_publishes_nothing() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let env = OutEnv {
+        peers: &[PeerId::human("alice")],
+        membership: &mem,
+    };
+    assert_eq!(
+        roster(&o.route_line("alice", "#mu", "mu peers", "ID", &env)),
+        vec![NO_AGENTS.to_string()],
+        "a mesh with only humans on it has no agents to list"
+    );
+}
+
+#[test]
+fn mu_say_to_a_present_peer_publishes_and_remembers_like_an_explicit_address() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+    };
+    // Typed in the lobby: directed, so it remembers — and privately, because
+    // `#cc-abc` is not where alice said it.
+    let d = o.route_line("alice", "#mu", "mu say cc:abc hello there", "SAY", &env);
+    let (id, targets, body, memory) = published(&d);
+    assert_eq!(id, "SAY", "one minted id, the caller's");
+    assert_eq!(targets, &[PeerId::parse("cc:abc")]);
+    assert_eq!(
+        body, "hello there",
+        "the verb and destination are not the body"
+    );
+    assert_eq!(
+        memory,
+        &Some(MemoryUpdate {
+            human: "alice".into(),
+            destination: MemoryDestination::Private,
+        })
+    );
+    assert!(
+        o.is_own_echo(&event("SAY", "human:alice")),
+        "a verb's publication is loop-guarded like any other"
+    );
+}
+
+#[test]
+fn mu_say_inside_the_peers_own_channel_remembers_that_channel() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+    };
+    let d = o.route_line("alice", "#cc-abc", "mu say cc:abc hello", "ID", &env);
+    let (_, targets, _, memory) = published(&d);
+    assert_eq!(targets, &[PeerId::parse("cc:abc")]);
+    assert_eq!(
+        memory,
+        &Some(MemoryUpdate {
+            human: "alice".into(),
+            destination: MemoryDestination::Channel("#cc-abc".into()),
+        }),
+        "the same rule an explicit address follows, from the same code"
+    );
+}
+
+#[test]
+fn mu_say_falls_back_to_the_alias_the_roster_printed() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+    };
+    // `cc-abc` is the alias `#cc-abc` is built from, not a peer id.
+    let d = o.route_line("alice", "#mu", "mu say cc-abc hi", "ID", &env);
+    let (_, targets, body, _) = published(&d);
+    assert_eq!(targets, &[PeerId::parse("cc:abc")]);
+    assert_eq!(body, "hi");
+    // …and folded, because the human typed it into IRC.
+    let d = o.route_line("alice", "#mu", "MU SAY CC-ABC hi", "ID2", &env);
+    let (_, targets, _, _) = published(&d);
+    assert_eq!(targets, &[PeerId::parse("cc:abc")]);
+}
+
+#[test]
+fn mu_say_to_an_absent_peer_names_it_and_publishes_nothing() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+    };
+    assert_eq!(
+        command_refusal(&o.route_line("alice", "#mu", "mu say cc:gone hi", "ID", &env)),
+        RefuseReason::AbsentDestination(PeerId::parse("cc:gone"))
+    );
+}
+
+#[test]
+fn mu_say_to_something_that_is_no_peer_at_all_quotes_what_was_typed() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+    };
+    assert_eq!(
+        command_refusal(&o.route_line("alice", "#mu", "mu say wibble hi", "ID", &env)),
+        RefuseReason::UnknownPeer("wibble".into())
+    );
+}
+
+#[test]
+fn mu_say_to_an_ambiguous_alias_names_the_colliding_peers() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    // `cc:a:b` and `cc:a-b` are different peers that share the alias `cc-a-b`.
+    let peers = vec![PeerId::parse("cc:a:b"), PeerId::parse("cc:a-b")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+    };
+    match command_refusal(&o.route_line("alice", "#mu", "mu say cc-a-b hi", "ID", &env)) {
+        RefuseReason::AmbiguousPeer(peers) => {
+            assert!(peers.contains(&PeerId::parse("cc:a:b")), "{peers:?}");
+            assert!(peers.contains(&PeerId::parse("cc:a-b")), "{peers:?}");
+        }
+        other => panic!("expected AmbiguousPeer, got {other:?}"),
+    }
+    // The full id of either one still resolves: ambiguity is the alias's, not
+    // the peers'.
+    let d = o.route_line("alice", "#mu", "mu say cc:a:b hi", "ID2", &env);
+    let (_, targets, _, _) = published(&d);
+    assert_eq!(targets, &[PeerId::parse("cc:a:b")]);
+}
+
+#[test]
+fn mu_say_to_a_human_is_refused_by_id_and_by_nick() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc"), PeerId::human("bob")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+    };
+    assert_eq!(
+        command_refusal(&o.route_line("alice", "#mu", "mu say human:bob hi", "ID", &env)),
+        RefuseReason::HumanDestination
+    );
+    assert_eq!(
+        command_refusal(&o.route_line("alice", "#mu", "mu say bob hi", "ID2", &env)),
+        RefuseReason::HumanDestination,
+        "the alias of a fronted human is still a human"
+    );
+}
+
+#[test]
+fn an_unsupported_verb_replies_with_usage_and_publishes_nothing() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+    };
+    for line in [
+        "mu wat",
+        "mu peers now",  // the verb takes no argument
+        "mu say cc:abc", // a destination with nothing to say
+        "mu say",
+    ] {
+        assert_eq!(
+            replied(&o.route_line("alice", "#mu", line, "ID", &env)),
+            &CommandReply::Usage,
+            "`{line}` must cost a usage line and no publication"
+        );
+    }
+    assert!(!USAGE.is_empty(), "the usage line names the verbs");
+}
+
+#[test]
+fn ordinary_text_that_merely_starts_with_mu_is_still_a_message() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("mu:d")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+    };
+    // A bare `mu` is a word, not a verb.
+    let d = o.route_line("alice", "#mu", "mu", "ID", &env);
+    let (_, targets, body, _) = published(&d);
+    assert_eq!(targets, &[PeerId::parse("mu:d")]);
+    assert_eq!(body, "mu");
+    // A peer id is a token ending in `:`, so it is an address and not a verb.
+    let d = o.route_line("alice", "#mu", "mu:d: hello", "ID2", &env);
+    let (_, targets, body, memory) = published(&d);
+    assert_eq!(targets, &[PeerId::parse("mu:d")]);
+    assert_eq!(body, "hello");
+    assert!(memory.is_some(), "an explicit address still remembers");
+}
+
+#[test]
+fn a_command_is_dispatched_ahead_of_routing_but_behind_both_gates() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+    };
+    // Loop guard 1 still comes first: a verb the gateway's own line carries is
+    // its own output coming back, never a command to run.
+    assert_eq!(
+        o.route_line("mu-gw", "#mu", "mu peers", "ID", &env),
+        OutboundDecision::Drop(OutDrop::OwnNick)
+    );
+    // So does sender authorization: a nick in no shared channel cannot be
+    // vouched for, and does not get the roster either.
+    assert_eq!(
+        o.route_line("mallory", "#mu", "mu peers", "ID", &env),
+        OutboundDecision::Refuse(RefuseReason::UnauthorizedSender("mallory".into()))
+    );
+    // A line while disconnected is still dropped rather than answered.
+    o.set_connected(false);
+    assert_eq!(
+        o.route_line("alice", "#mu", "mu peers", "ID", &env),
+        OutboundDecision::Drop(OutDrop::Disconnected)
     );
 }

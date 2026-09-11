@@ -11,8 +11,8 @@ rust-version.workspace = true
 # Increments 2a-3 are the offline capability library: configuration + mapping +
 # framing; the registration/capability adapter state machine, membership, and
 # mesh→IRC routing; IRC→mesh routing with both loop guards. The integration
-# increment adds what actually touches the network, starting with a TLS line
-# transport; the bridge loop and the daemon that runs it follow.
+# increment adds what actually touches the network — a TLS line transport, and
+# the bridge that executes those decisions over it.
 [lib]
 name = "mu_irc_gateway"
 path = "src/lib.rs"
@@ -41,15 +41,18 @@ mu-dialogue = { path = "../mu-dialogue" }
 biscuit-auth = { workspace = true }
 
 # ── integration increment ───────────────────────────────────────────────────
-# The async runtime the transport (and later the bridge) runs on. `full` matches
-# the workspace default; the gateway uses net, time, sync, signal and the
-# multi-thread runtime.
+# The async runtime the bridge runs on. `full` matches the workspace default;
+# the gateway uses net, time, sync, signal and the multi-thread runtime.
 tokio = { workspace = true }
 # The IRC socket. Deliberately NOT an IRC client crate: the adapter already owns
 # registration/CAP/SASL, and every maintained client wants to own that handshake
 # itself. What is missing is a TLS line transport, which is these two.
 tokio-rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
+# The bridge's error plumbing.
+anyhow = { workspace = true }
+# Body-free operational logging (never a message body, never a credential).
+tracing = { workspace = true }
 
 [dev-dependencies]
 # The routing ingress test mints a real capability-signed `DmEnvelope` and

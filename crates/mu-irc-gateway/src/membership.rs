@@ -24,9 +24,13 @@
 //!   (30 s, doubling, capped at ten minutes).
 //!
 //! Everything is invalidated on the events the plan calls disposable: a gateway
-//! PART/KICK drops one channel, and a disconnect or an incompatible `CASEMAPPING`
-//! change drops all of it — after which fresh discovery and NAMES rebuild it from
-//! nothing, with no traffic retained.
+//! PART/KICK drops one channel, and a disconnect drops all of it — after which
+//! fresh discovery and NAMES rebuild it from nothing, with no traffic retained.
+//! A live `CASEMAPPING` change is the one case that is re-derived rather than
+//! dropped: the gateway is still in the same channels, so every folded key is
+//! rebuilt from the wire spelling it came from and a fresh NAMES commits over
+//! the kept roster. Dropping the channel set there would be unrecoverable — a
+//! JOIN for a channel the client already occupies yields no echo and no NAMES.
 
 use std::collections::{HashMap, HashSet};
 
@@ -433,19 +437,111 @@ impl Membership {
         effects
     }
 
-    /// The server changed `CASEMAPPING` to `cm`. If it differs, every folded key
-    /// the view holds is now suspect, so the view is invalidated exactly like a
-    /// disconnect and rebuilt under the new rule from fresh NAMES.
+    /// The server changed `CASEMAPPING` to `cm`. Every folded key the view holds
+    /// is now derived under the wrong rule, so each one is RE-DERIVED from the
+    /// wire spelling it was built from — the channel from its display name, each
+    /// member from theirs.
+    ///
+    /// The channel SET is kept, because a mapping change does not move the
+    /// gateway out of anything: it is still in exactly the channels it was in,
+    /// and a view that forgot them could never be repaired (a JOIN for a channel
+    /// the client already occupies produces no self-JOIN echo and no NAMES, so
+    /// nothing would ever re-open a sync). The rosters are kept only as a
+    /// starting point — the caller re-opens a NAMES generation per channel via
+    /// [`self_joined`](Self::self_joined) and the fresh burst commits over them —
+    /// so any open sync is dropped here rather than committed under two rules.
+    ///
+    /// Folding is lossy, so a re-derivation can MOVE a human: `alice[]` is
+    /// `alice{}` under rfc1459 and `alice[]` under ascii, which are two different
+    /// `human:` peer ids. That is reported as a [`HumanEffect::Rename`], the same
+    /// effect a NICK produces, because it is the same thing from the mesh's side.
+    /// A fold that collides two humans onto one key withdraws the loser.
     pub fn set_casemapping(&mut self, cm: CaseMapping) -> Vec<HumanEffect> {
         if cm == self.cm {
             return Vec::new();
         }
-        let effects = self.reset();
+        let old_cm = self.cm;
         self.cm = cm;
         // Re-DERIVED from the wire spelling, not re-folded from the previous
         // folded value: folding is lossy, so re-folding would silently change
         // who the gateway thinks it is.
         self.self_nick.set_casemapping(cm);
+        let self_folded = self.self_nick.folded().to_string();
+
+        // Re-key the channels and their rosters from the spellings the wire gave.
+        let mut rekeyed: HashMap<String, Channel> = HashMap::new();
+        let mut moved: HashMap<String, String> = HashMap::new();
+        for channel in std::mem::take(&mut self.channels).into_values() {
+            let entry = rekeyed
+                .entry(fold_nick(&channel.display, cm))
+                .or_insert_with(|| Channel {
+                    display: channel.display.clone(),
+                    members: HashMap::new(),
+                    sync: None,
+                });
+            for member in channel.members.into_values() {
+                let new_key = fold_nick(&member.display, cm);
+                // A nick that folds onto the gateway's own identity under the new
+                // rule is the gateway, not a human to front.
+                if new_key == self_folded {
+                    continue;
+                }
+                moved.insert(fold_nick(&member.display, old_cm), new_key.clone());
+                entry.members.insert(new_key, member);
+            }
+        }
+        self.channels = rekeyed;
+
+        // Presence is a projection of the rosters, so it is rebuilt from them
+        // rather than re-keyed separately and allowed to disagree.
+        let mut before: Vec<String> = self.present.keys().cloned().collect();
+        before.sort();
+        self.present = HashMap::new();
+        for (folded_ch, channel) in &self.channels {
+            for key in channel.members.keys() {
+                self.present
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(folded_ch.clone());
+            }
+        }
+
+        // Identities the new rule leaves exactly where they were are settled
+        // FIRST, so a collision is always reported as the newcomer losing rather
+        // than as a rename onto an identity that never moved.
+        let stayed: HashSet<String> = before
+            .iter()
+            .filter(|k| moved.get(*k).is_some_and(|new| new == *k))
+            .cloned()
+            .collect();
+        let mut claimed = stayed.clone();
+        let mut effects = Vec::new();
+        for old_key in &before {
+            if stayed.contains(old_key) {
+                continue;
+            }
+            match moved.get(old_key) {
+                Some(new_key)
+                    if self.present.contains_key(new_key) && !claimed.contains(new_key) =>
+                {
+                    claimed.insert(new_key.clone());
+                    effects.push(HumanEffect::Rename {
+                        from: PeerId::human(old_key.clone()),
+                        to: PeerId::human(new_key.clone()),
+                    });
+                }
+                // Folded onto someone else's identity, or onto the gateway's:
+                // either way this human is no longer addressable.
+                _ => effects.push(HumanEffect::Withdraw(PeerId::human(old_key.clone()))),
+            }
+        }
+        let mut after: Vec<String> = self.present.keys().cloned().collect();
+        after.sort();
+        for new_key in after {
+            if !claimed.contains(&new_key) && !before.contains(&new_key) {
+                effects.push(HumanEffect::Register(PeerId::human(new_key)));
+            }
+        }
         effects
     }
 
@@ -465,6 +561,20 @@ impl Membership {
         set.iter()
             .find_map(|ch| self.channels.get(ch)?.members.get(&key))
             .map(|m| m.display.clone())
+    }
+
+    /// Every human currently observed present, as the `human:` peer id the mesh
+    /// fronts for them.
+    ///
+    /// The executor's answer to "who should have a mesh endpoint right now" —
+    /// which is a question with an answer even when a registration failed or a
+    /// mesh connection dropped, because presence is what IRC says it is and this
+    /// view never stopped saying it. Sorted, so a reconnect's effects are
+    /// reproducible.
+    pub fn present_humans(&self) -> Vec<PeerId> {
+        let mut keys: Vec<&String> = self.present.keys().collect();
+        keys.sort();
+        keys.into_iter().map(|k| PeerId::human(k.clone())).collect()
     }
 
     /// The channels a human is currently observed in (folded names), or empty.

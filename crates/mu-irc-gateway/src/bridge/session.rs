@@ -56,7 +56,9 @@ use crate::config::{GatewayConfig, IrcConfig};
 use crate::framing::{frame_privmsg, FrameParams};
 use crate::mapping::fold_nick;
 use crate::membership::{ChannelEffect, ChannelReconciler, HumanEffect, Membership};
-use crate::outbound::{OutDrop, OutEnv, Outbound, OutboundDecision, RefuseReason};
+use crate::outbound::{
+    MemoryDestination, OutDrop, OutEnv, Outbound, OutboundDecision, RefuseReason,
+};
 use crate::routing::{RouteDecision, RouteEnv, Router};
 use crate::transport::{self, Connection, FromServer, LineWriter, SendError};
 
@@ -285,8 +287,10 @@ struct Session {
     router: Router,
     out: Outbound,
     reconciler: ChannelReconciler,
-    /// Folded human nick → folded channel they were last addressed toward. The
-    /// mesh→IRC side reads it; the IRC→mesh side writes it.
+    /// Folded human nick → the folded channel a reply to them belongs in. The
+    /// mesh→IRC side reads it; the IRC→mesh side writes it — a directed line in
+    /// an agent's channel puts an entry here, and an explicit address typed
+    /// anywhere else removes one, which is how a reply falls back to a DM.
     remembered: HashMap<String, String>,
     /// Folded channel → the NAMES generation whose replies are current.
     names_gen: HashMap<String, u64>,
@@ -834,7 +838,18 @@ fn on_privmsg(
             memory,
         } => {
             if let Some(update) = memory {
-                session.remembered.insert(update.human, update.channel);
+                match update.destination {
+                    MemoryDestination::Channel(channel) => {
+                        session.remembered.insert(update.human, channel);
+                    }
+                    // An address typed anywhere but the agent's own channel says
+                    // the reply belongs in a DM. That is a write: a channel
+                    // remembered from an earlier line would otherwise keep
+                    // aiming replies at a room this line did not name.
+                    MemoryDestination::Private => {
+                        session.remembered.remove(&update.human);
+                    }
+                }
             }
             // A mesh that is down is the same answer as a destination that is
             // gone, and the human gets it now rather than after a queued line is

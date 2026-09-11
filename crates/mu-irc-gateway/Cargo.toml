@@ -8,13 +8,11 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
-# Through increment 3 this is a library of tested, OFFLINE capabilities:
-# configuration + mapping + framing (2a); the registration/capability adapter
-# state machine, disposable membership/channel lifecycle, and mesh→IRC routing
-# (2b); and IRC→mesh routing with both loop guards (3). There is deliberately NO
-# binary yet: the maintained IRC client, the real TLS/mesh transport, and the
-# event loop that executes these decisions are wired in the integration
-# increment, after each capability slice is reviewed.
+# Increments 2a-3 are the offline capability library: configuration + mapping +
+# framing; the registration/capability adapter state machine, membership, and
+# mesh→IRC routing; IRC→mesh routing with both loop guards. The integration
+# increment adds what actually touches the network, starting with a TLS line
+# transport; the bridge loop and the daemon that runs it follow.
 [lib]
 name = "mu_irc_gateway"
 path = "src/lib.rs"
@@ -42,9 +40,27 @@ mu-dialogue = { path = "../mu-dialogue" }
 # takes a biscuit `PublicKey`. No new verification is introduced here.
 biscuit-auth = { workspace = true }
 
+# ── integration increment ───────────────────────────────────────────────────
+# The async runtime the transport (and later the bridge) runs on. `full` matches
+# the workspace default; the gateway uses net, time, sync, signal and the
+# multi-thread runtime.
+tokio = { workspace = true }
+# The IRC socket. Deliberately NOT an IRC client crate: the adapter already owns
+# registration/CAP/SASL, and every maintained client wants to own that handshake
+# itself. What is missing is a TLS line transport, which is these two.
+tokio-rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+
 [dev-dependencies]
 # The routing ingress test mints a real capability-signed `DmEnvelope` and
 # serializes it, to prove the fail-closed gate accepts a valid one and rejects a
 # tampered or wrongly-signed one — exercising `mesh::verify_and_decode_dm` for
 # real, not a stub.
 serde_json = { workspace = true }
+# The transport's `start_paused` tests (the bounded shutdown grace, the shared
+# connect budget) drive tokio's clock instead of waiting those windows out in
+# real time. `test-util` is NOT part of the workspace `full` feature, so the
+# crate that uses it has to ask for it here — otherwise `cargo test -p
+# mu-irc-gateway` compiles only when some other crate in the build happens to
+# unify the feature in.
+tokio = { workspace = true, features = ["test-util"] }

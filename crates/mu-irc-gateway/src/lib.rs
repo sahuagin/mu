@@ -55,6 +55,15 @@
 //!   nick, and its own minted ids / `human:` senders recorded before publication
 //!   can race observation, in the bounded [`recent`] window).
 //!
+//! Increment **4** — the bot verbs, in that same [`outbound`] module because
+//! they are dispatched ahead of its routing rules and share them: `mu peers`
+//! renders the live presence set, `mu say <peer id or alias> <text>` resolves
+//! against it (full id first, then the channel alias) and publishes through the
+//! very code an explicit address does, so both leave the same routing memory.
+//! A command line is never mirrored, never fanned out and never published as
+//! itself; an unsupported verb costs one [`outbound::USAGE`] line and nothing
+//! more. Answers go privately to whoever typed the verb.
+//!
 //! Integration — what actually runs:
 //!
 //! - [`transport`] — one TCP connection, TLS by default, split into a line
@@ -68,9 +77,6 @@
 //!   half](bridge::run) is one IRC connection around one state-owning select
 //!   loop, with reconnect backoff; `main.rs` is configuration, signals, and a
 //!   call to [`bridge::run`].
-//!
-//! The textual bot verbs (`mu peers`, `mu say …`) remain absent, landing in
-//! their own independently reviewed increment.
 
 pub mod adapter;
 pub mod bridge;
@@ -100,7 +106,8 @@ pub use mapping::{
 };
 pub use membership::{ChannelEffect, ChannelReconciler, HumanEffect, Member, Membership};
 pub use outbound::{
-    MemoryDestination, MemoryUpdate, OutDrop, OutEnv, Outbound, OutboundDecision, RefuseReason,
+    CommandReply, MemoryDestination, MemoryUpdate, OutDrop, OutEnv, Outbound, OutboundDecision,
+    RefuseReason, NO_AGENTS, USAGE,
 };
 pub use recent::{RecentSet, DEFAULT_CAPACITY};
 pub use routing::{

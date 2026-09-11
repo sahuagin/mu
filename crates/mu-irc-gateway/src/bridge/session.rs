@@ -57,7 +57,8 @@ use crate::framing::{frame_privmsg, FrameParams};
 use crate::mapping::fold_nick;
 use crate::membership::{ChannelEffect, ChannelReconciler, HumanEffect, Membership};
 use crate::outbound::{
-    MemoryDestination, OutDrop, OutEnv, Outbound, OutboundDecision, RefuseReason,
+    Answer, CommandReply, MemoryDestination, OutDrop, OutEnv, Outbound, OutboundDecision,
+    RefuseReason, NO_AGENTS, USAGE,
 };
 use crate::routing::{RouteDecision, RouteEnv, Router};
 use crate::transport::{self, Connection, FromServer, LineWriter, SendError};
@@ -840,6 +841,7 @@ fn on_privmsg(
             targets,
             body,
             memory,
+            answer,
         } => {
             if let Some(update) = memory {
                 match update.destination {
@@ -868,11 +870,19 @@ fn on_privmsg(
                 Vec::new()
             };
             if resolved.is_empty() {
-                // Every destination vanished between the sweep and now.
+                // Every destination vanished between the sweep and now. Where
+                // that is said is the DECISION's to name: a line said to a room
+                // is answered in it, but a `mu say` is a command, and a command
+                // answers whoever typed it for every outcome — including this
+                // one, or a channel would read the one failure the verb has.
                 session.refused_out += 1;
+                let failed_to = match answer {
+                    Answer::WhereItWasSaid => reply_to,
+                    Answer::Sender => sender,
+                };
                 return notify(
                     writer,
-                    reply_to,
+                    failed_to,
                     "no mesh destination is reachable right now",
                 );
             }
@@ -889,6 +899,20 @@ fn on_privmsg(
                     generation: link.generation,
                 },
             );
+            Ok(())
+        }
+        // A bot verb: nothing is published, and the answer goes to whoever typed
+        // it rather than to the room they typed it in. Every line goes out
+        // through the same framing the mirror uses — a roster is not a second,
+        // unchecked way onto the wire — and each is gateway-authored, which loop
+        // guard 1 is what keeps out of the mesh if one is ever read back.
+        OutboundDecision::Reply(reply) => {
+            if matches!(reply, CommandReply::Refused(_)) {
+                session.refused_out += 1;
+            }
+            for line in command_lines(&reply) {
+                notify(writer, sender, &line)?;
+            }
             Ok(())
         }
         OutboundDecision::Refuse(reason) => {
@@ -1215,7 +1239,30 @@ fn refusal_text(reason: &RefuseReason) -> String {
             "{nick} is not in any channel this gateway is in, so it cannot be vouched for \
              on the mesh — join a channel the gateway is in first"
         ),
-        RefuseReason::NoDestinations => "no agents are on the mesh right now".into(),
+        RefuseReason::AmbiguousPeer(peers) => {
+            let names: Vec<String> = peers.iter().map(PeerId::to_string).collect();
+            format!(
+                "that name matches more than one peer ({}) — say one of them by its full id, \
+                 e.g. `mu say {} your message`",
+                names.join(", "),
+                names.first().map(String::as_str).unwrap_or("cc:id")
+            )
+        }
+        RefuseReason::UnknownPeer(dest) => {
+            format!("{dest} names no agent on the mesh right now — `mu peers` lists them")
+        }
+        RefuseReason::NoDestinations => NO_AGENTS.into(),
+    }
+}
+
+/// The operator-facing lines of one bot-verb answer. The roster arrives
+/// already rendered (the mapping rules that produced it are the outbound side's,
+/// not this module's); a refusal and a usage line are one line each.
+fn command_lines(reply: &CommandReply) -> Vec<String> {
+    match reply {
+        CommandReply::Peers(lines) => lines.clone(),
+        CommandReply::Refused(reason) => vec![refusal_text(reason)],
+        CommandReply::Usage => vec![USAGE.to_string()],
     }
 }
 
@@ -1720,6 +1767,233 @@ mod tests {
             "a diagnostic never carries the body: {sent:?}"
         );
         assert_eq!(session.refused_out, 1);
+    }
+
+    // ───────────────────────── Bot verbs, executed ───────────────────────────
+
+    /// The bodies of the PRIVMSGs this connection sent to `target`.
+    fn said_to(lines: &[String], target: &str) -> Vec<String> {
+        let prefix = format!("PRIVMSG {target} :");
+        lines
+            .iter()
+            .filter_map(|l| l.strip_prefix(prefix.as_str()).map(str::to_string))
+            .collect()
+    }
+
+    /// A scripted session with one discovered agent and alice in the lobby —
+    /// what every bot verb below is typed into — and the ends it is observed
+    /// through.
+    struct Verb {
+        session: Session,
+        jobs: mpsc::Receiver<PublishJob>,
+        writer: LineWriter,
+        lines: mpsc::Receiver<String>,
+        /// The channel the one discovered agent maps to.
+        channel: String,
+        /// The mesh link, so a test can take it down under a live peer.
+        link: watch::Sender<LinkState>,
+    }
+
+    fn verb_session() -> Verb {
+        let Scripted {
+            mut session,
+            jobs,
+            link,
+        } = scripted_session(PUBLISH_QUEUE);
+        let channel = one_agent(&mut session);
+        already_in(&mut session, LOBBY, "alice");
+        let (writer, mut lines) = transport::LineWriter::scripted(64);
+        let _ = written(&mut lines);
+        Verb {
+            session,
+            jobs,
+            writer,
+            lines,
+            channel,
+            link,
+        }
+    }
+
+    #[test]
+    fn mu_peers_is_answered_privately_and_published_nowhere() {
+        let Verb {
+            mut session,
+            mut jobs,
+            mut writer,
+            mut lines,
+            channel,
+            ..
+        } = verb_session();
+        // Typed in the LOBBY, where an ordinary line would fan out to the mesh.
+        on_privmsg(&mut session, &mut writer, "alice", LOBBY, "mu peers").unwrap();
+        assert!(jobs.try_recv().is_err(), "a command is never published");
+        let sent = written(&mut lines);
+        let privately = said_to(&sent, "alice");
+        assert_eq!(
+            privately.len(),
+            sent.len(),
+            "the roster is for whoever asked, not for the channel: {sent:?}"
+        );
+        assert!(privately[0].contains("1 agent"), "{privately:?}");
+        assert!(
+            privately
+                .iter()
+                .any(|l| l.contains("cc:abc") && l.contains(&channel)),
+            "one line naming the peer's full id and its channel: {privately:?}"
+        );
+    }
+
+    #[test]
+    fn mu_say_publishes_the_text_alone_and_says_nothing_back() {
+        let Verb {
+            mut session,
+            mut jobs,
+            mut writer,
+            mut lines,
+            ..
+        } = verb_session();
+        on_privmsg(
+            &mut session,
+            &mut writer,
+            "alice",
+            LOBBY,
+            "mu say cc:abc hello",
+        )
+        .unwrap();
+        let job = jobs.try_recv().expect("a present peer is published to");
+        assert_eq!(job.body, "hello", "the verb is not part of the body");
+        assert_eq!(job.from, "human:alice");
+        assert_eq!(job.targets.len(), 1);
+        assert!(
+            written(&mut lines).is_empty(),
+            "a delivered line needs no answer"
+        );
+        // …and it wrote the routing memory an explicit address would: typed in
+        // the lobby rather than in `#cc-abc`, so the reply comes back privately.
+        assert!(!session.remembered.contains_key("alice"));
+    }
+
+    #[test]
+    fn mu_say_to_an_absent_peer_is_answered_privately_and_published_nowhere() {
+        let Verb {
+            mut session,
+            mut jobs,
+            mut writer,
+            mut lines,
+            ..
+        } = verb_session();
+        on_privmsg(
+            &mut session,
+            &mut writer,
+            "alice",
+            LOBBY,
+            "mu say cc:gone hi",
+        )
+        .unwrap();
+        assert!(jobs.try_recv().is_err(), "nothing is published");
+        let privately = said_to(&written(&mut lines), "alice");
+        assert_eq!(privately.len(), 1, "{privately:?}");
+        assert!(privately[0].contains("cc:gone"), "{privately:?}");
+        assert!(
+            !privately[0].contains("hi"),
+            "never the body: {privately:?}"
+        );
+        assert_eq!(session.refused_out, 1, "a refused command is counted");
+    }
+
+    #[test]
+    fn mu_say_to_an_ambiguous_alias_names_the_colliding_peers() {
+        let Verb {
+            mut session,
+            mut jobs,
+            mut writer,
+            mut lines,
+            ..
+        } = verb_session();
+        // Two peers that share the alias `cc-a-b`, and so one channel.
+        session.discovery = Discovery::from_srv(HashMap::from([
+            ("cc:a:b".to_string(), "mu.agent.cc.a.b.dm".to_string()),
+            ("cc:a-b".to_string(), "mu.agent.cc.a-b.dm".to_string()),
+        ]));
+        on_privmsg(
+            &mut session,
+            &mut writer,
+            "alice",
+            LOBBY,
+            "mu say cc-a-b hi",
+        )
+        .unwrap();
+        assert!(jobs.try_recv().is_err(), "neither peer is chosen");
+        let privately = said_to(&written(&mut lines), "alice");
+        assert_eq!(privately.len(), 1, "{privately:?}");
+        assert!(privately[0].contains("cc:a:b"), "{privately:?}");
+        assert!(privately[0].contains("cc:a-b"), "{privately:?}");
+    }
+
+    #[test]
+    fn mu_say_with_the_mesh_down_answers_the_sender_not_the_channel() {
+        let Verb {
+            mut session,
+            mut jobs,
+            mut writer,
+            mut lines,
+            link,
+            ..
+        } = verb_session();
+        // The peer is present, so the verb resolves and publishes — but the link
+        // it would publish over is gone, which is the one `mu say` outcome the
+        // executor answers rather than the command code.
+        link.send_replace(LinkState {
+            up: false,
+            generation: 1,
+        });
+        on_privmsg(
+            &mut session,
+            &mut writer,
+            "alice",
+            LOBBY,
+            "mu say cc:abc hello",
+        )
+        .unwrap();
+        assert!(jobs.try_recv().is_err(), "nothing is held for a dead mesh");
+        let sent = written(&mut lines);
+        assert!(
+            said_to(&sent, LOBBY).is_empty(),
+            "a command's failure is not the channel's to read: {sent:?}"
+        );
+        let privately = said_to(&sent, "alice");
+        assert_eq!(privately.len(), 1, "{privately:?}");
+        assert_eq!(sent.len(), 1, "and nothing else went out: {sent:?}");
+        assert!(
+            privately[0].contains("no mesh destination is reachable"),
+            "{privately:?}"
+        );
+        assert!(
+            !privately[0].contains("hello"),
+            "never the body: {privately:?}"
+        );
+        assert_eq!(session.refused_out, 1, "a refused command is counted");
+    }
+
+    #[test]
+    fn an_unknown_verb_costs_one_usage_line_and_no_publish() {
+        let Verb {
+            mut session,
+            mut jobs,
+            mut writer,
+            mut lines,
+            ..
+        } = verb_session();
+        on_privmsg(&mut session, &mut writer, "alice", LOBBY, "mu wat").unwrap();
+        assert!(
+            jobs.try_recv().is_err(),
+            "a near-miss command must not become a broadcast"
+        );
+        assert_eq!(
+            said_to(&written(&mut lines), "alice"),
+            vec![USAGE.to_string()]
+        );
+        assert_eq!(session.refused_out, 0, "usage is an answer, not a refusal");
     }
 
     // ─────────────── What a session does with the link's state ───────────────

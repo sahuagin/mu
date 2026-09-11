@@ -30,6 +30,13 @@ pub use mu_dialogue::mesh::MeshConfig;
 pub struct Secret(String);
 
 impl Secret {
+    /// Wrap a credential value. Used by config loading and by callers that hold
+    /// a password from another source (e.g. constructing an [`IrcConfig`]
+    /// directly). The value is redacted in `Debug` from this point on.
+    pub fn new(value: impl Into<String>) -> Self {
+        Secret(value.into())
+    }
+
     /// The secret bytes, for the one place that authenticates. Kept off `Debug`
     /// and `Display` on purpose.
     pub fn expose(&self) -> &str {
@@ -179,8 +186,95 @@ pub enum ConfigError {
     SaslPasswordConflict,
     #[error("cannot read `sasl_password_file` {0}: {1}")]
     PasswordFile(PathBuf, std::io::Error),
+    /// `nick` is not usable as an IRC nickname. The reason is a fixed phrase,
+    /// never the offending nick, so the diagnostic stays value-free like the
+    /// rest of this enum.
+    #[error("[irc] `nick` is not a valid IRC nickname: {0}")]
+    InvalidNick(NickFault),
     #[error("mesh config: {0}")]
     Mesh(String),
+}
+
+/// The longest nickname this gateway will register. RFC 1459 caps a nick at 9
+/// characters and modern servers advertise `NICKLEN` well above that, so the
+/// limit here is only a sanity bound: it keeps a pathological value from being
+/// interpolated into `NICK`/`USER` and blowing the 512-byte line budget before
+/// the server ever sees it.
+pub const NICK_MAX_LEN: usize = 32;
+
+/// Why a nickname cannot be used. Each variant is a fixed phrase and carries no
+/// part of the offending value, so it composes into a value-free diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum NickFault {
+    #[error("it is empty")]
+    Empty,
+    #[error("it is longer than {} characters", NICK_MAX_LEN)]
+    TooLong,
+    #[error("it contains a non-ASCII character, and an RFC 2812 nickname is ASCII")]
+    NotAscii,
+    #[error("it does not begin with a letter or one of `[ ] \\ ` _ ^ {{ | }}`")]
+    BadStart,
+    #[error(
+        "it contains a character that is not a letter, a digit, `-`, \
+         or one of `[ ] \\ ` _ ^ {{ | }}`"
+    )]
+    BadCharacter,
+}
+
+/// The RFC 2812 `special` set — `%x5B-60` and `%x7B-7D`, i.e. the nine
+/// characters `[`, `]`, `\`, `` ` ``, `_`, `^`, `{`, `|`, `}`. On IRC these are
+/// ordinary nickname characters rather than punctuation: `{}|^` are the
+/// case-folded twins of `[]\~` (see [`crate::mapping`]), which is exactly why
+/// the same nick may be spelled with either.
+fn is_nick_special(b: u8) -> bool {
+    matches!(
+        b,
+        b'[' | b']' | b'\\' | b'`' | b'_' | b'^' | b'{' | b'|' | b'}'
+    )
+}
+
+/// Check that `nick` is a usable IRC nickname, per the RFC 2812 grammar:
+///
+/// ```text
+/// nickname = ( letter / special ) *( letter / digit / special / "-" )
+/// special  = %x5B-60 / %x7B-7D   ; "[", "]", "\", "`", "_", "^", "{", "|", "}"
+/// ```
+///
+/// with the RFC's 9-character bound relaxed to [`NICK_MAX_LEN`], since modern
+/// servers advertise `NICKLEN` well above nine.
+///
+/// This is the ONE rule, shared by config loading and by
+/// [`crate::adapter::Registration::start`]: `IrcConfig` is a public struct that
+/// a caller can build without going through [`load_irc`], so the adapter cannot
+/// assume the loader vetted the nick before it is interpolated into `NICK` and
+/// `USER`. Taking the grammar whole rather than blacklisting the dangerous
+/// bytes is what makes that safe by construction: CR and LF (which would append
+/// whole extra protocol lines), NUL, a space or a `,` (which would silently
+/// change which parameter the server reads) and a leading `:` (a trailing-
+/// parameter marker) are all outside the grammar, and so is everything nobody
+/// has thought of yet.
+pub fn validate_nick(nick: &str) -> Result<(), NickFault> {
+    if nick.is_empty() {
+        return Err(NickFault::Empty);
+    }
+    if nick.len() > NICK_MAX_LEN {
+        return Err(NickFault::TooLong);
+    }
+    if !nick.is_ascii() {
+        return Err(NickFault::NotAscii);
+    }
+    // ASCII from here, so bytes and characters are the same thing.
+    let bytes = nick.as_bytes();
+    if !(bytes[0].is_ascii_alphabetic() || is_nick_special(bytes[0])) {
+        return Err(NickFault::BadStart);
+    }
+    if !bytes[1..]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || is_nick_special(b) || b == b'-')
+    {
+        return Err(NickFault::BadCharacter);
+    }
+    Ok(())
 }
 
 /// The raw `[irc]` section as it appears in TOML, before validation. Every
@@ -384,6 +478,7 @@ fn validate(raw: IrcRaw) -> Result<IrcConfig, ConfigError> {
     };
     let server = require(raw.server, "server")?;
     let nick = require(raw.nick, "nick")?;
+    validate_nick(&nick).map_err(ConfigError::InvalidNick)?;
 
     // Non-empty-only: an empty string in TOML is treated as "unset" so it does
     // not, for instance, half-configure SASL with a blank user.

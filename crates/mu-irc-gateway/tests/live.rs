@@ -50,8 +50,8 @@ const STEP: Duration = Duration::from_secs(30);
 
 // ─────────────────────────────── The test ───────────────────────────────────
 
-/// One connection, one registration, one join, one human presence, and one line
-/// in each direction — through the production bridge.
+/// One connection, one registration, one join, one human presence, both bot
+/// verbs, and one line in each direction — through the production bridge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_bridge_registers_joins_fronts_a_human_and_routes_both_ways() {
     let Some(server) = env("MU_IRC_TEST_SERVER") else {
@@ -179,6 +179,48 @@ async fn the_bridge_registers_joins_fronts_a_human_and_routes_both_ways() {
         received.from,
         human_peer.to_string(),
         "the sender is the human the gateway fronts, asserted under the gateway's capability"
+    );
+
+    // 3b. The bot verbs, typed into the same channel by the same person.
+    //     `mu peers` answers PRIVATELY with the live presence set, so the agent
+    //     this test fronted has to be in it — by its FULL peer id, which is the
+    //     spelling `mu say` takes back.
+    human.send(&format!("PRIVMSG {lobby} :mu peers"));
+    let roster = human
+        .wait_for("the `mu peers` roster", |m| {
+            m.command == "PRIVMSG"
+                && m.params
+                    .get(1)
+                    .is_some_and(|t| t.contains(&agent.to_string()))
+        })
+        .await;
+    assert!(
+        roster
+            .params
+            .first()
+            .is_some_and(|target| target.eq_ignore_ascii_case(&human_nick)),
+        "the roster answers whoever asked rather than the channel: {:?}",
+        roster.params.first()
+    );
+
+    // 3c. `mu say <peer> <text>` reaches that peer. The `mu peers` line above is
+    //     a command and not a message, so the next thing the agent receives is
+    //     THIS body — a gateway that published the command line would fail here
+    //     rather than quietly broadcast it.
+    let said_body = format!("said from irc {}", std::process::id());
+    human.send(&format!("PRIVMSG {lobby} :mu say {agent} {said_body}"));
+    let said = tokio::time::timeout(STEP, agent_rx.recv())
+        .await
+        .expect("the agent receives the `mu say` line within the step timeout")
+        .expect("the agent's endpoint stream stays open");
+    assert_eq!(
+        said.body, said_body,
+        "the next line the agent received must be the `mu say` body: a command is never published"
+    );
+    assert_eq!(
+        said.from,
+        human_peer.to_string(),
+        "a verb publishes as the same human an ordinary line does"
     );
 
     // 4. mesh → IRC: the agent answers. The human is present in the lobby but

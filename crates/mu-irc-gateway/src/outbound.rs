@@ -30,6 +30,14 @@
 //! address, or a message to a specific agent's channel) — never a lobby or
 //! private fan-out — so the mesh→IRC side's remembered-channel precedence
 //! reflects real, directed conversations.
+//!
+//! What a directed line remembers is **where the human typed it**, not where the
+//! agent lives. A line in the peer's own channel is a conversation happening in
+//! that channel, so the reply belongs there. The same address typed in the lobby,
+//! in some other agent's channel, or privately to the gateway is not: the human
+//! may not even be in the peer's channel, and remembering it would send the reply
+//! to a room they never asked about — so those record
+//! [`MemoryDestination::Private`] and the reply comes back as a DM.
 
 use mu_peer::PeerId;
 
@@ -47,15 +55,28 @@ pub struct OutEnv<'a> {
     pub membership: &'a Membership,
 }
 
-/// A routing-memory write the executor should apply: this human was last
-/// addressed toward this channel. Folded keys, ready to key the mesh→IRC
-/// `remembered` map.
+/// A routing-memory write the executor should apply: where this human's next
+/// inbound DM belongs, as decided by the line they just typed. Folded keys,
+/// ready to key the mesh→IRC `remembered` map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryUpdate {
     /// Folded human nick.
     pub human: String,
-    /// Folded channel the human directed a message at.
-    pub channel: String,
+    /// Where a reply to this human belongs now.
+    pub destination: MemoryDestination,
+}
+
+/// Where a directed line says a reply to that human belongs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryDestination {
+    /// This folded channel: the human spoke to the agent *in* it, so the
+    /// conversation is happening there and the answer is part of it.
+    Channel(String),
+    /// Privately. The human addressed the agent from somewhere that is not the
+    /// agent's own channel, so there is no channel the reply is part of — and
+    /// this is a WRITE, not the absence of one: an earlier in-channel line must
+    /// not keep steering replies into a room this line did not name.
+    Private,
 }
 
 /// What the outbound side decided for one IRC line.
@@ -233,7 +254,7 @@ impl Outbound {
             match classify_address(addr) {
                 Address::Human => return OutboundDecision::Refuse(RefuseReason::HumanDestination),
                 Address::Agent(peer) => {
-                    return self.publish_explicit(from, peer, body, minted_id, env);
+                    return self.publish_explicit(from, peer, target, body, minted_id, env);
                 }
                 // Not an address at all (ordinary text that happens to hold a
                 // colon): fall through to channel/private handling.
@@ -251,11 +272,21 @@ impl Outbound {
     }
 
     /// Publish an explicitly-addressed line to one currently-discovered agent,
-    /// remembering that this human directed a message at that agent's channel.
+    /// remembering where the reply belongs — which is decided by `source`, the
+    /// IRC target the human typed the line to, not by where the agent lives.
+    ///
+    /// Addressing `cc:abc` *in* `#cc-abc` is a conversation in that channel and
+    /// the reply is part of it. Addressing it from the lobby, from another
+    /// agent's channel, or in a private line to the gateway is not: the human
+    /// is very likely not in `#cc-abc` at all, so remembering the agent's
+    /// channel would aim the reply at a room they never joined and it would
+    /// fall through to a DM anyway — with a stale memory left behind to
+    /// mis-route the next one. Those record [`MemoryDestination::Private`].
     fn publish_explicit(
         &mut self,
         from: PeerId,
         peer: PeerId,
+        source: &str,
         body: &str,
         minted_id: &str,
         env: &OutEnv,
@@ -263,9 +294,17 @@ impl Outbound {
         if !discovered(env.peers, &peer) {
             return OutboundDecision::Refuse(RefuseReason::AbsentDestination(peer));
         }
-        let memory = channel_for(&peer, &self.prefix, self.channellen).map(|ch| MemoryUpdate {
+        let source_folded = fold_nick(source, self.cm);
+        let in_peers_own_channel = channel_for(&peer, &self.prefix, self.channellen)
+            .is_some_and(|ch| fold_nick(&ch, self.cm) == source_folded);
+        let destination = if in_peers_own_channel {
+            MemoryDestination::Channel(source_folded)
+        } else {
+            MemoryDestination::Private
+        };
+        let memory = Some(MemoryUpdate {
             human: human_key(&from),
-            channel: fold_nick(&ch, self.cm),
+            destination,
         });
         self.mint(minted_id);
         OutboundDecision::Publish {
@@ -304,7 +343,7 @@ impl Outbound {
                 }
                 let memory = Some(MemoryUpdate {
                     human: human_key(&from),
-                    channel: fold_nick(target, self.cm),
+                    destination: MemoryDestination::Channel(fold_nick(target, self.cm)),
                 });
                 self.mint(minted_id);
                 OutboundDecision::Publish {

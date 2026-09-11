@@ -9,11 +9,11 @@ authors.workspace = true
 rust-version.workspace = true
 
 # So far this is a library of tested, OFFLINE capabilities: configuration +
-# mapping + framing (2a), plus the registration/capability adapter state machine
-# and the disposable membership/channel lifecycle (2b). There is deliberately NO
-# binary yet: the maintained IRC client, the real TLS/mesh transport, and the
-# event loop that executes these decisions are wired in the integration
-# increment, after each capability slice is reviewed.
+# mapping + framing (2a); the registration/capability adapter state machine, the
+# disposable membership/channel lifecycle, and mesh→IRC routing (2b). There is
+# deliberately NO binary yet: the maintained IRC client, the real TLS/mesh
+# transport, and the event loop that executes these decisions are wired in the
+# integration increment, after each capability slice is reviewed.
 [lib]
 name = "mu_irc_gateway"
 path = "src/lib.rs"
@@ -36,3 +36,14 @@ mu-peer = { workspace = true }
 # `MeshConfig` for mesh-config loading rather than re-implementing it. No IRC
 # client dependency lands here — that arrives with the 2b adapter.
 mu-dialogue = { path = "../mu-dialogue" }
+# The issuer public-key type at the routing ingress boundary: mesh→IRC reception
+# runs the SAME fail-closed `mesh::verify_and_decode_dm` the daemon does, which
+# takes a biscuit `PublicKey`. No new verification is introduced here.
+biscuit-auth = { workspace = true }
+
+[dev-dependencies]
+# The routing ingress test mints a real capability-signed `DmEnvelope` and
+# serializes it, to prove the fail-closed gate accepts a valid one and rejects a
+# tampered or wrongly-signed one — exercising `mesh::verify_and_decode_dm` for
+# real, not a stub.
+serde_json = { workspace = true }

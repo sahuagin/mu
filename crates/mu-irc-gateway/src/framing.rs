@@ -135,6 +135,27 @@ fn escape_tag_value(id: &str) -> Result<String, FramingError> {
     Ok(out)
 }
 
+/// Check `target` against the PRIVMSG target rules: non-empty, free of raw
+/// `\r`, `\n` and `\0`, and a single channel-or-nick rather than a list or a
+/// spelling that ends the parameter early.
+///
+/// [`frame_privmsg`] applies exactly this gate before it frames anything; it is
+/// public so a caller deciding *whether* an outbound line is possible at all —
+/// routing asking whether a destination-derived nick may appear on the wire —
+/// asks the framing rules instead of re-deriving them somewhere else.
+pub fn validate_target(target: &str) -> Result<(), FramingError> {
+    if target.is_empty() {
+        return Err(FramingError::EmptyTarget);
+    }
+    if has_control(target) {
+        return Err(FramingError::ControlChar);
+    }
+    if !is_single_target(target) {
+        return Err(FramingError::InvalidTarget);
+    }
+    Ok(())
+}
+
 /// Frame `body` as one or more complete PRIVMSG lines (each ending in `\r\n`),
 /// none exceeding [`LINE_BUDGET`] bytes.
 ///
@@ -142,14 +163,9 @@ fn escape_tag_value(id: &str) -> Result<String, FramingError> {
 /// line. A longer body is split on scalar boundaries, each non-final line
 /// carrying [`CONTINUATION_MARKER`]; the pieces reassemble to the original.
 pub fn frame_privmsg(params: &FrameParams, body: &str) -> Result<Vec<String>, FramingError> {
-    if params.target.is_empty() {
-        return Err(FramingError::EmptyTarget);
-    }
-    if has_control(params.target) || has_control(body) {
+    validate_target(params.target)?;
+    if has_control(body) {
         return Err(FramingError::ControlChar);
-    }
-    if !is_single_target(params.target) {
-        return Err(FramingError::InvalidTarget);
     }
 
     // The invariant part of every line: `[@+mu.id=<id> ]PRIVMSG <target> :`.

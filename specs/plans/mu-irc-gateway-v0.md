@@ -103,7 +103,19 @@ durable-wake path. The mu daemon stays entirely unaware that IRC exists.
   gateway's own human-endpoint subjects (`mu.agent.human.*.dm`), so endpoint and
   observer reception of the same minted id must be de-duplicated to exactly one
   IRC delivery — without suppressing genuinely different destinations that share
-  a fan-out id.
+  a fan-out id. The de-duplication memory, like the outbound loop guard and the
+  per-withdrawal notice suppression, is a fixed-capacity window of
+  recently-recorded keys rather than an unbounded set: the duplicate it
+  collapses arrives within one dispatch, so a bounded window covers it, and a
+  long-lived connection's memory does not grow with total traffic. Who is
+  addressed is the sender's choice, not the gateway's, so only an event that
+  reaches a delivery decision spends a slot of that window: a destination
+  addressing nobody must not evict the keys real deliveries depend on. A bounded
+  entry COUNT is only half a memory bound, since every part of that key is
+  remote text the shared DM decoder does not size-limit: the window retains a
+  fixed-size digest of `(id, destination, session)`, and the gateway's own
+  ingress refuses an envelope whose `id`, `session` or destination subject is
+  longer than a documented cap before routing sees it at all.
 
 ## Ordered increments (each separately reviewed, within the review cap)
 
@@ -167,16 +179,31 @@ durable-wake path. The mu daemon stays entirely unaware that IRC exists.
      v0 negotiating once — live CASEMAPPING/CHANNELLEN handling);
      disposable membership/channel lifecycle from NAMES and
      JOIN/PART/KICK/QUIT/NICK plus fresh discovery; mesh→IRC routing with agent
-     channels, collision labels, lobby fallbacks, exclusive human routing,
-     per-withdrawal bodiless-notice suppression, and exactly-once
-     endpoint/observer overlap handling.
+     channels whose presence is exact peer-id membership in the discovered set
+     (folded channel collisions decide only whether a present target's body
+     needs a disambiguating label), lobby fallbacks that name the intended
+     target, exclusive human routing, a `human`-role destination carrying no
+     usable nick (none at all, an empty subject component, a component the
+     mesh's own subject derivation could not have emitted — one carrying the `:`
+     that `PeerId::parse` would re-split into a different peer, whitespace, or a
+     control character — or text an IRC line cannot carry) dropped body-free
+     rather than routed as an agent, every
+     outbound line — the bodiless notice included — built through the framing
+     module, per-withdrawal bodiless-notice suppression in a bounded window, and
+     exactly-once endpoint/observer overlap handling over a bounded window of
+     recently-seen keys that only delivered events consume.
 
      The 2b slice lands as **offline library capabilities only**, mirroring 2a:
      the adapter is a registration/capability *state machine* over a small
      single-connection transport trait — the trait's real TLS socket, the
      maintained IRC client crate, and event-loop wiring are the integration
-     increment's job. Nothing here opens a socket or subscribes a subject; every
-     capability is exercised offline.
+     increment's job. Membership and routing are pure state machines driven by
+     *injected* IRC events and discovery snapshots that emit typed *effects and
+     decisions* (which channels to JOIN/PART, which PRIVMSG lines to frame); the
+     executor that runs those effects against the live mesh/IRC connections —
+     using `front_peer`/`release_peer` and the observer subscription — is
+     deferred to increment 5. Nothing here opens a socket or subscribes a
+     subject; every capability is exercised offline.
 3. **IRC → mesh.** Delivery for present-agent channels and lobby/private
    fan-out, canonical human senders, one shared id per broadcast, refusal of
    absent/human destinations and nonmember private senders, and routing-memory

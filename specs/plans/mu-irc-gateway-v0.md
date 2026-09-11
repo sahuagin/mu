@@ -164,12 +164,13 @@ durable-wake path. The mu daemon stays entirely unaware that IRC exists.
      Offline regression tests only; **no IRC client, adapter, membership, or
      routing yet.** This is the completion boundary of the present increment.
    - **2b — adapter, membership, routing.** IRC adapter over a maintained Rust
-     IRC client (one connection, TLS, mandatory SASL PLAIN when configured —
-     mandatory meaning fail-closed: a CAP reply that does not acknowledge
-     `sasl`, a terminal SASL numeric in either exchange phase, and a welcome
-     numeric before `903` all fail registration rather than completing it
-     unauthenticated, an unsolicited `sasl` ACK is ignored rather than entering
-     the exchange, and the response is chunked at 400 base64 characters with the
+     IRC client (superseded by the amendment below; one connection, TLS,
+     mandatory SASL PLAIN when configured — mandatory meaning fail-closed: a
+     CAP reply that does not acknowledge `sasl`, a terminal SASL numeric in
+     either exchange phase, and a welcome numeric before `903` all fail
+     registration rather than completing it unauthenticated, an unsolicited
+     `sasl` ACK is ignored rather than entering the exchange, and the response
+     is chunked at 400 base64 characters with the
      `AUTHENTICATE +` terminator an exact multiple requires; the configured nick
      is validated before it is interpolated into `NICK`/`USER`, and every
      outbound `AUTHENTICATE` payload is redacted in `Debug`), optional
@@ -196,14 +197,49 @@ durable-wake path. The mu daemon stays entirely unaware that IRC exists.
      The 2b slice lands as **offline library capabilities only**, mirroring 2a:
      the adapter is a registration/capability *state machine* over a small
      single-connection transport trait — the trait's real TLS socket, the
-     maintained IRC client crate, and event-loop wiring are the integration
-     increment's job. Membership and routing are pure state machines driven by
-     *injected* IRC events and discovery snapshots that emit typed *effects and
-     decisions* (which channels to JOIN/PART, which PRIVMSG lines to frame); the
-     executor that runs those effects against the live mesh/IRC connections —
-     using `front_peer`/`release_peer` and the observer subscription — is
-     deferred to increment 5. Nothing here opens a socket or subscribes a
-     subject; every capability is exercised offline.
+     client itself, and event-loop wiring are the integration increment's job
+     (the "maintained IRC client crate" this originally named is superseded by
+     the amendment below). Membership and routing are pure state machines
+     driven by *injected* IRC events and discovery snapshots that emit typed
+     *effects and decisions* (which channels to JOIN/PART, which PRIVMSG lines
+     to frame); the executor that runs those effects against the live mesh/IRC
+     connections — using `front_peer`/`release_peer` and the observer
+     subscription — is deferred to increment 5. Nothing here opens a socket or
+     subscribes a subject; every capability is exercised offline.
+
+     **Amendment, 2026-09-10 — the integration increment ships a plain TLS line
+     transport, not a maintained IRC client crate.** The two mentions above are
+     superseded; `crates/mu-irc-gateway/src/transport.rs` implements the
+     adapter's `Transport` trait over `tokio` + `tokio-rustls` directly.
+
+     *Why.* By the time 2b landed, the adapter already owned the whole
+     registration handshake: CAP LS 302 negotiation with cap-notify, CAP
+     DEL/NEW, mandatory fail-closed SASL PLAIN (chunked at 400 base64
+     characters, terminator included), nick rejection, and live
+     CASEMAPPING/CHANNELLEN handling from ISUPPORT — all reviewed and covered by
+     offline regression tests. Every maintained Rust IRC client wants to own
+     that same handshake. Adopting one therefore meant either running two
+     registration state machines against one socket, or reaching past the
+     crate's API to suppress its own; neither leaves the reviewed one in charge.
+     What was actually missing is the part a client crate adds no value to: a
+     socket, TLS to the system trust store, CRLF framing, a bounded outbound
+     queue, and reconnection. Both `tokio` and `tokio-rustls` were already in
+     the workspace dependency graph, so this direction added no new third-party
+     surface, where a client crate would have.
+
+     *What it costs.* Protocol decisions a client crate would have made for us —
+     IRCv3 message-tag parsing, numeric tables, CTCP, SASL mechanisms beyond
+     PLAIN — are now ours to make and to keep correct, and a protocol bug here
+     is ours to find. The line transport is deliberately small (framing,
+     lifecycle, TLS setup) to keep that surface bounded; the protocol itself
+     lives in the adapter, which is where the tests are.
+
+     *What would reopen it.* v0 exclusions coming back in — multi-connection or
+     multi-nick operation, SASL mechanisms beyond PLAIN (SCRAM, EXTERNAL),
+     server-time/batch/chathistory, or IRCv3 capabilities whose state machines
+     are substantially more than a flag — would make a maintained crate's
+     protocol coverage worth two state machines, and this decision should be
+     re-taken rather than extended.
 3. **IRC → mesh.** Delivery for present-agent channels and lobby/private
    fan-out, canonical human senders, one shared id per broadcast, refusal of
    absent/human destinations — an explicit destination is present only on exact

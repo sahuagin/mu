@@ -11,11 +11,15 @@ rust-version.workspace = true
 # Increments 2a-3 are the offline capability library: configuration + mapping +
 # framing; the registration/capability adapter state machine, membership, and
 # mesh→IRC routing; IRC→mesh routing with both loop guards. The integration
-# increment adds what actually touches the network — a TLS line transport, and
-# the bridge that executes those decisions over it.
+# increment adds what actually touches the network — a TLS line transport, the
+# bridge that executes those decisions over it, and the daemon that runs it.
 [lib]
 name = "mu_irc_gateway"
 path = "src/lib.rs"
+
+[[bin]]
+name = "mu-irc-gateway"
+path = "src/main.rs"
 
 [dependencies]
 serde = { workspace = true }
@@ -49,10 +53,12 @@ tokio = { workspace = true }
 # itself. What is missing is a TLS line transport, which is these two.
 tokio-rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
-# The bridge's error plumbing.
+# The bridge's error plumbing, and the binary's CLI.
 anyhow = { workspace = true }
+clap = { workspace = true }
 # Body-free operational logging (never a message body, never a credential).
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 # The routing ingress test mints a real capability-signed `DmEnvelope` and

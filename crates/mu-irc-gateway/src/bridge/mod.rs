@@ -16,7 +16,7 @@
 //!   subscriptions behind an ingress gate, the ordered presence worker, the
 //!   ordered per-session publish worker, the `$SRV` discovery sweep, and the
 //!   watcher that tracks the NATS connection in every phase;
-//! - the session half is one IRC connection — the reader, registration, and ONE
+//! - [`session`] is one IRC connection — the reader, registration, and ONE
 //!   select loop that owns membership, routing, the outbound loop guards, the
 //!   reconciler and the socket's write half, with the reconnect backoff around
 //!   it.
@@ -43,3 +43,6 @@
 //! diagnostics name classes, counts and peer ids.
 
 pub mod mesh_side;
+mod session;
+
+pub use session::run;

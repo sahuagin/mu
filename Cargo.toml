@@ -53,6 +53,14 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 rustls-webpki = { version = "0.103.13", default-features = false }
 futures = "0.3"
 async-trait = "0.1"
+# mu-irc-gateway's IRC socket. The adapter owns registration itself, so what is
+# needed from a client library is a TLS line transport, not a second handshake
+# state machine. Both crates are already in the graph (async-nats and reqwest
+# build them), and the provider is pinned to `ring` — the one the rest of the
+# workspace already resolves — rather than rustls' aws-lc-rs default, which
+# would add a C/assembly toolchain requirement to the build.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-native-certs = "0.8"
 
 # serialization
 # `rc` feature enables Serialize/Deserialize for Arc<T> / Rc<T> — used

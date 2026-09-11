@@ -1,11 +1,13 @@
 //! `mu-irc-gateway` — a standalone single-nick IRC frontend to the mu agent
 //! mesh (see `specs/plans/mu-irc-gateway-v0.md`).
 //!
-//! This crate is built in reviewable capability slices, all **offline** — a
-//! library of pure, testable capabilities with no socket, no live mesh, and no
-//! runnable bridge. The real TLS/IRC transport, the mesh subscriptions, and the
-//! event loop that executes the effects these capabilities *decide* are the
-//! integration increment's job.
+//! The crate was built in reviewable capability slices: each one a pure,
+//! testable *decision* module with no socket and no live mesh, and then a final
+//! increment that runs them against a real server. The split survives in the
+//! structure — [`routing`] decides what to put on IRC, [`outbound`] decides what
+//! to publish, [`membership`] decides who is present, and only [`transport`]
+//! touches the network — which is why every rule below can be tested without
+//! either server.
 //!
 //! Increment **2a** — configuration and pure mapping/framing:
 //!
@@ -53,9 +55,15 @@
 //!   nick, and its own minted ids / `human:` senders recorded before publication
 //!   can race observation, in the bounded [`recent`] window).
 //!
-//! The maintained IRC client and network execution (integration, increment 5)
-//! and the textual bot verbs (increment 4) are deliberately absent, each landing
-//! in its own independently reviewed increment.
+//! Integration — what actually runs:
+//!
+//! - [`transport`] — one TCP connection, TLS by default, split into a line
+//!   reader and a bounded line writer. Deliberately NOT an IRC client crate:
+//!   [`adapter`] already owns registration, and what was missing is a socket.
+//!
+//! The bridge loop that executes these decisions over that socket, and the
+//! textual bot verbs (`mu peers`, `mu say …`), remain absent — each landing in
+//! its own independently reviewed increment.
 
 pub mod adapter;
 pub mod config;
@@ -65,6 +73,7 @@ pub mod membership;
 pub mod outbound;
 pub mod recent;
 pub mod routing;
+pub mod transport;
 
 pub use adapter::{
     AdapterError, Clock, ConnectRequest, Diagnostic, FixedClock, IrcMessage, IsupportSettings,

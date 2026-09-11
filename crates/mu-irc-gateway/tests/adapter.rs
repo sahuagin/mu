@@ -13,6 +13,7 @@ use mu_irc_gateway::config::{
 };
 use mu_irc_gateway::framing::{frame_privmsg, FrameParams};
 use mu_irc_gateway::mapping::CaseMapping;
+use mu_irc_gateway::transport::TlsTrust;
 
 /// The one password value that must never surface off the wire. The `AUTHENTICATE`
 /// line legitimately carries its base64 form; nothing else may.
@@ -22,6 +23,9 @@ fn cfg(sasl: bool, tls: bool) -> IrcConfig {
     IrcConfig {
         server: "irc.example.org:6697".into(),
         tls,
+        // The adapter never touches the trust store: it decides lines, and the
+        // transport is what verifies a certificate.
+        tls_trust: TlsTrust::default(),
         nick: "mu-gw".into(),
         sasl: sasl.then(|| SaslCreds {
             user: "acct".into(),

@@ -325,6 +325,35 @@ durable-wake path. The mu daemon stays entirely unaware that IRC exists.
    ordinary routing, with live full-id/alias resolution, ambiguity replies
    naming colliding peers, correct explicit-address routing-memory updates, and
    no publication for unsupported commands.
+
+   **As landed (after 5a/5b, so the stack's increment 6).** Both verbs live in
+   `outbound`, dispatched ahead of every routing rule there and behind the two
+   gates that already ran ahead of those: the own-nick loop guard, and the one
+   sender-authorization check — `mu say` publishes under the gateway's own
+   capability exactly as an explicit address does, and the roster is not
+   something to hand a nick the gateway shares no channel with.
+
+   `mu peers` renders the presence set itself, one line per present agent
+   carrying the full peer id (the spelling both `mu say` and an explicit address
+   take) and the channel `mapping` gives it, marked `(shared)` where two present
+   peers fold onto one channel — the same collision the mesh→IRC side labels
+   bodies for. Humans are left out: the contract names no place for them, they
+   are not mesh destinations, and IRC already shows who is in the room.
+
+   `mu say` resolves the full peer id first — exact membership in the discovery
+   snapshot, never a matching DM subject — and only then the channel alias,
+   folded under the server's `CASEMAPPING` because a human typed it into IRC. An
+   alias several peers answer to resolves to none of them and names them all
+   back. What resolves is published through the SAME `publish_explicit` an
+   explicit address goes through, so which spelling was used cannot change the
+   routing memory left behind.
+
+   A verb's answer is addressed to whoever typed it rather than to the channel
+   they typed it in, and leaves through the framing module like every other
+   line — a roster is not a second, unchecked way onto the wire, and it is
+   gateway-authored text that loop guard 1 keeps out of the mirror. A bare `mu`
+   stays ordinary text; everything after a real verb prefix is claimed, so a
+   near-miss command costs one usage line rather than becoming a fan-out.
 5. **Integration + acceptance.** Wire the tested capabilities into the
    standalone binary using existing mesh registration/release APIs for human
    endpoints, optional observer fallback, verification-failure counters and

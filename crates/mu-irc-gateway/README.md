@@ -24,7 +24,7 @@ mirrors both directions, and reconnects with backoff.
 | `adapter` | registration state machine: CAP negotiation, mandatory SASL PLAIN when configured (refused over cleartext, never in printable state), optional message-tags/account caps, live CASEMAPPING/CHANNELLEN |
 | `membership` | channel membership and human presence from generation-scoped NAMES plus JOIN/PART/KICK/QUIT/NICK, and a channel reconciler with refused-JOIN backoff |
 | `routing` | mesh→IRC decisions behind the fail-closed `mesh::verify_and_decode_dm` ingress, exactly-once endpoint/observer overlap handling, exclusive human-delivery precedence |
-| `outbound` | IRC→mesh decisions: explicit address, agent channel, or fan-out under one minted id; one sender-authorization check ahead of all destination logic; both loop guards |
+| `outbound` | IRC→mesh decisions: the bot verbs first, then explicit address, agent channel, or fan-out under one minted id; one sender-authorization check ahead of all destination logic; both loop guards |
 | `transport` | the socket: TCP, TLS by default (system anchors plus any configured private CA), CRLF framing, a bounded outbound queue |
 | `bridge` | the loop that runs all of the above against a live server and a live mesh |
 
@@ -281,8 +281,51 @@ Ergo (`ergochat`) with TLS on 6697 and services enabled:
 Everything is ordinary IRC. Address an agent by prefixing a line with its peer
 id and a colon (`cc:abc: hello`), or just talk in that agent's channel. A line
 in the lobby, or a private message to the gateway's nick, fans out to every
-discovered agent under a single mesh id. There are no slash commands and no bot
-verbs yet (see below).
+discovered agent under a single mesh id. There are no slash commands; the two
+bot verbs below are ordinary text too.
+
+## Bot verbs
+
+Two textual commands, typed in any channel the gateway is in or privately to its
+nick. Both answer **privately**, to whoever typed them — a roster is for the
+person who asked, not for the room.
+
+```text
+<alice> mu peers
+     (privately, from mu-gw)  2 agents on the mesh right now:
+     (privately, from mu-gw)  cc:abc — #cc-abc
+     (privately, from mu-gw)  mu:d5 — #mu-d5
+
+<alice> mu say cc-abc deploy is green
+     (nothing comes back: the line was delivered to cc:abc)
+```
+
+`mu peers` lists the agents `$SRV` discovery currently sees, each by its full
+peer id — the spelling `mu say` and an explicit address both take — and the
+channel it maps to. A channel two present peers fold onto is marked `(shared)`,
+the same collision the mesh→IRC side labels bodies for. Humans are not listed:
+they are not mesh destinations, and IRC already shows who is in the room.
+
+`mu say <peer id or alias> <text>` is `cc:abc: text` in different clothes. The
+destination is resolved against the same live presence set — the full peer id
+first, then the alias the channel name is built from (`cc-abc`), folded under the
+server's `CASEMAPPING` — and it publishes through the same code an explicit
+address does, so both leave the same routing memory behind: the reply comes back
+to the peer's channel if that is where you typed it, and privately otherwise.
+An alias more than one peer answers to is refused naming them, an absent or
+unknown destination is refused naming it, and a human is refused as a
+destination the way any other human address is. A mesh that is down when the
+line reaches the wire is the one failure the publish path reports rather than
+the verb, and it is reported the same way: privately, to whoever typed the
+command — where an explicit address gets that news back in the channel it was
+typed in, because that is where the line itself was said.
+
+A command line is never mirrored to the lobby, never fanned out, and never
+published as itself. An `mu <verb>` the gateway does not implement — `mu peers`
+with an argument, `mu say` with nothing to say — costs one line of usage and no
+publication, which is the point of dispatching verbs first: a typo must not
+become a broadcast. A bare `mu` is a word, not a verb, and is carried as
+ordinary text.
 
 ## Humans-only fallback
 
@@ -356,15 +399,16 @@ gateway and requires `RPL_WHOISACCOUNT` naming the configured user, so the
 authenticated registration is confirmed by the server rather than inferred.
 
 It connects, registers, joins the lobby, checks that a human's JOIN became a
-`human:` endpoint on `$SRV`, routes one line each way, checks the mesh→IRC line
-reaches the human's nick rather than the channel they are sitting in and arrives
-exactly once despite the endpoint/observer overlap, and shuts down with a `QUIT`
-and a released endpoint. Neither server is faked: what needs a server and
+`human:` endpoint on `$SRV`, routes one line each way, runs both bot verbs
+(`mu peers` names the test's own mesh peer in a private answer, and `mu say`
+reaches it), checks the mesh→IRC line reaches the human's nick rather than the
+channel they are sitting in and arrives exactly once despite the
+endpoint/observer overlap, and shuts down with a `QUIT` and a released
+endpoint. Neither server is faked: what needs a server and
 does not have one is reported as a skip, never mocked.
 
 ## Not here yet
 
-- **Bot verbs** (`mu peers`, `mu say <peer> <text>`) — its own increment.
 - **Multi-nick / multi-operator fan-in** — exactly one gateway nick.
 - **IRC-side persistence, scrollback or history** — none, deliberately.
 - **Daemon changes**, or any IRC awareness in `mu-coding` — none.

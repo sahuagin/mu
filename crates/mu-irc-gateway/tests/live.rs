@@ -20,6 +20,7 @@
 //! | --- | --- |
 //! | `MU_IRC_TEST_SERVER` | `host:port` of an IRC server. **Required**; without it every test here skips. |
 //! | `MU_IRC_TEST_TLS` | `0` for a plaintext server. Default: TLS (and then SASL, if configured). |
+//! | `MU_IRC_TEST_TLS_CA` | Path to a PEM CA bundle, fed to the same `[irc] tls_ca_file` the daemon reads. What lets this run against a private/self-signed server over TLS — and therefore with SASL. Setting it together with `MU_IRC_TEST_TLS=0` is a hard error rather than a silent downgrade. |
 //! | `MU_IRC_TEST_NATS` | NATS url. Optional: without it the harness spawns a local `nats-server` on an OS-assigned port under a name nothing else has, and proves it owns the port by reading that name back out of the broker's `INFO` greeting. It skips only when there is no `nats-server` binary at all (`NATS_BIN` to point at one); a binary that is present and will not start is a failure, not a skip. |
 //! | `MU_IRC_TEST_ISSUER_KEY` | Hex Ed25519 mesh issuer key. Optional: a fresh one is generated for an isolated broker. |
 //! | `MU_IRC_TEST_NICK` | The gateway's nick. Default `mu-gw-test`. |
@@ -64,7 +65,10 @@ async fn the_bridge_registers_joins_fronts_a_human_and_routes_both_ways() {
     let tls = env("MU_IRC_TEST_TLS").as_deref() != Some("0");
     // Read before anything is started: a half-configured credential pair is a
     // configuration error, and the operator should hear about it now rather
-    // than after a broker and two connections have been spent.
+    // than after a broker and two connections have been spent. The same is true
+    // of the CA bundle — a path that is not a usable trust anchor is a mistake
+    // in the invocation, not a property of the server under test.
+    let trust = trust(tls);
     let sasl = sasl(tls);
     let sasl_account = sasl.as_ref().map(|creds| creds.user.clone());
 
@@ -108,7 +112,7 @@ async fn the_bridge_registers_joins_fronts_a_human_and_routes_both_ways() {
         .expect("fronting the test agent on the mesh");
 
     // A person, on IRC, in the lobby.
-    let mut human = Client::connect(&server, tls, &human_nick).await;
+    let mut human = Client::connect(&server, tls, &trust, &human_nick).await;
     human.send(&format!("JOIN {lobby}"));
     human
         .wait_for("our own JOIN", |m| {
@@ -121,10 +125,7 @@ async fn the_bridge_registers_joins_fronts_a_human_and_routes_both_ways() {
         irc: IrcConfig {
             server: server.clone(),
             tls,
-            // The system store, as an unconfigured gateway gets: this harness
-            // runs against whatever server the operator points it at, and
-            // choosing its anchors is not this increment's job.
-            tls_trust: TlsTrust::default(),
+            tls_trust: trust.clone(),
             nick: nick.clone(),
             sasl,
             channel_prefix: "#".to_string(),
@@ -330,8 +331,8 @@ async fn drain(
 }
 
 impl Client {
-    async fn connect(server: &str, tls: bool, nick: &str) -> Self {
-        let conn = transport::connect(server, tls, Duration::from_secs(20))
+    async fn connect(server: &str, tls: bool, trust: &TlsTrust, nick: &str) -> Self {
+        let conn = transport::connect_with_trust(server, tls, trust, Duration::from_secs(20))
             .await
             .expect("the test client connects to the IRC server");
         let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
@@ -640,6 +641,40 @@ impl Drop for NatsServer {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// The trust store from the environment.
+///
+/// `MU_IRC_TEST_TLS_CA` goes through `TlsTrust::with_ca_file` — the SAME entry
+/// point `[irc] tls_ca_file` uses — so a fixture server with a self-signed CA is
+/// reachable over TLS, which is what makes the SASL leg runnable at all: the
+/// adapter refuses credentials over cleartext, so before this the only TLS run
+/// available was one against a publicly-issued certificate.
+///
+/// The system anchors are KEPT (the production default), because the point of
+/// the variable is to add a private CA, not to prove the harness can exclude
+/// public ones.
+///
+/// A bundle with `MU_IRC_TEST_TLS=0` is a configuration error and panics. It is
+/// exactly the invocation whose silent version would be worst: the operator
+/// pointed at a CA, believes the run verified a certificate against it, and
+/// nothing was verified at all.
+fn trust(tls: bool) -> TlsTrust {
+    let Some(path) = env("MU_IRC_TEST_TLS_CA") else {
+        return TlsTrust::system();
+    };
+    assert!(
+        tls,
+        "MU_IRC_TEST_TLS_CA is set with MU_IRC_TEST_TLS=0. A cleartext connection presents no \
+         certificate, so the CA would verify nothing — drop one of the two."
+    );
+    let path = std::path::PathBuf::from(path);
+    TlsTrust::with_ca_file(&path, true).unwrap_or_else(|e| {
+        panic!(
+            "MU_IRC_TEST_TLS_CA points at {}, which cannot be used as a trust anchor: {e}",
+            path.display()
+        )
+    })
 }
 
 /// SASL credentials from the environment.

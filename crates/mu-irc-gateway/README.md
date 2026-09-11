@@ -25,7 +25,7 @@ mirrors both directions, and reconnects with backoff.
 | `membership` | channel membership and human presence from generation-scoped NAMES plus JOIN/PART/KICK/QUIT/NICK, and a channel reconciler with refused-JOIN backoff |
 | `routing` | mesh→IRC decisions behind the fail-closed `mesh::verify_and_decode_dm` ingress, exactly-once endpoint/observer overlap handling, exclusive human-delivery precedence |
 | `outbound` | IRC→mesh decisions: explicit address, agent channel, or fan-out under one minted id; one sender-authorization check ahead of all destination logic; both loop guards |
-| `transport` | the socket: TCP, TLS by default, CRLF framing, a bounded outbound queue |
+| `transport` | the socket: TCP, TLS by default (system anchors plus any configured private CA), CRLF framing, a bounded outbound queue |
 | `bridge` | the loop that runs all of the above against a live server and a live mesh |
 
 ## Configuration
@@ -48,7 +48,9 @@ every secret redacted, and exits without connecting to anything.
 | --- | --- | --- | --- |
 | `server` | yes | — | `host:port` of the IRC server (a bare host takes 6697 with TLS, 6667 without) |
 | `nick` | yes | — | the single nick the gateway registers as |
-| `tls` | no | `true` | connect over TLS, verified against the system trust store |
+| `tls` | no | `true` | connect over TLS, verified against the trust store below |
+| `tls_ca_file` | no | — | PEM bundle of extra CA certificates to trust for this connection (a private CA) |
+| `tls_system_roots` | no | `true` | whether the system trust store is part of that trust store |
 | `sasl_user` | no | — | SASL PLAIN account |
 | `sasl_password` | no | — | SASL PLAIN password, inline |
 | `sasl_password_file` | no | — | SASL PLAIN password from a file (mutually exclusive with the inline form) |
@@ -61,6 +63,88 @@ password (or a password without a user) is rejected. Credential errors name a
 field or a path, never a secret value — including malformed TOML, which is
 reported as a field name and expected type rather than a message quoting the
 offending line.
+
+### Trusting a private CA
+
+`tls_ca_file` **adds** a PEM bundle's certificates to what this connection
+verifies a server certificate against; `tls_system_roots = false` drops the
+system anchors so the bundle is the only one left. Both are read and parsed at
+startup, so `mu-irc-gateway --check-config` is where a bad bundle is reported.
+
+The trust model behind those two keys — why the anchors are additive, why the
+validation is eager, and why there is no "skip verification" switch — is in
+`specs/plans/mu-irc-gateway-v0.md`, **Amendment, 2026-09-11**. Read it before
+changing any of this; what follows is only how to set it up.
+
+One consequence belongs here because it is what a hand-made certificate usually
+gets wrong: **the server name is still checked, exactly.** Trusting a CA decides
+who may *issue* the certificate, never which name it is for. If `server` is an
+IP address, that IP must be in the certificate's `subjectAltName` — a `DNS:`
+SAN, or a CN, does not stand in for it. Give the certificate a `DNS:` SAN and
+use that hostname, or give it an `IP:` SAN and connect by address; either works,
+mixing them does not.
+
+#### Making one with `openssl`
+
+A CA whose only job is to sign this one server. Keep `ca.key` somewhere you
+would keep a password — anything holding it can mint a certificate the gateway
+will trust.
+
+```sh
+# 1. The CA: a key, and a self-signed certificate for it (10 years).
+openssl ecparam -name prime256v1 -genkey -noout -out ca.key
+openssl req -x509 -new -key ca.key -sha256 -days 3650 \
+    -subj "/CN=example LAN CA" \
+    -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" \
+    -out ca.pem
+
+# 2. The server's key and request.
+openssl ecparam -name prime256v1 -genkey -noout -out irc.key.ec
+openssl pkcs8 -topk8 -nocrypt -in irc.key.ec -out irc.key
+openssl req -new -key irc.key -subj "/CN=irc.lan" -out irc.csr
+
+# 3. The SANs are the part that matters — list every name and address the
+#    gateway (and your other clients) will connect to.
+cat > irc.ext <<'EXT'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:irc.lan,IP:192.168.1.10
+EXT
+
+# 4. Sign it (10 years).
+openssl x509 -req -in irc.csr -sha256 -days 3650 \
+    -CA ca.pem -CAkey ca.key -CAcreateserial \
+    -extfile irc.ext -out irc.pem
+```
+
+`irc.pem` + `irc.key` go to the IRC server (for Ergo, `tls-certificate` /
+`tls-key` in its listener config). **`ca.pem`** is the one the gateway needs:
+
+```toml
+[irc]
+server = "irc.lan:6697"
+nick = "mu-gw"
+tls_ca_file = "/home/you/.config/mu/irc-ca.pem"
+```
+
+Confirm it before running anything:
+
+```sh
+mu-irc-gateway --check-config   # prints `ca_file` and the anchor count
+```
+
+#### The same CA on a phone
+
+Your own IRC client has to trust the CA too, and a phone will not read the
+gateway's config. On iOS with **Igloo IRC**: mail or AirDrop `ca.pem` to the
+device, open it (Settings offers to install a *profile*), then — and this is the
+step that is easy to miss — **Settings → General → About → Certificate Trust
+Settings** and switch the CA on. Installing the profile alone is not enough; iOS
+keeps root trust behind that second toggle, and Igloo will keep refusing the
+connection until it is flipped. Only `ca.pem` ever leaves the machine: never
+`ca.key`, and never the server's key.
 
 SASL is **mandatory when configured**: if the server does not acknowledge `sasl`,
 answers with a terminal SASL numeric, or welcomes the connection before the
@@ -248,14 +332,28 @@ MU_IRC_TEST_SERVER=127.0.0.1:6667 MU_IRC_TEST_TLS=0 \
   cargo test -p mu-irc-gateway --test live -- --nocapture
 ```
 
+Against a private-CA server, with the authenticated path actually exercised:
+
+```sh
+MU_IRC_TEST_SERVER=irc.lan:6697 \
+MU_IRC_TEST_TLS_CA=$HOME/.config/mu/irc-ca.pem \
+MU_IRC_TEST_SASL_USER=mu-gw MU_IRC_TEST_SASL_PASSWORD=… \
+  cargo test -p mu-irc-gateway --test live -- --nocapture
+```
+
 | variable | meaning |
 | --- | --- |
 | `MU_IRC_TEST_SERVER` | `host:port` of an IRC server. Required; without it the test skips. |
 | `MU_IRC_TEST_TLS` | `0` for a plaintext server (then no SASL — credentials over cleartext are refused). |
+| `MU_IRC_TEST_TLS_CA` | Path to a PEM CA bundle, fed to the same `tls_ca_file` the daemon reads. This is what lets the harness run over TLS against a server with a private CA — and therefore run the SASL leg, which TLS is a precondition for. Setting it with `MU_IRC_TEST_TLS=0` is a hard error, not a quiet downgrade. |
 | `MU_IRC_TEST_NATS` | NATS url. Without it the harness starts a local `nats-server` (`NATS_BIN` to point at one) under a unique name and confirms that name in the broker's `INFO` greeting before using it. No binary at all is a skip; a binary that will not start is a failure. |
 | `MU_IRC_TEST_ISSUER_KEY` | Hex Ed25519 mesh issuer key. A fresh one is generated for an isolated broker. |
 | `MU_IRC_TEST_NICK`, `MU_IRC_TEST_LOBBY` | Defaults `mu-gw-test`, `#mu-live-test`. |
 | `MU_IRC_TEST_SASL_USER`, `MU_IRC_TEST_SASL_PASSWORD` | SASL PLAIN, TLS only. |
+
+With `MU_IRC_TEST_TLS_CA` and SASL credentials set, the run also WHOISes the
+gateway and requires `RPL_WHOISACCOUNT` naming the configured user, so the
+authenticated registration is confirmed by the server rather than inferred.
 
 It connects, registers, joins the lobby, checks that a human's JOIN became a
 `human:` endpoint on `$SRV`, routes one line each way, checks the mesh→IRC line

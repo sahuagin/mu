@@ -281,6 +281,19 @@ durable-wake path. The mu daemon stays entirely unaware that IRC exists.
    fallback, best-effort gaps, the missing native broadcast subject, and the v1
    exclusions.
 
+   As landed: the transport is a plain TLS line client over `tokio` +
+   `tokio-rustls` rather than a maintained IRC client crate. The adapter already
+   owns registration, CAP and SASL; every such crate wants to own that same
+   handshake, so adopting one meant running two registration state machines or
+   suppressing the crate's. What was actually missing — a socket, TLS, CRLF
+   framing, reconnection — is the smaller dependency, and both crates were
+   already in the workspace graph. The bridge is one task per *input* (IRC
+   reader, an ingress gate over the mesh subscriptions, discovery sweep, ordered
+   presence worker, and a per-session ordered publish worker) around ONE
+   state-owning select loop, because both directions
+   mutate the same membership and routing state and a second state-owning task
+   would need a lock around all of it.
+
 ## v0 exclusions
 
 - No IRC-side persistence, scrollback replay, or history buffering.

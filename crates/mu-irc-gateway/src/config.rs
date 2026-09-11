@@ -4,6 +4,11 @@
 //! `mu_dialogue::mesh::load`, so there is one loader and one set of defaults for
 //! the mesh connection. This module owns only the IRC-specific `[irc]` section.
 //!
+//! Validation is eager where the alternative is a runtime surprise. `tls_ca_file`
+//! is READ and PARSED here, not at connect time, so an operator running IRC
+//! behind a private CA learns that their bundle is missing, unparsable or empty
+//! from `--check-config` rather than from a reconnect loop that never succeeds.
+//!
 //! Secrets are handled carefully. A SASL password read from config or a file is
 //! wrapped in [`Secret`], whose `Debug` redacts it, and every [`ConfigError`]
 //! names a field or a path but never a secret value — including the
@@ -22,6 +27,8 @@ use serde::Deserialize;
 
 use mu_dialogue::mesh;
 pub use mu_dialogue::mesh::MeshConfig;
+
+use crate::transport::{CaFault, TlsTrust};
 
 /// A credential value that must never be logged. `Debug` redacts it; the plain
 /// value is reachable only through [`Secret::expose`], which callers use when
@@ -67,6 +74,11 @@ pub struct IrcConfig {
     pub server: String,
     /// Whether to connect over TLS. Defaults to `true`.
     pub tls: bool,
+    /// What a server certificate is verified against: the system trust store by
+    /// default, plus (or instead of) the PEM bundle `tls_ca_file` names. Built
+    /// here, at load time, so a bundle that cannot be used is a configuration
+    /// error rather than a reconnect that never succeeds.
+    pub tls_trust: TlsTrust,
     /// The single nick the gateway registers as.
     pub nick: String,
     /// SASL PLAIN credentials, or `None` when SASL is not configured.
@@ -186,6 +198,22 @@ pub enum ConfigError {
     SaslPasswordConflict,
     #[error("cannot read `sasl_password_file` {0}: {1}")]
     PasswordFile(PathBuf, std::io::Error),
+    /// `tls_ca_file` names something that cannot serve as a trust anchor. The
+    /// fault is a fixed phrase or an io error from [`CaFault`]; no part of the
+    /// file's contents reaches the diagnostic, for the same reason a malformed
+    /// `sasl_password` is reported by field name.
+    #[error("[irc] `tls_ca_file` {0} cannot be used: {1}")]
+    TlsCaFile(PathBuf, CaFault),
+    #[error(
+        "[irc] sets `tls_system_roots = false` without a `tls_ca_file`, which leaves nothing \
+         to verify any server certificate against"
+    )]
+    NoTrustAnchors,
+    #[error(
+        "[irc] sets `tls = false` with `tls_ca_file`/`tls_system_roots`: a cleartext \
+         connection presents no certificate, so nothing would be verified against them"
+    )]
+    TrustWithoutTls,
     /// `nick` is not usable as an IRC nickname. The reason is a fixed phrase,
     /// never the offending nick, so the diagnostic stays value-free like the
     /// rest of this enum.
@@ -286,6 +314,8 @@ pub fn validate_nick(nick: &str) -> Result<(), NickFault> {
 struct IrcRaw {
     server: Option<String>,
     tls: Option<bool>,
+    tls_ca_file: Option<String>,
+    tls_system_roots: Option<bool>,
     nick: Option<String>,
     sasl_user: Option<String>,
     sasl_password: Option<String>,
@@ -332,6 +362,8 @@ pub fn load_irc(path: &Path) -> Result<IrcConfig, ConfigError> {
 const IRC_FIELDS: &[(&str, FieldType)] = &[
     ("server", FieldType::Str),
     ("tls", FieldType::Bool),
+    ("tls_ca_file", FieldType::Str),
+    ("tls_system_roots", FieldType::Bool),
     ("nick", FieldType::Str),
     ("sasl_user", FieldType::Str),
     ("sasl_password", FieldType::Str),
@@ -483,6 +515,9 @@ fn validate(raw: IrcRaw) -> Result<IrcConfig, ConfigError> {
     // Non-empty-only: an empty string in TOML is treated as "unset" so it does
     // not, for instance, half-configure SASL with a blank user.
     let nonempty = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+
+    let tls = raw.tls.unwrap_or(true);
+    let tls_trust = tls_trust(tls, nonempty(raw.tls_ca_file), raw.tls_system_roots)?;
     let user = nonempty(raw.sasl_user);
     let inline = nonempty(raw.sasl_password);
     let file = nonempty(raw.sasl_password_file);
@@ -510,13 +545,57 @@ fn validate(raw: IrcRaw) -> Result<IrcConfig, ConfigError> {
 
     Ok(IrcConfig {
         server,
-        tls: raw.tls.unwrap_or(true),
+        tls,
+        tls_trust,
         nick,
         sasl,
         channel_prefix: nonempty(raw.channel_prefix).unwrap_or_else(|| "#".to_string()),
         lobby: nonempty(raw.lobby).unwrap_or_else(|| "#mu".to_string()),
         observe_agent_dms: raw.observe_agent_dms.unwrap_or(true),
     })
+}
+
+/// Resolve what a server certificate is verified against.
+///
+/// Three rules, each one a contradiction the operator would otherwise only find
+/// out about at connect time, or never:
+///
+/// - **Trust settings without TLS.** A cleartext connection presents no
+///   certificate at all, so `tls_ca_file` or `tls_system_roots` alongside `tls =
+///   false` describes verification that cannot happen. Refused rather than
+///   ignored: the operator who wrote them believes the connection is verified.
+/// - **`tls_system_roots = false` with no bundle.** That is an empty trust
+///   store, and an empty store cannot validate anything. Refused here, where the
+///   fix is one line away, rather than as a connect failure every 2 seconds.
+/// - **A bundle that cannot be used.** The file is read and parsed NOW — the
+///   same moment `--check-config` runs — so a missing path, a file that is not
+///   PEM, and a bundle with no certificate in it are startup errors. The fault
+///   comes from [`CaFault`], which carries no file content.
+///
+/// Note what is NOT a rule: a bundle never REPLACES the system anchors unless
+/// asked to. `tls_system_roots` defaults to `true`, so adding a private CA for a
+/// LAN server leaves every public network still verifiable.
+fn tls_trust(
+    tls: bool,
+    ca_file: Option<String>,
+    system_roots: Option<bool>,
+) -> Result<TlsTrust, ConfigError> {
+    if !tls {
+        if ca_file.is_some() || system_roots.is_some() {
+            return Err(ConfigError::TrustWithoutTls);
+        }
+        // Nothing is verified on a cleartext connection; the value is inert.
+        return Ok(TlsTrust::system());
+    }
+    let system_roots = system_roots.unwrap_or(true);
+    let Some(ca_file) = ca_file else {
+        if !system_roots {
+            return Err(ConfigError::NoTrustAnchors);
+        }
+        return Ok(TlsTrust::system());
+    };
+    let path = PathBuf::from(ca_file);
+    TlsTrust::with_ca_file(&path, system_roots).map_err(|e| ConfigError::TlsCaFile(path, e))
 }
 
 /// Read a SASL password from a file, trimming a trailing newline. An empty file

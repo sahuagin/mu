@@ -240,6 +240,62 @@ durable-wake path. The mu daemon stays entirely unaware that IRC exists.
      are substantially more than a flag — would make a maintained crate's
      protocol coverage worth two state machines, and this decision should be
      re-taken rather than extended.
+
+     **Amendment, 2026-09-11 — the transport's trust is configurable: the
+     system anchors, an operator's CA bundle, or only the bundle.** The clause
+     "TLS to the system trust store" in the *Why* paragraph above is superseded.
+     What a server certificate is verified against is a value the connection is
+     given: `[irc] tls_ca_file` names a PEM bundle whose certificates are ADDED
+     to the anchors, and `[irc] tls_system_roots = false` drops the native store
+     so that bundle is the only anchor left. With neither key set the behaviour
+     is unchanged — the system store alone, which is what every configuration
+     written before this increment keeps.
+
+     *Why.* The server this gateway is run against is on a private LAN behind a
+     CA the operator runs themselves, and that is the intended shape rather
+     than a stage on the way to a public certificate: an IRC server that never
+     faces the internet has no public name to be issued one for. v0 already
+     refuses SASL credentials over cleartext, so until this increment the only
+     configuration that would actually run on that LAN was one with no
+     credentials at all — which is to say the capability is what makes the
+     authenticated path reachable at all, not a convenience on top of it.
+
+     *The anchors are additive.* A bundle never REPLACES the system store
+     unless `tls_system_roots = false` asks it to. A gateway that trusts a LAN
+     CA therefore still verifies a public network normally, and the operator
+     who adds a CA does not silently narrow what the process will talk to. The
+     exclusive mode exists because "this connection should trust exactly one
+     issuer" is a real and stricter thing to want; it is just not the default,
+     since the failure it produces when chosen by accident is a connection that
+     never succeeds.
+
+     *Validation is eager.* The bundle is read and parsed at CONFIG LOAD, not
+     at connect time, so `mu-irc-gateway --check-config` is where a missing
+     path, a file that is not PEM, and a bundle with no usable anchor in it are
+     reported. The diagnostic names the path and a fixed phrase and never
+     echoes the file, the same rule that keeps a credential error from echoing
+     a password. Two combinations are refused at that same moment rather than
+     ignored: `tls_system_roots = false` with no bundle (an empty trust store
+     can validate nothing), and either key alongside `tls = false` (a cleartext
+     connection presents no certificate, so an operator who wrote them believes
+     in verification that cannot happen). The alternative to all of this is
+     finding out from a reconnect loop that never succeeds.
+
+     *The server name is still checked, exactly.* Trusting a CA decides who may
+     ISSUE a certificate, never which name it is for. If `server` names an IP
+     address, that address has to be in the certificate's `subjectAltName`: a
+     `DNS:` SAN, or a CN, does not stand in for it, and nothing about
+     configuring an anchor loosens that.
+
+     *There is no skip-verification switch, and there will not be one.* This is
+     a decision, not an unbuilt feature. The adapter's SASL gate refuses to
+     send a password over anything but TLS; a transport that could be told to
+     accept any certificate would make that refusal decorative, because the
+     password would then go to whoever answered the address. A private CA is
+     the supported way to reach a self-signed server precisely because it still
+     verifies — the operator names an issuer instead of naming nobody. Nothing
+     short of a mechanism that keeps the credential safe without verifying the
+     peer would reopen this, and TLS does not offer one.
 3. **IRC → mesh.** Delivery for present-agent channels and lobby/private
    fan-out, canonical human senders, one shared id per broadcast, refusal of
    absent/human destinations — an explicit destination is present only on exact
@@ -306,6 +362,30 @@ durable-wake path. The mu daemon stays entirely unaware that IRC exists.
    shared fail-closed gate before forwarding anything, so the bridge enters this
    crate's ingress at `Router::accept_verified` — verification already done by
    the same function, the size caps applied at the same place either way.
+6. **Private-CA trust**, specified by the 2026-09-11 amendment above and
+   lands as two increments that merge together: 5a ships the capability — the keys
+   are parsed and validated at load, `--check-config` reports faults, and the
+   transport gains `connect_with_trust` — while the bridge still connects with
+   the system store until 5b wires the configured trust into the connection and
+   the live harness; 5a merged alone would therefore accept a bundle it does not
+   yet honour, which is why the two are stacked and merged as a pair. 5a and 5b (continuing the numbering the bridge slices
+   used), split so the capability is reviewed before anything in production
+   calls it.
+   - **5a — the capability.** `[irc] tls_ca_file` and `tls_system_roots`, their
+     eager validation and the refusals above, the `TlsTrust` anchor set and its
+     `CaFault`, and the transport's per-connection TLS configuration — reached
+     through `transport::connect_with_trust`, while plain `transport::connect`
+     keeps the system-store behaviour every existing caller has. Tested at the
+     seam against a fixture CA signing a loopback server: that the private CA
+     is trusted when configured and not otherwise, that it does not loosen
+     server-name verification, that an unusable bundle is refused without
+     echoing it, and that the default is still the system store alone. No
+     bridge, no live server.
+   - **5b — integration.** The bridge's connection is given the configured
+     trust, the live harness takes a bundle from `MU_IRC_TEST_TLS_CA` through
+     the same entry point `[irc] tls_ca_file` uses (which is what makes a live
+     TLS-plus-SASL run against the operator's own server possible), and the
+     crate README gains the operator-facing recipe.
 
 ## v0 exclusions
 

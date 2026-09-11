@@ -1375,6 +1375,7 @@ mod tests {
     use crate::bridge::mesh_side::nats_watcher;
     use crate::config::{SaslCreds, Secret};
     use crate::mapping::{channel_for, CaseMapping};
+    use crate::transport::TlsTrust;
 
     const LOBBY: &str = "#mu";
 
@@ -1383,6 +1384,7 @@ mod tests {
         IrcConfig {
             server: "irc.invalid:6667".into(),
             tls: false,
+            tls_trust: TlsTrust::default(),
             nick: "mu-gw".into(),
             sasl: None,
             channel_prefix: "#".into(),

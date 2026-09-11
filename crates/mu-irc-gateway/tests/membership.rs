@@ -175,16 +175,102 @@ fn reset_withdraws_all_humans_and_forgets_channels() {
 }
 
 #[test]
-fn incompatible_casemapping_invalidates_like_a_disconnect() {
+fn a_casemapping_change_keeps_the_channels_the_gateway_is_still_in() {
+    // The gateway does not leave a channel because the server changed how it
+    // folds case. Forgetting the channel set here is unrecoverable: the bridge
+    // can only re-open a NAMES generation for a channel the view still holds,
+    // and a JOIN for one the client already occupies yields no echo and no
+    // NAMES — so the roster could never be rebuilt and the humans in it would
+    // stay un-fronted for the life of the connection.
     let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#a");
-    m.joined("#a", "alice", None);
-    // Switching to ascii could re-partition folded identities, so all is dropped.
+    let g = m.self_joined("#a");
+    m.names_reply("#a", g, names(&[("alice", None)]));
+    m.names_end("#a", g);
+    m.self_joined("#b");
+    m.joined("#b", "bob", None);
+
     let e = m.set_casemapping(CaseMapping::Ascii);
-    assert_eq!(e, vec![HumanEffect::Withdraw(human("alice"))]);
-    assert!(m.joined_channels().is_empty());
+    assert!(e.is_empty(), "nothing moved, so nothing to report: {e:?}");
+    let mut joined = m.joined_channels();
+    joined.sort();
+    assert_eq!(joined, vec!["#a".to_string(), "#b".to_string()]);
+    assert!(m.is_present("alice") && m.is_present("bob"));
+    assert_eq!(m.casemapping(), CaseMapping::Ascii);
     // The same mapping is a no-op.
     assert!(m.set_casemapping(CaseMapping::Ascii).is_empty());
+}
+
+#[test]
+fn a_casemapping_change_that_moves_a_human_is_a_rename() {
+    // `alice[]` folds to `alice{}` under rfc1459 and to `alice[]` under ascii:
+    // two different `human:` peer ids, so the endpoint the gateway fronts has to
+    // move. That is the same thing a NICK does, and it is reported the same way
+    // so the executor's release-then-front ordering applies unchanged.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#a");
+    m.names_reply("#a", g, names(&[("alice[]", None), ("bob", None)]));
+    m.names_end("#a", g);
+    assert!(m.is_present("alice{}"));
+
+    let e = m.set_casemapping(CaseMapping::Ascii);
+    assert_eq!(
+        e,
+        vec![HumanEffect::Rename {
+            from: human("alice{}"),
+            to: human("alice[]"),
+        }],
+        "bob folds the same way under both rules and must not move"
+    );
+    assert!(m.is_present("alice[]"));
+    assert!(m.is_present("bob"));
+    // The display spelling is still the wire's, so a private PRIVMSG addresses
+    // the person the server knows.
+    assert_eq!(m.display_nick("alice[]").as_deref(), Some("alice[]"));
+}
+
+#[test]
+fn a_casemapping_change_that_collides_two_humans_withdraws_the_loser() {
+    // Under ascii `a{` and `a[` are two people; under rfc1459 they fold to one
+    // key. One identity survives, and the other is no longer addressable — so it
+    // is withdrawn rather than left fronted with nobody behind it.
+    let mut m = Membership::new("mu-gw", CaseMapping::Ascii);
+    let g = m.self_joined("#a");
+    m.names_reply("#a", g, names(&[("a{", None), ("a[", None)]));
+    m.names_end("#a", g);
+    assert!(m.is_present("a{") && m.is_present("a["));
+
+    // `a{` is already its own fold under rfc1459, so it is the identity that
+    // stays; `a[` folds onto it and is withdrawn rather than renamed onto
+    // someone who never moved.
+    let e = m.set_casemapping(RFC);
+    assert_eq!(e, vec![HumanEffect::Withdraw(human("a["))], "{e:?}");
+    assert!(
+        m.is_present("a{"),
+        "the surviving folded identity is present"
+    );
+    assert_eq!(m.channels_of("a{").len(), 1);
+}
+
+#[test]
+fn a_casemapping_change_leaves_the_roster_re_syncable() {
+    // What the bridge does next: re-open a generation per kept channel and let a
+    // fresh NAMES burst commit over the re-folded roster. The kept roster is a
+    // starting point, not an authority — a member who left during the change is
+    // withdrawn by the commit.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#a");
+    m.names_reply("#a", g, names(&[("alice", None), ("carol", None)]));
+    m.names_end("#a", g);
+    m.set_casemapping(CaseMapping::Ascii);
+
+    let g2 = m.self_joined("#a");
+    assert_ne!(g2, g, "a fresh generation, so a stale burst cannot commit");
+    m.names_reply("#a", g2, names(&[("alice", None), ("dave", None)]));
+    let e = m.names_end("#a", g2);
+    assert!(e.contains(&HumanEffect::Register(human("dave"))));
+    assert!(e.contains(&HumanEffect::Withdraw(human("carol"))));
+    assert!(m.is_present("alice") && m.is_present("dave"));
+    assert!(!m.is_present("carol"));
 }
 
 #[test]

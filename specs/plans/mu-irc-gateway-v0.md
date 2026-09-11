@@ -92,7 +92,10 @@ durable-wake path. The mu daemon stays entirely unaware that IRC exists.
   same peer always maps to the same channel. Collisions in the short alias are
   disambiguated by falling back to a label carrying more of the full id.
 - **Reverse lookup** (IRC channel/target → mesh peer) resolves against the
-  *current* set of discovered peers, never a stored roster; ambiguity is
+  *current* set of discovered peers, never a stored roster, comparing channel
+  names under the server's advertised `CASEMAPPING` — the server treats
+  case-equivalent channel names as one channel, so the gateway must too;
+  ambiguity (including peers whose channels collide only once folded) is
   reported to the operator naming the colliding peers, and no channel is ever
   created for a human.
 - **Observer subject.** `observe_agent_dms` subscribes the agent-DM wildcard
@@ -124,16 +127,38 @@ durable-wake path. The mu daemon stays entirely unaware that IRC exists.
      loading existing mesh settings without changing daemon defaults and
      rejecting invalid or conflicting credential settings without revealing
      secrets. No IRC adapter yet.
-2. **mesh → IRC.** IRC adapter over a maintained Rust IRC client (one
-   connection, TLS, mandatory SASL PLAIN when configured, optional
-   message-tags/account caps, CASEMAPPING/CHANNELLEN handling); pure mapping
-   functions; IRC framing within the 512-byte budget with UTF-8 splitting,
-   continuation markers, injection prevention, and `+mu.id` only when tags are
-   negotiated; disposable membership/channel lifecycle from NAMES and
-   JOIN/PART/KICK/QUIT/NICK plus fresh discovery; mesh→IRC routing with agent
-   channels, collision labels, lobby fallbacks, exclusive human routing,
-   per-withdrawal bodiless-notice suppression, and exactly-once endpoint/observer
-   overlap handling.
+2. **mesh → IRC**, split into two independently reviewed capability slices.
+   (2a was cut to fit the review cap; review-driven fixes and their tests then
+   grew it to ~2,020 reviewable lines, 18 over the default, and its third board
+   ran with `MU_REVIEW_SIZE_OVERRIDE=1` rather than splitting it again.)
+   - **2a — configuration + pure mapping/framing.** The `mu-irc-gateway` crate
+     (library only, no runnable bridge) with: gateway-local `[irc]`
+     configuration (all keys, defaults, credential-pair and mutually-exclusive
+     password-source validation, password-file loading, secret-safe errors and
+     debug — deserialization faults reported as field name plus expected type
+     rather than a serde message that would quote an unquoted password, and the
+     mesh URL printed with any userinfo credential redacted), delegating
+     mesh-config loading to `mu_dialogue::mesh::load`
+     unchanged; pure CASEMAPPING-aware nick folding and human `PeerId`
+     construction; the specified role aliases, deterministic CHANNELLEN-limited
+     channel names with a stable hash tail, human channel exclusion, and reverse
+     resolution against a supplied current-peer snapshot with explicit unknown
+     and ambiguous results; UTF-8-safe PRIVMSG framing that budgets the complete
+     serialized line against 512 bytes with marked continuations, CR/LF
+     injection prevention covering the attacker-supplied mesh id as well as the
+     target and body, single-channel-or-nick target validation that also refuses
+     the target-list and parameter delimiters (`,`, space, a leading `:`), and
+     `+mu.id` only when message-tags is negotiated.
+     Offline regression tests only; **no IRC client, adapter, membership, or
+     routing yet.** This is the completion boundary of the present increment.
+   - **2b — adapter, membership, routing.** IRC adapter over a maintained Rust
+     IRC client (one connection, TLS, mandatory SASL PLAIN when configured,
+     optional message-tags/account caps, live CASEMAPPING/CHANNELLEN handling);
+     disposable membership/channel lifecycle from NAMES and
+     JOIN/PART/KICK/QUIT/NICK plus fresh discovery; mesh→IRC routing with agent
+     channels, collision labels, lobby fallbacks, exclusive human routing,
+     per-withdrawal bodiless-notice suppression, and exactly-once
+     endpoint/observer overlap handling.
 3. **IRC → mesh.** Delivery for present-agent channels and lobby/private
    fan-out, canonical human senders, one shared id per broadcast, refusal of
    absent/human destinations and nonmember private senders, and routing-memory

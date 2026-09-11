@@ -15,6 +15,7 @@ members = [
     "crates/t4c",
     "crates/mu-dialogue",
     "crates/mu-peer",
+    "crates/mu-irc-gateway",
 ]
 
 [workspace.package]

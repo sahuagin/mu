@@ -2160,6 +2160,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mu-irc-gateway"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "mu-dialogue",
+ "mu-peer",
+ "serde",
+ "thiserror 1.0.69",
+ "toml",
+]
+
+[[package]]
 name = "mu-openai"
 version = "0.0.1"
 dependencies = [

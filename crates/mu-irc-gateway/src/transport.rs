@@ -29,6 +29,16 @@
 //! reading makes [`LineWriter::send_line`] report [`SendError::Overflow`] and
 //! the line is dropped, rather than growing memory until the process dies.
 //!
+//! **Trust is per configuration, the system store is cached.** What a server
+//! certificate is verified against is a [`TlsTrust`] a caller may pass in
+//! ([`connect_with_trust`]; plain [`connect`] is the system store), so an
+//! operator on a private LAN can add their own CA's PEM bundle (`[irc]
+//! tls_ca_file`) on top of — or instead of — the system anchors. What stays
+//! process-wide is the expensive part: the system store is read and parsed at
+//! most once. There is no state anywhere in here that skips verification, and
+//! server-name checking is untouched by any of it — connecting to an IP address
+//! requires that address in the certificate's SAN.
+//!
 //! **Secret-safe.** No line content is ever logged here, at any level: the
 //! outbound stream carries the SASL `AUTHENTICATE` response, which is a
 //! reversibly-encoded password. Diagnostics name counts, lengths and error
@@ -36,9 +46,12 @@
 
 use std::fmt;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use rustls_pki_types::pem::PemObject as _;
+use rustls_pki_types::CertificateDer;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, OnceCell};
@@ -95,12 +108,149 @@ pub enum ConnectError {
     Tls(String, io::Error),
     #[error("`{0}` is not a valid TLS server name")]
     BadServerName(String),
-    /// No system trust anchors could be loaded, so no server certificate could
-    /// ever be validated. Refused rather than silently trusting anything.
-    #[error("no system trust anchors are available for TLS ({0})")]
+    /// The configured trust store came out EMPTY, so no server certificate
+    /// could ever be validated. Refused rather than silently trusting anything.
+    #[error("no trust anchors are available for TLS ({0})")]
     NoTrustAnchors(String),
     #[error("TLS client configuration: {0}")]
     TlsConfig(String),
+}
+
+/// Why a `tls_ca_file` bundle cannot be used as a trust anchor.
+///
+/// Every variant but [`CaFault::Read`] is a FIXED phrase, and `Read` carries an
+/// `io::Error` that describes a syscall. Nothing here can quote the file: the
+/// PEM reader's own `Display` renders the offending line verbatim
+/// (`IllegalSectionStart { line }`), and a bundle that an operator got wrong is
+/// as likely to be a private key as a certificate. A diagnostic from this module
+/// is safe to log, which only holds if it never carries file content.
+#[derive(Debug, thiserror::Error)]
+pub enum CaFault {
+    #[error("it cannot be read: {0}")]
+    Read(io::Error),
+    #[error("it is not a readable PEM bundle (a section is truncated or its body is not base64)")]
+    NotPem,
+    #[error("it holds no CERTIFICATE section")]
+    Empty,
+    #[error("it holds a CERTIFICATE section that is not a usable trust anchor")]
+    Unusable,
+}
+
+/// What one connection verifies the server certificate against.
+///
+/// [`TlsTrust::system()`] — also the [`Default`] — is the system trust store and
+/// nothing else, which is every public IRC network. An operator running IRC on
+/// a private LAN behind a CA of their own adds that CA's PEM bundle with
+/// [`TlsTrust::with_ca_file`], which LAYERS the bundle on top of the system
+/// anchors; passing `system_roots = false` narrows the store to the bundle
+/// alone, for a network that should trust nothing else.
+///
+/// There is deliberately NO "skip verification" state. The adapter refuses to
+/// send a SASL password over anything but TLS, and a transport that could be
+/// told to accept any certificate would make that gate decorative — a private CA
+/// is the supported way to run a self-signed server, precisely because it still
+/// verifies.
+///
+/// Server-name verification is unaffected and stays exact: the anchors decide
+/// WHO may issue the certificate, never WHICH name it is for. Connecting to a
+/// bare IP means rustls builds a [`ServerName::IpAddress`], and the certificate
+/// has to carry that address in a SAN — a CN, or a DNS SAN naming the host, does
+/// not satisfy it.
+#[derive(Clone)]
+pub struct TlsTrust {
+    /// Whether the system trust store is part of the store. Default `true`.
+    system_roots: bool,
+    /// Where the extra anchors came from, for diagnostics only.
+    ca_file: Option<PathBuf>,
+    /// Extra anchors, each already proven addable to a [`RootCertStore`] by
+    /// [`TlsTrust::with_ca_file`] — so a connect-time failure to add one is
+    /// impossible rather than merely unlikely.
+    extra: Vec<CertificateDer<'static>>,
+}
+
+impl TlsTrust {
+    /// The system trust store and nothing else.
+    pub fn system() -> Self {
+        Self {
+            system_roots: true,
+            ca_file: None,
+            extra: Vec::new(),
+        }
+    }
+
+    /// Add every certificate in the PEM bundle at `path`, keeping the system
+    /// anchors when `system_roots`.
+    ///
+    /// The bundle is read and PARSED here rather than at connect time, so a
+    /// path that does not exist, a file that is not PEM, a bundle with no
+    /// certificate in it, and a certificate that is not a usable anchor are all
+    /// configuration errors the operator hears about at startup — the same
+    /// moment `--check-config` would tell them — instead of a TLS failure on
+    /// some later reconnect.
+    pub fn with_ca_file(path: &Path, system_roots: bool) -> Result<Self, CaFault> {
+        let mut extra = Vec::new();
+        // A scratch store, used only to prove each anchor is usable. The real
+        // one is built per connection on top of the cached native roots.
+        let mut probe = RootCertStore::empty();
+        for item in CertificateDer::pem_file_iter(path).map_err(pem_fault)? {
+            let cert = item.map_err(pem_fault)?;
+            probe.add(cert.clone()).map_err(|_| CaFault::Unusable)?;
+            extra.push(cert);
+        }
+        if extra.is_empty() {
+            return Err(CaFault::Empty);
+        }
+        Ok(Self {
+            system_roots,
+            ca_file: Some(path.to_path_buf()),
+            extra,
+        })
+    }
+
+    /// Whether the system trust store is part of this store.
+    pub fn system_roots(&self) -> bool {
+        self.system_roots
+    }
+
+    /// The bundle these extra anchors were read from, if any.
+    pub fn ca_file(&self) -> Option<&Path> {
+        self.ca_file.as_deref()
+    }
+
+    /// How many anchors the bundle contributed.
+    pub fn extra_anchors(&self) -> usize {
+        self.extra.len()
+    }
+}
+
+impl Default for TlsTrust {
+    fn default() -> Self {
+        Self::system()
+    }
+}
+
+/// Names the bundle and counts its anchors. NEVER the anchors themselves: a
+/// `[irc]` config is printed in full by `--check-config`, and a DER dump there
+/// would be noise at best.
+impl fmt::Debug for TlsTrust {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TlsTrust")
+            .field("system_roots", &self.system_roots)
+            .field("ca_file", &self.ca_file)
+            .field("extra_anchors", &self.extra.len())
+            .finish()
+    }
+}
+
+/// Classify a PEM reader failure WITHOUT forwarding its `Display`. See
+/// [`CaFault`] for why the parser is not allowed to phrase the complaint.
+fn pem_fault(e: rustls_pki_types::pem::Error) -> CaFault {
+    match e {
+        rustls_pki_types::pem::Error::Io(e) => CaFault::Read(e),
+        // MissingSectionEnd / IllegalSectionStart / Base64Decode / SectionTooLarge:
+        // the file has a section that cannot be read as one.
+        _ => CaFault::NotPem,
+    }
 }
 
 /// Why an outbound line was not handed to the socket.
@@ -366,7 +516,24 @@ impl Lifecycle {
 trait Duplex: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Duplex for T {}
 
-/// Connect to `server` (`host[:port]`), optionally over TLS, within `timeout`.
+/// Connect to `server` (`host[:port]`), optionally over TLS, within `timeout`,
+/// verifying the server certificate against the system trust store.
+///
+/// This is the whole of what a caller with no opinion about trust anchors
+/// needs, and it is deliberately the shorter signature: an operator's private
+/// CA is the exception, not the shape every call site has to spell out. That
+/// exception is [`connect_with_trust`], which is this function with the
+/// [`TlsTrust`] passed in; the two are identical in every other respect.
+pub async fn connect(
+    server: &str,
+    tls: bool,
+    timeout: Duration,
+) -> Result<Connection, ConnectError> {
+    connect_with_trust(server, tls, &TlsTrust::system(), timeout).await
+}
+
+/// [`connect`], with what a server certificate is verified against as a
+/// parameter.
 ///
 /// `timeout` is ONE budget for the whole establishment — the TCP connect, the
 /// first-connection trust-store load and the TLS handshake share it — because a
@@ -374,19 +541,26 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Duplex for T {}
 /// cannot see. A per-stage budget would let the documented bound be exceeded by
 /// however many stages there happen to be.
 ///
-/// TLS verifies the server certificate against the system trust store; there is
-/// no "insecure" switch, because the SASL gate in the adapter refuses to send a
-/// password over anything but TLS and a transport that could be told to skip
-/// verification would make that gate decorative.
-pub async fn connect(
+/// TLS verifies the server certificate against `trust` — the system store, an
+/// operator's private CA bundle, or both (see [`TlsTrust`]). There is no
+/// "insecure" switch on any of those paths, because the SASL gate in the adapter
+/// refuses to send a password over anything but TLS and a transport that could
+/// be told to skip verification would make that gate decorative.
+///
+/// The name checked is the host half of `server`, exactly as written. A `server`
+/// that names an IP address is verified as an IP address: the certificate has to
+/// carry it in a SAN, and a DNS name on the certificate does not stand in for
+/// one.
+pub async fn connect_with_trust(
     server: &str,
     tls: bool,
+    trust: &TlsTrust,
     timeout: Duration,
 ) -> Result<Connection, ConnectError> {
     let (host, port) = split_server(server, tls)?;
     let endpoint = format!("{host}:{port}");
     let dial = || TcpStream::connect((host.clone(), port));
-    connect_with(dial, &host, endpoint, tls, timeout).await
+    connect_with(dial, &host, endpoint, tls, trust, timeout).await
 }
 
 /// [`connect`] with the TCP stage as a parameter.
@@ -400,13 +574,15 @@ async fn connect_with<C, F>(
     host: &str,
     endpoint: String,
     tls: bool,
+    trust: &TlsTrust,
     timeout: Duration,
 ) -> Result<Connection, ConnectError>
 where
     C: FnOnce() -> F,
     F: std::future::Future<Output = io::Result<TcpStream>>,
 {
-    let established = tokio::time::timeout(timeout, establish(dial, host, &endpoint, tls)).await;
+    let established =
+        tokio::time::timeout(timeout, establish(dial, host, &endpoint, tls, trust)).await;
     match established {
         Ok(connected) => connected,
         Err(_) => Err(ConnectError::Timeout(endpoint, timeout)),
@@ -420,6 +596,7 @@ async fn establish<C, F>(
     host: &str,
     endpoint: &str,
     tls: bool,
+    trust: &TlsTrust,
 ) -> Result<Connection, ConnectError>
 where
     C: FnOnce() -> F,
@@ -432,7 +609,7 @@ where
     let _ = tcp.set_nodelay(true);
 
     let stream: Box<dyn Duplex> = if tls {
-        let config = tls_config().await?;
+        let config = tls_config(trust).await?;
         let name = ServerName::try_from(host.to_string())
             .map_err(|_| ConnectError::BadServerName(host.to_string()))?
             .to_owned();
@@ -648,40 +825,43 @@ async fn next_line<R: AsyncRead + Unpin>(
     }
 }
 
-/// The process-wide TLS client configuration, built at most once.
+/// The NATIVE trust anchors, read at most once.
 ///
-/// Reading the system trust store is blocking file I/O and is not cheap, and a
-/// reconnect loop would otherwise pay it on every attempt, on the runtime, with
-/// no deadline of its own. A failed load is NOT cached: a trust store that was
-/// unreadable once (a store still being written at boot, say) is retried by the
-/// next connection rather than poisoning every one of them.
-static TLS_CONFIG: OnceCell<Arc<ClientConfig>> = OnceCell::const_new();
+/// The cache is here and NOT around the finished [`ClientConfig`] because the
+/// configuration is now per-[`TlsTrust`]: an operator's `tls_ca_file` layers
+/// extra anchors on top of these, and one process-wide `ClientConfig` could only
+/// serve one such set. What was expensive is unchanged, though — reading and
+/// parsing the system store is blocking file I/O a reconnect loop must not
+/// repeat — so that is what stays cached, and assembling a `ClientConfig` from
+/// an already-parsed store is the cheap part that is paid per connection.
+///
+/// A failed load is NOT cached: a trust store that was unreadable once (a store
+/// still being written at boot, say) is retried by the next connection rather
+/// than poisoning every one of them. An EMPTY native store counts as a failure
+/// here for the same reason — and, because it is reported rather than fatal, a
+/// host with no system store can still connect on a `tls_ca_file` alone.
+static NATIVE_ROOTS: OnceCell<Arc<RootCertStore>> = OnceCell::const_new();
 
-/// The shared TLS client configuration, loading it on first use.
+/// The cached native trust anchors, loading them on first use. The `Err` is the
+/// body-free reason the store is unusable, for whoever has to explain it.
 ///
 /// The one-time load runs on a blocking thread, so it never stalls the runtime,
 /// and it happens inside [`connect`]'s budget, so it cannot make a connection
 /// overrun the deadline its caller asked for.
-async fn tls_config() -> Result<Arc<ClientConfig>, ConnectError> {
-    TLS_CONFIG
+async fn native_roots() -> Result<Arc<RootCertStore>, String> {
+    NATIVE_ROOTS
         .get_or_try_init(|| async {
-            tokio::task::spawn_blocking(build_tls_config)
+            tokio::task::spawn_blocking(load_native_roots)
                 .await
-                .map_err(|e| ConnectError::TlsConfig(format!("trust store load failed: {e}")))?
+                .map_err(|e| format!("the trust store load task failed: {e}"))?
                 .map(Arc::new)
         })
         .await
         .cloned()
 }
 
-/// Build the TLS client configuration: system trust anchors, safe defaults, no
-/// client certificate.
-///
-/// The crypto provider is named explicitly rather than left to the process
-/// default, so which implementation performs the handshake is a property of this
-/// file rather than of whichever crate in the build happened to install a
-/// default first.
-fn build_tls_config() -> Result<ClientConfig, ConnectError> {
+/// Read the system trust store into a [`RootCertStore`].
+fn load_native_roots() -> Result<RootCertStore, String> {
     let native = rustls_native_certs::load_native_certs();
     let mut roots = RootCertStore::empty();
     for cert in native.certs {
@@ -690,7 +870,7 @@ fn build_tls_config() -> Result<ClientConfig, ConnectError> {
         let _ = roots.add(cert);
     }
     if roots.is_empty() {
-        let why = if native.errors.is_empty() {
+        return Err(if native.errors.is_empty() {
             "the system trust store is empty".to_string()
         } else {
             native
@@ -699,14 +879,59 @@ fn build_tls_config() -> Result<ClientConfig, ConnectError> {
                 .map(|e| e.to_string())
                 .collect::<Vec<_>>()
                 .join("; ")
-        };
-        return Err(ConnectError::NoTrustAnchors(why));
+        });
+    }
+    Ok(roots)
+}
+
+/// Build the TLS client configuration for one [`TlsTrust`]: its anchors, safe
+/// defaults, no client certificate.
+///
+/// The crypto provider is named explicitly rather than left to the process
+/// default, so which implementation performs the handshake is a property of this
+/// file rather than of whichever crate in the build happened to install a
+/// default first.
+///
+/// The refusal rule is unchanged and is about the RESULT, not its sources: an
+/// empty store is refused, because nothing could ever be validated against it.
+/// A system store that will not load is therefore fatal when it was the only
+/// source asked for, and survivable — loudly — when a `tls_ca_file` supplied
+/// anchors of its own.
+async fn tls_config(trust: &TlsTrust) -> Result<Arc<ClientConfig>, ConnectError> {
+    let mut roots = RootCertStore::empty();
+    let mut native_fault = None;
+    if trust.system_roots {
+        match native_roots().await {
+            Ok(native) => roots = (*native).clone(),
+            Err(why) => native_fault = Some(why),
+        }
+    }
+    for anchor in &trust.extra {
+        // Proven addable by `TlsTrust::with_ca_file`; mapped rather than
+        // ignored so this cannot become a silently smaller trust store.
+        roots
+            .add(anchor.clone())
+            .map_err(|e| ConnectError::TlsConfig(format!("CA bundle anchor: {e}")))?;
+    }
+    if roots.is_empty() {
+        return Err(ConnectError::NoTrustAnchors(native_fault.unwrap_or_else(
+            || "no CA bundle was configured and the system store was not asked for".to_string(),
+        )));
+    }
+    if let Some(why) = native_fault {
+        // Asked for and unavailable, but the bundle carried it. Said out loud:
+        // the store is smaller than the configuration describes.
+        tracing::warn!(
+            anchors = roots.roots.len(),
+            "the system trust store is unusable ({why}); verifying against the configured CA \
+             bundle alone"
+        );
     }
     let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
     ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| ConnectError::TlsConfig(e.to_string()))
-        .map(|b| b.with_root_certificates(roots).with_no_client_auth())
+        .map(|b| Arc::new(b.with_root_certificates(roots).with_no_client_auth()))
 }
 
 /// Split `host[:port]`, defaulting the port by scheme. Accepts a bracketed IPv6
@@ -1279,7 +1504,7 @@ mod tests {
         // Warm the shared trust store first: its one-time load is not the thing
         // under test. A host with no trust anchors cannot handshake at all —
         // there is no budget to measure there, so there is nothing to assert.
-        if tls_config().await.is_err() {
+        if tls_config(&TlsTrust::system()).await.is_err() {
             return;
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1308,7 +1533,8 @@ mod tests {
         };
 
         let started = tokio::time::Instant::now();
-        let outcome = connect_with(dial, "127.0.0.1", addr.to_string(), true, budget).await;
+        let trust = TlsTrust::system();
+        let outcome = connect_with(dial, "127.0.0.1", addr.to_string(), true, &trust, budget).await;
         let took = started.elapsed();
         let Err(failed) = outcome else {
             panic!("a peer that never answers the handshake cannot connect");
@@ -1323,6 +1549,197 @@ mod tests {
             "every stage shares one budget of {budget:?}; establishment took {took:?}"
         );
         peer.abort();
+    }
+
+    // ── Private-CA trust ────────────────────────────────────────────────
+
+    /// The committed fixtures: a test CA, and a leaf it signed carrying
+    /// `IP:127.0.0.1` and `DNS:irc.test.invalid`. Generated once by
+    /// `tests/fixtures/make-tls-fixtures.sh` (10-year validity, P-256/SHA-256);
+    /// `rcgen` is not in this workspace's Cargo.lock, so they are committed
+    /// rather than minted at test time.
+    const CA_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ca.pem");
+    const LEAF_CERT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/server.pem");
+    const LEAF_KEY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/server.key.pem");
+
+    fn test_ca() -> TlsTrust {
+        // No system anchors: the positive leg then proves the bundle alone
+        // verified the certificate, on a host with a trust store or without one.
+        TlsTrust::with_ca_file(Path::new(CA_FILE), false).expect("the fixture CA loads")
+    }
+
+    /// A TLS server presenting the fixture leaf, on an OS-assigned port. It
+    /// accepts and then holds the connection open: the only question here is
+    /// whether the client's handshake completed.
+    async fn private_ca_server() -> (std::net::SocketAddr, JoinHandle<()>) {
+        use rustls_pki_types::PrivateKeyDer;
+        use tokio_rustls::rustls::ServerConfig;
+        use tokio_rustls::TlsAcceptor;
+
+        let certs = CertificateDer::pem_file_iter(LEAF_CERT)
+            .expect("the fixture leaf opens")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("the fixture leaf parses");
+        let key = PrivateKeyDer::from_pem_file(LEAF_KEY).expect("the fixture key parses");
+        let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("safe defaults")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("the fixture chain and key agree");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(tls) = acceptor.accept(stream).await {
+                        let _held = tls;
+                        std::future::pending::<()>().await;
+                    }
+                });
+            }
+        });
+        (addr, task)
+    }
+
+    /// The increment's point: a server certificate signed by an operator's own
+    /// CA is accepted when that CA is configured, and rejected when it is not.
+    ///
+    /// The negative leg is the one that matters — it is what says the positive
+    /// leg proved the CA rather than some general looseness. On a host with no
+    /// system trust store the rejection arrives as `NoTrustAnchors` instead of a
+    /// handshake failure; both are refusals, which is the assertion.
+    #[tokio::test]
+    async fn a_private_ca_is_trusted_when_configured_and_not_otherwise() {
+        let (addr, server) = private_ca_server().await;
+        let endpoint = addr.to_string();
+        let budget = Duration::from_secs(20);
+
+        connect_with_trust(&endpoint, true, &test_ca(), budget)
+            .await
+            .expect("a certificate signed by the configured CA verifies");
+
+        let Err(refused) = connect_with_trust(&endpoint, true, &TlsTrust::system(), budget).await
+        else {
+            panic!("a privately-signed certificate must NOT verify against the system anchors");
+        };
+        assert!(
+            matches!(
+                refused,
+                ConnectError::Tls(..) | ConnectError::NoTrustAnchors(..)
+            ),
+            "expected a verification refusal, got {refused:?}"
+        );
+
+        // And the bundle ADDS: with the system anchors kept (the default), the
+        // private CA still verifies.
+        let layered = TlsTrust::with_ca_file(Path::new(CA_FILE), true).unwrap();
+        connect_with_trust(&endpoint, true, &layered, budget)
+            .await
+            .expect("a configured CA is layered on the system anchors, not swapped for them");
+
+        server.abort();
+    }
+
+    /// Trusting a CA says who may ISSUE a certificate, never which name it is
+    /// for. A configured CA must not make name verification any softer — which
+    /// is exactly what an operator connecting to a LAN box by IP is relying on.
+    ///
+    /// `connect_with` rather than `connect` because the name and the address
+    /// have to differ: the fixture's SANs are `IP:127.0.0.1` and
+    /// `DNS:irc.test.invalid`, and `localhost` is neither.
+    #[tokio::test]
+    async fn a_configured_ca_does_not_loosen_server_name_verification() {
+        let (addr, server) = private_ca_server().await;
+        let trust = test_ca();
+        let budget = Duration::from_secs(20);
+
+        for (name, expected) in [("irc.test.invalid", true), ("localhost", false)] {
+            let dial = || TcpStream::connect(addr);
+            let outcome = connect_with(dial, name, addr.to_string(), true, &trust, budget).await;
+            assert_eq!(
+                outcome.is_ok(),
+                expected,
+                "`{name}` against SANs IP:127.0.0.1 + DNS:irc.test.invalid: got {:?}",
+                outcome.err()
+            );
+        }
+
+        // The IP SAN is what `connect("127.0.0.1:…")` verifies against: rustls
+        // builds a `ServerName::IpAddress`, and the DNS SAN does not stand in.
+        connect_with_trust(&addr.to_string(), true, &trust, budget)
+            .await
+            .expect("the certificate carries IP:127.0.0.1 in a SAN");
+
+        server.abort();
+    }
+
+    #[test]
+    fn a_ca_bundle_that_cannot_anchor_anything_is_refused_without_echoing_it() {
+        // `CARGO_TARGET_TMPDIR` is set for integration tests only, so a unit
+        // test takes the process temp dir (which .cargo/config.toml points
+        // inside `target/`, so `cargo clean` sweeps it).
+        let dir = std::env::temp_dir().join(format!("mu-irc-gw-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sentinel = "NOT-BASE64-DO-NOT-ECHO!!";
+        let bad = dir.join("bad-ca.pem");
+        std::fs::write(
+            &bad,
+            format!("-----BEGIN CERTIFICATE-----\n{sentinel}\n-----END CERTIFICATE-----\n"),
+        )
+        .unwrap();
+        let fault = TlsTrust::with_ca_file(&bad, true).unwrap_err();
+        assert!(matches!(fault, CaFault::NotPem), "got {fault:?}");
+        for rendered in [format!("{fault}"), format!("{fault:?}")] {
+            assert!(
+                !rendered.contains(sentinel),
+                "the fault echoed the file: {rendered}"
+            );
+        }
+
+        // A section that reads as PEM and decodes, but is not a certificate.
+        // The bundle is refused WHOLE: half a trust store is not a trust store.
+        let junk = dir.join("junk-ca.pem");
+        std::fs::write(
+            &junk,
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            TlsTrust::with_ca_file(&junk, true).unwrap_err(),
+            CaFault::Unusable
+        ));
+
+        let empty = dir.join("empty-ca.pem");
+        std::fs::write(&empty, "").unwrap();
+        assert!(matches!(
+            TlsTrust::with_ca_file(&empty, true).unwrap_err(),
+            CaFault::Empty
+        ));
+        assert!(matches!(
+            TlsTrust::with_ca_file(&dir.join("absent.pem"), true).unwrap_err(),
+            CaFault::Read(_)
+        ));
+    }
+
+    /// The default is the v0 behaviour, unchanged: the system store, nothing
+    /// added, and no way to say "skip verification".
+    #[test]
+    fn the_default_trust_is_the_system_store_alone() {
+        let trust = TlsTrust::default();
+        assert!(trust.system_roots());
+        assert_eq!(trust.extra_anchors(), 0);
+        assert!(trust.ca_file().is_none());
+        // Debug is printed verbatim by `--check-config`: it names the bundle and
+        // counts anchors, never their bytes.
+        let printed = format!("{:?}", test_ca());
+        assert!(printed.contains("extra_anchors: 1"), "{printed}");
+        assert!(printed.contains("ca.pem"), "{printed}");
+        assert!(!printed.contains("CERTIFICATE"), "{printed}");
     }
 
     #[test]

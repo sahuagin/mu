@@ -107,6 +107,10 @@ pub use routing::{
     DropReason, IngressRejected, OversizedField, RouteDecision, RouteEnv, Router,
     MAX_DESTINATION_LEN, MAX_FIELD_LEN,
 };
+// The trust half of the transport, named at the crate root because `IrcConfig`
+// (re-exported above) has a public field of this type and `ConfigError` carries
+// the fault: a consumer on the root surface has to be able to name both.
+pub use transport::{CaFault, TlsTrust};
 
 // The shared mesh config type, re-exported so a consumer configures the mesh
 // side through this crate without a second dependency edge.

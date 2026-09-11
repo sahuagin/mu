@@ -11,6 +11,7 @@ use mu_irc_gateway::mapping::{
     channel_for, fold_nick, human_identity, human_peer, peer_alias, resolve_channel, CaseMapping,
     Resolved,
 };
+use mu_irc_gateway::transport::CaFault;
 use mu_peer::PeerId;
 
 /// A distinctive password value: every credential-error diagnostic is asserted
@@ -53,6 +54,10 @@ nick = "mu-gw"
     assert_eq!(cfg.server, "irc.example.org:6697");
     assert_eq!(cfg.nick, "mu-gw");
     assert!(cfg.tls, "tls defaults on");
+    assert!(
+        cfg.tls_trust.system_roots() && cfg.tls_trust.extra_anchors() == 0,
+        "trust defaults to the system store alone"
+    );
     assert_eq!(cfg.channel_prefix, "#");
     assert_eq!(cfg.lobby, "#mu");
     assert!(cfg.observe_agent_dms, "observer defaults on");
@@ -410,6 +415,151 @@ fn mesh_url_credentials_are_redacted_in_debug() {
         },
     };
     assert!(format!("{cfg:?}").contains("nats://127.0.0.1:4222"));
+}
+
+// ─────────────────────────── Private-CA trust ───────────────────────────────
+
+/// The committed test CA bundle — see `tests/fixtures/make-tls-fixtures.sh`.
+const CA_PEM: &str = include_str!("fixtures/ca.pem");
+
+/// Build an `[irc]` section with whatever TLS-trust keys are given.
+fn trust_config(name: &str, keys: &str) -> PathBuf {
+    tmp(name, &format!("[irc]\nserver=\"h:1\"\nnick=\"n\"\n{keys}"))
+}
+
+#[test]
+fn a_ca_bundle_is_loaded_and_layered_on_the_system_anchors() {
+    let ca = tmp("ca.pem", CA_PEM);
+    let p = trust_config(
+        "ca-ok.toml",
+        &format!("tls_ca_file={:?}\n", ca.display().to_string()),
+    );
+    let cfg = load_irc(&p).unwrap();
+    assert_eq!(cfg.tls_trust.extra_anchors(), 1, "the bundle's one anchor");
+    assert_eq!(cfg.tls_trust.ca_file(), Some(ca.as_path()));
+    assert!(
+        cfg.tls_trust.system_roots(),
+        "a private CA is ADDED; the system anchors stay unless told otherwise"
+    );
+
+    // …and `tls_system_roots = false` narrows it to the bundle alone.
+    let p = trust_config(
+        "ca-only.toml",
+        &format!(
+            "tls_ca_file={:?}\ntls_system_roots=false\n",
+            ca.display().to_string()
+        ),
+    );
+    let cfg = load_irc(&p).unwrap();
+    assert_eq!(cfg.tls_trust.extra_anchors(), 1);
+    assert!(!cfg.tls_trust.system_roots());
+}
+
+#[test]
+fn a_missing_ca_file_is_a_configuration_error() {
+    let missing = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no-such-ca.pem");
+    let p = trust_config(
+        "ca-missing.toml",
+        &format!("tls_ca_file={:?}\n", missing.display().to_string()),
+    );
+    let err = load_irc(&p).unwrap_err();
+    assert!(
+        matches!(&err, ConfigError::TlsCaFile(path, CaFault::Read(_)) if path == &missing),
+        "expected a read fault naming the path, got {err:?}"
+    );
+}
+
+#[test]
+fn an_unparsable_ca_file_is_a_configuration_error_that_does_not_echo_it() {
+    // A well-formed section header around a body that is not base64: the PEM
+    // reader's own Display would render that body verbatim.
+    let sentinel = "NOT-BASE64-AND-DO-NOT-ECHO-ME!!";
+    let ca = tmp(
+        "bad.pem",
+        &format!("-----BEGIN CERTIFICATE-----\n{sentinel}\n-----END CERTIFICATE-----\n"),
+    );
+    let p = trust_config(
+        "ca-bad.toml",
+        &format!("tls_ca_file={:?}\n", ca.display().to_string()),
+    );
+    let err = load_irc(&p).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::TlsCaFile(_, CaFault::NotPem)),
+        "expected a parse fault, got {err:?}"
+    );
+    let (d, dbg) = (format!("{err}"), format!("{err:?}"));
+    assert!(!d.contains(sentinel), "Display echoed the file: {d}");
+    assert!(!dbg.contains(sentinel), "Debug echoed the file: {dbg}");
+}
+
+#[test]
+fn an_empty_ca_bundle_is_a_configuration_error() {
+    // Empty as in "holds no certificate": both a zero-byte file and one whose
+    // only section is something else. Neither can anchor anything.
+    for (name, body) in [
+        ("empty.pem", ""),
+        (
+            "keyonly.pem",
+            "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n",
+        ),
+    ] {
+        let ca = tmp(name, body);
+        let p = trust_config(
+            &format!("ca-{name}.toml"),
+            &format!("tls_ca_file={:?}\n", ca.display().to_string()),
+        );
+        let err = load_irc(&p).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::TlsCaFile(_, CaFault::Empty)),
+            "{name}: expected an empty-bundle fault, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn a_trust_store_that_could_never_verify_anything_is_refused() {
+    // No system anchors and no bundle is an EMPTY store. Caught at load, where
+    // the fix is one line, rather than as a connect failure every 2 seconds.
+    let p = trust_config("no-anchors.toml", "tls_system_roots=false\n");
+    assert!(matches!(load_irc(&p), Err(ConfigError::NoTrustAnchors)));
+}
+
+#[test]
+fn trust_settings_on_a_cleartext_connection_are_refused() {
+    // A cleartext connection presents no certificate, so these describe
+    // verification that cannot happen. Refusing beats ignoring: the operator
+    // who wrote them believes the connection is verified.
+    let ca = tmp("cleartext-ca.pem", CA_PEM);
+    for keys in [
+        format!("tls=false\ntls_ca_file={:?}\n", ca.display().to_string()),
+        "tls=false\ntls_system_roots=true\n".to_string(),
+    ] {
+        let p = trust_config("cleartext-trust.toml", &keys);
+        assert!(
+            matches!(load_irc(&p), Err(ConfigError::TrustWithoutTls)),
+            "expected a refusal for `{keys}`"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_tls_key_is_still_named_rather_than_silently_ignored() {
+    // The new keys join `deny_unknown_fields` and the IRC_FIELDS table, so a
+    // near-miss typo is reported instead of quietly disabling verification.
+    let p = trust_config("ca-typo.toml", "tls_ca_files=\"/x\"\n");
+    let err = load_irc(&p).unwrap_err();
+    let text = format!("{err}");
+    assert!(
+        matches!(err, ConfigError::Malformed(..)) && text.contains("tls_ca_files"),
+        "expected the typo to be named, got {text}"
+    );
+    // And a well-typed key with the wrong TOML type is reported by type.
+    let p = trust_config("ca-type.toml", "tls_system_roots=\"yes\"\n");
+    let text = format!("{}", load_irc(&p).unwrap_err());
+    assert!(
+        text.contains("tls_system_roots") && text.contains("boolean"),
+        "expected a type complaint, got {text}"
+    );
 }
 
 /// Assert an error's Display and Debug never contain the sentinel secret.

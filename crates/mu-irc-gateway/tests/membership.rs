@@ -1,4 +1,4 @@
-//! Offline membership + channel-lifecycle tests for increment 2b. No socket:
+//! Offline membership + channel-lifecycle tests. No socket:
 //! every case drives the two state machines with normalized events and asserts
 //! on the effects and observed state.
 

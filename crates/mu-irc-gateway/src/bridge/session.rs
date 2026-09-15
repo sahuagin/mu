@@ -210,10 +210,10 @@ fn publish_is_uncertain(outcome: mesh::Publish, accepted: u64, now: u64) -> bool
 ///
 /// Returns an error only for a failure no reconnect can fix — a mesh that cannot
 /// be reached at startup, or a configuration the adapter refuses before a byte
-/// is sent ([`SessionError::Fatal`]). An IRC server that is down is not one of
+/// is sent (`SessionError::Fatal`). An IRC server that is down is not one of
 /// those: it is retried with backoff, because that is what a gateway to a chat
 /// network has to survive. The distinction is the adapter's and the transport's,
-/// not a guess made here — see [`SessionError`].
+/// not a guess made here — see `SessionError`.
 pub async fn run(config: GatewayConfig, mut shutdown: watch::Receiver<bool>) -> Result<()> {
     let (mesh_side, mut inputs) = MeshSide::start(&config).await?;
 

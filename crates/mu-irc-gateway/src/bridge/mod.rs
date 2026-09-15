@@ -16,7 +16,7 @@
 //!   subscriptions behind an ingress gate, the ordered presence worker, the
 //!   ordered per-session publish worker, the `$SRV` discovery sweep, and the
 //!   watcher that tracks the NATS connection in every phase;
-//! - [`session`] is one IRC connection — the reader, registration, and ONE
+//! - `session` is one IRC connection — the reader, registration, and ONE
 //!   select loop that owns membership, routing, the outbound loop guards, the
 //!   reconciler and the socket's write half, with the reconnect backoff around
 //!   it.
@@ -29,7 +29,7 @@
 //! On the IRC side the connection's queues die with it. On the mesh side the
 //! subscriptions stay up (dropping them would lose the refusal detection that
 //! tells an operator the observer is not watching), but they feed
-//! [`mesh_side::ingress_gate`], which drops every event arriving while no
+//! `mesh_side::ingress_gate`, which drops every event arriving while no
 //! session is registered rather than retaining bodies for an outage's duration.
 //! The IRC→mesh direction is the mirror image: its queue is bounded, created per
 //! session and cancelled with it, emptied if the mesh goes down under it, and

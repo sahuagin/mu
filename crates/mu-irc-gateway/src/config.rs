@@ -13,7 +13,7 @@
 //! wrapped in [`Secret`], whose `Debug` redacts it, and every [`ConfigError`]
 //! names a field or a path but never a secret value — including the
 //! deserialization path, which reports the field name and expected type from
-//! [`IRC_FIELDS`] rather than forwarding a serde message that would quote the
+//! `IRC_FIELDS` rather than forwarding a serde message that would quote the
 //! offending value. The mesh half carries two secrets: the borrowed
 //! [`MeshConfig`] derives `Debug` over its plaintext Ed25519 `issuer_key`, and
 //! its `nats_url` may hold userinfo credentials — so [`GatewayConfig`] does NOT
@@ -176,13 +176,13 @@ pub enum ConfigError {
     /// The file is not valid TOML. The second field is deliberately NOT the
     /// `toml` crate's own `Display`: that quotes the offending source line, so a
     /// malformed `sasl_password = "…"` would put the credential in the
-    /// diagnostic. See [`toml_error_summary`].
+    /// diagnostic. See `toml_error_summary`.
     #[error("{0} is not valid TOML: {1}")]
     Toml(PathBuf, String),
     #[error("no [irc] section in {0}")]
     MissingSection(PathBuf),
     /// The `[irc]` section did not deserialize. The second field is built by
-    /// [`section_fault`] from the field NAME and the expected TYPE only — the
+    /// `section_fault` from the field NAME and the expected TYPE only — the
     /// serde error's own text is discarded, because `invalid type: integer
     /// `8675309`, expected a string` embeds the offending value, and that value
     /// is the operator's unquoted password.

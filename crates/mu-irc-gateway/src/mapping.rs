@@ -193,7 +193,7 @@ fn hash_tail(peer: &PeerId) -> String {
 /// routed to one.
 ///
 /// When `<prefix><alias>` fits, that is the channel. When it would exceed
-/// `channellen`, the tail is replaced by [`hash_tail`] so the result stays
+/// `channellen`, the tail is replaced by `hash_tail` so the result stays
 /// within budget AND is stable per peer. A pathologically small `channellen`
 /// (no room for even the hash) still yields a deterministic, in-budget name —
 /// two peers may then share it, which reverse resolution reports as ambiguous

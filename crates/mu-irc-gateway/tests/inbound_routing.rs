@@ -1,4 +1,4 @@
-//! Offline mesh→IRC routing tests for increment 2b: the fail-closed ingress,
+//! Offline mesh→IRC routing tests: the fail-closed ingress,
 //! exactly-once overlap, and every decision branch (agent channel / collision /
 //! lobby, and the exclusive human precedence). No socket, no live mesh.
 

@@ -57,6 +57,10 @@ Shapes file:
                                                    # any dependency named or renamed
                                                    # (package = ...) to it is a site
   ignore_case = false                              # content kind only
+  skip_cfg_test = false                            # content kind only: drop matches inside a
+                                                   # `#[cfg(test)]`-attributed item or module
+                                                   # (nested ones included); the skipped count
+                                                   # is printed next to the counted one
   baseline = 0                                     # sites the repo has today
 
 Stdlib only (Python 3.11+ for tomllib); no rg dependency, so CI runners and
@@ -262,11 +266,209 @@ def _cargo_dependency_sites(root: Path, manifest: Path, rel: str, text: str, cra
     return out
 
 
-def _sites(root: Path, inv: dict, global_excludes: list[str]) -> list[tuple[str, int | None, str]]:
+_CFG_TEST_ATTR = re.compile(r"^\s*#\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+_CHAR_LIT = re.compile(r"'(\\u\{[0-9a-fA-F_]+\}|\\.|[^'\\])'")
+
+
+def _lex_lines(text: str) -> list[dict]:
+    """One pass over a Rust file, carrying lexical state across lines: block
+    comments (nested, as Rust nests them), string literals (which may span
+    lines) and raw strings (r"…", r#"…"#, with a `b` or `c` prefix too). For each
+    line: `code` — the line's code characters with every literal collapsed to
+    its opening quote and every comment removed, each paired with its column
+    in the original line — and whether the line began in code (an attribute
+    inside a comment or string is not one)."""
+    infos: list[dict] = []
+    mode = "code"          # code | block | str | raw
+    block_depth = 0
+    raw_close = ""
+    for line in text.splitlines():
+        code: list[tuple[int, str]] = []
+        began_in_code = mode == "code"
+        i = 0
+        n = len(line)
+        while i < n:
+            c = line[i]
+            if mode == "block":
+                if line.startswith("/*", i):
+                    block_depth += 1
+                    i += 2
+                elif line.startswith("*/", i):
+                    block_depth -= 1
+                    i += 2
+                    if block_depth == 0:
+                        mode = "code"
+                else:
+                    i += 1
+                continue
+            if mode == "str":
+                if c == "\\":
+                    i += 2
+                    continue
+                if c == '"':
+                    mode = "code"
+                i += 1
+                continue
+            if mode == "raw":
+                j = line.find(raw_close, i)
+                if j < 0:
+                    i = n
+                else:
+                    i = j + len(raw_close)
+                    mode = "code"
+                continue
+            # code
+            if line.startswith("//", i):
+                break
+            if line.startswith("/*", i):
+                mode = "block"
+                block_depth = 1
+                i += 2
+                continue
+            prev_ident = i > 0 and (line[i - 1].isalnum() or line[i - 1] == "_")
+            if not prev_ident:
+                m = re.match(r"(?:[bc]?r)(#*)\"", line[i:])
+                if m:
+                    raw_close = '"' + m.group(1)
+                    mode = "raw"
+                    code.append((i, '"'))
+                    i += m.end()
+                    continue
+                m = re.match(r"[bc]?\"", line[i:])
+                if m:
+                    mode = "str"
+                    code.append((i, '"'))
+                    i += m.end()
+                    continue
+                m = re.match(r"b?" + _CHAR_LIT.pattern, line[i:])
+                if m:
+                    code.append((i, "'"))
+                    i += m.end()
+                    continue
+            if c == "'":
+                # a lifetime or label: the quote alone
+                i += 1
+                continue
+            code.append((i, c))
+            i += 1
+        infos.append({"code": code, "began_in_code": began_in_code})
+    return infos
+
+
+def _cfg_test_spans(text: str, rel: str) -> list[tuple[int, int, int, int]]:
+    """Character ranges `(line, col, end_line, end_col)` (1-based lines,
+    inclusive ends) of every `#[cfg(test)]`-attributed item: from the
+    attribute through the item's end. The item is whatever code follows the
+    attribute — on the attribute's own line or after other attributes,
+    comments and blank lines — and it ends, walking code tokens with literals
+    and comments already removed, at the `}` that balances its first `{`, or
+    for a brace-less item at its `;`, or at the `,` that ends a struct field
+    or enum variant (a `,` inside the item's own parentheses, brackets or
+    generic angle brackets is not the end — a `<` counts as a generic opener
+    only when it directly follows an identifier or `>` (`Vec<`, `fn f<`,
+    `impl<`, `Option<Vec<`), never as an operator (`1 < 2`, `a << b`, `x <=`),
+    so a comparison cannot hold a span open; an unmatched generic `<` is
+    dropped at the item's `;`; a `,` inside a `where` clause is not the end
+    either), or just before the `}` that closes the
+    enclosing scope. A second item on the same line as the end is outside
+    the range, which is why ranges are columns and not lines. Nested
+    modules fall inside the outer span by construction. The attribute is
+    recognised only in code, and only as `#[cfg(test)]` itself; `cfg(all(test,
+    ...))` and friends are left to `exclude`. An item that never ends before
+    the end of the file is an AuditError: the audit will not guess where test
+    code ends."""
+    infos = _lex_lines(text)
+    tokens: list[tuple[int, int, str]] = []   # (line 1-based, col, char)
+    line_starts: list[int] = []               # index into tokens where each line begins
+    for ln, info in enumerate(infos, 1):
+        line_starts.append(len(tokens))
+        tokens.extend((ln, col, ch) for col, ch in info["code"])
+    spans: list[tuple[int, int, int, int]] = []
+    ln = 0
+    while ln < len(infos):
+        info = infos[ln]
+        text_of_line = "".join(ch for _, ch in info["code"])
+        m = _CFG_TEST_ATTR.match(text_of_line) if info["began_in_code"] else None
+        if not m:
+            ln += 1
+            continue
+        first = line_starts[ln] + text_of_line.index("#")
+        t = line_starts[ln] + m.end()            # first token after the attribute
+        depth = paren = angle = 0
+        opened = False
+        in_where = False       # a `where` clause's commas do not end the item
+        word = ""              # the identifier being read, for `where`
+        end = -1
+        prev = t - 1
+        while t < len(tokens):
+            _, _, ch = tokens[t]
+            if ch == "{":
+                depth += 1
+                opened = True
+            elif ch == "}":
+                if depth == 0:
+                    end = prev      # the enclosing scope closed: the item ended before it
+                    break
+                depth -= 1
+                if opened and depth == 0:
+                    end = t
+                    break
+            elif not opened:
+                if ch.isalnum() or ch == "_":
+                    word += ch
+                else:
+                    if word == "where":
+                        in_where = True
+                    word = ""
+                if ch == "(" or ch == "[":
+                    paren += 1
+                elif ch == ")" or ch == "]":
+                    paren -= 1
+                elif ch == "<":
+                    # a generic opener directly follows an identifier or a `>`
+                    # on the same line; an operator does not (`1 < 2`, `a << b`)
+                    p_ln, p_col, p_ch = tokens[t - 1] if t > 0 else (0, -1, " ")
+                    cur_ln, cur_col, _ = tokens[t]
+                    adjacent = p_ln == cur_ln and p_col == cur_col - 1
+                    if adjacent and (p_ch.isalnum() or p_ch in "_>"):
+                        angle += 1
+                elif ch == ">" and angle > 0 and not (t > 0 and tokens[t - 1][2] == "-"):
+                    angle -= 1
+                elif ch == ";" and paren <= 0:
+                    end = t
+                    break
+                elif ch == "," and paren <= 0 and angle <= 0 and not in_where:
+                    end = t
+                    break
+            prev = t
+            t += 1
+        if end < 0:
+            raise AuditError(
+                f"{rel}:{ln + 1}: the #[cfg(test)] item never ends before the end of the file; "
+                f"the audit will not guess where test code ends (fix the file, or exclude it)"
+            )
+        sl, sc, _ = tokens[first]
+        el, ec, _ = tokens[end]
+        spans.append((sl, sc, el, ec))
+        # Resume on the line after the item's end (`el` is 1-based, `ln` is
+        # 0-based, so `el` is already the next 0-based index). An attribute
+        # that follows the end on the same line is not recognised: the
+        # attribute regex anchors at the line's first code.
+        ln = el
+    return spans
+
+
+def _in_cfg_test(spans: list[tuple[int, int, int, int]], line: int, col: int) -> bool:
+    return any((sl, sc) <= (line, col) <= (el, ec) for sl, sc, el, ec in spans)
+
+
+def _sites(root: Path, inv: dict, global_excludes: list[str]) -> tuple[list[tuple[str, int | None, str]], int]:
+    """(every site, sites skipped as `#[cfg(test)]` regions). The skipped count
+    is zero unless the invariant sets `skip_cfg_test`."""
     files = _files(root, inv["paths"], list(inv.get("exclude", [])), global_excludes)
     kind = inv.get("kind", "content")
     if kind == "path":
-        return [(f.relative_to(root).as_posix(), None, "") for f in files]
+        return [(f.relative_to(root).as_posix(), None, "") for f in files], 0
     if kind == "cargo-dependency":
         out = []
         for f in files:
@@ -278,22 +480,33 @@ def _sites(root: Path, inv: dict, global_excludes: list[str]) -> list[tuple[str,
             except UnicodeDecodeError as e:
                 raise AuditError(f"{rel}: not valid UTF-8 ({e.reason} at byte {e.start})") from e
             out.extend(_cargo_dependency_sites(root, f, rel, text, inv["crate"]))
-        return out
+        return out, 0
     if kind != "content":
         raise AuditError(f"invariant {inv['id']!r}: unknown kind {kind!r} (content|path)")
     flags = re.IGNORECASE if inv.get("ignore_case") else 0
     rx = re.compile(inv["pattern"], flags)
+    skip_tests = bool(inv.get("skip_cfg_test", False))
     out = []
+    skipped = 0
     for f in files:
         rel = f.relative_to(root).as_posix()
         try:
             text = f.read_text(encoding="utf-8", errors="replace")
         except OSError as e:
             raise AuditError(f"cannot read scoped file {rel}: {e.strerror or e}") from e
+        spans = _cfg_test_spans(text, rel) if skip_tests else []
         for n, line in enumerate(text.splitlines(), 1):
-            if rx.search(line):
+            matches = [m.start() for m in rx.finditer(line)]
+            if not matches:
+                continue
+            # one site per line, as before; the line is a site if ANY match on
+            # it lies outside every test span (a test item and a product item
+            # sharing a line cannot hide the product match)
+            if spans and all(_in_cfg_test(spans, n, col) for col in matches):
+                skipped += 1
+            else:
                 out.append((rel, n, line.strip()[:160]))
-    return out
+    return out, skipped
 
 
 def _parse_shapes(text: str, what: str) -> dict:
@@ -327,6 +540,11 @@ def _validate(invs: list[dict], what: str) -> None:
             raise AuditError(f"{what}: invariant {inv['id']!r}: kind must be a string")
         if "ignore_case" in inv and not isinstance(inv["ignore_case"], bool):
             raise AuditError(f"{what}: invariant {inv['id']!r}: ignore_case must be true/false")
+        if "skip_cfg_test" in inv:
+            if not isinstance(inv["skip_cfg_test"], bool):
+                raise AuditError(f"{what}: invariant {inv['id']!r}: skip_cfg_test must be true/false")
+            if inv.get("kind", "content") != "content":
+                raise AuditError(f"{what}: invariant {inv['id']!r}: skip_cfg_test applies to kind=content only")
         if inv["id"] in seen:
             raise AuditError(f"{what}: duplicate invariant id {inv['id']!r}")
         seen.add(inv["id"])
@@ -449,7 +667,7 @@ def load_base(root: Path, config: Path, base_rev: str | None, base_config: Path 
     return {"excludes": excludes, "invariants": {inv["id"]: inv for inv in invs}}, src
 
 
-_SHAPE_KEYS = ("kind", "paths", "exclude", "pattern", "ignore_case", "crate")
+_SHAPE_KEYS = ("kind", "paths", "exclude", "pattern", "ignore_case", "crate", "skip_cfg_test")
 
 
 def _shape(inv: dict) -> tuple:
@@ -483,7 +701,7 @@ def audit(root: Path, config: Path, report: bool, base_rev: str | None, base_con
             notes.append(f"new invariant (not at BASE): baseline initialised at {head_b}")
         elif base is not None and binv.get("retired", False):
             notes.append(f"re-activated (retired at BASE): baseline initialised at {head_b}")
-        sites = _sites(root, inv, excludes)
+        sites, skipped = _sites(root, inv, excludes)
         n = len(sites)
         if pinned:
             base_b = int(binv.get("baseline", 0))
@@ -497,7 +715,7 @@ def audit(root: Path, config: Path, report: bool, base_rev: str | None, base_con
                 # the shape changed: BASE's shape is still enforced at BASE's ceiling
                 # against THIS checkout, so narrowing cannot hide a new site; the new
                 # shape's own count must simply be recorded exactly (checked below).
-                base_sites = _sites(root, binv, base_excludes)
+                base_sites, _ = _sites(root, binv, base_excludes)
                 n_base_shape = len(base_sites)
                 notes.append(f"shape changed since BASE; BASE's shape still counts {n_base_shape} site(s) here against its ceiling {base_b}")
                 if n_base_shape > base_b:
@@ -515,7 +733,8 @@ def audit(root: Path, config: Path, report: bool, base_rev: str | None, base_con
             failures += 1
         else:
             status = "ok"
-        print(f"{inv['id']}: {n} site(s), baseline {head_b} — {status}")
+        skipped_note = f" ({skipped} in #[cfg(test)] skipped)" if inv.get("skip_cfg_test") else ""
+        print(f"{inv['id']}: {n} site(s){skipped_note}, baseline {head_b} — {status}")
         for note in notes:
             print(f"  {note}")
         if status != "ok" or report or any(x.startswith("VIOLATION") for x in notes):
@@ -629,6 +848,156 @@ def self_test() -> int:
         )
         rc, out = _run(root, "--base-config", str(basecfg))
         check("at BASE's baseline with the same count passes", rc == 0 and "no-file-ipc: 1 site(s), baseline 1 — ok" in out, out)
+
+        # skip_cfg_test (mu-hg9eo): matches inside #[cfg(test)] items are not
+        # sites, nested modules included; the skipped count is reported; the
+        # flag is part of the pinned shape, so BASE's un-flagged shape still
+        # counts at its own ceiling while the flagged one records its number.
+        (root / "src" / "lib.rs").write_text(
+            'pub fn work() {\n'
+            '    std::thread::sleep(d); // product site 1\n'
+            '    let s = "}"; // a brace in a string must not end a span\n'
+            '}\n'
+            '#[cfg(test)]\n'
+            'use std::thread::sleep; // attribute on a brace-less item: its own lines only\n'
+            'pub fn more() { std::thread::sleep(d) } // product site 2\n'
+            '#[cfg(test)]\n'
+            '#[allow(dead_code)]\n'
+            'mod tests {\n'
+            '    use super::*;\n'
+            '    fn a() { std::thread::sleep(d) } // test site\n'
+            '    mod inner {\n'
+            '        fn b() { let c = \'{\'; std::thread::sleep(d) } // nested test site, char literal brace\n'
+            '    }\n'
+            '    /* a comment with } inside */\n'
+            '    fn c() { std::thread::sleep(d) } // test site after the comment\n'
+            '}\n'
+            '#[cfg(test)]\n'
+            'fn helper() { std::thread::sleep(d) } // cfg(test) fn: test site\n'
+            'pub fn last() { std::thread::sleep(d) } // product site 3, after the spans\n'
+        )
+        (root / ".invariants.toml").write_text(
+            '[[invariant]]\nid = "no-sleep"\nrule = "no new sleep sites"\nkind = "content"\n'
+            'paths = ["src/**/*.rs"]\npattern = "thread::sleep\\\\("\nbaseline = 7\n'
+        )
+        rc, out = _run(root, "--no-base")
+        check("without skip_cfg_test every match counts (7: 3 product, 4 in test regions)",
+              rc == 0 and "no-sleep: 7 site(s), baseline 7 — ok" in out, out)
+        (root / ".invariants.toml").write_text(
+            '[[invariant]]\nid = "no-sleep"\nrule = "no new sleep sites"\nkind = "content"\n'
+            'paths = ["src/**/*.rs"]\npattern = "thread::sleep\\\\("\nskip_cfg_test = true\nbaseline = 3\n'
+        )
+        rc, out = _run(root, "--no-base")
+        check("skip_cfg_test drops the test-region matches and says how many",
+              rc == 0 and "no-sleep: 3 site(s) (4 in #[cfg(test)] skipped), baseline 3 — ok" in out, out)
+        rc, out = _run(root, "--report", "--no-base")
+        check("the skipped sites are not listed as sites", "src/lib.rs:2" in out and "src/lib.rs:7" in out and "src/lib.rs:21" in out
+              and "src/lib.rs:12" not in out and "src/lib.rs:14" not in out and "src/lib.rs:17" not in out and "src/lib.rs:20" not in out, out)
+        basecfg2 = root / "base2.toml"
+        basecfg2.write_text(
+            '[[invariant]]\nid = "no-sleep"\nrule = "r"\nkind = "content"\n'
+            'paths = ["src/**/*.rs"]\npattern = "thread::sleep\\\\("\nbaseline = 7\n'
+        )
+        rc, out = _run(root, "--base-config", str(basecfg2))
+        check("adding skip_cfg_test is a shape change: BASE's shape still counts 7 against its ceiling 7, the new shape records 3",
+              rc == 0 and "shape changed since BASE; BASE's shape still counts 7 site(s) here against its ceiling 7" in out
+              and "no-sleep: 3 site(s) (4 in #[cfg(test)] skipped), baseline 3 — ok" in out, out)
+        (root / "src" / "lib.rs").write_text((root / "src" / "lib.rs").read_text() + 'pub fn added() { std::thread::sleep(d) }\n')
+        rc, out = _run(root, "--base-config", str(basecfg2))
+        check("a new product site still fails under the flagged shape", rc == 1 and "no-sleep: 4 site(s) (4 in #[cfg(test)] skipped), baseline 3 — VIOLATION" in out, out)
+        # the scanner's edges (board round 1): an item on the attribute's own
+        # line, attributes inside comments and strings, literals that span
+        # lines or carry braces, and a span that never closes.
+        (root / "src" / "lib.rs").write_text(
+            '#[cfg(test)] fn helper() { std::thread::sleep(d) }\n'
+            'fn production() { std::thread::sleep(d) } // product: the line after a same-line item\n'
+            '/*\n'
+            '#[cfg(test)]\n'
+            '*/\n'
+            'fn p2() { std::thread::sleep(d) } // product: the attribute above is in a comment\n'
+            'const S: &str = r#"\n'
+            '#[cfg(test)]\n'
+            '}"#;\n'
+            'fn p3() { std::thread::sleep(d) } // product: attribute and brace in a raw string\n'
+            '#[cfg(test)]\n'
+            'mod tests {\n'
+            '    const T: &str = r"multi\n'
+            '}\n'
+            'line"; // the } above is inside the raw string\n'
+            '    const B: &[u8] = b"}"; let c = b\'{\'; let u = \'\\u{7D}\'; /* nested /* } */ */\n'
+            '    fn t() { std::thread::sleep(d) } // test\n'
+            '}\n'
+            '#[cfg(test)] mod tests_out;\n'
+            'fn p4() { std::thread::sleep(d) } // product after a brace-less same-line item\n'
+        )
+        (root / ".invariants.toml").write_text(
+            '[[invariant]]\nid = "no-sleep"\nrule = "r"\nkind = "content"\n'
+            'paths = ["src/**/*.rs"]\npattern = "thread::sleep\\\\("\nskip_cfg_test = true\nbaseline = 4\n'
+        )
+        rc, out = _run(root, "--report", "--no-base")
+        check("same-line items, commented/quoted attributes and multi-line or byte literals do not swallow product sites",
+              rc == 0 and "no-sleep: 4 site(s) (2 in #[cfg(test)] skipped), baseline 4 — ok" in out
+              and "src/lib.rs:2" in out and "src/lib.rs:6" in out and "src/lib.rs:10" in out and "src/lib.rs:20" in out
+              and "src/lib.rs:1" not in out.replace("src/lib.rs:10", "") and "src/lib.rs:17" not in out, out)
+        # round 2: a second item on the attribute's line, and attributes on
+        # comma-delimited items (struct fields, enum variants) — the span must
+        # end at the item, not drift into the next production item.
+        (root / "src" / "lib.rs").write_text(
+            '#[cfg(test)] fn helper() { std::thread::sleep(d) } fn production() {\n'
+            '    std::thread::sleep(d) // product: the item after helper on the same line\n'
+            '}\n'
+            '#[cfg(test)] fn h2() {} fn p2() { std::thread::sleep(d) } // product, same line as a test item\n'
+            'struct S {\n'
+            '    #[cfg(test)]\n'
+            '    field: Vec<(u8, u8)>,\n'
+            '}\n'
+            'fn p3() { std::thread::sleep(d) } // product after an attributed field\n'
+            'enum E {\n'
+            '    #[cfg(test)]\n'
+            '    Only\n'
+            '}\n'
+            'fn p4() { std::thread::sleep(d) } // product after an attributed last variant\n'
+            '#[cfg(test)]\n'
+            'fn generic<A, B>(a: (A, B)) { std::thread::sleep(d) } // test: commas in the signature\n'
+        )
+        (root / "src" / "ops.rs").write_text(
+            '#[cfg(test)] fn h() { std::thread::sleep(d) } fn p() { std::thread::sleep(d) } // both on one line: a site\n'
+            '#[cfg(test)] const FLAG: bool = 1 < 2;\n'
+            'fn p2() { std::thread::sleep(d) } // product after a const with a comparison\n'
+            '#[cfg(test)] const MASK: u32 = 1 << 4;\n'
+            'fn p3() { std::thread::sleep(d) } // product after a const with a shift\n'
+            '#[cfg(test)] const V: Vec<(u8, u8)> = Vec::new();\n'
+            'fn p4() { std::thread::sleep(d) } // product after a generic-typed const\n'
+            '#[cfg(test)]\n'
+            'fn w<T>(t: T) where T: Ord, { std::thread::sleep(d) } // test: a where clause comma\n'
+            '#[cfg(test)]\n'
+            'mod c { const C: &CStr = c"}"; fn t() { std::thread::sleep(d) } } // test: a c-string brace\n'
+        )
+        rc, out = _run(root, "--report", "--no-base")
+        check("a line with a test match and a product match is a site; comparison and shift operators in a brace-less item do not extend the span",
+              rc == 0 and "no-sleep: 8 site(s) (4 in #[cfg(test)] skipped), baseline 4 — VIOLATION" in out
+              and "src/ops.rs:1" in out and "src/ops.rs:3" in out and "src/ops.rs:5" in out and "src/ops.rs:7" in out
+              and "src/ops.rs:9" not in out and "src/ops.rs:11" not in out, out)
+        (root / "src" / "ops.rs").unlink()
+        rc, out = _run(root, "--report", "--no-base")
+        check("a second item on the attribute's line and attributed fields/variants do not extend the span",
+              rc == 0 and "no-sleep: 4 site(s) (2 in #[cfg(test)] skipped), baseline 4 — ok" in out
+              and "src/lib.rs:2" in out and "src/lib.rs:4" in out and "src/lib.rs:9" in out and "src/lib.rs:14" in out
+              and "src/lib.rs:16" not in out, out)
+        (root / "src" / "lib.rs").write_text('#[cfg(test)]\nmod tests {\n    fn t() { std::thread::sleep(d) }\n// never closed\n')
+        rc, out = _run(root, "--no-base")
+        check("a cfg(test) span that never closes fails the audit naming the line, instead of absorbing the file",
+              rc == 2 and "src/lib.rs:1: the #[cfg(test)] item never ends" in out, out)
+        (root / ".invariants.toml").write_text(
+            '[[invariant]]\nid = "x"\nrule = "r"\nkind = "path"\npaths = ["src/*.rs"]\nskip_cfg_test = true\nbaseline = 0\n'
+        )
+        rc, out = _run(root, "--no-base")
+        check("skip_cfg_test on a non-content kind is a shapes-file error (exit 2)", rc == 2 and "applies to kind=content only" in out, out)
+        (root / "src" / "lib.rs").unlink()
+        (root / ".invariants.toml").write_text(
+            '[[invariant]]\nid = "no-file-ipc"\nrule = "r"\nkind = "content"\npaths = ["src/**/*.txt"]\npattern = "FILE_IPC"\nbaseline = 1\n'
+        )
+        (root / "src" / "a.txt").write_text("FILE_IPC\n")
 
         # unreadable scoped file: the gate must not pass
         posix_non_root = hasattr(os, "geteuid") and os.geteuid() != 0

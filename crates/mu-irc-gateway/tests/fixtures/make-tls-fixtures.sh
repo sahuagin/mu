@@ -1,26 +1,12 @@
 #!/bin/sh
-# Regenerate the private-CA TLS fixtures used by the offline transport tests.
-#
-# The fixtures are COMMITTED, not generated at test time: `rcgen` is not in this
-# workspace's dependency graph (checked against Cargo.lock), and adding a
-# certificate-generation crate to build a two-certificate chain is a larger
-# dependency decision than the test needs. They are valid for 10 years from the
-# date below; re-run this script to replace them.
+# Regenerate the test-only TLS fixtures in this directory (ca.pem, server.pem,
+# server.key.pem). What they are, why they are harmless, and the rule that
+# they are never used outside the test suite: see README.md alongside.
 #
 #   sh crates/mu-irc-gateway/tests/fixtures/make-tls-fixtures.sh
 #
-# What lands in git:
-#
-#   ca.pem          the test CA certificate — the PEM bundle a test feeds to
-#                   `[irc] tls_ca_file`
-#   server.pem      a leaf certificate signed by that CA, with SANs
-#                   `IP:127.0.0.1` and `DNS:irc.test.invalid`
-#   server.key.pem  the leaf's PKCS#8 private key
-#
-# The CA's PRIVATE key is deliberately NOT kept: nothing in the tests signs
-# anything, so the only thing a retained CA key could do is sign something else.
-# The leaf key has to be kept — the test's TLS server presents it — and is a
-# throwaway that has never protected anything.
+# The CA key is created in a temp directory that the trap below removes; only
+# the CA certificate, the leaf, and the leaf's key land next to this script.
 #
 # P-256/SHA-256 rather than Ed25519 so the fixture verifies under every rustls
 # crypto provider, not just the one this crate happens to pin today.

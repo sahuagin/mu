@@ -1,15 +1,14 @@
 //! `mu-irc-gateway` — a standalone single-nick IRC frontend to the mu agent
 //! mesh (see `specs/plans/mu-irc-gateway-v0.md`).
 //!
-//! The crate was built in reviewable capability slices: each one a pure,
-//! testable *decision* module with no socket and no live mesh, and then a final
-//! increment that runs them against a real server. The split survives in the
-//! structure — [`routing`] decides what to put on IRC, [`outbound`] decides what
-//! to publish, [`membership`] decides who is present, and only [`bridge`] and
-//! [`transport`] touch the network — which is why every rule below can be tested
-//! without either server.
+//! The crate is a set of pure, testable *decision* modules with no socket and
+//! no live mesh, plus the two modules that run them against a real server.
+//! [`routing`] decides what to put on IRC, [`outbound`] decides what to
+//! publish, [`membership`] decides who is present, and only [`bridge`] and
+//! [`transport`] touch the network — which is why every rule below can be
+//! tested without either server.
 //!
-//! Increment **2a** — configuration and pure mapping/framing:
+//! Configuration and pure mapping/framing:
 //!
 //! - [`config`] — gateway-local `[irc]` configuration and validation, with
 //!   mesh-config loading delegated to the shared `mu_dialogue::mesh::load`.
@@ -21,7 +20,7 @@
 //!   body and the mesh id alike, and the `+mu.id` client tag only when
 //!   message-tags is negotiated.
 //!
-//! Increment **2b** — the adapter, membership, and mesh→IRC routing:
+//! The adapter, membership, and the mesh→IRC direction:
 //!
 //! - [`adapter`] — a single-connection registration/capability state machine
 //!   over a small [`adapter::Transport`] seam: CAP negotiation, mandatory SASL
@@ -44,7 +43,7 @@
 //! - [`recent`] — the one bounded retention policy the gateway's
 //!   "have I seen this id?" memories share.
 //!
-//! Increment **3** — the IRC→mesh direction:
+//! The IRC→mesh direction:
 //!
 //! - [`outbound`] — a human's IRC line becomes a mesh publish decision: an
 //!   explicit `role:id:` address, the agent a channel maps to, or a fan-out
@@ -55,16 +54,16 @@
 //!   nick, and its own minted ids / `human:` senders recorded before publication
 //!   can race observation, in the bounded [`recent`] window).
 //!
-//! Increment **4** — the bot verbs, in that same [`outbound`] module because
-//! they are dispatched ahead of its routing rules and share them: `mu peers`
-//! renders the live presence set, `mu say <peer id or alias> <text>` resolves
-//! against it (full id first, then the channel alias) and publishes through the
-//! very code an explicit address does, so both leave the same routing memory.
-//! A command line is never mirrored, never fanned out and never published as
-//! itself; an unsupported verb costs one [`outbound::USAGE`] line and nothing
-//! more. Answers go privately to whoever typed the verb.
+//! The bot verbs live in that same [`outbound`] module because they are
+//! dispatched ahead of its routing rules and share them: `mu peers` renders the
+//! live presence set, `mu say <peer id or alias> <text>` resolves against it
+//! (full id first, then the channel alias) and publishes through the very code
+//! an explicit address does, so both leave the same routing memory. A command
+//! line is never mirrored, never fanned out and never published as itself; an
+//! unsupported verb costs one [`outbound::USAGE`] line and nothing more.
+//! Answers go privately to whoever typed the verb.
 //!
-//! Integration — what actually runs:
+//! What actually runs:
 //!
 //! - [`transport`] — one TCP connection, TLS by default, split into a line
 //!   reader and a bounded line writer. Deliberately NOT an IRC client crate:

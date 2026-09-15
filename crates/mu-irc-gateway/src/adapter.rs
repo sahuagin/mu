@@ -1,9 +1,9 @@
 //! Offline IRC adapter: a single-connection registration/capability state
 //! machine, normalized IRC message parsing, and live ISUPPORT tracking.
 //!
-//! This module is **offline**. It never opens a socket. The real TLS transport,
-//! the maintained IRC client crate, and the read/write event loop are the
-//! integration increment's job; here the adapter is a pure state machine that
+//! This module is **offline**. It never opens a socket. The socket, TLS and
+//! CRLF framing belong to [`crate::transport`] and the read/write event loop to
+//! [`crate::bridge`]; here the adapter is a pure state machine that
 //! *consumes* parsed inbound [`IrcMessage`]s and *produces* the exact outbound
 //! protocol lines to send, so the whole registration handshake — CAP
 //! negotiation, mandatory SASL PLAIN, optional message-tags/account
@@ -24,10 +24,10 @@
 //! the state machine, or of a step, cannot leak a credential.
 //!
 //! SASL, when configured, is MANDATORY and fails closed. There is no path from
-//! configured credentials to [`RegPhase::Ready`] that skips the exchange: a CAP
+//! configured credentials to `RegPhase::Ready` that skips the exchange: a CAP
 //! reply that omits `sasl`, a NAK, a terminal SASL numeric in either exchange
 //! phase, and a welcome numeric arriving before `903` all end the machine in
-//! [`RegPhase::Failed`]. The welcome case is decided in
+//! `RegPhase::Failed`. The welcome case is decided in
 //! [`Registration::on_message`] *before* the message reaches a phase handler,
 //! so it holds in every phase that precedes the welcome rather than only in
 //! the one phase that expects a welcome. With no credentials configured the
@@ -47,7 +47,7 @@
 //!
 //! Registration rejection is terminal too. A server that refuses the
 //! configured nick (`432`, `433`, `436`, `437`) will never send `001`, so
-//! those numerics end the machine in [`RegPhase::Failed`] with
+//! those numerics end the machine in `RegPhase::Failed` with
 //! [`AdapterError::NickRejected`] instead of leaving it waiting for a welcome
 //! that is not coming. v0 does not retry under a replacement nick: the gateway
 //! is single-nick by design and the operator picks another one. An automatic
@@ -61,9 +61,9 @@ use base64::Engine as _;
 use crate::config::{validate_nick, IrcConfig, NickFault, SaslCreds};
 use crate::mapping::CaseMapping;
 
-/// The one connection this gateway drives. The integration increment implements
-/// it over a real TLS socket + IRC client; the offline registration returns the
-/// lines a caller would hand to [`Transport::send_line`]. Kept deliberately
+/// The one connection this gateway drives. [`crate::transport::LineWriter`]
+/// implements it over a real TCP/TLS socket; the offline registration returns
+/// the lines a caller would hand to [`Transport::send_line`]. Kept deliberately
 /// tiny — a single connection, write-only from the state machine's side (reads
 /// arrive as [`IrcMessage`]s fed into [`Registration::on_message`]).
 pub trait Transport {
@@ -76,7 +76,7 @@ pub trait Transport {
 }
 
 /// Injectable wall clock, so a [`Diagnostic`] timestamp is deterministic under
-/// test. The integration increment passes a real clock.
+/// test. The bridge passes [`SystemClock`].
 pub trait Clock {
     fn now(&self) -> SystemTime;
 }
@@ -371,7 +371,7 @@ pub enum AdapterError {
     #[error("the server refused the `sasl` capability")]
     SaslRejected,
     /// The server rejected the SASL exchange (a terminal SASL numeric — see
-    /// [`terminal_sasl_failure`]). No detail is carried: the numeric class is
+    /// `terminal_sasl_failure`). No detail is carried: the numeric class is
     /// all a body-free diagnostic may say.
     #[error("SASL authentication failed")]
     SaslFailed,
@@ -437,7 +437,7 @@ enum RegPhase {
 /// `Debug` is hand-written, not derived: `out` is the one structure in this
 /// module that legitimately carries the base64 SASL response, and a caller
 /// logging a step (or the `Result` wrapping it) would otherwise print a
-/// reversibly-encoded password. See [`redact_outbound`].
+/// reversibly-encoded password. See `redact_outbound`.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Step {
     /// Protocol lines to send, in order (no CRLF; the transport adds it).
@@ -476,9 +476,11 @@ fn redact_outbound(line: &str) -> String {
     }
 }
 
-/// The connection the gateway asks the executor to open. `tls` mirrors config;
-/// the integration increment refuses a cleartext socket the same way the SASL
-/// gate does, but the request is carried explicitly so the policy is visible.
+/// The connection the gateway asks the executor to open. `tls` mirrors config
+/// and the transport opens exactly what it says — TLS when `true`, cleartext
+/// otherwise; it is this module's SASL gate that refuses credentials over a
+/// cleartext connection. The flag is carried explicitly so that policy is
+/// visible at the request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectRequest {
     pub server: String,

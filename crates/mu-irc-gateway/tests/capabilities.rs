@@ -1,4 +1,4 @@
-//! Offline capability regression tests for increment 2a: configuration,
+//! Offline capability regression tests: configuration,
 //! identity folding, mapping/channel policy, and framing. No network, no IRC
 //! client — every check is a pure function of its inputs or a temp file.
 

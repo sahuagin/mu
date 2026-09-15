@@ -2,23 +2,22 @@
 //! connection, TLS by default, split into a line reader and a line writer.
 //!
 //! **Why a plain line client and not an IRC crate.** The plan of record
-//! originally assigned a maintained IRC client crate to the integration
-//! increment; it was amended instead of quietly contradicted. The decision,
-//! its rationale, what it costs and what would reopen it are recorded in
-//! `specs/plans/mu-irc-gateway-v0.md`, increment 2b, *Amendment, 2026-09-10 —
-//! the integration increment ships a plain TLS line transport*. In short: the
+//! originally called for a maintained IRC client crate here; it was amended
+//! instead of quietly contradicted. The decision, its rationale, what it costs
+//! and what would reopen it are recorded in `specs/plans/mu-irc-gateway-v0.md`
+//! under *Amendment, 2026-09-10* (the plain TLS line transport). In short: the
 //! adapter already owns registration, and what was missing is a socket, TLS,
 //! CRLF framing and reconnection. That is this module, over `tokio` +
 //! `tokio-rustls`.
 //!
-//! **A connection is a unit.** Both halves share one [`Lifecycle`]: whichever
+//! **A connection is a unit.** Both halves share one `Lifecycle`: whichever
 //! fails first ends the other and puts exactly one [`FromServer::Closed`] on
 //! the inbound stream. A consumer watches that one stream, so a writer that
 //! died silently would leave it parked on a socket nobody drives.
 //!
 //! **Ending is never the consumer's to block.** The `Closed` slot is RESERVED
 //! when the inbound channel is built, so a consumer that has stopped draining
-//! delays LINES and nothing else: [`Lifecycle::close`] is synchronous, the
+//! delays LINES and nothing else: `Lifecycle::close` is synchronous, the
 //! teardown it reports has already happened, and no half of the connection can
 //! be parked by backpressure on its way out.
 //!
@@ -271,7 +270,7 @@ pub enum FromServer {
     /// One protocol line, CRLF stripped.
     Line(String),
     /// The connection ended, with a body-free reason for the log. Exactly
-    /// one per connection, whichever half failed first — see [`Lifecycle`].
+    /// one per connection, whichever half failed first — see `Lifecycle`.
     Closed(String),
 }
 
@@ -295,7 +294,7 @@ pub struct LineWriter {
 impl LineWriter {
     /// Whether this connection is still live. `false` means it is finished —
     /// for EITHER half's failure, because the writer task drops the queue as
-    /// soon as the shared [`Lifecycle`] ends, before it waits on a broken
+    /// soon as the shared `Lifecycle` ends, before it waits on a broken
     /// socket to finish tearing down. A [`FromServer::Closed`] is on the
     /// inbound stream by then.
     pub fn is_connected(&self) -> bool {
@@ -1606,8 +1605,9 @@ mod tests {
         (addr, task)
     }
 
-    /// The increment's point: a server certificate signed by an operator's own
-    /// CA is accepted when that CA is configured, and rejected when it is not.
+    /// The point of configurable trust: a server certificate signed by an
+    /// operator's own CA is accepted when that CA is configured, and rejected
+    /// when it is not.
     ///
     /// The negative leg is the one that matters — it is what says the positive
     /// leg proved the CA rather than some general looseness. On a host with no

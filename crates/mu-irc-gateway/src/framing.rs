@@ -20,7 +20,7 @@
 //!
 //! The mesh id carried by that tag is attacker-influenced — it arrives verbatim
 //! on the envelope — so it is never interpolated raw. An id outside the safe
-//! grammar ([`is_safe_id_char`]) is either rendered with IRCv3 message-tag
+//! grammar (`is_safe_id_char`) is either rendered with IRCv3 message-tag
 //! escaping or refused outright, and the ESCAPED form is what the line budget
 //! counts, so no id can end a tag early, start a second tag, or open a second
 //! command.

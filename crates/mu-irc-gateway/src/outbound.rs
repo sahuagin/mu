@@ -1,4 +1,4 @@
-//! IRC → mesh routing (increments 3 and 4).
+//! IRC → mesh routing, and the bot verbs dispatched ahead of it.
 //!
 //! An offline decision function for the other direction: a human types a line in
 //! IRC, and this decides the mesh DM(s) to publish — to one explicitly-addressed
@@ -38,9 +38,8 @@
 //! may not even be in the peer's channel, and remembering it would send the reply
 //! to a room they never asked about — so those record
 //! [`MemoryDestination::Private`] and the reply comes back as a DM.
-
 //!
-//! # Bot verbs (increment 4)
+//! # Bot verbs
 //!
 //! Two textual commands are dispatched AHEAD of all of the above, because a
 //! command is not a message: `mu peers` prints the live presence set and

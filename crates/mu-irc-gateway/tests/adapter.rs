@@ -1,4 +1,4 @@
-//! Offline adapter tests for increment 2b: the registration/capability state
+//! Offline adapter tests: the registration/capability state
 //! machine, ISUPPORT tracking, and — above all — that no credential, raw or
 //! base64-encoded, survives in any printable state. No socket, no IRC client:
 //! every check drives the state machine with parsed lines.

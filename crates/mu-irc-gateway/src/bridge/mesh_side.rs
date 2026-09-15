@@ -8,17 +8,17 @@
 //!
 //! One task per *input*, and none of them owns the bridge's state:
 //!
-//! - [`ingress_gate`] drains the endpoint and observer subscriptions ALWAYS and
+//! - `ingress_gate` drains the endpoint and observer subscriptions ALWAYS and
 //!   forwards only while an IRC session is registered, which is what makes an
 //!   IRC outage lossy rather than retentive;
-//! - [`presence_worker`] runs `front`/`release` in order (a rename is a release
+//! - `presence_worker` runs `front`/`release` in order (a rename is a release
 //!   and a front that must not overlap) and keeps trying the fronting that
 //!   failed, because a human IRC still reports present is a human the gateway
 //!   still owes a mesh inbox;
 //! - [`publish_worker`] runs the fan-out publishes in order, one worker per IRC
 //!   session over a bounded queue that dies with it, and drops rather than
 //!   delivers anything the mesh went down under;
-//! - [`discovery_worker`] sweeps `$SRV` on the refresh timer into a `watch`, so
+//! - `discovery_worker` sweeps `$SRV` on the refresh timer into a `watch`, so
 //!   the NEWEST snapshot wins the slot instead of the oldest;
 //! - [`nats_watcher`] tracks the connection itself, in every phase, so what a
 //!   session reads is true of the process and not of one loop's attention — and
@@ -274,7 +274,7 @@ pub struct MeshSide<P: MeshPresence = Gateway> {
     /// decided under an EARLIER [`LinkState::generation`] is dropped rather than
     /// delivered over the link that replaced it.
     pub mesh_up: watch::Receiver<LinkState>,
-    /// How many mesh events [`ingress_gate`] has dropped since a session last
+    /// How many mesh events `ingress_gate` has dropped since a session last
     /// reported. Read (and zeroed) at session start, which is where "what
     /// arrived while IRC was down" is diagnosed.
     pub ingress_dropped: Arc<AtomicU64>,
@@ -871,7 +871,7 @@ pub fn discard_stale_discovery(rx: &mut watch::Receiver<Discovery>) {
 /// count.
 ///
 /// The same argument as [`discard_stale_discovery`], for the other slot the mesh
-/// half hands out. [`ingress_gate`] stops FORWARDING the moment `session_live`
+/// half hands out. `ingress_gate` stops FORWARDING the moment `session_live`
 /// goes false, but what it forwarded a moment earlier is already in the channel,
 /// and the channel is the mesh half's — it outlives the session that was reading
 /// it. Left there, those bodies are delivered to the NEXT session: a DM answered

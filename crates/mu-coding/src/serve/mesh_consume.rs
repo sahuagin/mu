@@ -355,12 +355,14 @@ pub(crate) async fn mesh_code_index_tools(mesh: &MeshConfig) -> Result<Vec<Arc<d
     // otherwise a mesh with no `mu-mesh-svc` on it shadows a working MCP
     // import with tools that answer "no responders" for the daemon's whole
     // life (operator's live session, 2026-09-16). Same probe mu-mesh-check
-    // uses: NATS Micro `$SRV.PING.<name>`, bounded.
+    // uses: NATS Micro `$SRV.PING.<name>`, bounded. Whether an import then
+    // actually supplies the tools is the caller's to report (it may be
+    // disabled or unconfigured) — the Err only says the names are free.
     if !discoverable(&client).await {
         return Err(anyhow!(
             "code_index service not discoverable on the mesh at {} (no reply to \
              $SRV.PING.{SERVICE_NAME} within {}s; is mu-mesh-svc running?) — leaving \
-             code_recall/code_status to the [[mcp.servers]] import",
+             code_recall/code_status to the [[mcp.servers]] import, if one is configured",
             mesh.nats_url,
             DISCOVERY_TIMEOUT.as_secs()
         ));

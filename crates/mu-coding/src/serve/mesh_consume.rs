@@ -30,9 +30,15 @@ use mu_core::config::MeshConfig;
 /// Subject root the mesh `code_index` service listens on (endpoints:
 /// `.recall`, `.status`) — must match the service side.
 const SERVICE_SUBJECT: &str = "mu.svc.code_index";
+/// The service's NATS Micro name — what `$SRV.PING.<name>` discovers it by
+/// (mesh-slice `SERVICE_NAME`). Discovery is by name, the calls by subject.
+const SERVICE_NAME: &str = "code_index";
 /// One request/reply round-trip bound. Generous: covers the backend's
 /// cold-embedder reload behind the service.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Boot-time discovery bound. Short on purpose: a live service answers a
+/// `$SRV.PING` from memory, so silence this long means nobody is there.
+const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 // ── wire types (consumer-side mirror of the mesh contract) ────────────────
 
@@ -302,6 +308,21 @@ fn read_only(spec: ToolSpec) -> ToolSpec {
 /// bounded NATS connect (this runs on daemon startup — same fail-fast rule
 /// as the mesh adapter), one shared proxy, two tools. Best-effort caller:
 /// an error here degrades to "no mesh tools", never a startup failure.
+/// Is a `code_index` service answering on this bus right now? A no-responders
+/// error, any other request failure, or `DISCOVERY_TIMEOUT` of silence all
+/// mean "no" — the caller only needs the boolean, the log line says why.
+async fn discoverable(client: &async_nats::Client) -> bool {
+    let subject = format!("$SRV.PING.{SERVICE_NAME}");
+    matches!(
+        tokio::time::timeout(
+            DISCOVERY_TIMEOUT,
+            client.request(subject, bytes::Bytes::new())
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
 pub(crate) async fn mesh_code_index_tools(mesh: &MeshConfig) -> Result<Vec<Arc<dyn Tool>>> {
     if mesh.issuer_key.is_empty() {
         return Err(anyhow!(
@@ -327,6 +348,23 @@ pub(crate) async fn mesh_code_index_tools(mesh: &MeshConfig) -> Result<Vec<Arc<d
         )
     })?
     .map_err(|e| anyhow!("mesh consume: connect NATS at {}: {e}", mesh.nats_url))?;
+
+    // A connected bus is not a served tool. Registering these tools evicts
+    // the `[[mcp.servers]]` code_recall/code_status import (name collision,
+    // consumption wins), so an undiscoverable service must NOT register:
+    // otherwise a mesh with no `mu-mesh-svc` on it shadows a working MCP
+    // import with tools that answer "no responders" for the daemon's whole
+    // life (operator's live session, 2026-09-16). Same probe mu-mesh-check
+    // uses: NATS Micro `$SRV.PING.<name>`, bounded.
+    if !discoverable(&client).await {
+        return Err(anyhow!(
+            "code_index service not discoverable on the mesh at {} (no reply to \
+             $SRV.PING.{SERVICE_NAME} within {}s; is mu-mesh-svc running?) — leaving \
+             code_recall/code_status to the [[mcp.servers]] import",
+            mesh.nats_url,
+            DISCOVERY_TIMEOUT.as_secs()
+        ));
+    }
 
     let proxy = Arc::new(CodeIndexProxy { client, root });
     let recall_spec = read_only(ToolSpec {
@@ -524,7 +562,9 @@ mod tests {
         let issuer_hex = root.private().to_bytes_hex();
 
         // Minimal service side: decode, VERIFY the capability against the
-        // issuer (signature + right, no fail-open), reply typed hits.
+        // issuer (signature + right, no fail-open), reply typed hits. It
+        // also answers `$SRV.PING.<name>` like the real NATS Micro service —
+        // the consumer refuses to register against a bus where nothing does.
         let svc = async_nats::connect("127.0.0.1:14530")
             .await
             .expect("svc connect");
@@ -532,7 +572,23 @@ mod tests {
             .subscribe(format!("{SERVICE_SUBJECT}.recall"))
             .await
             .expect("svc subscribe");
+        let mut ping = svc
+            .subscribe(format!("$SRV.PING.{SERVICE_NAME}"))
+            .await
+            .expect("ping subscribe");
         svc.flush().await.expect("svc flush");
+        let ping_client = svc.clone();
+        let ping_task = tokio::spawn(async move {
+            while let Some(msg) = ping.next().await {
+                if let Some(rt) = msg.reply {
+                    let body = json!({"name": SERVICE_NAME, "id": "test", "version": "0.1.0"});
+                    ping_client
+                        .publish(rt, serde_json::to_vec(&body).unwrap().into())
+                        .await
+                        .ok();
+                }
+            }
+        });
         let svc_task = tokio::spawn(async move {
             while let Some(msg) = sub.next().await {
                 #[derive(Deserialize)]
@@ -595,8 +651,65 @@ mod tests {
         );
 
         svc_task.abort();
+        ping_task.abort();
         nats.kill().ok();
         nats.wait().ok();
+    }
+
+    /// A reachable bus with NO `code_index` service must yield no tools (an
+    /// Err the daemon logs and moves past), so the `[[mcp.servers]]` import
+    /// supplies code_recall/code_status instead of a dead mesh shadow.
+    #[tokio::test]
+    async fn no_service_on_the_bus_means_no_mesh_tools() {
+        let bin = std::env::var("NATS_BIN").unwrap_or_else(|_| "nats-server".to_string());
+        let Ok(mut nats) = std::process::Command::new(&bin)
+            .args(["-p", "14531", "-a", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            eprintln!("skipping: cannot spawn nats-server ({bin})");
+            return;
+        };
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect("127.0.0.1:14531")
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let mesh = MeshConfig {
+            nats_url: "127.0.0.1:14531".to_string(),
+            consume_code_index: true,
+            issuer_key: KeyPair::new().private().to_bytes_hex(),
+            ..MeshConfig::default()
+        };
+        let started = std::time::Instant::now();
+        let err = match mesh_code_index_tools(&mesh).await {
+            Ok(tools) => {
+                nats.kill().ok();
+                nats.wait().ok();
+                panic!(
+                    "registered {} mesh tools against a bus with no code_index service",
+                    tools.len()
+                );
+            }
+            Err(e) => e.to_string(),
+        };
+        nats.kill().ok();
+        nats.wait().ok();
+        assert!(
+            err.contains("not discoverable") && err.contains("[[mcp.servers]]"),
+            "error must say what is missing and who covers for it: {err}"
+        );
+        assert!(
+            started.elapsed() < DISCOVERY_TIMEOUT + std::time::Duration::from_secs(3),
+            "discovery must be bounded, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

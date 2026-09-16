@@ -2223,7 +2223,10 @@ async fn mesh_dm_lands_in_supervisor_mailbox_and_rogue_dm_is_dropped() {
         routes: mu_core::config::RoutesConfig {
             ollama_discover: false,
         },
+        // A dialogue-only daemon: master switch on, inbound RPC serve off.
         mesh: mu_core::config::MeshConfig {
+            enabled: true,
+            serve: false,
             nats_url: url.clone(),
             dialogue: true,
             issuer_key: issuer_hex,

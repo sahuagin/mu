@@ -50,6 +50,16 @@ The `mu` CLI subcommands: `serve` (daemon), `ask` (one-shot), `resume`, `tui`,
 ## Build & test
 
 - Toolchain: **stable** with `rustfmt` + `clippy` (`rust-toolchain.toml`).
+  Host tools this repo's recipes call and does not vendor: `just`, `jj`,
+  `invariant-audit` (agent_tools; used by `just invariants`). Pinned install,
+  one line — bump the rev here when the tool changes:
+
+  ```sh
+  cargo install --git https://github.com/sahuagin/agent_tools --rev f3a3ab4e6e5c invariant-audit
+  ```
+
+  `scripts/tests/invariant-audit-test.sh` checks the installed tool parses this
+  repo's shapes file.
 - **`just ci` is the gate** — `fmt-check` → `clippy` → `test`, fail-fast in that
   order; it mirrors `.github/workflows/ci.yml` verbatim. A green `just ci` is the
   local proxy for green CI. Run it before pushing. The three steps are:

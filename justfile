@@ -51,17 +51,21 @@ ci:
 # every site of each violation shape in .invariants.toml and fail if a count
 # rose above its ceiling — the lower of BASE's (main) and the checkout's
 # baseline, so a PR cannot raise one in the commit that adds the violation.
-# On-demand seam for now; gate wiring (just ci / CI / pre-pr-check) is the
-# separate increment AGENTS.md invariant 5 asks for. Extra args go to the
-# script: where `main` does not resolve (shallow clone, first commit) use
-# `just invariants --no-base` or set MU_INVARIANTS_BASE=<rev>.
+# The audit is the installed `invariant-audit` binary from agent_tools (PR #69,
+# tree-sitter; the pinned install line is in AGENTS.md → Build & test), a tool
+# like cargo or jj, not a script in this repo (agent_tools bead at-zzb).
+# scripts/tests/invariant-audit-test.sh checks the installed tool against this
+# repo's shapes file. On-demand seam for now; gate wiring (just ci / CI
+# / pre-pr-check) is the separate increment AGENTS.md invariant 5 asks for.
+# Extra args go to the tool: where `main` does not resolve (shallow clone,
+# first commit) use `just invariants --no-base` or set MU_INVARIANTS_BASE=<rev>.
 invariants *args:
-    python3 scripts/invariant-audit.py {{args}}
+    invariant-audit {{args}}
 
 # The same audit listing every site of every shape without failing — the
 # "find them all" view a correction has to cover. Needs no BASE.
 invariants-report *args:
-    python3 scripts/invariant-audit.py --report --no-base {{args}}
+    invariant-audit --report --no-base {{args}}
 
 # Pre-PR cross-provider review gate (bead mu-6qst): run the pre-PR checks, then
 # have the `code_review` panel inspect the diff before a PR. Local only (needs

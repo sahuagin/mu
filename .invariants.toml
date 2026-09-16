@@ -1,6 +1,9 @@
 # Architecture invariants as mechanically checkable violation SHAPES.
-# Audited by scripts/invariant-audit.py (`just invariants` / `just invariants-report`). Each entry names the rule (quote AGENTS.md), where to look, what a
-# violation looks like, and `baseline` = the number of sites the repo has today.
+# Audited by the installed `invariant-audit` binary from agent_tools (`just
+# invariants` / `just invariants-report`; the tool's README documents the
+# schema, incl. `skip_cfg_test` for Rust content shapes). Each entry names the
+# rule (quote AGENTS.md), where to look, what a violation looks like, and
+# `baseline` = the number of sites the repo has today.
 # The audit lists EVERY site and fails when a count rises; lower the baseline in
 # the PR that removes sites. Baselines only go down, and are pinned to BASE (main).
 # An entry present at BASE may not be deleted outright: mark it `retired = true` first.

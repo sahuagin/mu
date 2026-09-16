@@ -408,11 +408,15 @@ impl Store {
         // inbox: the gateway fronts it so DMs arriving between its polls are
         // buffered into this store instead of dropped. Only peers this server
         // actually serves — a `mu:` id belongs to a daemon that speaks the mesh
-        // itself, and fronting it would steal its subject. Idempotent, so all
-        // but the first touch is a map lookup. Never fatal: a NATS hiccup must
-        // not take down messaging (same fail-open rule as etcd presence).
+        // itself, and a `human:` id to whichever gateway can see the person
+        // (the IRC gateway fronts every nick it sees); fronting either would
+        // steal its subject, and a human's DMs would then land here, where no
+        // IRC client reads. Idempotent, so all but the first touch is a map
+        // lookup. Never fatal: a NATS hiccup must not take down messaging
+        // (same fail-open rule as etcd presence).
         if let Some(gw) = &self.mesh {
-            if PeerId::parse(peer_id).as_mu().is_none() {
+            let peer = PeerId::parse(peer_id);
+            if peer.as_mu().is_none() && !peer.is_human() {
                 if let Err(e) = gw.front_peer(peer_id).await {
                     warn!("gateway: fronting {peer_id} failed, mesh inbox absent: {e:#}");
                 }
@@ -2117,6 +2121,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hist["messages"].as_array().unwrap().len(), 2);
+    }
+
+    /// Touching a peer fronts it on the mesh only when this server is the one
+    /// that serves it: a cc session, yes; a `human:` nick, never — the IRC
+    /// gateway fronts humans, and a competing registration here would pull
+    /// their DMs into a store no IRC client reads (mu-nyfsd). A `mu:` daemon
+    /// was already excluded for the same reason.
+    #[tokio::test]
+    #[ignore = "requires a live NATS server"]
+    async fn touching_a_peer_fronts_only_what_this_server_serves() {
+        let root = biscuit_auth::KeyPair::new();
+        let cfg = mesh::MeshConfig {
+            enabled: true,
+            nats_url: std::env::var("MU_DIALOGUE_TEST_NATS")
+                .unwrap_or_else(|_| "127.0.0.1:4222".to_string()),
+            issuer_key: root.private().to_bytes_hex(),
+        };
+        let (gw, _rx) = mesh::connect(&cfg).await.expect("connect to NATS");
+        let gw = Arc::new(gw);
+        let mut store = test_store().await;
+        store.mesh = Some(Arc::clone(&gw));
+
+        let pid = std::process::id();
+        let cc = format!("cc:touch{pid}");
+        let human = format!("human:touch{pid}");
+        let daemon = format!("mu:touch{pid}:session-1");
+        for p in [&cc, &human, &daemon] {
+            store.touch_peer(p, now_ms()).await.unwrap();
+        }
+        let fronted = gw.fronted_peers().await;
+        assert!(fronted.contains(&cc), "a cc peer is fronted: {fronted:?}");
+        assert!(!fronted.contains(&human), "a human is not: {fronted:?}");
+        assert!(
+            !fronted.contains(&daemon),
+            "a mu daemon is not: {fronted:?}"
+        );
+        // All three are still recorded as peers — presence in the store is
+        // separate from who carries their mesh inbox.
+        let listed = store.list_peers(None, 0).await.unwrap();
+        for p in [&cc, &human, &daemon] {
+            assert!(listed.iter().any(|row| &row.peer_id == p), "{p} listed");
+        }
     }
 
     /// The role filter and the recency window narrow the broadcast set.

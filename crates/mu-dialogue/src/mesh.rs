@@ -1406,8 +1406,24 @@ impl Gateway {
     /// Prefers the session's own inbox (mu-6s7s), where the subject is the
     /// address and no `session` field is needed; falls back to the daemon
     /// subject plus that field for daemons without per-session inboxes.
+    ///
+    /// A `human:<nick>` is on the mesh only while a gateway fronts it (the IRC
+    /// gateway registers each nick it sees, with its DM subject, and releases
+    /// it when the nick leaves), so a human resolves to whatever that gateway
+    /// advertises and, once they are gone, to nothing — the message then stays
+    /// in the store. "Gone" is as seen through the [`LIVENESS_TTL`] cache, the
+    /// same best-effort window every mu peer already gets: a send inside the
+    /// few seconds after a nick quits can still be published to a subject
+    /// nobody holds. Without this branch every agent → human reply was
+    /// store-only, and the IRC gateway reads only the mesh (mu-nyfsd).
     pub async fn address(&self, peer_id: &str) -> Option<MeshTarget> {
         let peer = PeerId::parse(peer_id);
+        if peer.is_human() {
+            return self.live_subject(peer_id).await.map(|subject| MeshTarget {
+                subject,
+                session: None,
+            });
+        }
         let target = peer.as_mu()?;
         // The session itself on the mesh → its own subject identifies it, so
         // the envelope needs no `session` field.
@@ -2893,6 +2909,49 @@ mod live_tests {
             .address(&format!("mu:gwabsent{pid}:session-1"))
             .await
             .is_none());
+    }
+
+    /// A human is reachable exactly while some gateway fronts them — the
+    /// IRC gateway registers each nick it sees through this same API — and
+    /// resolves to the subject that gateway advertises, with no session
+    /// field. Gone from `$SRV`, they resolve to nothing and the store keeps
+    /// the message. Before mu-nyfsd `address()` refused every non-mu role,
+    /// which stranded every agent → human reply.
+    #[tokio::test]
+    #[ignore = "requires a live NATS server"]
+    async fn addressing_a_human_follows_the_gateway_that_fronts_them() {
+        let (server, _rx, _root) = live_gateway().await;
+        // A second gateway plays the IRC gateway on the other side.
+        let (irc, _irc_rx, _irc_root) = live_gateway().await;
+        let pid = std::process::id();
+        let present = format!("human:gwhuman{pid}");
+        let absent = format!("human:gwnobody{pid}");
+
+        assert!(
+            irc.front_peer(&present).await.expect("front the human"),
+            "first fronting registers"
+        );
+
+        let t = server
+            .address(&present)
+            .await
+            .expect("fronted human reachable");
+        assert_eq!(t.subject, format!("mu.agent.human.gwhuman{pid}.dm"));
+        assert_eq!(t.session, None, "a human has no session to name");
+        assert!(
+            server.address(&absent).await.is_none(),
+            "a nick nobody fronts stays in the store"
+        );
+
+        // Released: the next fresh sweep no longer finds them. The liveness
+        // cache is cleared by hand rather than waited out, so the test checks
+        // resolution, not the TTL.
+        assert!(irc.release_peer(&present).await, "release what we fronted");
+        *server.live_cache.lock().await = None;
+        assert!(
+            server.address(&present).await.is_none(),
+            "a human who left resolves to nothing"
+        );
     }
 
     /// Outbound: what `dialogue_say` puts on the wire is an envelope a mu

@@ -458,11 +458,19 @@ where
     // the import: failure degrades to "no mesh tools", never a boot failure —
     // and "no service discoverable" IS a failure here, so the MCP import
     // still supplies working code_recall/code_status in that case.
-    let mut mesh_code_index = "off";
+    // What the mesh side of code_index came to; the boot summary combines it
+    // with what the MCP import actually registered (below), because the
+    // import is its own best-effort step that may be disabled or unconfigured.
+    enum MeshCodeIndex {
+        Off,
+        Mesh,
+        Unavailable,
+    }
+    let mut mesh_code_index = MeshCodeIndex::Off;
     if daemon_info.config().mesh.consumes_code_index() {
         match mesh_consume::mesh_code_index_tools(&daemon_info.config().mesh).await {
             Ok(mesh_tools) => {
-                mesh_code_index = "mesh";
+                mesh_code_index = MeshCodeIndex::Mesh;
                 for tool in mesh_tools {
                     let name = tool.spec().name;
                     if tools.iter().any(|t| t.spec().name == name) {
@@ -474,9 +482,9 @@ where
                 }
             }
             Err(e) => {
-                mesh_code_index = "unavailable at boot (tools fall to the [[mcp.servers]] import)";
+                mesh_code_index = MeshCodeIndex::Unavailable;
                 tracing::warn!(error = %e,
-                    "mesh code_index consumption not started; the [[mcp.servers]] import covers code_recall/code_status");
+                    "mesh code_index consumption not started; code_recall/code_status fall to the [[mcp.servers]] import if one is configured");
             }
         }
     }
@@ -545,6 +553,23 @@ where
         tracing::info!("MCP disabled; skipping outbound MCP imports");
         daemon_info.set_mcp_status(Vec::new());
     }
+    // The code_index line of the boot summary reports what REGISTERED, not
+    // what was hoped for: with the mesh service unavailable, "the MCP import
+    // covers it" is only true once a code_recall actually exists in the set.
+    let code_recall_registered = tools.iter().any(|t| t.spec().name == "code_recall");
+    let mesh_code_index = match (mesh_code_index, code_recall_registered) {
+        (MeshCodeIndex::Mesh, _) => "mesh",
+        (MeshCodeIndex::Unavailable, true) => "mcp import (mesh service unavailable at boot)",
+        (MeshCodeIndex::Unavailable, false) => {
+            tracing::warn!(
+                "code_recall/code_status are not available: the mesh code_index service was \
+                 unavailable at boot and no [[mcp.servers]] code-index registered"
+            );
+            "NONE (mesh service unavailable at boot; no MCP code-index registered)"
+        }
+        (MeshCodeIndex::Off, true) => "mcp import",
+        (MeshCodeIndex::Off, false) => "none",
+    };
     let tools = Arc::new(tools);
     // mu-kex4.6.4: discover skills once at startup so `capabilities/discover`
     // can project them alongside tools (the daemon previously knew only tools;

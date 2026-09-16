@@ -93,29 +93,45 @@ pub struct Config {
     /// providers). Accepted-and-ignored here as opaque passthrough.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialogue: Option<toml::Value>,
-    /// `[mesh]` — NATS service-mesh transport (mu-wxc4): when enabled, the
-    /// daemon connects to NATS and serves its JSON-RPC surface over the mesh
-    /// (via `serve/mesh.rs`), in addition to stdio. Default disabled, so a
-    /// bare install touches no NATS.
+    /// `[mesh]` — the daemon's NATS mesh surface (mu-wxc4): serving its
+    /// JSON-RPC over the mesh (`serve/mesh.rs`), consuming the mesh
+    /// `code_index` service, and joining as a dialogue agent. `enabled` is
+    /// the master switch; default off, so a bare install touches no NATS.
     pub mesh: MeshConfig,
 }
 
 /// `[mesh]` section (mu-wxc4). Off by default.
+///
+/// `enabled` is the MASTER switch: when false the daemon opens no NATS
+/// connection at all, whatever the other flags say (they are reported as
+/// ignored at boot, not silently honoured). With it on, three independent
+/// capabilities each have their own flag: `serve` (inbound JSON-RPC),
+/// `consume_code_index` (mesh-backed code tools) and `dialogue` (agent
+/// presence + DM inbox). Before mu-mesh-consume-discovery-bj54v `enabled`
+/// gated only serving and the other two ran regardless, so a config reading
+/// `enabled = false` could still be on the mesh.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MeshConfig {
-    /// Serve the daemon over the NATS mesh when true.
+    /// Master switch: touch NATS at all. `false` = no mesh, full stop.
     pub enabled: bool,
     /// NATS server URL (e.g. `127.0.0.1:4222`).
     pub nats_url: String,
+    /// Serve the daemon's JSON-RPC surface over the mesh on `subject`
+    /// (what `enabled` alone used to mean). Defaults to `true` so an
+    /// existing `enabled = true` config keeps serving; set `false` for a
+    /// daemon that only consumes services and/or talks dialogue.
+    pub serve: bool,
     /// Inbound request subject the daemon subscribes to. Defaults to a
     /// per-daemon subject at startup when left empty.
     pub subject: String,
     /// mu-a0l6: CONSUME the mesh `code_index` service — register
-    /// `code_recall`/`code_status` as session tools backed by NATS
-    /// request/reply (subject-addressed) instead of the `[[mcp.servers]]`
-    /// HTTP import. When both are enabled the mesh tools register first and
-    /// the MCP import skips the colliding names.
+    /// `code_recall`/`code_status`/`code_sources` as session tools backed by
+    /// NATS request/reply (subject-addressed) instead of the
+    /// `[[mcp.servers]]` HTTP import. The mesh tools register first and the
+    /// MCP import skips the colliding names — but ONLY when the service is
+    /// discoverable at boot; a mesh with no `code_index` responder leaves
+    /// the tools to the MCP import instead of shadowing it with a dead one.
     pub consume_code_index: bool,
     /// Hex Ed25519 private key the daemon mints per-request mesh
     /// capabilities with; the mesh services must trust its public half.
@@ -136,11 +152,47 @@ impl Default for MeshConfig {
         Self {
             enabled: false,
             nats_url: "127.0.0.1:4222".to_string(),
+            serve: true,
             subject: String::new(),
             consume_code_index: false,
             issuer_key: String::new(),
             dialogue: false,
         }
+    }
+}
+
+impl MeshConfig {
+    /// Serve JSON-RPC over the mesh: the master switch AND `serve`.
+    pub fn serves(&self) -> bool {
+        self.enabled && self.serve
+    }
+
+    /// Consume the mesh `code_index` service: the master switch AND
+    /// `consume_code_index`.
+    pub fn consumes_code_index(&self) -> bool {
+        self.enabled && self.consume_code_index
+    }
+
+    /// Join the mesh as a dialogue agent: the master switch AND `dialogue`.
+    pub fn dialogues(&self) -> bool {
+        self.enabled && self.dialogue
+    }
+
+    /// Capability flags that are set but inert because `enabled` is false —
+    /// what boot reports as ignored so a half-configured section is never
+    /// silent. Empty when the master switch is on (or nothing is set).
+    pub fn ignored_when_disabled(&self) -> Vec<&'static str> {
+        if self.enabled {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if self.consume_code_index {
+            out.push("consume_code_index");
+        }
+        if self.dialogue {
+            out.push("dialogue");
+        }
+        out
     }
 }
 
@@ -1282,6 +1334,47 @@ mod tests {
     fn empty_toml_parses_to_default() {
         let c: Config = toml::from_str("").expect("empty TOML must parse");
         assert_eq!(c, Config::default());
+    }
+
+    /// `[mesh].enabled` is the master switch: sub-flags set under
+    /// `enabled = false` are inert AND reported, never silently honoured
+    /// (the operator's config read `enabled = false` while the daemon sat
+    /// on the mesh — mu-mesh-consume-discovery-bj54v).
+    #[test]
+    fn mesh_enabled_is_the_master_switch() {
+        let off = MeshConfig::default();
+        assert!(!off.serves() && !off.consumes_code_index() && !off.dialogues());
+        assert!(
+            off.ignored_when_disabled().is_empty(),
+            "nothing set, nothing ignored"
+        );
+
+        let c: Config =
+            toml::from_str("[mesh]\nenabled = false\nconsume_code_index = true\ndialogue = true\n")
+                .expect("parse");
+        assert!(!c.mesh.consumes_code_index() && !c.mesh.dialogues());
+        assert_eq!(
+            c.mesh.ignored_when_disabled(),
+            vec!["consume_code_index", "dialogue"]
+        );
+
+        let c: Config =
+            toml::from_str("[mesh]\nenabled = true\nconsume_code_index = true\n").expect("parse");
+        assert!(c.mesh.consumes_code_index());
+        assert!(!c.mesh.dialogues());
+        assert!(c.mesh.ignored_when_disabled().is_empty());
+    }
+
+    /// `serve` defaults on so a pre-existing `enabled = true` section keeps
+    /// serving; `serve = false` is the consume/dialogue-only daemon.
+    #[test]
+    fn mesh_serve_defaults_on_under_enabled() {
+        let c: Config = toml::from_str("[mesh]\nenabled = true\n").expect("parse");
+        assert!(c.mesh.serves());
+        let c: Config = toml::from_str("[mesh]\nenabled = true\nserve = false\ndialogue = true\n")
+            .expect("parse");
+        assert!(!c.mesh.serves());
+        assert!(c.mesh.dialogues());
     }
 
     #[test]

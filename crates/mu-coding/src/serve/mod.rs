@@ -443,13 +443,26 @@ where
     // Once registered they're base session tools, so the mu-onq8 `discover`
     // tool ranks them alongside everything else.
     let mut tools = tools;
+    // `[mesh].enabled` is the master switch (mu-mesh-consume-discovery-bj54v):
+    // off means none of the three mesh capabilities run, and any that are
+    // configured anyway are named here rather than silently dropped. The
+    // resolved state of all three is logged once, after the serve block.
+    let mesh_ignored = daemon_info.config().mesh.ignored_when_disabled();
+    if !mesh_ignored.is_empty() {
+        tracing::warn!(ignored = ?mesh_ignored,
+            "[mesh].enabled = false: these [mesh] flags are set but inert; set enabled = true to use them");
+    }
     // mu-a0l6: mesh-consumed code_index tools register FIRST — enabling
     // consumption is an explicit operator choice, so it wins name collisions;
     // the MCP import below then warns+skips its duplicates. Best-effort like
-    // the import: failure degrades to "no mesh tools", never a boot failure.
-    if daemon_info.config().mesh.consume_code_index {
+    // the import: failure degrades to "no mesh tools", never a boot failure —
+    // and "no service discoverable" IS a failure here, so the MCP import
+    // still supplies working code_recall/code_status in that case.
+    let mut mesh_code_index = "off";
+    if daemon_info.config().mesh.consumes_code_index() {
         match mesh_consume::mesh_code_index_tools(&daemon_info.config().mesh).await {
             Ok(mesh_tools) => {
+                mesh_code_index = "mesh";
                 for tool in mesh_tools {
                     let name = tool.spec().name;
                     if tools.iter().any(|t| t.spec().name == name) {
@@ -460,8 +473,11 @@ where
                     }
                 }
             }
-            Err(e) => tracing::warn!(error = %e,
-                "mesh code_index consumption failed to start; continuing without it"),
+            Err(e) => {
+                mesh_code_index = "unavailable at boot (tools fall to the [[mcp.servers]] import)";
+                tracing::warn!(error = %e,
+                    "mesh code_index consumption not started; the [[mcp.servers]] import covers code_recall/code_status");
+            }
         }
     }
     // spec mu-046: the outbound Router is constructed early so mesh dialogue
@@ -473,7 +489,8 @@ where
     // the mesh surface; the returned guard is captured by the transport
     // closure below so dialogue leaves the mesh when the daemon exits.
     let mut mesh_dialogue_guard = None;
-    if daemon_info.config().mesh.dialogue {
+    let mut mesh_dialogue_state = "off";
+    if daemon_info.config().mesh.dialogues() {
         match mesh_dialogue::spawn_mesh_dialogue(
             &daemon_info.config().mesh,
             daemon_info.daemon_id(),
@@ -484,6 +501,7 @@ where
         {
             Ok((guard, dialogue_tools, mesh_sessions)) => {
                 mesh_dialogue_guard = Some(guard);
+                mesh_dialogue_state = "on";
                 // mu-6s7s: sessions become first-class mesh participants —
                 // handlers/session.rs joins each one as it is created.
                 daemon_info.set_mesh_sessions(&mesh_sessions);
@@ -497,8 +515,11 @@ where
                     }
                 }
             }
-            Err(e) => tracing::warn!(error = %e,
-                "mesh dialogue failed to start; continuing without it"),
+            Err(e) => {
+                mesh_dialogue_state = "failed (see warning above)";
+                tracing::warn!(error = %e,
+                    "mesh dialogue failed to start; continuing without it");
+            }
         }
     }
     if daemon_info.config().mcp.enabled {
@@ -624,15 +645,15 @@ where
             auth::initial_connection_state(&auth_registry),
             auth::AuthState::Unauthenticated
         );
-        if mesh_cfg.enabled && auth_required {
+        if mesh_cfg.serves() && auth_required {
             tracing::error!(
-                "[mesh].enabled but an auth mechanism requires a per-connection handshake; \
+                "[mesh] serve requested but an auth mechanism requires a per-connection handshake; \
                  the mesh multiplexes peers on one subject and cannot yet isolate their auth \
-                 (mu-iqo8) — refusing to expose protected commands over the mesh. Disable \
-                 [mesh] or [auth], or wait for per-request capabilities."
+                 (mu-iqo8) — refusing to expose protected commands over the mesh. Set \
+                 [mesh].serve = false, disable [auth], or wait for per-request capabilities."
             );
             None
-        } else if mesh_cfg.enabled {
+        } else if mesh_cfg.serves() {
             let subject = if mesh_cfg.subject.is_empty() {
                 format!("mu.daemon.{}.rpc", daemon_info.daemon_id())
             } else {
@@ -664,6 +685,27 @@ where
             None
         }
     };
+    // One line with what the [mesh] section RESOLVED to, so a config question
+    // is answered by the boot log instead of a restart-and-grep loop
+    // (mu-qqv0's complaint, daemon side).
+    {
+        let mesh_cfg = &daemon_info.config().mesh;
+        let serve_state = if !mesh_cfg.serves() {
+            "off"
+        } else if mesh_guard.is_some() {
+            "on"
+        } else {
+            "failed (see above)"
+        };
+        tracing::info!(
+            enabled = mesh_cfg.enabled,
+            nats = %mesh_cfg.nats_url,
+            serve = serve_state,
+            dialogue = mesh_dialogue_state,
+            code_index = mesh_code_index,
+            "mesh: resolved [mesh] state"
+        );
+    }
     // mu-mb02: start MCP server on a unix socket if MU_MCP_SOCKET is
     // set or if the default socket path's parent exists. The MCP surface
     // shares Sessions + DaemonInfo with the primary JSON-RPC loop so

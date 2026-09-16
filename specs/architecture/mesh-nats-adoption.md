@@ -45,7 +45,10 @@ reinventing. NATS provides, off the shelf:
    (e.g. `code_index.recall()/status()`); the proxy interprets that into
    directed request/reply and relays the typed result back. **The caller never
    sees the bus.** A memory call stays a memory call; the service layer decides
-   it means "directed 1-1 to the memory service, relay the reply".
+   it means "directed 1-1 to the memory service, relay the reply". A consumer
+   registers its tools only after the service answers `$SRV.PING` at boot: a
+   reachable bus with nobody on it must not replace a working fallback (the
+   `[[mcp.servers]]` import) with tools that can only say "no responders".
 
 5. **MCP only at the foreign edge.** CC speaks MCP 1.0; an MCP↔NATS adapter is
    the ONLY MCP-speaking hop. The fleet never speaks MCP internally. The
@@ -80,7 +83,8 @@ outbound queue:
 - **Outbound** rides an outbound `Router` lane the adapter registers and is the
   SOLE consumer of, routed per `request_id → reply subject`. Even immediate
   rejects take the one egress path.
-- Config-gated (`[mesh].enabled`); the adapter handle aborts its tasks on drop,
+- Config-gated (`[mesh].enabled` — the section's master switch — AND
+  `[mesh].serve`, default on); the adapter handle aborts its tasks on drop,
   tying it to the daemon shutdown cascade.
 
 **Auth posture (fail-closed, mu-iqo8).** The adapter serves ONE auth state and

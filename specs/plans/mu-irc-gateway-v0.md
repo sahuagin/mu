@@ -419,7 +419,8 @@ durable-wake path. The mu daemon stays entirely unaware that IRC exists.
 ## v0 exclusions
 
 - No IRC-side persistence, scrollback replay, or history buffering.
-- No multi-nick / multi-operator fan-in; exactly one gateway nick.
+- No multi-nick / multi-operator fan-in; exactly one gateway nick. (Lifted by
+  `mu-irc-gateway-v1-puppets.md`, 2026-09-16: one puppet nick per live agent.)
 - No daemon changes and no IRC awareness in `mu-coding`.
 - No native mesh broadcast subject; fan-out is to discovered endpoints only.
 - No provisioning or installation of IRC/NATS servers by this work; live

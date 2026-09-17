@@ -173,15 +173,19 @@ separate, later idea).
   select loop; nothing in the bridge grows a second state owner. Outbound
   writes go to the puppet's own bounded writer; a puppet that is not
   registered yet falls back to `mu-gw` with the v0 label.
-- Pacing: at most `connect_parallelism` (default 4) registrations in flight,
-  a per-puppet backoff on failure (same 2 s → 5 min schedule as the main
-  connection), and a `min_age` (default 60 s, i.e. two discovery sweeps) before
-  a newly discovered agent gets a puppet, so a review seat that lives a minute
-  never costs a connection. A gateway restart reconnects puppets under the
-  same pacing; no reconnect storm.
-- Cap: `max` (default 32) live puppets; agents beyond it are channel-only with
-  a notice in `mu peers`. Nothing is queued across a reconnect on either side
-  (v0 rule).
+- Pacing: at most `connect_parallelism` (default 2 — landed so in increment
+  1: Ergo throttles 32 connections per 10 minutes per IP, and two in flight
+  with backoff stays well under it) registrations in flight, a per-puppet
+  backoff on failure (same 2 s → 5 min schedule as the main connection), and
+  a `min_age` (default 60 s, i.e. two discovery sweeps) before a newly
+  discovered agent gets a puppet, so a review seat that lives a minute never
+  costs a connection. A gateway restart reconnects puppets under the same
+  pacing; no reconnect storm.
+- Cap: `max` (default 16 — landed so in increment 1: Ergo's per-IP
+  `max-concurrent-connections` default, so an unexempted host degrades to
+  channel-only rather than refused connections; raise it with the exemption)
+  live puppets; agents beyond it are channel-only with a notice in
+  `mu peers`. Nothing is queued across a reconnect on either side (v0 rule).
 - **Outbound enqueue is non-blocking.** The state-owning loop never awaits a
   puppet writer. A delivery is `try_send` into that puppet's bounded queue;
   `Full` or `Closed` means that puppet is stalled or gone, and the decision's

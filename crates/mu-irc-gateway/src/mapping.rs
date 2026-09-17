@@ -290,14 +290,20 @@ fn nick_alias(peer: &PeerId) -> String {
 /// `alias` cut to leave room for the peer's [`hash_tail`], then the tail
 /// appended, all within `nicklen` bytes. The same rule [`channel_for`] uses
 /// for an over-long channel, so a nick and a channel that both had to be cut
-/// carry the same 8-hex tail. A `nicklen` too small for even the tail still
-/// yields a deterministic, in-budget nick (the tail itself is cut) — two peers
-/// may then collide, which registration reports as `433` rather than
-/// mis-routing.
+/// carry the same 8-hex tail.
+///
+/// The alias's leading letter is always kept: a hex tail may start with a
+/// digit, and a digit-led nick is a `432`, not a collision. So a `nicklen`
+/// too small for even the tail yields the lead plus as much tail as fits —
+/// deterministic and in-budget, and two peers may then collide, which
+/// registration reports as `433` rather than mis-routing. `nicklen == 0` has
+/// no valid nick at all and yields the empty string; the pool never
+/// registers one (a server cannot advertise `NICKLEN=0`).
 fn nick_tailed(peer: &PeerId, alias: &str, nicklen: usize) -> String {
     let hash = hash_tail(peer);
-    let hash = &hash[..HASH_LEN.min(nicklen)];
-    let keep = nicklen - hash.len();
+    // Room for the tail after the lead letter; the tail shrinks first.
+    let keep = nicklen.saturating_sub(HASH_LEN).max(1.min(nicklen));
+    let hash = &hash[..nicklen.saturating_sub(keep).min(HASH_LEN)];
     format!("{}{hash}", truncate_bytes(alias, keep))
 }
 
@@ -390,13 +396,18 @@ impl NickTable {
 
     /// Record that `peer` holds `nick` (the spelling the server accepted).
     /// Refused when another peer's nick folds equal, or when `peer` already
-    /// holds a nick — both are decisions for the pool, not silent overwrites.
+    /// holds a different nick — both are decisions for the pool, not silent
+    /// overwrites. The same peer re-recording the same folded nick is fine and
+    /// adopts the new spelling: a case-only `NICK` the server accepted is the
+    /// same identity with a new wire form, and `nick_of` must report the form
+    /// the server now uses.
     pub fn insert(&mut self, nick: &str, peer: PeerId) -> Result<(), NickCollision> {
         let folded = fold_nick(nick, self.cm);
-        if let Some((_, holder)) = self.by_nick.get(&folded) {
+        if let Some((orig, holder)) = self.by_nick.get_mut(&folded) {
             if *holder != peer {
                 return Err(NickCollision::HeldBy(holder.clone()));
             }
+            *orig = nick.to_string();
             return Ok(());
         }
         if let Some(held) = self.by_peer.get(&peer) {

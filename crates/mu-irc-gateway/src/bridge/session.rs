@@ -1441,6 +1441,7 @@ mod tests {
             channel_prefix: "#".into(),
             lobby: LOBBY.into(),
             observe_agent_dms: true,
+            puppets: Default::default(),
         }
     }
 

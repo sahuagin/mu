@@ -5,11 +5,14 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use mu_irc_gateway::config::{load, load_irc, ConfigError, GatewayConfig, MeshConfig};
+use mu_irc_gateway::config::{
+    load, load_irc, validate_nick, ConfigError, GatewayConfig, MeshConfig, PuppetsConfig,
+    NICK_MAX_LEN,
+};
 use mu_irc_gateway::framing::{frame_privmsg, FrameParams, FramingError, CONTINUATION_MARKER};
 use mu_irc_gateway::mapping::{
-    channel_for, fold_nick, human_identity, human_peer, peer_alias, resolve_channel, CaseMapping,
-    Resolved,
+    channel_for, fold_nick, human_identity, human_peer, nick_for, nick_for_tailed, peer_alias,
+    relayed_nick, resolve_channel, CaseMapping, NickCollision, NickTable, Resolved,
 };
 use mu_irc_gateway::transport::CaFault;
 use mu_peer::PeerId;
@@ -78,6 +81,123 @@ fn required_fields_are_enforced() {
     ));
     let p = tmp("nosection.toml", "[other]\nx = 1\n");
     assert!(matches!(load_irc(&p), Err(ConfigError::MissingSection(_))));
+}
+
+#[test]
+fn puppets_defaults_apply_when_the_table_is_absent() {
+    let cfg = load_irc(&tmp(
+        "nopuppets.toml",
+        "[irc]\nserver=\"h:1\"\nnick=\"n\"\n",
+    ))
+    .unwrap();
+    assert_eq!(cfg.puppets, PuppetsConfig::default());
+    assert!(cfg.puppets.enabled, "puppets default on");
+    assert_eq!(cfg.puppets.roles, vec!["cc", "mu"]);
+    assert!(
+        !cfg.puppets.daemons,
+        "bare daemons are channel-only by default (ruling A)"
+    );
+    assert_eq!(cfg.puppets.max, 16);
+    assert_eq!(cfg.puppets.min_age_secs, 60);
+    assert_eq!(cfg.puppets.connect_parallelism, 2);
+}
+
+#[test]
+fn puppets_table_loads_and_shows_in_debug() {
+    let cfg = load_irc(&tmp(
+        "puppets.toml",
+        r#"
+[irc]
+server = "h:1"
+nick = "n"
+
+[irc.puppets]
+enabled = false
+roles = ["cc"]
+daemons = true
+max = 4
+min_age_secs = 5
+connect_parallelism = 1
+"#,
+    ))
+    .unwrap();
+    assert!(!cfg.puppets.enabled);
+    assert_eq!(cfg.puppets.roles, vec!["cc"]);
+    assert!(cfg.puppets.daemons);
+    assert_eq!(cfg.puppets.max, 4);
+    assert_eq!(cfg.puppets.min_age_secs, 5);
+    assert_eq!(cfg.puppets.connect_parallelism, 1);
+    // `--check-config` prints `{config:#?}`: the table is part of what it shows.
+    let dbg = format!("{cfg:?}");
+    assert!(
+        dbg.contains("puppets") && dbg.contains("connect_parallelism: 1"),
+        "{dbg}"
+    );
+}
+
+#[test]
+fn puppets_refuse_sasl_keys_with_a_reason_not_a_generic_unknown_field() {
+    let p = tmp(
+        "puppetsasl.toml",
+        &format!(
+            "[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\nsasl_user=\"u\"\nsasl_password=\"{SENTINEL}\"\n"
+        ),
+    );
+    let err = load_irc(&p).unwrap_err();
+    assert!(matches!(err, ConfigError::PuppetsSasl(_)), "{err:?}");
+    assert_no_secret(&err);
+    let text = format!("{err}");
+    assert!(
+        text.contains("unauthenticated"),
+        "the reason should be stated: {text}"
+    );
+}
+
+#[test]
+fn puppets_unknown_and_mistyped_fields_are_named_without_values() {
+    let p = tmp(
+        "puppetstypo.toml",
+        "[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\nmax = \"sixteen\"\n",
+    );
+    let err = load_irc(&p).unwrap_err();
+    assert!(matches!(err, ConfigError::PuppetsMalformed(_)), "{err:?}");
+    let text = format!("{err}");
+    assert!(text.contains("`max`") && text.contains("integer"), "{text}");
+    assert!(!text.contains("sixteen"), "values never appear: {text}");
+
+    let p = tmp(
+        "puppetsunknown.toml",
+        "[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\nenabld = true\n",
+    );
+    let err = load_irc(&p).unwrap_err();
+    assert!(
+        format!("{err}").contains("enabld"),
+        "the typo should be named: {err}"
+    );
+}
+
+#[test]
+fn puppets_reject_zero_bounds_and_a_human_role() {
+    let p = tmp(
+        "puppetszero.toml",
+        "[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\nmax = 0\n",
+    );
+    let err = load_irc(&p).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::PuppetsInvalid("max", _)),
+        "{err:?}"
+    );
+    assert!(format!("{err}").contains("enabled = false"), "{err}");
+
+    let p = tmp(
+        "puppetshuman.toml",
+        "[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\nroles = [\"cc\", \"human\"]\n",
+    );
+    let err = load_irc(&p).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::PuppetsInvalid("roles", _)),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -860,6 +980,209 @@ fn channels_colliding_only_under_folding_are_ambiguous() {
         resolve_channel("#cc-x{y", &peers, "#", 50, CaseMapping::Ascii),
         Resolved::Peer(r)
     );
+}
+
+// ───────────────────────────── Puppet nicks ─────────────────────────────────
+//
+// Design: specs/plans/mu-irc-gateway-v1-puppets.md, "Nick mapping contract"
+// (increment 1). Every nick here is checked against the same grammar the
+// gateway's own nick must satisfy, because a puppet nick the server would
+// answer with `432` is the failure the design exists to rule out.
+
+/// The roles on the fleet today, in the id shapes discovery actually reports.
+fn current_roster() -> Vec<PeerId> {
+    vec![
+        PeerId::parse("cc:f8c8245e-f8ef-4bdc-9e18-45f41c2bf94f"),
+        PeerId::parse("cc:c689911a"),
+        PeerId::mu_daemon("bb9c4b941bf7d6d1"),
+        PeerId::mu_session("bb9c4b941bf7d6d1", "session-1"),
+        PeerId::parse("warden:w1:sub.2"),
+    ]
+}
+
+#[test]
+fn every_current_role_yields_a_valid_nick_within_nicklen() {
+    for peer in current_roster() {
+        let nick = nick_for(&peer, NICK_MAX_LEN).expect("agents get a nick");
+        assert!(nick.len() <= NICK_MAX_LEN, "{peer}: {nick} exceeds NICKLEN");
+        assert_eq!(
+            validate_nick(&nick),
+            Ok(()),
+            "{peer}: {nick} fails the nick grammar"
+        );
+        let tailed = nick_for_tailed(&peer, NICK_MAX_LEN).expect("agents get a tailed nick");
+        assert!(
+            tailed.len() <= NICK_MAX_LEN,
+            "{peer}: {tailed} exceeds NICKLEN"
+        );
+        assert_eq!(
+            validate_nick(&tailed),
+            Ok(()),
+            "{peer}: {tailed} fails the nick grammar"
+        );
+    }
+}
+
+#[test]
+fn short_ids_map_to_the_readable_form_the_terrain_probe_used() {
+    // `cc-c689911a` is the nick the operator's Ergo answered with 001 Welcome;
+    // `cc:c689911a` and `cc.c689911a` got 432.
+    assert_eq!(
+        nick_for(&PeerId::parse("cc:c689911a"), 32).as_deref(),
+        Some("cc-c689911a")
+    );
+    assert_eq!(
+        nick_for(&PeerId::mu_session("bb9c4b941bf7d6d1", "session-1"), 32).as_deref(),
+        Some("mu-bb9c4b941bf7d6d1-session-1")
+    );
+    assert_eq!(
+        nick_for(&PeerId::mu_daemon("bb9c4b941bf7d6d1"), 32).as_deref(),
+        Some("mu-bb9c4b941bf7d6d1")
+    );
+}
+
+#[test]
+fn a_cc_uuid_session_is_cut_and_tailed_stably() {
+    // `cc-<uuid>` is 39 bytes against NICKLEN 32: the id is cut and the peer's
+    // 8-hex hash tail appended, so the nick fits, starts readably, and is the
+    // same on every run.
+    let peer = PeerId::parse("cc:f8c8245e-f8ef-4bdc-9e18-45f41c2bf94f");
+    let nick = nick_for(&peer, 32).unwrap();
+    assert_eq!(nick.len(), 32);
+    assert!(nick.starts_with("cc-f8c8245e"), "{nick}");
+    assert_eq!(nick_for(&peer, 32), Some(nick.clone()));
+    // The over-budget plain form IS the tailed form: a 433 on it means the
+    // agent stays channel-only, per the contract.
+    assert_eq!(nick_for_tailed(&peer, 32), Some(nick.clone()));
+    // A sibling session differing only in the cut-off part still gets its own
+    // nick: the hash covers the whole id.
+    let sibling = PeerId::parse("cc:f8c8245e-f8ef-4bdc-9e18-000000000000");
+    assert_ne!(nick_for(&sibling, 32), Some(nick));
+}
+
+#[test]
+fn the_tailed_form_of_a_short_nick_carries_the_tail_within_budget() {
+    let peer = PeerId::parse("cc:abc");
+    let plain = nick_for(&peer, 32).unwrap();
+    let tailed = nick_for_tailed(&peer, 32).unwrap();
+    assert_ne!(plain, tailed);
+    assert!(tailed.starts_with(&plain), "{tailed} should extend {plain}");
+    assert_eq!(tailed.len(), plain.len() + 8);
+    assert_eq!(validate_nick(&tailed), Ok(()));
+    // Two peers whose plain nicks fold equal get DIFFERENT tailed forms.
+    let twin = PeerId::parse("cc:ABC");
+    assert_eq!(
+        fold_nick(&plain, CaseMapping::Ascii),
+        fold_nick(&nick_for(&twin, 32).unwrap(), CaseMapping::Ascii),
+        "precondition: plain nicks collide once folded"
+    );
+    assert_ne!(nick_for_tailed(&twin, 32), Some(tailed));
+}
+
+#[test]
+fn nick_alphabet_replaces_what_the_server_rejects_and_leads_with_a_letter() {
+    // `:` and `.` are the two the operator's Ergo answered with 432; spaces and
+    // commas would change what the server parses. All become `-`.
+    let nick = nick_for(&PeerId::parse("warden:w.1:sub 2,x"), 32).unwrap();
+    assert_eq!(nick, "warden-w-1-sub-2-x");
+    assert_eq!(validate_nick(&nick), Ok(()));
+    // A role that does not start with a letter is led by one rather than
+    // trusted to: the grammar's first character is a letter here by design.
+    let nick = nick_for(&PeerId::parse("9bot:x"), 32).unwrap();
+    assert!(
+        nick.starts_with(|c: char| c.is_ascii_alphabetic()),
+        "{nick}"
+    );
+    assert_eq!(validate_nick(&nick), Ok(()));
+    // The nine RFC 2812 specials are ordinary nick characters and survive.
+    let nick = nick_for(&PeerId::parse("cc:a[b]c"), 32).unwrap();
+    assert_eq!(nick, "cc-a[b]c");
+}
+
+#[test]
+fn humans_never_get_a_puppet_nick() {
+    assert_eq!(nick_for(&PeerId::human("alice"), 32), None);
+    assert_eq!(nick_for_tailed(&PeerId::human("alice"), 32), None);
+}
+
+#[test]
+fn tiny_nicklen_never_panics_and_stays_in_budget() {
+    let peer = PeerId::parse("cc:some-longish-id");
+    for len in 0..=10 {
+        let n = nick_for(&peer, len).unwrap();
+        assert!(n.len() <= len, "len {len}: {n:?} too long");
+        let t = nick_for_tailed(&peer, len).unwrap();
+        assert!(t.len() <= len, "len {len}: {t:?} too long");
+    }
+}
+
+#[test]
+fn relayed_identity_uses_the_advertised_separator() {
+    assert_eq!(relayed_nick("cc-c689911a", "/"), "cc-c689911a/mu");
+}
+
+#[test]
+fn nick_table_resolves_by_table_folds_under_casemapping_and_refuses_collisions() {
+    let a = PeerId::parse("cc:abc");
+    let b = PeerId::parse("cc:ABC");
+    let mut t = NickTable::new(CaseMapping::Rfc1459);
+    t.insert("cc-abc", a.clone()).unwrap();
+    // Reverse resolution is by table: the spelling the server uses, any case.
+    assert_eq!(t.resolve("CC-ABC"), Some(&a));
+    assert_eq!(t.nick_of(&a), Some("cc-abc"));
+    assert!(t.is_owned("Cc-Abc"));
+    // A stranger or a human is simply not in the table.
+    assert_eq!(t.resolve("alice"), None);
+    assert!(!t.is_owned("alice"));
+    // A second peer whose nick folds equal is refused, naming the holder —
+    // the pool then registers the tailed form instead.
+    assert_eq!(
+        t.insert("cc-ABC", b.clone()),
+        Err(NickCollision::HeldBy(a.clone()))
+    );
+    // Re-inserting the holder's own nick is idempotent.
+    assert_eq!(t.insert("cc-abc", a.clone()), Ok(()));
+    // A peer cannot silently hold two nicks.
+    assert_eq!(
+        t.insert("cc-abc-tail", a.clone()),
+        Err(NickCollision::PeerHasNick("cc-abc".to_string()))
+    );
+    assert_eq!(t.len(), 1);
+    assert_eq!(t.remove_peer(&a).as_deref(), Some("cc-abc"));
+    assert!(t.is_empty());
+    assert_eq!(t.insert("cc-ABC", b.clone()), Ok(()));
+    assert_eq!(t.resolve("cc-abc"), Some(&b));
+}
+
+#[test]
+fn nick_table_refolds_from_wire_spellings_on_casemapping_change() {
+    // The SelfNick lesson: `gw[` folds to `gw{` under rfc1459 and stays `gw{`
+    // if re-folded under ascii, while the real nick now folds to `gw[`.
+    // The table re-derives from the wire spelling, so it keeps recognizing
+    // the nick the server actually uses.
+    let a = PeerId::parse("cc:a[b");
+    let mut t = NickTable::new(CaseMapping::Rfc1459);
+    t.insert("cc-a[b", a.clone()).unwrap();
+    assert_eq!(
+        t.resolve("cc-a{b"),
+        Some(&a),
+        "rfc1459: [ and {{ are one nick"
+    );
+    let dropped = t.set_casemapping(CaseMapping::Ascii);
+    assert!(dropped.is_empty());
+    assert_eq!(t.resolve("cc-a[b"), Some(&a));
+    assert_eq!(t.resolve("cc-a{b"), None, "ascii: [ and {{ are distinct");
+    // Two entries distinct under ascii that collide under rfc1459: the change
+    // keeps one deterministically and returns the other for re-registration.
+    let b = PeerId::parse("cc:a{b");
+    t.insert("cc-a{b", b.clone()).unwrap();
+    let dropped = t.set_casemapping(CaseMapping::Rfc1459);
+    assert_eq!(dropped, vec![("cc-a{b".to_string(), b)]);
+    assert_eq!(t.len(), 1);
+    assert_eq!(t.resolve("cc-a{b"), Some(&a));
+    // The owned set is what membership subtracts from human presence.
+    let owned: Vec<&str> = t.owned_folded().collect();
+    assert_eq!(owned, vec!["cc-a{b"]);
 }
 
 // ───────────────────────────────── Framing ──────────────────────────────────

@@ -1,10 +1,16 @@
 //! Pure mesh↔IRC name mapping: nick folding, human identity, role aliases,
-//! deterministic channel names, and reverse resolution.
+//! deterministic channel names, puppet nicks, and reverse resolution.
 //!
-//! Everything here is a pure function of its arguments. Reverse resolution in
-//! particular takes the *current* discovered-peer snapshot as a parameter — it
+//! Everything here is a pure function of its arguments. Reverse resolution of
+//! CHANNELS takes the *current* discovered-peer snapshot as a parameter — it
 //! never consults a stored roster — so a changing mesh yields changing results
 //! with no hidden state (the gateway's "process state is disposable" rule).
+//! Reverse resolution of puppet NICKS is the one deliberate exception: a nick
+//! is granted by the server at registration, so which peer holds which nick is
+//! a fact the pool learns, not one it can recompute — [`NickTable`] holds it
+//! (specs/plans/mu-irc-gateway-v1-puppets.md, "Nick mapping contract").
+
+use std::collections::HashMap;
 
 use mu_peer::PeerId;
 
@@ -232,6 +238,244 @@ fn truncate_bytes(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Replace characters that are illegal in an IRC NICK with `-`. The nick
+/// grammar (RFC 2812, enforced by [`crate::config::validate_nick`]) admits
+/// letters, digits, `-` and the nine specials `[ ] \\ ` _ ^ { | }`; everything
+/// else — including the `:` and `.` a peer id carries, which the operator's
+/// Ergo answers with `432 Erroneous nickname` — becomes `-`. Deterministic, so
+/// the same peer always yields the same nick body.
+fn sanitize_nick(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric()
+                || c == '-'
+                || matches!(c, '[' | ']' | '\\' | '`' | '_' | '^' | '{' | '|' | '}')
+            {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// The letter a puppet nick is prefixed with when the peer's role does not
+/// start with one. The nick grammar allows a special (`[`, `_`, …) first, but
+/// the design pins "first character must be a letter" so completion and
+/// reading stay predictable; roles are letters today — this enforces rather
+/// than assumes.
+const NICK_LEAD: char = 'p';
+
+/// The puppet nick body for a peer, before any length fitting:
+/// `role-id[-sub]` through the NICK alphabet, led by a letter.
+fn nick_alias(peer: &PeerId) -> String {
+    let mut parts = vec![peer.role().to_string()];
+    if !peer.id().is_empty() {
+        parts.push(peer.id().to_string());
+    }
+    if let Some(sub) = peer.sub() {
+        if !sub.is_empty() {
+            parts.push(sub.to_string());
+        }
+    }
+    let mut alias = sanitize_nick(&parts.join("-"));
+    if !alias.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        alias.insert(0, NICK_LEAD);
+    }
+    alias
+}
+
+/// `alias` cut to leave room for the peer's [`hash_tail`], then the tail
+/// appended, all within `nicklen` bytes. The same rule [`channel_for`] uses
+/// for an over-long channel, so a nick and a channel that both had to be cut
+/// carry the same 8-hex tail. A `nicklen` too small for even the tail still
+/// yields a deterministic, in-budget nick (the tail itself is cut) — two peers
+/// may then collide, which registration reports as `433` rather than
+/// mis-routing.
+fn nick_tailed(peer: &PeerId, alias: &str, nicklen: usize) -> String {
+    let hash = hash_tail(peer);
+    let hash = &hash[..HASH_LEN.min(nicklen)];
+    let keep = nicklen - hash.len();
+    format!("{}{hash}", truncate_bytes(alias, keep))
+}
+
+/// The nick a puppet registers for `peer`, within `nicklen` bytes (the
+/// server's advertised `NICKLEN`).
+///
+/// `None` for a human: humans keep their own names and never get a puppet.
+/// Otherwise `role-id[-sub]` through the nick alphabet — `cc:c689911a` →
+/// `cc-c689911a`, `mu:<daemon>:session-1` → `mu-<daemon>-session-1` — and when
+/// that exceeds `nicklen` (a cc session id is a 36-char UUID, so `cc-<uuid>` is
+/// 39 bytes against Ergo's 32), the id is cut and the peer's stable 8-hex hash
+/// tail appended, so the result is inside budget and the same on every run.
+/// Reverse resolution is never by parsing this back: see [`NickTable`].
+pub fn nick_for(peer: &PeerId, nicklen: usize) -> Option<String> {
+    if peer.is_human() {
+        return None;
+    }
+    let alias = nick_alias(peer);
+    if alias.len() <= nicklen {
+        return Some(alias);
+    }
+    Some(nick_tailed(peer, &alias, nicklen))
+}
+
+/// The hash-tail form of a puppet nick, unconditionally: what a puppet
+/// registers when its plain [`nick_for`] form collides with another peer's
+/// under the server's folding, or is already held on the server (`433`, or a
+/// human who joined first — humans are never contested). When the plain form
+/// was itself already tailed (over budget) the two are identical, and a `433`
+/// on this one means the agent stays channel-only for the session.
+pub fn nick_for_tailed(peer: &PeerId, nicklen: usize) -> Option<String> {
+    if peer.is_human() {
+        return None;
+    }
+    Some(nick_tailed(peer, &nick_alias(peer), nicklen))
+}
+
+/// The relayed identity a channel operator speaks as through Ergo's
+/// `RELAYMSG`: `<nick><separator>mu`, e.g. `cc-c689911a/mu` under the
+/// advertised `draft/relaymsg=/`. A relayed identity is never a member of
+/// anything and never appears in NAMES; it exists only on the lines it is
+/// stamped on.
+pub fn relayed_nick(nick: &str, separator: &str) -> String {
+    format!("{nick}{separator}mu")
+}
+
+/// Why a nick could not be added to a [`NickTable`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NickCollision {
+    /// Another peer already holds a nick that folds equal under the table's
+    /// casemapping — the server would treat the two as one identity.
+    HeldBy(PeerId),
+    /// This peer already holds a (different) nick; release it first.
+    PeerHasNick(String),
+}
+
+/// `folded nick → peer` for the nicks the gateway itself holds (its own and
+/// every puppet's). Reverse resolution of a puppet nick is by THIS table,
+/// never by parsing: a nick not in it is a human or a stranger.
+///
+/// Like [`SelfNick`], every entry keeps the wire spelling and derives the
+/// folded key from it, so a `CASEMAPPING` change re-derives from originals
+/// rather than re-folding a folded value (which is lossy: `gw[` folded under
+/// rfc1459 is `gw{` and would stay `gw{` under ascii, where the real nick now
+/// folds to `gw[`). The set of folded keys is the gateway-owned nick set that
+/// membership subtracts from human presence (increment 2a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NickTable {
+    cm: CaseMapping,
+    /// folded nick → (wire spelling, peer)
+    by_nick: HashMap<String, (String, PeerId)>,
+    /// peer → folded nick
+    by_peer: HashMap<PeerId, String>,
+}
+
+impl NickTable {
+    /// An empty table folding under `cm`.
+    pub fn new(cm: CaseMapping) -> Self {
+        NickTable {
+            cm,
+            by_nick: HashMap::new(),
+            by_peer: HashMap::new(),
+        }
+    }
+
+    /// The casemapping the table currently folds under.
+    pub fn casemapping(&self) -> CaseMapping {
+        self.cm
+    }
+
+    /// Record that `peer` holds `nick` (the spelling the server accepted).
+    /// Refused when another peer's nick folds equal, or when `peer` already
+    /// holds a nick — both are decisions for the pool, not silent overwrites.
+    pub fn insert(&mut self, nick: &str, peer: PeerId) -> Result<(), NickCollision> {
+        let folded = fold_nick(nick, self.cm);
+        if let Some((_, holder)) = self.by_nick.get(&folded) {
+            if *holder != peer {
+                return Err(NickCollision::HeldBy(holder.clone()));
+            }
+            return Ok(());
+        }
+        if let Some(held) = self.by_peer.get(&peer) {
+            if *held != folded {
+                return Err(NickCollision::PeerHasNick(
+                    self.by_nick
+                        .get(held)
+                        .map(|(orig, _)| orig.clone())
+                        .unwrap_or_else(|| held.clone()),
+                ));
+            }
+        }
+        self.by_peer.insert(peer.clone(), folded.clone());
+        self.by_nick.insert(folded, (nick.to_string(), peer));
+        Ok(())
+    }
+
+    /// Forget the nick `peer` holds, if any. Returns the wire spelling that was
+    /// released.
+    pub fn remove_peer(&mut self, peer: &PeerId) -> Option<String> {
+        let folded = self.by_peer.remove(peer)?;
+        self.by_nick.remove(&folded).map(|(orig, _)| orig)
+    }
+
+    /// The peer holding `nick` (folded under the table's casemapping), if the
+    /// gateway holds it at all. `None` means a human or a stranger.
+    pub fn resolve(&self, nick: &str) -> Option<&PeerId> {
+        self.by_nick
+            .get(&fold_nick(nick, self.cm))
+            .map(|(_, peer)| peer)
+    }
+
+    /// The wire spelling of the nick `peer` holds, if any.
+    pub fn nick_of(&self, peer: &PeerId) -> Option<&str> {
+        self.by_peer
+            .get(peer)
+            .and_then(|folded| self.by_nick.get(folded))
+            .map(|(orig, _)| orig.as_str())
+    }
+
+    /// Whether `nick` is one the gateway holds — the own-nick-SET guard.
+    pub fn is_owned(&self, nick: &str) -> bool {
+        self.by_nick.contains_key(&fold_nick(nick, self.cm))
+    }
+
+    /// Every held nick, folded — the gateway-owned nick set for membership.
+    pub fn owned_folded(&self) -> impl Iterator<Item = &str> {
+        self.by_nick.keys().map(String::as_str)
+    }
+
+    /// Number of nicks held.
+    pub fn len(&self) -> usize {
+        self.by_nick.len()
+    }
+
+    /// Whether no nick is held.
+    pub fn is_empty(&self) -> bool {
+        self.by_nick.is_empty()
+    }
+
+    /// The server changed `CASEMAPPING`: re-derive every folded key FROM THE
+    /// WIRE SPELLING. Two entries whose spellings fold equal under the new
+    /// mapping cannot both be kept; the one with the lexicographically later
+    /// wire spelling is dropped and returned so the pool can re-register it
+    /// under its tailed form. Deterministic, so two gateways reading the same
+    /// change make the same choice.
+    pub fn set_casemapping(&mut self, cm: CaseMapping) -> Vec<(String, PeerId)> {
+        self.cm = cm;
+        let mut entries: Vec<(String, PeerId)> = self.by_nick.drain().map(|(_, v)| v).collect();
+        entries.sort();
+        self.by_peer.clear();
+        let mut dropped = Vec::new();
+        for (orig, peer) in entries {
+            if self.insert(&orig, peer.clone()).is_err() {
+                dropped.push((orig, peer));
+            }
+        }
+        dropped
+    }
 }
 
 /// The outcome of resolving an IRC channel back to a mesh peer.

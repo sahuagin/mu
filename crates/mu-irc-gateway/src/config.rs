@@ -89,6 +89,58 @@ pub struct IrcConfig {
     pub lobby: String,
     /// Whether to subscribe the agent-DM observer wildcard. Defaults to `true`.
     pub observe_agent_dms: bool,
+    /// `[irc.puppets]` — one IRC nick per live agent. Defaults apply when the
+    /// table is absent.
+    pub puppets: PuppetsConfig,
+}
+
+/// The validated `[irc.puppets]` table: one IRC nick per live agent, operated
+/// by the gateway over its own connection (design:
+/// `specs/plans/mu-irc-gateway-v1-puppets.md`). Every field has a default, so
+/// an absent table is the design's defaults; `enabled = false` is the one
+/// switch that turns the whole thing off. Puppets connect unauthenticated from
+/// the LAN and inherit the `[irc]` TLS settings; a `sasl_*` key in this table
+/// is refused rather than ignored, because it describes a credential no puppet
+/// will ever present.
+///
+/// Until the pool is wired to the bridge (design increment 2b) nothing reads
+/// this at runtime; it exists so the contract is loaded, validated and shown by
+/// `--check-config` before any puppet connects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PuppetsConfig {
+    /// Run puppets at all. Defaults to `true`.
+    pub enabled: bool,
+    /// Roles whose SESSION-shaped peers get a puppet (`cc:<id>`,
+    /// `mu:<daemon>:<session>`) — ruling A. Defaults to `["cc", "mu"]`. `human`
+    /// is never accepted: humans keep their own names.
+    pub roles: Vec<String>,
+    /// Also give bare daemons (`mu:<daemon>`, no session) a puppet. Defaults to
+    /// `false` (ruling A: a daemon puppet is a nick nobody can usefully address).
+    pub daemons: bool,
+    /// Upper bound on concurrently connected puppets. Defaults to 16 — Ergo's
+    /// per-IP `max-concurrent-connections`, which the operator raises for the
+    /// gateway host before increment 2b goes live.
+    pub max: usize,
+    /// A peer must have been discovered this long before it gets a puppet, so
+    /// a review-panel seat that lives for one ask never costs a connection.
+    /// Defaults to 60.
+    pub min_age_secs: u64,
+    /// Puppet connections started concurrently. Defaults to 2, well under
+    /// Ergo's throttle of 32 connections per 10 minutes.
+    pub connect_parallelism: usize,
+}
+
+impl Default for PuppetsConfig {
+    fn default() -> Self {
+        PuppetsConfig {
+            enabled: true,
+            roles: vec!["cc".to_string(), "mu".to_string()],
+            daemons: false,
+            max: 16,
+            min_age_secs: 60,
+            connect_parallelism: 2,
+        }
+    }
 }
 
 /// Both halves of the gateway's configuration: the IRC side (this crate) and
@@ -219,6 +271,20 @@ pub enum ConfigError {
     /// rest of this enum.
     #[error("[irc] `nick` is not a valid IRC nickname: {0}")]
     InvalidNick(NickFault),
+    /// `[irc.puppets]` carries a SASL key. Puppets connect unauthenticated
+    /// (the LAN is exempt from `require-sasl`), so a credential here would
+    /// never be presented; refused so the operator is not left believing it is.
+    #[error(
+        "[irc.puppets] cannot carry `{0}`: puppets connect unauthenticated and inherit \
+         only the TLS settings of [irc]; remove the `sasl_*` keys from [irc.puppets]"
+    )]
+    PuppetsSasl(&'static str),
+    /// `[irc.puppets]` is malformed; the message names fields and types only.
+    #[error("[irc.puppets] is malformed: {0}")]
+    PuppetsMalformed(String),
+    /// A `[irc.puppets]` value is out of range or contradictory.
+    #[error("[irc.puppets] `{0}` {1}")]
+    PuppetsInvalid(&'static str, &'static str),
     #[error("mesh config: {0}")]
     Mesh(String),
 }
@@ -323,7 +389,35 @@ struct IrcRaw {
     channel_prefix: Option<String>,
     lobby: Option<String>,
     observe_agent_dms: Option<bool>,
+    /// The nested `[irc.puppets]` table, kept raw here and parsed by
+    /// [`parse_puppets`] so its faults are described in its own terms.
+    puppets: Option<toml::Value>,
 }
+
+/// The raw `[irc.puppets]` table before validation. Every field optional so a
+/// default applies per field, unknown keys rejected so a typo cannot silently
+/// leave a puppet setting at its default.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PuppetsRaw {
+    enabled: Option<bool>,
+    roles: Option<Vec<String>>,
+    daemons: Option<bool>,
+    max: Option<u64>,
+    min_age_secs: Option<u64>,
+    connect_parallelism: Option<u64>,
+}
+
+/// The `[irc.puppets]` fields and the TOML type each expects, for the same
+/// value-free fault description [`IRC_FIELDS`] gives the parent section.
+const PUPPETS_FIELDS: &[(&str, FieldType)] = &[
+    ("enabled", FieldType::Bool),
+    ("roles", FieldType::StrList),
+    ("daemons", FieldType::Bool),
+    ("max", FieldType::Int),
+    ("min_age_secs", FieldType::Int),
+    ("connect_parallelism", FieldType::Int),
+];
 
 /// Resolve the config path: `$MU_CONFIG` if set, else `~/.config/mu/config.toml`
 /// (the same convention `mu-dialogue` uses).
@@ -371,6 +465,7 @@ const IRC_FIELDS: &[(&str, FieldType)] = &[
     ("channel_prefix", FieldType::Str),
     ("lobby", FieldType::Str),
     ("observe_agent_dms", FieldType::Bool),
+    ("puppets", FieldType::Table),
 ];
 
 /// The TOML type an `[irc]` field accepts.
@@ -378,6 +473,9 @@ const IRC_FIELDS: &[(&str, FieldType)] = &[
 enum FieldType {
     Str,
     Bool,
+    Int,
+    StrList,
+    Table,
 }
 
 impl FieldType {
@@ -385,6 +483,9 @@ impl FieldType {
         match self {
             Self::Str => "string",
             Self::Bool => "boolean",
+            Self::Int => "non-negative integer",
+            Self::StrList => "list of strings",
+            Self::Table => "table",
         }
     }
 
@@ -392,6 +493,11 @@ impl FieldType {
         match self {
             Self::Str => value.is_str(),
             Self::Bool => value.is_bool(),
+            Self::Int => value.as_integer().is_some_and(|i| i >= 0),
+            Self::StrList => value
+                .as_array()
+                .is_some_and(|items| items.iter().all(toml::Value::is_str)),
+            Self::Table => value.is_table(),
         }
     }
 }
@@ -405,11 +511,16 @@ impl FieldType {
 /// identifier — a long or exotic key is reported anonymously, since a key that
 /// is not a plausible field name is more likely to be misplaced data.
 fn section_fault(section: &toml::Value) -> String {
+    table_fault(section, "[irc]", IRC_FIELDS)
+}
+
+/// [`section_fault`] for any table with a known field list.
+fn table_fault(section: &toml::Value, label: &str, fields: &[(&str, FieldType)]) -> String {
     let Some(table) = section.as_table() else {
-        return "[irc] is not a table".to_string();
+        return format!("{label} is not a table");
     };
     for (key, value) in table {
-        match IRC_FIELDS.iter().find(|(name, _)| name == key) {
+        match fields.iter().find(|(name, _)| name == key) {
             None => return format!("unknown field{}", named(key)),
             Some((name, ty)) if !ty.matches(value) => {
                 return format!("field `{name}` expects a {}", ty.name())
@@ -419,7 +530,7 @@ fn section_fault(section: &toml::Value) -> String {
     }
     // Every key is recognized and well-typed, so the failure is structural
     // (a duplicate or a nested table serde rejected). Say so without quoting.
-    "section is not a valid [irc] table".to_string()
+    format!("section is not a valid {label} table")
 }
 
 /// Render ` \`key\`` when `key` is identifier-shaped, and the empty string
@@ -543,6 +654,11 @@ fn validate(raw: IrcRaw) -> Result<IrcConfig, ConfigError> {
         (_, Some(_), Some(_)) => unreachable!("password conflict checked above"),
     };
 
+    let puppets = match raw.puppets {
+        None => PuppetsConfig::default(),
+        Some(table) => parse_puppets(&table)?,
+    };
+
     Ok(IrcConfig {
         server,
         tls,
@@ -552,6 +668,69 @@ fn validate(raw: IrcRaw) -> Result<IrcConfig, ConfigError> {
         channel_prefix: nonempty(raw.channel_prefix).unwrap_or_else(|| "#".to_string()),
         lobby: nonempty(raw.lobby).unwrap_or_else(|| "#mu".to_string()),
         observe_agent_dms: raw.observe_agent_dms.unwrap_or(true),
+        puppets,
+    })
+}
+
+/// Validate the `[irc.puppets]` table. Faults are described in the table's own
+/// terms (field names and types, never values), the way `[irc]` faults are.
+fn parse_puppets(table: &toml::Value) -> Result<PuppetsConfig, ConfigError> {
+    // Named before the generic unknown-field path so the diagnostic says WHY
+    // the key has no place here, not merely that it is unknown.
+    if let Some(t) = table.as_table() {
+        for key in ["sasl_user", "sasl_password", "sasl_password_file"] {
+            if t.contains_key(key) {
+                return Err(ConfigError::PuppetsSasl(key));
+            }
+        }
+    }
+    let raw: PuppetsRaw = table.clone().try_into().map_err(|_: toml::de::Error| {
+        ConfigError::PuppetsMalformed(table_fault(table, "[irc.puppets]", PUPPETS_FIELDS))
+    })?;
+    let defaults = PuppetsConfig::default();
+    let roles = match raw.roles {
+        None => defaults.roles,
+        Some(roles) => {
+            for role in &roles {
+                if role.is_empty() || !role.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    return Err(ConfigError::PuppetsInvalid(
+                        "roles",
+                        "entries must be non-empty and alphanumeric (a peer role such as `cc`)",
+                    ));
+                }
+                if role == "human" {
+                    return Err(ConfigError::PuppetsInvalid(
+                        "roles",
+                        "cannot include `human`: humans keep their own nicks and never get a puppet",
+                    ));
+                }
+            }
+            roles
+        }
+    };
+    let bounded =
+        |v: Option<u64>, field: &'static str, dflt: usize| -> Result<usize, ConfigError> {
+            match v {
+                None => Ok(dflt),
+                Some(0) => Err(ConfigError::PuppetsInvalid(
+                    field,
+                    "must be at least 1 (set `enabled = false` to turn puppets off)",
+                )),
+                Some(n) => usize::try_from(n)
+                    .map_err(|_| ConfigError::PuppetsInvalid(field, "is too large")),
+            }
+        };
+    Ok(PuppetsConfig {
+        enabled: raw.enabled.unwrap_or(defaults.enabled),
+        roles,
+        daemons: raw.daemons.unwrap_or(defaults.daemons),
+        max: bounded(raw.max, "max", defaults.max)?,
+        min_age_secs: raw.min_age_secs.unwrap_or(defaults.min_age_secs),
+        connect_parallelism: bounded(
+            raw.connect_parallelism,
+            "connect_parallelism",
+            defaults.connect_parallelism,
+        )?,
     })
 }
 

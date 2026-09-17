@@ -474,9 +474,19 @@ pub async fn forward_events(
         // Error AgentEvent), emit one TaskTelemetry envelope. This is
         // the forensics-axis foundation — downstream classifier
         // (mu-8alb) and analytics sink (mu-8ypx) project from these.
-        if let Some(telemetry) = task_telemetry_for(&session_id, &event, event_log.provider_info())
-        {
-            event_log.append(EventActor::System, telemetry);
+        // The ask's cost is a walk of the whole log; only the two terminal
+        // events need it, so a streaming delta never pays for the scan
+        // (round-6 board). The log prices each call under the card in
+        // force at that call — a buffered provider switch is logged
+        // before this Done, so the provider current now is not the one
+        // the calls ran under (round 12).
+        if matches!(event, AgentEvent::Done { .. } | AgentEvent::Error { .. }) {
+            let ask_cost = event_log.last_ask_cost();
+            if let Some(telemetry) =
+                task_telemetry_for(&session_id, &event, event_log.provider_info(), ask_cost)
+            {
+                event_log.append(EventActor::System, telemetry);
+            }
         }
 
         // MCP status projection: recompute SessionStatus and push
@@ -529,6 +539,7 @@ fn compute_status(
     // rather than cumulative_usage (per-ask Done) which only updates
     // when the full ask completes.
     let (usage, last_call_input) = event_log.live_usage();
+    let cost = event_log.session_cost();
     let snap = provider_status
         .lock()
         .ok()
@@ -561,6 +572,7 @@ fn compute_status(
         provider_kind: &provider_kind,
         model: &model,
         cumulative_usage: usage.as_ref(),
+        cost,
         ask_count: event_log.ask_count(),
         tool_call_count: event_log.tool_call_count(),
         elapsed_total_ms: event_log.elapsed_total_ms(),
@@ -584,6 +596,7 @@ pub(crate) fn task_telemetry_for(
     session_id: &str,
     event: &AgentEvent,
     provider_info: Option<(String, String)>,
+    ask_cost: Option<f64>,
 ) -> Option<EventPayload> {
     use mu_core::agent::StopReason;
     use mu_core::event_log::TaskExitReason;
@@ -625,6 +638,15 @@ pub(crate) fn task_telemetry_for(
     };
 
     let (provider_kind, model) = provider_info.unwrap_or_default();
+    // `ask_cost` is the log's per-call, per-era figure for this ask
+    // (`SessionEventLog::last_ask_cost`), computed while the call sizes
+    // and the card in force at each call are still known: the sink keeps
+    // only the task's totals, from which a per-request tier (gpt-6-astra's
+    // long-context surcharge) cannot be recovered. Only the envelope that
+    // carries the usage (Done) carries the cost: the agent loop emits
+    // Error and then Done{Error} for one failure, and pricing both would
+    // sink the ask's cost twice (round-5 board).
+    let cost_usd = usage.and(ask_cost);
 
     Some(EventPayload::TaskTelemetry {
         task_id,
@@ -647,6 +669,7 @@ pub(crate) fn task_telemetry_for(
         exit_reason,
         max_budget_usd: None,
         actual_spend_usd: None,
+        cost_usd,
         local_hour: None,
         day_of_week: None,
         tz: None,
@@ -1717,6 +1740,7 @@ mod tests {
                 "openrouter".to_owned(),
                 "deepseek/deepseek-v4-flash".to_owned(),
             )),
+            None,
         )
         .expect("Done should yield TaskTelemetry");
 
@@ -1740,6 +1764,7 @@ mod tests {
                 tools_actually_called,
                 max_budget_usd,
                 actual_spend_usd,
+                cost_usd,
                 local_hour,
                 day_of_week,
                 tz,
@@ -1767,6 +1792,8 @@ mod tests {
                 assert!(tools_actually_called.is_empty());
                 assert_eq!(max_budget_usd, None);
                 assert_eq!(actual_spend_usd, None);
+                // openrouter is not on the rate card: no figure rather than a guess
+                assert_eq!(cost_usd, None);
                 assert_eq!(local_hour, None);
                 assert_eq!(day_of_week, None);
                 assert_eq!(tz, None);
@@ -1779,6 +1806,60 @@ mod tests {
 
     /// Done with Aborted stop_reason → TaskExitReason::Cancelled (the
     /// cancel_session / operator-stop code path).
+    /// mu-hx0ta (round-5 board): the agent loop emits Error and then
+    /// Done{Error} for one failure, and both reach task_telemetry_for.
+    /// Only the Done envelope, which carries the usage, carries the cost;
+    /// the Error envelope has neither, so the sink never counts an
+    /// errored ask's spend twice. The figure itself is the log's per-call,
+    /// per-era `last_ask_cost` (tested in mu-core), carried as given.
+    #[test]
+    fn task_telemetry_prices_only_the_envelope_with_usage() {
+        let usage = mu_core::agent::Usage {
+            input_tokens: 300_000,
+            ..Default::default()
+        };
+        let provider = Some(("openai_api".to_owned(), "gpt-6-astra".to_owned()));
+        let err = AgentEvent::Error {
+            message: "boom".into(),
+        };
+        match task_telemetry_for("session-err", &err, provider.clone(), Some(6.0)).expect("emits") {
+            EventPayload::TaskTelemetry {
+                cost_usd,
+                prompt_tokens,
+                ..
+            } => {
+                assert_eq!(prompt_tokens, None);
+                assert_eq!(cost_usd, None);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+        let done = AgentEvent::Done {
+            stop_reason: mu_core::agent::StopReason::Error,
+            usage: Some(usage),
+            elapsed_ms: Some(1),
+            turn_count: 1,
+            command_receipts: Vec::new(),
+        };
+        match task_telemetry_for("session-err", &done, provider.clone(), Some(6.0)).expect("emits")
+        {
+            EventPayload::TaskTelemetry {
+                cost_usd,
+                prompt_tokens,
+                ..
+            } => {
+                assert_eq!(prompt_tokens, Some(300_000));
+                assert_eq!(cost_usd, Some(6.0));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+        // an ask whose cost the log could not price (a call under an
+        // unknown card) sinks no figure rather than a partial one
+        match task_telemetry_for("session-err", &done, provider, None).expect("emits") {
+            EventPayload::TaskTelemetry { cost_usd, .. } => assert_eq!(cost_usd, None),
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
     #[test]
     fn mu_5g7i_telemetry_done_aborted_maps_to_cancelled() {
         use mu_core::agent::StopReason;
@@ -1795,6 +1876,7 @@ mod tests {
             "session-xyz",
             &event,
             Some(("anthropic_api".to_owned(), "claude-haiku-4-5".to_owned())),
+            None,
         )
         .expect("Aborted Done should yield TaskTelemetry");
 
@@ -1828,6 +1910,7 @@ mod tests {
             "session-err",
             &event,
             Some(("openai_api".to_owned(), "gpt-5.5-codex".to_owned())),
+            None,
         )
         .expect("Error should yield TaskTelemetry");
 
@@ -1880,6 +1963,7 @@ mod tests {
             "session-tier",
             &event,
             Some(("anthropic_api".to_owned(), "claude-sonnet-4-6".to_owned())),
+            None,
         )
         .expect("Done should yield TaskTelemetry");
 
@@ -1914,7 +1998,7 @@ mod tests {
     fn mu_5g7i_telemetry_skips_non_terminal_events() {
         let event = AgentEvent::TextDelta { delta: "hi".into() };
         assert!(
-            task_telemetry_for("session-x", &event, Some(("p".into(), "m".into()))).is_none(),
+            task_telemetry_for("session-x", &event, Some(("p".into(), "m".into())), None).is_none(),
             "TextDelta is not terminal — should not produce TaskTelemetry"
         );
     }
@@ -1933,7 +2017,8 @@ mod tests {
             elapsed_ms: None,
             command_receipts: Vec::new(),
         };
-        let payload = task_telemetry_for("session-no-info", &event, None).expect("must still emit");
+        let payload =
+            task_telemetry_for("session-no-info", &event, None, None).expect("must still emit");
         match payload {
             EventPayload::TaskTelemetry {
                 provider_kind,

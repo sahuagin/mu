@@ -279,6 +279,13 @@ pub fn derive_session_info(
     let (provider_kind, model) = log
         .provider_info()
         .unwrap_or_else(|| ("unknown".into(), "unknown".into()));
+    // The log prices itself: per call under the card in force at each
+    // call, legacy Done-only asks at the base rate under THEIR card (a
+    // floor, labelled), unknown when any usage ran under a card mu has no
+    // rate for — never the cumulative usage under the current card, which
+    // is neither exact nor a bound (rounds 7-10).
+    let cost = log.session_cost();
+    let (cost_usd, cost_basis, cost_lane) = (cost.known(), cost.basis, Some(cost.lane));
     SessionInfo {
         session_id: session_id.to_string(),
         daemon_id: daemon_id.to_string(),
@@ -292,6 +299,9 @@ pub fn derive_session_info(
         ask_count: log.ask_count(),
         tool_call_count: log.tool_call_count(),
         cumulative_usage: log.cumulative_usage(),
+        cost_usd,
+        cost_basis,
+        cost_lane,
     }
 }
 

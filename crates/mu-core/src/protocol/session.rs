@@ -335,6 +335,22 @@ pub struct SessionInfo {
     pub tool_call_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cumulative_usage: Option<crate::agent::Usage>,
+    /// Session cost in USD from the daemon's rate card, summed per model
+    /// call (`mu_core::pricing::ModelPricing::cost_of_requests`), so a
+    /// per-request pricing tier is exact. `None` for an unpriced
+    /// (provider, model) pair or a peer that predates the field; a
+    /// consumer that recomputes from `cumulative_usage` gets only the
+    /// base rate. API-equivalent on a subscription lane. mu-hx0ta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// What `cost_usd` is (per-call exact, base-rate floor, unknown); see
+    /// `session_status::CostBasis`. Absent on an older peer = unknown.
+    #[serde(default)]
+    pub cost_basis: crate::session_status::CostBasis,
+    /// Which lane(s) the priced usage ran on (billed / api_equivalent /
+    /// mixed); see `session_status::CostLane`. Absent on an older peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_lane: Option<crate::session_status::CostLane>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

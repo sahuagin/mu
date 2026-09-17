@@ -265,6 +265,7 @@ impl MuMcpHandler {
         let log = self.sessions.event_log(session_id)?;
         let (provider_kind, model) = log.provider_info().unwrap_or_default();
         let usage = log.cumulative_usage();
+        let cost = log.session_cost();
         // mu-context-limits-wire: this pull path used to leave the context
         // fields unset, so it disagreed with the forwarder's push path.
         // Both now read the same recorded soft/hard limits and report the
@@ -289,6 +290,7 @@ impl MuMcpHandler {
             provider_kind: &provider_kind,
             model: &model,
             cumulative_usage: usage.as_ref(),
+            cost,
             ask_count: log.ask_count(),
             tool_call_count: log.tool_call_count(),
             elapsed_total_ms: log.elapsed_total_ms(),

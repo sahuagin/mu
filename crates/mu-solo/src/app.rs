@@ -766,6 +766,29 @@ fn pending_interjection_commit_lines(
     )
 }
 
+/// What a displayed cost figure is (mu-hx0ta): exact per-call pricing
+/// from the daemon (`$`), the daemon's base-rate floor for a legacy ask
+/// (`≥$`), mu-solo's own offline estimate from the session totals at the
+/// current card (`≈$`, neither exact nor a bound), or nothing (`$?`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CostMark {
+    Exact,
+    Floor,
+    Estimate,
+    Unknown,
+}
+
+impl CostMark {
+    fn glyph(self) -> &'static str {
+        match self {
+            CostMark::Exact => "",
+            CostMark::Floor => "≥",
+            CostMark::Estimate => "≈",
+            CostMark::Unknown => "?",
+        }
+    }
+}
+
 /// Normalize a provider string to the daemon's wire enum
 /// (`ProviderSelector::kind`, snake_case). Accept the common spellings
 /// users type at the CLI. Shared between session create and
@@ -4255,11 +4278,27 @@ impl App {
                 self.ask_count,
             )),
             {
-                let cost = self.compute_cost();
-                if cost > 0.0 {
-                    Line::from(format!("  cost:        ${cost:.4}"))
+                let (cost, mark) = self.session_cost();
+                let note = match mark {
+                    CostMark::Exact => "",
+                    CostMark::Floor => " — ≥: a legacy ask is priced at the base rate, a floor where the model surcharges large requests",
+                    CostMark::Estimate => " — ≈: estimated from the session totals at the current rate card; the daemon status carries the exact figure",
+                    CostMark::Unknown => "",
+                };
+                let glyph = mark.glyph();
+                use mu_core::session_status::CostLane;
+                if mark == CostMark::Unknown {
+                    Line::from("  cost:        (unknown — no rate card for this provider/model, or usage under one)")
                 } else {
-                    Line::from("  cost:        (unknown — no pricing for this provider/model)")
+                    match self.cost_lane() {
+                        CostLane::ApiEquivalent => Line::from(format!(
+                            "  cost:        ~{glyph}${cost:.4} (API-equivalent; a flat-rate subscription lane, nothing billed{note})"
+                        )),
+                        CostLane::Mixed => Line::from(format!(
+                            "  cost:        {glyph}${cost:.4}~ (mixed: part billed on a metered lane, part API-equivalent on a subscription lane{note})"
+                        )),
+                        CostLane::Billed => Line::from(format!("  cost:        {glyph}${cost:.4}{note}")),
+                    }
                 }
             },
             Line::from(format!("  session_id:  {}", self.session_id)),
@@ -5715,7 +5754,7 @@ impl App {
                 self.cumulative_output_tokens,
                 self.cumulative_cache_read,
                 self.cumulative_cache_creation,
-                self.compute_cost(),
+                self.session_cost().0,
                 None,
                 None,
                 None,
@@ -5747,8 +5786,23 @@ impl App {
                 metrics_text_len += cs.len();
                 spans.push(Span::styled(cs, dim));
             }
-            if cost > 0.0 {
-                let cs = format!(" ${cost:.2}");
+            {
+                // A leading `~` marks an API-equivalent figure (a
+                // subscription lane, nothing billed), a trailing `~` a
+                // mixed total (part billed, part API-equivalent); see
+                // cost_lane. The CostMark glyph says what the figure is
+                // (`≥` floor, `≈` offline estimate); unknown shows `$?`,
+                // never `$0.00`, which reads as free. See session_cost.
+                use mu_core::session_status::CostLane;
+                let (lead, trail) = match self.cost_lane() {
+                    CostLane::ApiEquivalent => ("~", ""),
+                    CostLane::Mixed => ("", "~"),
+                    CostLane::Billed => ("", ""),
+                };
+                let cs = match self.session_cost().1 {
+                    CostMark::Unknown => " $?".to_string(),
+                    mark => format!(" {lead}{}${cost:.2}{trail}", mark.glyph()),
+                };
                 metrics_text_len += cs.len();
                 spans.push(Span::styled(cs, dim));
             }
@@ -5858,29 +5912,65 @@ impl App {
         ])
     }
 
-    /// Inline cost for the status line and `/status`, from mu-core's rate
-    /// card (`mu_core::pricing`) so the two cannot drift — this used to be a
-    /// hand-kept mirror of that table (4.x prefixes, a fixed cache-read
-    /// modifier) and went stale the first time the table grew. An OAuth
-    /// session is priced at the API rate card, as before. Returns 0.0 for
-    /// an unknown (provider, model) pair.
-    fn compute_cost(&self) -> f64 {
-        let kind = normalize_provider_kind(&self.provider);
-        let kind = if kind == "anthropic_oauth" {
-            "anthropic_api"
+    /// Which lane(s) the figure from [`Self::session_cost`] ran on: the
+    /// daemon's `cost_lane` when its status carries one — the total spans
+    /// every era of the session, and a session that switched between a
+    /// subscription lane and a metered one is `Mixed`, neither "nothing
+    /// billed" nor "money" (round-13 board); otherwise the current
+    /// provider, which is all an offline estimate has. Subscription lanes
+    /// (`anthropic_oauth`, `openai_codex`) price API-equivalent cost (see
+    /// `mu_core::pricing`); both display sites label it so a subscription
+    /// session never reads as a bill. mu-hx0ta.
+    fn cost_lane(&self) -> mu_core::session_status::CostLane {
+        use mu_core::session_status::CostLane;
+        if let Some(lane) = self.mcp_status.as_ref().and_then(|s| s.cost_lane) {
+            return lane;
+        }
+        if mu_core::pricing::is_api_equivalent_lane(&normalize_provider_kind(&self.provider)) {
+            CostLane::ApiEquivalent
         } else {
-            kind.as_str()
+            CostLane::Billed
+        }
+    }
+
+    /// Session cost for the status line and `/status`, with what the
+    /// figure is. The daemon's `SessionStatus` is the source when the MCP
+    /// status subscription is up: it prices the log per model call under
+    /// the card in force at each call (exact; a per-request pricing tier
+    /// such as gpt-6-astra's long-context surcharge lands on the calls
+    /// that crossed it), marks a legacy Done-only ask's base-rate figure
+    /// as a floor, and says unknown when any usage ran under a card mu has
+    /// no rate for. Offline, mu-solo only holds per-ask accumulators and
+    /// its current provider, so all it can offer is an ESTIMATE: the base
+    /// rate on the totals at the current card — not exact, and not a
+    /// bound either if the session switched models or crossed a tier —
+    /// and both display sites mark it so (`≈`). The rate card is
+    /// mu-core's (`mu_core::pricing`) so the two cannot drift — this used
+    /// to be a hand-kept mirror of that table and went stale the first
+    /// time the table grew. A subscription session (OAuth, codex) is
+    /// priced at the API rate card and labelled API-equivalent by
+    /// [`Self::cost_is_api_equivalent`]. mu-hx0ta.
+    fn session_cost(&self) -> (f64, CostMark) {
+        if let Some(ref s) = self.mcp_status {
+            use mu_core::session_status::CostBasis;
+            return match s.cost_basis {
+                CostBasis::PerCall => (s.cost_usd, CostMark::Exact),
+                CostBasis::BaseRate => (s.cost_usd, CostMark::Floor),
+                CostBasis::Unknown => (0.0, CostMark::Unknown),
+            };
+        }
+        let kind = normalize_provider_kind(&self.provider);
+        let Some(pricing) = mu_core::pricing::for_model(&kind, &self.model) else {
+            return (0.0, CostMark::Unknown);
         };
-        let Some(pricing) = mu_core::pricing::for_model(kind, &self.model) else {
-            return 0.0;
-        };
-        pricing.cost(&mu_core::agent::types::Usage {
+        let cost = pricing.base_rate_cost(&mu_core::agent::types::Usage {
             input_tokens: self.cumulative_input_tokens,
             output_tokens: self.cumulative_output_tokens,
             cache_creation_input_tokens: Some(self.cumulative_cache_creation),
             cache_read_input_tokens: Some(self.cumulative_cache_read),
             ..Default::default()
-        })
+        });
+        (cost, CostMark::Estimate)
     }
 
     /// Apply a single MCP status update. Syncs the inline accumulators

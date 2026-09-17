@@ -58,13 +58,12 @@
 //! call from the event log (`SessionEventLog::request_usages`).
 //!
 //! A flat-rate subscription lane (`is_api_equivalent_lane`: `openai_codex`,
-//! `anthropic_oauth`) has no row of its own here: a figure priced for it
-//! by its api-key lane's card is API-EQUIVALENT — what the same tokens
-//! would have cost on the api-key lane, not money paid — and a display
-//! that shows one must say so. The lanes are switched on (`for_model`
-//! resolving them to the api-key card) in the increment that gives every
-//! display that label; until then `for_model` returns None for them, as
-//! it always has, and [`CostLane`] carries the distinction.
+//! `anthropic_oauth`) is priced by its api-key lane's card: the figure is
+//! API-EQUIVALENT — what the same tokens would have cost on the api-key
+//! lane, not money paid — and every display says so (mu-analytics tags it
+//! `subscription`; mu-solo and mu-tui label from the daemon's
+//! [`CostLane`]). `for_model` resolves `anthropic_oauth` to the
+//! `anthropic_api` rows and `openai_codex` has rows of its own.
 //!
 //! Source for rate-card values: Anthropic public pricing page,
 //! 2026-04-16 (unchanged through May 2026), operator-confirmed, for the
@@ -346,10 +345,17 @@ impl SessionCost {
 /// Look up pricing for a (provider, model) pair. Match is exact on
 /// provider kind (e.g. `"anthropic_api"`), prefix on model name
 /// (e.g. `"claude-opus-4-7"` matches `claude-opus-4-7-20260101`).
-/// Returns None for unknown pairs, including the subscription lanes
-/// (`is_api_equivalent_lane`) until the increment that labels their
-/// figures resolves them to the api-key card.
+/// Returns None for unknown pairs. The Anthropic OAuth lane
+/// (`anthropic_oauth`, the Claude subscription) is priced at the
+/// `anthropic_api` card: like `openai_codex`, its figure is API-equivalent,
+/// not money paid, and every display labels it so (round-11 board: the
+/// event log priced the lane by its recorded kind and got no card).
 pub fn for_model(provider_kind: &str, model: &str) -> Option<ModelPricing> {
+    let provider_kind = if provider_kind == "anthropic_oauth" {
+        "anthropic_api"
+    } else {
+        provider_kind
+    };
     let entry = MODEL_RATES
         .iter()
         .find(|(p, m, _)| *p == provider_kind && model.starts_with(m))?;
@@ -390,12 +396,10 @@ const fn openai_card(input_per_mtok: f64, output_per_mtok: f64) -> ModelPricing 
 }
 
 /// gpt-6-astra's card: $10 / $50, cached input 0.10x, writes 1.25x, and the
-/// long-context tier from the model page (read 2026-09-09). Not in the
-/// table yet: the only tiered card lands together with the consumers that
-/// carry a per-call figure and its provenance, so no cumulative consumer
-/// can fire the tier on a sum in between (round-15/17 boards). The
-/// capability is tested against it here.
-#[cfg(test)]
+/// long-context tier from the model page (read 2026-09-09). The only
+/// tiered card, in the table now that every consumer carries a per-call
+/// figure with its provenance (no cumulative consumer prices a sum with
+/// `cost()` any more).
 const GPT_6_ASTRA: ModelPricing = ModelPricing {
     input_per_mtok: 10.00,
     output_per_mtok: 50.00,
@@ -462,10 +466,17 @@ const MODEL_RATES: &[(&str, &str, ModelPricing)] = &[
     ("anthropic_api", "claude-sonnet-4", card(3.00, 15.00)),
     ("anthropic_api", "claude-haiku-4", card(1.00, 5.00)),
     // OpenAI (model pages, developers.openai.com/api/docs/models, read
-    // gpt-5.5 per mu-analytics' rate table). The api-key lane: real
-    // per-token spend. gpt-6-astra (the tiered card, `GPT_6_ASTRA`) joins
-    // with the consumers that carry per-call cost and its provenance.
+    // 2026-09-09 for gpt-6-astra; gpt-5.5 per mu-analytics' rate table).
+    // Both lanes carry the card: `openai_api` is real per-token spend;
+    // `openai_codex` is the subscription, so its figure is API-EQUIVALENT,
+    // not money paid — displayed labelled (`CostLane`). gpt-6-astra: a
+    // request whose prompt exceeds 272k tokens is 2x input/cache and 1.5x
+    // output for the whole request (`LongContextTier`; priced per model
+    // call).
+    ("openai_api", "gpt-6-astra", GPT_6_ASTRA),
+    ("openai_codex", "gpt-6-astra", GPT_6_ASTRA),
     ("openai_api", "gpt-5.5", openai_card(5.00, 30.00)),
+    ("openai_codex", "gpt-5.5", openai_card(5.00, 30.00)),
 ];
 
 #[cfg(test)]
@@ -488,7 +499,7 @@ mod tests {
     #[test]
     fn unknown_pair_returns_none() {
         assert!(for_model("anthropic_api", "claude-future-9").is_none());
-        assert!(for_model("openai_codex", "any").is_none());
+        assert!(for_model("openai_codex", "gpt-4o").is_none());
         assert!(for_model("openai_api", "gpt-4o").is_none());
     }
 
@@ -515,9 +526,10 @@ mod tests {
         };
         let cost = p.cost(&usage);
         assert!((cost - 0.277_082).abs() < 1e-9, "{cost}");
-        // neither lane has the tiered card in the table yet (see GPT_6_ASTRA)
-        assert_eq!(for_model("openai_api", "gpt-6-astra"), None);
-        assert_eq!(for_model("openai_codex", "gpt-6-astra"), None);
+        // both OpenAI lanes carry the same card; api-key is real spend,
+        // codex is the API-equivalent figure
+        assert_eq!(for_model("openai_api", "gpt-6-astra"), Some(p));
+        assert_eq!(for_model("openai_codex", "gpt-6-astra"), Some(p));
         assert_eq!(
             for_model("openai_api", "gpt-5.5").map(|c| (c.input_per_mtok, c.output_per_mtok)),
             Some((5.00, 30.00))
@@ -705,6 +717,24 @@ mod tests {
         assert_eq!(CostLane::Billed.fold(false, false), CostLane::Billed);
         assert_eq!(CostLane::Billed.fold(false, true), CostLane::Billed);
         assert_eq!(CostLane::Billed.fold(true, true), CostLane::Mixed);
+    }
+
+    /// The subscription lanes price at the api-key card (API-equivalent).
+    #[test]
+    fn subscription_lanes_price_at_the_api_card() {
+        assert_eq!(
+            for_model("anthropic_oauth", "claude-opus-4-8"),
+            for_model("anthropic_api", "claude-opus-4-8")
+        );
+        assert!(for_model("anthropic_oauth", "claude-opus-4-8").is_some());
+        assert_eq!(
+            for_model("openai_codex", "gpt-5.5"),
+            for_model("openai_api", "gpt-5.5")
+        );
+        assert!(is_api_equivalent_lane("anthropic_oauth"));
+        assert!(is_api_equivalent_lane("openai_codex"));
+        assert!(!is_api_equivalent_lane("anthropic_api"));
+        assert!(!is_api_equivalent_lane("openai_api"));
     }
 
     #[test]

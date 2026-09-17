@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     completion_tokens    INTEGER,
     cache_read_tokens    INTEGER,
     cache_write_tokens   INTEGER,
+    cost_usd             REAL,
     exit_reason          TEXT NOT NULL,
     outcome_class        TEXT NOT NULL,
     outcome_confidence   TEXT NOT NULL,
@@ -52,6 +53,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "tool_call_count",
         "ALTER TABLE tasks ADD COLUMN tool_call_count INTEGER NOT NULL DEFAULT 0",
     ),
+    // mu-hx0ta: the producer's per-call rate-card cost. NULL on rows
+    // compacted from telemetry that predates the field; a reader then
+    // prices the totals itself (base rate on a tiered card).
+    ("cost_usd", "ALTER TABLE tasks ADD COLUMN cost_usd REAL"),
 ];
 
 /// Open the sink at `path`, creating the file (and parent dirs) + schema if
@@ -105,6 +110,10 @@ pub struct TaskRow {
     pub completion_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
     pub cache_write_tokens: Option<u64>,
+    /// Rate-card cost summed per model call by the producer; the one
+    /// figure a per-request pricing tier is exact in. API-equivalent on a
+    /// subscription lane. mu-hx0ta.
+    pub cost_usd: Option<f64>,
     pub exit_reason: TaskExitReason,
     pub classification: Classification,
     /// Number of tools the agent actually called during this task. 0
@@ -164,8 +173,8 @@ pub fn upsert_task(conn: &Connection, row: &TaskRow) -> Result<()> {
             started_at_unix_ms, ended_at_unix_ms, wall_clock_ms,
             prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
             exit_reason, outcome_class, outcome_confidence, rationale,
-            tool_call_count
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            tool_call_count, cost_usd
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
         ON CONFLICT(task_id) DO UPDATE SET
             session_id           = excluded.session_id,
             parent_task_id       = excluded.parent_task_id,
@@ -183,7 +192,8 @@ pub fn upsert_task(conn: &Connection, row: &TaskRow) -> Result<()> {
             outcome_class        = excluded.outcome_class,
             outcome_confidence   = excluded.outcome_confidence,
             rationale            = excluded.rationale,
-            tool_call_count      = excluded.tool_call_count
+            tool_call_count      = excluded.tool_call_count,
+            cost_usd             = excluded.cost_usd
         ",
         params![
             row.task_id,
@@ -204,6 +214,7 @@ pub fn upsert_task(conn: &Connection, row: &TaskRow) -> Result<()> {
             confidence_str(row.classification.confidence),
             row.classification.rationale,
             row.tool_call_count,
+            row.cost_usd,
         ],
     )
     .context("upserting task row")?;
@@ -270,6 +281,7 @@ mod tests {
             completion_tokens: Some(17),
             cache_read_tokens: None,
             cache_write_tokens: None,
+            cost_usd: None,
             exit_reason: TaskExitReason::Done,
             classification: Classification {
                 outcome: Outcome::NarrativeNoAction,

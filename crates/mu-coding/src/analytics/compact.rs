@@ -247,6 +247,7 @@ pub fn project_event(
         completion_tokens: parsed.completion_tokens,
         cache_read_tokens: parsed.cache_read_tokens,
         cache_write_tokens: parsed.cache_write_tokens,
+        cost_usd: parsed.cost_usd,
         exit_reason,
         classification,
         // Prefer the producer-supplied list when present (older
@@ -288,6 +289,10 @@ struct ParsedTelemetry {
     cache_read_tokens: Option<u64>,
     #[serde(default)]
     cache_write_tokens: Option<u64>,
+    /// Per-call rate-card cost from the producer (mu-hx0ta); the only
+    /// place a per-request pricing tier can be applied.
+    #[serde(default)]
+    cost_usd: Option<f64>,
     /// Names of tools the agent actually invoked during this task.
     /// Defaults to empty when the producer omits the field (older
     /// events) so back-compat doesn't break.
@@ -329,6 +334,7 @@ mod tests {
                 exit_reason: TaskExitReason::Done,
                 max_budget_usd: None,
                 actual_spend_usd: None,
+                cost_usd: None,
                 local_hour: None,
                 day_of_week: None,
                 tz: None,

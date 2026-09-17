@@ -173,18 +173,32 @@ separate, later idea).
   select loop; nothing in the bridge grows a second state owner. Outbound
   writes go to the puppet's own bounded writer; a puppet that is not
   registered yet falls back to `mu-gw` with the v0 label.
-- Pacing: at most `connect_parallelism` (default 2 — landed so in increment
-  1: Ergo throttles 32 connections per 10 minutes per IP, and two in flight
-  with backoff stays well under it) registrations in flight, a per-puppet
-  backoff on failure (same 2 s → 5 min schedule as the main connection), and
-  a `min_age` (default 60 s, i.e. two discovery sweeps) before a newly
-  discovered agent gets a puppet, so a review seat that lives a minute never
-  costs a connection. A gateway restart reconnects puppets under the same
-  pacing; no reconnect storm.
-- Cap: `max` (default 16 — landed so in increment 1: Ergo's per-IP
-  `max-concurrent-connections` default, so an unexempted host degrades to
-  channel-only rather than refused connections; raise it with the exemption)
-  live puppets; agents beyond it are channel-only with a notice in
+- Pacing, three bounds that do three different things (increments 1 and 2a):
+  `connect_parallelism` (default 2) bounds how many registrations are *in
+  flight* at once; a per-puppet backoff on failure (same 2 s → 5 min schedule
+  as the main connection) bounds how fast *one* peer retries; and the pool's
+  rolling **attempt budget** — at most 24 connection attempts started per
+  10-minute window across all puppets, re-offers after a `433` included —
+  bounds the aggregate *rate*, which the first two do not (a freed slot
+  refills at once and backoff is per peer, so churn over many peers could
+  otherwise exceed Ergo's 32 connections per 10 minutes per IP). The budget
+  keeps 8 attempts in reserve for `mu-gw`'s own reconnects on the same
+  address, and it is the one piece of pool state that OUTLIVES the pool: the
+  session rebuilds its pool empty on every main-connection registration, but
+  Ergo's window does not reset with it, so the bridge holds the attempt
+  history outside the session and hands it to each new pool. A registration
+  that drops before 60 s of stable uptime continues its backoff schedule
+  rather than restarting at 2 s, as the main connection does. A `min_age` (default 60 s, i.e. two discovery sweeps) before a
+  newly discovered agent gets a puppet keeps a review seat that lives a
+  minute from ever costing a connection. A gateway restart reconnects
+  puppets under the same pacing; no reconnect storm.
+- Cap: `max` (default 16) live puppets, *not* counting `mu-gw` — so the host
+  holds up to `max + 1` connections. Ergo's per-IP `max-concurrent-connections`
+  is 16 with only localhost exempt, which is why the operator's exemption
+  (below) precedes 2b going live: without it the 17th connection is refused
+  and that puppet backs off like any other failed connection (it does not
+  become channel-only — channel-only is for a nick that cannot be had or a
+  peer beyond `max`). Agents beyond the cap are channel-only with a notice in
   `mu peers`. Nothing is queued across a reconnect on either side (v0 rule).
 - **Outbound enqueue is non-blocking.** The state-owning loop never awaits a
   puppet writer. A delivery is `try_send` into that puppet's bounded queue;

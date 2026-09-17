@@ -827,3 +827,59 @@ fn owned_set_refolds_from_wire_spellings_on_casemapping_change() {
     assert!(m.is_owned("cc-a[b2") && !m.is_owned("cc-a[b"));
     assert_eq!(m.owned_nicks(), vec!["cc-a[b2"]);
 }
+
+#[test]
+fn a_renamed_puppet_leaves_a_tombstone_so_a_stale_names_line_cannot_front_it() {
+    // Own cc-old, open a sync, rename it, then a delayed 353 still naming the
+    // old spelling arrives: it must not become `human:cc-old`.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned_nicks(["cc-old"]);
+    let g = m.self_joined("#mu");
+    assert!(m.renamed("cc-old", "cc-new").is_empty());
+    assert!(m.is_owned("cc-new") && !m.is_owned("cc-old"));
+    m.names_reply(
+        "#mu",
+        g,
+        names(&[("alice", None), ("cc-old", None), ("cc-new", None)]),
+    );
+    let effects = m.names_end("#mu", g);
+    assert_eq!(effects, vec![HumanEffect::Register(human("alice"))]);
+    assert!(
+        !m.is_present("cc-old"),
+        "the vacated spelling was tombstoned"
+    );
+    assert!(!m.is_present("cc-new"), "the new spelling is owned");
+    // A real human who later takes the freed nick arrives by JOIN, which is
+    // newer than the tombstone.
+    assert_eq!(
+        m.joined("#mu", "cc-old", None),
+        vec![HumanEffect::Register(human("cc-old"))]
+    );
+}
+
+#[test]
+fn an_owned_puppet_quit_or_part_is_tombstoned_for_an_open_sync_even_after_release() {
+    // Own cc-abc, open a sync, the puppet QUITs, the pool releases the nick,
+    // then a delayed 353 still lists it: the observed departure wins.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned_nicks(["cc-abc", "cc-def"]);
+    let g = m.self_joined("#mu");
+    assert!(m.quit("cc-abc").is_empty());
+    assert!(m.left("#mu", "cc-def").is_empty());
+    assert!(m.set_owned_nicks(Vec::<&str>::new()).is_empty());
+    m.names_reply(
+        "#mu",
+        g,
+        names(&[("alice", None), ("cc-abc", None), ("cc-def", None)]),
+    );
+    assert_eq!(
+        m.names_end("#mu", g),
+        vec![HumanEffect::Register(human("alice"))]
+    );
+    assert!(!m.is_present("cc-abc") && !m.is_present("cc-def"));
+    // A live JOIN under the freed name is newer than the tombstone.
+    assert_eq!(
+        m.joined("#mu", "cc-abc", None),
+        vec![HumanEffect::Register(human("cc-abc"))]
+    );
+}

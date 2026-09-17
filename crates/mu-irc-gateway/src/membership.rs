@@ -208,6 +208,9 @@ impl Membership {
             ch.members.remove(key);
             if let Some(sync) = ch.sync.as_mut() {
                 sync.pending.remove(key);
+                // Tombstoned too: if the pool releases the nick before this
+                // sync ends, a delayed snapshot line must still not front it.
+                sync.departed.insert(key.to_string());
             }
         }
         match self.forget_presence(key) {
@@ -356,7 +359,17 @@ impl Membership {
         }
         if self.owned.contains_key(&key) {
             // A puppet leaving is the pool's business; the gateway is still in
-            // the channel and no human moved.
+            // the channel and no human moved. The departure is still recorded
+            // for an open sync: if the pool later releases the nick, a delayed
+            // snapshot line naming it must not front a human.
+            if let Some(sync) = self
+                .channels
+                .get_mut(&folded_ch)
+                .and_then(|c| c.sync.as_mut())
+            {
+                sync.pending.remove(&key);
+                sync.departed.insert(key);
+            }
             return Vec::new();
         }
         let Some(ch) = self.channels.get_mut(&folded_ch) else {
@@ -373,7 +386,18 @@ impl Membership {
     /// A QUIT removes the nick from every channel at once.
     pub fn quit(&mut self, nick: &str) -> Vec<HumanEffect> {
         let key = self.fold(nick);
-        if self.is_own(&key) {
+        if key == self.self_nick.folded() {
+            return Vec::new();
+        }
+        if self.owned.contains_key(&key) {
+            // A puppet's QUIT: no human moved, but the departure is tombstoned
+            // in every open sync for the same reason as in `left`.
+            for ch in self.channels.values_mut() {
+                if let Some(sync) = ch.sync.as_mut() {
+                    sync.pending.remove(&key);
+                    sync.departed.insert(key.clone());
+                }
+            }
             return Vec::new();
         }
         let channels: Vec<String> = self.channels.keys().cloned().collect();
@@ -402,8 +426,19 @@ impl Membership {
         let new = self.fold(to);
         if self.owned.remove(&old).is_some() {
             // A puppet renamed (a server can force a NICK): it stays ours under
-            // the new spelling and is still not a human.
-            self.owned.insert(new, to.to_string());
+            // the new spelling and is still not a human. The vacated spelling
+            // gets the same tombstone the gateway's own rename leaves: it is no
+            // longer in the owned set, so a delayed snapshot line naming it
+            // would otherwise land in `pending` and be fronted as a human.
+            self.owned.insert(new.clone(), to.to_string());
+            if old != new {
+                for ch in self.channels.values_mut() {
+                    if let Some(sync) = ch.sync.as_mut() {
+                        sync.pending.remove(&old);
+                        sync.departed.insert(old.clone());
+                    }
+                }
+            }
             return Vec::new();
         }
         if old == self.self_nick.folded() {

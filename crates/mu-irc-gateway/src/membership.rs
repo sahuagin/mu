@@ -10,12 +10,16 @@
 //!   watched happen wins over a snapshot line that contradicts it, in either
 //!   order of arrival — a departure leaves a tombstone for the rest of that
 //!   sync, and a later JOIN or NICK clears it.
-//!   Every real nick other than the gateway's own is a human operator (mesh
-//!   agents are channels, never IRC members), so membership is also the sole
-//!   authority on which humans are *present* — the fact routing consults before
-//!   ever disclosing a private body. It emits [`HumanEffect`]s (front / release /
-//!   rename) whose executor uses `front_peer`/`release_peer`; it never touches
-//!   the mesh itself.
+//!   Every real nick other than the gateway's OWN nicks is a human operator —
+//!   the gateway's nick plus every puppet nick it holds on behalf of an agent
+//!   (`specs/plans/mu-irc-gateway-v1-puppets.md`): humans are present nicks
+//!   minus that owned set. So membership is also the sole authority on which
+//!   humans are *present* — the fact routing consults before ever disclosing a
+//!   private body. It emits [`HumanEffect`]s (front / release / rename) whose
+//!   executor uses `front_peer`/`release_peer`; it never touches the mesh
+//!   itself. The owned set is handed in by the bridge, from the puppet pool,
+//!   BEFORE any puppet connects, so no JOIN or NAMES entry for a puppet is ever
+//!   read as a human arriving.
 //! - [`ChannelReconciler`] decides which channels the gateway *should* be in from
 //!   the current discovered-agent snapshot (the lobby always; one channel per
 //!   agent peer via [`crate::mapping::channel_for`]; never a human channel),
@@ -112,6 +116,10 @@ pub struct Membership {
     /// already-folded nick loses the gateway's identity across a `CASEMAPPING`
     /// change, so the original is what survives.
     self_nick: SelfNick,
+    /// Puppet nicks the gateway holds: folded key → wire spelling (kept so a
+    /// `CASEMAPPING` change re-derives, as with `self_nick`). Never humans,
+    /// never present, never fronted.
+    owned: HashMap<String, String>,
     cm: CaseMapping,
     channels: HashMap<String, Channel>,
     /// Folded human nick → the set of folded channels they are currently in.
@@ -127,6 +135,7 @@ impl Membership {
     pub fn new(self_nick: &str, cm: CaseMapping) -> Self {
         Membership {
             self_nick: SelfNick::new(self_nick, cm),
+            owned: HashMap::new(),
             cm,
             channels: HashMap::new(),
             present: HashMap::new(),
@@ -143,6 +152,68 @@ impl Membership {
     /// `CASEMAPPING` changes; changes only when the gateway itself renames.
     pub fn self_nick(&self) -> &str {
         self.self_nick.original()
+    }
+
+    /// Whether a folded nick is one of the gateway's own: its nick, or a
+    /// puppet it holds. Such a nick is never a human.
+    fn is_own(&self, key: &str) -> bool {
+        key == self.self_nick.folded() || self.owned.contains_key(key)
+    }
+
+    /// Replace the set of puppet nicks the gateway holds (wire spellings). The
+    /// bridge calls this from the pool's owned set — before the first puppet
+    /// connects, and again as puppets register or give up.
+    ///
+    /// A nick that is newly owned but currently tracked as a human (a puppet
+    /// whose JOIN arrived before the pool told membership about it) is evicted
+    /// from every roster and withdrawn, so the correction is made here rather
+    /// than left to whoever noticed the ordering. A nick no longer owned is
+    /// simply forgotten from the set; if it is still on the server it is
+    /// somebody else's, and the next event about it is treated as a human's.
+    pub fn set_owned_nicks<I, S>(&mut self, nicks: I) -> Vec<HumanEffect>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let cm = self.cm;
+        self.owned = nicks
+            .into_iter()
+            .map(|n| (fold_nick(n.as_ref(), cm), n.as_ref().to_string()))
+            .collect();
+        let keys: Vec<String> = self.owned.keys().cloned().collect();
+        let mut effects = Vec::new();
+        for key in keys {
+            effects.extend(self.evict(&key));
+        }
+        effects
+    }
+
+    /// The puppet nicks currently owned, in their wire spelling.
+    pub fn owned_nicks(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = self.owned.values().map(String::as_str).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Whether `nick` is one of the gateway's own nicks (its own or a puppet's).
+    pub fn is_owned(&self, nick: &str) -> bool {
+        self.is_own(&self.fold(nick))
+    }
+
+    /// Remove `key` from every roster and open sync, and withdraw it if it was
+    /// present — the correction for a nick learned to be the gateway's own
+    /// after it was seen.
+    fn evict(&mut self, key: &str) -> Vec<HumanEffect> {
+        for ch in self.channels.values_mut() {
+            ch.members.remove(key);
+            if let Some(sync) = ch.sync.as_mut() {
+                sync.pending.remove(key);
+            }
+        }
+        match self.forget_presence(key) {
+            Some(peer) => vec![HumanEffect::Withdraw(peer)],
+            None => Vec::new(),
+        }
     }
 
     fn fold(&self, name: &str) -> String {
@@ -177,6 +248,7 @@ impl Membership {
         let folded = self.fold(channel);
         let cm = self.cm;
         let self_nick = self.self_nick.folded().to_string();
+        let owned = &self.owned;
         let Some(ch) = self.channels.get_mut(&folded) else {
             return;
         };
@@ -185,7 +257,8 @@ impl Membership {
         };
         for (nick, account) in nicks {
             let key = fold_nick(strip_prefixes(&nick), cm);
-            if key == self_nick {
+            if key == self_nick || owned.contains_key(&key) {
+                // The gateway's own nick or one of its puppets: never a human.
                 continue;
             }
             if sync.departed.contains(&key) {
@@ -252,8 +325,9 @@ impl Membership {
     ) -> Vec<HumanEffect> {
         let folded_ch = self.fold(channel);
         let key = self.fold(nick);
-        if key == self.self_nick.folded() {
-            // Our own JOIN echo: `self_joined` already recorded the channel.
+        if self.is_own(&key) {
+            // Our own JOIN echo (`self_joined` already recorded the channel),
+            // or a puppet of ours arriving: neither is a human.
             return Vec::new();
         }
         let member = Member {
@@ -280,6 +354,11 @@ impl Membership {
         if key == self.self_nick.folded() {
             return self.drop_channel(&folded_ch);
         }
+        if self.owned.contains_key(&key) {
+            // A puppet leaving is the pool's business; the gateway is still in
+            // the channel and no human moved.
+            return Vec::new();
+        }
         let Some(ch) = self.channels.get_mut(&folded_ch) else {
             return Vec::new();
         };
@@ -294,7 +373,7 @@ impl Membership {
     /// A QUIT removes the nick from every channel at once.
     pub fn quit(&mut self, nick: &str) -> Vec<HumanEffect> {
         let key = self.fold(nick);
-        if key == self.self_nick.folded() {
+        if self.is_own(&key) {
             return Vec::new();
         }
         let channels: Vec<String> = self.channels.keys().cloned().collect();
@@ -321,6 +400,12 @@ impl Membership {
     pub fn renamed(&mut self, from: &str, to: &str) -> Vec<HumanEffect> {
         let old = self.fold(from);
         let new = self.fold(to);
+        if self.owned.remove(&old).is_some() {
+            // A puppet renamed (a server can force a NICK): it stays ours under
+            // the new spelling and is still not a human.
+            self.owned.insert(new, to.to_string());
+            return Vec::new();
+        }
         if old == self.self_nick.folded() {
             // The gateway renamed itself: track the new self by its WIRE
             // spelling, so a later CASEMAPPING change re-derives correctly.
@@ -467,6 +552,12 @@ impl Membership {
         // who the gateway thinks it is.
         self.self_nick.set_casemapping(cm);
         let self_folded = self.self_nick.folded().to_string();
+        // The owned set re-derives from wire spellings for the same reason.
+        self.owned = self
+            .owned
+            .values()
+            .map(|wire| (fold_nick(wire, cm), wire.clone()))
+            .collect();
 
         // Re-key the channels and their rosters from the spellings the wire gave.
         let mut rekeyed: HashMap<String, Channel> = HashMap::new();
@@ -481,9 +572,9 @@ impl Membership {
                 });
             for member in channel.members.into_values() {
                 let new_key = fold_nick(&member.display, cm);
-                // A nick that folds onto the gateway's own identity under the new
-                // rule is the gateway, not a human to front.
-                if new_key == self_folded {
+                // A nick that folds onto the gateway's own identity — or onto
+                // one of its puppets — under the new rule is not a human to front.
+                if new_key == self_folded || self.owned.contains_key(&new_key) {
                     continue;
                 }
                 moved.insert(fold_nick(&member.display, old_cm), new_key.clone());

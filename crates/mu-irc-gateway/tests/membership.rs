@@ -716,3 +716,114 @@ fn a_refused_channel_that_leaves_discovery_is_forgotten() {
         "a leaked diagnosed marker swallowed the new diagnostic"
     );
 }
+
+// ──────────────────────── Gateway-owned nick set (puppets) ──────────────────
+//
+// Design: specs/plans/mu-irc-gateway-v1-puppets.md — humans are present nicks
+// minus the set of nicks the gateway itself holds (its own + every puppet).
+// Increment 2a: the set is fed by the bridge from the pool; until 2b nothing
+// feeds it, and an empty set is exactly v0.
+
+#[test]
+fn puppet_joins_and_names_entries_are_never_humans() {
+    let mut m = Membership::new("mu-gw", RFC);
+    assert!(m.set_owned_nicks(["cc-abc", "mu-d-session-1"]).is_empty());
+    assert_eq!(m.owned_nicks(), vec!["cc-abc", "mu-d-session-1"]);
+    let g = m.self_joined("#mu");
+    // A NAMES burst listing puppets beside a human fronts the human only.
+    m.names_reply(
+        "#mu",
+        g,
+        names(&[
+            ("alice", None),
+            ("cc-abc", None),
+            ("@mu-d-session-1", None),
+            ("mu-gw", None),
+        ]),
+    );
+    let effects = m.names_end("#mu", g);
+    assert_eq!(effects, vec![HumanEffect::Register(human("alice"))]);
+    assert!(!m.is_present("cc-abc"));
+    assert!(
+        !m.is_present("MU-D-SESSION-1"),
+        "owned nicks fold like every other name"
+    );
+    assert_eq!(m.present_humans(), vec![human("alice")]);
+    // A live puppet JOIN produces no Register and no presence.
+    assert!(m.joined("#mu", "CC-ABC", None).is_empty());
+    assert!(!m.is_present("cc-abc"));
+    assert_eq!(m.present_humans(), vec![human("alice")]);
+    // A puppet PART or QUIT is not a human departure and does not drop the channel.
+    assert!(m.left("#mu", "cc-abc").is_empty());
+    assert!(m.quit("mu-d-session-1").is_empty());
+    assert_eq!(m.joined_channels(), vec!["#mu".to_string()]);
+    assert!(
+        m.is_present("alice"),
+        "the human is untouched by puppet churn"
+    );
+    assert!(m.is_owned("cc-abc") && m.is_owned("mu-gw") && !m.is_owned("alice"));
+}
+
+#[test]
+fn an_owned_set_arriving_after_a_live_join_evicts_the_puppet_from_humans() {
+    // The window the bridge must not open (2b wires the set before the first
+    // puppet connects) — but if it ever does, membership corrects rather than
+    // leaves a puppet fronted as `human:cc-abc`.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None), ("cc-abc", None)]));
+    let effects = m.names_end("#mu", g);
+    assert!(
+        effects.contains(&HumanEffect::Register(human("cc-abc"))),
+        "precondition: fronted"
+    );
+    assert!(m.is_present("cc-abc"));
+    let effects = m.set_owned_nicks(["cc-abc"]);
+    assert_eq!(effects, vec![HumanEffect::Withdraw(human("cc-abc"))]);
+    assert!(!m.is_present("cc-abc"));
+    assert_eq!(m.present_humans(), vec![human("alice")]);
+    // And it stays out of a NAMES that still lists it.
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None), ("cc-abc", None)]));
+    assert!(m.names_end("#mu", g).is_empty());
+    assert!(!m.is_present("cc-abc"));
+}
+
+#[test]
+fn a_nick_dropped_from_the_owned_set_becomes_a_human_again_on_its_next_event() {
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned_nicks(["cc-abc"]);
+    m.self_joined("#mu");
+    assert!(m.joined("#mu", "cc-abc", None).is_empty());
+    // The pool gave the nick up (say the peer left and a human took the name).
+    m.set_owned_nicks(Vec::<&str>::new());
+    assert!(!m.is_owned("cc-abc"));
+    assert_eq!(
+        m.joined("#mu", "cc-abc", None),
+        vec![HumanEffect::Register(human("cc-abc"))]
+    );
+}
+
+#[test]
+fn owned_set_refolds_from_wire_spellings_on_casemapping_change() {
+    let mut m = Membership::new("mu-gw", CaseMapping::Ascii);
+    m.set_owned_nicks(["cc-a[b"]);
+    let g = m.self_joined("#mu");
+    // Under ascii `cc-a{b` is a different nick — a human, fronted.
+    m.names_reply("#mu", g, names(&[("cc-a{b", None)]));
+    assert_eq!(
+        m.names_end("#mu", g),
+        vec![HumanEffect::Register(human("cc-a{b"))]
+    );
+    // Under rfc1459 `[` and `{` fold together: the human now collides with the
+    // gateway's puppet and is withdrawn, and the puppet stays owned.
+    let effects = m.set_casemapping(RFC);
+    assert_eq!(effects, vec![HumanEffect::Withdraw(human("cc-a{b"))]);
+    assert!(m.is_owned("cc-a{b"));
+    assert!(m.is_owned("cc-a[b"));
+    assert!(m.present_humans().is_empty());
+    // A puppet renamed by the server stays owned under its new spelling.
+    assert!(m.renamed("cc-a[b", "cc-a[b2").is_empty());
+    assert!(m.is_owned("cc-a[b2") && !m.is_owned("cc-a[b"));
+    assert_eq!(m.owned_nicks(), vec!["cc-a[b2"]);
+}

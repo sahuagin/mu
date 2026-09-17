@@ -84,6 +84,7 @@ pub mod framing;
 pub mod mapping;
 pub mod membership;
 pub mod outbound;
+pub mod puppets;
 pub mod recent;
 pub mod routing;
 pub mod transport;
@@ -108,6 +109,10 @@ pub use membership::{ChannelEffect, ChannelReconciler, HumanEffect, Member, Memb
 pub use outbound::{
     CommandReply, MemoryDestination, MemoryUpdate, OutDrop, OutEnv, Outbound, OutboundDecision,
     RefuseReason, NO_AGENTS, USAGE,
+};
+pub use puppets::{
+    backoff_ms, classify, line_class, qualifies, ChannelOnly, FanIn, FanInDrop, LineClass, Pool,
+    PoolAction, Puppet, PuppetState, PuppetStatus, Source, BACKOFF_MAX_MS, BACKOFF_MIN_MS,
 };
 pub use recent::{RecentSet, DEFAULT_CAPACITY};
 pub use routing::{
